@@ -402,6 +402,10 @@ pub(crate) struct SamplerFileMetadata {
     pub(crate) fine_tune_cents: Option<f64>,
     /// Suggested sample gain from the signed instrument-chunk decibel field.
     pub(crate) gain_db: Option<i16>,
+    /// Inclusive MIDI key range from the instrument chunk.
+    pub(crate) key_range: Option<(u8, u8)>,
+    /// Inclusive MIDI velocity range from the instrument chunk.
+    pub(crate) velocity_range: Option<(u8, u8)>,
     /// First supported WAVE or AIFF sustain loop as half-open source-frame bounds.
     pub(crate) loop_points: Option<(usize, usize)>,
     /// AIFF `INST` loop mode when its sustain markers resolve to valid frame bounds.
@@ -433,6 +437,8 @@ pub(crate) fn wav_sampler_metadata(path: &Path) -> Option<SamplerFileMetadata> {
     let mut inst_root_key = None;
     let mut inst_fine_tune_cents = None;
     let mut inst_gain_db = None;
+    let mut inst_key_range = None;
+    let mut inst_velocity_range = None;
     let mut smpl_root_key = None;
     let mut smpl_fine_tune_cents = None;
     let mut loop_points = None;
@@ -453,6 +459,19 @@ pub(crate) fn wav_sampler_metadata(path: &Path) -> Option<SamplerFileMetadata> {
                 let mut instrument = [0; 7];
                 file.read_exact(&mut instrument).ok()?;
                 inst_gain_db.get_or_insert_with(|| i16::from(i8::from_le_bytes([instrument[2]])));
+                let low_note = instrument[3];
+                let high_note = instrument[4];
+                if low_note <= high_note && high_note <= 127 {
+                    inst_key_range = Some((low_note, high_note));
+                }
+                let low_velocity = instrument[5];
+                let high_velocity = instrument[6];
+                if (1..=127).contains(&low_velocity)
+                    && (1..=127).contains(&high_velocity)
+                    && low_velocity <= high_velocity
+                {
+                    inst_velocity_range = Some((low_velocity, high_velocity));
+                }
                 if instrument[0] <= 127 {
                     inst_root_key = Some(u16::from(instrument[0]));
                     let fine_tune_cents = i8::from_le_bytes([instrument[1]]);
@@ -525,11 +544,17 @@ pub(crate) fn wav_sampler_metadata(path: &Path) -> Option<SamplerFileMetadata> {
         root_key: inst_root_key.or(smpl_root_key),
         fine_tune_cents: inst_fine_tune_cents.or(smpl_fine_tune_cents),
         gain_db: inst_gain_db,
+        key_range: inst_key_range,
+        velocity_range: inst_velocity_range,
         loop_points,
         ping_pong_loop: None,
     };
-    (metadata.root_key.is_some() || metadata.gain_db.is_some() || metadata.loop_points.is_some())
-        .then_some(metadata)
+    (metadata.root_key.is_some()
+        || metadata.gain_db.is_some()
+        || metadata.key_range.is_some()
+        || metadata.velocity_range.is_some()
+        || metadata.loop_points.is_some())
+    .then_some(metadata)
 }
 
 /// Read sampler metadata from a standard AIFF or AIFF-C `INST` and `MARK` chunk.
@@ -559,6 +584,8 @@ pub(crate) fn aiff_sampler_metadata(path: &Path) -> Option<SamplerFileMetadata> 
     let mut root_key = None;
     let mut fine_tune_cents = None;
     let mut gain_db = None;
+    let mut key_range = None;
+    let mut velocity_range = None;
     let mut sustain_loop = None;
     let mut marker_positions = None;
     while cursor.checked_add(8)? <= form_end {
@@ -579,12 +606,25 @@ pub(crate) fn aiff_sampler_metadata(path: &Path) -> Option<SamplerFileMetadata> 
                 let mut instrument = [0; 20];
                 file.read_exact(&mut instrument).ok()?;
                 gain_db = Some(i16::from_be_bytes([instrument[6], instrument[7]]));
-                if instrument[0] <= 127 {
+                let detune_cents = i8::from_be_bytes([instrument[1]]);
+                if (-50..=50).contains(&detune_cents) {
+                    fine_tune_cents = Some(f64::from(detune_cents));
+                }
+                if (1..=127).contains(&instrument[0]) {
                     root_key = Some(u16::from(instrument[0]));
-                    let detune_cents = i8::from_be_bytes([instrument[1]]);
-                    if (-50..=50).contains(&detune_cents) {
-                        fine_tune_cents = Some(f64::from(detune_cents));
-                    }
+                }
+                let low_note = instrument[2];
+                let high_note = instrument[3];
+                if low_note <= high_note && high_note <= 127 {
+                    key_range = Some((low_note, high_note));
+                }
+                let low_velocity = instrument[4];
+                let high_velocity = instrument[5];
+                if (1..=127).contains(&low_velocity)
+                    && (1..=127).contains(&high_velocity)
+                    && low_velocity <= high_velocity
+                {
+                    velocity_range = Some((low_velocity, high_velocity));
                 }
                 sustain_loop = Some((
                     i16::from_be_bytes([instrument[8], instrument[9]]),
@@ -625,11 +665,17 @@ pub(crate) fn aiff_sampler_metadata(path: &Path) -> Option<SamplerFileMetadata> 
         root_key,
         fine_tune_cents,
         gain_db,
+        key_range,
+        velocity_range,
         loop_points,
         ping_pong_loop,
     };
-    (metadata.root_key.is_some() || metadata.gain_db.is_some() || metadata.loop_points.is_some())
-        .then_some(metadata)
+    (metadata.root_key.is_some()
+        || metadata.gain_db.is_some()
+        || metadata.key_range.is_some()
+        || metadata.velocity_range.is_some()
+        || metadata.loop_points.is_some())
+    .then_some(metadata)
 }
 
 fn read_aiff_marker_positions(
@@ -2061,7 +2107,7 @@ mod tests {
             (-6i8).to_le_bytes()[0],
             0,
             127,
-            0,
+            1,
             127,
         ];
         let mut sampler = [0u8; 36];
@@ -2083,6 +2129,8 @@ mod tests {
             assert_eq!(metadata.root_key, Some(72));
             assert_eq!(metadata.fine_tune_cents, Some(-23.0));
             assert_eq!(metadata.gain_db, Some(-6));
+            assert_eq!(metadata.key_range, Some((0, 127)));
+            assert_eq!(metadata.velocity_range, Some((1, 127)));
             assert_eq!(metadata.loop_points, None);
         }
 
@@ -2098,6 +2146,42 @@ mod tests {
         let metadata = wav_sampler_metadata(&path).expect("valid smpl root should parse");
         assert_eq!(metadata.root_key, Some(60));
         assert_eq!(metadata.fine_tune_cents, Some(50.0));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ignores_invalid_wave_and_aiff_sampler_ranges_without_dropping_valid_metadata() {
+        let root = fixture_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("invalid-ranges.wav");
+        let wave_instrument = [60, 0, 0, 100, 50, 1, 127];
+        std::fs::write(
+            &path,
+            wave_with_sampler_chunks(&[("inst", &wave_instrument)]),
+        )
+        .unwrap();
+        let wave_metadata = wav_sampler_metadata(&path).expect("WAVE root metadata remains valid");
+        assert_eq!(wave_metadata.root_key, Some(60));
+        assert_eq!(wave_metadata.key_range, None);
+        assert_eq!(wave_metadata.velocity_range, Some((1, 127)));
+
+        let mut aiff_instrument = [0u8; 20];
+        aiff_instrument[0] = 60;
+        aiff_instrument[2] = 0;
+        aiff_instrument[3] = 127;
+        aiff_instrument[4] = 0;
+        aiff_instrument[5] = 127;
+        let path = root.join("invalid-ranges.aiff");
+        std::fs::write(
+            &path,
+            aiff_with_chunks(b"AIFF", &[(b"INST", &aiff_instrument)]),
+        )
+        .unwrap();
+        let aiff_metadata = aiff_sampler_metadata(&path).expect("AIFF root metadata remains valid");
+        assert_eq!(aiff_metadata.root_key, Some(60));
+        assert_eq!(aiff_metadata.key_range, Some((0, 127)));
+        assert_eq!(aiff_metadata.velocity_range, None);
 
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -2125,8 +2209,32 @@ mod tests {
             assert_eq!(metadata.root_key, Some(72));
             assert_eq!(metadata.fine_tune_cents, Some(-23.0));
             assert_eq!(metadata.gain_db, Some(-6));
+            assert_eq!(metadata.key_range, Some((24, 96)));
+            assert_eq!(metadata.velocity_range, Some((1, 127)));
             assert_eq!(metadata.loop_points, None);
         }
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ignores_zero_aiff_root_note_as_fl_studio_does() {
+        let root = fixture_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("zero-root.aiff");
+        let mut instrument = [0u8; 20];
+        instrument[1] = 12;
+        instrument[2] = 0;
+        instrument[3] = 127;
+        instrument[4] = 1;
+        instrument[5] = 127;
+        std::fs::write(&path, aiff_with_chunks(b"AIFF", &[(b"INST", &instrument)])).unwrap();
+
+        let metadata = aiff_sampler_metadata(&path).expect("other AIFF metadata remains usable");
+        assert_eq!(metadata.root_key, None);
+        assert_eq!(metadata.fine_tune_cents, Some(12.0));
+        assert_eq!(metadata.key_range, Some((0, 127)));
+        assert_eq!(metadata.velocity_range, Some((1, 127)));
 
         std::fs::remove_dir_all(root).unwrap();
     }

@@ -6666,6 +6666,8 @@ fn prepare_sampler_arrangement(
                 gain: gain * sampler_metadata_gain(sample_metadata.gain_db),
                 pan,
                 reverse: channel.sample_reversed(),
+                key_range: sample_metadata.key_range,
+                velocity_range: sample_metadata.velocity_range,
                 root_key: resolve_sampler_channel_root_key(
                     channel,
                     sample_metadata.root_key,
@@ -6712,6 +6714,9 @@ fn prepare_sampler_arrangement(
                     )
                 }),
         );
+        if !source.accepts_note(note_key, note.velocity) {
+            continue;
+        }
         if source.audio.frame_count() == 0 {
             return Err(format!(
                 "Sampler channel {} references an empty sample",
@@ -6816,10 +6821,30 @@ struct SamplerVoiceSource {
     gain: f32,
     pan: f32,
     reverse: bool,
+    key_range: Option<(u8, u8)>,
+    velocity_range: Option<(u8, u8)>,
     root_key: u16,
     fine_tune_cents: f64,
     loop_bounds: Option<SampleBounds>,
     ping_pong_loop: bool,
+}
+
+impl SamplerVoiceSource {
+    fn accepts_note(&self, key: u16, velocity: u8) -> bool {
+        let Ok(key) = u8::try_from(key) else {
+            return false;
+        };
+        let velocity = velocity.min(127);
+        let key_is_in_range = match self.key_range {
+            Some((low, high)) => (low..=high).contains(&key),
+            None => true,
+        };
+        let velocity_is_in_range = match self.velocity_range {
+            Some((low, high)) => (low..=high).contains(&velocity),
+            None => true,
+        };
+        key_is_in_range && velocity_is_in_range
+    }
 }
 
 fn validated_sampler_loop_bounds(
@@ -8926,6 +8951,8 @@ fn prepare_sampler_pattern_for_channel_internal(
                 gain: gain * sampler_metadata_gain(sample_metadata.gain_db),
                 pan,
                 reverse: channel.sample_reversed(),
+                key_range: sample_metadata.key_range,
+                velocity_range: sample_metadata.velocity_range,
                 root_key: resolve_sampler_channel_root_key(
                     channel,
                     sample_metadata.root_key,
@@ -8962,6 +8989,9 @@ fn prepare_sampler_pattern_for_channel_internal(
                 )
             }),
         );
+        if !source.accepts_note(note_key, note.velocity) {
+            continue;
+        }
         let channel_swing_mix_raw = channels_by_id
             .get(&note.channel_id)
             .map_or(128, |channel| channel.swing_mix());
@@ -9315,6 +9345,9 @@ impl<'a> SamplerVoiceEngine<'a> {
 
     fn start_voice(&mut self, note: ScheduledSamplerNote) -> Option<usize> {
         let source = self.sources_by_channel.get(&note.channel_id)?;
+        if !source.accepts_note(note.key, note.velocity) {
+            return None;
+        }
         let slot_index = self
             .voices
             .iter()
@@ -13157,6 +13190,8 @@ mod tests {
                     gain: 1.0,
                     pan: -1.0,
                     reverse: false,
+                    key_range: None,
+                    velocity_range: None,
                     root_key: SAMPLER_ROOT_KEY,
                     fine_tune_cents: 0.0,
                     loop_bounds: None,
@@ -13747,6 +13782,8 @@ mod tests {
                 gain: 1.0,
                 pan: 0.0,
                 reverse: false,
+                key_range: None,
+                velocity_range: None,
                 root_key: SAMPLER_ROOT_KEY,
                 fine_tune_cents: 0.0,
                 loop_bounds: None,
@@ -13795,6 +13832,8 @@ mod tests {
                 gain: 1.0,
                 pan: 0.0,
                 reverse: false,
+                key_range: None,
+                velocity_range: None,
                 root_key: SAMPLER_ROOT_KEY,
                 fine_tune_cents: 0.0,
                 loop_bounds: None,
@@ -13840,6 +13879,8 @@ mod tests {
                 gain: 1.0,
                 pan: 0.0,
                 reverse: false,
+                key_range: None,
+                velocity_range: None,
                 root_key: SAMPLER_ROOT_KEY,
                 fine_tune_cents: 0.0,
                 loop_bounds: None,
@@ -13902,6 +13943,8 @@ mod tests {
                 gain: 1.0,
                 pan: 0.0,
                 reverse: false,
+                key_range: None,
+                velocity_range: None,
                 root_key: SAMPLER_ROOT_KEY,
                 fine_tune_cents: 0.0,
                 loop_bounds: None,
@@ -13951,6 +13994,8 @@ mod tests {
                 gain: 1.0,
                 pan: -1.0,
                 reverse: false,
+                key_range: None,
+                velocity_range: None,
                 root_key: SAMPLER_ROOT_KEY,
                 fine_tune_cents: 0.0,
                 loop_bounds: None,
@@ -13998,6 +14043,8 @@ mod tests {
                 gain: 1.0,
                 pan: -1.0,
                 reverse: true,
+                key_range: None,
+                velocity_range: None,
                 root_key: SAMPLER_ROOT_KEY,
                 fine_tune_cents: 0.0,
                 loop_bounds: None,
@@ -14036,6 +14083,8 @@ mod tests {
                 gain: 1.0,
                 pan: -1.0,
                 reverse: false,
+                key_range: None,
+                velocity_range: None,
                 root_key: SAMPLER_ROOT_KEY,
                 fine_tune_cents: 0.0,
                 loop_bounds: Some(SampleBounds { start: 1, end: 4 }),
@@ -14080,6 +14129,8 @@ mod tests {
                 gain: 1.0,
                 pan: -1.0,
                 reverse: false,
+                key_range: None,
+                velocity_range: None,
                 root_key: SAMPLER_ROOT_KEY,
                 fine_tune_cents: 0.0,
                 loop_bounds: Some(SampleBounds { start: 1, end: 4 }),
@@ -14125,6 +14176,8 @@ mod tests {
                 gain: 1.0,
                 pan: -1.0,
                 reverse: false,
+                key_range: None,
+                velocity_range: None,
                 root_key: SAMPLER_ROOT_KEY,
                 fine_tune_cents: 0.0,
                 loop_bounds: None,
@@ -14165,6 +14218,8 @@ mod tests {
                 gain: 1.0,
                 pan: -1.0,
                 reverse: false,
+                key_range: None,
+                velocity_range: None,
                 root_key: 48,
                 fine_tune_cents: 0.0,
                 loop_bounds: None,
@@ -14203,6 +14258,33 @@ mod tests {
     }
 
     #[test]
+    fn sampler_source_honors_inclusive_sample_key_and_velocity_ranges() {
+        let source = SamplerVoiceSource {
+            audio: Arc::new(DecodedAudio {
+                sample_rate: 1,
+                channels: vec![vec![0.0]],
+            }),
+            gain: 1.0,
+            pan: 0.0,
+            reverse: false,
+            key_range: Some((48, 72)),
+            velocity_range: Some((32, 96)),
+            root_key: SAMPLER_ROOT_KEY,
+            fine_tune_cents: 0.0,
+            loop_bounds: None,
+            ping_pong_loop: false,
+        };
+
+        assert!(source.accepts_note(48, 32));
+        assert!(source.accepts_note(72, 96));
+        assert!(!source.accepts_note(47, 64));
+        assert!(!source.accepts_note(73, 64));
+        assert!(!source.accepts_note(60, 31));
+        assert!(!source.accepts_note(60, 97));
+        assert!(!source.accepts_note(128, 64));
+    }
+
+    #[test]
     fn sampler_metadata_gain_converts_decibels_to_linear_amplitude() {
         assert_eq!(sampler_metadata_gain(None), 1.0);
         assert_eq!(sampler_metadata_gain(Some(0)), 1.0);
@@ -14234,6 +14316,8 @@ mod tests {
                 gain: 1.0,
                 pan: 0.0,
                 reverse: false,
+                key_range: None,
+                velocity_range: None,
                 root_key: SAMPLER_ROOT_KEY,
                 fine_tune_cents: 0.0,
                 loop_bounds: None,
@@ -14274,6 +14358,8 @@ mod tests {
                 gain: 1.0,
                 pan: -1.0,
                 reverse: false,
+                key_range: None,
+                velocity_range: None,
                 root_key: SAMPLER_ROOT_KEY,
                 fine_tune_cents: 0.0,
                 loop_bounds: None,
@@ -14322,6 +14408,8 @@ mod tests {
                     gain: 1.0,
                     pan: -1.0,
                     reverse: false,
+                    key_range: None,
+                    velocity_range: None,
                     root_key: SAMPLER_ROOT_KEY,
                     fine_tune_cents: 0.0,
                     loop_bounds: None,
@@ -14335,6 +14423,8 @@ mod tests {
                     gain: 1.0,
                     pan: -1.0,
                     reverse: false,
+                    key_range: None,
+                    velocity_range: None,
                     root_key: SAMPLER_ROOT_KEY,
                     fine_tune_cents: 0.0,
                     loop_bounds: None,
