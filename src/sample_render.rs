@@ -5274,6 +5274,8 @@ pub fn stream_sampler_midi_input_to_device(
                             stop_frame: Some(u64::MAX),
                             channel_id: target_channel_id,
                             key: note_key,
+                            midi_channel: 0,
+                            slide_note: false,
                             velocity,
                             pan: engine.live_midi_pan(midi_channel),
                             fine_pitch_offset_cents: 0,
@@ -5472,6 +5474,8 @@ pub fn stream_mixed_layer_midi_input_to_device(
                                         stop_frame: Some(u64::MAX),
                                         channel_id: target_channel_id,
                                         key: rendered_key,
+                                        midi_channel: 0,
+                                        slide_note: false,
                                         velocity,
                                         pan: sampler_engine.live_midi_pan(channel),
                                         fine_pitch_offset_cents: 0,
@@ -6795,7 +6799,7 @@ fn prepare_sampler_arrangement(
                     )
                 }),
         );
-        if !source.accepts_note(note_key, note.velocity) {
+        if !note.is_slide_note() && !source.accepts_note(note_key, note.velocity) {
             continue;
         }
         if source.audio.frame_count() == 0 {
@@ -6813,6 +6817,26 @@ fn prepare_sampler_arrangement(
                     .map(|frame| frame.max(start_frame.saturating_add(1)))
             })
             .transpose()?;
+        if note.is_slide_note() {
+            rendered_pattern_clip_indices.insert(placed.clip_index);
+            notes.push(ScheduledSamplerNote {
+                clip_index: placed.clip_index,
+                playlist_track_id,
+                start_tick: placed.start_tick,
+                stop_tick: placed.stop_tick,
+                start_frame,
+                stop_frame,
+                channel_id: placed.target_channel_id,
+                key: note_key,
+                midi_channel: note.midi_channel,
+                slide_note: true,
+                velocity: note.velocity,
+                pan: note.pan,
+                fine_pitch_offset_cents: note.fine_pitch_offset_cents(),
+                layer_gain: placed.target_gain,
+            });
+            continue;
+        }
         let natural_duration = (source.audio.frame_count() as f64
             / sampler_source_step(
                 source.audio.sample_rate,
@@ -6859,13 +6883,15 @@ fn prepare_sampler_arrangement(
             stop_frame,
             channel_id: placed.target_channel_id,
             key: note_key,
+            midi_channel: note.midi_channel,
+            slide_note: false,
             velocity: note.velocity,
             pan: note.pan,
             fine_pitch_offset_cents: note.fine_pitch_offset_cents(),
             layer_gain: placed.target_gain,
         });
     }
-    notes.sort_by_key(|note| (note.start_frame, note.channel_id, note.key));
+    notes.sort_by_key(|note| (note.start_frame, note.slide_note, note.channel_id, note.key));
     Ok(PreparedSamplerArrangement {
         summary: SamplerPatternRenderSummary {
             frames: output_frames,
@@ -6959,6 +6985,8 @@ struct ScheduledSamplerNote {
     stop_frame: Option<u64>,
     channel_id: u16,
     key: u16,
+    midi_channel: u8,
+    slide_note: bool,
     velocity: u8,
     pan: u8,
     fine_pitch_offset_cents: i16,
@@ -9127,7 +9155,7 @@ fn prepare_sampler_pattern_for_channel_internal(
                 )
             }),
         );
-        if !source.accepts_note(note_key, note.velocity) {
+        if !note.is_slide_note() && !source.accepts_note(note_key, note.velocity) {
             continue;
         }
         let channel_swing_mix_raw = channels_by_id
@@ -9161,6 +9189,25 @@ fn prepare_sampler_pattern_for_channel_internal(
                     .max(start_frame.saturating_add(1)),
             )
         };
+        if note.is_slide_note() {
+            notes.push(ScheduledSamplerNote {
+                clip_index: 0,
+                playlist_track_id: None,
+                start_tick: 0,
+                stop_tick: None,
+                start_frame,
+                stop_frame,
+                channel_id: target_channel_id,
+                key: note_key,
+                midi_channel: note.midi_channel,
+                slide_note: true,
+                velocity: note.velocity,
+                pan: note.pan,
+                fine_pitch_offset_cents: note.fine_pitch_offset_cents(),
+                layer_gain,
+            });
+            continue;
+        }
         let natural_duration = (source.audio.frame_count() as f64
             / sampler_source_step(
                 source.audio.sample_rate,
@@ -9206,6 +9253,8 @@ fn prepare_sampler_pattern_for_channel_internal(
             stop_frame,
             channel_id: target_channel_id,
             key: note_key,
+            midi_channel: note.midi_channel,
+            slide_note: false,
             velocity: note.velocity,
             pan: note.pan,
             fine_pitch_offset_cents: note.fine_pitch_offset_cents(),
@@ -9224,7 +9273,7 @@ fn prepare_sampler_pattern_for_channel_internal(
             options.pattern_id
         ));
     }
-    notes.sort_by_key(|note| (note.start_frame, note.channel_id, note.key));
+    notes.sort_by_key(|note| (note.start_frame, note.slide_note, note.channel_id, note.key));
     Ok(PreparedSamplerPattern {
         summary: SamplerPatternRenderSummary {
             frames: output_frames,
@@ -9275,10 +9324,14 @@ struct SamplerVoice {
     channel_id: u16,
     playlist_track_id: Option<u32>,
     key: u16,
+    midi_channel: u8,
+    note_fine_pitch_offset_cents: i16,
     input_midi_channel: Option<u8>,
     source_position: f64,
     source_step: f64,
     base_source_step: f64,
+    pitch_offset_cents: f64,
+    pitch_slide: Option<SamplerPitchSlide>,
     key_released: bool,
     release_started: bool,
     volume_envelope_enabled: bool,
@@ -9297,6 +9350,41 @@ struct SamplerVoice {
     release_remaining: Option<usize>,
     release_total_frames: Option<usize>,
     release_cosine: bool,
+}
+
+#[derive(Clone, Copy)]
+struct SamplerPitchSlide {
+    start_frame: u64,
+    end_frame: u64,
+    start_pitch_cents: f64,
+    target_pitch_cents: f64,
+}
+
+fn update_sampler_voice_pitch(voice: &mut SamplerVoice, frame: u64, pitch_bend_cents: [i16; 16]) {
+    if let Some(slide) = voice.pitch_slide {
+        let progress = if frame >= slide.end_frame {
+            1.0
+        } else {
+            frame.saturating_sub(slide.start_frame) as f64
+                / slide.end_frame.saturating_sub(slide.start_frame).max(1) as f64
+        }
+        .clamp(0.0, 1.0);
+        voice.pitch_offset_cents = slide.start_pitch_cents
+            + (slide.target_pitch_cents - slide.start_pitch_cents) * progress;
+        if frame >= slide.end_frame {
+            voice.pitch_slide = None;
+        }
+    }
+    let pitch_bend = voice
+        .input_midi_channel
+        .map_or(0, |channel| pitch_bend_cents[usize::from(channel)]);
+    set_sampler_voice_source_step(voice, pitch_bend);
+}
+
+fn set_sampler_voice_source_step(voice: &mut SamplerVoice, pitch_bend_cents: i16) {
+    let slide_ratio = 2.0_f64.powf(voice.pitch_offset_cents / 1_200.0);
+    voice.source_step =
+        voice.base_source_step * audio_clip_master_pitch_ratio(pitch_bend_cents) * slide_ratio;
 }
 
 impl<'a> SamplerVoiceEngine<'a> {
@@ -9367,6 +9455,11 @@ impl<'a> SamplerVoiceEngine<'a> {
         let live_midi_expression = self.live_midi_expression;
         for offset in 0..frame_count {
             let frame = block_start + offset as u64;
+            for voice in self.voices.iter_mut().filter_map(Option::as_mut) {
+                if voice.pitch_slide.is_some() {
+                    update_sampler_voice_pitch(voice, frame, self.pitch_bend_cents);
+                }
+            }
             while self
                 .notes
                 .get(self.next_note)
@@ -9395,6 +9488,10 @@ impl<'a> SamplerVoiceEngine<'a> {
                         .stop_frame
                         .is_some_and(|stop_frame| frame >= stop_frame)
                 {
+                    if voice.pitch_slide.is_some() {
+                        update_sampler_voice_pitch(voice, frame, self.pitch_bend_cents);
+                    }
+                    voice.pitch_slide = None;
                     begin_sampler_voice_release(voice, self.release_frames);
                 }
                 let fade = match voice.release_remaining {
@@ -9506,6 +9603,10 @@ impl<'a> SamplerVoiceEngine<'a> {
 
     fn start_voice(&mut self, note: ScheduledSamplerNote) -> Option<usize> {
         let source = self.sources_by_channel.get(&note.channel_id)?;
+        if note.slide_note {
+            self.apply_pitch_slide(note);
+            return None;
+        }
         if !source.accepts_note(note.key, note.velocity) {
             return None;
         }
@@ -9642,6 +9743,8 @@ impl<'a> SamplerVoiceEngine<'a> {
             channel_id: note.channel_id,
             playlist_track_id: note.playlist_track_id,
             key: note.key,
+            midi_channel: note.midi_channel,
+            note_fine_pitch_offset_cents: note.fine_pitch_offset_cents,
             input_midi_channel: None,
             source_position: if source.reverse {
                 source.audio.frame_count().saturating_sub(1) as f64
@@ -9650,6 +9753,8 @@ impl<'a> SamplerVoiceEngine<'a> {
             },
             source_step,
             base_source_step: source_step,
+            pitch_offset_cents: 0.0,
+            pitch_slide: None,
             key_released: false,
             release_started: false,
             volume_envelope_enabled: source.volume_envelope_enabled,
@@ -9672,12 +9777,57 @@ impl<'a> SamplerVoiceEngine<'a> {
         Some(slot_index)
     }
 
+    fn apply_pitch_slide(&mut self, note: ScheduledSamplerNote) {
+        let Some(end_frame) = note.stop_frame.filter(|end| *end > note.start_frame) else {
+            return;
+        };
+        let reference_pitch = self
+            .voices
+            .iter()
+            .flatten()
+            .filter(|voice| {
+                voice.channel_id == note.channel_id
+                    && voice.midi_channel == note.midi_channel
+                    && !voice.key_released
+                    && voice
+                        .stop_frame
+                        .is_none_or(|stop_frame| stop_frame > note.start_frame)
+            })
+            .map(|voice| (voice.key, voice.note_fine_pitch_offset_cents))
+            .max();
+        let Some((reference_key, reference_fine_pitch_cents)) = reference_pitch else {
+            return;
+        };
+        let pitch_delta_cents = (i32::from(note.key) - i32::from(reference_key)) as f64 * 100.0
+            + f64::from(note.fine_pitch_offset_cents)
+            - f64::from(reference_fine_pitch_cents);
+        for voice in self.voices.iter_mut().flatten().filter(|voice| {
+            voice.channel_id == note.channel_id
+                && voice.midi_channel == note.midi_channel
+                && !voice.key_released
+                && voice
+                    .stop_frame
+                    .is_none_or(|stop_frame| stop_frame > note.start_frame)
+        }) {
+            update_sampler_voice_pitch(voice, note.start_frame, self.pitch_bend_cents);
+            let start_pitch_cents = voice.pitch_offset_cents;
+            voice.pitch_slide = Some(SamplerPitchSlide {
+                start_frame: note.start_frame,
+                end_frame,
+                start_pitch_cents,
+                target_pitch_cents: start_pitch_cents + pitch_delta_cents,
+            });
+            update_sampler_voice_pitch(voice, note.start_frame, self.pitch_bend_cents);
+        }
+    }
+
     fn queue_live_notes(&mut self, notes: impl IntoIterator<Item = ScheduledSamplerNote>) {
         self.discard_consumed_live_notes();
         self.live_notes.extend(notes);
         self.live_notes.sort_by_key(|note| {
             (
                 note.start_frame,
+                note.slide_note,
                 note.playlist_track_id,
                 note.channel_id,
                 note.key,
@@ -9714,11 +9864,10 @@ impl<'a> SamplerVoiceEngine<'a> {
 
     fn set_voice_input_midi_channel(&mut self, slot_index: usize, channel: u8) {
         let channel = channel & 0x0F;
-        let pitch_bend_cents = self.pitch_bend_cents[usize::from(channel)];
         if let Some(voice) = self.voices[slot_index].as_mut() {
+            voice.midi_channel = channel;
             voice.input_midi_channel = Some(channel);
-            voice.source_step =
-                voice.base_source_step * audio_clip_master_pitch_ratio(pitch_bend_cents);
+            set_sampler_voice_source_step(voice, self.pitch_bend_cents[usize::from(channel)]);
         }
     }
 
@@ -9726,10 +9875,9 @@ impl<'a> SamplerVoiceEngine<'a> {
         let channel = channel & 0x0F;
         let cents = cents.clamp(-1200, 1200);
         self.pitch_bend_cents[usize::from(channel)] = cents;
-        let ratio = audio_clip_master_pitch_ratio(cents);
         for voice in self.voices.iter_mut().filter_map(Option::as_mut) {
             if voice.input_midi_channel == Some(channel) {
-                voice.source_step = voice.base_source_step * ratio;
+                set_sampler_voice_source_step(voice, cents);
             }
         }
     }
@@ -9830,6 +9978,7 @@ impl<'a> SamplerVoiceEngine<'a> {
 fn begin_sampler_voice_release(voice: &mut SamplerVoice, release_frames: usize) {
     voice.key_released = true;
     voice.release_started = true;
+    voice.pitch_slide = None;
     if voice.volume_envelope_enabled {
         voice.release_remaining = Some(release_frames);
         voice.release_total_frames = Some(release_frames);
@@ -9840,6 +9989,7 @@ fn begin_sampler_voice_release(voice: &mut SamplerVoice, release_frames: usize) 
 fn begin_sampler_voice_fast_cut_declick(voice: &mut SamplerVoice, fade_frames: usize) {
     voice.key_released = true;
     voice.release_started = true;
+    voice.pitch_slide = None;
     voice.release_remaining = Some(fade_frames);
     voice.release_total_frames = Some(fade_frames);
     voice.release_cosine = true;
@@ -13496,6 +13646,8 @@ mod tests {
                 stop_frame: None,
                 channel_id: 2,
                 key: SAMPLER_ROOT_KEY,
+                midi_channel: 0,
+                slide_note: false,
                 velocity: 127,
                 pan: 64,
                 fine_pitch_offset_cents: 0,
@@ -14137,6 +14289,8 @@ mod tests {
             stop_frame: Some(3),
             channel_id: 7,
             key: SAMPLER_ROOT_KEY,
+            midi_channel: 0,
+            slide_note: false,
             velocity: 127,
             pan: 64,
             fine_pitch_offset_cents: 0,
@@ -14195,6 +14349,8 @@ mod tests {
             stop_frame: Some(2),
             channel_id: 7,
             key: SAMPLER_ROOT_KEY,
+            midi_channel: 0,
+            slide_note: false,
             velocity: 127,
             pan: 64,
             fine_pitch_offset_cents: 0,
@@ -14249,6 +14405,8 @@ mod tests {
             stop_frame: Some(4),
             channel_id: 7,
             key: SAMPLER_ROOT_KEY,
+            midi_channel: 0,
+            slide_note: false,
             velocity: 127,
             pan: 64,
             fine_pitch_offset_cents: 0,
@@ -14318,6 +14476,8 @@ mod tests {
             stop_frame: Some(10),
             channel_id: 7,
             key: SAMPLER_ROOT_KEY,
+            midi_channel: 0,
+            slide_note: false,
             velocity: 127,
             pan: 64,
             fine_pitch_offset_cents: 0,
@@ -14374,6 +14534,8 @@ mod tests {
                 stop_frame: None,
                 channel_id: 7,
                 key: SAMPLER_ROOT_KEY,
+                midi_channel: 0,
+                slide_note: false,
                 velocity: 127,
                 pan: 96,
                 fine_pitch_offset_cents: 0,
@@ -14388,6 +14550,8 @@ mod tests {
                 stop_frame: None,
                 channel_id: 7,
                 key: SAMPLER_ROOT_KEY,
+                midi_channel: 0,
+                slide_note: false,
                 velocity: 127,
                 pan: 32,
                 fine_pitch_offset_cents: 0,
@@ -14448,6 +14612,8 @@ mod tests {
                 stop_frame: None,
                 channel_id: 7,
                 key: SAMPLER_ROOT_KEY,
+                midi_channel: 0,
+                slide_note: false,
                 velocity: 127,
                 pan: 64,
                 fine_pitch_offset_cents: 0,
@@ -14511,6 +14677,8 @@ mod tests {
             stop_frame: None,
             channel_id: 7,
             key: SAMPLER_ROOT_KEY,
+            midi_channel: 0,
+            slide_note: false,
             velocity: 127,
             pan: 64,
             fine_pitch_offset_cents: 0,
@@ -14561,6 +14729,8 @@ mod tests {
             stop_frame: None,
             channel_id: 7,
             key: SAMPLER_ROOT_KEY,
+            midi_channel: 0,
+            slide_note: false,
             velocity: 127,
             pan: 64,
             fine_pitch_offset_cents: 0,
@@ -14611,6 +14781,8 @@ mod tests {
             stop_frame: None,
             channel_id: 7,
             key: SAMPLER_ROOT_KEY,
+            midi_channel: 0,
+            slide_note: false,
             velocity: 127,
             pan: 64,
             fine_pitch_offset_cents: 0,
@@ -14659,6 +14831,8 @@ mod tests {
             stop_frame: Some(100),
             channel_id: 7,
             key: SAMPLER_ROOT_KEY,
+            midi_channel: 0,
+            slide_note: false,
             velocity: 127,
             pan: 64,
             fine_pitch_offset_cents: 0,
@@ -14713,6 +14887,8 @@ mod tests {
             stop_frame: Some(100),
             channel_id: 7,
             key: SAMPLER_ROOT_KEY,
+            midi_channel: 0,
+            slide_note: false,
             velocity: 127,
             pan: 64,
             fine_pitch_offset_cents: 0,
@@ -14767,6 +14943,8 @@ mod tests {
             stop_frame: Some(2),
             channel_id: 7,
             key: SAMPLER_ROOT_KEY,
+            midi_channel: 0,
+            slide_note: false,
             velocity: 127,
             pan: 64,
             fine_pitch_offset_cents: 0,
@@ -14836,6 +15014,8 @@ mod tests {
             stop_frame: Some(100),
             channel_id: 2,
             key: SAMPLER_ROOT_KEY + 12,
+            midi_channel: 0,
+            slide_note: false,
             velocity: 127,
             pan: 64,
             fine_pitch_offset_cents: 0,
@@ -14886,6 +15066,8 @@ mod tests {
             stop_frame: Some(100),
             channel_id: 2,
             key: SAMPLER_ROOT_KEY,
+            midi_channel: 0,
+            slide_note: false,
             velocity: 127,
             pan: 64,
             fine_pitch_offset_cents: 0,
@@ -15016,6 +15198,8 @@ mod tests {
             stop_frame: None,
             channel_id: 7,
             key: SAMPLER_ROOT_KEY,
+            midi_channel: 0,
+            slide_note: false,
             velocity: 127,
             pan: 64,
             fine_pitch_offset_cents: 50,
@@ -15066,6 +15250,8 @@ mod tests {
             stop_frame: None,
             channel_id: 3,
             key: SAMPLER_ROOT_KEY,
+            midi_channel: 0,
+            slide_note: false,
             velocity: 127,
             pan: 64,
             fine_pitch_offset_cents: 0,
@@ -15148,6 +15334,8 @@ mod tests {
                 stop_frame: Some(12),
                 channel_id: 1,
                 key: SAMPLER_ROOT_KEY,
+                midi_channel: 0,
+                slide_note: false,
                 velocity: 127,
                 pan: 64,
                 fine_pitch_offset_cents: 0,
@@ -15162,6 +15350,8 @@ mod tests {
                 stop_frame: Some(12),
                 channel_id: 2,
                 key: SAMPLER_ROOT_KEY,
+                midi_channel: 0,
+                slide_note: false,
                 velocity: 127,
                 pan: 64,
                 fine_pitch_offset_cents: 0,
@@ -15242,6 +15432,8 @@ mod tests {
                 stop_frame: None,
                 channel_id: 1,
                 key: SAMPLER_ROOT_KEY,
+                midi_channel: 0,
+                slide_note: false,
                 velocity: 127,
                 pan: 64,
                 fine_pitch_offset_cents: 0,
@@ -15256,6 +15448,8 @@ mod tests {
                 stop_frame: None,
                 channel_id: 2,
                 key: SAMPLER_ROOT_KEY,
+                midi_channel: 0,
+                slide_note: false,
                 velocity: 127,
                 pan: 64,
                 fine_pitch_offset_cents: 0,
@@ -15270,6 +15464,8 @@ mod tests {
                 stop_frame: None,
                 channel_id: 1,
                 key: SAMPLER_ROOT_KEY,
+                midi_channel: 0,
+                slide_note: false,
                 velocity: 127,
                 pan: 64,
                 fine_pitch_offset_cents: 0,
@@ -15340,6 +15536,8 @@ mod tests {
                 stop_frame: None,
                 channel_id: 1,
                 key: SAMPLER_ROOT_KEY,
+                midi_channel: 0,
+                slide_note: false,
                 velocity: 127,
                 pan: 64,
                 fine_pitch_offset_cents: 0,
@@ -15354,6 +15552,8 @@ mod tests {
                 stop_frame: None,
                 channel_id: 1,
                 key: SAMPLER_ROOT_KEY + 1,
+                midi_channel: 0,
+                slide_note: false,
                 velocity: 127,
                 pan: 64,
                 fine_pitch_offset_cents: 0,
@@ -15422,6 +15622,8 @@ mod tests {
             stop_frame: None,
             channel_id,
             key: SAMPLER_ROOT_KEY,
+            midi_channel: 0,
+            slide_note: false,
             velocity: 127,
             pan: 64,
             fine_pitch_offset_cents: 0,
@@ -15493,6 +15695,8 @@ mod tests {
             stop_frame: None,
             channel_id,
             key: SAMPLER_ROOT_KEY,
+            midi_channel: 0,
+            slide_note: false,
             velocity: 127,
             pan: 64,
             fine_pitch_offset_cents: 0,
@@ -15525,6 +15729,144 @@ mod tests {
         let mut after_fade = vec![0.0; 2];
         engine.render_block(11, 1, &mut after_fade);
         assert_eq!(after_fade, [10.0, 0.0]);
+    }
+
+    #[test]
+    fn sampler_slide_notes_glide_overlapping_notes_in_their_midi_color_group() {
+        let source = SamplerVoiceSource {
+            audio: Arc::new(DecodedAudio {
+                sample_rate: 1_000,
+                channels: vec![vec![1.0; 64]],
+            }),
+            gain: 1.0,
+            pan: -1.0,
+            reverse: false,
+            volume_envelope_enabled: false,
+            max_polyphony_raw: None,
+            mono_enabled: false,
+            channel_cut_groups: None,
+            fast_declick_for_cut_groups: false,
+            key_range: None,
+            velocity_range: None,
+            root_key: SAMPLER_ROOT_KEY,
+            fine_tune_cents: 0.0,
+            loop_bounds: None,
+            ping_pong_loop: false,
+            release_loop_bounds: None,
+            release_ping_pong_loop: false,
+        };
+        let sources = HashMap::from([(1, source)]);
+        let make_note =
+            |start_frame, stop_frame, key, midi_channel, fine_pitch_offset_cents, slide_note| {
+                ScheduledSamplerNote {
+                    clip_index: 0,
+                    playlist_track_id: None,
+                    start_tick: start_frame,
+                    stop_tick: stop_frame,
+                    start_frame,
+                    stop_frame,
+                    channel_id: 1,
+                    key,
+                    midi_channel,
+                    slide_note,
+                    velocity: 127,
+                    pan: 64,
+                    fine_pitch_offset_cents,
+                    layer_gain: 1.0,
+                }
+            };
+        let notes = [
+            make_note(0, Some(30), SAMPLER_ROOT_KEY, 0, 0, false),
+            make_note(0, Some(30), SAMPLER_ROOT_KEY + 4, 0, 20, false),
+            make_note(0, Some(30), SAMPLER_ROOT_KEY + 7, 1, 0, false),
+            make_note(2, Some(12), SAMPLER_ROOT_KEY + 12, 0, -30, true),
+        ];
+        let mut engine = SamplerVoiceEngine::new(&sources, &notes, 4, 4, 1_000);
+
+        engine.render_block(0, 2, &mut [0.0; 4]);
+        assert_eq!(engine.voices.iter().flatten().count(), 3);
+        engine.render_block(2, 5, &mut [0.0; 10]);
+
+        assert_eq!(
+            engine
+                .voices
+                .iter()
+                .flatten()
+                .filter(|voice| voice.midi_channel == 0)
+                .map(|voice| voice.pitch_offset_cents)
+                .collect::<Vec<_>>(),
+            [300.0, 300.0]
+        );
+        let other_color_voice = engine
+            .voices
+            .iter()
+            .flatten()
+            .find(|voice| voice.midi_channel == 1)
+            .expect("a different note color should keep playing");
+        assert_eq!(other_color_voice.pitch_offset_cents, 0.0);
+
+        engine.render_block(7, 6, &mut [0.0; 12]);
+        assert_eq!(
+            engine
+                .voices
+                .iter()
+                .flatten()
+                .filter(|voice| voice.midi_channel == 0)
+                .map(|voice| (voice.pitch_offset_cents, voice.pitch_slide.is_none()))
+                .collect::<Vec<_>>(),
+            [(750.0, true), (750.0, true)]
+        );
+        assert_eq!(engine.voices.iter().flatten().count(), 3);
+    }
+
+    #[test]
+    fn sampler_slide_note_without_an_overlapping_voice_is_silent() {
+        let source = SamplerVoiceSource {
+            audio: Arc::new(DecodedAudio {
+                sample_rate: 1_000,
+                channels: vec![vec![1.0; 16]],
+            }),
+            gain: 1.0,
+            pan: -1.0,
+            reverse: false,
+            volume_envelope_enabled: false,
+            max_polyphony_raw: None,
+            mono_enabled: false,
+            channel_cut_groups: None,
+            fast_declick_for_cut_groups: false,
+            key_range: None,
+            velocity_range: None,
+            root_key: SAMPLER_ROOT_KEY,
+            fine_tune_cents: 0.0,
+            loop_bounds: None,
+            ping_pong_loop: false,
+            release_loop_bounds: None,
+            release_ping_pong_loop: false,
+        };
+        let sources = HashMap::from([(1, source)]);
+        let notes = [ScheduledSamplerNote {
+            clip_index: 0,
+            playlist_track_id: None,
+            start_tick: 0,
+            stop_tick: Some(4),
+            start_frame: 0,
+            stop_frame: Some(4),
+            channel_id: 1,
+            key: SAMPLER_ROOT_KEY + 7,
+            midi_channel: 0,
+            slide_note: true,
+            velocity: 127,
+            pan: 64,
+            fine_pitch_offset_cents: 0,
+            layer_gain: 1.0,
+        }];
+        let mut engine = SamplerVoiceEngine::new(&sources, &notes, 1, 4, 1_000);
+        let mut output = [0.0; 8];
+
+        engine.render_block(0, 4, &mut output);
+
+        assert_eq!(output, [0.0; 8]);
+        assert!(engine.voices.iter().all(Option::is_none));
     }
 
     #[test]
