@@ -6736,6 +6736,7 @@ fn prepare_sampler_arrangement(
                 gain: gain * sampler_metadata_gain(sample_metadata.gain_db),
                 pan,
                 reverse: channel.sample_reversed(),
+                volume_envelope_enabled: channel.sampler_volume_envelope_enabled().unwrap_or(false),
                 key_range: sample_metadata.key_range,
                 velocity_range: sample_metadata.velocity_range,
                 root_key: resolve_sampler_channel_root_key(
@@ -6820,13 +6821,18 @@ fn prepare_sampler_arrangement(
         {
             return Err("Sampler sample duration is outside the renderable range".to_owned());
         }
+        let natural_end_frame = start_frame
+            .checked_add(natural_duration as u64)
+            .ok_or_else(|| "Sampler render timeline length overflow".to_owned())?;
         let voice_end_frame = match stop_frame {
-            Some(stop_frame) => stop_frame,
-            None => start_frame
+            Some(stop_frame) if source.volume_envelope_enabled => stop_frame,
+            Some(stop_frame) if source.loop_bounds.is_some() => stop_frame
                 .checked_add(natural_duration as u64)
                 .ok_or_else(|| "Sampler render timeline length overflow".to_owned())?,
+            Some(stop_frame) => natural_end_frame.max(stop_frame),
+            None => natural_end_frame,
         };
-        let tail_frames = if stop_frame.is_some() {
+        let tail_frames = if source.volume_envelope_enabled && stop_frame.is_some() {
             release_frames
         } else {
             0
@@ -6895,6 +6901,7 @@ struct SamplerVoiceSource {
     gain: f32,
     pan: f32,
     reverse: bool,
+    volume_envelope_enabled: bool,
     key_range: Option<(u8, u8)>,
     velocity_range: Option<(u8, u8)>,
     root_key: u16,
@@ -9060,6 +9067,7 @@ fn prepare_sampler_pattern_for_channel_internal(
                 gain: gain * sampler_metadata_gain(sample_metadata.gain_db),
                 pan,
                 reverse: channel.sample_reversed(),
+                volume_envelope_enabled: channel.sampler_volume_envelope_enabled().unwrap_or(false),
                 key_range: sample_metadata.key_range,
                 velocity_range: sample_metadata.velocity_range,
                 root_key: resolve_sampler_channel_root_key(
@@ -9150,13 +9158,18 @@ fn prepare_sampler_pattern_for_channel_internal(
         {
             return Err("Sampler sample duration is outside the renderable range".to_owned());
         }
+        let natural_end_frame = start_frame
+            .checked_add(natural_duration as u64)
+            .ok_or_else(|| "Sampler render timeline length overflow".to_owned())?;
         let voice_end_frame = match stop_frame {
-            Some(stop_frame) => stop_frame,
-            None => start_frame
+            Some(stop_frame) if source.volume_envelope_enabled => stop_frame,
+            Some(stop_frame) if source.loop_bounds.is_some() => stop_frame
                 .checked_add(natural_duration as u64)
                 .ok_or_else(|| "Sampler render timeline length overflow".to_owned())?,
+            Some(stop_frame) => natural_end_frame.max(stop_frame),
+            None => natural_end_frame,
         };
-        let tail_frames = if stop_frame.is_some() {
+        let tail_frames = if source.volume_envelope_enabled && stop_frame.is_some() {
             release_frames
         } else {
             0
@@ -9249,6 +9262,8 @@ struct SamplerVoice {
     source_step: f64,
     base_source_step: f64,
     key_released: bool,
+    release_started: bool,
+    volume_envelope_enabled: bool,
     loop_bounds: Option<SampleBounds>,
     ping_pong_loop: bool,
     release_loop_bounds: Option<SampleBounds>,
@@ -9355,12 +9370,12 @@ impl<'a> SamplerVoiceEngine<'a> {
                 let Some(voice) = voice_slot.as_mut() else {
                     continue;
                 };
-                if voice.release_remaining.is_none()
+                if !voice.release_started
                     && voice
                         .stop_frame
                         .is_some_and(|stop_frame| frame >= stop_frame)
                 {
-                    voice.release_remaining = Some(self.release_frames);
+                    begin_sampler_voice_release(voice, self.release_frames);
                 }
                 let fade = match voice.release_remaining {
                     Some(0) => {
@@ -9532,6 +9547,8 @@ impl<'a> SamplerVoiceEngine<'a> {
             source_step,
             base_source_step: source_step,
             key_released: false,
+            release_started: false,
+            volume_envelope_enabled: source.volume_envelope_enabled,
             loop_bounds: source.loop_bounds,
             ping_pong_loop: source.ping_pong_loop,
             release_loop_bounds: source.release_loop_bounds,
@@ -9641,13 +9658,11 @@ impl<'a> SamplerVoiceEngine<'a> {
         let sustain_down = self.sustain_down[usize::from(channel)];
         let release_frames = self.release_frames;
         for voice in self.voices.iter_mut().filter_map(Option::as_mut) {
-            if voice.input_midi_channel == Some(channel)
-                && !voice.key_released
-                && voice.release_remaining.is_none()
-            {
-                voice.key_released = true;
+            if voice.input_midi_channel == Some(channel) && !voice.key_released {
                 if !sustain_down {
-                    voice.release_remaining = Some(release_frames);
+                    begin_sampler_voice_release(voice, release_frames);
+                } else {
+                    voice.key_released = true;
                 }
             }
         }
@@ -9674,9 +9689,9 @@ impl<'a> SamplerVoiceEngine<'a> {
             for voice in self.voices.iter_mut().filter_map(Option::as_mut) {
                 if voice.input_midi_channel == Some(channel)
                     && voice.key_released
-                    && voice.release_remaining.is_none()
+                    && !voice.release_started
                 {
-                    voice.release_remaining = Some(self.release_frames);
+                    begin_sampler_voice_release(voice, self.release_frames);
                 }
             }
         }
@@ -9694,23 +9709,32 @@ impl<'a> SamplerVoiceEngine<'a> {
                     && voice.key == key
                     && voice.input_midi_channel == Some(midi_channel)
                     && !voice.key_released
-                    && voice.release_remaining.is_none()
             })
             .min_by_key(|voice| voice.started_frame);
         if let Some(voice) = voice {
-            voice.key_released = true;
             if !sustain_down {
-                voice.release_remaining = Some(self.release_frames);
+                begin_sampler_voice_release(voice, self.release_frames);
+            } else {
+                voice.key_released = true;
             }
         }
     }
 }
 
+fn begin_sampler_voice_release(voice: &mut SamplerVoice, release_frames: usize) {
+    voice.key_released = true;
+    voice.release_started = true;
+    if voice.volume_envelope_enabled {
+        voice.release_remaining = Some(release_frames);
+    }
+}
+
 fn advance_sampler_voice_position(voice: &mut SamplerVoice) {
     let mut next_position = voice.source_position + voice.source_step;
-    let is_releasing = voice.release_remaining.is_some();
-    let (loop_bounds, ping_pong_loop) = if is_releasing {
+    let (loop_bounds, ping_pong_loop) = if voice.release_started && voice.volume_envelope_enabled {
         (voice.release_loop_bounds, voice.release_ping_pong_loop)
+    } else if voice.release_started {
+        (None, false)
     } else {
         (voice.loop_bounds, voice.ping_pong_loop)
     };
@@ -9718,7 +9742,7 @@ fn advance_sampler_voice_position(voice: &mut SamplerVoice) {
         voice.source_position = next_position;
         return;
     };
-    if voice.stop_frame.is_none() && !is_releasing {
+    if voice.stop_frame.is_none() && !voice.release_started {
         voice.source_position = next_position;
         return;
     }
@@ -13371,6 +13395,7 @@ mod tests {
                     gain: 1.0,
                     pan: -1.0,
                     reverse: false,
+                    volume_envelope_enabled: false,
                     key_range: None,
                     velocity_range: None,
                     root_key: SAMPLER_ROOT_KEY,
@@ -13968,6 +13993,7 @@ mod tests {
                 gain: 1.0,
                 pan: 0.0,
                 reverse: false,
+                volume_envelope_enabled: true,
                 key_range: None,
                 velocity_range: None,
                 root_key: SAMPLER_ROOT_KEY,
@@ -14010,6 +14036,104 @@ mod tests {
     }
 
     #[test]
+    fn sampler_without_volume_envelope_plays_to_sample_end_after_note_off() {
+        let sources = HashMap::from([(
+            7,
+            SamplerVoiceSource {
+                audio: Arc::new(DecodedAudio {
+                    sample_rate: 8,
+                    channels: vec![vec![1.0; 8]],
+                }),
+                gain: 1.0,
+                pan: -1.0,
+                reverse: false,
+                volume_envelope_enabled: false,
+                key_range: None,
+                velocity_range: None,
+                root_key: SAMPLER_ROOT_KEY,
+                fine_tune_cents: 0.0,
+                loop_bounds: None,
+                ping_pong_loop: false,
+                release_loop_bounds: None,
+                release_ping_pong_loop: false,
+            },
+        )]);
+        let notes = [ScheduledSamplerNote {
+            clip_index: 0,
+            playlist_track_id: None,
+            start_tick: 0,
+            stop_tick: None,
+            start_frame: 0,
+            stop_frame: Some(2),
+            channel_id: 7,
+            key: SAMPLER_ROOT_KEY,
+            velocity: 127,
+            pan: 64,
+            fine_pitch_offset_cents: 0,
+            layer_gain: 1.0,
+        }];
+        let mut engine = SamplerVoiceEngine::new(&sources, &notes, 1, 4, 8);
+        let mut output = vec![0.0; 16];
+
+        engine.render_block(0, 8, &mut output);
+
+        assert_eq!(
+            output,
+            vec![
+                1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0
+            ]
+        );
+    }
+
+    #[test]
+    fn sampler_without_volume_envelope_exits_sustain_loop_after_note_off() {
+        let sources = HashMap::from([(
+            7,
+            SamplerVoiceSource {
+                audio: Arc::new(DecodedAudio {
+                    sample_rate: 8,
+                    channels: vec![(0..6).map(|frame| frame as f32).collect()],
+                }),
+                gain: 1.0,
+                pan: -1.0,
+                reverse: false,
+                volume_envelope_enabled: false,
+                key_range: None,
+                velocity_range: None,
+                root_key: SAMPLER_ROOT_KEY,
+                fine_tune_cents: 0.0,
+                loop_bounds: Some(SampleBounds { start: 1, end: 3 }),
+                ping_pong_loop: false,
+                release_loop_bounds: None,
+                release_ping_pong_loop: false,
+            },
+        )]);
+        let notes = [ScheduledSamplerNote {
+            clip_index: 0,
+            playlist_track_id: None,
+            start_tick: 0,
+            stop_tick: None,
+            start_frame: 0,
+            stop_frame: Some(4),
+            channel_id: 7,
+            key: SAMPLER_ROOT_KEY,
+            velocity: 127,
+            pan: 64,
+            fine_pitch_offset_cents: 0,
+            layer_gain: 1.0,
+        }];
+        let mut engine = SamplerVoiceEngine::new(&sources, &notes, 1, 4, 8);
+        let mut output = vec![0.0; 12];
+
+        engine.render_block(0, 6, &mut output);
+
+        assert_eq!(
+            output,
+            vec![0.0, 0.0, 1.0, 0.0, 2.0, 0.0, 1.0, 0.0, 2.0, 0.0, 3.0, 0.0]
+        );
+    }
+
+    #[test]
     fn sampler_precomputed_fades_process_sample_data_before_playback() {
         let source = Arc::new(DecodedAudio {
             sample_rate: 5,
@@ -14038,6 +14162,7 @@ mod tests {
                 gain: 1.0,
                 pan: 0.0,
                 reverse: false,
+                volume_envelope_enabled: false,
                 key_range: None,
                 velocity_range: None,
                 root_key: SAMPLER_ROOT_KEY,
@@ -14088,6 +14213,7 @@ mod tests {
                 gain: 1.0,
                 pan: 0.0,
                 reverse: false,
+                volume_envelope_enabled: false,
                 key_range: None,
                 velocity_range: None,
                 root_key: SAMPLER_ROOT_KEY,
@@ -14156,6 +14282,7 @@ mod tests {
                 gain: 1.0,
                 pan: 0.0,
                 reverse: false,
+                volume_envelope_enabled: false,
                 key_range: None,
                 velocity_range: None,
                 root_key: SAMPLER_ROOT_KEY,
@@ -14210,6 +14337,7 @@ mod tests {
                 gain: 1.0,
                 pan: -1.0,
                 reverse: false,
+                volume_envelope_enabled: true,
                 key_range: None,
                 velocity_range: None,
                 root_key: SAMPLER_ROOT_KEY,
@@ -14261,6 +14389,7 @@ mod tests {
                 gain: 1.0,
                 pan: -1.0,
                 reverse: false,
+                volume_envelope_enabled: false,
                 key_range: None,
                 velocity_range: None,
                 root_key: SAMPLER_ROOT_KEY,
@@ -14306,6 +14435,7 @@ mod tests {
                 gain: 1.0,
                 pan: -1.0,
                 reverse: true,
+                volume_envelope_enabled: false,
                 key_range: None,
                 velocity_range: None,
                 root_key: SAMPLER_ROOT_KEY,
@@ -14349,6 +14479,7 @@ mod tests {
                 gain: 1.0,
                 pan: -1.0,
                 reverse: false,
+                volume_envelope_enabled: false,
                 key_range: None,
                 velocity_range: None,
                 root_key: SAMPLER_ROOT_KEY,
@@ -14398,6 +14529,7 @@ mod tests {
                 gain: 1.0,
                 pan: -1.0,
                 reverse: false,
+                volume_envelope_enabled: false,
                 key_range: None,
                 velocity_range: None,
                 root_key: SAMPLER_ROOT_KEY,
@@ -14447,6 +14579,7 @@ mod tests {
                 gain: 1.0,
                 pan: -1.0,
                 reverse: false,
+                volume_envelope_enabled: true,
                 key_range: None,
                 velocity_range: None,
                 root_key: SAMPLER_ROOT_KEY,
@@ -14511,6 +14644,7 @@ mod tests {
                 gain: 1.0,
                 pan: -1.0,
                 reverse: false,
+                volume_envelope_enabled: false,
                 key_range: None,
                 velocity_range: None,
                 root_key: SAMPLER_ROOT_KEY,
@@ -14556,6 +14690,7 @@ mod tests {
                 gain: 1.0,
                 pan: -1.0,
                 reverse: false,
+                volume_envelope_enabled: false,
                 key_range: None,
                 velocity_range: None,
                 root_key: 48,
@@ -14608,6 +14743,7 @@ mod tests {
             gain: 1.0,
             pan: 0.0,
             reverse: false,
+            volume_envelope_enabled: false,
             key_range: Some((48, 72)),
             velocity_range: Some((32, 96)),
             root_key: SAMPLER_ROOT_KEY,
@@ -14676,6 +14812,7 @@ mod tests {
                 gain: 1.0,
                 pan: 0.0,
                 reverse: false,
+                volume_envelope_enabled: false,
                 key_range: None,
                 velocity_range: None,
                 root_key: SAMPLER_ROOT_KEY,
@@ -14721,6 +14858,7 @@ mod tests {
                 gain: 1.0,
                 pan: -1.0,
                 reverse: false,
+                volume_envelope_enabled: false,
                 key_range: None,
                 velocity_range: None,
                 root_key: SAMPLER_ROOT_KEY,
@@ -14774,6 +14912,7 @@ mod tests {
                     gain: 1.0,
                     pan: -1.0,
                     reverse: false,
+                    volume_envelope_enabled: false,
                     key_range: None,
                     velocity_range: None,
                     root_key: SAMPLER_ROOT_KEY,
@@ -14791,6 +14930,7 @@ mod tests {
                     gain: 1.0,
                     pan: -1.0,
                     reverse: false,
+                    volume_envelope_enabled: false,
                     key_range: None,
                     velocity_range: None,
                     root_key: SAMPLER_ROOT_KEY,

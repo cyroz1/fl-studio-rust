@@ -458,6 +458,8 @@ pub struct ChannelSummary {
     sampler_fx_flags: Option<u16>,
     sampler_fade_out_raw: Option<u16>,
     sampler_fade_in_raw: Option<u16>,
+    sampler_volume_envelope_enabled: Option<bool>,
+    envelope_lfo_events_seen: u8,
     sampler_flags: Option<u32>,
     sampler_root_note: Option<u32>,
     keyboard_fine_tune_raw: Option<i32>,
@@ -840,6 +842,15 @@ impl ChannelSummary {
     pub fn sampler_fade_in_raw(&self) -> Option<u16> {
         (self.kind == Some(0))
             .then_some(self.sampler_fade_in_raw)
+            .flatten()
+    }
+
+    /// Whether the kind-0 Sampler's Volume envelope is enabled, when its saved `0xDA`
+    /// envelope records include the Volume record. FL Studio plays a sample through to its
+    /// natural end after note-off when this envelope is disabled.
+    pub fn sampler_volume_envelope_enabled(&self) -> Option<bool> {
+        (self.kind == Some(0))
+            .then_some(self.sampler_volume_envelope_enabled)
             .flatten()
     }
 
@@ -4340,6 +4351,21 @@ impl FlpDocument {
                     channel.sampler_fade_in_raw.get_or_insert_with(|| {
                         u16::from_le_bytes([event.payload[0], event.payload[1]])
                     });
+                }
+                0xDA if matches!(event.encoding, PayloadEncoding::Data { .. }) => {
+                    // PyFLP documents five ordered 0xDA records (Panning, Volume,
+                    // Mod X, Mod Y, Pitch); the Volume envelope is the second record.
+                    if channel.envelope_lfo_events_seen == 1 && event.payload.len() >= 8 {
+                        channel.sampler_volume_envelope_enabled = Some(
+                            i32::from_le_bytes(
+                                event.payload[4..8]
+                                    .try_into()
+                                    .expect("the envelope enabled field has four bytes"),
+                            ) != 0,
+                        );
+                    }
+                    channel.envelope_lfo_events_seen =
+                        channel.envelope_lfo_events_seen.saturating_add(1);
                 }
                 0x8F if event.encoding == PayloadEncoding::Dword
                     && event.payload.len() == 4
@@ -24384,6 +24410,32 @@ mod tests {
             assert_eq!(channels[0].sample_path(), Some(path));
             assert_eq!(document.encode_lossless().unwrap(), input);
         }
+    }
+
+    #[test]
+    fn decodes_sampler_volume_envelope_enable_flag_from_ordered_envelope_records() {
+        let mut event_stream = vec![0x40, 7, 0, 0x15, 0];
+        // 0xDA records are ordered Panning, Volume, Mod X, Mod Y, Pitch.
+        event_stream.extend_from_slice(&[0xDA, 8, 0, 0, 0, 0, 0, 0, 0, 0]);
+        event_stream.extend_from_slice(&[0xDA, 8, 0, 0, 0, 0, 1, 0, 0, 0]);
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+        let input = flp_fixture(&event_stream, &[], &[]);
+        let document = FlpDocument::parse(&input).expect("envelope fixture should parse");
+
+        assert_eq!(
+            document.channels()[0].sampler_volume_envelope_enabled(),
+            Some(true)
+        );
+        assert_eq!(document.encode_lossless().unwrap(), input);
+
+        let mut audio_channel = event_stream;
+        audio_channel[4] = 4;
+        let audio_input = flp_fixture(&audio_channel, &[], &[]);
+        let audio_document = FlpDocument::parse(&audio_input).expect("audio clip should parse");
+        assert_eq!(
+            audio_document.channels()[0].sampler_volume_envelope_enabled(),
+            None
+        );
     }
 
     #[test]
