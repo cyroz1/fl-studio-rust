@@ -9349,7 +9349,7 @@ struct SamplerVoice {
     source_step: f64,
     base_source_step: f64,
     pitch_offset_cents: f64,
-    pitch_slide: Option<SamplerPitchSlide>,
+    note_slide: Option<SamplerNoteSlide>,
     key_released: bool,
     release_started: bool,
     volume_envelope_enabled: bool,
@@ -9359,7 +9359,11 @@ struct SamplerVoice {
     release_ping_pong_loop: bool,
     stop_frame: Option<u64>,
     started_frame: u64,
+    base_gain: f32,
+    velocity_gain: f32,
     gain: f32,
+    channel_pan: f32,
+    note_pan_value: f32,
     left_gain: f32,
     right_gain: f32,
     mixer_transform: MixerSourceRouteTransform,
@@ -9371,15 +9375,24 @@ struct SamplerVoice {
 }
 
 #[derive(Clone, Copy)]
-struct SamplerPitchSlide {
+struct SamplerNoteSlide {
     start_frame: u64,
     end_frame: u64,
     start_pitch_cents: f64,
     target_pitch_cents: f64,
+    start_velocity_gain: f32,
+    target_velocity_gain: f32,
+    start_pan_value: f32,
+    target_pan_value: f32,
 }
 
-fn update_sampler_voice_pitch(voice: &mut SamplerVoice, frame: u64, pitch_bend_cents: [i16; 16]) {
-    if let Some(slide) = voice.pitch_slide {
+fn update_sampler_voice_slide(
+    voice: &mut SamplerVoice,
+    frame: u64,
+    pitch_bend_cents: [i16; 16],
+    pan_law: PanLaw,
+) {
+    if let Some(slide) = voice.note_slide {
         let progress = if frame >= slide.end_frame {
             1.0
         } else {
@@ -9389,8 +9402,17 @@ fn update_sampler_voice_pitch(voice: &mut SamplerVoice, frame: u64, pitch_bend_c
         .clamp(0.0, 1.0);
         voice.pitch_offset_cents = slide.start_pitch_cents
             + (slide.target_pitch_cents - slide.start_pitch_cents) * progress;
+        let progress = progress as f32;
+        voice.velocity_gain = slide.start_velocity_gain
+            + (slide.target_velocity_gain - slide.start_velocity_gain) * progress;
+        voice.gain = voice.base_gain * voice.velocity_gain;
+        voice.note_pan_value =
+            slide.start_pan_value + (slide.target_pan_value - slide.start_pan_value) * progress;
+        let effective_pan = sampler_note_pan_value(voice.channel_pan, voice.note_pan_value);
+        (voice.left_gain, voice.right_gain) =
+            channel_pan_gains(effective_pan, voice.source.channels.len() == 1, pan_law);
         if frame >= slide.end_frame {
-            voice.pitch_slide = None;
+            voice.note_slide = None;
         }
     }
     let pitch_bend = voice
@@ -9504,8 +9526,8 @@ impl<'a> SamplerVoiceEngine<'a> {
         for offset in 0..frame_count {
             let frame = block_start + offset as u64;
             for voice in self.voices.iter_mut().filter_map(Option::as_mut) {
-                if voice.pitch_slide.is_some() {
-                    update_sampler_voice_pitch(voice, frame, self.pitch_bend_cents);
+                if voice.note_slide.is_some() {
+                    update_sampler_voice_slide(voice, frame, self.pitch_bend_cents, self.pan_law);
                 }
             }
             while self
@@ -9538,10 +9560,15 @@ impl<'a> SamplerVoiceEngine<'a> {
                         .stop_frame
                         .is_some_and(|stop_frame| frame >= stop_frame)
                 {
-                    if voice.pitch_slide.is_some() {
-                        update_sampler_voice_pitch(voice, frame, self.pitch_bend_cents);
+                    if voice.note_slide.is_some() {
+                        update_sampler_voice_slide(
+                            voice,
+                            frame,
+                            self.pitch_bend_cents,
+                            self.pan_law,
+                        );
                     }
-                    voice.pitch_slide = None;
+                    voice.note_slide = None;
                     begin_sampler_voice_release(voice, self.release_frames);
                 }
                 let fade = match voice.release_remaining {
@@ -9768,13 +9795,15 @@ impl<'a> SamplerVoiceEngine<'a> {
         } else {
             source_step
         };
-        let effective_pan = sampler_note_pan(source.pan, note.pan);
+        let note_pan_value = f32::from(note.pan.min(128));
+        let effective_pan = sampler_note_pan_value(source.pan, note_pan_value);
         let (left_gain, right_gain) = channel_pan_gains(
             effective_pan,
             source.audio.channels.len() == 1,
             self.pan_law,
         );
         let velocity_gain = f32::from(note.velocity.min(127)) / 127.0;
+        let base_gain = source.gain * note.layer_gain;
         let live_mixer_source_control = self
             .live_mixer_source_routes_by_channel
             .and_then(|routes| routes.get(&note.channel_id))
@@ -9809,7 +9838,7 @@ impl<'a> SamplerVoiceEngine<'a> {
             source_step,
             base_source_step: source_step,
             pitch_offset_cents: 0.0,
-            pitch_slide: None,
+            note_slide: None,
             key_released: false,
             release_started: false,
             volume_envelope_enabled: source.volume_envelope_enabled,
@@ -9819,7 +9848,11 @@ impl<'a> SamplerVoiceEngine<'a> {
             release_ping_pong_loop: source.release_ping_pong_loop,
             stop_frame: note.stop_frame,
             started_frame: note.start_frame,
-            gain: source.gain * velocity_gain * note.layer_gain,
+            base_gain,
+            velocity_gain,
+            gain: base_gain * velocity_gain,
+            channel_pan: source.pan,
+            note_pan_value,
             left_gain,
             right_gain,
             mixer_transform,
@@ -9860,6 +9893,8 @@ impl<'a> SamplerVoiceEngine<'a> {
         let target_pitch_cents =
             f64::from(note.key) * 100.0 + f64::from(note.fine_pitch_offset_cents);
         let pitch_delta_cents = target_pitch_cents - reference_pitch_cents;
+        let target_pan_value = f32::from(note.pan.min(128));
+        let target_velocity_gain = f32::from(note.velocity.min(127)) / 127.0;
         for voice in self.voices.iter_mut().flatten().filter(|voice| {
             voice.channel_id == note.channel_id
                 && voice.midi_channel == note.midi_channel
@@ -9868,15 +9903,29 @@ impl<'a> SamplerVoiceEngine<'a> {
                     .stop_frame
                     .is_none_or(|stop_frame| stop_frame > note.start_frame)
         }) {
-            update_sampler_voice_pitch(voice, note.start_frame, self.pitch_bend_cents);
+            update_sampler_voice_slide(
+                voice,
+                note.start_frame,
+                self.pitch_bend_cents,
+                self.pan_law,
+            );
             let start_pitch_cents = voice.pitch_offset_cents;
-            voice.pitch_slide = Some(SamplerPitchSlide {
+            voice.note_slide = Some(SamplerNoteSlide {
                 start_frame: note.start_frame,
                 end_frame,
                 start_pitch_cents,
                 target_pitch_cents: start_pitch_cents + pitch_delta_cents,
+                start_velocity_gain: voice.velocity_gain,
+                target_velocity_gain,
+                start_pan_value: voice.note_pan_value,
+                target_pan_value,
             });
-            update_sampler_voice_pitch(voice, note.start_frame, self.pitch_bend_cents);
+            update_sampler_voice_slide(
+                voice,
+                note.start_frame,
+                self.pitch_bend_cents,
+                self.pan_law,
+            );
         }
     }
 
@@ -9955,7 +10004,8 @@ impl<'a> SamplerVoiceEngine<'a> {
             if voice.input_midi_channel == Some(channel)
                 && let Some(source) = sources_by_channel.get(&voice.channel_id)
             {
-                let effective_pan = sampler_note_pan(source.pan, pan);
+                voice.note_pan_value = f32::from(pan.min(127));
+                let effective_pan = sampler_note_pan_value(voice.channel_pan, voice.note_pan_value);
                 (voice.left_gain, voice.right_gain) =
                     channel_pan_gains(effective_pan, source.audio.channels.len() == 1, pan_law);
             }
@@ -10087,7 +10137,7 @@ fn sampler_voice_render_end_frame(
 fn begin_sampler_voice_release(voice: &mut SamplerVoice, release_frames: usize) {
     voice.key_released = true;
     voice.release_started = true;
-    voice.pitch_slide = None;
+    voice.note_slide = None;
     if voice.volume_envelope_enabled {
         voice.release_remaining = Some(release_frames);
         voice.release_total_frames = Some(release_frames);
@@ -10098,7 +10148,7 @@ fn begin_sampler_voice_release(voice: &mut SamplerVoice, release_frames: usize) 
 fn begin_sampler_voice_fast_cut_declick(voice: &mut SamplerVoice, fade_frames: usize) {
     voice.key_released = true;
     voice.release_started = true;
-    voice.pitch_slide = None;
+    voice.note_slide = None;
     voice.release_remaining = Some(fade_frames);
     voice.release_total_frames = Some(fade_frames);
     voice.release_cosine = true;
@@ -10184,9 +10234,8 @@ pub(crate) fn channel_pan_gains(pan: f32, mono: bool, pan_law: PanLaw) -> (f32, 
     }
 }
 
-/// Treats the stored 0–128 note pan as an offset from the channel pan, centered at 64.
-fn sampler_note_pan(channel_pan: f32, note_pan: u8) -> f32 {
-    let note_pan_offset = f32::from(note_pan.min(128)) / 64.0 - 1.0;
+fn sampler_note_pan_value(channel_pan: f32, note_pan: f32) -> f32 {
+    let note_pan_offset = note_pan.clamp(0.0, 128.0) / 64.0 - 1.0;
     (channel_pan + note_pan_offset).clamp(-1.0, 1.0)
 }
 
@@ -14353,12 +14402,12 @@ mod tests {
 
     #[test]
     fn sampler_note_pan_is_a_centered_offset_from_channel_pan() {
-        assert_eq!(sampler_note_pan(0.0, 64), 0.0);
-        assert_eq!(sampler_note_pan(0.0, 0), -1.0);
-        assert_eq!(sampler_note_pan(0.0, 128), 1.0);
-        assert_eq!(sampler_note_pan(-0.5, 96), 0.0);
-        assert_eq!(sampler_note_pan(0.5, 128), 1.0);
-        assert_eq!(sampler_note_pan(-0.5, 0), -1.0);
+        assert_eq!(sampler_note_pan_value(0.0, 64.0), 0.0);
+        assert_eq!(sampler_note_pan_value(0.0, 0.0), -1.0);
+        assert_eq!(sampler_note_pan_value(0.0, 128.0), 1.0);
+        assert_eq!(sampler_note_pan_value(-0.5, 96.0), 0.0);
+        assert_eq!(sampler_note_pan_value(0.5, 128.0), 1.0);
+        assert_eq!(sampler_note_pan_value(-0.5, 0.0), -1.0);
     }
 
     #[test]
@@ -15921,7 +15970,7 @@ mod tests {
                 .iter()
                 .flatten()
                 .filter(|voice| voice.midi_channel == 0)
-                .map(|voice| (voice.pitch_offset_cents, voice.pitch_slide.is_none()))
+                .map(|voice| (voice.pitch_offset_cents, voice.note_slide.is_none()))
                 .collect::<Vec<_>>(),
             [(750.0, true), (750.0, true)]
         );
@@ -15984,7 +16033,76 @@ mod tests {
         engine.render_block(5, 3, &mut [0.0; 6]);
 
         assert_eq!(engine.voices[0].as_ref().unwrap().pitch_offset_cents, 700.0);
-        assert!(engine.voices[0].as_ref().unwrap().pitch_slide.is_none());
+        assert!(engine.voices[0].as_ref().unwrap().note_slide.is_none());
+    }
+
+    #[test]
+    fn sampler_slide_notes_interpolate_velocity_and_pan() {
+        let source = SamplerVoiceSource {
+            audio: Arc::new(DecodedAudio {
+                sample_rate: 1_000,
+                channels: vec![vec![1.0; 256]],
+            }),
+            gain: 1.0,
+            pan: 0.75,
+            reverse: false,
+            volume_envelope_enabled: false,
+            max_polyphony_raw: None,
+            mono_enabled: false,
+            channel_cut_groups: None,
+            fast_declick_for_cut_groups: false,
+            key_range: None,
+            velocity_range: None,
+            root_key: SAMPLER_ROOT_KEY,
+            fine_tune_cents: 0.0,
+            loop_bounds: None,
+            ping_pong_loop: false,
+            release_loop_bounds: None,
+            release_ping_pong_loop: false,
+        };
+        let sources = HashMap::from([(1, source)]);
+        let note = |start_frame, stop_frame, velocity, pan, slide_note| ScheduledSamplerNote {
+            clip_index: 0,
+            playlist_track_id: None,
+            start_tick: start_frame,
+            stop_tick: stop_frame,
+            start_frame,
+            stop_frame,
+            channel_id: 1,
+            key: SAMPLER_ROOT_KEY,
+            midi_channel: 0,
+            slide_note,
+            velocity,
+            pan,
+            fine_pitch_offset_cents: 0,
+            layer_gain: 1.0,
+        };
+        let notes = [
+            note(0, None, 127, 128, false),
+            note(2, Some(6), 0, 64, true),
+        ];
+        let mut engine = SamplerVoiceEngine::new(&sources, &notes, 2, 4, 1_000);
+
+        engine.render_block(0, 4, &mut [0.0; 8]);
+        let voice = engine.voices[0].as_ref().unwrap();
+        assert!((voice.velocity_gain - 0.75).abs() < 1e-6);
+        assert!((voice.note_pan_value - 112.0).abs() < 1e-6);
+        assert!(
+            (sampler_note_pan_value(voice.channel_pan, voice.note_pan_value) - 1.0).abs() < 1e-6
+        );
+
+        engine.render_block(4, 3, &mut [0.0; 6]);
+        let voice = engine.voices[0].as_ref().unwrap();
+        assert_eq!(voice.velocity_gain, 0.0);
+        assert_eq!(voice.note_pan_value, 64.0);
+        assert_eq!(
+            sampler_note_pan_value(voice.channel_pan, voice.note_pan_value),
+            0.75
+        );
+        let expected_pan = channel_pan_gains(0.75, true, PanLaw::Circular);
+        assert!((voice.left_gain - expected_pan.0).abs() < 1e-6);
+        assert!((voice.right_gain - expected_pan.1).abs() < 1e-6);
+        assert!(voice.note_slide.is_none());
     }
 
     #[test]
