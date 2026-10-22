@@ -805,6 +805,18 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_optional_bool(crossfade, "Layer Crossfade")?,
             )
         }
+        [command, input, output, channel_id, fade_raw] if command == "set-layer-fade" => {
+            let fade_raw = parse_u16(fade_raw, "Layer Fade")?;
+            if fade_raw > 256 {
+                return Err("Layer Fade must be between 0 and 256".to_owned());
+            }
+            set_layer_fade(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(channel_id, "Layer channel id")?,
+                fade_raw,
+            )
+        }
         [command, input, output, channel_id, point_index, position, value, tension]
             if command == "edit-automation-point" =>
         {
@@ -3322,6 +3334,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild set-channel-swing <input.flp> <output.flp> <channel-id> <percent-0..100>\n",
             "  flp-rebuild set-layer-children <input.flp> <output.flp> <layer-channel-id> <child-ids-comma-separated|->\n",
             "  flp-rebuild set-layer-flags <input.flp> <output.flp> <layer-channel-id> <random:0|1|-> <crossfade:0|1|->\n",
+            "  flp-rebuild set-layer-fade <input.flp> <output.flp> <layer-channel-id> <fade:0..256>\n",
             "  flp-rebuild edit-automation-point <input.flp> <output.flp> <channel-id> <point-index> <position-beats> <value> <tension>\n",
             "  flp-rebuild insert-automation-point <input.flp> <output.flp> <channel-id> <insertion-slot> <position-beats> <value> <tension>\n",
             "  flp-rebuild delete-automation-point <input.flp> <output.flp> <channel-id> <point-index>\n",
@@ -6614,6 +6627,28 @@ fn set_layer_flags(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "updated Layer channel {layer_channel_id} flags in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn set_layer_fade(
+    input: &Path,
+    output: &Path,
+    layer_channel_id: u16,
+    fade_raw: u16,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .set_layer_fade(layer_channel_id, fade_raw)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "set Layer channel {layer_channel_id} Fade to {fade_raw} in {}",
         output.display()
     );
     Ok(())

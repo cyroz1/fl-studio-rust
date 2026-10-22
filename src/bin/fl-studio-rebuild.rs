@@ -22089,6 +22089,7 @@ impl DawUi {
         let mut channel_swing_edits = Vec::new();
         let mut layer_edits = Vec::new();
         let mut layer_flag_edits = Vec::new();
+        let mut layer_fade_edits = Vec::new();
         let mut channel_mixer_track_edits = Vec::<(Vec<u16>, i8)>::new();
         let mut channel_stretch_edits = Vec::new();
         let mut step_toggles = Vec::<(u16, Vec<usize>, u32, StepToggleOperation)>::new();
@@ -22336,9 +22337,12 @@ impl DawUi {
                 let mut pan_changed = false;
                 let mut layer_child_apply = None;
                 let mut layer_flags_apply = None;
+                let mut layer_fade_apply = None;
                 let layer_flags = channel.layer_flags();
                 let mut layer_random = channel.layer_random_enabled().unwrap_or(false);
                 let mut layer_crossfade = channel.layer_crossfade_enabled().unwrap_or(false);
+                let layer_fade_raw = channel.layer_fade_raw();
+                let mut layer_fade = layer_fade_raw.unwrap_or(0);
                 egui::Frame::new()
                     .fill(PANEL_DARK)
                     .inner_margin(4.0)
@@ -23073,6 +23077,22 @@ impl DawUi {
                                     ui.small("No recognized flags event");
                                 }
                             });
+                            ui.horizontal(|ui| {
+                                let fade_response = ui
+                                    .add_enabled(
+                                        layer_fade_raw.is_some(),
+                                        egui::Slider::new(&mut layer_fade, 0..=256).text("Fade"),
+                                    )
+                                    .on_hover_text(
+                                        "Crossfade position from the first to last child Sampler",
+                                    );
+                                if fade_response.changed() {
+                                    layer_fade_apply = Some(layer_fade);
+                                }
+                                if layer_fade_raw.is_none() {
+                                    ui.small("No recognized Fade field in Channel Parameters");
+                                }
+                            });
                         }
                         if let Some(settings) = channel.stretch_settings() {
                             let mut time_raw = settings.time_raw();
@@ -23153,6 +23173,9 @@ impl DawUi {
                 }
                 if let Some((random, crossfade)) = layer_flags_apply {
                     layer_flag_edits.push((channel.id(), random, crossfade));
+                }
+                if let Some(fade_raw) = layer_fade_apply {
+                    layer_fade_edits.push((channel.id(), fade_raw));
                 }
                 if !zipped && let Some(pattern) = &selected_pattern {
                     ui.horizontal_wrapped(|ui| {
@@ -23694,6 +23717,22 @@ impl DawUi {
                     }
                     Err(error) => {
                         self.status = format!("Could not update Layer flags: {error}");
+                    }
+                }
+            }
+        }
+        if !layer_fade_edits.is_empty()
+            && let Some(document) = self.document.as_mut()
+        {
+            for (channel_id, fade_raw) in layer_fade_edits {
+                match document.set_layer_fade(channel_id, fade_raw) {
+                    Ok(()) => {
+                        self.dirty = true;
+                        self.status = format!("Layer channel {channel_id} Fade updated");
+                    }
+                    Err(error) => {
+                        self.status =
+                            format!("Could not update Layer channel {channel_id} Fade: {error}");
                     }
                 }
             }

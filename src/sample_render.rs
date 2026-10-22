@@ -5247,12 +5247,18 @@ pub fn stream_sampler_midi_input_to_device(
                 }) => {
                     let source_key = key.min(127);
                     let routed_targets = channel_router
-                        .targets_for_note(source_channel_id, note_seed, u16::from(source_key))
+                        .targets_for_note_with_gain(
+                            source_channel_id,
+                            note_seed,
+                            u16::from(source_key),
+                        )
                         .into_iter()
-                        .filter(|target_channel_id| target_channel_ids.contains(target_channel_id));
+                        .filter(|(target_channel_id, _)| {
+                            target_channel_ids.contains(target_channel_id)
+                        });
                     note_seed = note_seed.wrapping_add(1);
                     let mut active_targets = Vec::new();
-                    for target_channel_id in routed_targets {
+                    for (target_channel_id, layer_gain) in routed_targets {
                         let pitch_offset = pitch_offsets_by_channel
                             .get(&target_channel_id)
                             .copied()
@@ -5271,6 +5277,7 @@ pub fn stream_sampler_midi_input_to_device(
                             velocity,
                             pan: engine.live_midi_pan(midi_channel),
                             fine_pitch_offset_cents: 0,
+                            layer_gain,
                         }) {
                             engine.set_voice_input_midi_channel(slot_index, midi_channel);
                             active_targets.push((target_channel_id, note_key));
@@ -5430,13 +5437,13 @@ pub fn stream_mixed_layer_midi_input_to_device(
                     })) => {
                         let source_key = key.min(127);
                         let routed_targets = channel_router
-                            .targets_for_note(
+                            .targets_for_note_with_gain(
                                 config.source_channel_id,
                                 note_seed,
                                 u16::from(source_key),
                             )
                             .into_iter()
-                            .filter(|target_channel_id| {
+                            .filter(|(target_channel_id, _)| {
                                 config
                                     .sampler_target_channel_ids
                                     .contains(target_channel_id)
@@ -5444,7 +5451,7 @@ pub fn stream_mixed_layer_midi_input_to_device(
                             });
                         note_seed = note_seed.wrapping_add(1);
                         let mut active_targets = Vec::new();
-                        for target_channel_id in routed_targets {
+                        for (target_channel_id, layer_gain) in routed_targets {
                             if config
                                 .sampler_target_channel_ids
                                 .contains(&target_channel_id)
@@ -5468,6 +5475,7 @@ pub fn stream_mixed_layer_midi_input_to_device(
                                         velocity,
                                         pan: sampler_engine.live_midi_pan(channel),
                                         fine_pitch_offset_cents: 0,
+                                        layer_gain,
                                     })
                                 {
                                     sampler_engine
@@ -6274,6 +6282,7 @@ pub(crate) fn swing_note_start_tick(
 pub(crate) struct PlaylistPatternNote<'a> {
     pub(crate) note: &'a PatternNote,
     pub(crate) target_channel_id: u16,
+    pub(crate) target_gain: f32,
     pub(crate) start_tick: u64,
     pub(crate) stop_tick: Option<u64>,
     pub(crate) clip_index: usize,
@@ -6326,8 +6335,31 @@ pub(crate) fn schedule_playlist_pattern_notes<'a>(
     arrangement: &Arrangement,
     track_filter: PlaylistTrackFilter<'_>,
     options: PlaylistPatternScheduleOptions,
-    mut channel_swing_mix_raw: impl FnMut(u16) -> u16,
+    channel_swing_mix_raw: impl FnMut(u16) -> u16,
     mut resolve_targets: impl FnMut(u16, u64, u16) -> Vec<u16>,
+) -> Result<PlaylistPatternSchedule<'a>, String> {
+    schedule_playlist_pattern_notes_with_gains(
+        patterns,
+        arrangement,
+        track_filter,
+        options,
+        channel_swing_mix_raw,
+        |channel_id, seed, key| {
+            resolve_targets(channel_id, seed, key)
+                .into_iter()
+                .map(|target_channel_id| (target_channel_id, 1.0))
+                .collect()
+        },
+    )
+}
+
+pub(crate) fn schedule_playlist_pattern_notes_with_gains<'a>(
+    patterns: &'a [Pattern],
+    arrangement: &Arrangement,
+    track_filter: PlaylistTrackFilter<'_>,
+    options: PlaylistPatternScheduleOptions,
+    mut channel_swing_mix_raw: impl FnMut(u16) -> u16,
+    mut resolve_targets: impl FnMut(u16, u64, u16) -> Vec<(u16, f32)>,
 ) -> Result<PlaylistPatternSchedule<'a>, String> {
     let patterns_by_id: HashMap<_, _> = patterns
         .iter()
@@ -6432,7 +6464,9 @@ pub(crate) fn schedule_playlist_pattern_notes<'a>(
                     ^ repetition.rotate_left(17)
                     ^ (note_index as u64).rotate_left(3)
                     ^ nominal_start_tick.rotate_left(47);
-                for target_channel_id in resolve_targets(note.channel_id, note_seed, note.key) {
+                for (target_channel_id, target_gain) in
+                    resolve_targets(note.channel_id, note_seed, note.key)
+                {
                     if schedule.notes.len() >= MAX_SCHEDULED_PLAYLIST_NOTES {
                         return Err(format!(
                             "Playlist expands to more than {MAX_SCHEDULED_PLAYLIST_NOTES} pattern note events"
@@ -6441,6 +6475,7 @@ pub(crate) fn schedule_playlist_pattern_notes<'a>(
                     schedule.notes.push(PlaylistPatternNote {
                         note,
                         target_channel_id,
+                        target_gain,
                         start_tick,
                         stop_tick,
                         clip_index,
@@ -6515,7 +6550,7 @@ fn prepare_sampler_arrangement(
         .map(|channel| (channel.id(), channel))
         .collect();
     let channel_router = ChannelNoteRouter::new(channels.clone());
-    let schedule = schedule_playlist_pattern_notes(
+    let schedule = schedule_playlist_pattern_notes_with_gains(
         &patterns,
         &arrangement,
         track_filter,
@@ -6533,9 +6568,9 @@ fn prepare_sampler_arrangement(
         },
         |channel_id, seed, key| {
             channel_router
-                .targets_for_note(channel_id, seed, key)
+                .targets_for_note_with_gain(channel_id, seed, key)
                 .into_iter()
-                .filter(|target_channel_id| {
+                .filter(|(target_channel_id, _)| {
                     channels_by_id
                         .get(target_channel_id)
                         .is_some_and(|channel| {
@@ -6784,6 +6819,7 @@ fn prepare_sampler_arrangement(
             velocity: note.velocity,
             pan: note.pan,
             fine_pitch_offset_cents: note.fine_pitch_offset_cents(),
+            layer_gain: placed.target_gain,
         });
     }
     notes.sort_by_key(|note| (note.start_frame, note.channel_id, note.key));
@@ -6878,6 +6914,7 @@ struct ScheduledSamplerNote {
     velocity: u8,
     pan: u8,
     fine_pitch_offset_cents: i16,
+    layer_gain: f32,
 }
 
 #[derive(Clone)]
@@ -8828,9 +8865,9 @@ fn prepare_sampler_pattern_for_channel_internal(
         .filter(|(_, note)| !note.is_muted())
         .flat_map(|(note_index, note)| {
             channel_router
-                .targets_for_note(note.channel_id, note_index as u64, note.key)
+                .targets_for_note_with_gain(note.channel_id, note_index as u64, note.key)
                 .into_iter()
-                .filter(|target_channel_id| {
+                .filter(|(target_channel_id, _)| {
                     channels_by_id
                         .get(target_channel_id)
                         .is_some_and(|channel| {
@@ -8844,9 +8881,9 @@ fn prepare_sampler_pattern_for_channel_internal(
                                 }
                         })
                 })
-                .map(move |target_channel_id| (note, target_channel_id))
+                .map(move |(target_channel_id, target_gain)| (note, target_channel_id, target_gain))
         })
-        .filter(|(_, target_channel_id)| {
+        .filter(|(_, target_channel_id, _)| {
             channel_filter.is_none_or(|channel_ids| channel_ids.contains(target_channel_id))
         })
         .collect::<Vec<_>>();
@@ -8894,7 +8931,7 @@ fn prepare_sampler_pattern_for_channel_internal(
         .round()
         .max(1.0) as u64;
 
-    for (note, target_channel_id) in sampler_notes {
+    for (note, target_channel_id, layer_gain) in sampler_notes {
         check_cancelled(cancelled)?;
         let Some(channel) = channels_by_id.get(&target_channel_id) else {
             continue;
@@ -9084,6 +9121,7 @@ fn prepare_sampler_pattern_for_channel_internal(
             velocity: note.velocity,
             pan: note.pan,
             fine_pitch_offset_cents: note.fine_pitch_offset_cents(),
+            layer_gain,
         });
     }
 
@@ -9443,7 +9481,7 @@ impl<'a> SamplerVoiceEngine<'a> {
             release_ping_pong_loop: source.release_ping_pong_loop,
             stop_frame: note.stop_frame,
             started_frame: note.start_frame,
-            gain: source.gain * velocity_gain,
+            gain: source.gain * velocity_gain * note.layer_gain,
             left_gain,
             right_gain,
             mixer_transform,
@@ -13207,6 +13245,7 @@ mod tests {
                 velocity: 127,
                 pan: 64,
                 fine_pitch_offset_cents: 0,
+                layer_gain: 1.0,
             }],
             sources_by_channel: HashMap::from([(
                 2,
@@ -13440,6 +13479,7 @@ mod tests {
             notes: vec![PlaylistPatternNote {
                 note: &pattern.notes[0],
                 target_channel_id: 3,
+                target_gain: 1.0,
                 start_tick: 96,
                 stop_tick: Some(120),
                 clip_index: 1,
@@ -13834,6 +13874,7 @@ mod tests {
             velocity: 127,
             pan: 64,
             fine_pitch_offset_cents: 0,
+            layer_gain: 1.0,
         }];
 
         let mut whole_engine = SamplerVoiceEngine::new(&sources, &notes, 4, 4, 4);
@@ -13886,6 +13927,7 @@ mod tests {
             velocity: 127,
             pan: 64,
             fine_pitch_offset_cents: 0,
+            layer_gain: 1.0,
         }];
 
         let mut complete_engine = SamplerVoiceEngine::new(&sources, &notes, 1, 4, 8);
@@ -13936,6 +13978,7 @@ mod tests {
                 velocity: 127,
                 pan: 96,
                 fine_pitch_offset_cents: 0,
+                layer_gain: 1.0,
             },
             ScheduledSamplerNote {
                 clip_index: 0,
@@ -13949,6 +13992,7 @@ mod tests {
                 velocity: 127,
                 pan: 32,
                 fine_pitch_offset_cents: 0,
+                layer_gain: 1.0,
             },
         ];
         let mut engine = SamplerVoiceEngine::new(&sources, &notes, 1, 4, 4);
@@ -14003,6 +14047,7 @@ mod tests {
                 velocity: 127,
                 pan: 64,
                 fine_pitch_offset_cents: 0,
+                layer_gain: 1.0,
             })
             .expect("live voice should start");
         engine.set_voice_input_midi_channel(slot_index, 2);
@@ -14060,6 +14105,7 @@ mod tests {
             velocity: 127,
             pan: 64,
             fine_pitch_offset_cents: 0,
+            layer_gain: 1.0,
         }];
         let mut engine = SamplerVoiceEngine::new(&sources, &notes, 1, 4, 4);
         engine.mixer_transforms_by_channel = Some(&transforms);
@@ -14068,6 +14114,50 @@ mod tests {
         engine.render_block(0, 1, &mut output);
 
         assert_eq!(output, vec![-0.5, 0.0]);
+    }
+
+    #[test]
+    fn sampler_voice_multiplies_the_layer_crossfade_gain() {
+        let sources = HashMap::from([(
+            7,
+            SamplerVoiceSource {
+                audio: Arc::new(DecodedAudio {
+                    sample_rate: 4,
+                    channels: vec![vec![1.0]],
+                }),
+                gain: 1.0,
+                pan: -1.0,
+                reverse: false,
+                key_range: None,
+                velocity_range: None,
+                root_key: SAMPLER_ROOT_KEY,
+                fine_tune_cents: 0.0,
+                loop_bounds: None,
+                ping_pong_loop: false,
+                release_loop_bounds: None,
+                release_ping_pong_loop: false,
+            },
+        )]);
+        let notes = [ScheduledSamplerNote {
+            clip_index: 0,
+            playlist_track_id: None,
+            start_tick: 0,
+            stop_tick: None,
+            start_frame: 0,
+            stop_frame: None,
+            channel_id: 7,
+            key: SAMPLER_ROOT_KEY,
+            velocity: 127,
+            pan: 64,
+            fine_pitch_offset_cents: 0,
+            layer_gain: 0.5,
+        }];
+        let mut engine = SamplerVoiceEngine::new(&sources, &notes, 1, 4, 4);
+        let mut output = vec![0.0; 2];
+
+        engine.render_block(0, 1, &mut output);
+
+        assert_eq!(output, vec![0.5, 0.0]);
     }
 
     #[test]
@@ -14105,6 +14195,7 @@ mod tests {
             velocity: 127,
             pan: 64,
             fine_pitch_offset_cents: 0,
+            layer_gain: 1.0,
         }];
         let mut engine = SamplerVoiceEngine::new(&sources, &notes, 1, 4, 4);
         let mut output = vec![0.0; 8];
@@ -14147,6 +14238,7 @@ mod tests {
             velocity: 127,
             pan: 64,
             fine_pitch_offset_cents: 0,
+            layer_gain: 1.0,
         }];
         let mut engine = SamplerVoiceEngine::new(&sources, &notes, 1, 4, 4);
         let mut output = vec![0.0; 18];
@@ -14195,6 +14287,7 @@ mod tests {
             velocity: 127,
             pan: 64,
             fine_pitch_offset_cents: 0,
+            layer_gain: 1.0,
         }];
         let mut engine = SamplerVoiceEngine::new(&sources, &notes, 1, 4, 4);
         let mut output = vec![0.0; 18];
@@ -14243,6 +14336,7 @@ mod tests {
             velocity: 127,
             pan: 64,
             fine_pitch_offset_cents: 0,
+            layer_gain: 1.0,
         }];
         let mut engine = SamplerVoiceEngine::new(&sources, &notes, 1, 6, 4);
         let mut output = vec![0.0; 16];
@@ -14306,6 +14400,7 @@ mod tests {
             velocity: 127,
             pan: 64,
             fine_pitch_offset_cents: 0,
+            layer_gain: 1.0,
         }];
         let mut engine = SamplerVoiceEngine::new(&sources, &notes, 1, 4, 4);
         let mut output = vec![0.0; 8];
@@ -14350,6 +14445,7 @@ mod tests {
             velocity: 127,
             pan: 64,
             fine_pitch_offset_cents: 0,
+            layer_gain: 1.0,
         }];
         let mut engine = SamplerVoiceEngine::new(&sources, &notes, 1, 4, 4);
         let mut output = vec![0.0; 8];
@@ -14452,6 +14548,7 @@ mod tests {
             velocity: 127,
             pan: 64,
             fine_pitch_offset_cents: 50,
+            layer_gain: 1.0,
         }];
         let mut engine = SamplerVoiceEngine::new(&sources, &notes, 1, 4, 4);
 
@@ -14496,6 +14593,7 @@ mod tests {
             velocity: 127,
             pan: 64,
             fine_pitch_offset_cents: 0,
+            layer_gain: 1.0,
         }];
         let mut engine = SamplerVoiceEngine::new(&sources, &notes, 1, 4, 4);
         let mut output = vec![0.0; 12];
@@ -14567,6 +14665,7 @@ mod tests {
                 velocity: 127,
                 pan: 64,
                 fine_pitch_offset_cents: 0,
+                layer_gain: 1.0,
             },
             ScheduledSamplerNote {
                 clip_index: 0,
@@ -14580,6 +14679,7 @@ mod tests {
                 velocity: 127,
                 pan: 64,
                 fine_pitch_offset_cents: 0,
+                layer_gain: 1.0,
             },
         ];
         let mut engine = SamplerVoiceEngine::new(&sources, &notes, 1, 4, 4);

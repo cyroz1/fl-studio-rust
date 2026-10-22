@@ -461,6 +461,7 @@ pub struct ChannelSummary {
     keyboard_main_pitch: Option<bool>,
     keyboard_add_root: Option<bool>,
     keyboard_key_region: Option<(u32, u32)>,
+    layer_fade_raw: Option<u32>,
     stretch_settings: Option<ChannelStretchSettings>,
     ping_pong_loop: bool,
     swing_mix: Option<u16>,
@@ -994,6 +995,19 @@ impl ChannelSummary {
         self.layer_flags().map(|flags| flags & 2 != 0)
     }
 
+    /// Saved Layer Fade control from Channel Parameters (`0xC7`) bytes 88–91.
+    ///
+    /// The independently documented field range is 0–256. Invalid and absent
+    /// values return `None`; non-Layer channels never expose this field.
+    pub fn layer_fade_raw(&self) -> Option<u16> {
+        if self.channel_type() != Some(ChannelType::Layer) {
+            return None;
+        }
+        self.layer_fade_raw
+            .filter(|value| *value <= 256)
+            .map(|value| value as u16)
+    }
+
     pub fn event_range(&self) -> std::ops::Range<usize> {
         self.first_event_index..self.end_event_index
     }
@@ -1006,6 +1020,14 @@ impl ChannelSummary {
 /// random sequence is not known, so rendered choices may differ from FL Studio.
 pub(crate) struct ChannelNoteRouter {
     channels_by_id: HashMap<u16, ChannelSummary>,
+}
+
+struct ChannelRouteState {
+    note_seed: u64,
+    key: u16,
+    active_layers: HashSet<u16>,
+    seen_targets: HashSet<u16>,
+    targets: Vec<(u16, f32)>,
 }
 
 impl ChannelNoteRouter {
@@ -1026,41 +1048,46 @@ impl ChannelNoteRouter {
         note_seed: u64,
         key: u16,
     ) -> Vec<u16> {
-        let mut targets = Vec::new();
-        let mut seen_targets = HashSet::new();
-        self.route_channel(
-            source_channel_id,
-            note_seed,
-            key,
-            &mut HashSet::new(),
-            &mut seen_targets,
-            &mut targets,
-        );
-        targets
+        self.targets_for_note_with_gain(source_channel_id, note_seed, key)
+            .into_iter()
+            .map(|(channel_id, _)| channel_id)
+            .collect()
     }
 
-    fn route_channel(
+    /// Returns Sampler route gains for the saved Layer crossfade position.
+    /// Non-crossfaded routes have gain 1.0. Crossfade is applied only when all
+    /// active children are built-in Sampler channels; VST3 routes retain gain 1.
+    pub(crate) fn targets_for_note_with_gain(
         &self,
-        channel_id: u16,
+        source_channel_id: u16,
         note_seed: u64,
         key: u16,
-        active_layers: &mut HashSet<u16>,
-        seen_targets: &mut HashSet<u16>,
-        targets: &mut Vec<u16>,
-    ) {
+    ) -> Vec<(u16, f32)> {
+        let mut state = ChannelRouteState {
+            note_seed,
+            key,
+            active_layers: HashSet::new(),
+            seen_targets: HashSet::new(),
+            targets: Vec::new(),
+        };
+        self.route_channel(source_channel_id, 1.0, &mut state);
+        state.targets
+    }
+
+    fn route_channel(&self, channel_id: u16, route_gain: f32, state: &mut ChannelRouteState) {
         let Some(channel) = self.channels_by_id.get(&channel_id) else {
             return;
         };
-        if channel.enabled == Some(false) || !channel_accepts_key(channel, key) {
+        if channel.enabled == Some(false) || !channel_accepts_key(channel, state.key) {
             return;
         }
         if channel.channel_type() != Some(ChannelType::Layer) {
-            if seen_targets.insert(channel_id) {
-                targets.push(channel_id);
+            if state.seen_targets.insert(channel_id) {
+                state.targets.push((channel_id, route_gain));
             }
             return;
         }
-        if !active_layers.insert(channel_id) {
+        if !state.active_layers.insert(channel_id) {
             return;
         }
 
@@ -1074,37 +1101,53 @@ impl ChannelNoteRouter {
                 self.channels_by_id.get(child_id).is_some_and(|child| {
                     child.enabled != Some(false)
                         && (child.channel_type() != Some(ChannelType::Layer)
-                            || !active_layers.contains(child_id))
-                        && channel_accepts_key(child, key)
+                            || !state.active_layers.contains(child_id))
+                        && channel_accepts_key(child, state.key)
                 })
             })
             .collect::<Vec<_>>();
         if channel.layer_random_enabled() == Some(true) && !children.is_empty() {
-            let mut random = note_seed ^ (u64::from(channel_id) << 32) ^ 0x9E37_79B9_7F4A_7C15;
+            let mut random =
+                state.note_seed ^ (u64::from(channel_id) << 32) ^ 0x9E37_79B9_7F4A_7C15;
             random = (random ^ (random >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
             random = (random ^ (random >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
             random ^= random >> 31;
             self.route_channel(
                 children[(random as usize) % children.len()],
-                note_seed,
-                key,
-                active_layers,
-                seen_targets,
-                targets,
+                route_gain,
+                state,
             );
+        } else if channel.layer_crossfade_enabled() == Some(true)
+            && channel.layer_fade_raw().is_some()
+            && !children.is_empty()
+            && children.iter().all(|child_id| {
+                self.channels_by_id
+                    .get(child_id)
+                    .is_some_and(|child| child.channel_type() == Some(ChannelType::Sampler))
+            })
+        {
+            let fade = f32::from(channel.layer_fade_raw().unwrap_or_default()) / 256.0;
+            let position = fade * (children.len().saturating_sub(1) as f32);
+            let lower_index = position.floor() as usize;
+            let upper_fraction = position - lower_index as f32;
+            for (index, child_id) in children.into_iter().enumerate() {
+                let child_gain = if index == lower_index {
+                    1.0 - upper_fraction
+                } else if index == lower_index + 1 {
+                    upper_fraction
+                } else {
+                    0.0
+                };
+                if child_gain > 0.0 {
+                    self.route_channel(child_id, route_gain * child_gain, state);
+                }
+            }
         } else {
             for child_id in children {
-                self.route_channel(
-                    child_id,
-                    note_seed,
-                    key,
-                    active_layers,
-                    seen_targets,
-                    targets,
-                );
+                self.route_channel(child_id, route_gain, state);
             }
         }
-        active_layers.remove(&channel_id);
+        state.active_layers.remove(&channel_id);
     }
 }
 
@@ -4311,6 +4354,16 @@ impl FlpDocument {
                                 .expect("the key-region high bound has four payload bytes"),
                         );
                         channel.keyboard_key_region = Some((low, high));
+                    }
+                    if channel.channel_type() == Some(ChannelType::Layer)
+                        && event.payload.len() >= 92
+                        && channel.layer_fade_raw.is_none()
+                    {
+                        channel.layer_fade_raw = Some(u32::from_le_bytes(
+                            event.payload[88..92]
+                                .try_into()
+                                .expect("the Layer Fade field has four payload bytes"),
+                        ));
                     }
                     if event.payload.len() >= 12 && channel.keyboard_main_pitch.is_none() {
                         channel.keyboard_main_pitch = Some(event.payload[11] != 0);
@@ -16106,6 +16159,58 @@ impl FlpDocument {
         Ok(())
     }
 
+    /// Sets the saved Layer Fade value in the existing Parameters (`0xC7`) event.
+    /// Values follow the documented 0..=256 range; all other payload bytes are retained.
+    pub fn set_layer_fade(&mut self, layer_channel_id: u16, fade_raw: u16) -> Result<(), FlpError> {
+        if fade_raw > 256 {
+            return Err(FlpError::UnsupportedEdit(
+                "Layer Fade must be in the 0..=256 range",
+            ));
+        }
+
+        self.require_unique_channel(layer_channel_id)?;
+        let channel = self
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id() == layer_channel_id)
+            .expect("the unique Layer channel was checked above");
+        if channel.kind != Some(ChannelType::Layer.raw()) {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel is not a Layer channel",
+            ));
+        }
+
+        let mut parameter_events = channel.event_range().filter(|index| {
+            let event = &self.events[*index];
+            event.opcode == 0xC7
+                && matches!(event.encoding, PayloadEncoding::Data { .. })
+                && ascii_version(&event.payload).is_none()
+        });
+        let Some(parameters_index) = parameter_events.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected Layer has no recognized Parameters (`0xC7`) event",
+            ));
+        };
+        if parameter_events.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected Layer has multiple Parameters (`0xC7`) events",
+            ));
+        }
+        if self.events[parameters_index].payload.len() < 92 {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected Layer's Parameters event does not contain the Fade field",
+            ));
+        }
+
+        let mut candidate = self.clone();
+        let mut payload = candidate.events[parameters_index].payload.clone();
+        payload[88..92].copy_from_slice(&u32::from(fade_raw).to_le_bytes());
+        candidate.events[parameters_index].replace_data_payload(payload)?;
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
     /// Edits one existing point in a type-5 automation channel and retains its
     /// opaque header, point tail, remaining points, and era-specific trailer.
     pub fn edit_automation_point(
@@ -20602,6 +20707,25 @@ mod tests {
         }
         event_stream.extend_from_slice(&[0x40, 1, 0, 0x15, 2]);
         event_stream.extend_from_slice(&[0x40, 2, 0, 0x15, 4, 0x62, 0, 0]);
+        flp_fixture(&event_stream, &[], &[])
+    }
+
+    fn layer_crossfade_fixture(fade_raw: u32) -> Vec<u8> {
+        let mut event_stream = vec![0x40, 0, 0, 0x15, 3, 0x90];
+        event_stream.extend_from_slice(&2u32.to_le_bytes());
+        for child in [1_u16, 2, 3] {
+            event_stream.push(0x5E);
+            event_stream.extend_from_slice(&child.to_le_bytes());
+        }
+        let mut parameters = vec![0; 92];
+        parameters[68..72].copy_from_slice(&0u32.to_le_bytes());
+        parameters[72..76].copy_from_slice(&127u32.to_le_bytes());
+        parameters[88..92].copy_from_slice(&fade_raw.to_le_bytes());
+        append_data_event(&mut event_stream, 0xC7, &parameters);
+        for child in [1_u8, 2, 3] {
+            event_stream.extend_from_slice(&[0x40, child, 0, 0x15, 0]);
+        }
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
         flp_fixture(&event_stream, &[], &[])
     }
 
@@ -30272,6 +30396,75 @@ mod tests {
             .flat_map(|seed| router.targets_for_note(0, seed, 60))
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(choices, [1, 2].into_iter().collect());
+    }
+
+    #[test]
+    fn layer_crossfade_routes_sampler_children_at_the_saved_fade_position() {
+        for (fade, expected) in [
+            (0, [1.0, 0.0, 0.0]),
+            (64, [0.5, 0.5, 0.0]),
+            (128, [0.0, 1.0, 0.0]),
+            (192, [0.0, 0.5, 0.5]),
+            (256, [0.0, 0.0, 1.0]),
+        ] {
+            let document = FlpDocument::parse(&layer_crossfade_fixture(fade))
+                .expect("Layer crossfade fixture should parse");
+            assert_eq!(document.channels()[0].layer_fade_raw(), Some(fade as u16));
+            let router = ChannelNoteRouter::new(document.channels());
+            let targets = router.targets_for_note_with_gain(0, 0, 60);
+            let mut actual = [0.0; 3];
+            for (channel_id, gain) in targets {
+                actual[usize::from(channel_id - 1)] = gain;
+            }
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn editing_layer_fade_preserves_other_parameter_bytes() {
+        let original = layer_crossfade_fixture(64);
+        let mut document = FlpDocument::parse(&original).expect("Layer fixture should parse");
+        let parameters_index = document.channels()[0]
+            .event_range()
+            .find(|index| document.events()[*index].opcode() == 0xC7)
+            .expect("Layer fixture should have Parameters");
+        let before = document.events()[parameters_index].payload().to_vec();
+
+        document
+            .set_layer_fade(0, 192)
+            .expect("Layer Fade should be editable");
+        let after = document.events()[parameters_index].payload();
+        assert_eq!(document.channels()[0].layer_fade_raw(), Some(192));
+        assert_eq!(&after[..88], &before[..88]);
+        assert_eq!(&after[88..92], &192u32.to_le_bytes());
+        assert_eq!(&after[92..], &before[92..]);
+        assert!(document.set_layer_fade(0, 257).is_err());
+
+        let encoded = document
+            .encode_lossless()
+            .expect("edited Layer should encode");
+        let reopened = FlpDocument::parse(&encoded).expect("edited Layer should reopen");
+        assert_eq!(reopened.channels()[0].layer_fade_raw(), Some(192));
+    }
+
+    #[test]
+    fn layer_crossfade_keeps_unsupported_children_at_unity_gain() {
+        let mixed_children = FlpDocument::parse(&layer_channel_fixture(2, &[1, 2]))
+            .expect("mixed Layer fixture should parse");
+        let router = ChannelNoteRouter::new(mixed_children.channels());
+        assert_eq!(
+            router.targets_for_note_with_gain(0, 0, 60),
+            vec![(1, 1.0), (2, 1.0)]
+        );
+
+        let invalid_fade = FlpDocument::parse(&layer_crossfade_fixture(257))
+            .expect("invalid-fade Layer fixture should parse");
+        assert_eq!(invalid_fade.channels()[0].layer_fade_raw(), None);
+        let router = ChannelNoteRouter::new(invalid_fade.channels());
+        assert_eq!(
+            router.targets_for_note_with_gain(0, 0, 60),
+            vec![(1, 1.0), (2, 1.0), (3, 1.0)]
+        );
     }
 
     #[test]
