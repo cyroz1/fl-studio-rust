@@ -155,6 +155,7 @@ flp-rebuild import-midi-template-tracks <input.flp> <input.mid> <output.flp> <pa
 flp-rebuild import-midi-template-format2 <input.flp> <input.mid> <output.flp> <template-channel-id> <track-numbers:all|1,2,...>
 flp-rebuild create-playlist-pattern-clip <input.flp> <output.flp> <arrangement-id> <pattern-id> <position-ticks> <length-ticks> <track-index:zero-based>
 flp-rebuild create-playlist-audio-clip <input.flp> <output.flp> <arrangement-id> <channel-id> <position-ticks> <length-ticks> <track-index:zero-based>
+flp-rebuild create-playlist-automation-clip <input.flp> <output.flp> <arrangement-id> <channel-id> <position-ticks> <length-ticks> <track-index:zero-based>
 flp-rebuild import-midi-new-project <template.flp> <input.mid> <output.flp> <template-channel-id> <track-numbers:all|1,2,...>
 flp-rebuild edit-clip <input.flp> <output.flp> <arrangement-id> <clip-index> <position> <length>
 flp-rebuild delete-playlist-clip <input.flp> <output.flp> <arrangement-id> <clip-index>

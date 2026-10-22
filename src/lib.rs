@@ -8745,6 +8745,140 @@ impl FlpDocument {
         )
     }
 
+    /// Creates a Playlist Automation Clip from a recognized Automation Clip record.
+    ///
+    /// The target must be a type-5 channel with an existing `0xEA` point blob. The complete
+    /// Playlist record is copied from an Automation Clip in this or another arrangement; only
+    /// its position, channel target, length, track, and clip ID (when present) are changed. For
+    /// 88-byte records, the established source window is initialized to `[0, length]`.
+    pub fn create_playlist_automation_clip(
+        &mut self,
+        arrangement_id: u16,
+        channel_id: u16,
+        position_ticks: u32,
+        length_ticks: u32,
+        track_index: u16,
+    ) -> Result<usize, FlpError> {
+        if length_ticks == 0 {
+            return Err(FlpError::UnsupportedEdit(
+                "Playlist Automation Clip length must be greater than zero",
+            ));
+        }
+        if track_index > 499 {
+            return Err(FlpError::UnsupportedEdit(
+                "Playlist track index must be between 0 and 499",
+            ));
+        }
+
+        let channels = self.channels();
+        let mut matching_channels = channels.iter().filter(|channel| channel.id() == channel_id);
+        let Some(channel) = matching_channels.next() else {
+            return Err(FlpError::ChannelNotFound(channel_id));
+        };
+        if matching_channels.next().is_some() || channel.kind() != Some(5) {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested channel is not one unambiguous Automation channel",
+            ));
+        }
+        let automation_channels = self.automation_channels()?;
+        let automation_channel = automation_channels
+            .iter()
+            .find(|automation| automation.channel_id() == channel_id)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested Automation channel has no decoded point data",
+            ))?;
+        if automation_channel.data_event_index().is_none() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested Automation channel has no recognized 0xEA point blob",
+            ));
+        }
+
+        let arrangements = self.arrangements()?;
+        let mut matching_arrangements = arrangements
+            .iter()
+            .filter(|arrangement| arrangement.id == arrangement_id);
+        let Some(arrangement) = matching_arrangements.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested arrangement does not exist",
+            ));
+        };
+        if matching_arrangements.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested arrangement id is ambiguous",
+            ));
+        }
+
+        let automation_channel_ids = automation_channels
+            .iter()
+            .filter(|channel| channel.data_event_index().is_some())
+            .map(AutomationChannel::channel_id)
+            .collect::<HashSet<_>>();
+        let is_automation_clip = |clip: &&PlaylistClip| matches!(clip.target(), PlaylistClipTarget::Channel { id } if automation_channel_ids.contains(&id));
+        let template = arrangement
+            .clips
+            .iter()
+            .find(|clip| matches!(clip.target(), PlaylistClipTarget::Channel { id } if id == channel_id))
+            .or_else(|| arrangement.clips.iter().find(is_automation_clip))
+            .or_else(|| {
+                arrangements
+                    .iter()
+                    .flat_map(|candidate| candidate.clips.iter())
+                    .find(|clip| {
+                        matches!(clip.target(), PlaylistClipTarget::Channel { id } if id == channel_id)
+                    })
+            })
+            .or_else(|| {
+                arrangements
+                    .iter()
+                    .flat_map(|candidate| candidate.clips.iter())
+                    .find(is_automation_clip)
+            })
+            .ok_or(FlpError::UnsupportedEdit(
+                "the project has no recognized Automation Clip record to use as a template",
+            ))?;
+        if channel_id >= template.pattern_base {
+            return Err(FlpError::UnsupportedEdit(
+                "the Automation channel ID does not fit the template's channel target range",
+            ));
+        }
+
+        let record_size = template.record_size;
+        let record_start = template
+            .source_record_index
+            .checked_mul(record_size)
+            .ok_or(FlpError::LengthOverflow)?;
+        let record_end = record_start
+            .checked_add(record_size)
+            .ok_or(FlpError::LengthOverflow)?;
+        let event =
+            self.events
+                .get(template.source_event_index)
+                .ok_or(FlpError::UnsupportedEdit(
+                    "the Playlist Automation Clip template event no longer exists",
+                ))?;
+        if event.opcode != 0xE9 || !matches!(event.encoding, PayloadEncoding::Data { .. }) {
+            return Err(FlpError::UnsupportedEdit(
+                "the Playlist Automation Clip template is not in a length-prefixed data event",
+            ));
+        }
+        if record_end > event.payload.len() || !event.payload.len().is_multiple_of(record_size) {
+            return Err(FlpError::UnsupportedEdit(
+                "the Playlist Automation Clip template does not fit its event payload",
+            ));
+        }
+
+        let mut record = event.payload[record_start..record_end].to_vec();
+        record[6..8].copy_from_slice(&channel_id.to_le_bytes());
+        initialize_new_playlist_clip_length(&mut record, length_ticks);
+        let clipboard = PlaylistClipClipboard { raw_record: record };
+        self.paste_playlist_clip(
+            arrangement_id,
+            &clipboard,
+            position_ticks,
+            499u16 - track_index,
+        )
+    }
+
     /// Removes one Playlist clip's complete stored record without rewriting its neighbors.
     pub fn delete_playlist_clip(
         &mut self,
@@ -20037,19 +20171,19 @@ mod tests {
         ArpeggioOptions, ArpeggioRangePattern, ArpeggioSyncMode, ArticulateOptions,
         ChannelGroupSummary, ChannelLevelAdjustmentsEdit, ChannelNoteRouter, ChannelSortOrder,
         ChannelStretchMode, ChannelStretchSettingsEdit, ChannelSummary, ClawMachineOptions,
-        FlpDocument, FlpError, FlpEvent, FstPreset, FstPresetKind, LimitNoteOptions,
-        LimitSnapDirection, MixerInsertEdit, MixerInsertSummary, MixerLiveInsertEnabledGain,
-        MixerLiveSendGain, MixerLiveSendOutputPath, MixerLiveSendTargetKey, MixerParameterKind,
-        MixerParameterRecord, MixerRouteAudibility, MixerSendSummary, MixerSourceRouteTransform,
-        PATTERN_NOTE_DEFAULT_FLAGS, PATTERN_NOTE_SLIDE_FLAG, PLAYLIST_CLIP_MUTED_FLAG,
-        PatternController, PatternControllerEdit, PatternNote, PatternNoteEdit,
-        PatternNoteRotation, PayloadEncoding, PlaylistClipEdit, PlaylistClipTarget,
-        PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync,
-        ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions, RiffMachineOptions,
-        RiffMachineQuantizeMode, SamplerEnvelopeLfoEdit, SamplerEnvelopeLfoTarget,
-        SamplerVolumeEnvelopeEdit, ScaleLevelsOptions, TimeMarkerEdit, apply_mixer_pan,
-        apply_mixer_stereo_separation, midi::MidiChannelMapping, midi::MidiEventKind,
-        midi::MidiFile, midi::MidiImportOptions, note_pitch_in_scale,
+        FLP_AUTOMATION_COUNT_OFFSET, FLP_AUTOMATION_POINTS_OFFSET, FlpDocument, FlpError, FlpEvent,
+        FstPreset, FstPresetKind, LimitNoteOptions, LimitSnapDirection, MixerInsertEdit,
+        MixerInsertSummary, MixerLiveInsertEnabledGain, MixerLiveSendGain, MixerLiveSendOutputPath,
+        MixerLiveSendTargetKey, MixerParameterKind, MixerParameterRecord, MixerRouteAudibility,
+        MixerSendSummary, MixerSourceRouteTransform, PATTERN_NOTE_DEFAULT_FLAGS,
+        PATTERN_NOTE_SLIDE_FLAG, PLAYLIST_CLIP_MUTED_FLAG, PatternController,
+        PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation, PayloadEncoding,
+        PlaylistClipEdit, PlaylistClipTarget, PlaylistTrackEdit, PlaylistTrackMotion,
+        PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit,
+        RandomizerOptions, RiffMachineOptions, RiffMachineQuantizeMode, SamplerEnvelopeLfoEdit,
+        SamplerEnvelopeLfoTarget, SamplerVolumeEnvelopeEdit, ScaleLevelsOptions, TimeMarkerEdit,
+        apply_mixer_pan, apply_mixer_stereo_separation, midi::MidiChannelMapping,
+        midi::MidiEventKind, midi::MidiFile, midi::MidiImportOptions, note_pitch_in_scale,
         parse_vst_plugin_state_metadata, riff_machine_groove_note_timing,
     };
 
@@ -20806,6 +20940,42 @@ mod tests {
 
         FlpDocument::parse(&flp_fixture(&event_stream, &[], &[]))
             .expect("cross-arrangement Audio Clip fixture should parse")
+    }
+
+    fn automation_playlist_fixture(template_arrangement_id: Option<u16>) -> FlpDocument {
+        let mut event_stream = vec![0x40, 11, 0, 0x15, 5];
+        let mut automation = vec![0xA5; FLP_AUTOMATION_POINTS_OFFSET];
+        automation[FLP_AUTOMATION_COUNT_OFFSET..FLP_AUTOMATION_POINTS_OFFSET]
+            .copy_from_slice(&1_u32.to_le_bytes());
+        automation.extend_from_slice(&4.0_f64.to_le_bytes());
+        automation.extend_from_slice(&0.5_f64.to_le_bytes());
+        automation.extend_from_slice(&0.0_f32.to_le_bytes());
+        automation.extend_from_slice(&[0x10, 0x20, 0x30, 0x40]);
+        append_data_event(&mut event_stream, 0xEA, &automation);
+        event_stream.extend_from_slice(&[0x62, 0, 0, 0x63, 3, 0]);
+        if template_arrangement_id == Some(3) {
+            let mut clip = [0xA5_u8; 80];
+            clip[4..6].copy_from_slice(&0x5000_u16.to_le_bytes());
+            clip[6..8].copy_from_slice(&11_u16.to_le_bytes());
+            clip[8..12].copy_from_slice(&960_u32.to_le_bytes());
+            clip[12..14].copy_from_slice(&499_u16.to_le_bytes());
+            clip[32..36].copy_from_slice(&1_u32.to_le_bytes());
+            append_data_event(&mut event_stream, 0xE9, &clip);
+        }
+        event_stream.extend_from_slice(&[0x63, 4, 0]);
+        if template_arrangement_id == Some(4) {
+            let mut clip = [0xA5_u8; 80];
+            clip[4..6].copy_from_slice(&0x5000_u16.to_le_bytes());
+            clip[6..8].copy_from_slice(&11_u16.to_le_bytes());
+            clip[8..12].copy_from_slice(&960_u32.to_le_bytes());
+            clip[12..14].copy_from_slice(&499_u16.to_le_bytes());
+            clip[32..36].copy_from_slice(&1_u32.to_le_bytes());
+            append_data_event(&mut event_stream, 0xE9, &clip);
+        }
+
+        let mut input = flp_fixture(&event_stream, &[], &[]);
+        input[10..12].copy_from_slice(&1_u16.to_le_bytes());
+        FlpDocument::parse(&input).expect("Automation Clip fixture should parse")
     }
 
     fn merge_pattern_clips_fixture(include_unsupported_pattern_event: bool) -> FlpDocument {
@@ -22283,6 +22453,101 @@ mod tests {
             .expect("edited project should encode");
         let reparsed = FlpDocument::parse(&encoded).expect("edited project should parse");
         assert_eq!(reparsed.arrangements().unwrap()[0].clips.len(), 3);
+    }
+
+    #[test]
+    fn creates_playlist_automation_clip_from_an_automation_clip_template() {
+        let mut document = automation_playlist_fixture(Some(3));
+        let original_clip = document.arrangements().unwrap()[0].clips[0].clone();
+        let original_record = document
+            .events()
+            .iter()
+            .find(|event| event.opcode() == 0xE9)
+            .unwrap()
+            .payload()
+            .to_vec();
+
+        let inserted_index = document
+            .create_playlist_automation_clip(3, 11, 3_840, 720, 4)
+            .expect("an Automation Clip should be created from its channel template");
+        assert_eq!(inserted_index, 1);
+
+        let arrangement = &document.arrangements().unwrap()[0];
+        assert_eq!(arrangement.clips.len(), 2);
+        assert_eq!(arrangement.clips[0], original_clip);
+        let added_clip = &arrangement.clips[inserted_index];
+        assert_eq!(added_clip.position_ticks, 3_840);
+        assert_eq!(added_clip.length_ticks, 720);
+        assert_eq!(added_clip.track_index, Some(4));
+        assert_eq!(added_clip.target(), PlaylistClipTarget::Channel { id: 11 });
+        assert_eq!(added_clip.clip_id, Some(2));
+
+        let mut expected_new_record = original_record.clone();
+        expected_new_record[0..4].copy_from_slice(&3_840_u32.to_le_bytes());
+        expected_new_record[6..8].copy_from_slice(&11_u16.to_le_bytes());
+        expected_new_record[8..12].copy_from_slice(&720_u32.to_le_bytes());
+        expected_new_record[12..14].copy_from_slice(&495_u16.to_le_bytes());
+        expected_new_record[32..36].copy_from_slice(&2_u32.to_le_bytes());
+        let mut expected_payload = original_record;
+        expected_payload.extend_from_slice(&expected_new_record);
+        let event = document
+            .events()
+            .iter()
+            .find(|event| event.opcode() == 0xE9)
+            .expect("the Playlist clip event should remain present");
+        assert_eq!(event.payload(), expected_payload);
+
+        let encoded = document
+            .encode_lossless()
+            .expect("the Automation Clip project should encode");
+        let reparsed = FlpDocument::parse(&encoded).expect("the edited project should parse");
+        assert_eq!(
+            reparsed.arrangements().unwrap(),
+            document.arrangements().unwrap()
+        );
+    }
+
+    #[test]
+    fn playlist_automation_clip_creation_rejects_missing_template_atomically() {
+        let mut document = automation_playlist_fixture(None);
+        let original = document.encode_lossless().unwrap();
+        let error = document
+            .create_playlist_automation_clip(3, 11, 0, 960, 0)
+            .expect_err("a missing Automation Clip template must be rejected");
+        assert!(error.to_string().contains("Automation Clip record"));
+        assert_eq!(document.encode_lossless().unwrap(), original);
+
+        let error = document
+            .create_playlist_automation_clip(3, 12, 0, 960, 0)
+            .expect_err("a missing Automation channel must be rejected");
+        assert!(matches!(error, FlpError::ChannelNotFound(12)));
+        assert_eq!(document.encode_lossless().unwrap(), original);
+    }
+
+    #[test]
+    fn creates_playlist_automation_clip_in_empty_arrangement_from_project_template() {
+        let mut document = automation_playlist_fixture(Some(4));
+        let inserted_index = document
+            .create_playlist_automation_clip(3, 11, 1_920, 960, 2)
+            .expect("an Automation Clip should reuse a template from another arrangement");
+        assert_eq!(inserted_index, 0);
+
+        let arrangements = document.arrangements().unwrap();
+        assert_eq!(arrangements.len(), 2);
+        assert_eq!(arrangements[0].id, 3);
+        assert_eq!(arrangements[0].clips.len(), 1);
+        assert_eq!(arrangements[0].clips[0].position_ticks, 1_920);
+        assert_eq!(
+            arrangements[0].clips[0].target(),
+            PlaylistClipTarget::Channel { id: 11 }
+        );
+        assert_eq!(arrangements[0].clips[0].track_index, Some(2));
+        assert_eq!(arrangements[1].id, 4);
+        assert_eq!(arrangements[1].clips.len(), 1);
+
+        let encoded = document.encode_lossless().unwrap();
+        let reparsed = FlpDocument::parse(&encoded).expect("project should parse after edit");
+        assert_eq!(reparsed.arrangements().unwrap(), arrangements);
     }
 
     #[test]

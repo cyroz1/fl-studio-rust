@@ -15646,11 +15646,20 @@ impl DawUi {
             self.empty_project_view(ui);
             return;
         }
-        let (arrangements, channels, ppq, patterns, project_time_signature, base_tempo_bpm) = {
+        let (
+            arrangements,
+            channels,
+            automation_channels,
+            ppq,
+            patterns,
+            project_time_signature,
+            base_tempo_bpm,
+        ) = {
             let document = self.document.as_ref().expect("document checked above");
             (
                 document.arrangements().unwrap_or_default(),
                 document.channels(),
+                document.automation_channels().unwrap_or_default(),
                 document.header().ppq().max(1),
                 document.patterns().unwrap_or_default(),
                 document.metadata().time_signature(),
@@ -15671,6 +15680,20 @@ impl DawUi {
             .into_iter()
             .map(|channel| (channel.id(), channel.kind()))
             .collect();
+        let automation_channel_ids = automation_channels
+            .iter()
+            .filter(|channel| channel.data_event_index().is_some())
+            .map(AutomationChannel::channel_id)
+            .collect::<BTreeSet<_>>();
+        let selected_automation_channel_id = self
+            .selected_automation_channel
+            .filter(|channel_id| automation_channel_ids.contains(channel_id))
+            .or_else(|| automation_channel_ids.first().copied());
+        let has_automation_clip_template = arrangements.iter().any(|candidate| {
+            candidate.clips.iter().any(|clip| {
+                matches!(clip.target(), PlaylistClipTarget::Channel { id } if automation_channel_ids.contains(&id))
+            })
+        });
         let has_audio_clip_template = self
             .document
             .as_ref()
@@ -15730,6 +15753,7 @@ impl DawUi {
         }
 
         let mut create_pattern_clip_requested = false;
+        let mut create_automation_clip_requested = None;
         let mut playlist_track_edits_requested = Vec::new();
         let mut auto_name_playlist_track_requested = None;
         let mut playlist_track_clips_mute_action = None;
@@ -15891,6 +15915,34 @@ impl DawUi {
                     "Add the selected pattern at the end of the arrangement"
                 })
                 .clicked();
+            ui.menu_button("New Automation Clip", |ui| {
+                if !has_automation_clip_template {
+                    ui.label("No saved Automation Clip template is available in this project.");
+                    ui.separator();
+                }
+                if automation_channel_ids.is_empty() {
+                    ui.label("No Automation channels with a saved point blob");
+                } else {
+                    for channel_id in &automation_channel_ids {
+                        let name = automation_channels
+                            .iter()
+                            .find(|channel| channel.channel_id() == *channel_id)
+                            .and_then(AutomationChannel::display_name)
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| format!("Channel {channel_id}"));
+                        if ui
+                            .add_enabled(
+                                has_automation_clip_template,
+                                egui::Button::new(name),
+                            )
+                            .clicked()
+                        {
+                            create_automation_clip_requested = Some(*channel_id);
+                            ui.close();
+                        }
+                    }
+                }
+            });
             ui.menu_button(
                 format!("Tracks ({selected_track_count})"),
                 |ui| {
@@ -16152,6 +16204,41 @@ impl DawUi {
             .or_else(|| arrangement.clips.first())
             .and_then(|clip| clip.track_index)
             .unwrap_or(0);
+        let new_automation_clip_position = new_pattern_clip_position;
+        let new_automation_clip_length = selected_automation_channel_id
+            .and_then(|channel_id| {
+                automation_channels
+                    .iter()
+                    .find(|channel| channel.channel_id() == channel_id)
+            })
+            .and_then(|channel| {
+                channel
+                    .points()
+                    .iter()
+                    .map(|point| point.position_beats())
+                    .filter(|beats| beats.is_finite() && *beats >= 0.0)
+                    .max_by(f64::total_cmp)
+            })
+            .map(|beats| {
+                (beats * f64::from(ppq))
+                    .ceil()
+                    .clamp(0.0, f64::from(u32::MAX)) as u32
+            })
+            .unwrap_or(0)
+            .max(measure_length_ticks);
+        let new_automation_clip_track = arrangement
+            .clips
+            .iter()
+            .find(|clip| {
+                matches!(clip.target(), PlaylistClipTarget::Channel { id } if Some(id) == selected_automation_channel_id)
+            })
+            .or_else(|| {
+                arrangement.clips.iter().find(|clip| {
+                    matches!(clip.target(), PlaylistClipTarget::Channel { id } if automation_channel_ids.contains(&id))
+                })
+            })
+            .and_then(|clip| clip.track_index)
+            .unwrap_or(new_pattern_clip_track);
         let label_width = PLAYLIST_LABEL_WIDTH;
         let touch_gesture = ui.input(|input| input.multi_touch());
         let any_touches = ui.input(|input| input.any_touches());
@@ -19961,6 +20048,33 @@ impl DawUi {
                 }
                 Err(error) => {
                     self.status = format!("Could not add a Pattern Clip: {error}");
+                }
+            }
+        }
+        if let Some(channel_id) = create_automation_clip_requested
+            && let Some(document) = self.document.as_mut()
+        {
+            match document.create_playlist_automation_clip(
+                arrangement.id,
+                channel_id,
+                new_automation_clip_position,
+                new_automation_clip_length,
+                new_automation_clip_track,
+            ) {
+                Ok(clip_index) => {
+                    self.stop_project_playback();
+                    self.selected_automation_channel = Some(channel_id);
+                    self.selected_arrangement = Some(arrangement.id);
+                    self.selected_clip = Some(clip_index);
+                    self.selected_playlist_clips.clear();
+                    self.selected_playlist_clips.insert(clip_index);
+                    self.playlist_selection_anchor = Some(clip_index);
+                    self.dirty = true;
+                    self.status = format!("Added Automation Channel {channel_id} to the Playlist");
+                    playlist_clip_list_changed = true;
+                }
+                Err(error) => {
+                    self.status = format!("Could not add an Automation Clip: {error}");
                 }
             }
         }
