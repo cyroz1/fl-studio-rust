@@ -23111,7 +23111,7 @@ impl DawUi {
                         if channel.kind() == Some(0) {
                             ui.collapsing("Precomputed sample fades", |ui| {
                                 ui.small(
-                                    "Saved sample-processing controls. They are not applied by this renderer yet.",
+                                    "Precomputed Fade In and Fade Out are applied during Sampler playback and rendering.",
                                 );
                                 let valid_values = sampler_fade_out_raw
                                     .is_none_or(|value| value <= 1024)

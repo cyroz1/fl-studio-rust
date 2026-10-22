@@ -6618,6 +6618,8 @@ fn prepare_sampler_arrangement(
 
     let resolver = SamplePathResolver::new(project_path);
     let mut decoded_by_path = HashMap::<PathBuf, Arc<DecodedAudio>>::new();
+    let mut faded_audio_by_settings =
+        HashMap::<(PathBuf, Option<u16>, Option<u16>), Arc<DecodedAudio>>::new();
     let mut sources_by_channel = HashMap::<u16, SamplerVoiceSource>::new();
     let mut mixer_transforms_by_channel = HashMap::<u16, MixerSourceRouteTransform>::new();
     let mut live_mixer_source_routes_by_channel = HashMap::<u16, MixerLiveSourceRoutePlan>::new();
@@ -6698,8 +6700,32 @@ fn prepare_sampler_arrangement(
                         )
                     })?;
                 let audio = Arc::new(audio);
-                decoded_by_path.insert(resolved_path, Arc::clone(&audio));
+                decoded_by_path.insert(resolved_path.clone(), Arc::clone(&audio));
                 audio
+            };
+            let fade_in_raw = supported_sampler_fade_raw(channel.sampler_fade_in_raw());
+            let fade_out_raw = supported_sampler_fade_raw(channel.sampler_fade_out_raw());
+            let audio = if fade_in_raw.is_none() && fade_out_raw.is_none() {
+                audio
+            } else {
+                let key = (resolved_path.clone(), fade_in_raw, fade_out_raw);
+                if let Some(audio) = faded_audio_by_settings.get(&key) {
+                    Arc::clone(audio)
+                } else {
+                    let bytes = decoded_audio_bytes(&audio)?;
+                    cached_source_bytes = cached_source_bytes
+                        .checked_add(bytes)
+                        .filter(|total| *total <= MAX_SOURCE_CACHE_BYTES)
+                        .ok_or_else(|| {
+                            format!(
+                                "sampler sources exceed the {} MiB render cache limit",
+                                MAX_SOURCE_CACHE_BYTES / (1024 * 1024)
+                            )
+                        })?;
+                    let faded_audio = sampler_precompute_fades(&audio, fade_in_raw, fade_out_raw);
+                    faded_audio_by_settings.insert(key, Arc::clone(&faded_audio));
+                    faded_audio
+                }
             };
             let loop_bounds = validated_sampler_loop_bounds(loop_points, audio.frame_count());
             let release_loop_bounds =
@@ -8923,6 +8949,8 @@ fn prepare_sampler_pattern_for_channel_internal(
 
     let resolver = SamplePathResolver::new(project_path);
     let mut decoded_by_path = HashMap::<PathBuf, Arc<DecodedAudio>>::new();
+    let mut faded_audio_by_settings =
+        HashMap::<(PathBuf, Option<u16>, Option<u16>), Arc<DecodedAudio>>::new();
     let mut sources_by_channel = HashMap::<u16, SamplerVoiceSource>::new();
     let mut mixer_transforms_by_channel = HashMap::<u16, MixerSourceRouteTransform>::new();
     let mut live_mixer_source_routes_by_channel = HashMap::<u16, MixerLiveSourceRoutePlan>::new();
@@ -8996,8 +9024,32 @@ fn prepare_sampler_pattern_for_channel_internal(
                         )
                     })?;
                 let audio = Arc::new(audio);
-                decoded_by_path.insert(resolved_path, Arc::clone(&audio));
+                decoded_by_path.insert(resolved_path.clone(), Arc::clone(&audio));
                 audio
+            };
+            let fade_in_raw = supported_sampler_fade_raw(channel.sampler_fade_in_raw());
+            let fade_out_raw = supported_sampler_fade_raw(channel.sampler_fade_out_raw());
+            let audio = if fade_in_raw.is_none() && fade_out_raw.is_none() {
+                audio
+            } else {
+                let key = (resolved_path.clone(), fade_in_raw, fade_out_raw);
+                if let Some(audio) = faded_audio_by_settings.get(&key) {
+                    Arc::clone(audio)
+                } else {
+                    let bytes = decoded_audio_bytes(&audio)?;
+                    cached_source_bytes = cached_source_bytes
+                        .checked_add(bytes)
+                        .filter(|total| *total <= MAX_SOURCE_CACHE_BYTES)
+                        .ok_or_else(|| {
+                            format!(
+                                "sampler sources exceed the {} MiB render cache limit",
+                                MAX_SOURCE_CACHE_BYTES / (1024 * 1024)
+                            )
+                        })?;
+                    let faded_audio = sampler_precompute_fades(&audio, fade_in_raw, fade_out_raw);
+                    faded_audio_by_settings.insert(key, Arc::clone(&faded_audio));
+                    faded_audio
+                }
             };
             let loop_bounds = validated_sampler_loop_bounds(loop_points, audio.frame_count());
             let release_loop_bounds =
@@ -9745,6 +9797,59 @@ fn sampler_metadata_gain(gain_db: Option<i16>) -> f32 {
             .powf(f64::from(gain_db) / 20.0)
             .min(f64::from(f32::MAX)) as f32
     })
+}
+
+/// Applies the saved endpoint attenuation as a provisional linear-amplitude taper across the
+/// source sample. FL Studio documents these as precomputed fades but does not publish the curve.
+fn sampler_precomputed_fade_gain(
+    source_position: f64,
+    source_frame_count: usize,
+    fade_in_raw: Option<u16>,
+    fade_out_raw: Option<u16>,
+) -> f32 {
+    if source_frame_count <= 1 || !source_position.is_finite() {
+        return 1.0;
+    }
+    let progress = (source_position / (source_frame_count - 1) as f64).clamp(0.0, 1.0) as f32;
+    let fade_in_amount = fade_in_raw
+        .filter(|value| *value <= 1024)
+        .map_or(0.0, |value| f32::from(value) / 1024.0);
+    let fade_out_amount = fade_out_raw
+        .filter(|value| *value <= 1024)
+        .map_or(0.0, |value| f32::from(value) / 1024.0);
+    let fade_in_gain = 1.0 - fade_in_amount * (1.0 - progress);
+    let fade_out_gain = 1.0 - fade_out_amount * progress;
+    fade_in_gain * fade_out_gain
+}
+
+fn supported_sampler_fade_raw(raw_value: Option<u16>) -> Option<u16> {
+    raw_value.filter(|value| (1..=1024).contains(value))
+}
+
+fn sampler_precompute_fades(
+    source: &Arc<DecodedAudio>,
+    fade_in_raw: Option<u16>,
+    fade_out_raw: Option<u16>,
+) -> Arc<DecodedAudio> {
+    let fade_in_raw = supported_sampler_fade_raw(fade_in_raw);
+    let fade_out_raw = supported_sampler_fade_raw(fade_out_raw);
+    if fade_in_raw.is_none() && fade_out_raw.is_none() {
+        return Arc::clone(source);
+    }
+
+    let mut processed = (**source).clone();
+    let source_frame_count = processed.frame_count();
+    for channel in &mut processed.channels {
+        for (frame, sample) in channel.iter_mut().enumerate() {
+            *sample *= sampler_precomputed_fade_gain(
+                frame as f64,
+                source_frame_count,
+                fade_in_raw,
+                fade_out_raw,
+            );
+        }
+    }
+    Arc::new(processed)
 }
 
 fn audio_clip_master_pitch_ratio(pitch_offset_cents: i16) -> f64 {
@@ -13905,6 +14010,23 @@ mod tests {
     }
 
     #[test]
+    fn sampler_precomputed_fades_process_sample_data_before_playback() {
+        let source = Arc::new(DecodedAudio {
+            sample_rate: 5,
+            channels: vec![vec![1.0; 5], vec![-1.0; 5]],
+        });
+        let faded = sampler_precompute_fades(&source, Some(1024), None);
+
+        assert_eq!(faded.channels[0], [0.0, 0.25, 0.5, 0.75, 1.0]);
+        assert_eq!(faded.channels[1], [0.0, -0.25, -0.5, -0.75, -1.0]);
+        assert_eq!(source.channels[0], [1.0; 5]);
+        assert!(Arc::ptr_eq(
+            &source,
+            &sampler_precompute_fades(&source, Some(0), Some(1025))
+        ));
+    }
+
+    #[test]
     fn sampler_loop_seek_warmup_preserves_the_current_voice_sample_position() {
         let sources = HashMap::from([(
             7,
@@ -14512,6 +14634,23 @@ mod tests {
         assert!((sampler_metadata_gain(Some(-6)) - 10.0f32.powf(-6.0 / 20.0)).abs() < 1e-6);
         assert_eq!(sampler_metadata_gain(Some(20)), 10.0);
         assert!(sampler_metadata_gain(Some(i16::MAX)).is_finite());
+    }
+
+    #[test]
+    fn sampler_precomputed_fades_attenuate_source_endpoints() {
+        assert_eq!(sampler_precomputed_fade_gain(0.0, 5, None, None), 1.0);
+        assert_eq!(sampler_precomputed_fade_gain(0.0, 5, Some(0), Some(0)), 1.0);
+        assert_eq!(sampler_precomputed_fade_gain(0.0, 5, Some(1024), None), 0.0);
+        assert_eq!(sampler_precomputed_fade_gain(4.0, 5, Some(1024), None), 1.0);
+        assert_eq!(sampler_precomputed_fade_gain(0.0, 5, None, Some(1024)), 1.0);
+        assert_eq!(sampler_precomputed_fade_gain(4.0, 5, None, Some(1024)), 0.0);
+        assert!((sampler_precomputed_fade_gain(2.0, 5, Some(1024), None) - 0.5).abs() < 1e-6);
+        assert!((sampler_precomputed_fade_gain(2.0, 5, None, Some(1024)) - 0.5).abs() < 1e-6);
+        assert_eq!(sampler_precomputed_fade_gain(2.0, 5, Some(1025), None), 1.0);
+        assert_eq!(
+            sampler_precomputed_fade_gain(0.0, 1, Some(1024), Some(1024)),
+            1.0
+        );
     }
 
     #[test]

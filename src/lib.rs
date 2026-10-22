@@ -826,8 +826,8 @@ impl ChannelSummary {
     }
 
     /// Saved raw Sampler precomputed Fade Out value (`0x4B`), when present.
-    /// FL Studio documents a 0..=1024 range and applies this in its sample-processing tools; the
-    /// current audio renderer does not apply that processing yet.
+    /// FL Studio documents a 0..=1024 range. Supported Sampler rendering applies a provisional
+    /// linear-amplitude fade across the source sample; exact native curve comparison is open.
     pub fn sampler_fade_out_raw(&self) -> Option<u16> {
         (self.kind == Some(0))
             .then_some(self.sampler_fade_out_raw)
@@ -835,8 +835,8 @@ impl ChannelSummary {
     }
 
     /// Saved raw Sampler precomputed Fade In value (`0x4C`), when present.
-    /// FL Studio documents a 0..=1024 range and applies this in its sample-processing tools; the
-    /// current audio renderer does not apply that processing yet.
+    /// FL Studio documents a 0..=1024 range. Supported Sampler rendering applies a provisional
+    /// linear-amplitude fade across the source sample; exact native curve comparison is open.
     pub fn sampler_fade_in_raw(&self) -> Option<u16> {
         (self.kind == Some(0))
             .then_some(self.sampler_fade_in_raw)
