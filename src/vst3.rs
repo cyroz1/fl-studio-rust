@@ -231,7 +231,7 @@ pub struct Vst3PatternRenderOptions {
     pub tail_seconds: f64,
     pub global_swing_mix_raw: u8,
     pub channel_swing_mix_raw: u16,
-    /// Effective continuous project Master pitch for this channel, in cents.
+    /// Effective continuous project Master pitch and channel Fine Tune for this channel, in cents.
     pub pitch_offset_cents: i16,
     /// Effective project Master pitch as a note transposition when Add to Key is enabled.
     pub note_pitch_offset_semitones: i16,
@@ -2502,7 +2502,7 @@ impl Vst3HostRuntime {
             };
             let channel = channels_by_id.get(&channel_id).copied();
             let pitch_offset_cents = channel.map_or(0, |channel| {
-                channel.master_pitch_render_offset_cents(project_master_pitch_cents)
+                channel_pitch_offset_cents(channel, project_master_pitch_cents)
             });
             let note_pitch_offset_semitones = channel.map_or(0, |channel| {
                 channel.master_pitch_note_offset_semitones(project_master_pitch_cents)
@@ -2801,7 +2801,7 @@ impl Vst3HostRuntime {
             };
             let channel = channels_by_id.get(&channel_id);
             let pitch_offset_cents = channel.map_or(0, |channel| {
-                channel.master_pitch_render_offset_cents(project_master_pitch_cents)
+                channel_pitch_offset_cents(channel, project_master_pitch_cents)
             });
             let note_pitch_offset_semitones = channel.map_or(0, |channel| {
                 channel.master_pitch_note_offset_semitones(project_master_pitch_cents)
@@ -3143,8 +3143,8 @@ fn prepare_pattern_render_with_automation(
         pitch_offset_cents,
         note_pitch_offset_semitones,
     } = options;
-    if !(-1200..=1200).contains(&pitch_offset_cents) {
-        return Err("VST3 pitch offset must be between -1200 and 1200 cents".to_owned());
+    if !(-1300..=1300).contains(&pitch_offset_cents) {
+        return Err("VST3 pitch offset must be between -1300 and 1300 cents".to_owned());
     }
     if !(-12..=12).contains(&note_pitch_offset_semitones) {
         return Err("VST3 note pitch offset must be between -12 and 12 semitones".to_owned());
@@ -4278,6 +4278,26 @@ fn combined_pitch_offset_cents(
     i32::from(project_pitch_offset_cents) + i32::from(fine_pitch_offset_cents)
 }
 
+fn channel_pitch_offset_cents(
+    channel: &crate::ChannelSummary,
+    project_master_pitch_cents: Option<i16>,
+) -> i16 {
+    add_channel_fine_tune_cents(
+        channel.master_pitch_render_offset_cents(project_master_pitch_cents),
+        channel.keyboard_fine_tune_cents(),
+    )
+}
+
+fn add_channel_fine_tune_cents(
+    master_pitch_offset_cents: i16,
+    fine_tune_cents: Option<i32>,
+) -> i16 {
+    let fine_tune_cents = fine_tune_cents
+        .and_then(|cents| i16::try_from(cents).ok())
+        .unwrap_or_default();
+    master_pitch_offset_cents.saturating_add(fine_tune_cents)
+}
+
 fn append_vst_output_block_to_stereo(
     stereo: &mut Vec<f32>,
     interleaved: &[f32],
@@ -5250,6 +5270,32 @@ mod tests {
                     if tuning == 475.0
             ));
         }
+    }
+
+    #[test]
+    fn hosted_vst3_channel_fine_tune_combines_with_master_and_note_pitch() {
+        let channel_pitch = add_channel_fine_tune_cents(375, Some(35));
+        assert_eq!(channel_pitch, 410);
+        assert_eq!(add_channel_fine_tune_cents(375, None), 375);
+        assert_eq!(add_channel_fine_tune_cents(1200, Some(100)), 1300);
+        assert_eq!(add_channel_fine_tune_cents(-1200, Some(-100)), -1300);
+        assert_eq!(add_channel_fine_tune_cents(i16::MAX, Some(100)), i16::MAX);
+
+        let note_pitch = combined_pitch_offset_cents(channel_pitch, 100);
+        let plugin_event = plugin_event_with_pitch_offset(
+            MidiEvent::NoteOn {
+                channel: MidiChannel::Ch1,
+                note: 60,
+                velocity: 100,
+            },
+            0,
+            note_pitch,
+        )
+        .unwrap();
+        assert!(matches!(
+            plugin_event.data,
+            PluginEventData::NoteOn { tuning, .. } if tuning == 510.0
+        ));
     }
 
     #[test]

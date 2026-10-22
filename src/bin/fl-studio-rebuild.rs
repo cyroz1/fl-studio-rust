@@ -450,14 +450,16 @@ fn project_channel_swing_mix_raw(document: &FlpDocument, channel_id: u16) -> u16
         .map_or(128, |channel| channel.swing_mix())
 }
 
-fn project_channel_master_pitch_offset_cents(document: &FlpDocument, channel_id: u16) -> i16 {
+fn project_channel_pitch_offset_cents(document: &FlpDocument, channel_id: u16) -> i16 {
     let project_master_pitch_cents = document.metadata().master_pitch_cents();
     document
         .channels()
         .into_iter()
         .find(|channel| channel.id() == channel_id)
         .map_or(0, |channel| {
-            channel.master_pitch_render_offset_cents(project_master_pitch_cents)
+            channel
+                .master_pitch_render_offset_cents(project_master_pitch_cents)
+                .saturating_add(channel.keyboard_fine_tune_cents().unwrap_or_default() as i16)
         })
 }
 
@@ -23143,10 +23145,12 @@ impl DawUi {
                                 }
                             });
                         }
-                        if matches!(channel.kind(), Some(0 | 4)) {
+                        if matches!(channel.kind(), Some(0 | 4))
+                            || channel.plugin_identifier().is_some()
+                        {
                             ui.collapsing("Channel fine tuning", |ui| {
                                 ui.small(
-                                    "Tunes the sample base pitch. Playback and renders apply this to Sampler and Audio Clip channels.",
+                                    "Tunes the channel pitch in cents. Playback and renders apply this to Sampler, Audio Clip, and hosted VST3 channels.",
                                 );
                                 if channel_fine_tune_raw.is_none_or(|value| {
                                     (-100..=100).contains(&value)
@@ -30543,7 +30547,7 @@ impl DawUi {
         let tempo_bpm = document.metadata().tempo_bpm().unwrap_or(self.tempo_bpm);
         let global_swing_mix_raw = document.metadata().global_swing_mix();
         let channel_swing_mix_raw = project_channel_swing_mix_raw(&document, channel_id);
-        let pitch_offset_cents = project_channel_master_pitch_offset_cents(&document, channel_id);
+        let pitch_offset_cents = project_channel_pitch_offset_cents(&document, channel_id);
         let note_pitch_offset_semitones =
             project_channel_master_pitch_note_offset_semitones(&document, channel_id);
         let selected_format = self.playlist_song_output_format;
@@ -30699,7 +30703,7 @@ impl DawUi {
                         tail_seconds: 2.0,
                         global_swing_mix_raw: 0,
                         channel_swing_mix_raw: 0,
-                        pitch_offset_cents: project_channel_master_pitch_offset_cents(
+                        pitch_offset_cents: project_channel_pitch_offset_cents(
                             &document, channel_id,
                         ),
                         note_pitch_offset_semitones:
@@ -30963,7 +30967,7 @@ impl DawUi {
             None
         };
         let tempo_bpm = document.metadata().tempo_bpm().unwrap_or(self.tempo_bpm);
-        let pitch_offset_cents = project_channel_master_pitch_offset_cents(document, channel_id);
+        let pitch_offset_cents = project_channel_pitch_offset_cents(document, channel_id);
         let note_pitch_offset_semitones =
             project_channel_master_pitch_note_offset_semitones(document, channel_id);
 
@@ -31181,7 +31185,7 @@ impl DawUi {
             .into_iter()
             .find(|channel| channel.id() == channel_id)
             .is_some_and(|channel| channel.kind() == Some(0));
-        let pitch_offset_cents = project_channel_master_pitch_offset_cents(document, channel_id);
+        let pitch_offset_cents = project_channel_pitch_offset_cents(document, channel_id);
         let note_pitch_offset_semitones =
             project_channel_master_pitch_note_offset_semitones(document, channel_id);
         let instance_id = self.channel_vst3_instances.get(&channel_id).copied();
@@ -31438,7 +31442,7 @@ impl DawUi {
         let tempo_bpm = document.metadata().tempo_bpm().unwrap_or(self.tempo_bpm);
         let global_swing_mix_raw = document.metadata().global_swing_mix();
         let channel_swing_mix_raw = project_channel_swing_mix_raw(document, channel_id);
-        let pitch_offset_cents = project_channel_master_pitch_offset_cents(document, channel_id);
+        let pitch_offset_cents = project_channel_pitch_offset_cents(document, channel_id);
         let note_pitch_offset_semitones =
             project_channel_master_pitch_note_offset_semitones(document, channel_id);
 

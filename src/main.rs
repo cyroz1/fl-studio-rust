@@ -4611,8 +4611,9 @@ fn render_pattern_vst3(
 
     let class_uid = matching_project_class_uid(&document, channel_id, bundle_path);
     let channel_swing_mix_raw = channel.swing_mix();
-    let pitch_offset_cents =
-        channel.master_pitch_render_offset_cents(document.metadata().master_pitch_cents());
+    let pitch_offset_cents = channel
+        .master_pitch_render_offset_cents(document.metadata().master_pitch_cents())
+        .saturating_add(channel.keyboard_fine_tune_cents().unwrap_or_default() as i16);
     let note_pitch_offset_semitones =
         channel.master_pitch_note_offset_semitones(document.metadata().master_pitch_cents());
     let mut host = Vst3HostRuntime::new(48_000.0, 512)?;
