@@ -70,8 +70,8 @@ use flp_rebuild::{
     PlaylistTrack, PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync,
     ProjectInfoEdit, ProjectSettingsEdit, QuantizeNoteMode, QuantizeNoteOptions,
     RandomNoteChordMap, RandomNoteGeneratorOptions, RandomizerOptions, RiffMachineOptions,
-    RiffMachineQuantizeMode, SamplerVolumeEnvelopeEdit, ScaleLevelsOptions, StrumOptions,
-    TimeMarker, TimeMarkerEdit, VstPluginStateMetadata,
+    RiffMachineQuantizeMode, SamplerEnvelopeLfo, SamplerEnvelopeLfoEdit, SamplerEnvelopeLfoTarget,
+    ScaleLevelsOptions, StrumOptions, TimeMarker, TimeMarkerEdit, VstPluginStateMetadata,
 };
 use md5::{Digest, Md5};
 use vst3_host::midi::{MidiChannel as Vst3MidiChannel, MidiEvent as Vst3MidiEvent};
@@ -22112,7 +22112,7 @@ impl DawUi {
         let mut global_swing_edit = None;
         let mut channel_swing_edits = Vec::new();
         let mut sampler_fade_edits = Vec::new();
-        let mut sampler_volume_envelope_edits = Vec::new();
+        let mut sampler_envelope_lfo_edits = Vec::new();
         let mut channel_fine_tune_edits = Vec::new();
         let mut layer_edits = Vec::new();
         let mut layer_flag_edits = Vec::new();
@@ -22366,7 +22366,7 @@ impl DawUi {
                 let mut layer_flags_apply = None;
                 let mut layer_fade_apply = None;
                 let mut sampler_fade_apply = None;
-                let mut sampler_volume_envelope_apply = None;
+                let mut sampler_envelope_lfo_applies = Vec::new();
                 let mut channel_fine_tune_apply = None;
                 let layer_flags = channel.layer_flags();
                 let mut layer_random = channel.layer_random_enabled().unwrap_or(false);
@@ -23168,131 +23168,29 @@ impl DawUi {
                                     );
                                 }
                             });
-                            if let Some(envelope) = channel.sampler_volume_envelope() {
-                                let mut edit = SamplerVolumeEnvelopeEdit::default();
-                                ui.collapsing("Volume envelope (raw)", |ui| {
-                                    ui.small(
-                                        "Edits saved raw values. Envelope timing and curve shapes are not yet matched to FL Studio playback.",
-                                    );
-                                    let mut enabled = envelope.enabled();
-                                    if ui.checkbox(&mut enabled, "Enabled").changed() {
-                                        edit.enabled = Some(enabled);
-                                    }
-                                    let mut tempo_sync = envelope.tempo_sync_enabled();
-                                    if ui.checkbox(&mut tempo_sync, "Tempo sync").changed() {
-                                        edit.tempo_sync = Some(tempo_sync);
-                                    }
-                                    macro_rules! raw_field {
-                                        ($ui:ident, $field:ident, $label:literal, $saved:expr, $range:expr) => {{
-                                            let saved = $saved;
-                                            let mut raw = saved.unwrap_or_default();
-                                            $ui.label($label);
-                                            if $ui
-                                                .add_enabled(
-                                                    saved.is_some(),
-                                                    egui::DragValue::new(&mut raw).range($range),
-                                                )
-                                                .changed()
-                                            {
-                                                edit.$field = Some(raw);
-                                            }
-                                            $ui.end_row();
-                                        }};
-                                    }
-                                    egui::Grid::new(("sampler-volume-envelope", channel.id()))
-                                        .num_columns(2)
-                                        .show(ui, |ui| {
-                                            raw_field!(
-                                                ui,
-                                                predelay_raw,
-                                                "Predelay raw",
-                                                envelope.predelay_raw(),
-                                                100..=65_536
-                                            );
-                                            raw_field!(
-                                                ui,
-                                                attack_raw,
-                                                "Attack raw",
-                                                envelope.attack_raw(),
-                                                100..=65_536
-                                            );
-                                            raw_field!(
-                                                ui,
-                                                hold_raw,
-                                                "Hold raw",
-                                                envelope.hold_raw(),
-                                                100..=65_536
-                                            );
-                                            raw_field!(
-                                                ui,
-                                                decay_raw,
-                                                "Decay raw",
-                                                envelope.decay_raw(),
-                                                100..=65_536
-                                            );
-                                            raw_field!(
-                                                ui,
-                                                sustain_raw,
-                                                "Sustain raw",
-                                                envelope.sustain_raw(),
-                                                0..=128
-                                            );
-                                            raw_field!(
-                                                ui,
-                                                release_raw,
-                                                "Release raw",
-                                                envelope.release_raw(),
-                                                100..=65_536
-                                            );
-                                            raw_field!(
-                                                ui,
-                                                amount_raw,
-                                                "Amount raw",
-                                                envelope.amount_raw(),
-                                                -128..=128
-                                            );
-                                            raw_field!(
-                                                ui,
-                                                attack_tension_raw,
-                                                "Attack tension raw",
-                                                envelope.attack_tension_raw(),
-                                                -128..=128
-                                            );
-                                            raw_field!(
-                                                ui,
-                                                decay_tension_raw,
-                                                "Decay tension raw",
-                                                envelope.decay_tension_raw(),
-                                                -128..=128
-                                            );
-                                            raw_field!(
-                                                ui,
-                                                release_tension_raw,
-                                                "Release tension raw",
-                                                envelope.release_tension_raw(),
-                                                -128..=128
-                                            );
-                                        });
-                                    if envelope.predelay_raw().is_none()
-                                        || envelope.attack_raw().is_none()
-                                        || envelope.hold_raw().is_none()
-                                        || envelope.decay_raw().is_none()
-                                        || envelope.sustain_raw().is_none()
-                                        || envelope.release_raw().is_none()
-                                        || envelope.amount_raw().is_none()
-                                        || envelope.attack_tension_raw().is_none()
-                                        || envelope.decay_tension_raw().is_none()
-                                        || envelope.release_tension_raw().is_none()
-                                    {
-                                        ui.small(
-                                            "Some fields are unavailable because this saved record is truncated.",
+                            ui.collapsing("Sampler envelopes and LFOs (raw)", |ui| {
+                                ui.small(
+                                    "Edits saved raw values for the five ordered targets. Envelope and LFO modulation are not yet applied to playback.",
+                                );
+                                for target in SamplerEnvelopeLfoTarget::all() {
+                                    if let Some(record) = channel.sampler_envelope_lfo(target) {
+                                        let mut edit = None;
+                                        ui.collapsing(
+                                            format!("{} (raw)", target.label()),
+                                            |ui| {
+                                                edit = draw_sampler_envelope_lfo_editor(
+                                                    ui,
+                                                    channel.id(),
+                                                    record,
+                                                );
+                                            },
                                         );
+                                        if let Some(edit) = edit {
+                                            sampler_envelope_lfo_applies.push((target, edit));
+                                        }
                                     }
-                                });
-                                if edit != SamplerVolumeEnvelopeEdit::default() {
-                                    sampler_volume_envelope_apply = Some(edit);
                                 }
-                            }
+                            });
                         }
                         if matches!(channel.kind(), Some(0 | 4))
                             || channel.plugin_identifier().is_some()
@@ -23413,9 +23311,11 @@ impl DawUi {
                 if let Some((fade_out_raw, fade_in_raw)) = sampler_fade_apply {
                     sampler_fade_edits.push((channel.id(), fade_out_raw, fade_in_raw));
                 }
-                if let Some(edit) = sampler_volume_envelope_apply {
-                    sampler_volume_envelope_edits.push((channel.id(), edit));
-                }
+                sampler_envelope_lfo_edits.extend(
+                    sampler_envelope_lfo_applies
+                        .into_iter()
+                        .map(|(target, edit)| (channel.id(), target, edit)),
+                );
                 if let Some(cents) = channel_fine_tune_apply {
                     channel_fine_tune_edits.push((channel.id(), cents));
                 }
@@ -23709,19 +23609,24 @@ impl DawUi {
                 None => {}
             }
         }
-        for (channel_id, edit) in sampler_volume_envelope_edits {
+        for (channel_id, target, edit) in sampler_envelope_lfo_edits {
             let result = self
                 .document
                 .as_mut()
-                .map(|document| document.edit_sampler_volume_envelope(channel_id, edit));
+                .map(|document| document.edit_sampler_envelope_lfo(channel_id, target, edit));
             match result {
                 Some(Ok(())) => {
                     self.dirty = true;
-                    self.status = format!("Channel {channel_id} Volume envelope updated");
+                    self.status = format!(
+                        "Channel {channel_id} {} envelope/LFO updated",
+                        target.label()
+                    );
                 }
                 Some(Err(error)) => {
-                    self.status =
-                        format!("Could not update channel {channel_id} Volume envelope: {error}");
+                    self.status = format!(
+                        "Could not update channel {channel_id} {} envelope/LFO: {error}",
+                        target.label()
+                    );
                 }
                 None => {}
             }
@@ -48096,6 +48001,159 @@ fn channel_type_icon_description(channel_type: Option<ChannelType>) -> String {
         Some(ChannelType::Unknown(raw)) => format!("Unknown channel type {raw}"),
         None => "Unclassified channel".to_owned(),
     }
+}
+
+fn draw_sampler_envelope_lfo_editor(
+    ui: &mut egui::Ui,
+    channel_id: u16,
+    record: SamplerEnvelopeLfo,
+) -> Option<SamplerEnvelopeLfoEdit> {
+    let mut enabled = record.enabled();
+    let mut envelope_tempo_sync = record.tempo_sync_enabled();
+    let mut lfo_tempo_sync = record.lfo_tempo_sync_enabled();
+    let mut lfo_phase_retrigger = record.lfo_phase_retrigger_enabled();
+    let enabled_changed = ui.checkbox(&mut enabled, "Enabled").changed();
+    ui.horizontal_wrapped(|ui| {
+        ui.checkbox(&mut envelope_tempo_sync, "Envelope tempo sync");
+        ui.checkbox(&mut lfo_tempo_sync, "LFO tempo sync");
+        ui.checkbox(&mut lfo_phase_retrigger, "LFO phase retrigger");
+    });
+
+    macro_rules! edit_raw {
+        ($ui:ident, $label:literal, $saved:expr, $range:expr) => {{
+            if let Some(mut value) = $saved {
+                let changed = $ui
+                    .add(
+                        egui::DragValue::new(&mut value)
+                            .range($range)
+                            .prefix(concat!($label, " ")),
+                    )
+                    .changed();
+                changed.then_some(value)
+            } else {
+                $ui.label(concat!($label, " unavailable"));
+                None
+            }
+        }};
+    }
+
+    let (
+        predelay_raw,
+        attack_raw,
+        hold_raw,
+        decay_raw,
+        sustain_raw,
+        release_raw,
+        amount_raw,
+        attack_tension_raw,
+        decay_tension_raw,
+        release_tension_raw,
+    ) = egui::Grid::new(("sampler-envelope-raw", channel_id, record.target()))
+        .num_columns(2)
+        .show(ui, |ui| {
+            ui.label("Envelope raw values");
+            ui.end_row();
+            let predelay = edit_raw!(ui, "Predelay", record.predelay_raw(), 100..=65_536);
+            let attack = edit_raw!(ui, "Attack", record.attack_raw(), 100..=65_536);
+            let hold = edit_raw!(ui, "Hold", record.hold_raw(), 100..=65_536);
+            let decay = edit_raw!(ui, "Decay", record.decay_raw(), 100..=65_536);
+            let sustain = edit_raw!(ui, "Sustain", record.sustain_raw(), 0..=128);
+            let release = edit_raw!(ui, "Release", record.release_raw(), 100..=65_536);
+            let amount = edit_raw!(ui, "Amount", record.amount_raw(), -128..=128);
+            let attack_tension = edit_raw!(
+                ui,
+                "Attack tension",
+                record.attack_tension_raw(),
+                -128..=128
+            );
+            let decay_tension =
+                edit_raw!(ui, "Decay tension", record.decay_tension_raw(), -128..=128);
+            let release_tension = edit_raw!(
+                ui,
+                "Release tension",
+                record.release_tension_raw(),
+                -128..=128
+            );
+            ui.end_row();
+            (
+                predelay,
+                attack,
+                hold,
+                decay,
+                sustain,
+                release,
+                amount,
+                attack_tension,
+                decay_tension,
+                release_tension,
+            )
+        })
+        .inner;
+    let (lfo_predelay_raw, lfo_attack_raw, lfo_amount_raw, lfo_speed_raw, lfo_shape_raw) =
+        egui::Grid::new(("sampler-lfo-raw", channel_id, record.target()))
+            .num_columns(2)
+            .show(ui, |ui| {
+                ui.label("LFO raw values");
+                ui.end_row();
+                let predelay = edit_raw!(ui, "Predelay", record.lfo_predelay_raw(), 100..=65_536);
+                let attack = edit_raw!(ui, "Attack", record.lfo_attack_raw(), 100..=65_536);
+                let amount = edit_raw!(ui, "Amount", record.lfo_amount_raw(), -128..=128);
+                let speed = edit_raw!(ui, "Speed", record.lfo_speed_raw(), 200..=65_536);
+                let shape = edit_raw!(
+                    ui,
+                    "Shape (0 sine, 1 triangle, 2 pulse)",
+                    record.lfo_shape_raw(),
+                    0..=2
+                );
+                ui.end_row();
+                (predelay, attack, amount, speed, shape)
+            })
+            .inner;
+
+    let tempo_sync_changed = envelope_tempo_sync != record.tempo_sync_enabled();
+    let lfo_tempo_sync_changed = lfo_tempo_sync != record.lfo_tempo_sync_enabled();
+    let lfo_phase_retrigger_changed = lfo_phase_retrigger != record.lfo_phase_retrigger_enabled();
+    let edit = SamplerEnvelopeLfoEdit {
+        enabled: enabled_changed.then_some(enabled),
+        tempo_sync: tempo_sync_changed.then_some(envelope_tempo_sync),
+        lfo_tempo_sync: lfo_tempo_sync_changed.then_some(lfo_tempo_sync),
+        lfo_phase_retrigger: lfo_phase_retrigger_changed.then_some(lfo_phase_retrigger),
+        predelay_raw,
+        attack_raw,
+        hold_raw,
+        decay_raw,
+        sustain_raw,
+        release_raw,
+        amount_raw,
+        attack_tension_raw,
+        decay_tension_raw,
+        release_tension_raw,
+        lfo_predelay_raw,
+        lfo_attack_raw,
+        lfo_amount_raw,
+        lfo_speed_raw,
+        lfo_shape_raw,
+    };
+    (edit.enabled.is_some()
+        || edit.tempo_sync.is_some()
+        || edit.lfo_tempo_sync.is_some()
+        || edit.lfo_phase_retrigger.is_some()
+        || edit.predelay_raw.is_some()
+        || edit.attack_raw.is_some()
+        || edit.hold_raw.is_some()
+        || edit.decay_raw.is_some()
+        || edit.sustain_raw.is_some()
+        || edit.release_raw.is_some()
+        || edit.amount_raw.is_some()
+        || edit.attack_tension_raw.is_some()
+        || edit.decay_tension_raw.is_some()
+        || edit.release_tension_raw.is_some()
+        || edit.lfo_predelay_raw.is_some()
+        || edit.lfo_attack_raw.is_some()
+        || edit.lfo_amount_raw.is_some()
+        || edit.lfo_speed_raw.is_some()
+        || edit.lfo_shape_raw.is_some())
+    .then_some(edit)
 }
 
 fn channel_stretch_mode_label(raw: i32) -> String {

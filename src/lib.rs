@@ -447,13 +447,55 @@ impl ChannelType {
     }
 }
 
-/// Decoded raw fields from the Sampler's Volume envelope `0xDA` record.
+/// The ordered target represented by one Sampler Envelope/LFO (`0xDA`) record.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(usize)]
+pub enum SamplerEnvelopeLfoTarget {
+    Panning = 0,
+    Volume = 1,
+    ModX = 2,
+    ModY = 3,
+    Pitch = 4,
+}
+
+impl SamplerEnvelopeLfoTarget {
+    pub const fn all() -> [Self; 5] {
+        [
+            Self::Panning,
+            Self::Volume,
+            Self::ModX,
+            Self::ModY,
+            Self::Pitch,
+        ]
+    }
+
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Panning => "Panning",
+            Self::Volume => "Volume",
+            Self::ModX => "Mod X",
+            Self::ModY => "Mod Y",
+            Self::Pitch => "Pitch",
+        }
+    }
+
+    fn from_index(index: usize) -> Option<Self> {
+        Self::all().get(index).copied()
+    }
+}
+
+/// Decoded raw fields from one of the Sampler's five ordered `0xDA` records.
 ///
-/// FL stores one `0xDA` record for each of five envelope/LFO targets. This
-/// record is the second one, for Volume. Time and level values remain in their
-/// native raw units; the exact display curves and playback timing are separate.
+/// The record order is Panning, Volume, Mod X, Mod Y, and Pitch. Time and
+/// level values remain in their native raw units; audio modulation behavior
+/// and display curves are separate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SamplerVolumeEnvelope {
+pub struct SamplerEnvelopeLfo {
+    target: SamplerEnvelopeLfoTarget,
     flags_raw: i32,
     enabled: bool,
     predelay_raw: Option<i32>,
@@ -466,15 +508,32 @@ pub struct SamplerVolumeEnvelope {
     attack_tension_raw: Option<i32>,
     decay_tension_raw: Option<i32>,
     release_tension_raw: Option<i32>,
+    lfo_predelay_raw: Option<u32>,
+    lfo_attack_raw: Option<u32>,
+    lfo_amount_raw: Option<i32>,
+    lfo_speed_raw: Option<u32>,
+    lfo_shape_raw: Option<i32>,
 }
 
-impl SamplerVolumeEnvelope {
+impl SamplerEnvelopeLfo {
+    pub fn target(&self) -> SamplerEnvelopeLfoTarget {
+        self.target
+    }
+
     pub fn enabled(&self) -> bool {
         self.enabled
     }
 
     pub fn tempo_sync_enabled(&self) -> bool {
         self.flags_raw & 1 != 0
+    }
+
+    pub fn lfo_tempo_sync_enabled(&self) -> bool {
+        self.flags_raw & (1 << 1) != 0
+    }
+
+    pub fn lfo_phase_retrigger_enabled(&self) -> bool {
+        self.flags_raw & (1 << 5) != 0
     }
 
     pub fn flags_raw(&self) -> i32 {
@@ -520,11 +579,35 @@ impl SamplerVolumeEnvelope {
     pub fn release_tension_raw(&self) -> Option<i32> {
         self.release_tension_raw
     }
+
+    pub fn lfo_predelay_raw(&self) -> Option<u32> {
+        self.lfo_predelay_raw
+    }
+
+    pub fn lfo_attack_raw(&self) -> Option<u32> {
+        self.lfo_attack_raw
+    }
+
+    pub fn lfo_amount_raw(&self) -> Option<i32> {
+        self.lfo_amount_raw
+    }
+
+    pub fn lfo_speed_raw(&self) -> Option<u32> {
+        self.lfo_speed_raw
+    }
+
+    /// Raw LFO shape code: 0 Sine, 1 Triangle, or 2 Pulse.
+    pub fn lfo_shape_raw(&self) -> Option<i32> {
+        self.lfo_shape_raw
+    }
 }
 
-/// Lossless edits to the recognized Sampler Volume envelope fields.
+/// Backwards-compatible name for the Volume target record.
+pub type SamplerVolumeEnvelope = SamplerEnvelopeLfo;
+
+/// Lossless edits to recognized Sampler Envelope/LFO fields.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct SamplerVolumeEnvelopeEdit {
+pub struct SamplerEnvelopeLfoEdit {
     pub enabled: Option<bool>,
     pub tempo_sync: Option<bool>,
     pub predelay_raw: Option<i32>,
@@ -537,9 +620,22 @@ pub struct SamplerVolumeEnvelopeEdit {
     pub attack_tension_raw: Option<i32>,
     pub decay_tension_raw: Option<i32>,
     pub release_tension_raw: Option<i32>,
+    pub lfo_tempo_sync: Option<bool>,
+    pub lfo_phase_retrigger: Option<bool>,
+    pub lfo_predelay_raw: Option<u32>,
+    pub lfo_attack_raw: Option<u32>,
+    pub lfo_amount_raw: Option<i32>,
+    pub lfo_speed_raw: Option<u32>,
+    pub lfo_shape_raw: Option<i32>,
 }
 
-fn decode_sampler_volume_envelope(payload: &[u8]) -> Option<SamplerVolumeEnvelope> {
+/// Backwards-compatible edit type for the Volume target.
+pub type SamplerVolumeEnvelopeEdit = SamplerEnvelopeLfoEdit;
+
+fn decode_sampler_envelope_lfo(
+    payload: &[u8],
+    target: SamplerEnvelopeLfoTarget,
+) -> Option<SamplerEnvelopeLfo> {
     let i32_at = |offset: usize| {
         Some(i32::from_le_bytes(
             payload
@@ -548,7 +644,16 @@ fn decode_sampler_volume_envelope(payload: &[u8]) -> Option<SamplerVolumeEnvelop
                 .ok()?,
         ))
     };
-    Some(SamplerVolumeEnvelope {
+    let u32_at = |offset: usize| {
+        Some(u32::from_le_bytes(
+            payload
+                .get(offset..offset.checked_add(4)?)?
+                .try_into()
+                .ok()?,
+        ))
+    };
+    Some(SamplerEnvelopeLfo {
+        target,
         flags_raw: i32_at(0)?,
         enabled: i32_at(4)? != 0,
         predelay_raw: i32_at(8),
@@ -561,6 +666,11 @@ fn decode_sampler_volume_envelope(payload: &[u8]) -> Option<SamplerVolumeEnvelop
         attack_tension_raw: i32_at(56),
         decay_tension_raw: i32_at(60),
         release_tension_raw: i32_at(64),
+        lfo_predelay_raw: u32_at(36),
+        lfo_attack_raw: u32_at(40),
+        lfo_amount_raw: i32_at(44),
+        lfo_speed_raw: u32_at(48),
+        lfo_shape_raw: i32_at(52),
     })
 }
 
@@ -575,8 +685,7 @@ pub struct ChannelSummary {
     sampler_fx_flags: Option<u16>,
     sampler_fade_out_raw: Option<u16>,
     sampler_fade_in_raw: Option<u16>,
-    sampler_volume_envelope_enabled: Option<bool>,
-    sampler_volume_envelope: Option<SamplerVolumeEnvelope>,
+    sampler_envelope_lfos: [Option<SamplerEnvelopeLfo>; 5],
     sampler_max_polyphony_raw: Option<u32>,
     sampler_mono_enabled: Option<bool>,
     channel_cut_groups: Option<(u16, u16)>,
@@ -970,17 +1079,29 @@ impl ChannelSummary {
     /// envelope records include the Volume record. FL Studio plays a sample through to its
     /// natural end after note-off when this envelope is disabled.
     pub fn sampler_volume_envelope_enabled(&self) -> Option<bool> {
+        self.sampler_envelope_lfo(SamplerEnvelopeLfoTarget::Volume)
+            .map(|record| record.enabled())
+    }
+
+    /// Saved raw PAHDSR/LFO fields from one ordered Sampler `0xDA` record.
+    pub fn sampler_envelope_lfo(
+        &self,
+        target: SamplerEnvelopeLfoTarget,
+    ) -> Option<SamplerEnvelopeLfo> {
         (self.kind == Some(0))
-            .then_some(self.sampler_volume_envelope_enabled)
+            .then_some(self.sampler_envelope_lfos[target.index()])
             .flatten()
     }
 
-    /// Saved raw PAHDSR/LFO fields from the Sampler's second `0xDA` record,
-    /// which represents its Volume envelope.
+    /// The five ordered Sampler Envelope/LFO records, retaining missing or truncated records as
+    /// `None` entries so the target indices stay aligned with the FL event order.
+    pub fn sampler_envelope_lfos(&self) -> Option<[Option<SamplerEnvelopeLfo>; 5]> {
+        (self.kind == Some(0)).then_some(self.sampler_envelope_lfos)
+    }
+
+    /// Saved raw fields from the Sampler's Volume-target `0xDA` record.
     pub fn sampler_volume_envelope(&self) -> Option<SamplerVolumeEnvelope> {
-        (self.kind == Some(0))
-            .then_some(self.sampler_volume_envelope)
-            .flatten()
+        self.sampler_envelope_lfo(SamplerEnvelopeLfoTarget::Volume)
     }
 
     /// Saved raw Sampler Max Polyphony value from the channel's `0xDD` event, when present.
@@ -4545,13 +4666,13 @@ impl FlpDocument {
                 }
                 0xDA if matches!(event.encoding, PayloadEncoding::Data { .. }) => {
                     // PyFLP documents five ordered 0xDA records (Panning, Volume,
-                    // Mod X, Mod Y, Pitch); the Volume envelope is the second record.
-                    if channel.envelope_lfo_events_seen == 1 {
-                        channel.sampler_volume_envelope =
-                            decode_sampler_volume_envelope(&event.payload);
-                        channel.sampler_volume_envelope_enabled = channel
-                            .sampler_volume_envelope
-                            .map(|envelope| envelope.enabled());
+                    // Mod X, Mod Y, Pitch).
+                    let target_index = usize::from(channel.envelope_lfo_events_seen);
+                    if channel.kind == Some(ChannelType::Sampler.raw())
+                        && let Some(target) = SamplerEnvelopeLfoTarget::from_index(target_index)
+                    {
+                        channel.sampler_envelope_lfos[target_index] =
+                            decode_sampler_envelope_lfo(&event.payload, target);
                     }
                     channel.envelope_lfo_events_seen =
                         channel.envelope_lfo_events_seen.saturating_add(1);
@@ -16409,17 +16530,31 @@ impl FlpDocument {
 
     /// Edits raw fields in a Sampler's existing Volume envelope (`0xDA`) record.
     ///
-    /// The second ordered `0xDA` record is Volume. Only recognized PAHDSR,
-    /// amount, tension, and tempo-sync fields are changed; LFO fields and any
-    /// trailing bytes are preserved. This does not add a missing envelope
-    /// record or change Sampler playback timing.
+    /// The second ordered `0xDA` record is Volume. This compatibility wrapper delegates to
+    /// [`Self::edit_sampler_envelope_lfo`] and changes only supplied fields.
     pub fn edit_sampler_volume_envelope(
         &mut self,
         channel_id: u16,
         edit: SamplerVolumeEnvelopeEdit,
     ) -> Result<(), FlpError> {
+        self.edit_sampler_envelope_lfo(channel_id, SamplerEnvelopeLfoTarget::Volume, edit)
+    }
+
+    /// Edits recognized raw fields in one of a Sampler's five ordered `0xDA` records.
+    ///
+    /// The records represent Panning, Volume, Mod X, Mod Y, and Pitch in that order. This edits
+    /// only selected fields and preserves other flags, LFO/envelope fields, trailing bytes, and
+    /// unrelated events. It does not add a missing record or apply the controls to audio.
+    pub fn edit_sampler_envelope_lfo(
+        &mut self,
+        channel_id: u16,
+        target: SamplerEnvelopeLfoTarget,
+        edit: SamplerEnvelopeLfoEdit,
+    ) -> Result<(), FlpError> {
         let has_edit = edit.enabled.is_some()
             || edit.tempo_sync.is_some()
+            || edit.lfo_tempo_sync.is_some()
+            || edit.lfo_phase_retrigger.is_some()
             || edit.predelay_raw.is_some()
             || edit.attack_raw.is_some()
             || edit.hold_raw.is_some()
@@ -16429,10 +16564,15 @@ impl FlpDocument {
             || edit.amount_raw.is_some()
             || edit.attack_tension_raw.is_some()
             || edit.decay_tension_raw.is_some()
-            || edit.release_tension_raw.is_some();
+            || edit.release_tension_raw.is_some()
+            || edit.lfo_predelay_raw.is_some()
+            || edit.lfo_attack_raw.is_some()
+            || edit.lfo_amount_raw.is_some()
+            || edit.lfo_speed_raw.is_some()
+            || edit.lfo_shape_raw.is_some();
         if !has_edit {
             return Err(FlpError::UnsupportedEdit(
-                "at least one Sampler Volume envelope field must be supplied",
+                "at least one Sampler Envelope/LFO field must be supplied",
             ));
         }
         if [
@@ -16447,7 +16587,26 @@ impl FlpDocument {
         .any(|value| !(100..=65_536).contains(&value))
         {
             return Err(FlpError::UnsupportedEdit(
-                "Sampler envelope time fields must be in the 100..=65536 raw range",
+                "Sampler envelope and LFO time fields must be in the 100..=65536 raw range",
+            ));
+        }
+        if edit
+            .lfo_predelay_raw
+            .is_some_and(|value| !(100..=65_536).contains(&value))
+            || edit
+                .lfo_attack_raw
+                .is_some_and(|value| !(100..=65_536).contains(&value))
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "Sampler envelope and LFO time fields must be in the 100..=65536 raw range",
+            ));
+        }
+        if edit
+            .lfo_speed_raw
+            .is_some_and(|value| !(200..=65_536).contains(&value))
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "Sampler LFO speed must be in the 200..=65536 raw range",
             ));
         }
         if edit
@@ -16456,6 +16615,22 @@ impl FlpDocument {
         {
             return Err(FlpError::UnsupportedEdit(
                 "Sampler envelope sustain must be in the 0..=128 raw range",
+            ));
+        }
+        if edit
+            .lfo_amount_raw
+            .is_some_and(|value| !(-128..=128).contains(&value))
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "Sampler LFO amount must be in the -128..=128 raw range",
+            ));
+        }
+        if edit
+            .lfo_shape_raw
+            .is_some_and(|value| !(0..=2).contains(&value))
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "Sampler LFO shape must be 0 (Sine), 1 (Triangle), or 2 (Pulse)",
             ));
         }
         if [
@@ -16481,22 +16656,25 @@ impl FlpDocument {
             .expect("the unique channel was checked above");
         if channel.kind != Some(ChannelType::Sampler.raw()) {
             return Err(FlpError::UnsupportedEdit(
-                "the Volume envelope applies only to Sampler channels",
+                "Envelope/LFO records apply only to Sampler channels",
             ));
         }
         let envelope_events = channel
             .event_range()
-            .filter(|index| self.events[*index].opcode == 0xDA)
+            .filter(|index| {
+                self.events[*index].opcode == 0xDA
+                    && matches!(self.events[*index].encoding, PayloadEncoding::Data { .. })
+            })
             .collect::<Vec<_>>();
-        let Some(event_index) = envelope_events.get(1).copied() else {
+        let Some(event_index) = envelope_events.get(target.index()).copied() else {
             return Err(FlpError::UnsupportedEdit(
-                "the selected Sampler has no second 0xDA Volume envelope record",
+                "the selected Sampler does not have the requested ordered 0xDA record",
             ));
         };
         let event = &self.events[event_index];
         if !matches!(event.encoding, PayloadEncoding::Data { .. }) || event.payload.len() < 8 {
             return Err(FlpError::UnsupportedEdit(
-                "the Volume envelope record is truncated or not length-prefixed",
+                "the Envelope/LFO record is truncated or not length-prefixed",
             ));
         }
 
@@ -16505,13 +16683,24 @@ impl FlpDocument {
         if let Some(enabled) = edit.enabled {
             payload[4..8].copy_from_slice(&(if enabled { 1_i32 } else { 0_i32 }).to_le_bytes());
         }
-        if let Some(tempo_sync) = edit.tempo_sync {
-            let mut flags = i32::from_le_bytes(payload[0..4].try_into().unwrap());
-            if tempo_sync {
-                flags |= 1;
-            } else {
-                flags &= !1;
+        let mut flags = i32::from_le_bytes(payload[0..4].try_into().unwrap());
+        for (value, bit) in [
+            (edit.tempo_sync, 1_i32),
+            (edit.lfo_tempo_sync, 1_i32 << 1),
+            (edit.lfo_phase_retrigger, 1_i32 << 5),
+        ] {
+            if let Some(enabled) = value {
+                if enabled {
+                    flags |= bit;
+                } else {
+                    flags &= !bit;
+                }
             }
+        }
+        if edit.tempo_sync.is_some()
+            || edit.lfo_tempo_sync.is_some()
+            || edit.lfo_phase_retrigger.is_some()
+        {
             payload[0..4].copy_from_slice(&flags.to_le_bytes());
         }
         for (offset, value) in [
@@ -16530,7 +16719,33 @@ impl FlpDocument {
                 let end = offset.checked_add(4).ok_or(FlpError::LengthOverflow)?;
                 let Some(field) = payload.get_mut(offset..end) else {
                     return Err(FlpError::UnsupportedEdit(
-                        "the Volume envelope record does not contain every selected field",
+                        "the Envelope/LFO record does not contain every selected field",
+                    ));
+                };
+                field.copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        for (offset, value) in [
+            (36_usize, edit.lfo_predelay_raw),
+            (40, edit.lfo_attack_raw),
+            (48, edit.lfo_speed_raw),
+        ] {
+            if let Some(value) = value {
+                let end = offset.checked_add(4).ok_or(FlpError::LengthOverflow)?;
+                let Some(field) = payload.get_mut(offset..end) else {
+                    return Err(FlpError::UnsupportedEdit(
+                        "the Envelope/LFO record does not contain every selected field",
+                    ));
+                };
+                field.copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        for (offset, value) in [(44_usize, edit.lfo_amount_raw), (52, edit.lfo_shape_raw)] {
+            if let Some(value) = value {
+                let end = offset.checked_add(4).ok_or(FlpError::LengthOverflow)?;
+                let Some(field) = payload.get_mut(offset..end) else {
+                    return Err(FlpError::UnsupportedEdit(
+                        "the Envelope/LFO record does not contain every selected field",
                     ));
                 };
                 field.copy_from_slice(&value.to_le_bytes());
@@ -19831,9 +20046,10 @@ mod tests {
         PatternNoteRotation, PayloadEncoding, PlaylistClipEdit, PlaylistClipTarget,
         PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync,
         ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions, RiffMachineOptions,
-        RiffMachineQuantizeMode, SamplerVolumeEnvelopeEdit, ScaleLevelsOptions, TimeMarkerEdit,
-        apply_mixer_pan, apply_mixer_stereo_separation, midi::MidiChannelMapping,
-        midi::MidiEventKind, midi::MidiFile, midi::MidiImportOptions, note_pitch_in_scale,
+        RiffMachineQuantizeMode, SamplerEnvelopeLfoEdit, SamplerEnvelopeLfoTarget,
+        SamplerVolumeEnvelopeEdit, ScaleLevelsOptions, TimeMarkerEdit, apply_mixer_pan,
+        apply_mixer_stereo_separation, midi::MidiChannelMapping, midi::MidiEventKind,
+        midi::MidiFile, midi::MidiImportOptions, note_pitch_in_scale,
         parse_vst_plugin_state_metadata, riff_machine_groove_note_timing,
     };
 
@@ -25021,6 +25237,114 @@ mod tests {
             Err(FlpError::UnsupportedEdit(_))
         ));
         assert_eq!(document.encode_lossless().unwrap(), before);
+    }
+
+    #[test]
+    fn decodes_all_five_sampler_envelope_lfo_targets_in_record_order() {
+        let mut event_stream = vec![0x40, 7, 0, 0x15, 0];
+        for (index, target) in SamplerEnvelopeLfoTarget::all().into_iter().enumerate() {
+            let mut payload = vec![0_u8; 72];
+            let flags = (index as i32) << 1;
+            payload[0..4].copy_from_slice(&flags.to_le_bytes());
+            payload[4..8].copy_from_slice(&(index as i32).to_le_bytes());
+            payload[8..12].copy_from_slice(&(100 + index as i32).to_le_bytes());
+            payload[44..48].copy_from_slice(&(index as i32 - 2).to_le_bytes());
+            payload[48..52].copy_from_slice(&(200 + index as u32).to_le_bytes());
+            payload[52..56].copy_from_slice(&(index as i32 % 3).to_le_bytes());
+            append_data_event(&mut event_stream, 0xDA, &payload);
+            assert_eq!(target.index(), index);
+        }
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+        let input = flp_fixture(&event_stream, &[], &[]);
+        let document = FlpDocument::parse(&input).expect("envelope fixture should parse");
+        let channel = document.channels().remove(0);
+        let records = channel
+            .sampler_envelope_lfos()
+            .expect("Sampler envelope records should be exposed");
+
+        for (index, target) in SamplerEnvelopeLfoTarget::all().into_iter().enumerate() {
+            let record = records[index].expect("each target record should decode");
+            assert_eq!(record.target(), target);
+            assert_eq!(record.flags_raw(), (index as i32) << 1);
+            assert_eq!(record.enabled(), index != 0);
+            assert_eq!(record.lfo_tempo_sync_enabled(), index % 2 == 1);
+            assert_eq!(record.predelay_raw(), Some(100 + index as i32));
+            assert_eq!(record.lfo_amount_raw(), Some(index as i32 - 2));
+            assert_eq!(record.lfo_speed_raw(), Some(200 + index as u32));
+            assert_eq!(record.lfo_shape_raw(), Some(index as i32 % 3));
+            assert_eq!(channel.sampler_envelope_lfo(target), Some(record));
+        }
+        assert_eq!(document.encode_lossless().unwrap(), input);
+    }
+
+    #[test]
+    fn sampler_envelope_lfo_edits_preserve_unselected_fields_for_every_target() {
+        let mut event_stream = vec![0x40, 7, 0, 0x15, 0];
+        let mut original_payloads = Vec::new();
+        for _ in SamplerEnvelopeLfoTarget::all() {
+            let mut payload = vec![0_u8; 76];
+            payload[0..4].copy_from_slice(&0x54_i32.to_le_bytes());
+            payload[4..8].copy_from_slice(&0_i32.to_le_bytes());
+            for (offset, value) in (8..=64).step_by(4).zip(101_i32..=123) {
+                payload[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            payload[72..76].copy_from_slice(&[0xA1, 0xB2, 0xC3, 0xD4]);
+            original_payloads.push(payload.clone());
+            append_data_event(&mut event_stream, 0xDA, &payload);
+        }
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+        let input = flp_fixture(&event_stream, &[], &[]);
+        let mut document = FlpDocument::parse(&input).expect("envelope fixture should parse");
+        let event_indices = document
+            .events()
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| event.opcode() == 0xDA)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+
+        for (index, target) in SamplerEnvelopeLfoTarget::all().into_iter().enumerate() {
+            document
+                .edit_sampler_envelope_lfo(
+                    7,
+                    target,
+                    SamplerEnvelopeLfoEdit {
+                        enabled: Some(true),
+                        tempo_sync: Some(true),
+                        lfo_tempo_sync: Some(false),
+                        lfo_phase_retrigger: Some(true),
+                        attack_raw: Some(1_234 + index as i32),
+                        lfo_speed_raw: Some(2_000 + index as u32),
+                        lfo_shape_raw: Some(index as i32 % 3),
+                        ..SamplerEnvelopeLfoEdit::default()
+                    },
+                )
+                .expect("every ordered target should be editable");
+
+            let mut expected = original_payloads[index].clone();
+            expected[0..4].copy_from_slice(&0x75_i32.to_le_bytes());
+            expected[4..8].copy_from_slice(&1_i32.to_le_bytes());
+            expected[12..16].copy_from_slice(&(1_234 + index as i32).to_le_bytes());
+            expected[48..52].copy_from_slice(&(2_000 + index as u32).to_le_bytes());
+            expected[52..56].copy_from_slice(&(index as i32 % 3).to_le_bytes());
+            assert_eq!(document.events()[event_indices[index]].payload(), expected);
+        }
+
+        let encoded = document
+            .encode_lossless()
+            .expect("updated project should encode");
+        let reparsed = FlpDocument::parse(&encoded).expect("updated project should parse");
+        let records = reparsed.channels()[0].sampler_envelope_lfos().unwrap();
+        for (index, record) in records.into_iter().enumerate() {
+            let record = record.expect("edited target should still decode");
+            assert!(record.enabled());
+            assert!(record.tempo_sync_enabled());
+            assert!(record.lfo_phase_retrigger_enabled());
+            assert!(!record.lfo_tempo_sync_enabled());
+            assert_eq!(record.attack_raw(), Some(1_234 + index as i32));
+            assert_eq!(record.lfo_speed_raw(), Some(2_000 + index as u32));
+            assert_eq!(record.lfo_shape_raw(), Some(index as i32 % 3));
+        }
     }
 
     #[test]

@@ -21,8 +21,8 @@ use flp_rebuild::{
     PatternNoteRotation, PlaylistClipEdit, PlaylistTrackEdit, PlaylistTrackMotion,
     PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit, QuantizeNoteMode,
     QuantizeNoteOptions, RandomNoteChordMap, RandomNoteGeneratorOptions, RandomizerOptions,
-    RiffMachineOptions, RiffMachineQuantizeMode, SamplerVolumeEnvelopeEdit, ScaleLevelsOptions,
-    StrumOptions, TimeMarkerEdit,
+    RiffMachineOptions, RiffMachineQuantizeMode, SamplerEnvelopeLfoEdit, SamplerEnvelopeLfoTarget,
+    SamplerVolumeEnvelopeEdit, ScaleLevelsOptions, StrumOptions, TimeMarkerEdit,
 };
 
 struct MidiControlChangeImport<'a> {
@@ -807,6 +807,47 @@ fn run(args: Vec<String>) -> Result<(), String> {
                         release_tension,
                         "envelope release tension raw",
                     )?,
+                    ..SamplerVolumeEnvelopeEdit::default()
+                },
+            )
+        }
+        [command, input, output, channel_id, target, enabled, tempo_sync, lfo_tempo_sync, lfo_retrigger, predelay, attack, hold, decay, sustain, release, amount, attack_tension, decay_tension, release_tension, lfo_predelay, lfo_attack, lfo_amount, lfo_speed, lfo_shape]
+            if command == "edit-sampler-envelope-lfo" =>
+        {
+            edit_sampler_envelope_lfo(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(channel_id, "Sampler channel id")?,
+                parse_sampler_envelope_lfo_target(target)?,
+                SamplerEnvelopeLfoEdit {
+                    enabled: parse_optional_bool(enabled, "envelope enabled")?,
+                    tempo_sync: parse_optional_bool(tempo_sync, "envelope tempo sync")?,
+                    lfo_tempo_sync: parse_optional_bool(lfo_tempo_sync, "LFO tempo sync")?,
+                    lfo_phase_retrigger: parse_optional_bool(lfo_retrigger, "LFO phase retrigger")?,
+                    predelay_raw: parse_optional_i32(predelay, "envelope predelay raw")?,
+                    attack_raw: parse_optional_i32(attack, "envelope attack raw")?,
+                    hold_raw: parse_optional_i32(hold, "envelope hold raw")?,
+                    decay_raw: parse_optional_i32(decay, "envelope decay raw")?,
+                    sustain_raw: parse_optional_i32(sustain, "envelope sustain raw")?,
+                    release_raw: parse_optional_i32(release, "envelope release raw")?,
+                    amount_raw: parse_optional_i32(amount, "envelope amount raw")?,
+                    attack_tension_raw: parse_optional_i32(
+                        attack_tension,
+                        "envelope attack tension raw",
+                    )?,
+                    decay_tension_raw: parse_optional_i32(
+                        decay_tension,
+                        "envelope decay tension raw",
+                    )?,
+                    release_tension_raw: parse_optional_i32(
+                        release_tension,
+                        "envelope release tension raw",
+                    )?,
+                    lfo_predelay_raw: parse_optional_u32(lfo_predelay, "LFO predelay raw")?,
+                    lfo_attack_raw: parse_optional_u32(lfo_attack, "LFO attack raw")?,
+                    lfo_amount_raw: parse_optional_i32(lfo_amount, "LFO amount raw")?,
+                    lfo_speed_raw: parse_optional_u32(lfo_speed, "LFO speed raw")?,
+                    lfo_shape_raw: parse_optional_i32(lfo_shape, "LFO shape raw")?,
                 },
             )
         }
@@ -3391,6 +3432,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild set-channel-levels <input.flp> <output.flp> <channel-id> <volume-0..12800> <pan-0..12800>\n",
             "  flp-rebuild set-sampler-quick-fades <input.flp> <output.flp> <sampler-channel-id> <fade-out-0..1024> <fade-in-0..1024>\n",
             "  flp-rebuild edit-sampler-volume-envelope <input.flp> <output.flp> <sampler-channel-id> <enabled:0|1|-> <tempo-sync:0|1|-> <predelay-raw|-> <attack-raw|-> <hold-raw|-> <decay-raw|-> <sustain-raw|-> <release-raw|-> <amount-raw|-> <attack-tension-raw|-> <decay-tension-raw|-> <release-tension-raw|->\n",
+            "  flp-rebuild edit-sampler-envelope-lfo <input.flp> <output.flp> <sampler-channel-id> <target:panning|volume|mod-x|mod-y|pitch> <enabled:0|1|-> <envelope-tempo-sync:0|1|-> <lfo-tempo-sync:0|1|-> <lfo-phase-retrigger:0|1|-> <predelay-raw|-> <attack-raw|-> <hold-raw|-> <decay-raw|-> <sustain-raw|-> <release-raw|-> <amount-raw|-> <attack-tension-raw|-> <decay-tension-raw|-> <release-tension-raw|-> <lfo-predelay-raw|-> <lfo-attack-raw|-> <lfo-amount-raw|-> <lfo-speed-raw|-> <lfo-shape:0|1|2|->\n",
             "  flp-rebuild set-channel-fine-tune <input.flp> <output.flp> <channel-id> <-100..100-cents>\n",
             "  flp-rebuild set-channel-enabled <input.flp> <output.flp> <channel-id> <0|1>\n",
             "  flp-rebuild set-channel-sample-path <input.flp> <output.flp> <channel-id> <sample-path>\n",
@@ -4443,6 +4485,20 @@ fn parse_optional_bool(value: &str, description: &str) -> Result<Option<bool>, S
     }
 }
 
+fn parse_sampler_envelope_lfo_target(value: &str) -> Result<SamplerEnvelopeLfoTarget, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "panning" | "pan" => Ok(SamplerEnvelopeLfoTarget::Panning),
+        "volume" => Ok(SamplerEnvelopeLfoTarget::Volume),
+        "mod-x" | "modx" => Ok(SamplerEnvelopeLfoTarget::ModX),
+        "mod-y" | "mody" => Ok(SamplerEnvelopeLfoTarget::ModY),
+        "pitch" => Ok(SamplerEnvelopeLfoTarget::Pitch),
+        _ => Err(
+            "Sampler envelope/LFO target must be panning, volume, mod-x, mod-y, or pitch"
+                .to_owned(),
+        ),
+    }
+}
+
 fn parse_playlist_track_sync(value: &str) -> Result<PlaylistTrackSync, String> {
     match value.to_ascii_lowercase().as_str() {
         "off" => Ok(PlaylistTrackSync::Off),
@@ -5334,7 +5390,7 @@ fn list_channels(path: &Path) -> Result<(), String> {
     println!("channels: {}", channels.len());
     for channel in channels {
         println!(
-            "id={} kind={} type={:?} enabled={} zipped={} main_pitch={} add_to_key={} fine_tune_raw={:?} stretch_settings={:?} sampler_fade_out_raw={:?} sampler_fade_in_raw={:?} sampler_volume_envelope={:?} color={:?} volume={:?} pan={:?} level_adjusts_raw={:?} swing_mix_raw={:?} layer_children={:?} layer_flags={:?} plugin={} name={} sample_path={:?} events={:?}",
+            "id={} kind={} type={:?} enabled={} zipped={} main_pitch={} add_to_key={} fine_tune_raw={:?} stretch_settings={:?} sampler_fade_out_raw={:?} sampler_fade_in_raw={:?} sampler_volume_envelope={:?} sampler_envelopes={:?} color={:?} volume={:?} pan={:?} level_adjusts_raw={:?} swing_mix_raw={:?} layer_children={:?} layer_flags={:?} plugin={} name={} sample_path={:?} events={:?}",
             channel.id(),
             channel
                 .kind()
@@ -5351,6 +5407,7 @@ fn list_channels(path: &Path) -> Result<(), String> {
             channel.sampler_fade_out_raw(),
             channel.sampler_fade_in_raw(),
             channel.sampler_volume_envelope(),
+            channel.sampler_envelope_lfos(),
             channel.color(),
             channel.volume(),
             channel.pan(),
@@ -6741,6 +6798,30 @@ fn edit_sampler_volume_envelope(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "edited Sampler channel {channel_id} Volume envelope in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn edit_sampler_envelope_lfo(
+    input: &Path,
+    output: &Path,
+    channel_id: u16,
+    target: SamplerEnvelopeLfoTarget,
+    edit: SamplerEnvelopeLfoEdit,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .edit_sampler_envelope_lfo(channel_id, target, edit)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "edited Sampler channel {channel_id} {} envelope/LFO in {}",
+        target.label(),
         output.display()
     );
     Ok(())
@@ -9814,9 +9895,38 @@ mod tests {
         parse_midi_channel_number, parse_midi_import_options,
         parse_midi_import_options_with_channels, parse_midi_import_options_with_mixer_tracks,
         parse_midi_pattern_target, parse_midi_track_selection, parse_mixer_track, parse_raw_byte,
-        parse_rgb_hex, parse_scale_name,
+        parse_rgb_hex, parse_sampler_envelope_lfo_target, parse_scale_name,
     };
-    use flp_rebuild::midi::MidiImportOptions;
+    use flp_rebuild::{SamplerEnvelopeLfoTarget, midi::MidiImportOptions};
+
+    #[test]
+    fn parses_sampler_envelope_lfo_targets() {
+        assert_eq!(
+            parse_sampler_envelope_lfo_target("panning"),
+            Ok(SamplerEnvelopeLfoTarget::Panning)
+        );
+        assert_eq!(
+            parse_sampler_envelope_lfo_target("PAN"),
+            Ok(SamplerEnvelopeLfoTarget::Panning)
+        );
+        assert_eq!(
+            parse_sampler_envelope_lfo_target("volume"),
+            Ok(SamplerEnvelopeLfoTarget::Volume)
+        );
+        assert_eq!(
+            parse_sampler_envelope_lfo_target("mod-x"),
+            Ok(SamplerEnvelopeLfoTarget::ModX)
+        );
+        assert_eq!(
+            parse_sampler_envelope_lfo_target("mod-y"),
+            Ok(SamplerEnvelopeLfoTarget::ModY)
+        );
+        assert_eq!(
+            parse_sampler_envelope_lfo_target("pitch"),
+            Ok(SamplerEnvelopeLfoTarget::Pitch)
+        );
+        assert!(parse_sampler_envelope_lfo_target("filter").is_err());
+    }
 
     #[test]
     fn parses_midi_import_options() {
