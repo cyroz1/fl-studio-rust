@@ -62,6 +62,7 @@ flp-rebuild linearize-pattern-controllers <input.flp> <output.flp> <pattern-id> 
 flp-rebuild spline-pattern-controllers <input.flp> <output.flp> <pattern-id> <channel> <flags> <start-tick> <end-tick>
 flp-rebuild delete-pattern-controller-range <input.flp> <output.flp> <pattern-id> <channel> <flags> <start-tick> <end-tick>
 flp-rebuild playlist <file.flp> [start] [count]
+flp-rebuild diff-playlist-clip <before.flp> <after.flp> <arrangement-id> <clip-index>
 flp-rebuild notes <file.flp> <pattern-id> [start] [count]
 flp-rebuild events <file.flp> [start] [count]
 flp-rebuild extract-event <file.flp> <index> <output.bin>

@@ -35,3 +35,7 @@ The new `export-midi-song` path was run against the prepared `NewStuff.flp` expo
 ## Arrangement payload boundaries
 
 NewStuff contains one `0xE9` event with a 119,520-byte payload. Changing the first payload dword in a copied file, and separately changing the first character in event 114's 12-entry `0xFD` UTF-16LE string, left the MIDI export byte-identical. These experiments show that those changes do not affect this project's MIDI export. They do not establish the full meaning of either event; `0xE9` remains a candidate Playlist/arrangement container and the `0xFD` field's role is unknown.
+
+## Playlist clip record comparisons
+
+`diff-playlist-clip <before.flp> <after.flp> <arrangement-id> <clip-index>` reports byte offsets that changed in one corresponding raw `0xE9` clip record. Use two copies of a minimal native project saved after changing exactly one Playlist Audio Clip property. The command does not infer field meanings; verify the same clip index and record layout in both saves before assigning semantics to changed offsets.

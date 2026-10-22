@@ -279,6 +279,16 @@ fn run(args: Vec<String>) -> Result<(), String> {
             parse_usize(start, "clip start")?,
             parse_usize(count, "clip count")?,
         ),
+        [command, before, after, arrangement_id, clip_index]
+            if command == "diff-playlist-clip" =>
+        {
+            diff_playlist_clip_records(
+                Path::new(before),
+                Path::new(after),
+                parse_u16(arrangement_id, "arrangement id")?,
+                parse_usize(clip_index, "clip index")?,
+            )
+        }
         [command, path] if command == "events" => dump_events(Path::new(path), 0, 64),
         [command, path] if command == "midi-info" => inspect_midi(Path::new(path)),
         [command, project, output, pattern_id] if command == "export-midi-pattern" => {
@@ -3315,6 +3325,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild spline-pattern-controllers <input.flp> <output.flp> <pattern-id> <channel:0..255> <flags:0..255> <start-tick> <end-tick>\n",
             "  flp-rebuild delete-pattern-controller-range <input.flp> <output.flp> <pattern-id> <channel:0..255> <flags:0..255> <start-tick> <end-tick>\n",
             "  flp-rebuild playlist <file.flp> [start] [count]\n",
+            "  flp-rebuild diff-playlist-clip <before.flp> <after.flp> <arrangement-id> <clip-index>\n",
             "  flp-rebuild notes <file.flp> <pattern-id> [start] [count]\n",
             "  flp-rebuild events <file.flp> [start] [count]\n",
             "  flp-rebuild extract-event <file.flp> <index> <output.bin>\n",
@@ -5902,6 +5913,46 @@ fn list_playlist(path: &Path, start: usize, count: usize) -> Result<(), String> 
                 clip.has_opaque_record_tail(),
             );
         }
+    }
+    Ok(())
+}
+
+fn diff_playlist_clip_records(
+    before_path: &Path,
+    after_path: &Path,
+    arrangement_id: u16,
+    clip_index: usize,
+) -> Result<(), String> {
+    let (_, before_document) = load_document(before_path)?;
+    let (_, after_document) = load_document(after_path)?;
+    let before_record = before_document
+        .playlist_clip_record_bytes(arrangement_id, clip_index)
+        .map_err(|error| format!("could not read the before clip record: {error}"))?;
+    let after_record = after_document
+        .playlist_clip_record_bytes(arrangement_id, clip_index)
+        .map_err(|error| format!("could not read the after clip record: {error}"))?;
+
+    println!(
+        "arrangement={arrangement_id} clip={clip_index} before_bytes={} after_bytes={}",
+        before_record.len(),
+        after_record.len()
+    );
+    let mut changed_bytes = 0usize;
+    for offset in 0..before_record.len().max(after_record.len()) {
+        let before = before_record.get(offset).copied();
+        let after = after_record.get(offset).copied();
+        if before == after {
+            continue;
+        }
+        changed_bytes += 1;
+        let before = before.map_or_else(|| "--".to_owned(), |value| format!("{value:02X}"));
+        let after = after.map_or_else(|| "--".to_owned(), |value| format!("{value:02X}"));
+        println!("  offset={offset:02} (0x{offset:02X}) {before} -> {after}");
+    }
+    if changed_bytes == 0 {
+        println!("no raw record differences");
+    } else {
+        println!("changed bytes: {changed_bytes}");
     }
     Ok(())
 }

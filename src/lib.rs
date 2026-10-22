@@ -6341,6 +6341,56 @@ impl FlpDocument {
         self.arrangements_impl(true)
     }
 
+    /// Returns the exact stored bytes for one Playlist clip record.
+    ///
+    /// This is useful when comparing native project saves to identify fields
+    /// that are not decoded yet. The bytes are borrowed from the original
+    /// `0xE9` event payload and are never interpreted or rewritten here.
+    pub fn playlist_clip_record_bytes(
+        &self,
+        arrangement_id: u16,
+        clip_index: usize,
+    ) -> Result<&[u8], FlpError> {
+        let arrangements = self.arrangements()?;
+        let mut matching_arrangements = arrangements
+            .iter()
+            .filter(|arrangement| arrangement.id == arrangement_id);
+        let Some(arrangement) = matching_arrangements.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested arrangement does not exist",
+            ));
+        };
+        if matching_arrangements.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested arrangement id is ambiguous",
+            ));
+        }
+        let Some(clip) = arrangement.clips.get(clip_index) else {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested playlist clip does not exist",
+            ));
+        };
+        let event_index = clip.source_event_index;
+        let record_start = clip
+            .source_record_index
+            .checked_mul(clip.record_size)
+            .ok_or(FlpError::LengthOverflow)?;
+        let record_end = record_start
+            .checked_add(clip.record_size)
+            .ok_or(FlpError::LengthOverflow)?;
+        let event = self.events.get(event_index).ok_or(FlpError::InvalidEvent {
+            offset: 0,
+            detail: "the Playlist clip source event is unavailable",
+        })?;
+        event
+            .payload
+            .get(record_start..record_end)
+            .ok_or(FlpError::InvalidEvent {
+                offset: event.file_offset,
+                detail: "the Playlist clip record is outside its source event",
+            })
+    }
+
     /// Returns flattened time markers without decoding Playlist clip records.
     /// This lets callers inspect marker data even when a project's clip layout
     /// is not yet supported by `arrangements()`.
@@ -21320,6 +21370,12 @@ mod tests {
                 .clips
                 .iter()
                 .all(|clip| clip.record_size == 80)
+        );
+        assert_eq!(
+            document
+                .playlist_clip_record_bytes(0, 2)
+                .expect("raw clip bytes should be available"),
+            &payload[160..240]
         );
     }
 
