@@ -447,6 +447,123 @@ impl ChannelType {
     }
 }
 
+/// Decoded raw fields from the Sampler's Volume envelope `0xDA` record.
+///
+/// FL stores one `0xDA` record for each of five envelope/LFO targets. This
+/// record is the second one, for Volume. Time and level values remain in their
+/// native raw units; the exact display curves and playback timing are separate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SamplerVolumeEnvelope {
+    flags_raw: i32,
+    enabled: bool,
+    predelay_raw: Option<i32>,
+    attack_raw: Option<i32>,
+    hold_raw: Option<i32>,
+    decay_raw: Option<i32>,
+    sustain_raw: Option<i32>,
+    release_raw: Option<i32>,
+    amount_raw: Option<i32>,
+    attack_tension_raw: Option<i32>,
+    decay_tension_raw: Option<i32>,
+    release_tension_raw: Option<i32>,
+}
+
+impl SamplerVolumeEnvelope {
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub fn tempo_sync_enabled(&self) -> bool {
+        self.flags_raw & 1 != 0
+    }
+
+    pub fn flags_raw(&self) -> i32 {
+        self.flags_raw
+    }
+
+    pub fn predelay_raw(&self) -> Option<i32> {
+        self.predelay_raw
+    }
+
+    pub fn attack_raw(&self) -> Option<i32> {
+        self.attack_raw
+    }
+
+    pub fn hold_raw(&self) -> Option<i32> {
+        self.hold_raw
+    }
+
+    pub fn decay_raw(&self) -> Option<i32> {
+        self.decay_raw
+    }
+
+    pub fn sustain_raw(&self) -> Option<i32> {
+        self.sustain_raw
+    }
+
+    pub fn release_raw(&self) -> Option<i32> {
+        self.release_raw
+    }
+
+    pub fn amount_raw(&self) -> Option<i32> {
+        self.amount_raw
+    }
+
+    pub fn attack_tension_raw(&self) -> Option<i32> {
+        self.attack_tension_raw
+    }
+
+    pub fn decay_tension_raw(&self) -> Option<i32> {
+        self.decay_tension_raw
+    }
+
+    pub fn release_tension_raw(&self) -> Option<i32> {
+        self.release_tension_raw
+    }
+}
+
+/// Lossless edits to the recognized Sampler Volume envelope fields.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SamplerVolumeEnvelopeEdit {
+    pub enabled: Option<bool>,
+    pub tempo_sync: Option<bool>,
+    pub predelay_raw: Option<i32>,
+    pub attack_raw: Option<i32>,
+    pub hold_raw: Option<i32>,
+    pub decay_raw: Option<i32>,
+    pub sustain_raw: Option<i32>,
+    pub release_raw: Option<i32>,
+    pub amount_raw: Option<i32>,
+    pub attack_tension_raw: Option<i32>,
+    pub decay_tension_raw: Option<i32>,
+    pub release_tension_raw: Option<i32>,
+}
+
+fn decode_sampler_volume_envelope(payload: &[u8]) -> Option<SamplerVolumeEnvelope> {
+    let i32_at = |offset: usize| {
+        Some(i32::from_le_bytes(
+            payload
+                .get(offset..offset.checked_add(4)?)?
+                .try_into()
+                .ok()?,
+        ))
+    };
+    Some(SamplerVolumeEnvelope {
+        flags_raw: i32_at(0)?,
+        enabled: i32_at(4)? != 0,
+        predelay_raw: i32_at(8),
+        attack_raw: i32_at(12),
+        hold_raw: i32_at(16),
+        decay_raw: i32_at(20),
+        sustain_raw: i32_at(24),
+        release_raw: i32_at(28),
+        amount_raw: i32_at(32),
+        attack_tension_raw: i32_at(56),
+        decay_tension_raw: i32_at(60),
+        release_tension_raw: i32_at(64),
+    })
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ChannelSummary {
     id: u16,
@@ -459,6 +576,7 @@ pub struct ChannelSummary {
     sampler_fade_out_raw: Option<u16>,
     sampler_fade_in_raw: Option<u16>,
     sampler_volume_envelope_enabled: Option<bool>,
+    sampler_volume_envelope: Option<SamplerVolumeEnvelope>,
     sampler_max_polyphony_raw: Option<u32>,
     sampler_mono_enabled: Option<bool>,
     channel_cut_groups: Option<(u16, u16)>,
@@ -854,6 +972,14 @@ impl ChannelSummary {
     pub fn sampler_volume_envelope_enabled(&self) -> Option<bool> {
         (self.kind == Some(0))
             .then_some(self.sampler_volume_envelope_enabled)
+            .flatten()
+    }
+
+    /// Saved raw PAHDSR/LFO fields from the Sampler's second `0xDA` record,
+    /// which represents its Volume envelope.
+    pub fn sampler_volume_envelope(&self) -> Option<SamplerVolumeEnvelope> {
+        (self.kind == Some(0))
+            .then_some(self.sampler_volume_envelope)
             .flatten()
     }
 
@@ -4420,14 +4546,12 @@ impl FlpDocument {
                 0xDA if matches!(event.encoding, PayloadEncoding::Data { .. }) => {
                     // PyFLP documents five ordered 0xDA records (Panning, Volume,
                     // Mod X, Mod Y, Pitch); the Volume envelope is the second record.
-                    if channel.envelope_lfo_events_seen == 1 && event.payload.len() >= 8 {
-                        channel.sampler_volume_envelope_enabled = Some(
-                            i32::from_le_bytes(
-                                event.payload[4..8]
-                                    .try_into()
-                                    .expect("the envelope enabled field has four bytes"),
-                            ) != 0,
-                        );
+                    if channel.envelope_lfo_events_seen == 1 {
+                        channel.sampler_volume_envelope =
+                            decode_sampler_volume_envelope(&event.payload);
+                        channel.sampler_volume_envelope_enabled = channel
+                            .sampler_volume_envelope
+                            .map(|envelope| envelope.enabled());
                     }
                     channel.envelope_lfo_events_seen =
                         channel.envelope_lfo_events_seen.saturating_add(1);
@@ -16283,6 +16407,141 @@ impl FlpDocument {
         Ok(())
     }
 
+    /// Edits raw fields in a Sampler's existing Volume envelope (`0xDA`) record.
+    ///
+    /// The second ordered `0xDA` record is Volume. Only recognized PAHDSR,
+    /// amount, tension, and tempo-sync fields are changed; LFO fields and any
+    /// trailing bytes are preserved. This does not add a missing envelope
+    /// record or change Sampler playback timing.
+    pub fn edit_sampler_volume_envelope(
+        &mut self,
+        channel_id: u16,
+        edit: SamplerVolumeEnvelopeEdit,
+    ) -> Result<(), FlpError> {
+        let has_edit = edit.enabled.is_some()
+            || edit.tempo_sync.is_some()
+            || edit.predelay_raw.is_some()
+            || edit.attack_raw.is_some()
+            || edit.hold_raw.is_some()
+            || edit.decay_raw.is_some()
+            || edit.sustain_raw.is_some()
+            || edit.release_raw.is_some()
+            || edit.amount_raw.is_some()
+            || edit.attack_tension_raw.is_some()
+            || edit.decay_tension_raw.is_some()
+            || edit.release_tension_raw.is_some();
+        if !has_edit {
+            return Err(FlpError::UnsupportedEdit(
+                "at least one Sampler Volume envelope field must be supplied",
+            ));
+        }
+        if [
+            edit.predelay_raw,
+            edit.attack_raw,
+            edit.hold_raw,
+            edit.decay_raw,
+            edit.release_raw,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|value| !(100..=65_536).contains(&value))
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "Sampler envelope time fields must be in the 100..=65536 raw range",
+            ));
+        }
+        if edit
+            .sustain_raw
+            .is_some_and(|value| !(0..=128).contains(&value))
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "Sampler envelope sustain must be in the 0..=128 raw range",
+            ));
+        }
+        if [
+            edit.amount_raw,
+            edit.attack_tension_raw,
+            edit.decay_tension_raw,
+            edit.release_tension_raw,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|value| !(-128..=128).contains(&value))
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "Sampler envelope amount and tension fields must be in the -128..=128 raw range",
+            ));
+        }
+
+        self.require_unique_channel(channel_id)?;
+        let channel = self
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id() == channel_id)
+            .expect("the unique channel was checked above");
+        if channel.kind != Some(ChannelType::Sampler.raw()) {
+            return Err(FlpError::UnsupportedEdit(
+                "the Volume envelope applies only to Sampler channels",
+            ));
+        }
+        let envelope_events = channel
+            .event_range()
+            .filter(|index| self.events[*index].opcode == 0xDA)
+            .collect::<Vec<_>>();
+        let Some(event_index) = envelope_events.get(1).copied() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected Sampler has no second 0xDA Volume envelope record",
+            ));
+        };
+        let event = &self.events[event_index];
+        if !matches!(event.encoding, PayloadEncoding::Data { .. }) || event.payload.len() < 8 {
+            return Err(FlpError::UnsupportedEdit(
+                "the Volume envelope record is truncated or not length-prefixed",
+            ));
+        }
+
+        let mut candidate = self.clone();
+        let mut payload = candidate.events[event_index].payload.clone();
+        if let Some(enabled) = edit.enabled {
+            payload[4..8].copy_from_slice(&(if enabled { 1_i32 } else { 0_i32 }).to_le_bytes());
+        }
+        if let Some(tempo_sync) = edit.tempo_sync {
+            let mut flags = i32::from_le_bytes(payload[0..4].try_into().unwrap());
+            if tempo_sync {
+                flags |= 1;
+            } else {
+                flags &= !1;
+            }
+            payload[0..4].copy_from_slice(&flags.to_le_bytes());
+        }
+        for (offset, value) in [
+            (8_usize, edit.predelay_raw),
+            (12, edit.attack_raw),
+            (16, edit.hold_raw),
+            (20, edit.decay_raw),
+            (24, edit.sustain_raw),
+            (28, edit.release_raw),
+            (32, edit.amount_raw),
+            (56, edit.attack_tension_raw),
+            (60, edit.decay_tension_raw),
+            (64, edit.release_tension_raw),
+        ] {
+            if let Some(value) = value {
+                let end = offset.checked_add(4).ok_or(FlpError::LengthOverflow)?;
+                let Some(field) = payload.get_mut(offset..end) else {
+                    return Err(FlpError::UnsupportedEdit(
+                        "the Volume envelope record does not contain every selected field",
+                    ));
+                };
+                field.copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        candidate.events[event_index].replace_data_payload(payload)?;
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
     /// Sets the channel Fine Tune (`0x8E`) value in cents.
     ///
     /// FL Studio documents this control in the -100..=100 cent range. Existing dword events are
@@ -19572,9 +19831,9 @@ mod tests {
         PatternNoteRotation, PayloadEncoding, PlaylistClipEdit, PlaylistClipTarget,
         PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync,
         ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions, RiffMachineOptions,
-        RiffMachineQuantizeMode, ScaleLevelsOptions, TimeMarkerEdit, apply_mixer_pan,
-        apply_mixer_stereo_separation, midi::MidiChannelMapping, midi::MidiEventKind,
-        midi::MidiFile, midi::MidiImportOptions, note_pitch_in_scale,
+        RiffMachineQuantizeMode, SamplerVolumeEnvelopeEdit, ScaleLevelsOptions, TimeMarkerEdit,
+        apply_mixer_pan, apply_mixer_stereo_separation, midi::MidiChannelMapping,
+        midi::MidiEventKind, midi::MidiFile, midi::MidiImportOptions, note_pitch_in_scale,
         parse_vst_plugin_state_metadata, riff_machine_groove_note_timing,
     };
 
@@ -24612,6 +24871,156 @@ mod tests {
             audio_document.channels()[0].sampler_volume_envelope_enabled(),
             None
         );
+    }
+
+    #[test]
+    fn decodes_sampler_volume_envelope_raw_fields() {
+        let mut volume = vec![0_u8; 76];
+        volume[0..4].copy_from_slice(&0x2b_i32.to_le_bytes());
+        volume[4..8].copy_from_slice(&1_i32.to_le_bytes());
+        for (offset, value) in [
+            (8_usize, 101_i32),
+            (12, 202),
+            (16, 303),
+            (20, 404),
+            (24, 64),
+            (28, 505),
+            (32, -20),
+            (56, -64),
+            (60, 0),
+            (64, 120),
+        ] {
+            volume[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        volume[36..56].copy_from_slice(&[0x5a; 20]);
+        volume[72..76].copy_from_slice(&[0xA1, 0xB2, 0xC3, 0xD4]);
+
+        let mut event_stream = vec![0x40, 7, 0, 0x15, 0];
+        append_data_event(&mut event_stream, 0xDA, &[0; 72]);
+        append_data_event(&mut event_stream, 0xDA, &volume);
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+        let input = flp_fixture(&event_stream, &[], &[]);
+        let document = FlpDocument::parse(&input).expect("envelope fixture should parse");
+        let channel = document.channels().remove(0);
+        let envelope = channel
+            .sampler_volume_envelope()
+            .expect("Volume envelope should be decoded");
+
+        assert_eq!(envelope.flags_raw(), 0x2b);
+        assert!(envelope.enabled());
+        assert!(envelope.tempo_sync_enabled());
+        assert_eq!(envelope.predelay_raw(), Some(101));
+        assert_eq!(envelope.attack_raw(), Some(202));
+        assert_eq!(envelope.hold_raw(), Some(303));
+        assert_eq!(envelope.decay_raw(), Some(404));
+        assert_eq!(envelope.sustain_raw(), Some(64));
+        assert_eq!(envelope.release_raw(), Some(505));
+        assert_eq!(envelope.amount_raw(), Some(-20));
+        assert_eq!(envelope.attack_tension_raw(), Some(-64));
+        assert_eq!(envelope.decay_tension_raw(), Some(0));
+        assert_eq!(envelope.release_tension_raw(), Some(120));
+        assert_eq!(document.encode_lossless().unwrap(), input);
+    }
+
+    #[test]
+    fn sampler_volume_envelope_edit_preserves_lfo_and_trailing_bytes() {
+        let mut volume = vec![0_u8; 76];
+        volume[0..4].copy_from_slice(&0x2b_i32.to_le_bytes());
+        volume[4..8].copy_from_slice(&1_i32.to_le_bytes());
+        for (offset, value) in (36..56).step_by(4).zip(1_i32..=5) {
+            volume[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        volume[72..76].copy_from_slice(&[0xA1, 0xB2, 0xC3, 0xD4]);
+
+        let mut event_stream = vec![0x40, 7, 0, 0x15, 0];
+        append_data_event(&mut event_stream, 0xDA, &[0; 72]);
+        append_data_event(&mut event_stream, 0xDA, &volume);
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+        let input = flp_fixture(&event_stream, &[], &[]);
+        let mut document = FlpDocument::parse(&input).expect("envelope fixture should parse");
+        let volume_event_index = document
+            .events()
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| event.opcode() == 0xDA)
+            .nth(1)
+            .map(|(index, _)| index)
+            .expect("Volume envelope event should exist");
+        let before_payload = document.events()[volume_event_index].payload().to_vec();
+
+        document
+            .edit_sampler_volume_envelope(
+                7,
+                SamplerVolumeEnvelopeEdit {
+                    enabled: Some(false),
+                    tempo_sync: Some(false),
+                    attack_raw: Some(1_234),
+                    attack_tension_raw: Some(42),
+                    ..SamplerVolumeEnvelopeEdit::default()
+                },
+            )
+            .expect("recognized fields should be editable");
+
+        let mut expected_payload = before_payload;
+        expected_payload[0..4].copy_from_slice(&0x2a_i32.to_le_bytes());
+        expected_payload[4..8].copy_from_slice(&0_i32.to_le_bytes());
+        expected_payload[12..16].copy_from_slice(&1_234_i32.to_le_bytes());
+        expected_payload[56..60].copy_from_slice(&42_i32.to_le_bytes());
+        assert_eq!(
+            document.events()[volume_event_index].payload(),
+            expected_payload
+        );
+
+        let encoded = document
+            .encode_lossless()
+            .expect("updated project should encode");
+        let reparsed = FlpDocument::parse(&encoded).expect("updated project should parse");
+        let envelope = reparsed.channels()[0]
+            .sampler_volume_envelope()
+            .expect("edited envelope should be decoded");
+        assert!(!envelope.enabled());
+        assert!(!envelope.tempo_sync_enabled());
+        assert_eq!(envelope.attack_raw(), Some(1_234));
+        assert_eq!(envelope.attack_tension_raw(), Some(42));
+        assert_eq!(
+            reparsed.events()[volume_event_index].payload(),
+            expected_payload
+        );
+    }
+
+    #[test]
+    fn sampler_volume_envelope_invalid_edit_is_atomic() {
+        let mut event_stream = vec![0x40, 7, 0, 0x15, 0];
+        append_data_event(&mut event_stream, 0xDA, &[0; 72]);
+        append_data_event(&mut event_stream, 0xDA, &[0; 64]);
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+        let input = flp_fixture(&event_stream, &[], &[]);
+        let mut document = FlpDocument::parse(&input).expect("envelope fixture should parse");
+        let before = document.encode_lossless().expect("document should encode");
+
+        assert!(matches!(
+            document.edit_sampler_volume_envelope(
+                7,
+                SamplerVolumeEnvelopeEdit {
+                    attack_raw: Some(99),
+                    ..SamplerVolumeEnvelopeEdit::default()
+                }
+            ),
+            Err(FlpError::UnsupportedEdit(_))
+        ));
+        assert_eq!(document.encode_lossless().unwrap(), before);
+
+        assert!(matches!(
+            document.edit_sampler_volume_envelope(
+                7,
+                SamplerVolumeEnvelopeEdit {
+                    release_tension_raw: Some(10),
+                    ..SamplerVolumeEnvelopeEdit::default()
+                }
+            ),
+            Err(FlpError::UnsupportedEdit(_))
+        ));
+        assert_eq!(document.encode_lossless().unwrap(), before);
     }
 
     #[test]

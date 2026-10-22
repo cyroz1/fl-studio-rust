@@ -21,7 +21,8 @@ use flp_rebuild::{
     PatternNoteRotation, PlaylistClipEdit, PlaylistTrackEdit, PlaylistTrackMotion,
     PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit, QuantizeNoteMode,
     QuantizeNoteOptions, RandomNoteChordMap, RandomNoteGeneratorOptions, RandomizerOptions,
-    RiffMachineOptions, RiffMachineQuantizeMode, ScaleLevelsOptions, StrumOptions, TimeMarkerEdit,
+    RiffMachineOptions, RiffMachineQuantizeMode, SamplerVolumeEnvelopeEdit, ScaleLevelsOptions,
+    StrumOptions, TimeMarkerEdit,
 };
 
 struct MidiControlChangeImport<'a> {
@@ -775,6 +776,38 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u16(channel_id, "Sampler channel id")?,
                 parse_u16(fade_out, "Sampler Fade Out raw value")?,
                 parse_u16(fade_in, "Sampler Fade In raw value")?,
+            )
+        }
+        [command, input, output, channel_id, enabled, tempo_sync, predelay, attack, hold, decay, sustain, release, amount, attack_tension, decay_tension, release_tension]
+            if command == "edit-sampler-volume-envelope" =>
+        {
+            edit_sampler_volume_envelope(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(channel_id, "Sampler channel id")?,
+                SamplerVolumeEnvelopeEdit {
+                    enabled: parse_optional_bool(enabled, "Volume envelope enabled")?,
+                    tempo_sync: parse_optional_bool(tempo_sync, "Volume envelope tempo sync")?,
+                    predelay_raw: parse_optional_i32(predelay, "envelope predelay raw")?,
+                    attack_raw: parse_optional_i32(attack, "envelope attack raw")?,
+                    hold_raw: parse_optional_i32(hold, "envelope hold raw")?,
+                    decay_raw: parse_optional_i32(decay, "envelope decay raw")?,
+                    sustain_raw: parse_optional_i32(sustain, "envelope sustain raw")?,
+                    release_raw: parse_optional_i32(release, "envelope release raw")?,
+                    amount_raw: parse_optional_i32(amount, "envelope amount raw")?,
+                    attack_tension_raw: parse_optional_i32(
+                        attack_tension,
+                        "envelope attack tension raw",
+                    )?,
+                    decay_tension_raw: parse_optional_i32(
+                        decay_tension,
+                        "envelope decay tension raw",
+                    )?,
+                    release_tension_raw: parse_optional_i32(
+                        release_tension,
+                        "envelope release tension raw",
+                    )?,
+                },
             )
         }
         [command, input, output, channel_id, cents] if command == "set-channel-fine-tune" => {
@@ -3357,6 +3390,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild set-channel-color-gradient <input.flp> <output.flp> <channel-ids:comma-separated-in-order> <start-RRGGBB> <end-RRGGBB>\n",
             "  flp-rebuild set-channel-levels <input.flp> <output.flp> <channel-id> <volume-0..12800> <pan-0..12800>\n",
             "  flp-rebuild set-sampler-quick-fades <input.flp> <output.flp> <sampler-channel-id> <fade-out-0..1024> <fade-in-0..1024>\n",
+            "  flp-rebuild edit-sampler-volume-envelope <input.flp> <output.flp> <sampler-channel-id> <enabled:0|1|-> <tempo-sync:0|1|-> <predelay-raw|-> <attack-raw|-> <hold-raw|-> <decay-raw|-> <sustain-raw|-> <release-raw|-> <amount-raw|-> <attack-tension-raw|-> <decay-tension-raw|-> <release-tension-raw|->\n",
             "  flp-rebuild set-channel-fine-tune <input.flp> <output.flp> <channel-id> <-100..100-cents>\n",
             "  flp-rebuild set-channel-enabled <input.flp> <output.flp> <channel-id> <0|1>\n",
             "  flp-rebuild set-channel-sample-path <input.flp> <output.flp> <channel-id> <sample-path>\n",
@@ -5300,7 +5334,7 @@ fn list_channels(path: &Path) -> Result<(), String> {
     println!("channels: {}", channels.len());
     for channel in channels {
         println!(
-            "id={} kind={} type={:?} enabled={} zipped={} main_pitch={} add_to_key={} fine_tune_raw={:?} stretch_settings={:?} sampler_fade_out_raw={:?} sampler_fade_in_raw={:?} color={:?} volume={:?} pan={:?} level_adjusts_raw={:?} swing_mix_raw={:?} layer_children={:?} layer_flags={:?} plugin={} name={} sample_path={:?} events={:?}",
+            "id={} kind={} type={:?} enabled={} zipped={} main_pitch={} add_to_key={} fine_tune_raw={:?} stretch_settings={:?} sampler_fade_out_raw={:?} sampler_fade_in_raw={:?} sampler_volume_envelope={:?} color={:?} volume={:?} pan={:?} level_adjusts_raw={:?} swing_mix_raw={:?} layer_children={:?} layer_flags={:?} plugin={} name={} sample_path={:?} events={:?}",
             channel.id(),
             channel
                 .kind()
@@ -5316,6 +5350,7 @@ fn list_channels(path: &Path) -> Result<(), String> {
             channel.stretch_settings(),
             channel.sampler_fade_out_raw(),
             channel.sampler_fade_in_raw(),
+            channel.sampler_volume_envelope(),
             channel.color(),
             channel.volume(),
             channel.pan(),
@@ -6684,6 +6719,28 @@ fn set_sampler_quick_fades(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "set Sampler channel {channel_id} precomputed Fade Out to {fade_out_raw} and Fade In to {fade_in_raw} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn edit_sampler_volume_envelope(
+    input: &Path,
+    output: &Path,
+    channel_id: u16,
+    edit: SamplerVolumeEnvelopeEdit,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .edit_sampler_volume_envelope(channel_id, edit)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "edited Sampler channel {channel_id} Volume envelope in {}",
         output.display()
     );
     Ok(())
