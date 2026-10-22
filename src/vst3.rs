@@ -62,6 +62,7 @@ struct ScheduledMidiEvent {
     note_id: i32,
     note_pan: u8,
     note_mod_x: u8,
+    note_mod_y: u8,
     note_release: u8,
     performance_track_id: Option<u32>,
 }
@@ -71,9 +72,18 @@ struct ScheduledVst3Note {
     note_id: i32,
     note_pan: u8,
     note_mod_x: u8,
+    note_mod_y: u8,
     note_release: u8,
     supports_pan: bool,
     supports_brightness: bool,
+    mod_y_expression: Option<Vst3ModYExpression>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Vst3ModYExpression {
+    kind: NoteExpressionType,
+    min: f64,
+    max: f64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -106,6 +116,7 @@ struct PreparedPatternRender {
     pitch_offset_cents: i16,
     supports_note_pan: bool,
     supports_note_brightness: bool,
+    mod_y_expression: Option<Vst3ModYExpression>,
     note_count: usize,
     sample_rate: f64,
     sample_rate_u32: u32,
@@ -276,6 +287,7 @@ pub(crate) struct PlaylistMidiNote {
     pub(crate) fine_pitch_offset_cents: i16,
     pub(crate) pan: u8,
     pub(crate) mod_x: u8,
+    pub(crate) mod_y: u8,
     pub(crate) release: u8,
 }
 
@@ -469,6 +481,7 @@ impl Vst3PlaylistStreamProcessor {
                 note_id,
                 note_pan: 64,
                 note_mod_x: 128,
+                note_mod_y: 128,
                 note_release: 64,
                 performance_track_id: Some(LIVE_VST3_INPUT_TRACK_ID),
             },
@@ -506,6 +519,7 @@ impl Vst3PlaylistStreamProcessor {
                 note_id,
                 note_pan: 64,
                 note_mod_x: 128,
+                note_mod_y: 128,
                 note_release: 64,
                 performance_track_id: Some(LIVE_VST3_INPUT_TRACK_ID),
             },
@@ -550,6 +564,7 @@ impl Vst3PlaylistStreamProcessor {
                 note_id: -1,
                 note_pan: 64,
                 note_mod_x: 128,
+                note_mod_y: 128,
                 note_release: 64,
                 performance_track_id: Some(LIVE_VST3_INPUT_TRACK_ID),
             },
@@ -1024,9 +1039,11 @@ impl PlaylistPluginStream {
                                 note_id: event.note_id,
                                 note_pan: event.note_pan,
                                 note_mod_x: event.note_mod_x,
+                                note_mod_y: event.note_mod_y,
                                 note_release: event.note_release,
                                 supports_pan: self.render.supports_note_pan,
                                 supports_brightness: self.render.supports_note_brightness,
+                                mod_y_expression: self.render.mod_y_expression,
                             },
                         )?;
                         if event.performance_track_id.is_some() {
@@ -1130,9 +1147,11 @@ impl PlaylistPluginStream {
                             note_id: 0,
                             note_pan: 64,
                             note_mod_x: 128,
+                            note_mod_y: 128,
                             note_release: release,
                             supports_pan: false,
                             supports_brightness: false,
+                            mod_y_expression: None,
                         },
                     )?;
                 }
@@ -1256,9 +1275,11 @@ impl PlaylistPluginStream {
                             note_id: 0,
                             note_pan: 64,
                             note_mod_x: 128,
+                            note_mod_y: 128,
                             note_release: 0,
                             supports_pan: false,
                             supports_brightness: false,
+                            mod_y_expression: None,
                         },
                     )?;
                 }
@@ -2469,6 +2490,7 @@ impl Vst3HostRuntime {
                     .entry(target_channel_id)
                     .or_default()
                     .push(PlaylistMidiNote {
+                        mod_y: note.mod_y,
                         start_tick,
                         stop_tick,
                         key: note.key,
@@ -2745,6 +2767,7 @@ impl Vst3HostRuntime {
                 .entry(placed.target_channel_id)
                 .or_default()
                 .push(PlaylistMidiNote {
+                    mod_y: note.mod_y,
                     start_tick: placed.start_tick,
                     stop_tick,
                     key: note.key,
@@ -3011,7 +3034,8 @@ fn prepare_playlist_pattern_render(
     let (mut events, note_count) =
         scheduled_playlist_midi_events_with_tempo_map(notes, tempo_map, sample_rate)?;
     transpose_scheduled_note_events(&mut events, note_pitch_offset_semitones);
-    let (supports_note_pan, supports_note_brightness) = plugin_note_expression_support(plugin);
+    let (supports_note_pan, supports_note_brightness, mod_y_expression) =
+        plugin_note_expression_support(plugin);
     let last_event_frame = events.iter().map(|event| event.frame).max().unwrap_or(0);
     Ok(PreparedPatternRender {
         events,
@@ -3019,6 +3043,7 @@ fn prepare_playlist_pattern_render(
         pitch_offset_cents,
         supports_note_pan,
         supports_note_brightness,
+        mod_y_expression,
         note_count,
         sample_rate,
         sample_rate_u32,
@@ -3103,6 +3128,7 @@ fn scheduled_playlist_midi_events_with_tempo_map(
             note_id,
             note_pan: note.pan,
             note_mod_x: note.mod_x,
+            note_mod_y: note.mod_y,
             note_release: note.release,
             performance_track_id: None,
         });
@@ -3118,6 +3144,7 @@ fn scheduled_playlist_midi_events_with_tempo_map(
             note_id,
             note_pan: note.pan,
             note_mod_x: note.mod_x,
+            note_mod_y: note.mod_y,
             note_release: note.release,
             performance_track_id: None,
         });
@@ -3185,7 +3212,8 @@ fn prepare_pattern_render_with_automation(
         channel_swing_mix_raw,
     )?;
     transpose_scheduled_note_events(&mut events, note_pitch_offset_semitones);
-    let (supports_note_pan, supports_note_brightness) = plugin_note_expression_support(plugin);
+    let (supports_note_pan, supports_note_brightness, mod_y_expression) =
+        plugin_note_expression_support(plugin);
     if note_count == 0 {
         return Err(format!(
             "pattern channel {channel_id} has no notes to render"
@@ -3211,6 +3239,7 @@ fn prepare_pattern_render_with_automation(
         pitch_offset_cents,
         supports_note_pan,
         supports_note_brightness,
+        mod_y_expression,
         note_count,
         sample_rate,
         sample_rate_u32,
@@ -3220,13 +3249,14 @@ fn prepare_pattern_render_with_automation(
     })
 }
 
-fn plugin_note_expression_support(plugin: &Plugin) -> (bool, bool) {
+fn plugin_note_expression_support(plugin: &Plugin) -> (bool, bool, Option<Vst3ModYExpression>) {
     let Ok(expressions) = plugin.note_expressions() else {
-        return (false, false);
+        return (false, false, None);
     };
     (
         note_expressions_support_pan(&expressions),
         note_expressions_support_brightness(&expressions),
+        note_expressions_support_mod_y(&expressions),
     )
 }
 
@@ -3240,6 +3270,48 @@ fn note_expressions_support_brightness(expressions: &[NoteExpressionInfo]) -> bo
     expressions
         .iter()
         .any(|expression| expression.kind == NoteExpressionType::Brightness)
+}
+
+fn note_expressions_support_mod_y(
+    expressions: &[NoteExpressionInfo],
+) -> Option<Vst3ModYExpression> {
+    expressions
+        .iter()
+        .filter_map(|expression| {
+            if !matches!(expression.kind, NoteExpressionType::Custom(_))
+                || !expression.min.is_finite()
+                || !expression.max.is_finite()
+                || !(0.0..=1.0).contains(&expression.min)
+                || !(0.0..=1.0).contains(&expression.max)
+                || expression.min > expression.max
+            {
+                return None;
+            }
+            let title = format!(
+                "{} {}",
+                expression.title.to_ascii_lowercase(),
+                expression.short_title.to_ascii_lowercase()
+            );
+            let priority = if title.contains("mod y") || title.contains("mody") {
+                0
+            } else if title.contains("resonance") {
+                1
+            } else if title.contains("timbre") {
+                2
+            } else {
+                return None;
+            };
+            Some((
+                priority,
+                Vst3ModYExpression {
+                    kind: expression.kind,
+                    min: expression.min,
+                    max: expression.max,
+                },
+            ))
+        })
+        .min_by_key(|(priority, _)| *priority)
+        .map(|(_, expression)| expression)
 }
 
 fn transpose_scheduled_note_events(events: &mut [ScheduledMidiEvent], semitones: i16) {
@@ -3267,6 +3339,11 @@ fn vst3_note_pan_value(note_pan: u8) -> f64 {
 
 fn vst3_note_brightness_value(note_mod_x: u8) -> f64 {
     f64::from(note_mod_x) / 255.0
+}
+
+fn vst3_note_mod_y_value(note_mod_y: u8, expression: Vst3ModYExpression) -> f64 {
+    let progress = f64::from(note_mod_y) / 255.0;
+    expression.min + (expression.max - expression.min) * progress
 }
 
 fn vst3_note_release_value(note_release: u8) -> f32 {
@@ -3634,9 +3711,11 @@ fn process_pattern_render(
                         note_id: event.note_id,
                         note_pan: event.note_pan,
                         note_mod_x: event.note_mod_x,
+                        note_mod_y: event.note_mod_y,
                         note_release: event.note_release,
                         supports_pan: render.supports_note_pan,
                         supports_brightness: render.supports_note_brightness,
+                        mod_y_expression: render.mod_y_expression,
                     },
                 )?;
                 event_index += 1;
@@ -3776,9 +3855,11 @@ fn stream_live_midi_input(
                                     note_id: 0,
                                     note_pan: 64,
                                     note_mod_x: 128,
+                                    note_mod_y: 128,
                                     note_release: release,
                                     supports_pan: false,
                                     supports_brightness: false,
+                                    mod_y_expression: None,
                                 },
                             )?;
                         }
@@ -3895,9 +3976,11 @@ fn stream_live_midi_input(
                         note_id: 0,
                         note_pan: 64,
                         note_mod_x: 128,
+                        note_mod_y: 128,
                         note_release: 0,
                         supports_pan: false,
                         supports_brightness: false,
+                        mod_y_expression: None,
                     },
                 )?;
             }
@@ -3969,9 +4052,11 @@ fn stream_pattern_render(
                             note_id: event.note_id,
                             note_pan: event.note_pan,
                             note_mod_x: event.note_mod_x,
+                            note_mod_y: event.note_mod_y,
                             note_release: event.note_release,
                             supports_pan: render.supports_note_pan,
                             supports_brightness: render.supports_note_brightness,
+                            mod_y_expression: render.mod_y_expression,
                         },
                     )?;
                     event_index += 1;
@@ -4212,7 +4297,7 @@ fn send_scheduled_midi_event(
             .send_midi_event_at(event, sample_offset)
             .map_err(|error| error.to_string());
     }
-    if note.supports_pan || note.supports_brightness {
+    if note.supports_pan || note.supports_brightness || note.mod_y_expression.is_some() {
         let mut plugin_event = plugin_event_with_pitch_offset_and_note_id(
             event,
             sample_offset,
@@ -4244,6 +4329,16 @@ fn send_scheduled_midi_event(
                         note_id,
                         NoteExpressionType::Brightness,
                         vst3_note_brightness_value(note.note_mod_x),
+                        sample_offset,
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+            if let Some(expression) = note.mod_y_expression {
+                plugin
+                    .send_note_expression_at(
+                        note_id,
+                        expression.kind,
+                        vst3_note_mod_y_value(note.note_mod_y, expression),
                         sample_offset,
                     )
                     .map_err(|error| error.to_string())?;
@@ -4454,6 +4549,7 @@ fn scheduled_pattern_events(
             note_id,
             note_pan: note.pan,
             note_mod_x: note.mod_x,
+            note_mod_y: note.mod_y,
             note_release: note.release,
             performance_track_id: None,
         });
@@ -4469,6 +4565,7 @@ fn scheduled_pattern_events(
             note_id,
             note_pan: note.pan,
             note_mod_x: note.mod_x,
+            note_mod_y: note.mod_y,
             note_release: note.release,
             performance_track_id: None,
         });
@@ -4782,6 +4879,7 @@ mod tests {
                 note_id: 7,
                 note_pan: 64,
                 note_mod_x: 128,
+                note_mod_y: 128,
                 note_release: 64,
                 performance_track_id: None,
             },
@@ -4797,6 +4895,7 @@ mod tests {
                 note_id: 7,
                 note_pan: 64,
                 note_mod_x: 128,
+                note_mod_y: 128,
                 note_release: 64,
                 performance_track_id: None,
             },
@@ -5318,6 +5417,24 @@ mod tests {
     }
 
     #[test]
+    fn pattern_scheduler_carries_note_mod_y_to_note_off() {
+        let note = PatternNote {
+            position: 0,
+            length: 120,
+            channel_id: 7,
+            key: 64,
+            velocity: 100,
+            mod_y: 231,
+            ..PatternNote::default()
+        };
+        let (events, _) =
+            scheduled_pattern_events(&[note], 7, 480, 120.0, 48_000.0, 0, 128).unwrap();
+
+        assert_eq!(events[0].note_mod_y, 231);
+        assert_eq!(events[1].note_mod_y, 231);
+    }
+
+    #[test]
     fn pattern_scheduler_carries_note_release_to_note_off() {
         let note = PatternNote {
             position: 0,
@@ -5374,6 +5491,53 @@ mod tests {
         assert!(note_expressions_support_pan(&[expression(
             NoteExpressionType::Pan
         )]));
+    }
+
+    #[test]
+    fn vst3_mod_y_uses_a_named_custom_timbre_or_resonance_dimension() {
+        let expression = |id, title: &str, short_title: &str, min, max| NoteExpressionInfo {
+            kind: NoteExpressionType::Custom(id),
+            title: title.to_owned(),
+            short_title: short_title.to_owned(),
+            units: String::new(),
+            default_value: (min + max) * 0.5,
+            min,
+            max,
+            step_count: 0,
+            is_bipolar: false,
+            is_one_shot: false,
+            is_absolute: true,
+        };
+        let unrelated = expression(100_010, "Position", "Pos", 0.0, 1.0);
+        let timbre = expression(100_011, "Timbre", "Tone", 0.0, 1.0);
+        let resonance = expression(100_012, "Resonance", "Res", 0.2, 0.8);
+        let standard_brightness = NoteExpressionInfo {
+            kind: NoteExpressionType::Brightness,
+            title: "Brightness".to_owned(),
+            short_title: "Bright".to_owned(),
+            units: String::new(),
+            default_value: 0.5,
+            min: 0.0,
+            max: 1.0,
+            step_count: 0,
+            is_bipolar: false,
+            is_one_shot: false,
+            is_absolute: true,
+        };
+
+        assert_eq!(note_expressions_support_mod_y(&[unrelated]), None);
+        assert_eq!(note_expressions_support_mod_y(&[standard_brightness]), None);
+        let mapped = note_expressions_support_mod_y(&[timbre, resonance]).unwrap();
+        assert_eq!(
+            mapped,
+            Vst3ModYExpression {
+                kind: NoteExpressionType::Custom(100_012),
+                min: 0.2,
+                max: 0.8,
+            }
+        );
+        assert!((vst3_note_mod_y_value(0, mapped) - 0.2).abs() < 1e-12);
+        assert!((vst3_note_mod_y_value(255, mapped) - 0.8).abs() < 1e-12);
     }
 
     #[test]
@@ -5539,6 +5703,7 @@ mod tests {
     fn playlist_notes_keep_absolute_arrangement_ticks_and_order_tied_note_offs_first() {
         let notes = [
             PlaylistMidiNote {
+                mod_y: 31,
                 start_tick: 480,
                 stop_tick: 720,
                 key: 64,
@@ -5550,6 +5715,7 @@ mod tests {
                 release: 89,
             },
             PlaylistMidiNote {
+                mod_y: 219,
                 start_tick: 720,
                 stop_tick: 960,
                 key: 64,
@@ -5582,6 +5748,13 @@ mod tests {
             events[2].event,
             MidiEvent::NoteOn { note: 64, .. }
         ));
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.note_mod_y)
+                .collect::<Vec<_>>(),
+            [31, 31, 219, 219]
+        );
         assert_eq!(events[3].frame, 48_000);
         assert!(matches!(
             events[3].event,
@@ -5606,6 +5779,7 @@ mod tests {
             fine_pitch_offset_cents: 0,
             pan: 64,
             mod_x: 128,
+            mod_y: 128,
             release: 64,
         };
         let (mut events, note_count) =
@@ -5628,6 +5802,7 @@ mod tests {
     fn playlist_vst3_notes_follow_the_shared_tempo_map() {
         let tempo_map = PlaylistTempoMap::from_tempo_events(480, 120.0, &[(480, 60.0)]).unwrap();
         let note = PlaylistMidiNote {
+            mod_y: 128,
             start_tick: 480,
             stop_tick: 720,
             key: 64,
@@ -5658,6 +5833,7 @@ mod tests {
             fine_pitch_offset_cents: 0,
             pan: 64,
             mod_x: 128,
+            mod_y: 128,
             release: 64,
         };
         assert!(

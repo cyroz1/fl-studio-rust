@@ -7054,6 +7054,7 @@ struct PerformanceVst3Note {
     fine_pitch_offset_cents: i16,
     pan: u8,
     mod_x: u8,
+    mod_y: u8,
     release: u8,
 }
 
@@ -7328,6 +7329,7 @@ impl PlaylistPerformanceRuntime {
                     .entry(placed.clip_index)
                     .or_default()
                     .push(PerformanceVst3Note {
+                        mod_y: placed.note.mod_y,
                         relative_start_tick,
                         relative_stop_tick,
                         channel_id: placed.target_channel_id,
@@ -8019,6 +8021,7 @@ impl PlaylistPerformanceRuntime {
                         .entry((track_id, template.channel_id))
                         .or_default()
                         .push(PlaylistMidiNote {
+                            mod_y: template.mod_y,
                             start_tick,
                             stop_tick: stop_tick.max(start_tick.saturating_add(1)),
                             key: template.key,
