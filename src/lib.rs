@@ -1084,12 +1084,13 @@ impl ChannelSummary {
     }
 }
 
-/// Resolves note channels to the enabled channels that should receive their MIDI.
+/// Resolves a note at a channel to the enabled Sampler or instrument channels
+/// reached through any Layer children.
 ///
 /// Layer Random uses a stable per-note pseudo-random choice in this runtime so
-/// Sampler and VST3 render paths agree on the selected child. FL Studio's native
-/// random sequence is not known, so rendered choices may differ from FL Studio.
-pub(crate) struct ChannelNoteRouter {
+/// Sampler and VST3 paths can share a routing seed. FL Studio's native random
+/// sequence is not known, so rendered choices may differ from FL Studio.
+pub struct ChannelNoteRouter {
     channels_by_id: HashMap<u16, ChannelSummary>,
 }
 
@@ -1102,7 +1103,8 @@ struct ChannelRouteState {
 }
 
 impl ChannelNoteRouter {
-    pub(crate) fn new(channels: impl IntoIterator<Item = ChannelSummary>) -> Self {
+    /// Builds a router from a project's channel summaries.
+    pub fn new(channels: impl IntoIterator<Item = ChannelSummary>) -> Self {
         Self {
             channels_by_id: channels
                 .into_iter()
@@ -1113,12 +1115,7 @@ impl ChannelNoteRouter {
 
     /// Returns targets for a note after applying the source and child key regions.
     /// Layer Random chooses from the children that accept this note.
-    pub(crate) fn targets_for_note(
-        &self,
-        source_channel_id: u16,
-        note_seed: u64,
-        key: u16,
-    ) -> Vec<u16> {
+    pub fn targets_for_note(&self, source_channel_id: u16, note_seed: u64, key: u16) -> Vec<u16> {
         self.targets_for_note_with_gain(source_channel_id, note_seed, key)
             .into_iter()
             .map(|(channel_id, _)| channel_id)
@@ -1129,7 +1126,7 @@ impl ChannelNoteRouter {
     /// Non-crossfaded routes have gain 1.0. Crossfade is applied only when all
     /// active child subtrees lead exclusively to built-in Sampler channels;
     /// VST3 routes retain gain 1.
-    pub(crate) fn targets_for_note_with_gain(
+    pub fn targets_for_note_with_gain(
         &self,
         source_channel_id: u16,
         note_seed: u64,

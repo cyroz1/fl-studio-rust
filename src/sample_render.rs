@@ -577,6 +577,7 @@ pub enum SamplerLiveNoteEvent {
         channel: u8,
         key: u8,
         velocity: u8,
+        route_seed: u64,
     },
     NoteOff {
         channel: u8,
@@ -5232,7 +5233,6 @@ pub fn stream_sampler_midi_input_to_device(
     let mut block = vec![0.0f32; LIVE_BLOCK_FRAMES * 2];
     let mut block_start = 0u64;
     let mut note_targets = HashMap::<(u8, u8), VecDeque<Vec<(u16, u16)>>>::new();
-    let mut note_seed = 0u64;
     loop {
         check_cancelled(Some(cancelled))?;
         if writer.is_cancelled() {
@@ -5244,19 +5244,19 @@ pub fn stream_sampler_midi_input_to_device(
                     channel: midi_channel,
                     key,
                     velocity,
+                    route_seed,
                 }) => {
                     let source_key = key.min(127);
                     let routed_targets = channel_router
                         .targets_for_note_with_gain(
                             source_channel_id,
-                            note_seed,
+                            route_seed,
                             u16::from(source_key),
                         )
                         .into_iter()
                         .filter(|(target_channel_id, _)| {
                             target_channel_ids.contains(target_channel_id)
                         });
-                    note_seed = note_seed.wrapping_add(1);
                     let mut active_targets = Vec::new();
                     for (target_channel_id, layer_gain) in routed_targets {
                         let pitch_offset = pitch_offsets_by_channel

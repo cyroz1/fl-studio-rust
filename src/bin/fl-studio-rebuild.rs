@@ -59,15 +59,16 @@ use flp_rebuild::vst3::{
 use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, ArpeggioRangePattern, ArpeggioSyncMode, Arrangement,
     ArticulateOptions, AutomationChannel, AutomationPoint, AutomationPointEdit,
-    ChannelGroupSummary, ChannelSortOrder, ChannelStretchMode, ChannelStretchSettingsEdit,
-    ChannelSummary, ChannelType, ClawMachineOptions, FlamOptions, FlpDocument, FlpError, FstPreset,
-    FstPresetKind, HumanizerOptions, LimitNoteOptions, LimitSnapDirection, MixerInsertEdit,
-    MixerInsertSummary, MixerParameterKind, MixerParameterRecord, MixerSendSummary,
-    PATTERN_NOTE_DEFAULT_FLAGS, PATTERN_NOTE_DEFAULT_RELEASE, PATTERN_NOTE_SLIDE_FLAG, Pattern,
-    PatternController, PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation,
-    PayloadEncoding, PlaylistClip, PlaylistClipEdit, PlaylistClipSelectionClipboard,
-    PlaylistClipTarget, PlaylistTrack, PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress,
-    PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit, QuantizeNoteMode, QuantizeNoteOptions,
+    ChannelGroupSummary, ChannelNoteRouter, ChannelSortOrder, ChannelStretchMode,
+    ChannelStretchSettingsEdit, ChannelSummary, ChannelType, ClawMachineOptions, FlamOptions,
+    FlpDocument, FlpError, FstPreset, FstPresetKind, HumanizerOptions, LimitNoteOptions,
+    LimitSnapDirection, MixerInsertEdit, MixerInsertSummary, MixerParameterKind,
+    MixerParameterRecord, MixerSendSummary, PATTERN_NOTE_DEFAULT_FLAGS,
+    PATTERN_NOTE_DEFAULT_RELEASE, PATTERN_NOTE_SLIDE_FLAG, Pattern, PatternController,
+    PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation, PayloadEncoding,
+    PlaylistClip, PlaylistClipEdit, PlaylistClipSelectionClipboard, PlaylistClipTarget,
+    PlaylistTrack, PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync,
+    ProjectInfoEdit, ProjectSettingsEdit, QuantizeNoteMode, QuantizeNoteOptions,
     RandomNoteChordMap, RandomNoteGeneratorOptions, RandomizerOptions, RiffMachineOptions,
     RiffMachineQuantizeMode, ScaleLevelsOptions, StrumOptions, TimeMarker, TimeMarkerEdit,
     VstPluginStateMetadata,
@@ -4269,7 +4270,10 @@ struct DawUi {
     midi_thru_input_queue: MidiThruInputQueue,
     midi_live_sampler_note_mapping: BTreeMap<(u8, u8), VecDeque<u8>>,
     midi_live_vst3_note_mapping: BTreeMap<(u8, u8), VecDeque<Option<u8>>>,
+    midi_live_vst3_route_mapping: BTreeMap<(u8, u8), VecDeque<BTreeSet<u16>>>,
     midi_live_layer_note_mapping: BTreeMap<(u8, u8), VecDeque<u8>>,
+    live_input_note_route_seed: u64,
+    current_live_input_note_route_seed: Option<u64>,
     midi_live_sampler_sustain_channels: BTreeSet<u8>,
     midi_output_gain_mapping: Option<MidiControlChangeMapping>,
     midi_mixer_control_mappings: Vec<MidiMixerControlMapping>,
@@ -4556,6 +4560,7 @@ struct LivePlaylistVst3InputSession {
     performance_mode: bool,
     target_channel_ids: BTreeSet<u16>,
     sessions: BTreeMap<u16, Vst3PlaylistLiveInputSession>,
+    router: ChannelNoteRouter,
 }
 
 fn is_performance_clip_trigger_channel_event(
@@ -5486,7 +5491,10 @@ impl DawUi {
             midi_thru_input_queue,
             midi_live_sampler_note_mapping: BTreeMap::new(),
             midi_live_vst3_note_mapping: BTreeMap::new(),
+            midi_live_vst3_route_mapping: BTreeMap::new(),
             midi_live_layer_note_mapping: BTreeMap::new(),
+            live_input_note_route_seed: 0,
+            current_live_input_note_route_seed: None,
             midi_live_sampler_sustain_channels: BTreeSet::new(),
             midi_output_gain_mapping,
             midi_mixer_control_mappings,
@@ -41868,8 +41876,7 @@ impl DawUi {
             &channels_by_id,
             &mut BTreeSet::new(),
         )?;
-        (targets.vst3_channel_ids.is_empty() && !targets.sampler_channel_ids.is_empty())
-            .then_some(targets.sampler_channel_ids)
+        (!targets.sampler_channel_ids.is_empty()).then_some(targets.sampler_channel_ids)
     }
 
     fn live_vst3_target_channels(&self, source_channel_id: u16) -> Option<BTreeSet<u16>> {
@@ -41893,8 +41900,7 @@ impl DawUi {
             &channels_by_id,
             &mut BTreeSet::new(),
         )?;
-        (targets.sampler_channel_ids.is_empty() && !targets.vst3_channel_ids.is_empty())
-            .then_some(targets.vst3_channel_ids)
+        (!targets.vst3_channel_ids.is_empty()).then_some(targets.vst3_channel_ids)
     }
 
     fn live_layer_input_targets(&self, source_channel_id: u16) -> Option<LiveLayerInputTargets> {
@@ -41914,6 +41920,23 @@ impl DawUi {
         )?;
         (!targets.sampler_channel_ids.is_empty() && !targets.vst3_channel_ids.is_empty())
             .then_some(targets)
+    }
+
+    fn live_playlist_vst3_note_targets(
+        &self,
+        source_channel_id: u16,
+        route_seed: u64,
+        key: u8,
+    ) -> Option<BTreeSet<u16>> {
+        let session = self.live_playlist_vst3_input.as_ref()?;
+        Some(
+            session
+                .router
+                .targets_for_note(source_channel_id, route_seed, u16::from(key.min(127)))
+                .into_iter()
+                .filter(|target_id| session.target_channel_ids.contains(target_id))
+                .collect(),
+        )
     }
 
     fn collect_live_layer_destinations(
@@ -42006,65 +42029,69 @@ impl DawUi {
         let Some(target_channel_ids) = self.live_vst3_target_channels(channel_id) else {
             return false;
         };
-        if target_channel_ids != BTreeSet::from([channel_id]) {
-            self.status =
-                "Playlist live audition currently requires a directly selected loaded VST3 channel"
-                    .to_owned();
-            return false;
-        }
         let Some(senders) = (if pattern_mode {
             self.pending_sampler_stream
                 .as_ref()
-                .map(|pending| &pending.live_midi_senders)
+                .map(|pending| pending.live_midi_senders.clone())
         } else {
             self.pending_audio_render
                 .as_ref()
-                .map(|pending| &pending.live_midi_senders)
+                .map(|pending| pending.live_midi_senders.clone())
         }) else {
             return false;
         };
-        let Some(sender) = senders.get(&channel_id) else {
-            self.status =
-                "The selected VST3 channel is not part of the active playback stream".to_owned();
+        let Some(document) = self.document.as_ref() else {
             return false;
         };
-        let session = sender.begin_session();
-        for (channel_index, state) in self.midi_input_channel_state.iter().copied().enumerate() {
-            let channel = channel_index as u8;
-            for (controller, value) in [
-                (10, state.raw_pan()),
-                (74, state.raw_mod_x()),
-                (71, state.raw_mod_y()),
-                (101, 0),
-                (100, 0),
-                (6, state.raw_pitch_bend_sensitivity_semitones()),
-                (38, state.raw_pitch_bend_sensitivity_cents()),
-                (101, 127),
-                (100, 127),
-                (
-                    64,
-                    if self.midi_live_sampler_sustain_channels.contains(&channel) {
-                        127
-                    } else {
-                        0
-                    },
-                ),
-            ] {
-                let event = Vst3LiveInputEvent::ControlChange {
+        let router = ChannelNoteRouter::new(document.channels());
+        let mut sessions = BTreeMap::new();
+        for target_channel_id in &target_channel_ids {
+            let Some(sender) = senders.get(target_channel_id) else {
+                self.status = format!(
+                    "VST3 channel {target_channel_id} is not part of the active playback stream"
+                );
+                return false;
+            };
+            let session = sender.begin_session();
+            for (channel_index, state) in self.midi_input_channel_state.iter().copied().enumerate()
+            {
+                let channel = channel_index as u8;
+                for (controller, value) in [
+                    (10, state.raw_pan()),
+                    (74, state.raw_mod_x()),
+                    (71, state.raw_mod_y()),
+                    (101, 0),
+                    (100, 0),
+                    (6, state.raw_pitch_bend_sensitivity_semitones()),
+                    (38, state.raw_pitch_bend_sensitivity_cents()),
+                    (101, 127),
+                    (100, 127),
+                    (
+                        64,
+                        if self.midi_live_sampler_sustain_channels.contains(&channel) {
+                            127
+                        } else {
+                            0
+                        },
+                    ),
+                ] {
+                    let event = Vst3LiveInputEvent::ControlChange {
+                        channel,
+                        controller,
+                        value,
+                    };
+                    if let Some(event) = vst3_playlist_midi_event(event) {
+                        let _ = session.try_send(event);
+                    }
+                }
+                if let Some(event) = vst3_playlist_midi_event(Vst3LiveInputEvent::PitchBend {
                     channel,
-                    controller,
-                    value,
-                };
-                if let Some(event) = vst3_playlist_midi_event(event) {
+                    value: state.raw_pitch_bend_value(),
+                }) {
                     let _ = session.try_send(event);
                 }
             }
-            if let Some(event) = vst3_playlist_midi_event(Vst3LiveInputEvent::PitchBend {
-                channel,
-                value: state.raw_pitch_bend_value(),
-            }) {
-                let _ = session.try_send(event);
-            }
+            sessions.insert(*target_channel_id, session);
         }
         self.live_playlist_vst3_input = Some(LivePlaylistVst3InputSession {
             pattern_id,
@@ -42072,14 +42099,25 @@ impl DawUi {
             pattern_mode,
             performance_mode,
             target_channel_ids,
-            sessions: BTreeMap::from([(channel_id, session)]),
+            sessions,
+            router,
         });
-        self.status = if performance_mode {
-            format!("Sending live MIDI to VST3 channel {channel_id} during Performance playback")
-        } else if pattern_mode {
-            format!("Sending live MIDI to VST3 channel {channel_id} during Pattern playback")
+        let source_is_layer = document
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id() == channel_id)
+            .is_some_and(|channel| channel.channel_type() == Some(ChannelType::Layer));
+        let source_name = if source_is_layer {
+            format!("Layer channel {channel_id}")
         } else {
-            format!("Sending live MIDI to VST3 channel {channel_id} during Playlist playback")
+            format!("VST3 channel {channel_id}")
+        };
+        self.status = if performance_mode {
+            format!("Sending live MIDI to {source_name} during Performance playback")
+        } else if pattern_mode {
+            format!("Sending live MIDI to {source_name} during Pattern playback")
+        } else {
+            format!("Sending live MIDI to {source_name} during Playlist playback")
         };
         true
     }
@@ -42100,7 +42138,7 @@ impl DawUi {
             return false;
         }
         let Some(target_channel_ids) = self.live_vst3_target_channels(channel_id) else {
-            self.status = "Live VST3 audition needs a loaded VST3 channel or a Layer whose enabled descendants are loaded VST3s".to_owned();
+            self.status = "Live VST3 audition needs a loaded VST3 channel or a Layer with loaded VST3 descendants".to_owned();
             return false;
         };
         if self.audio_engine.is_none() {
@@ -42497,12 +42535,21 @@ impl DawUi {
             self.status = "Enable the selected Sampler channel for live MIDI audition".to_owned();
             return false;
         }
-        if self.live_vst3_input.is_some() || self.live_playlist_vst3_input.is_some() {
+        let keep_vst3_layer_session =
+            self.live_playlist_vst3_input
+                .as_ref()
+                .is_some_and(|session| {
+                    session.channel_id == channel_id
+                        && self.live_layer_input_targets(channel_id).is_some()
+                });
+        if self.live_vst3_input.is_some()
+            || (self.live_playlist_vst3_input.is_some() && !keep_vst3_layer_session)
+        {
             self.stop_live_vst3_input();
             self.stop_live_audition_playback_if_stopped();
         }
         let Some(target_channel_ids) = self.live_sampler_target_channels(channel_id) else {
-            self.status = "Live Sampler audition needs a Sampler channel or a Layer whose enabled descendants are Samplers".to_owned();
+            self.status = "Live Sampler audition needs a Sampler channel or a Layer with supported Sampler descendants".to_owned();
             return false;
         };
         let Some(project_path) = self.sample_project_path() else {
@@ -42666,6 +42713,7 @@ impl DawUi {
 
     fn stop_live_vst3_input(&mut self) {
         self.midi_live_vst3_note_mapping.clear();
+        self.midi_live_vst3_route_mapping.clear();
         self.stop_live_layer_input();
         if let Some(session) = self.live_playlist_vst3_input.take() {
             for playlist_session in session.sessions.values() {
@@ -42907,7 +42955,16 @@ impl DawUi {
             self.stop_live_layer_input();
             self.stop_live_audition_playback_if_stopped();
         }
-        if self.live_vst3_input.is_some() || self.live_playlist_vst3_input.is_some() {
+        let keep_vst3_layer_session =
+            self.live_playlist_vst3_input
+                .as_ref()
+                .is_some_and(|session| {
+                    session.channel_id == channel_id
+                        && self.live_layer_input_targets(channel_id).is_some()
+                });
+        if self.live_vst3_input.is_some()
+            || (self.live_playlist_vst3_input.is_some() && !keep_vst3_layer_session)
+        {
             self.stop_live_vst3_input();
             self.stop_live_audition_playback_if_stopped();
         }
@@ -42941,6 +42998,7 @@ impl DawUi {
                         channel,
                         key: audition_key,
                         velocity,
+                        route_seed: self.current_live_input_note_route_seed.unwrap_or_default(),
                     },
                     Some(((channel & 0x0F, key.min(127)), audition_key)),
                 )
@@ -43147,6 +43205,225 @@ impl DawUi {
         }
     }
 
+    fn handle_live_playlist_vst3_input(
+        &mut self,
+        event: MidiInputEvent,
+        pattern_id: u16,
+        channel_id: u16,
+    ) {
+        if self.live_playlist_vst3_input.is_none()
+            && matches!(event, MidiInputEvent::NoteOn { velocity: 1.., .. })
+            && !self.start_live_playlist_vst3_input(pattern_id, channel_id)
+        {
+            return;
+        }
+        if self.live_playlist_vst3_input.is_none() {
+            return;
+        }
+
+        let (live_event, mapped_note_on, event_targets) = match event {
+            MidiInputEvent::NoteOn {
+                channel,
+                key,
+                velocity,
+            } if velocity > 0 => {
+                let audition_key = if self.midi_record_snap_to_scale
+                    && self.piano_roll_scale != PianoRollScale::None
+                {
+                    snap_piano_roll_key_to_scale(
+                        u16::from(key),
+                        self.piano_roll_scale,
+                        self.piano_roll_scale_root,
+                        0,
+                        127,
+                    ) as u8
+                } else {
+                    key.min(127)
+                };
+                let source_note = (channel & 0x0F, key.min(127));
+                let route_seed = self.current_live_input_note_route_seed.unwrap_or_default();
+                let targets = self
+                    .live_playlist_vst3_note_targets(channel_id, route_seed, audition_key)
+                    .unwrap_or_default();
+                if targets.is_empty() {
+                    self.midi_live_vst3_note_mapping
+                        .entry(source_note)
+                        .or_default()
+                        .push_back(None);
+                    self.midi_live_vst3_route_mapping
+                        .entry(source_note)
+                        .or_default()
+                        .push_back(BTreeSet::new());
+                    return;
+                }
+                (
+                    Vst3LiveInputEvent::NoteOn {
+                        channel,
+                        key: audition_key,
+                        velocity,
+                    },
+                    Some((source_note, Some(audition_key), targets.clone())),
+                    Some(targets),
+                )
+            }
+            MidiInputEvent::NoteOn { channel, key, .. }
+            | MidiInputEvent::NoteOff { channel, key, .. } => {
+                let source_note = (channel & 0x0F, key.min(127));
+                let mapped_key = self
+                    .midi_live_vst3_note_mapping
+                    .get_mut(&source_note)
+                    .and_then(VecDeque::pop_front);
+                let remove_key_mapping = self
+                    .midi_live_vst3_note_mapping
+                    .get(&source_note)
+                    .is_some_and(VecDeque::is_empty);
+                if remove_key_mapping {
+                    self.midi_live_vst3_note_mapping.remove(&source_note);
+                }
+                let targets = self
+                    .midi_live_vst3_route_mapping
+                    .get_mut(&source_note)
+                    .and_then(VecDeque::pop_front);
+                let remove_route_mapping = self
+                    .midi_live_vst3_route_mapping
+                    .get(&source_note)
+                    .is_some_and(VecDeque::is_empty);
+                if remove_route_mapping {
+                    self.midi_live_vst3_route_mapping.remove(&source_note);
+                }
+                let Some(Some(mapped_key)) = mapped_key else {
+                    return;
+                };
+                let Some(targets) = targets else {
+                    return;
+                };
+                if targets.is_empty() {
+                    return;
+                }
+                (
+                    Vst3LiveInputEvent::NoteOff {
+                        channel,
+                        key: mapped_key,
+                    },
+                    None,
+                    Some(targets),
+                )
+            }
+            MidiInputEvent::ControlChange {
+                channel,
+                controller,
+                value,
+            } => (
+                Vst3LiveInputEvent::ControlChange {
+                    channel,
+                    controller,
+                    value,
+                },
+                None,
+                None,
+            ),
+            MidiInputEvent::ProgramChange { channel, program } => (
+                Vst3LiveInputEvent::ProgramChange { channel, program },
+                None,
+                None,
+            ),
+            MidiInputEvent::PitchBend { channel, value } => (
+                Vst3LiveInputEvent::PitchBend {
+                    channel,
+                    value: (i32::from(value) + 8192).clamp(0, 16_383) as u16,
+                },
+                None,
+                None,
+            ),
+            MidiInputEvent::ChannelPressure { channel, pressure } => (
+                Vst3LiveInputEvent::ChannelPressure { channel, pressure },
+                None,
+                None,
+            ),
+            MidiInputEvent::PolyphonicPressure {
+                channel,
+                key,
+                pressure,
+            } => {
+                let source_note = (channel & 0x0F, key.min(127));
+                let mapped_key = self
+                    .midi_live_vst3_note_mapping
+                    .get(&source_note)
+                    .and_then(VecDeque::front)
+                    .copied();
+                let targets = self
+                    .midi_live_vst3_route_mapping
+                    .get(&source_note)
+                    .and_then(VecDeque::front)
+                    .cloned();
+                let (Some(Some(mapped_key)), Some(targets)) = (mapped_key, targets) else {
+                    return;
+                };
+                if targets.is_empty() {
+                    return;
+                }
+                (
+                    Vst3LiveInputEvent::PolyphonicPressure {
+                        channel,
+                        key: mapped_key,
+                        pressure,
+                    },
+                    None,
+                    Some(targets),
+                )
+            }
+            _ => return,
+        };
+
+        if let MidiInputEvent::ControlChange {
+            channel,
+            controller: 120 | 123..=127,
+            ..
+        } = event
+        {
+            let channel = channel & 0x0F;
+            self.midi_live_vst3_note_mapping
+                .retain(|(mapped_channel, _), _| *mapped_channel != channel);
+            self.midi_live_vst3_route_mapping
+                .retain(|(mapped_channel, _), _| *mapped_channel != channel);
+        }
+
+        let midi_event = vst3_playlist_midi_event(live_event);
+        let sent = if let (Some(midi_event), Some(session)) =
+            (midi_event, self.live_playlist_vst3_input.as_ref())
+        {
+            let targets_are_available = event_targets
+                .as_ref()
+                .is_none_or(|targets| targets.is_subset(&session.target_channel_ids));
+            targets_are_available
+                && session
+                    .sessions
+                    .iter()
+                    .filter(|(target_id, _)| {
+                        event_targets
+                            .as_ref()
+                            .is_none_or(|targets| targets.contains(target_id))
+                    })
+                    .all(|(_, playlist_session)| playlist_session.try_send(midi_event).is_ok())
+        } else {
+            false
+        };
+        if sent {
+            if let Some((source_note, Some(audition_key), targets)) = mapped_note_on {
+                self.midi_live_vst3_note_mapping
+                    .entry(source_note)
+                    .or_default()
+                    .push_back(Some(audition_key));
+                self.midi_live_vst3_route_mapping
+                    .entry(source_note)
+                    .or_default()
+                    .push_back(targets);
+            }
+        } else if self.live_playlist_vst3_input.is_some() {
+            self.stop_live_vst3_input();
+        }
+    }
+
     fn handle_live_vst3_input(&mut self, event: MidiInputEvent) {
         if !self.can_audition_live_midi_input()
             || (self.performance_launch_sender.is_some()
@@ -43162,7 +43439,8 @@ impl DawUi {
         if self.live_vst3_target_channels(channel_id).is_none() {
             return;
         }
-        if self.playing && !self.channel_vst3_instances.contains_key(&channel_id) {
+        if self.playing {
+            self.handle_live_playlist_vst3_input(event, pattern_id, channel_id);
             return;
         }
         let key_region = self.document.as_ref().and_then(|document| {
@@ -43176,7 +43454,10 @@ impl DawUi {
             self.stop_live_layer_input();
             self.stop_live_audition_playback_if_stopped();
         }
-        if self.live_sampler_input.is_some() {
+        let keep_sampler_layer_session = self.live_sampler_input.as_ref().is_some_and(|session| {
+            session.channel_id == channel_id && self.live_layer_input_targets(channel_id).is_some()
+        });
+        if self.live_sampler_input.is_some() && !keep_sampler_layer_session {
             self.stop_live_sampler_input();
             self.stop_live_audition_playback_if_stopped();
         }
@@ -43479,6 +43760,14 @@ impl DawUi {
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
             };
             self.midi_activity = Some((describe_event(message.event), message.received_at));
+            self.current_live_input_note_route_seed =
+                if matches!(message.event, MidiInputEvent::NoteOn { velocity: 1.., .. }) {
+                    let route_seed = self.live_input_note_route_seed;
+                    self.live_input_note_route_seed = route_seed.wrapping_add(1);
+                    Some(route_seed)
+                } else {
+                    None
+                };
             if let MidiInputEvent::ControlChange { channel, .. }
             | MidiInputEvent::PitchBend { channel, .. } = message.event
                 && let Some(state) = self.midi_input_channel_state.get_mut(usize::from(channel))
@@ -43508,6 +43797,7 @@ impl DawUi {
                 self.handle_live_sampler_input(message.event);
                 self.handle_live_vst3_input(message.event);
             }
+            self.current_live_input_note_route_seed = None;
             self.handle_midi_performance_note(message);
             self.handle_midi_control_change(message, history_snapshot_available);
             if let MidiInputEvent::Transport(command) = message.event {
