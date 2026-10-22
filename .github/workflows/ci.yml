@@ -1066,11 +1066,9 @@ jobs:
           xdotool windowfocus --sync "$pattern_window"
           xdotool key F5
           sleep 1
-          xdotool mousemove 570 298 click 1
-          sleep 0.3
           ffmpeg -y -loglevel error -f x11grab -draw_mouse 0 -video_size 1600x900 -framerate 1 \
             -i "$DISPLAY" -frames:v 1 "$GITHUB_WORKSPACE/dist/gui-preview/modern-pattern-clip-before-resize.png"
-          resize_start_x=$(python3 - "$GITHUB_WORKSPACE/dist/gui-preview/modern-pattern-clip-before-resize.png" <<'PY'
+          read -r clip_center_x resize_start_x clip_y <<< "$(python3 - "$GITHUB_WORKSPACE/dist/gui-preview/modern-pattern-clip-before-resize.png" <<'PY'
           import struct
           import sys
           import zlib
@@ -1099,7 +1097,10 @@ jobs:
           pixels = zlib.decompress(b"".join(compressed))
           previous = bytearray(stride)
           row_offset = 0
-          purple_x = []
+          longest_run = 0
+          clip_left = 0
+          clip_right = 0
+          clip_y = 0
           for y in range(height):
               filter_type = pixels[row_offset]
               row_offset += 1
@@ -1130,26 +1131,50 @@ jobs:
                           else upper_left
                       )
                       row[index] = (row[index] + predictor) & 255
-              if 286 <= y <= 310:
-                  for x in range(width):
+              if 100 <= y < height - 24:
+                  run_start = None
+                  for x in range(240, width):
                       index = x * bytes_per_pixel
                       red, green, blue = row[index : index + 3]
                       if red > 100 and blue > 140 and blue - red > 20 and green < 190:
-                          purple_x.append(x)
+                          if run_start is None:
+                              run_start = x
+                      elif run_start is not None:
+                          run_length = x - run_start
+                          if run_length > longest_run:
+                              longest_run = run_length
+                              clip_left = run_start
+                              clip_right = x - 1
+                              clip_y = y
+                          run_start = None
+                  if run_start is not None:
+                      run_length = width - run_start
+                      if run_length > longest_run:
+                          longest_run = run_length
+                          clip_left = run_start
+                          clip_right = width - 1
+                          clip_y = y
               previous = row
 
-          if not purple_x:
-              raise SystemExit("Could not locate the Pattern Clip in the resize capture.")
-          # Start four pixels inside the detected right edge, within the resize hit zone.
-          print(max(purple_x) - 3)
+          if longest_run < 80:
+              raise SystemExit(
+                  f"Could not locate a Pattern Clip color run in the resize capture; "
+                  f"longest run was {longest_run} pixels at row {clip_y}."
+              )
+          # Read the clip row and right edge from the image instead of assuming a fixed lane.
+          clip_center_x = (clip_left + clip_right) // 2
+          resize_start_x = clip_right - 3
+          print(clip_center_x, resize_start_x, clip_y)
           PY
-          )
+          )"
           resize_end_x=$((resize_start_x + 41))
+          xdotool mousemove --sync "$clip_center_x" "$clip_y" click 1
+          sleep 0.2
           xdotool keydown Shift_L
-          xdotool mousemove --sync "$resize_start_x" 298
+          xdotool mousemove --sync "$resize_start_x" "$clip_y"
           xdotool mousedown 1
           sleep 0.2
-          xdotool mousemove --sync "$resize_end_x" 298
+          xdotool mousemove --sync "$resize_end_x" "$clip_y"
           sleep 0.3
           xdotool mouseup 1
           xdotool keyup Shift_L
