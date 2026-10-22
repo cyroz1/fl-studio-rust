@@ -460,6 +460,7 @@ pub struct ChannelSummary {
     sampler_fade_in_raw: Option<u16>,
     sampler_flags: Option<u32>,
     sampler_root_note: Option<u32>,
+    keyboard_fine_tune_raw: Option<i32>,
     keyboard_main_pitch: Option<bool>,
     keyboard_add_root: Option<bool>,
     keyboard_key_region: Option<(u32, u32)>,
@@ -865,6 +866,21 @@ impl ChannelSummary {
         self.sampler_root_note
             .filter(|note| *note <= 127)
             .map(|note| note as u16)
+    }
+
+    /// Saved channel Fine Tune value (`0x8E`) in cents when it falls in FL Studio's documented
+    /// -100..=100 range. The raw value remains available even when it is outside that range.
+    pub fn keyboard_fine_tune_raw(&self) -> Option<i32> {
+        self.keyboard_fine_tune_raw
+    }
+
+    /// Channel Fine Tune in cents for Sampler, Native instrument, and Audio Clip channels.
+    pub fn keyboard_fine_tune_cents(&self) -> Option<i32> {
+        if !matches!(self.kind, Some(0 | 2 | 4)) {
+            return None;
+        }
+        self.keyboard_fine_tune_raw
+            .filter(|cents| (-100..=100).contains(cents))
     }
 
     /// Inclusive playable MIDI key range from the channel Parameters event.
@@ -4340,6 +4356,16 @@ impl FlpDocument {
                     && channel.sampler_root_note.is_none() =>
                 {
                     channel.sampler_root_note = Some(u32::from_le_bytes(
+                        event.payload[..4]
+                            .try_into()
+                            .expect("a dword event has four payload bytes"),
+                    ));
+                }
+                0x8E if event.encoding == PayloadEncoding::Dword
+                    && event.payload.len() == 4
+                    && channel.keyboard_fine_tune_raw.is_none() =>
+                {
+                    channel.keyboard_fine_tune_raw = Some(i32::from_le_bytes(
                         event.payload[..4]
                             .try_into()
                             .expect("a dword event has four payload bytes"),
@@ -16093,6 +16119,88 @@ impl FlpDocument {
         Ok(())
     }
 
+    /// Sets the channel Fine Tune (`0x8E`) value in cents.
+    ///
+    /// FL Studio documents this control in the -100..=100 cent range. Existing dword events are
+    /// edited in place; when absent, the event is inserted among the channel's keyboard-related
+    /// dword events. Unrelated event bytes are retained.
+    pub fn set_channel_fine_tune_cents(
+        &mut self,
+        channel_id: u16,
+        cents: i32,
+    ) -> Result<(), FlpError> {
+        if !(-100..=100).contains(&cents) {
+            return Err(FlpError::UnsupportedEdit(
+                "channel Fine Tune must be in the -100..=100 cent range",
+            ));
+        }
+
+        self.require_unique_channel(channel_id)?;
+        let channel = self
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id == channel_id)
+            .expect("the unique channel was checked above");
+        if !matches!(channel.kind, Some(0 | 2 | 4)) {
+            return Err(FlpError::UnsupportedEdit(
+                "channel Fine Tune applies only to Sampler, Native instrument, or Audio Clip channels",
+            ));
+        }
+
+        let matching_events = channel
+            .event_range()
+            .filter(|index| self.events[*index].opcode == 0x8E)
+            .collect::<Vec<_>>();
+        if matching_events.len() > 1 {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel has duplicate Fine Tune events",
+            ));
+        }
+        if let Some(index) = matching_events.first() {
+            let event = &self.events[*index];
+            if event.encoding != PayloadEncoding::Dword || event.payload.len() != 4 {
+                return Err(FlpError::UnsupportedEdit(
+                    "the selected channel has an unrecognized Fine Tune event",
+                ));
+            }
+            self.events[*index].replace_dword_payload(cents as u32)?;
+            self.refresh_event_offsets()?;
+            return Ok(());
+        }
+
+        let mut candidate = self.clone();
+        let channel = candidate
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id == channel_id)
+            .expect("the unique channel remains present");
+        let insertion_index = channel
+            .event_range()
+            .find(|index| {
+                let opcode = candidate.events[*index].opcode;
+                (0x80..=0xBF).contains(&opcode) && opcode > 0x8E
+            })
+            .or_else(|| {
+                channel
+                    .event_range()
+                    .rfind(|index| (0x80..=0xBF).contains(&candidate.events[*index].opcode))
+                    .map(|index| index + 1)
+            })
+            .or_else(|| {
+                channel
+                    .event_range()
+                    .find(|index| candidate.events[*index].opcode == 0x15)
+                    .map(|index| index + 1)
+            })
+            .unwrap_or(channel.end_event_index);
+        candidate
+            .events
+            .insert(insertion_index, FlpEvent::new_dword(0x8E, cents as u32));
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
     /// Edits established raw fields in one channel's existing `0xD5` Level Adjusts event.
     ///
     /// `event_index` is the global FLP event index, available from `channel-events` and
@@ -24409,6 +24517,101 @@ mod tests {
             assert_eq!(document.channels()[0].sampler_root_key(), expected_root_key);
             assert_eq!(document.encode_lossless().unwrap(), input);
         }
+    }
+
+    #[test]
+    fn decodes_channel_fine_tune_as_signed_cents_and_checks_documented_range() {
+        for (kind, cents, expected) in [
+            (0_u8, -100_i32, Some(-100_i32)),
+            (4, 100, Some(100)),
+            (2, -37, Some(-37)),
+            (0, 101, None),
+            (3, 50, None),
+        ] {
+            let mut event_stream = vec![0x40, 7, 0, 0x15, kind, 0x8E];
+            event_stream.extend_from_slice(&cents.to_le_bytes());
+            event_stream.extend_from_slice(&[0x62, 0, 0]);
+            let input = flp_fixture(&event_stream, &[], &[]);
+            let document = FlpDocument::parse(&input).expect("fixture should parse");
+
+            assert_eq!(document.channels()[0].keyboard_fine_tune_raw(), Some(cents));
+            assert_eq!(document.channels()[0].keyboard_fine_tune_cents(), expected);
+            assert_eq!(document.encode_lossless().unwrap(), input);
+        }
+    }
+
+    #[test]
+    fn edits_channel_fine_tune_in_place_or_inserts_its_dword_event() {
+        let mut event_stream = vec![0x40, 7, 0, 0x15, 0, 0x87];
+        event_stream.extend_from_slice(&60_u32.to_le_bytes());
+        event_stream.extend_from_slice(&[0x8E]);
+        event_stream.extend_from_slice(&(-20_i32).to_le_bytes());
+        event_stream.extend_from_slice(&[0x8F]);
+        event_stream.extend_from_slice(&0xA5_u32.to_le_bytes());
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+        let input = flp_fixture(&event_stream, &[], &[]);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+        let unrelated_root_event = document.events()[2].wire_bytes().to_vec();
+        let unrelated_flags_event = document.events()[4].wire_bytes().to_vec();
+
+        document
+            .set_channel_fine_tune_cents(7, 35)
+            .expect("Fine Tune should update");
+        assert_eq!(document.channels()[0].keyboard_fine_tune_cents(), Some(35));
+        assert_eq!(document.events()[2].wire_bytes(), unrelated_root_event);
+        assert_eq!(document.events()[4].wire_bytes(), unrelated_flags_event);
+        let reparsed = FlpDocument::parse(&document.encode_lossless().unwrap())
+            .expect("edited fixture should parse");
+        assert_eq!(reparsed.channels()[0].keyboard_fine_tune_raw(), Some(35));
+
+        let mut missing_event_stream = vec![0x40, 7, 0, 0x15, 4, 0x90];
+        missing_event_stream.extend_from_slice(&0x1234_5678_u32.to_le_bytes());
+        missing_event_stream.extend_from_slice(&[0x62, 0, 0]);
+        let missing_input = flp_fixture(&missing_event_stream, &[], &[]);
+        let mut missing = FlpDocument::parse(&missing_input).expect("fixture should parse");
+        missing
+            .set_channel_fine_tune_cents(7, -100)
+            .expect("missing Fine Tune should be inserted");
+        let fine_tune_index = missing.channels()[0]
+            .event_range()
+            .find(|index| missing.events()[*index].opcode() == 0x8E)
+            .expect("Fine Tune should be inserted");
+        let following_dword_index = missing.channels()[0]
+            .event_range()
+            .find(|index| missing.events()[*index].opcode() == 0x90)
+            .expect("unrelated dword should remain");
+        assert!(fine_tune_index < following_dword_index);
+        assert_eq!(missing.channels()[0].keyboard_fine_tune_cents(), Some(-100));
+        assert_eq!(
+            FlpDocument::parse(&missing.encode_lossless().unwrap())
+                .unwrap()
+                .channels()[0]
+                .keyboard_fine_tune_raw(),
+            Some(-100)
+        );
+    }
+
+    #[test]
+    fn channel_fine_tune_edit_rejects_invalid_ranges_and_non_instrument_channels() {
+        let event_stream = [0x40, 7, 0, 0x15, 0, 0x62, 0, 0];
+        let input = flp_fixture(&event_stream, &[], &[]);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+        let before = document.clone();
+        assert!(matches!(
+            document.set_channel_fine_tune_cents(7, 101),
+            Err(FlpError::UnsupportedEdit(_))
+        ));
+        assert_eq!(document, before);
+
+        let layer_event_stream = [0x40, 7, 0, 0x15, 3, 0x62, 0, 0];
+        let layer_input = flp_fixture(&layer_event_stream, &[], &[]);
+        let mut layer = FlpDocument::parse(&layer_input).expect("fixture should parse");
+        let before = layer.clone();
+        assert!(matches!(
+            layer.set_channel_fine_tune_cents(7, 25),
+            Err(FlpError::UnsupportedEdit(_))
+        ));
+        assert_eq!(layer, before);
     }
 
     #[test]

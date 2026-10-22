@@ -6099,7 +6099,10 @@ fn prepare_audio_clip_render(
             resolved_path,
             gain,
             pan,
-            audio_clip_master_pitch_ratio(channel.master_pitch_offset_cents(master_pitch_cents)),
+            audio_clip_pitch_ratio(
+                f64::from(channel.master_pitch_offset_cents(master_pitch_cents))
+                    + f64::from(channel.keyboard_fine_tune_cents().unwrap_or_default()),
+            ),
             mixer_track,
             mixer_route_plan,
         ));
@@ -6715,6 +6718,7 @@ fn prepare_sampler_arrangement(
                     options.read_sample_root_note,
                 ),
                 fine_tune_cents: sample_metadata.fine_tune_cents.unwrap_or_default()
+                    + f64::from(channel.keyboard_fine_tune_cents().unwrap_or_default())
                     + f64::from(channel.master_pitch_render_offset_cents(
                         document.metadata().master_pitch_cents(),
                     )),
@@ -9012,6 +9016,7 @@ fn prepare_sampler_pattern_for_channel_internal(
                     options.read_sample_root_note,
                 ),
                 fine_tune_cents: sample_metadata.fine_tune_cents.unwrap_or_default()
+                    + f64::from(channel.keyboard_fine_tune_cents().unwrap_or_default())
                     + f64::from(channel.master_pitch_render_offset_cents(
                         document.metadata().master_pitch_cents(),
                     )),
@@ -9743,7 +9748,11 @@ fn sampler_metadata_gain(gain_db: Option<i16>) -> f32 {
 }
 
 fn audio_clip_master_pitch_ratio(pitch_offset_cents: i16) -> f64 {
-    2.0f64.powf(f64::from(pitch_offset_cents) / 1_200.0)
+    audio_clip_pitch_ratio(f64::from(pitch_offset_cents))
+}
+
+fn audio_clip_pitch_ratio(pitch_offset_cents: f64) -> f64 {
+    2.0f64.powf(pitch_offset_cents / 1_200.0)
 }
 
 fn transpose_sampler_note_key(key: u16, semitones: i16) -> u16 {
@@ -13666,9 +13675,11 @@ mod tests {
     fn playlist_audio_clip_master_pitch_changes_playback_rate_and_duration() {
         let pitch_up = audio_clip_master_pitch_ratio(1_200);
         let pitch_down = audio_clip_master_pitch_ratio(-1_200);
+        let channel_fine_tune_up = audio_clip_pitch_ratio(50.0);
         assert_eq!(pitch_up, 2.0);
         assert_eq!(pitch_down, 0.5);
         assert_eq!(audio_clip_master_pitch_ratio(0), 1.0);
+        assert!((channel_fine_tune_up - 2.0f64.powf(50.0 / 1_200.0)).abs() < 1e-12);
         assert_eq!(source_duration_to_frames(4, 4, 4, pitch_up).unwrap(), 2);
         assert_eq!(source_duration_to_frames(4, 4, 4, pitch_down).unwrap(), 8);
 

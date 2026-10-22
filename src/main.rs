@@ -767,6 +767,17 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u16(fade_in, "Sampler Fade In raw value")?,
             )
         }
+        [command, input, output, channel_id, cents] if command == "set-channel-fine-tune" => {
+            let cents = cents
+                .parse::<i32>()
+                .map_err(|_| "channel Fine Tune must be a signed integer in -100..=100".to_owned())?;
+            set_channel_fine_tune(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(channel_id, "channel id")?,
+                cents,
+            )
+        }
         [command, input, output, channel_id, event_index, pan, volume, mod_x, mod_y]
             if command == "edit-channel-level-adjustments" =>
         {
@@ -3335,6 +3346,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild set-channel-color-gradient <input.flp> <output.flp> <channel-ids:comma-separated-in-order> <start-RRGGBB> <end-RRGGBB>\n",
             "  flp-rebuild set-channel-levels <input.flp> <output.flp> <channel-id> <volume-0..12800> <pan-0..12800>\n",
             "  flp-rebuild set-sampler-quick-fades <input.flp> <output.flp> <sampler-channel-id> <fade-out-0..1024> <fade-in-0..1024>\n",
+            "  flp-rebuild set-channel-fine-tune <input.flp> <output.flp> <channel-id> <-100..100-cents>\n",
             "  flp-rebuild set-channel-enabled <input.flp> <output.flp> <channel-id> <0|1>\n",
             "  flp-rebuild set-channel-sample-path <input.flp> <output.flp> <channel-id> <sample-path>\n",
             "  flp-rebuild set-channel-zipped <input.flp> <output.flp> <channel-id> <0|1>\n",
@@ -5276,7 +5288,7 @@ fn list_channels(path: &Path) -> Result<(), String> {
     println!("channels: {}", channels.len());
     for channel in channels {
         println!(
-            "id={} kind={} type={:?} enabled={} zipped={} main_pitch={} add_to_key={} stretch_settings={:?} sampler_fade_out_raw={:?} sampler_fade_in_raw={:?} color={:?} volume={:?} pan={:?} level_adjusts_raw={:?} swing_mix_raw={:?} layer_children={:?} layer_flags={:?} plugin={} name={} sample_path={:?} events={:?}",
+            "id={} kind={} type={:?} enabled={} zipped={} main_pitch={} add_to_key={} fine_tune_raw={:?} stretch_settings={:?} sampler_fade_out_raw={:?} sampler_fade_in_raw={:?} color={:?} volume={:?} pan={:?} level_adjusts_raw={:?} swing_mix_raw={:?} layer_children={:?} layer_flags={:?} plugin={} name={} sample_path={:?} events={:?}",
             channel.id(),
             channel
                 .kind()
@@ -5288,6 +5300,7 @@ fn list_channels(path: &Path) -> Result<(), String> {
             channel.zipped(),
             channel.keyboard_main_pitch_enabled(),
             channel.keyboard_add_to_key_enabled(),
+            channel.keyboard_fine_tune_raw(),
             channel.stretch_settings(),
             channel.sampler_fade_out_raw(),
             channel.sampler_fade_in_raw(),
@@ -6619,6 +6632,28 @@ fn set_sampler_quick_fades(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "set Sampler channel {channel_id} precomputed Fade Out to {fade_out_raw} and Fade In to {fade_in_raw} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn set_channel_fine_tune(
+    input: &Path,
+    output: &Path,
+    channel_id: u16,
+    cents: i32,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .set_channel_fine_tune_cents(channel_id, cents)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "set channel {channel_id} Fine Tune to {cents} cents in {}",
         output.display()
     );
     Ok(())

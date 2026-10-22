@@ -22088,6 +22088,7 @@ impl DawUi {
         let mut global_swing_edit = None;
         let mut channel_swing_edits = Vec::new();
         let mut sampler_fade_edits = Vec::new();
+        let mut channel_fine_tune_edits = Vec::new();
         let mut layer_edits = Vec::new();
         let mut layer_flag_edits = Vec::new();
         let mut layer_fade_edits = Vec::new();
@@ -22340,6 +22341,7 @@ impl DawUi {
                 let mut layer_flags_apply = None;
                 let mut layer_fade_apply = None;
                 let mut sampler_fade_apply = None;
+                let mut channel_fine_tune_apply = None;
                 let layer_flags = channel.layer_flags();
                 let mut layer_random = channel.layer_random_enabled().unwrap_or(false);
                 let mut layer_crossfade = channel.layer_crossfade_enabled().unwrap_or(false);
@@ -22349,6 +22351,10 @@ impl DawUi {
                 let sampler_fade_in_raw = channel.sampler_fade_in_raw();
                 let mut sampler_fade_out = sampler_fade_out_raw.unwrap_or(0);
                 let mut sampler_fade_in = sampler_fade_in_raw.unwrap_or(0);
+                let channel_fine_tune_raw = channel.keyboard_fine_tune_raw();
+                let mut channel_fine_tune = channel
+                    .keyboard_fine_tune_cents()
+                    .unwrap_or_default();
                 egui::Frame::new()
                     .fill(PANEL_DARK)
                     .inner_margin(4.0)
@@ -23137,6 +23143,37 @@ impl DawUi {
                                 }
                             });
                         }
+                        if matches!(channel.kind(), Some(0 | 4)) {
+                            ui.collapsing("Channel fine tuning", |ui| {
+                                ui.small(
+                                    "Tunes the sample base pitch. Playback and renders apply this to Sampler and Audio Clip channels.",
+                                );
+                                if channel_fine_tune_raw.is_none_or(|value| {
+                                    (-100..=100).contains(&value)
+                                }) {
+                                    if ui
+                                        .add(
+                                            egui::Slider::new(
+                                                &mut channel_fine_tune,
+                                                -100..=100,
+                                            )
+                                            .text("Fine Tune (cents)"),
+                                        )
+                                        .changed()
+                                    {
+                                        channel_fine_tune_apply = Some(channel_fine_tune);
+                                    }
+                                } else {
+                                    ui.colored_label(
+                                        ORANGE,
+                                        format!(
+                                            "Unsupported saved Fine Tune value: {:?}",
+                                            channel_fine_tune_raw
+                                        ),
+                                    );
+                                }
+                            });
+                        }
                         if let Some(settings) = channel.stretch_settings() {
                             let mut time_raw = settings.time_raw();
                             let mut pitch_raw = settings.pitch_raw();
@@ -23222,6 +23259,9 @@ impl DawUi {
                 }
                 if let Some((fade_out_raw, fade_in_raw)) = sampler_fade_apply {
                     sampler_fade_edits.push((channel.id(), fade_out_raw, fade_in_raw));
+                }
+                if let Some(cents) = channel_fine_tune_apply {
+                    channel_fine_tune_edits.push((channel.id(), cents));
                 }
                 if !zipped && let Some(pattern) = &selected_pattern {
                     ui.horizontal_wrapped(|ui| {
@@ -23509,6 +23549,22 @@ impl DawUi {
                 }
                 Some(Err(error)) => {
                     self.status = format!("Could not change Sampler precomputed fades: {error}");
+                }
+                None => {}
+            }
+        }
+        for (channel_id, cents) in channel_fine_tune_edits {
+            let result = self
+                .document
+                .as_mut()
+                .map(|document| document.set_channel_fine_tune_cents(channel_id, cents));
+            match result {
+                Some(Ok(())) => {
+                    self.dirty = true;
+                    self.status = format!("Channel {channel_id} Fine Tune set to {cents} cents");
+                }
+                Some(Err(error)) => {
+                    self.status = format!("Could not change channel Fine Tune: {error}");
                 }
                 None => {}
             }
