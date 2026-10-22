@@ -4563,6 +4563,20 @@ struct LivePlaylistVst3InputSession {
     router: ChannelNoteRouter,
 }
 
+fn live_playlist_vst3_note_targets(
+    router: &ChannelNoteRouter,
+    target_channel_ids: &BTreeSet<u16>,
+    source_channel_id: u16,
+    route_seed: u64,
+    key: u8,
+) -> BTreeSet<u16> {
+    router
+        .targets_for_note(source_channel_id, route_seed, u16::from(key.min(127)))
+        .into_iter()
+        .filter(|target_id| target_channel_ids.contains(target_id))
+        .collect()
+}
+
 fn is_performance_clip_trigger_channel_event(
     event: MidiInputEvent,
     performance_channel: u8,
@@ -41929,14 +41943,13 @@ impl DawUi {
         key: u8,
     ) -> Option<BTreeSet<u16>> {
         let session = self.live_playlist_vst3_input.as_ref()?;
-        Some(
-            session
-                .router
-                .targets_for_note(source_channel_id, route_seed, u16::from(key.min(127)))
-                .into_iter()
-                .filter(|target_id| session.target_channel_ids.contains(target_id))
-                .collect(),
-        )
+        Some(live_playlist_vst3_note_targets(
+            &session.router,
+            &session.target_channel_ids,
+            source_channel_id,
+            route_seed,
+            key,
+        ))
     }
 
     fn collect_live_layer_destinations(
@@ -54774,24 +54787,24 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        ActivePlaylistClipDrag, Arrangement, ChannelDisplayFilter, DetachedWindowKind,
-        DetachedWindowPlacement, DetachedWindowPlacements, DetectedPianoRollScale, FlpDocument,
-        MainView, MidiAutomationRecording, MidiControlChangeMapping, MidiControllerCcBinding,
-        MidiControllerTemplate, MidiDeviceSelections, MidiInputDevice, MidiInputEvent,
-        MidiMixerControlMapping, MidiMixerControlTarget, MidiOutputDevice,
-        MidiVst3ParameterMapping, MidiVst3ParameterTarget, PIANO_ROLL_RULER_HEIGHT, Pattern,
-        PatternController, PatternNote, PatternVst3ParameterLink, PianoRollChordStamp,
-        PianoRollGrid, PianoRollScale, PianoRollSnap, PlaylistClip, PlaylistClipDragKind,
-        PlaylistTempoMap, PlaylistTrack, PluginCandidate, PluginFormat, TimeSelectionShift,
-        TouchGesture, TouchTapTracker, TouchZoomConfig, WINDOW_LAYOUT_PRESETS_HEADER,
-        WindowLayoutPreset, audio_recording_start_tick_with_offset,
-        built_in_midi_controller_templates, candidate_live_mixer_send_key,
-        candidate_matches_vst_identity, candidate_mixer_controls,
+        ActivePlaylistClipDrag, Arrangement, ChannelDisplayFilter, ChannelNoteRouter,
+        DetachedWindowKind, DetachedWindowPlacement, DetachedWindowPlacements,
+        DetectedPianoRollScale, FlpDocument, MainView, MidiAutomationRecording,
+        MidiControlChangeMapping, MidiControllerCcBinding, MidiControllerTemplate,
+        MidiDeviceSelections, MidiInputDevice, MidiInputEvent, MidiMixerControlMapping,
+        MidiMixerControlTarget, MidiOutputDevice, MidiVst3ParameterMapping,
+        MidiVst3ParameterTarget, PIANO_ROLL_RULER_HEIGHT, Pattern, PatternController, PatternNote,
+        PatternVst3ParameterLink, PianoRollChordStamp, PianoRollGrid, PianoRollScale,
+        PianoRollSnap, PlaylistClip, PlaylistClipDragKind, PlaylistTempoMap, PlaylistTrack,
+        PluginCandidate, PluginFormat, TimeSelectionShift, TouchGesture, TouchTapTracker,
+        TouchZoomConfig, WINDOW_LAYOUT_PRESETS_HEADER, WindowLayoutPreset,
+        audio_recording_start_tick_with_offset, built_in_midi_controller_templates,
+        candidate_live_mixer_send_key, candidate_matches_vst_identity, candidate_mixer_controls,
         candidate_mixer_stereo_separation, detect_chord_name, detect_piano_roll_channel_scale,
         detect_piano_roll_scale, encode_midi_device_id, encode_midi_device_selections,
         encode_midi_output_routes, first_available_playlist_track,
-        is_performance_clip_trigger_channel_event, midi_button_press_edge,
-        midi_cc_to_mixer_fader_raw, midi_cc_to_mixer_pan_raw,
+        is_performance_clip_trigger_channel_event, live_playlist_vst3_note_targets,
+        midi_button_press_edge, midi_cc_to_mixer_fader_raw, midi_cc_to_mixer_pan_raw,
         midi_cc_to_mixer_stereo_separation_raw, midi_controller_binding_for_device,
         midi_mixer_button_press_edge, midi_mixer_control_for_cc,
         midi_vst3_parameter_mapping_for_target, midi_vst3_parameter_mappings_for_cc,
@@ -54877,6 +54890,57 @@ mod tests {
         bytes.extend_from_slice(&(event_stream.len() as u32).to_le_bytes());
         bytes.extend_from_slice(&event_stream);
         FlpDocument::parse(&bytes).expect("Mixer send route fixture should parse")
+    }
+
+    fn random_layer_routing_document() -> FlpDocument {
+        let mut event_stream = vec![0x40, 0, 0, 0x15, 3, 0x90];
+        event_stream.extend_from_slice(&1u32.to_le_bytes());
+        for child_id in [1_u16, 2] {
+            event_stream.push(0x5E);
+            event_stream.extend_from_slice(&child_id.to_le_bytes());
+        }
+        event_stream.extend_from_slice(&[0x40, 1, 0, 0x15, 0]);
+        event_stream.extend_from_slice(&[0x40, 2, 0, 0x15, 4, 0x62, 0, 0]);
+
+        let mut bytes = b"FLhd".to_vec();
+        bytes.extend_from_slice(&6u32.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&96u16.to_le_bytes());
+        bytes.extend_from_slice(b"FLdt");
+        bytes.extend_from_slice(&(event_stream.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&event_stream);
+        FlpDocument::parse(&bytes).expect("random Layer routing fixture should parse")
+    }
+
+    #[test]
+    fn active_playlist_random_layer_splits_each_seeded_note_between_destinations() {
+        let document = random_layer_routing_document();
+        let router = ChannelNoteRouter::new(document.channels());
+        let sampler_channel_ids = BTreeSet::from([1_u16]);
+        let vst3_channel_ids = BTreeSet::from([2_u16]);
+
+        for route_seed in 0..64 {
+            let all_targets = router.targets_for_note(0, route_seed, 60);
+            let sampler_targets =
+                live_playlist_vst3_note_targets(&router, &sampler_channel_ids, 0, route_seed, 60);
+            let vst3_targets =
+                live_playlist_vst3_note_targets(&router, &vst3_channel_ids, 0, route_seed, 60);
+
+            assert_eq!(all_targets.len(), 1);
+            assert_ne!(sampler_targets.is_empty(), vst3_targets.is_empty());
+            assert_eq!(
+                sampler_targets
+                    .union(&vst3_targets)
+                    .copied()
+                    .collect::<BTreeSet<_>>(),
+                all_targets.into_iter().collect()
+            );
+            assert_eq!(
+                live_playlist_vst3_note_targets(&router, &vst3_channel_ids, 0, route_seed, 60,),
+                vst3_targets
+            );
+        }
     }
 
     #[test]
