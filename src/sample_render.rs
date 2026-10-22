@@ -6892,6 +6892,15 @@ fn prepare_sampler_arrangement(
         });
     }
     notes.sort_by_key(|note| (note.start_frame, note.slide_note, note.channel_id, note.key));
+    output_frames = output_frames.max(sampler_voice_render_end_frame(
+        &notes,
+        &sources_by_channel,
+        options.sampler_voice_limit,
+        release_frames as usize,
+        options.sample_rate,
+        options.resampling_quality,
+        pan_law,
+    )?);
     Ok(PreparedSamplerArrangement {
         summary: SamplerPatternRenderSummary {
             frames: output_frames,
@@ -9274,6 +9283,15 @@ fn prepare_sampler_pattern_for_channel_internal(
         ));
     }
     notes.sort_by_key(|note| (note.start_frame, note.slide_note, note.channel_id, note.key));
+    output_frames = output_frames.max(sampler_voice_render_end_frame(
+        &notes,
+        &sources_by_channel,
+        options.voice_limit,
+        release_frames as usize,
+        options.sample_rate,
+        options.resampling_quality,
+        pan_law,
+    )?);
     Ok(PreparedSamplerPattern {
         summary: SamplerPatternRenderSummary {
             frames: output_frames,
@@ -9448,11 +9466,41 @@ impl<'a> SamplerVoiceEngine<'a> {
         block_start: u64,
         frame_count: usize,
         output: &mut [f32],
-        mut meter_buses: Option<&mut [f32]>,
+        meter_buses: Option<&mut [f32]>,
         meter_stride_samples: usize,
     ) {
-        output.fill(0.0);
+        let _ = self.process_block(
+            block_start,
+            frame_count,
+            Some(output),
+            meter_buses,
+            meter_stride_samples,
+            true,
+        );
+    }
+
+    fn advance_block_without_output(
+        &mut self,
+        block_start: u64,
+        frame_count: usize,
+    ) -> Option<u64> {
+        self.process_block(block_start, frame_count, None, None, 0, false)
+    }
+
+    fn process_block(
+        &mut self,
+        block_start: u64,
+        frame_count: usize,
+        mut output: Option<&mut [f32]>,
+        mut meter_buses: Option<&mut [f32]>,
+        meter_stride_samples: usize,
+        render_samples: bool,
+    ) -> Option<u64> {
+        if let Some(output) = output.as_deref_mut() {
+            output.fill(0.0);
+        }
         let live_midi_expression = self.live_midi_expression;
+        let mut last_active_output_frame = None;
         for offset in 0..frame_count {
             let frame = block_start + offset as u64;
             for voice in self.voices.iter_mut().filter_map(Option::as_mut) {
@@ -9478,7 +9526,9 @@ impl<'a> SamplerVoiceEngine<'a> {
                 self.next_live_note += 1;
                 let _ = self.start_voice(note);
             }
-            let output_frame = &mut output[offset * 2..offset * 2 + 2];
+            let mut output_frame = output
+                .as_deref_mut()
+                .map(|output| &mut output[offset * 2..offset * 2 + 2]);
             for voice_slot in &mut self.voices {
                 let Some(voice) = voice_slot.as_mut() else {
                     continue;
@@ -9518,69 +9568,73 @@ impl<'a> SamplerVoiceEngine<'a> {
                     *voice_slot = None;
                     continue;
                 }
-                let left = resample_sample(
-                    &voice.source.channels[0],
-                    voice.source_position,
-                    voice.source_step,
-                    self.resampling_quality,
-                );
-                let right = if voice.source.channels.len() == 1 {
-                    left
-                } else {
-                    resample_sample(
-                        &voice.source.channels[1],
+                last_active_output_frame = Some(frame.saturating_add(1));
+                if render_samples {
+                    let left = resample_sample(
+                        &voice.source.channels[0],
                         voice.source_position,
                         voice.source_step,
                         self.resampling_quality,
-                    )
-                };
-                let expression = voice
-                    .input_midi_channel
-                    .map_or(127, |channel| live_midi_expression[usize::from(channel)]);
-                let gain = voice.gain * (f32::from(expression) / 127.0) * fade;
-                let mut routed_frame = [
-                    left * gain * voice.left_gain,
-                    right * gain * voice.right_gain,
-                ];
-                let live_controls =
-                    voice
-                        .live_mixer_source_control
-                        .as_ref()
-                        .map(|(source_control, targets)| {
-                            let controls = source_control.next_frame_controls(targets);
-                            source_control.apply_output_frame(controls, &mut routed_frame);
-                            (source_control, controls)
-                        });
-                if live_controls.is_none() {
-                    voice.mixer_transform.apply_frame(&mut routed_frame);
-                }
-                output_frame[0] += routed_frame[0];
-                output_frame[1] += routed_frame[1];
-                if let Some(meter_buses) = meter_buses.as_deref_mut() {
-                    let source_frame = [
+                    );
+                    let right = if voice.source.channels.len() == 1 {
+                        left
+                    } else {
+                        resample_sample(
+                            &voice.source.channels[1],
+                            voice.source_position,
+                            voice.source_step,
+                            self.resampling_quality,
+                        )
+                    };
+                    let expression = voice
+                        .input_midi_channel
+                        .map_or(127, |channel| live_midi_expression[usize::from(channel)]);
+                    let gain = voice.gain * (f32::from(expression) / 127.0) * fade;
+                    let mut routed_frame = [
                         left * gain * voice.left_gain,
                         right * gain * voice.right_gain,
                     ];
-                    let meter_transforms = live_controls.map_or_else(
-                        || voice.mixer_meter_transforms.as_slice(),
-                        |(source_control, _)| source_control.insert_meter_transforms(),
+                    let live_controls = voice.live_mixer_source_control.as_ref().map(
+                        |(source_control, targets)| {
+                            let controls = source_control.next_frame_controls(targets);
+                            source_control.apply_output_frame(controls, &mut routed_frame);
+                            (source_control, controls)
+                        },
                     );
-                    for (track, transform) in meter_transforms {
-                        debug_assert!(*track < MIXER_TRACK_METER_COUNT);
-                        let mut meter_frame = source_frame;
-                        if let Some((source_control, controls)) = live_controls {
-                            source_control.apply_meter_frame(
-                                controls,
-                                *track,
-                                *transform,
-                                &mut meter_frame,
-                            );
-                        } else {
-                            transform.apply_frame(&mut meter_frame);
+                    if live_controls.is_none() {
+                        voice.mixer_transform.apply_frame(&mut routed_frame);
+                    }
+                    let output_frame = output_frame
+                        .as_deref_mut()
+                        .expect("rendering sampler samples has an output block");
+                    output_frame[0] += routed_frame[0];
+                    output_frame[1] += routed_frame[1];
+                    if let Some(meter_buses) = meter_buses.as_deref_mut() {
+                        let source_frame = [
+                            left * gain * voice.left_gain,
+                            right * gain * voice.right_gain,
+                        ];
+                        let meter_transforms = live_controls.map_or_else(
+                            || voice.mixer_meter_transforms.as_slice(),
+                            |(source_control, _)| source_control.insert_meter_transforms(),
+                        );
+                        for (track, transform) in meter_transforms {
+                            debug_assert!(*track < MIXER_TRACK_METER_COUNT);
+                            let mut meter_frame = source_frame;
+                            if let Some((source_control, controls)) = live_controls {
+                                source_control.apply_meter_frame(
+                                    controls,
+                                    *track,
+                                    *transform,
+                                    &mut meter_frame,
+                                );
+                            } else {
+                                transform.apply_frame(&mut meter_frame);
+                            }
+                            let meter_offset = *track * meter_stride_samples + offset * 2;
+                            meter_buses[meter_offset] += meter_frame[0];
+                            meter_buses[meter_offset + 1] += meter_frame[1];
                         }
-                        let meter_offset = *track * meter_stride_samples + offset * 2;
-                        meter_buses[meter_offset] += meter_frame[0];
-                        meter_buses[meter_offset + 1] += meter_frame[1];
                     }
                 }
                 advance_sampler_voice_position(voice);
@@ -9599,6 +9653,7 @@ impl<'a> SamplerVoiceEngine<'a> {
                 }
             }
         }
+        last_active_output_frame
     }
 
     fn start_voice(&mut self, note: ScheduledSamplerNote) -> Option<usize> {
@@ -9781,7 +9836,7 @@ impl<'a> SamplerVoiceEngine<'a> {
         let Some(end_frame) = note.stop_frame.filter(|end| *end > note.start_frame) else {
             return;
         };
-        let reference_pitch = self
+        let reference_pitch_cents = self
             .voices
             .iter()
             .flatten()
@@ -9793,14 +9848,18 @@ impl<'a> SamplerVoiceEngine<'a> {
                         .stop_frame
                         .is_none_or(|stop_frame| stop_frame > note.start_frame)
             })
-            .map(|voice| (voice.key, voice.note_fine_pitch_offset_cents))
-            .max();
-        let Some((reference_key, reference_fine_pitch_cents)) = reference_pitch else {
+            .map(|voice| {
+                f64::from(voice.key) * 100.0
+                    + f64::from(voice.note_fine_pitch_offset_cents)
+                    + voice.pitch_offset_cents
+            })
+            .max_by(f64::total_cmp);
+        let Some(reference_pitch_cents) = reference_pitch_cents else {
             return;
         };
-        let pitch_delta_cents = (i32::from(note.key) - i32::from(reference_key)) as f64 * 100.0
-            + f64::from(note.fine_pitch_offset_cents)
-            - f64::from(reference_fine_pitch_cents);
+        let target_pitch_cents =
+            f64::from(note.key) * 100.0 + f64::from(note.fine_pitch_offset_cents);
+        let pitch_delta_cents = target_pitch_cents - reference_pitch_cents;
         for voice in self.voices.iter_mut().flatten().filter(|voice| {
             voice.channel_id == note.channel_id
                 && voice.midi_channel == note.midi_channel
@@ -9973,6 +10032,56 @@ impl<'a> SamplerVoiceEngine<'a> {
             }
         }
     }
+}
+
+fn sampler_voice_render_end_frame(
+    notes: &[ScheduledSamplerNote],
+    sources_by_channel: &HashMap<u16, SamplerVoiceSource>,
+    voice_limit: usize,
+    release_frames: usize,
+    sample_rate: u32,
+    resampling_quality: ResamplingQuality,
+    pan_law: PanLaw,
+) -> Result<u64, String> {
+    if !notes.iter().any(|note| note.slide_note) {
+        return Ok(0);
+    }
+    let mut engine = SamplerVoiceEngine::with_resampling_quality_and_pan_law(
+        sources_by_channel,
+        notes,
+        voice_limit,
+        release_frames,
+        sample_rate,
+        resampling_quality,
+        pan_law,
+    );
+    let mut block_start = 0u64;
+    let mut last_active_output_frame = 0u64;
+    while engine.next_note < notes.len() || engine.voices.iter().any(Option::is_some) {
+        if engine.voices.iter().all(Option::is_none) {
+            while engine
+                .notes
+                .get(engine.next_note)
+                .is_some_and(|note| note.slide_note)
+            {
+                engine.next_note += 1;
+            }
+            let Some(next_note) = engine.notes.get(engine.next_note) else {
+                break;
+            };
+            block_start = block_start.max(next_note.start_frame);
+        }
+        let frames_until_overflow = u64::MAX - block_start;
+        if frames_until_overflow == 0 {
+            return Err("Sampler render timeline length overflow".to_owned());
+        }
+        let frame_count = frames_until_overflow.min(SAMPLER_BLOCK_FRAMES as u64) as usize;
+        if let Some(end_frame) = engine.advance_block_without_output(block_start, frame_count) {
+            last_active_output_frame = last_active_output_frame.max(end_frame);
+        }
+        block_start += frame_count as u64;
+    }
+    Ok(last_active_output_frame)
 }
 
 fn begin_sampler_voice_release(voice: &mut SamplerVoice, release_frames: usize) {
@@ -15817,6 +15926,144 @@ mod tests {
             [(750.0, true), (750.0, true)]
         );
         assert_eq!(engine.voices.iter().flatten().count(), 3);
+    }
+
+    #[test]
+    fn sampler_sequential_slide_notes_target_their_piano_roll_pitch() {
+        let source = SamplerVoiceSource {
+            audio: Arc::new(DecodedAudio {
+                sample_rate: 1_000,
+                channels: vec![vec![1.0; 256]],
+            }),
+            gain: 1.0,
+            pan: -1.0,
+            reverse: false,
+            volume_envelope_enabled: false,
+            max_polyphony_raw: None,
+            mono_enabled: false,
+            channel_cut_groups: None,
+            fast_declick_for_cut_groups: false,
+            key_range: None,
+            velocity_range: None,
+            root_key: SAMPLER_ROOT_KEY,
+            fine_tune_cents: 0.0,
+            loop_bounds: None,
+            ping_pong_loop: false,
+            release_loop_bounds: None,
+            release_ping_pong_loop: false,
+        };
+        let sources = HashMap::from([(1, source)]);
+        let note = |start_frame, stop_frame, key, slide_note| ScheduledSamplerNote {
+            clip_index: 0,
+            playlist_track_id: None,
+            start_tick: start_frame,
+            stop_tick: stop_frame,
+            start_frame,
+            stop_frame,
+            channel_id: 1,
+            key,
+            midi_channel: 0,
+            slide_note,
+            velocity: 127,
+            pan: 64,
+            fine_pitch_offset_cents: 0,
+            layer_gain: 1.0,
+        };
+        let notes = [
+            note(0, None, SAMPLER_ROOT_KEY, false),
+            note(2, Some(4), SAMPLER_ROOT_KEY + 12, true),
+            note(5, Some(7), SAMPLER_ROOT_KEY + 7, true),
+        ];
+        let mut engine = SamplerVoiceEngine::new(&sources, &notes, 2, 4, 1_000);
+
+        engine.render_block(0, 5, &mut [0.0; 10]);
+        assert_eq!(
+            engine.voices[0].as_ref().unwrap().pitch_offset_cents,
+            1_200.0
+        );
+        engine.render_block(5, 3, &mut [0.0; 6]);
+
+        assert_eq!(engine.voices[0].as_ref().unwrap().pitch_offset_cents, 700.0);
+        assert!(engine.voices[0].as_ref().unwrap().pitch_slide.is_none());
+    }
+
+    #[test]
+    fn sampler_downward_slide_extends_one_shot_render_duration() {
+        let source = SamplerVoiceSource {
+            audio: Arc::new(DecodedAudio {
+                sample_rate: 1_000,
+                channels: vec![vec![1.0; 64]],
+            }),
+            gain: 1.0,
+            pan: -1.0,
+            reverse: false,
+            volume_envelope_enabled: false,
+            max_polyphony_raw: None,
+            mono_enabled: false,
+            channel_cut_groups: None,
+            fast_declick_for_cut_groups: false,
+            key_range: None,
+            velocity_range: None,
+            root_key: SAMPLER_ROOT_KEY,
+            fine_tune_cents: 0.0,
+            loop_bounds: None,
+            ping_pong_loop: false,
+            release_loop_bounds: None,
+            release_ping_pong_loop: false,
+        };
+        let sources = HashMap::from([(1, source)]);
+        let notes = [
+            ScheduledSamplerNote {
+                clip_index: 0,
+                playlist_track_id: None,
+                start_tick: 0,
+                stop_tick: None,
+                start_frame: 0,
+                stop_frame: None,
+                channel_id: 1,
+                key: SAMPLER_ROOT_KEY,
+                midi_channel: 0,
+                slide_note: false,
+                velocity: 127,
+                pan: 64,
+                fine_pitch_offset_cents: 0,
+                layer_gain: 1.0,
+            },
+            ScheduledSamplerNote {
+                clip_index: 0,
+                playlist_track_id: None,
+                start_tick: 2,
+                stop_tick: Some(4),
+                start_frame: 2,
+                stop_frame: Some(4),
+                channel_id: 1,
+                key: SAMPLER_ROOT_KEY - 12,
+                midi_channel: 0,
+                slide_note: true,
+                velocity: 127,
+                pan: 64,
+                fine_pitch_offset_cents: 0,
+                layer_gain: 1.0,
+            },
+        ];
+        let render_end_frame = sampler_voice_render_end_frame(
+            &notes,
+            &sources,
+            2,
+            4,
+            1_000,
+            ResamplingQuality::Linear,
+            PanLaw::Circular,
+        )
+        .unwrap();
+        assert!(render_end_frame > 64);
+
+        let mut engine = SamplerVoiceEngine::new(&sources, &notes, 2, 4, 1_000);
+        engine.render_block(0, 64, &mut vec![0.0; 128]);
+        assert!(engine.voices.iter().any(Option::is_some));
+        let remaining_frames = usize::try_from(render_end_frame - 64).unwrap();
+        engine.render_block(64, remaining_frames, &mut vec![0.0; remaining_frames * 2]);
+        assert!(engine.voices.iter().all(Option::is_none));
     }
 
     #[test]
