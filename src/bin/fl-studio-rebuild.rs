@@ -11911,6 +11911,10 @@ impl DawUi {
                     ("F6", "Channel Rack"),
                     ("F7", "Piano roll"),
                     ("F9", "Mixer"),
+                    ("Ctrl/Cmd+O", "Open project"),
+                    ("Ctrl/Cmd+R", "Render Playlist mix"),
+                    ("Ctrl/Cmd+Shift+M", "Export song MIDI"),
+                    ("Piano roll Ctrl/Cmd+M", "Import MIDI file"),
                     (
                         "Piano roll Delete/Backspace",
                         "Delete selection or target-channel notes",
@@ -26207,7 +26211,8 @@ impl DawUi {
                     && pattern.notes.iter().any(|note| !note.is_muted())
             });
         let mut add_note_requested = false;
-        let mut open_midi_requested = false;
+        let mut open_midi_requested = !ui.ctx().egui_wants_keyboard_input()
+            && ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::M));
         let mut export_midi_requested = false;
         let mut render_requested = false;
         let mut render_insert_requested = false;
@@ -46723,6 +46728,31 @@ impl eframe::App for DawUi {
         }
         ui.painter()
             .rect_filled(ui.max_rect(), egui::CornerRadius::ZERO, APP_BACKGROUND);
+        let open_project_requested = !ui.ctx().egui_wants_keyboard_input()
+            && ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::O));
+        if open_project_requested {
+            self.open_dialog();
+        }
+        let render_playlist_requested = !ui.ctx().egui_wants_keyboard_input()
+            && ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::R));
+        if render_playlist_requested
+            && self.document.is_some()
+            && self.current_path.is_some()
+            && self.pending_song_render.is_none()
+        {
+            self.playlist_render_mixer_stems = false;
+            self.playlist_render_options_open = true;
+        }
+        let export_song_midi_requested = !ui.ctx().egui_wants_keyboard_input()
+            && ui.input_mut(|input| {
+                input.consume_key(
+                    egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                    egui::Key::M,
+                )
+            });
+        if export_song_midi_requested {
+            self.export_song_midi_dialog();
+        }
         let play_pause_requested = !ui.ctx().egui_wants_keyboard_input()
             && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Space));
         if play_pause_requested {
