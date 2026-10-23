@@ -16150,6 +16150,37 @@ impl DawUi {
         let mut muted_clip_requested = None;
         let mut playlist_clip_group_requested = None;
         let mut playlist_audio_clip_reverse_requested = None;
+        if self.selected_arrangement == Some(arrangement.id)
+            && !ui.ctx().egui_wants_keyboard_input()
+            && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Num9))
+        {
+            let selected_clip_indices = if self.selected_playlist_clips.is_empty() {
+                self.selected_clip.into_iter().collect::<Vec<_>>()
+            } else {
+                self.selected_playlist_clips
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>()
+            };
+            let clip_edits = selected_clip_indices
+                .into_iter()
+                .filter_map(|clip_index| {
+                    let PlaylistClipTarget::Channel { id } =
+                        arrangement.clips.get(clip_index)?.target()
+                    else {
+                        return None;
+                    };
+                    channel_audio_clip_reverse
+                        .get(&id)
+                        .map(|reversed| (clip_index, !*reversed))
+                })
+                .collect::<Vec<_>>();
+            if clip_edits.is_empty() {
+                self.status = "Select one or more Audio Clips to reverse".to_owned();
+            } else {
+                playlist_audio_clip_reverse_requested = Some(clip_edits);
+            }
+        }
         let mut copy_clip_requested = None;
         let mut cut_clip_requested = None;
         let mut paste_clip_after_requested = None;
