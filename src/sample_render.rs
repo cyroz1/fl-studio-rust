@@ -155,6 +155,14 @@ impl PlaylistTempoMap {
         Ok(frames.round() as u64)
     }
 
+    fn tempo_bpm_at_tick(&self, tick: u64) -> f64 {
+        let segment_index = self
+            .segments
+            .partition_point(|segment| segment.start_tick <= tick)
+            .saturating_sub(1);
+        self.segments[segment_index].tempo_bpm
+    }
+
     /// Convert a fractional Playlist tick position to a rounded sample-frame position.
     pub fn frame_at_fractional_tick(&self, tick: f64, sample_rate: u32) -> Result<u64, String> {
         if !tick.is_finite() || tick < 0.0 {
@@ -6087,6 +6095,77 @@ fn channel_audio_clip_stretch_plan(
     }
 }
 
+fn sampler_resample_stretch_pitch_adjustment(
+    channel: &ChannelSummary,
+    source_frames: usize,
+    source_sample_rate: u32,
+    ppq: u16,
+    tempo_bpm: f64,
+) -> Result<Option<(f64, f64)>, String> {
+    let Some(settings) = channel.stretch_settings().filter(|settings| {
+        settings.time_raw() > 0 && settings.mode() == ChannelStretchMode::Resample
+    }) else {
+        return Ok(None);
+    };
+    if ppq == 0 {
+        return Err("project PPQ must be greater than zero".to_owned());
+    }
+    if source_frames == 0 || source_sample_rate == 0 {
+        return Err(format!(
+            "Sampler channel {} has an empty or invalid audio source range",
+            channel.id()
+        ));
+    }
+    if !tempo_bpm.is_finite() || tempo_bpm <= 0.0 {
+        return Err("project tempo must be finite and positive".to_owned());
+    }
+    let pitch_raw = settings.pitch_raw();
+    if !(-1_200..=1_200).contains(&pitch_raw) {
+        return Err(format!(
+            "Sampler channel {} has unsupported Resample pitch {pitch_raw} cents",
+            channel.id()
+        ));
+    }
+    let multiplier = 2.0_f64.powf(f64::from(settings.multiplier_raw()) / 10_000.0);
+    if !multiplier.is_finite() || !(0.25..=4.0).contains(&multiplier) {
+        return Err(format!(
+            "Sampler channel {} has Resample multiplier outside 0.25x to 4x",
+            channel.id()
+        ));
+    }
+
+    let target_ticks = f64::from(settings.time_raw()) * f64::from(ppq) / 192.0 * multiplier;
+    let target_seconds = target_ticks * 60.0 / (f64::from(ppq) * tempo_bpm);
+    if !target_ticks.is_finite()
+        || target_ticks <= 0.0
+        || !target_seconds.is_finite()
+        || target_seconds <= 0.0
+    {
+        return Err(format!(
+            "Sampler channel {} Resample duration is outside the renderable range",
+            channel.id()
+        ));
+    }
+
+    let source_seconds = source_frames as f64 / f64::from(source_sample_rate);
+    let pitch_factor = 2.0_f64.powf(f64::from(pitch_raw) / 1_200.0);
+    let playback_rate_ratio = source_seconds / target_seconds * pitch_factor;
+    if !playback_rate_ratio.is_finite() || playback_rate_ratio <= 0.0 {
+        return Err(format!(
+            "Sampler channel {} Resample rate is outside the renderable range",
+            channel.id()
+        ));
+    }
+    let pitch_adjustment_cents = 1_200.0 * playback_rate_ratio.log2();
+    if !pitch_adjustment_cents.is_finite() {
+        return Err(format!(
+            "Sampler channel {} Resample pitch is outside the renderable range",
+            channel.id()
+        ));
+    }
+    Ok(Some((target_ticks, pitch_adjustment_cents)))
+}
+
 fn prepare_audio_clip_render(
     document: &FlpDocument,
     project_path: &Path,
@@ -6930,6 +7009,54 @@ fn prepare_sampler_arrangement(
             let loop_bounds = validated_sampler_loop_bounds(loop_points, audio.frame_count());
             let release_loop_bounds =
                 validated_sampler_loop_bounds(release_loop_points, audio.frame_count());
+            let sampler_stretch = sampler_resample_stretch_pitch_adjustment(
+                channel,
+                audio.frame_count(),
+                audio.sample_rate,
+                ppq,
+                tempo_map.tempo_bpm_at_tick(placed.start_tick),
+            )?;
+            if let Some((_, first_pitch_adjustment_cents)) = sampler_stretch {
+                for scheduled_note in schedule.notes.iter().filter(|scheduled_note| {
+                    scheduled_note.target_channel_id == placed.target_channel_id
+                }) {
+                    let start_tick = scheduled_note.start_tick;
+                    let start_tick_f64 = start_tick as f64;
+                    let Some((note_target_ticks, note_pitch_adjustment_cents)) =
+                        sampler_resample_stretch_pitch_adjustment(
+                            channel,
+                            audio.frame_count(),
+                            audio.sample_rate,
+                            ppq,
+                            tempo_map.tempo_bpm_at_tick(start_tick),
+                        )?
+                    else {
+                        continue;
+                    };
+                    if tempo_map.has_tempo_change_between(
+                        start_tick_f64,
+                        start_tick_f64 + note_target_ticks,
+                    ) || (loop_bounds.is_some()
+                        && scheduled_note.stop_tick.is_some_and(|stop_tick| {
+                            tempo_map.has_tempo_change_between(
+                                start_tick_f64 + note_target_ticks,
+                                stop_tick as f64,
+                            )
+                        }))
+                    {
+                        return Err(format!(
+                            "Sampler channel {} uses Resample time stretching across Playlist tempo automation, which this renderer cannot follow",
+                            placed.target_channel_id
+                        ));
+                    }
+                    if (note_pitch_adjustment_cents - first_pitch_adjustment_cents).abs() > 0.01 {
+                        return Err(format!(
+                            "Sampler channel {} uses Resample time stretching at multiple Playlist tempos, which this renderer cannot follow",
+                            placed.target_channel_id
+                        ));
+                    }
+                }
+            }
             let (gain, pan) = channel_gain_pan(channel.volume(), channel.pan());
             source_entry.insert(SamplerVoiceSource {
                 audio,
@@ -6954,7 +7081,8 @@ fn prepare_sampler_arrangement(
                     + f64::from(channel.keyboard_fine_tune_cents().unwrap_or_default())
                     + f64::from(channel.master_pitch_render_offset_cents(
                         document.metadata().master_pitch_cents(),
-                    )),
+                    ))
+                    + sampler_stretch.map_or(0.0, |(_, cents)| cents),
                 loop_bounds,
                 ping_pong_loop: sample_metadata
                     .ping_pong_loop
@@ -9311,6 +9439,13 @@ fn prepare_sampler_pattern_for_channel_internal(
             let loop_bounds = validated_sampler_loop_bounds(loop_points, audio.frame_count());
             let release_loop_bounds =
                 validated_sampler_loop_bounds(release_loop_points, audio.frame_count());
+            let sampler_stretch = sampler_resample_stretch_pitch_adjustment(
+                channel,
+                audio.frame_count(),
+                audio.sample_rate,
+                ppq,
+                tempo_bpm,
+            )?;
             let (gain, pan) = channel_gain_pan(channel.volume(), channel.pan());
             source_entry.insert(SamplerVoiceSource {
                 audio,
@@ -9335,7 +9470,8 @@ fn prepare_sampler_pattern_for_channel_internal(
                     + f64::from(channel.keyboard_fine_tune_cents().unwrap_or_default())
                     + f64::from(channel.master_pitch_render_offset_cents(
                         document.metadata().master_pitch_cents(),
-                    )),
+                    ))
+                    + sampler_stretch.map_or(0.0, |(_, cents)| cents),
                 loop_bounds,
                 ping_pong_loop: sample_metadata
                     .ping_pong_loop
