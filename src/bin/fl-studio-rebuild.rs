@@ -35614,7 +35614,7 @@ impl DawUi {
                     },
                 )
                 .on_hover_text(
-                    "Right-Shift+drag a selected note edge to stretch the sequence; Alt+Right-Shift uses 25% steps · Alt/Option+wheel edits the active property · Shift+Alt/Option+wheel nudges timing",
+                    "Drag the selection stretch handle or use Right-Shift+drag on a selected note edge; Alt on the handle bypasses snap, while Alt+Right-Shift uses 25% steps · Alt/Option+wheel edits the active property · Shift+Alt/Option+wheel nudges timing",
                 );
                 let note_id = (pattern.id, note.channel_id, *channel_index);
                 let modifiers = scroll_modifiers;
@@ -35984,6 +35984,217 @@ impl DawUi {
                     self.active_note_drag = None;
                 }
                 *channel_index += 1;
+            }
+            let stretch_grid_rect = egui::Rect::from_min_max(
+                egui::pos2(rect.left() + keyboard_width, grid_rect.top()),
+                grid_rect.right_bottom(),
+            );
+            let mut selection_stretch_handle = None;
+            if !self.piano_roll_zoom_mode
+                && !self.piano_roll_playback_mode
+                && !self.piano_roll_slice_mode
+                && !self.piano_roll_delete_mode
+                && !self.piano_roll_mute_mode
+                && !self.piano_roll_stamp_mode
+                && !suppress_piano_roll_touch_edits
+                && let Some(channel_id) = self.selected_note_channel
+            {
+                let selected_bounds = note_selection_rects
+                    .iter()
+                    .filter(|(selected_channel, note_index, _, _, _)| {
+                        *selected_channel == channel_id
+                            && self
+                                .selected_piano_notes
+                                .contains(&(pattern.id, *selected_channel, *note_index))
+                    })
+                    .map(|(_, _, note_rect, _, _)| *note_rect)
+                    .reduce(|bounds, next| {
+                        egui::Rect::from_min_max(
+                            egui::pos2(
+                                bounds.left().min(next.left()),
+                                bounds.top().min(next.top()),
+                            ),
+                            egui::pos2(
+                                bounds.right().max(next.right()),
+                                bounds.bottom().max(next.bottom()),
+                            ),
+                        )
+                    })
+                    .map(|bounds| bounds.intersect(stretch_grid_rect))
+                    .filter(|bounds| bounds.is_positive());
+                let targets =
+                    piano_roll_selected_note_drag_targets(pattern, pattern.id, channel_id, &self.selected_piano_notes);
+                if let Some(bounds) = selected_bounds.filter(|_| !targets.is_empty()) {
+                    let center = egui::pos2(
+                        bounds.right().clamp(
+                            stretch_grid_rect.left() + 8.0,
+                            stretch_grid_rect.right() - 8.0,
+                        ),
+                        (bounds.top() - 8.0).clamp(
+                            stretch_grid_rect.top() + 8.0,
+                            stretch_grid_rect.bottom() - 8.0,
+                        ),
+                    );
+                    let handle_rect = egui::Rect::from_center_size(center, Vec2::splat(15.0));
+                    selection_stretch_handle = Some(handle_rect);
+                    note_rects.push(handle_rect);
+                    painter.rect_filled(
+                        handle_rect,
+                        egui::CornerRadius::same(7),
+                        Color32::from_rgb(39, 69, 88),
+                    );
+                    painter.rect_stroke(
+                        handle_rect,
+                        egui::CornerRadius::same(7),
+                        Stroke::new(1.0, Color32::from_rgb(120, 184, 224)),
+                        egui::StrokeKind::Inside,
+                    );
+                    painter.line_segment(
+                        [
+                            egui::pos2(handle_rect.left() + 3.0, center.y),
+                            egui::pos2(handle_rect.right() - 3.0, center.y),
+                        ],
+                        Stroke::new(1.2, Color32::WHITE),
+                    );
+                    painter.line_segment(
+                        [
+                            egui::pos2(handle_rect.left() + 3.0, center.y),
+                            egui::pos2(handle_rect.left() + 5.5, center.y - 2.5),
+                        ],
+                        Stroke::new(1.2, Color32::WHITE),
+                    );
+                    painter.line_segment(
+                        [
+                            egui::pos2(handle_rect.left() + 3.0, center.y),
+                            egui::pos2(handle_rect.left() + 5.5, center.y + 2.5),
+                        ],
+                        Stroke::new(1.2, Color32::WHITE),
+                    );
+                    painter.line_segment(
+                        [
+                            egui::pos2(handle_rect.right() - 3.0, center.y),
+                            egui::pos2(handle_rect.right() - 5.5, center.y - 2.5),
+                        ],
+                        Stroke::new(1.2, Color32::WHITE),
+                    );
+                    painter.line_segment(
+                        [
+                            egui::pos2(handle_rect.right() - 3.0, center.y),
+                            egui::pos2(handle_rect.right() - 5.5, center.y + 2.5),
+                        ],
+                        Stroke::new(1.2, Color32::WHITE),
+                    );
+                    let handle_response = ui
+                        .interact(
+                            handle_rect,
+                            Id::new(("piano-roll-selection-stretch", pattern.id, channel_id)),
+                            Sense::click_and_drag(),
+                        )
+                        .on_hover_text(
+                            "Drag to stretch selected notes; hold Alt to bypass snap",
+                        );
+                    if handle_response.drag_started_by(PointerButton::Primary)
+                        && self.active_note_drag.is_none()
+                        && let (Some(pointer), Some(anchor_index)) = (
+                            handle_response.interact_pointer_pos(),
+                            targets.first().map(|target| target.channel_note_index),
+                        )
+                    {
+                        self.active_note_drag = Some(ActiveNoteDrag {
+                            pattern_id: pattern.id,
+                            channel_id,
+                            channel_note_index: usize::MAX,
+                            start_pointer: pointer,
+                            targets,
+                            kind: NoteDragKind::Stretch,
+                            stretch_quarter_steps: false,
+                            scale_snap: None,
+                        });
+                        self.selected_note = Some((
+                            pattern.id,
+                            channel_id,
+                            anchor_index,
+                        ));
+                    }
+                    if handle_response.dragged()
+                        && let Some(drag) = self
+                            .active_note_drag
+                            .as_ref()
+                            .filter(|drag| {
+                                drag.pattern_id == pattern.id
+                                    && drag.channel_id == channel_id
+                                    && drag.channel_note_index == usize::MAX
+                            })
+                            .cloned()
+                        && let Some(pointer) = handle_response.interact_pointer_pos()
+                    {
+                        let tick_delta =
+                            ((pointer.x - drag.start_pointer.x) / tick_scale).round() as i64;
+                        let start_tick = drag
+                            .targets
+                            .iter()
+                            .map(|target| target.start_position)
+                            .min()
+                            .unwrap_or_default();
+                        let end_tick = drag
+                            .targets
+                            .iter()
+                            .map(|target| {
+                                u64::from(target.start_position) + u64::from(target.start_length)
+                            })
+                            .max()
+                            .unwrap_or(u64::from(start_tick));
+                        let original_duration =
+                            end_tick.saturating_sub(u64::from(start_tick)).max(1);
+                        let unsnapped = ui.input(|input| input.modifiers.alt);
+                        let stretch_snap_ticks = if unsnapped { 1 } else { snap_ticks };
+                        let stretched_duration = piano_roll_stretched_duration(
+                            start_tick,
+                            end_tick,
+                            tick_delta,
+                            stretch_snap_ticks,
+                            false,
+                        );
+                        let mut updated = self.document.clone();
+                        let result = if let Some(document) = updated.as_mut() {
+                            drag.targets.iter().try_for_each(|target| {
+                                document.edit_pattern_note(
+                                    drag.pattern_id,
+                                    target.channel_id,
+                                    target.channel_note_index,
+                                    piano_roll_stretched_note_edit(
+                                        *target,
+                                        start_tick,
+                                        original_duration,
+                                        stretched_duration,
+                                        stretch_snap_ticks,
+                                    ),
+                                )
+                            })
+                        } else {
+                            return;
+                        };
+                        if result.is_ok() {
+                            self.document = updated;
+                            self.dirty = true;
+                            self.status = format!(
+                                "Stretched {} selected notes",
+                                drag.targets.len()
+                            );
+                        } else if let Err(error) = result {
+                            self.status = format!("Could not stretch selected notes: {error}");
+                        }
+                    }
+                    if handle_response.drag_stopped()
+                        && self.active_note_drag.as_ref().is_some_and(|drag| {
+                            drag.pattern_id == pattern.id
+                                && drag.channel_id == channel_id
+                                && drag.channel_note_index == usize::MAX
+                        })
+                    {
+                        self.active_note_drag = None;
+                    }
+                }
             }
             let grid_body_rect = egui::Rect::from_min_max(
                 egui::pos2(grid_rect.left() + keyboard_width, grid_rect.top()),
@@ -36574,6 +36785,12 @@ impl DawUi {
             if grid_response.drag_started_by(PointerButton::Primary)
                 && !self.piano_roll_zoom_mode
                 && (self.piano_roll_select_mode || modifiers.command)
+                && ui
+                    .input(|input| input.pointer.press_origin())
+                    .is_none_or(|origin| {
+                        !selection_stretch_handle
+                            .is_some_and(|handle| handle.contains(origin))
+                    })
                 && let Some(origin) = ui
                     .input(|input| input.pointer.press_origin())
                     .or_else(|| grid_response.interact_pointer_pos())
@@ -49829,6 +50046,31 @@ fn piano_roll_stretched_duration(
         u64::from(snapped_end.saturating_sub(start_tick)).max(1)
     };
     duration.min(u64::from(u32::MAX))
+}
+
+fn piano_roll_selected_note_drag_targets(
+    pattern: &Pattern,
+    pattern_id: u16,
+    channel_id: u16,
+    selected_notes: &BTreeSet<(u16, u16, usize)>,
+) -> Vec<NoteDragTarget> {
+    pattern
+        .notes
+        .iter()
+        .filter(|note| note.channel_id == channel_id)
+        .enumerate()
+        .filter_map(|(channel_note_index, note)| {
+            selected_notes
+                .contains(&(pattern_id, channel_id, channel_note_index))
+                .then_some(NoteDragTarget {
+                    channel_id,
+                    channel_note_index,
+                    start_position: note.position,
+                    start_length: note.length,
+                    start_key: note.key,
+                })
+        })
+        .collect()
 }
 
 fn piano_roll_stretched_note_edit(
