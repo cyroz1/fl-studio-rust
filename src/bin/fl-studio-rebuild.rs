@@ -16504,7 +16504,8 @@ impl DawUi {
             ui.separator();
             ui.label("Clip focus");
             for focus in PlaylistClipFocus::ALL {
-                ui.selectable_value(
+                let response = ui
+                    .selectable_value(
                     &mut self.playlist_clip_focus,
                     focus,
                     focus.label(),
@@ -16513,6 +16514,36 @@ impl DawUi {
                     "Bring {} Clips to the top of overlapping stacks; press M to cycle focus",
                     focus.label()
                 ));
+                if focus == PlaylistClipFocus::Pattern {
+                    response.context_menu(|ui| {
+                        ui.label("Pattern Clip source");
+                        if patterns.is_empty() {
+                            ui.weak("No patterns");
+                        }
+                        for pattern in &patterns {
+                            let label = pattern
+                                .name
+                                .as_deref()
+                                .filter(|name| !name.trim().is_empty())
+                                .map_or_else(|| format!("Pattern {}", pattern.id), str::to_owned);
+                            ui.horizontal(|ui| {
+                                show_pattern_color_swatch(ui, pattern.color);
+                                if ui
+                                    .selectable_label(
+                                        selected_pattern_id == Some(pattern.id),
+                                        label,
+                                    )
+                                    .clicked()
+                                {
+                                    self.selected_pattern = Some(pattern.id);
+                                    self.status =
+                                        format!("Selected Pattern {} for Playlist placement", pattern.id);
+                                    ui.close();
+                                }
+                            });
+                        }
+                    });
+                }
             }
             let previous_edit_patterns_in = self.playlist_edit_patterns_in;
             let previous_scroll_to_position = self.playlist_scroll_to_position;
