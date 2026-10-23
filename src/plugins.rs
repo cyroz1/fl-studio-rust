@@ -32,6 +32,16 @@ pub struct PluginCandidate {
     /// VST3 processor class IDs declared by a bundle's validated moduleinfo.json,
     /// including IDs retired by its compatibility mappings.
     pub class_ids: Vec<String>,
+    /// Audio Unit component identities parsed from a bundle's `Info.plist`.
+    pub audio_unit_components: Vec<AudioUnitComponentInfo>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AudioUnitComponentInfo {
+    pub name: String,
+    pub type_code: String,
+    pub subtype_code: String,
+    pub manufacturer_code: String,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -331,6 +341,7 @@ fn add_candidate(
         .map(|value| value.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string());
     let mut class_ids = Vec::new();
+    let mut audio_unit_components = Vec::new();
     if format == PluginFormat::Vst3 {
         match vst3_host::discovery::read_module_info(path) {
             Ok(Some(module_info)) => {
@@ -353,13 +364,69 @@ fn add_candidate(
                 .scan_errors
                 .push((path.to_path_buf(), error.to_string())),
         }
+    } else if format == PluginFormat::AudioUnitCandidate {
+        match read_audio_unit_components(path) {
+            Ok(components) => audio_unit_components = components,
+            Err(error) => report.scan_errors.push((path.to_path_buf(), error)),
+        }
     }
     report.candidates.push(PluginCandidate {
         format,
         name,
         path: path.to_path_buf(),
         class_ids,
+        audio_unit_components,
     });
+}
+
+fn read_audio_unit_components(bundle_path: &Path) -> Result<Vec<AudioUnitComponentInfo>, String> {
+    const MAX_INFO_PLIST_BYTES: u64 = 4 * 1024 * 1024;
+    let contents_info = bundle_path.join("Contents").join("Info.plist");
+    let info_path = if contents_info.is_file() {
+        contents_info
+    } else {
+        bundle_path.join("Info.plist")
+    };
+    let metadata = fs::metadata(&info_path)
+        .map_err(|error| format!("could not read Audio Unit Info.plist metadata: {error}"))?;
+    if metadata.len() > MAX_INFO_PLIST_BYTES {
+        return Err(format!(
+            "Audio Unit Info.plist is larger than {MAX_INFO_PLIST_BYTES} bytes"
+        ));
+    }
+    let plist = plist::Value::from_file(&info_path)
+        .map_err(|error| format!("could not parse Audio Unit Info.plist: {error}"))?;
+    let dictionary = plist
+        .as_dictionary()
+        .ok_or_else(|| "Audio Unit Info.plist root is not a dictionary".to_owned())?;
+    let entries = dictionary
+        .get("AudioComponents")
+        .and_then(plist::Value::as_array)
+        .ok_or_else(|| "Audio Unit Info.plist has no AudioComponents array".to_owned())?;
+    let mut components = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let entry = entry
+            .as_dictionary()
+            .ok_or_else(|| format!("AudioComponents entry {index} is not a dictionary"))?;
+        let field = |key: &str| {
+            entry
+                .get(key)
+                .and_then(plist::Value::as_string)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| format!("AudioComponents entry {index} has no string {key:?} field"))
+        };
+        components.push(AudioUnitComponentInfo {
+            name: field("name")?,
+            type_code: field("type")?,
+            subtype_code: field("subtype")?,
+            manufacturer_code: field("manufacturer")?,
+        });
+    }
+    if components.is_empty() {
+        return Err("Audio Unit Info.plist has an empty AudioComponents array".to_owned());
+    }
+    Ok(components)
 }
 
 fn push_unique_class_id(class_ids: &mut Vec<String>, class_id: &str) {
@@ -383,7 +450,7 @@ fn normalized_path(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{PluginFormat, PluginScanReport, walk};
+    use super::{AudioUnitComponentInfo, PluginFormat, PluginScanReport, walk};
     use std::collections::HashSet;
     use std::fs;
     use std::path::PathBuf;
@@ -492,8 +559,53 @@ mod tests {
         let temp = TestDirectory::new();
         let component = temp.0.join("Vendor").join("Echo.component");
         let audio_component = temp.0.join("Vendor").join("Codec.audiocomp");
-        fs::create_dir_all(&component).expect("Audio Unit bundle should be created");
-        fs::create_dir_all(&audio_component).expect("audio component bundle should be created");
+        for (bundle, name, type_code, subtype_code, manufacturer_code) in [
+            (&component, "Echo", "aufx", "ECHO", "ACME"),
+            (&audio_component, "Codec", "aufc", "CODE", "ACME"),
+        ] {
+            let info_path = bundle.join("Contents").join("Info.plist");
+            fs::create_dir_all(info_path.parent().expect("Info.plist should have a parent"))
+                .expect("Audio Unit Contents directory should be created");
+            if name == "Codec" {
+                let mut component_info = plist::Dictionary::new();
+                component_info.insert("name".to_owned(), plist::Value::String(name.to_owned()));
+                component_info.insert(
+                    "type".to_owned(),
+                    plist::Value::String(type_code.to_owned()),
+                );
+                component_info.insert(
+                    "subtype".to_owned(),
+                    plist::Value::String(subtype_code.to_owned()),
+                );
+                component_info.insert(
+                    "manufacturer".to_owned(),
+                    plist::Value::String(manufacturer_code.to_owned()),
+                );
+                let mut root = plist::Dictionary::new();
+                root.insert(
+                    "AudioComponents".to_owned(),
+                    plist::Value::Array(vec![plist::Value::Dictionary(component_info)]),
+                );
+                plist::Value::Dictionary(root)
+                    .to_file_binary(&info_path)
+                    .expect("binary Audio Unit metadata should be written");
+            } else {
+                fs::write(
+                    &info_path,
+                    format!(
+                        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>AudioComponents</key><array><dict>
+<key>name</key><string>{name}</string>
+<key>type</key><string>{type_code}</string>
+<key>subtype</key><string>{subtype_code}</string>
+<key>manufacturer</key><string>{manufacturer_code}</string>
+</dict></array></dict></plist>"#
+                    ),
+                )
+                .expect("Audio Unit metadata should be written");
+            }
+        }
 
         let mut report = PluginScanReport::default();
         let mut visited = HashSet::new();
@@ -518,7 +630,52 @@ mod tests {
                 && candidate.name == "Codec"
                 && candidate.path == audio_component
         }));
+        let echo = report
+            .candidates
+            .iter()
+            .find(|candidate| candidate.path.ends_with("Echo.component"))
+            .expect("Audio Unit bundle should be discovered");
+        assert_eq!(
+            echo.audio_unit_components,
+            vec![AudioUnitComponentInfo {
+                name: "Echo".to_owned(),
+                type_code: "aufx".to_owned(),
+                subtype_code: "ECHO".to_owned(),
+                manufacturer_code: "ACME".to_owned(),
+            }]
+        );
+        let codec = report
+            .candidates
+            .iter()
+            .find(|candidate| candidate.path.ends_with("Codec.audiocomp"))
+            .expect("audio component bundle should be discovered");
+        assert_eq!(codec.audio_unit_components[0].name, "Codec");
+        assert_eq!(codec.audio_unit_components[0].type_code, "aufc");
         assert!(report.scan_errors.is_empty());
+    }
+
+    #[test]
+    fn scan_keeps_audio_unit_bundle_when_component_metadata_is_missing() {
+        let temp = TestDirectory::new();
+        let component = temp.0.join("Vendor").join("Unknown.component");
+        fs::create_dir_all(&component).expect("Audio Unit candidate bundle should be created");
+
+        let mut report = PluginScanReport::default();
+        let mut visited = HashSet::new();
+        let mut found = HashSet::new();
+        walk(
+            &temp.0,
+            PluginFormat::AudioUnitCandidate,
+            0,
+            &mut report,
+            &mut visited,
+            &mut found,
+        );
+
+        assert_eq!(report.candidates.len(), 1);
+        assert!(report.candidates[0].audio_unit_components.is_empty());
+        assert_eq!(report.scan_errors.len(), 1);
+        assert!(report.scan_errors[0].1.contains("Info.plist"));
     }
 
     #[test]

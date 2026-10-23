@@ -46448,7 +46448,7 @@ impl DawUi {
                 ));
                 ui.label(
                     egui::RichText::new(
-                        "Bundles are listed by filename only. Audio Unit validation, loading, and playback are not available yet.",
+                        "Component names and identifiers are read from Info.plist when present. Registry validation, loading, and playback are not available yet.",
                     )
                     .color(MUTED),
                 );
@@ -46459,6 +46459,18 @@ impl DawUi {
                         .show(ui, |ui| {
                             ui.strong(&candidate.name);
                             ui.small(candidate.path.display().to_string());
+                            for component in &candidate.audio_unit_components {
+                                ui.small(format!(
+                                    "{} · type {} · subtype {} · manufacturer {}",
+                                    component.name,
+                                    component.type_code,
+                                    component.subtype_code,
+                                    component.manufacturer_code
+                                ));
+                            }
+                            if candidate.audio_unit_components.is_empty() {
+                                ui.small("No AudioComponents metadata decoded");
+                            }
                         });
                     ui.add_space(3.0);
                 }
@@ -57791,6 +57803,7 @@ mod tests {
             name: "Example".to_owned(),
             path: PathBuf::from("/plugins/Example.vst3"),
             class_ids: vec!["00112233445566778899AABBCCDDEEFF".to_owned()],
+            audio_unit_components: Vec::new(),
         };
 
         assert!(candidate_matches_vst_identity(
@@ -58016,6 +58029,7 @@ mod tests {
             name: "Example".to_owned(),
             path: PathBuf::from("/plugins/Example.vst3"),
             class_ids: Vec::new(),
+            audio_unit_components: Vec::new(),
         };
 
         assert!(candidate_matches_vst_identity(
