@@ -27258,7 +27258,9 @@ impl DawUi {
             }
             if ui
                 .selectable_label(self.piano_roll_slice_mode, "Slice (C)")
-                .on_hover_text("Drag a cut line across notes to split them")
+                .on_hover_text(
+                    "Drag a cut line across notes; Shift-click makes one vertical cut, and Shift+Alt bypasses snap",
+                )
                 .clicked()
             {
                 self.piano_roll_slice_mode = !self.piano_roll_slice_mode;
@@ -36096,6 +36098,44 @@ impl DawUi {
                     Sense::hover()
                 },
             );
+            let slice_click = if self.piano_roll_slice_mode
+                && !scroll_modifiers.command
+                && !suppress_piano_roll_touch_edits
+                && slice_response.clicked_by(PointerButton::Primary)
+                && ui.input(|input| input.modifiers.shift)
+            {
+                slice_response.interact_pointer_pos().map(|pointer| {
+                    let pointer = egui::pos2(
+                        pointer.x.clamp(grid_body_rect.left(), grid_body_rect.right()),
+                        pointer.y.clamp(grid_body_rect.top(), grid_body_rect.bottom()),
+                    );
+                    let snap_ticks = if ui.input(|input| input.modifiers.alt) {
+                        0
+                    } else {
+                        snap_ticks
+                    };
+                    (
+                        piano_roll_time_tick_at_x(
+                            pointer.x,
+                            grid_rect.left() + keyboard_width,
+                            tick_scale,
+                            snap_ticks,
+                        ),
+                        pointer,
+                    )
+                })
+            } else {
+                None
+            };
+            if let Some((_, pointer)) = slice_click
+                && self.piano_roll_slice_drag.is_none()
+            {
+                self.piano_roll_slice_drag = Some(PianoRollSliceDrag {
+                    pattern_id: pattern.id,
+                    start: pointer,
+                    current: pointer,
+                });
+            }
             if self.piano_roll_slice_mode
                 && !scroll_modifiers.command
                 && slice_response.drag_started_by(PointerButton::Primary)
@@ -36124,7 +36164,7 @@ impl DawUi {
                     [drag.start, drag.current],
                     Stroke::new(2.0, Color32::from_rgb(255, 156, 88)),
                 );
-                if slice_response.drag_stopped_by(PointerButton::Primary) {
+                if slice_response.drag_stopped_by(PointerButton::Primary) || slice_click.is_some() {
                     let note_cuts = note_selection_rects
                         .iter()
                         .filter_map(
@@ -36134,17 +36174,21 @@ impl DawUi {
                                 {
                                     return None;
                                 }
-                                let cut_x = piano_roll_slice_line_cut_x(
-                                    drag.start,
-                                    drag.current,
-                                    *note_rect,
-                                )?;
-                                let cut_tick = piano_roll_time_tick_at_x(
-                                    cut_x,
-                                    grid_rect.left() + keyboard_width,
-                                    tick_scale,
-                                    snap_ticks,
-                                );
+                                let cut_tick = if let Some((cut_tick, _)) = slice_click {
+                                    cut_tick
+                                } else {
+                                    let cut_x = piano_roll_slice_line_cut_x(
+                                        drag.start,
+                                        drag.current,
+                                        *note_rect,
+                                    )?;
+                                    piano_roll_time_tick_at_x(
+                                        cut_x,
+                                        grid_rect.left() + keyboard_width,
+                                        tick_scale,
+                                        snap_ticks,
+                                    )
+                                };
                                 let note_end =
                                     u64::from(*note_start) + u64::from(*note_length);
                                 (u64::from(cut_tick) > u64::from(*note_start)

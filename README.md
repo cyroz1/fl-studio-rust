@@ -268,7 +268,7 @@ The Piano roll's **Edit** target selector applies note-transform buttons to eith
 
 **Claw machine channel/selected** and `claw-notes` gate notes on a repeating period, slew their timing toward the period start or end, and can remove notes shorter than one period slice or stretch notes across gaps left by removed notes. `claw-notes-selected` accepts comma-separated zero-based channel-local note indexes. Its 16-slice gate and timing curve are local interpretations; native note-splitting and exact distortion behavior remain unverified ([FL Studio Claw Machine manual](https://www.image-line.com/fl-studio-learning/fl-studio-online-manual/html/pianoroll_claw.htm)).
 
-**Slice channel/selected** splits targeted notes that cross the configured tick, retaining their note properties. The drag-based directional Slice tool remains incomplete.
+**Slice channel/selected** splits targeted notes that cross the configured tick, retaining their note properties. In the Piano roll, Slice (C) also cuts notes where a dragged line intersects them; Shift-click makes a single vertical cut at the clicked time, and Shift+Alt-click bypasses snap.
 
 **Scale Levels channel/selected** and `scale-levels-notes` adjust note velocities with Center, logarithmic Tension, Multiply, and Offset. `scale-levels-notes-selected` accepts comma-separated zero-based channel-local note indexes. Center and Tension use local formulas pending comparison against native FL Studio.
 
