@@ -32,7 +32,11 @@ use crate::media::{
     DecodedAudio, SamplePathResolver, decode_audio_file, process_audio_range_for_playback,
     sample_sampler_metadata,
 };
-use crate::vst3::{PlaylistMidiNote, Vst3PlaylistStreamProcessor};
+use crate::vst3::{
+    PlaylistMidiNote, Vst3ParameterAutomation, Vst3PlaylistAutomationPoint,
+    Vst3PlaylistParameterAutomation, Vst3PlaylistStreamProcessor,
+    expand_pattern_parameter_automation_for_clip,
+};
 use crate::{
     Arrangement, ChannelNoteRouter, ChannelStretchMode, ChannelSummary, FlpDocument,
     MixerInsertSignalTransform, MixerLiveSourceRoutePlan, MixerRouteAudibility,
@@ -2111,6 +2115,11 @@ pub fn stream_playlist_performance_with_vst3_to_device(
         performance.meters.is_some(),
         Some(cancelled),
     )?;
+    let performance_pattern_automation = vst3_processor
+        .as_ref()
+        .map(Vst3PlaylistStreamProcessor::performance_pattern_automation)
+        .cloned()
+        .unwrap_or_default();
     let runtime = PlaylistPerformanceRuntime::new(
         document,
         options,
@@ -2122,6 +2131,7 @@ pub fn stream_playlist_performance_with_vst3_to_device(
             audio_clip_indices: &performance_audio_clip_indices,
             vst3_clip_indices: &performance_vst3_clip_indices,
             vst3_channel_ids: &loaded_vst3_channels,
+            pattern_automation: &performance_pattern_automation,
             sampler: &sampler,
             audio: &audio,
         },
@@ -7803,6 +7813,7 @@ struct PerformanceVst3Clip {
     source_start_tick: u32,
     length_ticks: u64,
     notes: Vec<PerformanceVst3Note>,
+    parameter_automation_by_channel: BTreeMap<u16, Vec<Vst3PlaylistParameterAutomation>>,
 }
 
 #[derive(Clone, Copy)]
@@ -7856,6 +7867,7 @@ struct PlaylistPerformanceSources<'a> {
     audio_clip_indices: &'a BTreeSet<usize>,
     vst3_clip_indices: &'a BTreeSet<usize>,
     vst3_channel_ids: &'a BTreeSet<u16>,
+    pattern_automation: &'a BTreeMap<(u16, u16), Vec<Vst3ParameterAutomation>>,
     sampler: &'a PreparedSamplerArrangement,
     audio: &'a PreparedAudioClipRender,
 }
@@ -8119,6 +8131,27 @@ impl PlaylistPerformanceRuntime {
                     )
                 })?;
                 let notes = notes_by_clip.remove(&clip_index).unwrap_or_default();
+                let parameter_automation_by_channel = match clip.target() {
+                    PlaylistClipTarget::Pattern { id: pattern_id } => {
+                        let pattern = patterns
+                            .iter()
+                            .find(|pattern| pattern.id == pattern_id)
+                            .ok_or_else(|| {
+                                format!(
+                                    "Performance VST3 Pattern Clip {} has no Pattern",
+                                    clip_index + 1
+                                )
+                            })?;
+                        expand_pattern_parameter_automation_for_clip(
+                            pattern_id,
+                            pattern,
+                            clip,
+                            document.header().ppq(),
+                            sources.pattern_automation,
+                        )?
+                    }
+                    PlaylistClipTarget::Channel { .. } => BTreeMap::new(),
+                };
                 vst3_clips_by_index.insert(
                     clip_index,
                     PerformanceVst3Clip {
@@ -8126,6 +8159,7 @@ impl PlaylistPerformanceRuntime {
                         source_start_tick: clip.position_ticks,
                         length_ticks: u64::from(clip.length_ticks),
                         notes,
+                        parameter_automation_by_channel,
                     },
                 );
             }
@@ -8702,6 +8736,8 @@ impl PlaylistPerformanceRuntime {
         }
         let mut vst3_notes_by_track_and_channel =
             BTreeMap::<(u32, u16), Vec<PlaylistMidiNote>>::new();
+        let mut vst3_automation_by_track_channel_parameter =
+            BTreeMap::<(u32, u16, u32), Vec<Vst3PlaylistAutomationPoint>>::new();
         for (&track_id, active) in &mut self.active_vst3_by_track {
             let clip = self
                 .vst3_clips_by_index
@@ -8726,6 +8762,7 @@ impl PlaylistPerformanceRuntime {
                 continue;
             }
             loop {
+                let loop_start_tick = active.next_loop_tick;
                 let loop_offset_ticks = active.initial_offset_ticks.min(clip.length_ticks);
                 let loop_length_ticks = clip.length_ticks.saturating_sub(loop_offset_ticks);
                 if loop_length_ticks == 0 {
@@ -8796,6 +8833,19 @@ impl PlaylistPerformanceRuntime {
                             release: template.release,
                         });
                 }
+                for ((channel_id, parameter_id), points) in
+                    performance_parameter_automation_points_for_loop(
+                        &clip.parameter_automation_by_channel,
+                        loop_start_tick,
+                        loop_offset_ticks,
+                        loop_length_ticks,
+                    )?
+                {
+                    vst3_automation_by_track_channel_parameter
+                        .entry((track_id, channel_id, parameter_id))
+                        .or_default()
+                        .extend(points);
+                }
                 active.next_loop_tick = loop_end_tick;
                 active.initial_offset_ticks = 0;
                 if single_pass {
@@ -8804,11 +8854,44 @@ impl PlaylistPerformanceRuntime {
                 }
             }
         }
-        if !vst3_notes_by_track_and_channel.is_empty() {
+        if !vst3_notes_by_track_and_channel.is_empty()
+            || !vst3_automation_by_track_channel_parameter.is_empty()
+        {
             let processor = vst3_processor
                 .ok_or_else(|| "VST3 Performance Mode processor is unavailable".to_owned())?;
             for ((track_id, channel_id), notes) in vst3_notes_by_track_and_channel {
                 processor.schedule_performance_notes(track_id, channel_id, &notes)?;
+            }
+            let mut automation_by_track_and_channel =
+                BTreeMap::<(u32, u16), Vec<Vst3PlaylistParameterAutomation>>::new();
+            for ((track_id, channel_id, parameter_id), mut points) in
+                vst3_automation_by_track_channel_parameter
+            {
+                points.sort_by_key(|point| point.tick);
+                let mut unique_points =
+                    Vec::<Vst3PlaylistAutomationPoint>::with_capacity(points.len());
+                for point in points {
+                    if let Some(previous) = unique_points.last_mut()
+                        && previous.tick == point.tick
+                    {
+                        previous.value = point.value;
+                    } else {
+                        unique_points.push(point);
+                    }
+                }
+                if !unique_points.is_empty() {
+                    automation_by_track_and_channel
+                        .entry((track_id, channel_id))
+                        .or_default()
+                        .push(Vst3PlaylistParameterAutomation {
+                            parameter_id,
+                            points: unique_points,
+                        });
+                }
+            }
+            for ((track_id, channel_id), lanes) in automation_by_track_and_channel {
+                processor
+                    .schedule_performance_parameter_automation(track_id, channel_id, &lanes)?;
             }
         }
         let mut completed_stop_tracks = Vec::new();
@@ -9328,6 +9411,60 @@ fn performance_latch_should_stop(
     requested_clip_index: usize,
 ) -> bool {
     press == Some(PlaylistTrackPress::Latch) && active_clip_index == Some(requested_clip_index)
+}
+
+fn performance_parameter_automation_points_for_loop(
+    automation_by_channel: &BTreeMap<u16, Vec<Vst3PlaylistParameterAutomation>>,
+    loop_start_tick: u64,
+    loop_offset_ticks: u64,
+    loop_length_ticks: u64,
+) -> Result<BTreeMap<(u16, u32), Vec<Vst3PlaylistAutomationPoint>>, String> {
+    let mut points_by_lane = BTreeMap::new();
+    let loop_end_tick = loop_start_tick
+        .checked_add(loop_length_ticks)
+        .ok_or_else(|| "Performance Mode automation loop end overflow".to_owned())?;
+    for (&channel_id, lanes) in automation_by_channel {
+        for lane in lanes {
+            if let Some(previous) = lane
+                .points
+                .iter()
+                .filter(|point| point.tick < loop_offset_ticks)
+                .max_by_key(|point| point.tick)
+            {
+                points_by_lane
+                    .entry((channel_id, lane.parameter_id))
+                    .or_insert_with(Vec::new)
+                    .push(Vst3PlaylistAutomationPoint {
+                        tick: loop_start_tick,
+                        value: previous.value,
+                    });
+            }
+            for point in lane
+                .points
+                .iter()
+                .filter(|point| point.tick >= loop_offset_ticks)
+            {
+                let relative_tick = point.tick.saturating_sub(loop_offset_ticks);
+                if relative_tick >= loop_length_ticks {
+                    continue;
+                }
+                let absolute_tick = loop_start_tick
+                    .checked_add(relative_tick)
+                    .ok_or_else(|| "Performance Mode automation position overflow".to_owned())?;
+                if absolute_tick >= loop_end_tick {
+                    continue;
+                }
+                points_by_lane
+                    .entry((channel_id, lane.parameter_id))
+                    .or_insert_with(Vec::new)
+                    .push(Vst3PlaylistAutomationPoint {
+                        tick: absolute_tick,
+                        value: point.value,
+                    });
+            }
+        }
+    }
+    Ok(points_by_lane)
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -14275,6 +14412,75 @@ mod tests {
             PlaylistTempoMap::from_tempo_events(96, 120.0, &[(96, 60.0), (96, 90.0)]).unwrap();
 
         assert_eq!(map.frame_at_tick(192, 48_000).unwrap(), 56_000);
+    }
+
+    #[test]
+    fn performance_vst3_parameter_automation_rebases_offsets_and_repeats() {
+        let automation = BTreeMap::from([(
+            4,
+            vec![Vst3PlaylistParameterAutomation {
+                parameter_id: 21,
+                points: vec![
+                    Vst3PlaylistAutomationPoint {
+                        tick: 24,
+                        value: 0.2,
+                    },
+                    Vst3PlaylistAutomationPoint {
+                        tick: 48,
+                        value: 0.8,
+                    },
+                    Vst3PlaylistAutomationPoint {
+                        tick: 120,
+                        value: 0.4,
+                    },
+                    Vst3PlaylistAutomationPoint {
+                        tick: 192,
+                        value: 0.6,
+                    },
+                ],
+            }],
+        )]);
+
+        let first_pass =
+            performance_parameter_automation_points_for_loop(&automation, 500, 32, 160)
+                .expect("the first launched pass should schedule");
+        assert_eq!(
+            first_pass[&(4, 21)],
+            vec![
+                Vst3PlaylistAutomationPoint {
+                    tick: 500,
+                    value: 0.2,
+                },
+                Vst3PlaylistAutomationPoint {
+                    tick: 516,
+                    value: 0.8,
+                },
+                Vst3PlaylistAutomationPoint {
+                    tick: 588,
+                    value: 0.4,
+                },
+            ]
+        );
+
+        let repeated = performance_parameter_automation_points_for_loop(&automation, 660, 0, 192)
+            .expect("the repeated pass should schedule");
+        assert_eq!(
+            repeated[&(4, 21)],
+            vec![
+                Vst3PlaylistAutomationPoint {
+                    tick: 684,
+                    value: 0.2,
+                },
+                Vst3PlaylistAutomationPoint {
+                    tick: 708,
+                    value: 0.8,
+                },
+                Vst3PlaylistAutomationPoint {
+                    tick: 780,
+                    value: 0.4,
+                },
+            ]
+        );
     }
 
     #[test]

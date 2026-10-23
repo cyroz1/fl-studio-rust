@@ -7162,6 +7162,33 @@ impl DawUi {
         automations
     }
 
+    fn pattern_vst3_parameter_automations_for_playlist(
+        &self,
+        document: &FlpDocument,
+    ) -> BTreeMap<(u16, u16), Vec<Vst3ParameterAutomation>> {
+        let Ok(patterns) = document.patterns() else {
+            return BTreeMap::new();
+        };
+        let ppq = document.header().ppq();
+        if ppq == 0 {
+            return BTreeMap::new();
+        }
+        let mut playlist_automation = BTreeMap::new();
+        for pattern in patterns {
+            let channel_automation = self.pattern_vst3_parameter_automations_for_pattern(
+                pattern.id,
+                &pattern.controllers,
+                ppq,
+            );
+            for (channel_id, lanes) in channel_automation {
+                if !lanes.is_empty() {
+                    playlist_automation.insert((pattern.id, channel_id), lanes);
+                }
+            }
+        }
+        playlist_automation
+    }
+
     fn make_audio_clip_unique_as_sample(
         &mut self,
         arrangement_id: u16,
@@ -10551,15 +10578,19 @@ impl DawUi {
                 return;
             }
         };
+        let playback_document = self.document.as_ref().expect("project was checked above");
+        let playlist_parameter_automation =
+            self.pattern_vst3_parameter_automations_for_playlist(playback_document);
         let vst3_processor = self
             .vst3_host
             .as_ref()
             .map(|host| {
-                host.prepare_playlist_stream(
-                    self.document.as_ref().expect("project was checked above"),
+                host.prepare_playlist_stream_with_pattern_automation(
+                    playback_document,
                     options,
                     &self.channel_vst3_instances,
                     true,
+                    &playlist_parameter_automation,
                 )
             })
             .transpose();
@@ -10988,16 +11019,19 @@ impl DawUi {
                 return;
             }
         };
+        let playlist_parameter_automation =
+            self.pattern_vst3_parameter_automations_for_playlist(&static_document);
         let vst3_processor = self
             .vst3_host
             .as_ref()
             .map(|host| {
-                host.prepare_playlist_performance_stream(
+                host.prepare_playlist_performance_stream_with_pattern_automation(
                     &static_document,
                     options,
                     &self.channel_vst3_instances,
                     &performance_vst3_channel_ids,
                     true,
+                    &playlist_parameter_automation,
                 )
             })
             .transpose();
@@ -34969,15 +35003,18 @@ impl DawUi {
             tail_seconds: self.playlist_render_tail_seconds,
             ..PlaylistRenderOptions::default()
         };
+        let playlist_parameter_automation =
+            self.pattern_vst3_parameter_automations_for_playlist(&render_document);
         let vst3_processor = self
             .vst3_host
             .as_ref()
             .map(|host| {
-                host.prepare_playlist_stream(
+                host.prepare_playlist_stream_with_pattern_automation(
                     &render_document,
                     options,
                     &self.channel_vst3_instances,
                     self.playlist_render_include_plugin_tails,
+                    &playlist_parameter_automation,
                 )
             })
             .transpose();
@@ -35687,15 +35724,18 @@ impl DawUi {
             tail_seconds: self.playlist_render_tail_seconds,
             ..PlaylistRenderOptions::default()
         };
+        let playlist_parameter_automation =
+            self.pattern_vst3_parameter_automations_for_playlist(document);
         let vst3_processor = self
             .vst3_host
             .as_ref()
             .map(|host| {
-                host.prepare_playlist_stream(
+                host.prepare_playlist_stream_with_pattern_automation(
                     document,
                     options,
                     &self.channel_vst3_instances,
                     self.playlist_render_include_plugin_tails,
+                    &playlist_parameter_automation,
                 )
             })
             .transpose();
@@ -35845,15 +35885,18 @@ impl DawUi {
             tail_seconds: self.playlist_render_tail_seconds,
             ..PlaylistRenderOptions::default()
         };
+        let playlist_parameter_automation =
+            self.pattern_vst3_parameter_automations_for_playlist(document);
         let vst3_processor = self
             .vst3_host
             .as_ref()
             .map(|host| {
-                host.prepare_playlist_stream(
+                host.prepare_playlist_stream_with_pattern_automation(
                     document,
                     options,
                     &self.channel_vst3_instances,
                     self.playlist_render_include_plugin_tails,
+                    &playlist_parameter_automation,
                 )
             })
             .transpose();
@@ -35977,15 +36020,18 @@ impl DawUi {
             tail_seconds: self.playlist_render_tail_seconds,
             ..PlaylistRenderOptions::default()
         };
+        let playlist_parameter_automation =
+            self.pattern_vst3_parameter_automations_for_playlist(document);
         let vst3_processor = self
             .vst3_host
             .as_ref()
             .map(|host| {
-                host.prepare_playlist_stream(
+                host.prepare_playlist_stream_with_pattern_automation(
                     document,
                     options,
                     &self.channel_vst3_instances,
                     self.playlist_render_include_plugin_tails,
+                    &playlist_parameter_automation,
                 )
             })
             .transpose();
