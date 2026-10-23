@@ -6531,10 +6531,12 @@ fn validate_sampler_duration_stretch_tempo(
         ));
     }
     let target_end_tick = start_tick_f64 + plan.target_ticks;
-    let mut active_end_tick = target_end_tick;
-    if has_loop {
-        active_end_tick = active_end_tick.max(stop_tick.map_or(f64::MAX, |tick| tick as f64));
-    }
+    let active_end_tick = match (has_loop, stop_tick) {
+        (true, Some(stop_tick)) => stop_tick as f64,
+        (true, None) => f64::MAX,
+        (false, Some(stop_tick)) => target_end_tick.min(stop_tick as f64),
+        (false, None) => target_end_tick,
+    };
     if tempo_map.has_tempo_change_between(start_tick_f64, active_end_tick) {
         return Err(format!(
             "Sampler channel {channel_id} uses duration-preserving time stretching across Playlist tempo automation, which this renderer cannot follow"
@@ -15459,7 +15461,7 @@ mod tests {
     }
 
     #[test]
-    fn sampler_duration_stretch_rejects_tempo_changes_during_the_stretched_sample() {
+    fn sampler_duration_stretch_checks_tempo_changes_only_while_the_voice_is_active() {
         let plan = SamplerDurationPreservingStretchPlan {
             target_ticks: 384.0,
             target_frames: 8_000,
@@ -15477,10 +15479,36 @@ mod tests {
 
         let loop_tempo_map = PlaylistTempoMap::from_tempo_events(96, 120.0, &[(512, 100.0)])
             .expect("loop tempo automation map should build");
+
+        assert!(
+            validate_sampler_duration_stretch_tempo(plan, 3, &tempo_map, 0, Some(96), false)
+                .is_ok()
+        );
+
+        let change_before_note_off =
+            validate_sampler_duration_stretch_tempo(plan, 3, &tempo_map, 0, Some(288), false)
+                .unwrap_err();
+        assert!(change_before_note_off.contains("across Playlist tempo automation"));
+
+        assert!(
+            validate_sampler_duration_stretch_tempo(plan, 3, &loop_tempo_map, 0, Some(96), true)
+                .is_ok()
+        );
+
         let loop_error =
             validate_sampler_duration_stretch_tempo(plan, 3, &loop_tempo_map, 0, Some(768), true)
                 .unwrap_err();
         assert!(loop_error.contains("across Playlist tempo automation"));
+
+        let held_loop_error =
+            validate_sampler_duration_stretch_tempo(plan, 3, &loop_tempo_map, 0, None, true)
+                .unwrap_err();
+        assert!(held_loop_error.contains("across Playlist tempo automation"));
+
+        assert!(
+            validate_sampler_duration_stretch_tempo(plan, 3, &loop_tempo_map, 0, Some(768), false)
+                .is_ok()
+        );
 
         let changed_start_error =
             validate_sampler_duration_stretch_tempo(plan, 3, &tempo_map, 384, None, false)

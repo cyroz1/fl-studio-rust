@@ -25419,7 +25419,7 @@ impl DawUi {
                             let mut mode_changed = false;
                             ui.collapsing("Time stretch", |ui| {
                                 ui.small(
-                                    "Playlist Audio Clips use TIME, PITCH, and MUL in Resample, Stretch, Elastique 3 Generic, and mono-only Elastique 3 Mono modes. Sampler Stretch and Elastique 3 Generic support mono or stereo samples; Elastique 3 Mono requires a mono sample. Playlist Sampler notes and live MIDI input use the transport tempo at note-on; each voice keeps that rate. Pattern playback uses project tempo. Other Sampler modes and tempo changes during a stretched scheduled Playlist sample are unsupported.",
+                                    "Playlist Audio Clips use TIME, PITCH, and MUL in Resample, Stretch, Elastique 3 Generic, and mono-only Elastique 3 Mono modes. Sampler Stretch and Elastique 3 Generic support mono or stereo samples; Elastique 3 Mono requires a mono sample. Playlist Sampler notes and live MIDI input use the transport tempo at note-on; each voice keeps that rate. Pattern playback uses project tempo. Other Sampler modes and tempo changes while a stretched scheduled Playlist Sampler voice is active are unsupported.",
                                 );
                                 ui.horizontal_wrapped(|ui| {
                                     time_changed = ui
