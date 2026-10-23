@@ -327,7 +327,7 @@ The `mixer <file.flp>` command reports recognized insert fields and each `0xE1` 
 
 ## Automated checks and installers
 
-GitHub Actions runs formatting checks, Clippy, and the Rust test suite on Ubuntu, macOS, and Windows for pushes, pull requests, and manual runs. Each platform job also builds and launches its desktop app. CI uploads a Windows NSIS installer and Linux Debian, AppImage, and pacman packages; macOS uploads a signed and notarized DMG when Apple signing secrets are configured, and otherwise runs an unsigned local smoke check without publishing a macOS artifact. See [macOS CI packaging](docs/macos-ci-packaging.md). The package definitions are in [`Packager.toml`](Packager.toml).
+GitHub Actions runs formatting checks, Clippy, and the Rust test suite on native x64 and ARM64 runners for Linux and Windows, and on Apple Silicon for macOS. Each job builds and launches its desktop app. CI uploads a macOS ARM64 DMG; Windows x64 and ARM64 setup installers; and, for both Linux architectures, AppImage, Debian (`.deb`), RPM (`.rpm`), and Arch (`.pkg.tar.zst`) packages. Linux package metadata and executable architectures are checked before upload. Artifacts are named `installers-<platform>` and retained for 14 days. The macOS DMG is signed and notarized when Apple signing secrets are configured, and unsigned otherwise. See [macOS CI packaging](docs/macos-ci-packaging.md). The package definitions are in [`Packager.toml`](Packager.toml).
 
 ## Compatibility plan
 
