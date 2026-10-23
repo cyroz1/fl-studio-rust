@@ -252,9 +252,28 @@ jobs:
       - name: Verify Linux package architectures
         if: runner.os == 'Linux'
         shell: bash
+        env:
+          TARGET_PLATFORM: ${{ matrix.platform }}
         run: |
           set -euo pipefail
           shopt -s nullglob
+          case "$TARGET_PLATFORM" in
+            linux-x64)
+              expected_runner_arch=x86_64
+              ;;
+            linux-arm64)
+              expected_runner_arch=aarch64
+              ;;
+            *)
+              echo "::error::Unexpected Linux package target: $TARGET_PLATFORM"
+              exit 1
+              ;;
+          esac
+          actual_runner_arch="$(uname -m)"
+          if [[ "$actual_runner_arch" != "$expected_runner_arch" ]]; then
+            echo "::error::Linux runner architecture is $actual_runner_arch; expected $expected_runner_arch for $TARGET_PLATFORM."
+            exit 1
+          fi
           deb_packages=(dist/linux-packages/*.deb)
           rpm_packages=(dist/linux-packages/*.rpm)
           arch_packages=(dist/linux-packages/*.pkg.tar.zst)
@@ -332,6 +351,8 @@ jobs:
       - name: Install and launch Windows setup
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          TARGET_PLATFORM: ${{ matrix.platform }}
         run: |
           $ErrorActionPreference = 'Stop'
           $installers = @(Get-ChildItem -Path dist -Filter '*-setup.exe' -File)
@@ -349,6 +370,39 @@ jobs:
           if (-not (Test-Path -LiteralPath $appPath -PathType Leaf)) {
             throw "Installed app executable is missing: $appPath"
           }
+
+          $expectedRunnerArch = switch ($env:TARGET_PLATFORM) {
+            'windows-arm64' { 'ARM64' }
+            'windows-x64' { 'X64' }
+            default { throw "Unexpected Windows package target: $env:TARGET_PLATFORM" }
+          }
+          if ($env:RUNNER_ARCH -ne $expectedRunnerArch) {
+            throw "Windows runner architecture is $env:RUNNER_ARCH; expected $expectedRunnerArch for $env:TARGET_PLATFORM."
+          }
+          $expectedMachine = if ($expectedRunnerArch -eq 'ARM64') { 0xAA64 } else { 0x8664 }
+          $stream = [System.IO.File]::OpenRead($appPath)
+          $reader = [System.IO.BinaryReader]::new($stream)
+          try {
+            $stream.Position = 0x3c
+            $peOffset = $reader.ReadInt32()
+            if ($peOffset -lt 0 -or $peOffset + 6 -gt $stream.Length) {
+              throw "Installed app has an invalid PE header offset: $peOffset"
+            }
+            $stream.Position = $peOffset
+            if ($reader.ReadUInt32() -ne 0x00004550) {
+              throw 'Installed app does not contain a PE signature.'
+            }
+            $machine = $reader.ReadUInt16()
+            if ($machine -ne $expectedMachine) {
+              throw ('Installed app PE machine is 0x{0:X4}; expected 0x{1:X4} for {2}.' -f `
+                $machine, $expectedMachine, $env:RUNNER_ARCH)
+            }
+            Write-Host ('Verified installed app PE machine 0x{0:X4} for {1}.' -f `
+              $machine, $env:RUNNER_ARCH)
+          } finally {
+            $reader.Dispose()
+          }
+
           $env:APPDATA = Join-Path $env:RUNNER_TEMP 'fl-studio-ui-config'
           New-Item -ItemType Directory -Path $env:APPDATA -Force | Out-Null
           $app = Start-Process -FilePath $appPath -WorkingDirectory $installPath -PassThru
@@ -1631,6 +1685,45 @@ jobs:
           fi
           sleep 3
           echo "Installed macOS app remained running after launch."
+
+      - name: Verify macOS disk image architecture
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          disk_images=(dist/*.dmg)
+          if (( ${#disk_images[@]} != 1 )); then
+            echo "::error::Expected exactly one macOS disk image; found ${#disk_images[@]}."
+            printf '%s\n' "${disk_images[@]}"
+            exit 1
+          fi
+
+          mount_path="$RUNNER_TEMP/fl-studio-architecture-check"
+          mkdir -p "$mount_path"
+          cleanup() {
+            hdiutil detach "$mount_path" -quiet 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          hdiutil attach -readonly -nobrowse -mountpoint "$mount_path" "${disk_images[0]}"
+
+          app_path="$(find "$mount_path" -maxdepth 2 -type d -name '*.app' -print -quit)"
+          if [[ -z "$app_path" ]]; then
+            echo "::error::The macOS disk image does not contain an app bundle."
+            exit 1
+          fi
+          app_executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app_path/Contents/Info.plist")"
+          app_binary="$app_path/Contents/MacOS/$app_executable"
+          if [[ ! -x "$app_binary" ]]; then
+            echo "::error::The app executable in the macOS disk image is missing or not executable."
+            exit 1
+          fi
+          architectures="$(lipo -archs "$app_binary")"
+          if [[ " $architectures " != *" arm64 "* ]]; then
+            echo "::error::The macOS app contains architectures '$architectures'; expected arm64."
+            exit 1
+          fi
+          echo "Verified macOS disk image app architecture: $architectures."
 
       - name: Stage platform packages
         shell: bash
