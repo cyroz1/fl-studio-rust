@@ -5874,6 +5874,13 @@ fn probe_vst3_state(bundle: &Path, project: &Path, channel_id: u16) -> Result<()
     Ok(())
 }
 
+fn pattern_color_label(color: Option<[u8; 4]>) -> String {
+    color.map_or_else(
+        || "default".to_owned(),
+        |[red, green, blue, _]| format!("#{red:02X}{green:02X}{blue:02X}"),
+    )
+}
+
 fn list_patterns(path: &Path) -> Result<(), String> {
     let (_, document) = load_document(path)?;
     let patterns = document.patterns().map_err(|error| error.to_string())?;
@@ -5889,9 +5896,10 @@ fn list_patterns(path: &Path) -> Result<(), String> {
             .collect::<Vec<_>>()
             .join(",");
         println!(
-            "id={} name={} length_ticks={} notes={} controllers={} channels=[{}] time_signatures=[{}]",
+            "id={} name={} color={} length_ticks={} notes={} controllers={} channels=[{}] time_signatures=[{}]",
             pattern.id,
             pattern.name.as_deref().unwrap_or("(unnamed)"),
+            pattern_color_label(pattern.color),
             pattern
                 .length_ticks
                 .map_or_else(|| "default".to_owned(), |length| length.to_string()),
@@ -9974,7 +9982,7 @@ mod tests {
         parse_midi_channel_number, parse_midi_import_options,
         parse_midi_import_options_with_channels, parse_midi_import_options_with_mixer_tracks,
         parse_midi_pattern_target, parse_midi_track_selection, parse_mixer_track, parse_raw_byte,
-        parse_rgb_hex, parse_sampler_envelope_lfo_target, parse_scale_name,
+        parse_rgb_hex, parse_sampler_envelope_lfo_target, parse_scale_name, pattern_color_label,
     };
     use flp_rebuild::{SamplerEnvelopeLfoTarget, midi::MidiImportOptions};
 
@@ -10109,6 +10117,19 @@ mod tests {
         assert_eq!(parse_rgb_hex("#102030"), Ok([0x10, 0x20, 0x30]));
         assert!(parse_rgb_hex("#12345").is_err());
         assert!(parse_rgb_hex("xyzxyz").is_err());
+    }
+
+    #[test]
+    fn formats_pattern_color_without_changing_reserved_alpha() {
+        assert_eq!(
+            pattern_color_label(Some([0x12, 0x34, 0x56, 0xA5])),
+            "#123456"
+        );
+    }
+
+    #[test]
+    fn formats_missing_pattern_color_as_default() {
+        assert_eq!(pattern_color_label(None), "default");
     }
 
     #[test]
