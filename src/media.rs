@@ -2059,9 +2059,11 @@ mod tests {
             .map(|sample| f32::from_le_bytes(*sample))
             .collect::<Vec<_>>();
         assert_eq!(samples.len(), mono_samples.len() * 2);
+        let (stereo_samples, remainder) = samples.as_chunks::<2>();
+        assert!(remainder.is_empty());
         assert!(
-            samples
-                .chunks_exact(2)
+            stereo_samples
+                .iter()
                 .zip(mono_samples)
                 .all(|(stereo, mono)| (stereo[0] - mono).abs() < 1.0e-6 && stereo[0] == stereo[1])
         );
