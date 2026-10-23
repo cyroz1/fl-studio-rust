@@ -6166,6 +6166,23 @@ fn sampler_resample_stretch_pitch_adjustment(
     Ok(Some((target_ticks, pitch_adjustment_cents)))
 }
 
+fn sampler_note_fine_pitch_with_delta(
+    note_pitch_cents: i16,
+    pitch_delta_cents: f64,
+    channel_id: u16,
+) -> Result<i16, String> {
+    let adjusted_pitch_cents = f64::from(note_pitch_cents) + pitch_delta_cents;
+    if !adjusted_pitch_cents.is_finite()
+        || adjusted_pitch_cents < f64::from(i16::MIN)
+        || adjusted_pitch_cents > f64::from(i16::MAX)
+    {
+        return Err(format!(
+            "Sampler channel {channel_id} Resample pitch exceeds the supported range"
+        ));
+    }
+    Ok(adjusted_pitch_cents.round() as i16)
+}
+
 fn prepare_audio_clip_render(
     document: &FlpDocument,
     project_path: &Path,
@@ -6900,6 +6917,9 @@ fn prepare_sampler_arrangement(
     let mut faded_audio_by_settings =
         HashMap::<(PathBuf, Option<u16>, Option<u16>), Arc<DecodedAudio>>::new();
     let mut sources_by_channel = HashMap::<u16, SamplerVoiceSource>::new();
+    // Store the tick-zero rate in each shared source, then offset scheduled notes from it to
+    // match the tempo at their own start ticks.
+    let mut resample_pitch_adjustment_by_channel = HashMap::<u16, f64>::new();
     let mut mixer_transforms_by_channel = HashMap::<u16, MixerSourceRouteTransform>::new();
     let mut live_mixer_source_routes_by_channel = HashMap::<u16, MixerLiveSourceRoutePlan>::new();
     let mut mixer_meter_transforms_by_channel =
@@ -7014,48 +7034,11 @@ fn prepare_sampler_arrangement(
                 audio.frame_count(),
                 audio.sample_rate,
                 ppq,
-                tempo_map.tempo_bpm_at_tick(placed.start_tick),
+                tempo_map.tempo_bpm_at_tick(0),
             )?;
-            if let Some((_, first_pitch_adjustment_cents)) = sampler_stretch {
-                for scheduled_note in schedule.notes.iter().filter(|scheduled_note| {
-                    scheduled_note.target_channel_id == placed.target_channel_id
-                }) {
-                    let start_tick = scheduled_note.start_tick;
-                    let start_tick_f64 = start_tick as f64;
-                    let Some((note_target_ticks, note_pitch_adjustment_cents)) =
-                        sampler_resample_stretch_pitch_adjustment(
-                            channel,
-                            audio.frame_count(),
-                            audio.sample_rate,
-                            ppq,
-                            tempo_map.tempo_bpm_at_tick(start_tick),
-                        )?
-                    else {
-                        continue;
-                    };
-                    if tempo_map.has_tempo_change_between(
-                        start_tick_f64,
-                        start_tick_f64 + note_target_ticks,
-                    ) || (loop_bounds.is_some()
-                        && scheduled_note.stop_tick.is_some_and(|stop_tick| {
-                            tempo_map.has_tempo_change_between(
-                                start_tick_f64 + note_target_ticks,
-                                stop_tick as f64,
-                            )
-                        }))
-                    {
-                        return Err(format!(
-                            "Sampler channel {} uses Resample time stretching across Playlist tempo automation, which this renderer cannot follow",
-                            placed.target_channel_id
-                        ));
-                    }
-                    if (note_pitch_adjustment_cents - first_pitch_adjustment_cents).abs() > 0.01 {
-                        return Err(format!(
-                            "Sampler channel {} uses Resample time stretching at multiple Playlist tempos, which this renderer cannot follow",
-                            placed.target_channel_id
-                        ));
-                    }
-                }
+            if let Some((_, pitch_adjustment_cents)) = sampler_stretch {
+                resample_pitch_adjustment_by_channel
+                    .insert(placed.target_channel_id, pitch_adjustment_cents);
             }
             let (gain, pan) = channel_gain_pan(channel.volume(), channel.pan());
             source_entry.insert(SamplerVoiceSource {
@@ -7140,6 +7123,46 @@ fn prepare_sampler_arrangement(
                     .map(|frame| frame.max(start_frame.saturating_add(1)))
             })
             .transpose()?;
+        let mut fine_pitch_offset_cents = note.fine_pitch_offset_cents();
+        if !note.is_slide_note()
+            && let Some(base_pitch_adjustment_cents) =
+                resample_pitch_adjustment_by_channel.get(&placed.target_channel_id)
+        {
+            let Some((target_ticks, note_pitch_adjustment_cents)) =
+                sampler_resample_stretch_pitch_adjustment(
+                    channel,
+                    source.audio.frame_count(),
+                    source.audio.sample_rate,
+                    ppq,
+                    tempo_map.tempo_bpm_at_tick(placed.start_tick),
+                )?
+            else {
+                return Err(format!(
+                    "Sampler channel {} Resample settings changed while preparing its Playlist notes",
+                    placed.target_channel_id
+                ));
+            };
+            let start_tick_f64 = placed.start_tick as f64;
+            if tempo_map.has_tempo_change_between(start_tick_f64, start_tick_f64 + target_ticks)
+                || (source.loop_bounds.is_some()
+                    && placed.stop_tick.is_some_and(|stop_tick| {
+                        tempo_map.has_tempo_change_between(
+                            start_tick_f64 + target_ticks,
+                            stop_tick as f64,
+                        )
+                    }))
+            {
+                return Err(format!(
+                    "Sampler channel {} uses Resample time stretching across Playlist tempo automation, which this renderer cannot follow",
+                    placed.target_channel_id
+                ));
+            }
+            fine_pitch_offset_cents = sampler_note_fine_pitch_with_delta(
+                fine_pitch_offset_cents,
+                note_pitch_adjustment_cents - base_pitch_adjustment_cents,
+                placed.target_channel_id,
+            )?;
+        }
         if note.is_slide_note() {
             rendered_pattern_clip_indices.insert(placed.clip_index);
             notes.push(ScheduledSamplerNote {
@@ -7155,7 +7178,7 @@ fn prepare_sampler_arrangement(
                 slide_note: true,
                 velocity: note.velocity,
                 pan: note.pan,
-                fine_pitch_offset_cents: note.fine_pitch_offset_cents(),
+                fine_pitch_offset_cents,
                 layer_gain: placed.target_gain,
             });
             continue;
@@ -7166,7 +7189,7 @@ fn prepare_sampler_arrangement(
                 options.sample_rate,
                 note_key,
                 source.root_key,
-                source.fine_tune_cents + f64::from(note.fine_pitch_offset_cents()),
+                source.fine_tune_cents + f64::from(fine_pitch_offset_cents),
             ))
         .ceil();
         if !natural_duration.is_finite()
@@ -7210,7 +7233,7 @@ fn prepare_sampler_arrangement(
             slide_note: false,
             velocity: note.velocity,
             pan: note.pan,
-            fine_pitch_offset_cents: note.fine_pitch_offset_cents(),
+            fine_pitch_offset_cents,
             layer_gain: placed.target_gain,
         });
     }

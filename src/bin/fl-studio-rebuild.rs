@@ -25390,7 +25390,7 @@ impl DawUi {
                             let mut mode_changed = false;
                             ui.collapsing("Time stretch", |ui| {
                                 ui.small(
-                                    "Playlist Audio Clips use TIME, PITCH, and MUL in Resample, Stretch, and Elastique 3 Generic modes. Sampler notes apply Resample settings at a fixed tempo; other Sampler modes and tempo changes during a stretched duration are unsupported.",
+                                    "Playlist Audio Clips use TIME, PITCH, and MUL in Resample, Stretch, and Elastique 3 Generic modes. Playlist Sampler notes apply Resample settings at each note's start tempo; Pattern playback uses project tempo. Other Sampler modes and tempo changes during a stretched Playlist sample are unsupported.",
                                 );
                                 ui.horizontal_wrapped(|ui| {
                                     time_changed = ui

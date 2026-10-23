@@ -772,9 +772,10 @@ pub struct ChannelLevelAdjustmentsEdit {
 ///
 /// The four values are retained in FL Studio's stored units. Their field offsets and
 /// stretch-mode codes follow the independently documented PyFLP channel layout. Playlist Audio
-/// Playlist clip playback and rendering apply supported channel settings for modes Resample,
-/// Stretch, and Elastique 3 Generic. Sampler note playback applies Resample settings at a fixed
-/// tempo; other Sampler stretch modes and tempo automation remain unsupported.
+/// Clip playback and rendering apply supported channel settings for modes Resample,
+/// Stretch, and Elastique 3 Generic. Playlist Sampler notes apply Resample settings at each
+/// scheduled note's start tempo; Pattern Sampler playback uses project tempo. Tempo automation
+/// during a stretched Playlist Sampler sample and other Sampler stretch modes remain unsupported.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ChannelStretchSettings {
     time_raw: u32,
