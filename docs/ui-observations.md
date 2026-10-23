@@ -80,6 +80,8 @@ These observations come from the installed FL Studio 2026 desktop application an
 - The observed project used colored track groups and displayed a long arrangement across more than one hundred bars.
 - FL Studio displays audio samples as waveforms inside Playlist clips and offers stereo, combined, and spectral preview modes; its clip view also reflects audio fades and gain previews ([Image-Line Audio Clips manual](https://www.image-line.com/fl-studio-learning-content/fl-studio-online-manual/html/playlist_audioclip.htm)). The rewrite offers combined or separate-channel min/max waveforms and a coarse log-frequency spectral preview for resolved audio clips, crops legacy records to decoded source offsets and maps editable 88-byte Audio Clip tick windows to sample frames at the project's base tempo for previews and supported playback/renders, then scales visible detail with Playlist zoom. The tick conversion is an approximation and does not model sample tempo metadata, Playlist tempo automation, or clip-specific stretch. Its spectral coloring/analysis and fade/gain previews do not match FL Studio yet.
 
+- Right-click a Sampler or Audio Clip channel in the Channel Rack and choose **Reverse sample source** to toggle its saved Reverse flag; sample-backed audio playback and Playlist Audio Clip playback/render apply the setting. Audio Clips that share one channel share its Reverse state, matching Image-Line's channel-property model.
+
 ## Piano roll
 
 - The left piano keyboard aligns note pitch with a bar-and-beat grid.

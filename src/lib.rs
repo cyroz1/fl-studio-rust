@@ -1074,12 +1074,12 @@ impl ChannelSummary {
         self.zipped
     }
 
-    /// Whether a kind-0 Sampler's saved Reverse option is enabled.
+    /// Whether a Sampler or sample-backed Audio Clip's saved Reverse option is enabled.
     ///
     /// The Reverse bit is bit 1 of the channel's `0x46` FX flags word. Unknown
     /// flag bits remain untouched in the original event stream.
     pub fn sample_reversed(&self) -> bool {
-        self.kind == Some(0)
+        matches!(self.kind, Some(0 | 4))
             && self
                 .sampler_fx_flags
                 .is_some_and(|flags| flags & (1 << 1) != 0)
@@ -17780,6 +17780,86 @@ impl FlpDocument {
         let payload = replace_project_string_payload(&event.payload, path, utf16)?;
         self.events[event_index].replace_data_payload(payload)?;
         self.refresh_event_offsets()?;
+        Ok(())
+    }
+
+    /// Sets Reverse on a kind-0 Sampler or kind-4 Audio Clip channel using bit 1
+    /// of its `0x46` FX flags word. Other flag bits and channel events are kept.
+    pub fn set_channel_sample_reversed(
+        &mut self,
+        channel_id: u16,
+        reversed: bool,
+    ) -> Result<(), FlpError> {
+        let channels = self.channels();
+        let mut matching = channels.iter().filter(|channel| channel.id == channel_id);
+        let Some(channel) = matching.next() else {
+            return Err(FlpError::ChannelNotFound(channel_id));
+        };
+        if matching.next().is_some() {
+            return Err(FlpError::AmbiguousChannelId(channel_id));
+        }
+        if !matches!(channel.kind, Some(0 | 4)) {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel is not a Sampler or Audio Clip channel",
+            ));
+        }
+
+        let mut reverse_events = channel
+            .event_range()
+            .filter(|index| self.events[*index].opcode == 0x46);
+        let existing_event = reverse_events.next();
+        if reverse_events.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel has multiple 0x46 FX flags events",
+            ));
+        }
+
+        let mut candidate = self.clone();
+        if let Some(event_index) = existing_event {
+            let event = &candidate.events[event_index];
+            if event.encoding != PayloadEncoding::Word || event.payload.len() != 2 {
+                return Err(FlpError::UnsupportedEdit(
+                    "the selected channel's 0x46 FX flags event is not a word event",
+                ));
+            }
+            let old_flags = u16::from_le_bytes([event.payload[0], event.payload[1]]);
+            let flags = if reversed {
+                old_flags | (1 << 1)
+            } else {
+                old_flags & !(1 << 1)
+            };
+            if flags == old_flags {
+                return Ok(());
+            }
+            candidate.events[event_index].replace_word_payload(flags)?;
+        } else if reversed {
+            let mut kind_events = channel
+                .event_range()
+                .filter(|index| self.events[*index].opcode == 0x15);
+            let Some(kind_index) = kind_events.next() else {
+                return Err(FlpError::UnsupportedEdit(
+                    "the selected channel has no recognized 0x15 kind event",
+                ));
+            };
+            if kind_events.next().is_some() {
+                return Err(FlpError::UnsupportedEdit(
+                    "the selected channel has multiple 0x15 kind events",
+                ));
+            }
+            let kind_event = &candidate.events[kind_index];
+            if kind_event.encoding != PayloadEncoding::Byte || kind_event.payload.len() != 1 {
+                return Err(FlpError::UnsupportedEdit(
+                    "the selected channel's 0x15 kind event is not a one-byte event",
+                ));
+            }
+            candidate
+                .events
+                .insert(kind_index + 1, FlpEvent::new_word(0x46, 1 << 1));
+        } else {
+            return Ok(());
+        }
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
         Ok(())
     }
 

@@ -22551,6 +22551,7 @@ impl DawUi {
         let mut save_channel_preset = None;
         let mut duplicate_channel_request = None;
         let mut channel_enabled_edits = Vec::new();
+        let mut channel_sample_reverse_edits = Vec::new();
         let mut channel_main_pitch_edits = Vec::new();
         let mut channel_add_to_key_edits = Vec::new();
         let mut channel_zipped_edits = Vec::new();
@@ -23133,6 +23134,20 @@ impl DawUi {
                                     duplicate_channel_request =
                                         Some((channel.id(), duplicate_name));
                                     ui.close();
+                                }
+                                if matches!(channel.kind(), Some(0 | 4)) {
+                                    let reversed = channel.sample_reversed();
+                                    if ui
+                                        .selectable_label(reversed, "Reverse sample source")
+                                        .on_hover_text(
+                                            "Reverse this channel's sample source. Audio Clips sharing the channel use the same setting.",
+                                        )
+                                        .clicked()
+                                    {
+                                        channel_sample_reverse_edits
+                                            .push((channel.id(), !reversed));
+                                        ui.close();
+                                    }
                                 }
                                 ui.menu_button("Mixer track", |ui| {
                                     if ui
@@ -23967,6 +23982,26 @@ impl DawUi {
                 }
                 Some(Err(error)) => {
                     self.status = format!("Could not change channel mute state: {error}");
+                }
+                None => {}
+            }
+        }
+        for (channel_id, reversed) in channel_sample_reverse_edits {
+            let result = self
+                .document
+                .as_mut()
+                .map(|document| document.set_channel_sample_reversed(channel_id, reversed));
+            match result {
+                Some(Ok(())) => {
+                    self.stop_project_playback();
+                    self.dirty = true;
+                    self.status = format!(
+                        "Sample source on channel {channel_id} {}",
+                        if reversed { "reversed" } else { "restored" }
+                    );
+                }
+                Some(Err(error)) => {
+                    self.status = format!("Could not change sample Reverse setting: {error}");
                 }
                 None => {}
             }

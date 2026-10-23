@@ -673,6 +673,16 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 sample_path,
             )
         }
+        [command, input, output, channel_id, reversed]
+            if command == "set-channel-sample-reversed" =>
+        {
+            set_channel_sample_reversed(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(channel_id, "channel id")?,
+                parse_bool(reversed, "sample Reverse setting")?,
+            )
+        }
         [command, input, output, event_index, record_index, value]
             if command == "set-mixer-parameter-record-value" =>
         {
@@ -3458,6 +3468,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild set-channel-fine-tune <input.flp> <output.flp> <channel-id> <-100..100-cents>\n",
             "  flp-rebuild set-channel-enabled <input.flp> <output.flp> <channel-id> <0|1>\n",
             "  flp-rebuild set-channel-sample-path <input.flp> <output.flp> <channel-id> <sample-path>\n",
+            "  flp-rebuild set-channel-sample-reversed <input.flp> <output.flp> <channel-id> <0|1>\n",
             "  flp-rebuild set-channel-zipped <input.flp> <output.flp> <channel-id> <0|1>\n",
             "  flp-rebuild set-channel-main-pitch <input.flp> <output.flp> <channel-id> <0|1>\n",
             "  flp-rebuild set-channel-add-to-key <input.flp> <output.flp> <channel-id> <0|1>\n",
@@ -6618,6 +6629,29 @@ fn set_channel_sample_path(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "set channel {channel_id} sample path to {sample_path:?} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn set_channel_sample_reversed(
+    input: &Path,
+    output: &Path,
+    channel_id: u16,
+    reversed: bool,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .set_channel_sample_reversed(channel_id, reversed)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "{} sample source on channel {channel_id} in {}",
+        if reversed { "reversed" } else { "restored" },
         output.display()
     );
     Ok(())

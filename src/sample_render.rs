@@ -6043,6 +6043,7 @@ fn prepare_audio_clip_render(
         &PlaylistClip,
         u16,
         PathBuf,
+        bool,
         f32,
         f32,
         f64,
@@ -6101,6 +6102,7 @@ fn prepare_audio_clip_render(
             clip,
             id,
             resolved_path,
+            channel.sample_reversed(),
             gain,
             pan,
             audio_clip_pitch_ratio(
@@ -6129,7 +6131,7 @@ fn prepare_audio_clip_render(
     )?;
     let mut decoded_by_path = HashMap::<PathBuf, DecodedAudio>::new();
     let mut cached_source_bytes = 0usize;
-    for (_, _, _, path, _, _, _, _, _) in &candidate_clips {
+    for (_, _, _, path, _, _, _, _, _, _) in &candidate_clips {
         check_cancelled(cancelled)?;
         if decoded_by_path.contains_key(path) {
             continue;
@@ -6156,6 +6158,7 @@ fn prepare_audio_clip_render(
         clip,
         channel_id,
         path,
+        reverse,
         gain,
         pan,
         pitch_ratio,
@@ -6219,6 +6222,7 @@ fn prepare_audio_clip_render(
             path: path.clone(),
             start_frame,
             source_bounds,
+            reverse: *reverse,
             pitch_ratio: *pitch_ratio,
             duration_frames,
             gain: *gain,
@@ -10457,6 +10461,7 @@ struct PreparedClip {
     path: PathBuf,
     start_frame: u64,
     source_bounds: SampleBounds,
+    reverse: bool,
     pitch_ratio: f64,
     duration_frames: u64,
     gain: f32,
@@ -11325,10 +11330,13 @@ fn mix_clip_window_into_stereo_with_quality_and_meter(
         if output_offset.is_multiple_of(16_384) {
             check_cancelled(cancelled)?;
         }
-        let position = (clip.source_bounds.start as f64
-            + output_offset as f64 * source_frames_per_output)
-            .min((clip.source_bounds.end - 1) as f64);
-        let source_position = position - clip.source_bounds.start as f64;
+        let last_source_position = (clip.source_bounds.end - clip.source_bounds.start - 1) as f64;
+        let source_offset = output_offset as f64 * source_frames_per_output;
+        let source_position = if clip.reverse {
+            (last_source_position - source_offset).max(0.0)
+        } else {
+            source_offset.min(last_source_position)
+        };
         let left = resample_sample(
             &source.channels[0][clip.source_bounds.start..clip.source_bounds.end],
             source_position,
@@ -12797,6 +12805,7 @@ mod tests {
             path: PathBuf::new(),
             start_frame: 0,
             source_bounds: SampleBounds { start: 0, end: 2 },
+            reverse: false,
             pitch_ratio: 1.0,
             duration_frames: 2,
             gain: 1.0,
@@ -12882,6 +12891,7 @@ mod tests {
             path: PathBuf::new(),
             start_frame: 0,
             source_bounds: SampleBounds { start: 0, end: 2 },
+            reverse: false,
             pitch_ratio: 1.0,
             duration_frames: 2,
             gain: 1.0,
@@ -12983,6 +12993,7 @@ mod tests {
             path,
             start_frame: 0,
             source_bounds: SampleBounds { start: 0, end: 64 },
+            reverse: false,
             pitch_ratio: 1.0,
             duration_frames: 50,
             gain: 1.0,
@@ -13765,6 +13776,7 @@ mod tests {
                 path,
                 start_frame: 0,
                 source_bounds: SampleBounds { start: 0, end: 2 },
+                reverse: false,
                 pitch_ratio: 1.0,
                 duration_frames: 2,
                 gain: 0.5,
@@ -14133,6 +14145,7 @@ mod tests {
                 path: path.clone(),
                 start_frame,
                 source_bounds: SampleBounds { start: 0, end: 8 },
+                reverse: false,
                 pitch_ratio: 1.0,
                 duration_frames: 8,
                 gain,
@@ -14207,6 +14220,7 @@ mod tests {
             path: PathBuf::new(),
             start_frame: 0,
             source_bounds: SampleBounds { start: 0, end: 2 },
+            reverse: false,
             pitch_ratio: 1.0,
             duration_frames: 4,
             gain: 1.0,
@@ -14258,6 +14272,7 @@ mod tests {
             path: PathBuf::new(),
             start_frame: 0,
             source_bounds: SampleBounds { start: 0, end: 4 },
+            reverse: false,
             pitch_ratio: pitch_up,
             duration_frames: 2,
             gain: 1.0,
@@ -14287,6 +14302,7 @@ mod tests {
             path: PathBuf::new(),
             start_frame: 0,
             source_bounds: SampleBounds { start: 0, end: 1 },
+            reverse: false,
             pitch_ratio: 1.0,
             duration_frames: 1,
             gain: 1.0,
@@ -14323,6 +14339,7 @@ mod tests {
             path: path.clone(),
             start_frame: 2,
             source_bounds: SampleBounds { start: 0, end: 5 },
+            reverse: false,
             pitch_ratio: 1.0,
             duration_frames: 5,
             gain: 0.5,
