@@ -958,6 +958,39 @@ impl PlaylistEditPatternsIn {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum PlaylistClipFocus {
+    #[default]
+    Pattern,
+    Audio,
+    Automation,
+}
+
+impl PlaylistClipFocus {
+    const ALL: [Self; 3] = [Self::Pattern, Self::Audio, Self::Automation];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Pattern => "Pattern",
+            Self::Audio => "Audio",
+            Self::Automation => "Automation",
+        }
+    }
+
+    fn includes(self, clip: &PlaylistClip, channel_kinds: &BTreeMap<u16, Option<u8>>) -> bool {
+        match (self, clip.target()) {
+            (Self::Pattern, PlaylistClipTarget::Pattern { .. }) => true,
+            (Self::Audio, PlaylistClipTarget::Channel { id }) => {
+                channel_kinds.get(&id).copied().flatten() == Some(4)
+            }
+            (Self::Automation, PlaylistClipTarget::Channel { id }) => {
+                channel_kinds.get(&id).copied().flatten() == Some(5)
+            }
+            _ => false,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PlaylistPatternEditorTarget {
     ChannelRack,
@@ -4429,6 +4462,7 @@ struct DawUi {
     hide_collapsed_playlist_groups: bool,
     playlist_zero_crossing_splits: bool,
     playlist_edit_patterns_in: PlaylistEditPatternsIn,
+    playlist_clip_focus: PlaylistClipFocus,
     playlist_scroll_to_position: bool,
     active_playlist_clip_drag: Option<ActivePlaylistClipDrag>,
     active_playlist_clip_drag_targets: Vec<PlaylistClipDragTarget>,
@@ -5707,6 +5741,7 @@ impl DawUi {
             collapsed_playlist_groups: BTreeSet::new(),
             hide_collapsed_playlist_groups,
             playlist_edit_patterns_in,
+            playlist_clip_focus: PlaylistClipFocus::default(),
             playlist_scroll_to_position,
             active_playlist_clip_drag: None,
             active_playlist_clip_drag_targets: Vec::new(),
@@ -16449,6 +16484,19 @@ impl DawUi {
                         ui.selectable_value(&mut self.playlist_waveform_mode, mode, mode.label());
                     }
                 });
+            ui.separator();
+            ui.label("Clip focus");
+            for focus in PlaylistClipFocus::ALL {
+                ui.selectable_value(
+                    &mut self.playlist_clip_focus,
+                    focus,
+                    focus.label(),
+                )
+                .on_hover_text(format!(
+                    "Bring {} Clips to the top of overlapping stacks",
+                    focus.label()
+                ));
+            }
             let previous_edit_patterns_in = self.playlist_edit_patterns_in;
             let previous_scroll_to_position = self.playlist_scroll_to_position;
             ui.menu_button(
@@ -17031,6 +17079,11 @@ impl DawUi {
             ((max_tick as f32 * self.timeline_zoom) + 240.0).clamp(min_grid_width, 50000.0);
         let row_height = 27.0 * self.playlist_track_zoom;
         let tick_scale = self.timeline_zoom;
+        let mut playlist_clip_draw_order = (0..arrangement.clips.len()).collect::<Vec<_>>();
+        playlist_clip_draw_order.sort_by_key(|clip_index| {
+            self.playlist_clip_focus
+                .includes(&arrangement.clips[*clip_index], &channel_kinds)
+        });
         let playhead_tick = self.current_playhead_tick();
         let measure_tick_limit = (grid_width / tick_scale.max(0.001))
             .ceil()
@@ -17877,7 +17930,8 @@ impl DawUi {
                             ));
                         }
 
-                        for (clip_index, clip) in arrangement.clips.iter().enumerate() {
+                        for clip_index in playlist_clip_draw_order.iter().copied() {
+                            let clip = &arrangement.clips[clip_index];
                             if clip.track_index != Some(row) {
                                 continue;
                             }
@@ -19707,12 +19761,48 @@ impl DawUi {
                                         Some(vec![(clip_index, !clip.is_muted())]);
                                 } else {
                                     let modifiers = ui.input(|input| input.modifiers);
-                                    self.set_playlist_clip_selection(
-                                        arrangement.id,
-                                        clip_index,
-                                        arrangement.clips.len(),
-                                        modifiers,
-                                    );
+                                    let stack_selection = if modifiers.ctrl || modifiers.command {
+                                        response.interact_pointer_pos().map(|pointer| {
+                                            let tick = ((pointer.x - grid_rect.left())
+                                                / tick_scale.max(0.001))
+                                                .floor()
+                                                .max(0.0)
+                                                .min(u32::MAX as f32)
+                                                as u32;
+                                            arrangement
+                                                .clips
+                                                .iter()
+                                                .enumerate()
+                                                .filter_map(|(index, candidate)| {
+                                                    let end_tick = candidate
+                                                        .position_ticks
+                                                        .saturating_add(candidate.length_ticks);
+                                                    (candidate.track_index == Some(row)
+                                                        && candidate.length_ticks > 0
+                                                        && candidate.position_ticks <= tick
+                                                        && tick < end_tick)
+                                                        .then_some(index)
+                                                })
+                                                .collect::<BTreeSet<_>>()
+                                        })
+                                    } else {
+                                        None
+                                    };
+                                    if let Some(stack_selection) =
+                                        stack_selection.filter(|indices| indices.len() > 1)
+                                    {
+                                        self.selected_arrangement = Some(arrangement.id);
+                                        self.selected_clip = Some(clip_index);
+                                        self.playlist_selection_anchor = Some(clip_index);
+                                        self.selected_playlist_clips = stack_selection;
+                                    } else {
+                                        self.set_playlist_clip_selection(
+                                            arrangement.id,
+                                            clip_index,
+                                            arrangement.clips.len(),
+                                            modifiers,
+                                        );
+                                    }
                                     let selected_count = self.selected_playlist_clips.len();
                                     self.status = if selected_count > 1 {
                                         format!("Selected {selected_count} Playlist clips")
