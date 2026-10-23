@@ -23110,7 +23110,7 @@ impl DawUi {
                                 }
                                 if ui
                                     .add_enabled(
-                                        matches!(channel.kind(), Some(0 | 1 | 2 | 3 | 4 | 5)),
+                                        matches!(channel.kind(), Some(0..=5)),
                                         egui::Button::new("Duplicate channel"),
                                     )
                                     .on_hover_text(
