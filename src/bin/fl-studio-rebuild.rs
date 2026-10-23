@@ -4187,6 +4187,7 @@ struct DawUi {
     piano_roll_mouse_wheel_fine: bool,
     piano_roll_nudge_notes_with_mouse_wheel: bool,
     piano_roll_resize_from_left: bool,
+    piano_roll_note_grouping_enabled: bool,
     piano_roll_edit_scope: PianoRollEditScope,
     piano_roll_event_editor_open: bool,
     piano_roll_event_target: PianoRollEventTarget,
@@ -5335,6 +5336,7 @@ impl DawUi {
         let piano_roll_nudge_notes_with_mouse_wheel =
             load_piano_roll_nudge_notes_with_mouse_wheel();
         let piano_roll_resize_from_left = load_piano_roll_resize_from_left();
+        let piano_roll_note_grouping_enabled = load_piano_roll_note_grouping_enabled();
         let channel_rack_mute_removed_steps = load_channel_rack_mute_removed_steps();
         let hide_collapsed_playlist_groups = load_hide_collapsed_playlist_groups();
         let playlist_zero_crossing_splits = load_playlist_zero_crossing_splits();
@@ -5459,6 +5461,7 @@ impl DawUi {
             piano_roll_mouse_wheel_fine: false,
             piano_roll_nudge_notes_with_mouse_wheel,
             piano_roll_resize_from_left,
+            piano_roll_note_grouping_enabled,
             piano_roll_edit_scope: PianoRollEditScope::Automatic,
             piano_roll_event_editor_open: false,
             piano_roll_event_target: PianoRollEventTarget::Velocity,
@@ -25694,14 +25697,30 @@ impl DawUi {
             .as_ref()
             .zip(target)
             .map(|(pattern, (pattern_id, channel_id))| match command {
-                PianoRollSelectionCommand::Odd => {
-                    piano_roll_odd_note_selection(pattern, pattern_id, channel_id, main_grid_ticks)
-                }
+                PianoRollSelectionCommand::Odd => piano_roll_odd_note_selection_with_grouping(
+                    pattern,
+                    pattern_id,
+                    channel_id,
+                    main_grid_ticks,
+                    self.piano_roll_note_grouping_enabled,
+                ),
                 PianoRollSelectionCommand::Overlapping => {
-                    piano_roll_overlap_note_selection(pattern, pattern_id, channel_id, false)
+                    piano_roll_overlap_note_selection_with_grouping(
+                        pattern,
+                        pattern_id,
+                        channel_id,
+                        false,
+                        self.piano_roll_note_grouping_enabled,
+                    )
                 }
                 PianoRollSelectionCommand::Stacked => {
-                    piano_roll_overlap_note_selection(pattern, pattern_id, channel_id, true)
+                    piano_roll_overlap_note_selection_with_grouping(
+                        pattern,
+                        pattern_id,
+                        channel_id,
+                        true,
+                        self.piano_roll_note_grouping_enabled,
+                    )
                 }
                 PianoRollSelectionCommand::Muted => pattern
                     .notes
@@ -25757,7 +25776,7 @@ impl DawUi {
                     let select_more = command == PianoRollSelectionCommand::RandomMore;
                     let selected = pattern.as_ref().zip(target).and_then(
                         |(pattern, (pattern_id, channel_id))| {
-                            piano_roll_random_note_selection(
+                            piano_roll_random_note_selection_with_grouping(
                                 pattern,
                                 pattern_id,
                                 channel_id,
@@ -25767,6 +25786,7 @@ impl DawUi {
                                     .duration_since(UNIX_EPOCH)
                                     .unwrap_or_default()
                                     .as_nanos() as u64,
+                                self.piano_roll_note_grouping_enabled,
                             )
                         },
                     );
@@ -27227,6 +27247,20 @@ impl DawUi {
                         );
                     }
                 });
+            if ui
+                .selectable_label(self.piano_roll_note_grouping_enabled, "Grouping")
+                .on_hover_text(
+                    "When enabled, grouped notes are selected, moved, resized, muted, and deleted together",
+                )
+                .clicked()
+            {
+                self.piano_roll_note_grouping_enabled = !self.piano_roll_note_grouping_enabled;
+                if let Err(error) =
+                    save_piano_roll_note_grouping_enabled(self.piano_roll_note_grouping_enabled)
+                {
+                    self.status = format!("Could not save Piano roll grouping setting: {error}");
+                }
+            }
             ui.separator();
             if ui
                 .selectable_label(
@@ -35447,8 +35481,13 @@ impl DawUi {
                 let selected_note_ids = self
                     .selected_note_channel
                     .map(|channel_id| {
-                        piano_roll_pitch_range_note_selection(
-                            pattern, pattern.id, channel_id, low_key, high_key,
+                        piano_roll_pitch_range_note_selection_with_grouping(
+                            pattern,
+                            pattern.id,
+                            channel_id,
+                            low_key,
+                            high_key,
+                            self.piano_roll_note_grouping_enabled,
                         )
                     })
                     .unwrap_or_default();
@@ -35735,11 +35774,12 @@ impl DawUi {
                 {
                     self.last_piano_roll_delete_note = Some(note_id);
                     notes_to_delete.extend(
-                        piano_roll_note_group_members(
+                        piano_roll_note_group_members_with_grouping(
                             pattern,
                             pattern.id,
                             note.channel_id,
                             *channel_index,
+                            self.piano_roll_note_grouping_enabled,
                         )
                         .into_iter()
                         .map(|(_, channel_id, note_index)| (channel_id, note_index)),
@@ -35751,11 +35791,12 @@ impl DawUi {
                     && self.last_piano_roll_mute_note != Some(note_id)
                 {
                     self.last_piano_roll_mute_note = Some(note_id);
-                    let targets = piano_roll_note_group_members(
+                    let targets = piano_roll_note_group_members_with_grouping(
                         pattern,
                         pattern.id,
                         note.channel_id,
                         *channel_index,
+                        self.piano_roll_note_grouping_enabled,
                     )
                     .into_iter()
                     .map(|(_, channel_id, note_index)| (channel_id, note_index))
@@ -35782,11 +35823,12 @@ impl DawUi {
                     {
                         self.selected_piano_notes.clear();
                     }
-                    let group_members = piano_roll_note_group_members(
+                    let group_members = piano_roll_note_group_members_with_grouping(
                         pattern,
                         pattern.id,
                         note.channel_id,
                         *channel_index,
+                        self.piano_roll_note_grouping_enabled,
                     );
                     if additive
                         && group_members
@@ -35852,11 +35894,12 @@ impl DawUi {
                             .retain(|(selected_pattern, _, _)| *selected_pattern != pattern.id);
                     }
                     self.selected_piano_notes
-                        .extend(piano_roll_note_group_members(
+                        .extend(piano_roll_note_group_members_with_grouping(
                             pattern,
                             pattern.id,
                             note.channel_id,
                             *channel_index,
+                            self.piano_roll_note_grouping_enabled,
                         ));
                     let mut selected_note_indices = BTreeMap::<u16, usize>::new();
                     let mut targets = Vec::new();
@@ -36781,8 +36824,13 @@ impl DawUi {
                     let selected_note_ids = self
                         .selected_note_channel
                         .map(|channel_id| {
-                            piano_roll_time_range_note_selection(
-                                pattern, pattern.id, channel_id, start, end,
+                            piano_roll_time_range_note_selection_with_grouping(
+                                pattern,
+                                pattern.id,
+                                channel_id,
+                                start,
+                                end,
+                                self.piano_roll_note_grouping_enabled,
                             )
                         })
                         .unwrap_or_default();
@@ -36992,12 +37040,13 @@ impl DawUi {
                         })
                         .map(|(_, channel_note_index, _, _, _)| *channel_note_index)
                         .collect::<Vec<_>>();
-                    update_piano_roll_box_selection(
+                    update_piano_roll_box_selection_with_grouping(
                         pattern,
                         pattern.id,
                         selection.channel_id,
                         &enclosed_note_indices,
                         selection.additive,
+                        self.piano_roll_note_grouping_enabled,
                         &mut self.selected_piano_notes,
                     );
                     self.selected_note = self
@@ -37244,11 +37293,12 @@ impl DawUi {
                                 let existing_end = existing_start + u64::from(existing.length);
                                 if existing_start < painted_end && painted_start < existing_end {
                                     targets.extend(
-                                        piano_roll_note_group_members(
+                                        piano_roll_note_group_members_with_grouping(
                                             pattern,
                                             pattern.id,
                                             existing.channel_id,
                                             note_index,
+                                            self.piano_roll_note_grouping_enabled,
                                         )
                                         .into_iter()
                                         .map(
@@ -38952,11 +39002,16 @@ impl DawUi {
             }
         }
         if delete_requested && let Some(document) = self.document.as_ref() {
-            let mut grouped_indices =
-                piano_roll_note_group_members(pattern, pattern_id, channel_id, channel_note_index)
-                    .into_iter()
-                    .map(|(_, _, note_index)| note_index)
-                    .collect::<Vec<_>>();
+            let mut grouped_indices = piano_roll_note_group_members_with_grouping(
+                pattern,
+                pattern_id,
+                channel_id,
+                channel_note_index,
+                self.piano_roll_note_grouping_enabled,
+            )
+            .into_iter()
+            .map(|(_, _, note_index)| note_index)
+            .collect::<Vec<_>>();
             grouped_indices.sort_unstable_by(|left, right| right.cmp(left));
             let deleted_count = grouped_indices.len();
             let mut updated = document.clone();
@@ -49820,11 +49875,28 @@ fn piano_roll_cross_pattern_ghost_notes(
     ghosts.into_iter().collect()
 }
 
+#[cfg(test)]
 fn piano_roll_note_group_members(
     pattern: &Pattern,
     pattern_id: u16,
     channel_id: u16,
     channel_note_index: usize,
+) -> Vec<(u16, u16, usize)> {
+    piano_roll_note_group_members_with_grouping(
+        pattern,
+        pattern_id,
+        channel_id,
+        channel_note_index,
+        true,
+    )
+}
+
+fn piano_roll_note_group_members_with_grouping(
+    pattern: &Pattern,
+    pattern_id: u16,
+    channel_id: u16,
+    channel_note_index: usize,
+    grouping_enabled: bool,
 ) -> Vec<(u16, u16, usize)> {
     let Some(note) = pattern
         .notes
@@ -49834,7 +49906,7 @@ fn piano_roll_note_group_members(
     else {
         return Vec::new();
     };
-    if note.group == 0 {
+    if !grouping_enabled || note.group == 0 {
         return vec![(pattern_id, channel_id, channel_note_index)];
     }
     let group = note.group;
@@ -49848,11 +49920,28 @@ fn piano_roll_note_group_members(
         .collect()
 }
 
+#[cfg(test)]
 fn piano_roll_odd_note_selection(
     pattern: &Pattern,
     pattern_id: u16,
     channel_id: u16,
     main_grid_ticks: u32,
+) -> Vec<(u16, u16, usize)> {
+    piano_roll_odd_note_selection_with_grouping(
+        pattern,
+        pattern_id,
+        channel_id,
+        main_grid_ticks,
+        true,
+    )
+}
+
+fn piano_roll_odd_note_selection_with_grouping(
+    pattern: &Pattern,
+    pattern_id: u16,
+    channel_id: u16,
+    main_grid_ticks: u32,
+    grouping_enabled: bool,
 ) -> Vec<(u16, u16, usize)> {
     let main_grid_ticks = main_grid_ticks.max(1);
     let mut off_grid_groups = BTreeSet::<(u16, usize)>::new();
@@ -49863,10 +49952,10 @@ fn piano_roll_odd_note_selection(
         .enumerate()
     {
         if note.position % main_grid_ticks != 0 {
-            let group_key = if note.group == 0 {
-                (0, note_index)
-            } else {
+            let group_key = if grouping_enabled && note.group != 0 {
                 (note.group, 0)
+            } else {
+                (0, note_index)
             };
             off_grid_groups.insert(group_key);
         }
@@ -49878,10 +49967,10 @@ fn piano_roll_odd_note_selection(
         .filter(|note| note.channel_id == channel_id)
         .enumerate()
         .filter(|(note_index, note)| {
-            let group_key = if note.group == 0 {
-                (0, *note_index)
-            } else {
+            let group_key = if grouping_enabled && note.group != 0 {
                 (note.group, 0)
+            } else {
+                (0, *note_index)
             };
             off_grid_groups.contains(&group_key)
         })
@@ -49889,11 +49978,28 @@ fn piano_roll_odd_note_selection(
         .collect()
 }
 
+#[cfg(test)]
 fn piano_roll_overlap_note_selection(
     pattern: &Pattern,
     pattern_id: u16,
     channel_id: u16,
     stacked_only: bool,
+) -> Vec<(u16, u16, usize)> {
+    piano_roll_overlap_note_selection_with_grouping(
+        pattern,
+        pattern_id,
+        channel_id,
+        stacked_only,
+        true,
+    )
+}
+
+fn piano_roll_overlap_note_selection_with_grouping(
+    pattern: &Pattern,
+    pattern_id: u16,
+    channel_id: u16,
+    stacked_only: bool,
+    grouping_enabled: bool,
 ) -> Vec<(u16, u16, usize)> {
     let channel_notes = pattern
         .notes
@@ -49966,7 +50072,7 @@ fn piano_roll_overlap_note_selection(
         .enumerate()
         .filter(|(note_index, note)| {
             selected_indices.contains(note_index)
-                || (note.group != 0 && selected_groups.contains(&note.group))
+                || (grouping_enabled && note.group != 0 && selected_groups.contains(&note.group))
         })
         .map(|(note_index, _)| (pattern_id, channel_id, note_index))
         .collect()
@@ -50013,12 +50119,26 @@ fn piano_roll_selection_time_range(
     found_note.then_some((start, end))
 }
 
+#[cfg(test)]
 fn piano_roll_time_range_note_selection(
     pattern: &Pattern,
     pattern_id: u16,
     channel_id: u16,
     start: u32,
     end: u32,
+) -> Vec<(u16, u16, usize)> {
+    piano_roll_time_range_note_selection_with_grouping(
+        pattern, pattern_id, channel_id, start, end, true,
+    )
+}
+
+fn piano_roll_time_range_note_selection_with_grouping(
+    pattern: &Pattern,
+    pattern_id: u16,
+    channel_id: u16,
+    start: u32,
+    end: u32,
+    grouping_enabled: bool,
 ) -> Vec<(u16, u16, usize)> {
     if end <= start {
         return Vec::new();
@@ -50034,7 +50154,7 @@ fn piano_roll_time_range_note_selection(
     for (note_index, note) in channel_notes.iter().enumerate() {
         if (start..end).contains(&note.position) {
             selected_indices.insert(note_index);
-            if note.group != 0 {
+            if grouping_enabled && note.group != 0 {
                 selected_groups.insert(note.group);
             }
         }
@@ -50045,18 +50165,32 @@ fn piano_roll_time_range_note_selection(
         .enumerate()
         .filter(|(note_index, note)| {
             selected_indices.contains(note_index)
-                || (note.group != 0 && selected_groups.contains(&note.group))
+                || (grouping_enabled && note.group != 0 && selected_groups.contains(&note.group))
         })
         .map(|(note_index, _)| (pattern_id, channel_id, note_index))
         .collect()
 }
 
+#[cfg(test)]
 fn piano_roll_pitch_range_note_selection(
     pattern: &Pattern,
     pattern_id: u16,
     channel_id: u16,
     first_key: u16,
     last_key: u16,
+) -> Vec<(u16, u16, usize)> {
+    piano_roll_pitch_range_note_selection_with_grouping(
+        pattern, pattern_id, channel_id, first_key, last_key, true,
+    )
+}
+
+fn piano_roll_pitch_range_note_selection_with_grouping(
+    pattern: &Pattern,
+    pattern_id: u16,
+    channel_id: u16,
+    first_key: u16,
+    last_key: u16,
+    grouping_enabled: bool,
 ) -> Vec<(u16, u16, usize)> {
     let low_key = first_key.min(last_key);
     let high_key = first_key.max(last_key);
@@ -50070,7 +50204,7 @@ fn piano_roll_pitch_range_note_selection(
     for (note_index, note) in channel_notes.iter().enumerate() {
         if (low_key..=high_key).contains(&note.key) {
             selected_indices.insert(note_index);
-            if note.group != 0 {
+            if grouping_enabled && note.group != 0 {
                 selected_groups.insert(note.group);
             }
         }
@@ -50081,7 +50215,7 @@ fn piano_roll_pitch_range_note_selection(
         .enumerate()
         .filter(|(note_index, note)| {
             selected_indices.contains(note_index)
-                || (note.group != 0 && selected_groups.contains(&note.group))
+                || (grouping_enabled && note.group != 0 && selected_groups.contains(&note.group))
         })
         .map(|(note_index, _)| (pattern_id, channel_id, note_index))
         .collect()
@@ -50276,6 +50410,7 @@ fn piano_roll_duplicate_offset(
         .unwrap_or_else(|| last_end.saturating_sub(first_position).max(1))
 }
 
+#[cfg(test)]
 fn piano_roll_random_note_selection(
     pattern: &Pattern,
     pattern_id: u16,
@@ -50284,6 +50419,26 @@ fn piano_roll_random_note_selection(
     select_more: bool,
     seed: u64,
 ) -> Option<BTreeSet<(u16, u16, usize)>> {
+    piano_roll_random_note_selection_with_grouping(
+        pattern,
+        pattern_id,
+        channel_id,
+        selected,
+        select_more,
+        seed,
+        true,
+    )
+}
+
+fn piano_roll_random_note_selection_with_grouping(
+    pattern: &Pattern,
+    pattern_id: u16,
+    channel_id: u16,
+    selected: &BTreeSet<(u16, u16, usize)>,
+    select_more: bool,
+    seed: u64,
+    grouping_enabled: bool,
+) -> Option<BTreeSet<(u16, u16, usize)>> {
     let mut groups = BTreeMap::<(u16, usize), Vec<(u16, u16, usize)>>::new();
     for (note_index, note) in pattern
         .notes
@@ -50291,10 +50446,10 @@ fn piano_roll_random_note_selection(
         .filter(|note| note.channel_id == channel_id)
         .enumerate()
     {
-        let group_key = if note.group == 0 {
-            (0, note_index)
-        } else {
+        let group_key = if grouping_enabled && note.group != 0 {
             (note.group, 0)
+        } else {
+            (0, note_index)
         };
         groups
             .entry(group_key)
@@ -50398,12 +50553,33 @@ fn toggle_piano_roll_note_group_selection(
     !remove
 }
 
+#[cfg(test)]
 fn update_piano_roll_box_selection(
     pattern: &Pattern,
     pattern_id: u16,
     channel_id: u16,
     enclosed_note_indices: &[usize],
     additive: bool,
+    selected: &mut BTreeSet<(u16, u16, usize)>,
+) {
+    update_piano_roll_box_selection_with_grouping(
+        pattern,
+        pattern_id,
+        channel_id,
+        enclosed_note_indices,
+        additive,
+        true,
+        selected,
+    );
+}
+
+fn update_piano_roll_box_selection_with_grouping(
+    pattern: &Pattern,
+    pattern_id: u16,
+    channel_id: u16,
+    enclosed_note_indices: &[usize],
+    additive: bool,
+    grouping_enabled: bool,
     selected: &mut BTreeSet<(u16, u16, usize)>,
 ) {
     let mut processed_groups = BTreeSet::new();
@@ -50414,15 +50590,21 @@ fn update_piano_roll_box_selection(
             .filter(|note| note.channel_id == channel_id)
             .nth(*note_index)
             .map_or(0, |note| note.group);
-        let key = if group == 0 {
-            (group, *note_index)
-        } else {
+        let key = if grouping_enabled && group != 0 {
             (group, 0)
+        } else {
+            (0, *note_index)
         };
         if !processed_groups.insert(key) {
             continue;
         }
-        let members = piano_roll_note_group_members(pattern, pattern_id, channel_id, *note_index);
+        let members = piano_roll_note_group_members_with_grouping(
+            pattern,
+            pattern_id,
+            channel_id,
+            *note_index,
+            grouping_enabled,
+        );
         toggle_piano_roll_note_group_selection(selected, &members, additive);
     }
 }
@@ -52165,6 +52347,31 @@ fn save_piano_roll_resize_from_left(enabled: bool) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| "the Piano roll resize setting path has no parent folder".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    fs::write(&path, format!("{enabled}\n"))
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
+fn piano_roll_note_grouping_settings_file() -> Option<PathBuf> {
+    browser_favorites_file()?
+        .parent()
+        .map(|directory| directory.join("piano-roll-note-grouping.txt"))
+}
+
+fn load_piano_roll_note_grouping_enabled() -> bool {
+    piano_roll_note_grouping_settings_file()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|contents| contents.trim().parse::<bool>().ok())
+        .unwrap_or(true)
+}
+
+fn save_piano_roll_note_grouping_enabled(enabled: bool) -> Result<(), String> {
+    let path = piano_roll_note_grouping_settings_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the Piano roll grouping setting path has no parent folder".to_owned())?;
     fs::create_dir_all(parent)
         .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
     fs::write(&path, format!("{enabled}\n"))
