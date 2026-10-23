@@ -912,6 +912,105 @@ enum MainView {
     Automation,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum PlaylistEditPatternsIn {
+    #[default]
+    Automatic,
+    ChannelRack,
+    PianoRoll,
+    PianoRollOrEventEditor,
+}
+
+impl PlaylistEditPatternsIn {
+    const ALL: [Self; 4] = [
+        Self::Automatic,
+        Self::ChannelRack,
+        Self::PianoRoll,
+        Self::PianoRollOrEventEditor,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Automatic => "Automatic",
+            Self::ChannelRack => "Channel rack",
+            Self::PianoRoll => "Piano roll",
+            Self::PianoRollOrEventEditor => "Piano roll or event editor",
+        }
+    }
+
+    const fn settings_key(self) -> &'static str {
+        match self {
+            Self::Automatic => "automatic",
+            Self::ChannelRack => "channel_rack",
+            Self::PianoRoll => "piano_roll",
+            Self::PianoRollOrEventEditor => "piano_roll_or_event_editor",
+        }
+    }
+
+    fn from_settings_key(key: &str) -> Option<Self> {
+        match key {
+            "automatic" => Some(Self::Automatic),
+            "channel_rack" => Some(Self::ChannelRack),
+            "piano_roll" => Some(Self::PianoRoll),
+            "piano_roll_or_event_editor" => Some(Self::PianoRollOrEventEditor),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlaylistPatternEditorTarget {
+    ChannelRack,
+    PianoRoll,
+    EventEditor,
+}
+
+fn playlist_pattern_editor_target(
+    mode: PlaylistEditPatternsIn,
+    has_notes: bool,
+    has_event_data: bool,
+    alternate_action: bool,
+) -> PlaylistPatternEditorTarget {
+    let target = match mode {
+        PlaylistEditPatternsIn::Automatic => {
+            if has_notes {
+                PlaylistPatternEditorTarget::PianoRoll
+            } else if has_event_data {
+                PlaylistPatternEditorTarget::EventEditor
+            } else {
+                PlaylistPatternEditorTarget::ChannelRack
+            }
+        }
+        PlaylistEditPatternsIn::ChannelRack => PlaylistPatternEditorTarget::ChannelRack,
+        PlaylistEditPatternsIn::PianoRoll => PlaylistPatternEditorTarget::PianoRoll,
+        PlaylistEditPatternsIn::PianoRollOrEventEditor => {
+            if !has_notes && has_event_data {
+                PlaylistPatternEditorTarget::EventEditor
+            } else {
+                PlaylistPatternEditorTarget::PianoRoll
+            }
+        }
+    };
+    if alternate_action {
+        match target {
+            PlaylistPatternEditorTarget::ChannelRack => PlaylistPatternEditorTarget::PianoRoll,
+            PlaylistPatternEditorTarget::PianoRoll | PlaylistPatternEditorTarget::EventEditor => {
+                PlaylistPatternEditorTarget::ChannelRack
+            }
+        }
+    } else {
+        target
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PlaylistPatternOpenRequest {
+    clip_index: usize,
+    pattern_id: u16,
+    target: PlaylistPatternEditorTarget,
+    scroll_to_tick: Option<u32>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum DetachedWindowKind {
     Playlist,
@@ -4329,6 +4428,8 @@ struct DawUi {
     collapsed_playlist_groups: BTreeSet<(u16, u32)>,
     hide_collapsed_playlist_groups: bool,
     playlist_zero_crossing_splits: bool,
+    playlist_edit_patterns_in: PlaylistEditPatternsIn,
+    playlist_scroll_to_position: bool,
     active_playlist_clip_drag: Option<ActivePlaylistClipDrag>,
     active_playlist_clip_drag_targets: Vec<PlaylistClipDragTarget>,
     selected_time_marker: Option<usize>,
@@ -5349,6 +5450,8 @@ impl DawUi {
         let channel_rack_mute_removed_steps = load_channel_rack_mute_removed_steps();
         let hide_collapsed_playlist_groups = load_hide_collapsed_playlist_groups();
         let playlist_zero_crossing_splits = load_playlist_zero_crossing_splits();
+        let playlist_edit_patterns_in = load_playlist_edit_patterns_in();
+        let playlist_scroll_to_position = load_playlist_scroll_to_position();
         let browser_path = initial_project
             .as_deref()
             .and_then(Path::parent)
@@ -5603,6 +5706,8 @@ impl DawUi {
             soloed_playlist_track_range: None,
             collapsed_playlist_groups: BTreeSet::new(),
             hide_collapsed_playlist_groups,
+            playlist_edit_patterns_in,
+            playlist_scroll_to_position,
             active_playlist_clip_drag: None,
             active_playlist_clip_drag_targets: Vec::new(),
             selected_time_marker: None,
@@ -16344,6 +16449,38 @@ impl DawUi {
                         ui.selectable_value(&mut self.playlist_waveform_mode, mode, mode.label());
                     }
                 });
+            let previous_edit_patterns_in = self.playlist_edit_patterns_in;
+            let previous_scroll_to_position = self.playlist_scroll_to_position;
+            ui.menu_button(
+                format!("Edit patterns in: {}", self.playlist_edit_patterns_in.label()),
+                |ui| {
+                    for mode in PlaylistEditPatternsIn::ALL {
+                        if ui
+                            .selectable_value(
+                                &mut self.playlist_edit_patterns_in,
+                                mode,
+                                mode.label(),
+                            )
+                            .clicked()
+                        {
+                            ui.close();
+                        }
+                    }
+                    ui.separator();
+                    ui.checkbox(&mut self.playlist_scroll_to_position, "Scroll to position");
+                },
+            );
+            if self.playlist_edit_patterns_in != previous_edit_patterns_in
+                && let Err(error) = save_playlist_edit_patterns_in(self.playlist_edit_patterns_in)
+            {
+                self.status = format!("Could not save Playlist edit mode: {error}");
+            }
+            if self.playlist_scroll_to_position != previous_scroll_to_position
+                && let Err(error) =
+                    save_playlist_scroll_to_position(self.playlist_scroll_to_position)
+            {
+                self.status = format!("Could not save Playlist scroll setting: {error}");
+            }
             let has_project_pattern_clip_template = arrangements.iter().any(|candidate| {
                 candidate
                     .clips
@@ -18682,7 +18819,13 @@ impl DawUi {
                                         && patterns.iter().any(|pattern| pattern.id == id)
                                         && ui.button("Open in Piano roll").clicked()
                                     {
-                                        open_pattern_clip_requested = Some((clip_index, id));
+                                        open_pattern_clip_requested =
+                                            Some(PlaylistPatternOpenRequest {
+                                                clip_index,
+                                                pattern_id: id,
+                                                target: PlaylistPatternEditorTarget::PianoRoll,
+                                                scroll_to_tick: Some(0),
+                                            });
                                         ui.close();
                                     }
                                     ui.separator();
@@ -18933,9 +19076,39 @@ impl DawUi {
                                 && response.double_clicked_by(PointerButton::Primary)
                                 && let flp_rebuild::PlaylistClipTarget::Pattern { id } =
                                     clip.target()
-                                && patterns.iter().any(|pattern| pattern.id == id)
+                                && let Some(pattern) =
+                                    patterns.iter().find(|pattern| pattern.id == id)
                             {
-                                open_pattern_clip_requested = Some((clip_index, id));
+                                let alternate_action =
+                                    ui.input(|input| input.modifiers.alt);
+                                let target = playlist_pattern_editor_target(
+                                    self.playlist_edit_patterns_in,
+                                    !pattern.notes.is_empty(),
+                                    !pattern.controllers.is_empty(),
+                                    alternate_action,
+                                );
+                                let pointer_x = response
+                                    .interact_pointer_pos()
+                                    .map_or(clip_rect.left(), |pointer| pointer.x);
+                                let scroll_to_tick = Some(if self.playlist_scroll_to_position {
+                                    playlist_pattern_scroll_tick_for_clip_click(
+                                        pattern,
+                                        clip,
+                                        pointer_x,
+                                        clip_rect.left(),
+                                        tick_scale,
+                                        ppq,
+                                        project_time_signature.unwrap_or((4, 4)),
+                                    )
+                                } else {
+                                    0
+                                });
+                                open_pattern_clip_requested = Some(PlaylistPatternOpenRequest {
+                                    clip_index,
+                                    pattern_id: id,
+                                    target,
+                                    scroll_to_tick,
+                                });
                             }
                             if response.drag_started_by(PointerButton::Primary)
                                 && !self.playlist_mute_tool_active
@@ -20192,7 +20365,13 @@ impl DawUi {
         }
 
         let mut playlist_clip_list_changed = false;
-        if let Some((clip_index, pattern_id)) = open_pattern_clip_requested {
+        if let Some(request) = open_pattern_clip_requested {
+            let PlaylistPatternOpenRequest {
+                clip_index,
+                pattern_id,
+                target,
+                scroll_to_tick,
+            } = request;
             self.selected_pattern = Some(pattern_id);
             self.selected_arrangement = Some(arrangement.id);
             self.selected_clip = Some(clip_index);
@@ -20214,8 +20393,33 @@ impl DawUi {
             self.selected_note_channel = target_channel_id;
             self.selected_note = None;
             self.selected_piano_notes.clear();
-            self.view = MainView::PianoRoll;
-            self.status = format!("Opened Pattern {pattern_id} in the Piano roll");
+            self.piano_roll_pending_scroll_offset = None;
+            match target {
+                PlaylistPatternEditorTarget::ChannelRack => {
+                    self.view = MainView::ChannelRack;
+                    self.status = format!("Opened Pattern {pattern_id} in the Channel Rack");
+                }
+                PlaylistPatternEditorTarget::PianoRoll => {
+                    self.view = MainView::PianoRoll;
+                    self.status = format!("Opened Pattern {pattern_id} in the Piano roll");
+                }
+                PlaylistPatternEditorTarget::EventEditor => {
+                    self.view = MainView::PianoRoll;
+                    self.piano_roll_event_editor_open = true;
+                    self.piano_roll_event_target = PianoRollEventTarget::RawControllers;
+                    self.piano_roll_controller_stream = None;
+                    self.status = format!("Opened Pattern {pattern_id} in the Event Editor");
+                }
+            }
+            if target != PlaylistPatternEditorTarget::ChannelRack
+                && let Some(tick) = scroll_to_tick
+            {
+                let tick_scale = (self.piano_roll_zoom * 0.9).clamp(0.05, 0.22);
+                self.piano_roll_pending_scroll_offset = Some(Vec2::new(
+                    tick as f32 * tick_scale,
+                    self.piano_roll_grid_scroll_offset.y,
+                ));
+            }
         }
         if let Some(clip_index) = delete_clip_requested {
             let clip_indices = if self.selected_arrangement == Some(arrangement.id)
@@ -52757,6 +52961,56 @@ fn save_playlist_zero_crossing_splits(enabled: bool) -> Result<(), String> {
         .map_err(|error| format!("could not write {}: {error}", path.display()))
 }
 
+fn playlist_edit_patterns_in_settings_file() -> Option<PathBuf> {
+    browser_favorites_file()?
+        .parent()
+        .map(|directory| directory.join("playlist-edit-patterns-in.txt"))
+}
+
+fn load_playlist_edit_patterns_in() -> PlaylistEditPatternsIn {
+    playlist_edit_patterns_in_settings_file()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|contents| PlaylistEditPatternsIn::from_settings_key(contents.trim()))
+        .unwrap_or_default()
+}
+
+fn save_playlist_edit_patterns_in(mode: PlaylistEditPatternsIn) -> Result<(), String> {
+    let path = playlist_edit_patterns_in_settings_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the Playlist edit mode path has no parent folder".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    fs::write(&path, format!("{}\n", mode.settings_key()))
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
+fn playlist_scroll_to_position_settings_file() -> Option<PathBuf> {
+    browser_favorites_file()?
+        .parent()
+        .map(|directory| directory.join("playlist-scroll-to-position.txt"))
+}
+
+fn load_playlist_scroll_to_position() -> bool {
+    playlist_scroll_to_position_settings_file()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|contents| contents.trim().parse::<bool>().ok())
+        .unwrap_or(true)
+}
+
+fn save_playlist_scroll_to_position(enabled: bool) -> Result<(), String> {
+    let path = playlist_scroll_to_position_settings_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the Playlist scroll setting path has no parent folder".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    fs::write(&path, format!("{enabled}\n"))
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
 fn browser_column_width_settings_file() -> Option<PathBuf> {
     browser_favorites_file()?
         .parent()
@@ -55223,6 +55477,71 @@ fn playlist_bar_ticks(ppq: u16, time_signature: (u8, u8)) -> u64 {
     (u64::from(ppq.max(1)) * u64::from(time_signature.0.max(1)) * 4
         / u64::from(time_signature.1.max(1)))
     .max(1)
+}
+
+fn playlist_pattern_scroll_tick_for_clip_click(
+    pattern: &Pattern,
+    clip: &PlaylistClip,
+    pointer_x: f32,
+    clip_left: f32,
+    timeline_tick_scale: f32,
+    ppq: u16,
+    default_time_signature: (u8, u8),
+) -> u32 {
+    let clip_length = u64::from(clip.length_ticks).max(1);
+    let pointer_offset =
+        ((pointer_x - clip_left).max(0.0) / timeline_tick_scale.max(f32::EPSILON)).floor() as u64;
+    let clip_offset = pointer_offset.min(clip_length.saturating_sub(1));
+    let inferred_note_end = pattern
+        .notes
+        .iter()
+        .filter(|note| note.length > 0)
+        .map(|note| u64::from(note.position).saturating_add(u64::from(note.length)))
+        .max()
+        .unwrap_or(0);
+    let inferred_controller_end = pattern
+        .controllers
+        .iter()
+        .map(|controller| u64::from(controller.position).saturating_add(1))
+        .max()
+        .unwrap_or(0);
+    let loop_length = pattern
+        .length_ticks
+        .map(u64::from)
+        .filter(|length| *length > 0)
+        .unwrap_or_else(|| {
+            let inferred_length = inferred_note_end.max(inferred_controller_end);
+            if inferred_length > 0 {
+                inferred_length
+            } else {
+                clip_length
+            }
+        })
+        .max(1);
+    let pattern_tick = clip_offset % loop_length;
+    let (meter_start, time_signature) = pattern
+        .time_markers
+        .iter()
+        .filter(|marker| {
+            marker.is_signature() && u64::from(marker.position_ticks()) <= pattern_tick
+        })
+        .filter_map(|marker| {
+            Some((
+                u64::from(marker.position_ticks()),
+                (marker.numerator()?, marker.denominator()?),
+            ))
+        })
+        .max_by_key(|(position, _)| *position)
+        .unwrap_or((0, default_time_signature));
+    let measure_ticks = playlist_bar_ticks(ppq, time_signature);
+    let bar_start = meter_start.saturating_add(
+        pattern_tick
+            .saturating_sub(meter_start)
+            .checked_div(measure_ticks)
+            .unwrap_or(0)
+            .saturating_mul(measure_ticks),
+    );
+    u32::try_from(bar_start).unwrap_or(u32::MAX)
 }
 
 fn playlist_track_group_range(track_id: u32, tracks: &[PlaylistTrack]) -> Option<(u32, u32)> {
