@@ -25,8 +25,8 @@ use flp_rebuild::audio::{
 use flp_rebuild::media::{
     AudioExportOptions, AudioWaveform, DecodedAudio, SamplePathResolver, WaveformPeak,
     decode_audio_file, decode_audio_preview, decode_audio_preview_from_position,
-    decode_audio_waveform, find_empty_project_template, summarize_audio_waveform,
-    write_audio_range_to_wav_with_options,
+    decode_audio_waveform, find_empty_project_template, process_audio_range_to_stereo_preview,
+    summarize_audio_waveform, write_audio_range_to_wav_with_options,
 };
 use flp_rebuild::midi::{MidiChannelMapping, MidiFile, MidiImportOptions};
 use flp_rebuild::plugins::{PluginCandidate, PluginFormat, scan_installed_plugins};
@@ -4113,6 +4113,12 @@ struct PendingSampleEditorExport {
     worker: thread::JoinHandle<()>,
 }
 
+struct PendingSampleEditorPreview {
+    path: PathBuf,
+    receiver: Receiver<Result<Vec<f32>, String>>,
+    worker: thread::JoinHandle<()>,
+}
+
 struct SampleEditorRecordingSession {
     receiver: Receiver<Result<AudioRecordingSummary, String>>,
     worker: thread::JoinHandle<()>,
@@ -4708,6 +4714,10 @@ struct DawUi {
     sample_editor: Option<SampleEditorState>,
     sample_editor_pending: Option<PendingSampleEditor>,
     sample_editor_export_pending: Option<PendingSampleEditorExport>,
+    sample_editor_preview_pending: Option<PendingSampleEditorPreview>,
+    sample_editor_preview_cancelled: bool,
+    sample_editor_preview_active: bool,
+    sample_editor_preview_error: Option<String>,
     sample_editor_recording: Option<SampleEditorRecordingSession>,
     audio_test_tone: bool,
     audio_monitor_input: bool,
@@ -5992,6 +6002,10 @@ impl DawUi {
             sample_editor: None,
             sample_editor_pending: None,
             sample_editor_export_pending: None,
+            sample_editor_preview_pending: None,
+            sample_editor_preview_cancelled: false,
+            sample_editor_preview_active: false,
+            sample_editor_preview_error: None,
             sample_editor_recording: None,
             audio_test_tone: false,
             audio_monitor_input: false,
@@ -14419,6 +14433,7 @@ impl DawUi {
         full_sample: bool,
         start_fraction: Option<f64>,
     ) {
+        self.stop_sample_editor_preview();
         self.cancel_clap_note_previews();
         self.browser_preview_error = None;
         self.browser_preview_path = None;
@@ -14889,6 +14904,7 @@ impl DawUi {
     }
 
     fn request_sample_editor(&mut self, path: PathBuf, ctx: &egui::Context) {
+        self.stop_sample_editor_preview();
         if self.sample_editor_recording.is_some() {
             self.status = "Stop sample editor recording before opening another sample".to_owned();
             return;
@@ -14926,6 +14942,175 @@ impl DawUi {
         });
         self.status = format!("Loading sample editor for {}…", path.display());
         ctx.request_repaint_after(Duration::from_millis(40));
+    }
+
+    fn request_sample_editor_preview(&mut self, ctx: &egui::Context) {
+        if self.sample_editor_preview_pending.is_some() {
+            return;
+        }
+        let Some(editor) = self.sample_editor.as_ref() else {
+            return;
+        };
+        if editor.audio.channels.len() > 2 {
+            self.sample_editor_preview_error =
+                Some("Sample Editor preview supports mono and stereo audio".to_owned());
+            return;
+        }
+        let path = editor.path.clone();
+        let audio = Arc::clone(&editor.audio);
+        let frame_range = editor.selection_start..editor.selection_end;
+        let output_frames =
+            (frame_range.end - frame_range.start) as f64 * f64::from(editor.stretch_ratio);
+        let output_frames = output_frames.round().max(1.0);
+        let sample_rate = f64::from(editor.audio.sample_rate.max(1));
+        let options = AudioExportOptions {
+            pitch_shift_semitones: editor.pitch_shift_semitones,
+            stretch_ratio: editor.stretch_ratio,
+            fade_in_frames: (f64::from(editor.fade_in_seconds.max(0.0)) * sample_rate)
+                .round()
+                .clamp(0.0, output_frames) as usize,
+            fade_out_frames: (f64::from(editor.fade_out_seconds.max(0.0)) * sample_rate)
+                .round()
+                .clamp(0.0, output_frames) as usize,
+            reverse: editor.reverse_export,
+            normalization_target_dbfs: editor
+                .normalize_export
+                .then_some(editor.normalization_target_dbfs),
+        };
+
+        if self.audio_engine.is_none() {
+            match AudioEngine::start(&self.audio_settings) {
+                Ok(engine) => self.audio_engine = Some(engine),
+                Err(error) => {
+                    self.sample_editor_preview_error = Some(error.clone());
+                    self.status = format!("Could not start Sample Editor preview: {error}");
+                    return;
+                }
+            }
+        }
+        let Some(engine) = self.audio_engine.as_ref() else {
+            self.sample_editor_preview_error = Some("Audio output is not available".to_owned());
+            return;
+        };
+        if !engine.output_active() {
+            let error = "Enable an output device before previewing the selection".to_owned();
+            self.sample_editor_preview_error = Some(error.clone());
+            self.status = error;
+            return;
+        }
+        let output_sample_rate = engine.sample_rate();
+
+        self.browser_preview_queued = None;
+        self.browser_preview_cancelled = self.browser_preview_pending.is_some();
+        self.browser_preview_path = None;
+        engine.stop_browser_preview();
+        engine.set_browser_preview_looping(false);
+        self.sample_editor_preview_cancelled = false;
+        self.sample_editor_preview_active = false;
+        self.sample_editor_preview_error = None;
+
+        let (sender, receiver) = mpsc::channel();
+        let worker = match thread::Builder::new()
+            .name("sample-editor-preview".to_owned())
+            .spawn(move || {
+                let result = process_audio_range_to_stereo_preview(
+                    &audio,
+                    frame_range,
+                    options,
+                    output_sample_rate,
+                );
+                let _ = sender.send(result);
+            }) {
+            Ok(worker) => worker,
+            Err(error) => {
+                self.sample_editor_preview_error = Some(error.to_string());
+                self.status = format!("Could not start Sample Editor preview: {error}");
+                return;
+            }
+        };
+        self.sample_editor_preview_pending = Some(PendingSampleEditorPreview {
+            path,
+            receiver,
+            worker,
+        });
+        self.status = "Processing Sample Editor preview…".to_owned();
+        ctx.request_repaint_after(Duration::from_millis(40));
+    }
+
+    fn stop_sample_editor_preview(&mut self) {
+        self.sample_editor_preview_cancelled = self.sample_editor_preview_pending.is_some();
+        if self.sample_editor_preview_active
+            && let Some(engine) = self.audio_engine.as_ref()
+        {
+            engine.stop_browser_preview();
+        }
+        self.sample_editor_preview_active = false;
+    }
+
+    fn poll_sample_editor_preview(&mut self, ctx: &egui::Context) {
+        let completed =
+            self.sample_editor_preview_pending
+                .as_ref()
+                .and_then(|pending| match pending.receiver.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(TryRecvError::Disconnected) => Some(Err(
+                        "Sample Editor preview worker stopped unexpectedly".to_owned(),
+                    )),
+                    Err(TryRecvError::Empty) => None,
+                });
+        if let Some(result) = completed
+            && let Some(pending) = self.sample_editor_preview_pending.take()
+        {
+            let _ = pending.worker.join();
+            let stale_editor = self
+                .sample_editor
+                .as_ref()
+                .is_none_or(|editor| editor.path != pending.path);
+            if self.sample_editor_preview_cancelled || stale_editor {
+                self.sample_editor_preview_cancelled = false;
+            } else {
+                match result {
+                    Ok(samples) => {
+                        let start_result = if let Some(engine) = self.audio_engine.as_ref() {
+                            engine.set_browser_preview_gain(self.browser_preview_volume);
+                            engine.set_browser_preview_looping(false);
+                            engine.set_browser_preview(samples)
+                        } else {
+                            Err("Audio output is not available".to_owned())
+                        };
+                        match start_result {
+                            Ok(()) => {
+                                self.sample_editor_preview_active = true;
+                                self.status = format!(
+                                    "Previewing processed selection from {}",
+                                    pending.path.display()
+                                );
+                            }
+                            Err(error) => {
+                                self.sample_editor_preview_error = Some(error.clone());
+                                self.status =
+                                    format!("Could not play Sample Editor preview: {error}");
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        self.sample_editor_preview_error = Some(error.clone());
+                        self.status = format!("Could not process Sample Editor preview: {error}");
+                    }
+                }
+            }
+        }
+        if self.sample_editor_preview_active
+            && !self
+                .audio_engine
+                .as_ref()
+                .is_some_and(AudioEngine::browser_preview_active)
+        {
+            self.sample_editor_preview_active = false;
+        }
+        if self.sample_editor_preview_pending.is_some() || self.sample_editor_preview_active {
+            ctx.request_repaint_after(Duration::from_millis(40));
+        }
     }
 
     fn poll_sample_editor(&mut self, ctx: &egui::Context) {
@@ -14994,6 +15179,9 @@ impl DawUi {
         }
 
         let export_pending = self.sample_editor_export_pending.is_some();
+        let preview_pending = self.sample_editor_preview_pending.is_some();
+        let preview_active = self.sample_editor_preview_active;
+        let preview_error = self.sample_editor_preview_error.clone();
         let Some(editor) = self.sample_editor.as_mut() else {
             let Some(recording) = self.sample_editor_recording.as_ref() else {
                 return;
@@ -15031,6 +15219,8 @@ impl DawUi {
             .map(|recording| (recording.capture_active, recording.started_at.elapsed()));
         let mut open = true;
         let mut save_selection = false;
+        let mut preview_selection = false;
+        let mut stop_preview = false;
         let mut start_recording = false;
         let mut stop_recording = false;
         egui::Window::new("Sample editor")
@@ -15156,6 +15346,31 @@ impl DawUi {
                 });
                 ui.checkbox(&mut editor.reverse_export, "Reverse selection on export");
                 ui.horizontal(|ui| {
+                    preview_selection = ui
+                        .add_enabled(
+                            editor.audio.channels.len() <= 2 && !preview_pending,
+                            egui::Button::new("▶ Preview processed selection"),
+                        )
+                        .on_hover_text(
+                            "Audition the selected range with the current pitch, stretch, fade, normalization, and reverse settings",
+                        )
+                        .clicked();
+                    if preview_pending || preview_active {
+                        stop_preview = ui
+                            .button(if preview_pending { "Cancel preview" } else { "■ Stop" })
+                            .clicked();
+                    }
+                });
+                if preview_pending {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.small("Processing preview…");
+                    });
+                }
+                if let Some(error) = &preview_error {
+                    ui.label(egui::RichText::new(error).color(ORANGE).small());
+                }
+                ui.horizontal(|ui| {
                     if ui
                         .add_enabled(!export_pending, egui::Button::new("Save selection as WAV…"))
                         .clicked()
@@ -15173,9 +15388,15 @@ impl DawUi {
             });
         if !open {
             self.sample_editor = None;
+            self.stop_sample_editor_preview();
         }
         if save_selection {
             self.save_sample_editor_selection(ctx);
+        }
+        if stop_preview {
+            self.stop_sample_editor_preview();
+        } else if preview_selection {
+            self.request_sample_editor_preview(ctx);
         }
         if stop_recording {
             self.stop_sample_editor_recording();
@@ -49708,6 +49929,7 @@ impl eframe::App for DawUi {
         self.poll_vst3_stream();
         self.poll_sampler_stream();
         self.poll_browser_preview(ui.ctx());
+        self.poll_sample_editor_preview(ui.ctx());
         self.poll_clap_note_preview(ui.ctx());
         self.poll_audio_unit_note_preview(ui.ctx());
         self.poll_sample_editor_recording(ui.ctx());

@@ -567,6 +567,80 @@ fn process_audio_range(
     })
 }
 
+/// Process a selected sample range and return interleaved stereo preview frames at the device
+/// rate. The preview uses the same pitch, stretch, fade, normalization, and reverse settings as
+/// Sample Editor export, while leaving the decoded source unchanged.
+pub fn process_audio_range_to_stereo_preview(
+    audio: &DecodedAudio,
+    frame_range: Range<usize>,
+    options: AudioExportOptions,
+    output_sample_rate: u32,
+) -> Result<Vec<f32>, String> {
+    if !(8_000..=384_000).contains(&output_sample_rate) {
+        return Err("Sample Editor preview rate must be between 8 kHz and 384 kHz".to_owned());
+    }
+    let mut processed = process_audio_range(
+        audio,
+        frame_range,
+        options.pitch_shift_semitones,
+        options.stretch_ratio,
+    )?;
+    let frame_count = processed.frame_count();
+    if options.fade_in_frames > frame_count || options.fade_out_frames > frame_count {
+        return Err("fade lengths cannot exceed the selected frame range".to_owned());
+    }
+    if options
+        .normalization_target_dbfs
+        .is_some_and(|target| !target.is_finite() || !(-60.0..=0.0).contains(&target))
+    {
+        return Err("normalization target must be between -60 and 0 dBFS".to_owned());
+    }
+
+    if options.reverse {
+        for channel in &mut processed.channels {
+            channel.reverse();
+        }
+    }
+    let normalization_gain = options.normalization_target_dbfs.map_or(1.0, |target| {
+        let peak = processed
+            .channels
+            .iter()
+            .flatten()
+            .copied()
+            .filter(|sample| sample.is_finite())
+            .map(f32::abs)
+            .fold(0.0_f32, f32::max);
+        if peak == 0.0 {
+            1.0
+        } else {
+            10.0_f64.powf(f64::from(target) / 20.0) / f64::from(peak)
+        }
+    });
+    for offset in 0..frame_count {
+        let fade_in_gain = if options.fade_in_frames > 0 && offset < options.fade_in_frames {
+            offset as f32 / options.fade_in_frames as f32
+        } else {
+            1.0
+        };
+        let remaining_frames = frame_count - offset - 1;
+        let fade_out_gain =
+            if options.fade_out_frames > 0 && remaining_frames < options.fade_out_frames {
+                remaining_frames as f32 / options.fade_out_frames as f32
+            } else {
+                1.0
+            };
+        let gain = f64::from(fade_in_gain * fade_out_gain) * normalization_gain;
+        for channel in &mut processed.channels {
+            channel[offset] = if channel[offset].is_finite() {
+                (f64::from(channel[offset]) * gain) as f32
+            } else {
+                0.0
+            };
+        }
+    }
+    decoded_audio_to_stereo_samples(&processed, output_sample_rate, None)
+}
+
 /// Decode common FL Studio sample formats by inspecting file content rather than its extension.
 ///
 /// FLP projects can contain compressed audio whose filename extension does not match its
@@ -1950,6 +2024,47 @@ mod tests {
             .map(|&sample| f32::from_le_bytes(sample))
             .collect::<Vec<_>>();
         assert_eq!(samples, [0.0, 0.0, 0.5, 0.25, 0.5, 0.25, 0.0, 0.0]);
+        assert_eq!(audio, original);
+        fs::remove_dir_all(root).expect("fixture directory should be removed");
+    }
+
+    #[test]
+    fn sample_editor_preview_matches_export_fades_normalization_and_reverse() {
+        let root = fixture_root();
+        fs::create_dir_all(&root).expect("fixture directory should be created");
+        let output_path = root.join("preview-comparison.wav");
+        let audio = DecodedAudio {
+            sample_rate: 8_000,
+            channels: vec![vec![0.25, 0.5, 1.0, 0.75]],
+        };
+        let original = audio.clone();
+        let options = AudioExportOptions {
+            fade_in_frames: 2,
+            fade_out_frames: 2,
+            reverse: true,
+            normalization_target_dbfs: Some(-6.020_6),
+            ..AudioExportOptions::default()
+        };
+
+        let samples = process_audio_range_to_stereo_preview(&audio, 0..4, options, 8_000)
+            .expect("selected audio should produce a stereo preview");
+        write_audio_range_to_wav_with_options(&audio, 0..4, options, &output_path)
+            .expect("the same selection should export");
+
+        let exported = fs::read(&output_path).expect("processed WAV should be readable");
+        let mono_samples = exported[44..]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|sample| f32::from_le_bytes(*sample))
+            .collect::<Vec<_>>();
+        assert_eq!(samples.len(), mono_samples.len() * 2);
+        assert!(
+            samples
+                .chunks_exact(2)
+                .zip(mono_samples)
+                .all(|(stereo, mono)| (stereo[0] - mono).abs() < 1.0e-6 && stereo[0] == stereo[1])
+        );
         assert_eq!(audio, original);
         fs::remove_dir_all(root).expect("fixture directory should be removed");
     }
