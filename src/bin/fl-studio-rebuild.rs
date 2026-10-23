@@ -17941,8 +17941,10 @@ impl DawUi {
                         let scene_region_response = ui.interact(
                             grid_rect,
                             Id::new(("playlist-performance-scene", arrangement.id, track_id)),
-                            if can_trigger_performance_scene || can_create_clip_at_pointer {
+                            if can_trigger_performance_scene {
                                 Sense::click()
+                            } else if can_create_clip_at_pointer {
+                                Sense::click_and_drag()
                             } else {
                                 Sense::hover()
                             },
@@ -17953,11 +17955,11 @@ impl DawUi {
                             )
                         } else if can_create_pattern_clip_at_pointer {
                             scene_region_response.on_hover_text(
-                                "Click blank Playlist space to add the selected Pattern; hold Alt to bypass snap.",
+                                "Click or drag in blank Playlist space to place the selected Pattern; hold Alt to bypass snap.",
                             )
                         } else if can_create_automation_clip_at_pointer {
                             scene_region_response.on_hover_text(
-                                "Click blank Playlist space to add the selected Automation Clip; hold Alt to bypass snap.",
+                                "Click or drag in blank Playlist space to place the selected Automation Clip; hold Alt to bypass snap.",
                             )
                         } else {
                             scene_region_response
@@ -19887,52 +19889,167 @@ impl DawUi {
                                 }
                             }
                         }
+                        let clicked_on_playlist_clip = |pointer: egui::Pos2| {
+                            arrangement.clips.iter().any(|clip| {
+                                if clip.track_index != Some(row) {
+                                    return false;
+                                }
+                                let left =
+                                    grid_rect.left() + clip.position_ticks as f32 * tick_scale;
+                                let width = (clip.length_ticks as f32 * tick_scale).max(4.0);
+                                egui::Rect::from_min_size(
+                                    egui::pos2(left, grid_rect.top() + 3.0),
+                                    Vec2::new(width, row_height - 6.0),
+                                )
+                                .contains(pointer)
+                            })
+                        };
+                        let primary_drag_stopped = scene_region_response.drag_stopped()
+                            && ui.input(|input| {
+                                input.pointer.button_released(PointerButton::Primary)
+                            });
+                        let placement_clicked = scene_region_response
+                            .clicked_by(PointerButton::Primary)
+                            && !scene_region_response.double_clicked();
+                        let placement_pointer = scene_region_response.interact_pointer_pos();
                         if can_create_clip_at_pointer
-                            && scene_region_response.clicked_by(PointerButton::Primary)
-                            && !scene_region_response.double_clicked()
-                            && let Some(pointer) = scene_region_response.interact_pointer_pos()
+                            && scene_region_response.dragged()
+                            && let Some(pointer) = placement_pointer
+                            && grid_rect.contains(pointer)
                         {
                             let modifiers = ui.input(|input| input.modifiers);
-                            if !modifiers.ctrl && !modifiers.command && !modifiers.shift {
-                                let clicked_on_clip = arrangement.clips.iter().any(|clip| {
-                                    if clip.track_index != Some(row) {
-                                        return false;
+                            if !modifiers.ctrl
+                                && !modifiers.command
+                                && !modifiers.shift
+                                && !clicked_on_playlist_clip(pointer)
+                            {
+                                let position_ticks = playlist_audio_drop_position_ticks(
+                                    pointer.x,
+                                    grid_rect.left(),
+                                    tick_scale,
+                                    ppq,
+                                    !modifiers.alt,
+                                );
+                                let measure_length_at_position = playlist_bar_ticks(
+                                    ppq,
+                                    playlist_signature_at_tick(
+                                        project_time_signature,
+                                        &signature_changes,
+                                        position_ticks,
+                                    ),
+                                )
+                                .min(u64::from(u32::MAX))
+                                    as u32;
+                                let preview = match self.playlist_clip_focus {
+                                    PlaylistClipFocus::Pattern => selected_pattern_id.map(|id| {
+                                        (
+                                            selected_pattern_clip_length
+                                                .unwrap_or(measure_length_at_position),
+                                            playlist_clip_base_color(
+                                                &flp_rebuild::PlaylistClipTarget::Pattern { id },
+                                                &patterns,
+                                                &channel_kinds,
+                                            ),
+                                        )
+                                    }),
+                                    PlaylistClipFocus::Automation => {
+                                        selected_automation_channel_id.map(|channel_id| {
+                                            let content_length_ticks = automation_channels
+                                                .iter()
+                                                .find(|channel| {
+                                                    channel.channel_id() == channel_id
+                                                })
+                                                .and_then(|channel| {
+                                                    channel
+                                                        .points()
+                                                        .iter()
+                                                        .map(|point| point.position_beats())
+                                                        .filter(|beats| {
+                                                            beats.is_finite() && *beats >= 0.0
+                                                        })
+                                                        .max_by(f64::total_cmp)
+                                                })
+                                                .map(|beats| {
+                                                    (beats * f64::from(ppq))
+                                                        .ceil()
+                                                        .clamp(0.0, f64::from(u32::MAX))
+                                                        as u32
+                                                })
+                                                .unwrap_or(0);
+                                            (
+                                                content_length_ticks
+                                                    .max(measure_length_at_position),
+                                                playlist_clip_base_color(
+                                                    &flp_rebuild::PlaylistClipTarget::Channel {
+                                                        id: channel_id,
+                                                    },
+                                                    &patterns,
+                                                    &channel_kinds,
+                                                ),
+                                            )
+                                        })
                                     }
-                                    let left = grid_rect.left()
-                                        + clip.position_ticks as f32 * tick_scale;
-                                    let width = (clip.length_ticks as f32 * tick_scale).max(4.0);
-                                    egui::Rect::from_min_size(
-                                        egui::pos2(left, grid_rect.top() + 3.0),
-                                        Vec2::new(width, row_height - 6.0),
-                                    )
-                                    .contains(pointer)
-                                });
-                                if !clicked_on_clip {
-                                    let position_ticks = playlist_audio_drop_position_ticks(
-                                        pointer.x,
-                                        grid_rect.left(),
-                                        tick_scale,
-                                        ppq,
-                                        !modifiers.alt,
+                                    PlaylistClipFocus::Audio => None,
+                                };
+                                if let Some((length_ticks, color)) = preview {
+                                    let ghost_rect = egui::Rect::from_min_size(
+                                        egui::pos2(
+                                            grid_rect.left()
+                                                + position_ticks as f32 * tick_scale,
+                                            grid_rect.top() + 3.0,
+                                        ),
+                                        Vec2::new(
+                                            (length_ticks as f32 * tick_scale).max(4.0),
+                                            row_height - 6.0,
+                                        ),
                                     );
-                                    match self.playlist_clip_focus {
-                                        PlaylistClipFocus::Pattern => {
-                                            create_pattern_clip_at_requested =
-                                                Some((position_ticks, row));
-                                        }
-                                        PlaylistClipFocus::Automation => {
-                                            if let Some(channel_id) =
-                                                selected_automation_channel_id
-                                            {
-                                                create_automation_clip_at_requested = Some((
-                                                    channel_id,
-                                                    position_ticks,
-                                                    row,
-                                                ));
-                                            }
-                                        }
-                                        PlaylistClipFocus::Audio => {}
+                                    painter.rect_filled(
+                                        ghost_rect,
+                                        egui::CornerRadius::same(3),
+                                        color.gamma_multiply(0.55),
+                                    );
+                                    painter.rect_stroke(
+                                        ghost_rect,
+                                        egui::CornerRadius::same(3),
+                                        Stroke::new(1.5, color.gamma_multiply(0.9)),
+                                        egui::StrokeKind::Inside,
+                                    );
+                                }
+                            }
+                        }
+                        if can_create_clip_at_pointer
+                            && (placement_clicked || primary_drag_stopped)
+                            && let Some(pointer) = placement_pointer
+                            && grid_rect.contains(pointer)
+                        {
+                            let modifiers = ui.input(|input| input.modifiers);
+                            if !modifiers.ctrl
+                                && !modifiers.command
+                                && !modifiers.shift
+                                && !clicked_on_playlist_clip(pointer)
+                            {
+                                let position_ticks = playlist_audio_drop_position_ticks(
+                                    pointer.x,
+                                    grid_rect.left(),
+                                    tick_scale,
+                                    ppq,
+                                    !modifiers.alt,
+                                );
+                                match self.playlist_clip_focus {
+                                    PlaylistClipFocus::Pattern => {
+                                        create_pattern_clip_at_requested =
+                                            Some((position_ticks, row));
                                     }
+                                    PlaylistClipFocus::Automation => {
+                                        if let Some(channel_id) = selected_automation_channel_id {
+                                            create_automation_clip_at_requested = Some((
+                                                channel_id,
+                                                position_ticks,
+                                                row,
+                                            ));
+                                        }
+                                    }
+                                    PlaylistClipFocus::Audio => {}
                                 }
                             }
                         }
