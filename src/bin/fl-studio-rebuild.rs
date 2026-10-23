@@ -23110,11 +23110,11 @@ impl DawUi {
                                 }
                                 if ui
                                     .add_enabled(
-                                        matches!(channel.kind(), Some(0 | 2 | 3 | 5)),
+                                        matches!(channel.kind(), Some(0 | 2 | 3 | 4 | 5)),
                                         egui::Button::new("Duplicate channel"),
                                     )
                                     .on_hover_text(
-                                        "Duplicate this Sampler, Native instrument, Layer, or Automation channel while preserving its saved state and Layer child references.",
+                                        "Duplicate this Sampler, Native instrument, Layer, Audio Clip, or Automation channel while preserving its saved state and Layer child references. Playlist clips remain assigned to the source Audio Clip channel.",
                                     )
                                     .clicked()
                                 {
