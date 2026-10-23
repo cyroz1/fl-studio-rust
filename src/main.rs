@@ -5978,10 +5978,32 @@ fn create_pattern_controller_stream(
     Ok(())
 }
 
+fn playlist_pattern_color_label(
+    target: &flp_rebuild::PlaylistClipTarget,
+    patterns: Option<&[flp_rebuild::Pattern]>,
+) -> String {
+    match target {
+        flp_rebuild::PlaylistClipTarget::Pattern { id } => {
+            let Some(patterns) = patterns else {
+                return "unavailable".to_owned();
+            };
+            patterns
+                .iter()
+                .find(|pattern| pattern.id == *id)
+                .map_or_else(
+                    || "unknown".to_owned(),
+                    |pattern| pattern_color_label(pattern.color),
+                )
+        }
+        flp_rebuild::PlaylistClipTarget::Channel { .. } => "none".to_owned(),
+    }
+}
+
 fn list_playlist(path: &Path, start: usize, count: usize) -> Result<(), String> {
     let (_, document) = load_document(path)?;
     let playlist_tracks = document.playlist_tracks();
     let channels = document.channels();
+    let patterns = document.patterns().ok();
     let arrangements = document.arrangements().map_err(|error| error.to_string())?;
     println!("arrangements: {}", arrangements.len());
     for arrangement in arrangements {
@@ -6010,8 +6032,9 @@ fn list_playlist(path: &Path, start: usize, count: usize) -> Result<(), String> 
                     .unwrap_or("(channel not found)"),
                 flp_rebuild::PlaylistClipTarget::Pattern { .. } => "(pattern)",
             };
+            let pattern_color = playlist_pattern_color_label(&target, patterns.as_deref());
             println!(
-                "  clip={} position={} length={} track={} track_name={:?} raw_track={} target={:?} target_name={:?} group={} muted={} flags=0x{:04X} offsets={:.6}..{:.6} scale={:?} clip_id={} record_size={} opaque_tail={}",
+                "  clip={} position={} length={} track={} track_name={:?} raw_track={} target={:?} target_name={:?} pattern_color={} group={} muted={} flags=0x{:04X} offsets={:.6}..{:.6} scale={:?} clip_id={} record_size={} opaque_tail={}",
                 index,
                 clip.position_ticks,
                 clip.length_ticks,
@@ -6024,6 +6047,7 @@ fn list_playlist(path: &Path, start: usize, count: usize) -> Result<(), String> 
                 clip.raw_track_index,
                 target,
                 target_name,
+                pattern_color,
                 clip.group,
                 clip.is_muted(),
                 clip.item_flags,
@@ -9983,6 +10007,7 @@ mod tests {
         parse_midi_import_options_with_channels, parse_midi_import_options_with_mixer_tracks,
         parse_midi_pattern_target, parse_midi_track_selection, parse_mixer_track, parse_raw_byte,
         parse_rgb_hex, parse_sampler_envelope_lfo_target, parse_scale_name, pattern_color_label,
+        playlist_pattern_color_label,
     };
     use flp_rebuild::{SamplerEnvelopeLfoTarget, midi::MidiImportOptions};
 
@@ -10130,6 +10155,53 @@ mod tests {
     #[test]
     fn formats_missing_pattern_color_as_default() {
         assert_eq!(pattern_color_label(None), "default");
+    }
+
+    #[test]
+    fn playlist_cli_reports_pattern_color_and_distinguishes_missing_targets() {
+        let patterns = [
+            flp_rebuild::Pattern {
+                id: 7,
+                color: Some([0x12, 0x34, 0x56, 0xA5]),
+                ..flp_rebuild::Pattern::default()
+            },
+            flp_rebuild::Pattern {
+                id: 8,
+                ..flp_rebuild::Pattern::default()
+            },
+        ];
+        assert_eq!(
+            playlist_pattern_color_label(
+                &flp_rebuild::PlaylistClipTarget::Pattern { id: 7 },
+                Some(&patterns),
+            ),
+            "#123456"
+        );
+        assert_eq!(
+            playlist_pattern_color_label(
+                &flp_rebuild::PlaylistClipTarget::Pattern { id: 8 },
+                Some(&patterns),
+            ),
+            "default"
+        );
+        assert_eq!(
+            playlist_pattern_color_label(
+                &flp_rebuild::PlaylistClipTarget::Pattern { id: 9 },
+                Some(&patterns),
+            ),
+            "unknown"
+        );
+        assert_eq!(
+            playlist_pattern_color_label(
+                &flp_rebuild::PlaylistClipTarget::Channel { id: 1 },
+                Some(&patterns),
+            ),
+            "none"
+        );
+        assert_eq!(
+            playlist_pattern_color_label(&flp_rebuild::PlaylistClipTarget::Pattern { id: 7 }, None,),
+            "unavailable"
+        );
     }
 
     #[test]
