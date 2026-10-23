@@ -1957,9 +1957,9 @@ pub fn stream_audio_clips_to_device(
 /// callbacks continue to consume only complete stereo frames from the bounded streaming queue.
 /// The recognized Master mute, polarity, and stereo-swap flags are applied to the final mix.
 /// Linear Playlist `TEMPO` automation updates audio, Sampler, and VST3 note timing. Playlist
-/// Audio Clip channel Resample, Stretch, and Elastique 3 Generic modes are prepared before
-/// playback; stretch through tempo automation, other stretch modes, parameter automation, and
-/// Mixer effects remain incomplete.
+/// Audio Clip channel Resample, Stretch, Elastique 3 Generic, and mono-only Elastique 3 Mono
+/// modes are prepared before playback; stretch through tempo automation, other stretch modes,
+/// parameter automation, and Mixer effects remain incomplete.
 pub fn stream_playlist_to_device(
     document: &FlpDocument,
     project_path: impl AsRef<Path>,
@@ -5251,7 +5251,9 @@ pub fn stream_sampler_midi_input_to_device(
                     settings.time_raw() > 0
                         && matches!(
                             settings.mode(),
-                            ChannelStretchMode::Stretch | ChannelStretchMode::Elastique3Generic
+                            ChannelStretchMode::Stretch
+                                | ChannelStretchMode::Elastique3Generic
+                                | ChannelStretchMode::Elastique3Mono
                         )
                 })
         })
@@ -5309,7 +5311,7 @@ pub fn stream_sampler_midi_input_to_device(
                         && let Some(target_channel_id) = duration_stretch_channels.first()
                     {
                         return Err(format!(
-                            "Sampler channel {target_channel_id} uses duration-preserving Stretch; live tempo changes require rebuilding the stretched sample"
+                            "Sampler channel {target_channel_id} uses duration-preserving time stretching; live tempo changes require rebuilding the stretched sample"
                         ));
                     }
                     live_resample_fine_pitch_by_channel.clear();
@@ -6102,15 +6104,26 @@ fn audio_clip_render_start_tick(
         .ok_or_else(|| "selected clip position precedes its selection start".to_owned())
 }
 
+#[derive(Clone, Copy)]
+struct AudioSourceDimensions {
+    frames: usize,
+    channels: usize,
+    sample_rate: u32,
+}
+
 fn channel_audio_clip_stretch_plan(
     settings: Option<(u32, i32, i32, i32)>,
     tempo_map: &PlaylistTempoMap,
     ppq: u16,
     clip_start_tick: u32,
-    source_frames: usize,
-    sample_rate: u32,
+    source: AudioSourceDimensions,
     clip_index: usize,
 ) -> Result<Option<AudioClipStretchPlan>, String> {
+    let AudioSourceDimensions {
+        frames: source_frames,
+        channels: source_channels,
+        sample_rate,
+    } = source;
     let Some((time_raw, pitch_raw, multiplier_raw, mode_raw)) =
         settings.filter(|settings| settings.0 > 0)
     else {
@@ -6172,7 +6185,12 @@ fn channel_audio_clip_stretch_plan(
                 playback_rate_ratio,
             }))
         }
-        ChannelStretchMode::Stretch | ChannelStretchMode::Elastique3Generic => {
+        ChannelStretchMode::Elastique3Mono if source_channels != 1 => Err(format!(
+            "Playlist clip {clip_index} uses Elastique 3 Mono with a non-mono source"
+        )),
+        ChannelStretchMode::Stretch
+        | ChannelStretchMode::Elastique3Generic
+        | ChannelStretchMode::Elastique3Mono => {
             let stretch_ratio = target_duration_frames as f64 / source_frames as f64;
             if !stretch_ratio.is_finite() || !(0.5..=2.0).contains(&stretch_ratio) {
                 return Err(format!(
@@ -6283,6 +6301,7 @@ struct SamplerDurationPreservingStretchSettings {
 fn sampler_duration_preserving_stretch_plan(
     channel: &ChannelSummary,
     source_frames: usize,
+    source_channels: usize,
     source_sample_rate: u32,
     ppq: u16,
     tempo_bpm: f64,
@@ -6302,6 +6321,7 @@ fn sampler_duration_preserving_stretch_plan(
             mode_raw: settings.mode_raw(),
         },
         source_frames,
+        source_channels,
         source_sample_rate,
         ppq,
         tempo_bpm,
@@ -6312,6 +6332,7 @@ fn sampler_duration_preserving_stretch_plan_from_settings(
     channel_id: u16,
     settings: SamplerDurationPreservingStretchSettings,
     source_frames: usize,
+    source_channels: usize,
     source_sample_rate: u32,
     ppq: u16,
     tempo_bpm: f64,
@@ -6319,6 +6340,12 @@ fn sampler_duration_preserving_stretch_plan_from_settings(
     match ChannelStretchMode::from_raw(settings.mode_raw) {
         ChannelStretchMode::Resample => return Ok(None),
         ChannelStretchMode::Stretch | ChannelStretchMode::Elastique3Generic => {}
+        ChannelStretchMode::Elastique3Mono if source_channels == 1 => {}
+        ChannelStretchMode::Elastique3Mono => {
+            return Err(format!(
+                "Sampler channel {channel_id} uses Elastique 3 Mono with a non-mono source"
+            ));
+        }
         mode => {
             return Err(format!(
                 "Sampler channel {} uses unsupported time-stretch mode {} ({mode:?})",
@@ -6426,6 +6453,7 @@ fn prepare_sampler_stretch_source(
     let Some(plan) = sampler_duration_preserving_stretch_plan(
         channel,
         audio.frame_count(),
+        audio.channels.len(),
         audio.sample_rate,
         ppq,
         tempo_bpm,
@@ -6498,7 +6526,7 @@ fn validate_sampler_duration_stretch_tempo(
     let active_tempo = tempo_map.tempo_bpm_at_tick(start_tick);
     if (active_tempo - plan.tempo_bpm).abs() > 0.0005 {
         return Err(format!(
-            "Sampler channel {channel_id} uses duration-preserving Stretch at {:.3} BPM, but a note starts at {:.3} BPM",
+            "Sampler channel {channel_id} uses duration-preserving time stretching at {:.3} BPM, but a note starts at {:.3} BPM",
             plan.tempo_bpm, active_tempo
         ));
     }
@@ -6509,7 +6537,7 @@ fn validate_sampler_duration_stretch_tempo(
     }
     if tempo_map.has_tempo_change_between(start_tick_f64, active_end_tick) {
         return Err(format!(
-            "Sampler channel {channel_id} uses duration-preserving Stretch across Playlist tempo automation, which this renderer cannot follow"
+            "Sampler channel {channel_id} uses duration-preserving time stretching across Playlist tempo automation, which this renderer cannot follow"
         ));
     }
     Ok(())
@@ -6746,8 +6774,11 @@ fn prepare_audio_clip_render(
             &tempo_map,
             ppq,
             clip.position_ticks,
-            source_bounds.end - source_bounds.start,
-            audio.sample_rate,
+            AudioSourceDimensions {
+                frames: source_bounds.end - source_bounds.start,
+                channels: audio.channels.len(),
+                sample_rate: audio.sample_rate,
+            },
             *clip_index,
         )?;
         let mut source_id = raw_source_id;
@@ -15165,8 +15196,11 @@ mod tests {
             &tempo_map,
             96,
             0,
-            8_000,
-            8_000,
+            AudioSourceDimensions {
+                frames: 8_000,
+                channels: 1,
+                sample_rate: 8_000,
+            },
             3,
         )
         .unwrap();
@@ -15179,13 +15213,50 @@ mod tests {
             })
         ));
 
+        let elastique_mono = channel_audio_clip_stretch_plan(
+            Some((192, 200, 0, 2)),
+            &tempo_map,
+            96,
+            0,
+            AudioSourceDimensions {
+                frames: 8_000,
+                channels: 1,
+                sample_rate: 8_000,
+            },
+            3,
+        )
+        .unwrap();
+        assert!(matches!(
+            elastique_mono,
+            Some(AudioClipStretchPlan::DurationPreserving { mode_raw: 2, .. })
+        ));
+        assert!(
+            channel_audio_clip_stretch_plan(
+                Some((192, 200, 0, 2)),
+                &tempo_map,
+                96,
+                0,
+                AudioSourceDimensions {
+                    frames: 8_000,
+                    channels: 2,
+                    sample_rate: 8_000,
+                },
+                3,
+            )
+            .unwrap_err()
+            .contains("non-mono source")
+        );
+
         let resample = channel_audio_clip_stretch_plan(
             Some((192, 1_200, 10_000, 0)),
             &tempo_map,
             96,
             0,
-            8_000,
-            8_000,
+            AudioSourceDimensions {
+                frames: 8_000,
+                channels: 1,
+                sample_rate: 8_000,
+            },
             4,
         )
         .unwrap();
@@ -15202,8 +15273,11 @@ mod tests {
                 &tempo_map,
                 96,
                 0,
-                8_000,
-                8_000,
+                AudioSourceDimensions {
+                    frames: 8_000,
+                    channels: 1,
+                    sample_rate: 8_000,
+                },
                 5,
             )
             .unwrap()
@@ -15211,12 +15285,15 @@ mod tests {
         );
         assert!(
             channel_audio_clip_stretch_plan(
-                Some((192, 0, 0, 2)),
+                Some((192, 0, 0, 3)),
                 &tempo_map,
                 96,
                 0,
-                8_000,
-                8_000,
+                AudioSourceDimensions {
+                    frames: 8_000,
+                    channels: 1,
+                    sample_rate: 8_000,
+                },
                 6,
             )
             .unwrap_err()
@@ -15234,8 +15311,11 @@ mod tests {
             &tempo_map,
             96,
             0,
-            16_000,
-            8_000,
+            AudioSourceDimensions {
+                frames: 16_000,
+                channels: 1,
+                sample_rate: 8_000,
+            },
             7,
         )
         .unwrap_err();
@@ -15288,7 +15368,7 @@ mod tests {
 
     #[test]
     fn sampler_stretch_plan_maps_time_multiplier_pitch_and_supported_modes() {
-        for mode_raw in [-1, 1] {
+        for mode_raw in [-1, 1, 2] {
             let plan = sampler_duration_preserving_stretch_plan_from_settings(
                 7,
                 SamplerDurationPreservingStretchSettings {
@@ -15298,6 +15378,7 @@ mod tests {
                     mode_raw,
                 },
                 16_000,
+                1,
                 8_000,
                 96,
                 120.0,
@@ -15321,6 +15402,7 @@ mod tests {
                     mode_raw: 0,
                 },
                 8_000,
+                1,
                 8_000,
                 96,
                 120.0,
@@ -15335,15 +15417,34 @@ mod tests {
                     time_raw: 192,
                     pitch_raw: 0,
                     multiplier_raw: 0,
-                    mode_raw: 2,
+                    mode_raw: 3,
                 },
                 8_000,
+                1,
                 8_000,
                 96,
                 120.0,
             )
             .unwrap_err()
             .contains("unsupported time-stretch mode")
+        );
+        assert!(
+            sampler_duration_preserving_stretch_plan_from_settings(
+                7,
+                SamplerDurationPreservingStretchSettings {
+                    time_raw: 192,
+                    pitch_raw: 0,
+                    multiplier_raw: 0,
+                    mode_raw: 2,
+                },
+                8_000,
+                2,
+                8_000,
+                96,
+                120.0,
+            )
+            .unwrap_err()
+            .contains("non-mono source")
         );
     }
 

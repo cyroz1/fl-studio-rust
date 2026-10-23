@@ -8755,7 +8755,7 @@ impl DawUi {
                 });
                 ui.label(
                     egui::RichText::new(
-                        "Affects supported Sampler and VST3 note playback and rendering, plus Playlist Audio Clips, when Enable main pitch is on. Unstretched and Resample clips change playback rate; Stretch and Elastique 3 Generic clips preserve their target duration. Native instruments remain incomplete."
+                        "Affects supported Sampler and VST3 note playback and rendering, plus Playlist Audio Clips, when Enable main pitch is on. Unstretched and Resample clips change playback rate; Stretch, Elastique 3 Generic, and mono-only Elastique 3 Mono clips preserve their target duration. Native instruments remain incomplete."
                     )
                     .color(MUTED),
                 );
@@ -25419,7 +25419,7 @@ impl DawUi {
                             let mut mode_changed = false;
                             ui.collapsing("Time stretch", |ui| {
                                 ui.small(
-                                    "Playlist Audio Clips use TIME, PITCH, and MUL in Resample, Stretch, and Elastique 3 Generic modes. Playlist Sampler notes and live MIDI input use the transport tempo at note-on; each voice keeps that rate. Pattern playback uses project tempo. Other Sampler modes and tempo changes during a stretched scheduled Playlist sample are unsupported.",
+                                    "Playlist Audio Clips use TIME, PITCH, and MUL in Resample, Stretch, Elastique 3 Generic, and mono-only Elastique 3 Mono modes. Sampler Stretch and Elastique 3 Generic support mono or stereo samples; Elastique 3 Mono requires a mono sample. Playlist Sampler notes and live MIDI input use the transport tempo at note-on; each voice keeps that rate. Pattern playback uses project tempo. Other Sampler modes and tempo changes during a stretched scheduled Playlist sample are unsupported.",
                                 );
                                 ui.horizontal_wrapped(|ui| {
                                     time_changed = ui
