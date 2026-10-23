@@ -17,6 +17,7 @@ use flp_rebuild::sample_render::PlaylistTempoMap;
 
 pub const MIDI_INPUT_QUEUE_CAPACITY: usize = 4_096;
 pub const MIDI_THRU_INPUT_QUEUE_CAPACITY: usize = 4_096;
+pub const MIDI_THRU_MAX_SYSTEM_EXCLUSIVE_BYTES: usize = 65_536;
 const MAX_CAPTURED_NOTES: usize = 100_000;
 const MAX_NOTE_TICK: u32 = u32::MAX - 1;
 
@@ -234,10 +235,16 @@ pub struct ReceivedMidiMessage {
     pub event: MidiInputEvent,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct MidiThruInputMessage {
     pub generation: u64,
-    pub event: MidiInputEvent,
+    pub payload: MidiThruInputPayload,
+}
+
+#[derive(Clone, Debug)]
+pub enum MidiThruInputPayload {
+    Event(MidiInputEvent),
+    SystemExclusive(Arc<[u8]>),
 }
 
 #[derive(Clone)]
@@ -269,7 +276,30 @@ impl MidiThruInputQueue {
         }
         let message = MidiThruInputMessage {
             generation: self.generation.load(Ordering::Acquire),
-            event,
+            payload: MidiThruInputPayload::Event(event),
+        };
+        if let Err(TrySendError::Full(_)) = self.sender.try_send(message) {
+            self.dropped_messages.fetch_add(1, Ordering::Relaxed);
+            self.generation.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn try_send_system_exclusive(&self, bytes: &[u8]) {
+        if !self.enabled.load(Ordering::Acquire)
+            || bytes.len() < 2
+            || bytes.first() != Some(&0xF0)
+            || bytes.last() != Some(&0xF7)
+        {
+            return;
+        }
+        if bytes.len() > MIDI_THRU_MAX_SYSTEM_EXCLUSIVE_BYTES {
+            self.dropped_messages.fetch_add(1, Ordering::Relaxed);
+            self.generation.fetch_add(1, Ordering::AcqRel);
+            return;
+        }
+        let message = MidiThruInputMessage {
+            generation: self.generation.load(Ordering::Acquire),
+            payload: MidiThruInputPayload::SystemExclusive(Arc::from(bytes)),
         };
         if let Err(TrySendError::Full(_)) = self.sender.try_send(message) {
             self.dropped_messages.fetch_add(1, Ordering::Relaxed);
@@ -326,18 +356,22 @@ pub fn connect_input_device(
             &port,
             "FL Studio Rebuild MIDI Input",
             move |timestamp_micros, bytes, _| {
-                let Some(event) = parse_midi_message(bytes) else {
-                    return;
-                };
-                let message = ReceivedMidiMessage {
-                    timestamp_micros,
-                    received_at: Instant::now(),
-                    event,
-                };
-                if let Err(TrySendError::Full(_)) = sender.try_send(message) {
-                    dropped_messages.fetch_add(1, Ordering::Relaxed);
+                let event = parse_midi_message(bytes);
+                if let Some(event) = event {
+                    let message = ReceivedMidiMessage {
+                        timestamp_micros,
+                        received_at: Instant::now(),
+                        event,
+                    };
+                    if let Err(TrySendError::Full(_)) = sender.try_send(message) {
+                        dropped_messages.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
-                thru_queue.try_send(event);
+                if bytes.first() == Some(&0xF0) {
+                    thru_queue.try_send_system_exclusive(bytes);
+                } else if let Some(event) = event {
+                    thru_queue.try_send(event);
+                }
             },
             (),
         )
@@ -993,6 +1027,8 @@ fn quantize_recording_tick(tick: u32, snap_ticks: Option<u32>) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::mpsc;
 
     #[test]
     fn parses_channel_voice_messages_and_zero_velocity_note_off() {
@@ -1052,6 +1088,43 @@ mod tests {
             Some(MidiInputEvent::Transport(MidiTransportCommand::RecordStop))
         );
         assert_eq!(parse_midi_message(&[0xF0, 0x7F, 0x00, 0x06, 0x02]), None);
+    }
+
+    #[test]
+    fn system_exclusive_midi_thru_payload_is_bounded_and_preserves_bytes() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let enabled = Arc::new(AtomicBool::new(true));
+        let generation = Arc::new(AtomicU64::new(4));
+        let dropped_messages = Arc::new(AtomicU64::new(0));
+        let queue = MidiThruInputQueue::new(
+            sender,
+            Arc::clone(&enabled),
+            Arc::clone(&generation),
+            Arc::clone(&dropped_messages),
+        );
+        let message = [0xF0, 0x7D, 0x01, 0x02, 0xF7];
+
+        queue.try_send_system_exclusive(&message);
+
+        let queued = receiver
+            .try_recv()
+            .expect("SysEx should enter MIDI Thru queue");
+        assert_eq!(queued.generation, 4);
+        assert!(matches!(
+            queued.payload,
+            MidiThruInputPayload::SystemExclusive(bytes) if bytes.as_ref() == message
+        ));
+        assert_eq!(dropped_messages.load(Ordering::Relaxed), 0);
+        assert_eq!(generation.load(Ordering::Relaxed), 4);
+
+        queue.try_send_system_exclusive(&[0xF0, 0x01]);
+        let mut oversized = vec![0x01; MIDI_THRU_MAX_SYSTEM_EXCLUSIVE_BYTES + 1];
+        oversized[0] = 0xF0;
+        *oversized.last_mut().unwrap() = 0xF7;
+        queue.try_send_system_exclusive(&oversized);
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(dropped_messages.load(Ordering::Relaxed), 1);
+        assert_eq!(generation.load(Ordering::Relaxed), 5);
     }
 
     #[test]

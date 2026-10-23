@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use crate::midi_input::{
     MIDI_THRU_INPUT_QUEUE_CAPACITY, MidiInputEvent, MidiInputEvent::*, MidiThruInputMessage,
-    MidiThruInputQueue, MidiTransportCommand,
+    MidiThruInputPayload, MidiThruInputQueue, MidiTransportCommand,
 };
 use crate::midi_output::ConnectedMidiOutput;
 
@@ -253,14 +253,18 @@ fn run_worker(
                 let current_settings = *settings
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let result = state.processor.process(
-                    message.event,
-                    current_settings,
-                    state
-                        .output
-                        .as_mut()
-                        .expect("enabled MIDI Thru has an output"),
-                );
+                let output = state
+                    .output
+                    .as_mut()
+                    .expect("enabled MIDI Thru has an output");
+                let result = match message.payload {
+                    MidiThruInputPayload::Event(event) => {
+                        state.processor.process(event, current_settings, output)
+                    }
+                    MidiThruInputPayload::SystemExclusive(bytes) => {
+                        state.processor.process_system_exclusive(&bytes, output)
+                    }
+                };
                 if let Err(error) = result {
                     state.report_error(error, &generation_atomic, &enabled_atomic, &error_sender);
                 }
@@ -322,6 +326,14 @@ struct MidiThruProcessor {
 }
 
 impl MidiThruProcessor {
+    fn process_system_exclusive(
+        &mut self,
+        bytes: &[u8],
+        output: &mut impl MidiThruOutput,
+    ) -> Result<(), String> {
+        output.send(bytes)
+    }
+
     fn process(
         &mut self,
         event: MidiInputEvent,
@@ -742,5 +754,20 @@ mod tests {
             super::snap_key_to_pitch_classes(61, (1 << 0) | (1 << 2)),
             60
         );
+    }
+
+    #[test]
+    fn system_exclusive_is_forwarded_byte_for_byte() {
+        let mut processor = MidiThruProcessor::default();
+        let mut output = TestOutput::default();
+        let message = [0xF0, 0x7D, 0x01, 0x02, 0xF7];
+
+        processor
+            .process_system_exclusive(&message, &mut output)
+            .unwrap();
+
+        assert_eq!(output.0, vec![message.to_vec()]);
+        assert!(processor.active_notes.is_empty());
+        assert!(processor.note_mapping.is_empty());
     }
 }
