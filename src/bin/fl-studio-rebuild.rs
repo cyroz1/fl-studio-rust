@@ -12164,6 +12164,7 @@ impl DawUi {
                         "Delete selection or target-channel notes",
                     ),
                     ("Shift+Arrow", "Nudge selected Piano roll notes"),
+                    ("Alt+Arrow", "Nudge selected Piano roll notes by pixels"),
                     (
                         "Shift+Ctrl/Cmd+Left/Right",
                         "Rotate Piano roll notes with bar wrapping",
@@ -26899,6 +26900,8 @@ impl DawUi {
             let select_next_time = ui.input_mut(|input| {
                 input.consume_key(egui::Modifiers::COMMAND, egui::Key::ArrowRight)
             });
+            let piano_roll_pixel_nudge_ticks =
+                (1.0 / (self.piano_roll_zoom * 0.9).clamp(0.05, 0.22)).round() as i64;
             note_nudge_requested = ui.input_mut(|input| {
                 if input.consume_key(egui::Modifiers::COMMAND, egui::Key::ArrowUp) {
                     Some((0, 12))
@@ -26917,6 +26920,14 @@ impl DawUi {
                 } else if input.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowUp) {
                     Some((0, 1))
                 } else if input.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowDown) {
+                    Some((0, -1))
+                } else if input.consume_key(egui::Modifiers::ALT, egui::Key::ArrowLeft) {
+                    Some((-piano_roll_pixel_nudge_ticks, 0))
+                } else if input.consume_key(egui::Modifiers::ALT, egui::Key::ArrowRight) {
+                    Some((piano_roll_pixel_nudge_ticks, 0))
+                } else if input.consume_key(egui::Modifiers::ALT, egui::Key::ArrowUp) {
+                    Some((0, 1))
+                } else if input.consume_key(egui::Modifiers::ALT, egui::Key::ArrowDown) {
                     Some((0, -1))
                 } else {
                     None
