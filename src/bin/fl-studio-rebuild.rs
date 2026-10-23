@@ -34,12 +34,12 @@ use flp_rebuild::project_package::{ProjectPackageWorkspace, copy_unique_sample_f
 use flp_rebuild::sample_render::{
     AudioClipRenderOptions, AudioClipRenderSummary, AudioFileRenderOptions, AudioRecordingSummary,
     AudioRenderEncodingOptions, AudioRenderOutput, LayerLiveInputConfig, LayerLiveInputEvent,
-    MP3_BITRATES_KBPS, MixerStemRenderOptions, PlaylistPerformanceCommand,
-    PlaylistPerformanceLaunch, PlaylistPerformanceStream, PlaylistRenderOptions,
-    PlaylistRenderRange, PlaylistRenderSummary, PlaylistStreamMonitor, PlaylistTempoMap,
-    ResamplingQuality, SamplerLiveInputRouting, SamplerLiveNoteEvent, SamplerPatternLoopPlayback,
-    SamplerPatternRenderOptions, SamplerPatternRenderSummary, Vst3LiveInputEvent,
-    Vst3PatternLoopPlayback, WavChannelMode, WavDitherMode, WavSampleFormat,
+    MP3_BITRATES_KBPS, MixerStemRenderOptions, PlaylistAudioClipEnvelope,
+    PlaylistPerformanceCommand, PlaylistPerformanceLaunch, PlaylistPerformanceStream,
+    PlaylistRenderOptions, PlaylistRenderRange, PlaylistRenderSummary, PlaylistStreamMonitor,
+    PlaylistTempoMap, ResamplingQuality, SamplerLiveInputRouting, SamplerLiveNoteEvent,
+    SamplerPatternLoopPlayback, SamplerPatternRenderOptions, SamplerPatternRenderSummary,
+    Vst3LiveInputEvent, Vst3PatternLoopPlayback, WavChannelMode, WavDitherMode, WavSampleFormat,
     nearest_playlist_audio_clip_zero_crossing_tick, playlist_performance_clip_indices_with_vst3,
     playlist_performance_static_document_with_vst3, playlist_performance_vst3_channel_ids,
     playlist_performance_vst3_clip_indices, render_audio_clips_to_file,
@@ -4610,6 +4610,7 @@ struct DawUi {
     midi_mixer_control_mappings: Vec<MidiMixerControlMapping>,
     midi_vst3_parameter_mappings: Vec<MidiVst3ParameterMapping>,
     pattern_vst3_parameter_links: Vec<PatternVst3ParameterLink>,
+    playlist_audio_clip_envelopes: Vec<ProjectPlaylistAudioClipEnvelope>,
     midi_vst3_parameter_learning: Option<MidiVst3ParameterTarget>,
     midi_mixer_button_cc_active: BTreeSet<(String, u8, u8)>,
     midi_mixer_control_learning: Option<MidiMixerControlLearning>,
@@ -5136,6 +5137,12 @@ struct PatternVst3ParameterLink {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct ProjectPlaylistAudioClipEnvelope {
+    project_path: String,
+    envelope: PlaylistAudioClipEnvelope,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct MidiMixerControlMapping {
     input_device_id: String,
     channel: u8,
@@ -5533,6 +5540,7 @@ impl DawUi {
         let midi_mixer_control_mappings = load_midi_mixer_control_mappings();
         let midi_vst3_parameter_mappings = load_midi_vst3_parameter_mappings();
         let pattern_vst3_parameter_links = load_pattern_vst3_parameter_links();
+        let playlist_audio_clip_envelopes = load_playlist_audio_clip_envelopes();
         let midi_play_pause_mapping = load_midi_play_pause_mapping();
         let midi_controller_templates = load_midi_controller_templates();
         let live_resampling_quality = load_live_resampling_quality();
@@ -5898,6 +5906,7 @@ impl DawUi {
             midi_mixer_control_mappings,
             midi_vst3_parameter_mappings,
             pattern_vst3_parameter_links,
+            playlist_audio_clip_envelopes,
             midi_vst3_parameter_learning: None,
             midi_mixer_button_cc_active: BTreeSet::new(),
             midi_mixer_control_learning: None,
@@ -7297,6 +7306,76 @@ impl DawUi {
                 channel.id() == id && channel.kind() == Some(4) && channel.enabled() != Some(false)
             })
             .then_some((arrangement_id, clip_index))
+    }
+
+    fn playlist_audio_clip_envelopes_for_current_project(
+        &self,
+        arrangement_id: u16,
+    ) -> Arc<Vec<PlaylistAudioClipEnvelope>> {
+        let Some(project_path) = self.current_path.as_deref() else {
+            return Arc::new(Vec::new());
+        };
+        Arc::new(
+            self.playlist_audio_clip_envelopes
+                .iter()
+                .filter(|entry| {
+                    entry.envelope.arrangement_id == arrangement_id
+                        && project_paths_equal(Path::new(&entry.project_path), project_path)
+                })
+                .map(|entry| entry.envelope)
+                .collect(),
+        )
+    }
+
+    fn playlist_audio_clip_envelope(
+        &self,
+        arrangement_id: u16,
+        clip_id: u32,
+    ) -> PlaylistAudioClipEnvelope {
+        self.current_path
+            .as_deref()
+            .and_then(|project_path| {
+                self.playlist_audio_clip_envelopes.iter().find(|entry| {
+                    entry.envelope.arrangement_id == arrangement_id
+                        && entry.envelope.clip_id == clip_id
+                        && project_paths_equal(Path::new(&entry.project_path), project_path)
+                })
+            })
+            .map(|entry| entry.envelope)
+            .unwrap_or(PlaylistAudioClipEnvelope {
+                arrangement_id,
+                clip_id,
+                gain_centidb: 0,
+                fade_in_ms: 0,
+                fade_out_ms: 0,
+            })
+    }
+
+    fn save_playlist_audio_clip_envelope(&mut self, envelope: PlaylistAudioClipEnvelope) {
+        let Some(project_path) = self.current_path.as_ref() else {
+            self.status = "Save the project before editing instance gain or fades".to_owned();
+            return;
+        };
+        let mut updated = self.playlist_audio_clip_envelopes.clone();
+        upsert_playlist_audio_clip_envelope(
+            &mut updated,
+            ProjectPlaylistAudioClipEnvelope {
+                project_path: project_path.to_string_lossy().into_owned(),
+                envelope,
+            },
+        );
+        match save_playlist_audio_clip_envelopes(&updated) {
+            Ok(()) => {
+                self.playlist_audio_clip_envelopes = updated;
+                self.status = format!(
+                    "Updated Audio Clip {} gain and fades; changes are app-local and apply on the next playback start",
+                    envelope.clip_id
+                );
+            }
+            Err(error) => {
+                self.status = format!("Could not save Audio Clip gain and fades: {error}");
+            }
+        }
     }
 
     fn audio_clip_render_source_details(
@@ -10565,6 +10644,9 @@ impl DawUi {
             tail_seconds: 2,
             soloed_playlist_track_range: self.soloed_playlist_track_range,
             read_sample_root_note: self.read_sample_root_note,
+            clip_envelopes: self.playlist_audio_clip_envelopes_for_current_project(
+                self.selected_arrangement.unwrap_or(0),
+            ),
             ..PlaylistRenderOptions::default()
         };
         let arrangement_id = options.arrangement_id;
@@ -10587,7 +10669,7 @@ impl DawUi {
             .map(|host| {
                 host.prepare_playlist_stream_with_pattern_automation(
                     playback_document,
-                    options,
+                    options.clone(),
                     &self.channel_vst3_instances,
                     true,
                     &playlist_parameter_automation,
@@ -10647,6 +10729,7 @@ impl DawUi {
         worker_mixer_meters.clear();
         self.mixer_insert_peak_holds.fill(0.0);
         let (sender, receiver) = mpsc::sync_channel(1);
+        let worker_options = options.clone();
         let worker = thread::Builder::new()
             .name("project-audio-render".to_owned())
             .spawn(move || {
@@ -10656,7 +10739,7 @@ impl DawUi {
                         stream_playlist_with_vst3_to_device_with_monitor(
                             &document,
                             &project_path,
-                            options,
+                            worker_options,
                             &writer,
                             &worker_cancelled,
                             vst3_processor,
@@ -10982,6 +11065,7 @@ impl DawUi {
             tail_seconds: 2,
             soloed_playlist_track_range: self.soloed_playlist_track_range,
             read_sample_root_note: self.read_sample_root_note,
+            clip_envelopes: self.playlist_audio_clip_envelopes_for_current_project(arrangement_id),
             ..PlaylistRenderOptions::default()
         };
         let playlist_tempo_map = match PlaylistTempoMap::for_arrangement(document, arrangement_id) {
@@ -11027,7 +11111,7 @@ impl DawUi {
             .map(|host| {
                 host.prepare_playlist_performance_stream_with_pattern_automation(
                     &static_document,
-                    options,
+                    options.clone(),
                     &self.channel_vst3_instances,
                     &performance_vst3_channel_ids,
                     true,
@@ -11076,6 +11160,7 @@ impl DawUi {
         self.mixer_insert_peak_holds.fill(0.0);
         let (launch_sender, launch_receiver) = mpsc::channel();
         let (sender, receiver) = mpsc::sync_channel(1);
+        let worker_options = options.clone();
         let worker = thread::Builder::new()
             .name("performance-audio-render".to_owned())
             .spawn(move || {
@@ -11085,7 +11170,7 @@ impl DawUi {
                         stream_playlist_performance_with_vst3_to_device(
                             &document,
                             &project_path,
-                            options,
+                            worker_options,
                             &writer,
                             &worker_cancelled,
                             vst3_processor,
@@ -19259,6 +19344,71 @@ impl DawUi {
                                         make_audio_clip_unique_as_sample_requested =
                                             Some(clip_index);
                                         ui.close();
+                                    }
+                                    if let Some(clip_id) = clip.clip_id {
+                                        ui.menu_button("Gain and fades…", |ui| {
+                                            let mut envelope = self.playlist_audio_clip_envelope(
+                                                arrangement.id,
+                                                clip_id,
+                                            );
+                                            ui.label("App-local instance controls");
+                                            let mut gain_db =
+                                                f32::from(envelope.gain_centidb) / 100.0;
+                                            let gain_changed = ui
+                                                .add(
+                                                    egui::DragValue::new(&mut gain_db)
+                                                        .range(-96.0..=36.0)
+                                                        .speed(0.1)
+                                                        .suffix(" dB"),
+                                                )
+                                                .changed();
+                                            let fade_in_changed = ui
+                                                .add(
+                                                    egui::DragValue::new(&mut envelope.fade_in_ms)
+                                                        .range(0..=600_000)
+                                                        .speed(1.0)
+                                                        .suffix(" ms fade in"),
+                                                )
+                                                .changed();
+                                            let fade_out_changed = ui
+                                                .add(
+                                                    egui::DragValue::new(&mut envelope.fade_out_ms)
+                                                        .range(0..=600_000)
+                                                        .speed(1.0)
+                                                        .suffix(" ms fade out"),
+                                                )
+                                                .changed();
+                                            if gain_changed || fade_in_changed || fade_out_changed {
+                                                if gain_changed {
+                                                    envelope.gain_centidb =
+                                                        (gain_db * 100.0).round() as i16;
+                                                }
+                                                self.save_playlist_audio_clip_envelope(envelope);
+                                            }
+                                            if ui.button("Reset gain and fades").clicked() {
+                                                self.save_playlist_audio_clip_envelope(
+                                                    PlaylistAudioClipEnvelope {
+                                                        arrangement_id: arrangement.id,
+                                                        clip_id,
+                                                        gain_centidb: 0,
+                                                        fade_in_ms: 0,
+                                                        fade_out_ms: 0,
+                                                    },
+                                                );
+                                                ui.close();
+                                            }
+                                            ui.small(
+                                                "Linear fades apply to playback and renders when playback starts. These values stay on this machine.",
+                                            );
+                                        });
+                                    } else {
+                                        ui.add_enabled(
+                                            false,
+                                            egui::Button::new("Gain and fades…"),
+                                        )
+                                        .on_disabled_hover_text(
+                                            "This FLP clip record has no recognized stable clip ID",
+                                        );
                                     }
                                     ui.menu_button("Consolidate audio…", |ui| {
                                         let can_consolidate =
@@ -34254,6 +34404,9 @@ impl DawUi {
             wav_channel_mode: self.playlist_render_channel_mode,
             resampling_quality: self.playlist_render_quality,
             soloed_playlist_track_range: self.soloed_playlist_track_range,
+            clip_envelopes: self.playlist_audio_clip_envelopes_for_current_project(
+                self.selected_arrangement.unwrap_or_default(),
+            ),
             ..AudioClipRenderOptions::default()
         };
         let output = self.audio_render_output();
@@ -34344,6 +34497,7 @@ impl DawUi {
             clip_index: Some(clip_index),
             start_from_song_start,
             soloed_playlist_track_range: self.soloed_playlist_track_range,
+            clip_envelopes: self.playlist_audio_clip_envelopes_for_current_project(arrangement_id),
         };
         let output = self.audio_render_output();
         self.start_audio_clip_export(options, output_path, output, action, source);
@@ -34388,6 +34542,7 @@ impl DawUi {
         let package_workspace = self.package_workspace.clone();
         let output_path_for_worker = output_path.clone();
         let (sender, receiver) = mpsc::sync_channel(1);
+        let worker_options = options.clone();
         let worker = thread::Builder::new()
             .name("playlist-audio-clip-render".to_owned())
             .spawn(move || {
@@ -34395,7 +34550,7 @@ impl DawUi {
                 let result = render_audio_clips_to_file(
                     &document,
                     &project_path,
-                    options,
+                    worker_options,
                     &output_path_for_worker,
                     output_format,
                 );
@@ -34994,6 +35149,7 @@ impl DawUi {
             sample_rate: self.audio_settings.sample_rate,
             soloed_playlist_track_range: Some((track_id, track_id)),
             read_sample_root_note: self.read_sample_root_note,
+            clip_envelopes: self.playlist_audio_clip_envelopes_for_current_project(arrangement_id),
             wav_sample_format: self.playlist_render_format,
             wav_dither_mode: self.playlist_render_dither_mode,
             wav_save_playlist_markers: false,
@@ -35011,7 +35167,7 @@ impl DawUi {
             .map(|host| {
                 host.prepare_playlist_stream_with_pattern_automation(
                     &render_document,
-                    options,
+                    options.clone(),
                     &self.channel_vst3_instances,
                     self.playlist_render_include_plugin_tails,
                     &playlist_parameter_automation,
@@ -35043,13 +35199,14 @@ impl DawUi {
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
         let (sender, receiver) = mpsc::sync_channel(1);
+        let worker_options = options.clone();
         let worker = thread::Builder::new()
             .name("playlist-pattern-clip-consolidation".to_owned())
             .spawn(move || {
                 let result = render_playlist_with_vst3_to_file_from_frame_cancellable(
                     &document,
                     &worker_project_path,
-                    options,
+                    worker_options,
                     &output_path_for_worker,
                     PlaylistRenderRange {
                         output_format,
@@ -35715,6 +35872,7 @@ impl DawUi {
             sample_rate: self.audio_settings.sample_rate,
             soloed_playlist_track_range: Some((track_id, track_id)),
             read_sample_root_note: self.read_sample_root_note,
+            clip_envelopes: self.playlist_audio_clip_envelopes_for_current_project(arrangement_id),
             wav_sample_format: self.playlist_render_format,
             wav_dither_mode: self.playlist_render_dither_mode,
             wav_save_playlist_markers: false,
@@ -35732,7 +35890,7 @@ impl DawUi {
             .map(|host| {
                 host.prepare_playlist_stream_with_pattern_automation(
                     document,
-                    options,
+                    options.clone(),
                     &self.channel_vst3_instances,
                     self.playlist_render_include_plugin_tails,
                     &playlist_parameter_automation,
@@ -35755,6 +35913,7 @@ impl DawUi {
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
         let (sender, receiver) = mpsc::sync_channel(1);
+        let worker_options = options.clone();
         let worker = thread::Builder::new()
             .name("playlist-track-freeze-render".to_owned())
             .spawn(move || {
@@ -35762,7 +35921,7 @@ impl DawUi {
                     PlaylistSongOutputFormat::Wav => render_playlist_with_vst3_to_wav_cancellable(
                         &document,
                         &worker_project_path,
-                        options,
+                        worker_options,
                         &output_path_for_worker,
                         vst3_processor,
                         &worker_cancelled,
@@ -35876,6 +36035,9 @@ impl DawUi {
             sample_rate: self.audio_settings.sample_rate,
             soloed_playlist_track_range: self.soloed_playlist_track_range,
             read_sample_root_note: self.read_sample_root_note,
+            clip_envelopes: self.playlist_audio_clip_envelopes_for_current_project(
+                self.selected_arrangement.unwrap_or_default(),
+            ),
             wav_sample_format: self.playlist_render_format,
             wav_dither_mode: self.playlist_render_dither_mode,
             wav_save_playlist_markers: self.playlist_render_save_markers,
@@ -35893,7 +36055,7 @@ impl DawUi {
             .map(|host| {
                 host.prepare_playlist_stream_with_pattern_automation(
                     document,
-                    options,
+                    options.clone(),
                     &self.channel_vst3_instances,
                     self.playlist_render_include_plugin_tails,
                     &playlist_parameter_automation,
@@ -35916,6 +36078,7 @@ impl DawUi {
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
         let (sender, receiver) = mpsc::sync_channel(1);
+        let worker_options = options.clone();
         let worker = thread::Builder::new()
             .name("playlist-render".to_owned())
             .spawn(move || {
@@ -35923,7 +36086,7 @@ impl DawUi {
                     PlaylistSongOutputFormat::Wav => render_playlist_with_vst3_to_wav_cancellable(
                         &document,
                         &project_path,
-                        options,
+                        worker_options,
                         &output_path_for_worker,
                         vst3_processor,
                         &worker_cancelled,
@@ -36011,6 +36174,9 @@ impl DawUi {
             sample_rate: self.audio_settings.sample_rate,
             soloed_playlist_track_range: self.soloed_playlist_track_range,
             read_sample_root_note: self.read_sample_root_note,
+            clip_envelopes: self.playlist_audio_clip_envelopes_for_current_project(
+                self.selected_arrangement.unwrap_or_default(),
+            ),
             wav_sample_format: self.playlist_render_format,
             wav_dither_mode: self.playlist_render_dither_mode,
             wav_save_playlist_markers: self.playlist_render_save_markers,
@@ -36028,7 +36194,7 @@ impl DawUi {
             .map(|host| {
                 host.prepare_playlist_stream_with_pattern_automation(
                     document,
-                    options,
+                    options.clone(),
                     &self.channel_vst3_instances,
                     self.playlist_render_include_plugin_tails,
                     &playlist_parameter_automation,
@@ -36057,13 +36223,14 @@ impl DawUi {
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
         let (sender, receiver) = mpsc::sync_channel(1);
+        let worker_options = options.clone();
         let worker = thread::Builder::new()
             .name("mixer-stem-render".to_owned())
             .spawn(move || {
                 let result = render_playlist_mixer_stems_with_vst3_cancellable(
                     &document,
                     &project_path,
-                    options,
+                    worker_options,
                     &output_directory_for_worker,
                     stem_options,
                     vst3_processor,
@@ -45177,6 +45344,9 @@ impl DawUi {
             tail_seconds: 2,
             soloed_playlist_track_range: self.soloed_playlist_track_range,
             read_sample_root_note: self.read_sample_root_note,
+            clip_envelopes: self.playlist_audio_clip_envelopes_for_current_project(
+                self.selected_arrangement.unwrap_or(0),
+            ),
             ..PlaylistRenderOptions::default()
         };
         let mut preparation_document = document.clone();
@@ -45330,6 +45500,9 @@ impl DawUi {
             tail_seconds: 2,
             soloed_playlist_track_range: self.soloed_playlist_track_range,
             read_sample_root_note: self.read_sample_root_note,
+            clip_envelopes: self.playlist_audio_clip_envelopes_for_current_project(
+                self.selected_arrangement.unwrap_or(0),
+            ),
             ..PlaylistRenderOptions::default()
         };
         let mut preparation_document = document.clone();
@@ -52643,6 +52816,10 @@ fn pattern_vst3_parameter_links_file() -> Option<PathBuf> {
     midi_control_change_mapping_file("pattern-vst3-parameter-links.txt")
 }
 
+fn playlist_audio_clip_envelopes_file() -> Option<PathBuf> {
+    midi_control_change_mapping_file("playlist-audio-clip-envelopes.txt")
+}
+
 fn legacy_midi_mixer_fader_mapping_file() -> Option<PathBuf> {
     midi_control_change_mapping_file("midi-mixer-fader-mapping.txt")
 }
@@ -52687,6 +52864,13 @@ fn load_pattern_vst3_parameter_links() -> Vec<PatternVst3ParameterLink> {
     pattern_vst3_parameter_links_file()
         .and_then(|path| fs::read_to_string(path).ok())
         .map(|contents| parse_pattern_vst3_parameter_links(&contents))
+        .unwrap_or_default()
+}
+
+fn load_playlist_audio_clip_envelopes() -> Vec<ProjectPlaylistAudioClipEnvelope> {
+    playlist_audio_clip_envelopes_file()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .map(|contents| parse_playlist_audio_clip_envelopes(&contents))
         .unwrap_or_default()
 }
 
@@ -52845,6 +53029,20 @@ fn save_pattern_vst3_parameter_links(links: &[PatternVst3ParameterLink]) -> Resu
     fs::create_dir_all(parent)
         .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
     fs::write(&path, serialize_pattern_vst3_parameter_links(links))
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
+fn save_playlist_audio_clip_envelopes(
+    envelopes: &[ProjectPlaylistAudioClipEnvelope],
+) -> Result<(), String> {
+    let path = playlist_audio_clip_envelopes_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the Playlist Audio Clip settings path has no parent folder".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    fs::write(&path, serialize_playlist_audio_clip_envelopes(envelopes))
         .map_err(|error| format!("could not write {}: {error}", path.display()))
 }
 
@@ -53147,6 +53345,113 @@ fn pattern_vst3_parameter_automation_for_channel(
             })
         })
         .collect()
+}
+
+fn valid_playlist_audio_clip_envelope(entry: &ProjectPlaylistAudioClipEnvelope) -> bool {
+    !entry.project_path.is_empty()
+        && (-9_600..=3_600).contains(&entry.envelope.gain_centidb)
+        && entry.envelope.fade_in_ms <= 600_000
+        && entry.envelope.fade_out_ms <= 600_000
+}
+
+fn same_playlist_audio_clip_envelope_key(
+    left: &ProjectPlaylistAudioClipEnvelope,
+    right: &ProjectPlaylistAudioClipEnvelope,
+) -> bool {
+    left.envelope.arrangement_id == right.envelope.arrangement_id
+        && left.envelope.clip_id == right.envelope.clip_id
+        && project_paths_equal(
+            Path::new(&left.project_path),
+            Path::new(&right.project_path),
+        )
+}
+
+fn upsert_playlist_audio_clip_envelope(
+    entries: &mut Vec<ProjectPlaylistAudioClipEnvelope>,
+    entry: ProjectPlaylistAudioClipEnvelope,
+) {
+    if !valid_playlist_audio_clip_envelope(&entry) {
+        return;
+    }
+    if let Some(existing) = entries
+        .iter_mut()
+        .find(|existing| same_playlist_audio_clip_envelope_key(existing, &entry))
+    {
+        *existing = entry;
+    } else {
+        entries.push(entry);
+    }
+}
+
+fn parse_playlist_audio_clip_envelopes(contents: &str) -> Vec<ProjectPlaylistAudioClipEnvelope> {
+    let mut envelopes = Vec::new();
+    for line in contents.lines() {
+        let Some(encoded) = line.strip_prefix("envelope=") else {
+            continue;
+        };
+        let mut fields = encoded.split('\t');
+        let Some(project_path) = fields.next().and_then(decode_midi_device_id) else {
+            continue;
+        };
+        let Some(arrangement_id) = fields.next().and_then(|value| value.parse::<u16>().ok()) else {
+            continue;
+        };
+        let Some(clip_id) = fields.next().and_then(|value| value.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(gain_centidb) = fields.next().and_then(|value| value.parse::<i16>().ok()) else {
+            continue;
+        };
+        let Some(fade_in_ms) = fields.next().and_then(|value| value.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(fade_out_ms) = fields.next().and_then(|value| value.parse::<u32>().ok()) else {
+            continue;
+        };
+        if fields.next().is_some() {
+            continue;
+        }
+        upsert_playlist_audio_clip_envelope(
+            &mut envelopes,
+            ProjectPlaylistAudioClipEnvelope {
+                project_path,
+                envelope: PlaylistAudioClipEnvelope {
+                    arrangement_id,
+                    clip_id,
+                    gain_centidb,
+                    fade_in_ms,
+                    fade_out_ms,
+                },
+            },
+        );
+    }
+    envelopes
+}
+
+fn serialize_playlist_audio_clip_envelopes(
+    envelopes: &[ProjectPlaylistAudioClipEnvelope],
+) -> String {
+    let mut contents = String::from("version=1\n");
+    let mut normalized = Vec::new();
+    for entry in envelopes {
+        upsert_playlist_audio_clip_envelope(&mut normalized, entry.clone());
+    }
+    for entry in normalized {
+        contents.push_str("envelope=");
+        contents.push_str(&encode_midi_device_id(&entry.project_path));
+        contents.push('\t');
+        contents.push_str(&entry.envelope.arrangement_id.to_string());
+        contents.push('\t');
+        contents.push_str(&entry.envelope.clip_id.to_string());
+        contents.push('\t');
+        contents.push_str(&entry.envelope.gain_centidb.to_string());
+        contents.push('\t');
+        contents.push_str(&entry.envelope.fade_in_ms.to_string());
+        contents.push('\t');
+        contents.push_str(&entry.envelope.fade_out_ms.to_string());
+        contents.push('\n');
+    }
+    contents
 }
 
 fn parse_pattern_vst3_parameter_links(contents: &str) -> Vec<PatternVst3ParameterLink> {
@@ -58828,12 +59133,12 @@ mod tests {
         MidiMixerControlTarget, MidiOutputDevice, MidiVst3ParameterMapping,
         MidiVst3ParameterTarget, PIANO_ROLL_RULER_HEIGHT, Pattern, PatternController, PatternNote,
         PatternVst3ParameterLink, PianoRollChordStamp, PianoRollGrid, PianoRollScale,
-        PianoRollSnap, PlaylistClip, PlaylistClipDragKind, PlaylistClipEdit,
-        PlaylistClipResizeEdge, PlaylistTempoMap, PlaylistTrack, PluginCandidate, PluginFormat,
-        TimeSelectionShift, TouchGesture, TouchTapTracker, TouchZoomConfig,
-        WINDOW_LAYOUT_PRESETS_HEADER, WindowLayoutPreset, audio_recording_start_tick_with_offset,
-        built_in_midi_controller_templates, candidate_live_mixer_send_key,
-        candidate_matches_vst_identity, candidate_mixer_controls,
+        PianoRollSnap, PlaylistAudioClipEnvelope, PlaylistClip, PlaylistClipDragKind,
+        PlaylistClipEdit, PlaylistClipResizeEdge, PlaylistTempoMap, PlaylistTrack, PluginCandidate,
+        PluginFormat, ProjectPlaylistAudioClipEnvelope, TimeSelectionShift, TouchGesture,
+        TouchTapTracker, TouchZoomConfig, WINDOW_LAYOUT_PRESETS_HEADER, WindowLayoutPreset,
+        audio_recording_start_tick_with_offset, built_in_midi_controller_templates,
+        candidate_live_mixer_send_key, candidate_matches_vst_identity, candidate_mixer_controls,
         candidate_mixer_stereo_separation, detect_chord_name, detect_piano_roll_channel_scale,
         detect_piano_roll_scale, encode_midi_device_id, encode_midi_device_selections,
         encode_midi_output_routes, first_available_playlist_track,
@@ -58847,14 +59152,14 @@ mod tests {
         parse_midi_device_selections, parse_midi_mixer_control_mappings,
         parse_midi_output_programs, parse_midi_output_routes, parse_midi_output_values,
         parse_midi_vst3_parameter_mappings, parse_pattern_vst3_parameter_links,
-        parse_window_layout_presets, pattern_color_from_random_index, pattern_loop_frame_at_tick,
-        pattern_loop_tick_at_frame, pattern_vst3_parameter_automation_for_channel,
-        pattern_vst3_parameter_link_for_target, piano_roll_color_group_note_ids,
-        piano_roll_controller_stroke_points, piano_roll_controller_value_at,
-        piano_roll_controller_value_range, piano_roll_cross_pattern_ghost_notes,
-        piano_roll_discard_length_edit, piano_roll_duplicate_offset,
-        piano_roll_ghost_note_is_visible, piano_roll_key_at_y, piano_roll_note_group_members,
-        piano_roll_note_nudge_edit, piano_roll_odd_note_selection,
+        parse_playlist_audio_clip_envelopes, parse_window_layout_presets,
+        pattern_color_from_random_index, pattern_loop_frame_at_tick, pattern_loop_tick_at_frame,
+        pattern_vst3_parameter_automation_for_channel, pattern_vst3_parameter_link_for_target,
+        piano_roll_color_group_note_ids, piano_roll_controller_stroke_points,
+        piano_roll_controller_value_at, piano_roll_controller_value_range,
+        piano_roll_cross_pattern_ghost_notes, piano_roll_discard_length_edit,
+        piano_roll_duplicate_offset, piano_roll_ghost_note_is_visible, piano_roll_key_at_y,
+        piano_roll_note_group_members, piano_roll_note_nudge_edit, piano_roll_odd_note_selection,
         piano_roll_overlap_note_selection, piano_roll_pitch_range_note_selection,
         piano_roll_random_note_selection, piano_roll_selection_time_range,
         piano_roll_shift_time_range, piano_roll_time_range_from_drag,
@@ -58871,13 +59176,14 @@ mod tests {
         remove_midi_vst3_parameter_mapping, remove_pattern_vst3_parameter_link,
         sample_editor_selection_for_drag, serialize_midi_controller_templates,
         serialize_midi_mixer_control_mappings, serialize_midi_vst3_parameter_mappings,
-        serialize_pattern_vst3_parameter_links, serialize_window_layout_presets,
-        should_auto_connect_midi_input, should_auto_connect_midi_output, snap_note_tick,
-        snap_piano_roll_key_to_scale, snap_recorded_midi_notes_to_scale,
-        toggle_piano_roll_note_group_selection, touch_pan_zoom_scroll_offset, track_two_finger_tap,
-        update_channel_rack_selection, update_layer_child_selection,
-        update_piano_roll_box_selection, upsert_midi_mixer_control_mapping,
-        upsert_midi_vst3_parameter_mapping, upsert_pattern_vst3_parameter_link, zoom_to_fit,
+        serialize_pattern_vst3_parameter_links, serialize_playlist_audio_clip_envelopes,
+        serialize_window_layout_presets, should_auto_connect_midi_input,
+        should_auto_connect_midi_output, snap_note_tick, snap_piano_roll_key_to_scale,
+        snap_recorded_midi_notes_to_scale, toggle_piano_roll_note_group_selection,
+        touch_pan_zoom_scroll_offset, track_two_finger_tap, update_channel_rack_selection,
+        update_layer_child_selection, update_piano_roll_box_selection,
+        upsert_midi_mixer_control_mapping, upsert_midi_vst3_parameter_mapping,
+        upsert_pattern_vst3_parameter_link, upsert_playlist_audio_clip_envelope, zoom_to_fit,
     };
 
     #[test]
@@ -60425,6 +60731,100 @@ mod tests {
 
         remove_pattern_vst3_parameter_link(&mut links, &project_path, 4, &target);
         assert_eq!(links, vec![other_target]);
+    }
+
+    #[test]
+    fn playlist_audio_clip_envelopes_round_trip_per_project_and_clip() {
+        let project_path = std::env::temp_dir().join("audio clip project 雪.flp");
+        let entry = ProjectPlaylistAudioClipEnvelope {
+            project_path: project_path.to_string_lossy().into_owned(),
+            envelope: PlaylistAudioClipEnvelope {
+                arrangement_id: 3,
+                clip_id: 41,
+                gain_centidb: -1_250,
+                fade_in_ms: 225,
+                fade_out_ms: 480,
+            },
+        };
+        let other_clip = ProjectPlaylistAudioClipEnvelope {
+            envelope: PlaylistAudioClipEnvelope {
+                clip_id: 42,
+                gain_centidb: 600,
+                fade_in_ms: 0,
+                fade_out_ms: 0,
+                ..entry.envelope
+            },
+            ..entry.clone()
+        };
+        let other_project = ProjectPlaylistAudioClipEnvelope {
+            project_path: std::env::temp_dir()
+                .join("another audio clip project.flp")
+                .to_string_lossy()
+                .into_owned(),
+            ..entry.clone()
+        };
+        let encoded = serialize_playlist_audio_clip_envelopes(&[
+            entry.clone(),
+            other_clip.clone(),
+            other_project.clone(),
+        ]);
+        assert_eq!(
+            parse_playlist_audio_clip_envelopes(&encoded),
+            vec![entry.clone(), other_clip.clone(), other_project.clone()]
+        );
+
+        let replacement = ProjectPlaylistAudioClipEnvelope {
+            envelope: PlaylistAudioClipEnvelope {
+                fade_in_ms: 330,
+                ..entry.envelope
+            },
+            ..entry.clone()
+        };
+        let mut entries = vec![entry, other_clip.clone(), other_project.clone()];
+        upsert_playlist_audio_clip_envelope(&mut entries, replacement.clone());
+        assert_eq!(entries, vec![replacement, other_clip, other_project]);
+    }
+
+    #[test]
+    fn playlist_audio_clip_envelopes_reject_invalid_gain_and_fade_ranges() {
+        let valid = ProjectPlaylistAudioClipEnvelope {
+            project_path: "project.flp".to_owned(),
+            envelope: PlaylistAudioClipEnvelope {
+                arrangement_id: 0,
+                clip_id: 1,
+                gain_centidb: 0,
+                fade_in_ms: 0,
+                fade_out_ms: 0,
+            },
+        };
+        for envelope in [
+            PlaylistAudioClipEnvelope {
+                gain_centidb: -9_601,
+                ..valid.envelope
+            },
+            PlaylistAudioClipEnvelope {
+                gain_centidb: 3_601,
+                ..valid.envelope
+            },
+            PlaylistAudioClipEnvelope {
+                fade_in_ms: 600_001,
+                ..valid.envelope
+            },
+            PlaylistAudioClipEnvelope {
+                fade_out_ms: 600_001,
+                ..valid.envelope
+            },
+        ] {
+            let mut entries = Vec::new();
+            upsert_playlist_audio_clip_envelope(
+                &mut entries,
+                ProjectPlaylistAudioClipEnvelope {
+                    envelope,
+                    ..valid.clone()
+                },
+            );
+            assert!(entries.is_empty());
+        }
     }
 
     #[test]

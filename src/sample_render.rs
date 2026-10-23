@@ -469,7 +469,7 @@ fn sampler_note_pitch_offset_semitones(
     root_key_offset + channel.master_pitch_note_offset_semitones(project_master_pitch_cents)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AudioClipRenderOptions {
     pub arrangement_id: u16,
     pub sample_rate: u32,
@@ -483,6 +483,20 @@ pub struct AudioClipRenderOptions {
     pub start_from_song_start: bool,
     /// Render only this inclusive one-based Playlist track range when soloing.
     pub soloed_playlist_track_range: Option<(u32, u32)>,
+    /// App-local per-instance gain and linear fade settings keyed by arrangement and clip ID.
+    pub clip_envelopes: Arc<Vec<PlaylistAudioClipEnvelope>>,
+}
+
+/// Local per-instance Audio Clip gain and edge fades. Values are kept separate from opaque FLP
+/// records until the native Clip Properties serialization has been verified.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PlaylistAudioClipEnvelope {
+    pub arrangement_id: u16,
+    pub clip_id: u32,
+    /// Gain in hundredths of a decibel, limited by the editor to -96 dB through +36 dB.
+    pub gain_centidb: i16,
+    pub fade_in_ms: u32,
+    pub fade_out_ms: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -549,6 +563,7 @@ impl Default for AudioClipRenderOptions {
             clip_index: None,
             start_from_song_start: false,
             soloed_playlist_track_range: None,
+            clip_envelopes: Arc::new(Vec::new()),
         }
     }
 }
@@ -927,7 +942,7 @@ impl WavChannelMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlaylistRenderOptions {
     pub arrangement_id: u16,
     pub sample_rate: u32,
@@ -944,6 +959,8 @@ pub struct PlaylistRenderOptions {
     /// Render only this inclusive one-based Playlist track range when soloing.
     pub soloed_playlist_track_range: Option<(u32, u32)>,
     pub read_sample_root_note: bool,
+    /// App-local per-instance Audio Clip controls applied in live playback and renders.
+    pub clip_envelopes: Arc<Vec<PlaylistAudioClipEnvelope>>,
 }
 
 /// Output format and timeline range for a Playlist render that begins after song start.
@@ -1647,6 +1664,7 @@ impl Default for PlaylistRenderOptions {
             tail_seconds: 0,
             soloed_playlist_track_range: None,
             read_sample_root_note: true,
+            clip_envelopes: Arc::new(Vec::new()),
         }
     }
 }
@@ -1793,7 +1811,8 @@ pub fn render_audio_clips_to_file(
     let project_path = project_path.as_ref();
     let output_path = output_path.as_ref();
     validate_output_path_with_extension(project_path, output_path, output_format.extension())?;
-    let (mix, summary) = render_audio_clips_to_stereo_buffer(document, project_path, options)?;
+    let (mix, summary) =
+        render_audio_clips_to_stereo_buffer(document, project_path, options.clone())?;
     write_audio_buffer_to_file(
         output_path,
         &mix,
@@ -1939,7 +1958,7 @@ pub fn stream_audio_clips_to_device(
     let render = prepare_audio_clip_render(
         document,
         project_path.as_ref(),
-        options,
+        options.clone(),
         false,
         Some(cancelled),
     )?;
@@ -2104,6 +2123,7 @@ pub fn stream_playlist_performance_with_vst3_to_device(
             clip_index: None,
             start_from_song_start: false,
             soloed_playlist_track_range: options.soloed_playlist_track_range,
+            clip_envelopes: Arc::clone(&options.clip_envelopes),
         },
         performance.meters.is_some(),
         Some(cancelled),
@@ -2111,7 +2131,7 @@ pub fn stream_playlist_performance_with_vst3_to_device(
     let mut sampler = prepare_sampler_arrangement(
         document,
         project_path,
-        options,
+        options.clone(),
         performance.meters.is_some(),
         Some(cancelled),
     )?;
@@ -2122,7 +2142,7 @@ pub fn stream_playlist_performance_with_vst3_to_device(
         .unwrap_or_default();
     let runtime = PlaylistPerformanceRuntime::new(
         document,
-        options,
+        options.clone(),
         performance.performance_zone_end_tick,
         performance.start_frame,
         performance.launches,
@@ -2265,6 +2285,7 @@ fn stream_playlist_with_vst3_to_device_from_frame_inner(
             clip_index: None,
             start_from_song_start: false,
             soloed_playlist_track_range: options.soloed_playlist_track_range,
+            clip_envelopes: Arc::clone(&options.clip_envelopes),
         },
         meters.is_some(),
         Some(cancelled),
@@ -2272,7 +2293,7 @@ fn stream_playlist_with_vst3_to_device_from_frame_inner(
     let sampler = prepare_sampler_arrangement(
         document,
         project_path,
-        options,
+        options.clone(),
         meters.is_some(),
         Some(cancelled),
     )?;
@@ -2572,12 +2593,18 @@ fn render_playlist_with_vst3_cancellable(
             clip_index: None,
             start_from_song_start: false,
             soloed_playlist_track_range: options.soloed_playlist_track_range,
+            clip_envelopes: Arc::clone(&options.clip_envelopes),
         },
         false,
         Some(cancelled),
     )?;
-    let sampler =
-        prepare_sampler_arrangement(document, project_path, options, false, Some(cancelled))?;
+    let sampler = prepare_sampler_arrangement(
+        document,
+        project_path,
+        options.clone(),
+        false,
+        Some(cancelled),
+    )?;
     if audio.clips.is_empty()
         && sampler.notes.is_empty()
         && vst3_processor
@@ -2722,7 +2749,7 @@ fn render_playlist_with_vst3_cancellable(
                 PreparedPlaylistBlockMix {
                     audio: &audio,
                     sampler: &sampler,
-                    options,
+                    options: options.clone(),
                     frames,
                     master_output,
                     vst3_processor: vst3_processor.as_mut(),
@@ -2759,7 +2786,7 @@ fn render_playlist_with_vst3_cancellable(
                 PreparedPlaylistBlockMix {
                     audio: &audio,
                     sampler: &sampler,
-                    options,
+                    options: options.clone(),
                     frames,
                     master_output,
                     vst3_processor: vst3_processor.as_mut(),
@@ -2964,12 +2991,18 @@ pub fn render_playlist_mixer_stems_with_vst3_cancellable(
             clip_index: None,
             start_from_song_start: false,
             soloed_playlist_track_range: options.soloed_playlist_track_range,
+            clip_envelopes: Arc::clone(&options.clip_envelopes),
         },
         false,
         Some(cancelled),
     )?;
-    let sampler =
-        prepare_sampler_arrangement(document, project_path, options, false, Some(cancelled))?;
+    let sampler = prepare_sampler_arrangement(
+        document,
+        project_path,
+        options.clone(),
+        false,
+        Some(cancelled),
+    )?;
     if audio.clips.is_empty()
         && sampler.notes.is_empty()
         && vst3_processor
@@ -3100,7 +3133,7 @@ pub fn render_playlist_mixer_stems_with_vst3_cancellable(
         PreparedPlaylistBlockMix {
             audio: &audio,
             sampler: &sampler,
-            options,
+            options: options.clone(),
             frames,
             master_output,
             vst3_processor: vst3_processor.as_mut(),
@@ -6036,7 +6069,8 @@ fn render_audio_clips_to_stereo_buffer_inner(
     cancelled: Option<&AtomicBool>,
 ) -> Result<(Vec<f32>, AudioClipRenderSummary), String> {
     crate::audio::enable_denormal_protection();
-    let render = prepare_audio_clip_render(document, project_path, options, false, cancelled)?;
+    let render =
+        prepare_audio_clip_render(document, project_path, options.clone(), false, cancelled)?;
     require_audio_clips(&render)?;
     let output_frames = render.summary.frames;
 
@@ -6880,6 +6914,34 @@ fn prepare_audio_clip_render(
             options.sample_rate,
         )?;
         let duration_frames = source_duration_frames.min(timeline_clip_frames);
+        let envelope = options
+            .clip_envelopes
+            .iter()
+            .find(|envelope| {
+                envelope.arrangement_id == options.arrangement_id
+                    && clip.clip_id == Some(envelope.clip_id)
+            })
+            .copied();
+        let (envelope_gain, fade_in_frames, fade_out_frames) = if let Some(envelope) = envelope {
+            if !(-9_600..=3_600).contains(&envelope.gain_centidb)
+                || envelope.fade_in_ms > 600_000
+                || envelope.fade_out_ms > 600_000
+            {
+                return Err(format!(
+                    "Playlist clip {clip_index} gain or fade duration is outside the supported range"
+                ));
+            }
+            let fade_frames = |milliseconds: u32| {
+                u64::from(milliseconds).saturating_mul(u64::from(options.sample_rate)) / 1_000
+            };
+            (
+                10.0_f32.powf(f32::from(envelope.gain_centidb) / 2_000.0),
+                fade_frames(envelope.fade_in_ms).min(duration_frames),
+                fade_frames(envelope.fade_out_ms).min(duration_frames),
+            )
+        } else {
+            (1.0, 0, 0)
+        };
         let end_frame = start_frame
             .checked_add(duration_frames)
             .ok_or_else(|| "render timeline length overflow".to_owned())?;
@@ -6906,6 +6968,9 @@ fn prepare_audio_clip_render(
             pitch_ratio: effective_pitch_ratio,
             duration_frames,
             gain: *gain,
+            envelope_gain,
+            fade_in_frames,
+            fade_out_frames,
             pan: *pan,
             pan_law,
             mixer_transform: mixer_route_plan.output_transform,
@@ -11422,6 +11487,9 @@ struct PreparedClip {
     pitch_ratio: f64,
     duration_frames: u64,
     gain: f32,
+    envelope_gain: f32,
+    fade_in_frames: u64,
+    fade_out_frames: u64,
     pan: f32,
     pan_law: PanLaw,
     mixer_transform: MixerSourceRouteTransform,
@@ -12368,9 +12436,10 @@ fn mix_clip_window_into_stereo_with_quality_and_meter(
         let output_index = usize::try_from(output_frame - mix_start_frame)
             .map_err(|_| "audio output frame index exceeds this platform".to_owned())?
             * 2;
+        let envelope_gain = playlist_audio_clip_envelope_gain(clip, output_offset);
         let mut frame = [
-            left * clip.gain * left_pan_gain,
-            right * clip.gain * right_pan_gain,
+            left * clip.gain * envelope_gain * left_pan_gain,
+            right * clip.gain * envelope_gain * right_pan_gain,
         ];
         let live_controls = match (
             clip.live_mixer_source_control.as_ref(),
@@ -12398,8 +12467,8 @@ fn mix_clip_window_into_stereo_with_quality_and_meter(
                     return Err("Mixer meter route exceeds the supported track range".to_owned());
                 }
                 let mut meter_frame = [
-                    left * clip.gain * left_pan_gain,
-                    right * clip.gain * right_pan_gain,
+                    left * clip.gain * envelope_gain * left_pan_gain,
+                    right * clip.gain * envelope_gain * right_pan_gain,
                 ];
                 if let Some((source_control, controls)) = live_controls {
                     source_control.apply_meter_frame(
@@ -12418,6 +12487,23 @@ fn mix_clip_window_into_stereo_with_quality_and_meter(
         }
     }
     Ok(())
+}
+
+fn playlist_audio_clip_envelope_gain(clip: &PreparedClip, output_offset: u64) -> f32 {
+    let fade_in_gain = if clip.fade_in_frames == 0 {
+        1.0
+    } else {
+        (output_offset as f32 / clip.fade_in_frames as f32).clamp(0.0, 1.0)
+    };
+    let fade_out_gain = if clip.fade_out_frames == 0 {
+        1.0
+    } else {
+        let remaining_frames = clip
+            .duration_frames
+            .saturating_sub(output_offset.saturating_add(1));
+        (remaining_frames as f32 / clip.fade_out_frames as f32).clamp(0.0, 1.0)
+    };
+    clip.envelope_gain * fade_in_gain * fade_out_gain
 }
 
 fn decoded_audio_bytes(audio: &DecodedAudio) -> Result<usize, String> {
@@ -13822,6 +13908,9 @@ mod tests {
             pitch_ratio: 1.0,
             duration_frames: 2,
             gain: 1.0,
+            envelope_gain: 1.0,
+            fade_in_frames: 0,
+            fade_out_frames: 0,
             pan: 0.0,
             pan_law: PanLaw::Circular,
             mixer_transform: saved_transform,
@@ -13909,6 +13998,9 @@ mod tests {
             pitch_ratio: 1.0,
             duration_frames: 2,
             gain: 1.0,
+            envelope_gain: 1.0,
+            fade_in_frames: 0,
+            fade_out_frames: 0,
             pan: 0.0,
             pan_law: PanLaw::Triangular,
             mixer_transform: MixerSourceRouteTransform::default(),
@@ -14009,6 +14101,9 @@ mod tests {
             pitch_ratio: 1.0,
             duration_frames: 50,
             gain: 1.0,
+            envelope_gain: 1.0,
+            fade_in_frames: 0,
+            fade_out_frames: 0,
             pan: 0.0,
             pan_law: PanLaw::Circular,
             mixer_transform,
@@ -14860,6 +14955,9 @@ mod tests {
                 pitch_ratio: 1.0,
                 duration_frames: 2,
                 gain: 0.5,
+                envelope_gain: 1.0,
+                fade_in_frames: 0,
+                fade_out_frames: 0,
                 pan: 0.0,
                 pan_law: PanLaw::Circular,
                 mixer_transform: MixerSourceRouteTransform::from_insert_transform(
@@ -14987,6 +15085,7 @@ mod tests {
                     tail_seconds: 0,
                     soloed_playlist_track_range: None,
                     read_sample_root_note: true,
+                    clip_envelopes: Arc::new(Vec::new()),
                 },
                 frames: 2,
                 master_output: MixerMasterOutput::default(),
@@ -15230,6 +15329,9 @@ mod tests {
                 pitch_ratio: 1.0,
                 duration_frames: 8,
                 gain,
+                envelope_gain: 1.0,
+                fade_in_frames: 0,
+                fade_out_frames: 0,
                 pan: 0.0,
                 pan_law: PanLaw::Circular,
                 mixer_transform: transform,
@@ -15306,6 +15408,9 @@ mod tests {
             pitch_ratio: 1.0,
             duration_frames: 4,
             gain: 1.0,
+            envelope_gain: 1.0,
+            fade_in_frames: 0,
+            fade_out_frames: 0,
             pan: 0.0,
             pan_law: PanLaw::Circular,
             mixer_transform: MixerSourceRouteTransform::default(),
@@ -15327,6 +15432,46 @@ mod tests {
         ];
         for (actual, expected) in mix.iter().zip(expected) {
             assert!((actual - expected).abs() < 1.0e-6);
+        }
+    }
+
+    #[test]
+    fn playlist_audio_clip_gain_and_linear_fades_shape_each_mixed_frame() {
+        let source = DecodedAudio {
+            sample_rate: 4,
+            channels: vec![vec![1.0; 4]],
+        };
+        let clip = PreparedClip {
+            clip_index: 0,
+            playlist_track_id: None,
+            channel_id: 0,
+            mixer_track: None,
+            path: PathBuf::new(),
+            source_id: 0,
+            start_frame: 0,
+            source_bounds: SampleBounds { start: 0, end: 4 },
+            reverse: false,
+            pitch_ratio: 1.0,
+            duration_frames: 4,
+            gain: 1.0,
+            envelope_gain: 0.5,
+            fade_in_frames: 2,
+            fade_out_frames: 2,
+            pan: 0.0,
+            pan_law: PanLaw::Circular,
+            mixer_transform: MixerSourceRouteTransform::default(),
+            live_mixer_source_control: None,
+            mixer_meter_transforms: Vec::new(),
+        };
+        let mut mix = vec![0.0; 8];
+
+        mix_clip_into_stereo(&mut mix, &source, &clip, 4, None).unwrap();
+
+        let expected_frame_gains = [0.0, 0.25, 0.25, 0.0];
+        let center_gain = std::f32::consts::FRAC_1_SQRT_2;
+        for (frame, expected_gain) in expected_frame_gains.into_iter().enumerate() {
+            assert!((mix[frame * 2] - expected_gain * center_gain).abs() < 1.0e-6);
+            assert!((mix[frame * 2 + 1] - expected_gain * center_gain).abs() < 1.0e-6);
         }
     }
 
@@ -15359,6 +15504,9 @@ mod tests {
             pitch_ratio: pitch_up,
             duration_frames: 2,
             gain: 1.0,
+            envelope_gain: 1.0,
+            fade_in_frames: 0,
+            fade_out_frames: 0,
             pan: 0.0,
             pan_law: PanLaw::Circular,
             mixer_transform: MixerSourceRouteTransform::default(),
@@ -15741,6 +15889,9 @@ mod tests {
             pitch_ratio: 1.0,
             duration_frames: 1,
             gain: 1.0,
+            envelope_gain: 1.0,
+            fade_in_frames: 0,
+            fade_out_frames: 0,
             pan: 0.0,
             pan_law: PanLaw::Circular,
             mixer_transform: MixerSourceRouteTransform::from_insert_transform(
@@ -15779,6 +15930,9 @@ mod tests {
             pitch_ratio: 1.0,
             duration_frames: 5,
             gain: 0.5,
+            envelope_gain: 1.0,
+            fade_in_frames: 0,
+            fade_out_frames: 0,
             pan: 0.5,
             pan_law: PanLaw::Circular,
             mixer_transform: MixerSourceRouteTransform::default(),

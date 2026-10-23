@@ -2479,8 +2479,11 @@ impl Vst3HostRuntime {
         include_plugin_reported_tails: bool,
         pattern_automation: &BTreeMap<(u16, u16), Vec<Vst3ParameterAutomation>>,
     ) -> Result<Vst3PlaylistStreamProcessor, String> {
-        let playlist_automation =
-            expand_playlist_pattern_parameter_automation(document, options, pattern_automation)?;
+        let playlist_automation = expand_playlist_pattern_parameter_automation(
+            document,
+            options.clone(),
+            pattern_automation,
+        )?;
         self.prepare_playlist_stream_inner(
             document,
             options,
@@ -2521,8 +2524,11 @@ impl Vst3HostRuntime {
         include_plugin_reported_tails: bool,
         pattern_automation: &BTreeMap<(u16, u16), Vec<Vst3ParameterAutomation>>,
     ) -> Result<Vst3PlaylistStreamProcessor, String> {
-        let playlist_automation =
-            expand_playlist_pattern_parameter_automation(document, options, pattern_automation)?;
+        let playlist_automation = expand_playlist_pattern_parameter_automation(
+            document,
+            options.clone(),
+            pattern_automation,
+        )?;
         let mut processor = self.prepare_playlist_stream_inner(
             document,
             options,
