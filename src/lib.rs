@@ -8577,6 +8577,92 @@ impl FlpDocument {
         Ok(new_id)
     }
 
+    /// Sets Reverse for one Playlist Audio Clip while leaving its other uses unchanged.
+    ///
+    /// The saved Reverse bit belongs to the kind-4 channel. When another Playlist clip,
+    /// Pattern note, or Layer uses that channel, this operation first copies the channel
+    /// and retargets only the selected clip. Otherwise, changing the channel flag is
+    /// equivalent to changing this clip's Reverse state.
+    pub fn set_playlist_audio_clip_reversed(
+        &mut self,
+        arrangement_id: u16,
+        clip_index: usize,
+        reversed: bool,
+    ) -> Result<u16, FlpError> {
+        let arrangements = self.arrangements()?;
+        let mut matching_arrangements = arrangements
+            .iter()
+            .filter(|arrangement| arrangement.id == arrangement_id);
+        let Some(arrangement) = matching_arrangements.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested arrangement does not exist",
+            ));
+        };
+        if matching_arrangements.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested arrangement id is ambiguous",
+            ));
+        }
+        let Some(clip) = arrangement.clips.get(clip_index) else {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested Playlist Audio Clip does not exist",
+            ));
+        };
+        let PlaylistClipTarget::Channel { id: source_id } = clip.target() else {
+            return Err(FlpError::UnsupportedEdit(
+                "per-clip Reverse applies to Playlist Audio Clips",
+            ));
+        };
+
+        let channels = self.channels();
+        let mut matching_channels = channels.iter().filter(|channel| channel.id() == source_id);
+        let Some(source_channel) = matching_channels.next() else {
+            return Err(FlpError::ChannelNotFound(source_id));
+        };
+        if matching_channels.next().is_some() {
+            return Err(FlpError::AmbiguousChannelId(source_id));
+        }
+        if source_channel.kind() != Some(4) {
+            return Err(FlpError::UnsupportedEdit(
+                "per-clip Reverse applies to kind-4 Audio Clip channels",
+            ));
+        }
+        if source_channel.audio_clip_reversed() == reversed {
+            return Ok(source_id);
+        }
+
+        let playlist_users = arrangements
+            .iter()
+            .flat_map(|arrangement| arrangement.clips.iter())
+            .filter(|candidate| {
+                matches!(candidate.target(), PlaylistClipTarget::Channel { id } if id == source_id)
+            })
+            .count();
+        let pattern_note_uses_channel = self.patterns()?.iter().any(|pattern| {
+            pattern
+                .notes
+                .iter()
+                .any(|note| note.channel_id == source_id)
+        });
+        let layer_uses_channel = channels.iter().any(|channel| {
+            channel
+                .layer_child_ids()
+                .is_some_and(|child_ids| child_ids.contains(&source_id))
+        });
+        let needs_private_channel =
+            playlist_users > 1 || pattern_note_uses_channel || layer_uses_channel;
+
+        let mut candidate = self.clone();
+        let target_id = if needs_private_channel {
+            candidate.make_playlist_audio_clip_unique(arrangement_id, clip_index)?
+        } else {
+            source_id
+        };
+        candidate.set_channel_sample_reversed(target_id, reversed)?;
+        *self = candidate;
+        Ok(target_id)
+    }
+
     /// Creates a Pattern Clip from a recognized Playlist record in the target arrangement.
     /// For an empty arrangement, a Pattern Clip record from another arrangement is reused.
     /// Position, item index, length, track, and (when present) clip ID are assigned; other

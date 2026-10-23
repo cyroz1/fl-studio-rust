@@ -16059,6 +16059,11 @@ impl DawUi {
             })
             .map(ChannelSummary::id)
             .collect::<BTreeSet<_>>();
+        let channel_audio_clip_reverse: BTreeMap<_, _> = channels
+            .iter()
+            .filter(|channel| channel.kind() == Some(4))
+            .map(|channel| (channel.id(), channel.audio_clip_reversed()))
+            .collect();
         let channel_kinds: BTreeMap<_, _> = channels
             .into_iter()
             .map(|channel| (channel.id(), channel.kind()))
@@ -16144,6 +16149,7 @@ impl DawUi {
         let mut delete_clip_requested = None;
         let mut muted_clip_requested = None;
         let mut playlist_clip_group_requested = None;
+        let mut playlist_audio_clip_reverse_requested = None;
         let mut copy_clip_requested = None;
         let mut cut_clip_requested = None;
         let mut paste_clip_after_requested = None;
@@ -18106,6 +18112,20 @@ impl DawUi {
                                         .map(|clip| (*index, clip.is_muted()))
                                 })
                                 .collect::<Vec<_>>();
+                            let reverse_selection_states = mute_selection_indices
+                                .iter()
+                                .filter_map(|index| {
+                                    let clip = arrangement.clips.get(*index)?;
+                                    let flp_rebuild::PlaylistClipTarget::Channel { id } =
+                                        clip.target()
+                                    else {
+                                        return None;
+                                    };
+                                    channel_audio_clip_reverse
+                                        .get(&id)
+                                        .map(|reversed| (*index, *reversed))
+                                })
+                                .collect::<Vec<_>>();
                             let can_group_clip_selection =
                                 mute_selection_indices.len() > 1 && next_playlist_clip_group.is_some();
                             let can_ungroup_clip_selection = mute_selection_indices.iter().any(
@@ -18258,6 +18278,53 @@ impl DawUi {
                                     }
                                 }
                                 if is_audio_clip {
+                                    if reverse_selection_states.len() > 1 {
+                                        if ui.button("Reverse selected Audio Clips").clicked() {
+                                            playlist_audio_clip_reverse_requested = Some(
+                                                reverse_selection_states
+                                                    .iter()
+                                                    .map(|(index, _)| (*index, true))
+                                                    .collect(),
+                                            );
+                                            ui.close();
+                                        }
+                                        if ui.button("Forward selected Audio Clips").clicked() {
+                                            playlist_audio_clip_reverse_requested = Some(
+                                                reverse_selection_states
+                                                    .iter()
+                                                    .map(|(index, _)| (*index, false))
+                                                    .collect(),
+                                            );
+                                            ui.close();
+                                        }
+                                        if ui
+                                            .button("Flip selected Reverse states")
+                                            .clicked()
+                                        {
+                                            playlist_audio_clip_reverse_requested = Some(
+                                                reverse_selection_states
+                                                    .iter()
+                                                    .map(|(index, reversed)| {
+                                                        (*index, !*reversed)
+                                                    })
+                                                    .collect(),
+                                            );
+                                            ui.close();
+                                        }
+                                    } else if let Some((index, reversed)) =
+                                        reverse_selection_states.first()
+                                        && ui
+                                            .button(if *reversed {
+                                                "Forward this Audio Clip"
+                                            } else {
+                                                "Reverse this Audio Clip"
+                                            })
+                                            .clicked()
+                                    {
+                                        playlist_audio_clip_reverse_requested =
+                                            Some(vec![(*index, !*reversed)]);
+                                        ui.close();
+                                    }
                                     if ui.button("Make unique").clicked() {
                                         make_audio_clip_unique_requested = Some(clip_index);
                                         ui.close();
@@ -20103,6 +20170,58 @@ impl DawUi {
                     self.status = format!("Could not change Playlist clip mute state: {error}");
                 }
                 None => self.status = "Open a project to mute Playlist clips".to_owned(),
+            }
+        }
+
+        if let Some(clip_edits) = playlist_audio_clip_reverse_requested {
+            let result = self.document.as_ref().map(|document| {
+                let mut updated = document.clone();
+                let mut channel_ids = Vec::with_capacity(clip_edits.len());
+                for (clip_index, reversed) in &clip_edits {
+                    channel_ids.push(
+                        updated
+                            .set_playlist_audio_clip_reversed(
+                                arrangement.id,
+                                *clip_index,
+                                *reversed,
+                            )
+                            .map_err(|error| error.to_string())?,
+                    );
+                }
+                Ok::<_, String>((updated, channel_ids))
+            });
+            match result {
+                Some(Ok((updated, channel_ids))) => {
+                    self.document = Some(updated);
+                    self.stop_project_playback();
+                    self.selected_arrangement = Some(arrangement.id);
+                    self.selected_clip = clip_edits.first().map(|(index, _)| *index);
+                    self.selected_playlist_clips =
+                        clip_edits.iter().map(|(index, _)| *index).collect();
+                    self.dirty = true;
+                    ui.ctx().request_repaint();
+                    if clip_edits.len() == 1 {
+                        let (clip_index, reversed) = clip_edits[0];
+                        self.status = format!(
+                            "{} Reverse for Audio Clip {} on channel {}",
+                            if reversed { "Enabled" } else { "Disabled" },
+                            clip_index + 1,
+                            channel_ids[0]
+                        );
+                    } else {
+                        self.status = format!(
+                            "Updated Reverse for {} selected Audio Clips",
+                            clip_edits.len()
+                        );
+                    }
+                    self.refresh_audio_waveform_paths();
+                }
+                Some(Err(error)) => {
+                    self.status = format!("Could not change Audio Clip Reverse: {error}");
+                }
+                None => {
+                    self.status = "Open a project to change Audio Clip Reverse".to_owned();
+                }
             }
         }
 
