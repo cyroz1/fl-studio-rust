@@ -37056,6 +37056,25 @@ impl DawUi {
                     self.piano_roll_magic_lasso = Some(lasso);
                 }
             }
+            if !self.piano_roll_editable_ghost_channels
+                && grid_response.double_clicked_by(PointerButton::Secondary)
+                && let Some(pointer) = pointer
+                && grid_body_rect.contains(pointer)
+                && let Some(channel_id) = note_selection_rects
+                    .iter()
+                    .rev()
+                    .find(|(channel_id, _, note_rect, _, _)| {
+                        Some(*channel_id) != self.selected_note_channel
+                            && note_rect.contains(pointer)
+                    })
+                    .map(|(channel_id, _, _, _, _)| *channel_id)
+            {
+                self.selected_piano_notes.clear();
+                self.selected_note = None;
+                self.piano_roll_magic_lasso = None;
+                self.selected_note_channel = Some(channel_id);
+                self.status = format!("Switched to ghost channel {channel_id}");
+            }
             if self.piano_roll_zoom_mode
                 && grid_response.drag_started_by(PointerButton::Primary)
                 && let Some(origin) = ui
