@@ -17383,6 +17383,23 @@ impl DawUi {
                         context_response.context_menu(|ui| {
                             ui.label(track_name);
                             ui.separator();
+                            let ghost_track_key = (arrangement.id, track_id);
+                            let mut show_ghost_notes = !self
+                                .piano_roll_hidden_ghost_tracks
+                                .contains(&ghost_track_key);
+                            if ui
+                                .checkbox(&mut show_ghost_notes, "Show ghost notes")
+                                .changed()
+                            {
+                                if show_ghost_notes {
+                                    self.piano_roll_hidden_ghost_tracks
+                                        .remove(&ghost_track_key);
+                                } else {
+                                    self.piano_roll_hidden_ghost_tracks
+                                        .insert(ghost_track_key);
+                                }
+                            }
+                            ui.separator();
                             let can_stop_performance_track = self.performance_mode_active
                                 && self.playing
                                 && self.performance_launch_sender.is_some();
