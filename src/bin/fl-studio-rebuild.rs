@@ -17383,22 +17383,39 @@ impl DawUi {
                         context_response.context_menu(|ui| {
                             ui.label(track_name);
                             ui.separator();
-                            let ghost_track_key = (arrangement.id, track_id);
-                            let mut show_ghost_notes = !self
-                                .piano_roll_hidden_ghost_tracks
-                                .contains(&ghost_track_key);
-                            if ui
-                                .checkbox(&mut show_ghost_notes, "Show ghost notes")
-                                .changed()
+                            let ghost_track_keys = if self
+                                .selected_playlist_tracks
+                                .contains(&track_id)
                             {
-                                if show_ghost_notes {
-                                    self.piano_roll_hidden_ghost_tracks
-                                        .remove(&ghost_track_key);
-                                } else {
-                                    self.piano_roll_hidden_ghost_tracks
-                                        .insert(ghost_track_key);
+                                tracks
+                                    .iter()
+                                    .filter(|track| {
+                                        self.selected_playlist_tracks.contains(&track.id)
+                                    })
+                                    .map(|track| (arrangement.id, track.id))
+                                    .collect::<Vec<_>>()
+                            } else {
+                                vec![(arrangement.id, track_id)]
+                            };
+                            let mut show_ghost_notes = ghost_track_keys.iter().all(|key| {
+                                !self.piano_roll_hidden_ghost_tracks.contains(key)
+                            });
+                            let ghost_notes_response =
+                                ui.checkbox(&mut show_ghost_notes, "Show ghost notes");
+                            if ghost_notes_response.changed() {
+                                for key in &ghost_track_keys {
+                                    if show_ghost_notes {
+                                        self.piano_roll_hidden_ghost_tracks.remove(key);
+                                    } else {
+                                        self.piano_roll_hidden_ghost_tracks.insert(*key);
+                                    }
                                 }
                             }
+                            ghost_notes_response.on_hover_text(if ghost_track_keys.len() > 1 {
+                                "Applies to the selected Playlist tracks"
+                            } else {
+                                "Show or hide this track's notes in the Piano roll"
+                            });
                             ui.separator();
                             let can_stop_performance_track = self.performance_mode_active
                                 && self.playing
@@ -26919,10 +26936,21 @@ impl DawUi {
                 ((arrangement_id, track_id), label)
             })
             .collect::<Vec<_>>();
-        let ghost_clip_options = cross_pattern_ghost_notes
+        let mut ghost_clip_keys = cross_pattern_ghost_notes
             .iter()
             .map(|note| note.source_clip)
             .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        ghost_clip_keys.sort_by_key(|clip_key| {
+            (
+                clip_key.track_id.unwrap_or(u32::MAX),
+                clip_key.position_ticks,
+                clip_key.clip_index,
+                clip_key.clip_id,
+            )
+        });
+        let ghost_clip_options = ghost_clip_keys
             .into_iter()
             .map(|clip_key| {
                 let track_label = clip_key
