@@ -53075,15 +53075,18 @@ fn draw_audio_clip_waveform(
         for column in 0..columns {
             let source_span = u128::from(source_end - source_start);
             let (frame_start, frame_end) = if settings.reverse {
-                (
-                    u128::from(source_end) - source_span * (column + 1) as u128 / columns as u128,
-                    u128::from(source_end) - source_span * column as u128 / columns as u128,
-                )
+                let frame_start =
+                    u128::from(source_end) - source_span * (column + 1) as u128 / columns as u128;
+                let frame_end =
+                    u128::from(source_end) - source_span * column as u128 / columns as u128;
+                let frame_start = frame_start.min(u128::from(source_end - 1));
+                (frame_start, frame_end.max(frame_start + 1))
             } else {
-                (
-                    u128::from(source_start) + source_span * column as u128 / columns as u128,
-                    u128::from(source_start) + source_span * (column + 1) as u128 / columns as u128,
-                )
+                let frame_start =
+                    u128::from(source_start) + source_span * column as u128 / columns as u128;
+                let frame_end =
+                    u128::from(source_start) + source_span * (column + 1) as u128 / columns as u128;
+                (frame_start, frame_end.max(frame_start + 1))
             };
             let first_peak = (frame_start * peak_count / frame_count) as usize;
             let last_peak = ((frame_end * peak_count / frame_count) as usize)
