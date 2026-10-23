@@ -16329,6 +16329,7 @@ impl DawUi {
         let mut create_pattern_clip_at_requested = None;
         let mut open_pattern_clip_requested = None;
         let mut create_automation_clip_requested = None;
+        let mut create_automation_clip_at_requested = None;
         let mut playlist_track_edits_requested = Vec::new();
         let mut auto_name_playlist_track_requested = None;
         let mut playlist_track_clips_mute_action = None;
@@ -16541,6 +16542,34 @@ impl DawUi {
                                     ui.close();
                                 }
                             });
+                        }
+                    });
+                } else if focus == PlaylistClipFocus::Automation {
+                    response.context_menu(|ui| {
+                        ui.label("Automation Clip source");
+                        if automation_channel_ids.is_empty() {
+                            ui.weak("No Automation channels with a saved point blob");
+                        }
+                        for channel_id in &automation_channel_ids {
+                            let name = automation_channels
+                                .iter()
+                                .find(|channel| channel.channel_id() == *channel_id)
+                                .and_then(AutomationChannel::display_name)
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| format!("Channel {channel_id}"));
+                            if ui
+                                .selectable_label(
+                                    selected_automation_channel_id == Some(*channel_id),
+                                    name,
+                                )
+                                .clicked()
+                            {
+                                self.selected_automation_channel = Some(*channel_id);
+                                self.status = format!(
+                                    "Selected Automation Channel {channel_id} for Playlist placement"
+                                );
+                                ui.close();
+                            }
                         }
                     });
                 }
@@ -16879,27 +16908,6 @@ impl DawUi {
             .and_then(|clip| clip.track_index)
             .unwrap_or(0);
         let new_automation_clip_position = new_pattern_clip_position;
-        let new_automation_clip_length = selected_automation_channel_id
-            .and_then(|channel_id| {
-                automation_channels
-                    .iter()
-                    .find(|channel| channel.channel_id() == channel_id)
-            })
-            .and_then(|channel| {
-                channel
-                    .points()
-                    .iter()
-                    .map(|point| point.position_beats())
-                    .filter(|beats| beats.is_finite() && *beats >= 0.0)
-                    .max_by(f64::total_cmp)
-            })
-            .map(|beats| {
-                (beats * f64::from(ppq))
-                    .ceil()
-                    .clamp(0.0, f64::from(u32::MAX)) as u32
-            })
-            .unwrap_or(0)
-            .max(measure_length_ticks);
         let new_automation_clip_track = arrangement
             .clips
             .iter()
@@ -17921,10 +17929,19 @@ impl DawUi {
                             && !self.playlist_slip_tool_active
                             && !suppress_playlist_touch_edits
                             && !can_trigger_performance_scene;
+                        let can_create_automation_clip_at_pointer = has_automation_clip_template
+                            && selected_automation_channel_id.is_some()
+                            && self.playlist_clip_focus == PlaylistClipFocus::Automation
+                            && !self.playlist_mute_tool_active
+                            && !self.playlist_slip_tool_active
+                            && !suppress_playlist_touch_edits
+                            && !can_trigger_performance_scene;
+                        let can_create_clip_at_pointer = can_create_pattern_clip_at_pointer
+                            || can_create_automation_clip_at_pointer;
                         let scene_region_response = ui.interact(
                             grid_rect,
                             Id::new(("playlist-performance-scene", arrangement.id, track_id)),
-                            if can_trigger_performance_scene || can_create_pattern_clip_at_pointer {
+                            if can_trigger_performance_scene || can_create_clip_at_pointer {
                                 Sense::click()
                             } else {
                                 Sense::hover()
@@ -17937,6 +17954,10 @@ impl DawUi {
                         } else if can_create_pattern_clip_at_pointer {
                             scene_region_response.on_hover_text(
                                 "Click blank Playlist space to add the selected Pattern; hold Alt to bypass snap.",
+                            )
+                        } else if can_create_automation_clip_at_pointer {
+                            scene_region_response.on_hover_text(
+                                "Click blank Playlist space to add the selected Automation Clip; hold Alt to bypass snap.",
                             )
                         } else {
                             scene_region_response
@@ -19866,7 +19887,7 @@ impl DawUi {
                                 }
                             }
                         }
-                        if can_create_pattern_clip_at_pointer
+                        if can_create_clip_at_pointer
                             && scene_region_response.clicked_by(PointerButton::Primary)
                             && !scene_region_response.double_clicked()
                             && let Some(pointer) = scene_region_response.interact_pointer_pos()
@@ -19887,16 +19908,31 @@ impl DawUi {
                                     .contains(pointer)
                                 });
                                 if !clicked_on_clip {
-                                    create_pattern_clip_at_requested = Some((
-                                        playlist_audio_drop_position_ticks(
-                                            pointer.x,
-                                            grid_rect.left(),
-                                            tick_scale,
-                                            ppq,
-                                            !modifiers.alt,
-                                        ),
-                                        row,
-                                    ));
+                                    let position_ticks = playlist_audio_drop_position_ticks(
+                                        pointer.x,
+                                        grid_rect.left(),
+                                        tick_scale,
+                                        ppq,
+                                        !modifiers.alt,
+                                    );
+                                    match self.playlist_clip_focus {
+                                        PlaylistClipFocus::Pattern => {
+                                            create_pattern_clip_at_requested =
+                                                Some((position_ticks, row));
+                                        }
+                                        PlaylistClipFocus::Automation => {
+                                            if let Some(channel_id) =
+                                                selected_automation_channel_id
+                                            {
+                                                create_automation_clip_at_requested = Some((
+                                                    channel_id,
+                                                    position_ticks,
+                                                    row,
+                                                ));
+                                            }
+                                        }
+                                        PlaylistClipFocus::Audio => {}
+                                    }
                                 }
                             }
                         }
@@ -21092,15 +21128,55 @@ impl DawUi {
                 }
             }
         }
-        if let Some(channel_id) = create_automation_clip_requested
+        if let Some((channel_id, position_ticks, track_index)) = create_automation_clip_at_requested
+            .or_else(|| {
+                create_automation_clip_requested.map(|channel_id| {
+                    (
+                        channel_id,
+                        new_automation_clip_position,
+                        new_automation_clip_track,
+                    )
+                })
+            })
             && let Some(document) = self.document.as_mut()
         {
+            let content_length_ticks = automation_channels
+                .iter()
+                .find(|channel| channel.channel_id() == channel_id)
+                .and_then(|channel| {
+                    channel
+                        .points()
+                        .iter()
+                        .map(|point| point.position_beats())
+                        .filter(|beats| beats.is_finite() && *beats >= 0.0)
+                        .max_by(f64::total_cmp)
+                })
+                .map(|beats| {
+                    (beats * f64::from(ppq))
+                        .ceil()
+                        .clamp(0.0, f64::from(u32::MAX)) as u32
+                })
+                .unwrap_or(0);
+            let fallback_length_ticks = if create_automation_clip_at_requested.is_some() {
+                playlist_bar_ticks(
+                    ppq,
+                    playlist_signature_at_tick(
+                        project_time_signature,
+                        &signature_changes,
+                        position_ticks,
+                    ),
+                )
+                .min(u64::from(u32::MAX)) as u32
+            } else {
+                measure_length_ticks
+            };
+            let length_ticks = content_length_ticks.max(fallback_length_ticks);
             match document.create_playlist_automation_clip(
                 arrangement.id,
                 channel_id,
-                new_automation_clip_position,
-                new_automation_clip_length,
-                new_automation_clip_track,
+                position_ticks,
+                length_ticks,
+                track_index,
             ) {
                 Ok(clip_index) => {
                     self.stop_project_playback();
@@ -21111,7 +21187,11 @@ impl DawUi {
                     self.selected_playlist_clips.insert(clip_index);
                     self.playlist_selection_anchor = Some(clip_index);
                     self.dirty = true;
-                    self.status = format!("Added Automation Channel {channel_id} to the Playlist");
+                    self.status = if create_automation_clip_at_requested.is_some() {
+                        format!("Placed Automation Channel {channel_id} at tick {position_ticks}")
+                    } else {
+                        format!("Added Automation Channel {channel_id} to the Playlist")
+                    };
                     playlist_clip_list_changed = true;
                 }
                 Err(error) => {
