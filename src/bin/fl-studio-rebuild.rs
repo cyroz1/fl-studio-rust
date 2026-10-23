@@ -35641,7 +35641,7 @@ impl DawUi {
                     },
                 )
                 .on_hover_text(
-                    "Drag the selection stretch handle or use Right-Shift+drag on a selected note edge; Alt on the handle bypasses snap, while Alt+Right-Shift uses 25% steps. Edit > Allow resizing from left enables left-edge note resizing · Alt/Option+wheel edits the active property · Shift+Alt/Option+wheel nudges timing",
+                    "Drag the selection stretch handle or use Right-Shift+drag on a selected note edge; Alt on the handle bypasses snap, while Alt+Right-Shift uses 25% steps. Edit > Allow resizing from left enables left-edge resizing. After clicking to move a note, Shift locks pitch and Ctrl/Cmd locks timing · Alt/Option+wheel edits the active property · Shift+Alt/Option+wheel nudges timing",
                 );
                 let note_id = (pattern.id, note.channel_id, *channel_index);
                 let modifiers = scroll_modifiers;
@@ -35908,10 +35908,16 @@ impl DawUi {
                     })
                     && let Some(pointer) = response.interact_pointer_pos()
                 {
-                    let tick_delta =
-                        ((pointer.x - drag.start_pointer.x) / tick_scale).round() as i64;
-                    let semitones =
-                        ((drag.start_pointer.y - pointer.y) / key_height).round() as i32;
+                    let tick_delta = if drag.kind == NoteDragKind::Move && modifiers.command {
+                        0
+                    } else {
+                        ((pointer.x - drag.start_pointer.x) / tick_scale).round() as i64
+                    };
+                    let semitones = if drag.kind == NoteDragKind::Move && modifiers.shift {
+                        0
+                    } else {
+                        ((drag.start_pointer.y - pointer.y) / key_height).round() as i32
+                    };
                     let edit_snap_ticks = if modifiers.alt { 1 } else { snap_ticks };
                     let stretch_bounds = (drag.kind == NoteDragKind::Stretch).then(|| {
                         let start_tick = drag
