@@ -42,7 +42,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --yes ffmpeg libasound2-dev libxcb1-dev libxkbcommon-x11-0 mesa-vulkan-drivers xvfb xdotool
+          sudo apt-get install --yes binutils ffmpeg libarchive-tools libasound2-dev libxcb1-dev libxkbcommon-x11-0 mesa-vulkan-drivers rpm xvfb xdotool
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -166,10 +166,16 @@ jobs:
             x86_64)
               nfpm_asset_arch=x86_64
               package_arch=amd64
+              rpm_arch=x86_64
+              archlinux_arch=x86_64
+              elf_machine="Advanced Micro Devices X86-64"
               ;;
             aarch64)
               nfpm_asset_arch=arm64
               package_arch=arm64
+              rpm_arch=aarch64
+              archlinux_arch=aarch64
+              elf_machine=AArch64
               ;;
             *)
               echo "::error::Unsupported Linux package architecture: $(uname -m)"
@@ -199,6 +205,10 @@ jobs:
           {
             echo "NFPM_ARCH=$package_arch"
             echo "NFPM_VERSION=$package_version"
+            echo "LINUX_DEB_ARCH=$package_arch"
+            echo "LINUX_RPM_ARCH=$rpm_arch"
+            echo "LINUX_ARCHLINUX_ARCH=$archlinux_arch"
+            echo "LINUX_ELF_MACHINE=$elf_machine"
           } >> "$GITHUB_ENV"
 
       - name: Configure Linux AppImage package
@@ -238,6 +248,56 @@ jobs:
             nfpm package --config packaging/nfpm.yaml --packager "$format" \
               --target dist/linux-packages
           done
+
+      - name: Verify Linux package architectures
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          deb_packages=(dist/linux-packages/*.deb)
+          rpm_packages=(dist/linux-packages/*.rpm)
+          arch_packages=(dist/linux-packages/*.pkg.tar.zst)
+          appimages=(dist/*.AppImage)
+          for pair in \
+            "Debian:${#deb_packages[@]}" \
+            "RPM:${#rpm_packages[@]}" \
+            "Arch:${#arch_packages[@]}" \
+            "AppImage:${#appimages[@]}"; do
+            package_name="${pair%%:*}"
+            package_count="${pair##*:}"
+            if [[ "$package_count" != 1 ]]; then
+              echo "::error::Expected exactly one $package_name package; found $package_count."
+              exit 1
+            fi
+          done
+
+          deb_arch="$(dpkg-deb -f "${deb_packages[0]}" Architecture)"
+          if [[ "$deb_arch" != "$LINUX_DEB_ARCH" ]]; then
+            echo "::error::Debian package architecture is $deb_arch; expected $LINUX_DEB_ARCH."
+            exit 1
+          fi
+
+          rpm_arch="$(rpm -qp --qf '%{ARCH}\n' "${rpm_packages[0]}")"
+          if [[ "$rpm_arch" != "$LINUX_RPM_ARCH" ]]; then
+            echo "::error::RPM package architecture is $rpm_arch; expected $LINUX_RPM_ARCH."
+            exit 1
+          fi
+
+          archlinux_arch="$(bsdtar -xOf "${arch_packages[0]}" .PKGINFO \
+            | awk -F ' = ' '$1 == "arch" { print $2; exit }')"
+          if [[ "$archlinux_arch" != "$LINUX_ARCHLINUX_ARCH" ]]; then
+            echo "::error::Arch package architecture is $archlinux_arch; expected $LINUX_ARCHLINUX_ARCH."
+            exit 1
+          fi
+
+          elf_machine="$(readelf --file-header target/release/fl-studio-rebuild \
+            | sed -n 's/^[[:space:]]*Machine:[[:space:]]*//p')"
+          if [[ "$elf_machine" != "$LINUX_ELF_MACHINE" ]]; then
+            echo "::error::Linux executable architecture is '$elf_machine'; expected '$LINUX_ELF_MACHINE'."
+            exit 1
+          fi
+          echo "Verified Debian, RPM, Arch, and executable architectures for $(uname -m)."
 
       - name: Install Linux Debian package
         if: runner.os == 'Linux'
