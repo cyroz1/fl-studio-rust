@@ -23,10 +23,10 @@ use flp_rebuild::audio::{
     MixerTrackPeakMeters, enumerate_devices,
 };
 use flp_rebuild::media::{
-    AudioWaveform, DecodedAudio, SamplePathResolver, WaveformPeak, decode_audio_file,
-    decode_audio_preview, decode_audio_preview_from_position, decode_audio_waveform,
-    find_empty_project_template, summarize_audio_waveform,
-    write_audio_range_to_wav_with_processing,
+    AudioExportOptions, AudioWaveform, DecodedAudio, SamplePathResolver, WaveformPeak,
+    decode_audio_file, decode_audio_preview, decode_audio_preview_from_position,
+    decode_audio_waveform, find_empty_project_template, summarize_audio_waveform,
+    write_audio_range_to_wav_with_pitch_processing,
 };
 use flp_rebuild::midi::{MidiChannelMapping, MidiFile, MidiImportOptions};
 use flp_rebuild::plugins::{PluginCandidate, PluginFormat, scan_installed_plugins};
@@ -4124,6 +4124,7 @@ struct SampleEditorState {
     selection_end: usize,
     spectral_view: bool,
     selection_drag_anchor: Option<usize>,
+    pitch_shift_semitones: f32,
     fade_in_seconds: f32,
     fade_out_seconds: f32,
     normalize_export: bool,
@@ -14947,6 +14948,7 @@ impl DawUi {
                         selection_end,
                         spectral_view: false,
                         selection_drag_anchor: None,
+                        pitch_shift_semitones: 0.0,
                         fade_in_seconds: 0.0,
                         fade_out_seconds: 0.0,
                         normalize_export: false,
@@ -15099,6 +15101,19 @@ impl DawUi {
                     editor.selection_end as f64 / f64::from(sample_rate),
                     selection_duration
                 ));
+                ui.add_enabled_ui(editor.audio.channels.len() <= 2, |ui| {
+                    ui.add(
+                        egui::Slider::new(
+                            &mut editor.pitch_shift_semitones,
+                            -24.0..=24.0,
+                        )
+                        .step_by(0.01)
+                        .text("Pitch shift (semitones)"),
+                    );
+                });
+                if editor.audio.channels.len() > 2 {
+                    ui.small("Pitch shifting is available for mono and stereo samples.");
+                }
                 let maximum_fade_seconds = selection_duration as f32;
                 editor.fade_in_seconds =
                     editor.fade_in_seconds.clamp(0.0, maximum_fade_seconds);
@@ -15125,7 +15140,7 @@ impl DawUi {
                     if ui.button("Save selection as WAV…").clicked() {
                         save_selection = true;
                     }
-                    ui.small("Fades, normalization, and reversal apply to the export; the source stays unchanged.");
+                    ui.small("Pitch, fades, normalization, and reversal apply to the export; the source stays unchanged.");
                 });
             });
         if !open {
@@ -15148,11 +15163,16 @@ impl DawUi {
         let Some(editor) = self.sample_editor.as_ref() else {
             return;
         };
+        let pitch_suffix = if editor.pitch_shift_semitones == 0.0 {
+            "trim"
+        } else {
+            "edited"
+        };
         let default_name = editor
             .path
             .file_stem()
-            .map(|stem| format!("{}-trim.wav", stem.to_string_lossy()))
-            .unwrap_or_else(|| "trimmed-sample.wav".to_owned());
+            .map(|stem| format!("{}-{pitch_suffix}.wav", stem.to_string_lossy()))
+            .unwrap_or_else(|| format!("sample-{pitch_suffix}.wav"));
         let mut dialog = rfd::FileDialog::new()
             .set_file_name(default_name)
             .add_filter("WAV audio", &["wav"]);
@@ -15184,15 +15204,18 @@ impl DawUi {
         let fade_out_frames = (f64::from(editor.fade_out_seconds.max(0.0)) * sample_rate)
             .round()
             .clamp(0.0, selected_frames as f64) as usize;
-        match write_audio_range_to_wav_with_processing(
+        match write_audio_range_to_wav_with_pitch_processing(
             &editor.audio,
             editor.selection_start..editor.selection_end,
-            fade_in_frames,
-            fade_out_frames,
-            editor.reverse_export,
-            editor
-                .normalize_export
-                .then_some(editor.normalization_target_dbfs),
+            AudioExportOptions {
+                pitch_shift_semitones: editor.pitch_shift_semitones,
+                fade_in_frames,
+                fade_out_frames,
+                reverse: editor.reverse_export,
+                normalization_target_dbfs: editor
+                    .normalize_export
+                    .then_some(editor.normalization_target_dbfs),
+            },
             &output_path,
         ) {
             Ok(()) => {

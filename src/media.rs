@@ -13,9 +13,11 @@ use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, TrackType};
 use symphonia::core::io::{MediaSource, MediaSourceStream};
 use symphonia::core::meta::MetadataOptions;
+use timestretch::{StretchParams, pitch_shift};
 
 const FACTORY_DATA_MACRO: &str = "%FLStudioFactoryData%";
 const MAX_DECODED_SAMPLE_BYTES: usize = 512 * 1024 * 1024;
+const MAX_PITCH_SHIFT_INTERLEAVED_SAMPLES: usize = 16 * 1024 * 1024;
 const WAVEFORM_SPECTRUM_WINDOW: usize = 256;
 const WAVEFORM_SPECTRUM_COLUMNS: usize = 128;
 const WAVEFORM_SPECTRUM_BANDS: usize = 32;
@@ -383,6 +385,122 @@ pub fn write_audio_range_to_wav_with_processing(
         let _ = fs::remove_dir(directory);
     }
     Ok(())
+}
+
+/// Processing options for a Sample Editor selection export.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct AudioExportOptions {
+    pub pitch_shift_semitones: f32,
+    pub fade_in_frames: usize,
+    pub fade_out_frames: usize,
+    pub reverse: bool,
+    pub normalization_target_dbfs: Option<f32>,
+}
+
+/// Pitch-shift a selected mono or stereo range while preserving its duration, then export it with
+/// the same fades, normalization, and reverse options as a normal Sample Editor selection.
+/// Pitch shifts are limited to two octaves in either direction.
+pub fn write_audio_range_to_wav_with_pitch_processing(
+    audio: &DecodedAudio,
+    frame_range: Range<usize>,
+    options: AudioExportOptions,
+    output_path: impl AsRef<Path>,
+) -> Result<(), String> {
+    if options.pitch_shift_semitones == 0.0 {
+        return write_audio_range_to_wav_with_processing(
+            audio,
+            frame_range,
+            options.fade_in_frames,
+            options.fade_out_frames,
+            options.reverse,
+            options.normalization_target_dbfs,
+            output_path,
+        );
+    }
+
+    let output_path = output_path.as_ref();
+    if !output_path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("wav"))
+    {
+        return Err("trimmed audio output must use the .wav extension".to_owned());
+    }
+    let pitched_audio = pitch_shift_audio_range(audio, frame_range, options.pitch_shift_semitones)?;
+    let frame_count = pitched_audio.frame_count();
+    write_audio_range_to_wav_with_processing(
+        &pitched_audio,
+        0..frame_count,
+        options.fade_in_frames,
+        options.fade_out_frames,
+        options.reverse,
+        options.normalization_target_dbfs,
+        output_path,
+    )
+}
+
+fn pitch_shift_audio_range(
+    audio: &DecodedAudio,
+    frame_range: Range<usize>,
+    pitch_shift_semitones: f32,
+) -> Result<DecodedAudio, String> {
+    if !pitch_shift_semitones.is_finite() || !(-24.0..=24.0).contains(&pitch_shift_semitones) {
+        return Err("pitch shift must be between -24 and +24 semitones".to_owned());
+    }
+    if !(8_000..=384_000).contains(&audio.sample_rate) {
+        return Err("sample rate must be between 8,000 and 384,000 Hz".to_owned());
+    }
+    let channel_count = audio.channels.len();
+    if !(1..=2).contains(&channel_count) {
+        return Err("pitch shifting supports mono or stereo audio".to_owned());
+    }
+    let source_frames = audio.frame_count();
+    if audio
+        .channels
+        .iter()
+        .any(|channel| channel.len() != source_frames)
+    {
+        return Err("audio channels must have the same frame count".to_owned());
+    }
+    if frame_range.start >= frame_range.end || frame_range.end > source_frames {
+        return Err("audio selection must contain frames from the source".to_owned());
+    }
+    let frame_count = frame_range.end - frame_range.start;
+    let sample_count = frame_count
+        .checked_mul(channel_count)
+        .ok_or_else(|| "pitch-shifted audio selection is too large".to_owned())?;
+    if sample_count > MAX_PITCH_SHIFT_INTERLEAVED_SAMPLES {
+        return Err(
+            "pitch-shifted selection exceeds the 16-million-sample processing limit".to_owned(),
+        );
+    }
+    let mut interleaved = Vec::with_capacity(sample_count);
+    for frame in frame_range {
+        for channel in &audio.channels {
+            let sample = channel[frame];
+            interleaved.push(if sample.is_finite() { sample } else { 0.0 });
+        }
+    }
+    let pitch_factor = 2.0_f64.powf(f64::from(pitch_shift_semitones) / 12.0);
+    let parameters = StretchParams::new(1.0)
+        .with_sample_rate(audio.sample_rate)
+        .with_channels(channel_count as u32);
+    let shifted = pitch_shift(&interleaved, &parameters, pitch_factor)
+        .map_err(|error| format!("could not pitch-shift selected audio: {error}"))?;
+    drop(interleaved);
+    if shifted.len() != sample_count {
+        return Err("pitch-shift engine changed the selected audio duration".to_owned());
+    }
+    let mut channels = vec![Vec::with_capacity(frame_count); channel_count];
+    for frame in 0..frame_count {
+        for channel in 0..channel_count {
+            let sample = shifted[frame * channel_count + channel];
+            channels[channel].push(if sample.is_finite() { sample } else { 0.0 });
+        }
+    }
+    Ok(DecodedAudio {
+        sample_rate: audio.sample_rate,
+        channels,
+    })
 }
 
 /// Decode common FL Studio sample formats by inspecting file content rather than its extension.
@@ -1829,6 +1947,73 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(samples, [0.75, 0.5, 0.25]);
         fs::remove_dir_all(root).expect("fixture directory should be removed");
+    }
+
+    #[test]
+    fn sample_editor_pitch_shift_changes_pitch_and_keeps_selection_duration() {
+        let root = fixture_root();
+        fs::create_dir_all(&root).expect("fixture directory should be created");
+        let output_path = root.join("pitched.wav");
+        let sample_rate = 44_100_u32;
+        let audio = DecodedAudio {
+            sample_rate,
+            channels: vec![
+                (0..sample_rate as usize)
+                    .map(|frame| {
+                        (std::f32::consts::TAU * 440.0 * frame as f32 / sample_rate as f32).sin()
+                            * 0.5
+                    })
+                    .collect(),
+            ],
+        };
+        let original = audio.clone();
+
+        write_audio_range_to_wav_with_pitch_processing(
+            &audio,
+            0..sample_rate as usize,
+            AudioExportOptions {
+                pitch_shift_semitones: 12.0,
+                ..AudioExportOptions::default()
+            },
+            &output_path,
+        )
+        .expect("one-octave pitch shift should export");
+
+        let bytes = fs::read(&output_path).expect("pitched WAV should be readable");
+        let samples = bytes[44..]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&sample| f32::from_le_bytes(sample))
+            .collect::<Vec<_>>();
+        assert_eq!(samples.len(), sample_rate as usize);
+        let middle = &samples[4_410..39_690];
+        let positive_crossings = middle
+            .windows(2)
+            .filter(|pair| pair[0] <= 0.0 && pair[1] > 0.0)
+            .count();
+        let estimated_frequency =
+            positive_crossings as f32 * sample_rate as f32 / middle.len() as f32;
+        assert!((850.0..=910.0).contains(&estimated_frequency));
+        assert_eq!(audio, original);
+        fs::remove_dir_all(root).expect("fixture directory should be removed");
+    }
+
+    #[test]
+    fn sample_editor_pitch_shift_rejects_unsupported_or_invalid_inputs() {
+        let stereo = DecodedAudio {
+            sample_rate: 44_100,
+            channels: vec![vec![0.0; 8], vec![0.0; 8]],
+        };
+        assert!(pitch_shift_audio_range(&stereo, 0..8, f32::NAN).is_err());
+        assert!(pitch_shift_audio_range(&stereo, 0..8, 24.01).is_err());
+        assert!(pitch_shift_audio_range(&stereo, 0..9, 1.0).is_err());
+
+        let multichannel = DecodedAudio {
+            sample_rate: 44_100,
+            channels: vec![vec![0.0; 8], vec![0.0; 8], vec![0.0; 8]],
+        };
+        assert!(pitch_shift_audio_range(&multichannel, 0..8, 1.0).is_err());
     }
 
     #[test]
