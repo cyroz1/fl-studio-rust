@@ -427,6 +427,14 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 name,
             )
         }
+        [command, input, output, pattern_id, color] if command == "set-pattern-color" => {
+            set_pattern_color(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_rgb_hex(color)?,
+            )
+        }
         [command, input, output, pattern_id] if command == "delete-pattern" => {
             delete_pattern(
                 Path::new(input),
@@ -3421,6 +3429,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild create-pattern <input.flp> <output.flp>\n",
             "  flp-rebuild duplicate-pattern <input.flp> <output.flp> <pattern-id>\n",
             "  flp-rebuild rename-pattern <input.flp> <output.flp> <pattern-id> <name>\n",
+            "  flp-rebuild set-pattern-color <input.flp> <output.flp> <pattern-id> <RRGGBB>\n",
             "  flp-rebuild delete-pattern <input.flp> <output.flp> <pattern-id>\n",
             "  flp-rebuild set-project-info <input.flp> <output.flp> <title|-> <author|-> <genre|-> <comments|-> <web-link|->\n",
             "  flp-rebuild set-project-settings <input.flp> <output.flp> <play-truncated:0|1|-> <fast-declick:0|1|-> [pan-law-raw|-]\n",
@@ -4648,11 +4657,11 @@ fn parse_u32(value: &str, description: &str) -> Result<u32, String> {
 fn parse_rgb_hex(value: &str) -> Result<[u8; 3], String> {
     let digits = value.strip_prefix('#').unwrap_or(value);
     if digits.len() != 6 || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err("channel color must be six hexadecimal digits (RRGGBB)".to_owned());
+        return Err("color must be six hexadecimal digits (RRGGBB)".to_owned());
     }
     let parse_component = |start| {
         u8::from_str_radix(&digits[start..start + 2], 16)
-            .map_err(|_| "channel color must be six hexadecimal digits (RRGGBB)".to_owned())
+            .map_err(|_| "color must be six hexadecimal digits (RRGGBB)".to_owned())
     };
     Ok([
         parse_component(0)?,
@@ -8413,6 +8422,31 @@ fn rename_pattern(input: &Path, output: &Path, pattern_id: u16, name: &str) -> R
     Ok(())
 }
 
+fn set_pattern_color(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    rgb: [u8; 3],
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .set_pattern_color(pattern_id, rgb)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "set Pattern {pattern_id} color to #{:02X}{:02X}{:02X} in {}",
+        rgb[0],
+        rgb[1],
+        rgb[2],
+        output.display()
+    );
+    Ok(())
+}
+
 fn delete_pattern(input: &Path, output: &Path, pattern_id: u16) -> Result<(), String> {
     let (_, mut document) = load_document(input)?;
     document
@@ -10070,7 +10104,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_channel_rgb_in_hex_form_with_optional_prefix() {
+    fn parses_rgb_color_in_hex_form_with_optional_prefix() {
         assert_eq!(parse_rgb_hex("1aB2c3"), Ok([0x1A, 0xB2, 0xC3]));
         assert_eq!(parse_rgb_hex("#102030"), Ok([0x10, 0x20, 0x30]));
         assert!(parse_rgb_hex("#12345").is_err());
