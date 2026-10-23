@@ -155,7 +155,8 @@ impl PlaylistTempoMap {
         Ok(frames.round() as u64)
     }
 
-    fn tempo_bpm_at_tick(&self, tick: u64) -> f64 {
+    /// Return the active tempo at an absolute Playlist tick.
+    pub fn tempo_bpm_at_tick(&self, tick: u64) -> f64 {
         let segment_index = self
             .segments
             .partition_point(|segment| segment.start_tick <= tick)
@@ -591,6 +592,9 @@ impl Default for SamplerPatternRenderOptions {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SamplerLiveNoteEvent {
+    TempoBpmMilli {
+        value: u32,
+    },
     NoteOn {
         channel: u8,
         key: u8,
@@ -5230,6 +5234,32 @@ pub fn stream_sampler_midi_input_to_device(
         &target_channel_ids,
         Some(cancelled),
     )?;
+    let channels_by_id = channels
+        .iter()
+        .map(|channel| (channel.id(), channel))
+        .collect::<HashMap<_, _>>();
+    let ppq = document.header().ppq();
+    let project_tempo_bpm = document.metadata().tempo_bpm().unwrap_or(140.0);
+    let mut base_resample_pitch_adjustment_by_channel = HashMap::<u16, f64>::new();
+    for target_channel_id in &target_channel_ids {
+        let channel = channels_by_id
+            .get(target_channel_id)
+            .ok_or_else(|| format!("Sampler channel {target_channel_id} was not found"))?;
+        let source = render
+            .sources_by_channel
+            .get(target_channel_id)
+            .ok_or_else(|| format!("Sampler channel {target_channel_id} has no resolved sample"))?;
+        if let Some((_, pitch_adjustment_cents)) = sampler_resample_stretch_pitch_adjustment(
+            channel,
+            source.audio.frame_count(),
+            source.audio.sample_rate,
+            ppq,
+            project_tempo_bpm,
+        )? {
+            base_resample_pitch_adjustment_by_channel
+                .insert(*target_channel_id, pitch_adjustment_cents);
+        }
+    }
     let channel_router = ChannelNoteRouter::new(channels);
     let empty_notes = [];
     let mut engine = SamplerVoiceEngine::with_resampling_quality_and_pan_law(
@@ -5249,6 +5279,7 @@ pub fn stream_sampler_midi_input_to_device(
     let mut block = vec![0.0f32; LIVE_BLOCK_FRAMES * 2];
     let mut block_start = 0u64;
     let mut note_targets = HashMap::<(u8, u8), VecDeque<Vec<(u16, u16)>>>::new();
+    let mut live_resample_fine_pitch_by_channel = HashMap::<u16, i16>::new();
     loop {
         check_cancelled(Some(cancelled))?;
         if writer.is_cancelled() {
@@ -5256,6 +5287,46 @@ pub fn stream_sampler_midi_input_to_device(
         }
         loop {
             match events.try_recv() {
+                Ok(SamplerLiveNoteEvent::TempoBpmMilli { value }) => {
+                    let tempo_bpm = f64::from(value.max(1)) / 1000.0;
+                    live_resample_fine_pitch_by_channel.clear();
+                    for (target_channel_id, base_adjustment_cents) in
+                        &base_resample_pitch_adjustment_by_channel
+                    {
+                        let channel = channels_by_id.get(target_channel_id).ok_or_else(|| {
+                            format!("Sampler channel {target_channel_id} was not found")
+                        })?;
+                        let source = render
+                            .sources_by_channel
+                            .get(target_channel_id)
+                            .ok_or_else(|| {
+                                format!(
+                                    "Sampler channel {target_channel_id} has no resolved sample"
+                                )
+                            })?;
+                        let Some((_, pitch_adjustment_cents)) =
+                            sampler_resample_stretch_pitch_adjustment(
+                                channel,
+                                source.audio.frame_count(),
+                                source.audio.sample_rate,
+                                ppq,
+                                tempo_bpm,
+                            )?
+                        else {
+                            return Err(format!(
+                                "Sampler channel {target_channel_id} Resample settings changed while preparing live input"
+                            ));
+                        };
+                        live_resample_fine_pitch_by_channel.insert(
+                            *target_channel_id,
+                            sampler_note_fine_pitch_with_delta(
+                                0,
+                                pitch_adjustment_cents - base_adjustment_cents,
+                                *target_channel_id,
+                            )?,
+                        );
+                    }
+                }
                 Ok(SamplerLiveNoteEvent::NoteOn {
                     channel: midi_channel,
                     key,
@@ -5294,7 +5365,10 @@ pub fn stream_sampler_midi_input_to_device(
                             slide_note: false,
                             velocity,
                             pan: engine.live_midi_pan(midi_channel),
-                            fine_pitch_offset_cents: 0,
+                            fine_pitch_offset_cents: live_resample_fine_pitch_by_channel
+                                .get(&target_channel_id)
+                                .copied()
+                                .unwrap_or_default(),
                             layer_gain,
                         }) {
                             engine.set_voice_input_midi_channel(slot_index, midi_channel);

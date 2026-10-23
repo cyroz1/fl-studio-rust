@@ -12447,6 +12447,35 @@ impl DawUi {
         tempo_map.tick_at_frame(frames, engine.sample_rate())
     }
 
+    fn live_sampler_tempo_bpm_milli(&self) -> u32 {
+        let project_tempo_bpm = self
+            .document
+            .as_ref()
+            .and_then(|document| document.metadata().tempo_bpm())
+            .unwrap_or(140.0);
+        let tempo_bpm =
+            if self.playing && !self.pattern_playback_mode && self.playlist_playback_loaded {
+                self.current_playhead_tick()
+                    .filter(|tick| tick.is_finite() && *tick >= 0.0)
+                    .and_then(|tick| {
+                        self.playlist_tempo_map
+                            .as_ref()
+                            .map(|tempo_map| tempo_map.tempo_bpm_at_tick(tick.floor() as u64))
+                    })
+                    .unwrap_or(project_tempo_bpm)
+            } else {
+                project_tempo_bpm
+            };
+        let tempo_milli = (tempo_bpm * 1000.0).round();
+        if !tempo_milli.is_finite() || tempo_milli <= 1.0 {
+            1
+        } else if tempo_milli >= f64::from(u32::MAX) {
+            u32::MAX
+        } else {
+            tempo_milli as u32
+        }
+    }
+
     fn current_pattern_mode_playhead_tick(&self) -> Option<(u16, f64)> {
         let (pattern_id, loop_length_ticks) = self.pattern_mode_playback_source?;
         let document = self.document.as_ref()?;
@@ -25390,7 +25419,7 @@ impl DawUi {
                             let mut mode_changed = false;
                             ui.collapsing("Time stretch", |ui| {
                                 ui.small(
-                                    "Playlist Audio Clips use TIME, PITCH, and MUL in Resample, Stretch, and Elastique 3 Generic modes. Playlist Sampler notes apply Resample settings at each note's start tempo; Pattern playback uses project tempo. Other Sampler modes and tempo changes during a stretched Playlist sample are unsupported.",
+                                    "Playlist Audio Clips use TIME, PITCH, and MUL in Resample, Stretch, and Elastique 3 Generic modes. Playlist Sampler notes and live MIDI input use the transport tempo at note-on; each voice keeps that rate. Pattern playback uses project tempo. Other Sampler modes and tempo changes during a stretched scheduled Playlist sample are unsupported.",
                                 );
                                 ui.horizontal_wrapped(|ui| {
                                     time_changed = ui
@@ -46030,9 +46059,22 @@ impl DawUi {
         {
             return;
         }
-        if let Some(session) = &self.live_sampler_input
-            && session.sender.send(live_event).is_ok()
-        {
+        let event_sent = if let Some(session) = &self.live_sampler_input {
+            if matches!(live_event, SamplerLiveNoteEvent::NoteOn { .. }) {
+                session
+                    .sender
+                    .send(SamplerLiveNoteEvent::TempoBpmMilli {
+                        value: self.live_sampler_tempo_bpm_milli(),
+                    })
+                    .is_ok()
+                    && session.sender.send(live_event).is_ok()
+            } else {
+                session.sender.send(live_event).is_ok()
+            }
+        } else {
+            false
+        };
+        if event_sent {
             if let Some((source_note, audition_key)) = mapped_note_on {
                 self.midi_live_sampler_note_mapping
                     .entry(source_note)

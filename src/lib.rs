@@ -774,8 +774,10 @@ pub struct ChannelLevelAdjustmentsEdit {
 /// stretch-mode codes follow the independently documented PyFLP channel layout. Playlist Audio
 /// Clip playback and rendering apply supported channel settings for modes Resample,
 /// Stretch, and Elastique 3 Generic. Playlist Sampler notes apply Resample settings at each
-/// scheduled note's start tempo; Pattern Sampler playback uses project tempo. Tempo automation
-/// during a stretched Playlist Sampler sample and other Sampler stretch modes remain unsupported.
+/// scheduled note's start tempo, and live Sampler MIDI input during Playlist playback uses the
+/// transport tempo at note-on; each voice keeps that rate for its lifetime. Pattern Sampler
+/// playback and audition use project tempo. Tempo automation during a stretched scheduled
+/// Playlist Sampler sample and other Sampler stretch modes remain unsupported.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ChannelStretchSettings {
     time_raw: u32,
