@@ -8,6 +8,9 @@ use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use audio_unit_probe::{
+    AudioUnitProbeKey, AudioUnitProbeRequest, AudioUnitProbeResponse, AudioUnitProbeState,
+};
 use clap_probe::{
     ClapInspectionResponse, ClapInspectionState, ClapInstanceInspectionResponse,
     ClapInstanceInspectionState, ClapNotePreviewRequest, ClapNotePreviewResponse,
@@ -76,6 +79,8 @@ use flp_rebuild::{
 use md5::{Digest, Md5};
 use vst3_host::midi::{MidiChannel as Vst3MidiChannel, MidiEvent as Vst3MidiEvent};
 
+#[path = "fl-studio-rebuild/audio_unit_probe.rs"]
+mod audio_unit_probe;
 #[path = "fl-studio-rebuild/clap_probe.rs"]
 mod clap_probe;
 mod midi_input;
@@ -781,6 +786,24 @@ fn clap_descriptor_supports_note_preview(features: &[String]) -> bool {
 
 fn main() -> eframe::Result {
     let args = std::env::args_os().collect::<Vec<_>>();
+    if args
+        .get(1)
+        .is_some_and(|argument| argument == std::ffi::OsStr::new(audio_unit_probe::PROBE_FLAG))
+    {
+        let (Some(type_code), Some(subtype_code), Some(manufacturer_code)) = (
+            args.get(2).and_then(|value| value.to_str()),
+            args.get(3).and_then(|value| value.to_str()),
+            args.get(4).and_then(|value| value.to_str()),
+        ) else {
+            eprintln!("Audio Unit probe needs type, subtype, and manufacturer codes");
+            std::process::exit(2);
+        };
+        std::process::exit(audio_unit_probe::run_child(
+            type_code,
+            subtype_code,
+            manufacturer_code,
+        ));
+    }
     if args
         .get(1)
         .is_some_and(|argument| argument == std::ffi::OsStr::new(clap_probe::PROBE_FLAG))
@@ -4291,6 +4314,9 @@ struct DawUi {
     playlist_track_zoom: f32,
     playlist_waveform_mode: PlaylistWaveformMode,
     plugin_candidates: Vec<PluginCandidate>,
+    audio_unit_probe_sender: Sender<AudioUnitProbeRequest>,
+    audio_unit_probe_receiver: Receiver<AudioUnitProbeResponse>,
+    audio_unit_probe_states: BTreeMap<AudioUnitProbeKey, AudioUnitProbeState>,
     clap_inspection_sender: Sender<PathBuf>,
     clap_inspection_receiver: Receiver<ClapInspectionResponse>,
     clap_inspection_states: BTreeMap<PathBuf, ClapInspectionState>,
@@ -5203,6 +5229,8 @@ impl DawUi {
                 MIN_WINDOW_INNER_HEIGHT / ui_scale,
             )));
         let plugin_candidates = scan_installed_plugins().candidates;
+        let (audio_unit_probe_sender, audio_unit_probe_receiver) =
+            audio_unit_probe::start_worker(creation.egui_ctx.clone());
         let (clap_inspection_sender, clap_inspection_receiver) =
             clap_probe::start_worker(creation.egui_ctx.clone());
         let (clap_instance_inspection_sender, clap_instance_inspection_receiver) =
@@ -5551,6 +5579,9 @@ impl DawUi {
             playlist_waveform_mode: PlaylistWaveformMode::Combined,
             playlist_zero_crossing_splits,
             plugin_candidates,
+            audio_unit_probe_sender,
+            audio_unit_probe_receiver,
+            audio_unit_probe_states: BTreeMap::new(),
             clap_inspection_sender,
             clap_inspection_receiver,
             clap_inspection_states: BTreeMap::new(),
@@ -45875,6 +45906,7 @@ impl DawUi {
         let mut inspect_clap_path = None;
         let mut inspect_clap_instance = None;
         let mut preview_clap_note = None;
+        let mut probe_audio_unit = None;
         let mut open_id = None;
         let mut close_id = None;
         let mut parameter_edits = Vec::new();
@@ -45915,6 +45947,14 @@ impl DawUi {
             };
             self.clap_instance_inspection_states
                 .insert((path, plugin_id), state);
+        }
+        while let Ok((path, component, result)) = self.audio_unit_probe_receiver.try_recv() {
+            let key = audio_unit_probe::probe_key(&path, &component);
+            let state = match result {
+                Ok(result) => AudioUnitProbeState::Completed(result),
+                Err(error) => AudioUnitProbeState::Failed(error),
+            };
+            self.audio_unit_probe_states.insert(key, state);
         }
 
         ui.horizontal(|ui| {
@@ -46448,7 +46488,7 @@ impl DawUi {
                 ));
                 ui.label(
                     egui::RichText::new(
-                        "Component names and identifiers are read from Info.plist. Each valid identity is checked against the macOS Audio Component catalog; loading and playback are not available yet.",
+                        "Component identities are read from Info.plist and checked against the macOS catalog. Registered components can be instantiated and initialized in a short-lived helper process; audio processing and persistent hosting are not available yet.",
                     )
                     .color(MUTED),
                 );
@@ -46460,19 +46500,63 @@ impl DawUi {
                             ui.strong(&candidate.name);
                             ui.small(candidate.path.display().to_string());
                             for component in &candidate.audio_unit_components {
+                                let key = audio_unit_probe::probe_key(&candidate.path, component);
+                                let state = self.audio_unit_probe_states.get(&key);
                                 let registry_status = match component.registered {
                                     Some(true) => " · registered with macOS",
                                     Some(false) => " · not found in macOS catalog",
                                     None => " · catalog not checked",
                                 };
-                                ui.small(format!(
-                                    "{} · type {} · subtype {} · manufacturer {}{}",
-                                    component.name,
-                                    component.type_code,
-                                    component.subtype_code,
-                                    component.manufacturer_code,
-                                    registry_status
-                                ));
+                                ui.horizontal(|ui| {
+                                    ui.small(format!(
+                                        "{} · type {} · subtype {} · manufacturer {}{}",
+                                        component.name,
+                                        component.type_code,
+                                        component.subtype_code,
+                                        component.manufacturer_code,
+                                        registry_status
+                                    ));
+                                    let probing =
+                                        matches!(state, Some(AudioUnitProbeState::Probing));
+                                    if ui
+                                        .add_enabled(
+                                            component.registered == Some(true) && !probing,
+                                            egui::Button::new(if probing {
+                                                "Initializing…"
+                                            } else if state.is_some() {
+                                                "Test again"
+                                            } else {
+                                                "Test initialize"
+                                            }),
+                                        )
+                                        .clicked()
+                                    {
+                                        probe_audio_unit =
+                                            Some((candidate.path.clone(), component.clone()));
+                                    }
+                                });
+                                match state {
+                                    Some(AudioUnitProbeState::Probing) => {
+                                        ui.small("Testing in a short-lived helper process…");
+                                    }
+                                    Some(AudioUnitProbeState::Completed(result)) => {
+                                        let summary = result.summary();
+                                        if result.component_found
+                                            && result.instance_status == Some(0)
+                                            && result.initialize_status == Some(0)
+                                            && result.uninitialize_status == Some(0)
+                                            && result.dispose_status == Some(0)
+                                        {
+                                            ui.colored_label(GREEN, summary);
+                                        } else {
+                                            ui.colored_label(ORANGE, summary);
+                                        }
+                                    }
+                                    Some(AudioUnitProbeState::Failed(error)) => {
+                                        ui.colored_label(ORANGE, error);
+                                    }
+                                    None => {}
+                                }
                             }
                             if candidate.audio_unit_components.is_empty() {
                                 ui.small("No AudioComponents metadata decoded");
@@ -46490,6 +46574,26 @@ impl DawUi {
                 self.clap_inspection_states.insert(
                     path,
                     ClapInspectionState::Failed("descriptor worker is unavailable".to_owned()),
+                );
+            } else {
+                ui.ctx().request_repaint();
+            }
+        }
+
+        if let Some((path, component)) = probe_audio_unit {
+            let key = audio_unit_probe::probe_key(&path, &component);
+            self.audio_unit_probe_states
+                .insert(key.clone(), AudioUnitProbeState::Probing);
+            if self
+                .audio_unit_probe_sender
+                .send((path, component))
+                .is_err()
+            {
+                self.audio_unit_probe_states.insert(
+                    key,
+                    AudioUnitProbeState::Failed(
+                        "Audio Unit probe worker is unavailable".to_owned(),
+                    ),
                 );
             } else {
                 ui.ctx().request_repaint();
