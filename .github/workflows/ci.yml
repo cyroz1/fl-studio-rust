@@ -29,7 +29,7 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install stable Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -1677,7 +1677,7 @@ jobs:
 
       - name: Upload Linux packages
         if: runner.os == 'Linux'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: installers-${{ matrix.platform }}
           path: dist/ci-installer/*
@@ -1686,7 +1686,7 @@ jobs:
 
       - name: Upload Windows setup installer
         if: runner.os == 'Windows'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: installers-${{ matrix.platform }}
           path: dist/ci-installer/*
@@ -1695,7 +1695,7 @@ jobs:
 
       - name: Upload macOS disk image
         if: runner.os == 'macOS'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: installers-${{ matrix.platform }}
           path: dist/ci-installer/*
