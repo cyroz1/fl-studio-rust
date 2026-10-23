@@ -3466,6 +3466,13 @@ struct PianoRollSelectionDrag {
     additive: bool,
 }
 
+#[derive(Clone, Debug)]
+struct PianoRollMagicLasso {
+    pattern_id: u16,
+    channel_id: u16,
+    points: Vec<egui::Pos2>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct PianoRollZoomDrag {
     pattern_id: u16,
@@ -4138,6 +4145,7 @@ struct DawUi {
     last_piano_roll_mute_note: Option<(u16, u16, usize)>,
     last_piano_roll_delete_note: Option<(u16, u16, usize)>,
     piano_roll_selection_drag: Option<PianoRollSelectionDrag>,
+    piano_roll_magic_lasso: Option<PianoRollMagicLasso>,
     piano_roll_zoom_mode: bool,
     piano_roll_zoom_drag: Option<PianoRollZoomDrag>,
     piano_roll_playback_mode: bool,
@@ -5412,6 +5420,7 @@ impl DawUi {
             last_piano_roll_mute_note: None,
             last_piano_roll_delete_note: None,
             piano_roll_selection_drag: None,
+            piano_roll_magic_lasso: None,
             piano_roll_zoom_mode: false,
             piano_roll_zoom_drag: None,
             piano_roll_playback_mode: false,
@@ -25656,6 +25665,7 @@ impl DawUi {
     }
 
     fn apply_piano_roll_selection_command(&mut self, command: PianoRollSelectionCommand) {
+        self.piano_roll_magic_lasso = None;
         let target = self.selected_pattern.zip(self.selected_note_channel);
         let pattern = target.and_then(|(pattern_id, _)| {
             self.document.as_ref().and_then(|document| {
@@ -26850,6 +26860,12 @@ impl DawUi {
         let mut note_mute_requested = None;
         let mut note_nudge_requested = None;
         let mut note_rotation_requested = None;
+        let cancel_magic_lasso = self.piano_roll_magic_lasso.is_some()
+            && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        if cancel_magic_lasso {
+            self.piano_roll_magic_lasso = None;
+            self.status = "Magic Lasso canceled".to_owned();
+        }
         if ui.memory(|memory| memory.focused().is_none()) {
             delete_selection_requested = ui.input_mut(|input| {
                 input.consume_key(egui::Modifiers::NONE, egui::Key::Delete)
@@ -27495,6 +27511,30 @@ impl DawUi {
                 }
             });
             ui.menu_button("Selection", |ui| {
+                if self.piano_roll_magic_lasso.is_some() {
+                    if ui.button("Cancel Magic Lasso (Esc)").clicked() {
+                        self.piano_roll_magic_lasso = None;
+                        self.status = "Magic Lasso canceled".to_owned();
+                        ui.close();
+                    }
+                } else if ui.button("Magic Lasso").clicked() {
+                    if !self.selected_piano_notes.is_empty() {
+                        self.status = "Deselect notes before using Magic Lasso".to_owned();
+                    } else if let Some((pattern_id, channel_id)) =
+                        self.selected_pattern.zip(self.selected_note_channel)
+                    {
+                        self.piano_roll_magic_lasso = Some(PianoRollMagicLasso {
+                            pattern_id,
+                            channel_id,
+                            points: Vec::new(),
+                        });
+                        self.status =
+                            "Magic Lasso armed: move around notes without clicking".to_owned();
+                        ui.close();
+                    } else {
+                        self.status = "Select a Pattern channel before using Magic Lasso".to_owned();
+                    }
+                }
                 if ui.button("Select all notes (Ctrl/Cmd+A)").clicked() {
                     self.apply_piano_roll_selection_command(PianoRollSelectionCommand::All);
                     ui.close();
@@ -36890,6 +36930,94 @@ impl DawUi {
                 }
             }
             let modifiers = ui.input(|input| input.modifiers);
+            if let Some(mut lasso) = self.piano_roll_magic_lasso.take() {
+                if lasso.pattern_id != pattern.id
+                    || Some(lasso.channel_id) != self.selected_note_channel
+                {
+                    self.status = "Magic Lasso canceled because the target changed".to_owned();
+                } else if !self.selected_piano_notes.is_empty() {
+                    self.status = "Magic Lasso canceled because notes are selected".to_owned();
+                } else if primary_down || secondary_down {
+                    self.status = "Magic Lasso canceled by pointer click".to_owned();
+                } else if let Some(pointer) = pointer.filter(|pointer| grid_body_rect.contains(*pointer))
+                {
+                    let returning_to_start = lasso
+                        .points
+                        .first()
+                        .is_some_and(|start| lasso.points.len() >= 8 && (*start - pointer).length() <= 12.0);
+                    if lasso.points.last().is_none_or(|last| {
+                        (*last - pointer).length() >= 2.0 || returning_to_start
+                    }) {
+                        if lasso.points.len() >= 2048 {
+                            lasso.points.clear();
+                        }
+                        lasso.points.push(pointer);
+                    }
+                    for segment in lasso.points.windows(2) {
+                        painter.line_segment(
+                            [segment[0], segment[1]],
+                            Stroke::new(2.0, Color32::from_rgb(105, 178, 245)),
+                        );
+                    }
+                    if let Some(start) = lasso.points.first() {
+                        painter.circle_filled(
+                            *start,
+                            3.0,
+                            Color32::from_rgb(105, 178, 245),
+                        );
+                    }
+                    if piano_roll_magic_lasso_is_closed(&lasso.points) {
+                        let enclosed_note_indices = note_selection_rects
+                            .iter()
+                            .filter(|(channel_id, _, note_rect, _, _)| {
+                                *channel_id == lasso.channel_id
+                                    && piano_roll_point_in_polygon(
+                                        note_rect.center(),
+                                        &lasso.points,
+                                    )
+                            })
+                            .map(|(_, channel_note_index, _, _, _)| *channel_note_index)
+                            .collect::<Vec<_>>();
+                        if enclosed_note_indices.is_empty() {
+                            lasso.points.clear();
+                            self.status =
+                                "Magic Lasso found no notes; try another loop".to_owned();
+                            self.piano_roll_magic_lasso = Some(lasso);
+                        } else {
+                            update_piano_roll_box_selection_with_grouping(
+                                pattern,
+                                pattern.id,
+                                lasso.channel_id,
+                                &enclosed_note_indices,
+                                false,
+                                self.piano_roll_note_grouping_enabled,
+                                &mut self.selected_piano_notes,
+                            );
+                            self.selected_note = self
+                                .selected_piano_notes
+                                .iter()
+                                .rev()
+                                .find(|(selected_pattern, _, _)| *selected_pattern == pattern.id)
+                                .copied();
+                            self.selected_note_channel = Some(lasso.channel_id);
+                            let selected_count = self
+                                .selected_piano_notes
+                                .iter()
+                                .filter(|(selected_pattern, _, _)| {
+                                    *selected_pattern == pattern.id
+                                })
+                                .count();
+                            self.status =
+                                format!("Magic Lasso selected {selected_count} notes");
+                        }
+                    } else {
+                        self.piano_roll_magic_lasso = Some(lasso);
+                    }
+                } else {
+                    lasso.points.clear();
+                    self.piano_roll_magic_lasso = Some(lasso);
+                }
+            }
             if self.piano_roll_zoom_mode
                 && grid_response.drag_started_by(PointerButton::Primary)
                 && let Some(origin) = ui
@@ -50253,6 +50381,52 @@ fn piano_roll_time_tick_at_x(
         .round()
         .clamp(0.0, u32::MAX as f32) as i64;
     snap_note_tick(tick, snap_ticks, 0)
+}
+
+fn piano_roll_magic_lasso_is_closed(points: &[egui::Pos2]) -> bool {
+    if points.len() < 8 {
+        return false;
+    }
+    let first = points[0];
+    let last = points[points.len() - 1];
+    if (last - first).length() > 12.0 {
+        return false;
+    }
+    let mut path_length = points
+        .windows(2)
+        .map(|segment| (segment[1] - segment[0]).length())
+        .sum::<f32>();
+    path_length += (last - first).length();
+    let twice_area = points
+        .iter()
+        .zip(points.iter().cycle().skip(1))
+        .take(points.len())
+        .map(|(point, next)| point.x * next.y - next.x * point.y)
+        .sum::<f32>()
+        .abs();
+    path_length >= 48.0 && twice_area >= 320.0
+}
+
+fn piano_roll_point_in_polygon(point: egui::Pos2, polygon: &[egui::Pos2]) -> bool {
+    if polygon.len() < 3 {
+        return false;
+    }
+    let mut inside = false;
+    let mut previous = polygon.len() - 1;
+    for current in 0..polygon.len() {
+        let current_point = polygon[current];
+        let previous_point = polygon[previous];
+        if (current_point.y > point.y) != (previous_point.y > point.y) {
+            let crossing_x = (previous_point.x - current_point.x) * (point.y - current_point.y)
+                / (previous_point.y - current_point.y)
+                + current_point.x;
+            if point.x < crossing_x {
+                inside = !inside;
+            }
+        }
+        previous = current;
+    }
+    inside
 }
 
 fn piano_roll_slice_line_cut_x(
