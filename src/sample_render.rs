@@ -10742,6 +10742,10 @@ fn audio_clip_pitch_ratio(pitch_offset_cents: f64) -> f64 {
     2.0f64.powf(pitch_offset_cents / 1_200.0)
 }
 
+fn audio_clip_master_pitch_ratio(pitch_offset_cents: i16) -> f64 {
+    audio_clip_pitch_ratio(f64::from(pitch_offset_cents))
+}
+
 fn audio_clip_duration_preserving_pitch_cents(
     channel_pitch_cents: f64,
     stretch_pitch_cents: i32,
