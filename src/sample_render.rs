@@ -5241,6 +5241,22 @@ pub fn stream_sampler_midi_input_to_device(
     let ppq = document.header().ppq();
     let project_tempo_bpm = document.metadata().tempo_bpm().unwrap_or(140.0);
     let mut base_resample_pitch_adjustment_by_channel = HashMap::<u16, f64>::new();
+    let duration_stretch_channels = target_channel_ids
+        .iter()
+        .filter(|target_channel_id| {
+            channels_by_id
+                .get(target_channel_id)
+                .and_then(|channel| channel.stretch_settings())
+                .is_some_and(|settings| {
+                    settings.time_raw() > 0
+                        && matches!(
+                            settings.mode(),
+                            ChannelStretchMode::Stretch | ChannelStretchMode::Elastique3Generic
+                        )
+                })
+        })
+        .copied()
+        .collect::<BTreeSet<_>>();
     for target_channel_id in &target_channel_ids {
         let channel = channels_by_id
             .get(target_channel_id)
@@ -5289,6 +5305,13 @@ pub fn stream_sampler_midi_input_to_device(
             match events.try_recv() {
                 Ok(SamplerLiveNoteEvent::TempoBpmMilli { value }) => {
                     let tempo_bpm = f64::from(value.max(1)) / 1000.0;
+                    if (tempo_bpm - project_tempo_bpm).abs() > 0.0005
+                        && let Some(target_channel_id) = duration_stretch_channels.first()
+                    {
+                        return Err(format!(
+                            "Sampler channel {target_channel_id} uses duration-preserving Stretch; live tempo changes require rebuilding the stretched sample"
+                        ));
+                    }
                     live_resample_fine_pitch_by_channel.clear();
                     for (target_channel_id, base_adjustment_cents) in
                         &base_resample_pitch_adjustment_by_channel
@@ -6240,6 +6263,258 @@ fn sampler_resample_stretch_pitch_adjustment(
     Ok(Some((target_ticks, pitch_adjustment_cents)))
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SamplerDurationPreservingStretchPlan {
+    target_ticks: f64,
+    target_frames: usize,
+    stretch_ratio: f64,
+    pitch_raw: i32,
+    tempo_bpm: f64,
+}
+
+#[derive(Clone, Copy)]
+struct SamplerDurationPreservingStretchSettings {
+    time_raw: u32,
+    pitch_raw: i32,
+    multiplier_raw: i32,
+    mode_raw: i32,
+}
+
+fn sampler_duration_preserving_stretch_plan(
+    channel: &ChannelSummary,
+    source_frames: usize,
+    source_sample_rate: u32,
+    ppq: u16,
+    tempo_bpm: f64,
+) -> Result<Option<SamplerDurationPreservingStretchPlan>, String> {
+    let Some(settings) = channel
+        .stretch_settings()
+        .filter(|settings| settings.time_raw() > 0)
+    else {
+        return Ok(None);
+    };
+    sampler_duration_preserving_stretch_plan_from_settings(
+        channel.id(),
+        SamplerDurationPreservingStretchSettings {
+            time_raw: settings.time_raw(),
+            pitch_raw: settings.pitch_raw(),
+            multiplier_raw: settings.multiplier_raw(),
+            mode_raw: settings.mode_raw(),
+        },
+        source_frames,
+        source_sample_rate,
+        ppq,
+        tempo_bpm,
+    )
+}
+
+fn sampler_duration_preserving_stretch_plan_from_settings(
+    channel_id: u16,
+    settings: SamplerDurationPreservingStretchSettings,
+    source_frames: usize,
+    source_sample_rate: u32,
+    ppq: u16,
+    tempo_bpm: f64,
+) -> Result<Option<SamplerDurationPreservingStretchPlan>, String> {
+    match ChannelStretchMode::from_raw(settings.mode_raw) {
+        ChannelStretchMode::Resample => return Ok(None),
+        ChannelStretchMode::Stretch | ChannelStretchMode::Elastique3Generic => {}
+        mode => {
+            return Err(format!(
+                "Sampler channel {} uses unsupported time-stretch mode {} ({mode:?})",
+                channel_id, settings.mode_raw
+            ));
+        }
+    }
+    if ppq == 0 {
+        return Err("project PPQ must be greater than zero".to_owned());
+    }
+    if settings.time_raw == 0 {
+        return Ok(None);
+    }
+    if source_frames == 0 || source_sample_rate == 0 {
+        return Err(format!(
+            "Sampler channel {channel_id} has an empty or invalid audio source range"
+        ));
+    }
+    if !tempo_bpm.is_finite() || tempo_bpm <= 0.0 {
+        return Err("project tempo must be finite and positive".to_owned());
+    }
+    if !(-1_200..=1_200).contains(&settings.pitch_raw) {
+        return Err(format!(
+            "Sampler channel {channel_id} has unsupported stretch pitch {} cents",
+            settings.pitch_raw
+        ));
+    }
+    let multiplier = 2.0_f64.powf(f64::from(settings.multiplier_raw) / 10_000.0);
+    if !multiplier.is_finite() || !(0.25..=4.0).contains(&multiplier) {
+        return Err(format!(
+            "Sampler channel {channel_id} stretch multiplier is outside 0.25x to 4x"
+        ));
+    }
+
+    let target_ticks = f64::from(settings.time_raw) * f64::from(ppq) / 192.0 * multiplier;
+    let target_seconds = target_ticks * 60.0 / (f64::from(ppq) * tempo_bpm);
+    let target_frames_f64 = target_seconds * f64::from(source_sample_rate);
+    if !target_frames_f64.is_finite()
+        || target_frames_f64 <= 0.0
+        || target_frames_f64 > usize::MAX as f64
+    {
+        return Err(format!(
+            "Sampler channel {channel_id} stretch duration is outside the renderable range"
+        ));
+    }
+    let target_frames = target_frames_f64.round() as usize;
+    let stretch_ratio = target_frames as f64 / source_frames as f64;
+    if !target_ticks.is_finite()
+        || target_ticks <= 0.0
+        || !target_seconds.is_finite()
+        || target_seconds <= 0.0
+        || target_frames == 0
+        || !stretch_ratio.is_finite()
+        || !(0.5..=2.0).contains(&stretch_ratio)
+    {
+        return Err(format!(
+            "Sampler channel {channel_id} needs a duration-preserving stretch ratio outside the supported 0.5x to 2x range"
+        ));
+    }
+
+    Ok(Some(SamplerDurationPreservingStretchPlan {
+        target_ticks,
+        target_frames,
+        stretch_ratio,
+        pitch_raw: settings.pitch_raw,
+        tempo_bpm,
+    }))
+}
+
+fn process_sampler_duration_preserving_stretch(
+    audio: &DecodedAudio,
+    plan: SamplerDurationPreservingStretchPlan,
+) -> Result<DecodedAudio, String> {
+    let mut processed = process_audio_range_for_playback(
+        audio,
+        0..audio.frame_count(),
+        plan.pitch_raw as f32 / 100.0,
+        plan.stretch_ratio as f32,
+    )?;
+    if processed.frame_count() != plan.target_frames {
+        for channel in &mut processed.channels {
+            let last_sample = channel.last().copied().unwrap_or_default();
+            channel.resize(plan.target_frames, last_sample);
+        }
+    }
+    Ok(processed)
+}
+
+struct PreparedSamplerStretchSource {
+    audio: Arc<DecodedAudio>,
+    loop_points: Option<(usize, usize)>,
+    release_loop_points: Option<(usize, usize)>,
+    duration_stretch_plan: Option<SamplerDurationPreservingStretchPlan>,
+}
+
+fn prepare_sampler_stretch_source(
+    channel: &ChannelSummary,
+    audio: Arc<DecodedAudio>,
+    loop_points: Option<(usize, usize)>,
+    release_loop_points: Option<(usize, usize)>,
+    ppq: u16,
+    tempo_bpm: f64,
+    cached_source_bytes: &mut usize,
+) -> Result<PreparedSamplerStretchSource, String> {
+    let Some(plan) = sampler_duration_preserving_stretch_plan(
+        channel,
+        audio.frame_count(),
+        audio.sample_rate,
+        ppq,
+        tempo_bpm,
+    )?
+    else {
+        return Ok(PreparedSamplerStretchSource {
+            audio,
+            loop_points,
+            release_loop_points,
+            duration_stretch_plan: None,
+        });
+    };
+
+    let source_frames = audio.frame_count();
+    let stretched_audio = process_sampler_duration_preserving_stretch(&audio, plan)?;
+    *cached_source_bytes = (*cached_source_bytes)
+        .checked_add(decoded_audio_bytes(&stretched_audio)?)
+        .filter(|total| *total <= MAX_SOURCE_CACHE_BYTES)
+        .ok_or_else(|| {
+            format!(
+                "sampler sources exceed the {} MiB render cache limit",
+                MAX_SOURCE_CACHE_BYTES / (1024 * 1024)
+            )
+        })?;
+    let stretched_frames = stretched_audio.frame_count();
+    Ok(PreparedSamplerStretchSource {
+        audio: Arc::new(stretched_audio),
+        loop_points: scale_sampler_loop_points(loop_points, source_frames, stretched_frames),
+        release_loop_points: scale_sampler_loop_points(
+            release_loop_points,
+            source_frames,
+            stretched_frames,
+        ),
+        duration_stretch_plan: Some(plan),
+    })
+}
+
+fn scale_sampler_loop_points(
+    loop_points: Option<(usize, usize)>,
+    source_frames: usize,
+    output_frames: usize,
+) -> Option<(usize, usize)> {
+    let (start, end) = loop_points?;
+    if source_frames == 0 || start >= end || end > source_frames {
+        return None;
+    }
+    let scale_floor =
+        |frame: usize| (frame as u128 * output_frames as u128 / source_frames as u128) as usize;
+    let scale_ceil = |frame: usize| {
+        let numerator = frame as u128 * output_frames as u128;
+        let denominator = source_frames as u128;
+        let quotient = numerator / denominator;
+        let rounded = quotient + u128::from(!numerator.is_multiple_of(denominator));
+        usize::try_from(rounded).ok()
+    };
+    let scaled_start = scale_floor(start);
+    let scaled_end = scale_ceil(end)?;
+    (scaled_start < scaled_end && scaled_end <= output_frames).then_some((scaled_start, scaled_end))
+}
+
+fn validate_sampler_duration_stretch_tempo(
+    plan: SamplerDurationPreservingStretchPlan,
+    channel_id: u16,
+    tempo_map: &PlaylistTempoMap,
+    start_tick: u64,
+    stop_tick: Option<u64>,
+    has_loop: bool,
+) -> Result<(), String> {
+    let start_tick_f64 = start_tick as f64;
+    let active_tempo = tempo_map.tempo_bpm_at_tick(start_tick);
+    if (active_tempo - plan.tempo_bpm).abs() > 0.0005 {
+        return Err(format!(
+            "Sampler channel {channel_id} uses duration-preserving Stretch at {:.3} BPM, but a note starts at {:.3} BPM",
+            plan.tempo_bpm, active_tempo
+        ));
+    }
+    let target_end_tick = start_tick_f64 + plan.target_ticks;
+    let mut active_end_tick = target_end_tick;
+    if has_loop {
+        active_end_tick = active_end_tick.max(stop_tick.map_or(f64::MAX, |tick| tick as f64));
+    }
+    if tempo_map.has_tempo_change_between(start_tick_f64, active_end_tick) {
+        return Err(format!(
+            "Sampler channel {channel_id} uses duration-preserving Stretch across Playlist tempo automation, which this renderer cannot follow"
+        ));
+    }
+    Ok(())
+}
+
 fn sampler_note_fine_pitch_with_delta(
     note_pitch_cents: i16,
     pitch_delta_cents: f64,
@@ -6995,9 +7270,11 @@ fn prepare_sampler_arrangement(
     let mut faded_audio_by_settings =
         HashMap::<(PathBuf, Option<u16>, Option<u16>), Arc<DecodedAudio>>::new();
     let mut sources_by_channel = HashMap::<u16, SamplerVoiceSource>::new();
-    // Store the tick-zero rate in each shared source, then offset scheduled notes from it to
+    // Store each channel's tick-zero Resample rate, then offset scheduled notes from it to
     // match the tempo at their own start ticks.
     let mut resample_pitch_adjustment_by_channel = HashMap::<u16, f64>::new();
+    let mut duration_stretch_plan_by_channel =
+        HashMap::<u16, SamplerDurationPreservingStretchPlan>::new();
     let mut mixer_transforms_by_channel = HashMap::<u16, MixerSourceRouteTransform>::new();
     let mut live_mixer_source_routes_by_channel = HashMap::<u16, MixerLiveSourceRoutePlan>::new();
     let mut mixer_meter_transforms_by_channel =
@@ -7104,9 +7381,27 @@ fn prepare_sampler_arrangement(
                     faded_audio
                 }
             };
-            let loop_bounds = validated_sampler_loop_bounds(loop_points, audio.frame_count());
-            let release_loop_bounds =
-                validated_sampler_loop_bounds(release_loop_points, audio.frame_count());
+            let prepared_stretch_source = prepare_sampler_stretch_source(
+                channel,
+                audio,
+                loop_points,
+                release_loop_points,
+                ppq,
+                tempo_map.tempo_bpm_at_tick(placed.start_tick),
+                &mut cached_source_bytes,
+            )?;
+            if let Some(plan) = prepared_stretch_source.duration_stretch_plan {
+                duration_stretch_plan_by_channel.insert(placed.target_channel_id, plan);
+            }
+            let audio = prepared_stretch_source.audio;
+            let loop_bounds = validated_sampler_loop_bounds(
+                prepared_stretch_source.loop_points,
+                audio.frame_count(),
+            );
+            let release_loop_bounds = validated_sampler_loop_bounds(
+                prepared_stretch_source.release_loop_points,
+                audio.frame_count(),
+            );
             let sampler_stretch = sampler_resample_stretch_pitch_adjustment(
                 channel,
                 audio.frame_count(),
@@ -7167,6 +7462,16 @@ fn prepare_sampler_arrangement(
         let Some(source) = sources_by_channel.get(&placed.target_channel_id) else {
             continue;
         };
+        if let Some(plan) = duration_stretch_plan_by_channel.get(&placed.target_channel_id) {
+            validate_sampler_duration_stretch_tempo(
+                *plan,
+                placed.target_channel_id,
+                &tempo_map,
+                placed.start_tick,
+                placed.stop_tick,
+                source.loop_bounds.is_some(),
+            )?;
+        }
         let playlist_track_id = arrangement
             .clips
             .get(placed.clip_index)
@@ -9537,9 +9842,24 @@ fn prepare_sampler_pattern_for_channel_internal(
                     faded_audio
                 }
             };
-            let loop_bounds = validated_sampler_loop_bounds(loop_points, audio.frame_count());
-            let release_loop_bounds =
-                validated_sampler_loop_bounds(release_loop_points, audio.frame_count());
+            let prepared_stretch_source = prepare_sampler_stretch_source(
+                channel,
+                audio,
+                loop_points,
+                release_loop_points,
+                ppq,
+                tempo_bpm,
+                &mut cached_source_bytes,
+            )?;
+            let audio = prepared_stretch_source.audio;
+            let loop_bounds = validated_sampler_loop_bounds(
+                prepared_stretch_source.loop_points,
+                audio.frame_count(),
+            );
+            let release_loop_bounds = validated_sampler_loop_bounds(
+                prepared_stretch_source.release_loop_points,
+                audio.frame_count(),
+            );
             let sampler_stretch = sampler_resample_stretch_pitch_adjustment(
                 channel,
                 audio.frame_count(),
@@ -14939,6 +15259,132 @@ mod tests {
         assert_eq!(processed.sample_rate, audio.sample_rate);
         assert_eq!(processed.channels.len(), 1);
         assert_eq!(processed.frame_count(), 4_000);
+    }
+
+    #[test]
+    fn sampler_duration_preserving_stretch_keeps_target_frames_with_pitch_shift() {
+        let audio = DecodedAudio {
+            sample_rate: 8_000,
+            channels: vec![
+                (0..8_000)
+                    .map(|frame| (std::f32::consts::TAU * frame as f32 / 80.0).sin())
+                    .collect(),
+            ],
+        };
+        let plan = SamplerDurationPreservingStretchPlan {
+            target_ticks: 384.0,
+            target_frames: 12_000,
+            stretch_ratio: 1.5,
+            pitch_raw: 700,
+            tempo_bpm: 120.0,
+        };
+
+        let processed = process_sampler_duration_preserving_stretch(&audio, plan).unwrap();
+
+        assert_eq!(processed.sample_rate, audio.sample_rate);
+        assert_eq!(processed.channels.len(), 1);
+        assert_eq!(processed.frame_count(), 12_000);
+    }
+
+    #[test]
+    fn sampler_stretch_plan_maps_time_multiplier_pitch_and_supported_modes() {
+        for mode_raw in [-1, 1] {
+            let plan = sampler_duration_preserving_stretch_plan_from_settings(
+                7,
+                SamplerDurationPreservingStretchSettings {
+                    time_raw: 192,
+                    pitch_raw: 700,
+                    multiplier_raw: 20_000,
+                    mode_raw,
+                },
+                16_000,
+                8_000,
+                96,
+                120.0,
+            )
+            .unwrap()
+            .expect("supported duration-preserving mode should produce a plan");
+            assert!((plan.target_ticks - 384.0).abs() < 1e-12);
+            assert_eq!(plan.target_frames, 16_000);
+            assert!((plan.stretch_ratio - 1.0).abs() < 1e-12);
+            assert_eq!(plan.pitch_raw, 700);
+            assert_eq!(plan.tempo_bpm, 120.0);
+        }
+
+        assert!(
+            sampler_duration_preserving_stretch_plan_from_settings(
+                7,
+                SamplerDurationPreservingStretchSettings {
+                    time_raw: 192,
+                    pitch_raw: 0,
+                    multiplier_raw: 0,
+                    mode_raw: 0,
+                },
+                8_000,
+                8_000,
+                96,
+                120.0,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            sampler_duration_preserving_stretch_plan_from_settings(
+                7,
+                SamplerDurationPreservingStretchSettings {
+                    time_raw: 192,
+                    pitch_raw: 0,
+                    multiplier_raw: 0,
+                    mode_raw: 2,
+                },
+                8_000,
+                8_000,
+                96,
+                120.0,
+            )
+            .unwrap_err()
+            .contains("unsupported time-stretch mode")
+        );
+    }
+
+    #[test]
+    fn sampler_stretch_scales_sample_loop_points_to_the_new_source_length() {
+        assert_eq!(
+            scale_sampler_loop_points(Some((200, 600)), 800, 1_200),
+            Some((300, 900))
+        );
+        assert_eq!(scale_sampler_loop_points(Some((2, 6)), 8, 4), Some((1, 3)));
+        assert_eq!(scale_sampler_loop_points(Some((6, 8)), 8, 4), Some((3, 4)));
+    }
+
+    #[test]
+    fn sampler_duration_stretch_rejects_tempo_changes_during_the_stretched_sample() {
+        let plan = SamplerDurationPreservingStretchPlan {
+            target_ticks: 384.0,
+            target_frames: 8_000,
+            stretch_ratio: 1.0,
+            pitch_raw: 0,
+            tempo_bpm: 120.0,
+        };
+        let tempo_map = PlaylistTempoMap::from_tempo_events(96, 120.0, &[(192, 100.0)])
+            .expect("tempo automation map should build");
+
+        let error =
+            validate_sampler_duration_stretch_tempo(plan, 3, &tempo_map, 0, Some(768), false)
+                .unwrap_err();
+        assert!(error.contains("across Playlist tempo automation"));
+
+        let loop_tempo_map = PlaylistTempoMap::from_tempo_events(96, 120.0, &[(512, 100.0)])
+            .expect("loop tempo automation map should build");
+        let loop_error =
+            validate_sampler_duration_stretch_tempo(plan, 3, &loop_tempo_map, 0, Some(768), true)
+                .unwrap_err();
+        assert!(loop_error.contains("across Playlist tempo automation"));
+
+        let changed_start_error =
+            validate_sampler_duration_stretch_tempo(plan, 3, &tempo_map, 384, None, false)
+                .unwrap_err();
+        assert!(changed_start_error.contains("note starts at 100.000 BPM"));
     }
 
     #[test]
