@@ -3331,6 +3331,7 @@ fn scale_chord_pitches_from_top(
 enum NoteDragKind {
     Move,
     Resize,
+    ResizeFromLeft,
     Stretch,
 }
 
@@ -4185,6 +4186,7 @@ struct DawUi {
     piano_roll_mouse_wheel_action: Option<PianoRollMouseWheelAction>,
     piano_roll_mouse_wheel_fine: bool,
     piano_roll_nudge_notes_with_mouse_wheel: bool,
+    piano_roll_resize_from_left: bool,
     piano_roll_edit_scope: PianoRollEditScope,
     piano_roll_event_editor_open: bool,
     piano_roll_event_target: PianoRollEventTarget,
@@ -5332,6 +5334,7 @@ impl DawUi {
         let midi_recording_offset_ms = load_midi_recording_offset_ms();
         let piano_roll_nudge_notes_with_mouse_wheel =
             load_piano_roll_nudge_notes_with_mouse_wheel();
+        let piano_roll_resize_from_left = load_piano_roll_resize_from_left();
         let channel_rack_mute_removed_steps = load_channel_rack_mute_removed_steps();
         let hide_collapsed_playlist_groups = load_hide_collapsed_playlist_groups();
         let playlist_zero_crossing_splits = load_playlist_zero_crossing_splits();
@@ -5455,6 +5458,7 @@ impl DawUi {
             piano_roll_mouse_wheel_action: None,
             piano_roll_mouse_wheel_fine: false,
             piano_roll_nudge_notes_with_mouse_wheel,
+            piano_roll_resize_from_left,
             piano_roll_edit_scope: PianoRollEditScope::Automatic,
             piano_roll_event_editor_open: false,
             piano_roll_event_target: PianoRollEventTarget::Velocity,
@@ -27422,6 +27426,17 @@ impl DawUi {
                 {
                     self.status = format!("Could not save Piano roll mouse-wheel setting: {error}");
                 }
+                if ui
+                    .checkbox(&mut self.piano_roll_resize_from_left, "Allow resizing from left")
+                    .on_hover_text(
+                        "Drag a note's left edge to change its start while keeping its end fixed",
+                    )
+                    .changed()
+                    && let Err(error) =
+                        save_piano_roll_resize_from_left(self.piano_roll_resize_from_left)
+                {
+                    self.status = format!("Could not save Piano roll resize setting: {error}");
+                }
                 ui.separator();
                 if ui
                     .add_enabled(
@@ -35601,6 +35616,17 @@ impl DawUi {
                         egui::CornerRadius::same(1),
                         Color32::from_white_alpha(if selected { 100 } else { 45 }),
                     );
+                    if self.piano_roll_resize_from_left {
+                        let left_resize_handle = egui::Rect::from_min_max(
+                            note_rect.left_top(),
+                            egui::pos2((note_rect.left() + 5.0).min(note_rect.right()), note_rect.bottom()),
+                        );
+                        painter.rect_filled(
+                            left_resize_handle,
+                            egui::CornerRadius::same(1),
+                            Color32::from_white_alpha(if selected { 100 } else { 45 }),
+                        );
+                    }
                 }
                 let response = ui.interact(
                     note_rect,
@@ -35615,7 +35641,7 @@ impl DawUi {
                     },
                 )
                 .on_hover_text(
-                    "Drag the selection stretch handle or use Right-Shift+drag on a selected note edge; Alt on the handle bypasses snap, while Alt+Right-Shift uses 25% steps · Alt/Option+wheel edits the active property · Shift+Alt/Option+wheel nudges timing",
+                    "Drag the selection stretch handle or use Right-Shift+drag on a selected note edge; Alt on the handle bypasses snap, while Alt+Right-Shift uses 25% steps. Edit > Allow resizing from left enables left-edge note resizing · Alt/Option+wheel edits the active property · Shift+Alt/Option+wheel nudges timing",
                 );
                 let note_id = (pattern.id, note.channel_id, *channel_index);
                 let modifiers = scroll_modifiers;
@@ -35781,10 +35807,20 @@ impl DawUi {
                         if selected_count == 1 { "" } else { "s" }
                     );
                 }
-                let resize = response
-                    .interact_pointer_pos()
-                    .is_some_and(|pointer| pointer.x >= note_rect.right() - 6.0);
-                let stretch = resize && modifiers.shift;
+                let pointer_on_resize_edge = response.interact_pointer_pos();
+                let resize_from_left = self.piano_roll_resize_from_left
+                    && pointer_on_resize_edge
+                        .is_some_and(|pointer| {
+                            pointer.x <= note_rect.left() + 6.0
+                                && pointer.x - note_rect.left()
+                                    <= note_rect.right() - pointer.x
+                        });
+                let resize_from_right = pointer_on_resize_edge
+                    .is_some_and(|pointer| {
+                        pointer.x >= note_rect.right() - 6.0 && !resize_from_left
+                    });
+                let resize = resize_from_left || resize_from_right;
+                let stretch = resize_from_right && modifiers.shift;
                 if response.is_pointer_button_down_on()
                     && !self.piano_roll_zoom_mode
                     && !self.piano_roll_playback_mode
@@ -35793,7 +35829,7 @@ impl DawUi {
                     && !self.piano_roll_mute_mode
                     && self.active_note_drag.is_none()
                     && !modifiers.command
-                    && (!modifiers.shift || stretch)
+                    && (!modifiers.shift || stretch || resize_from_left)
                 {
                     if !self.selected_piano_notes.contains(&note_id)
                         || self
@@ -35843,6 +35879,8 @@ impl DawUi {
                         targets,
                         kind: if stretch {
                             NoteDragKind::Stretch
+                        } else if resize_from_left {
+                            NoteDragKind::ResizeFromLeft
                         } else if resize {
                             NoteDragKind::Resize
                         } else {
@@ -35874,6 +35912,7 @@ impl DawUi {
                         ((pointer.x - drag.start_pointer.x) / tick_scale).round() as i64;
                     let semitones =
                         ((drag.start_pointer.y - pointer.y) / key_height).round() as i32;
+                    let edit_snap_ticks = if modifiers.alt { 1 } else { snap_ticks };
                     let stretch_bounds = (drag.kind == NoteDragKind::Stretch).then(|| {
                         let start_tick = drag
                             .targets
@@ -35912,7 +35951,7 @@ impl DawUi {
                                 NoteDragKind::Move => PatternNoteEdit {
                                     position: Some(snap_note_tick(
                                         i64::from(target.start_position).saturating_add(tick_delta),
-                                        snap_ticks,
+                                        edit_snap_ticks,
                                         0,
                                     )),
                                     key: Some({
@@ -35935,11 +35974,41 @@ impl DawUi {
                                 NoteDragKind::Resize => PatternNoteEdit {
                                     length: Some(snap_note_tick(
                                         i64::from(target.start_length).saturating_add(tick_delta),
-                                        snap_ticks,
+                                        edit_snap_ticks,
                                         1,
                                     )),
                                     ..PatternNoteEdit::default()
                                 },
+                                NoteDragKind::ResizeFromLeft => {
+                                    if target.start_length == 0 {
+                                        PatternNoteEdit::default()
+                                    } else {
+                                        let original_end = u64::from(target.start_position)
+                                            + u64::from(target.start_length);
+                                        let position = snap_note_tick(
+                                            i64::from(target.start_position)
+                                                .saturating_add(tick_delta),
+                                            edit_snap_ticks,
+                                            0,
+                                        )
+                                        .min(
+                                            original_end
+                                                .saturating_sub(1)
+                                                .min(u64::from(u32::MAX))
+                                                as u32,
+                                        );
+                                        PatternNoteEdit {
+                                            position: Some(position),
+                                            length: Some(
+                                                original_end
+                                                    .saturating_sub(u64::from(position))
+                                                    .min(u64::from(u32::MAX))
+                                                    as u32,
+                                            ),
+                                            ..PatternNoteEdit::default()
+                                        }
+                                    }
+                                }
                                 NoteDragKind::Stretch => {
                                     let (start_tick, _, original_duration) = stretch_bounds
                                         .expect("stretch drags have a selected time range");
@@ -35970,6 +36039,7 @@ impl DawUi {
                             let action = match drag.kind {
                                 NoteDragKind::Move => "Moved",
                                 NoteDragKind::Resize => "Resized",
+                                NoteDragKind::ResizeFromLeft => "Resized",
                                 NoteDragKind::Stretch => "Stretched",
                             };
                             format!("{action} {} selected notes", drag.targets.len())
@@ -35977,6 +36047,9 @@ impl DawUi {
                             match drag.kind {
                                 NoteDragKind::Move => "Piano roll note moved".to_owned(),
                                 NoteDragKind::Resize => "Piano roll note length changed".to_owned(),
+                                NoteDragKind::ResizeFromLeft => {
+                                    "Piano roll note start changed".to_owned()
+                                }
                                 NoteDragKind::Stretch => "Piano roll note group stretched".to_owned(),
                             }
                         };
@@ -52050,6 +52123,31 @@ fn save_piano_roll_nudge_notes_with_mouse_wheel(enabled: bool) -> Result<(), Str
     let parent = path
         .parent()
         .ok_or_else(|| "the Piano roll mouse-wheel setting path has no parent folder".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    fs::write(&path, format!("{enabled}\n"))
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
+fn piano_roll_resize_from_left_settings_file() -> Option<PathBuf> {
+    browser_favorites_file()?
+        .parent()
+        .map(|directory| directory.join("piano-roll-resize-from-left.txt"))
+}
+
+fn load_piano_roll_resize_from_left() -> bool {
+    piano_roll_resize_from_left_settings_file()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|contents| contents.trim().parse::<bool>().ok())
+        .unwrap_or(false)
+}
+
+fn save_piano_roll_resize_from_left(enabled: bool) -> Result<(), String> {
+    let path = piano_roll_resize_from_left_settings_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the Piano roll resize setting path has no parent folder".to_owned())?;
     fs::create_dir_all(parent)
         .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
     fs::write(&path, format!("{enabled}\n"))
