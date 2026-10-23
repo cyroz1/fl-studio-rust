@@ -6933,7 +6933,9 @@ fn prepare_sampler_arrangement(
             let (gain, pan) = channel_gain_pan(channel.volume(), channel.pan());
             source_entry.insert(SamplerVoiceSource {
                 audio,
-                gain: gain * sampler_metadata_gain(sample_metadata.gain_db),
+                gain: gain
+                    * sampler_metadata_gain(sample_metadata.gain_db)
+                    * sampler_volume_envelope_sustain_gain(channel),
                 pan,
                 reverse: channel.sample_reversed(),
                 volume_envelope_enabled: channel.sampler_volume_envelope_enabled().unwrap_or(false),
@@ -9312,7 +9314,9 @@ fn prepare_sampler_pattern_for_channel_internal(
             let (gain, pan) = channel_gain_pan(channel.volume(), channel.pan());
             source_entry.insert(SamplerVoiceSource {
                 audio,
-                gain: gain * sampler_metadata_gain(sample_metadata.gain_db),
+                gain: gain
+                    * sampler_metadata_gain(sample_metadata.gain_db)
+                    * sampler_volume_envelope_sustain_gain(channel),
                 pan,
                 reverse: channel.sample_reversed(),
                 volume_envelope_enabled: channel.sampler_volume_envelope_enabled().unwrap_or(false),
@@ -11404,6 +11408,58 @@ pub(crate) fn channel_gain_pan(volume: Option<u32>, pan: Option<i32>) -> (f32, f
         .map(|raw| (raw.clamp(0, 12_800) as f32 / 6_400.0) - 1.0)
         .unwrap_or(0.0);
     (gain, pan)
+}
+
+/// Returns the supported steady-state multiplier for a Sampler Volume envelope.
+///
+/// The envelope's saved raw time minimum (100) is documented as 0%, so an envelope whose
+/// pre-delay, attack, hold, and decay are all at that minimum reaches sustain immediately.
+/// Other timing shapes remain unsupported until their native time mapping and curves are
+/// verified. Amount is a bipolar multiplier around the unmodulated level: zero leaves volume
+/// unchanged, positive values move toward sustain, and negative values invert that movement.
+fn sampler_volume_envelope_sustain_gain(channel: &ChannelSummary) -> f32 {
+    let Some(envelope) = channel.sampler_volume_envelope() else {
+        return 1.0;
+    };
+    sampler_volume_envelope_sustain_gain_from_raw(
+        envelope.enabled(),
+        envelope.predelay_raw(),
+        envelope.attack_raw(),
+        envelope.hold_raw(),
+        envelope.decay_raw(),
+        envelope.sustain_raw(),
+        envelope.amount_raw(),
+    )
+}
+
+fn sampler_volume_envelope_sustain_gain_from_raw(
+    enabled: bool,
+    predelay: Option<i32>,
+    attack: Option<i32>,
+    hold: Option<i32>,
+    decay: Option<i32>,
+    sustain: Option<i32>,
+    amount: Option<i32>,
+) -> f32 {
+    if !enabled {
+        return 1.0;
+    }
+    let (Some(predelay), Some(attack), Some(hold), Some(decay), Some(sustain), Some(amount)) =
+        (predelay, attack, hold, decay, sustain, amount)
+    else {
+        return 1.0;
+    };
+    if [predelay, attack, hold, decay]
+        .into_iter()
+        .any(|raw| raw != 100)
+        || !(0..=128).contains(&sustain)
+        || !(-128..=128).contains(&amount)
+    {
+        return 1.0;
+    }
+    let envelope_amount = amount as f32 / 128.0;
+    let sustain_level = sustain as f32 / 128.0;
+    (1.0 + envelope_amount * (sustain_level - 1.0)).clamp(0.0, 2.0)
 }
 
 fn check_cancelled(cancelled: Option<&AtomicBool>) -> Result<(), String> {
@@ -14719,6 +14775,79 @@ mod tests {
         assert_eq!(channel_gain_pan(Some(5_000), Some(0)), (0.5, -1.0));
         assert_eq!(channel_gain_pan(Some(12_800), Some(12_800)), (1.28, 1.0));
         assert_eq!(channel_gain_pan(None, None), (1.0, 0.0));
+    }
+
+    #[test]
+    fn sampler_volume_envelope_applies_sustain_for_zero_time_stages() {
+        let gain = |sustain, amount| {
+            sampler_volume_envelope_sustain_gain_from_raw(
+                true,
+                Some(100),
+                Some(100),
+                Some(100),
+                Some(100),
+                Some(sustain),
+                Some(amount),
+            )
+        };
+
+        assert_eq!(gain(64, 128), 0.5);
+        assert_eq!(gain(64, -128), 1.5);
+        assert_eq!(gain(64, 0), 1.0);
+        assert_eq!(gain(128, 128), 1.0);
+        assert_eq!(gain(0, 64), 0.5);
+    }
+
+    #[test]
+    fn sampler_volume_envelope_ignores_disabled_incomplete_or_unsupported_stages() {
+        assert_eq!(
+            sampler_volume_envelope_sustain_gain_from_raw(
+                false,
+                Some(100),
+                Some(100),
+                Some(100),
+                Some(100),
+                Some(0),
+                Some(128),
+            ),
+            1.0
+        );
+        assert_eq!(
+            sampler_volume_envelope_sustain_gain_from_raw(
+                true,
+                Some(101),
+                Some(100),
+                Some(100),
+                Some(100),
+                Some(0),
+                Some(128),
+            ),
+            1.0
+        );
+        assert_eq!(
+            sampler_volume_envelope_sustain_gain_from_raw(
+                true,
+                Some(100),
+                Some(100),
+                Some(100),
+                Some(100),
+                Some(129),
+                Some(128),
+            ),
+            1.0
+        );
+        assert_eq!(
+            sampler_volume_envelope_sustain_gain_from_raw(
+                true,
+                Some(100),
+                None,
+                Some(100),
+                Some(100),
+                Some(0),
+                Some(128),
+            ),
+            1.0
+        );
     }
 
     #[test]

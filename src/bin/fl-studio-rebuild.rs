@@ -25324,7 +25324,7 @@ impl DawUi {
                             });
                             ui.collapsing("Sampler envelopes and LFOs (raw)", |ui| {
                                 ui.small(
-                                    "Edits saved raw values for the five ordered targets. Envelope and LFO modulation are not yet applied to playback.",
+                                    "Edits the five saved targets. Zero-time Volume envelope sustain is applied in playback; other envelope stages and all LFO modulation remain unsupported.",
                                 );
                                 for target in SamplerEnvelopeLfoTarget::all() {
                                     if let Some(record) = channel.sampler_envelope_lfo(target) {
