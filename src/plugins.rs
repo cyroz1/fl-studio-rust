@@ -10,6 +10,7 @@ pub enum PluginFormat {
     Vst2Candidate,
     Vst3,
     Clap,
+    AudioUnitCandidate,
 }
 
 impl fmt::Display for PluginFormat {
@@ -18,6 +19,7 @@ impl fmt::Display for PluginFormat {
             Self::Vst2Candidate => formatter.write_str("VST2 candidate (not validated)"),
             Self::Vst3 => formatter.write_str("VST3"),
             Self::Clap => formatter.write_str("CLAP"),
+            Self::AudioUnitCandidate => formatter.write_str("Audio Unit candidate (not hosted)"),
         }
     }
 }
@@ -45,10 +47,11 @@ struct SearchRoot {
     path: PathBuf,
 }
 
-/// Finds VST and CLAP plug-in candidates in conventional platform folders.
-/// `VST3_PATH`, `VST2_PATH`, and `CLAP_PATH` can add directories using platform
-/// path-list syntax. VST2 DLLs and CLAP bundles are listed as candidates only;
-/// checking them requires loading executable code.
+/// Finds VST, CLAP, and macOS Audio Unit bundle candidates in conventional
+/// platform folders. `VST3_PATH`, `VST2_PATH`, and `CLAP_PATH` can add
+/// directories using platform path-list syntax. VST2 DLLs, CLAP bundles, and
+/// Audio Unit bundles are listed as candidates only; checking them requires
+/// loading executable code or consulting the platform's plug-in registry.
 pub fn scan_installed_plugins() -> PluginScanReport {
     let roots = default_search_roots();
     let mut report = PluginScanReport {
@@ -181,7 +184,15 @@ fn macos_search_roots(roots: &mut Vec<SearchRoot>) {
             format: PluginFormat::Vst2Candidate,
             path: base.join("VST"),
         });
+        roots.push(SearchRoot {
+            format: PluginFormat::AudioUnitCandidate,
+            path: base.join("Components"),
+        });
     }
+    roots.push(SearchRoot {
+        format: PluginFormat::AudioUnitCandidate,
+        path: PathBuf::from("/System/Library/Components"),
+    });
 }
 
 #[cfg(target_os = "linux")]
@@ -287,6 +298,14 @@ fn walk(
             continue;
         }
         if format == PluginFormat::Clap && extension.eq_ignore_ascii_case("clap") {
+            add_candidate(&path, format, report, found);
+            continue;
+        }
+        if format == PluginFormat::AudioUnitCandidate
+            && path.is_dir()
+            && (extension.eq_ignore_ascii_case("component")
+                || extension.eq_ignore_ascii_case("audiocomp"))
+        {
             add_candidate(&path, format, report, found);
             continue;
         }
@@ -464,6 +483,40 @@ mod tests {
         }));
         assert!(report.candidates.iter().any(|candidate| {
             candidate.format == PluginFormat::Clap && candidate.path == clap_library
+        }));
+        assert!(report.scan_errors.is_empty());
+    }
+
+    #[test]
+    fn scan_finds_audio_unit_bundle_candidates_by_bundle_extension() {
+        let temp = TestDirectory::new();
+        let component = temp.0.join("Vendor").join("Echo.component");
+        let audio_component = temp.0.join("Vendor").join("Codec.audiocomp");
+        fs::create_dir_all(&component).expect("Audio Unit bundle should be created");
+        fs::create_dir_all(&audio_component).expect("audio component bundle should be created");
+
+        let mut report = PluginScanReport::default();
+        let mut visited = HashSet::new();
+        let mut found = HashSet::new();
+        walk(
+            &temp.0,
+            PluginFormat::AudioUnitCandidate,
+            0,
+            &mut report,
+            &mut visited,
+            &mut found,
+        );
+
+        assert_eq!(report.candidates.len(), 2);
+        assert!(report.candidates.iter().any(|candidate| {
+            candidate.format == PluginFormat::AudioUnitCandidate
+                && candidate.name == "Echo"
+                && candidate.path == component
+        }));
+        assert!(report.candidates.iter().any(|candidate| {
+            candidate.format == PluginFormat::AudioUnitCandidate
+                && candidate.name == "Codec"
+                && candidate.path == audio_component
         }));
         assert!(report.scan_errors.is_empty());
     }

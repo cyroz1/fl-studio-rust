@@ -45926,7 +45926,7 @@ impl DawUi {
         });
         ui.label(
             egui::RichText::new(
-                "Matching VST3 channels load with the project. Detected CLAP bundles are listed below.",
+                "Matching VST3 channels load with the project. Detected CLAP and macOS Audio Unit bundles are listed below.",
             )
             .color(MUTED),
         );
@@ -46433,6 +46433,35 @@ impl DawUi {
                         }
                     });
                 ui.add_space(3.0);
+            }
+
+            if cfg!(target_os = "macos") {
+                let audio_unit_candidates = self
+                    .plugin_candidates
+                    .iter()
+                    .filter(|candidate| candidate.format == PluginFormat::AudioUnitCandidate)
+                    .collect::<Vec<_>>();
+                ui.separator();
+                ui.heading(format!(
+                    "Detected Audio Unit bundles ({})",
+                    audio_unit_candidates.len()
+                ));
+                ui.label(
+                    egui::RichText::new(
+                        "Bundles are listed by filename only. Audio Unit validation, loading, and playback are not available yet.",
+                    )
+                    .color(MUTED),
+                );
+                for candidate in audio_unit_candidates {
+                    egui::Frame::new()
+                        .fill(PANEL_DARK)
+                        .inner_margin(6.0)
+                        .show(ui, |ui| {
+                            ui.strong(&candidate.name);
+                            ui.small(candidate.path.display().to_string());
+                        });
+                    ui.add_space(3.0);
+                }
             }
         });
 
