@@ -42,6 +42,25 @@ pub struct AudioUnitComponentInfo {
     pub type_code: String,
     pub subtype_code: String,
     pub manufacturer_code: String,
+    /// Whether macOS reports this exact identity in its Audio Component catalog.
+    /// `None` means the current platform cannot query the catalog or an ID is malformed.
+    pub registered: Option<bool>,
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct AudioComponentDescription {
+    component_type: u32,
+    component_subtype: u32,
+    component_manufacturer: u32,
+    component_flags: u32,
+    component_flags_mask: u32,
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "AudioToolbox", kind = "framework")]
+unsafe extern "C" {
+    fn AudioComponentCount(description: *const AudioComponentDescription) -> u32;
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -366,7 +385,15 @@ fn add_candidate(
         }
     } else if format == PluginFormat::AudioUnitCandidate {
         match read_audio_unit_components(path) {
-            Ok(components) => audio_unit_components = components,
+            Ok(components) => {
+                audio_unit_components = components
+                    .into_iter()
+                    .map(|mut component| {
+                        component.registered = audio_unit_component_registered(&component);
+                        component
+                    })
+                    .collect();
+            }
             Err(error) => report.scan_errors.push((path.to_path_buf(), error)),
         }
     }
@@ -421,12 +448,40 @@ fn read_audio_unit_components(bundle_path: &Path) -> Result<Vec<AudioUnitCompone
             type_code: field("type")?,
             subtype_code: field("subtype")?,
             manufacturer_code: field("manufacturer")?,
+            registered: None,
         });
     }
     if components.is_empty() {
         return Err("Audio Unit Info.plist has an empty AudioComponents array".to_owned());
     }
     Ok(components)
+}
+
+fn audio_unit_component_registered(component: &AudioUnitComponentInfo) -> Option<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        let description = AudioComponentDescription {
+            component_type: audio_unit_fourcc(&component.type_code)?,
+            component_subtype: audio_unit_fourcc(&component.subtype_code)?,
+            component_manufacturer: audio_unit_fourcc(&component.manufacturer_code)?,
+            component_flags: 0,
+            component_flags_mask: 0,
+        };
+        // SAFETY: AudioComponentCount reads the fully initialized C-compatible
+        // description and does not retain the pointer.
+        Some(unsafe { AudioComponentCount(&description) > 0 })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = component;
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn audio_unit_fourcc(code: &str) -> Option<u32> {
+    let bytes: [u8; 4] = code.as_bytes().try_into().ok()?;
+    Some(u32::from_be_bytes(bytes))
 }
 
 fn push_unique_class_id(class_ids: &mut Vec<String>, class_id: &str) {
@@ -450,7 +505,7 @@ fn normalized_path(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{AudioUnitComponentInfo, PluginFormat, PluginScanReport, walk};
+    use super::{PluginFormat, PluginScanReport, walk};
     use std::collections::HashSet;
     use std::fs;
     use std::path::PathBuf;
@@ -635,15 +690,12 @@ mod tests {
             .iter()
             .find(|candidate| candidate.path.ends_with("Echo.component"))
             .expect("Audio Unit bundle should be discovered");
-        assert_eq!(
-            echo.audio_unit_components,
-            vec![AudioUnitComponentInfo {
-                name: "Echo".to_owned(),
-                type_code: "aufx".to_owned(),
-                subtype_code: "ECHO".to_owned(),
-                manufacturer_code: "ACME".to_owned(),
-            }]
-        );
+        assert_eq!(echo.audio_unit_components[0].name, "Echo");
+        assert_eq!(echo.audio_unit_components[0].type_code, "aufx");
+        assert_eq!(echo.audio_unit_components[0].subtype_code, "ECHO");
+        assert_eq!(echo.audio_unit_components[0].manufacturer_code, "ACME");
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(echo.audio_unit_components[0].registered, None);
         let codec = report
             .candidates
             .iter()
@@ -652,6 +704,15 @@ mod tests {
         assert_eq!(codec.audio_unit_components[0].name, "Codec");
         assert_eq!(codec.audio_unit_components[0].type_code, "aufc");
         assert!(report.scan_errors.is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn audio_unit_four_character_codes_use_big_endian_bytes() {
+        assert_eq!(audio_unit_fourcc("aufx"), Some(0x6175_6678));
+        assert_eq!(audio_unit_fourcc("ACME"), Some(0x4143_4d45));
+        assert_eq!(audio_unit_fourcc("abc"), None);
+        assert_eq!(audio_unit_fourcc("éé"), None);
     }
 
     #[test]

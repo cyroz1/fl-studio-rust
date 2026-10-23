@@ -46448,7 +46448,7 @@ impl DawUi {
                 ));
                 ui.label(
                     egui::RichText::new(
-                        "Component names and identifiers are read from Info.plist when present. Registry validation, loading, and playback are not available yet.",
+                        "Component names and identifiers are read from Info.plist. Each valid identity is checked against the macOS Audio Component catalog; loading and playback are not available yet.",
                     )
                     .color(MUTED),
                 );
@@ -46460,12 +46460,18 @@ impl DawUi {
                             ui.strong(&candidate.name);
                             ui.small(candidate.path.display().to_string());
                             for component in &candidate.audio_unit_components {
+                                let registry_status = match component.registered {
+                                    Some(true) => " · registered with macOS",
+                                    Some(false) => " · not found in macOS catalog",
+                                    None => " · catalog not checked",
+                                };
                                 ui.small(format!(
-                                    "{} · type {} · subtype {} · manufacturer {}",
+                                    "{} · type {} · subtype {} · manufacturer {}{}",
                                     component.name,
                                     component.type_code,
                                     component.subtype_code,
-                                    component.manufacturer_code
+                                    component.manufacturer_code,
+                                    registry_status
                                 ));
                             }
                             if candidate.audio_unit_components.is_empty() {
