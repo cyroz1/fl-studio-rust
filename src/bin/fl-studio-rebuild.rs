@@ -9,6 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use audio_unit_probe::{
+    AudioUnitNotePreviewRequest, AudioUnitNotePreviewResponse, AudioUnitNotePreviewState,
     AudioUnitProbeKey, AudioUnitProbeRequest, AudioUnitProbeResponse, AudioUnitProbeState,
 };
 use clap_probe::{
@@ -802,6 +803,29 @@ fn main() -> eframe::Result {
             type_code,
             subtype_code,
             manufacturer_code,
+        ));
+    }
+    if args.get(1).is_some_and(|argument| {
+        argument == std::ffi::OsStr::new(audio_unit_probe::NOTE_PREVIEW_FLAG)
+    }) {
+        let (Some(type_code), Some(subtype_code), Some(manufacturer_code), Some(sample_rate)) = (
+            args.get(2).and_then(|value| value.to_str()),
+            args.get(3).and_then(|value| value.to_str()),
+            args.get(4).and_then(|value| value.to_str()),
+            args.get(5).and_then(|value| value.to_str()),
+        ) else {
+            eprintln!("Audio Unit preview needs type, subtype, manufacturer, and sample rate");
+            std::process::exit(2);
+        };
+        let Ok(sample_rate) = sample_rate.parse::<u32>() else {
+            eprintln!("Audio Unit preview sample rate must be an integer");
+            std::process::exit(2);
+        };
+        std::process::exit(audio_unit_probe::run_note_preview_child(
+            type_code,
+            subtype_code,
+            manufacturer_code,
+            sample_rate,
         ));
     }
     if args
@@ -4317,6 +4341,9 @@ struct DawUi {
     audio_unit_probe_sender: Sender<AudioUnitProbeRequest>,
     audio_unit_probe_receiver: Receiver<AudioUnitProbeResponse>,
     audio_unit_probe_states: BTreeMap<AudioUnitProbeKey, AudioUnitProbeState>,
+    audio_unit_note_preview_sender: Sender<AudioUnitNotePreviewRequest>,
+    audio_unit_note_preview_receiver: Receiver<AudioUnitNotePreviewResponse>,
+    audio_unit_note_preview_states: BTreeMap<AudioUnitProbeKey, AudioUnitNotePreviewState>,
     clap_inspection_sender: Sender<PathBuf>,
     clap_inspection_receiver: Receiver<ClapInspectionResponse>,
     clap_inspection_states: BTreeMap<PathBuf, ClapInspectionState>,
@@ -5231,6 +5258,8 @@ impl DawUi {
         let plugin_candidates = scan_installed_plugins().candidates;
         let (audio_unit_probe_sender, audio_unit_probe_receiver) =
             audio_unit_probe::start_worker(creation.egui_ctx.clone());
+        let (audio_unit_note_preview_sender, audio_unit_note_preview_receiver) =
+            audio_unit_probe::start_note_preview_worker(creation.egui_ctx.clone());
         let (clap_inspection_sender, clap_inspection_receiver) =
             clap_probe::start_worker(creation.egui_ctx.clone());
         let (clap_instance_inspection_sender, clap_instance_inspection_receiver) =
@@ -5582,6 +5611,9 @@ impl DawUi {
             audio_unit_probe_sender,
             audio_unit_probe_receiver,
             audio_unit_probe_states: BTreeMap::new(),
+            audio_unit_note_preview_sender,
+            audio_unit_note_preview_receiver,
+            audio_unit_note_preview_states: BTreeMap::new(),
             clap_inspection_sender,
             clap_inspection_receiver,
             clap_inspection_states: BTreeMap::new(),
@@ -13906,6 +13938,124 @@ impl DawUi {
         }
     }
 
+    fn request_audio_unit_note_preview(
+        &mut self,
+        path: PathBuf,
+        component: flp_rebuild::plugins::AudioUnitComponentInfo,
+        ctx: &egui::Context,
+    ) {
+        if self
+            .audio_unit_note_preview_states
+            .values()
+            .any(|state| matches!(state, AudioUnitNotePreviewState::Rendering))
+            || self
+                .clap_note_preview_states
+                .values()
+                .any(|state| matches!(state, ClapNotePreviewState::Rendering))
+        {
+            return;
+        }
+        if self.audio_engine.is_none() {
+            match AudioEngine::start(&self.audio_settings) {
+                Ok(engine) => self.audio_engine = Some(engine),
+                Err(error) => {
+                    self.audio_unit_note_preview_states.insert(
+                        audio_unit_probe::probe_key(&path, &component),
+                        AudioUnitNotePreviewState::Failed(error.clone()),
+                    );
+                    self.status = format!("Could not start Audio Unit preview audio: {error}");
+                    return;
+                }
+            }
+        }
+        let Some(engine) = self.audio_engine.as_ref() else {
+            return;
+        };
+        if !engine.output_active() {
+            let error = "Enable an output device before previewing an Audio Unit instrument";
+            self.audio_unit_note_preview_states.insert(
+                audio_unit_probe::probe_key(&path, &component),
+                AudioUnitNotePreviewState::Failed(error.to_owned()),
+            );
+            self.status = error.to_owned();
+            return;
+        }
+
+        let sample_rate = engine.sample_rate();
+        self.browser_preview_queued = None;
+        self.browser_preview_cancelled = self.browser_preview_pending.is_some();
+        self.browser_preview_path = None;
+        self.browser_preview_error = None;
+        engine.stop_browser_preview();
+        engine.set_browser_preview_looping(false);
+
+        let key = audio_unit_probe::probe_key(&path, &component);
+        self.audio_unit_note_preview_states
+            .insert(key.clone(), AudioUnitNotePreviewState::Rendering);
+        if self
+            .audio_unit_note_preview_sender
+            .send((path, component.clone(), sample_rate))
+            .is_err()
+        {
+            let error = "Audio Unit preview worker is unavailable".to_owned();
+            self.audio_unit_note_preview_states
+                .insert(key, AudioUnitNotePreviewState::Failed(error.clone()));
+            self.status = error;
+        } else {
+            self.status = format!("Rendering C4 preview for {}", component.name);
+            ctx.request_repaint_after(Duration::from_millis(40));
+        }
+    }
+
+    fn poll_audio_unit_note_preview(&mut self, ctx: &egui::Context) {
+        while let Ok((path, component, result)) = self.audio_unit_note_preview_receiver.try_recv() {
+            let key = audio_unit_probe::probe_key(&path, &component);
+            if !matches!(
+                self.audio_unit_note_preview_states.get(&key),
+                Some(AudioUnitNotePreviewState::Rendering)
+            ) {
+                continue;
+            }
+
+            let result = result.and_then(|samples| {
+                let engine = self
+                    .audio_engine
+                    .as_ref()
+                    .ok_or_else(|| "Audio output is not available".to_owned())?;
+                if !engine.output_active() {
+                    return Err(
+                        "Enable an output device before previewing an Audio Unit instrument".into(),
+                    );
+                }
+                engine.set_browser_preview_gain(self.browser_preview_volume);
+                engine.set_browser_preview_looping(false);
+                engine.set_browser_preview(samples)
+            });
+            match result {
+                Ok(()) => {
+                    self.browser_preview_path = None;
+                    self.browser_preview_error = None;
+                    self.audio_unit_note_preview_states
+                        .insert(key, AudioUnitNotePreviewState::Ready);
+                    self.status = format!("Previewing {} at C4", component.name);
+                }
+                Err(error) => {
+                    self.audio_unit_note_preview_states
+                        .insert(key, AudioUnitNotePreviewState::Failed(error.clone()));
+                    self.status = format!("Could not preview {}: {error}", component.name);
+                }
+            }
+        }
+
+        if self
+            .audio_unit_note_preview_states
+            .values()
+            .any(|state| matches!(state, AudioUnitNotePreviewState::Rendering))
+        {
+            ctx.request_repaint_after(Duration::from_millis(40));
+        }
+    }
+
     fn request_clap_note_preview(
         &mut self,
         path: PathBuf,
@@ -13917,6 +14067,10 @@ impl DawUi {
             .clap_note_preview_states
             .values()
             .any(|state| matches!(state, ClapNotePreviewState::Rendering))
+            || self
+                .audio_unit_note_preview_states
+                .values()
+                .any(|state| matches!(state, AudioUnitNotePreviewState::Rendering))
         {
             return;
         }
@@ -45907,6 +46061,7 @@ impl DawUi {
         let mut inspect_clap_instance = None;
         let mut preview_clap_note = None;
         let mut probe_audio_unit = None;
+        let mut preview_audio_unit = None;
         let mut open_id = None;
         let mut close_id = None;
         let mut parameter_edits = Vec::new();
@@ -45931,6 +46086,10 @@ impl DawUi {
             .clap_note_preview_states
             .values()
             .any(|state| matches!(state, ClapNotePreviewState::Rendering));
+        let audio_unit_note_preview_busy = self
+            .audio_unit_note_preview_states
+            .values()
+            .any(|state| matches!(state, AudioUnitNotePreviewState::Rendering));
 
         while let Ok((path, result)) = self.clap_inspection_receiver.try_recv() {
             let state = match result {
@@ -46299,7 +46458,8 @@ impl DawUi {
                                             };
                                             if ui
                                                 .add_enabled(
-                                                    !clap_note_preview_busy,
+                                                    !clap_note_preview_busy
+                                                        && !audio_unit_note_preview_busy,
                                                     egui::Button::new(button_label),
                                                 )
                                                 .clicked()
@@ -46488,7 +46648,7 @@ impl DawUi {
                 ));
                 ui.label(
                     egui::RichText::new(
-                        "Component identities are read from Info.plist and checked against the macOS catalog. Registered components can be instantiated and initialized in a short-lived helper process; audio processing and persistent hosting are not available yet.",
+                        "Component identities are read from Info.plist and checked against the macOS catalog. Registered instruments can render a short C4 audition in a timed helper process; persistent hosting and project integration are not available yet.",
                     )
                     .color(MUTED),
                 );
@@ -46502,6 +46662,7 @@ impl DawUi {
                             for component in &candidate.audio_unit_components {
                                 let key = audio_unit_probe::probe_key(&candidate.path, component);
                                 let state = self.audio_unit_probe_states.get(&key);
+                                let preview_state = self.audio_unit_note_preview_states.get(&key);
                                 let registry_status = match component.registered {
                                     Some(true) => " · registered with macOS",
                                     Some(false) => " · not found in macOS catalog",
@@ -46520,7 +46681,12 @@ impl DawUi {
                                         matches!(state, Some(AudioUnitProbeState::Probing));
                                     if ui
                                         .add_enabled(
-                                            component.registered == Some(true) && !probing,
+                                            component.registered == Some(true)
+                                                && !probing
+                                                && !matches!(
+                                                    preview_state,
+                                                    Some(AudioUnitNotePreviewState::Rendering)
+                                                ),
                                             egui::Button::new(if probing {
                                                 "Initializing…"
                                             } else if state.is_some() {
@@ -46533,6 +46699,34 @@ impl DawUi {
                                     {
                                         probe_audio_unit =
                                             Some((candidate.path.clone(), component.clone()));
+                                    }
+                                    if component.type_code == "aumu" {
+                                        let previewing = matches!(
+                                            preview_state,
+                                            Some(AudioUnitNotePreviewState::Rendering)
+                                        );
+                                        if ui
+                                            .add_enabled(
+                                                component.registered == Some(true)
+                                                    && !probing
+                                                    && !previewing
+                                                    && !clap_note_preview_busy
+                                                    && !audio_unit_note_preview_busy,
+                                                egui::Button::new(if previewing {
+                                                    "Rendering…"
+                                                } else if preview_state.is_some() {
+                                                    "Preview again"
+                                                } else {
+                                                    "Preview C4"
+                                                }),
+                                            )
+                                            .clicked()
+                                        {
+                                            preview_audio_unit = Some((
+                                                candidate.path.clone(),
+                                                component.clone(),
+                                            ));
+                                        }
                                     }
                                 });
                                 match state {
@@ -46553,6 +46747,18 @@ impl DawUi {
                                         }
                                     }
                                     Some(AudioUnitProbeState::Failed(error)) => {
+                                        ui.colored_label(ORANGE, error);
+                                    }
+                                    None => {}
+                                }
+                                match preview_state {
+                                    Some(AudioUnitNotePreviewState::Rendering) => {
+                                        ui.small("Rendering a short audition in a timed helper process…");
+                                    }
+                                    Some(AudioUnitNotePreviewState::Ready) => {
+                                        ui.colored_label(GREEN, "C4 audition played through the shared preview output");
+                                    }
+                                    Some(AudioUnitNotePreviewState::Failed(error)) => {
                                         ui.colored_label(ORANGE, error);
                                     }
                                     None => {}
@@ -46598,6 +46804,10 @@ impl DawUi {
             } else {
                 ui.ctx().request_repaint();
             }
+        }
+
+        if let Some((path, component)) = preview_audio_unit {
+            self.request_audio_unit_note_preview(path, component, ui.ctx());
         }
 
         if let Some((path, plugin_id)) = inspect_clap_instance {
@@ -47351,6 +47561,7 @@ impl eframe::App for DawUi {
         self.poll_sampler_stream();
         self.poll_browser_preview(ui.ctx());
         self.poll_clap_note_preview(ui.ctx());
+        self.poll_audio_unit_note_preview(ui.ctx());
         self.poll_sample_editor_recording(ui.ctx());
         self.poll_sample_editor(ui.ctx());
         self.sample_editor_window(ui.ctx());
