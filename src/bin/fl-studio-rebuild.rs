@@ -3360,6 +3360,7 @@ struct PianoRollScrubDrag {
     pattern_id: u16,
     channel_id: u16,
     last_tick: u32,
+    secondary_button: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -35677,11 +35678,20 @@ impl DawUi {
                     && !self.piano_roll_mute_mode
                     && !self.piano_roll_stamp_mode
                     && !modifiers.command;
+                let alt_scrub_right_click = draw_or_paint_mode
+                    && !self.piano_roll_paint_mode
+                    && modifiers.alt;
+                let continuing_alt_scrub = self.piano_roll_scrub_drag.is_some_and(|drag| {
+                    drag.pattern_id == pattern.id && drag.secondary_button
+                });
                 let delete_note_gesture = (self.piano_roll_mute_mode && delete_gesture)
                     || (self.piano_roll_delete_mode
                         && mute_gesture
                         && !modifiers.command)
-                    || (draw_or_paint_mode && delete_gesture);
+                    || (draw_or_paint_mode
+                        && delete_gesture
+                        && !alt_scrub_right_click
+                        && !continuing_alt_scrub);
                 if delete_note_gesture
                     && (!ghost || self.piano_roll_editable_ghost_channels)
                     && self.last_piano_roll_delete_note != Some(note_id)
@@ -36203,124 +36213,163 @@ impl DawUi {
             let scrub_channel_id = self
                 .selected_note_channel
                 .or_else(|| pattern.notes.first().map(|note| note.channel_id));
-            if !self.piano_roll_playback_mode {
-                self.piano_roll_scrub_drag = None;
+            let (
+                primary_pressed,
+                primary_down,
+                primary_released,
+                secondary_pressed,
+                secondary_down,
+                secondary_released,
+                press_origin,
+                pointer,
+            ) = ui.input(|input| {
+                (
+                    input.pointer.primary_pressed(),
+                    input.pointer.primary_down(),
+                    input.pointer.primary_released(),
+                    input.pointer.button_pressed(PointerButton::Secondary),
+                    input.pointer.secondary_down(),
+                    input.pointer.button_released(PointerButton::Secondary),
+                    input.pointer.press_origin(),
+                    input.pointer.interact_pos(),
+                )
+            });
+            let alt_draw_scrub_mode = !self.piano_roll_select_mode
+                && !self.piano_roll_zoom_mode
+                && !self.piano_roll_playback_mode
+                && !self.piano_roll_paint_mode
+                && !self.piano_roll_slice_mode
+                && !self.piano_roll_delete_mode
+                && !self.piano_roll_mute_mode
+                && !self.piano_roll_stamp_mode
+                && !suppress_piano_roll_touch_edits
+                && !scroll_modifiers.command;
+            let scrub_start_button = if self.piano_roll_playback_mode && primary_pressed {
+                Some(false)
+            } else if alt_draw_scrub_mode && scroll_modifiers.alt && secondary_pressed {
+                Some(true)
             } else {
-                let (primary_pressed, primary_down, primary_released, press_origin, pointer) =
-                    ui.input(|input| {
-                        (
-                            input.pointer.primary_pressed(),
-                            input.pointer.primary_down(),
-                            input.pointer.primary_released(),
-                            input.pointer.press_origin(),
-                            input.pointer.interact_pos(),
-                        )
+                None
+            };
+            if let Some(secondary_button) = scrub_start_button {
+                self.piano_roll_scrub_drag = None;
+                if let (Some(origin), Some(channel_id)) = (press_origin, scrub_channel_id)
+                    && grid_body_rect.contains(origin)
+                {
+                    let start_tick = piano_roll_time_tick_at_x(
+                        origin.x,
+                        grid_rect.left() + keyboard_width,
+                        tick_scale,
+                        0,
+                    );
+                    self.piano_roll_scrub_drag = Some(PianoRollScrubDrag {
+                        pattern_id: pattern.id,
+                        channel_id,
+                        last_tick: start_tick,
+                        secondary_button,
                     });
-                if primary_pressed {
-                    self.piano_roll_scrub_drag = None;
-                    if let (Some(origin), Some(channel_id)) = (press_origin, scrub_channel_id)
-                        && grid_body_rect.contains(origin)
+                    let active_onset = pattern
+                        .notes
+                        .iter()
+                        .filter(|note| {
+                            note.channel_id == channel_id
+                                && !note.is_muted()
+                                && note.position <= start_tick
+                                && start_tick < note.position.saturating_add(note.length.max(1))
+                        })
+                        .map(|note| note.position)
+                        .max();
+                    if let Some(onset) = active_onset
+                        && let Some(note_index) = pattern
+                            .notes
+                            .iter()
+                            .filter(|note| note.channel_id == channel_id)
+                            .position(|note| note.position == onset && !note.is_muted())
                     {
-                        let start_tick = piano_roll_time_tick_at_x(
-                            origin.x,
-                            grid_rect.left() + keyboard_width,
-                            tick_scale,
-                            0,
-                        );
-                        self.piano_roll_scrub_drag = Some(PianoRollScrubDrag {
-                            pattern_id: pattern.id,
-                            channel_id,
-                            last_tick: start_tick,
-                        });
-                        let active_onset = pattern
+                        self.play_piano_roll_note(pattern.id, channel_id, note_index);
+                    }
+                }
+            }
+            if let Some(mut drag) = self.piano_roll_scrub_drag {
+                let button_down = if drag.secondary_button {
+                    secondary_down
+                } else {
+                    primary_down
+                };
+                let button_released = if drag.secondary_button {
+                    secondary_released
+                } else {
+                    primary_released
+                };
+                let mode_still_active = if drag.secondary_button {
+                    alt_draw_scrub_mode
+                } else {
+                    self.piano_roll_playback_mode
+                };
+                if drag.pattern_id != pattern.id
+                    || Some(drag.channel_id) != scrub_channel_id
+                    || !mode_still_active
+                    || !button_down
+                    || button_released
+                {
+                    self.piano_roll_scrub_drag = None;
+                } else if let Some(pointer) = pointer {
+                    let pointer_x = pointer
+                        .x
+                        .clamp(grid_body_rect.left(), grid_body_rect.right());
+                    let current_tick = piano_roll_time_tick_at_x(
+                        pointer_x,
+                        grid_rect.left() + keyboard_width,
+                        tick_scale,
+                        0,
+                    );
+                    let crossed_onset = if current_tick > drag.last_tick {
+                        pattern
                             .notes
                             .iter()
                             .filter(|note| {
-                                note.channel_id == channel_id
+                                note.channel_id == drag.channel_id
                                     && !note.is_muted()
-                                    && note.position <= start_tick
-                                    && start_tick
-                                        < note.position.saturating_add(note.length.max(1))
+                                    && note.position > drag.last_tick
+                                    && note.position <= current_tick
                             })
                             .map(|note| note.position)
-                            .max();
-                        if let Some(onset) = active_onset
-                            && let Some(note_index) = pattern
-                                .notes
-                                .iter()
-                                .filter(|note| note.channel_id == channel_id)
-                                .position(|note| note.position == onset && !note.is_muted())
-                        {
-                            self.play_piano_roll_note(pattern.id, channel_id, note_index);
-                        }
-                    }
-                }
-                if let Some(mut drag) = self.piano_roll_scrub_drag {
-                    if drag.pattern_id != pattern.id
-                        || Some(drag.channel_id) != scrub_channel_id
-                        || !primary_down
-                        || primary_released
+                            .max()
+                    } else if current_tick < drag.last_tick {
+                        pattern
+                            .notes
+                            .iter()
+                            .filter(|note| {
+                                note.channel_id == drag.channel_id
+                                    && !note.is_muted()
+                                    && note.position < drag.last_tick
+                                    && note.position >= current_tick
+                            })
+                            .map(|note| note.position)
+                            .min()
+                    } else {
+                        None
+                    };
+                    if let Some(onset) = crossed_onset
+                        && let Some(note_index) = pattern
+                            .notes
+                            .iter()
+                            .filter(|note| note.channel_id == drag.channel_id)
+                            .position(|note| note.position == onset && !note.is_muted())
                     {
-                        self.piano_roll_scrub_drag = None;
-                    } else if let Some(pointer) = pointer {
-                        let pointer_x = pointer
-                            .x
-                            .clamp(grid_body_rect.left(), grid_body_rect.right());
-                        let current_tick = piano_roll_time_tick_at_x(
-                            pointer_x,
-                            grid_rect.left() + keyboard_width,
-                            tick_scale,
-                            0,
-                        );
-                        let crossed_onset = if current_tick > drag.last_tick {
-                            pattern
-                                .notes
-                                .iter()
-                                .filter(|note| {
-                                    note.channel_id == drag.channel_id
-                                        && !note.is_muted()
-                                        && note.position > drag.last_tick
-                                        && note.position <= current_tick
-                                })
-                                .map(|note| note.position)
-                                .max()
-                        } else if current_tick < drag.last_tick {
-                            pattern
-                                .notes
-                                .iter()
-                                .filter(|note| {
-                                    note.channel_id == drag.channel_id
-                                        && !note.is_muted()
-                                        && note.position < drag.last_tick
-                                        && note.position >= current_tick
-                                })
-                                .map(|note| note.position)
-                                .min()
-                        } else {
-                            None
-                        };
-                        if let Some(onset) = crossed_onset
-                            && let Some(note_index) = pattern
-                                .notes
-                                .iter()
-                                .filter(|note| note.channel_id == drag.channel_id)
-                                .position(|note| note.position == onset && !note.is_muted())
-                        {
-                            self.play_piano_roll_note(pattern.id, drag.channel_id, note_index);
-                        }
-                        drag.last_tick = current_tick;
-                        self.piano_roll_scrub_drag = Some(drag);
-                        let playhead_x = grid_rect.left()
-                            + keyboard_width
-                            + drag.last_tick as f32 * tick_scale;
-                        painter.line_segment(
-                            [
-                                egui::pos2(playhead_x, grid_body_rect.top()),
-                                egui::pos2(playhead_x, grid_body_rect.bottom()),
-                            ],
-                            Stroke::new(2.0, Color32::from_rgb(255, 166, 64)),
-                        );
+                        self.play_piano_roll_note(pattern.id, drag.channel_id, note_index);
                     }
+                    drag.last_tick = current_tick;
+                    self.piano_roll_scrub_drag = Some(drag);
+                    let playhead_x =
+                        grid_rect.left() + keyboard_width + drag.last_tick as f32 * tick_scale;
+                    painter.line_segment(
+                        [
+                            egui::pos2(playhead_x, grid_body_rect.top()),
+                            egui::pos2(playhead_x, grid_body_rect.bottom()),
+                        ],
+                        Stroke::new(2.0, Color32::from_rgb(255, 166, 64)),
+                    );
                 }
             }
             if let Some(tick) = transport_playhead_tick {
