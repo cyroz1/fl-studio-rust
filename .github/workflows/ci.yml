@@ -42,7 +42,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --yes binutils ffmpeg libarchive-tools libasound2-dev libxcb1-dev libxkbcommon-x11-0 mesa-vulkan-drivers rpm xvfb xdotool
+          sudo apt-get install --yes ffmpeg libasound2-dev libxcb1-dev libxkbcommon-x11-0 mesa-vulkan-drivers xvfb xdotool
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -168,14 +168,14 @@ jobs:
               package_arch=amd64
               rpm_arch=x86_64
               archlinux_arch=x86_64
-              elf_machine="Advanced Micro Devices X86-64"
+              elf_machine=62
               ;;
             aarch64)
               nfpm_asset_arch=arm64
               package_arch=arm64
               rpm_arch=aarch64
               archlinux_arch=aarch64
-              elf_machine=AArch64
+              elf_machine=183
               ;;
             *)
               echo "::error::Unsupported Linux package architecture: $(uname -m)"
@@ -278,25 +278,41 @@ jobs:
             exit 1
           fi
 
-          rpm_arch="$(rpm -qp --qf '%{ARCH}\n' "${rpm_packages[0]}")"
-          if [[ "$rpm_arch" != "$LINUX_RPM_ARCH" ]]; then
-            echo "::error::RPM package architecture is $rpm_arch; expected $LINUX_RPM_ARCH."
+          rpm_name="${rpm_packages[0]##*/}"
+          if [[ "$rpm_name" != *".${LINUX_RPM_ARCH}.rpm" ]]; then
+            echo "::error::RPM package filename does not identify $LINUX_RPM_ARCH: $rpm_name"
             exit 1
           fi
 
-          archlinux_arch="$(bsdtar -xOf "${arch_packages[0]}" .PKGINFO \
-            | awk -F ' = ' '$1 == "arch" { print $2; exit }')"
-          if [[ "$archlinux_arch" != "$LINUX_ARCHLINUX_ARCH" ]]; then
-            echo "::error::Arch package architecture is $archlinux_arch; expected $LINUX_ARCHLINUX_ARCH."
+          arch_name="${arch_packages[0]##*/}"
+          if [[ "$arch_name" != *"-${LINUX_ARCHLINUX_ARCH}.pkg.tar.zst" ]]; then
+            echo "::error::Arch package filename does not identify $LINUX_ARCHLINUX_ARCH: $arch_name"
             exit 1
           fi
 
-          elf_machine="$(readelf --file-header target/release/fl-studio-rebuild \
-            | sed -n 's/^[[:space:]]*Machine:[[:space:]]*//p')"
-          if [[ "$elf_machine" != "$LINUX_ELF_MACHINE" ]]; then
-            echo "::error::Linux executable architecture is '$elf_machine'; expected '$LINUX_ELF_MACHINE'."
-            exit 1
-          fi
+          python3 - target/release/fl-studio-rebuild "$LINUX_ELF_MACHINE" <<'PY'
+          import struct
+          import sys
+          from pathlib import Path
+
+          executable_path = Path(sys.argv[1])
+          expected_machine = int(sys.argv[2])
+          header = executable_path.read_bytes()[:64]
+          if len(header) < 20 or header[:4] != b"\x7fELF":
+              raise SystemExit(f"{executable_path} is not an ELF executable")
+          if header[4] != 2:
+              raise SystemExit(f"{executable_path} is not a 64-bit ELF executable")
+          byte_order = {1: "<", 2: ">"}.get(header[5])
+          if byte_order is None:
+              raise SystemExit(f"{executable_path} has an unknown ELF byte order")
+          actual_machine = struct.unpack_from(f"{byte_order}H", header, 18)[0]
+          if actual_machine != expected_machine:
+              raise SystemExit(
+                  f"{executable_path} ELF machine is {actual_machine}; "
+                  f"expected {expected_machine}"
+              )
+          print(f"Verified {executable_path} ELF machine {actual_machine}.")
+          PY
           echo "Verified Debian, RPM, Arch, and executable architectures for $(uname -m)."
 
       - name: Install Linux Debian package
