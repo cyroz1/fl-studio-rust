@@ -311,8 +311,7 @@ with MIT; would need a commercial Rubber Band license or a clean-room
 implementation).
 
 - `[partial]` Channel Parameters expose the saved time, pitch, multiplier, and mode fields in the channel summary and allow lossless API/CLI/Channel Rack edits for an existing unique full-length `0xC7` event. The Channel Rack displays the saved raw fields and known mode choices under each eligible channel's Time stretch section. Stretch settings are not yet applied to playback or rendering, and clip-level settings still need format mapping and native comparison ([format observations](format-observations.md#channel-time-stretch-settings)).
-- `[todo]` Offline "stretch" with preserved transients
-- `[partial]` The Sample Editor can pitch-shift a mono or stereo selection by up to two octaves in either direction while preserving its duration, then export it with fades, normalization, and reversal without changing the source. Playback/render pitch processing and Playlist clip-level mapping remain incomplete.
+- `[partial]` The Sample Editor exports selected mono/stereo audio with offline time stretch from 0.5× to 2× duration while preserving pitch and using the engine's transient analysis, plus independent pitch shift up to two octaves in either direction. Stretch and pitch processing run asynchronously, preserve the decoded source, and combine with fades, normalization, and reversal; processing is bounded to 16 million interleaved samples. Preview/playback/render pitch processing and Playlist clip-level stretch mapping remain incomplete.
 
 ---
 

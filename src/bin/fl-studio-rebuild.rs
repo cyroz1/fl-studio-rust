@@ -26,7 +26,7 @@ use flp_rebuild::media::{
     AudioExportOptions, AudioWaveform, DecodedAudio, SamplePathResolver, WaveformPeak,
     decode_audio_file, decode_audio_preview, decode_audio_preview_from_position,
     decode_audio_waveform, find_empty_project_template, summarize_audio_waveform,
-    write_audio_range_to_wav_with_pitch_processing,
+    write_audio_range_to_wav_with_options,
 };
 use flp_rebuild::midi::{MidiChannelMapping, MidiFile, MidiImportOptions};
 use flp_rebuild::plugins::{PluginCandidate, PluginFormat, scan_installed_plugins};
@@ -4108,6 +4108,11 @@ struct PendingSampleEditor {
     recording_notice: Option<String>,
 }
 
+struct PendingSampleEditorExport {
+    receiver: Receiver<Result<PathBuf, String>>,
+    worker: thread::JoinHandle<()>,
+}
+
 struct SampleEditorRecordingSession {
     receiver: Receiver<Result<AudioRecordingSummary, String>>,
     worker: thread::JoinHandle<()>,
@@ -4118,13 +4123,14 @@ struct SampleEditorRecordingSession {
 
 struct SampleEditorState {
     path: PathBuf,
-    audio: DecodedAudio,
+    audio: Arc<DecodedAudio>,
     waveform: AudioWaveform,
     selection_start: usize,
     selection_end: usize,
     spectral_view: bool,
     selection_drag_anchor: Option<usize>,
     pitch_shift_semitones: f32,
+    stretch_ratio: f32,
     fade_in_seconds: f32,
     fade_out_seconds: f32,
     normalize_export: bool,
@@ -4701,6 +4707,7 @@ struct DawUi {
     browser_preview_error: Option<String>,
     sample_editor: Option<SampleEditorState>,
     sample_editor_pending: Option<PendingSampleEditor>,
+    sample_editor_export_pending: Option<PendingSampleEditorExport>,
     sample_editor_recording: Option<SampleEditorRecordingSession>,
     audio_test_tone: bool,
     audio_monitor_input: bool,
@@ -5984,6 +5991,7 @@ impl DawUi {
             browser_preview_error: None,
             sample_editor: None,
             sample_editor_pending: None,
+            sample_editor_export_pending: None,
             sample_editor_recording: None,
             audio_test_tone: false,
             audio_monitor_input: false,
@@ -14942,13 +14950,14 @@ impl DawUi {
                     });
                     self.sample_editor = Some(SampleEditorState {
                         path: pending.path,
-                        audio,
+                        audio: Arc::new(audio),
                         waveform,
                         selection_start: 0,
                         selection_end,
                         spectral_view: false,
                         selection_drag_anchor: None,
                         pitch_shift_semitones: 0.0,
+                        stretch_ratio: 1.0,
                         fade_in_seconds: 0.0,
                         fade_out_seconds: 0.0,
                         normalize_export: false,
@@ -14984,6 +14993,7 @@ impl DawUi {
             return;
         }
 
+        let export_pending = self.sample_editor_export_pending.is_some();
         let Some(editor) = self.sample_editor.as_mut() else {
             let Some(recording) = self.sample_editor_recording.as_ref() else {
                 return;
@@ -15095,12 +15105,14 @@ impl DawUi {
                 );
                 let selection_duration =
                     (editor.selection_end - editor.selection_start) as f64 / f64::from(sample_rate);
+                let output_duration = selection_duration * f64::from(editor.stretch_ratio);
                 ui.label(format!(
                     "Selected {:.3}–{:.3}s · {:.3}s",
                     editor.selection_start as f64 / f64::from(sample_rate),
                     editor.selection_end as f64 / f64::from(sample_rate),
                     selection_duration
                 ));
+                ui.small(format!("Export duration: {output_duration:.3}s"));
                 ui.add_enabled_ui(editor.audio.channels.len() <= 2, |ui| {
                     ui.add(
                         egui::Slider::new(
@@ -15110,11 +15122,18 @@ impl DawUi {
                         .step_by(0.01)
                         .text("Pitch shift (semitones)"),
                     );
+                    ui.add(
+                        egui::Slider::new(&mut editor.stretch_ratio, 0.5..=2.0)
+                            .step_by(0.01)
+                            .text("Time stretch (×)"),
+                    );
                 });
                 if editor.audio.channels.len() > 2 {
-                    ui.small("Pitch shifting is available for mono and stereo samples.");
+                    ui.small("Pitch shift and time stretch are available for mono and stereo samples.");
+                } else {
+                    ui.small("1.00× keeps duration; above 1 lengthens, below 1 shortens. Stretch preserves pitch and uses transient detection.");
                 }
-                let maximum_fade_seconds = selection_duration as f32;
+                let maximum_fade_seconds = output_duration as f32;
                 editor.fade_in_seconds =
                     editor.fade_in_seconds.clamp(0.0, maximum_fade_seconds);
                 editor.fade_out_seconds =
@@ -15137,17 +15156,26 @@ impl DawUi {
                 });
                 ui.checkbox(&mut editor.reverse_export, "Reverse selection on export");
                 ui.horizontal(|ui| {
-                    if ui.button("Save selection as WAV…").clicked() {
+                    if ui
+                        .add_enabled(!export_pending, egui::Button::new("Save selection as WAV…"))
+                        .clicked()
+                    {
                         save_selection = true;
                     }
-                    ui.small("Pitch, fades, normalization, and reversal apply to the export; the source stays unchanged.");
+                    ui.small("Pitch, time stretch, fades, normalization, and reversal apply to the export; the source stays unchanged.");
                 });
+                if export_pending {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.small("Processing sample export…");
+                    });
+                }
             });
         if !open {
             self.sample_editor = None;
         }
         if save_selection {
-            self.save_sample_editor_selection();
+            self.save_sample_editor_selection(ctx);
         }
         if stop_recording {
             self.stop_sample_editor_recording();
@@ -15159,14 +15187,19 @@ impl DawUi {
         }
     }
 
-    fn save_sample_editor_selection(&mut self) {
+    fn save_sample_editor_selection(&mut self, ctx: &egui::Context) {
+        if self.sample_editor_export_pending.is_some() {
+            return;
+        }
         let Some(editor) = self.sample_editor.as_ref() else {
             return;
         };
-        let pitch_suffix = if editor.pitch_shift_semitones == 0.0 {
-            "trim"
-        } else {
+        let pitch_suffix = if editor.pitch_shift_semitones != 0.0 {
             "edited"
+        } else if editor.stretch_ratio != 1.0 {
+            "stretched"
+        } else {
+            "trim"
         };
         let default_name = editor
             .path
@@ -15198,32 +15231,75 @@ impl DawUi {
         }
         let selected_frames = editor.selection_end - editor.selection_start;
         let sample_rate = f64::from(editor.audio.sample_rate.max(1));
+        let stretch_ratio = f64::from(editor.stretch_ratio);
+        let output_frames = (selected_frames as f64 * stretch_ratio).round().max(1.0);
         let fade_in_frames = (f64::from(editor.fade_in_seconds.max(0.0)) * sample_rate)
             .round()
-            .clamp(0.0, selected_frames as f64) as usize;
+            .clamp(0.0, output_frames) as usize;
         let fade_out_frames = (f64::from(editor.fade_out_seconds.max(0.0)) * sample_rate)
             .round()
-            .clamp(0.0, selected_frames as f64) as usize;
-        match write_audio_range_to_wav_with_pitch_processing(
-            &editor.audio,
-            editor.selection_start..editor.selection_end,
-            AudioExportOptions {
-                pitch_shift_semitones: editor.pitch_shift_semitones,
-                fade_in_frames,
-                fade_out_frames,
-                reverse: editor.reverse_export,
-                normalization_target_dbfs: editor
-                    .normalize_export
-                    .then_some(editor.normalization_target_dbfs),
-            },
-            &output_path,
-        ) {
-            Ok(()) => {
-                self.status = format!("Saved trimmed sample {}", output_path.display());
+            .clamp(0.0, output_frames) as usize;
+        let audio = Arc::clone(&editor.audio);
+        let frame_range = editor.selection_start..editor.selection_end;
+        let options = AudioExportOptions {
+            pitch_shift_semitones: editor.pitch_shift_semitones,
+            stretch_ratio: editor.stretch_ratio,
+            fade_in_frames,
+            fade_out_frames,
+            reverse: editor.reverse_export,
+            normalization_target_dbfs: editor
+                .normalize_export
+                .then_some(editor.normalization_target_dbfs),
+        };
+        let worker_output_path = output_path.clone();
+        let (sender, receiver) = mpsc::channel();
+        let worker = thread::Builder::new()
+            .name("sample-editor-export".to_owned())
+            .spawn(move || {
+                let result = write_audio_range_to_wav_with_options(
+                    &audio,
+                    frame_range,
+                    options,
+                    &worker_output_path,
+                )
+                .map(|()| worker_output_path);
+                let _ = sender.send(result);
+            });
+        match worker {
+            Ok(worker) => {
+                self.sample_editor_export_pending =
+                    Some(PendingSampleEditorExport { receiver, worker });
+                self.status = format!("Processing sample export to {}…", output_path.display());
+                ctx.request_repaint_after(Duration::from_millis(40));
             }
             Err(error) => {
-                self.status = format!("Could not save trimmed sample: {error}");
+                self.status = format!("Could not start sample export: {error}");
             }
+        }
+    }
+
+    fn poll_sample_editor_export(&mut self, ctx: &egui::Context) {
+        let completed =
+            self.sample_editor_export_pending
+                .as_ref()
+                .and_then(|pending| match pending.receiver.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(TryRecvError::Disconnected) => {
+                        Some(Err("sample export worker stopped unexpectedly".to_owned()))
+                    }
+                    Err(TryRecvError::Empty) => None,
+                });
+        if let Some(result) = completed
+            && let Some(pending) = self.sample_editor_export_pending.take()
+        {
+            let _ = pending.worker.join();
+            self.status = match result {
+                Ok(path) => format!("Saved processed sample {}", path.display()),
+                Err(error) => format!("Could not save processed sample: {error}"),
+            };
+        }
+        if self.sample_editor_export_pending.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(40));
         }
     }
 
@@ -49315,6 +49391,7 @@ impl eframe::App for DawUi {
         // The root Ui can be created before a native backend reports its
         // system theme. Keep its widget visuals on the app palette as well.
         *ui.visuals_mut() = app_visuals();
+        self.poll_sample_editor_export(ui.ctx());
         self.guard_window_close(ui.ctx());
         if ui.input(|input| input.pointer.button_released(PointerButton::Primary))
             && self.performance_launch_sender.is_some()
@@ -50670,6 +50747,9 @@ impl Drop for DawUi {
                 engine.stop_input_recording();
             }
             let _ = session.worker.join();
+        }
+        if let Some(export) = self.sample_editor_export_pending.take() {
+            let _ = export.worker.join();
         }
         for worker in self.audio_render_workers.drain(..) {
             let _ = worker.worker.join();

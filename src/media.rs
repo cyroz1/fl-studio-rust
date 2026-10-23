@@ -13,11 +13,11 @@ use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, TrackType};
 use symphonia::core::io::{MediaSource, MediaSourceStream};
 use symphonia::core::meta::MetadataOptions;
-use timestretch::{StretchParams, pitch_shift};
+use timestretch::{StretchParams, pitch_shift, stretch};
 
 const FACTORY_DATA_MACRO: &str = "%FLStudioFactoryData%";
 const MAX_DECODED_SAMPLE_BYTES: usize = 512 * 1024 * 1024;
-const MAX_PITCH_SHIFT_INTERLEAVED_SAMPLES: usize = 16 * 1024 * 1024;
+const MAX_SAMPLE_EDITOR_PROCESSING_SAMPLES: usize = 16 * 1024 * 1024;
 const WAVEFORM_SPECTRUM_WINDOW: usize = 256;
 const WAVEFORM_SPECTRUM_COLUMNS: usize = 128;
 const WAVEFORM_SPECTRUM_BANDS: usize = 32;
@@ -388,25 +388,41 @@ pub fn write_audio_range_to_wav_with_processing(
 }
 
 /// Processing options for a Sample Editor selection export.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AudioExportOptions {
     pub pitch_shift_semitones: f32,
+    /// Duration multiplier: values above 1.0 lengthen the selection without changing pitch.
+    pub stretch_ratio: f32,
     pub fade_in_frames: usize,
     pub fade_out_frames: usize,
     pub reverse: bool,
     pub normalization_target_dbfs: Option<f32>,
 }
 
-/// Pitch-shift a selected mono or stereo range while preserving its duration, then export it with
-/// the same fades, normalization, and reverse options as a normal Sample Editor selection.
-/// Pitch shifts are limited to two octaves in either direction.
-pub fn write_audio_range_to_wav_with_pitch_processing(
+impl Default for AudioExportOptions {
+    fn default() -> Self {
+        Self {
+            pitch_shift_semitones: 0.0,
+            stretch_ratio: 1.0,
+            fade_in_frames: 0,
+            fade_out_frames: 0,
+            reverse: false,
+            normalization_target_dbfs: None,
+        }
+    }
+}
+
+/// Process a selected mono or stereo range with duration-preserving pitch shift and/or
+/// transient-aware time stretch, then export it with fades, normalization, and reversal.
+/// Pitch shifts are limited to two octaves in either direction; stretch ratios are limited to
+/// 0.5–2.0. The decoded source is never modified.
+pub fn write_audio_range_to_wav_with_options(
     audio: &DecodedAudio,
     frame_range: Range<usize>,
     options: AudioExportOptions,
     output_path: impl AsRef<Path>,
 ) -> Result<(), String> {
-    if options.pitch_shift_semitones == 0.0 {
+    if options.pitch_shift_semitones == 0.0 && options.stretch_ratio == 1.0 {
         return write_audio_range_to_wav_with_processing(
             audio,
             frame_range,
@@ -423,12 +439,17 @@ pub fn write_audio_range_to_wav_with_pitch_processing(
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("wav"))
     {
-        return Err("trimmed audio output must use the .wav extension".to_owned());
+        return Err("processed audio output must use the .wav extension".to_owned());
     }
-    let pitched_audio = pitch_shift_audio_range(audio, frame_range, options.pitch_shift_semitones)?;
-    let frame_count = pitched_audio.frame_count();
+    let processed_audio = process_audio_range(
+        audio,
+        frame_range,
+        options.pitch_shift_semitones,
+        options.stretch_ratio,
+    )?;
+    let frame_count = processed_audio.frame_count();
     write_audio_range_to_wav_with_processing(
-        &pitched_audio,
+        &processed_audio,
         0..frame_count,
         options.fade_in_frames,
         options.fade_out_frames,
@@ -438,13 +459,17 @@ pub fn write_audio_range_to_wav_with_pitch_processing(
     )
 }
 
-fn pitch_shift_audio_range(
+fn process_audio_range(
     audio: &DecodedAudio,
     frame_range: Range<usize>,
     pitch_shift_semitones: f32,
+    stretch_ratio: f32,
 ) -> Result<DecodedAudio, String> {
     if !pitch_shift_semitones.is_finite() || !(-24.0..=24.0).contains(&pitch_shift_semitones) {
         return Err("pitch shift must be between -24 and +24 semitones".to_owned());
+    }
+    if !stretch_ratio.is_finite() || !(0.5..=2.0).contains(&stretch_ratio) {
+        return Err("stretch ratio must be between 0.5 and 2.0".to_owned());
     }
     if !(8_000..=384_000).contains(&audio.sample_rate) {
         return Err("sample rate must be between 8,000 and 384,000 Hz".to_owned());
@@ -467,11 +492,30 @@ fn pitch_shift_audio_range(
     let frame_count = frame_range.end - frame_range.start;
     let sample_count = frame_count
         .checked_mul(channel_count)
-        .ok_or_else(|| "pitch-shifted audio selection is too large".to_owned())?;
-    if sample_count > MAX_PITCH_SHIFT_INTERLEAVED_SAMPLES {
+        .ok_or_else(|| "processed audio selection is too large".to_owned())?;
+    if sample_count > MAX_SAMPLE_EDITOR_PROCESSING_SAMPLES {
+        return Err("selection exceeds the 16-million-sample processing limit".to_owned());
+    }
+    let output_frame_count = (frame_count as f64 * f64::from(stretch_ratio)).round() as usize;
+    let output_sample_count = output_frame_count
+        .checked_mul(channel_count)
+        .ok_or_else(|| "processed audio selection is too large".to_owned())?;
+    if output_frame_count == 0 || output_sample_count > MAX_SAMPLE_EDITOR_PROCESSING_SAMPLES {
         return Err(
-            "pitch-shifted selection exceeds the 16-million-sample processing limit".to_owned(),
+            "stretched selection exceeds the 16-million-sample processing limit".to_owned(),
         );
+    }
+    if pitch_shift_semitones != 0.0 {
+        let pitch_factor = 2.0_f64.powf(f64::from(pitch_shift_semitones) / 12.0);
+        let pitch_intermediate_frames = (output_frame_count as f64 * pitch_factor).round() as usize;
+        let pitch_intermediate_samples = pitch_intermediate_frames
+            .checked_mul(channel_count)
+            .ok_or_else(|| "pitch-shifted audio selection is too large".to_owned())?;
+        if pitch_intermediate_samples > MAX_SAMPLE_EDITOR_PROCESSING_SAMPLES {
+            return Err(
+                "pitch-shifted selection exceeds the 16-million-sample processing limit".to_owned(),
+            );
+        }
     }
     let mut interleaved = Vec::with_capacity(sample_count);
     for frame in frame_range {
@@ -480,26 +524,46 @@ fn pitch_shift_audio_range(
             interleaved.push(if sample.is_finite() { sample } else { 0.0 });
         }
     }
-    let pitch_factor = 2.0_f64.powf(f64::from(pitch_shift_semitones) / 12.0);
-    let parameters = StretchParams::new(1.0)
-        .with_sample_rate(audio.sample_rate)
-        .with_channels(channel_count as u32);
-    let shifted = pitch_shift(&interleaved, &parameters, pitch_factor)
-        .map_err(|error| format!("could not pitch-shift selected audio: {error}"))?;
-    drop(interleaved);
-    if shifted.len() != sample_count {
-        return Err("pitch-shift engine changed the selected audio duration".to_owned());
+    let channels = channel_count as u32;
+    let mut processed = if stretch_ratio == 1.0 {
+        interleaved
+    } else {
+        let parameters = StretchParams::new(f64::from(stretch_ratio))
+            .with_sample_rate(audio.sample_rate)
+            .with_channels(channels);
+        let output = stretch(&interleaved, &parameters)
+            .map_err(|error| format!("could not time-stretch selected audio: {error}"))?;
+        if output.len() != output_sample_count {
+            return Err("time-stretch engine returned an unexpected duration".to_owned());
+        }
+        output
+    };
+    if pitch_shift_semitones != 0.0 {
+        let pitch_factor = 2.0_f64.powf(f64::from(pitch_shift_semitones) / 12.0);
+        let parameters = StretchParams::new(1.0)
+            .with_sample_rate(audio.sample_rate)
+            .with_channels(channels);
+        processed = pitch_shift(&processed, &parameters, pitch_factor)
+            .map_err(|error| format!("could not pitch-shift selected audio: {error}"))?;
+        if processed.len() != output_sample_count {
+            return Err("pitch-shift engine changed the stretched audio duration".to_owned());
+        }
     }
-    let mut channels = vec![Vec::with_capacity(frame_count); channel_count];
-    for frame in 0..frame_count {
+
+    let processed_frame_count = processed.len() / channel_count;
+    if processed.len() % channel_count != 0 {
+        return Err("audio processor returned incomplete channel frames".to_owned());
+    }
+    let mut output_channels = vec![Vec::with_capacity(processed_frame_count); channel_count];
+    for frame in 0..processed_frame_count {
         for channel in 0..channel_count {
-            let sample = shifted[frame * channel_count + channel];
-            channels[channel].push(if sample.is_finite() { sample } else { 0.0 });
+            let sample = processed[frame * channel_count + channel];
+            output_channels[channel].push(if sample.is_finite() { sample } else { 0.0 });
         }
     }
     Ok(DecodedAudio {
         sample_rate: audio.sample_rate,
-        channels,
+        channels: output_channels,
     })
 }
 
@@ -1968,7 +2032,7 @@ mod tests {
         };
         let original = audio.clone();
 
-        write_audio_range_to_wav_with_pitch_processing(
+        write_audio_range_to_wav_with_options(
             &audio,
             0..sample_rate as usize,
             AudioExportOptions {
@@ -2000,20 +2064,167 @@ mod tests {
     }
 
     #[test]
-    fn sample_editor_pitch_shift_rejects_unsupported_or_invalid_inputs() {
+    fn sample_editor_audio_processing_rejects_unsupported_or_invalid_inputs() {
         let stereo = DecodedAudio {
             sample_rate: 44_100,
             channels: vec![vec![0.0; 8], vec![0.0; 8]],
         };
-        assert!(pitch_shift_audio_range(&stereo, 0..8, f32::NAN).is_err());
-        assert!(pitch_shift_audio_range(&stereo, 0..8, 24.01).is_err());
-        assert!(pitch_shift_audio_range(&stereo, 0..9, 1.0).is_err());
+        assert!(process_audio_range(&stereo, 0..8, f32::NAN, 1.0).is_err());
+        assert!(process_audio_range(&stereo, 0..8, 24.01, 1.0).is_err());
+        assert!(process_audio_range(&stereo, 0..8, 0.0, f32::NAN).is_err());
+        assert!(process_audio_range(&stereo, 0..8, 0.0, 0.49).is_err());
+        assert!(process_audio_range(&stereo, 0..8, 0.0, 2.01).is_err());
+        assert!(process_audio_range(&stereo, 0..9, 1.0, 1.0).is_err());
 
         let multichannel = DecodedAudio {
             sample_rate: 44_100,
             channels: vec![vec![0.0; 8], vec![0.0; 8], vec![0.0; 8]],
         };
-        assert!(pitch_shift_audio_range(&multichannel, 0..8, 1.0).is_err());
+        assert!(process_audio_range(&multichannel, 0..8, 1.0, 1.0).is_err());
+    }
+
+    #[test]
+    fn sample_editor_time_stretch_preserves_pitch_and_transient_timing() {
+        let root = fixture_root();
+        fs::create_dir_all(&root).expect("fixture directory should be created");
+        let output_path = root.join("stretched.wav");
+        let sample_rate = 44_100_u32;
+        let frame_count = sample_rate as usize * 2;
+        let click_position = sample_rate as usize / 2;
+        let mut source = vec![0.0_f32; frame_count];
+        for index in 0..20 {
+            source[click_position + index] = if index < 10 { 0.9 } else { -0.4 };
+        }
+        for (frame, sample) in source.iter_mut().enumerate() {
+            *sample +=
+                0.2 * (std::f32::consts::TAU * 440.0 * frame as f32 / sample_rate as f32).sin();
+        }
+        let audio = DecodedAudio {
+            sample_rate,
+            channels: vec![source],
+        };
+        let original = audio.clone();
+        let stretch_ratio = 1.5_f32;
+
+        write_audio_range_to_wav_with_options(
+            &audio,
+            0..frame_count,
+            AudioExportOptions {
+                stretch_ratio,
+                ..AudioExportOptions::default()
+            },
+            &output_path,
+        )
+        .expect("time-stretched selection should export");
+
+        let bytes = fs::read(&output_path).expect("stretched WAV should be readable");
+        let samples = bytes[44..]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&sample| f32::from_le_bytes(sample))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            samples.len(),
+            (frame_count as f32 * stretch_ratio).round() as usize
+        );
+        assert!(samples.iter().all(|sample| sample.is_finite()));
+
+        let expected_click_position = (click_position as f32 * stretch_ratio).round() as usize;
+        let search_radius = sample_rate as usize / 5;
+        let search_start = expected_click_position.saturating_sub(search_radius);
+        let search_end = (expected_click_position + search_radius).min(samples.len());
+        let transient_window = &samples[search_start..search_end];
+        let transient_peak = transient_window
+            .iter()
+            .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+        let transient_position = search_start
+            + transient_window
+                .iter()
+                .enumerate()
+                .max_by(|(_, left), (_, right)| left.abs().total_cmp(&right.abs()))
+                .map(|(index, _)| index)
+                .expect("transient search window should contain samples");
+        assert!(transient_peak > 0.5);
+        let timing_error = transient_position.abs_diff(expected_click_position);
+        let timing_tolerance = sample_rate as usize / 20;
+        assert!(
+            timing_error <= timing_tolerance,
+            "stretch moved the transient by {timing_error} frames (limit {timing_tolerance})"
+        );
+
+        let tonal_region = &samples[sample_rate as usize * 3 / 2..sample_rate as usize * 5 / 2];
+        let positive_crossings = tonal_region
+            .windows(2)
+            .filter(|pair| pair[0] <= 0.0 && pair[1] > 0.0)
+            .count();
+        let estimated_frequency =
+            positive_crossings as f32 * sample_rate as f32 / tonal_region.len() as f32;
+        assert!((420.0..=460.0).contains(&estimated_frequency));
+
+        let independently_shifted =
+            process_audio_range(&audio, 0..frame_count, 12.0, stretch_ratio)
+                .expect("pitch shift and time stretch should combine");
+        assert_eq!(
+            independently_shifted.frame_count(),
+            (frame_count as f32 * stretch_ratio).round() as usize
+        );
+        let shifted_tonal_region = &independently_shifted.channels[0]
+            [sample_rate as usize * 3 / 2..sample_rate as usize * 5 / 2];
+        let shifted_positive_crossings = shifted_tonal_region
+            .windows(2)
+            .filter(|pair| pair[0] <= 0.0 && pair[1] > 0.0)
+            .count();
+        let shifted_frequency = shifted_positive_crossings as f32 * sample_rate as f32
+            / shifted_tonal_region.len() as f32;
+        assert!((850.0..=910.0).contains(&shifted_frequency));
+        assert_eq!(audio, original);
+        fs::remove_dir_all(root).expect("fixture directory should be removed");
+    }
+
+    #[test]
+    fn sample_editor_time_stretch_supports_stereo_duration_limits() {
+        let sample_rate = 44_100_u32;
+        let frame_count = sample_rate as usize;
+        let audio = DecodedAudio {
+            sample_rate,
+            channels: vec![
+                (0..frame_count)
+                    .map(|frame| {
+                        (std::f32::consts::TAU * 220.0 * frame as f32 / sample_rate as f32).sin()
+                            * 0.5
+                    })
+                    .collect(),
+                (0..frame_count)
+                    .map(|frame| {
+                        (std::f32::consts::TAU * 660.0 * frame as f32 / sample_rate as f32).sin()
+                            * 0.5
+                    })
+                    .collect(),
+            ],
+        };
+        let original = audio.clone();
+
+        let compressed = process_audio_range(&audio, 0..frame_count, 0.0, 0.5)
+            .expect("half-duration stereo stretch should succeed");
+        let extended = process_audio_range(&audio, 0..frame_count, 0.0, 2.0)
+            .expect("double-duration stereo stretch should succeed");
+
+        assert_eq!(compressed.channels.len(), 2);
+        assert!(
+            compressed
+                .channels
+                .iter()
+                .all(|channel| channel.len() == frame_count / 2)
+        );
+        assert_eq!(extended.channels.len(), 2);
+        assert!(
+            extended
+                .channels
+                .iter()
+                .all(|channel| channel.len() == frame_count * 2)
+        );
+        assert_eq!(audio, original);
     }
 
     #[test]
