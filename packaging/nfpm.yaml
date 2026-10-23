@@ -1,0 +1,50 @@
+name: fl-studio-rebuild
+arch: ${NFPM_ARCH}
+platform: linux
+version: ${NFPM_VERSION}
+version_schema: semver
+maintainer: FL Studio Rebuild contributors <cyroz1@users.noreply.github.com>
+description: A desktop application for editing and playing FL Studio projects.
+license: MIT
+homepage: https://github.com/cyroz1/fl-studio-rust
+section: sound
+priority: optional
+
+contents:
+  - src: target/release/fl-studio-rebuild
+    dst: /usr/bin/fl-studio-rebuild
+    file_info:
+      mode: 0o755
+  - src: target/release/vst3-host-helper
+    dst: /usr/bin/vst3-host-helper
+    file_info:
+      mode: 0o755
+  - src: packaging/fl-studio-rebuild.desktop
+    dst: /usr/share/applications/fl-studio-rebuild.desktop
+  - src: packaging/fl-studio-rebuild.xml
+    dst: /usr/share/mime/packages/fl-studio-rebuild.xml
+  - src: assets/icon.png
+    dst: /usr/share/icons/hicolor/512x512/apps/fl-studio-rebuild.png
+  - src: assets/fonts/Inter-OFL.txt
+    dst: /usr/share/doc/fl-studio-rebuild/Inter-OFL.txt
+  - src: assets/licenses/LGPL-3.0.txt
+    dst: /usr/share/licenses/fl-studio-rebuild/LGPL-3.0.txt
+  - src: docs/third-party-notices.md
+    dst: /usr/share/doc/fl-studio-rebuild/third-party-notices.md
+
+overrides:
+  deb:
+    depends:
+      - libasound2
+      - libxcb1
+      - libxkbcommon-x11-0
+  rpm:
+    depends:
+      - "libasound.so.2()(64bit)"
+      - "libxcb.so.1()(64bit)"
+      - "libxkbcommon-x11.so.0()(64bit)"
+  archlinux:
+    depends:
+      - alsa-lib
+      - libxcb
+      - libxkbcommon-x11

@@ -10,12 +10,22 @@ permissions:
 
 jobs:
   verify-and-package:
-    name: Verify and package (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    name: Verify and package (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - runner: ubuntu-latest
+            platform: linux-x64
+          - runner: ubuntu-24.04-arm
+            platform: linux-arm64
+          - runner: macos-latest
+            platform: macos-arm64
+          - runner: windows-latest
+            platform: windows-x64
+          - runner: windows-11-arm
+            platform: windows-arm64
 
     steps:
       - name: Check out source
@@ -71,7 +81,7 @@ jobs:
           done
 
           if [[ "$present" -eq 0 ]]; then
-            echo "::notice::Apple signing secrets are not configured; CI will build and launch an unsigned macOS app locally without publishing a macOS installer."
+            echo "::notice::Apple signing secrets are not configured; CI will build, launch, and publish an unsigned macOS disk image."
             echo "available=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -99,6 +109,10 @@ jobs:
           from pathlib import Path
 
           config = Path("Packager.toml").read_text(encoding="utf-8")
+          old = 'formats = ["default"]'
+          if config.count(old) != 1:
+              raise SystemExit("Packager.toml must have one default formats setting")
+          config = config.replace(old, 'formats = ["app", "dmg"]')
           config += "\n[macos]\nsigning-identity = "
           config += json.dumps(os.environ["APPLE_SIGNING_IDENTITY"])
           config += "\n"
@@ -143,18 +157,96 @@ jobs:
       - name: Install Cargo Packager
         run: cargo install cargo-packager --version 0.11.8 --locked --force
 
-      - name: Build desktop installers (Linux and Windows)
-        if: runner.os != 'macOS'
-        run: cargo packager --release
+      - name: Install nFPM
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            x86_64)
+              nfpm_asset_arch=x86_64
+              package_arch=amd64
+              ;;
+            aarch64)
+              nfpm_asset_arch=arm64
+              package_arch=arm64
+              ;;
+            *)
+              echo "::error::Unsupported Linux package architecture: $(uname -m)"
+              exit 1
+              ;;
+          esac
+          nfpm_version=2.47.0
+          asset="nfpm_${nfpm_version}_Linux_${nfpm_asset_arch}.tar.gz"
+          download_dir="$RUNNER_TEMP/nfpm"
+          mkdir -p "$download_dir"
+          curl --fail --location --silent --show-error \
+            "https://github.com/goreleaser/nfpm/releases/download/v${nfpm_version}/${asset}" \
+            --output "$download_dir/$asset"
+          curl --fail --location --silent --show-error \
+            "https://github.com/goreleaser/nfpm/releases/download/v${nfpm_version}/checksums.txt" \
+            --output "$download_dir/checksums.txt"
+          checksum_line="$(grep -E "^[0-9a-f]{64}  ${asset}$" "$download_dir/checksums.txt" || true)"
+          if [[ -z "$checksum_line" ]]; then
+            echo "::error::No checksum found for $asset"
+            exit 1
+          fi
+          printf '%s\n' "$checksum_line" > "$download_dir/checksum.txt"
+          (cd "$download_dir" && sha256sum --check checksum.txt)
+          tar -xzf "$download_dir/$asset" -C "$download_dir" nfpm
+          echo "$download_dir" >> "$GITHUB_PATH"
+          package_version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
+          {
+            echo "NFPM_ARCH=$package_arch"
+            echo "NFPM_VERSION=$package_version"
+          } >> "$GITHUB_ENV"
 
-      - name: Install Linux package
+      - name: Configure Linux AppImage package
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          source = Path("Packager.toml").read_text(encoding="utf-8")
+          old = 'formats = ["default"]'
+          new = 'formats = ["appimage"]'
+          if source.count(old) != 1:
+              raise SystemExit("Packager.toml must have one default formats setting")
+          Path("Packager.linux-appimage.toml").write_text(
+              source.replace(old, new), encoding="utf-8"
+          )
+          PY
+
+      - name: Build desktop installers
+        if: runner.os != 'macOS'
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            cargo packager --release --config Packager.linux-appimage.toml
+          else
+            cargo packager --release
+          fi
+
+      - name: Build Linux distribution packages
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/linux-packages
+          for format in deb rpm archlinux; do
+            nfpm package --config packaging/nfpm.yaml --packager "$format" \
+              --target dist/linux-packages
+          done
+
+      - name: Install Linux Debian package
         if: runner.os == 'Linux'
         shell: bash
         run: |
           shopt -s nullglob
-          packages=(dist/*.deb)
+          packages=(dist/linux-packages/*.deb)
           if (( ${#packages[@]} != 1 )); then
-            echo "::error::Expected exactly one Linux .deb installer; found ${#packages[@]}."
+            echo "::error::Expected exactly one Linux .deb package; found ${#packages[@]}."
             printf '%s\n' "${packages[@]}"
             exit 1
           fi
@@ -1271,9 +1363,24 @@ jobs:
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
         run: cargo packager --release --config Packager.signed.toml
 
-      - name: Build unsigned macOS app for CI smoke check
+      - name: Configure unsigned macOS disk image
         if: runner.os == 'macOS' && steps.macos-signing-status.outputs.available != 'true'
-        run: cargo packager --release
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          config = Path("Packager.toml").read_text(encoding="utf-8")
+          old = 'formats = ["default"]'
+          if config.count(old) != 1:
+              raise SystemExit("Packager.toml must have one default formats setting")
+          config = config.replace(old, 'formats = ["app", "dmg"]')
+          Path("Packager.macos-smoke.toml").write_text(config, encoding="utf-8")
+          PY
+
+      - name: Build unsigned macOS disk image for CI smoke check
+        if: runner.os == 'macOS' && steps.macos-signing-status.outputs.available != 'true'
+        run: cargo packager --release --config Packager.macos-smoke.toml
 
       - name: Launch unsigned macOS app locally
         if: runner.os == 'macOS' && steps.macos-signing-status.outputs.available != 'true'
@@ -1449,40 +1556,54 @@ jobs:
           sleep 3
           echo "Installed macOS app remained running after launch."
 
-      - name: Stage exactly one platform installer
-        if: runner.os != 'macOS' || steps.macos-signing-status.outputs.available == 'true'
+      - name: Stage platform packages
         shell: bash
         run: |
+          set -euo pipefail
           shopt -s nullglob
           case "$RUNNER_OS" in
-            Linux) installers=(dist/*.AppImage) ;;
-            Windows) installers=(dist/*-setup.exe) ;;
-            macOS) installers=(dist/*.dmg) ;;
+            Linux)
+              installers=(
+                dist/*.AppImage
+                dist/linux-packages/*.deb
+                dist/linux-packages/*.rpm
+                dist/linux-packages/*.pkg.tar.zst
+              )
+              expected_count=4
+              ;;
+            Windows)
+              installers=(dist/*-setup.exe)
+              expected_count=1
+              ;;
+            macOS)
+              installers=(dist/*.dmg)
+              expected_count=1
+              ;;
             *)
-              echo "::error::Unsupported installer platform: $RUNNER_OS"
+              echo "::error::Unsupported package platform: $RUNNER_OS"
               exit 1
               ;;
           esac
-          if (( ${#installers[@]} != 1 )); then
-            echo "::error::Expected exactly one $RUNNER_OS installer in dist; found ${#installers[@]}."
+          if (( ${#installers[@]} != expected_count )); then
+            echo "::error::Expected $expected_count $RUNNER_OS packages; found ${#installers[@]}."
             printf '%s\n' "${installers[@]}"
             exit 1
           fi
           mkdir -p dist/ci-installer
-          cp "${installers[0]}" dist/ci-installer/
+          cp "${installers[@]}" dist/ci-installer/
           staged_installers=(dist/ci-installer/*)
-          if (( ${#staged_installers[@]} != 1 )); then
-            echo "::error::Expected exactly one staged installer; found ${#staged_installers[@]}."
+          if (( ${#staged_installers[@]} != expected_count )); then
+            echo "::error::Expected $expected_count staged packages; found ${#staged_installers[@]}."
             printf '%s\n' "${staged_installers[@]}"
             exit 1
           fi
-          echo "Staged installer: ${staged_installers[0]}"
+          printf 'Staged package: %s\n' "${staged_installers[@]}"
 
-      - name: Upload Linux AppImage installer
+      - name: Upload Linux packages
         if: runner.os == 'Linux'
         uses: actions/upload-artifact@v4
         with:
-          name: installers-${{ matrix.os }}
+          name: installers-${{ matrix.platform }}
           path: dist/ci-installer/*
           if-no-files-found: error
           retention-days: 14
@@ -1491,16 +1612,16 @@ jobs:
         if: runner.os == 'Windows'
         uses: actions/upload-artifact@v4
         with:
-          name: installers-${{ matrix.os }}
+          name: installers-${{ matrix.platform }}
           path: dist/ci-installer/*
           if-no-files-found: error
           retention-days: 14
 
-      - name: Upload signed macOS disk image
-        if: runner.os == 'macOS' && steps.macos-signing-status.outputs.available == 'true'
+      - name: Upload macOS disk image
+        if: runner.os == 'macOS'
         uses: actions/upload-artifact@v4
         with:
-          name: installers-${{ matrix.os }}
+          name: installers-${{ matrix.platform }}
           path: dist/ci-installer/*
           if-no-files-found: error
           retention-days: 14

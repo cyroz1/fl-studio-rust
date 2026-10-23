@@ -413,9 +413,9 @@ are applied where the Mixer rows below describe. Full export surface:
 
 | Item | Status | Notes |
 |---|---|---|
-| Windows installer (NSIS/WiX) | `[partial]` | CI builds installers; verify signed + working |
-| macOS app bundle, notarization | `[partial]` | CI runs formatting, Clippy, tests, and a packaged app launch smoke check. It uploads a `.dmg` only after Developer ID signing and Apple notarization; without those secrets it checks and launches the unsigned app locally and uploads no macOS artifact. Signed builds are validated with Apple's signature, stapler, and Gatekeeper tools. AU hosting + CoreAudio remain pending. |
-| Linux builds (AppImage/deb) | `[partial]` | CI builds; XCB headers handled |
+| Windows installer (NSIS/WiX) | `[partial]` | CI builds x64 and ARM64 Windows installers; signed distribution and native device verification remain. |
+| macOS app bundle, notarization | `[partial]` | Apple Silicon CI always builds and uploads a `.dmg`. With all six Developer ID and notarization secrets, CI signs, notarizes, installs, launches, and validates the disk image; without secrets it launches the unsigned app locally and uploads an unsigned disk image. Signed builds are checked with Apple's signature, stapler, and Gatekeeper tools. AU hosting + CoreAudio remain pending. |
+| Linux builds (AppImage/deb/rpm/Arch) | `[partial]` | CI builds AppImage, Debian, RPM, and Arch packages for x64 and ARM64; the Debian package is installed in CI and XCB headers are handled. |
 | Windows: ASIO support | `[partial]` | CPAL's ASIO backend is enabled on Windows; device enumeration includes available hosts, saved ASIO device IDs reopen through ASIO, and the UI limits ASIO devices to shared access. A Windows build and physical-driver input/output check remain. |
 | macOS: native menu bar, file associations | `[partial]` | The packaged app registers `.flp` project files and the application opens a project path passed on launch. Functional command menus remain in the app window; a native macOS menu bar and macOS file-open event handling while the app is already running remain. |
 | Cross-platform CI | `[done]` | |

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=FL Studio Rebuild
+GenericName=Digital Audio Workstation
+Comment=Edit and play FL Studio projects
+Exec=fl-studio-rebuild %f
+Icon=fl-studio-rebuild
+Terminal=false
+Categories=AudioVideo;Audio;Music;
+MimeType=application/x-flp;
+StartupNotify=true
