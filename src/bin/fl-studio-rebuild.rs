@@ -26664,11 +26664,18 @@ impl DawUi {
             .collect::<BTreeSet<_>>();
         let cross_pattern_ghost_notes = match (self.selected_pattern, ghost_arrangement.as_ref()) {
             (Some(pattern_id), Some(arrangement)) if self.piano_roll_ghost_channels => {
-                piano_roll_cross_pattern_ghost_notes(
+                let anchor_clip_index = self.selected_clip.filter(|clip_index| {
+                    self.selected_arrangement == Some(arrangement.id)
+                        && arrangement.clips.get(*clip_index).is_some_and(|clip| {
+                            matches!(clip.target(), PlaylistClipTarget::Pattern { id } if id == pattern_id)
+                        })
+                });
+                piano_roll_cross_pattern_ghost_notes_for_anchor(
                     pattern_id,
                     &patterns,
                     arrangement,
                     &disabled_track_ids,
+                    anchor_clip_index,
                 )
             }
             _ => Vec::new(),
@@ -49954,11 +49961,12 @@ fn piano_roll_ghost_note_is_visible(
         })
 }
 
-fn piano_roll_cross_pattern_ghost_notes(
+fn piano_roll_cross_pattern_ghost_notes_for_anchor(
     current_pattern_id: u16,
     patterns: &[Pattern],
     arrangement: &Arrangement,
     disabled_track_ids: &BTreeSet<u32>,
+    anchor_clip_index: Option<usize>,
 ) -> Vec<PianoRollGhostNote> {
     const MAX_GHOST_NOTES: usize = 20_000;
 
@@ -49976,7 +49984,12 @@ fn piano_roll_cross_pattern_ghost_notes(
     };
     let mut ghosts = BTreeSet::new();
 
-    'anchors: for anchor in &arrangement.clips {
+    'anchors: for (current_anchor_clip_index, anchor) in arrangement.clips.iter().enumerate() {
+        if anchor_clip_index
+            .is_some_and(|selected_index| selected_index != current_anchor_clip_index)
+        {
+            continue;
+        }
         if anchor.is_muted()
             || !clip_track_is_enabled(anchor)
             || !clip_has_default_scale(anchor)
@@ -50102,6 +50115,22 @@ fn piano_roll_cross_pattern_ghost_notes(
     }
 
     ghosts.into_iter().collect()
+}
+
+#[cfg(test)]
+fn piano_roll_cross_pattern_ghost_notes(
+    current_pattern_id: u16,
+    patterns: &[Pattern],
+    arrangement: &Arrangement,
+    disabled_track_ids: &BTreeSet<u32>,
+) -> Vec<PianoRollGhostNote> {
+    piano_roll_cross_pattern_ghost_notes_for_anchor(
+        current_pattern_id,
+        patterns,
+        arrangement,
+        disabled_track_ids,
+        None,
+    )
 }
 
 #[cfg(test)]
