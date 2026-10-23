@@ -18883,10 +18883,10 @@ impl DawUi {
                                     if ui
                                         .checkbox(
                                             &mut self.playlist_zero_crossing_splits,
-                                            "Zero-crossing splits",
+                                            "Zero-crossing edits",
                                         )
                                         .on_hover_text(
-                                            "Snap Audio Clip splits to a nearby source zero crossing (within 10 ms). If none is found, split at the cursor.",
+                                            "Snap Audio Clip split and trim edges to a nearby source zero crossing (within 10 ms). If none is found, use the cursor or grid edge.",
                                         )
                                         .changed()
                                         && let Err(error) = save_playlist_zero_crossing_splits(
@@ -18894,7 +18894,7 @@ impl DawUi {
                                         )
                                     {
                                         self.status = format!(
-                                            "Could not save the Playlist split setting: {error}"
+                                            "Could not save the Playlist zero-crossing setting: {error}"
                                         );
                                     }
                                     let selected_audio_clip_indices =
@@ -19711,7 +19711,7 @@ impl DawUi {
                                 let group_targets =
                                     self.active_playlist_clip_drag_targets.clone();
                                 let snap = !ui.input(|input| input.modifiers.alt);
-                                let edits = if drag.kind == PlaylistClipDragKind::Move
+                                        let mut edits = if drag.kind == PlaylistClipDragKind::Move
                                     && group_targets.len() > 1
                                 {
                                     playlist_clip_group_drag_edits(
@@ -19806,6 +19806,46 @@ impl DawUi {
                                         ),
                                     )]
                                 };
+                                        let mut snapped_resize_count = 0;
+                                        let mut resize_snap_error = None;
+                                        if response.drag_stopped()
+                                            && self.playlist_zero_crossing_splits
+                                            && matches!(
+                                                drag.kind,
+                                                PlaylistClipDragKind::ResizeAudioTicks { .. }
+                                                    | PlaylistClipDragKind::ResizeAudioMilliseconds {
+                                                        ..
+                                                    }
+                                            )
+                                        {
+                                            match (
+                                                self.document.as_ref(),
+                                                self.sample_project_path(),
+                                            ) {
+                                                (Some(document), Some(project_path)) => {
+                                                    match self.snap_playlist_audio_clip_resize_edits(
+                                                        document,
+                                                        &project_path,
+                                                        drag,
+                                                        &group_targets,
+                                                        &mut edits,
+                                                    ) {
+                                                        Ok(count) => {
+                                                            snapped_resize_count = count;
+                                                        }
+                                                        Err(error) => {
+                                                            resize_snap_error = Some(error);
+                                                        }
+                                                    }
+                                                }
+                                                _ => {
+                                                    resize_snap_error = Some(
+                                                        "the project path is not available"
+                                                            .to_owned(),
+                                                    );
+                                                }
+                                            }
+                                        }
                                 let unchanged = edits.iter().all(|(edited_index, edit)| {
                                     arrangement
                                         .clips
@@ -19834,7 +19874,11 @@ impl DawUi {
                                                 })
                                         })
                                 });
-                                if !unchanged {
+                                        if let Some(error) = resize_snap_error {
+                                            self.status = format!(
+                                                "Could not snap Audio Clip resize: {error}"
+                                            );
+                                        } else if !unchanged {
                                     let mut updated = self.document.clone();
                                     let result = updated.as_mut().map(|document| match drag.kind {
                                         PlaylistClipDragKind::Slip => {
@@ -19922,7 +19966,7 @@ impl DawUi {
                                             self.document = updated;
                                             self.stop_project_playback();
                                             self.dirty = true;
-                                            self.status = match drag.kind {
+                                                    let edit_status = match drag.kind {
                                                 PlaylistClipDragKind::Move => {
                                                     if group_targets.len() > 1 {
                                                         format!(
@@ -19957,6 +20001,13 @@ impl DawUi {
                                                     }
                                                 }
                                             };
+                                                    self.status = if snapped_resize_count > 0 {
+                                                        format!(
+                                                            "{edit_status}; snapped {snapped_resize_count} edge(s) to a zero crossing"
+                                                        )
+                                                    } else {
+                                                        edit_status
+                                                    };
                                         }
                                         Some(Err(error)) => {
                                             self.status = format!(
@@ -22112,6 +22163,171 @@ impl DawUi {
             Some(tick) => Ok((tick, true)),
             None => Ok((requested_tick, false)),
         }
+    }
+
+    fn snap_playlist_audio_clip_resize_edits(
+        &self,
+        document: &FlpDocument,
+        project_path: &Path,
+        drag: ActivePlaylistClipDrag,
+        group_targets: &[PlaylistClipDragTarget],
+        edits: &mut [(usize, PlaylistClipEdit)],
+    ) -> Result<usize, String> {
+        let (arrangement_id, edge) = match drag.kind {
+            PlaylistClipDragKind::ResizeAudioTicks { edge, .. }
+            | PlaylistClipDragKind::ResizeAudioMilliseconds { edge, .. } => {
+                (drag.arrangement_id, edge)
+            }
+            _ => return Err("the drag is not an Audio Clip edge resize".to_owned()),
+        };
+        let mut original_document = document.clone();
+        let anchor_target = match drag.kind {
+            PlaylistClipDragKind::ResizeAudioTicks {
+                source_start_tick,
+                source_end_tick,
+                sample_length_ticks,
+                ..
+            } => Some(PlaylistClipDragTarget {
+                clip_index: drag.clip_index,
+                start_position_ticks: drag.start_position_ticks,
+                start_length_ticks: drag.start_length_ticks,
+                start_track_index: drag.start_track_index,
+                audio_resize_ticks: Some((source_start_tick, source_end_tick, sample_length_ticks)),
+                audio_resize_milliseconds: None,
+                audio_slip_window: None,
+            }),
+            PlaylistClipDragKind::ResizeAudioMilliseconds {
+                source_start_ms,
+                source_end_ms,
+                sample_length_ms,
+                stored_start_offset,
+                stored_end_offset,
+                ..
+            } => Some(PlaylistClipDragTarget {
+                clip_index: drag.clip_index,
+                start_position_ticks: drag.start_position_ticks,
+                start_length_ticks: drag.start_length_ticks,
+                start_track_index: drag.start_track_index,
+                audio_resize_ticks: None,
+                audio_resize_milliseconds: Some((
+                    source_start_ms,
+                    source_end_ms,
+                    sample_length_ms,
+                    stored_start_offset,
+                    stored_end_offset,
+                )),
+                audio_slip_window: None,
+            }),
+            _ => None,
+        };
+        let restore_targets = if group_targets.is_empty() {
+            anchor_target.into_iter().collect::<Vec<_>>()
+        } else {
+            group_targets.to_vec()
+        };
+        for target in &restore_targets {
+            let legacy_offsets = target
+                .audio_resize_milliseconds
+                .map(|(_, _, _, start_offset, end_offset)| (start_offset, end_offset));
+            if target.audio_resize_ticks.is_none() && legacy_offsets.is_none() {
+                continue;
+            }
+            original_document
+                .edit_playlist_clip(
+                    arrangement_id,
+                    target.clip_index,
+                    PlaylistClipEdit {
+                        position_ticks: Some(target.start_position_ticks),
+                        length_ticks: Some(target.start_length_ticks),
+                        source_window_ticks: target
+                            .audio_resize_ticks
+                            .map(|(start_tick, end_tick, _)| (start_tick, end_tick)),
+                        start_offset: legacy_offsets.map(|(start, _)| start),
+                        end_offset: legacy_offsets.map(|(_, end)| end),
+                        ..PlaylistClipEdit::default()
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+        }
+
+        let arrangements = original_document
+            .arrangements()
+            .map_err(|error| error.to_string())?;
+        let mut matching_arrangements = arrangements
+            .iter()
+            .filter(|arrangement| arrangement.id == arrangement_id);
+        let Some(arrangement) = matching_arrangements.next() else {
+            return Err("the requested Playlist arrangement does not exist".to_owned());
+        };
+        if matching_arrangements.next().is_some() {
+            return Err("the requested Playlist arrangement is ambiguous".to_owned());
+        }
+
+        let channels = original_document.channels();
+        let ppq = original_document.header().ppq();
+        let tempo_bpm = original_document.metadata().tempo_bpm().unwrap_or(140.0);
+        let mut snapped_count = 0;
+        for (clip_index, edit) in edits {
+            let Some(clip) = arrangement.clips.get(*clip_index) else {
+                continue;
+            };
+            let PlaylistClipTarget::Channel { id } = clip.target() else {
+                continue;
+            };
+            let mut matching_channels = channels.iter().filter(|channel| channel.id() == id);
+            if !matching_channels
+                .next()
+                .is_some_and(|channel| channel.kind() == Some(4))
+                || matching_channels.next().is_some()
+            {
+                continue;
+            }
+
+            let clip_end_tick = clip
+                .position_ticks
+                .checked_add(clip.length_ticks)
+                .ok_or_else(|| "the Audio Clip timeline range overflows".to_owned())?;
+            let requested_boundary = match edge {
+                PlaylistClipResizeEdge::Right => {
+                    let length = edit.length_ticks.unwrap_or(clip.length_ticks);
+                    if length >= clip.length_ticks {
+                        continue;
+                    }
+                    clip.position_ticks.saturating_add(length)
+                }
+                PlaylistClipResizeEdge::Left => {
+                    let position = edit.position_ticks.unwrap_or(clip.position_ticks);
+                    if position <= clip.position_ticks {
+                        continue;
+                    }
+                    position
+                }
+            };
+            if requested_boundary <= clip.position_ticks || requested_boundary >= clip_end_tick {
+                continue;
+            }
+
+            let Some(crossing_tick) = nearest_playlist_audio_clip_zero_crossing_tick(
+                &original_document,
+                project_path,
+                arrangement_id,
+                *clip_index,
+                requested_boundary,
+            )?
+            else {
+                continue;
+            };
+            *edit = playlist_audio_clip_resize_edit_at_zero_crossing(
+                clip,
+                edit.clone(),
+                edge,
+                crossing_tick,
+                ppq,
+                tempo_bpm,
+            )?;
+            snapped_count += 1;
+        }
+        Ok(snapped_count)
     }
 
     fn split_selected_playlist_audio_clips(
@@ -57071,6 +57287,100 @@ fn playlist_signature_at_tick(
     signature
 }
 
+fn playlist_audio_clip_resize_edit_at_zero_crossing(
+    clip: &PlaylistClip,
+    mut edit: PlaylistClipEdit,
+    edge: PlaylistClipResizeEdge,
+    crossing_tick: u32,
+    ppq: u16,
+    tempo_bpm: f64,
+) -> Result<PlaylistClipEdit, String> {
+    let clip_end_tick = clip
+        .position_ticks
+        .checked_add(clip.length_ticks)
+        .ok_or_else(|| "the Audio Clip timeline range overflows".to_owned())?;
+    if crossing_tick <= clip.position_ticks || crossing_tick >= clip_end_tick {
+        return Err("the zero crossing must remain inside the Audio Clip".to_owned());
+    }
+
+    match edge {
+        PlaylistClipResizeEdge::Right => {
+            let length_ticks = crossing_tick - clip.position_ticks;
+            if length_ticks == 0 || length_ticks >= clip.length_ticks {
+                return Err("the snapped right edge must trim the Audio Clip".to_owned());
+            }
+            edit.length_ticks = Some(length_ticks);
+            if clip.has_opaque_record_tail() {
+                let source_start_tick = clip
+                    .source_window_ticks()
+                    .map(|(start, _)| start)
+                    .ok_or_else(|| "the Audio Clip source tick window is unavailable".to_owned())?;
+                let source_end_tick = source_start_tick
+                    .checked_add(length_ticks)
+                    .ok_or_else(|| "the Audio Clip source tick range overflows".to_owned())?;
+                edit.source_window_ticks = Some((source_start_tick, source_end_tick));
+            } else {
+                let source_start_ms = edit
+                    .start_offset
+                    .filter(|offset| offset.is_finite() && *offset >= 0.0)
+                    .ok_or_else(|| "the Audio Clip source start is unavailable".to_owned())?;
+                let milliseconds_per_tick =
+                    60_000.0 / (f64::from(ppq.max(1)) * tempo_bpm.max(f64::MIN_POSITIVE));
+                let source_end_ms =
+                    f64::from(source_start_ms) + f64::from(length_ticks) * milliseconds_per_tick;
+                if !source_end_ms.is_finite() || source_end_ms > f64::from(f32::MAX) {
+                    return Err(
+                        "the Audio Clip source end is outside the supported range".to_owned()
+                    );
+                }
+                edit.end_offset = Some(source_end_ms as f32);
+            }
+        }
+        PlaylistClipResizeEdge::Left => {
+            let position_ticks = edit.position_ticks.unwrap_or(clip.position_ticks);
+            if crossing_tick <= clip.position_ticks || position_ticks <= clip.position_ticks {
+                return Err("the snapped left edge must trim the Audio Clip".to_owned());
+            }
+            let length_ticks = clip_end_tick - crossing_tick;
+            edit.position_ticks = Some(crossing_tick);
+            edit.length_ticks = Some(length_ticks);
+            if clip.has_opaque_record_tail() {
+                let (source_start_tick, source_end_tick) = clip
+                    .source_window_ticks()
+                    .ok_or_else(|| "the Audio Clip source tick window is unavailable".to_owned())?;
+                let source_start_tick = source_start_tick
+                    .checked_add(crossing_tick - clip.position_ticks)
+                    .ok_or_else(|| "the Audio Clip source start tick overflows".to_owned())?;
+                if source_start_tick >= source_end_tick {
+                    return Err("the snapped source window would be empty".to_owned());
+                }
+                edit.source_window_ticks = Some((source_start_tick, source_end_tick));
+            } else {
+                let candidate_position_ticks = position_ticks;
+                let candidate_start_ms = edit
+                    .start_offset
+                    .filter(|offset| offset.is_finite() && *offset >= 0.0)
+                    .ok_or_else(|| "the Audio Clip source start is unavailable".to_owned())?;
+                let milliseconds_per_tick =
+                    60_000.0 / (f64::from(ppq.max(1)) * tempo_bpm.max(f64::MIN_POSITIVE));
+                let source_start_ms = f64::from(candidate_start_ms)
+                    + (f64::from(crossing_tick) - f64::from(candidate_position_ticks))
+                        * milliseconds_per_tick;
+                if !source_start_ms.is_finite()
+                    || source_start_ms < 0.0
+                    || source_start_ms > f64::from(f32::MAX)
+                {
+                    return Err(
+                        "the Audio Clip source start is outside the supported range".to_owned()
+                    );
+                }
+                edit.start_offset = Some(source_start_ms as f32);
+            }
+        }
+    }
+    Ok(edit)
+}
+
 fn append_playlist_measures(
     boundaries: &mut Vec<(u32, u64)>,
     measure_number: &mut u64,
@@ -58055,11 +58365,12 @@ mod tests {
         MidiMixerControlTarget, MidiOutputDevice, MidiVst3ParameterMapping,
         MidiVst3ParameterTarget, PIANO_ROLL_RULER_HEIGHT, Pattern, PatternController, PatternNote,
         PatternVst3ParameterLink, PianoRollChordStamp, PianoRollGrid, PianoRollScale,
-        PianoRollSnap, PlaylistClip, PlaylistClipDragKind, PlaylistTempoMap, PlaylistTrack,
-        PluginCandidate, PluginFormat, TimeSelectionShift, TouchGesture, TouchTapTracker,
-        TouchZoomConfig, WINDOW_LAYOUT_PRESETS_HEADER, WindowLayoutPreset,
-        audio_recording_start_tick_with_offset, built_in_midi_controller_templates,
-        candidate_live_mixer_send_key, candidate_matches_vst_identity, candidate_mixer_controls,
+        PianoRollSnap, PlaylistClip, PlaylistClipDragKind, PlaylistClipEdit,
+        PlaylistClipResizeEdge, PlaylistTempoMap, PlaylistTrack, PluginCandidate, PluginFormat,
+        TimeSelectionShift, TouchGesture, TouchTapTracker, TouchZoomConfig,
+        WINDOW_LAYOUT_PRESETS_HEADER, WindowLayoutPreset, audio_recording_start_tick_with_offset,
+        built_in_midi_controller_templates, candidate_live_mixer_send_key,
+        candidate_matches_vst_identity, candidate_mixer_controls,
         candidate_mixer_stereo_separation, detect_chord_name, detect_piano_roll_channel_scale,
         detect_piano_roll_scale, encode_midi_device_id, encode_midi_device_selections,
         encode_midi_output_routes, first_available_playlist_track,
@@ -58085,9 +58396,10 @@ mod tests {
         piano_roll_random_note_selection, piano_roll_selection_time_range,
         piano_roll_shift_time_range, piano_roll_time_range_from_drag,
         piano_roll_time_range_note_selection, piano_roll_time_tick_at_x,
-        playlist_audio_clip_join_candidates, playlist_audio_drop_position_ticks,
-        playlist_bar_ticks, playlist_clip_drag_edit, playlist_clip_local_recording_offset,
-        playlist_clip_split_position, playlist_group_parent_ids, playlist_measure_boundaries,
+        playlist_audio_clip_join_candidates, playlist_audio_clip_resize_edit_at_zero_crossing,
+        playlist_audio_drop_position_ticks, playlist_bar_ticks, playlist_clip_drag_edit,
+        playlist_clip_local_recording_offset, playlist_clip_split_position,
+        playlist_group_parent_ids, playlist_measure_boundaries,
         playlist_pattern_clip_join_candidates, playlist_pattern_clip_split_supported,
         playlist_pattern_recording_placement_tick, playlist_seek_tick_to_frame,
         playlist_signature_at_tick, playlist_song_position_label, playlist_track_group_range,
@@ -60898,6 +61210,94 @@ mod tests {
             15,
         );
         assert_eq!(minimum.length_ticks, Some(1));
+    }
+
+    #[test]
+    fn playlist_audio_clip_zero_crossing_resize_updates_timeline_and_source_windows() {
+        fn clip(record_size: usize) -> PlaylistClip {
+            let (mut clips, _) = playlist_audio_clip_fixture();
+            let mut clip = clips.remove(0);
+            clip.position_ticks = 120;
+            clip.length_ticks = 384;
+            clip.start_offset = 100.0;
+            clip.end_offset = 2_100.0;
+            clip.source_window_ticks = (record_size == 88).then_some((48, 432));
+            clip.record_size = record_size;
+            clip
+        }
+
+        let modern = clip(88);
+        let right = playlist_audio_clip_resize_edit_at_zero_crossing(
+            &modern,
+            PlaylistClipEdit {
+                length_ticks: Some(240),
+                source_window_ticks: Some((48, 288)),
+                ..PlaylistClipEdit::default()
+            },
+            PlaylistClipResizeEdge::Right,
+            370,
+            96,
+            120.0,
+        )
+        .expect("a right-edge zero crossing should resize a modern Audio Clip");
+        assert_eq!(right.length_ticks, Some(250));
+        assert_eq!(right.source_window_ticks, Some((48, 298)));
+
+        let left = playlist_audio_clip_resize_edit_at_zero_crossing(
+            &modern,
+            PlaylistClipEdit {
+                position_ticks: Some(240),
+                length_ticks: Some(264),
+                source_window_ticks: Some((168, 432)),
+                ..PlaylistClipEdit::default()
+            },
+            PlaylistClipResizeEdge::Left,
+            230,
+            96,
+            120.0,
+        )
+        .expect("a left-edge zero crossing may fall just before the grid edge");
+        assert_eq!(left.position_ticks, Some(230));
+        assert_eq!(left.length_ticks, Some(274));
+        assert_eq!(left.source_window_ticks, Some((158, 432)));
+
+        let legacy = clip(60);
+        let right = playlist_audio_clip_resize_edit_at_zero_crossing(
+            &legacy,
+            PlaylistClipEdit {
+                length_ticks: Some(240),
+                start_offset: Some(100.0),
+                end_offset: Some(1_350.0),
+                ..PlaylistClipEdit::default()
+            },
+            PlaylistClipResizeEdge::Right,
+            370,
+            96,
+            120.0,
+        )
+        .expect("a right-edge zero crossing should resize a legacy Audio Clip");
+        assert_eq!(right.length_ticks, Some(250));
+        assert!((right.end_offset.unwrap() - 1_402.083_3).abs() < 0.01);
+
+        let left = playlist_audio_clip_resize_edit_at_zero_crossing(
+            &legacy,
+            PlaylistClipEdit {
+                position_ticks: Some(240),
+                length_ticks: Some(264),
+                start_offset: Some(725.0),
+                end_offset: Some(2_100.0),
+                ..PlaylistClipEdit::default()
+            },
+            PlaylistClipResizeEdge::Left,
+            230,
+            96,
+            120.0,
+        )
+        .expect("a left-edge zero crossing should resize a legacy Audio Clip");
+        assert_eq!(left.position_ticks, Some(230));
+        assert_eq!(left.length_ticks, Some(274));
+        assert!((left.start_offset.unwrap() - 672.9167).abs() < 0.01);
+        assert_eq!(left.end_offset, Some(2_100.0));
     }
 
     #[test]
