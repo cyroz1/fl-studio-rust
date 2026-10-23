@@ -465,8 +465,31 @@ fn process_audio_range(
     pitch_shift_semitones: f32,
     stretch_ratio: f32,
 ) -> Result<DecodedAudio, String> {
-    if !pitch_shift_semitones.is_finite() || !(-24.0..=24.0).contains(&pitch_shift_semitones) {
-        return Err("pitch shift must be between -24 and +24 semitones".to_owned());
+    process_audio_range_with_pitch_limit(
+        audio,
+        frame_range,
+        pitch_shift_semitones,
+        stretch_ratio,
+        24.0,
+    )
+}
+
+fn process_audio_range_with_pitch_limit(
+    audio: &DecodedAudio,
+    frame_range: Range<usize>,
+    pitch_shift_semitones: f32,
+    stretch_ratio: f32,
+    max_pitch_shift_semitones: f32,
+) -> Result<DecodedAudio, String> {
+    if !pitch_shift_semitones.is_finite()
+        || !max_pitch_shift_semitones.is_finite()
+        || max_pitch_shift_semitones <= 0.0
+        || !(-max_pitch_shift_semitones..=max_pitch_shift_semitones)
+            .contains(&pitch_shift_semitones)
+    {
+        return Err(format!(
+            "pitch shift must be between -{max_pitch_shift_semitones} and +{max_pitch_shift_semitones} semitones"
+        ));
     }
     if !stretch_ratio.is_finite() || !(0.5..=2.0).contains(&stretch_ratio) {
         return Err("stretch ratio must be between 0.5 and 2.0".to_owned());
@@ -575,7 +598,13 @@ pub(crate) fn process_audio_range_for_playback(
     pitch_shift_semitones: f32,
     stretch_ratio: f32,
 ) -> Result<DecodedAudio, String> {
-    process_audio_range(audio, frame_range, pitch_shift_semitones, stretch_ratio)
+    process_audio_range_with_pitch_limit(
+        audio,
+        frame_range,
+        pitch_shift_semitones,
+        stretch_ratio,
+        25.0,
+    )
 }
 
 /// Process a selected sample range and return interleaved stereo preview frames at the device

@@ -8755,7 +8755,7 @@ impl DawUi {
                 });
                 ui.label(
                     egui::RichText::new(
-                        "Affects supported Sampler and VST3 note playback and rendering, plus unstretched Playlist Audio Clips (scale unset or 1.0), when Enable main pitch is on. Native instruments and stretched Audio Clips remain incomplete."
+                        "Affects supported Sampler and VST3 note playback and rendering, plus Playlist Audio Clips, when Enable main pitch is on. Unstretched and Resample clips change playback rate; Stretch and Elastique 3 Generic clips preserve their target duration. Native instruments remain incomplete."
                     )
                     .color(MUTED),
                 );

@@ -6380,10 +6380,8 @@ fn prepare_audio_clip_render(
             channel.audio_clip_reversed(),
             gain,
             pan,
-            audio_clip_pitch_ratio(
-                f64::from(channel.master_pitch_offset_cents(master_pitch_cents))
-                    + f64::from(channel.keyboard_fine_tune_cents().unwrap_or_default()),
-            ),
+            f64::from(channel.master_pitch_offset_cents(master_pitch_cents))
+                + f64::from(channel.keyboard_fine_tune_cents().unwrap_or_default()),
             mixer_track,
             channel.stretch_settings().map(|settings| {
                 (
@@ -6449,7 +6447,7 @@ fn prepare_audio_clip_render(
         reverse,
         gain,
         pan,
-        pitch_ratio,
+        pitch_offset_cents,
         mixer_track,
         stretch_settings,
         mixer_route_plan,
@@ -6478,7 +6476,7 @@ fn prepare_audio_clip_render(
             *clip_index,
         )?;
         let mut source_id = raw_source_id;
-        let mut effective_pitch_ratio = *pitch_ratio;
+        let mut effective_pitch_ratio = audio_clip_pitch_ratio(*pitch_offset_cents);
         match stretch_plan {
             Some(AudioClipStretchPlan::Resample {
                 playback_rate_ratio,
@@ -6488,11 +6486,17 @@ fn prepare_audio_clip_render(
                 pitch_raw,
                 mode_raw,
             }) => {
+                let duration_preserving_pitch_raw = audio_clip_duration_preserving_pitch_cents(
+                    *pitch_offset_cents,
+                    pitch_raw,
+                    *clip_index,
+                )?;
+                effective_pitch_ratio = 1.0;
                 let cache_key = ProcessedAudioCacheKey {
                     path: path.clone(),
                     source_bounds,
                     target_duration_frames,
-                    pitch_raw,
+                    pitch_raw: duration_preserving_pitch_raw,
                     mode_raw,
                 };
                 source_id = if let Some(source_id) = processed_source_ids.get(&cache_key) {
@@ -6504,7 +6508,7 @@ fn prepare_audio_clip_render(
                     let processed_audio = process_audio_range_for_playback(
                         &audio_sources[raw_source_id],
                         source_bounds.start..source_bounds.end,
-                        pitch_raw as f32 / 100.0,
+                        duration_preserving_pitch_raw as f32 / 100.0,
                         stretch_ratio,
                     )
                     .map_err(|error| {
@@ -10734,12 +10738,22 @@ fn sampler_precompute_fades(
     Arc::new(processed)
 }
 
-fn audio_clip_master_pitch_ratio(pitch_offset_cents: i16) -> f64 {
-    audio_clip_pitch_ratio(f64::from(pitch_offset_cents))
-}
-
 fn audio_clip_pitch_ratio(pitch_offset_cents: f64) -> f64 {
     2.0f64.powf(pitch_offset_cents / 1_200.0)
+}
+
+fn audio_clip_duration_preserving_pitch_cents(
+    channel_pitch_cents: f64,
+    stretch_pitch_cents: i32,
+    clip_index: usize,
+) -> Result<i32, String> {
+    let combined_cents = channel_pitch_cents + f64::from(stretch_pitch_cents);
+    if !combined_cents.is_finite() || !(-2_500.0..=2_500.0).contains(&combined_cents) {
+        return Err(format!(
+            "Playlist clip {clip_index} combines stretch and pitch offsets outside the supported ±25-semitone range"
+        ));
+    }
+    Ok(combined_cents.round() as i32)
 }
 
 fn transpose_sampler_note_key(key: u16, semitones: i16) -> u16 {
@@ -14754,13 +14768,13 @@ mod tests {
     }
 
     #[test]
-    fn playlist_audio_clip_master_pitch_changes_playback_rate_and_duration() {
-        let pitch_up = audio_clip_master_pitch_ratio(1_200);
-        let pitch_down = audio_clip_master_pitch_ratio(-1_200);
+    fn unstretched_playlist_audio_clip_master_pitch_changes_playback_rate_and_duration() {
+        let pitch_up = audio_clip_pitch_ratio(1_200.0);
+        let pitch_down = audio_clip_pitch_ratio(-1_200.0);
         let channel_fine_tune_up = audio_clip_pitch_ratio(50.0);
         assert_eq!(pitch_up, 2.0);
         assert_eq!(pitch_down, 0.5);
-        assert_eq!(audio_clip_master_pitch_ratio(0), 1.0);
+        assert_eq!(audio_clip_pitch_ratio(0.0), 1.0);
         assert!((channel_fine_tune_up - 2.0f64.powf(50.0 / 1_200.0)).abs() < 1e-12);
         assert_eq!(source_duration_to_frames(4, 4, 4, pitch_up).unwrap(), 2);
         assert_eq!(source_duration_to_frames(4, 4, 4, pitch_down).unwrap(), 8);
@@ -14792,6 +14806,30 @@ mod tests {
         mix_clip_into_stereo(&mut mix, &source, &clip, 4, None).unwrap();
         let center_gain = std::f32::consts::FRAC_1_SQRT_2;
         assert_eq!(mix, vec![0.0, 0.0, 2.0 * center_gain, 2.0 * center_gain]);
+    }
+
+    #[test]
+    fn stretched_playlist_audio_clip_combines_master_pitch_without_changing_duration() {
+        let combined_pitch_cents =
+            audio_clip_duration_preserving_pitch_cents(1_250.0, 200, 3).unwrap();
+        assert_eq!(combined_pitch_cents, 1_450);
+        let max_pitch_cents =
+            audio_clip_duration_preserving_pitch_cents(-1_300.0, -1_200, 3).unwrap();
+        assert_eq!(max_pitch_cents, -2_500);
+        assert!(audio_clip_duration_preserving_pitch_cents(1_301.0, 1_200, 3).is_err());
+
+        let audio = DecodedAudio {
+            sample_rate: 8_000,
+            channels: vec![
+                (0..8_000)
+                    .map(|frame| (std::f32::consts::TAU * frame as f32 / 80.0).sin())
+                    .collect(),
+            ],
+        };
+        let processed =
+            process_audio_range_for_playback(&audio, 0..8_000, max_pitch_cents as f32 / 100.0, 0.5)
+                .unwrap();
+        assert_eq!(processed.frame_count(), 4_000);
     }
 
     #[test]
