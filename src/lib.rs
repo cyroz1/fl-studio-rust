@@ -1589,6 +1589,8 @@ pub struct AutomationPointEdit {
 pub struct Pattern {
     pub id: u16,
     pub name: Option<String>,
+    /// Raw four-byte color stored by the Pattern's `0x96` event, in little-endian RGBA order.
+    pub color: Option<[u8; 4]>,
     pub length_ticks: Option<u32>,
     pub notes: Vec<PatternNote>,
     pub controllers: Vec<PatternController>,
@@ -5419,6 +5421,17 @@ impl FlpDocument {
                                 .filter(|name| !name.is_empty());
                     }
                 }
+                0x96 if event.encoding == PayloadEncoding::Dword && event.payload.len() == 4 => {
+                    if let Some(pattern_index) = current_pattern {
+                        patterns[pattern_index].color.get_or_insert_with(|| {
+                            event
+                                .payload
+                                .as_slice()
+                                .try_into()
+                                .expect("a dword event has four payload bytes")
+                        });
+                    }
+                }
                 0xA4 if event.payload.len() == 4 => {
                     if let Some(pattern_index) = current_pattern {
                         patterns[pattern_index].length_ticks = Some(u32::from_le_bytes([
@@ -6309,6 +6322,79 @@ impl FlpDocument {
         Ok(())
     }
 
+    /// Sets the RGB components of a Pattern's `0x96` color event while retaining its fourth
+    /// byte. Patterns without a color event receive one beside their name and other metadata.
+    pub fn set_pattern_color(&mut self, pattern_id: u16, rgb: [u8; 3]) -> Result<(), FlpError> {
+        let mut markers = self.events.iter().enumerate().filter(|(_, event)| {
+            event.opcode == 0x41
+                && event.encoding == PayloadEncoding::Word
+                && event.payload.as_slice() == pattern_id.to_le_bytes()
+        });
+        let Some((marker_index, _)) = markers.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested pattern marker does not exist",
+            ));
+        };
+        if markers.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested pattern id is ambiguous",
+            ));
+        }
+        let region_end = self.events[marker_index + 1..]
+            .iter()
+            .position(|event| {
+                (event.opcode == 0x41 && event.encoding == PayloadEncoding::Word)
+                    || matches!(event.opcode, 0x40 | 0x62 | 0x63)
+            })
+            .map_or(self.events.len(), |offset| marker_index + 1 + offset);
+        let color_events = (marker_index + 1..region_end)
+            .filter(|index| self.events[*index].opcode == 0x96)
+            .collect::<Vec<_>>();
+        if color_events.len() > 1 {
+            return Err(FlpError::UnsupportedEdit(
+                "the Pattern has multiple 0x96 color events",
+            ));
+        }
+
+        let mut candidate = self.clone();
+        if let Some(color_event_index) = color_events.first().copied() {
+            let event = &candidate.events[color_event_index];
+            if event.encoding != PayloadEncoding::Dword || event.payload.len() != 4 {
+                return Err(FlpError::UnsupportedEdit(
+                    "the Pattern's 0x96 color event is not a four-byte value",
+                ));
+            }
+            let fourth_byte = event.payload[3];
+            candidate.events[color_event_index].replace_dword_payload(u32::from_le_bytes([
+                rgb[0],
+                rgb[1],
+                rgb[2],
+                fourth_byte,
+            ]))?;
+        } else {
+            let name_event_index =
+                (marker_index + 1..region_end).find(|index| self.events[*index].opcode == 0xC1);
+            let insertion_index = if let Some(name_event_index) = name_event_index {
+                name_event_index + 1
+            } else {
+                marker_index
+                    + 1
+                    + usize::from(
+                        self.events
+                            .get(marker_index + 1)
+                            .is_some_and(Self::is_pattern_note_event),
+                    )
+            };
+            candidate.events.insert(
+                insertion_index,
+                FlpEvent::new_dword(0x96, u32::from_le_bytes([rgb[0], rgb[1], rgb[2], 0])),
+            );
+        }
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
     /// Deletes an unreferenced Pattern and its complete event region.
     ///
     /// Pattern Clips that still target this Pattern prevent deletion. Projects whose
@@ -6459,9 +6545,9 @@ impl FlpDocument {
         Ok(new_id)
     }
 
-    /// Duplicates a pattern's note records, raw `0xDF` controller events, recognized time-marker
-    /// events, name, and explicit length into a new pattern. Unknown events and all existing
-    /// pattern bytes remain untouched.
+    /// Duplicates a Pattern's note records, raw `0xDF` controller events, recognized time-marker
+    /// events, name, color, and explicit length into a new Pattern. Unknown events and all
+    /// existing Pattern bytes remain untouched.
     pub fn duplicate_pattern(&mut self, pattern_id: u16) -> Result<u16, FlpError> {
         let source_pattern = self
             .patterns()?
@@ -6526,6 +6612,13 @@ impl FlpDocument {
                 .iter()
                 .rposition(|event| event.opcode == 0xA4 && event.payload.len() == 4)
         });
+        let color_event_index = source_pattern.color.and_then(|_| {
+            source_region.iter().position(|event| {
+                event.opcode == 0x96
+                    && event.encoding == PayloadEncoding::Dword
+                    && event.payload.len() == 4
+            })
+        });
         let duplicate_auxiliary_events = source_region
             .iter()
             .enumerate()
@@ -6535,6 +6628,7 @@ impl FlpDocument {
                     || time_marker_event_indices.contains(&source_event_index)
                     || Some(*index) == name_event_index
                     || Some(*index) == length_event_index
+                    || Some(*index) == color_event_index
             })
             .map(|(_, event)| event.clone())
             .collect::<Vec<_>>();
@@ -27611,6 +27705,42 @@ mod tests {
     }
 
     #[test]
+    fn pattern_colors_decode_edit_and_roundtrip_without_changing_rgba_tail() {
+        let mut trailing_events = vec![0x96, 0x11, 0x22, 0x33, 0xA5, 0x41, 8, 0];
+        append_data_event(&mut trailing_events, 0xD0, &[]);
+        let input = pattern_fixture(&[], &trailing_events);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+
+        let patterns = document.patterns().expect("Patterns should decode");
+        assert_eq!(patterns[0].color, Some([0x11, 0x22, 0x33, 0xA5]));
+        assert_eq!(patterns[1].color, None);
+        assert_eq!(document.encode_lossless().unwrap(), input);
+
+        document
+            .set_pattern_color(7, [0xAA, 0xBB, 0xCC])
+            .expect("existing Pattern color should be editable");
+        document
+            .set_pattern_color(8, [0x10, 0x20, 0x30])
+            .expect("an absent Pattern color should be added");
+        let patterns = document.patterns().expect("edited Patterns should decode");
+        assert_eq!(patterns[0].color, Some([0xAA, 0xBB, 0xCC, 0xA5]));
+        assert_eq!(patterns[1].color, Some([0x10, 0x20, 0x30, 0]));
+
+        let encoded = document.encode_lossless().unwrap();
+        let reparsed = FlpDocument::parse(&encoded).expect("edited project should parse");
+        assert_eq!(reparsed.patterns().unwrap(), patterns);
+        assert_eq!(reparsed.encode_lossless().unwrap(), encoded);
+    }
+
+    #[test]
+    fn pattern_color_edit_rejects_ambiguous_events_without_mutation() {
+        let input = pattern_fixture(&[], &[0x96, 1, 2, 3, 0, 0x96, 4, 5, 6, 0]);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+        assert!(document.set_pattern_color(7, [10, 20, 30]).is_err());
+        assert_eq!(document.encode_lossless().unwrap(), input);
+    }
+
+    #[test]
     fn malformed_pattern_controller_payload_is_rejected() {
         let mut controller_event = Vec::new();
         append_data_event(&mut controller_event, 0xDF, &[0; 11]);
@@ -29919,6 +30049,7 @@ mod tests {
         append_data_event(&mut stream, 0xDF, &second_controller_payload);
         stream.extend_from_slice(&[0xA4, 0x80, 0x07, 0, 0]);
         append_project_info_string(&mut stream, 0xC1, "Verse");
+        stream.extend_from_slice(&[0x96, 0xAB, 0xCD, 0xEF, 0x52]);
         stream.extend_from_slice(&[0x40, 1, 0, 0x15, 2]);
         let input = flp_fixture(&stream, &[0xA1], &[0xB2]);
         let mut document = FlpDocument::parse(&input).expect("fixture should parse");
@@ -29952,6 +30083,7 @@ mod tests {
         assert_eq!(duplicate.time_markers[0].name(), Some("Pattern Meter"));
         assert_eq!(duplicate.length_ticks, Some(1920));
         assert_eq!(duplicate.name.as_deref(), Some("Verse"));
+        assert_eq!(duplicate.color, Some([0xAB, 0xCD, 0xEF, 0x52]));
 
         let duplicate_marker = document
             .events()
@@ -30000,6 +30132,9 @@ mod tests {
         );
         assert!(duplicate_events.iter().any(|event| event.opcode() == 0xA4));
         assert!(duplicate_events.iter().any(|event| event.opcode() == 0xC1));
+        assert!(duplicate_events.iter().any(|event| {
+            event.opcode() == 0x96 && event.payload() == [0xAB, 0xCD, 0xEF, 0x52]
+        }));
         let event_bytes_without_duplicate = document
             .events()
             .iter()

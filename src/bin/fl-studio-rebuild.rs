@@ -239,6 +239,43 @@ const MIDI_CHANNEL_COLORS: [Color32; 16] = [
     Color32::from_rgb(100, 129, 181),
     Color32::from_rgb(172, 128, 105),
 ];
+const PATTERN_COLOR_CYCLE: [[u8; 3]; 16] = [
+    [113, 172, 77],
+    [73, 128, 174],
+    [195, 129, 61],
+    [150, 93, 181],
+    [63, 157, 143],
+    [192, 91, 105],
+    [183, 159, 77],
+    [92, 146, 193],
+    [170, 112, 79],
+    [112, 158, 101],
+    [143, 112, 173],
+    [76, 154, 161],
+    [195, 110, 146],
+    [141, 143, 82],
+    [100, 129, 181],
+    [172, 128, 105],
+];
+
+fn next_pattern_color(current: Option<[u8; 3]>) -> [u8; 3] {
+    let Some(current_index) = current.and_then(|rgb| {
+        PATTERN_COLOR_CYCLE
+            .iter()
+            .position(|candidate| *candidate == rgb)
+    }) else {
+        return PATTERN_COLOR_CYCLE[0];
+    };
+    PATTERN_COLOR_CYCLE[(current_index + 1) % PATTERN_COLOR_CYCLE.len()]
+}
+
+fn show_pattern_color_swatch(ui: &mut egui::Ui, color: Option<[u8; 4]>) {
+    if let Some([red, green, blue, _]) = color {
+        let (rect, _) = ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
+        ui.painter()
+            .rect_filled(rect, 2.0, Color32::from_rgb(red, green, blue));
+    }
+}
 
 fn install_ui_fonts(context: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
@@ -1043,6 +1080,8 @@ struct ChannelGroupDialog {
 struct PatternRenameDialog {
     pattern_id: u16,
     name: String,
+    color_rgb: [u8; 3],
+    color_enabled: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6297,6 +6336,11 @@ impl DawUi {
         self.pattern_rename_dialog = Some(PatternRenameDialog {
             pattern_id,
             name: pattern.name.unwrap_or_default(),
+            color_rgb: pattern
+                .color
+                .map(|color| [color[0], color[1], color[2]])
+                .unwrap_or([0x48, 0x51, 0x56]),
+            color_enabled: pattern.color.is_some(),
         });
     }
 
@@ -6305,10 +6349,15 @@ impl DawUi {
             .document
             .as_ref()
             .and_then(|document| document.encode_lossless().ok());
-        let result = self
-            .document
-            .as_mut()
-            .map(|document| document.set_pattern_name(dialog.pattern_id, &dialog.name));
+        let result = self.document.as_mut().map(|document| {
+            let mut candidate = document.clone();
+            candidate.set_pattern_name(dialog.pattern_id, &dialog.name)?;
+            if dialog.color_enabled {
+                candidate.set_pattern_color(dialog.pattern_id, dialog.color_rgb)?;
+            }
+            *document = candidate;
+            Ok::<(), FlpError>(())
+        });
         match result {
             Some(Ok(())) => {
                 let changed = self
@@ -6318,19 +6367,28 @@ impl DawUi {
                     .zip(before)
                     .is_some_and(|(after, before)| after != before);
                 if changed {
-                    self.stop_project_playback();
                     self.dirty = true;
-                    self.status =
-                        format!("Renamed Pattern {} to {}", dialog.pattern_id, dialog.name);
+                    self.status = if dialog.color_enabled {
+                        format!("Updated Pattern {} name and color", dialog.pattern_id)
+                    } else {
+                        format!("Renamed Pattern {} to {}", dialog.pattern_id, dialog.name)
+                    };
                 } else {
-                    self.status = format!(
-                        "Pattern {} is already named {}",
-                        dialog.pattern_id, dialog.name
-                    );
+                    self.status = if dialog.color_enabled {
+                        format!(
+                            "Pattern {} already has that name and color",
+                            dialog.pattern_id
+                        )
+                    } else {
+                        format!(
+                            "Pattern {} is already named {}",
+                            dialog.pattern_id, dialog.name
+                        )
+                    };
                 }
             }
             Some(Err(error)) => {
-                self.status = format!("Could not rename Pattern: {error}");
+                self.status = format!("Could not update Pattern: {error}");
                 self.pattern_rename_dialog = Some(dialog);
             }
             None => self.status = "Open a project before renaming a Pattern".to_owned(),
@@ -6353,18 +6411,42 @@ impl DawUi {
             .show(context, |ui| {
                 ui.label(format!("Pattern {} name", dialog.pattern_id));
                 ui.text_edit_singleline(&mut dialog.name);
+                if ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F2)) {
+                    dialog.color_rgb =
+                        next_pattern_color(dialog.color_enabled.then_some(dialog.color_rgb));
+                    dialog.color_enabled = true;
+                }
                 ui.horizontal(|ui| {
-                    if ui.button("Rename").clicked() {
+                    ui.label("Color");
+                    let mut color = Color32::from_rgb(
+                        dialog.color_rgb[0],
+                        dialog.color_rgb[1],
+                        dialog.color_rgb[2],
+                    );
+                    if ui.color_edit_button_srgba(&mut color).changed() {
+                        dialog.color_rgb = [color.r(), color.g(), color.b()];
+                        dialog.color_enabled = true;
+                    }
+                    if ui.button("Cycle (F2)").clicked() {
+                        dialog.color_rgb =
+                            next_pattern_color(dialog.color_enabled.then_some(dialog.color_rgb));
+                        dialog.color_enabled = true;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Apply").clicked() {
                         apply = true;
                     }
                     if ui.button("Cancel").clicked() {
                         cancel = true;
                     }
                 });
-                if ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                if ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+                {
                     apply = true;
                 }
-                if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                if ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+                {
                     cancel = true;
                 }
             });
@@ -11597,7 +11679,7 @@ impl DawUi {
                 if let Some(pattern_id) = self
                     .selected_pattern
                     .filter(|pattern_id| patterns.iter().any(|pattern| pattern.id == *pattern_id))
-                    && ui.button("Rename selected pattern…").clicked()
+                    && ui.button("Rename / recolor selected pattern…").clicked()
                 {
                     self.open_pattern_rename_dialog(pattern_id);
                     ui.close();
@@ -11618,12 +11700,19 @@ impl DawUi {
                             .name
                             .as_deref()
                             .map_or_else(|| format!("Pattern {}", pattern.id), str::to_owned);
-                        if ui
-                            .selectable_value(&mut self.selected_pattern, Some(pattern.id), label)
-                            .clicked()
-                        {
-                            ui.close();
-                        }
+                        ui.horizontal(|ui| {
+                            show_pattern_color_swatch(ui, pattern.color);
+                            if ui
+                                .selectable_value(
+                                    &mut self.selected_pattern,
+                                    Some(pattern.id),
+                                    label,
+                                )
+                                .clicked()
+                            {
+                                ui.close();
+                            }
+                        });
                     }
                 }
             });
@@ -11961,7 +12050,10 @@ impl DawUi {
                     ("F6", "Channel Rack"),
                     ("F7", "Piano roll"),
                     ("F9", "Mixer"),
-                    ("F2", "Rename selected pattern"),
+                    (
+                        "F2",
+                        "Rename / recolor selected pattern; repeat to cycle colors",
+                    ),
                     ("F4", "Select next empty pattern and name it"),
                     ("Ctrl/Cmd+F4", "Select or create next empty pattern"),
                     ("Ctrl/Cmd+O", "Open project"),
@@ -12346,11 +12438,14 @@ impl DawUi {
                                 .as_deref()
                                 .filter(|name| !name.trim().is_empty())
                                 .map_or_else(|| format!("Pattern {}", pattern.id), str::to_owned);
-                            ui.selectable_value(
-                                &mut self.selected_pattern,
-                                Some(pattern.id),
-                                label,
-                            );
+                            ui.horizontal(|ui| {
+                                show_pattern_color_swatch(ui, pattern.color);
+                                ui.selectable_value(
+                                    &mut self.selected_pattern,
+                                    Some(pattern.id),
+                                    label,
+                                );
+                            });
                         }
                     });
                 if ui
@@ -22303,14 +22398,17 @@ impl DawUi {
                 .selected_text(format!("Pattern {}", self.selected_pattern.unwrap_or(0)))
                 .show_ui(ui, |ui| {
                     for pattern in &patterns {
-                        ui.selectable_value(
-                            &mut self.selected_pattern,
-                            Some(pattern.id),
-                            pattern
-                                .name
-                                .as_deref()
-                                .map_or_else(|| format!("Pattern {}", pattern.id), str::to_owned),
-                        );
+                        ui.horizontal(|ui| {
+                            show_pattern_color_swatch(ui, pattern.color);
+                            ui.selectable_value(
+                                &mut self.selected_pattern,
+                                Some(pattern.id),
+                                pattern.name.as_deref().map_or_else(
+                                    || format!("Pattern {}", pattern.id),
+                                    str::to_owned,
+                                ),
+                            );
+                        });
                     }
                 });
             ui.label("Display");
@@ -46800,7 +46898,8 @@ impl eframe::App for DawUi {
         {
             self.open_pattern_rename_dialog(pattern_id);
         }
-        let rename_pattern_requested = !ui.ctx().egui_wants_keyboard_input()
+        let rename_pattern_requested = self.pattern_rename_dialog.is_none()
+            && !ui.ctx().egui_wants_keyboard_input()
             && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F2));
         if rename_pattern_requested && let Some(pattern_id) = self.selected_pattern {
             self.open_pattern_rename_dialog(pattern_id);
@@ -55234,12 +55333,13 @@ mod tests {
         midi_cc_to_mixer_stereo_separation_raw, midi_controller_binding_for_device,
         midi_mixer_button_press_edge, midi_mixer_control_for_cc,
         midi_vst3_parameter_mapping_for_target, midi_vst3_parameter_mappings_for_cc,
-        next_empty_pattern_id, next_piano_roll_note_group, note_from_grid_position,
-        parse_midi_control_change_mapping, parse_midi_controller_templates,
-        parse_midi_device_selections, parse_midi_mixer_control_mappings,
-        parse_midi_output_programs, parse_midi_output_routes, parse_midi_output_values,
-        parse_midi_vst3_parameter_mappings, parse_pattern_vst3_parameter_links,
-        parse_window_layout_presets, pattern_loop_frame_at_tick, pattern_loop_tick_at_frame,
+        next_empty_pattern_id, next_pattern_color, next_piano_roll_note_group,
+        note_from_grid_position, parse_midi_control_change_mapping,
+        parse_midi_controller_templates, parse_midi_device_selections,
+        parse_midi_mixer_control_mappings, parse_midi_output_programs, parse_midi_output_routes,
+        parse_midi_output_values, parse_midi_vst3_parameter_mappings,
+        parse_pattern_vst3_parameter_links, parse_window_layout_presets,
+        pattern_loop_frame_at_tick, pattern_loop_tick_at_frame,
         pattern_vst3_parameter_automation_for_channel, pattern_vst3_parameter_link_for_target,
         piano_roll_color_group_note_ids, piano_roll_controller_stroke_points,
         piano_roll_controller_value_at, piano_roll_controller_value_range,
@@ -55292,6 +55392,23 @@ mod tests {
         assert_eq!(next_empty_pattern_id(&patterns, Some(2)), Some(4));
         assert_eq!(next_empty_pattern_id(&patterns, Some(4)), Some(1));
         assert_eq!(next_empty_pattern_id(&patterns[..1], Some(1)), None);
+    }
+
+    #[test]
+    fn pattern_color_cycle_advances_wraps_and_starts_at_first_color() {
+        assert_eq!(next_pattern_color(None), super::PATTERN_COLOR_CYCLE[0]);
+        assert_eq!(
+            next_pattern_color(Some(super::PATTERN_COLOR_CYCLE[0])),
+            super::PATTERN_COLOR_CYCLE[1]
+        );
+        assert_eq!(
+            next_pattern_color(Some(*super::PATTERN_COLOR_CYCLE.last().unwrap())),
+            super::PATTERN_COLOR_CYCLE[0]
+        );
+        assert_eq!(
+            next_pattern_color(Some([1, 2, 3])),
+            super::PATTERN_COLOR_CYCLE[0]
+        );
     }
 
     fn mixer_send_route_fixture() -> FlpDocument {
@@ -56105,6 +56222,7 @@ mod tests {
         let pattern = Pattern {
             id: 7,
             name: None,
+            color: None,
             length_ticks: None,
             notes: vec![
                 note(0, 0, 60),
@@ -58189,6 +58307,7 @@ mod tests {
         let pattern = Pattern {
             id: 7,
             name: None,
+            color: None,
             length_ticks: Some(96),
             notes: Vec::new(),
             controllers: Vec::new(),
