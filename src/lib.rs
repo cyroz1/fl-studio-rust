@@ -1074,12 +1074,20 @@ impl ChannelSummary {
         self.zipped
     }
 
-    /// Whether a Sampler or sample-backed Audio Clip's saved Reverse option is enabled.
+    /// Whether a kind-0 Sampler's saved Reverse option is enabled.
     ///
     /// The Reverse bit is bit 1 of the channel's `0x46` FX flags word. Unknown
     /// flag bits remain untouched in the original event stream.
     pub fn sample_reversed(&self) -> bool {
-        matches!(self.kind, Some(0 | 4))
+        self.kind == Some(0)
+            && self
+                .sampler_fx_flags
+                .is_some_and(|flags| flags & (1 << 1) != 0)
+    }
+
+    /// Whether a kind-4 Audio Clip channel's saved Reverse option is enabled.
+    pub fn audio_clip_reversed(&self) -> bool {
+        self.kind == Some(4)
             && self
                 .sampler_fx_flags
                 .is_some_and(|flags| flags & (1 << 1) != 0)

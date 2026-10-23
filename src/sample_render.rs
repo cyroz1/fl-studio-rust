@@ -6102,7 +6102,7 @@ fn prepare_audio_clip_render(
             clip,
             id,
             resolved_path,
-            channel.sample_reversed(),
+            channel.audio_clip_reversed(),
             gain,
             pan,
             audio_clip_pitch_ratio(

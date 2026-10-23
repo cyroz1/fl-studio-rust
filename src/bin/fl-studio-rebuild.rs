@@ -23136,7 +23136,11 @@ impl DawUi {
                                     ui.close();
                                 }
                                 if matches!(channel.kind(), Some(0 | 4)) {
-                                    let reversed = channel.sample_reversed();
+                                    let reversed = if channel.kind() == Some(4) {
+                                        channel.audio_clip_reversed()
+                                    } else {
+                                        channel.sample_reversed()
+                                    };
                                     if ui
                                         .selectable_label(reversed, "Reverse sample source")
                                         .on_hover_text(
