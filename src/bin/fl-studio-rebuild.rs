@@ -17414,16 +17414,11 @@ impl DawUi {
                             if !clip_rect.intersects(grid_rect) {
                                 continue;
                             }
-                            let color = match clip.target() {
-                                flp_rebuild::PlaylistClipTarget::Pattern { .. } => PURPLE,
-                                flp_rebuild::PlaylistClipTarget::Channel { id } => {
-                                    if channel_kinds.get(&id).copied().flatten() == Some(5) {
-                                        ORANGE
-                                    } else {
-                                        BLUE
-                                    }
-                                }
-                            };
+                            let color = playlist_clip_base_color(
+                                &clip.target(),
+                                &patterns,
+                                &channel_kinds,
+                            );
                             let mut clip_painter = painter.clone();
                             let clip_muted = clip.is_muted();
                             if track_muted || clip_muted {
@@ -52139,6 +52134,28 @@ fn clip_name(clip: &PlaylistClip, tracks: &[PlaylistTrack]) -> String {
     }
 }
 
+fn playlist_clip_base_color(
+    target: &flp_rebuild::PlaylistClipTarget,
+    patterns: &[Pattern],
+    channel_kinds: &BTreeMap<u16, Option<u8>>,
+) -> Color32 {
+    match target {
+        flp_rebuild::PlaylistClipTarget::Pattern { id } => patterns
+            .iter()
+            .find(|pattern| pattern.id == *id)
+            .and_then(|pattern| pattern.color)
+            .map(|[red, green, blue, _]| Color32::from_rgb(red, green, blue))
+            .unwrap_or(PURPLE),
+        flp_rebuild::PlaylistClipTarget::Channel { id } => {
+            if channel_kinds.get(id).copied().flatten() == Some(5) {
+                ORANGE
+            } else {
+                BLUE
+            }
+        }
+    }
+}
+
 fn note_name(key: u16) -> String {
     const NAMES: [&str; 12] = [
         "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
@@ -55408,6 +55425,48 @@ mod tests {
         assert_eq!(
             next_pattern_color(Some([1, 2, 3])),
             super::PATTERN_COLOR_CYCLE[0]
+        );
+    }
+
+    #[test]
+    fn playlist_pattern_clips_use_saved_pattern_colors() {
+        let patterns = [Pattern {
+            id: 7,
+            color: Some([0x12, 0x34, 0x56, 0xA5]),
+            ..Pattern::default()
+        }];
+        let channel_kinds = BTreeMap::from([(9, Some(5)), (10, Some(0))]);
+        assert_eq!(
+            super::playlist_clip_base_color(
+                &flp_rebuild::PlaylistClipTarget::Pattern { id: 7 },
+                &patterns,
+                &channel_kinds,
+            ),
+            super::Color32::from_rgb(0x12, 0x34, 0x56)
+        );
+        assert_eq!(
+            super::playlist_clip_base_color(
+                &flp_rebuild::PlaylistClipTarget::Pattern { id: 8 },
+                &patterns,
+                &channel_kinds,
+            ),
+            super::PURPLE
+        );
+        assert_eq!(
+            super::playlist_clip_base_color(
+                &flp_rebuild::PlaylistClipTarget::Channel { id: 9 },
+                &patterns,
+                &channel_kinds,
+            ),
+            super::ORANGE
+        );
+        assert_eq!(
+            super::playlist_clip_base_color(
+                &flp_rebuild::PlaylistClipTarget::Channel { id: 10 },
+                &patterns,
+                &channel_kinds,
+            ),
+            super::BLUE
         );
     }
 
