@@ -567,6 +567,17 @@ fn process_audio_range(
     })
 }
 
+/// Apply duration-preserving time stretch and independent pitch shift to one decoded source
+/// range for Playlist playback or rendering. The returned source keeps the input sample rate.
+pub(crate) fn process_audio_range_for_playback(
+    audio: &DecodedAudio,
+    frame_range: Range<usize>,
+    pitch_shift_semitones: f32,
+    stretch_ratio: f32,
+) -> Result<DecodedAudio, String> {
+    process_audio_range(audio, frame_range, pitch_shift_semitones, stretch_ratio)
+}
+
 /// Process a selected sample range and return interleaved stereo preview frames at the device
 /// rate. The preview uses the same pitch, stretch, fade, normalization, and reverse settings as
 /// Sample Editor export, while leaving the decoded source unchanged.

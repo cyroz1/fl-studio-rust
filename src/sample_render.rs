@@ -28,13 +28,16 @@ use crate::audio::{
     AudioInputRecording, LiveMixerSourceControl, LiveMixerSourceTargets, MIXER_TRACK_METER_COUNT,
     MixerTrackPeakMeters, StereoFrameDelay, StreamingAudioWriter,
 };
-use crate::media::{DecodedAudio, SamplePathResolver, decode_audio_file, sample_sampler_metadata};
+use crate::media::{
+    DecodedAudio, SamplePathResolver, decode_audio_file, process_audio_range_for_playback,
+    sample_sampler_metadata,
+};
 use crate::vst3::{PlaylistMidiNote, Vst3PlaylistStreamProcessor};
 use crate::{
-    Arrangement, ChannelNoteRouter, ChannelSummary, FlpDocument, MixerInsertSignalTransform,
-    MixerLiveSourceRoutePlan, MixerRouteAudibility, MixerSourceRoutePlan,
-    MixerSourceRouteTransform, Pattern, PatternNote, PlaylistClip, PlaylistClipTarget,
-    PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync,
+    Arrangement, ChannelNoteRouter, ChannelStretchMode, ChannelSummary, FlpDocument,
+    MixerInsertSignalTransform, MixerLiveSourceRoutePlan, MixerRouteAudibility,
+    MixerSourceRoutePlan, MixerSourceRouteTransform, Pattern, PatternNote, PlaylistClip,
+    PlaylistClipTarget, PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync,
 };
 
 const DEFAULT_SAMPLE_RATE: u32 = 44_100;
@@ -249,6 +252,13 @@ impl PlaylistTempoMap {
         let start = self.frame_at_tick(start_tick, sample_rate)?;
         let end = self.frame_at_tick(end_tick, sample_rate)?;
         Ok(end.saturating_sub(start))
+    }
+
+    fn has_tempo_change_between(&self, start_tick: f64, end_tick: f64) -> bool {
+        self.segments.iter().skip(1).any(|segment| {
+            let segment_tick = segment.start_tick as f64;
+            segment_tick > start_tick && segment_tick < end_tick
+        })
     }
 }
 
@@ -1934,8 +1944,10 @@ pub fn stream_audio_clips_to_device(
 /// Pattern clips are expanded on the worker thread into sample-offset note events. Audio-device
 /// callbacks continue to consume only complete stereo frames from the bounded streaming queue.
 /// The recognized Master mute, polarity, and stereo-swap flags are applied to the final mix.
-/// Linear Playlist `TEMPO` automation updates audio, Sampler, and VST3 note timing; parameter
-/// automation, Mixer routing and processing, and time stretching remain incomplete.
+/// Linear Playlist `TEMPO` automation updates audio, Sampler, and VST3 note timing. Playlist
+/// Audio Clip channel Resample, Stretch, and Elastique 3 Generic modes are prepared before
+/// playback; stretch through tempo automation, other stretch modes, parameter automation, and
+/// Mixer effects remain incomplete.
 pub fn stream_playlist_to_device(
     document: &FlpDocument,
     project_path: impl AsRef<Path>,
@@ -2128,11 +2140,7 @@ pub fn stream_playlist_performance_with_vst3_to_device(
         }
         processor.extend_to_output_frames(static_frames.max(vst3_summary.frames))?;
     }
-    let mut source_paths = audio
-        .decoded_by_path
-        .keys()
-        .cloned()
-        .collect::<BTreeSet<_>>();
+    let mut source_paths = audio.source_paths.iter().cloned().collect::<BTreeSet<_>>();
     source_paths.extend(sampler.source_paths.iter().cloned());
     let vst3_summary = vst3_processor.as_ref().map(|processor| processor.summary());
     let mut summary = PlaylistRenderSummary {
@@ -2277,7 +2285,7 @@ fn stream_playlist_with_vst3_to_device_from_frame_inner(
         processor.extend_to_output_frames(frames)?;
     }
     let mut source_paths: std::collections::BTreeSet<PathBuf> =
-        audio.decoded_by_path.keys().cloned().collect();
+        audio.source_paths.iter().cloned().collect();
     source_paths.extend(sampler.source_paths.iter().cloned());
     let vst3_summary = vst3_processor.as_ref().map(|processor| processor.summary());
     let mut summary = PlaylistRenderSummary {
@@ -2628,7 +2636,7 @@ fn render_playlist_with_vst3_cancellable(
         return Err("rendered FLAC exceeds the 36-bit sample-count limit".to_owned());
     }
     let mut source_paths: std::collections::BTreeSet<PathBuf> =
-        audio.decoded_by_path.keys().cloned().collect();
+        audio.source_paths.iter().cloned().collect();
     source_paths.extend(sampler.source_paths.iter().cloned());
     let vst3_summary = vst3_processor.as_ref().map(|processor| processor.summary());
     let mut summary = PlaylistRenderSummary {
@@ -3038,7 +3046,7 @@ pub fn render_playlist_mixer_stems_with_vst3_cancellable(
         .collect::<Result<Vec<_>, String>>()?;
 
     let mut source_paths: std::collections::BTreeSet<PathBuf> =
-        audio.decoded_by_path.keys().cloned().collect();
+        audio.source_paths.iter().cloned().collect();
     source_paths.extend(sampler.source_paths.iter().cloned());
     let vst3_summary = vst3_processor.as_ref().map(|processor| processor.summary());
     let mut summary = PlaylistRenderSummary {
@@ -4506,7 +4514,7 @@ fn stream_prepared_playlist_render_with_performance(
     let worker_clips = audio_clip_groups_for_workers(&track_groups, worker_count);
     let audio_mix_context = PreparedAudioClipMixContext {
         clips: &render.audio.clips,
-        decoded_by_path: &render.audio.decoded_by_path,
+        audio_sources: &render.audio.audio_sources,
         sample_rate: options.sample_rate,
         resampling_quality: options.resampling_quality,
         cancelled,
@@ -4514,7 +4522,7 @@ fn stream_prepared_playlist_render_with_performance(
     };
     let performance_audio_mix_context = PreparedAudioClipMixContext {
         clips: &render.audio.clips,
-        decoded_by_path: &render.audio.decoded_by_path,
+        audio_sources: &render.audio.audio_sources,
         sample_rate: options.sample_rate,
         resampling_quality: options.resampling_quality,
         cancelled,
@@ -5875,10 +5883,13 @@ fn stream_prepared_audio_clip_render(
         block.resize(frame_count * 2, 0.0);
         block.fill(0.0);
         for clip in &render.clips {
-            let audio = render
-                .decoded_by_path
-                .get(&clip.path)
-                .expect("prepared clips have decoded sources");
+            let audio = render.audio_sources.get(clip.source_id).ok_or_else(|| {
+                format!(
+                    "prepared audio clip {} from {} has no decoded source",
+                    clip.clip_index,
+                    clip.path.display()
+                )
+            })?;
             mix_clip_window_into_stereo_with_quality(
                 &mut block,
                 block_start,
@@ -5933,10 +5944,13 @@ fn render_audio_clips_to_stereo_buffer_inner(
 
     for clip in &render.clips {
         check_cancelled(cancelled)?;
-        let audio = render
-            .decoded_by_path
-            .get(&clip.path)
-            .expect("prepared clips have decoded sources");
+        let audio = render.audio_sources.get(clip.source_id).ok_or_else(|| {
+            format!(
+                "prepared audio clip {} from {} has no decoded source",
+                clip.clip_index,
+                clip.path.display()
+            )
+        })?;
         mix_clip_window_into_stereo_with_quality(
             &mut mix,
             0,
@@ -5981,6 +5995,96 @@ fn audio_clip_render_start_tick(
         .checked_sub(selection_start_tick)
         .map(u64::from)
         .ok_or_else(|| "selected clip position precedes its selection start".to_owned())
+}
+
+fn channel_audio_clip_stretch_plan(
+    settings: Option<(u32, i32, i32, i32)>,
+    tempo_map: &PlaylistTempoMap,
+    ppq: u16,
+    clip_start_tick: u32,
+    source_frames: usize,
+    sample_rate: u32,
+    clip_index: usize,
+) -> Result<Option<AudioClipStretchPlan>, String> {
+    let Some((time_raw, pitch_raw, multiplier_raw, mode_raw)) =
+        settings.filter(|settings| settings.0 > 0)
+    else {
+        return Ok(None);
+    };
+    if ppq == 0 {
+        return Err("project PPQ must be greater than zero".to_owned());
+    }
+    if source_frames == 0 {
+        return Err(format!(
+            "Playlist clip {clip_index} has an empty audio source range"
+        ));
+    }
+    if !(-1_200..=1_200).contains(&pitch_raw) {
+        return Err(format!(
+            "Playlist clip {clip_index} has unsupported channel stretch pitch {pitch_raw} cents"
+        ));
+    }
+    let multiplier = 2.0_f64.powf(f64::from(multiplier_raw) / 10_000.0);
+    if !multiplier.is_finite() || !(0.25..=4.0).contains(&multiplier) {
+        return Err(format!(
+            "Playlist clip {clip_index} has channel stretch multiplier outside 0.25x to 4x"
+        ));
+    }
+
+    let start_tick = f64::from(clip_start_tick);
+    let target_ticks = f64::from(time_raw) * f64::from(ppq) / 192.0 * multiplier;
+    let end_tick = start_tick + target_ticks;
+    if !end_tick.is_finite() || end_tick <= start_tick {
+        return Err(format!(
+            "Playlist clip {clip_index} channel stretch duration is outside the renderable timeline"
+        ));
+    }
+    if tempo_map.has_tempo_change_between(start_tick, end_tick) {
+        return Err(format!(
+            "Playlist clip {clip_index} channel time stretching crosses tempo automation, which this renderer cannot follow"
+        ));
+    }
+    let start_frame = tempo_map.frame_at_fractional_tick(start_tick, sample_rate)?;
+    let end_frame = tempo_map.frame_at_fractional_tick(end_tick, sample_rate)?;
+    let target_duration_frames = end_frame.saturating_sub(start_frame);
+    if target_duration_frames == 0 {
+        return Err(format!(
+            "Playlist clip {clip_index} channel stretch duration is shorter than one sample frame"
+        ));
+    }
+
+    let pitch_factor = 2.0_f64.powf(f64::from(pitch_raw) / 1_200.0);
+    match ChannelStretchMode::from_raw(mode_raw) {
+        ChannelStretchMode::Resample => {
+            let playback_rate_ratio =
+                source_frames as f64 / target_duration_frames as f64 * pitch_factor;
+            if !playback_rate_ratio.is_finite() || playback_rate_ratio <= 0.0 {
+                return Err(format!(
+                    "Playlist clip {clip_index} channel resample rate is outside the renderable range"
+                ));
+            }
+            Ok(Some(AudioClipStretchPlan::Resample {
+                playback_rate_ratio,
+            }))
+        }
+        ChannelStretchMode::Stretch | ChannelStretchMode::Elastique3Generic => {
+            let stretch_ratio = target_duration_frames as f64 / source_frames as f64;
+            if !stretch_ratio.is_finite() || !(0.5..=2.0).contains(&stretch_ratio) {
+                return Err(format!(
+                    "Playlist clip {clip_index} needs a stretch ratio outside the supported 0.5x to 2x range"
+                ));
+            }
+            Ok(Some(AudioClipStretchPlan::DurationPreserving {
+                target_duration_frames,
+                pitch_raw,
+                mode_raw,
+            }))
+        }
+        mode => Err(format!(
+            "Playlist clip {clip_index} uses unsupported channel stretch mode {} ({mode:?})",
+            mode_raw
+        )),
+    }
 }
 
 fn prepare_audio_clip_render(
@@ -6048,6 +6152,7 @@ fn prepare_audio_clip_render(
         f32,
         f64,
         Option<i8>,
+        Option<(u32, i32, i32, i32)>,
         MixerSourceRoutePlan,
     )>::new();
     for (clip_index, clip) in arrangement.clips.iter().enumerate() {
@@ -6110,6 +6215,14 @@ fn prepare_audio_clip_render(
                     + f64::from(channel.keyboard_fine_tune_cents().unwrap_or_default()),
             ),
             mixer_track,
+            channel.stretch_settings().map(|settings| {
+                (
+                    settings.time_raw(),
+                    settings.pitch_raw(),
+                    settings.multiplier_raw(),
+                    settings.mode_raw(),
+                )
+            }),
             mixer_route_plan,
         ));
     }
@@ -6129,11 +6242,13 @@ fn prepare_audio_clip_render(
         timeline_end_tick,
         options.sample_rate,
     )?;
-    let mut decoded_by_path = HashMap::<PathBuf, DecodedAudio>::new();
+    let mut source_id_by_path = HashMap::<PathBuf, usize>::new();
+    let mut source_paths = BTreeSet::new();
+    let mut audio_sources = Vec::<DecodedAudio>::new();
     let mut cached_source_bytes = 0usize;
-    for (_, _, _, path, _, _, _, _, _, _) in &candidate_clips {
+    for (_, _, _, path, _, _, _, _, _, _, _) in &candidate_clips {
         check_cancelled(cancelled)?;
-        if decoded_by_path.contains_key(path) {
+        if source_id_by_path.contains_key(path) {
             continue;
         }
         let audio = decode_audio_file(path)?;
@@ -6147,9 +6262,12 @@ fn prepare_audio_clip_render(
                     MAX_SOURCE_CACHE_BYTES / (1024 * 1024)
                 )
             })?;
-        decoded_by_path.insert(path.clone(), audio);
+        source_id_by_path.insert(path.clone(), audio_sources.len());
+        source_paths.insert(path.clone());
+        audio_sources.push(audio);
     }
 
+    let mut processed_source_ids = HashMap::<ProcessedAudioCacheKey, usize>::new();
     let mut clips = Vec::with_capacity(candidate_clips.len());
     let mut output_frames = timeline_frames;
     let mut live_source_routes_by_track = HashMap::new();
@@ -6163,21 +6281,90 @@ fn prepare_audio_clip_render(
         pan,
         pitch_ratio,
         mixer_track,
+        stretch_settings,
         mixer_route_plan,
     ) in &candidate_clips
     {
         check_cancelled(cancelled)?;
-        let audio = decoded_by_path
+        let raw_source_id = *source_id_by_path
             .get(path)
             .expect("all candidate source files were decoded");
+        let audio = &audio_sources[raw_source_id];
         if audio.channels.is_empty() || audio.channels.len() > 2 {
             return Err(format!(
                 "audio channel {channel_id} source has {} channels; only mono and stereo are supported by this renderer",
                 audio.channels.len()
             ));
         }
-        let source_bounds =
+        let mut source_bounds =
             sample_source_bounds_at_project_tempo(clip, audio, *clip_index, ppq, base_tempo_bpm)?;
+        let stretch_plan = channel_audio_clip_stretch_plan(
+            *stretch_settings,
+            &tempo_map,
+            ppq,
+            clip.position_ticks,
+            source_bounds.end - source_bounds.start,
+            audio.sample_rate,
+            *clip_index,
+        )?;
+        let mut source_id = raw_source_id;
+        let mut effective_pitch_ratio = *pitch_ratio;
+        match stretch_plan {
+            Some(AudioClipStretchPlan::Resample {
+                playback_rate_ratio,
+            }) => effective_pitch_ratio *= playback_rate_ratio,
+            Some(AudioClipStretchPlan::DurationPreserving {
+                target_duration_frames,
+                pitch_raw,
+                mode_raw,
+            }) => {
+                let cache_key = ProcessedAudioCacheKey {
+                    path: path.clone(),
+                    source_bounds,
+                    target_duration_frames,
+                    pitch_raw,
+                    mode_raw,
+                };
+                source_id = if let Some(source_id) = processed_source_ids.get(&cache_key) {
+                    *source_id
+                } else {
+                    check_cancelled(cancelled)?;
+                    let source_frames = source_bounds.end - source_bounds.start;
+                    let stretch_ratio = target_duration_frames as f32 / source_frames as f32;
+                    let processed_audio = process_audio_range_for_playback(
+                        &audio_sources[raw_source_id],
+                        source_bounds.start..source_bounds.end,
+                        pitch_raw as f32 / 100.0,
+                        stretch_ratio,
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "could not prepare stretch settings for Playlist clip {clip_index}: {error}"
+                        )
+                    })?;
+                    check_cancelled(cancelled)?;
+                    let bytes = decoded_audio_bytes(&processed_audio)?;
+                    cached_source_bytes = cached_source_bytes
+                        .checked_add(bytes)
+                        .filter(|total| *total <= MAX_SOURCE_CACHE_BYTES)
+                        .ok_or_else(|| {
+                            format!(
+                                "audio sources and stretched audio exceed the {} MiB render cache limit",
+                                MAX_SOURCE_CACHE_BYTES / (1024 * 1024)
+                            )
+                        })?;
+                    let source_id = audio_sources.len();
+                    audio_sources.push(processed_audio);
+                    processed_source_ids.insert(cache_key, source_id);
+                    source_id
+                };
+                source_bounds = SampleBounds {
+                    start: 0,
+                    end: audio_sources[source_id].frame_count(),
+                };
+            }
+            None => {}
+        }
         let absolute_start_tick = u64::from(clip.position_ticks);
         let absolute_end_tick = absolute_start_tick
             .checked_add(u64::from(clip.length_ticks))
@@ -6191,9 +6378,9 @@ fn prepare_audio_clip_render(
             .ok_or_else(|| "selected clip precedes its selection start".to_owned())?;
         let source_duration_frames = source_duration_to_frames(
             source_bounds.end - source_bounds.start,
-            audio.sample_rate,
+            audio_sources[source_id].sample_rate,
             options.sample_rate,
-            *pitch_ratio,
+            effective_pitch_ratio,
         )?;
         let timeline_clip_frames = tempo_map.frames_between_ticks(
             absolute_start_tick,
@@ -6220,10 +6407,11 @@ fn prepare_audio_clip_render(
             channel_id: *channel_id,
             mixer_track: *mixer_track,
             path: path.clone(),
+            source_id,
             start_frame,
             source_bounds,
             reverse: *reverse,
-            pitch_ratio: *pitch_ratio,
+            pitch_ratio: effective_pitch_ratio,
             duration_frames,
             gain: *gain,
             pan: *pan,
@@ -6240,10 +6428,11 @@ fn prepare_audio_clip_render(
             sample_rate: options.sample_rate,
             clips_rendered: clips.len(),
             clips_skipped_unsupported_scale,
-            source_files: decoded_by_path.len(),
+            source_files: source_paths.len(),
         },
         resampling_quality: options.resampling_quality,
-        decoded_by_path,
+        source_paths,
+        audio_sources,
         clips,
     })
 }
@@ -7233,12 +7422,13 @@ impl PlaylistPerformanceRuntime {
                 .clone();
             let source = sources
                 .audio
-                .decoded_by_path
-                .get(&template.path)
+                .audio_sources
+                .get(template.source_id)
                 .ok_or_else(|| {
                     format!(
-                        "Performance Audio Clip {} has no decoded sample",
-                        clip_index + 1
+                        "Performance Audio Clip {} from {} has no decoded sample",
+                        clip_index + 1,
+                        template.path.display()
                     )
                 })?;
             let source_duration_frames = source_duration_to_frames(
@@ -8135,7 +8325,7 @@ impl PlaylistPerformanceRuntime {
         sampler_engine.queue_live_notes(queued_notes);
         let dynamic_audio_context = PreparedAudioClipMixContext {
             clips: &self.active_audio_playbacks,
-            decoded_by_path: audio_context.decoded_by_path,
+            audio_sources: audio_context.audio_sources,
             sample_rate: audio_context.sample_rate,
             resampling_quality: audio_context.resampling_quality,
             cancelled: audio_context.cancelled,
@@ -10446,10 +10636,31 @@ fn windowed_sinc_sample(channel: &[f32], position: f64, source_step: f64, taps: 
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct SampleBounds {
     start: usize,
     end: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum AudioClipStretchPlan {
+    Resample {
+        playback_rate_ratio: f64,
+    },
+    DurationPreserving {
+        target_duration_frames: u64,
+        pitch_raw: i32,
+        mode_raw: i32,
+    },
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ProcessedAudioCacheKey {
+    path: PathBuf,
+    source_bounds: SampleBounds,
+    target_duration_frames: u64,
+    pitch_raw: i32,
+    mode_raw: i32,
 }
 
 #[derive(Clone, Debug)]
@@ -10459,6 +10670,7 @@ struct PreparedClip {
     channel_id: u16,
     mixer_track: Option<i8>,
     path: PathBuf,
+    source_id: usize,
     start_frame: u64,
     source_bounds: SampleBounds,
     reverse: bool,
@@ -10475,7 +10687,8 @@ struct PreparedClip {
 struct PreparedAudioClipRender {
     summary: AudioClipRenderSummary,
     resampling_quality: ResamplingQuality,
-    decoded_by_path: HashMap<PathBuf, DecodedAudio>,
+    source_paths: BTreeSet<PathBuf>,
+    audio_sources: Vec<DecodedAudio>,
     clips: Vec<PreparedClip>,
 }
 
@@ -10508,7 +10721,7 @@ struct AudioClipMixWorkerTask<'a> {
     worker_index: usize,
     worker_count: usize,
     clips: Vec<&'a PreparedClip>,
-    decoded_by_path: &'a HashMap<PathBuf, DecodedAudio>,
+    audio_sources: &'a [DecodedAudio],
     sample_rate: u32,
     resampling_quality: ResamplingQuality,
     cancelled: &'a AtomicBool,
@@ -10519,7 +10732,7 @@ struct AudioClipMixWorkerTask<'a> {
 
 struct PreparedAudioClipMixContext<'a> {
     clips: &'a [PreparedClip],
-    decoded_by_path: &'a HashMap<PathBuf, DecodedAudio>,
+    audio_sources: &'a [DecodedAudio],
     sample_rate: u32,
     resampling_quality: ResamplingQuality,
     cancelled: &'a AtomicBool,
@@ -10621,7 +10834,7 @@ impl<'scope> ParallelAudioClipMixer<'scope> {
                         worker_index,
                         worker_count,
                         clips,
-                        decoded_by_path: audio_context.decoded_by_path,
+                        audio_sources: audio_context.audio_sources,
                         sample_rate: audio_context.sample_rate,
                         resampling_quality: audio_context.resampling_quality,
                         cancelled: audio_context.cancelled,
@@ -10747,7 +10960,7 @@ fn audio_clip_mix_worker(task: AudioClipMixWorkerTask<'_>) {
         worker_index,
         worker_count,
         clips,
-        decoded_by_path,
+        audio_sources,
         sample_rate,
         resampling_quality,
         cancelled,
@@ -10797,10 +11010,11 @@ fn audio_clip_mix_worker(task: AudioClipMixWorkerTask<'_>) {
                 None
             };
             for clip in &clips {
-                let source = decoded_by_path.get(&clip.path).ok_or_else(|| {
+                let source = audio_sources.get(clip.source_id).ok_or_else(|| {
                     format!(
-                        "prepared audio clip {} has no decoded source",
-                        clip.clip_index
+                        "prepared audio clip {} from {} has no decoded source",
+                        clip.clip_index,
+                        clip.path.display()
                     )
                 })?;
                 mix_clip_window_into_stereo_with_quality_and_meter(
@@ -10854,10 +11068,11 @@ fn mix_prepared_audio_clip_block(
     let mut meter_buses = meter_buses;
     let meter_stride_samples = stereo.len();
     for clip in context.clips {
-        let source = context.decoded_by_path.get(&clip.path).ok_or_else(|| {
+        let source = context.audio_sources.get(clip.source_id).ok_or_else(|| {
             format!(
-                "prepared audio clip {} has no decoded source",
-                clip.clip_index
+                "prepared audio clip {} from {} has no decoded source",
+                clip.clip_index,
+                clip.path.display()
             )
         })?;
         mix_clip_window_into_stereo_with_quality_and_meter(
@@ -12803,6 +13018,7 @@ mod tests {
             channel_id: 1,
             mixer_track: Some(1),
             path: PathBuf::new(),
+            source_id: 0,
             start_frame: 0,
             source_bounds: SampleBounds { start: 0, end: 2 },
             reverse: false,
@@ -12889,6 +13105,7 @@ mod tests {
             channel_id: 1,
             mixer_track: Some(1),
             path: PathBuf::new(),
+            source_id: 0,
             start_frame: 0,
             source_bounds: SampleBounds { start: 0, end: 2 },
             reverse: false,
@@ -12961,20 +13178,17 @@ mod tests {
     #[test]
     fn performance_audio_clip_smooths_live_fader_across_send_routes() {
         let path = PathBuf::from("performance-audio.wav");
-        let decoded_by_path = HashMap::from([(
-            path.clone(),
-            DecodedAudio {
-                sample_rate: 1_000,
-                channels: vec![vec![1.0; 64], vec![1.0; 64]],
-            },
-        )]);
+        let audio_sources = vec![DecodedAudio {
+            sample_rate: 1_000,
+            channels: vec![vec![1.0; 64], vec![1.0; 64]],
+        }];
         let cancelled = AtomicBool::new(false);
         let meters = MixerTrackPeakMeters::default();
         meters.set_live_mixer_insert_fader_raw(1, Some(10_000));
         let no_arrangement_clips = [];
         let audio_context = PreparedAudioClipMixContext {
             clips: &no_arrangement_clips,
-            decoded_by_path: &decoded_by_path,
+            audio_sources: &audio_sources,
             sample_rate: 1_000,
             resampling_quality: ResamplingQuality::Linear,
             cancelled: &cancelled,
@@ -12991,6 +13205,7 @@ mod tests {
             channel_id: 1,
             mixer_track: Some(1),
             path,
+            source_id: 0,
             start_frame: 0,
             source_bounds: SampleBounds { start: 0, end: 64 },
             reverse: false,
@@ -13761,19 +13976,18 @@ mod tests {
                 source_files: 1,
             },
             resampling_quality: ResamplingQuality::Linear,
-            decoded_by_path: HashMap::from([(
-                path.clone(),
-                DecodedAudio {
-                    sample_rate: 4,
-                    channels: vec![vec![1.0, 3.0], vec![2.0, 4.0]],
-                },
-            )]),
+            source_paths: BTreeSet::from([path.clone()]),
+            audio_sources: vec![DecodedAudio {
+                sample_rate: 4,
+                channels: vec![vec![1.0, 3.0], vec![2.0, 4.0]],
+            }],
             clips: vec![PreparedClip {
                 clip_index: 0,
                 playlist_track_id: None,
                 channel_id: 4,
                 mixer_track: None,
                 path,
+                source_id: 0,
                 start_frame: 0,
                 source_bounds: SampleBounds { start: 0, end: 2 },
                 reverse: false,
@@ -14143,6 +14357,7 @@ mod tests {
                 channel_id: u16::try_from(clip_index).unwrap(),
                 mixer_track: Some(mixer_track),
                 path: path.clone(),
+                source_id: 0,
                 start_frame,
                 source_bounds: SampleBounds { start: 0, end: 8 },
                 reverse: false,
@@ -14157,11 +14372,11 @@ mod tests {
             }
         })
         .collect::<Vec<_>>();
-        let decoded_by_path = HashMap::from([(path, source)]);
+        let audio_sources = vec![source];
         let cancelled = AtomicBool::new(false);
         let audio_mix_context = PreparedAudioClipMixContext {
             clips: &clips,
-            decoded_by_path: &decoded_by_path,
+            audio_sources: &audio_sources,
             sample_rate: 8,
             resampling_quality: ResamplingQuality::Linear,
             cancelled: &cancelled,
@@ -14218,6 +14433,7 @@ mod tests {
             channel_id: 0,
             mixer_track: None,
             path: PathBuf::new(),
+            source_id: 0,
             start_frame: 0,
             source_bounds: SampleBounds { start: 0, end: 2 },
             reverse: false,
@@ -14270,6 +14486,7 @@ mod tests {
             channel_id: 0,
             mixer_track: None,
             path: PathBuf::new(),
+            source_id: 0,
             start_frame: 0,
             source_bounds: SampleBounds { start: 0, end: 4 },
             reverse: false,
@@ -14289,6 +14506,111 @@ mod tests {
     }
 
     #[test]
+    fn channel_audio_clip_stretch_plan_maps_time_multiplier_and_pitch() {
+        let tempo_map =
+            PlaylistTempoMap::constant(96, 120.0).expect("constant tempo map should build");
+        let generic = channel_audio_clip_stretch_plan(
+            Some((192, 200, 0, 1)),
+            &tempo_map,
+            96,
+            0,
+            8_000,
+            8_000,
+            3,
+        )
+        .unwrap();
+        assert!(matches!(
+            generic,
+            Some(AudioClipStretchPlan::DurationPreserving {
+                target_duration_frames: 4_000,
+                pitch_raw: 200,
+                mode_raw: 1,
+            })
+        ));
+
+        let resample = channel_audio_clip_stretch_plan(
+            Some((192, 1_200, 10_000, 0)),
+            &tempo_map,
+            96,
+            0,
+            8_000,
+            8_000,
+            4,
+        )
+        .unwrap();
+        assert!(matches!(
+            resample,
+            Some(AudioClipStretchPlan::Resample {
+                playback_rate_ratio
+            }) if (playback_rate_ratio - 2.0).abs() < 1e-12
+        ));
+
+        assert!(
+            channel_audio_clip_stretch_plan(
+                Some((0, 99_999, i32::MAX, 99)),
+                &tempo_map,
+                96,
+                0,
+                8_000,
+                8_000,
+                5,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            channel_audio_clip_stretch_plan(
+                Some((192, 0, 0, 2)),
+                &tempo_map,
+                96,
+                0,
+                8_000,
+                8_000,
+                6,
+            )
+            .unwrap_err()
+            .contains("unsupported channel stretch mode")
+        );
+    }
+
+    #[test]
+    fn channel_audio_clip_stretch_rejects_tempo_changes_inside_the_target_duration() {
+        let tempo_map = PlaylistTempoMap::from_tempo_events(96, 120.0, &[(96, 100.0)])
+            .expect("tempo automation map should build");
+
+        let error = channel_audio_clip_stretch_plan(
+            Some((384, 0, 0, -1)),
+            &tempo_map,
+            96,
+            0,
+            16_000,
+            8_000,
+            7,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("crosses tempo automation"));
+    }
+
+    #[test]
+    fn playback_audio_processor_returns_the_requested_stretched_duration() {
+        let audio = DecodedAudio {
+            sample_rate: 8_000,
+            channels: vec![
+                (0..8_000)
+                    .map(|frame| (std::f32::consts::TAU * frame as f32 / 80.0).sin())
+                    .collect(),
+            ],
+        };
+
+        let processed = process_audio_range_for_playback(&audio, 0..8_000, 2.0, 0.5).unwrap();
+
+        assert_eq!(processed.sample_rate, audio.sample_rate);
+        assert_eq!(processed.channels.len(), 1);
+        assert_eq!(processed.frame_count(), 4_000);
+    }
+
+    #[test]
     fn mixer_insert_transform_swaps_and_reverses_audio_clip_frames() {
         let source = DecodedAudio {
             sample_rate: 4,
@@ -14300,6 +14622,7 @@ mod tests {
             channel_id: 1,
             mixer_track: None,
             path: PathBuf::new(),
+            source_id: 0,
             start_frame: 0,
             source_bounds: SampleBounds { start: 0, end: 1 },
             reverse: false,
@@ -14337,6 +14660,7 @@ mod tests {
             channel_id: 3,
             mixer_track: None,
             path: path.clone(),
+            source_id: 0,
             start_frame: 2,
             source_bounds: SampleBounds { start: 0, end: 5 },
             reverse: false,
@@ -14358,7 +14682,8 @@ mod tests {
                 source_files: 1,
             },
             resampling_quality: ResamplingQuality::Linear,
-            decoded_by_path: HashMap::from([(path, source.clone())]),
+            source_paths: BTreeSet::from([path]),
+            audio_sources: vec![source.clone()],
             clips: vec![clip.clone()],
         };
         let mut offline = vec![0.0; render.summary.frames as usize * 2];

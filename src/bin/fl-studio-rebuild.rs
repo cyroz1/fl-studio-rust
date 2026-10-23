@@ -25390,7 +25390,7 @@ impl DawUi {
                             let mut mode_changed = false;
                             ui.collapsing("Time stretch", |ui| {
                                 ui.small(
-                                    "Stored raw fields; stretching is not yet applied to playback or renders.",
+                                    "Playlist Audio Clips use TIME, PITCH, and MUL in Resample, Stretch, and Elastique 3 Generic modes. Other modes and tempo changes inside the stretched duration are unsupported.",
                                 );
                                 ui.horizontal_wrapped(|ui| {
                                     time_changed = ui

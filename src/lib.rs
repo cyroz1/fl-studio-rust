@@ -771,8 +771,9 @@ pub struct ChannelLevelAdjustmentsEdit {
 /// Raw time-stretch settings from the channel Parameters (`0xC7`) payload.
 ///
 /// The four values are retained in FL Studio's stored units. Their field offsets and
-/// stretch-mode codes follow the independently documented PyFLP channel layout; this
-/// project does not yet apply them during audio playback or rendering.
+/// stretch-mode codes follow the independently documented PyFLP channel layout. Playlist Audio
+/// Clip playback and rendering apply supported channel settings for modes Resample, Stretch,
+/// and Elastique 3 Generic; other modes and Sampler note playback remain unsupported.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ChannelStretchSettings {
     time_raw: u32,
