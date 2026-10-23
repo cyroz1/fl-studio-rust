@@ -20207,18 +20207,9 @@ impl DawUi {
         if let Some(clip_edits) = playlist_audio_clip_reverse_requested {
             let result = self.document.as_ref().map(|document| {
                 let mut updated = document.clone();
-                let mut channel_ids = Vec::with_capacity(clip_edits.len());
-                for (clip_index, reversed) in &clip_edits {
-                    channel_ids.push(
-                        updated
-                            .set_playlist_audio_clip_reversed(
-                                arrangement.id,
-                                *clip_index,
-                                *reversed,
-                            )
-                            .map_err(|error| error.to_string())?,
-                    );
-                }
+                let channel_ids = updated
+                    .set_playlist_audio_clips_reversed(arrangement.id, &clip_edits)
+                    .map_err(|error| error.to_string())?;
                 Ok::<_, String>((updated, channel_ids))
             });
             match result {

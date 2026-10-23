@@ -8577,18 +8577,13 @@ impl FlpDocument {
         Ok(new_id)
     }
 
-    /// Sets Reverse for one Playlist Audio Clip while leaving its other uses unchanged.
-    ///
-    /// The saved Reverse bit belongs to the kind-4 channel. When another Playlist clip,
-    /// Pattern note, or Layer uses that channel, this operation first copies the channel
-    /// and retargets only the selected clip. Otherwise, changing the channel flag is
-    /// equivalent to changing this clip's Reverse state.
-    pub fn set_playlist_audio_clip_reversed(
+    fn retarget_playlist_audio_clip_channel(
         &mut self,
         arrangement_id: u16,
         clip_index: usize,
-        reversed: bool,
-    ) -> Result<u16, FlpError> {
+        expected_channel_id: u16,
+        new_channel_id: u16,
+    ) -> Result<(), FlpError> {
         let arrangements = self.arrangements()?;
         let mut matching_arrangements = arrangements
             .iter()
@@ -8608,59 +8603,204 @@ impl FlpDocument {
                 "the requested Playlist Audio Clip does not exist",
             ));
         };
-        let PlaylistClipTarget::Channel { id: source_id } = clip.target() else {
+        if !matches!(clip.target(), PlaylistClipTarget::Channel { id } if id == expected_channel_id)
+        {
             return Err(FlpError::UnsupportedEdit(
-                "per-clip Reverse applies to Playlist Audio Clips",
-            ));
-        };
-
-        let channels = self.channels();
-        let mut matching_channels = channels.iter().filter(|channel| channel.id() == source_id);
-        let Some(source_channel) = matching_channels.next() else {
-            return Err(FlpError::ChannelNotFound(source_id));
-        };
-        if matching_channels.next().is_some() {
-            return Err(FlpError::AmbiguousChannelId(source_id));
-        }
-        if source_channel.kind() != Some(4) {
-            return Err(FlpError::UnsupportedEdit(
-                "per-clip Reverse applies to kind-4 Audio Clip channels",
+                "the selected Playlist Audio Clip changed source during Reverse editing",
             ));
         }
-        if source_channel.audio_clip_reversed() == reversed {
-            return Ok(source_id);
+        let record_start = clip
+            .source_record_index
+            .checked_mul(clip.record_size)
+            .ok_or(FlpError::LengthOverflow)?;
+        let event =
+            self.events
+                .get_mut(clip.source_event_index)
+                .ok_or(FlpError::UnsupportedEdit(
+                    "the Playlist Audio Clip record event no longer exists",
+                ))?;
+        if event.opcode != 0xE9
+            || !matches!(event.encoding, PayloadEncoding::Data { .. })
+            || clip.record_size < 8
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "the Playlist Audio Clip record is not recognized",
+            ));
         }
+        write_event_payload_bytes(event, record_start + 6, &new_channel_id.to_le_bytes())
+    }
 
-        let playlist_users = arrangements
+    /// Sets Reverse for one Playlist Audio Clip while leaving its other uses unchanged.
+    ///
+    /// The saved Reverse bit belongs to the kind-4 channel. When another Playlist clip,
+    /// Pattern note, or Layer uses that channel, this operation first copies the channel
+    /// and retargets only the selected clip. Otherwise, changing the channel flag is
+    /// equivalent to changing this clip's Reverse state.
+    pub fn set_playlist_audio_clip_reversed(
+        &mut self,
+        arrangement_id: u16,
+        clip_index: usize,
+        reversed: bool,
+    ) -> Result<u16, FlpError> {
+        self.set_playlist_audio_clips_reversed(arrangement_id, &[(clip_index, reversed)])?
+            .into_iter()
+            .next()
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested Playlist Audio Clip does not exist",
+            ))
+    }
+
+    /// Sets Reverse for several Playlist Audio Clips atomically. Clips that share a source
+    /// and desired Reverse state share one copied channel when they need to be isolated from
+    /// unselected uses. If all uses of a source channel are selected for the same state, the
+    /// original channel is edited once instead of creating a copy.
+    pub fn set_playlist_audio_clips_reversed(
+        &mut self,
+        arrangement_id: u16,
+        clip_edits: &[(usize, bool)],
+    ) -> Result<Vec<u16>, FlpError> {
+        let arrangements = self.arrangements()?;
+        let mut matching_arrangements = arrangements
             .iter()
-            .flat_map(|arrangement| arrangement.clips.iter())
-            .filter(|candidate| {
-                matches!(candidate.target(), PlaylistClipTarget::Channel { id } if id == source_id)
-            })
-            .count();
-        let pattern_note_uses_channel = self.patterns()?.iter().any(|pattern| {
-            pattern
-                .notes
-                .iter()
-                .any(|note| note.channel_id == source_id)
-        });
-        let layer_uses_channel = channels.iter().any(|channel| {
-            channel
-                .layer_child_ids()
-                .is_some_and(|child_ids| child_ids.contains(&source_id))
-        });
-        let needs_private_channel =
-            playlist_users > 1 || pattern_note_uses_channel || layer_uses_channel;
-
-        let mut candidate = self.clone();
-        let target_id = if needs_private_channel {
-            candidate.make_playlist_audio_clip_unique(arrangement_id, clip_index)?
-        } else {
-            source_id
+            .filter(|arrangement| arrangement.id == arrangement_id);
+        let Some(arrangement) = matching_arrangements.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested arrangement does not exist",
+            ));
         };
-        candidate.set_channel_sample_reversed(target_id, reversed)?;
+        if matching_arrangements.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested arrangement id is ambiguous",
+            ));
+        }
+        let channels = self.channels();
+        let mut requested_states = BTreeMap::new();
+        let mut source_by_clip = BTreeMap::new();
+        let mut groups = BTreeMap::<(u16, bool), BTreeSet<usize>>::new();
+        let mut source_reverse_states = BTreeMap::new();
+        for (clip_index, reversed) in clip_edits {
+            if let Some(previous_state) = requested_states.insert(*clip_index, *reversed)
+                && previous_state != *reversed
+            {
+                return Err(FlpError::UnsupportedEdit(
+                    "a Playlist Audio Clip cannot have conflicting Reverse states in one edit",
+                ));
+            }
+            let Some(clip) = arrangement.clips.get(*clip_index) else {
+                return Err(FlpError::UnsupportedEdit(
+                    "the requested Playlist Audio Clip does not exist",
+                ));
+            };
+            let PlaylistClipTarget::Channel { id: source_id } = clip.target() else {
+                return Err(FlpError::UnsupportedEdit(
+                    "per-clip Reverse applies to Playlist Audio Clips",
+                ));
+            };
+            if let std::collections::btree_map::Entry::Vacant(entry) =
+                source_reverse_states.entry(source_id)
+            {
+                let mut matching_channels =
+                    channels.iter().filter(|channel| channel.id() == source_id);
+                let Some(source_channel) = matching_channels.next() else {
+                    return Err(FlpError::ChannelNotFound(source_id));
+                };
+                if matching_channels.next().is_some() {
+                    return Err(FlpError::AmbiguousChannelId(source_id));
+                }
+                if source_channel.kind() != Some(4) {
+                    return Err(FlpError::UnsupportedEdit(
+                        "per-clip Reverse applies to kind-4 Audio Clip channels",
+                    ));
+                }
+                entry.insert(source_channel.audio_clip_reversed());
+            }
+            source_by_clip.insert(*clip_index, source_id);
+            groups
+                .entry((source_id, *reversed))
+                .or_default()
+                .insert(*clip_index);
+        }
+
+        if clip_edits.is_empty() {
+            return Ok(Vec::new());
+        }
+        let patterns = self.patterns()?;
+        let mut candidate = self.clone();
+        let mut target_by_clip = source_by_clip.clone();
+        for ((source_id, reversed), group_clip_indices) in groups {
+            if source_reverse_states.get(&source_id) == Some(&reversed) {
+                continue;
+            }
+
+            let playlist_users = arrangements
+                .iter()
+                .flat_map(|arrangement| arrangement.clips.iter().enumerate())
+                .filter(|(_, clip)| {
+                    matches!(clip.target(), PlaylistClipTarget::Channel { id } if id == source_id)
+                })
+                .count();
+            let every_playlist_user_is_selected = playlist_users == group_clip_indices.len()
+                && arrangements.iter().all(|candidate_arrangement| {
+                    candidate_arrangement
+                        .clips
+                        .iter()
+                        .enumerate()
+                        .all(|(index, clip)| {
+                            !matches!(clip.target(), PlaylistClipTarget::Channel { id } if id == source_id)
+                                || (candidate_arrangement.id == arrangement_id
+                                    && group_clip_indices.contains(&index))
+                        })
+                });
+            let pattern_note_uses_channel = patterns.iter().any(|pattern| {
+                pattern
+                    .notes
+                    .iter()
+                    .any(|note| note.channel_id == source_id)
+            });
+            let layer_uses_channel = channels.iter().any(|channel| {
+                channel
+                    .layer_child_ids()
+                    .is_some_and(|child_ids| child_ids.contains(&source_id))
+            });
+
+            if every_playlist_user_is_selected && !pattern_note_uses_channel && !layer_uses_channel
+            {
+                candidate.set_channel_sample_reversed(source_id, reversed)?;
+                continue;
+            }
+
+            let mut clip_indices = group_clip_indices.into_iter();
+            let Some(first_clip_index) = clip_indices.next() else {
+                continue;
+            };
+            let new_channel_id =
+                candidate.make_playlist_audio_clip_unique(arrangement_id, first_clip_index)?;
+            candidate.set_channel_sample_reversed(new_channel_id, reversed)?;
+            target_by_clip.insert(first_clip_index, new_channel_id);
+            for clip_index in clip_indices {
+                candidate.retarget_playlist_audio_clip_channel(
+                    arrangement_id,
+                    clip_index,
+                    source_id,
+                    new_channel_id,
+                )?;
+                target_by_clip.insert(clip_index, new_channel_id);
+            }
+        }
+
+        let result = clip_edits
+            .iter()
+            .map(|(clip_index, _)| {
+                target_by_clip
+                    .get(clip_index)
+                    .copied()
+                    .ok_or(FlpError::UnsupportedEdit(
+                        "the requested Playlist Audio Clip lost its Reverse target",
+                    ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         *self = candidate;
-        Ok(target_id)
+        Ok(result)
     }
 
     /// Creates a Pattern Clip from a recognized Playlist record in the target arrangement.
