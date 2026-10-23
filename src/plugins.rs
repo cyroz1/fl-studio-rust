@@ -478,7 +478,7 @@ fn audio_unit_component_registered(component: &AudioUnitComponentInfo) -> Option
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 fn audio_unit_fourcc(code: &str) -> Option<u32> {
     let bytes: [u8; 4] = code.as_bytes().try_into().ok()?;
     Some(u32::from_be_bytes(bytes))
@@ -706,13 +706,12 @@ mod tests {
         assert!(report.scan_errors.is_empty());
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn audio_unit_four_character_codes_use_big_endian_bytes() {
-        assert_eq!(audio_unit_fourcc("aufx"), Some(0x6175_6678));
-        assert_eq!(audio_unit_fourcc("ACME"), Some(0x4143_4d45));
-        assert_eq!(audio_unit_fourcc("abc"), None);
-        assert_eq!(audio_unit_fourcc("éé"), None);
+        assert_eq!(super::audio_unit_fourcc("aufx"), Some(0x6175_6678));
+        assert_eq!(super::audio_unit_fourcc("ACME"), Some(0x4143_4d45));
+        assert_eq!(super::audio_unit_fourcc("abc"), None);
+        assert_eq!(super::audio_unit_fourcc("é"), None);
     }
 
     #[test]
