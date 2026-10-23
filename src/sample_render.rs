@@ -5260,7 +5260,7 @@ pub fn stream_sampler_midi_input_to_device(
                 .insert(*target_channel_id, pitch_adjustment_cents);
         }
     }
-    let channel_router = ChannelNoteRouter::new(channels);
+    let channel_router = ChannelNoteRouter::new(channels.clone());
     let empty_notes = [];
     let mut engine = SamplerVoiceEngine::with_resampling_quality_and_pan_law(
         &render.sources_by_channel,
