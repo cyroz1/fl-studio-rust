@@ -977,6 +977,14 @@ impl PlaylistClipFocus {
         }
     }
 
+    fn next(self) -> Self {
+        match self {
+            Self::Pattern => Self::Audio,
+            Self::Audio => Self::Automation,
+            Self::Automation => Self::Pattern,
+        }
+    }
+
     fn includes(self, clip: &PlaylistClip, channel_kinds: &BTreeMap<u16, Option<u8>>) -> bool {
         match (self, clip.target()) {
             (Self::Pattern, PlaylistClipTarget::Pattern { .. }) => true,
@@ -16493,7 +16501,7 @@ impl DawUi {
                     focus.label(),
                 )
                 .on_hover_text(format!(
-                    "Bring {} Clips to the top of overlapping stacks",
+                    "Bring {} Clips to the top of overlapping stacks; press M to cycle focus",
                     focus.label()
                 ));
             }
@@ -17019,6 +17027,11 @@ impl DawUi {
             } else {
                 muted_clip_requested = Some(clip_edits);
             }
+        }
+        if !ui.ctx().egui_wants_keyboard_input()
+            && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::M))
+        {
+            self.playlist_clip_focus = self.playlist_clip_focus.next();
         }
         if let Some((direction, extend)) = track_navigation {
             let current = self
