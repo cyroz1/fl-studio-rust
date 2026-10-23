@@ -3471,6 +3471,7 @@ struct PianoRollMagicLasso {
     pattern_id: u16,
     channel_id: u16,
     points: Vec<egui::Pos2>,
+    awaiting_deselect: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -27527,6 +27528,7 @@ impl DawUi {
                             pattern_id,
                             channel_id,
                             points: Vec::new(),
+                            awaiting_deselect: false,
                         });
                         self.status =
                             "Magic Lasso armed: move around notes without clicking".to_owned();
@@ -36935,6 +36937,38 @@ impl DawUi {
                     || Some(lasso.channel_id) != self.selected_note_channel
                 {
                     self.status = "Magic Lasso canceled because the target changed".to_owned();
+                } else if lasso.awaiting_deselect {
+                    if self.selected_piano_notes.is_empty() {
+                        lasso.awaiting_deselect = false;
+                        self.piano_roll_magic_lasso = Some(lasso);
+                    } else if secondary_pressed
+                        && let Some(pointer) = pointer
+                        && grid_body_rect.contains(pointer)
+                        && !note_rects.iter().any(|note_rect| note_rect.contains(pointer))
+                    {
+                        self.selected_piano_notes.retain(
+                            |(selected_pattern, selected_channel, _)| {
+                                (*selected_pattern, *selected_channel)
+                                    != (lasso.pattern_id, lasso.channel_id)
+                            },
+                        );
+                        if self.selected_note.is_some_and(
+                            |(selected_pattern, selected_channel, _)| {
+                                (selected_pattern, selected_channel)
+                                    == (lasso.pattern_id, lasso.channel_id)
+                            },
+                        ) {
+                            self.selected_note = None;
+                        }
+                        lasso.points.clear();
+                        lasso.awaiting_deselect = false;
+                        self.status = "Note selection cleared; Magic Lasso ready".to_owned();
+                        self.piano_roll_magic_lasso = Some(lasso);
+                    } else if primary_down || secondary_down {
+                        self.status = "Magic Lasso canceled by pointer click".to_owned();
+                    } else {
+                        self.piano_roll_magic_lasso = Some(lasso);
+                    }
                 } else if !self.selected_piano_notes.is_empty() {
                     self.status = "Magic Lasso canceled because notes are selected".to_owned();
                 } else if primary_down || secondary_down {
@@ -37007,8 +37041,12 @@ impl DawUi {
                                     *selected_pattern == pattern.id
                                 })
                                 .count();
-                            self.status =
-                                format!("Magic Lasso selected {selected_count} notes");
+                            lasso.points.clear();
+                            lasso.awaiting_deselect = true;
+                            self.status = format!(
+                                "Magic Lasso selected {selected_count} notes; right-click empty space to select again"
+                            );
+                            self.piano_roll_magic_lasso = Some(lasso);
                         }
                     } else {
                         self.piano_roll_magic_lasso = Some(lasso);
