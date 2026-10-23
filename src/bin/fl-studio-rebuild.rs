@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
-use std::hash::{Hash, Hasher};
+use std::hash::{BuildHasher, Hash, Hasher, RandomState};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -239,7 +239,7 @@ const MIDI_CHANNEL_COLORS: [Color32; 16] = [
     Color32::from_rgb(100, 129, 181),
     Color32::from_rgb(172, 128, 105),
 ];
-const PATTERN_COLOR_CYCLE: [[u8; 3]; 16] = [
+const PATTERN_COLOR_PALETTE: [[u8; 3]; 16] = [
     [113, 172, 77],
     [73, 128, 174],
     [195, 129, 61],
@@ -258,15 +258,35 @@ const PATTERN_COLOR_CYCLE: [[u8; 3]; 16] = [
     [172, 128, 105],
 ];
 
-fn next_pattern_color(current: Option<[u8; 3]>) -> [u8; 3] {
+static PATTERN_COLOR_SELECTION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn pattern_color_from_random_index(current: Option<[u8; 3]>, random_index: usize) -> [u8; 3] {
     let Some(current_index) = current.and_then(|rgb| {
-        PATTERN_COLOR_CYCLE
+        PATTERN_COLOR_PALETTE
             .iter()
             .position(|candidate| *candidate == rgb)
     }) else {
-        return PATTERN_COLOR_CYCLE[0];
+        return PATTERN_COLOR_PALETTE[random_index % PATTERN_COLOR_PALETTE.len()];
     };
-    PATTERN_COLOR_CYCLE[(current_index + 1) % PATTERN_COLOR_CYCLE.len()]
+
+    let mut choice = random_index % (PATTERN_COLOR_PALETTE.len() - 1);
+    if choice >= current_index {
+        choice += 1;
+    }
+    PATTERN_COLOR_PALETTE[choice]
+}
+
+fn random_pattern_color(current: Option<[u8; 3]>) -> [u8; 3] {
+    let sequence = PATTERN_COLOR_SELECTION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let mut hasher = RandomState::new().build_hasher();
+    sequence.hash(&mut hasher);
+    time.hash(&mut hasher);
+    current.hash(&mut hasher);
+    pattern_color_from_random_index(current, hasher.finish() as usize)
 }
 
 fn show_pattern_color_swatch(ui: &mut egui::Ui, color: Option<[u8; 4]>) {
@@ -6414,7 +6434,7 @@ impl DawUi {
                 ui.text_edit_singleline(&mut dialog.name);
                 if ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F2)) {
                     dialog.color_rgb =
-                        next_pattern_color(dialog.color_enabled.then_some(dialog.color_rgb));
+                        random_pattern_color(dialog.color_enabled.then_some(dialog.color_rgb));
                     dialog.color_enabled = true;
                 }
                 ui.horizontal(|ui| {
@@ -6428,9 +6448,9 @@ impl DawUi {
                         dialog.color_rgb = [color.r(), color.g(), color.b()];
                         dialog.color_enabled = true;
                     }
-                    if ui.button("Cycle (F2)").clicked() {
+                    if ui.button("Random (F2)").clicked() {
                         dialog.color_rgb =
-                            next_pattern_color(dialog.color_enabled.then_some(dialog.color_rgb));
+                            random_pattern_color(dialog.color_enabled.then_some(dialog.color_rgb));
                         dialog.color_enabled = true;
                     }
                 });
@@ -12053,7 +12073,7 @@ impl DawUi {
                     ("F9", "Mixer"),
                     (
                         "F2",
-                        "Rename / recolor selected pattern; repeat to cycle colors",
+                        "Rename / recolor selected pattern; repeat to choose random colors",
                     ),
                     ("F4", "Select next empty pattern and name it"),
                     ("Ctrl/Cmd+F4", "Select or create next empty pattern"),
@@ -55376,19 +55396,19 @@ mod tests {
         midi_cc_to_mixer_stereo_separation_raw, midi_controller_binding_for_device,
         midi_mixer_button_press_edge, midi_mixer_control_for_cc,
         midi_vst3_parameter_mapping_for_target, midi_vst3_parameter_mappings_for_cc,
-        next_empty_pattern_id, next_pattern_color, next_piano_roll_note_group,
-        note_from_grid_position, parse_midi_control_change_mapping,
-        parse_midi_controller_templates, parse_midi_device_selections,
-        parse_midi_mixer_control_mappings, parse_midi_output_programs, parse_midi_output_routes,
-        parse_midi_output_values, parse_midi_vst3_parameter_mappings,
-        parse_pattern_vst3_parameter_links, parse_window_layout_presets,
-        pattern_loop_frame_at_tick, pattern_loop_tick_at_frame,
-        pattern_vst3_parameter_automation_for_channel, pattern_vst3_parameter_link_for_target,
-        piano_roll_color_group_note_ids, piano_roll_controller_stroke_points,
-        piano_roll_controller_value_at, piano_roll_controller_value_range,
-        piano_roll_cross_pattern_ghost_notes, piano_roll_discard_length_edit,
-        piano_roll_duplicate_offset, piano_roll_ghost_note_is_visible, piano_roll_key_at_y,
-        piano_roll_note_group_members, piano_roll_note_nudge_edit, piano_roll_odd_note_selection,
+        next_empty_pattern_id, next_piano_roll_note_group, note_from_grid_position,
+        parse_midi_control_change_mapping, parse_midi_controller_templates,
+        parse_midi_device_selections, parse_midi_mixer_control_mappings,
+        parse_midi_output_programs, parse_midi_output_routes, parse_midi_output_values,
+        parse_midi_vst3_parameter_mappings, parse_pattern_vst3_parameter_links,
+        parse_window_layout_presets, pattern_color_from_random_index, pattern_loop_frame_at_tick,
+        pattern_loop_tick_at_frame, pattern_vst3_parameter_automation_for_channel,
+        pattern_vst3_parameter_link_for_target, piano_roll_color_group_note_ids,
+        piano_roll_controller_stroke_points, piano_roll_controller_value_at,
+        piano_roll_controller_value_range, piano_roll_cross_pattern_ghost_notes,
+        piano_roll_discard_length_edit, piano_roll_duplicate_offset,
+        piano_roll_ghost_note_is_visible, piano_roll_key_at_y, piano_roll_note_group_members,
+        piano_roll_note_nudge_edit, piano_roll_odd_note_selection,
         piano_roll_overlap_note_selection, piano_roll_pitch_range_note_selection,
         piano_roll_random_note_selection, piano_roll_selection_time_range,
         piano_roll_shift_time_range, piano_roll_time_range_from_drag,
@@ -55399,18 +55419,18 @@ mod tests {
         playlist_pattern_clip_join_candidates, playlist_pattern_clip_split_supported,
         playlist_pattern_recording_placement_tick, playlist_seek_tick_to_frame,
         playlist_signature_at_tick, playlist_song_position_label, playlist_track_group_range,
-        playlist_track_is_hidden, recolor_piano_roll_notes, record_pattern_controller_points,
-        recording_input_targets, remove_midi_vst3_parameter_mapping,
-        remove_pattern_vst3_parameter_link, sample_editor_selection_for_drag,
-        serialize_midi_controller_templates, serialize_midi_mixer_control_mappings,
-        serialize_midi_vst3_parameter_mappings, serialize_pattern_vst3_parameter_links,
-        serialize_window_layout_presets, should_auto_connect_midi_input,
-        should_auto_connect_midi_output, snap_note_tick, snap_piano_roll_key_to_scale,
-        snap_recorded_midi_notes_to_scale, toggle_piano_roll_note_group_selection,
-        touch_pan_zoom_scroll_offset, track_two_finger_tap, update_channel_rack_selection,
-        update_layer_child_selection, update_piano_roll_box_selection,
-        upsert_midi_mixer_control_mapping, upsert_midi_vst3_parameter_mapping,
-        upsert_pattern_vst3_parameter_link, zoom_to_fit,
+        playlist_track_is_hidden, random_pattern_color, recolor_piano_roll_notes,
+        record_pattern_controller_points, recording_input_targets,
+        remove_midi_vst3_parameter_mapping, remove_pattern_vst3_parameter_link,
+        sample_editor_selection_for_drag, serialize_midi_controller_templates,
+        serialize_midi_mixer_control_mappings, serialize_midi_vst3_parameter_mappings,
+        serialize_pattern_vst3_parameter_links, serialize_window_layout_presets,
+        should_auto_connect_midi_input, should_auto_connect_midi_output, snap_note_tick,
+        snap_piano_roll_key_to_scale, snap_recorded_midi_notes_to_scale,
+        toggle_piano_roll_note_group_selection, touch_pan_zoom_scroll_offset, track_two_finger_tap,
+        update_channel_rack_selection, update_layer_child_selection,
+        update_piano_roll_box_selection, upsert_midi_mixer_control_mapping,
+        upsert_midi_vst3_parameter_mapping, upsert_pattern_vst3_parameter_link, zoom_to_fit,
     };
 
     #[test]
@@ -55438,20 +55458,38 @@ mod tests {
     }
 
     #[test]
-    fn pattern_color_cycle_advances_wraps_and_starts_at_first_color() {
-        assert_eq!(next_pattern_color(None), super::PATTERN_COLOR_CYCLE[0]);
+    fn pattern_color_random_choice_maps_to_palette_and_skips_current() {
         assert_eq!(
-            next_pattern_color(Some(super::PATTERN_COLOR_CYCLE[0])),
-            super::PATTERN_COLOR_CYCLE[1]
+            pattern_color_from_random_index(None, 0),
+            super::PATTERN_COLOR_PALETTE[0]
         );
         assert_eq!(
-            next_pattern_color(Some(*super::PATTERN_COLOR_CYCLE.last().unwrap())),
-            super::PATTERN_COLOR_CYCLE[0]
+            pattern_color_from_random_index(None, super::PATTERN_COLOR_PALETTE.len()),
+            super::PATTERN_COLOR_PALETTE[0]
         );
-        assert_eq!(
-            next_pattern_color(Some([1, 2, 3])),
-            super::PATTERN_COLOR_CYCLE[0]
-        );
+
+        let current = super::PATTERN_COLOR_PALETTE[6];
+        let choices = (0..super::PATTERN_COLOR_PALETTE.len() - 1)
+            .map(|index| pattern_color_from_random_index(Some(current), index))
+            .collect::<Vec<_>>();
+        assert_eq!(choices.len(), super::PATTERN_COLOR_PALETTE.len() - 1);
+        assert!(!choices.contains(&current));
+        for color in super::PATTERN_COLOR_PALETTE {
+            if color != current {
+                assert!(choices.contains(&color));
+            }
+        }
+        for color in choices {
+            assert!(super::PATTERN_COLOR_PALETTE.contains(&color));
+        }
+    }
+
+    #[test]
+    fn random_pattern_color_returns_a_different_palette_entry() {
+        let current = super::PATTERN_COLOR_PALETTE[3];
+        let selected = random_pattern_color(Some(current));
+        assert_ne!(selected, current);
+        assert!(super::PATTERN_COLOR_PALETTE.contains(&selected));
     }
 
     #[test]
