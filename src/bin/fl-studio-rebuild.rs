@@ -16276,6 +16276,14 @@ impl DawUi {
             empty_view(ui, "This project has no decoded Playlist arrangement");
             return;
         };
+        let has_project_pattern_clip_template = arrangements.iter().any(|candidate| {
+            candidate
+                .clips
+                .iter()
+                .any(|clip| matches!(clip.target(), PlaylistClipTarget::Pattern { .. }))
+        });
+        let can_create_pattern_clip = selected_pattern_id.is_some()
+            && (!arrangement.clips.is_empty() || has_project_pattern_clip_template);
         let tracks = self
             .document
             .as_ref()
@@ -16318,6 +16326,7 @@ impl DawUi {
         }
 
         let mut create_pattern_clip_requested = false;
+        let mut create_pattern_clip_at_requested = None;
         let mut open_pattern_clip_requested = None;
         let mut create_automation_clip_requested = None;
         let mut playlist_track_edits_requested = Vec::new();
@@ -16537,14 +16546,6 @@ impl DawUi {
             {
                 self.status = format!("Could not save Playlist scroll setting: {error}");
             }
-            let has_project_pattern_clip_template = arrangements.iter().any(|candidate| {
-                candidate
-                    .clips
-                    .iter()
-                    .any(|clip| matches!(clip.target(), PlaylistClipTarget::Pattern { .. }))
-            });
-            let can_create_pattern_clip = selected_pattern_id.is_some()
-                && (!arrangement.clips.is_empty() || has_project_pattern_clip_template);
             create_pattern_clip_requested = ui
                 .add_enabled(
                     can_create_pattern_clip,
@@ -16818,9 +16819,9 @@ impl DawUi {
             ),
         )
         .min(u64::from(u32::MAX)) as u32;
-        let new_pattern_clip_length = selected_pattern_id
+        let selected_pattern_clip_length = selected_pattern_id
             .and_then(|pattern_id| patterns.iter().find(|pattern| pattern.id == pattern_id))
-            .map(|pattern| {
+            .and_then(|pattern| {
                 pattern
                     .length_ticks
                     .filter(|length| *length > 0)
@@ -16832,9 +16833,8 @@ impl DawUi {
                             .max()
                             .filter(|length| *length > 0)
                     })
-                    .unwrap_or(measure_length_ticks)
-            })
-            .unwrap_or(measure_length_ticks);
+            });
+        let new_pattern_clip_length = selected_pattern_clip_length.unwrap_or(measure_length_ticks);
         let new_pattern_clip_track = arrangement
             .clips
             .iter()
@@ -17884,10 +17884,16 @@ impl DawUi {
                             && self.performance_launch_sender.is_some()
                             && !self.playlist_mute_tool_active
                             && !suppress_playlist_touch_edits;
+                        let can_create_pattern_clip_at_pointer = can_create_pattern_clip
+                            && self.playlist_clip_focus == PlaylistClipFocus::Pattern
+                            && !self.playlist_mute_tool_active
+                            && !self.playlist_slip_tool_active
+                            && !suppress_playlist_touch_edits
+                            && !can_trigger_performance_scene;
                         let scene_region_response = ui.interact(
                             grid_rect,
                             Id::new(("playlist-performance-scene", arrangement.id, track_id)),
-                            if can_trigger_performance_scene {
+                            if can_trigger_performance_scene || can_create_pattern_clip_at_pointer {
                                 Sense::click()
                             } else {
                                 Sense::hover()
@@ -17896,6 +17902,10 @@ impl DawUi {
                         let scene_region_response = if can_trigger_performance_scene {
                             scene_region_response.on_hover_text(
                                 "Click a blank marker or bar region to launch its full scene, stopping tracks without a supported clip; Shift-click queues it.",
+                            )
+                        } else if can_create_pattern_clip_at_pointer {
+                            scene_region_response.on_hover_text(
+                                "Click blank Playlist space to add the selected Pattern; hold Alt to bypass snap.",
                             )
                         } else {
                             scene_region_response
@@ -19825,6 +19835,40 @@ impl DawUi {
                                 }
                             }
                         }
+                        if can_create_pattern_clip_at_pointer
+                            && scene_region_response.clicked_by(PointerButton::Primary)
+                            && !scene_region_response.double_clicked()
+                            && let Some(pointer) = scene_region_response.interact_pointer_pos()
+                        {
+                            let modifiers = ui.input(|input| input.modifiers);
+                            if !modifiers.ctrl && !modifiers.command && !modifiers.shift {
+                                let clicked_on_clip = arrangement.clips.iter().any(|clip| {
+                                    if clip.track_index != Some(row) {
+                                        return false;
+                                    }
+                                    let left = grid_rect.left()
+                                        + clip.position_ticks as f32 * tick_scale;
+                                    let width = (clip.length_ticks as f32 * tick_scale).max(4.0);
+                                    egui::Rect::from_min_size(
+                                        egui::pos2(left, grid_rect.top() + 3.0),
+                                        Vec2::new(width, row_height - 6.0),
+                                    )
+                                    .contains(pointer)
+                                });
+                                if !clicked_on_clip {
+                                    create_pattern_clip_at_requested = Some((
+                                        playlist_audio_drop_position_ticks(
+                                            pointer.x,
+                                            grid_rect.left(),
+                                            tick_scale,
+                                            ppq,
+                                            !modifiers.alt,
+                                        ),
+                                        row,
+                                    ));
+                                }
+                            }
+                        }
                         if can_trigger_performance_scene {
                             let (primary_pressed, primary_released, shift_pressed) =
                                 ui.input(|input| {
@@ -20968,16 +21012,33 @@ impl DawUi {
                 self.merge_playlist_pattern_clips(arrangement.id, &clip_indices);
         }
 
-        if create_pattern_clip_requested
+        if (create_pattern_clip_requested || create_pattern_clip_at_requested.is_some())
             && let Some(pattern_id) = selected_pattern_id
             && let Some(document) = self.document.as_mut()
         {
+            let (position_ticks, track_index) = create_pattern_clip_at_requested
+                .unwrap_or((new_pattern_clip_position, new_pattern_clip_track));
+            let clip_length_ticks = selected_pattern_clip_length.unwrap_or_else(|| {
+                if create_pattern_clip_at_requested.is_some() {
+                    playlist_bar_ticks(
+                        ppq,
+                        playlist_signature_at_tick(
+                            project_time_signature,
+                            &signature_changes,
+                            position_ticks,
+                        ),
+                    )
+                    .min(u64::from(u32::MAX)) as u32
+                } else {
+                    new_pattern_clip_length
+                }
+            });
             match document.create_playlist_pattern_clip(
                 arrangement.id,
                 pattern_id,
-                new_pattern_clip_position,
-                new_pattern_clip_length,
-                new_pattern_clip_track,
+                position_ticks,
+                clip_length_ticks,
+                track_index,
             ) {
                 Ok(clip_index) => {
                     self.stop_project_playback();
@@ -20988,7 +21049,11 @@ impl DawUi {
                     self.selected_playlist_clips.insert(clip_index);
                     self.playlist_selection_anchor = Some(clip_index);
                     self.dirty = true;
-                    self.status = format!("Added Pattern {pattern_id} to the Playlist");
+                    self.status = if create_pattern_clip_at_requested.is_some() {
+                        format!("Placed Pattern {pattern_id} at tick {position_ticks}")
+                    } else {
+                        format!("Added Pattern {pattern_id} to the Playlist")
+                    };
                     playlist_clip_list_changed = true;
                 }
                 Err(error) => {
