@@ -977,6 +977,23 @@ enum PlaylistPatternColorMode {
 impl PlaylistPatternColorMode {
     const ALL: [Self; 3] = [Self::Note, Self::Channel, Self::Pattern];
 
+    const fn settings_key(self) -> &'static str {
+        match self {
+            Self::Note => "note",
+            Self::Channel => "channel",
+            Self::Pattern => "pattern",
+        }
+    }
+
+    fn from_settings_key(key: &str) -> Option<Self> {
+        match key {
+            "note" => Some(Self::Note),
+            "channel" => Some(Self::Channel),
+            "pattern" => Some(Self::Pattern),
+            _ => None,
+        }
+    }
+
     const fn label(self) -> &'static str {
         match self {
             Self::Note => "Note",
@@ -5514,6 +5531,7 @@ impl DawUi {
         let channel_rack_mute_removed_steps = load_channel_rack_mute_removed_steps();
         let hide_collapsed_playlist_groups = load_hide_collapsed_playlist_groups();
         let playlist_zero_crossing_splits = load_playlist_zero_crossing_splits();
+        let playlist_pattern_color_mode = load_playlist_pattern_color_mode();
         let playlist_edit_patterns_in = load_playlist_edit_patterns_in();
         let playlist_scroll_to_position = load_playlist_scroll_to_position();
         let browser_path = initial_project
@@ -5772,7 +5790,7 @@ impl DawUi {
             hide_collapsed_playlist_groups,
             playlist_edit_patterns_in,
             playlist_clip_focus: PlaylistClipFocus::default(),
-            playlist_pattern_color_mode: PlaylistPatternColorMode::default(),
+            playlist_pattern_color_mode,
             playlist_scroll_to_position,
             active_playlist_clip_drag: None,
             active_playlist_clip_drag_targets: Vec::new(),
@@ -16653,6 +16671,7 @@ impl DawUi {
             if self.playlist_clip_focus == PlaylistClipFocus::Pattern {
                 ui.separator();
                 ui.label("Pattern color");
+                let previous_pattern_color_mode = self.playlist_pattern_color_mode;
                 for mode in PlaylistPatternColorMode::ALL {
                     ui.selectable_value(
                         &mut self.playlist_pattern_color_mode,
@@ -16670,6 +16689,12 @@ impl DawUi {
                             "Color Pattern Clips from the parent Pattern color"
                         }
                     });
+                }
+                if self.playlist_pattern_color_mode != previous_pattern_color_mode
+                    && let Err(error) =
+                        save_playlist_pattern_color_mode(self.playlist_pattern_color_mode)
+                {
+                    self.status = format!("Could not save Playlist pattern color mode: {error}");
                 }
             }
             let previous_edit_patterns_in = self.playlist_edit_patterns_in;
@@ -53844,6 +53869,31 @@ fn save_playlist_zero_crossing_splits(enabled: bool) -> Result<(), String> {
         .map_err(|error| format!("could not write {}: {error}", path.display()))
 }
 
+fn playlist_pattern_color_mode_settings_file() -> Option<PathBuf> {
+    browser_favorites_file()?
+        .parent()
+        .map(|directory| directory.join("playlist-pattern-color-mode.txt"))
+}
+
+fn load_playlist_pattern_color_mode() -> PlaylistPatternColorMode {
+    playlist_pattern_color_mode_settings_file()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|contents| PlaylistPatternColorMode::from_settings_key(contents.trim()))
+        .unwrap_or_default()
+}
+
+fn save_playlist_pattern_color_mode(mode: PlaylistPatternColorMode) -> Result<(), String> {
+    let path = playlist_pattern_color_mode_settings_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path.parent().ok_or_else(|| {
+        "the Playlist pattern color settings path has no parent folder".to_owned()
+    })?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    fs::write(&path, format!("{}\n", mode.settings_key()))
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
 fn playlist_edit_patterns_in_settings_file() -> Option<PathBuf> {
     browser_favorites_file()?
         .parent()
@@ -58474,6 +58524,24 @@ mod tests {
         let selected = random_pattern_color(Some(current));
         assert_ne!(selected, current);
         assert!(super::PATTERN_COLOR_PALETTE.contains(&selected));
+    }
+
+    #[test]
+    fn playlist_pattern_color_mode_settings_keys_round_trip() {
+        for mode in super::PlaylistPatternColorMode::ALL {
+            assert_eq!(
+                super::PlaylistPatternColorMode::from_settings_key(mode.settings_key()),
+                Some(mode)
+            );
+        }
+        assert_eq!(
+            super::PlaylistPatternColorMode::from_settings_key("unknown"),
+            None
+        );
+        assert_eq!(
+            super::PlaylistPatternColorMode::default(),
+            super::PlaylistPatternColorMode::Pattern
+        );
     }
 
     #[test]
