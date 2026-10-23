@@ -966,6 +966,26 @@ enum PlaylistClipFocus {
     Automation,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum PlaylistPatternColorMode {
+    Note,
+    Channel,
+    #[default]
+    Pattern,
+}
+
+impl PlaylistPatternColorMode {
+    const ALL: [Self; 3] = [Self::Note, Self::Channel, Self::Pattern];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Note => "Note",
+            Self::Channel => "Chan",
+            Self::Pattern => "Pat",
+        }
+    }
+}
+
 impl PlaylistClipFocus {
     const ALL: [Self; 3] = [Self::Pattern, Self::Audio, Self::Automation];
 
@@ -4471,6 +4491,7 @@ struct DawUi {
     playlist_zero_crossing_splits: bool,
     playlist_edit_patterns_in: PlaylistEditPatternsIn,
     playlist_clip_focus: PlaylistClipFocus,
+    playlist_pattern_color_mode: PlaylistPatternColorMode,
     playlist_scroll_to_position: bool,
     active_playlist_clip_drag: Option<ActivePlaylistClipDrag>,
     active_playlist_clip_drag_targets: Vec<PlaylistClipDragTarget>,
@@ -5751,6 +5772,7 @@ impl DawUi {
             hide_collapsed_playlist_groups,
             playlist_edit_patterns_in,
             playlist_clip_focus: PlaylistClipFocus::default(),
+            playlist_pattern_color_mode: PlaylistPatternColorMode::default(),
             playlist_scroll_to_position,
             active_playlist_clip_drag: None,
             active_playlist_clip_drag_targets: Vec::new(),
@@ -16243,6 +16265,10 @@ impl DawUi {
             .filter(|channel| channel.kind() == Some(4))
             .map(|channel| (channel.id(), channel.audio_clip_reversed()))
             .collect();
+        let channel_colors: BTreeMap<_, _> = channels
+            .iter()
+            .filter_map(|channel| channel.color().map(|color| (channel.id(), color)))
+            .collect();
         let audio_clip_channel_ids = channels
             .iter()
             .filter(|channel| channel.kind() == Some(4))
@@ -16620,6 +16646,28 @@ impl DawUi {
                                 );
                                 ui.close();
                             }
+                        }
+                    });
+                }
+            }
+            if self.playlist_clip_focus == PlaylistClipFocus::Pattern {
+                ui.separator();
+                ui.label("Pattern color");
+                for mode in PlaylistPatternColorMode::ALL {
+                    ui.selectable_value(
+                        &mut self.playlist_pattern_color_mode,
+                        mode,
+                        mode.label(),
+                    )
+                    .on_hover_text(match mode {
+                        PlaylistPatternColorMode::Note => {
+                            "Color Pattern Clips from their first note's Piano roll color group; event-only Patterns use pink"
+                        }
+                        PlaylistPatternColorMode::Channel => {
+                            "Color Pattern Clips from the first note's parent channel color"
+                        }
+                        PlaylistPatternColorMode::Pattern => {
+                            "Color Pattern Clips from the parent Pattern color"
                         }
                     });
                 }
@@ -18117,6 +18165,8 @@ impl DawUi {
                                 &clip.target(),
                                 &patterns,
                                 &channel_kinds,
+                                &channel_colors,
+                                self.playlist_pattern_color_mode,
                             );
                             let mut clip_painter = painter.clone();
                             let clip_muted = clip.is_muted();
@@ -20045,6 +20095,8 @@ impl DawUi {
                                                 &flp_rebuild::PlaylistClipTarget::Pattern { id },
                                                 &patterns,
                                                 &channel_kinds,
+                                                &channel_colors,
+                                                self.playlist_pattern_color_mode,
                                             ),
                                         )
                                     }),
@@ -20081,6 +20133,8 @@ impl DawUi {
                                                     },
                                                     &patterns,
                                                     &channel_kinds,
+                                                    &channel_colors,
+                                                    self.playlist_pattern_color_mode,
                                                 ),
                                             )
                                         })
@@ -20096,6 +20150,8 @@ impl DawUi {
                                                     },
                                                     &patterns,
                                                     &channel_kinds,
+                                                    &channel_colors,
+                                                    self.playlist_pattern_color_mode,
                                                 ),
                                             )
                                         })
@@ -54693,14 +54749,35 @@ fn playlist_clip_base_color(
     target: &flp_rebuild::PlaylistClipTarget,
     patterns: &[Pattern],
     channel_kinds: &BTreeMap<u16, Option<u8>>,
+    channel_colors: &BTreeMap<u16, [u8; 4]>,
+    pattern_color_mode: PlaylistPatternColorMode,
 ) -> Color32 {
     match target {
-        flp_rebuild::PlaylistClipTarget::Pattern { id } => patterns
-            .iter()
-            .find(|pattern| pattern.id == *id)
-            .and_then(|pattern| pattern.color)
-            .map(|[red, green, blue, _]| Color32::from_rgb(red, green, blue))
-            .unwrap_or(PURPLE),
+        flp_rebuild::PlaylistClipTarget::Pattern { id } => {
+            let Some(pattern) = patterns.iter().find(|pattern| pattern.id == *id) else {
+                return PURPLE;
+            };
+            match pattern_color_mode {
+                PlaylistPatternColorMode::Note => pattern
+                    .notes
+                    .first()
+                    .map(|note| MIDI_CHANNEL_COLORS[usize::from(note.midi_channel & 0x0f)])
+                    .or_else(|| {
+                        (!pattern.controllers.is_empty()).then_some(Color32::from_rgb(255, 0, 255))
+                    })
+                    .unwrap_or(PURPLE),
+                PlaylistPatternColorMode::Channel => pattern
+                    .notes
+                    .first()
+                    .and_then(|note| channel_colors.get(&note.channel_id))
+                    .map(|[red, green, blue, _]| Color32::from_rgb(*red, *green, *blue))
+                    .unwrap_or(PURPLE),
+                PlaylistPatternColorMode::Pattern => pattern
+                    .color
+                    .map(|[red, green, blue, _]| Color32::from_rgb(red, green, blue))
+                    .unwrap_or(PURPLE),
+            }
+        }
         flp_rebuild::PlaylistClipTarget::Channel { id } => {
             if channel_kinds.get(id).copied().flatten() == Some(5) {
                 ORANGE
@@ -58088,18 +58165,45 @@ mod tests {
     }
 
     #[test]
-    fn playlist_pattern_clips_use_saved_pattern_colors() {
-        let patterns = [Pattern {
-            id: 7,
-            color: Some([0x12, 0x34, 0x56, 0xA5]),
-            ..Pattern::default()
-        }];
+    fn playlist_pattern_clip_color_modes_follow_note_channel_and_pattern_colors() {
+        let first_note = PatternNote {
+            position: 0,
+            flags: 0,
+            channel_id: 10,
+            length: 96,
+            key: 60,
+            group: 0,
+            fine_pitch: 0,
+            reserved: 0,
+            release: 64,
+            midi_channel: 3,
+            pan: 64,
+            velocity: 100,
+            mod_x: 0,
+            mod_y: 0,
+        };
+        let patterns = [
+            Pattern {
+                id: 7,
+                color: Some([0x12, 0x34, 0x56, 0xA5]),
+                notes: vec![first_note],
+                ..Pattern::default()
+            },
+            Pattern {
+                id: 8,
+                controllers: vec![PatternController::default()],
+                ..Pattern::default()
+            },
+        ];
         let channel_kinds = BTreeMap::from([(9, Some(5)), (10, Some(0))]);
+        let channel_colors = BTreeMap::from([(10, [0x65, 0x43, 0x21, 0xFF])]);
         assert_eq!(
             super::playlist_clip_base_color(
                 &flp_rebuild::PlaylistClipTarget::Pattern { id: 7 },
                 &patterns,
                 &channel_kinds,
+                &channel_colors,
+                super::PlaylistPatternColorMode::Pattern,
             ),
             super::Color32::from_rgb(0x12, 0x34, 0x56)
         );
@@ -58108,14 +58212,48 @@ mod tests {
                 &flp_rebuild::PlaylistClipTarget::Pattern { id: 8 },
                 &patterns,
                 &channel_kinds,
+                &channel_colors,
+                super::PlaylistPatternColorMode::Pattern,
             ),
             super::PURPLE
+        );
+        assert_eq!(
+            super::playlist_clip_base_color(
+                &flp_rebuild::PlaylistClipTarget::Pattern { id: 7 },
+                &patterns,
+                &channel_kinds,
+                &channel_colors,
+                super::PlaylistPatternColorMode::Note,
+            ),
+            super::MIDI_CHANNEL_COLORS[3]
+        );
+        assert_eq!(
+            super::playlist_clip_base_color(
+                &flp_rebuild::PlaylistClipTarget::Pattern { id: 8 },
+                &patterns,
+                &channel_kinds,
+                &channel_colors,
+                super::PlaylistPatternColorMode::Note,
+            ),
+            super::Color32::from_rgb(255, 0, 255)
+        );
+        assert_eq!(
+            super::playlist_clip_base_color(
+                &flp_rebuild::PlaylistClipTarget::Pattern { id: 7 },
+                &patterns,
+                &channel_kinds,
+                &channel_colors,
+                super::PlaylistPatternColorMode::Channel,
+            ),
+            super::Color32::from_rgb(0x65, 0x43, 0x21)
         );
         assert_eq!(
             super::playlist_clip_base_color(
                 &flp_rebuild::PlaylistClipTarget::Channel { id: 9 },
                 &patterns,
                 &channel_kinds,
+                &channel_colors,
+                super::PlaylistPatternColorMode::Pattern,
             ),
             super::ORANGE
         );
@@ -58124,6 +58262,8 @@ mod tests {
                 &flp_rebuild::PlaylistClipTarget::Channel { id: 10 },
                 &patterns,
                 &channel_kinds,
+                &channel_colors,
+                super::PlaylistPatternColorMode::Pattern,
             ),
             super::BLUE
         );
