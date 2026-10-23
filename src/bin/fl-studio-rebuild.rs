@@ -17387,12 +17387,19 @@ impl DawUi {
                                 .selected_playlist_tracks
                                 .contains(&track_id)
                             {
-                                tracks
+                                let mut selected_track_ids = tracks
                                     .iter()
                                     .filter(|track| {
                                         self.selected_playlist_tracks.contains(&track.id)
                                     })
-                                    .map(|track| (arrangement.id, track.id))
+                                    .map(|track| track.id)
+                                    .collect::<BTreeSet<_>>();
+                                selected_track_ids.insert(track_id);
+                                selected_track_ids
+                                    .into_iter()
+                                    .map(|selected_track_id| {
+                                        (arrangement.id, selected_track_id)
+                                    })
                                     .collect::<Vec<_>>()
                             } else {
                                 vec![(arrangement.id, track_id)]
