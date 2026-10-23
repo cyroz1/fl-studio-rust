@@ -35582,6 +35582,7 @@ impl DawUi {
                 );
             }
 
+            let mut cross_pattern_ghost_note_selection_rects = Vec::new();
             if self.piano_roll_ghost_channels {
                 for ghost_note in cross_pattern_ghost_notes {
                     if self
@@ -35606,6 +35607,8 @@ impl DawUi {
                     )
                     .intersect(grid_rect);
                     if note_rect.is_positive() {
+                        cross_pattern_ghost_note_selection_rects
+                            .push((ghost_note.channel_id, note_rect));
                         painter.rect_stroke(
                             note_rect,
                             egui::CornerRadius::same(2),
@@ -37068,6 +37071,16 @@ impl DawUi {
                             && note_rect.contains(pointer)
                     })
                     .map(|(channel_id, _, _, _, _)| *channel_id)
+                    .or_else(|| {
+                        cross_pattern_ghost_note_selection_rects
+                            .iter()
+                            .rev()
+                            .find(|(channel_id, note_rect)| {
+                                Some(*channel_id) != self.selected_note_channel
+                                    && note_rect.contains(pointer)
+                            })
+                            .map(|(channel_id, _)| *channel_id)
+                    })
             {
                 self.selected_piano_notes.clear();
                 self.selected_note = None;
