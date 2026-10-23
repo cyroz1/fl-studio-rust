@@ -23110,11 +23110,11 @@ impl DawUi {
                                 }
                                 if ui
                                     .add_enabled(
-                                        matches!(channel.kind(), Some(0 | 2 | 3 | 4 | 5)),
+                                        matches!(channel.kind(), Some(0 | 1 | 2 | 3 | 4 | 5)),
                                         egui::Button::new("Duplicate channel"),
                                     )
                                     .on_hover_text(
-                                        "Duplicate this Sampler, Native instrument, Layer, Audio Clip, or Automation channel while preserving its saved state and Layer child references. Playlist clips remain assigned to the source Audio Clip channel.",
+                                        "Duplicate this Sampler, MIDI Out, Native instrument, Layer, Audio Clip, or Automation channel while preserving its saved state and Layer child references. MIDI Out retains its saved MIDI routing; Playlist clips remain assigned to the source Audio Clip channel.",
                                     )
                                     .clicked()
                                 {
@@ -48717,6 +48717,7 @@ fn update_channel_rack_selection(
 fn channel_type_icon_description(channel_type: Option<ChannelType>) -> String {
     match channel_type {
         Some(ChannelType::Sampler) => "Sampler channel".to_owned(),
+        Some(ChannelType::MidiOut) => "MIDI Out channel".to_owned(),
         Some(ChannelType::Native) => "Generator channel".to_owned(),
         Some(ChannelType::Layer) => "Layer channel".to_owned(),
         Some(ChannelType::Instrument) => "Instrument channel".to_owned(),
@@ -48913,6 +48914,15 @@ fn paint_channel_type_icon(
     );
     let center = icon_rect.center();
     match channel_type {
+        Some(ChannelType::MidiOut) => {
+            painter.text(
+                center,
+                Align2::CENTER_CENTER,
+                "M",
+                FontId::proportional(10.0),
+                color,
+            );
+        }
         Some(ChannelType::Sampler) => {
             for (offset, half_height) in [(-4.5, 3.0), (-1.5, 6.0), (1.5, 4.0), (4.5, 2.0)] {
                 painter.line_segment(

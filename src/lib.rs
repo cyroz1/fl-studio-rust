@@ -407,6 +407,7 @@ pub struct ProjectSettingsEdit {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChannelType {
     Sampler,
+    MidiOut,
     Native,
     Layer,
     Instrument,
@@ -427,6 +428,7 @@ impl ChannelType {
     pub fn from_raw(value: u8) -> Self {
         match value {
             0 => Self::Sampler,
+            1 => Self::MidiOut,
             2 => Self::Native,
             3 => Self::Layer,
             4 => Self::Instrument,
@@ -438,6 +440,7 @@ impl ChannelType {
     pub fn raw(self) -> u8 {
         match self {
             Self::Sampler => 0,
+            Self::MidiOut => 1,
             Self::Native => 2,
             Self::Layer => 3,
             Self::Instrument => 4,
@@ -18527,11 +18530,12 @@ impl FlpDocument {
                 channels.sort_by_key(|channel| match channel.channel_type() {
                     Some(ChannelType::Layer) => (0, 0),
                     Some(ChannelType::Native) => (1, 0),
-                    Some(ChannelType::Sampler) => (2, 0),
-                    Some(ChannelType::Instrument) => (3, 0),
-                    Some(ChannelType::Automation) => (4, 0),
-                    Some(ChannelType::Unknown(raw)) => (5, raw),
-                    None => (5, u8::MAX),
+                    Some(ChannelType::MidiOut) => (2, 0),
+                    Some(ChannelType::Sampler) => (3, 0),
+                    Some(ChannelType::Instrument) => (4, 0),
+                    Some(ChannelType::Automation) => (5, 0),
+                    Some(ChannelType::Unknown(raw)) => (6, raw),
+                    None => (6, u8::MAX),
                 })
             }
         }
@@ -18613,6 +18617,17 @@ impl FlpDocument {
         self.duplicate_channel_with_kind(source_channel_id, display_name, 0)
     }
 
+    /// Adds a MIDI Out channel by copying one existing kind-1 channel.
+    /// Its saved port, MIDI channel, and other channel events are retained byte-for-byte; the
+    /// clone receives a unique channel ID and the supplied display name.
+    pub fn duplicate_midi_out_channel(
+        &mut self,
+        source_channel_id: u16,
+        display_name: &str,
+    ) -> Result<u16, FlpError> {
+        self.duplicate_channel_with_kind(source_channel_id, display_name, 1)
+    }
+
     /// Adds a Native instrument channel by copying one existing kind-2 channel.
     /// Opaque plug-in and channel-state events are copied byte-for-byte; the clone receives a
     /// unique channel ID and the supplied display name.
@@ -18656,9 +18671,9 @@ impl FlpDocument {
         self.duplicate_channel_with_kind(source_channel_id, display_name, 3)
     }
 
-    /// Duplicates a kind-0 Sampler, kind-2 Native instrument, kind-3 Layer, kind-4 Audio Clip,
-    /// or kind-5 Automation channel. Other channel kinds are rejected because their state may
-    /// contain relationships that cannot be copied safely.
+    /// Duplicates a kind-0 Sampler, kind-1 MIDI Out, kind-2 Native instrument, kind-3 Layer,
+    /// kind-4 Audio Clip, or kind-5 Automation channel. Other channel kinds are rejected because
+    /// their state may contain relationships that cannot be copied safely.
     pub fn duplicate_channel(
         &mut self,
         source_channel_id: u16,
@@ -18678,11 +18693,12 @@ impl FlpDocument {
             Some(5) => self.duplicate_automation_channel(source_channel_id, display_name),
             Some(3) => self.duplicate_layer_channel(source_channel_id, display_name),
             Some(4) => self.duplicate_audio_clip_channel(source_channel_id, display_name),
+            Some(1) => self.duplicate_midi_out_channel(source_channel_id, display_name),
             Some(kind @ (0 | 2)) => {
                 self.duplicate_channel_with_kind(source_channel_id, display_name, kind)
             }
             _ => Err(FlpError::UnsupportedEdit(
-                "only kind-0 Sampler, kind-2 Native instrument, kind-3 Layer, kind-4 Audio Clip, or kind-5 Automation channels can be duplicated safely",
+                "only kind-0 Sampler, kind-1 MIDI Out, kind-2 Native instrument, kind-3 Layer, kind-4 Audio Clip, or kind-5 Automation channels can be duplicated safely",
             )),
         }
     }
@@ -32590,10 +32606,14 @@ mod tests {
     }
 
     #[test]
-    fn unknown_channel_type_round_trips_its_raw_value() {
-        let channel_type = super::ChannelType::from_raw(1);
-        assert_eq!(channel_type, super::ChannelType::Unknown(1));
-        assert_eq!(channel_type.raw(), 1);
+    fn channel_type_raw_values_round_trip_known_and_unknown_values() {
+        let midi_out = super::ChannelType::from_raw(1);
+        assert_eq!(midi_out, super::ChannelType::MidiOut);
+        assert_eq!(midi_out.raw(), 1);
+
+        let unknown = super::ChannelType::from_raw(255);
+        assert_eq!(unknown, super::ChannelType::Unknown(255));
+        assert_eq!(unknown.raw(), 255);
     }
 
     #[test]
