@@ -37060,7 +37060,8 @@ impl DawUi {
                 }
             }
             if !self.piano_roll_editable_ghost_channels
-                && grid_response.double_clicked_by(PointerButton::Secondary)
+                && (grid_response.double_clicked_by(PointerButton::Secondary)
+                    || grid_response.clicked_by(PointerButton::Extra1))
                 && let Some(pointer) = pointer
                 && grid_body_rect.contains(pointer)
                 && let Some(channel_id) = note_selection_rects
