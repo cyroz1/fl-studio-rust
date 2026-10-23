@@ -16170,6 +16170,7 @@ impl DawUi {
         }
 
         let mut create_pattern_clip_requested = false;
+        let mut open_pattern_clip_requested = None;
         let mut create_automation_clip_requested = None;
         let mut playlist_track_edits_requested = Vec::new();
         let mut auto_name_playlist_track_requested = None;
@@ -18676,6 +18677,15 @@ impl DawUi {
                                         ui.close();
                                     }
                                 } else if is_pattern_clip {
+                                    if let flp_rebuild::PlaylistClipTarget::Pattern { id } =
+                                        clip.target()
+                                        && patterns.iter().any(|pattern| pattern.id == id)
+                                        && ui.button("Open in Piano roll").clicked()
+                                    {
+                                        open_pattern_clip_requested = Some((clip_index, id));
+                                        ui.close();
+                                    }
+                                    ui.separator();
                                     let selected_pattern_context_indices = self
                                         .selected_playlist_pattern_clip_indices(arrangement.id)
                                         .filter(|indices| indices.contains(&clip_index));
@@ -18919,6 +18929,14 @@ impl DawUi {
                                     ui.close();
                                 }
                             });
+                            if !can_trigger_performance_clip
+                                && response.double_clicked_by(PointerButton::Primary)
+                                && let flp_rebuild::PlaylistClipTarget::Pattern { id } =
+                                    clip.target()
+                                && patterns.iter().any(|pattern| pattern.id == id)
+                            {
+                                open_pattern_clip_requested = Some((clip_index, id));
+                            }
                             if response.drag_started_by(PointerButton::Primary)
                                 && !self.playlist_mute_tool_active
                                 && self.active_playlist_clip_drag.is_none()
@@ -20174,6 +20192,31 @@ impl DawUi {
         }
 
         let mut playlist_clip_list_changed = false;
+        if let Some((clip_index, pattern_id)) = open_pattern_clip_requested {
+            self.selected_pattern = Some(pattern_id);
+            self.selected_arrangement = Some(arrangement.id);
+            self.selected_clip = Some(clip_index);
+            self.selected_playlist_clips.clear();
+            self.selected_playlist_clips.insert(clip_index);
+            self.playlist_selection_anchor = Some(clip_index);
+            let target_channel_id = patterns
+                .iter()
+                .find(|pattern| pattern.id == pattern_id)
+                .and_then(|pattern| {
+                    pattern
+                        .notes
+                        .iter()
+                        .find(|note| Some(note.channel_id) == self.selected_note_channel)
+                        .or_else(|| pattern.notes.first())
+                        .map(|note| note.channel_id)
+                })
+                .or(self.selected_note_channel);
+            self.selected_note_channel = target_channel_id;
+            self.selected_note = None;
+            self.selected_piano_notes.clear();
+            self.view = MainView::PianoRoll;
+            self.status = format!("Opened Pattern {pattern_id} in the Piano roll");
+        }
         if let Some(clip_index) = delete_clip_requested {
             let clip_indices = if self.selected_arrangement == Some(arrangement.id)
                 && self.selected_playlist_clips.contains(&clip_index)
