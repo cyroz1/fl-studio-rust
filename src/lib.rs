@@ -600,6 +600,31 @@ impl SamplerEnvelopeLfo {
     pub fn lfo_shape_raw(&self) -> Option<i32> {
         self.lfo_shape_raw
     }
+
+    /// Returns the decoded envelope/LFO fields with native units left raw for inspection.
+    pub fn raw_summary(&self) -> String {
+        format!(
+            "{} enabled={} flags_raw={} predelay_raw={:?} attack_raw={:?} hold_raw={:?} decay_raw={:?} sustain_raw={:?} release_raw={:?} amount_raw={:?} attack_tension_raw={:?} decay_tension_raw={:?} release_tension_raw={:?} lfo_predelay_raw={:?} lfo_attack_raw={:?} lfo_amount_raw={:?} lfo_speed_raw={:?} lfo_shape_raw={:?}",
+            self.target.label(),
+            self.enabled,
+            self.flags_raw,
+            self.predelay_raw,
+            self.attack_raw,
+            self.hold_raw,
+            self.decay_raw,
+            self.sustain_raw,
+            self.release_raw,
+            self.amount_raw,
+            self.attack_tension_raw,
+            self.decay_tension_raw,
+            self.release_tension_raw,
+            self.lfo_predelay_raw,
+            self.lfo_attack_raw,
+            self.lfo_amount_raw,
+            self.lfo_speed_raw,
+            self.lfo_shape_raw
+        )
+    }
 }
 
 /// Backwards-compatible name for the Volume target record.
@@ -25660,6 +25685,10 @@ mod tests {
             assert_eq!(record.lfo_speed_raw(), Some(200 + index as u32));
             assert_eq!(record.lfo_shape_raw(), Some(index as i32 % 3));
             assert_eq!(channel.sampler_envelope_lfo(target), Some(record));
+            let summary = record.raw_summary();
+            assert!(summary.starts_with(target.label()));
+            assert!(summary.contains(&format!("flags_raw={}", (index as i32) << 1)));
+            assert!(summary.contains(&format!("lfo_speed_raw=Some({})", 200 + index as u32)));
         }
         assert_eq!(document.encode_lossless().unwrap(), input);
     }

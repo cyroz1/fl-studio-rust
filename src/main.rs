@@ -4920,7 +4920,22 @@ fn inspect_preset(path: &Path) -> Result<(), String> {
         document.project_version().unwrap_or("unknown")
     );
     println!("events: {}", document.events().len());
-    println!("channel records: {}", document.channels().len());
+    let channels = document.channels();
+    println!("channel records: {}", channels.len());
+    for channel in channels {
+        println!(
+            "channel id={} type={:?} name={:?} sample_path={:?}",
+            channel.id(),
+            channel.channel_type(),
+            channel.display_name(),
+            channel.sample_path()
+        );
+        if let Some(envelopes) = channel.sampler_envelope_lfos() {
+            for envelope in envelopes.into_iter().flatten() {
+                println!("  envelope/LFO raw: {}", envelope.raw_summary());
+            }
+        }
+    }
     println!(
         "channel plug-in states: {}",
         document.channel_plugin_states().len()

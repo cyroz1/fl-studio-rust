@@ -3623,6 +3623,7 @@ struct FstPresetDetails {
     event_count: usize,
     channel_count: usize,
     channel_summaries: Vec<String>,
+    sampler_envelope_summaries: Vec<String>,
     plugin_state_count: usize,
     plugin_state_summaries: Vec<String>,
     mixer_insert_count: usize,
@@ -12826,6 +12827,19 @@ impl DawUi {
                 summary
             })
             .collect::<Vec<_>>();
+        let sampler_envelope_summaries = channels
+            .iter()
+            .flat_map(|channel| {
+                channel
+                    .sampler_envelope_lfos()
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .map(|envelope| {
+                        format!("Channel {} · {}", channel.id(), envelope.raw_summary())
+                    })
+            })
+            .collect::<Vec<_>>();
         let plugin_states = document.channel_plugin_states();
         let plugin_state_summaries = plugin_states
             .iter()
@@ -12890,6 +12904,7 @@ impl DawUi {
             event_count: document.events().len(),
             channel_count: channels.len(),
             channel_summaries,
+            sampler_envelope_summaries,
             plugin_state_count: plugin_states.len(),
             plugin_state_summaries,
             mixer_insert_count: mixer_inserts.len(),
@@ -13137,6 +13152,17 @@ impl DawUi {
                     format!("Decoded channels ({})", details.channel_summaries.len()),
                     |ui| {
                         for summary in &details.channel_summaries {
+                            ui.label(summary);
+                        }
+                    },
+                );
+                ui.collapsing(
+                    format!(
+                        "Sampler envelope/LFO raw fields ({})",
+                        details.sampler_envelope_summaries.len()
+                    ),
+                    |ui| {
+                        for summary in &details.sampler_envelope_summaries {
                             ui.label(summary);
                         }
                     },
