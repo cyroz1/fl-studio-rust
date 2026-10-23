@@ -3331,6 +3331,7 @@ fn scale_chord_pitches_from_top(
 enum NoteDragKind {
     Move,
     Resize,
+    Stretch,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3350,6 +3351,7 @@ struct ActiveNoteDrag {
     start_pointer: egui::Pos2,
     targets: Vec<NoteDragTarget>,
     kind: NoteDragKind,
+    stretch_quarter_steps: bool,
     scale_snap: Option<DetectedPianoRollScale>,
 }
 
@@ -35612,7 +35614,7 @@ impl DawUi {
                     },
                 )
                 .on_hover_text(
-                    "Alt/Option+wheel adjusts the active property (Ctrl is finer) · Shift+Alt/Option+wheel nudges timing; Edit can enable Shift-only",
+                    "Right-Shift+drag a selected note edge to stretch the sequence; Alt+Right-Shift uses 25% steps · Alt/Option+wheel edits the active property · Shift+Alt/Option+wheel nudges timing",
                 );
                 let note_id = (pattern.id, note.channel_id, *channel_index);
                 let modifiers = scroll_modifiers;
@@ -35769,6 +35771,10 @@ impl DawUi {
                         if selected_count == 1 { "" } else { "s" }
                     );
                 }
+                let resize = response
+                    .interact_pointer_pos()
+                    .is_some_and(|pointer| pointer.x >= note_rect.right() - 6.0);
+                let stretch = resize && modifiers.shift;
                 if response.is_pointer_button_down_on()
                     && !self.piano_roll_zoom_mode
                     && !self.piano_roll_playback_mode
@@ -35777,11 +35783,8 @@ impl DawUi {
                     && !self.piano_roll_mute_mode
                     && self.active_note_drag.is_none()
                     && !modifiers.command
-                    && !modifiers.shift
+                    && (!modifiers.shift || stretch)
                 {
-                    let resize = response
-                        .interact_pointer_pos()
-                        .is_some_and(|pointer| pointer.x >= note_rect.right() - 6.0);
                     if !self.selected_piano_notes.contains(&note_id)
                         || self
                             .selected_piano_notes
@@ -35828,11 +35831,14 @@ impl DawUi {
                         channel_note_index: *channel_index,
                         start_pointer,
                         targets,
-                        kind: if resize {
+                        kind: if stretch {
+                            NoteDragKind::Stretch
+                        } else if resize {
                             NoteDragKind::Resize
                         } else {
                             NoteDragKind::Move
                         },
+                        stretch_quarter_steps: stretch && modifiers.alt,
                         scale_snap: self
                             .piano_roll_snap_notes_to_scale
                             .then_some(scale_highlight)
@@ -35858,6 +35864,37 @@ impl DawUi {
                         ((pointer.x - drag.start_pointer.x) / tick_scale).round() as i64;
                     let semitones =
                         ((drag.start_pointer.y - pointer.y) / key_height).round() as i32;
+                    let stretch_bounds = (drag.kind == NoteDragKind::Stretch).then(|| {
+                        let start_tick = drag
+                            .targets
+                            .iter()
+                            .map(|target| target.start_position)
+                            .min()
+                            .unwrap_or_default();
+                        let end_tick = drag
+                            .targets
+                            .iter()
+                            .map(|target| {
+                                u64::from(target.start_position) + u64::from(target.start_length)
+                            })
+                            .max()
+                            .unwrap_or(u64::from(start_tick));
+                        let duration = end_tick
+                            .saturating_sub(u64::from(start_tick))
+                            .max(1);
+                        (start_tick, end_tick, duration)
+                    });
+                    let stretched_duration = stretch_bounds.map(
+                        |(start_tick, end_tick, _)| {
+                            piano_roll_stretched_duration(
+                                start_tick,
+                                end_tick,
+                                tick_delta,
+                                snap_ticks,
+                                drag.stretch_quarter_steps,
+                            )
+                        },
+                    );
                     let mut updated = self.document.clone();
                     let result = if let Some(document) = updated.as_mut() {
                         drag.targets.iter().try_for_each(|target| {
@@ -35893,6 +35930,18 @@ impl DawUi {
                                     )),
                                     ..PatternNoteEdit::default()
                                 },
+                                NoteDragKind::Stretch => {
+                                    let (start_tick, _, original_duration) = stretch_bounds
+                                        .expect("stretch drags have a selected time range");
+                                    piano_roll_stretched_note_edit(
+                                        *target,
+                                        start_tick,
+                                        original_duration,
+                                        stretched_duration
+                                            .expect("stretch drags have a target duration"),
+                                        snap_ticks,
+                                    )
+                                }
                             };
                             document.edit_pattern_note(
                                 drag.pattern_id,
@@ -35911,12 +35960,14 @@ impl DawUi {
                             let action = match drag.kind {
                                 NoteDragKind::Move => "Moved",
                                 NoteDragKind::Resize => "Resized",
+                                NoteDragKind::Stretch => "Stretched",
                             };
                             format!("{action} {} selected notes", drag.targets.len())
                         } else {
                             match drag.kind {
                                 NoteDragKind::Move => "Piano roll note moved".to_owned(),
                                 NoteDragKind::Resize => "Piano roll note length changed".to_owned(),
+                                NoteDragKind::Stretch => "Piano roll note group stretched".to_owned(),
                             }
                         };
                     } else if let Err(error) = result {
@@ -49752,6 +49803,72 @@ fn piano_roll_slice_line_cut_x(
         }
     }
     (first_t <= last_t).then_some(start.x + dx * ((first_t + last_t) * 0.5))
+}
+
+fn piano_roll_stretched_duration(
+    start_tick: u32,
+    end_tick: u64,
+    tick_delta: i64,
+    snap_ticks: u32,
+    quarter_steps: bool,
+) -> u64 {
+    let original_duration = end_tick.saturating_sub(u64::from(start_tick)).max(1);
+    let minimum_end = i64::from(start_tick).saturating_add(1);
+    let requested_end = i64::try_from(end_tick)
+        .unwrap_or(i64::MAX)
+        .saturating_add(tick_delta)
+        .max(minimum_end);
+    let duration = if quarter_steps {
+        let ratio = (requested_end - i64::from(start_tick)) as f64 / original_duration as f64;
+        let quarter_count = (ratio * 4.0).round().max(1.0);
+        (original_duration as f64 * quarter_count / 4.0)
+            .round()
+            .clamp(1.0, f64::from(u32::MAX)) as u64
+    } else {
+        let snapped_end = snap_note_tick(requested_end, snap_ticks, start_tick.saturating_add(1));
+        u64::from(snapped_end.saturating_sub(start_tick)).max(1)
+    };
+    duration.min(u64::from(u32::MAX))
+}
+
+fn piano_roll_stretched_note_edit(
+    target: NoteDragTarget,
+    start_tick: u32,
+    original_duration: u64,
+    stretched_duration: u64,
+    snap_ticks: u32,
+) -> PatternNoteEdit {
+    let original_duration = original_duration.max(1);
+    let scaled_tick = |tick: u64| {
+        let relative = tick.saturating_sub(u64::from(start_tick));
+        let scaled = (u128::from(relative) * u128::from(stretched_duration)
+            + u128::from(original_duration / 2))
+            / u128::from(original_duration);
+        u64::from(start_tick)
+            .saturating_add(scaled.min(u128::from(u64::MAX)) as u64)
+            .min(u64::from(u32::MAX))
+    };
+    let position = snap_note_tick(
+        scaled_tick(u64::from(target.start_position)) as i64,
+        snap_ticks,
+        0,
+    );
+    let length = if target.start_length == 0 {
+        0
+    } else {
+        let original_end = u64::from(target.start_position) + u64::from(target.start_length);
+        let end = snap_note_tick(
+            scaled_tick(original_end) as i64,
+            snap_ticks,
+            position.saturating_add(1),
+        );
+        end.saturating_sub(position).max(1)
+    };
+    PatternNoteEdit {
+        position: Some(position),
+        length: Some(length),
+        ..PatternNoteEdit::default()
+    }
 }
 
 fn piano_roll_time_range_from_drag(
