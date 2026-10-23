@@ -1158,6 +1158,14 @@ enum PlaylistWaveformMode {
     Spectral,
 }
 
+#[derive(Clone, Copy)]
+struct PlaylistWaveformSettings {
+    reverse: bool,
+    mode: PlaylistWaveformMode,
+    ppq: u16,
+    base_tempo_bpm: f64,
+}
+
 impl PlaylistWaveformMode {
     const fn label(self) -> &'static str {
         match self {
@@ -17720,9 +17728,15 @@ impl DawUi {
                                         clip_rect,
                                         clip,
                                         &waveform,
-                                        self.playlist_waveform_mode,
-                                        ppq,
-                                        base_tempo_bpm,
+                                        PlaylistWaveformSettings {
+                                            reverse: channel_audio_clip_reverse
+                                                .get(&id)
+                                                .copied()
+                                                .unwrap_or(false),
+                                            mode: self.playlist_waveform_mode,
+                                            ppq,
+                                            base_tempo_bpm,
+                                        },
                                     );
                                 } else if self.waveform_loads.contains_key(path) {
                                     clip_painter.text(
@@ -52959,9 +52973,7 @@ fn draw_audio_clip_waveform(
     clip_rect: egui::Rect,
     clip: &PlaylistClip,
     waveform: &AudioWaveform,
-    mode: PlaylistWaveformMode,
-    ppq: u16,
-    base_tempo_bpm: f64,
+    settings: PlaylistWaveformSettings,
 ) {
     if waveform.peaks.is_empty() || waveform.frame_count == 0 || waveform.sample_rate == 0 {
         return;
@@ -52975,12 +52987,15 @@ fn draw_audio_clip_waveform(
     let source_window = if let Some((start_tick, end_tick)) = clip.source_window_ticks() {
         if start_tick == 0 && end_tick == 0 {
             Some((0, full_frame_count))
-        } else if ppq == 0 || !base_tempo_bpm.is_finite() || base_tempo_bpm <= 0.0 {
+        } else if settings.ppq == 0
+            || !settings.base_tempo_bpm.is_finite()
+            || settings.base_tempo_bpm <= 0.0
+        {
             None
         } else {
             let ticks_to_frames = |ticks: u32| {
                 let frames = f64::from(ticks) * 60.0 * f64::from(waveform.sample_rate)
-                    / (f64::from(ppq) * base_tempo_bpm);
+                    / (f64::from(settings.ppq) * settings.base_tempo_bpm);
                 (frames.is_finite() && frames >= 0.0 && frames <= u64::MAX as f64)
                     .then_some(frames.round() as u64)
             };
@@ -53000,13 +53015,20 @@ fn draw_audio_clip_waveform(
     let Some((source_start, source_end)) = source_window else {
         return;
     };
-    if mode == PlaylistWaveformMode::Spectral {
-        draw_spectral_audio_clip(painter, clip_rect, waveform, source_start, source_end);
+    if settings.mode == PlaylistWaveformMode::Spectral {
+        draw_spectral_audio_clip(
+            painter,
+            clip_rect,
+            waveform,
+            source_start,
+            source_end,
+            settings.reverse,
+        );
         return;
     }
     let columns = clip_rect.width().ceil().clamp(1.0, 1024.0) as usize;
     let frame_count = u128::from(full_frame_count);
-    let stereo = mode == PlaylistWaveformMode::Stereo && waveform.channel_peaks.len() >= 2;
+    let stereo = settings.mode == PlaylistWaveformMode::Stereo && waveform.channel_peaks.len() >= 2;
     let display_channels = if stereo { 2 } else { 1 };
     if stereo {
         let center_y = clip_rect.center().y;
@@ -53051,10 +53073,18 @@ fn draw_audio_clip_waveform(
             Color32::from_rgba_unmultiplied(201, 220, 255, 155)
         };
         for column in 0..columns {
-            let frame_start = u128::from(source_start)
-                + u128::from(source_end - source_start) * column as u128 / columns as u128;
-            let frame_end = u128::from(source_start)
-                + u128::from(source_end - source_start) * (column + 1) as u128 / columns as u128;
+            let source_span = u128::from(source_end - source_start);
+            let (frame_start, frame_end) = if settings.reverse {
+                (
+                    u128::from(source_end) - source_span * (column + 1) as u128 / columns as u128,
+                    u128::from(source_end) - source_span * column as u128 / columns as u128,
+                )
+            } else {
+                (
+                    u128::from(source_start) + source_span * column as u128 / columns as u128,
+                    u128::from(source_start) + source_span * (column + 1) as u128 / columns as u128,
+                )
+            };
             let first_peak = (frame_start * peak_count / frame_count) as usize;
             let last_peak = ((frame_end * peak_count / frame_count) as usize)
                 .max(first_peak + 1)
@@ -53086,6 +53116,7 @@ fn draw_spectral_audio_clip(
     waveform: &AudioWaveform,
     source_start: u64,
     source_end: u64,
+    reverse: bool,
 ) {
     if waveform.spectral_bands.is_empty() || source_start >= source_end {
         return;
@@ -53110,11 +53141,12 @@ fn draw_spectral_audio_clip(
     for column_index in first_column.min(column_count - 1)..last_column {
         let center_frame = ((column_index as f64 + 0.5) * waveform.frame_count as f64
             / column_count as f64) as u64;
-        let position = u128::from(
-            center_frame
-                .saturating_sub(source_start)
-                .min(source_end - 1),
-        );
+        let source_position = center_frame.max(source_start).min(source_end - 1);
+        let position = u128::from(if reverse {
+            source_end - 1 - source_position
+        } else {
+            source_position - source_start
+        });
         let x = clip_rect.left() + position as f32 * clip_rect.width() / source_span as f32;
         let width = (clip_rect.width() / visible_columns as f32).max(1.0);
         let left = (x - width * 0.5).max(clip_rect.left());
