@@ -43499,14 +43499,69 @@ impl DawUi {
                                     .inner_margin(6.0)
                                     .show(ui, |ui| {
                                         ui.set_min_width(width - 14.0);
-                                        ui.horizontal(|ui| {
-                                            ui.monospace(format!("{:02}", slot_index + 1));
-                                            ui.vertical(|ui| {
-                                                ui.label(plugin_name);
-                                                ui.small(
-                                                    egui::RichText::new(&saved_state)
-                                                        .color(MUTED),
-                                                );
+                                        ui.vertical(|ui| {
+                                            ui.horizontal(|ui| {
+                                                ui.monospace(format!("{:02}", slot_index + 1));
+                                                ui.vertical(|ui| {
+                                                    ui.label(plugin_name);
+                                                    ui.small(
+                                                        egui::RichText::new(&saved_state)
+                                                            .color(MUTED),
+                                                    );
+                                                });
+                                            });
+                                            ui.horizontal(|ui| {
+                                                if let Some(mut enabled) = slot.enabled() {
+                                                    if ui.checkbox(&mut enabled, "Enabled").changed()
+                                                        && let Some((event_index, record_index)) =
+                                                            slot.enabled_parameter_location()
+                                                    {
+                                                        parameter_edits.push((
+                                                            event_index,
+                                                            record_index,
+                                                            if enabled { 1 } else { 0 },
+                                                        ));
+                                                    }
+                                                } else {
+                                                    ui.small(
+                                                        egui::RichText::new("Enabled: unavailable")
+                                                            .color(MUTED),
+                                                    );
+                                                }
+                                                if let Some(mut mix_raw) = slot.mix_raw() {
+                                                    if (-6_400..=6_400).contains(&mix_raw) {
+                                                        if ui
+                                                            .add(
+                                                                egui::Slider::new(
+                                                                    &mut mix_raw,
+                                                                    -6_400..=6_400,
+                                                                )
+                                                                .text("Mix raw"),
+                                                            )
+                                                            .changed()
+                                                            && let Some((event_index, record_index)) =
+                                                                slot.mix_parameter_location()
+                                                        {
+                                                            parameter_edits.push((
+                                                                event_index,
+                                                                record_index,
+                                                                mix_raw,
+                                                            ));
+                                                        }
+                                                    } else {
+                                                        ui.small(
+                                                            egui::RichText::new(format!(
+                                                                "Mix raw {mix_raw} is outside the documented range"
+                                                            ))
+                                                            .color(MUTED),
+                                                        );
+                                                    }
+                                                } else {
+                                                    ui.small(
+                                                        egui::RichText::new("Mix: unavailable")
+                                                            .color(MUTED),
+                                                    );
+                                                }
                                             });
                                         });
                                     });

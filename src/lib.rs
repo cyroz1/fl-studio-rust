@@ -2895,6 +2895,8 @@ pub struct MixerInsertSummary {
 
 /// Read-only description of one Mixer effect slot bounded by its closing marker.
 /// The original events and plug-in payload stay lossless in [`FlpDocument::events`].
+/// Slot parameters are exposed only for unique, unscoped records using the candidate
+/// `64 + insert ordinal` target mapping.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MixerEffectSlotSummary {
     insert_ordinal: usize,
@@ -2902,6 +2904,10 @@ pub struct MixerEffectSlotSummary {
     plugin_identifier: Option<String>,
     display_name: Option<String>,
     state_event_count: usize,
+    enabled: Option<bool>,
+    enabled_parameter_location: Option<(usize, usize)>,
+    mix_raw: Option<i32>,
+    mix_parameter_location: Option<(usize, usize)>,
     first_event_index: usize,
     end_event_index: usize,
 }
@@ -2944,6 +2950,26 @@ impl MixerEffectSlotSummary {
     /// Number of opaque `0xD5` state events in this slot.
     pub fn state_event_count(&self) -> usize {
         self.state_event_count
+    }
+
+    /// Saved slot enabled state when one unscoped boolean parameter record is recognized.
+    pub fn enabled(&self) -> Option<bool> {
+        self.enabled
+    }
+
+    /// Event and record location for the recognized enabled parameter.
+    pub fn enabled_parameter_location(&self) -> Option<(usize, usize)> {
+        self.enabled_parameter_location
+    }
+
+    /// Saved raw slot mix value when one unscoped parameter record is recognized.
+    pub fn mix_raw(&self) -> Option<i32> {
+        self.mix_raw
+    }
+
+    /// Event and record location for the recognized mix parameter.
+    pub fn mix_parameter_location(&self) -> Option<(usize, usize)> {
+        self.mix_parameter_location
     }
 
     /// Events assigned to this slot, excluding its closing marker when present.
@@ -7866,8 +7892,11 @@ impl FlpDocument {
     /// zero-through-nine order. The first boundary precedes slot zero's data; boundaries one
     /// through nine close slots zero through eight, and the following `0x93` closes slot nine
     /// when present. A complete boundary set is required so an unrelated legacy `0x62` marker
-    /// cannot be mistaken for an FX slot. Plug-in state remains opaque and lossless.
+    /// cannot be mistaken for an FX slot. Unique unscoped enabled and Mix records are attached
+    /// using the candidate `64 + insert ordinal` target mapping. Plug-in state remains opaque
+    /// and lossless.
     pub fn mixer_effect_slots(&self) -> Vec<MixerEffectSlotSummary> {
+        let parameter_records = self.mixer_parameter_records().unwrap_or_default();
         let mut slots = Vec::new();
         for insert in self.mixer_inserts() {
             let first_slot_event = insert.first_event_index + 3;
@@ -7892,12 +7921,31 @@ impl FlpDocument {
                     .iter()
                     .filter(|event| event.opcode == 0xD5)
                     .count();
+                let unique_slot_parameter = |kind| {
+                    let mut matching = parameter_records.iter().filter(|record| {
+                        record.kind() == kind
+                            && record.candidate_insert_ordinal() == Some(insert.ordinal)
+                            && usize::from(record.slot_index()) == usize::from(slot_index)
+                            && record.target_scope_raw() == 0
+                    });
+                    let record = matching.next()?;
+                    matching.next().is_none().then_some(record)
+                };
+                let enabled_record = unique_slot_parameter(MixerParameterKind::SlotEnabled)
+                    .filter(|record| matches!(record.value, 0 | 1));
+                let mix_record = unique_slot_parameter(MixerParameterKind::SlotMix);
                 MixerEffectSlotSummary {
                     insert_ordinal: insert.ordinal,
                     slot_index,
                     plugin_identifier,
                     display_name,
                     state_event_count,
+                    enabled: enabled_record.map(|record| record.value != 0),
+                    enabled_parameter_location: enabled_record
+                        .map(|record| (record.event_index, record.record_index)),
+                    mix_raw: mix_record.map(|record| record.value),
+                    mix_parameter_location: mix_record
+                        .map(|record| (record.event_index, record.record_index)),
                     first_event_index: start,
                     end_event_index: end,
                 }
@@ -7945,6 +7993,70 @@ impl FlpDocument {
             }
         }
         slots
+    }
+
+    /// Sets an effect-slot enabled parameter only when the candidate Mixer target and slot
+    /// contain one unscoped, recognized boolean record.
+    pub fn set_mixer_effect_slot_enabled(
+        &mut self,
+        insert_ordinal: usize,
+        slot_index: u16,
+        enabled: bool,
+    ) -> Result<(), FlpError> {
+        let slot = self.unique_mixer_effect_slot(insert_ordinal, slot_index)?;
+        let (event_index, record_index) =
+            slot.enabled_parameter_location
+                .ok_or(FlpError::UnsupportedEdit(
+                    "the requested effect slot has no unique unscoped enabled parameter",
+                ))?;
+        self.set_mixer_parameter_record_value(
+            event_index,
+            record_index,
+            if enabled { 1 } else { 0 },
+        )
+    }
+
+    /// Sets a raw effect-slot Mix parameter in the documented range of -6400 through 6400,
+    /// using the candidate Mixer target mapping.
+    pub fn set_mixer_effect_slot_mix_raw(
+        &mut self,
+        insert_ordinal: usize,
+        slot_index: u16,
+        mix_raw: i32,
+    ) -> Result<(), FlpError> {
+        if !(-6_400..=6_400).contains(&mix_raw) {
+            return Err(FlpError::UnsupportedEdit(
+                "effect-slot Mix values must be between -6400 and 6400",
+            ));
+        }
+        let slot = self.unique_mixer_effect_slot(insert_ordinal, slot_index)?;
+        let (event_index, record_index) =
+            slot.mix_parameter_location
+                .ok_or(FlpError::UnsupportedEdit(
+                    "the requested effect slot has no unique unscoped Mix parameter",
+                ))?;
+        self.set_mixer_parameter_record_value(event_index, record_index, mix_raw)
+    }
+
+    fn unique_mixer_effect_slot(
+        &self,
+        insert_ordinal: usize,
+        slot_index: u16,
+    ) -> Result<MixerEffectSlotSummary, FlpError> {
+        let mut matching = self.mixer_effect_slots().into_iter().filter(|slot| {
+            slot.insert_ordinal() == insert_ordinal && slot.slot_index() == slot_index
+        });
+        let Some(slot) = matching.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested Mixer effect slot does not exist in a recognized layout",
+            ));
+        };
+        if matching.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested Mixer effect slot is ambiguous",
+            ));
+        }
+        Ok(slot)
     }
 
     /// Edits known bits in one existing Mixer insert flag event while preserving
@@ -24326,6 +24438,136 @@ mod tests {
         let incomplete_document =
             FlpDocument::parse(&flp_fixture(&incomplete, &[], &[])).expect("fixture parses");
         assert!(incomplete_document.mixer_effect_slots().is_empty());
+    }
+
+    #[test]
+    fn mixer_effect_slots_decode_and_edit_unique_unscoped_parameters() {
+        let mut event_stream = Vec::new();
+        append_complete_mixer_insert_state(&mut event_stream, -1, 0, 0, "Master", &[0xAA, 0xBB]);
+        let target = (64_u16 << 6) | 3;
+        let mut parameters = Vec::new();
+        for (parameter_id, value) in [(0_u8, 1_i32), (1_u8, 1_250_i32)] {
+            parameters.extend_from_slice(&[0xA1, 0xB2, 0xC3, 0xD4, parameter_id, 0x5A]);
+            parameters.extend_from_slice(&target.to_le_bytes());
+            parameters.extend_from_slice(&value.to_le_bytes());
+        }
+        append_data_event(&mut event_stream, 0xE1, &parameters);
+
+        let original = flp_fixture(&event_stream, &[], &[]);
+        let original_document =
+            FlpDocument::parse(&original).expect("the original fixture should parse");
+        let mut document = FlpDocument::parse(&original).expect("the fixture should parse");
+        let slot = document
+            .mixer_effect_slots()
+            .into_iter()
+            .find(|slot| slot.insert_ordinal() == 0 && slot.slot_index() == 3)
+            .expect("the complete insert should contain slot three");
+        assert_eq!(slot.enabled(), Some(true));
+        assert_eq!(slot.mix_raw(), Some(1_250));
+        let enabled_location = slot
+            .enabled_parameter_location()
+            .expect("the enabled record is uniquely recognized");
+        let mix_location = slot
+            .mix_parameter_location()
+            .expect("the Mix record is uniquely recognized");
+
+        document
+            .set_mixer_effect_slot_enabled(0, 3, false)
+            .expect("the enabled parameter should be editable");
+        document
+            .set_mixer_effect_slot_mix_raw(0, 3, -3_200)
+            .expect("the Mix parameter should be editable");
+
+        let parameters = document
+            .mixer_parameter_records()
+            .expect("the 0xE1 records should remain valid");
+        let enabled = parameters
+            .iter()
+            .find(|record| (record.event_index(), record.record_index()) == enabled_location)
+            .expect("the enabled record should remain present");
+        assert_eq!(enabled.value(), 0);
+        assert_eq!(enabled.prefix(), [0xA1, 0xB2, 0xC3, 0xD4]);
+        assert_eq!(enabled.parameter_id(), 0);
+        assert_eq!(enabled.channel_data(), target);
+        let mix = parameters
+            .iter()
+            .find(|record| (record.event_index(), record.record_index()) == mix_location)
+            .expect("the Mix record should remain present");
+        assert_eq!(mix.value(), -3_200);
+        assert_eq!(mix.prefix(), [0xA1, 0xB2, 0xC3, 0xD4]);
+        assert_eq!(mix.parameter_id(), 1);
+        assert_eq!(mix.channel_data(), target);
+        let parameter_event_index = enabled_location.0;
+        let original_parameter_event = &original_document.events()[parameter_event_index];
+        let mut expected_payload = original_parameter_event.payload().to_vec();
+        let enabled_value_start = enabled_location.1 * 12 + 8;
+        expected_payload[enabled_value_start..enabled_value_start + 4]
+            .copy_from_slice(&0_i32.to_le_bytes());
+        let mix_value_start = mix_location.1 * 12 + 8;
+        expected_payload[mix_value_start..mix_value_start + 4]
+            .copy_from_slice(&(-3_200_i32).to_le_bytes());
+        assert_eq!(
+            document.events()[parameter_event_index].payload(),
+            expected_payload
+        );
+        for (event_index, (before, after)) in original_document
+            .events()
+            .iter()
+            .zip(document.events())
+            .enumerate()
+        {
+            if event_index != parameter_event_index {
+                assert_eq!(before.wire_bytes(), after.wire_bytes());
+            }
+        }
+        let encoded = document
+            .encode_lossless()
+            .expect("the edited project should encode");
+        let round_trip = FlpDocument::parse(&encoded).expect("the edited project should parse");
+        let round_trip_slot = round_trip
+            .mixer_effect_slots()
+            .into_iter()
+            .find(|slot| slot.insert_ordinal() == 0 && slot.slot_index() == 3)
+            .expect("the effect slot should survive the round trip");
+        assert_eq!(round_trip_slot.enabled(), Some(false));
+        assert_eq!(round_trip_slot.mix_raw(), Some(-3_200));
+    }
+
+    #[test]
+    fn mixer_effect_slot_parameter_edits_reject_ambiguous_or_scoped_records() {
+        let mut event_stream = Vec::new();
+        append_complete_mixer_insert_state(&mut event_stream, -1, 0, 0, "Master", &[0xAA, 0xBB]);
+        let target = (64_u16 << 6) | 3;
+        let mut parameters = Vec::new();
+        for (parameter_id, channel_data, value) in [
+            (0_u8, target, 1_i32),
+            (0_u8, target, 0_i32),
+            (1_u8, target | (1 << 13), 500_i32),
+        ] {
+            parameters.extend_from_slice(&[0, 0, 0, 0, parameter_id, 0]);
+            parameters.extend_from_slice(&channel_data.to_le_bytes());
+            parameters.extend_from_slice(&value.to_le_bytes());
+        }
+        append_data_event(&mut event_stream, 0xE1, &parameters);
+        let original = flp_fixture(&event_stream, &[], &[]);
+        let mut document = FlpDocument::parse(&original).expect("the fixture should parse");
+        let slot = document
+            .mixer_effect_slots()
+            .into_iter()
+            .find(|slot| slot.insert_ordinal() == 0 && slot.slot_index() == 3)
+            .expect("the complete insert should contain slot three");
+
+        assert_eq!(slot.enabled(), None);
+        assert_eq!(slot.enabled_parameter_location(), None);
+        assert_eq!(slot.mix_raw(), None);
+        assert_eq!(slot.mix_parameter_location(), None);
+        assert!(document.set_mixer_effect_slot_enabled(0, 3, false).is_err());
+        assert!(document.set_mixer_effect_slot_mix_raw(0, 3, 500).is_err());
+        assert!(document.set_mixer_effect_slot_mix_raw(0, 3, 6_401).is_err());
+        assert_eq!(
+            document.encode_lossless().expect("encoding should succeed"),
+            original
+        );
     }
 
     #[test]

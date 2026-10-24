@@ -707,6 +707,31 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 name,
             )
         }
+        [command, input, output, insert_ordinal, slot_index, enabled]
+            if command == "set-mixer-effect-slot-enabled" =>
+        {
+            set_mixer_effect_slot_enabled(
+                Path::new(input),
+                Path::new(output),
+                parse_usize(insert_ordinal, "Mixer insert ordinal")?,
+                parse_u16(slot_index, "Mixer effect slot index")?,
+                parse_bool(enabled, "effect-slot enabled setting")?,
+            )
+        }
+        [command, input, output, insert_ordinal, slot_index, value]
+            if command == "set-mixer-effect-slot-mix-raw" =>
+        {
+            let value = value
+                .parse::<i32>()
+                .map_err(|_| "effect-slot Mix value must be a signed 32-bit integer".to_owned())?;
+            set_mixer_effect_slot_mix_raw(
+                Path::new(input),
+                Path::new(output),
+                parse_usize(insert_ordinal, "Mixer insert ordinal")?,
+                parse_u16(slot_index, "Mixer effect slot index")?,
+                value,
+            )
+        }
         [command, input, output, insert_ordinal, field, enabled]
             if command == "set-mixer-insert-flag" =>
         {
@@ -3419,6 +3444,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild duplicate-channel <input.flp> <output.flp> <channel-id> <name>\n",
             "  flp-rebuild mixer <file.flp>\n",
             "  flp-rebuild set-mixer-parameter-record-value <input.flp> <output.flp> <event-index> <record-index> <signed-value>\n",
+            "  flp-rebuild set-mixer-effect-slot-enabled <input.flp> <output.flp> <insert-ordinal> <slot-index> <0|1>\n",
+            "  flp-rebuild set-mixer-effect-slot-mix-raw <input.flp> <output.flp> <insert-ordinal> <slot-index> <-6400..6400>\n",
             "  flp-rebuild rename-mixer-insert <input.flp> <output.flp> <insert-ordinal> <name>\n",
             "  flp-rebuild set-mixer-insert-flag <input.flp> <output.flp> <insert-ordinal> <enabled|soloed|polarity-reversed|swap-left-right|effects-enabled> <0|1>\n",
             "  flp-rebuild set-mixer-routing-flag <input.flp> <output.flp> <event-index> <flag-byte-index> <0|1>\n",
@@ -5629,11 +5656,13 @@ fn list_mixer(path: &Path) -> Result<(), String> {
     println!("recognized effect slot records: {}", effect_slots.len());
     for slot in effect_slots {
         println!(
-            "insert={} slot={} plugin={} name={} state_events={}",
+            "insert={} slot={} plugin={} name={} enabled={:?} mix_raw={:?} state_events={}",
             slot.insert_ordinal(),
             slot.slot_index(),
             slot.plugin_identifier().unwrap_or("(unknown)"),
             slot.display_name().unwrap_or("(unnamed)"),
+            slot.enabled(),
+            slot.mix_raw(),
             slot.state_event_count()
         );
     }
@@ -6522,6 +6551,52 @@ fn set_mixer_parameter_record_value(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "set Mixer 0xE1 event {event_index} record {record_index} value to {value} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn set_mixer_effect_slot_enabled(
+    input: &Path,
+    output: &Path,
+    insert_ordinal: usize,
+    slot_index: u16,
+    enabled: bool,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .set_mixer_effect_slot_enabled(insert_ordinal, slot_index, enabled)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "set Mixer insert {insert_ordinal} effect slot {slot_index} enabled to {enabled} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn set_mixer_effect_slot_mix_raw(
+    input: &Path,
+    output: &Path,
+    insert_ordinal: usize,
+    slot_index: u16,
+    mix_raw: i32,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .set_mixer_effect_slot_mix_raw(insert_ordinal, slot_index, mix_raw)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "set Mixer insert {insert_ordinal} effect slot {slot_index} Mix raw value to {mix_raw} in {}",
         output.display()
     );
     Ok(())
