@@ -15363,8 +15363,8 @@ impl FlpDocument {
         )
     }
 
-    /// Creates one named channel from a Sampler, Native instrument, or Layer template per
-    /// format-0/1 MIDI track
+    /// Creates one named channel from a Sampler, MIDI Out, Native instrument, or Layer template
+    /// per format-0/1 MIDI track
     /// using the supplied channel as a template, then imports each selected track into the
     /// existing Pattern. Channel state is copied verbatim except for its unique ID and name.
     /// The operation is atomic and rejects Format-2 files and invalid track selections.
@@ -15456,7 +15456,7 @@ impl FlpDocument {
         Ok(())
     }
 
-    /// Creates channels from a Sampler, Native instrument, or Layer template for every format-0/1
+    /// Creates channels from a Sampler, MIDI Out, Native instrument, or Layer template for every format-0/1
     /// track and imports the notes with the requested interpretation and routing options.
     pub fn import_midi_tracks_to_template_channels_with_options(
         &mut self,
@@ -15475,7 +15475,7 @@ impl FlpDocument {
         )
     }
 
-    /// Creates channels from a Sampler, Native instrument, or Layer template for selected format-0/1
+    /// Creates channels from a Sampler, MIDI Out, Native instrument, or Layer template for selected format-0/1
     /// tracks and imports them into an existing Pattern.
     pub fn import_midi_selected_tracks_to_template_channels(
         &mut self,
@@ -15493,7 +15493,7 @@ impl FlpDocument {
         )
     }
 
-    /// Creates channels from a Sampler, Native instrument, or Layer template for selected format-0/1
+    /// Creates channels from a Sampler, MIDI Out, Native instrument, or Layer template for selected format-0/1
     /// tracks and imports them with the requested note interpretation and routing options.
     /// When Mixer routing is enabled, channels use the lowest free positive insert numbers.
     pub fn import_midi_selected_tracks_to_template_channels_with_options(
@@ -15641,7 +15641,7 @@ impl FlpDocument {
         Ok((imported, channel_ids))
     }
 
-    /// Creates a new Pattern and clones one Sampler, Native instrument, or Layer template channel for
+    /// Creates a new Pattern and clones one Sampler, MIDI Out, Native instrument, or Layer template channel for
     /// each selected format-0/1 MIDI track. Pattern and channel edits commit atomically.
     pub fn import_midi_selected_tracks_to_template_channels_in_new_pattern(
         &mut self,
@@ -15657,7 +15657,7 @@ impl FlpDocument {
         )
     }
 
-    /// Creates a new Pattern and clones one Sampler, Native instrument, or Layer template channel for
+    /// Creates a new Pattern and clones one Sampler, MIDI Out, Native instrument, or Layer template channel for
     /// every format-0/1 MIDI track.
     pub fn import_midi_tracks_to_template_channels_in_new_pattern(
         &mut self,
@@ -15671,7 +15671,7 @@ impl FlpDocument {
         )
     }
 
-    /// Creates a new Pattern and clones one Sampler, Native instrument, or Layer template channel for
+    /// Creates a new Pattern and clones one Sampler, MIDI Out, Native instrument, or Layer template channel for
     /// every format-0/1 MIDI track, using the requested note and routing options.
     pub fn import_midi_tracks_to_template_channels_in_new_pattern_with_options(
         &mut self,
@@ -15688,7 +15688,7 @@ impl FlpDocument {
         )
     }
 
-    /// Creates a new Pattern and clones one Sampler, Native instrument, or Layer template channel for
+    /// Creates a new Pattern and clones one Sampler, MIDI Out, Native instrument, or Layer template channel for
     /// each selected format-0/1 track. The complete edit is atomic.
     pub fn import_midi_selected_tracks_to_template_channels_in_new_pattern_with_options(
         &mut self,
@@ -15790,10 +15790,10 @@ impl FlpDocument {
 
     /// Builds a separate project from `template` and imports the selected MIDI tracks into it.
     /// Format-0/1 tracks share one new Pattern; Format-2 sequences each get their own Pattern.
-    /// Each selected track receives a clone of a kind-0 Sampler, kind-2 Native instrument, or
-    /// kind-3 Layer template channel. Layer clones retain their child references. The source
-    /// template is never modified, and the returned project is available only after the full
-    /// import succeeds.
+    /// Each selected track receives a clone of a kind-0 Sampler, kind-1 MIDI Out, kind-2 Native
+    /// instrument, or kind-3 Layer template channel. MIDI Out clones retain their saved routing;
+    /// Layer clones retain their child references. The source template is never modified, and the
+    /// returned project is available only after the full import succeeds.
     pub fn new_project_from_midi_selected_tracks(
         template: &FlpDocument,
         midi: &midi::MidiFile,
@@ -15859,7 +15859,7 @@ impl FlpDocument {
     }
 
     /// Imports each independent Format-2 sequence into a separate Pattern and cloned channel
-    /// based on a Sampler, Native instrument, or Layer template.
+    /// based on a Sampler, MIDI Out, Native instrument, or Layer template.
     pub fn import_midi_format2_tracks_to_template_patterns(
         &mut self,
         midi: &midi::MidiFile,
@@ -15890,7 +15890,7 @@ impl FlpDocument {
     }
 
     /// Imports selected independent Format-2 sequences into separate Patterns and cloned
-    /// Sampler, Native instrument, or Layer channels. The complete operation is atomic.
+    /// Sampler, MIDI Out, Native instrument, or Layer channels. The complete operation is atomic.
     pub fn import_midi_selected_format2_tracks_to_template_patterns_with_options(
         &mut self,
         midi: &midi::MidiFile,
@@ -19024,14 +19024,18 @@ impl FlpDocument {
         }
     }
 
-    /// Duplicates a Sampler, Native instrument, or Layer channel as a MIDI track template.
+    /// Duplicates a Sampler, MIDI Out, Native instrument, or Layer channel as a MIDI track template.
     pub fn duplicate_midi_template_channel(
         &mut self,
         source_channel_id: u16,
         display_name: &str,
     ) -> Result<u16, FlpError> {
         let kind = self.midi_template_channel_kind(source_channel_id)?;
-        self.duplicate_channel_with_kind(source_channel_id, display_name, kind)
+        match kind {
+            1 => self.duplicate_midi_out_channel(source_channel_id, display_name),
+            3 => self.duplicate_layer_channel(source_channel_id, display_name),
+            _ => self.duplicate_channel_with_kind(source_channel_id, display_name, kind),
+        }
     }
 
     fn midi_template_channel_kind(&self, source_channel_id: u16) -> Result<u8, FlpError> {
@@ -19046,9 +19050,9 @@ impl FlpDocument {
             return Err(FlpError::AmbiguousChannelId(source_channel_id));
         }
         match source.kind() {
-            Some(kind @ (0 | 2 | 3)) => Ok(kind),
+            Some(kind @ 0..=3) => Ok(kind),
             _ => Err(FlpError::UnsupportedEdit(
-                "only kind-0 Sampler, kind-2 Native instrument, or kind-3 Layer channels can be duplicated safely",
+                "only kind-0 Sampler, kind-1 MIDI Out, kind-2 Native instrument, or kind-3 Layer channels can be duplicated safely",
             )),
         }
     }
@@ -32113,6 +32117,80 @@ mod tests {
             assert_eq!(channel.kind(), Some(3));
             assert_eq!(channel.layer_child_ids(), Some([1, 2].as_slice()));
         }
+        assert_eq!(template.encode_lossless().unwrap(), template_bytes);
+    }
+
+    #[test]
+    fn midi_template_import_clones_midi_out_channel_state() {
+        let midi = MidiFile::parse(&midi_tracks_fixture(
+            &[&[
+                0x00, 0x90, 0x41, 0x64, 0x60, 0x80, 0x41, 0x00, 0x00, 0xFF, 0x2F, 0x00,
+            ]],
+            1,
+            480,
+        ))
+        .expect("Format-1 MIDI fixture should parse");
+
+        let mut template_events = vec![0x40, 0, 0, 0x15, 1];
+        append_data_event(&mut template_events, 0xD4, &[0xA1, 0xB2, 0xC3, 0xD4]);
+        append_data_event(&mut template_events, 0xD5, &[0x11, 0x22, 0x33, 0x44, 0x55]);
+        append_data_event(
+            &mut template_events,
+            0xCB,
+            &utf16_project_string("MIDI Out Template"),
+        );
+        template_events.extend_from_slice(&[
+            0x40, 1, 0, 0x15, 0, // Sampler channel keeps the next channel ID occupied.
+            0x62, 0, 0, 0x41, 7, 0, 0xD0,
+            0, // Empty Pattern provides its note-event encoding.
+        ]);
+        let template_bytes = flp_fixture(&template_events, &[], &[]);
+        let template = FlpDocument::parse(&template_bytes).expect("MIDI Out template should parse");
+        let source_channel = template
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id() == 0)
+            .expect("source MIDI Out channel should exist");
+        assert_eq!(source_channel.kind(), Some(1));
+        let source_state = template.events()[source_channel.event_range()]
+            .iter()
+            .filter(|event| !matches!(event.opcode, 0x40 | 0xCB))
+            .map(|event| event.wire_bytes().to_vec())
+            .collect::<Vec<_>>();
+
+        let mut document = template.clone();
+        let (pattern_id, imported, channel_ids) = document
+            .import_midi_selected_tracks_to_template_channels_in_new_pattern_with_options(
+                &midi,
+                0,
+                &[0],
+                MidiImportOptions::default(),
+            )
+            .expect("MIDI Out should be accepted as a track template");
+        assert_eq!(imported, 1);
+        assert_eq!(channel_ids.len(), 1);
+        let copied_channel = document
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id() == channel_ids[0])
+            .expect("cloned MIDI Out channel should exist");
+        assert_eq!(copied_channel.kind(), Some(1));
+        let copied_state = document.events()[copied_channel.event_range()]
+            .iter()
+            .filter(|event| !matches!(event.opcode, 0x40 | 0xCB))
+            .map(|event| event.wire_bytes().to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(copied_state, source_state);
+
+        let pattern = document
+            .patterns()
+            .expect("imported Pattern should decode")
+            .into_iter()
+            .find(|pattern| pattern.id == pattern_id)
+            .expect("new Pattern should exist");
+        assert_eq!(pattern.notes.len(), 1);
+        assert_eq!(pattern.notes[0].channel_id, copied_channel.id());
+        assert_eq!(pattern.notes[0].key, 65);
         assert_eq!(template.encode_lossless().unwrap(), template_bytes);
     }
 
