@@ -283,6 +283,15 @@ pub struct Vst3PlaylistParameterAutomation {
     pub points: Vec<Vst3PlaylistAutomationPoint>,
 }
 
+/// App-linked VST3 automation sources expanded for Playlist playback and render.
+#[derive(Clone, Debug, Default)]
+pub struct Vst3PlaylistAutomationSources {
+    /// Pattern-relative automation keyed by `(pattern_id, VST3 channel_id)`.
+    pub pattern_clips: BTreeMap<(u16, u16), Vec<Vst3ParameterAutomation>>,
+    /// Automation Clip curves keyed by `(automation_channel_id, VST3 channel_id)`.
+    pub automation_clips: BTreeMap<(u16, u16), Vec<Vst3ParameterAutomation>>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Vst3PlaylistRenderSummary {
     pub plugin_channels_rendered: usize,
@@ -2479,10 +2488,36 @@ impl Vst3HostRuntime {
         include_plugin_reported_tails: bool,
         pattern_automation: &BTreeMap<(u16, u16), Vec<Vst3ParameterAutomation>>,
     ) -> Result<Vst3PlaylistStreamProcessor, String> {
-        let playlist_automation = expand_playlist_pattern_parameter_automation(
+        let playlist_automation = expand_playlist_parameter_automation(
             document,
             options.clone(),
             pattern_automation,
+            &BTreeMap::new(),
+        )?;
+        self.prepare_playlist_stream_inner(
+            document,
+            options,
+            channel_instances,
+            include_plugin_reported_tails,
+            &playlist_automation,
+            &BTreeSet::new(),
+        )
+    }
+
+    /// Prepare loaded VST3 channels with app-linked Pattern and Playlist Automation Clip curves.
+    pub fn prepare_playlist_stream_with_automation_sources(
+        &self,
+        document: &FlpDocument,
+        options: PlaylistRenderOptions,
+        channel_instances: &BTreeMap<u16, u64>,
+        include_plugin_reported_tails: bool,
+        automation_sources: &Vst3PlaylistAutomationSources,
+    ) -> Result<Vst3PlaylistStreamProcessor, String> {
+        let playlist_automation = expand_playlist_parameter_automation(
+            document,
+            options.clone(),
+            &automation_sources.pattern_clips,
+            &automation_sources.automation_clips,
         )?;
         self.prepare_playlist_stream_inner(
             document,
@@ -2524,10 +2559,11 @@ impl Vst3HostRuntime {
         include_plugin_reported_tails: bool,
         pattern_automation: &BTreeMap<(u16, u16), Vec<Vst3ParameterAutomation>>,
     ) -> Result<Vst3PlaylistStreamProcessor, String> {
-        let playlist_automation = expand_playlist_pattern_parameter_automation(
+        let playlist_automation = expand_playlist_parameter_automation(
             document,
             options.clone(),
             pattern_automation,
+            &BTreeMap::new(),
         )?;
         let mut processor = self.prepare_playlist_stream_inner(
             document,
@@ -2538,6 +2574,34 @@ impl Vst3HostRuntime {
             live_performance_channels,
         )?;
         processor.performance_pattern_automation = pattern_automation.clone();
+        Ok(processor)
+    }
+
+    /// Prepare Playlist and Performance playback with Pattern and Automation Clip curves.
+    pub fn prepare_playlist_performance_stream_with_automation_sources(
+        &self,
+        document: &FlpDocument,
+        options: PlaylistRenderOptions,
+        channel_instances: &BTreeMap<u16, u64>,
+        live_performance_channels: &BTreeSet<u16>,
+        include_plugin_reported_tails: bool,
+        automation_sources: &Vst3PlaylistAutomationSources,
+    ) -> Result<Vst3PlaylistStreamProcessor, String> {
+        let playlist_automation = expand_playlist_parameter_automation(
+            document,
+            options.clone(),
+            &automation_sources.pattern_clips,
+            &automation_sources.automation_clips,
+        )?;
+        let mut processor = self.prepare_playlist_stream_inner(
+            document,
+            options,
+            channel_instances,
+            include_plugin_reported_tails,
+            &playlist_automation,
+            live_performance_channels,
+        )?;
+        processor.performance_pattern_automation = automation_sources.pattern_clips.clone();
         Ok(processor)
     }
 
@@ -3185,12 +3249,13 @@ impl Vst3HostRuntime {
     }
 }
 
-fn expand_playlist_pattern_parameter_automation(
+fn expand_playlist_parameter_automation(
     document: &FlpDocument,
     options: PlaylistRenderOptions,
     pattern_automation: &BTreeMap<(u16, u16), Vec<Vst3ParameterAutomation>>,
+    automation_clip_automation: &BTreeMap<(u16, u16), Vec<Vst3ParameterAutomation>>,
 ) -> Result<BTreeMap<u16, Vec<Vst3PlaylistParameterAutomation>>, String> {
-    if pattern_automation.is_empty() {
+    if pattern_automation.is_empty() && automation_clip_automation.is_empty() {
         return Ok(BTreeMap::new());
     }
     let ppq = document.header().ppq();
@@ -3203,7 +3268,11 @@ fn expand_playlist_pattern_parameter_automation(
         .into_iter()
         .find(|arrangement| arrangement.id == options.arrangement_id)
         .ok_or_else(|| format!("arrangement {} was not found", options.arrangement_id))?;
-    let patterns = document.patterns().map_err(|error| error.to_string())?;
+    let patterns = if pattern_automation.is_empty() {
+        Vec::new()
+    } else {
+        document.patterns().map_err(|error| error.to_string())?
+    };
     let patterns_by_id = patterns
         .iter()
         .map(|pattern| (pattern.id, pattern))
@@ -3236,23 +3305,33 @@ fn expand_playlist_pattern_parameter_automation(
         {
             continue;
         }
-        let PlaylistClipTarget::Pattern { id: pattern_id } = clip.target() else {
-            continue;
-        };
         if clip.length_ticks == 0 {
             continue;
         }
-        let Some(pattern) = patterns_by_id.get(&pattern_id).copied() else {
-            continue;
+        let clip_automation = match clip.target() {
+            PlaylistClipTarget::Pattern { id: pattern_id } => {
+                let Some(pattern) = patterns_by_id.get(&pattern_id).copied() else {
+                    continue;
+                };
+                expand_pattern_parameter_automation_for_clip(
+                    pattern_id,
+                    pattern,
+                    clip,
+                    ppq,
+                    document.metadata().time_signature().unwrap_or((4, 4)),
+                    pattern_automation,
+                )?
+            }
+            PlaylistClipTarget::Channel {
+                id: automation_channel_id,
+            } => expand_automation_clip_parameter_automation_for_clip(
+                automation_channel_id,
+                clip,
+                ppq,
+                automation_clip_automation,
+            )?,
         };
-        for (channel_id, lanes) in expand_pattern_parameter_automation_for_clip(
-            pattern_id,
-            pattern,
-            clip,
-            ppq,
-            document.metadata().time_signature().unwrap_or((4, 4)),
-            pattern_automation,
-        )? {
+        for (channel_id, lanes) in clip_automation {
             for lane in lanes {
                 for (point_index, point) in lane.points.into_iter().enumerate() {
                     let absolute_tick = u64::from(clip.position_ticks)
@@ -3430,6 +3509,75 @@ pub(crate) fn expand_pattern_parameter_automation_for_clip(
                     points: unique_points,
                 },
             );
+        }
+    }
+    Ok(automation_by_channel)
+}
+
+fn expand_automation_clip_parameter_automation_for_clip(
+    automation_channel_id: u16,
+    clip: &crate::PlaylistClip,
+    ppq: u16,
+    automation_clip_automation: &BTreeMap<(u16, u16), Vec<Vst3ParameterAutomation>>,
+) -> Result<BTreeMap<u16, Vec<Vst3PlaylistParameterAutomation>>, String> {
+    if ppq == 0 {
+        return Err("project PPQ must be greater than zero".to_owned());
+    }
+    if clip.length_ticks == 0
+        || clip
+            .scale
+            .is_some_and(|scale| !scale.is_finite() || (scale - 1.0).abs() > 1e-9)
+    {
+        return Ok(BTreeMap::new());
+    }
+
+    let clip_length = u64::from(clip.length_ticks);
+    let mut expanded_point_count = 0usize;
+    let mut automation_by_channel = BTreeMap::<u16, Vec<Vst3PlaylistParameterAutomation>>::new();
+    for ((linked_automation_channel_id, target_channel_id), lanes) in automation_clip_automation {
+        if *linked_automation_channel_id != automation_channel_id {
+            continue;
+        }
+        for lane in lanes {
+            let mut points = Vec::new();
+            for point in &lane.points {
+                if !point.position_beats.is_finite()
+                    || point.position_beats < 0.0
+                    || !point.value.is_finite()
+                    || !(0.0..=1.0).contains(&point.value)
+                {
+                    continue;
+                }
+                let point_tick = point.position_beats * f64::from(ppq);
+                if !point_tick.is_finite() || point_tick >= u64::MAX as f64 {
+                    continue;
+                }
+                let relative_tick = point_tick.round() as u64;
+                if relative_tick >= clip_length {
+                    continue;
+                }
+                expanded_point_count = expanded_point_count
+                    .checked_add(1)
+                    .filter(|count| *count <= MAX_VST3_AUTOMATION_POINTS)
+                    .ok_or_else(|| {
+                        format!(
+                            "Playlist VST3 automation exceeds {MAX_VST3_AUTOMATION_POINTS} points"
+                        )
+                    })?;
+                points.push(Vst3PlaylistAutomationPoint {
+                    tick: relative_tick,
+                    value: point.value,
+                });
+            }
+            if !points.is_empty() {
+                automation_by_channel
+                    .entry(*target_channel_id)
+                    .or_default()
+                    .push(Vst3PlaylistParameterAutomation {
+                        parameter_id: lane.parameter_id,
+                        points,
+                    });
+            }
         }
     }
     Ok(automation_by_channel)
@@ -5227,7 +5375,7 @@ mod tests {
     use crate::{MixerInsertSignalTransform, MixerLiveSourceRoutePlan};
     use std::io::Write;
 
-    fn playlist_pattern_automation_fixture() -> FlpDocument {
+    fn playlist_parameter_automation_fixture() -> FlpDocument {
         fn append_data_event(event_stream: &mut Vec<u8>, opcode: u8, payload: &[u8]) {
             assert!(payload.len() < 128);
             event_stream.extend_from_slice(&[opcode, payload.len() as u8]);
@@ -5238,7 +5386,19 @@ mod tests {
         append_data_event(&mut event_stream, 0xC7, b"26.0.0\0");
         event_stream.extend_from_slice(&[0x40, 0, 0, 0x41, 7, 0, 0xA4]);
         event_stream.extend_from_slice(&96_u32.to_le_bytes());
-        event_stream.extend_from_slice(&[0x40, 9, 0, 0x15, 4, 0x48, 9, 0, 0x62, 0, 0, 0x63, 3, 0]);
+        event_stream.extend_from_slice(&[0x40, 9, 0, 0x15, 4, 0x48, 9, 0, 0x62, 0, 0]);
+
+        event_stream.extend_from_slice(&[0x40, 11, 0, 0x15, 5]);
+        let mut automation = vec![0xA5; 17];
+        automation.extend_from_slice(&3_u32.to_le_bytes());
+        for (position_delta, value) in [(0.25_f64, 0.2_f64), (0.75, 0.8), (2.0, 0.3)] {
+            automation.extend_from_slice(&position_delta.to_le_bytes());
+            automation.extend_from_slice(&value.to_le_bytes());
+            automation.extend_from_slice(&0.0_f32.to_le_bytes());
+            automation.extend_from_slice(&[0; 4]);
+        }
+        append_data_event(&mut event_stream, 0xEA, &automation);
+        event_stream.extend_from_slice(&[0x62, 0, 0, 0x63, 3, 0]);
 
         let mut clip = vec![0_u8; 80];
         clip[4..6].copy_from_slice(&0x5000_u16.to_le_bytes());
@@ -5247,6 +5407,15 @@ mod tests {
         clip[12..14].copy_from_slice(&499_u16.to_le_bytes());
         clip[64..72].copy_from_slice(&1.0_f64.to_le_bytes());
         append_data_event(&mut event_stream, 0xE9, &clip);
+
+        let mut automation_clip = vec![0_u8; 80];
+        automation_clip[0..4].copy_from_slice(&384_u32.to_le_bytes());
+        automation_clip[4..6].copy_from_slice(&0x5000_u16.to_le_bytes());
+        automation_clip[6..8].copy_from_slice(&11_u16.to_le_bytes());
+        automation_clip[8..12].copy_from_slice(&288_u32.to_le_bytes());
+        automation_clip[12..14].copy_from_slice(&499_u16.to_le_bytes());
+        automation_clip[64..72].copy_from_slice(&1.0_f64.to_le_bytes());
+        append_data_event(&mut event_stream, 0xE9, &automation_clip);
 
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"FLhd");
@@ -5533,7 +5702,7 @@ mod tests {
 
     #[test]
     fn playlist_pattern_automation_repeats_to_clip_end_and_uses_absolute_ticks() {
-        let document = playlist_pattern_automation_fixture();
+        let document = playlist_parameter_automation_fixture();
         let automation = BTreeMap::from([(
             (7, 4),
             vec![Vst3ParameterAutomation {
@@ -5550,13 +5719,14 @@ mod tests {
                 ],
             }],
         )]);
-        let expanded = expand_playlist_pattern_parameter_automation(
+        let expanded = expand_playlist_parameter_automation(
             &document,
             PlaylistRenderOptions {
                 arrangement_id: 3,
                 ..PlaylistRenderOptions::default()
             },
             &automation,
+            &BTreeMap::new(),
         )
         .expect("Pattern automation should expand over the Playlist clip");
 
@@ -5590,8 +5760,100 @@ mod tests {
     }
 
     #[test]
+    fn automation_clip_parameter_points_are_clipped_and_use_project_ticks() {
+        let document = playlist_parameter_automation_fixture();
+        let mut clip = document
+            .arrangements()
+            .expect("arrangements should decode")
+            .into_iter()
+            .find(|arrangement| arrangement.id == 3)
+            .and_then(|arrangement| arrangement.clips.first().cloned())
+            .expect("fixture clip should exist");
+        clip.length_ticks = 192;
+        clip.scale = None;
+        let automation = BTreeMap::from([(
+            (11, 4),
+            vec![Vst3ParameterAutomation {
+                parameter_id: 81,
+                points: vec![
+                    Vst3AutomationPoint {
+                        position_beats: 0.25,
+                        value: 0.2,
+                    },
+                    Vst3AutomationPoint {
+                        position_beats: 3.0,
+                        value: 0.8,
+                    },
+                ],
+            }],
+        )]);
+
+        let expanded =
+            expand_automation_clip_parameter_automation_for_clip(11, &clip, 96, &automation)
+                .expect("Automation Clip points should expand");
+        assert_eq!(
+            expanded[&4][0].points,
+            vec![Vst3PlaylistAutomationPoint {
+                tick: 24,
+                value: 0.2,
+            }]
+        );
+    }
+
+    #[test]
+    fn playlist_automation_clip_parameter_automation_uses_absolute_ticks_and_clip_length() {
+        let document = playlist_parameter_automation_fixture();
+        let automation = BTreeMap::from([(
+            (11, 4),
+            vec![Vst3ParameterAutomation {
+                parameter_id: 81,
+                points: vec![
+                    Vst3AutomationPoint {
+                        position_beats: 0.25,
+                        value: 0.2,
+                    },
+                    Vst3AutomationPoint {
+                        position_beats: 1.0,
+                        value: 0.8,
+                    },
+                    Vst3AutomationPoint {
+                        position_beats: 3.0,
+                        value: 0.3,
+                    },
+                ],
+            }],
+        )]);
+        let expanded = expand_playlist_parameter_automation(
+            &document,
+            PlaylistRenderOptions {
+                arrangement_id: 3,
+                ..PlaylistRenderOptions::default()
+            },
+            &BTreeMap::new(),
+            &automation,
+        )
+        .expect("Automation Clip parameter automation should expand");
+
+        assert_eq!(expanded.len(), 1);
+        assert_eq!(expanded[&4].len(), 1);
+        assert_eq!(
+            expanded[&4][0].points,
+            vec![
+                Vst3PlaylistAutomationPoint {
+                    tick: 408,
+                    value: 0.2,
+                },
+                Vst3PlaylistAutomationPoint {
+                    tick: 480,
+                    value: 0.8,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn pattern_controller_automation_defaults_to_the_pattern_meter_bar() {
-        let document = playlist_pattern_automation_fixture();
+        let document = playlist_parameter_automation_fixture();
         let mut pattern = document
             .patterns()
             .expect("Patterns should decode")
