@@ -62,11 +62,12 @@ struct MidiInputScriptWorker {
 impl MidiInputScriptWorker {
     fn start(
         script: &MidiControllerScript,
+        device_name: &str,
         output_sender: SyncSender<ReceivedMidiMessage>,
         thru_queue: MidiThruInputQueue,
         dropped_messages: Arc<AtomicU64>,
     ) -> Result<Self, String> {
-        let runtime = MidiScriptRuntime::start(script)?;
+        let runtime = MidiScriptRuntime::start_for_device(script, device_name)?;
         let stop_handle = runtime.stop_handle();
         let (sender, input_receiver) = mpsc::sync_channel(MIDI_INPUT_QUEUE_CAPACITY);
         let (error_sender, errors) = mpsc::sync_channel(16);
@@ -543,6 +544,7 @@ pub fn connect_input_device(
         .map(|script| {
             MidiInputScriptWorker::start(
                 script,
+                &device_name,
                 sender.clone(),
                 thru_queue.clone(),
                 Arc::clone(&dropped_messages),

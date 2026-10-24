@@ -101,7 +101,7 @@ def _request_transport_action(action):
         _active_transport_actions.append(action)
 
 
-def _install_modules(script_name):
+def _install_modules(script_name, device_name):
     midi = _module("midi")
     constants = {
         "FromMIDI_Max": 127,
@@ -138,7 +138,7 @@ def _install_modules(script_name):
     device = _module("device")
     device.isAssigned = lambda: False
     device.getPortNumber = lambda: -1
-    device.getName = lambda: script_name
+    device.getName = lambda: device_name
 
     transport = _module("transport")
     transport.start = lambda: _request_transport_action("start")
@@ -210,8 +210,9 @@ def _dispatch(namespace, value):
 def main():
     script_path = sys.argv[1]
     script_name = sys.argv[2]
+    device_name = sys.argv[3]
     sys.path.insert(0, __import__("os").path.dirname(script_path))
-    _install_modules(script_name)
+    _install_modules(script_name, device_name)
     try:
         namespace = runpy.run_path(script_path, run_name="__main__")
         callback = namespace.get("OnInit")

@@ -225,7 +225,10 @@ fn normalize_device_name(name: &str) -> String {
 }
 
 impl MidiScriptRuntime {
-    pub fn start(script: &MidiControllerScript) -> Result<Self, String> {
+    pub fn start_for_device(
+        script: &MidiControllerScript,
+        device_name: &str,
+    ) -> Result<Self, String> {
         let (program, prefix_args) = python_command()?;
         let mut command = Command::new(program);
         command
@@ -235,6 +238,7 @@ impl MidiScriptRuntime {
             .arg(MIDI_SCRIPT_RUNNER)
             .arg(&script.path)
             .arg(&script.name)
+            .arg(device_name)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -535,7 +539,7 @@ mod tests {
         )
         .unwrap();
         let script = MidiControllerScript::parse(script_path).unwrap();
-        let mut runtime = MidiScriptRuntime::start(&script).unwrap();
+        let mut runtime = MidiScriptRuntime::start_for_device(&script, "Test Input").unwrap();
 
         let controller = runtime.process_event(12, &[0xB2, 7, 25]).unwrap();
         let note_on = runtime.process_event(20, &[0x92, 60, 90]).unwrap();
@@ -556,7 +560,7 @@ mod tests {
         )
         .unwrap();
         let script = MidiControllerScript::parse(script_path).unwrap();
-        let mut runtime = MidiScriptRuntime::start(&script).unwrap();
+        let mut runtime = MidiScriptRuntime::start_for_device(&script, "Test Input").unwrap();
 
         let result = runtime.process_event(12, &[0xB0, 7, 127]).unwrap();
 
@@ -568,6 +572,23 @@ mod tests {
                 ScriptTransportAction::RecordToggle
             ]
         );
+    }
+
+    #[test]
+    fn python_device_name_reports_the_connected_input_device() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport device\ndef OnMidiIn(event):\n    event.data1 = ord(device.getName()[0])\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let mut runtime = MidiScriptRuntime::start_for_device(&script, "MIDI Keyboard").unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 127]).unwrap();
+
+        assert_eq!(result.bytes, [0xB0, b'M', 127]);
     }
 
     #[test]
