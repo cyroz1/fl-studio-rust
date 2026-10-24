@@ -626,7 +626,8 @@ fn midi_input_thru_message(event: MidiInputEvent) -> Option<([u8; 3], usize)> {
         Transport(
             MidiTransportCommand::Pause
             | MidiTransportCommand::RecordStart
-            | MidiTransportCommand::RecordStop,
+            | MidiTransportCommand::RecordStop
+            | MidiTransportCommand::RecordToggle,
         ) => return None,
     };
     Some((bytes, length))

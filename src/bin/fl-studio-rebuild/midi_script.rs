@@ -22,6 +22,25 @@ pub struct MidiControllerScript {
 pub struct ScriptMidiResult {
     pub handled: bool,
     pub bytes: Vec<u8>,
+    pub actions: Vec<ScriptTransportAction>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScriptTransportAction {
+    Start,
+    Stop,
+    RecordToggle,
+}
+
+impl ScriptTransportAction {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "start" => Some(Self::Start),
+            "stop" => Some(Self::Stop),
+            "record" => Some(Self::RecordToggle),
+            _ => None,
+        }
+    }
 }
 
 pub struct MidiScriptRuntime {
@@ -299,16 +318,29 @@ impl MidiScriptRuntime {
         if let Some(error) = response["error"].as_str() {
             return Err(format!("Python MIDI script callback failed: {error}"));
         }
+        let actions = response["actions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|action| {
+                action
+                    .as_str()
+                    .and_then(ScriptTransportAction::parse)
+                    .ok_or_else(|| "MIDI script returned an unknown transport action".to_owned())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         if response["handled"].as_bool().unwrap_or(false) {
             return Ok(ScriptMidiResult {
                 handled: true,
                 bytes: Vec::new(),
+                actions,
             });
         }
         let transformed = transform_message(bytes, &response)?;
         Ok(ScriptMidiResult {
             handled: false,
             bytes: transformed,
+            actions,
         })
     }
 
@@ -401,8 +433,8 @@ fn byte_value(response: &Value, key: &str, default: u8) -> Result<u8, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MidiControllerScript, MidiScriptRuntime, discover_midi_scripts, find_script_for_device,
-        transform_message,
+        MidiControllerScript, MidiScriptRuntime, ScriptTransportAction, discover_midi_scripts,
+        find_script_for_device, transform_message,
     };
     use serde_json::json;
     use std::fs;
@@ -512,6 +544,30 @@ mod tests {
         assert_eq!(controller.bytes, [0xB2, 7, 102]);
         assert_eq!(note_on.bytes, [0x92, 64, 90]);
         assert!(note_off.handled);
+    }
+
+    #[test]
+    fn python_transport_calls_are_returned_even_when_the_event_is_handled() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport transport\ndef OnMidiIn(event):\n    transport.start()\n    transport.record()\n    event.handled = True\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let mut runtime = MidiScriptRuntime::start(&script).unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 127]).unwrap();
+
+        assert!(result.handled);
+        assert_eq!(
+            result.actions,
+            [
+                ScriptTransportAction::Start,
+                ScriptTransportAction::RecordToggle
+            ]
+        );
     }
 
     #[test]

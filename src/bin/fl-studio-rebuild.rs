@@ -44342,6 +44342,9 @@ impl DawUi {
                     );
                 }
             }
+            MidiTransportCommand::RecordToggle => {
+                self.toggle_midi_recording(history_snapshot_available);
+            }
         }
     }
 

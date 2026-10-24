@@ -14,7 +14,9 @@ use flp_rebuild::midi::{
 };
 use midir::{Ignore, MidiInput, MidiInputConnection as MidirInputConnection};
 
-use super::midi_script::{MidiControllerScript, MidiScriptRuntime, MidiScriptStopHandle};
+use super::midi_script::{
+    MidiControllerScript, MidiScriptRuntime, MidiScriptStopHandle, ScriptTransportAction,
+};
 use flp_rebuild::sample_render::PlaylistTempoMap;
 
 pub const MIDI_INPUT_QUEUE_CAPACITY: usize = 4_096;
@@ -88,15 +90,39 @@ impl MidiInputScriptWorker {
                                 runtime.process_event(message.timestamp_micros, &message.bytes)
                             });
                             match transformed {
-                                Some(Ok(result)) if result.handled => continue,
-                                Some(Ok(result)) => forward_scripted_input(
-                                    &output_sender,
-                                    &thru_queue,
-                                    &dropped_messages,
-                                    message.timestamp_micros,
-                                    message.received_at,
-                                    &result.bytes,
-                                ),
+                                Some(Ok(result)) => {
+                                    for action in result.actions {
+                                        let command = match action {
+                                            ScriptTransportAction::Start => {
+                                                MidiTransportCommand::Start
+                                            }
+                                            ScriptTransportAction::Stop => {
+                                                MidiTransportCommand::Stop
+                                            }
+                                            ScriptTransportAction::RecordToggle => {
+                                                MidiTransportCommand::RecordToggle
+                                            }
+                                        };
+                                        let transport_message = ReceivedMidiMessage {
+                                            timestamp_micros: message.timestamp_micros,
+                                            received_at: message.received_at,
+                                            event: MidiInputEvent::Transport(command),
+                                        };
+                                        if output_sender.try_send(transport_message).is_err() {
+                                            dropped_messages.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                    }
+                                    if !result.handled {
+                                        forward_scripted_input(
+                                            &output_sender,
+                                            &thru_queue,
+                                            &dropped_messages,
+                                            message.timestamp_micros,
+                                            message.received_at,
+                                            &result.bytes,
+                                        );
+                                    }
+                                }
                                 Some(Err(error)) => {
                                     let _ = error_sender.try_send(error);
                                     if let Some(runtime) = runtime.take() {
@@ -201,6 +227,7 @@ pub enum MidiTransportCommand {
     Pause,
     RecordStart,
     RecordStop,
+    RecordToggle,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -716,6 +743,7 @@ pub fn describe_event(event: MidiInputEvent) -> String {
             MidiTransportCommand::Pause => "MMC Pause".to_owned(),
             MidiTransportCommand::RecordStart => "MMC Record".to_owned(),
             MidiTransportCommand::RecordStop => "MMC Record Exit".to_owned(),
+            MidiTransportCommand::RecordToggle => "MIDI script Record".to_owned(),
         },
     }
 }

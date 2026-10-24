@@ -6,6 +6,7 @@ import types
 
 _protocol_out = sys.stdout
 sys.stdout = sys.stderr
+_active_transport_actions = None
 
 
 def _emit(value):
@@ -95,6 +96,11 @@ def _module(name):
     return value
 
 
+def _request_transport_action(action):
+    if _active_transport_actions is not None:
+        _active_transport_actions.append(action)
+
+
 def _install_modules(script_name):
     midi = _module("midi")
     constants = {
@@ -134,6 +140,11 @@ def _install_modules(script_name):
     device.getPortNumber = lambda: -1
     device.getName = lambda: script_name
 
+    transport = _module("transport")
+    transport.start = lambda: _request_transport_action("start")
+    transport.stop = lambda: _request_transport_action("stop")
+    transport.record = lambda: _request_transport_action("record")
+
     for name in (
         "playlist",
         "channels",
@@ -141,7 +152,6 @@ def _install_modules(script_name):
         "patterns",
         "arrangement",
         "ui",
-        "transport",
         "plugins",
         "general",
         "launchMapPages",
@@ -169,13 +179,15 @@ def _specific_callback(event):
 
 
 def _dispatch(namespace, value):
+    global _active_transport_actions
+    _active_transport_actions = []
     event = EventData(value)
     for callback_name in ("OnMidiIn", "OnMidiMsg"):
         callback = namespace.get(callback_name)
         if callback is not None:
             callback(event)
         if event.handled:
-            return {"handled": True}
+            return {"handled": True, "actions": _active_transport_actions}
 
     if event.status == 0xF0:
         callback_name = "OnSysEx"
@@ -191,6 +203,7 @@ def _dispatch(namespace, value):
         "data1": int(event.data1),
         "data2": int(event.data2),
         "sysex": list(event.sysex),
+        "actions": _active_transport_actions,
     }
 
 
