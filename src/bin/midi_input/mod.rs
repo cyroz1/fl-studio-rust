@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -15,7 +15,8 @@ use flp_rebuild::midi::{
 use midir::{Ignore, MidiInput, MidiInputConnection as MidirInputConnection};
 
 use super::midi_script::{
-    MidiControllerScript, MidiScriptRuntime, MidiScriptStopHandle, ScriptTransportAction,
+    MidiControllerScript, MidiScriptRuntime, MidiScriptStopHandle, MidiScriptTransportState,
+    ScriptTransportAction,
 };
 use flp_rebuild::sample_render::PlaylistTempoMap;
 
@@ -66,14 +67,12 @@ impl MidiInputScriptWorker {
         output_sender: SyncSender<ReceivedMidiMessage>,
         thru_queue: MidiThruInputQueue,
         dropped_messages: Arc<AtomicU64>,
-        transport_state: Arc<AtomicU8>,
-        song_position: Arc<AtomicU64>,
+        transport_state: Arc<MidiScriptTransportState>,
     ) -> Result<Self, String> {
         let runtime = MidiScriptRuntime::start_for_device_with_transport_state(
             script,
             device_name,
             transport_state,
-            song_position,
         )?;
         let stop_handle = runtime.stop_handle();
         let (sender, input_receiver) = mpsc::sync_channel(MIDI_INPUT_QUEUE_CAPACITY);
@@ -582,8 +581,7 @@ pub fn connect_input_device(
     sender: SyncSender<ReceivedMidiMessage>,
     thru_queue: MidiThruInputQueue,
     dropped_messages: Arc<AtomicU64>,
-    transport_state: Arc<AtomicU8>,
-    song_position: Arc<AtomicU64>,
+    transport_state: Arc<MidiScriptTransportState>,
     script: Option<&MidiControllerScript>,
 ) -> Result<ConnectedMidiInput, String> {
     let mut input = MidiInput::new("FL Studio Rebuild MIDI Input")
@@ -606,7 +604,6 @@ pub fn connect_input_device(
                 thru_queue.clone(),
                 Arc::clone(&dropped_messages),
                 Arc::clone(&transport_state),
-                Arc::clone(&song_position),
             )
         })
         .transpose()?;

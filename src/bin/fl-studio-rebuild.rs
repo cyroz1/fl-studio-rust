@@ -3,7 +3,7 @@ use std::fs;
 use std::hash::{BuildHasher, Hash, Hasher, RandomState};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -105,9 +105,9 @@ use midi_output::{
     pattern_preview_messages, playlist_playback_messages,
 };
 use midi_script::{
-    MidiControllerScript, SCRIPT_TRANSPORT_PATTERN_MODE, SCRIPT_TRANSPORT_PLAYING,
-    SCRIPT_TRANSPORT_RECORDING, discover_midi_scripts, find_script_for_device,
-    normalized_song_position, song_position_ticks,
+    MidiControllerScript, MidiScriptTransportState, SCRIPT_TRANSPORT_PATTERN_MODE,
+    SCRIPT_TRANSPORT_PLAYING, SCRIPT_TRANSPORT_RECORDING, discover_midi_scripts,
+    find_script_for_device, normalized_song_position, song_position_ticks,
 };
 use midi_thru::{MidiThruSettings, MidiThruWorker};
 
@@ -4601,8 +4601,7 @@ struct DawUi {
     midi_connect_input_on_startup: bool,
     midi_input_error: Option<String>,
     midi_input_connection: Option<ConnectedMidiInput>,
-    midi_script_transport_state: Arc<AtomicU8>,
-    midi_script_song_position: Arc<AtomicU64>,
+    midi_script_transport_state: Arc<MidiScriptTransportState>,
     midi_message_sender: SyncSender<ReceivedMidiMessage>,
     midi_message_receiver: Receiver<ReceivedMidiMessage>,
     midi_dropped_messages: Arc<AtomicU64>,
@@ -5982,8 +5981,7 @@ impl DawUi {
             midi_connect_input_on_startup,
             midi_input_error,
             midi_input_connection: None,
-            midi_script_transport_state: Arc::new(AtomicU8::new(0)),
-            midi_script_song_position: Arc::new(AtomicU64::new(0.0_f64.to_bits())),
+            midi_script_transport_state: Arc::new(MidiScriptTransportState::default()),
             midi_message_sender,
             midi_message_receiver,
             midi_dropped_messages: Arc::new(AtomicU64::new(0)),
@@ -12763,24 +12761,25 @@ impl DawUi {
             state |= SCRIPT_TRANSPORT_PATTERN_MODE;
         }
         self.midi_script_transport_state
+            .state
             .store(state, Ordering::Relaxed);
-        let song_position = if self
+        let has_script = self
             .midi_input_connection
             .as_ref()
-            .is_some_and(|connection| connection.script_name.is_some())
-        {
-            self.midi_script_song_position_value()
+            .is_some_and(|connection| connection.script_name.is_some());
+        let (song_position, song_length_ticks) = if has_script {
+            self.midi_script_song_position_tick_and_length()
+                .map(|(tick, length)| (normalized_song_position(tick, length), length))
+                .unwrap_or((0.0, 0))
         } else {
-            0.0
+            (0.0, 0)
         };
-        self.midi_script_song_position
+        self.midi_script_transport_state
+            .song_position
             .store(song_position.to_bits(), Ordering::Relaxed);
-    }
-
-    fn midi_script_song_position_value(&self) -> f64 {
-        self.midi_script_song_position_tick_and_length()
-            .map(|(tick, length)| normalized_song_position(tick, length))
-            .unwrap_or(0.0)
+        self.midi_script_transport_state
+            .song_length_ticks
+            .store(song_length_ticks, Ordering::Relaxed);
     }
 
     fn midi_script_song_position_tick_and_length(&self) -> Option<(f64, u64)> {
@@ -43247,7 +43246,6 @@ impl DawUi {
             self.midi_thru_input_queue.clone(),
             Arc::clone(&self.midi_dropped_messages),
             Arc::clone(&self.midi_script_transport_state),
-            Arc::clone(&self.midi_script_song_position),
             selected_script.as_ref(),
         ) {
             Ok(connection) => {

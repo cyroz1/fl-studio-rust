@@ -121,6 +121,12 @@ def _set_song_pos(position, mode=-1):
         )
 
 
+def _get_song_length(mode):
+    if mode != 2:
+        raise NotImplementedError("only absolute-tick transport.getSongLength(2) is supported")
+    return int(_active_transport_state.get("song_length_ticks", 0))
+
+
 def _install_modules(script_name, device_name):
     midi = _module("midi")
     constants = {
@@ -169,6 +175,7 @@ def _install_modules(script_name, device_name):
     transport.isRecording = lambda: int(bool(_active_transport_state.get("is_recording", False)))
     transport.getSongPos = _get_song_pos
     transport.setSongPos = _set_song_pos
+    transport.getSongLength = _get_song_length
     transport.getLoopMode = lambda: (
         0 if _active_transport_state.get("pattern_mode", False) else 1
     )

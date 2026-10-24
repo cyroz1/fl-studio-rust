@@ -54,13 +54,19 @@ pub struct MidiScriptRuntime {
     child: Arc<Mutex<Child>>,
     stdin: BufWriter<ChildStdin>,
     stdout: BufReader<ChildStdout>,
-    transport_state: Arc<AtomicU8>,
-    song_position: Arc<AtomicU64>,
+    transport_state: Arc<MidiScriptTransportState>,
 }
 
 pub const SCRIPT_TRANSPORT_PLAYING: u8 = 1 << 0;
 pub const SCRIPT_TRANSPORT_RECORDING: u8 = 1 << 1;
 pub const SCRIPT_TRANSPORT_PATTERN_MODE: u8 = 1 << 2;
+
+#[derive(Default)]
+pub struct MidiScriptTransportState {
+    pub state: AtomicU8,
+    pub song_position: AtomicU64,
+    pub song_length_ticks: AtomicU64,
+}
 
 pub fn normalized_song_position(position_ticks: f64, length_ticks: u64) -> f64 {
     if !position_ticks.is_finite() || length_ticks == 0 {
@@ -260,16 +266,14 @@ impl MidiScriptRuntime {
         Self::start_for_device_with_transport_state(
             script,
             device_name,
-            Arc::new(AtomicU8::new(0)),
-            Arc::new(AtomicU64::new(0.0_f64.to_bits())),
+            Arc::new(MidiScriptTransportState::default()),
         )
     }
 
     pub fn start_for_device_with_transport_state(
         script: &MidiControllerScript,
         device_name: &str,
-        transport_state: Arc<AtomicU8>,
-        song_position: Arc<AtomicU64>,
+        transport_state: Arc<MidiScriptTransportState>,
     ) -> Result<Self, String> {
         let (program, prefix_args) = python_command()?;
         let mut command = Command::new(program);
@@ -304,7 +308,6 @@ impl MidiScriptRuntime {
             stdin: BufWriter::new(stdin),
             stdout: BufReader::new(stdout),
             transport_state,
-            song_position,
         };
         let mut ready = String::new();
         runtime.stdout.read_line(&mut ready).map_err(|error| {
@@ -374,8 +377,9 @@ impl MidiScriptRuntime {
     }
 
     fn exchange(&mut self, value: &Value) -> Result<Value, String> {
-        let transport = self.transport_state.load(Ordering::Relaxed);
-        let song_position = f64::from_bits(self.song_position.load(Ordering::Relaxed));
+        let transport = self.transport_state.state.load(Ordering::Relaxed);
+        let song_position =
+            f64::from_bits(self.transport_state.song_position.load(Ordering::Relaxed));
         let song_position = if song_position.is_finite() {
             song_position.clamp(0.0, 1.0)
         } else {
@@ -390,6 +394,10 @@ impl MidiScriptRuntime {
                     "is_recording": transport & SCRIPT_TRANSPORT_RECORDING != 0,
                     "pattern_mode": transport & SCRIPT_TRANSPORT_PATTERN_MODE != 0,
                     "song_position": song_position,
+                    "song_length_ticks": self
+                        .transport_state
+                        .song_length_ticks
+                        .load(Ordering::Relaxed),
                 }),
             );
         }
@@ -533,16 +541,16 @@ fn byte_value(response: &Value, key: &str, default: u8) -> Result<u8, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MidiControllerScript, MidiScriptRuntime, SCRIPT_TRANSPORT_PATTERN_MODE,
-        SCRIPT_TRANSPORT_PLAYING, SCRIPT_TRANSPORT_RECORDING, ScriptTransportAction,
-        discover_midi_scripts, find_script_for_device, normalized_song_position,
-        song_position_ticks, transform_message,
+        MidiControllerScript, MidiScriptRuntime, MidiScriptTransportState,
+        SCRIPT_TRANSPORT_PATTERN_MODE, SCRIPT_TRANSPORT_PLAYING, SCRIPT_TRANSPORT_RECORDING,
+        ScriptTransportAction, discover_midi_scripts, find_script_for_device,
+        normalized_song_position, song_position_ticks, transform_message,
     };
     use serde_json::json;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -720,19 +728,22 @@ mod tests {
         )
         .unwrap();
         let script = MidiControllerScript::parse(script_path).unwrap();
-        let transport_state = Arc::new(AtomicU8::new(
+        let transport_state = Arc::new(MidiScriptTransportState::default());
+        transport_state.state.store(
             SCRIPT_TRANSPORT_PLAYING | SCRIPT_TRANSPORT_RECORDING | SCRIPT_TRANSPORT_PATTERN_MODE,
-        ));
+            Ordering::Relaxed,
+        );
         let mut runtime = MidiScriptRuntime::start_for_device_with_transport_state(
             &script,
             "Test Input",
             Arc::clone(&transport_state),
-            Arc::new(AtomicU64::new(0.0_f64.to_bits())),
         )
         .unwrap();
 
         let pattern_mode = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
-        transport_state.store(SCRIPT_TRANSPORT_PLAYING, Ordering::Relaxed);
+        transport_state
+            .state
+            .store(SCRIPT_TRANSPORT_PLAYING, Ordering::Relaxed);
         let song_mode = runtime.process_event(20, &[0xB0, 7, 1]).unwrap();
 
         assert_eq!(pattern_mode.bytes, [0xB0, 96, 1]);
@@ -749,21 +760,56 @@ mod tests {
         )
         .unwrap();
         let script = MidiControllerScript::parse(script_path).unwrap();
-        let song_position = Arc::new(AtomicU64::new(0.25_f64.to_bits()));
+        let transport_state = Arc::new(MidiScriptTransportState::default());
+        transport_state
+            .song_position
+            .store(0.25_f64.to_bits(), Ordering::Relaxed);
         let mut runtime = MidiScriptRuntime::start_for_device_with_transport_state(
             &script,
             "Test Input",
-            Arc::new(AtomicU8::new(0)),
-            Arc::clone(&song_position),
+            Arc::clone(&transport_state),
         )
         .unwrap();
 
         let first = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
-        song_position.store(0.5_f64.to_bits(), Ordering::Relaxed);
+        transport_state
+            .song_position
+            .store(0.5_f64.to_bits(), Ordering::Relaxed);
         let second = runtime.process_event(20, &[0xB0, 7, 1]).unwrap();
 
         assert_eq!(first.bytes, [0xB0, 31, 1]);
         assert_eq!(second.bytes, [0xB0, 63, 1]);
+    }
+
+    #[test]
+    fn python_transport_song_length_reports_live_absolute_ticks() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport transport\ndef OnMidiIn(event):\n    event.data1 = transport.getSongLength(2)\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let transport_state = Arc::new(MidiScriptTransportState::default());
+        transport_state
+            .song_length_ticks
+            .store(96, Ordering::Relaxed);
+        let mut runtime = MidiScriptRuntime::start_for_device_with_transport_state(
+            &script,
+            "Test Input",
+            Arc::clone(&transport_state),
+        )
+        .unwrap();
+
+        let first = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
+        transport_state
+            .song_length_ticks
+            .store(120, Ordering::Relaxed);
+        let second = runtime.process_event(20, &[0xB0, 7, 1]).unwrap();
+
+        assert_eq!(first.bytes, [0xB0, 96, 1]);
+        assert_eq!(second.bytes, [0xB0, 120, 1]);
     }
 
     #[test]
