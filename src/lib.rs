@@ -746,8 +746,10 @@ pub struct ChannelSummary {
 
 /// Raw fields decoded from one FLP `0xD5` channel Level Adjusts event.
 ///
-/// The stored units and playback effect are not yet interpreted. The complete
-/// event payload remains available unchanged through [`FlpDocument::events`].
+/// The fields remain raw values and the complete payload stays available through
+/// [`FlpDocument::events`]. Supported Sampler routes apply only a unique, in-range
+/// Layer volume/pan record using provisional mappings; other fields and native
+/// playback parity remain unresolved.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ChannelLevelAdjustments {
     pan: i32,
@@ -1385,9 +1387,10 @@ pub struct ChannelNoteRouter {
 struct ChannelRouteState {
     note_seed: u64,
     key: u16,
+    apply_layer_level_adjustments: bool,
     active_layers: HashSet<u16>,
     seen_targets: HashSet<u16>,
-    targets: Vec<(u16, f32)>,
+    targets: Vec<(u16, f32, i32)>,
 }
 
 impl ChannelNoteRouter {
@@ -1410,28 +1413,60 @@ impl ChannelNoteRouter {
             .collect()
     }
 
-    /// Returns Sampler route gains for the saved Layer crossfade position.
-    /// Non-crossfaded routes have gain 1.0. Crossfade is applied only when all
-    /// active child subtrees lead exclusively to built-in Sampler channels;
-    /// VST3 routes retain gain 1.
+    /// Returns Layer-adjusted routes as `(channel_id, gain, pan_raw)`.
+    /// Layer volume and pan adjustments compose through nested Layers. The
+    /// playback ranges are provisional and intended for Sampler descendants;
+    /// VST3 descendants need plug-in-specific routing support.
+    pub fn targets_for_note_with_layer_adjustments(
+        &self,
+        source_channel_id: u16,
+        note_seed: u64,
+        key: u16,
+    ) -> Vec<(u16, f32, i32)> {
+        self.targets_for_note_with_controls(source_channel_id, note_seed, key, true)
+    }
+
+    fn targets_for_note_with_controls(
+        &self,
+        source_channel_id: u16,
+        note_seed: u64,
+        key: u16,
+        apply_layer_level_adjustments: bool,
+    ) -> Vec<(u16, f32, i32)> {
+        let mut state = ChannelRouteState {
+            note_seed,
+            key,
+            apply_layer_level_adjustments,
+            active_layers: HashSet::new(),
+            seen_targets: HashSet::new(),
+            targets: Vec::new(),
+        };
+        self.route_channel(source_channel_id, 1.0, 0, &mut state);
+        state.targets
+    }
+
+    /// Returns Layer crossfade gains without applying Level Adjusts values.
+    /// Use [`Self::targets_for_note_with_layer_adjustments`] to also return
+    /// provisional Layer volume and pan controls.
     pub fn targets_for_note_with_gain(
         &self,
         source_channel_id: u16,
         note_seed: u64,
         key: u16,
     ) -> Vec<(u16, f32)> {
-        let mut state = ChannelRouteState {
-            note_seed,
-            key,
-            active_layers: HashSet::new(),
-            seen_targets: HashSet::new(),
-            targets: Vec::new(),
-        };
-        self.route_channel(source_channel_id, 1.0, &mut state);
-        state.targets
+        self.targets_for_note_with_controls(source_channel_id, note_seed, key, false)
+            .into_iter()
+            .map(|(channel_id, gain, _)| (channel_id, gain))
+            .collect()
     }
 
-    fn route_channel(&self, channel_id: u16, route_gain: f32, state: &mut ChannelRouteState) {
+    fn route_channel(
+        &self,
+        channel_id: u16,
+        route_gain: f32,
+        route_pan_raw: i32,
+        state: &mut ChannelRouteState,
+    ) {
         let Some(channel) = self.channels_by_id.get(&channel_id) else {
             return;
         };
@@ -1440,13 +1475,22 @@ impl ChannelNoteRouter {
         }
         if channel.channel_type() != Some(ChannelType::Layer) {
             if state.seen_targets.insert(channel_id) {
-                state.targets.push((channel_id, route_gain));
+                state.targets.push((channel_id, route_gain, route_pan_raw));
             }
             return;
         }
         if !state.active_layers.insert(channel_id) {
             return;
         }
+        let (layer_gain, layer_pan_raw) = if state.apply_layer_level_adjustments {
+            layer_level_adjustments(channel)
+        } else {
+            (1.0, 0)
+        };
+        let child_gain = route_gain * layer_gain;
+        let child_pan_raw = route_pan_raw
+            .saturating_add(layer_pan_raw)
+            .clamp(-6_400, 6_400);
 
         let mut seen_children = HashSet::new();
         let children = channel
@@ -1471,7 +1515,8 @@ impl ChannelNoteRouter {
             random ^= random >> 31;
             self.route_channel(
                 children[(random as usize) % children.len()],
-                route_gain,
+                child_gain,
+                child_pan_raw,
                 state,
             );
         } else if channel.layer_crossfade_enabled() == Some(true)
@@ -1487,20 +1532,20 @@ impl ChannelNoteRouter {
             let lower_index = position.floor() as usize;
             let upper_fraction = position - lower_index as f32;
             for (index, child_id) in children.into_iter().enumerate() {
-                let child_gain = if index == lower_index {
+                let crossfade_gain = if index == lower_index {
                     1.0 - upper_fraction
                 } else if index == lower_index + 1 {
                     upper_fraction
                 } else {
                     0.0
                 };
-                if child_gain > 0.0 {
-                    self.route_channel(child_id, route_gain * child_gain, state);
+                if crossfade_gain > 0.0 {
+                    self.route_channel(child_id, child_gain * crossfade_gain, child_pan_raw, state);
                 }
             }
         } else {
             for child_id in children {
-                self.route_channel(child_id, route_gain, state);
+                self.route_channel(child_id, child_gain, child_pan_raw, state);
             }
         }
         state.active_layers.remove(&channel_id);
@@ -1549,6 +1594,26 @@ impl ChannelNoteRouter {
             _ => false,
         }
     }
+}
+
+/// Maps the unique saved Layer Level Adjusts record to provisional playback controls.
+/// Image-Line documents that these controls affect only notes passed through the Layer;
+/// the raw ranges are inferred from the common channel volume and pan ranges.
+fn layer_level_adjustments(channel: &ChannelSummary) -> (f32, i32) {
+    let [adjustments] = channel.level_adjustments.as_slice() else {
+        return (1.0, 0);
+    };
+    let gain = if adjustments.volume <= 12_800 {
+        adjustments.volume as f32 / 10_000.0
+    } else {
+        1.0
+    };
+    let pan_raw = if (-6_400..=6_400).contains(&adjustments.pan) {
+        adjustments.pan
+    } else {
+        0
+    };
+    (gain, pan_raw)
 }
 
 fn channel_accepts_key(channel: &ChannelSummary, key: u16) -> bool {
@@ -22320,6 +22385,36 @@ mod tests {
         flp_fixture(&event_stream, &[], &[])
     }
 
+    fn nested_layer_level_adjustment_fixture() -> Vec<u8> {
+        let mut event_stream = vec![0x40, 0, 0, 0x15, 3, 0x90];
+        event_stream.extend_from_slice(&0u32.to_le_bytes());
+        for child in [1_u16, 2] {
+            event_stream.push(0x5E);
+            event_stream.extend_from_slice(&child.to_le_bytes());
+        }
+        append_layer_level_adjustment(&mut event_stream, -1_600, 5_000);
+
+        event_stream.extend_from_slice(&[0x40, 1, 0, 0x15, 3, 0x90]);
+        event_stream.extend_from_slice(&0u32.to_le_bytes());
+        event_stream.push(0x5E);
+        event_stream.extend_from_slice(&3u16.to_le_bytes());
+        append_layer_level_adjustment(&mut event_stream, 800, 2_500);
+
+        event_stream.extend_from_slice(&[0x40, 2, 0, 0x15, 0]);
+        event_stream.extend_from_slice(&[0x40, 3, 0, 0x15, 0, 0x62, 0, 0]);
+        flp_fixture(&event_stream, &[], &[])
+    }
+
+    fn append_layer_level_adjustment(event_stream: &mut Vec<u8>, pan_raw: i32, volume_raw: u32) {
+        let mut payload = Vec::with_capacity(20);
+        payload.extend_from_slice(&pan_raw.to_le_bytes());
+        payload.extend_from_slice(&volume_raw.to_le_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&0i32.to_le_bytes());
+        payload.extend_from_slice(&0i32.to_le_bytes());
+        append_data_event(event_stream, 0xD5, &payload);
+    }
+
     #[test]
     fn decodes_time_markers_and_preserves_unknown_position_bits() {
         let mut event_stream = vec![0x63, 7, 0];
@@ -33121,6 +33216,23 @@ mod tests {
         let router = ChannelNoteRouter::new(document.channels());
         let actual = router.targets_for_note_with_gain(0, 0, 60);
         assert_eq!(actual, vec![(3, 0.25), (4, 0.25), (2, 0.5)]);
+    }
+
+    #[test]
+    fn layer_level_adjustments_compose_on_sampler_routes() {
+        let document = FlpDocument::parse(&nested_layer_level_adjustment_fixture())
+            .expect("Layer level-adjustment fixture should parse");
+        let router = ChannelNoteRouter::new(document.channels());
+
+        assert_eq!(
+            router.targets_for_note_with_layer_adjustments(0, 0, 60),
+            vec![(3, 0.125, -800), (2, 0.5, -1_600)]
+        );
+        assert_eq!(
+            router.targets_for_note_with_gain(0, 0, 60),
+            vec![(3, 1.0), (2, 1.0)],
+            "the crossfade-only API keeps its prior Level Adjusts behavior"
+        );
     }
 
     #[test]
