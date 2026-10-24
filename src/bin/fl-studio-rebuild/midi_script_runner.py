@@ -178,6 +178,15 @@ def _get_song_pos_hint():
     return str(_active_transport_state.get("song_position_hint", "1:01:000"))
 
 
+def _get_rec_ppq():
+    return max(1, int(_active_transport_state.get("ticks_per_quarter", 96)))
+
+
+def _get_rec_ppb():
+    numerator = max(1, int(_active_transport_state.get("time_signature_numerator", 4)))
+    return _get_rec_ppq() * numerator
+
+
 def _get_song_tick_pos(mode=0):
     position_ticks = int(_active_transport_state.get("song_position_ticks", 0))
     if mode == 0:
@@ -467,6 +476,8 @@ def _install_modules(script_name, device_name):
     )
 
     general = _module("general")
+    general.getRecPPQ = _get_rec_ppq
+    general.getRecPPB = _get_rec_ppb
     general.getProjectTitle = lambda: str(
         _active_transport_state.get("project_title", "")
     )

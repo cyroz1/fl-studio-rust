@@ -12916,9 +12916,17 @@ impl DawUi {
             .as_ref()
             .map(|document| u64::from(document.header().ppq().max(1)))
             .unwrap_or(96);
+        let time_signature_numerator = self
+            .document
+            .as_ref()
+            .map(|document| u64::from(document.metadata().time_signature().unwrap_or((4, 4)).0))
+            .unwrap_or(4);
         self.midi_script_transport_state
             .ticks_per_quarter
             .store(ticks_per_quarter, Ordering::Relaxed);
+        self.midi_script_transport_state
+            .time_signature_numerator
+            .store(time_signature_numerator, Ordering::Relaxed);
         self.midi_script_transport_state
             .song_length_ticks
             .store(song_length_ticks, Ordering::Relaxed);

@@ -82,6 +82,7 @@ pub struct MidiScriptTransportState {
     pub song_position: AtomicU64,
     pub song_position_ticks: AtomicU64,
     pub ticks_per_quarter: AtomicU64,
+    pub time_signature_numerator: AtomicU64,
     pub song_length_ticks: AtomicU64,
     pub song_position_seconds: AtomicU64,
     pub song_length_seconds: AtomicU64,
@@ -491,6 +492,11 @@ impl MidiScriptRuntime {
                     "ticks_per_quarter": self
                         .transport_state
                         .ticks_per_quarter
+                        .load(Ordering::Relaxed)
+                        .max(1),
+                    "time_signature_numerator": self
+                        .transport_state
+                        .time_signature_numerator
                         .load(Ordering::Relaxed)
                         .max(1),
                     "song_length_ticks": self
@@ -956,6 +962,35 @@ mod tests {
         let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
 
         assert_eq!(result.bytes, [0xB0, 5, 10]);
+    }
+
+    #[test]
+    fn python_general_recording_timebase_getters_report_loaded_project_values() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport general\ndef OnMidiIn(event):\n    event.data1 = general.getRecPPQ()\n    event.data2 = int(general.getRecPPB() == 672)\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let transport_state = Arc::new(MidiScriptTransportState::default());
+        transport_state
+            .ticks_per_quarter
+            .store(96, Ordering::Relaxed);
+        transport_state
+            .time_signature_numerator
+            .store(7, Ordering::Relaxed);
+        let mut runtime = MidiScriptRuntime::start_for_device_with_transport_state(
+            &script,
+            "Test Input",
+            transport_state,
+        )
+        .unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
+
+        assert_eq!(result.bytes, [0xB0, 96, 1]);
     }
 
     #[test]
