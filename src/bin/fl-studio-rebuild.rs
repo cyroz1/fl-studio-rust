@@ -12972,6 +12972,9 @@ impl DawUi {
                 Ordering::Relaxed,
             );
         self.midi_script_transport_state
+            .project_changed_flag
+            .store(if self.dirty { 1 } else { 0 }, Ordering::Relaxed);
+        self.midi_script_transport_state
             .time_signature_numerator
             .store(time_signature_numerator, Ordering::Relaxed);
         self.midi_script_transport_state

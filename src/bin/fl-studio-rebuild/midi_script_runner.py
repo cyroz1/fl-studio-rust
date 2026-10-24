@@ -629,6 +629,10 @@ def _install_modules(script_name, device_name):
     general = _module("general")
     general.getRecPPQ = _get_rec_ppq
     general.getRecPPB = _get_rec_ppb
+    general.getVersion = lambda: 1
+    general.getChangedFlag = lambda: int(
+        _active_transport_state.get("project_changed_flag", 0)
+    )
     general.getProjectTitle = lambda: str(
         _active_transport_state.get("project_title", "")
     )

@@ -94,6 +94,7 @@ pub struct MidiScriptTransportState {
     pub song_position_ticks: AtomicU64,
     pub ticks_per_quarter: AtomicU64,
     pub current_tempo_milli_bpm: AtomicU64,
+    pub project_changed_flag: AtomicI32,
     pub time_signature_numerator: AtomicU64,
     pub song_length_ticks: AtomicU64,
     pub song_position_seconds: AtomicU64,
@@ -115,6 +116,7 @@ impl Default for MidiScriptTransportState {
             song_position_ticks: AtomicU64::new(0),
             ticks_per_quarter: AtomicU64::new(96),
             current_tempo_milli_bpm: AtomicU64::new(140_000),
+            project_changed_flag: AtomicI32::new(0),
             time_signature_numerator: AtomicU64::new(4),
             song_length_ticks: AtomicU64::new(0),
             song_position_seconds: AtomicU64::new(0.0_f64.to_bits()),
@@ -545,6 +547,10 @@ impl MidiScriptRuntime {
                         .current_tempo_milli_bpm
                         .load(Ordering::Relaxed)
                         .max(1),
+                    "project_changed_flag": self
+                        .transport_state
+                        .project_changed_flag
+                        .load(Ordering::Relaxed),
                     "time_signature_numerator": self
                         .transport_state
                         .time_signature_numerator
@@ -1095,6 +1101,37 @@ mod tests {
         let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
 
         assert_eq!(result.bytes, [0xB0, 5, 10]);
+    }
+
+    #[test]
+    fn python_general_version_and_changed_flag_getters_report_runtime_state() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport general\ndef OnMidiIn(event):\n    event.data1 = general.getVersion()\n    event.data2 = general.getChangedFlag()\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let transport_state = Arc::new(MidiScriptTransportState::default());
+        let mut runtime = MidiScriptRuntime::start_for_device_with_transport_state(
+            &script,
+            "Test Input",
+            Arc::clone(&transport_state),
+        )
+        .unwrap();
+
+        transport_state
+            .project_changed_flag
+            .store(1, Ordering::Relaxed);
+        let dirty = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
+        transport_state
+            .project_changed_flag
+            .store(0, Ordering::Relaxed);
+        let clean = runtime.process_event(20, &[0xB0, 7, 1]).unwrap();
+
+        assert_eq!(dirty.bytes, [0xB0, 1, 1]);
+        assert_eq!(clean.bytes, [0xB0, 1, 0]);
     }
 
     #[test]
