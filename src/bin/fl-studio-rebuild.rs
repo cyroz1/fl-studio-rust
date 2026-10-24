@@ -52634,6 +52634,27 @@ impl eframe::App for DawUi {
             .map(Vst3HostRuntime::service_editors);
         match vst3_runtime_update {
             Some(Ok(changes)) if changes.io_changed || changes.latency_changed => {
+                let playlist_resume_tick = self
+                    .current_playhead_tick()
+                    .filter(|tick| tick.is_finite() && *tick >= 0.0)
+                    .map(|tick| tick.round().clamp(0.0, f64::from(u32::MAX)) as u32)
+                    .unwrap_or(self.playlist_seek_tick);
+                let pattern_resume_tick = self
+                    .current_pattern_mode_playhead_tick()
+                    .map(|(_, tick)| tick)
+                    .filter(|tick| tick.is_finite() && *tick >= 0.0)
+                    .map(|tick| tick.round() as u64)
+                    .unwrap_or(self.pattern_seek_tick);
+                let resume_pattern_playback = changes.latency_changed
+                    && self.playing
+                    && self
+                        .pattern_mode_playback_source
+                        .is_some_and(|(pattern_id, _)| Some(pattern_id) == self.selected_pattern);
+                let resume_playlist_playback = changes.latency_changed
+                    && self.playing
+                    && self.playlist_playback_loaded
+                    && !self.pattern_playback_mode
+                    && !self.performance_mode_active;
                 let playback_active = self.playing
                     || self.project_playback_loaded
                     || self.pending_audio_render.is_some()
@@ -52643,20 +52664,52 @@ impl eframe::App for DawUi {
                 if playback_active {
                     self.stop_project_playback();
                 }
-                self.status = if changes.io_changed {
-                    if playback_active {
-                        "A VST3 output layout changed; playback stopped to rebuild its routing"
-                            .to_owned()
-                    } else {
-                        "A VST3 output layout changed; routing will refresh on playback".to_owned()
-                    }
-                } else if playback_active {
-                    "A VST3 latency report changed; playback stopped. Start again to rebuild PDC."
-                        .to_owned()
+                self.playlist_seek_tick = playlist_resume_tick;
+                self.pattern_seek_tick = pattern_resume_tick;
+
+                let restart_attempted = resume_pattern_playback || resume_playlist_playback;
+                let resumed_tick = if resume_pattern_playback {
+                    self.start_pattern_mode_playback();
+                    self.playing.then_some(self.pattern_seek_tick)
+                } else if resume_playlist_playback {
+                    self.start_project_playback();
+                    self.playing.then_some(u64::from(playlist_resume_tick))
                 } else {
-                    "A VST3 latency report changed; PDC will refresh on the next playback start"
-                        .to_owned()
+                    None
                 };
+
+                if resumed_tick.is_none() && resume_pattern_playback {
+                    self.pattern_seek_tick = pattern_resume_tick;
+                } else if resumed_tick.is_none() && resume_playlist_playback {
+                    self.playlist_seek_tick = playlist_resume_tick;
+                }
+
+                if !restart_attempted || resumed_tick.is_some() {
+                    self.status = if let Some(tick) = resumed_tick {
+                        if changes.io_changed {
+                            format!(
+                                "A VST3 layout or latency report changed; playback resumed at tick {tick} with rebuilt routing and PDC"
+                            )
+                        } else {
+                            format!(
+                                "A VST3 latency report changed; playback resumed at tick {tick} with rebuilt PDC"
+                            )
+                        }
+                    } else if changes.io_changed {
+                        if playback_active {
+                            "A VST3 output layout changed; playback stopped to rebuild its routing"
+                                .to_owned()
+                        } else {
+                            "A VST3 output layout changed; routing will refresh on playback"
+                                .to_owned()
+                        }
+                    } else if playback_active {
+                        "A VST3 latency report changed; the active stream stopped. Stored transport position is retained for the next start.".to_owned()
+                    } else {
+                        "A VST3 latency report changed; PDC will refresh on the next playback start"
+                            .to_owned()
+                    };
+                }
             }
             Some(Err(error)) => {
                 self.status = format!("VST3 editor update failed: {error}");

@@ -4922,7 +4922,7 @@ impl Vst3HostRuntime {
     /// Service editor/UI requests and VST3 restart requests on the control thread.
     ///
     /// Latency reports are refreshed only after processing has stopped, as required before
-    /// rebuilding delay compensation. The caller should stop active streams when either
+    /// rebuilding delay compensation. Callers must rebuild active streams when either
     /// `io_changed` or `latency_changed` is returned; subsequent calls refresh reports once the
     /// corresponding plug-in instances are no longer processing.
     pub fn service_editors(&mut self) -> Result<Vst3HostServiceChanges, String> {
