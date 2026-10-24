@@ -3250,6 +3250,7 @@ fn expand_playlist_pattern_parameter_automation(
             pattern,
             clip,
             ppq,
+            document.metadata().time_signature().unwrap_or((4, 4)),
             pattern_automation,
         )? {
             for lane in lanes {
@@ -3304,6 +3305,7 @@ pub(crate) fn expand_pattern_parameter_automation_for_clip(
     pattern: &crate::Pattern,
     clip: &crate::PlaylistClip,
     ppq: u16,
+    default_time_signature: (u8, u8),
     pattern_automation: &BTreeMap<(u16, u16), Vec<Vst3ParameterAutomation>>,
 ) -> Result<BTreeMap<u16, Vec<Vst3PlaylistParameterAutomation>>, String> {
     if ppq == 0 {
@@ -3327,15 +3329,25 @@ pub(crate) fn expand_pattern_parameter_automation_for_clip(
                 .ok_or_else(|| "Pattern note end position overflow".to_owned())?;
             Ok::<_, String>(end.max(note_end))
         })?;
-    let loop_length = pattern
+    let signature = pattern
+        .time_markers
+        .iter()
+        .filter(|marker| marker.is_signature() && marker.position_ticks() == 0)
+        .find_map(|marker| Some((marker.numerator()?, marker.denominator()?)))
+        .unwrap_or(default_time_signature);
+    let bar_length = (u64::from(ppq)
+        .saturating_mul(u64::from(signature.0.max(1)))
+        .saturating_mul(4)
+        / u64::from(signature.1.max(1)))
+    .max(1);
+    let loop_length = match pattern
         .length_ticks
         .map(u64::from)
         .filter(|length| *length > 0)
-        .unwrap_or(if inferred_note_length > 0 {
-            inferred_note_length
-        } else {
-            clip_length
-        });
+    {
+        Some(explicit_length) => explicit_length.max(inferred_note_length),
+        None => inferred_note_length.max(bar_length),
+    };
     if loop_length == 0 {
         return Ok(BTreeMap::new());
     }
@@ -5572,6 +5584,74 @@ mod tests {
                 Vst3PlaylistAutomationPoint {
                     tick: 216,
                     value: 0.2,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn pattern_controller_automation_defaults_to_the_pattern_meter_bar() {
+        let document = playlist_pattern_automation_fixture();
+        let mut pattern = document
+            .patterns()
+            .expect("Patterns should decode")
+            .into_iter()
+            .find(|pattern| pattern.id == 7)
+            .expect("fixture Pattern should exist");
+        pattern.length_ticks = None;
+        pattern.notes.clear();
+        let mut clip = document
+            .arrangements()
+            .expect("arrangements should decode")
+            .into_iter()
+            .find(|arrangement| arrangement.id == 3)
+            .and_then(|arrangement| arrangement.clips.first().cloned())
+            .expect("fixture clip should exist");
+        clip.length_ticks = 768;
+        let automation = BTreeMap::from([(
+            (7, 4),
+            vec![Vst3ParameterAutomation {
+                parameter_id: 81,
+                points: vec![
+                    Vst3AutomationPoint {
+                        position_beats: 0.25,
+                        value: 0.2,
+                    },
+                    Vst3AutomationPoint {
+                        position_beats: 0.5,
+                        value: 0.8,
+                    },
+                ],
+            }],
+        )]);
+
+        let expanded = expand_pattern_parameter_automation_for_clip(
+            7,
+            &pattern,
+            &clip,
+            96,
+            (4, 4),
+            &automation,
+        )
+        .expect("default-meter Pattern automation should expand");
+        assert_eq!(
+            expanded[&4][0].points,
+            vec![
+                Vst3PlaylistAutomationPoint {
+                    tick: 24,
+                    value: 0.2,
+                },
+                Vst3PlaylistAutomationPoint {
+                    tick: 48,
+                    value: 0.8,
+                },
+                Vst3PlaylistAutomationPoint {
+                    tick: 408,
+                    value: 0.2,
+                },
+                Vst3PlaylistAutomationPoint {
+                    tick: 432,
+                    value: 0.8,
                 },
             ]
         );

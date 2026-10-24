@@ -8318,6 +8318,7 @@ impl PlaylistPerformanceRuntime {
                             pattern,
                             clip,
                             document.header().ppq(),
+                            document.metadata().time_signature().unwrap_or((4, 4)),
                             sources.pattern_automation,
                         )?
                     }
