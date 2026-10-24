@@ -40,6 +40,7 @@ flp-rebuild audio-info <audio-file>
 flp-rebuild render-audio-clips <project.flp> <output.wav> [arrangement-id]
 flp-rebuild time-markers <file.flp>
 flp-rebuild render-pattern-vst3 <project.flp> <pattern-id> <channel-id> <plugin.vst3> <output.{wav|flac|ogg|mp3}> [tail-seconds]
+flp-rebuild render-audio-vst3 <input-audio> <effect.vst3> <output.{wav|flac|ogg|mp3}> [class-uid|-] [tail-seconds]
 flp-rebuild plugin-state-preview <file.flp> <channel-id>
 flp-rebuild vst3-state-probe <plugin.vst3> <file.flp> <channel-id>
 flp-rebuild channels <file.flp>

@@ -16,6 +16,7 @@ use crate::audio::{
     LiveMixerSourceControl, LiveMixerSourceTargets, MixerTrackPeakMeters, StereoFrameDelay,
     StreamingAudioWriter,
 };
+use crate::media::DecodedAudio;
 use crate::sample_render::{
     AudioFileRenderOptions, PlaylistPatternScheduleOptions, PlaylistRenderOptions,
     PlaylistTempoMap, PlaylistTrackFilter, apply_mixer_master_output_to_stereo, channel_gain_pan,
@@ -26,7 +27,7 @@ use crate::{
     ChannelNoteRouter, ChannelPluginState, FlpDocument, MixerRouteAudibility,
     MixerSourceRouteTransform, PlaylistClipTarget,
 };
-use vst3_host::audio::AudioBuffers;
+use vst3_host::audio::{AudioBuffers, AudioBusLayout, BusAudioBuffers};
 use vst3_host::midi::{
     MidiChannel, MidiEvent, NoteExpressionInfo, NoteExpressionType, NoteId, PluginEvent,
     PluginEventData,
@@ -41,6 +42,8 @@ const VST3_NOTE_EXPRESSION_ID_START: u64 = 1 << 30;
 const VST3_NOTE_EXPRESSION_ID_COUNT: u64 = 1 << 30;
 const LIVE_VST3_INPUT_TRACK_ID: u32 = u32::MAX;
 const MAX_STEREO_BUFFER_BYTES: usize = 512 * 1024 * 1024;
+const VST3_EFFECT_RENDER_BLOCK_FRAMES: usize = 512;
+const MAX_VST3_EFFECT_LATENCY_SECONDS: f64 = 60.0;
 const MAX_VST3_AUTOMATION_POINTS: usize = 1_000_000;
 const MAX_PDC_DELAY_BYTES: u64 = 128 * 1024 * 1024;
 // Leave headroom below vst3-host's 4096-change processing queue for concurrent editor edits.
@@ -97,6 +100,30 @@ pub struct Vst3RenderSummary {
     pub sample_rate: u32,
     pub output_channels: usize,
     pub notes_rendered: usize,
+}
+
+/// Requested effect tail for an offline audio-file render. A finite plug-in-reported tail is
+/// included even when this value is shorter; an infinite tail uses this selected duration.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Vst3AudioEffectRenderOptions {
+    pub tail_seconds: f64,
+}
+
+impl Default for Vst3AudioEffectRenderOptions {
+    fn default() -> Self {
+        Self { tail_seconds: 2.0 }
+    }
+}
+
+/// Summary for audio processed through one loaded VST3 effect.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Vst3AudioEffectRenderSummary {
+    pub plugin_name: String,
+    pub input_frames: u64,
+    pub output_frames: u64,
+    pub sample_rate: u32,
+    pub latency_compensated_frames: u64,
+    pub tail_frames: u64,
 }
 
 /// One loaded VST3 instance and its target project channel for a summed offline render.
@@ -1637,6 +1664,10 @@ pub struct HostedPluginInfo {
     pub uid: String,
     pub path: PathBuf,
     pub has_editor: bool,
+    /// Number of audio input buses advertised by this VST3 class.
+    pub audio_inputs: u32,
+    /// Number of audio output buses advertised by this VST3 class.
+    pub audio_outputs: u32,
     /// Latency most recently reported by `IAudioProcessor::getLatencySamples`.
     pub latency_samples: u32,
     /// Sample rate configured for this plug-in instance when the report was read.
@@ -2081,6 +2112,97 @@ impl Vst3HostRuntime {
         Ok(info)
     }
 
+    /// Load a VST3 class that accepts audio and produces audio, for effect processing.
+    ///
+    /// Instrument-only classes are removed from the runtime and rejected. The instance remains
+    /// stopped until [`Self::start_audio_processing`] is called.
+    pub fn load_audio_effect(
+        &mut self,
+        path: impl AsRef<Path>,
+        class_id: Option<&str>,
+    ) -> Result<HostedPluginInfo, String> {
+        let info = self.load(path, class_id)?;
+        if info.audio_inputs == 0 || info.audio_outputs == 0 {
+            self.loaded.retain(|loaded| loaded.info.id != info.id);
+            return Err(format!(
+                "{} does not expose both audio input and output channels",
+                info.name
+            ));
+        }
+        Ok(info)
+    }
+
+    /// Read all audio buses for a loaded VST3 instance in bus-index order.
+    pub fn audio_bus_layout(&self, id: u64) -> Result<AudioBusLayout, String> {
+        self.plugin(id)?
+            .lock()
+            .map_err(|_| "plug-in state lock was poisoned".to_owned())?
+            .audio_bus_layout()
+            .map_err(|error| error.to_string())
+    }
+
+    /// Allocate reusable buffers for every configured audio bus.
+    pub fn create_audio_bus_buffers(
+        &self,
+        id: u64,
+        block_size: usize,
+    ) -> Result<BusAudioBuffers, String> {
+        if block_size == 0 {
+            return Err("audio block size must be greater than zero".to_owned());
+        }
+        self.plugin(id)?
+            .lock()
+            .map_err(|_| "plug-in state lock was poisoned".to_owned())?
+            .create_bus_audio_buffers(block_size)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Start one loaded VST3 instance for repeated audio-block processing.
+    pub fn start_audio_processing(&self, id: u64) -> Result<(), String> {
+        let plugin = self.plugin(id)?;
+        let mut plugin = plugin
+            .lock()
+            .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
+        if !plugin.is_processing() {
+            plugin
+                .start_processing()
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Process one bus-aware audio block on a started VST3 instance.
+    ///
+    /// Reuse buffers returned by [`Self::create_audio_bus_buffers`] and call this method from
+    /// one processing thread per instance. Every bus and channel must contain exactly
+    /// `buffers.block_size` frames; the plug-in's VST3 host validates bus counts and activation.
+    pub fn process_audio_block(
+        &self,
+        id: u64,
+        buffers: &mut BusAudioBuffers,
+    ) -> Result<(), String> {
+        let plugin = self.plugin(id)?;
+        let mut plugin = plugin
+            .lock()
+            .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
+        validate_vst3_audio_block(buffers, plugin.sample_rate(), plugin.block_size())?;
+        if !plugin.is_processing() {
+            return Err("VST3 audio processing has not been started".to_owned());
+        }
+        plugin
+            .process_bus_audio(buffers)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Stop audio processing for one loaded VST3 instance.
+    pub fn stop_audio_processing(&self, id: u64) -> Result<(), String> {
+        let plugin = self.plugin(id)?;
+        let mut plugin = plugin
+            .lock()
+            .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
+        plugin.stop_processing().map_err(|error| error.to_string())
+    }
+
     /// Pass a state blob to the plug-in's VST3 state loader.
     ///
     /// The caller must provide bytes compatible with that plug-in. This method does
@@ -2408,6 +2530,217 @@ impl Vst3HostRuntime {
                 })
             },
         )
+    }
+
+    /// Process a decoded mono or stereo source through one loaded VST3 audio effect and encode
+    /// the result to an audio file. The reported plug-in latency is removed from the output and
+    /// the output duration includes the longer of the selected tail and a finite reported tail.
+    ///
+    /// This is a standalone effect render; it does not apply FLP Mixer slot state, Mix controls,
+    /// or project routing.
+    pub fn render_audio_through_effect_to_file(
+        &self,
+        id: u64,
+        audio: &DecodedAudio,
+        options: Vst3AudioEffectRenderOptions,
+        path: impl AsRef<Path>,
+        file_options: AudioFileRenderOptions,
+    ) -> Result<Vst3AudioEffectRenderSummary, String> {
+        if !(8_000..=384_000).contains(&audio.sample_rate) {
+            return Err("audio sample rate must be between 8000 and 384000 Hz".to_owned());
+        }
+        if audio.channels.is_empty() || audio.channels.len() > 2 {
+            return Err(
+                "VST3 effect file rendering requires mono or stereo input audio".to_owned(),
+            );
+        }
+        let input_frames = audio.frame_count();
+        if input_frames == 0 {
+            return Err("input audio contains no frames".to_owned());
+        }
+        if audio
+            .channels
+            .iter()
+            .any(|channel| channel.len() != input_frames)
+        {
+            return Err("input audio channels have different frame counts".to_owned());
+        }
+        if !options.tail_seconds.is_finite()
+            || !(0.0..=MAX_REPORTED_TAIL_SECONDS).contains(&options.tail_seconds)
+        {
+            return Err(format!(
+                "effect render tail must be between 0 and {MAX_REPORTED_TAIL_SECONDS} seconds"
+            ));
+        }
+
+        let (plugin_name, sample_rate, latency_frames, tail_seconds, layout, block_size) = {
+            let plugin = self
+                .plugin(id)?
+                .lock()
+                .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
+            if plugin.info().audio_inputs == 0 || plugin.info().audio_outputs == 0 {
+                return Err(format!(
+                    "{} does not expose both audio input and output channels",
+                    plugin.info().name
+                ));
+            }
+            let sample_rate = plugin.sample_rate();
+            if (sample_rate - f64::from(audio.sample_rate)).abs() > 0.000_001 {
+                return Err(format!(
+                    "audio sample rate {} does not match the VST3 instance rate {sample_rate}",
+                    audio.sample_rate
+                ));
+            }
+            if plugin.is_processing() {
+                return Err("VST3 effect is already processing audio".to_owned());
+            }
+            let layout = plugin
+                .audio_bus_layout()
+                .map_err(|error| error.to_string())?;
+            let input_bus = layout
+                .inputs
+                .first()
+                .filter(|bus| bus.active && (1..=2).contains(&bus.channel_count))
+                .ok_or_else(|| {
+                    "VST3 effect must have an active mono or stereo main input bus".to_owned()
+                })?;
+            let output_bus = layout
+                .outputs
+                .first()
+                .filter(|bus| bus.active && (1..=2).contains(&bus.channel_count))
+                .ok_or_else(|| {
+                    "VST3 effect must have an active mono or stereo main output bus".to_owned()
+                })?;
+            let _ = (input_bus, output_bus);
+            let latency_frames = u64::from(plugin.latency_samples());
+            let maximum_compensated_latency =
+                (sample_rate * MAX_VST3_EFFECT_LATENCY_SECONDS).ceil() as u64;
+            if latency_frames > maximum_compensated_latency {
+                return Err(format!(
+                    "VST3 effect latency {latency_frames} frames exceeds the {MAX_VST3_EFFECT_LATENCY_SECONDS}-second offline processing limit"
+                ));
+            }
+            let reported_tail = reported_tail_seconds(plugin.tail_samples(), sample_rate);
+            let tail_seconds = options.tail_seconds.max(reported_tail.unwrap_or_default());
+            (
+                plugin.info().name.clone(),
+                audio.sample_rate,
+                latency_frames,
+                tail_seconds,
+                layout,
+                plugin
+                    .block_size()
+                    .clamp(1, VST3_EFFECT_RENDER_BLOCK_FRAMES),
+            )
+        };
+        let input_frames = u64::try_from(input_frames)
+            .map_err(|_| "input frame count exceeds the renderable range".to_owned())?;
+        let tail_frames = (tail_seconds * f64::from(sample_rate)).ceil() as u64;
+        let output_frames = input_frames
+            .checked_add(tail_frames)
+            .ok_or_else(|| "VST3 effect render length overflow".to_owned())?;
+        let process_frames = output_frames
+            .checked_add(latency_frames)
+            .ok_or_else(|| "VST3 effect processing length overflow".to_owned())?;
+        let mut buffers = self.create_audio_bus_buffers(id, block_size)?;
+        if buffers.inputs.len() != layout.inputs.len()
+            || buffers.outputs.len() != layout.outputs.len()
+        {
+            return Err("VST3 audio bus layout changed while preparing the render".to_owned());
+        }
+
+        self.start_audio_processing(id)?;
+        let render_result = render_stereo_audio_to_file(
+            path.as_ref(),
+            output_frames,
+            sample_rate,
+            file_options.encoding,
+            file_options.output_format,
+            |write_block| {
+                let mut output_block = Vec::with_capacity(VST3_EFFECT_RENDER_BLOCK_FRAMES * 2);
+                let mut processed_frames = 0_u64;
+                let mut frames_to_skip = latency_frames;
+                let mut written_frames = 0_u64;
+                while processed_frames < process_frames {
+                    let frame_count =
+                        usize::try_from((process_frames - processed_frames).min(block_size as u64))
+                            .map_err(|_| {
+                                "VST3 effect block size exceeds this platform".to_owned()
+                            })?;
+                    resize_vst3_bus_audio_buffers(&mut buffers, frame_count);
+                    let input_bus = &mut buffers.inputs[0];
+                    for frame in 0..frame_count {
+                        let source_frame = processed_frames.saturating_add(frame as u64);
+                        let (left, right) = if source_frame < input_frames {
+                            let source_frame = source_frame as usize;
+                            let left = audio.channels[0][source_frame];
+                            let right = audio
+                                .channels
+                                .get(1)
+                                .map_or(left, |channel| channel[source_frame]);
+                            (finite_sample(left), finite_sample(right))
+                        } else {
+                            (0.0, 0.0)
+                        };
+                        if input_bus.channels.len() == 1 {
+                            input_bus.channels[0][frame] = (left + right) * 0.5;
+                        } else {
+                            input_bus.channels[0][frame] = left;
+                            input_bus.channels[1][frame] = right;
+                        }
+                    }
+                    buffers.block_size = frame_count;
+                    self.process_audio_block(id, &mut buffers)?;
+                    let output_bus = &buffers.outputs[0];
+                    for frame in 0..frame_count {
+                        if frames_to_skip > 0 {
+                            frames_to_skip -= 1;
+                            continue;
+                        }
+                        if written_frames >= output_frames {
+                            break;
+                        }
+                        let left = finite_sample(output_bus.channels[0][frame]);
+                        let right = if output_bus.channels.len() == 1 {
+                            left
+                        } else {
+                            finite_sample(output_bus.channels[1][frame])
+                        };
+                        output_block.extend_from_slice(&[left, right]);
+                        written_frames += 1;
+                    }
+                    if output_block.len() >= VST3_EFFECT_RENDER_BLOCK_FRAMES * 2 {
+                        write_block(&output_block)?;
+                        output_block.clear();
+                    }
+                    processed_frames = processed_frames
+                        .checked_add(frame_count as u64)
+                        .ok_or_else(|| "VST3 effect processing position overflow".to_owned())?;
+                }
+                if written_frames != output_frames {
+                    return Err(format!(
+                        "VST3 effect produced {written_frames} frames after latency compensation; expected {output_frames}"
+                    ));
+                }
+                if !output_block.is_empty() {
+                    write_block(&output_block)?;
+                }
+                Ok(Vst3AudioEffectRenderSummary {
+                    plugin_name,
+                    input_frames,
+                    output_frames,
+                    sample_rate,
+                    latency_compensated_frames: latency_frames,
+                    tail_frames,
+                })
+            },
+        );
+        let stop_result = self.stop_audio_processing(id);
+        match (render_result, stop_result) {
+            (Ok(summary), Ok(())) => Ok(summary),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+        }
     }
 
     /// Render one pattern channel through an installed VST3 into interleaved stereo samples.
@@ -5800,9 +6133,57 @@ fn hosted_info(id: u64, plugin: &Plugin) -> HostedPluginInfo {
         uid: info.uid.clone(),
         path: info.path.clone(),
         has_editor: plugin.has_editor(),
+        audio_inputs: info.audio_inputs,
+        audio_outputs: info.audio_outputs,
         latency_samples: plugin.latency_samples(),
         sample_rate_hz: plugin.sample_rate(),
     }
+}
+
+fn validate_vst3_audio_block(
+    buffers: &BusAudioBuffers,
+    plugin_sample_rate: f64,
+    plugin_block_size: usize,
+) -> Result<(), String> {
+    if buffers.block_size == 0 {
+        return Err("audio block size must be greater than zero".to_owned());
+    }
+    if buffers.block_size > plugin_block_size {
+        return Err(format!(
+            "audio block has {} frames; the VST3 instance is configured for at most {plugin_block_size}",
+            buffers.block_size
+        ));
+    }
+    if !buffers.sample_rate.is_finite() || buffers.sample_rate <= 0.0 {
+        return Err("audio block sample rate must be finite and positive".to_owned());
+    }
+    let rate_tolerance = plugin_sample_rate.abs().max(1.0) * 1e-12;
+    if (buffers.sample_rate - plugin_sample_rate).abs() > rate_tolerance {
+        return Err(format!(
+            "audio block sample rate {} does not match the VST3 instance rate {plugin_sample_rate}",
+            buffers.sample_rate
+        ));
+    }
+    if buffers
+        .inputs
+        .iter()
+        .chain(&buffers.outputs)
+        .flat_map(|bus| &bus.channels)
+        .any(|channel| channel.len() != buffers.block_size)
+    {
+        return Err("every VST3 audio bus channel must match the block frame count".to_owned());
+    }
+    Ok(())
+}
+
+fn resize_vst3_bus_audio_buffers(buffers: &mut BusAudioBuffers, frame_count: usize) {
+    for bus in buffers.inputs.iter_mut().chain(&mut buffers.outputs) {
+        for channel in &mut bus.channels {
+            channel.resize(frame_count, 0.0);
+            channel.fill(0.0);
+        }
+    }
+    buffers.block_size = frame_count;
 }
 
 fn reported_tail_seconds(tail_samples: u32, sample_rate_hz: f64) -> Option<f64> {
@@ -6692,11 +7073,71 @@ mod tests {
             uid: "00000000000000000000000000000000".to_owned(),
             path: PathBuf::from("test.vst3"),
             has_editor: false,
+            audio_inputs: 0,
+            audio_outputs: 2,
             latency_samples: 480,
             sample_rate_hz: 48_000.0,
         };
 
         assert_eq!(info.latency_milliseconds(), Some(10.0));
+    }
+
+    #[test]
+    fn effect_audio_blocks_validate_rate_size_and_channel_shape() {
+        let layout = AudioBusLayout {
+            inputs: vec![vst3_host::audio::AudioBusConfig {
+                channel_count: 2,
+                active: true,
+            }],
+            outputs: vec![vst3_host::audio::AudioBusConfig {
+                channel_count: 2,
+                active: true,
+            }],
+        };
+        let mut buffers = BusAudioBuffers::new(&layout, 64, 48_000.0);
+        assert!(validate_vst3_audio_block(&buffers, 48_000.0, 512).is_ok());
+
+        assert!(
+            validate_vst3_audio_block(&buffers, 44_100.0, 512)
+                .expect_err("different plugin rate should fail")
+                .contains("does not match")
+        );
+        assert!(
+            validate_vst3_audio_block(&buffers, 48_000.0, 32)
+                .expect_err("oversized block should fail")
+                .contains("at most 32")
+        );
+
+        buffers.outputs[0].channels[1].pop();
+        assert!(
+            validate_vst3_audio_block(&buffers, 48_000.0, 512)
+                .expect_err("mismatched channel length should fail")
+                .contains("must match the block frame count")
+        );
+    }
+
+    #[test]
+    fn effect_audio_block_resize_clears_all_buses_and_sets_variable_block_size() {
+        let layout = AudioBusLayout {
+            inputs: vec![vst3_host::audio::AudioBusConfig {
+                channel_count: 2,
+                active: true,
+            }],
+            outputs: vec![vst3_host::audio::AudioBusConfig {
+                channel_count: 1,
+                active: true,
+            }],
+        };
+        let mut buffers = BusAudioBuffers::new(&layout, 64, 48_000.0);
+        buffers.inputs[0].channels[0].fill(0.5);
+        buffers.outputs[0].channels[0].fill(1.0);
+        resize_vst3_bus_audio_buffers(&mut buffers, 17);
+
+        assert_eq!(buffers.block_size, 17);
+        assert_eq!(buffers.inputs[0].channels[0], vec![0.0; 17]);
+        assert_eq!(buffers.inputs[0].channels[1], vec![0.0; 17]);
+        assert_eq!(buffers.outputs[0].channels[0], vec![0.0; 17]);
+        assert!(validate_vst3_audio_block(&buffers, 48_000.0, 512).is_ok());
     }
 
     #[test]
@@ -6710,6 +7151,8 @@ mod tests {
             uid: "00000000000000000000000000000000".to_owned(),
             path: PathBuf::from("test.vst3"),
             has_editor: false,
+            audio_inputs: 0,
+            audio_outputs: 2,
             latency_samples: 480,
             sample_rate_hz: 0.0,
         };

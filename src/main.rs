@@ -12,7 +12,7 @@ use flp_rebuild::sample_render::{
     AudioClipRenderOptions, AudioFileRenderOptions, AudioRenderEncodingOptions, AudioRenderOutput,
     SamplerPatternRenderOptions, render_audio_clips_to_wav, render_sampler_pattern_to_wav,
 };
-use flp_rebuild::vst3::{Vst3HostRuntime, Vst3PatternRenderOptions};
+use flp_rebuild::vst3::{Vst3AudioEffectRenderOptions, Vst3HostRuntime, Vst3PatternRenderOptions};
 use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, ArpeggioRangePattern, ArpeggioSyncMode, ArticulateOptions,
     AutomationPointEdit, ChannelLevelAdjustmentsEdit, ChannelSortOrder, ChannelStretchSettingsEdit,
@@ -149,6 +149,36 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 Path::new(bundle),
                 Path::new(output),
                 tail_seconds,
+            )
+        }
+        [command, input, bundle, output] if command == "render-audio-vst3" => {
+            render_audio_vst3(
+                Path::new(input),
+                Path::new(bundle),
+                Path::new(output),
+                None,
+                Vst3AudioEffectRenderOptions::default(),
+            )
+        }
+        [command, input, bundle, output, class_uid] if command == "render-audio-vst3" => {
+            render_audio_vst3(
+                Path::new(input),
+                Path::new(bundle),
+                Path::new(output),
+                Some(class_uid),
+                Vst3AudioEffectRenderOptions::default(),
+            )
+        }
+        [command, input, bundle, output, class_uid, tail] if command == "render-audio-vst3" => {
+            let class_uid = (class_uid != "-").then_some(class_uid.as_str());
+            render_audio_vst3(
+                Path::new(input),
+                Path::new(bundle),
+                Path::new(output),
+                class_uid,
+                Vst3AudioEffectRenderOptions {
+                    tail_seconds: parse_f64(tail, "effect tail")?,
+                },
             )
         }
         [command, path, channel_id] if command == "channel-events" => list_channel_events(
@@ -3465,6 +3495,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild scan <directory>\n",
             "  flp-rebuild plugin-scan\n",
             "  flp-rebuild render-pattern-vst3 <project.flp> <pattern-id> <channel-id> <plugin.vst3> <output.{wav|flac|ogg|mp3}> [tail-seconds]\n",
+            "  flp-rebuild render-audio-vst3 <input-audio> <effect.vst3> <output.{wav|flac|ogg|mp3}> [class-uid|-] [tail-seconds]\n",
             "  flp-rebuild channels <file.flp>\n",
             "  flp-rebuild channel-groups <file.flp>\n",
             "  flp-rebuild duplicate-channel <input.flp> <output.flp> <channel-id> <name>\n",
@@ -4866,6 +4897,53 @@ fn render_pattern_vst3(
     );
     println!(
         "render uses the plug-in's initial state; FLP plug-in state, Playlist clips, Mixer routing, and effects are not applied"
+    );
+    Ok(())
+}
+
+fn render_audio_vst3(
+    input_path: &Path,
+    bundle_path: &Path,
+    output_path: &Path,
+    class_uid: Option<&str>,
+    options: Vst3AudioEffectRenderOptions,
+) -> Result<(), String> {
+    let audio = decode_audio_file(input_path)?;
+    let output_extension = output_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    let output_format = match output_extension.as_str() {
+        "wav" => AudioRenderOutput::Wav,
+        "flac" => AudioRenderOutput::Flac {
+            bits_per_sample: 24,
+        },
+        "ogg" => AudioRenderOutput::Ogg { bitrate_kbps: 192 },
+        "mp3" => AudioRenderOutput::Mp3 { bitrate_kbps: 192 },
+        _ => return Err("VST3 effect output must use .wav, .flac, .ogg, or .mp3".to_owned()),
+    };
+    let mut host = Vst3HostRuntime::new(f64::from(audio.sample_rate), 512)?;
+    let effect = host.load_audio_effect(bundle_path, class_uid)?;
+    let summary = host.render_audio_through_effect_to_file(
+        effect.id,
+        &audio,
+        options,
+        output_path,
+        AudioFileRenderOptions {
+            output_format,
+            encoding: AudioRenderEncodingOptions::default(),
+        },
+    )?;
+    println!(
+        "rendered {} input frames through {} at {} Hz to {} ({} output frames, {} latency frames compensated, {} tail frames)",
+        summary.input_frames,
+        summary.plugin_name,
+        summary.sample_rate,
+        output_path.display(),
+        summary.output_frames,
+        summary.latency_compensated_frames,
+        summary.tail_frames
     );
     Ok(())
 }
