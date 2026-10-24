@@ -441,6 +441,9 @@ def _install_modules(script_name, device_name):
     transport.setSongPos = _set_song_pos
     transport.getSongLength = _get_song_length
     transport.getSongPosHint = _get_song_pos_hint
+    transport.getHWBeatLEDState = lambda: int(
+        _active_transport_state.get("hardware_beat_led_state", 0)
+    )
     transport.rewind = lambda startStop, flags=15: (
         _move_song_position(-1, startStop) if int(flags) & 8 else None
     )

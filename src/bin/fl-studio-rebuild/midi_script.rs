@@ -2,7 +2,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
@@ -85,6 +85,7 @@ pub struct MidiScriptTransportState {
     pub song_length_ticks: AtomicU64,
     pub song_position_seconds: AtomicU64,
     pub song_length_seconds: AtomicU64,
+    pub hardware_beat_led_state: AtomicI32,
     pub song_position_hint: Mutex<String>,
     pub song_length_hint: Mutex<String>,
 }
@@ -476,6 +477,10 @@ impl MidiScriptRuntime {
                             .song_length_seconds
                             .load(Ordering::Relaxed),
                     ),
+                    "hardware_beat_led_state": self
+                        .transport_state
+                        .hardware_beat_led_state
+                        .load(Ordering::Relaxed),
                     "song_position_hint": song_position_hint,
                     "song_length_hint": song_length_hint,
                 }),
@@ -859,6 +864,39 @@ mod tests {
         let result = runtime.process_event(12, &[0xB0, 7, 127]).unwrap();
 
         assert_eq!(result.bytes, [0xB0, b'M', 127]);
+    }
+
+    #[test]
+    fn python_hardware_beat_led_query_reports_the_current_indicator_state() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport transport\ndef OnMidiIn(event):\n    event.data1 = transport.getHWBeatLEDState()\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let transport_state = Arc::new(MidiScriptTransportState::default());
+        let mut runtime = MidiScriptRuntime::start_for_device_with_transport_state(
+            &script,
+            "Test Input",
+            Arc::clone(&transport_state),
+        )
+        .unwrap();
+
+        let stopped = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
+        transport_state
+            .hardware_beat_led_state
+            .store(SCRIPT_BEAT_INDICATOR_BAR, Ordering::Relaxed);
+        let bar = runtime.process_event(20, &[0xB0, 7, 1]).unwrap();
+        transport_state
+            .hardware_beat_led_state
+            .store(SCRIPT_BEAT_INDICATOR_BEAT, Ordering::Relaxed);
+        let beat = runtime.process_event(28, &[0xB0, 7, 1]).unwrap();
+
+        assert_eq!(stopped.bytes, [0xB0, 0, 1]);
+        assert_eq!(bar.bytes, [0xB0, 1, 1]);
+        assert_eq!(beat.bytes, [0xB0, 2, 1]);
     }
 
     #[test]

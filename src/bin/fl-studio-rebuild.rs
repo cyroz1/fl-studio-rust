@@ -12940,6 +12940,23 @@ impl DawUi {
     }
 
     fn publish_midi_script_beat_indicator(&mut self, has_script: bool, position_hint: &str) {
+        let beat_position = midi_script_bar_beat(position_hint);
+        let current_value = if !self.playing {
+            SCRIPT_BEAT_INDICATOR_OFF
+        } else {
+            beat_position
+                .map(|(_, beat)| {
+                    if beat == 1 {
+                        SCRIPT_BEAT_INDICATOR_BAR
+                    } else {
+                        SCRIPT_BEAT_INDICATOR_BEAT
+                    }
+                })
+                .unwrap_or(SCRIPT_BEAT_INDICATOR_OFF)
+        };
+        self.midi_script_transport_state
+            .hardware_beat_led_state
+            .store(current_value, Ordering::Relaxed);
         let Some(connection) = self
             .midi_input_connection
             .as_ref()
@@ -12966,24 +12983,14 @@ impl DawUi {
             }
             return;
         }
-        let mut components = position_hint.split(':');
-        let Some((bar, beat)) = components
-            .next()
-            .and_then(|bar| bar.parse::<u64>().ok())
-            .zip(components.next().and_then(|beat| beat.parse::<u64>().ok()))
-        else {
+        let Some((bar, beat)) = beat_position else {
             return;
         };
         let position = (identity.0, identity.1, bar, beat);
         if self.last_midi_script_beat_position.as_ref() == Some(&position) {
             return;
         }
-        let value = if beat == 1 {
-            SCRIPT_BEAT_INDICATOR_BAR
-        } else {
-            SCRIPT_BEAT_INDICATOR_BEAT
-        };
-        if self.notify_midi_script_beat_indicator(value) {
+        if self.notify_midi_script_beat_indicator(current_value) {
             self.last_midi_script_beat_position = Some(position);
         }
     }
@@ -60078,6 +60085,13 @@ fn playlist_song_position_label(
     format!("{bar}:{beat:02}:{tick_in_beat:03}")
 }
 
+fn midi_script_bar_beat(position_hint: &str) -> Option<(u64, u64)> {
+    let mut components = position_hint.split(':');
+    let bar = components.next()?.parse::<u64>().ok()?;
+    let beat = components.next()?.parse::<u64>().ok()?;
+    (bar > 0 && beat > 0).then_some((bar, beat))
+}
+
 fn playlist_song_position_bst_components(
     tick: f64,
     ppq: u16,
@@ -61272,7 +61286,7 @@ mod tests {
         live_playlist_vst3_note_targets, midi_button_press_edge, midi_cc_to_mixer_fader_raw,
         midi_cc_to_mixer_pan_raw, midi_cc_to_mixer_stereo_separation_raw,
         midi_controller_binding_for_device, midi_mixer_button_press_edge,
-        midi_mixer_control_for_cc, midi_script_marker_jump_target,
+        midi_mixer_control_for_cc, midi_script_bar_beat, midi_script_marker_jump_target,
         midi_script_marker_selection_target, midi_script_moved_song_position_tick,
         midi_script_pattern_jog_target, midi_script_tempo_jog_target,
         midi_script_time_position_seconds_to_ticks, midi_vst3_parameter_mapping_for_target,
@@ -64957,6 +64971,15 @@ mod tests {
             playlist_song_position_label(1_900.0, 96, Some((4, 4)), &signature_changes),
             "8:03:028"
         );
+    }
+
+    #[test]
+    fn midi_script_bar_beat_parses_one_based_position_hints() {
+        assert_eq!(midi_script_bar_beat("1:01:000"), Some((1, 1)));
+        assert_eq!(midi_script_bar_beat("12:03:128"), Some((12, 3)));
+        assert_eq!(midi_script_bar_beat("0:01:000"), None);
+        assert_eq!(midi_script_bar_beat("1:00:000"), None);
+        assert_eq!(midi_script_bar_beat("invalid"), None);
     }
 
     #[test]
