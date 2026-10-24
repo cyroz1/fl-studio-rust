@@ -31,6 +31,7 @@ pub enum ScriptTransportAction {
     Start,
     Stop,
     RecordToggle,
+    TogglePlayback,
     ToggleLoopMode,
     SetSongPosition(u32),
     SetSongPositionTicks(u64),
@@ -47,6 +48,7 @@ impl ScriptTransportAction {
             "start" => Some(Self::Start),
             "stop" => Some(Self::Stop),
             "record" => Some(Self::RecordToggle),
+            "toggle_playback" => Some(Self::TogglePlayback),
             "loop_mode" => Some(Self::ToggleLoopMode),
             _ => None,
         }
@@ -360,6 +362,7 @@ impl MidiScriptRuntime {
             "status": status,
             "data1": bytes.get(1).copied().unwrap_or(0),
             "data2": bytes.get(2).copied().unwrap_or(0),
+            "pmeflags": 2 | 32,
             "sysex": if status == 0xF0 { bytes } else { &[] },
         });
         let response = self.exchange(&value)?;
@@ -932,6 +935,52 @@ mod tests {
                 ScriptTransportAction::MarkerSelJog(-1),
             ]
         );
+    }
+
+    #[test]
+    fn python_global_transport_dispatches_supported_global_commands() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport midi\nimport transport\ndef OnMidiIn(event):\n    if event.pmeflags == midi.PME_System | midi.PME_FromMIDI:\n        play = transport.globalTransport(midi.FPT_Play, 1, event.pmeflags)\n        transport.globalTransport(midi.FPT_Stop, 1, event.pmeflags)\n        transport.globalTransport(midi.FPT_Record, 1, event.pmeflags)\n        transport.globalTransport(midi.FPT_Loop, 1, event.pmeflags)\n        transport.globalTransport(midi.FPT_MarkerJumpJog, 2, event.pmeflags)\n        transport.globalTransport(midi.FPT_MarkerSelJog, -1, event.pmeflags)\n        event.data1 = play\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let mut runtime = MidiScriptRuntime::start_for_device(&script, "Test Input").unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
+
+        assert_eq!(result.bytes, [0xB0, 8, 1]);
+        assert_eq!(
+            result.actions,
+            [
+                ScriptTransportAction::TogglePlayback,
+                ScriptTransportAction::Stop,
+                ScriptTransportAction::RecordToggle,
+                ScriptTransportAction::ToggleLoopMode,
+                ScriptTransportAction::MarkerJumpJog(2),
+                ScriptTransportAction::MarkerSelJog(-1),
+            ]
+        );
+    }
+
+    #[test]
+    fn python_global_transport_leaves_unsupported_or_non_global_commands_unhandled() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport midi\nimport transport\ndef OnMidiIn(event):\n    unsupported = transport.globalTransport(midi.FPT_Rewind, midi.SS_Start, event.pmeflags)\n    focused = transport.globalTransport(midi.FPT_Play, 1, event.pmeflags, midi.GT_Form)\n    event.data1 = int(unsupported == midi.GT_Cannot and focused == midi.GT_Cannot)\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let mut runtime = MidiScriptRuntime::start_for_device(&script, "Test Input").unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
+
+        assert_eq!(result.bytes, [0xB0, 1, 1]);
+        assert!(result.actions.is_empty());
     }
 
     #[test]

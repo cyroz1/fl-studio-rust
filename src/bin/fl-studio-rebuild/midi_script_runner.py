@@ -25,7 +25,7 @@ class EventData:
         self.data2 = value.get("data2", 0)
         self.port = 0
         self.sysex = bytes(value.get("sysex", []))
-        self.pmeflags = 0
+        self.pmeflags = int(value.get("pmeflags", 0))
         self.isIncrement = False
         self.res = 0.0
         self.inEv = 0
@@ -148,10 +148,128 @@ def _jog_marker(action, value, flags=None):
     _request_transport_action({"action": action, "increment": increment})
 
 
+def _global_transport(command, value, pmeflags=2, flags=15):
+    command = int(command)
+    value = int(value)
+    pmeflags = int(pmeflags)
+    flags = int(flags)
+    if not flags & 8 or not pmeflags & (2 | 4):
+        return -1
+
+    action = {
+        10: "toggle_playback",
+        11: "stop",
+        12: "record",
+        15: "loop_mode",
+    }.get(command)
+    if action is not None:
+        if value != 0:
+            _request_transport_action(action)
+        return 8
+    if command in (35, 36):
+        _jog_marker("marker_jump_jog" if command == 35 else "marker_sel_jog", value)
+        return 8
+    return -1
+
+
 def _install_modules(script_name, device_name):
     midi = _module("midi")
     constants = {
         "FromMIDI_Max": 127,
+        "PME_System": 2,
+        "PME_System_Safe": 4,
+        "PME_PreviewNote": 8,
+        "PME_FromHost": 16,
+        "PME_FromMIDI": 32,
+        "GT_Cannot": -1,
+        "GT_None": 0,
+        "GT_Plugin": 1,
+        "GT_Form": 2,
+        "GT_Menu": 4,
+        "GT_Global": 8,
+        "GT_All": 15,
+        "GT_Delayed": 5,
+        "SS_Stop": 0,
+        "SS_StartStep": 1,
+        "SS_Start": 2,
+        "FPT_Jog": 0,
+        "FPT_Jog2": 1,
+        "FPT_Strip": 2,
+        "FPT_StripJog": 3,
+        "FPT_StripHold": 4,
+        "FPT_Previous": 5,
+        "FPT_Next": 6,
+        "FPT_PreviousNext": 7,
+        "FPT_MoveJog": 8,
+        "FPT_Play": 10,
+        "FPT_Stop": 11,
+        "FPT_Record": 12,
+        "FPT_Rewind": 13,
+        "FPT_FastForward": 14,
+        "FPT_Loop": 15,
+        "FPT_Mute": 16,
+        "FPT_Mode": 17,
+        "FPT_Undo": 20,
+        "FPT_UndoUp": 21,
+        "FPT_UndoJog": 22,
+        "FPT_Punch": 30,
+        "FPT_PunchIn": 31,
+        "FPT_PunchOut": 32,
+        "FPT_AddMarker": 33,
+        "FPT_AddAltMarker": 34,
+        "FPT_MarkerJumpJog": 35,
+        "FPT_MarkerSelJog": 36,
+        "FPT_Up": 40,
+        "FPT_Down": 41,
+        "FPT_Left": 42,
+        "FPT_Right": 43,
+        "FPT_HZoomJog": 44,
+        "FPT_VZoomJog": 45,
+        "FPT_Snap": 48,
+        "FPT_SnapMode": 49,
+        "FPT_Cut": 50,
+        "FPT_Copy": 51,
+        "FPT_Paste": 52,
+        "FPT_Insert": 53,
+        "FPT_Delete": 54,
+        "FPT_NextWindow": 58,
+        "FPT_WindowJog": 59,
+        "FPT_F1": 60,
+        "FPT_F2": 61,
+        "FPT_F3": 62,
+        "FPT_F4": 63,
+        "FPT_F5": 64,
+        "FPT_F6": 65,
+        "FPT_F7": 66,
+        "FPT_F8": 67,
+        "FPT_F9": 68,
+        "FPT_F10": 69,
+        "FPT_F11": 70,
+        "FPT_F12": 71,
+        "FPT_Enter": 80,
+        "FPT_Escape": 81,
+        "FPT_Yes": 82,
+        "FPT_No": 83,
+        "FPT_Menu": 90,
+        "FPT_ItemMenu": 91,
+        "FPT_Save": 92,
+        "FPT_SaveNew": 93,
+        "FPT_PatternJog": 100,
+        "FPT_TrackJog": 101,
+        "FPT_ChannelJog": 102,
+        "FPT_TempoJog": 105,
+        "FPT_TapTempo": 106,
+        "FPT_NudgeMinus": 107,
+        "FPT_NudgePlus": 108,
+        "FPT_Metronome": 110,
+        "FPT_WaitForInput": 111,
+        "FPT_Overdub": 112,
+        "FPT_LoopRecord": 113,
+        "FPT_StepEdit": 114,
+        "FPT_CountDown": 115,
+        "FPT_NextMixerWindow": 120,
+        "FPT_MixerWindowJog": 121,
+        "FPT_ShuffleJog": 122,
         "REC_UpdateValue": 1,
         "REC_GetValue": 2,
         "REC_ShowHint": 4,
@@ -204,6 +322,7 @@ def _install_modules(script_name, device_name):
     transport.markerSelJog = lambda value, flags=None: _jog_marker(
         "marker_sel_jog", value, flags
     )
+    transport.globalTransport = _global_transport
     transport.getLoopMode = lambda: (
         0 if _active_transport_state.get("pattern_mode", False) else 1
     )
