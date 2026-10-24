@@ -68,6 +68,7 @@ pub struct MidiScriptTransportState {
     pub song_position: AtomicU64,
     pub song_position_ticks: AtomicU64,
     pub song_length_ticks: AtomicU64,
+    pub song_position_hint: Mutex<String>,
 }
 
 pub fn normalized_song_position(position_ticks: f64, length_ticks: u64) -> f64 {
@@ -394,6 +395,12 @@ impl MidiScriptRuntime {
         } else {
             0.0
         };
+        let song_position_hint = self
+            .transport_state
+            .song_position_hint
+            .lock()
+            .map(|hint| hint.clone())
+            .unwrap_or_else(|_| "1:01:000".to_owned());
         let mut request = value.clone();
         if let Some(object) = request.as_object_mut() {
             object.insert(
@@ -411,6 +418,7 @@ impl MidiScriptRuntime {
                         .transport_state
                         .song_length_ticks
                         .load(Ordering::Relaxed),
+                    "song_position_hint": song_position_hint,
                 }),
             );
         }
@@ -864,6 +872,30 @@ mod tests {
 
         assert_eq!(first.bytes, [0xB0, 96, 1]);
         assert_eq!(second.bytes, [0xB0, 120, 1]);
+    }
+
+    #[test]
+    fn python_transport_song_position_hint_reports_the_live_position_label() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport transport\ndef OnMidiIn(event):\n    event.data1 = int(transport.getSongPosHint() == '2:03:004') * 127\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let transport_state = Arc::new(MidiScriptTransportState::default());
+        *transport_state.song_position_hint.lock().unwrap() = "2:03:004".to_owned();
+        let mut runtime = MidiScriptRuntime::start_for_device_with_transport_state(
+            &script,
+            "Test Input",
+            Arc::clone(&transport_state),
+        )
+        .unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
+
+        assert_eq!(result.bytes, [0xB0, 127, 1]);
     }
 
     #[test]

@@ -12789,6 +12789,14 @@ impl DawUi {
         self.midi_script_transport_state
             .song_length_ticks
             .store(song_length_ticks, Ordering::Relaxed);
+        let song_position_hint = if has_script {
+            self.song_position_label()
+        } else {
+            "1:01:000".to_owned()
+        };
+        if let Ok(mut hint) = self.midi_script_transport_state.song_position_hint.lock() {
+            *hint = song_position_hint;
+        }
     }
 
     fn midi_script_song_position_tick_and_length(&self) -> Option<(f64, u64)> {
