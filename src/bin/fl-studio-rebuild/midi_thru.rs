@@ -629,7 +629,8 @@ fn midi_input_thru_message(event: MidiInputEvent) -> Option<([u8; 3], usize)> {
             | MidiTransportCommand::RecordStop
             | MidiTransportCommand::RecordToggle
             | MidiTransportCommand::ToggleLoopMode
-            | MidiTransportCommand::SetSongPosition(_),
+            | MidiTransportCommand::SetSongPosition(_)
+            | MidiTransportCommand::SetSongPositionTicks(_),
         ) => return None,
     };
     Some((bytes, length))

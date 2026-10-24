@@ -260,6 +260,9 @@ fn queue_script_transport_actions(
             ScriptTransportAction::SetSongPosition(position) => {
                 MidiTransportCommand::SetSongPosition(position)
             }
+            ScriptTransportAction::SetSongPositionTicks(position) => {
+                MidiTransportCommand::SetSongPositionTicks(position)
+            }
         };
         let transport_message = ReceivedMidiMessage {
             timestamp_micros,
@@ -283,6 +286,7 @@ pub enum MidiTransportCommand {
     RecordToggle,
     ToggleLoopMode,
     SetSongPosition(u32),
+    SetSongPositionTicks(u64),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -804,6 +808,7 @@ pub fn describe_event(event: MidiInputEvent) -> String {
             MidiTransportCommand::RecordToggle => "MIDI script Record".to_owned(),
             MidiTransportCommand::ToggleLoopMode => "MIDI script Loop Mode".to_owned(),
             MidiTransportCommand::SetSongPosition(_) => "MIDI script Song Position".to_owned(),
+            MidiTransportCommand::SetSongPositionTicks(_) => "MIDI script Song Position".to_owned(),
         },
     }
 }

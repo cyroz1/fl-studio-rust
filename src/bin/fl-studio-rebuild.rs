@@ -106,8 +106,8 @@ use midi_output::{
 };
 use midi_script::{
     MidiControllerScript, MidiScriptTransportState, SCRIPT_TRANSPORT_PATTERN_MODE,
-    SCRIPT_TRANSPORT_PLAYING, SCRIPT_TRANSPORT_RECORDING, discover_midi_scripts,
-    find_script_for_device, normalized_song_position, song_position_ticks,
+    SCRIPT_TRANSPORT_PLAYING, SCRIPT_TRANSPORT_RECORDING, absolute_song_position_ticks,
+    discover_midi_scripts, find_script_for_device, normalized_song_position, song_position_ticks,
 };
 use midi_thru::{MidiThruSettings, MidiThruWorker};
 
@@ -12767,16 +12767,25 @@ impl DawUi {
             .midi_input_connection
             .as_ref()
             .is_some_and(|connection| connection.script_name.is_some());
-        let (song_position, song_length_ticks) = if has_script {
+        let (song_position, song_position_ticks, song_length_ticks) = if has_script {
             self.midi_script_song_position_tick_and_length()
-                .map(|(tick, length)| (normalized_song_position(tick, length), length))
-                .unwrap_or((0.0, 0))
+                .map(|(tick, length)| {
+                    (
+                        normalized_song_position(tick, length),
+                        absolute_song_position_ticks(tick),
+                        length,
+                    )
+                })
+                .unwrap_or((0.0, 0, 0))
         } else {
-            (0.0, 0)
+            (0.0, 0, 0)
         };
         self.midi_script_transport_state
             .song_position
             .store(song_position.to_bits(), Ordering::Relaxed);
+        self.midi_script_transport_state
+            .song_position_ticks
+            .store(song_position_ticks, Ordering::Relaxed);
         self.midi_script_transport_state
             .song_length_ticks
             .store(song_length_ticks, Ordering::Relaxed);
@@ -12853,11 +12862,24 @@ impl DawUi {
                 "Could not set MIDI script song position without a selected timeline".to_owned();
             return;
         };
+        self.set_midi_script_song_position_tick(song_position_ticks(position, length), length);
+    }
+
+    fn set_midi_script_song_position_absolute_ticks(&mut self, tick: u64) {
+        let Some((_, length)) = self.midi_script_song_position_tick_and_length() else {
+            self.status =
+                "Could not set MIDI script song position without a selected timeline".to_owned();
+            return;
+        };
+        self.set_midi_script_song_position_tick(tick.min(length), length);
+    }
+
+    fn set_midi_script_song_position_tick(&mut self, tick: u64, length: u64) {
         if length == 0 {
             self.status = "Could not set MIDI script song position on an empty timeline".to_owned();
             return;
         }
-        let tick = song_position_ticks(position, length);
+        let tick = tick.min(length);
         if self.pattern_playback_mode {
             let Some(pattern_id) = self
                 .pattern_mode_playback_source
@@ -44496,6 +44518,9 @@ impl DawUi {
             }
             MidiTransportCommand::SetSongPosition(position) => {
                 self.set_midi_script_song_position(position);
+            }
+            MidiTransportCommand::SetSongPositionTicks(tick) => {
+                self.set_midi_script_song_position_absolute_ticks(tick);
             }
         }
     }

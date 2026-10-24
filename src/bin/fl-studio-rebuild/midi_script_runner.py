@@ -104,21 +104,29 @@ def _request_transport_action(action):
 
 
 def _get_song_pos(mode=-1):
-    if mode != -1:
-        raise NotImplementedError("only normalized transport.getSongPos() is supported")
-    return float(_active_transport_state.get("song_position", 0.0))
+    if mode == -1:
+        return float(_active_transport_state.get("song_position", 0.0))
+    if mode == 2:
+        return int(_active_transport_state.get("song_position_ticks", 0))
+    raise NotImplementedError("transport.getSongPos() supports normalized and absolute-tick modes")
 
 
 def _set_song_pos(position, mode=-1):
-    if mode != -1:
-        raise NotImplementedError("only normalized transport.setSongPos() is supported")
+    if mode not in (-1, 2):
+        raise NotImplementedError("transport.setSongPos() supports normalized and absolute-tick modes")
     position = float(position)
     if not math.isfinite(position):
         raise ValueError("transport.setSongPos() requires a finite position")
-    if _active_transport_actions is not None:
+    if _active_transport_actions is None:
+        return
+    if mode == 2:
         _active_transport_actions.append(
-            {"action": "set_song_position", "position": min(1.0, max(0.0, position))}
+            {"action": "set_song_position_ticks", "position": max(0, round(position))}
         )
+        return
+    _active_transport_actions.append(
+        {"action": "set_song_position", "position": min(1.0, max(0.0, position))}
+    )
 
 
 def _get_song_length(mode):

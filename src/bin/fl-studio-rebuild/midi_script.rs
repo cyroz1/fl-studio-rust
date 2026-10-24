@@ -33,6 +33,7 @@ pub enum ScriptTransportAction {
     RecordToggle,
     ToggleLoopMode,
     SetSongPosition(u32),
+    SetSongPositionTicks(u64),
 }
 
 const SCRIPT_SONG_POSITION_SCALE: f64 = 1_000_000.0;
@@ -65,6 +66,7 @@ pub const SCRIPT_TRANSPORT_PATTERN_MODE: u8 = 1 << 2;
 pub struct MidiScriptTransportState {
     pub state: AtomicU8,
     pub song_position: AtomicU64,
+    pub song_position_ticks: AtomicU64,
     pub song_length_ticks: AtomicU64,
 }
 
@@ -73,6 +75,13 @@ pub fn normalized_song_position(position_ticks: f64, length_ticks: u64) -> f64 {
         return 0.0;
     }
     (position_ticks / length_ticks as f64).clamp(0.0, 1.0)
+}
+
+pub fn absolute_song_position_ticks(position_ticks: f64) -> u64 {
+    if !position_ticks.is_finite() || position_ticks <= 0.0 {
+        return 0;
+    }
+    position_ticks.round() as u64
 }
 
 pub fn song_position_ticks(position: u32, length_ticks: u64) -> u64 {
@@ -394,6 +403,10 @@ impl MidiScriptRuntime {
                     "is_recording": transport & SCRIPT_TRANSPORT_RECORDING != 0,
                     "pattern_mode": transport & SCRIPT_TRANSPORT_PATTERN_MODE != 0,
                     "song_position": song_position,
+                    "song_position_ticks": self
+                        .transport_state
+                        .song_position_ticks
+                        .load(Ordering::Relaxed),
                     "song_length_ticks": self
                         .transport_state
                         .song_length_ticks
@@ -482,6 +495,12 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
             position.min(SCRIPT_SONG_POSITION_SCALE_U32),
         ));
     }
+    if name == Some("set_song_position_ticks") {
+        let position = action["position"]
+            .as_u64()
+            .ok_or_else(|| "MIDI script returned an invalid absolute song position".to_owned())?;
+        return Ok(ScriptTransportAction::SetSongPositionTicks(position));
+    }
     Err("MIDI script returned an unknown transport action".to_owned())
 }
 
@@ -543,8 +562,8 @@ mod tests {
     use super::{
         MidiControllerScript, MidiScriptRuntime, MidiScriptTransportState,
         SCRIPT_TRANSPORT_PATTERN_MODE, SCRIPT_TRANSPORT_PLAYING, SCRIPT_TRANSPORT_RECORDING,
-        ScriptTransportAction, discover_midi_scripts, find_script_for_device,
-        normalized_song_position, song_position_ticks, transform_message,
+        ScriptTransportAction, absolute_song_position_ticks, discover_midi_scripts,
+        find_script_for_device, normalized_song_position, song_position_ticks, transform_message,
     };
     use serde_json::json;
     use std::fs;
@@ -652,6 +671,9 @@ mod tests {
         assert_eq!(song_position_ticks(1_000_000, 96), 96);
         assert_eq!(song_position_ticks(2_000_000, 96), 96);
         assert_eq!(song_position_ticks(500_000, 0), 0);
+        assert_eq!(absolute_song_position_ticks(24.4), 24);
+        assert_eq!(absolute_song_position_ticks(-1.0), 0);
+        assert_eq!(absolute_song_position_ticks(f64::INFINITY), 0);
     }
 
     #[test]
@@ -681,7 +703,7 @@ mod tests {
         let script_path = temporary.path().join("device_test.py");
         fs::write(
             &script_path,
-            "# name=Test Script\nimport transport\ndef OnMidiIn(event):\n    transport.start()\n    transport.record()\n    transport.setLoopMode()\n    transport.setSongPos(0.75)\n    event.handled = True\n",
+            "# name=Test Script\nimport transport\ndef OnMidiIn(event):\n    transport.start()\n    transport.record()\n    transport.setLoopMode()\n    transport.setSongPos(0.75)\n    transport.setSongPos(48, 2)\n    event.handled = True\n",
         )
         .unwrap();
         let script = MidiControllerScript::parse(script_path).unwrap();
@@ -697,6 +719,7 @@ mod tests {
                 ScriptTransportAction::RecordToggle,
                 ScriptTransportAction::ToggleLoopMode,
                 ScriptTransportAction::SetSongPosition(750_000),
+                ScriptTransportAction::SetSongPositionTicks(48),
             ]
         );
     }
@@ -779,6 +802,37 @@ mod tests {
 
         assert_eq!(first.bytes, [0xB0, 31, 1]);
         assert_eq!(second.bytes, [0xB0, 63, 1]);
+    }
+
+    #[test]
+    fn python_transport_song_position_reports_live_absolute_ticks() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport transport\ndef OnMidiIn(event):\n    event.data1 = transport.getSongPos(2)\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let transport_state = Arc::new(MidiScriptTransportState::default());
+        transport_state
+            .song_position_ticks
+            .store(24, Ordering::Relaxed);
+        let mut runtime = MidiScriptRuntime::start_for_device_with_transport_state(
+            &script,
+            "Test Input",
+            Arc::clone(&transport_state),
+        )
+        .unwrap();
+
+        let first = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
+        transport_state
+            .song_position_ticks
+            .store(48, Ordering::Relaxed);
+        let second = runtime.process_event(20, &[0xB0, 7, 1]).unwrap();
+
+        assert_eq!(first.bytes, [0xB0, 24, 1]);
+        assert_eq!(second.bytes, [0xB0, 48, 1]);
     }
 
     #[test]
