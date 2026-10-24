@@ -145,6 +145,7 @@ def _install_modules(script_name, device_name):
     transport.start = lambda: _request_transport_action("start")
     transport.stop = lambda: _request_transport_action("stop")
     transport.record = lambda: _request_transport_action("record")
+    transport.setLoopMode = lambda: _request_transport_action("loop_mode")
     transport.isPlaying = lambda: int(bool(_active_transport_state.get("is_playing", False)))
     transport.isRecording = lambda: int(bool(_active_transport_state.get("is_recording", False)))
     transport.getLoopMode = lambda: (

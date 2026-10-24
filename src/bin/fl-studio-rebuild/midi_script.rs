@@ -31,6 +31,7 @@ pub enum ScriptTransportAction {
     Start,
     Stop,
     RecordToggle,
+    ToggleLoopMode,
 }
 
 impl ScriptTransportAction {
@@ -39,6 +40,7 @@ impl ScriptTransportAction {
             "start" => Some(Self::Start),
             "stop" => Some(Self::Stop),
             "record" => Some(Self::RecordToggle),
+            "loop_mode" => Some(Self::ToggleLoopMode),
             _ => None,
         }
     }
@@ -231,6 +233,7 @@ fn normalize_device_name(name: &str) -> String {
 }
 
 impl MidiScriptRuntime {
+    #[cfg(test)]
     pub fn start_for_device(
         script: &MidiControllerScript,
         device_name: &str,
@@ -603,7 +606,7 @@ mod tests {
         let script_path = temporary.path().join("device_test.py");
         fs::write(
             &script_path,
-            "# name=Test Script\nimport transport\ndef OnMidiIn(event):\n    transport.start()\n    transport.record()\n    event.handled = True\n",
+            "# name=Test Script\nimport transport\ndef OnMidiIn(event):\n    transport.start()\n    transport.record()\n    transport.setLoopMode()\n    event.handled = True\n",
         )
         .unwrap();
         let script = MidiControllerScript::parse(script_path).unwrap();
@@ -616,7 +619,8 @@ mod tests {
             result.actions,
             [
                 ScriptTransportAction::Start,
-                ScriptTransportAction::RecordToggle
+                ScriptTransportAction::RecordToggle,
+                ScriptTransportAction::ToggleLoopMode,
             ]
         );
     }

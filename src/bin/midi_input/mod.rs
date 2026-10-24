@@ -255,6 +255,7 @@ fn queue_script_transport_actions(
             ScriptTransportAction::Start => MidiTransportCommand::Start,
             ScriptTransportAction::Stop => MidiTransportCommand::Stop,
             ScriptTransportAction::RecordToggle => MidiTransportCommand::RecordToggle,
+            ScriptTransportAction::ToggleLoopMode => MidiTransportCommand::ToggleLoopMode,
         };
         let transport_message = ReceivedMidiMessage {
             timestamp_micros,
@@ -276,6 +277,7 @@ pub enum MidiTransportCommand {
     RecordStart,
     RecordStop,
     RecordToggle,
+    ToggleLoopMode,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -795,6 +797,7 @@ pub fn describe_event(event: MidiInputEvent) -> String {
             MidiTransportCommand::RecordStart => "MMC Record".to_owned(),
             MidiTransportCommand::RecordStop => "MMC Record Exit".to_owned(),
             MidiTransportCommand::RecordToggle => "MIDI script Record".to_owned(),
+            MidiTransportCommand::ToggleLoopMode => "MIDI script Loop Mode".to_owned(),
         },
     }
 }

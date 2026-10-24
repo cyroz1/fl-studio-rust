@@ -44371,6 +44371,9 @@ impl DawUi {
             MidiTransportCommand::RecordToggle => {
                 self.toggle_midi_recording(history_snapshot_available);
             }
+            MidiTransportCommand::ToggleLoopMode => {
+                self.set_pattern_playback_mode(!self.pattern_playback_mode);
+            }
         }
     }
 
