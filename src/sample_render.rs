@@ -483,12 +483,13 @@ pub struct AudioClipRenderOptions {
     pub start_from_song_start: bool,
     /// Render only this inclusive one-based Playlist track range when soloing.
     pub soloed_playlist_track_range: Option<(u32, u32)>,
-    /// App-local per-instance gain and linear fade settings keyed by arrangement and clip ID.
+    /// App-local per-instance audio controls keyed by arrangement and clip ID.
     pub clip_envelopes: Arc<Vec<PlaylistAudioClipEnvelope>>,
 }
 
-/// Local per-instance Audio Clip gain and edge fades. Values are kept separate from opaque FLP
-/// records until the native Clip Properties serialization has been verified.
+/// Local per-instance Audio Clip gain, edge fades, duration fitting, and pitch. Values are kept
+/// separate from opaque FLP records until the native Clip Properties serialization has been
+/// verified.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PlaylistAudioClipEnvelope {
     pub arrangement_id: u16,
@@ -497,6 +498,11 @@ pub struct PlaylistAudioClipEnvelope {
     pub gain_centidb: i16,
     pub fade_in_ms: u32,
     pub fade_out_ms: u32,
+    /// Fit this instance to its visible timeline duration using the Audio Clip channel's shared
+    /// stretch mode.
+    pub stretch_to_clip_duration: bool,
+    /// App-local instance pitch offset in cents, limited to -1200 through +1200.
+    pub stretch_pitch_cents: i16,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6254,6 +6260,82 @@ fn channel_audio_clip_stretch_plan(
     }
 }
 
+fn playlist_instance_audio_clip_stretch_plan(
+    mode_raw: i32,
+    pitch_raw: i32,
+    tempo_map: &PlaylistTempoMap,
+    clip_start_tick: u32,
+    clip_length_ticks: u32,
+    source: AudioSourceDimensions,
+    clip_index: usize,
+) -> Result<AudioClipStretchPlan, String> {
+    if clip_length_ticks == 0 {
+        return Err(format!(
+            "Playlist clip {clip_index} has no timeline duration to stretch to"
+        ));
+    }
+    if source.frames == 0 {
+        return Err(format!(
+            "Playlist clip {clip_index} has an empty audio source range"
+        ));
+    }
+    if !(-1_200..=1_200).contains(&pitch_raw) {
+        return Err(format!(
+            "Playlist clip {clip_index} has unsupported instance stretch pitch {pitch_raw} cents"
+        ));
+    }
+    let end_tick = clip_start_tick
+        .checked_add(clip_length_ticks)
+        .ok_or_else(|| format!("Playlist clip {clip_index} duration overflows the timeline"))?;
+    let target_duration_frames = tempo_map.frames_between_ticks(
+        u64::from(clip_start_tick),
+        u64::from(end_tick),
+        source.sample_rate,
+    )?;
+    if target_duration_frames == 0 {
+        return Err(format!(
+            "Playlist clip {clip_index} duration is shorter than one sample frame"
+        ));
+    }
+
+    match ChannelStretchMode::from_raw(mode_raw) {
+        ChannelStretchMode::Resample => {
+            let pitch_factor = 2.0_f64.powf(f64::from(pitch_raw) / 1_200.0);
+            let playback_rate_ratio =
+                source.frames as f64 / target_duration_frames as f64 * pitch_factor;
+            if !playback_rate_ratio.is_finite() || playback_rate_ratio <= 0.0 {
+                return Err(format!(
+                    "Playlist clip {clip_index} instance resample rate is outside the renderable range"
+                ));
+            }
+            Ok(AudioClipStretchPlan::Resample {
+                playback_rate_ratio,
+            })
+        }
+        ChannelStretchMode::Elastique3Mono if source.channels != 1 => Err(format!(
+            "Playlist clip {clip_index} uses Elastique 3 Mono with a non-mono source"
+        )),
+        ChannelStretchMode::Stretch
+        | ChannelStretchMode::Elastique3Generic
+        | ChannelStretchMode::Elastique3Mono => {
+            let stretch_ratio = target_duration_frames as f64 / source.frames as f64;
+            if !stretch_ratio.is_finite() || !(0.5..=2.0).contains(&stretch_ratio) {
+                return Err(format!(
+                    "Playlist clip {clip_index} needs a stretch ratio outside the supported 0.5x to 2x range"
+                ));
+            }
+            Ok(AudioClipStretchPlan::DurationPreserving {
+                target_duration_frames,
+                pitch_raw,
+                mode_raw,
+            })
+        }
+        mode => Err(format!(
+            "Playlist clip {clip_index} uses unsupported instance stretch mode {mode_raw} ({mode:?})"
+        )),
+    }
+}
+
 fn sampler_resample_stretch_pitch_adjustment(
     channel: &ChannelSummary,
     source_frames: usize,
@@ -6815,20 +6897,64 @@ fn prepare_audio_clip_render(
         }
         let mut source_bounds =
             sample_source_bounds_at_project_tempo(clip, audio, *clip_index, ppq, base_tempo_bpm)?;
-        let stretch_plan = channel_audio_clip_stretch_plan(
-            *stretch_settings,
-            &tempo_map,
-            ppq,
-            clip.position_ticks,
-            AudioSourceDimensions {
-                frames: source_bounds.end - source_bounds.start,
-                channels: audio.channels.len(),
-                sample_rate: audio.sample_rate,
-            },
-            *clip_index,
-        )?;
+        let clip_envelope = options
+            .clip_envelopes
+            .iter()
+            .find(|envelope| {
+                envelope.arrangement_id == options.arrangement_id
+                    && clip.clip_id == Some(envelope.clip_id)
+            })
+            .copied()
+            .unwrap_or(PlaylistAudioClipEnvelope {
+                arrangement_id: options.arrangement_id,
+                clip_id: clip.clip_id.unwrap_or_default(),
+                gain_centidb: 0,
+                fade_in_ms: 0,
+                fade_out_ms: 0,
+                stretch_to_clip_duration: false,
+                stretch_pitch_cents: 0,
+            });
+        if !(-9_600..=3_600).contains(&clip_envelope.gain_centidb)
+            || clip_envelope.fade_in_ms > 600_000
+            || clip_envelope.fade_out_ms > 600_000
+            || !(-1_200..=1_200).contains(&clip_envelope.stretch_pitch_cents)
+        {
+            return Err(format!(
+                "Playlist clip {clip_index} gain, fade, or pitch value is outside the supported range"
+            ));
+        }
+        let source_dimensions = AudioSourceDimensions {
+            frames: source_bounds.end - source_bounds.start,
+            channels: audio.channels.len(),
+            sample_rate: audio.sample_rate,
+        };
+        let stretch_plan = if clip_envelope.stretch_to_clip_duration {
+            let channel_pitch_raw = stretch_settings.map_or(0, |settings| settings.1);
+            let mode_raw = stretch_settings.map_or(0, |settings| settings.3);
+            playlist_instance_audio_clip_stretch_plan(
+                mode_raw,
+                channel_pitch_raw,
+                &tempo_map,
+                clip.position_ticks,
+                clip.length_ticks,
+                source_dimensions,
+                *clip_index,
+            )
+            .map(Some)?
+        } else {
+            channel_audio_clip_stretch_plan(
+                *stretch_settings,
+                &tempo_map,
+                ppq,
+                clip.position_ticks,
+                source_dimensions,
+                *clip_index,
+            )?
+        };
         let mut source_id = raw_source_id;
-        let mut effective_pitch_ratio = audio_clip_pitch_ratio(*pitch_offset_cents);
+        let instance_pitch_offset_cents =
+            *pitch_offset_cents + f64::from(clip_envelope.stretch_pitch_cents);
+        let mut effective_pitch_ratio = audio_clip_pitch_ratio(instance_pitch_offset_cents);
         match stretch_plan {
             Some(AudioClipStretchPlan::Resample {
                 playback_rate_ratio,
@@ -6839,7 +6965,7 @@ fn prepare_audio_clip_render(
                 mode_raw,
             }) => {
                 let duration_preserving_pitch_raw = audio_clip_duration_preserving_pitch_cents(
-                    *pitch_offset_cents,
+                    instance_pitch_offset_cents,
                     pitch_raw,
                     *clip_index,
                 )?;
@@ -6914,34 +7040,14 @@ fn prepare_audio_clip_render(
             options.sample_rate,
         )?;
         let duration_frames = source_duration_frames.min(timeline_clip_frames);
-        let envelope = options
-            .clip_envelopes
-            .iter()
-            .find(|envelope| {
-                envelope.arrangement_id == options.arrangement_id
-                    && clip.clip_id == Some(envelope.clip_id)
-            })
-            .copied();
-        let (envelope_gain, fade_in_frames, fade_out_frames) = if let Some(envelope) = envelope {
-            if !(-9_600..=3_600).contains(&envelope.gain_centidb)
-                || envelope.fade_in_ms > 600_000
-                || envelope.fade_out_ms > 600_000
-            {
-                return Err(format!(
-                    "Playlist clip {clip_index} gain or fade duration is outside the supported range"
-                ));
-            }
-            let fade_frames = |milliseconds: u32| {
-                u64::from(milliseconds).saturating_mul(u64::from(options.sample_rate)) / 1_000
-            };
-            (
-                10.0_f32.powf(f32::from(envelope.gain_centidb) / 2_000.0),
-                fade_frames(envelope.fade_in_ms).min(duration_frames),
-                fade_frames(envelope.fade_out_ms).min(duration_frames),
-            )
-        } else {
-            (1.0, 0, 0)
+        let fade_frames = |milliseconds: u32| {
+            u64::from(milliseconds).saturating_mul(u64::from(options.sample_rate)) / 1_000
         };
+        let (envelope_gain, fade_in_frames, fade_out_frames) = (
+            10.0_f32.powf(f32::from(clip_envelope.gain_centidb) / 2_000.0),
+            fade_frames(clip_envelope.fade_in_ms).min(duration_frames),
+            fade_frames(clip_envelope.fade_out_ms).min(duration_frames),
+        );
         let end_frame = start_frame
             .checked_add(duration_frames)
             .ok_or_else(|| "render timeline length overflow".to_owned())?;
@@ -15654,6 +15760,61 @@ mod tests {
             )
             .unwrap_err()
             .contains("unsupported channel stretch mode")
+        );
+    }
+
+    #[test]
+    fn playlist_instance_stretch_plan_targets_the_visible_clip_duration() {
+        let tempo_map =
+            PlaylistTempoMap::constant(96, 120.0).expect("constant tempo map should build");
+        let source = AudioSourceDimensions {
+            frames: 8_000,
+            channels: 1,
+            sample_rate: 8_000,
+        };
+
+        let resample =
+            playlist_instance_audio_clip_stretch_plan(0, 0, &tempo_map, 0, 96, source, 1).unwrap();
+        assert!(matches!(
+            resample,
+            AudioClipStretchPlan::Resample {
+                playback_rate_ratio
+            } if (playback_rate_ratio - 2.0).abs() < 1e-12
+        ));
+
+        for mode_raw in [-1, 1, 2] {
+            let plan = playlist_instance_audio_clip_stretch_plan(
+                mode_raw, 300, &tempo_map, 0, 96, source, 2,
+            )
+            .unwrap();
+            assert!(matches!(
+                plan,
+                AudioClipStretchPlan::DurationPreserving {
+                    target_duration_frames: 4_000,
+                    pitch_raw: 300,
+                    mode_raw: actual_mode,
+                } if actual_mode == mode_raw
+            ));
+        }
+
+        let stereo = AudioSourceDimensions {
+            channels: 2,
+            ..source
+        };
+        assert!(
+            playlist_instance_audio_clip_stretch_plan(2, 0, &tempo_map, 0, 96, stereo, 3,)
+                .unwrap_err()
+                .contains("non-mono source")
+        );
+        assert!(
+            playlist_instance_audio_clip_stretch_plan(1, 0, &tempo_map, 0, 48, source, 4,)
+                .unwrap_err()
+                .contains("0.5x to 2x")
+        );
+        assert!(
+            playlist_instance_audio_clip_stretch_plan(1, 0, &tempo_map, u32::MAX, 1, source, 5,)
+                .unwrap_err()
+                .contains("overflows")
         );
     }
 

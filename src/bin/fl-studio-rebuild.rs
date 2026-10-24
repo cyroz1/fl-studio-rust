@@ -7348,6 +7348,8 @@ impl DawUi {
                 gain_centidb: 0,
                 fade_in_ms: 0,
                 fade_out_ms: 0,
+                stretch_to_clip_duration: false,
+                stretch_pitch_cents: 0,
             })
     }
 
@@ -7368,12 +7370,12 @@ impl DawUi {
             Ok(()) => {
                 self.playlist_audio_clip_envelopes = updated;
                 self.status = format!(
-                    "Updated Audio Clip {} gain and fades; changes are app-local and apply on the next playback start",
+                    "Updated Audio Clip {} instance controls; changes are app-local and apply on the next playback start",
                     envelope.clip_id
                 );
             }
             Err(error) => {
-                self.status = format!("Could not save Audio Clip gain and fades: {error}");
+                self.status = format!("Could not save Audio Clip instance controls: {error}");
             }
         }
     }
@@ -19346,7 +19348,7 @@ impl DawUi {
                                         ui.close();
                                     }
                                     if let Some(clip_id) = clip.clip_id {
-                                        ui.menu_button("Gain and fades…", |ui| {
+                                        ui.menu_button("Audio Clip instance controls…", |ui| {
                                             let mut envelope = self.playlist_audio_clip_envelope(
                                                 arrangement.id,
                                                 clip_id,
@@ -19378,14 +19380,35 @@ impl DawUi {
                                                         .suffix(" ms fade out"),
                                                 )
                                                 .changed();
-                                            if gain_changed || fade_in_changed || fade_out_changed {
+                                            let fit_to_clip_duration = ui
+                                                .checkbox(
+                                                    &mut envelope.stretch_to_clip_duration,
+                                                    "Fit to clip duration",
+                                                )
+                                                .changed();
+                                            let stretch_pitch_changed = ui
+                                                .add(
+                                                    egui::DragValue::new(
+                                                        &mut envelope.stretch_pitch_cents,
+                                                    )
+                                                    .range(-1_200..=1_200)
+                                                    .speed(5.0)
+                                                    .suffix(" cents instance pitch"),
+                                                )
+                                                .changed();
+                                            if gain_changed
+                                                || fade_in_changed
+                                                || fade_out_changed
+                                                || fit_to_clip_duration
+                                                || stretch_pitch_changed
+                                            {
                                                 if gain_changed {
                                                     envelope.gain_centidb =
                                                         (gain_db * 100.0).round() as i16;
                                                 }
                                                 self.save_playlist_audio_clip_envelope(envelope);
                                             }
-                                            if ui.button("Reset gain and fades").clicked() {
+                                            if ui.button("Reset instance controls").clicked() {
                                                 self.save_playlist_audio_clip_envelope(
                                                     PlaylistAudioClipEnvelope {
                                                         arrangement_id: arrangement.id,
@@ -19393,18 +19416,20 @@ impl DawUi {
                                                         gain_centidb: 0,
                                                         fade_in_ms: 0,
                                                         fade_out_ms: 0,
+                                                        stretch_to_clip_duration: false,
+                                                        stretch_pitch_cents: 0,
                                                     },
                                                 );
                                                 ui.close();
                                             }
                                             ui.small(
-                                                "Linear fades apply to playback and renders when playback starts. These values stay on this machine.",
+                                                "Fit uses the mode saved on the Audio Clip channel and the instance's visible Playlist duration. The local processor approximates duration-preserving modes. These values stay on this machine and apply when playback starts.",
                                             );
                                         });
                                     } else {
                                         ui.add_enabled(
                                             false,
-                                            egui::Button::new("Gain and fades…"),
+                                            egui::Button::new("Audio Clip instance controls…"),
                                         )
                                         .on_disabled_hover_text(
                                             "This FLP clip record has no recognized stable clip ID",
@@ -53352,6 +53377,7 @@ fn valid_playlist_audio_clip_envelope(entry: &ProjectPlaylistAudioClipEnvelope) 
         && (-9_600..=3_600).contains(&entry.envelope.gain_centidb)
         && entry.envelope.fade_in_ms <= 600_000
         && entry.envelope.fade_out_ms <= 600_000
+        && (-1_200..=1_200).contains(&entry.envelope.stretch_pitch_cents)
 }
 
 fn same_playlist_audio_clip_envelope_key(
@@ -53408,6 +53434,21 @@ fn parse_playlist_audio_clip_envelopes(contents: &str) -> Vec<ProjectPlaylistAud
         let Some(fade_out_ms) = fields.next().and_then(|value| value.parse::<u32>().ok()) else {
             continue;
         };
+        let (stretch_to_clip_duration, stretch_pitch_cents) = match (fields.next(), fields.next()) {
+            (None, None) => (false, 0),
+            (Some(fit), Some(pitch)) => {
+                let stretch_to_clip_duration = match fit {
+                    "0" => false,
+                    "1" => true,
+                    _ => continue,
+                };
+                let Ok(stretch_pitch_cents) = pitch.parse::<i16>() else {
+                    continue;
+                };
+                (stretch_to_clip_duration, stretch_pitch_cents)
+            }
+            _ => continue,
+        };
         if fields.next().is_some() {
             continue;
         }
@@ -53421,6 +53462,8 @@ fn parse_playlist_audio_clip_envelopes(contents: &str) -> Vec<ProjectPlaylistAud
                     gain_centidb,
                     fade_in_ms,
                     fade_out_ms,
+                    stretch_to_clip_duration,
+                    stretch_pitch_cents,
                 },
             },
         );
@@ -53431,7 +53474,7 @@ fn parse_playlist_audio_clip_envelopes(contents: &str) -> Vec<ProjectPlaylistAud
 fn serialize_playlist_audio_clip_envelopes(
     envelopes: &[ProjectPlaylistAudioClipEnvelope],
 ) -> String {
-    let mut contents = String::from("version=1\n");
+    let mut contents = String::from("version=2\n");
     let mut normalized = Vec::new();
     for entry in envelopes {
         upsert_playlist_audio_clip_envelope(&mut normalized, entry.clone());
@@ -53449,6 +53492,14 @@ fn serialize_playlist_audio_clip_envelopes(
         contents.push_str(&entry.envelope.fade_in_ms.to_string());
         contents.push('\t');
         contents.push_str(&entry.envelope.fade_out_ms.to_string());
+        contents.push('\t');
+        contents.push_str(if entry.envelope.stretch_to_clip_duration {
+            "1"
+        } else {
+            "0"
+        });
+        contents.push('\t');
+        contents.push_str(&entry.envelope.stretch_pitch_cents.to_string());
         contents.push('\n');
     }
     contents
@@ -60744,6 +60795,8 @@ mod tests {
                 gain_centidb: -1_250,
                 fade_in_ms: 225,
                 fade_out_ms: 480,
+                stretch_to_clip_duration: true,
+                stretch_pitch_cents: 350,
             },
         };
         let other_clip = ProjectPlaylistAudioClipEnvelope {
@@ -60752,6 +60805,8 @@ mod tests {
                 gain_centidb: 600,
                 fade_in_ms: 0,
                 fade_out_ms: 0,
+                stretch_to_clip_duration: false,
+                stretch_pitch_cents: 0,
                 ..entry.envelope
             },
             ..entry.clone()
@@ -60786,6 +60841,31 @@ mod tests {
     }
 
     #[test]
+    fn playlist_audio_clip_envelopes_read_legacy_v1_records() {
+        let project_path = encode_midi_device_id("legacy project.flp");
+        let legacy = format!("version=1\nenvelope={project_path}\t2\t17\t-250\t120\t240\n");
+        assert_eq!(
+            parse_playlist_audio_clip_envelopes(&legacy),
+            vec![ProjectPlaylistAudioClipEnvelope {
+                project_path: "legacy project.flp".to_owned(),
+                envelope: PlaylistAudioClipEnvelope {
+                    arrangement_id: 2,
+                    clip_id: 17,
+                    gain_centidb: -250,
+                    fade_in_ms: 120,
+                    fade_out_ms: 240,
+                    stretch_to_clip_duration: false,
+                    stretch_pitch_cents: 0,
+                },
+            }]
+        );
+
+        let invalid_fit_setting =
+            format!("version=2\nenvelope={project_path}\t2\t17\t0\t0\t0\t2\t0\n");
+        assert!(parse_playlist_audio_clip_envelopes(&invalid_fit_setting).is_empty());
+    }
+
+    #[test]
     fn playlist_audio_clip_envelopes_reject_invalid_gain_and_fade_ranges() {
         let valid = ProjectPlaylistAudioClipEnvelope {
             project_path: "project.flp".to_owned(),
@@ -60795,6 +60875,8 @@ mod tests {
                 gain_centidb: 0,
                 fade_in_ms: 0,
                 fade_out_ms: 0,
+                stretch_to_clip_duration: false,
+                stretch_pitch_cents: 0,
             },
         };
         for envelope in [
@@ -60812,6 +60894,10 @@ mod tests {
             },
             PlaylistAudioClipEnvelope {
                 fade_out_ms: 600_001,
+                ..valid.envelope
+            },
+            PlaylistAudioClipEnvelope {
+                stretch_pitch_cents: 1_201,
                 ..valid.envelope
             },
         ] {
