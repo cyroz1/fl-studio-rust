@@ -788,6 +788,59 @@ fn matching_vst3_candidate<'a>(
         .find(|candidate| candidate_matches_vst_metadata(candidate, metadata))
 }
 
+fn remap_mixer_effect_instances_after_move(
+    instances: &mut BTreeMap<(usize, u16), u64>,
+    insert_ordinal: usize,
+    from_slot: u16,
+    to_slot: u16,
+) {
+    if from_slot == to_slot {
+        return;
+    }
+
+    let moved_instance = instances.remove(&(insert_ordinal, from_slot));
+    if from_slot < to_slot {
+        for slot in from_slot..to_slot {
+            if let Some(instance) = instances.remove(&(insert_ordinal, slot + 1)) {
+                instances.insert((insert_ordinal, slot), instance);
+            }
+        }
+    } else {
+        for slot in (to_slot..from_slot).rev() {
+            if let Some(instance) = instances.remove(&(insert_ordinal, slot)) {
+                instances.insert((insert_ordinal, slot + 1), instance);
+            }
+        }
+    }
+    if let Some(instance) = moved_instance {
+        instances.insert((insert_ordinal, to_slot), instance);
+    }
+}
+
+#[cfg(test)]
+mod mixer_effect_instance_tests {
+    use super::remap_mixer_effect_instances_after_move;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn effect_instance_mapping_tracks_forward_and_backward_slot_moves() {
+        let mut instances =
+            BTreeMap::from([((2, 0), 20), ((2, 1), 21), ((2, 3), 23), ((4, 5), 45)]);
+
+        remap_mixer_effect_instances_after_move(&mut instances, 2, 1, 3);
+        assert_eq!(
+            instances,
+            BTreeMap::from([((2, 0), 20), ((2, 2), 23), ((2, 3), 21), ((4, 5), 45),])
+        );
+
+        remap_mixer_effect_instances_after_move(&mut instances, 2, 3, 0);
+        assert_eq!(
+            instances,
+            BTreeMap::from([((2, 0), 21), ((2, 1), 20), ((2, 3), 23), ((4, 5), 45),])
+        );
+    }
+}
+
 fn clap_descriptor_supports_note_preview(features: &[String]) -> bool {
     features.iter().any(|feature| {
         matches!(
@@ -4595,6 +4648,7 @@ struct DawUi {
     clap_note_preview_states: BTreeMap<(PathBuf, String), ClapNotePreviewState>,
     vst3_host: Option<Vst3HostRuntime>,
     channel_vst3_instances: BTreeMap<u16, u64>,
+    mixer_effect_vst3_instances: BTreeMap<(usize, u16), u64>,
     audio_catalog: AudioDeviceCatalog,
     audio_settings: AudioSettings,
     live_resampling_quality: ResamplingQuality,
@@ -6051,6 +6105,7 @@ impl DawUi {
             clap_note_preview_states: BTreeMap::new(),
             vst3_host: None,
             channel_vst3_instances: BTreeMap::new(),
+            mixer_effect_vst3_instances: BTreeMap::new(),
             audio_catalog,
             audio_settings,
             live_resampling_quality,
@@ -7243,6 +7298,7 @@ impl DawUi {
                 self.last_plugin_action = None;
                 self.vst3_host = None;
                 self.channel_vst3_instances.clear();
+                self.mixer_effect_vst3_instances.clear();
                 self.selected_arrangement = document.arrangements().ok().and_then(|arrangements| {
                     arrangements.first().map(|arrangement| arrangement.id)
                 });
@@ -7272,7 +7328,7 @@ impl DawUi {
                     self.recovery_prompt = recovery_prompt_for_project(target_path);
                 }
                 let plugin_summary = self
-                    .load_project_vst3_channels()
+                    .load_project_vst3_plugins()
                     .map_or_else(String::new, |summary| format!(" · {summary}"));
                 if check_recovery {
                     self.status = format!("Opened {}{plugin_summary}", target_path.display());
@@ -7999,15 +8055,17 @@ impl DawUi {
         ctx.request_repaint();
     }
 
-    fn load_project_vst3_channels(&mut self) -> Option<String> {
-        let states = self
-            .document
-            .as_ref()
-            .map(FlpDocument::channel_plugin_states)
-            .unwrap_or_default();
+    fn load_project_vst3_plugins(&mut self) -> Option<String> {
+        self.vst3_host = None;
+        self.channel_vst3_instances.clear();
+        self.mixer_effect_vst3_instances.clear();
+        let document = self.document.as_ref()?;
+        let states = document.channel_plugin_states();
+        let effect_slots = document.mixer_effect_slots();
         let mut eligible_channels = 0usize;
+        let mut eligible_effects = 0usize;
         let mut unresolved = Vec::new();
-        let mut plans = Vec::new();
+        let mut channel_plans = Vec::new();
         for state in states {
             let Some(metadata) = state.vst_metadata() else {
                 continue;
@@ -8020,7 +8078,7 @@ impl DawUi {
             };
             eligible_channels += 1;
             if let Some(candidate) = matching_vst3_candidate(&self.plugin_candidates, metadata) {
-                plans.push((state, candidate.clone(), class_uid));
+                channel_plans.push((state, candidate.clone(), class_uid));
             } else {
                 unresolved.push(format!(
                     "channel {} has no installed match",
@@ -8028,13 +8086,38 @@ impl DawUi {
                 ));
             }
         }
-        if eligible_channels == 0 {
+
+        let mut effect_plans = Vec::new();
+        for slot in effect_slots {
+            let Some(metadata) = slot.vst_metadata() else {
+                continue;
+            };
+            if metadata.format_marker() != 12 || metadata.fourcc().is_some() {
+                continue;
+            }
+            let Some(class_uid) = metadata.class_uid() else {
+                continue;
+            };
+            eligible_effects += 1;
+            if let Some(candidate) = matching_vst3_candidate(&self.plugin_candidates, metadata) {
+                effect_plans.push((slot, candidate.clone(), class_uid));
+            } else {
+                unresolved.push(format!(
+                    "Mixer insert {} effect slot {} has no installed match",
+                    slot.insert_ordinal(),
+                    slot.slot_index() + 1
+                ));
+            }
+        }
+
+        let eligible_plugins = eligible_channels + eligible_effects;
+        if eligible_plugins == 0 {
             return None;
         }
-        if plans.is_empty() {
+        if channel_plans.is_empty() && effect_plans.is_empty() {
             return Some(format!(
-                "no installed VST3 matched {} project channel(s)",
-                eligible_channels
+                "no installed VST3 matched {} project channel(s) or {} Mixer effect slot(s)",
+                eligible_channels, eligible_effects
             ));
         }
 
@@ -8045,8 +8128,10 @@ impl DawUi {
             }
         };
         let mut channel_instances = BTreeMap::new();
+        let mut mixer_effect_instances = BTreeMap::new();
+        let mut loaded_effect_count = 0usize;
         let mut restored_count = 0usize;
-        for (state, candidate, class_uid) in plans {
+        for (state, candidate, class_uid) in channel_plans {
             let channel_id = state.channel_id();
             match host.load(&candidate.path, Some(&class_uid)) {
                 Ok(info) => {
@@ -8063,19 +8148,45 @@ impl DawUi {
                 )),
             }
         }
-        let loaded_count = channel_instances.len();
+        for (slot, candidate, class_uid) in effect_plans {
+            let key = (slot.insert_ordinal(), slot.slot_index());
+            match host.load_audio_effect(&candidate.path, Some(&class_uid)) {
+                Ok(info) => {
+                    loaded_effect_count += 1;
+                    match host.restore_flp_mixer_effect_state(info.id, &slot) {
+                        Ok(()) => {
+                            mixer_effect_instances.insert(key, info.id);
+                            restored_count += 1;
+                        }
+                        Err(error) => unresolved.push(format!(
+                            "Mixer insert {} effect slot {} state could not be restored: {error}",
+                            key.0,
+                            key.1 + 1
+                        )),
+                    }
+                }
+                Err(error) => unresolved.push(format!(
+                    "Mixer insert {} effect slot {} plug-in could not load: {error}",
+                    key.0,
+                    key.1 + 1
+                )),
+            }
+        }
+        let loaded_count = channel_instances.len() + loaded_effect_count;
         self.channel_vst3_instances = channel_instances;
+        self.mixer_effect_vst3_instances = mixer_effect_instances;
         if !host.loaded_plugins().is_empty() {
             self.vst3_host = Some(host);
         }
 
         if unresolved.is_empty() {
             Some(format!(
-                "auto-loaded {loaded_count} project VST3 channel(s); restored {restored_count} state(s)"
+                "auto-loaded {} project VST3 channel(s) and {loaded_effect_count} Mixer effect(s); restored {restored_count} state(s)",
+                self.channel_vst3_instances.len()
             ))
         } else {
             Some(format!(
-                "auto-loaded {loaded_count}/{eligible_channels} project VST3 channel(s); restored {restored_count} state(s); {} issue(s) ({})",
+                "auto-loaded {loaded_count}/{eligible_plugins} project VST3 channel/effect instance(s); restored {restored_count} state(s); {} issue(s) ({})",
                 unresolved.len(),
                 unresolved
                     .iter()
@@ -8186,16 +8297,26 @@ impl DawUi {
                 return;
             }
         };
-        let Some(document) = self.document.as_mut() else {
+        let Some(mut document) = self.document.as_ref().cloned() else {
             self.status = "Open a project before loading a Mixer state".to_owned();
             return;
         };
+        let capture_warnings = self.capture_loaded_vst3_state(&mut document);
         match document.apply_mixer_insert_state_preset(insert_ordinal, &preset) {
             Ok(event_count) => {
+                self.document = Some(document);
                 self.dirty = true;
+                let plugin_summary = self
+                    .load_project_vst3_plugins()
+                    .map_or_else(String::new, |summary| format!(" · {summary}"));
+                let capture_warning = if capture_warnings.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · {} VST3 state capture issue(s)", capture_warnings.len())
+                };
                 self.status = format!(
-                    "Loaded {event_count} Mixer effect-state events into insert {insert_ordinal} from {}",
-                    path.display()
+                    "Loaded {event_count} Mixer effect-state events into insert {insert_ordinal} from {}{plugin_summary}{capture_warning}",
+                    path.display(),
                 );
             }
             Err(error) => {
@@ -9678,7 +9799,14 @@ impl DawUi {
             .as_ref()
             .map(FlpDocument::channel_plugin_states)
             .unwrap_or_default();
+        let effect_slots = self
+            .document
+            .as_ref()
+            .map(FlpDocument::mixer_effect_slots)
+            .unwrap_or_default();
         let instances = self.channel_vst3_instances.clone();
+        let channel_instance_ids = instances.values().copied().collect::<BTreeSet<_>>();
+        self.mixer_effect_vst3_instances.clear();
         let Some(host) = self.vst3_host.as_mut() else {
             return Vec::new();
         };
@@ -9691,6 +9819,55 @@ impl DawUi {
                 warnings.push(format!("channel {}: {error}", state.channel_id()));
             }
         }
+
+        let loaded_plugins = host.loaded_plugins();
+        let mut slots_by_class_uid = BTreeMap::<String, Vec<_>>::new();
+        for slot in effect_slots {
+            let Some(metadata) = slot.vst_metadata() else {
+                continue;
+            };
+            if metadata.format_marker() != 12 || metadata.fourcc().is_some() {
+                continue;
+            }
+            let Some(class_uid) = metadata.class_uid() else {
+                continue;
+            };
+            slots_by_class_uid
+                .entry(class_uid.to_ascii_uppercase())
+                .or_default()
+                .push(slot);
+        }
+        let mut restored_effect_instances = BTreeMap::new();
+        for (class_uid, slots) in slots_by_class_uid {
+            if slots.len() != 1 {
+                continue;
+            }
+            let slot = &slots[0];
+            let mut matches = loaded_plugins.iter().filter(|plugin| {
+                !channel_instance_ids.contains(&plugin.id)
+                    && plugin.audio_inputs > 0
+                    && plugin.audio_outputs > 0
+                    && plugin.uid.eq_ignore_ascii_case(&class_uid)
+            });
+            let Some(plugin) = matches.next() else {
+                continue;
+            };
+            if matches.next().is_some() {
+                continue;
+            }
+            match host.restore_flp_mixer_effect_state(plugin.id, slot) {
+                Ok(()) => {
+                    restored_effect_instances
+                        .insert((slot.insert_ordinal(), slot.slot_index()), plugin.id);
+                }
+                Err(error) => warnings.push(format!(
+                    "Mixer insert {} effect slot {}: {error}",
+                    slot.insert_ordinal(),
+                    slot.slot_index() + 1
+                )),
+            }
+        }
+        self.mixer_effect_vst3_instances = restored_effect_instances;
         warnings
     }
 
@@ -9867,6 +10044,7 @@ impl DawUi {
             return Vec::new();
         };
         let instances = &self.channel_vst3_instances;
+        let effect_instances = &self.mixer_effect_vst3_instances;
         let mut warnings = Vec::new();
         for state in document.channel_plugin_states() {
             let Some(instance_id) = instances.get(&state.channel_id()).copied() else {
@@ -9883,6 +10061,32 @@ impl DawUi {
                 document.replace_vst3_channel_state_bytes(state.channel_id(), &updated_state)
             {
                 warnings.push(format!("channel {}: {error}", state.channel_id()));
+            }
+        }
+        for slot in document.mixer_effect_slots() {
+            let key = (slot.insert_ordinal(), slot.slot_index());
+            let Some(instance_id) = effect_instances.get(&key).copied() else {
+                continue;
+            };
+            let nested_state = match host.save_flp_mixer_effect_state(instance_id, &slot) {
+                Ok(nested_state) => nested_state,
+                Err(error) => {
+                    warnings.push(format!(
+                        "Mixer insert {} effect slot {}: {error}",
+                        key.0,
+                        key.1 + 1
+                    ));
+                    continue;
+                }
+            };
+            if let Err(error) =
+                document.replace_vst3_mixer_effect_slot_state_bytes(key.0, key.1, &nested_state)
+            {
+                warnings.push(format!(
+                    "Mixer insert {} effect slot {}: {error}",
+                    key.0,
+                    key.1 + 1
+                ));
             }
         }
         warnings
@@ -43560,6 +43764,14 @@ impl DawUi {
                                     1 => "1 saved state record".to_owned(),
                                     count => format!("{count} saved state records"),
                                 };
+                                let saved_state = if self
+                                    .mixer_effect_vst3_instances
+                                    .contains_key(&(insert.ordinal(), slot.slot_index()))
+                                {
+                                    format!("{saved_state} · VST3 loaded")
+                                } else {
+                                    saved_state
+                                };
                                 let width = ui.available_width();
                                 let slot_index_raw = slot_index as u16;
                                 let (response, dropped_slot) = ui.dnd_drop_zone::<(usize, u16), _>(
@@ -43682,7 +43894,7 @@ impl DawUi {
                             }
                             ui.small(
                                 egui::RichText::new(
-                                    "Move up/down carries saved slot events with the effect. State events can also be transferred from a Mixer preset; plug-ins are not hosted or processed in this view.",
+                                    "Move up/down carries saved slot events with the effect. Recognized VST3 effect state loads into the isolated host and is saved back with the project; Mixer audio processing is not yet connected to playback.",
                                 )
                                 .color(MUTED),
                             );
@@ -43981,6 +44193,12 @@ impl DawUi {
         {
             match document.move_mixer_effect_slot(insert_ordinal, from_slot, to_slot) {
                 Ok(()) => {
+                    remap_mixer_effect_instances_after_move(
+                        &mut self.mixer_effect_vst3_instances,
+                        insert_ordinal,
+                        from_slot,
+                        to_slot,
+                    );
                     self.dirty = true;
                     self.status = format!(
                         "Moved Mixer insert {insert_ordinal} effect slot {} to {}",
@@ -50547,7 +50765,7 @@ impl DawUi {
         });
         ui.label(
             egui::RichText::new(
-                "Matching VST3 channels load with the project. Detected CLAP and macOS Audio Unit bundles are listed below.",
+                "Matching VST3 instrument channels and recognized Mixer effect slots load with the project. Effect audio processing in the Mixer is not yet connected. Detected CLAP and macOS Audio Unit bundles are listed below.",
             )
             .color(MUTED),
         );
