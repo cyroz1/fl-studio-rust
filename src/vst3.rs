@@ -20,7 +20,7 @@ use crate::sample_render::{
     AudioFileRenderOptions, PlaylistPatternScheduleOptions, PlaylistRenderOptions,
     PlaylistTempoMap, PlaylistTrackFilter, apply_mixer_master_output_to_stereo, channel_gain_pan,
     channel_pan_gains, project_pan_law, render_stereo_audio_to_file,
-    schedule_playlist_pattern_notes, swing_note_start_tick,
+    schedule_playlist_pattern_notes_with_adjustments, swing_note_start_tick,
 };
 use crate::{
     ChannelNoteRouter, ChannelPluginState, FlpDocument, MixerRouteAudibility,
@@ -64,6 +64,8 @@ struct ScheduledMidiEvent {
     note_mod_x: u8,
     note_mod_y: u8,
     note_release: u8,
+    layer_gain: f32,
+    layer_pan_raw: i32,
     performance_track_id: Option<u32>,
 }
 
@@ -75,8 +77,11 @@ struct ScheduledVst3Note {
     note_mod_y: u8,
     note_release: u8,
     supports_pan: bool,
+    supports_volume: bool,
     supports_brightness: bool,
     mod_y_expression: Option<Vst3ModYExpression>,
+    layer_gain: f32,
+    layer_pan_raw: i32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -115,6 +120,7 @@ struct PreparedPatternRender {
     parameter_automation: Vec<PreparedParameterAutomation>,
     pitch_offset_cents: i16,
     supports_note_pan: bool,
+    supports_note_volume: bool,
     supports_note_brightness: bool,
     mod_y_expression: Option<Vst3ModYExpression>,
     note_count: usize,
@@ -313,6 +319,8 @@ pub(crate) struct PlaylistMidiNote {
     pub(crate) mod_x: u8,
     pub(crate) mod_y: u8,
     pub(crate) release: u8,
+    pub(crate) layer_gain: f32,
+    pub(crate) layer_pan_raw: i32,
 }
 
 struct PlaylistPluginStream {
@@ -320,7 +328,7 @@ struct PlaylistPluginStream {
     plugin: Arc<Mutex<Plugin>>,
     live_midi_receiver: Receiver<PlaylistLiveMidiEvent>,
     live_midi_stopped_generation: Arc<AtomicU64>,
-    live_midi_active_notes: BTreeMap<(u64, u8, u8), usize>,
+    live_midi_active_notes: BTreeMap<(u64, u8, u8), VecDeque<ScheduledVst3Note>>,
     live_midi_sustain_channels: BTreeMap<u64, BTreeSet<u8>>,
     render: PreparedPatternRender,
     resampler: StereoStreamResampler,
@@ -351,6 +359,9 @@ struct PlaylistLiveMixerSource {
 struct PlaylistLiveMidiEvent {
     generation: u64,
     event: MidiEvent,
+    note_id: i32,
+    layer_gain: f32,
+    layer_pan_raw: i32,
 }
 
 /// Routes live MIDI into a VST3 instrument already processing Playlist audio.
@@ -365,6 +376,7 @@ pub struct Vst3PlaylistLiveInputSender {
 pub struct Vst3PlaylistLiveInputSession {
     sender: Vst3PlaylistLiveInputSender,
     generation: u64,
+    active_notes: Mutex<HashMap<(u8, u8), VecDeque<(i32, f32, i32)>>>,
 }
 
 impl Vst3PlaylistLiveInputSender {
@@ -376,6 +388,7 @@ impl Vst3PlaylistLiveInputSender {
         Vst3PlaylistLiveInputSession {
             sender: self.clone(),
             generation,
+            active_notes: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -383,18 +396,108 @@ impl Vst3PlaylistLiveInputSender {
 impl Vst3PlaylistLiveInputSession {
     /// Queue one live MIDI event for the next Playlist plug-in processing block.
     pub fn try_send(&self, event: MidiEvent) -> Result<(), String> {
+        self.try_send_with_layer_adjustments(event, 1.0, 0)
+    }
+
+    /// Queue a live MIDI event with Layer gain and pan for the next processing block.
+    pub fn try_send_with_layer_adjustments(
+        &self,
+        mut event: MidiEvent,
+        layer_gain: f32,
+        layer_pan_raw: i32,
+    ) -> Result<(), String> {
+        if let MidiEvent::NoteOn {
+            channel,
+            note,
+            velocity: 0,
+        } = event
+        {
+            event = MidiEvent::NoteOff {
+                channel,
+                note,
+                velocity: 0,
+            };
+        }
+
+        let mut note_id = 0;
+        let mut event_layer_gain = 1.0;
+        let mut event_layer_pan_raw = 0;
+        let note_key = match event {
+            MidiEvent::NoteOn {
+                channel,
+                note,
+                velocity,
+            } if velocity > 0 => {
+                note_id = next_vst3_note_expression_id();
+                event_layer_gain = layer_gain;
+                event_layer_pan_raw = layer_pan_raw;
+                Some((channel.as_index(), note, true))
+            }
+            MidiEvent::NoteOff { channel, note, .. } => Some((channel.as_index(), note, false)),
+            _ => None,
+        };
+        let paired_note = if let Some((channel, note, false)) = note_key {
+            self.active_notes
+                .lock()
+                .map_err(|_| "VST3 live MIDI note state lock was poisoned".to_owned())?
+                .get_mut(&(channel, note))
+                .and_then(VecDeque::pop_front)
+        } else {
+            None
+        };
+        if let Some((paired_note_id, paired_gain, paired_pan)) = paired_note {
+            note_id = paired_note_id;
+            event_layer_gain = paired_gain;
+            event_layer_pan_raw = paired_pan;
+        }
         self.sender
             .sender
             .try_send(PlaylistLiveMidiEvent {
                 generation: self.generation,
                 event,
+                note_id,
+                layer_gain: event_layer_gain,
+                layer_pan_raw: event_layer_pan_raw,
             })
-            .map_err(|error| match error {
-                mpsc::TrySendError::Full(_) => "VST3 live MIDI queue is full".to_owned(),
-                mpsc::TrySendError::Disconnected(_) => {
-                    "Playlist VST3 processor is no longer available".to_owned()
+            .map_err(|error| {
+                if let Some((channel, note, false)) = note_key
+                    && let Some(paired_note) = paired_note
+                    && let Ok(mut active_notes) = self.active_notes.lock()
+                {
+                    active_notes
+                        .entry((channel, note))
+                        .or_default()
+                        .push_front(paired_note);
                 }
-            })
+                match error {
+                    mpsc::TrySendError::Full(_) => "VST3 live MIDI queue is full".to_owned(),
+                    mpsc::TrySendError::Disconnected(_) => {
+                        "Playlist VST3 processor is no longer available".to_owned()
+                    }
+                }
+            })?;
+
+        if let Some((channel, note, true)) = note_key {
+            self.active_notes
+                .lock()
+                .map_err(|_| "VST3 live MIDI note state lock was poisoned".to_owned())?
+                .entry((channel, note))
+                .or_default()
+                .push_back((note_id, layer_gain, layer_pan_raw));
+        }
+        if let MidiEvent::ControlChange {
+            channel,
+            controller: 120 | 123..=127,
+            ..
+        } = event
+        {
+            let channel = channel.as_index();
+            self.active_notes
+                .lock()
+                .map_err(|_| "VST3 live MIDI note state lock was poisoned".to_owned())?
+                .retain(|(active_channel, _), _| *active_channel != channel);
+        }
+        Ok(())
     }
 
     pub fn stop(&self) {
@@ -486,6 +589,8 @@ impl Vst3PlaylistStreamProcessor {
         midi_channel: u8,
         key: u8,
         velocity: u8,
+        layer_gain: f32,
+        layer_pan_raw: i32,
     ) -> Result<(i32, u8), String> {
         let midi_channel = MidiChannel::from_index(midi_channel & 0x0F)
             .ok_or_else(|| "MIDI channel is outside 0..15".to_owned())?;
@@ -514,6 +619,8 @@ impl Vst3PlaylistStreamProcessor {
                 note_mod_x: 128,
                 note_mod_y: 128,
                 note_release: 64,
+                layer_gain,
+                layer_pan_raw,
                 performance_track_id: Some(LIVE_VST3_INPUT_TRACK_ID),
             },
         );
@@ -552,6 +659,8 @@ impl Vst3PlaylistStreamProcessor {
                 note_mod_x: 128,
                 note_mod_y: 128,
                 note_release: 64,
+                layer_gain: 1.0,
+                layer_pan_raw: 0,
                 performance_track_id: Some(LIVE_VST3_INPUT_TRACK_ID),
             },
         );
@@ -597,6 +706,8 @@ impl Vst3PlaylistStreamProcessor {
                 note_mod_x: 128,
                 note_mod_y: 128,
                 note_release: 64,
+                layer_gain: 1.0,
+                layer_pan_raw: 0,
                 performance_track_id: Some(LIVE_VST3_INPUT_TRACK_ID),
             },
         );
@@ -1151,8 +1262,11 @@ impl PlaylistPluginStream {
                                 note_mod_y: event.note_mod_y,
                                 note_release: event.note_release,
                                 supports_pan: self.render.supports_note_pan,
+                                supports_volume: self.render.supports_note_volume,
                                 supports_brightness: self.render.supports_note_brightness,
                                 mod_y_expression: self.render.mod_y_expression,
+                                layer_gain: event.layer_gain,
+                                layer_pan_raw: event.layer_pan_raw,
                             },
                         )?;
                         if event.performance_track_id.is_some() {
@@ -1250,6 +1364,30 @@ impl PlaylistPluginStream {
                 MidiEvent::NoteOff { velocity, .. } => velocity,
                 _ => 0,
             };
+            let live_note = ScheduledVst3Note {
+                note_id: queued.note_id,
+                note_pan: 64,
+                note_mod_x: 128,
+                note_mod_y: 128,
+                note_release: release,
+                supports_pan: self.render.supports_note_pan,
+                supports_volume: self.render.supports_note_volume,
+                supports_brightness: self.render.supports_note_brightness,
+                mod_y_expression: self.render.mod_y_expression,
+                layer_gain: queued.layer_gain,
+                layer_pan_raw: queued.layer_pan_raw,
+            };
+            let note_off_context = match event {
+                MidiEvent::NoteOff { channel, note, .. } => self
+                    .live_midi_active_notes
+                    .get_mut(&(queued.generation, channel.as_index(), note))
+                    .and_then(VecDeque::pop_front),
+                _ => None,
+            };
+            let mut event_note = note_off_context.unwrap_or(live_note);
+            if matches!(event, MidiEvent::NoteOff { .. }) {
+                event_note.note_release = release;
+            }
             match event {
                 MidiEvent::NoteOn { .. } | MidiEvent::NoteOff { .. } => {
                     send_scheduled_midi_event(
@@ -1258,16 +1396,7 @@ impl PlaylistPluginStream {
                         0,
                         self.render.pitch_offset_cents,
                         0,
-                        ScheduledVst3Note {
-                            note_id: 0,
-                            note_pan: 64,
-                            note_mod_x: 128,
-                            note_mod_y: 128,
-                            note_release: release,
-                            supports_pan: false,
-                            supports_brightness: false,
-                            mod_y_expression: None,
-                        },
+                        event_note,
                     )?;
                 }
                 _ => plugin
@@ -1280,20 +1409,19 @@ impl PlaylistPluginStream {
                     note,
                     velocity,
                 } if velocity > 0 => {
-                    let count = self
-                        .live_midi_active_notes
+                    self.live_midi_active_notes
                         .entry((queued.generation, channel.as_index(), note))
-                        .or_default();
-                    *count = count.saturating_add(1);
+                        .or_default()
+                        .push_back(live_note);
                 }
                 MidiEvent::NoteOff { channel, note, .. } => {
                     let key = (queued.generation, channel.as_index(), note);
-                    if let Some(count) = self.live_midi_active_notes.get_mut(&key) {
-                        if *count <= 1 {
-                            self.live_midi_active_notes.remove(&key);
-                        } else {
-                            *count -= 1;
-                        }
+                    if self
+                        .live_midi_active_notes
+                        .get(&key)
+                        .is_some_and(VecDeque::is_empty)
+                    {
+                        self.live_midi_active_notes.remove(&key);
                     }
                 }
                 MidiEvent::ControlChange {
@@ -1371,11 +1499,19 @@ impl PlaylistPluginStream {
             .live_midi_active_notes
             .iter()
             .filter(|((generation, _, _), _)| *generation <= stopped_generation)
-            .map(|(&(generation, channel, note), &count)| (generation, channel, note, count))
+            .map(|(&(generation, channel, note), active)| {
+                (
+                    generation,
+                    channel,
+                    note,
+                    active.iter().copied().collect::<Vec<_>>(),
+                )
+            })
             .collect::<Vec<_>>();
-        for (generation, channel, note, count) in notes {
+        for (generation, channel, note, active_notes) in notes {
             if let Some(channel) = MidiChannel::from_index(channel) {
-                for _ in 0..count {
+                for mut active_note in active_notes {
+                    active_note.note_release = 0;
                     send_scheduled_midi_event(
                         plugin,
                         MidiEvent::NoteOff {
@@ -1386,16 +1522,7 @@ impl PlaylistPluginStream {
                         0,
                         self.render.pitch_offset_cents,
                         0,
-                        ScheduledVst3Note {
-                            note_id: 0,
-                            note_pan: 64,
-                            note_mod_x: 128,
-                            note_mod_y: 128,
-                            note_release: 0,
-                            supports_pan: false,
-                            supports_brightness: false,
-                            mod_y_expression: None,
-                        },
+                        active_note,
                     )?;
                 }
             }
@@ -2290,12 +2417,34 @@ impl Vst3HostRuntime {
         options: Vst3PatternRenderOptions,
         parameter_automation: &[Vst3ParameterAutomation],
     ) -> Result<(Vec<f32>, Vst3RenderSummary), String> {
+        self.render_pattern_channel_to_stereo_buffer_with_layer_adjustments(
+            id,
+            notes,
+            options,
+            parameter_automation,
+            None,
+        )
+    }
+
+    fn render_pattern_channel_to_stereo_buffer_with_layer_adjustments(
+        &self,
+        id: u64,
+        notes: &[PatternNote],
+        options: Vst3PatternRenderOptions,
+        parameter_automation: &[Vst3ParameterAutomation],
+        layer_adjustments: Option<&[(f32, i32)]>,
+    ) -> Result<(Vec<f32>, Vst3RenderSummary), String> {
         let plugin = self.plugin(id)?;
         let mut plugin = plugin
             .lock()
             .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
-        let render =
-            prepare_pattern_render_with_automation(&plugin, notes, options, parameter_automation)?;
+        let render = prepare_pattern_render_with_layer_adjustments(
+            &plugin,
+            notes,
+            options,
+            parameter_automation,
+            layer_adjustments,
+        )?;
         if !(1..=2).contains(&render.output_channels) {
             return Err(format!(
                 "VST3 preview supports mono or stereo output buses; this instrument has {} channels",
@@ -2356,7 +2505,7 @@ impl Vst3HostRuntime {
         let note_router = ChannelNoteRouter::new(project_channels.clone());
         let mixer_route_audibility = MixerRouteAudibility::from_document(document);
         let global_swing_mix_raw = document.metadata().global_swing_mix();
-        let mut routed_notes_by_channel = BTreeMap::<u16, Vec<PatternNote>>::new();
+        let mut routed_notes_by_channel = BTreeMap::<u16, Vec<(PatternNote, f32, i32)>>::new();
         for channel in channels {
             let channel_id = channel.options.channel_id;
             if !channels_by_id.contains_key(&channel_id) {
@@ -2377,11 +2526,14 @@ impl Vst3HostRuntime {
             if note.is_muted() {
                 continue;
             }
-            let targets =
-                note_router.targets_for_note(note.channel_id, note_index as u64, note.key);
+            let targets = note_router.targets_for_note_with_layer_adjustments(
+                note.channel_id,
+                note_index as u64,
+                note.key,
+            );
             if !targets
                 .iter()
-                .any(|channel_id| routed_notes_by_channel.contains_key(channel_id))
+                .any(|(channel_id, _, _)| routed_notes_by_channel.contains_key(channel_id))
             {
                 continue;
             }
@@ -2396,14 +2548,14 @@ impl Vst3HostRuntime {
             )?;
             let position = u32::try_from(swung_position)
                 .map_err(|_| "swing-adjusted VST3 note position exceeds 32-bit ticks")?;
-            for channel_id in targets {
+            for (channel_id, layer_gain, layer_pan_raw) in targets {
                 let Some(routed_notes) = routed_notes_by_channel.get_mut(&channel_id) else {
                     continue;
                 };
                 let mut routed_note = note.clone();
                 routed_note.position = position;
                 routed_note.channel_id = channel_id;
-                routed_notes.push(routed_note);
+                routed_notes.push((routed_note, layer_gain, layer_pan_raw));
             }
         }
 
@@ -2422,22 +2574,31 @@ impl Vst3HostRuntime {
             {
                 continue;
             }
-            let routed_notes = routed_notes_by_channel
+            let routed_note_data = routed_notes_by_channel
                 .get(&channel_id)
                 .expect("Pattern target channels were validated above");
-            if routed_notes.is_empty() {
+            if routed_note_data.is_empty() {
                 continue;
             }
+            let routed_notes = routed_note_data
+                .iter()
+                .map(|(note, _, _)| note.clone())
+                .collect::<Vec<_>>();
+            let layer_adjustments = routed_note_data
+                .iter()
+                .map(|(_, gain, pan_raw)| (*gain, *pan_raw))
+                .collect::<Vec<_>>();
 
             let mut options = channel.options;
             options.global_swing_mix_raw = 0;
             options.channel_swing_mix_raw = 0;
             let (mut stereo, summary) = self
-                .render_pattern_channel_to_stereo_buffer_with_automation(
+                .render_pattern_channel_to_stereo_buffer_with_layer_adjustments(
                     channel.instance_id,
-                    routed_notes,
+                    &routed_notes,
                     options,
                     &channel.parameter_automation,
+                    Some(&layer_adjustments),
                 )?;
             if let Some(expected_rate) = sample_rate
                 && summary.sample_rate != expected_rate
@@ -2836,8 +2997,12 @@ impl Vst3HostRuntime {
                 .checked_add(u64::from(note.length.max(1)))
                 .and_then(|tick| tick.checked_add(swing_offset))
                 .ok_or_else(|| "Pattern VST3 note end position overflow".to_owned())?;
-            for target_channel_id in
-                router.targets_for_note(note.channel_id, note_index as u64, note.key)
+            for (target_channel_id, layer_gain, layer_pan_raw) in router
+                .targets_for_note_with_layer_adjustments(
+                    note.channel_id,
+                    note_index as u64,
+                    note.key,
+                )
             {
                 if !plugin_channels.contains(&target_channel_id)
                     || !channels_by_id
@@ -2864,6 +3029,8 @@ impl Vst3HostRuntime {
                         pan: note.pan,
                         mod_x: note.mod_x,
                         release: note.release,
+                        layer_gain,
+                        layer_pan_raw,
                     });
             }
         }
@@ -3086,7 +3253,7 @@ impl Vst3HostRuntime {
                 })
                 .map(|channel| channel.id()),
         );
-        let schedule = schedule_playlist_pattern_notes(
+        let schedule = schedule_playlist_pattern_notes_with_adjustments(
             &patterns,
             &arrangement,
             track_filter,
@@ -3104,9 +3271,9 @@ impl Vst3HostRuntime {
             },
             |channel_id, seed, key| {
                 channel_router
-                    .targets_for_note(channel_id, seed, key)
+                    .targets_for_note_with_layer_adjustments(channel_id, seed, key)
                     .into_iter()
-                    .filter(|target_channel_id| {
+                    .filter(|(target_channel_id, _, _)| {
                         plugin_channels.contains(target_channel_id)
                             && channels_by_id
                                 .get(target_channel_id)
@@ -3143,6 +3310,8 @@ impl Vst3HostRuntime {
                     pan: note.pan,
                     mod_x: note.mod_x,
                     release: note.release,
+                    layer_gain: placed.target_gain,
+                    layer_pan_raw: placed.target_pan_raw,
                 });
         }
         for (&channel_id, lanes) in parameter_automation {
@@ -3845,7 +4014,7 @@ fn prepare_playlist_pattern_render(
     let (mut events, note_count) =
         scheduled_playlist_midi_events_with_tempo_map(notes, tempo_map, sample_rate)?;
     transpose_scheduled_note_events(&mut events, note_pitch_offset_semitones);
-    let (supports_note_pan, supports_note_brightness, mod_y_expression) =
+    let (supports_note_pan, supports_note_volume, supports_note_brightness, mod_y_expression) =
         plugin_note_expression_support(plugin);
     let last_event_frame = events.iter().map(|event| event.frame).max().unwrap_or(0);
     Ok(PreparedPatternRender {
@@ -3853,6 +4022,7 @@ fn prepare_playlist_pattern_render(
         parameter_automation: Vec::new(),
         pitch_offset_cents,
         supports_note_pan,
+        supports_note_volume,
         supports_note_brightness,
         mod_y_expression,
         note_count,
@@ -3941,6 +4111,8 @@ fn scheduled_playlist_midi_events_with_tempo_map(
             note_mod_x: note.mod_x,
             note_mod_y: note.mod_y,
             note_release: note.release,
+            layer_gain: note.layer_gain,
+            layer_pan_raw: note.layer_pan_raw,
             performance_track_id: None,
         });
         events.push(ScheduledMidiEvent {
@@ -3957,6 +4129,8 @@ fn scheduled_playlist_midi_events_with_tempo_map(
             note_mod_x: note.mod_x,
             note_mod_y: note.mod_y,
             note_release: note.release,
+            layer_gain: note.layer_gain,
+            layer_pan_raw: note.layer_pan_raw,
             performance_track_id: None,
         });
         note_count += 1;
@@ -3970,6 +4144,22 @@ fn prepare_pattern_render_with_automation(
     notes: &[PatternNote],
     options: Vst3PatternRenderOptions,
     parameter_automation: &[Vst3ParameterAutomation],
+) -> Result<PreparedPatternRender, String> {
+    prepare_pattern_render_with_layer_adjustments(
+        plugin,
+        notes,
+        options,
+        parameter_automation,
+        None,
+    )
+}
+
+fn prepare_pattern_render_with_layer_adjustments(
+    plugin: &Plugin,
+    notes: &[PatternNote],
+    options: Vst3PatternRenderOptions,
+    parameter_automation: &[Vst3ParameterAutomation],
+    layer_adjustments: Option<&[(f32, i32)]>,
 ) -> Result<PreparedPatternRender, String> {
     let Vst3PatternRenderOptions {
         channel_id,
@@ -4013,7 +4203,7 @@ fn prepare_pattern_render_with_automation(
     let parameter_automation =
         prepare_parameter_automation(parameter_automation, sample_rate, tempo_bpm)?;
 
-    let (mut events, note_count) = scheduled_pattern_events(
+    let (mut events, note_count) = scheduled_pattern_events_with_layer_adjustments(
         notes,
         channel_id,
         ppq,
@@ -4021,9 +4211,10 @@ fn prepare_pattern_render_with_automation(
         sample_rate,
         global_swing_mix_raw,
         channel_swing_mix_raw,
+        layer_adjustments,
     )?;
     transpose_scheduled_note_events(&mut events, note_pitch_offset_semitones);
-    let (supports_note_pan, supports_note_brightness, mod_y_expression) =
+    let (supports_note_pan, supports_note_volume, supports_note_brightness, mod_y_expression) =
         plugin_note_expression_support(plugin);
     if note_count == 0 {
         return Err(format!(
@@ -4049,6 +4240,7 @@ fn prepare_pattern_render_with_automation(
         parameter_automation,
         pitch_offset_cents,
         supports_note_pan,
+        supports_note_volume,
         supports_note_brightness,
         mod_y_expression,
         note_count,
@@ -4060,12 +4252,15 @@ fn prepare_pattern_render_with_automation(
     })
 }
 
-fn plugin_note_expression_support(plugin: &Plugin) -> (bool, bool, Option<Vst3ModYExpression>) {
+fn plugin_note_expression_support(
+    plugin: &Plugin,
+) -> (bool, bool, bool, Option<Vst3ModYExpression>) {
     let Ok(expressions) = plugin.note_expressions() else {
-        return (false, false, None);
+        return (false, false, false, None);
     };
     (
         note_expressions_support_pan(&expressions),
+        note_expressions_support_volume(&expressions),
         note_expressions_support_brightness(&expressions),
         note_expressions_support_mod_y(&expressions),
     )
@@ -4075,6 +4270,12 @@ fn note_expressions_support_pan(expressions: &[NoteExpressionInfo]) -> bool {
     expressions
         .iter()
         .any(|expression| expression.kind == NoteExpressionType::Pan)
+}
+
+fn note_expressions_support_volume(expressions: &[NoteExpressionInfo]) -> bool {
+    expressions
+        .iter()
+        .any(|expression| expression.kind == NoteExpressionType::Volume)
 }
 
 fn note_expressions_support_brightness(expressions: &[NoteExpressionInfo]) -> bool {
@@ -4146,6 +4347,16 @@ fn next_vst3_note_expression_id() -> i32 {
 
 fn vst3_note_pan_value(note_pan: u8) -> f64 {
     f64::from(note_pan.min(128)) / 128.0
+}
+
+fn vst3_note_pan_with_layer_offset(note_pan: u8, layer_pan_raw: i32) -> f64 {
+    (vst3_note_pan_value(note_pan) + f64::from(layer_pan_raw.clamp(-6_400, 6_400)) / 12_800.0)
+        .clamp(0.0, 1.0)
+}
+
+fn vst3_note_volume_value(layer_gain: f32) -> f64 {
+    // VST3's standard Volume note-expression range is 0..1, with 0.25 at unity gain.
+    (f64::from(layer_gain.max(0.0)) / 4.0).clamp(0.0, 1.0)
 }
 
 fn vst3_note_brightness_value(note_mod_x: u8) -> f64 {
@@ -4526,8 +4737,11 @@ fn process_pattern_render(
                         note_mod_y: event.note_mod_y,
                         note_release: event.note_release,
                         supports_pan: render.supports_note_pan,
+                        supports_volume: render.supports_note_volume,
                         supports_brightness: render.supports_note_brightness,
                         mod_y_expression: render.mod_y_expression,
+                        layer_gain: event.layer_gain,
+                        layer_pan_raw: event.layer_pan_raw,
                     },
                 )?;
                 event_index += 1;
@@ -4670,8 +4884,11 @@ fn stream_live_midi_input(
                                     note_mod_y: 128,
                                     note_release: release,
                                     supports_pan: false,
+                                    supports_volume: false,
                                     supports_brightness: false,
                                     mod_y_expression: None,
+                                    layer_gain: 1.0,
+                                    layer_pan_raw: 0,
                                 },
                             )?;
                         }
@@ -4791,8 +5008,11 @@ fn stream_live_midi_input(
                         note_mod_y: 128,
                         note_release: 0,
                         supports_pan: false,
+                        supports_volume: false,
                         supports_brightness: false,
                         mod_y_expression: None,
+                        layer_gain: 1.0,
+                        layer_pan_raw: 0,
                     },
                 )?;
             }
@@ -4867,8 +5087,11 @@ fn stream_pattern_render(
                             note_mod_y: event.note_mod_y,
                             note_release: event.note_release,
                             supports_pan: render.supports_note_pan,
+                            supports_volume: render.supports_note_volume,
                             supports_brightness: render.supports_note_brightness,
                             mod_y_expression: render.mod_y_expression,
+                            layer_gain: event.layer_gain,
+                            layer_pan_raw: event.layer_pan_raw,
                         },
                     )?;
                     event_index += 1;
@@ -5109,7 +5332,12 @@ fn send_scheduled_midi_event(
             .send_midi_event_at(event, sample_offset)
             .map_err(|error| error.to_string());
     }
-    if note.supports_pan || note.supports_brightness || note.mod_y_expression.is_some() {
+    let apply_layer_volume = note.supports_volume && (note.layer_gain - 1.0).abs() > f32::EPSILON;
+    if note.supports_pan
+        || apply_layer_volume
+        || note.supports_brightness
+        || note.mod_y_expression.is_some()
+    {
         let mut plugin_event = plugin_event_with_pitch_offset_and_note_id(
             event,
             sample_offset,
@@ -5130,7 +5358,17 @@ fn send_scheduled_midi_event(
                     .send_note_expression_at(
                         note_id,
                         NoteExpressionType::Pan,
-                        vst3_note_pan_value(note.note_pan),
+                        vst3_note_pan_with_layer_offset(note.note_pan, note.layer_pan_raw),
+                        sample_offset,
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+            if apply_layer_volume {
+                plugin
+                    .send_note_expression_at(
+                        note_id,
+                        NoteExpressionType::Volume,
+                        vst3_note_volume_value(note.layer_gain),
                         sample_offset,
                     )
                     .map_err(|error| error.to_string())?;
@@ -5280,6 +5518,7 @@ fn apply_stereo_mixer_transform(
     Ok(())
 }
 
+#[cfg(test)]
 fn scheduled_pattern_events(
     notes: &[PatternNote],
     channel_id: u16,
@@ -5289,17 +5528,43 @@ fn scheduled_pattern_events(
     global_swing_mix_raw: u8,
     channel_swing_mix_raw: u16,
 ) -> Result<(Vec<ScheduledMidiEvent>, usize), String> {
+    scheduled_pattern_events_with_layer_adjustments(
+        notes,
+        channel_id,
+        ppq,
+        tempo_bpm,
+        sample_rate,
+        global_swing_mix_raw,
+        channel_swing_mix_raw,
+        None,
+    )
+}
+
+fn scheduled_pattern_events_with_layer_adjustments(
+    notes: &[PatternNote],
+    channel_id: u16,
+    ppq: u16,
+    tempo_bpm: f64,
+    sample_rate: f64,
+    global_swing_mix_raw: u8,
+    channel_swing_mix_raw: u16,
+    layer_adjustments: Option<&[(f32, i32)]>,
+) -> Result<(Vec<ScheduledMidiEvent>, usize), String> {
     if ppq == 0 {
         return Err("project PPQ must be greater than zero".to_owned());
     }
     if !sample_rate.is_finite() || sample_rate <= 0.0 {
         return Err("VST3 host sample rate must be finite and positive".to_owned());
     }
+    if layer_adjustments.is_some_and(|adjustments| adjustments.len() != notes.len()) {
+        return Err("Layer adjustment count does not match the Pattern note count".to_owned());
+    }
     let mut events = Vec::new();
     let mut note_count = 0usize;
-    for note in notes
+    for (note_index, note) in notes
         .iter()
-        .filter(|note| note.channel_id == channel_id && !note.is_muted())
+        .enumerate()
+        .filter(|(_, note)| note.channel_id == channel_id && !note.is_muted())
     {
         if note.key > 127 {
             return Err(format!(
@@ -5349,6 +5614,9 @@ fn scheduled_pattern_events(
             return Err("note timing is outside the renderable range".to_owned());
         }
         let note_id = next_vst3_note_expression_id();
+        let (layer_gain, layer_pan_raw) = layer_adjustments
+            .and_then(|adjustments| adjustments.get(note_index).copied())
+            .unwrap_or((1.0, 0));
         events.push(ScheduledMidiEvent {
             frame: start_frame as u64,
             priority: 1,
@@ -5363,6 +5631,8 @@ fn scheduled_pattern_events(
             note_mod_x: note.mod_x,
             note_mod_y: note.mod_y,
             note_release: note.release,
+            layer_gain,
+            layer_pan_raw,
             performance_track_id: None,
         });
         events.push(ScheduledMidiEvent {
@@ -5379,6 +5649,8 @@ fn scheduled_pattern_events(
             note_mod_x: note.mod_x,
             note_mod_y: note.mod_y,
             note_release: note.release,
+            layer_gain,
+            layer_pan_raw,
             performance_track_id: None,
         });
         note_count += 1;
@@ -5819,6 +6091,8 @@ mod tests {
                 note_mod_x: 128,
                 note_mod_y: 128,
                 note_release: 64,
+                layer_gain: 1.0,
+                layer_pan_raw: 0,
                 performance_track_id: None,
             },
             ScheduledMidiEvent {
@@ -5835,6 +6109,8 @@ mod tests {
                 note_mod_x: 128,
                 note_mod_y: 128,
                 note_release: 64,
+                layer_gain: 1.0,
+                layer_pan_raw: 0,
                 performance_track_id: None,
             },
         ];
@@ -6686,6 +6962,33 @@ mod tests {
     }
 
     #[test]
+    fn pattern_scheduler_carries_layer_adjustments_to_note_events() {
+        let note = PatternNote {
+            position: 0,
+            length: 120,
+            channel_id: 7,
+            key: 64,
+            ..PatternNote::default()
+        };
+        let (events, _) = scheduled_pattern_events_with_layer_adjustments(
+            &[note],
+            7,
+            480,
+            120.0,
+            48_000.0,
+            0,
+            128,
+            Some(&[(0.75, 1_600)]),
+        )
+        .unwrap();
+
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|event| {
+            (event.layer_gain - 0.75).abs() < f32::EPSILON && event.layer_pan_raw == 1_600
+        }));
+    }
+
+    #[test]
     fn pattern_scheduler_carries_note_mod_y_to_note_off() {
         let note = PatternNote {
             position: 0,
@@ -6727,6 +7030,59 @@ mod tests {
         assert_eq!(vst3_note_pan_value(64), 0.5);
         assert_eq!(vst3_note_pan_value(128), 1.0);
         assert_eq!(vst3_note_pan_value(255), 1.0);
+        assert_eq!(vst3_note_pan_with_layer_offset(64, -6_400), 0.0);
+        assert_eq!(vst3_note_pan_with_layer_offset(64, 0), 0.5);
+        assert_eq!(vst3_note_pan_with_layer_offset(64, 6_400), 1.0);
+        assert_eq!(vst3_note_pan_with_layer_offset(0, -6_400), 0.0);
+        assert_eq!(vst3_note_pan_with_layer_offset(128, 6_400), 1.0);
+    }
+
+    #[test]
+    fn vst3_layer_gain_maps_to_standard_volume_expression_values() {
+        assert_eq!(vst3_note_volume_value(0.0), 0.0);
+        assert_eq!(vst3_note_volume_value(1.0), 0.25);
+        assert_eq!(vst3_note_volume_value(2.0), 0.5);
+        assert_eq!(vst3_note_volume_value(4.0), 1.0);
+        assert_eq!(vst3_note_volume_value(8.0), 1.0);
+    }
+
+    #[test]
+    fn playlist_live_layer_adjustments_keep_note_id_and_controls_paired() {
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let live_sender = Vst3PlaylistLiveInputSender {
+            sender,
+            next_generation: Arc::new(AtomicU64::new(0)),
+            stopped_generation: Arc::new(AtomicU64::new(0)),
+        };
+        let session = live_sender.begin_session();
+        let channel = MidiChannel::from_index(0).expect("MIDI channel 1 should exist");
+        session
+            .try_send_with_layer_adjustments(
+                MidiEvent::NoteOn {
+                    channel,
+                    note: 60,
+                    velocity: 100,
+                },
+                0.75,
+                1_600,
+            )
+            .expect("Layer-adjusted note-on should queue");
+        let note_on = receiver.try_recv().expect("note-on should be queued");
+        assert_eq!(note_on.layer_gain, 0.75);
+        assert_eq!(note_on.layer_pan_raw, 1_600);
+        assert!(note_on.note_id > 0);
+
+        session
+            .try_send(MidiEvent::NoteOff {
+                channel,
+                note: 60,
+                velocity: 32,
+            })
+            .expect("note-off should queue");
+        let note_off = receiver.try_recv().expect("note-off should be queued");
+        assert_eq!(note_off.note_id, note_on.note_id);
+        assert_eq!(note_off.layer_gain, note_on.layer_gain);
+        assert_eq!(note_off.layer_pan_raw, note_on.layer_pan_raw);
     }
 
     #[test]
@@ -6756,6 +7112,12 @@ mod tests {
         assert!(!note_expressions_support_pan(&[]));
         assert!(!note_expressions_support_pan(&[expression(
             NoteExpressionType::Volume
+        )]));
+        assert!(note_expressions_support_volume(&[expression(
+            NoteExpressionType::Volume
+        )]));
+        assert!(!note_expressions_support_volume(&[expression(
+            NoteExpressionType::Pan
         )]));
         assert!(note_expressions_support_pan(&[expression(
             NoteExpressionType::Pan
@@ -6982,6 +7344,8 @@ mod tests {
                 pan: 0,
                 mod_x: 128,
                 release: 89,
+                layer_gain: 1.0,
+                layer_pan_raw: 0,
             },
             PlaylistMidiNote {
                 mod_y: 219,
@@ -6994,6 +7358,8 @@ mod tests {
                 pan: 128,
                 mod_x: 128,
                 release: 21,
+                layer_gain: 1.0,
+                layer_pan_raw: 0,
             },
         ];
 
@@ -7038,6 +7404,30 @@ mod tests {
     }
 
     #[test]
+    fn playlist_scheduler_carries_layer_adjustments_to_note_events() {
+        let note = PlaylistMidiNote {
+            start_tick: 480,
+            stop_tick: 720,
+            key: 64,
+            velocity: 96,
+            midi_channel: 0,
+            fine_pitch_offset_cents: 0,
+            pan: 64,
+            mod_x: 128,
+            mod_y: 128,
+            release: 64,
+            layer_gain: 0.8,
+            layer_pan_raw: -2_400,
+        };
+        let (events, _) = scheduled_playlist_midi_events(&[note], 480, 120.0, 48_000.0).unwrap();
+
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|event| {
+            (event.layer_gain - 0.8).abs() < f32::EPSILON && event.layer_pan_raw == -2_400
+        }));
+    }
+
+    #[test]
     fn playlist_note_transposition_applies_root_offset_to_note_on_and_off() {
         let note = PlaylistMidiNote {
             start_tick: 0,
@@ -7050,6 +7440,8 @@ mod tests {
             mod_x: 128,
             mod_y: 128,
             release: 64,
+            layer_gain: 1.0,
+            layer_pan_raw: 0,
         };
         let (mut events, note_count) =
             scheduled_playlist_midi_events(&[note], 480, 120.0, 48_000.0).unwrap();
@@ -7081,6 +7473,8 @@ mod tests {
             pan: 64,
             mod_x: 128,
             release: 64,
+            layer_gain: 1.0,
+            layer_pan_raw: 0,
         };
 
         let (events, note_count) =
@@ -7104,6 +7498,8 @@ mod tests {
             mod_x: 128,
             mod_y: 128,
             release: 64,
+            layer_gain: 1.0,
+            layer_pan_raw: 0,
         };
         assert!(
             scheduled_playlist_midi_events(&[note], 480, 120.0, 48_000.0)

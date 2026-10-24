@@ -4934,6 +4934,7 @@ struct LivePlaylistVst3InputSession {
     router: ChannelNoteRouter,
 }
 
+#[cfg(test)]
 fn live_playlist_vst3_note_targets(
     router: &ChannelNoteRouter,
     target_channel_ids: &BTreeSet<u16>,
@@ -4945,6 +4946,25 @@ fn live_playlist_vst3_note_targets(
         .targets_for_note(source_channel_id, route_seed, u16::from(key.min(127)))
         .into_iter()
         .filter(|target_id| target_channel_ids.contains(target_id))
+        .collect()
+}
+
+fn live_playlist_vst3_note_layer_adjustments(
+    router: &ChannelNoteRouter,
+    target_channel_ids: &BTreeSet<u16>,
+    source_channel_id: u16,
+    route_seed: u64,
+    key: u8,
+) -> BTreeMap<u16, (f32, i32)> {
+    router
+        .targets_for_note_with_layer_adjustments(
+            source_channel_id,
+            route_seed,
+            u16::from(key.min(127)),
+        )
+        .into_iter()
+        .filter(|(target_id, _, _)| target_channel_ids.contains(target_id))
+        .map(|(target_id, gain, pan_raw)| (target_id, (gain, pan_raw)))
         .collect()
 }
 
@@ -46264,14 +46284,14 @@ impl DawUi {
             .then_some(targets)
     }
 
-    fn live_playlist_vst3_note_targets(
+    fn live_playlist_vst3_note_layer_adjustments(
         &self,
         source_channel_id: u16,
         route_seed: u64,
         key: u8,
-    ) -> Option<BTreeSet<u16>> {
+    ) -> Option<BTreeMap<u16, (f32, i32)>> {
         let session = self.live_playlist_vst3_input.as_ref()?;
-        Some(live_playlist_vst3_note_targets(
+        Some(live_playlist_vst3_note_layer_adjustments(
             &session.router,
             &session.target_channel_ids,
             source_channel_id,
@@ -47754,7 +47774,7 @@ impl DawUi {
             return;
         }
 
-        let (live_event, mapped_note_on, event_targets) = match event {
+        let (live_event, mapped_note_on, event_targets, event_layer_adjustments) = match event {
             MidiInputEvent::NoteOn {
                 channel,
                 key,
@@ -47775,9 +47795,10 @@ impl DawUi {
                 };
                 let source_note = (channel & 0x0F, key.min(127));
                 let route_seed = self.current_live_input_note_route_seed.unwrap_or_default();
-                let targets = self
-                    .live_playlist_vst3_note_targets(channel_id, route_seed, audition_key)
+                let layer_adjustments = self
+                    .live_playlist_vst3_note_layer_adjustments(channel_id, route_seed, audition_key)
                     .unwrap_or_default();
+                let targets = layer_adjustments.keys().copied().collect::<BTreeSet<_>>();
                 if targets.is_empty() {
                     self.midi_live_vst3_note_mapping
                         .entry(source_note)
@@ -47797,6 +47818,7 @@ impl DawUi {
                     },
                     Some((source_note, Some(audition_key), targets.clone())),
                     Some(targets),
+                    Some(layer_adjustments),
                 )
             }
             MidiInputEvent::NoteOn { channel, key, .. }
@@ -47840,6 +47862,7 @@ impl DawUi {
                     },
                     None,
                     Some(targets),
+                    None,
                 )
             }
             MidiInputEvent::ControlChange {
@@ -47854,9 +47877,11 @@ impl DawUi {
                 },
                 None,
                 None,
+                None,
             ),
             MidiInputEvent::ProgramChange { channel, program } => (
                 Vst3LiveInputEvent::ProgramChange { channel, program },
+                None,
                 None,
                 None,
             ),
@@ -47867,9 +47892,11 @@ impl DawUi {
                 },
                 None,
                 None,
+                None,
             ),
             MidiInputEvent::ChannelPressure { channel, pressure } => (
                 Vst3LiveInputEvent::ChannelPressure { channel, pressure },
+                None,
                 None,
                 None,
             ),
@@ -47903,6 +47930,7 @@ impl DawUi {
                     },
                     None,
                     Some(targets),
+                    None,
                 )
             }
             _ => return,
@@ -47937,7 +47965,18 @@ impl DawUi {
                             .as_ref()
                             .is_none_or(|targets| targets.contains(target_id))
                     })
-                    .all(|(_, playlist_session)| playlist_session.try_send(midi_event).is_ok())
+                    .all(|(target_id, playlist_session)| {
+                        if let Some((gain, pan_raw)) = event_layer_adjustments
+                            .as_ref()
+                            .and_then(|adjustments| adjustments.get(target_id))
+                        {
+                            playlist_session
+                                .try_send_with_layer_adjustments(midi_event, *gain, *pan_raw)
+                                .is_ok()
+                        } else {
+                            playlist_session.try_send(midi_event).is_ok()
+                        }
+                    })
         } else {
             false
         };

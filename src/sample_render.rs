@@ -5742,6 +5742,8 @@ pub fn stream_mixed_layer_midi_input_to_device(
                                         channel,
                                         source_key,
                                         velocity,
+                                        layer_gain,
+                                        layer_pan_raw,
                                     )?;
                                 active_targets.push(LiveLayerNoteDestination::Vst3 {
                                     channel_id: target_channel_id,
@@ -5967,17 +5969,23 @@ pub fn stream_vst3_midi_input_to_device(
                     }) => {
                         let source_key = key.min(127);
                         let routed_targets = channel_router
-                            .targets_for_note(source_channel_id, note_seed, u16::from(source_key))
+                            .targets_for_note_with_layer_adjustments(
+                                source_channel_id,
+                                note_seed,
+                                u16::from(source_key),
+                            )
                             .into_iter()
-                            .filter(|target_id| target_channel_ids.contains(target_id));
+                            .filter(|(target_id, _, _)| target_channel_ids.contains(target_id));
                         note_seed = note_seed.wrapping_add(1);
                         let mut active_targets = Vec::new();
-                        for target_channel_id in routed_targets {
+                        for (target_channel_id, layer_gain, layer_pan_raw) in routed_targets {
                             let (note_id, rendered_key) = processor.schedule_live_input_note_on(
                                 target_channel_id,
                                 channel,
                                 source_key,
                                 velocity,
+                                layer_gain,
+                                layer_pan_raw,
                             )?;
                             active_targets.push((target_channel_id, note_id, rendered_key));
                         }
@@ -8182,6 +8190,8 @@ struct PerformanceVst3Note {
     mod_x: u8,
     mod_y: u8,
     release: u8,
+    layer_gain: f32,
+    layer_pan_raw: i32,
 }
 
 struct ActivePerformanceAudioClip {
@@ -8400,7 +8410,7 @@ impl PlaylistPerformanceRuntime {
             let track_filter =
                 PlaylistTrackFilter::new(&disabled_track_ids, options.soloed_playlist_track_range);
             let mixer_route_audibility = MixerRouteAudibility::from_document(document);
-            let schedule = schedule_playlist_pattern_notes(
+            let schedule = schedule_playlist_pattern_notes_with_adjustments(
                 &patterns,
                 &arrangement,
                 track_filter,
@@ -8418,12 +8428,12 @@ impl PlaylistPerformanceRuntime {
                 },
                 |channel_id, note_seed, key| {
                     channel_router
-                        .targets_for_note(channel_id, note_seed, key)
+                        .targets_for_note_with_layer_adjustments(channel_id, note_seed, key)
                         .into_iter()
-                        .filter(|target_channel_id| {
+                        .filter(|(target_channel_id, _, _)| {
                             sources.vst3_channel_ids.contains(target_channel_id)
                         })
-                        .filter(|target_channel_id| {
+                        .filter(|(target_channel_id, _, _)| {
                             channels_by_id
                                 .get(target_channel_id)
                                 .is_some_and(|channel| {
@@ -8468,6 +8478,8 @@ impl PlaylistPerformanceRuntime {
                         pan: placed.note.pan,
                         mod_x: placed.note.mod_x,
                         release: placed.note.release,
+                        layer_gain: placed.target_gain,
+                        layer_pan_raw: placed.target_pan_raw,
                     });
             }
             for &clip_index in sources.vst3_clip_indices {
@@ -9185,6 +9197,8 @@ impl PlaylistPerformanceRuntime {
                             pan: template.pan,
                             mod_x: template.mod_x,
                             release: template.release,
+                            layer_gain: template.layer_gain,
+                            layer_pan_raw: template.layer_pan_raw,
                         });
                 }
                 for ((channel_id, parameter_id), points) in
