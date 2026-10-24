@@ -364,6 +364,15 @@ struct PlaylistLiveMidiEvent {
     layer_pan_raw: i32,
 }
 
+#[derive(Clone, Copy)]
+struct PlaylistLiveNoteContext {
+    note_id: i32,
+    layer_gain: f32,
+    layer_pan_raw: i32,
+}
+
+type PlaylistLiveNoteState = HashMap<(u8, u8), VecDeque<PlaylistLiveNoteContext>>;
+
 /// Routes live MIDI into a VST3 instrument already processing Playlist audio.
 #[derive(Clone)]
 pub struct Vst3PlaylistLiveInputSender {
@@ -376,7 +385,7 @@ pub struct Vst3PlaylistLiveInputSender {
 pub struct Vst3PlaylistLiveInputSession {
     sender: Vst3PlaylistLiveInputSender,
     generation: u64,
-    active_notes: Mutex<HashMap<(u8, u8), VecDeque<(i32, f32, i32)>>>,
+    active_notes: Mutex<PlaylistLiveNoteState>,
 }
 
 impl Vst3PlaylistLiveInputSender {
@@ -445,10 +454,10 @@ impl Vst3PlaylistLiveInputSession {
         } else {
             None
         };
-        if let Some((paired_note_id, paired_gain, paired_pan)) = paired_note {
-            note_id = paired_note_id;
-            event_layer_gain = paired_gain;
-            event_layer_pan_raw = paired_pan;
+        if let Some(paired_note) = paired_note {
+            note_id = paired_note.note_id;
+            event_layer_gain = paired_note.layer_gain;
+            event_layer_pan_raw = paired_note.layer_pan_raw;
         }
         self.sender
             .sender
@@ -483,7 +492,11 @@ impl Vst3PlaylistLiveInputSession {
                 .map_err(|_| "VST3 live MIDI note state lock was poisoned".to_owned())?
                 .entry((channel, note))
                 .or_default()
-                .push_back((note_id, layer_gain, layer_pan_raw));
+                .push_back(PlaylistLiveNoteContext {
+                    note_id,
+                    layer_gain,
+                    layer_pan_raw,
+                });
         }
         if let MidiEvent::ControlChange {
             channel,
@@ -4205,12 +4218,14 @@ fn prepare_pattern_render_with_layer_adjustments(
 
     let (mut events, note_count) = scheduled_pattern_events_with_layer_adjustments(
         notes,
-        channel_id,
-        ppq,
-        tempo_bpm,
-        sample_rate,
-        global_swing_mix_raw,
-        channel_swing_mix_raw,
+        PatternNoteScheduleOptions {
+            channel_id,
+            ppq,
+            tempo_bpm,
+            sample_rate,
+            global_swing_mix_raw,
+            channel_swing_mix_raw,
+        },
         layer_adjustments,
     )?;
     transpose_scheduled_note_events(&mut events, note_pitch_offset_semitones);
@@ -5518,6 +5533,16 @@ fn apply_stereo_mixer_transform(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct PatternNoteScheduleOptions {
+    channel_id: u16,
+    ppq: u16,
+    tempo_bpm: f64,
+    sample_rate: f64,
+    global_swing_mix_raw: u8,
+    channel_swing_mix_raw: u16,
+}
+
 #[cfg(test)]
 fn scheduled_pattern_events(
     notes: &[PatternNote],
@@ -5530,26 +5555,31 @@ fn scheduled_pattern_events(
 ) -> Result<(Vec<ScheduledMidiEvent>, usize), String> {
     scheduled_pattern_events_with_layer_adjustments(
         notes,
-        channel_id,
-        ppq,
-        tempo_bpm,
-        sample_rate,
-        global_swing_mix_raw,
-        channel_swing_mix_raw,
+        PatternNoteScheduleOptions {
+            channel_id,
+            ppq,
+            tempo_bpm,
+            sample_rate,
+            global_swing_mix_raw,
+            channel_swing_mix_raw,
+        },
         None,
     )
 }
 
 fn scheduled_pattern_events_with_layer_adjustments(
     notes: &[PatternNote],
-    channel_id: u16,
-    ppq: u16,
-    tempo_bpm: f64,
-    sample_rate: f64,
-    global_swing_mix_raw: u8,
-    channel_swing_mix_raw: u16,
+    options: PatternNoteScheduleOptions,
     layer_adjustments: Option<&[(f32, i32)]>,
 ) -> Result<(Vec<ScheduledMidiEvent>, usize), String> {
+    let PatternNoteScheduleOptions {
+        channel_id,
+        ppq,
+        tempo_bpm,
+        sample_rate,
+        global_swing_mix_raw,
+        channel_swing_mix_raw,
+    } = options;
     if ppq == 0 {
         return Err("project PPQ must be greater than zero".to_owned());
     }
@@ -6972,12 +7002,14 @@ mod tests {
         };
         let (events, _) = scheduled_pattern_events_with_layer_adjustments(
             &[note],
-            7,
-            480,
-            120.0,
-            48_000.0,
-            0,
-            128,
+            PatternNoteScheduleOptions {
+                channel_id: 7,
+                ppq: 480,
+                tempo_bpm: 120.0,
+                sample_rate: 48_000.0,
+                global_swing_mix_raw: 0,
+                channel_swing_mix_raw: 128,
+            },
             Some(&[(0.75, 1_600)]),
         )
         .unwrap();
