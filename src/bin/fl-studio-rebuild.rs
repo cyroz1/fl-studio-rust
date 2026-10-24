@@ -105,7 +105,8 @@ use midi_output::{
     pattern_preview_messages, playlist_playback_messages,
 };
 use midi_script::{
-    MidiControllerScript, MidiScriptTransportState, SCRIPT_TRANSPORT_PATTERN_MODE,
+    MidiControllerScript, MidiScriptTransportState, SCRIPT_PROJECT_LOAD_ERROR,
+    SCRIPT_PROJECT_LOAD_OK, SCRIPT_PROJECT_LOAD_START, SCRIPT_TRANSPORT_PATTERN_MODE,
     SCRIPT_TRANSPORT_PLAYING, SCRIPT_TRANSPORT_RECORDING, absolute_song_position_ticks,
     discover_midi_scripts, find_script_for_device, normalized_song_position, song_position_ticks,
 };
@@ -7048,6 +7049,13 @@ impl DawUi {
         }
     }
 
+    fn notify_midi_script_project_load(&self, status: i32) -> bool {
+        self.midi_input_connection
+            .as_ref()
+            .and_then(|connection| connection.notify_script_project_load(status))
+            .unwrap_or(true)
+    }
+
     fn load_project_from(
         &mut self,
         project_file: &Path,
@@ -7062,6 +7070,7 @@ impl DawUi {
         }
         self.recovery_prompt = None;
         self.pending_project_change = None;
+        self.notify_midi_script_project_load(SCRIPT_PROJECT_LOAD_START);
         let package_result = if has_extension(project_file, "zip") {
             ProjectPackageWorkspace::open(project_file)
                 .map(|(workspace, bytes)| (Some(workspace), bytes))
@@ -7236,10 +7245,18 @@ impl DawUi {
                         " · recent project list could not be saved: {error}"
                     ));
                 }
+                if !self.notify_midi_script_project_load(SCRIPT_PROJECT_LOAD_OK) {
+                    self.status
+                        .push_str(" · MIDI script project-load callback queue is full");
+                }
                 true
             }
             Err(error) => {
                 self.status = format!("Could not open project: {error}");
+                if !self.notify_midi_script_project_load(SCRIPT_PROJECT_LOAD_ERROR) {
+                    self.status
+                        .push_str(" · MIDI script project-load callback queue is full");
+                }
                 false
             }
         }

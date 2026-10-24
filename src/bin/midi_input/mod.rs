@@ -48,6 +48,7 @@ struct ScriptInputMessage {
 
 enum MidiInputScriptMessage {
     Input(ScriptInputMessage),
+    ProjectLoad(i32),
     Stop,
 }
 
@@ -61,6 +62,12 @@ struct MidiInputScriptWorker {
 }
 
 impl MidiInputScriptWorker {
+    fn notify_project_load(&self, status: i32) -> bool {
+        self.sender
+            .try_send(MidiInputScriptMessage::ProjectLoad(status))
+            .is_ok()
+    }
+
     fn start(
         script: &MidiControllerScript,
         device_name: &str,
@@ -122,6 +129,36 @@ impl MidiInputScriptWorker {
                     };
                     match message {
                         MidiInputScriptMessage::Stop => break,
+                        MidiInputScriptMessage::ProjectLoad(status) => {
+                            let received_at = Instant::now();
+                            let elapsed_micros = u64::try_from(
+                                received_at
+                                    .duration_since(timestamp_reference_at)
+                                    .as_micros(),
+                            )
+                            .unwrap_or(u64::MAX);
+                            let timestamp_micros =
+                                timestamp_reference_micros.saturating_add(elapsed_micros);
+                            let callback_result = runtime
+                                .as_mut()
+                                .map(|runtime| runtime.process_project_load(status));
+                            match callback_result {
+                                Some(Ok(result)) => queue_script_transport_actions(
+                                    &output_sender,
+                                    &dropped_messages,
+                                    timestamp_micros,
+                                    received_at,
+                                    result.actions,
+                                ),
+                                Some(Err(error)) => {
+                                    let _ = error_sender.try_send(error);
+                                    if let Some(runtime) = runtime.take() {
+                                        runtime.kill();
+                                    }
+                                }
+                                None => {}
+                            }
+                        }
                         MidiInputScriptMessage::Input(message) => {
                             timestamp_reference_micros = message.timestamp_micros;
                             timestamp_reference_at = message.received_at;
@@ -215,6 +252,10 @@ impl Drop for MidiInputScriptWorker {
 impl ConnectedMidiInput {
     pub fn take_script_error(&self) -> Option<String> {
         self.script_worker.as_ref()?.take_error()
+    }
+
+    pub fn notify_script_project_load(&self, status: i32) -> Option<bool> {
+        Some(self.script_worker.as_ref()?.notify_project_load(status))
     }
 }
 

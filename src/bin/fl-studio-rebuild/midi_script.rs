@@ -69,6 +69,9 @@ pub struct MidiScriptRuntime {
 pub const SCRIPT_TRANSPORT_PLAYING: u8 = 1 << 0;
 pub const SCRIPT_TRANSPORT_RECORDING: u8 = 1 << 1;
 pub const SCRIPT_TRANSPORT_PATTERN_MODE: u8 = 1 << 2;
+pub const SCRIPT_PROJECT_LOAD_START: i32 = 0;
+pub const SCRIPT_PROJECT_LOAD_OK: i32 = 100;
+pub const SCRIPT_PROJECT_LOAD_ERROR: i32 = 101;
 
 #[derive(Default)]
 pub struct MidiScriptTransportState {
@@ -394,6 +397,15 @@ impl MidiScriptRuntime {
         let response = self.exchange(&json!({"idle": true}))?;
         Ok(ScriptMidiResult {
             handled: response["handled"].as_bool().unwrap_or(false),
+            bytes: Vec::new(),
+            actions: parse_transport_actions(&response)?,
+        })
+    }
+
+    pub fn process_project_load(&mut self, status: i32) -> Result<ScriptMidiResult, String> {
+        let response = self.exchange(&json!({"project_load_status": status}))?;
+        Ok(ScriptMidiResult {
+            handled: false,
             bytes: Vec::new(),
             actions: parse_transport_actions(&response)?,
         })
@@ -1381,6 +1393,32 @@ mod tests {
         let result = runtime.process_idle().unwrap();
 
         assert_eq!(result.actions, [ScriptTransportAction::Stop]);
+    }
+
+    #[test]
+    fn python_project_load_callback_receives_documented_status_values() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport midi\nimport transport\ndef OnProjectLoad(status):\n    if status == midi.PL_Start:\n        transport.stop()\n    elif status == midi.PL_LoadOk:\n        transport.start()\n    elif status == midi.PL_LoadError:\n        transport.record()\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let mut runtime = MidiScriptRuntime::start_for_device(&script, "Test Input").unwrap();
+
+        assert_eq!(
+            runtime.process_project_load(0).unwrap().actions,
+            [ScriptTransportAction::Stop]
+        );
+        assert_eq!(
+            runtime.process_project_load(100).unwrap().actions,
+            [ScriptTransportAction::Start]
+        );
+        assert_eq!(
+            runtime.process_project_load(101).unwrap().actions,
+            [ScriptTransportAction::RecordToggle]
+        );
     }
 
     #[test]

@@ -285,6 +285,9 @@ def _install_modules(script_name, device_name):
     midi = _module("midi")
     constants = {
         "FromMIDI_Max": 127,
+        "PL_Start": 0,
+        "PL_LoadOk": 100,
+        "PL_LoadError": 101,
         "PME_System": 2,
         "PME_System_Safe": 4,
         "PME_PreviewNote": 8,
@@ -498,6 +501,11 @@ def _dispatch(namespace, value):
     global _active_transport_actions, _active_transport_state
     _active_transport_actions = []
     _active_transport_state = value.get("transport", {})
+    if "project_load_status" in value:
+        callback = namespace.get("OnProjectLoad")
+        if callback is not None:
+            callback(int(value["project_load_status"]))
+        return {"handled": False, "actions": _active_transport_actions}
     if value.get("idle"):
         callback = namespace.get("OnIdle")
         if callback is not None:
