@@ -36,13 +36,22 @@ pub enum ScriptTransportAction {
     SetSongPosition(u32),
     SetSongPositionTicks(u64),
     SetSongPositionTimeUs(u64),
-    MoveSongPosition { speed_millionths: i32, start: bool },
+    MoveSongPosition {
+        speed_millionths: i32,
+        start: bool,
+    },
     SetPlaybackSpeed(u32),
     PatternJog(i32),
     TempoJog(i32),
     MarkerJumpJog(i32),
     MarkerSelJog(i32),
     MidiOutput(Vec<u8>),
+    RepeatMidiOutput {
+        bytes: Vec<u8>,
+        delay_ms: u32,
+        rate_ms: u32,
+    },
+    StopRepeatMidiOutput,
 }
 
 const SCRIPT_SONG_POSITION_SCALE: f64 = 1_000_000.0;
@@ -724,6 +733,48 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
         }
         return Ok(ScriptTransportAction::MidiOutput(bytes));
     }
+    if name == Some("repeat_midi_event") {
+        let message = action["bytes"]
+            .as_array()
+            .filter(|message| message.len() <= 65_536)
+            .ok_or_else(|| "MIDI script returned an invalid repeat message".to_owned())?;
+        let bytes = message
+            .iter()
+            .map(|value| {
+                value
+                    .as_u64()
+                    .and_then(|value| u8::try_from(value).ok())
+                    .ok_or_else(|| "MIDI script returned an invalid output byte".to_owned())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if bytes.first() == Some(&0xF0) {
+            if bytes.len() < 2
+                || bytes.last() != Some(&0xF7)
+                || bytes[1..bytes.len() - 1].iter().any(|byte| *byte > 0x7F)
+            {
+                return Err("MIDI script returned incomplete repeated SysEx output".to_owned());
+            }
+        } else if !valid_short_midi_output(&bytes) {
+            return Err("MIDI script returned an invalid repeated MIDI output message".to_owned());
+        }
+        let delay_ms = action["delay_ms"]
+            .as_u64()
+            .and_then(|delay| u32::try_from(delay).ok())
+            .ok_or_else(|| "MIDI script returned an invalid repeat delay".to_owned())?;
+        let rate_ms = action["rate_ms"]
+            .as_u64()
+            .and_then(|rate| u32::try_from(rate).ok())
+            .filter(|rate| *rate > 0)
+            .ok_or_else(|| "MIDI script returned an invalid repeat rate".to_owned())?;
+        return Ok(ScriptTransportAction::RepeatMidiOutput {
+            bytes,
+            delay_ms,
+            rate_ms,
+        });
+    }
+    if name == Some("stop_repeat_midi_event") {
+        return Ok(ScriptTransportAction::StopRepeatMidiOutput);
+    }
     Err("MIDI script returned an unknown transport action".to_owned())
 }
 
@@ -1149,7 +1200,7 @@ mod tests {
     }
 
     #[test]
-    fn python_device_repeats_event_until_stopped() {
+    fn python_device_schedules_event_repeats_and_stops_them() {
         let temporary = TestDirectory::new();
         let script_path = temporary.path().join("device_test.py");
         fs::write(
@@ -1160,15 +1211,23 @@ mod tests {
         let script = MidiControllerScript::parse(script_path).unwrap();
         let mut runtime = MidiScriptRuntime::start_for_device(&script, "Test Input").unwrap();
 
-        runtime.process_event(12, &[0xB0, 7, 99]).unwrap();
+        let event = runtime.process_event(12, &[0xB0, 7, 99]).unwrap();
         let first_idle = runtime.process_idle().unwrap();
         let second_idle = runtime.process_idle().unwrap();
 
         assert_eq!(
-            first_idle.actions,
-            [ScriptTransportAction::MidiOutput(vec![0xB0, 7, 99])]
+            event.actions,
+            [ScriptTransportAction::RepeatMidiOutput {
+                bytes: vec![0xB0, 7, 99],
+                delay_ms: 0,
+                rate_ms: 10,
+            }]
         );
-        assert!(second_idle.actions.is_empty());
+        assert!(first_idle.actions.is_empty());
+        assert_eq!(
+            second_idle.actions,
+            [ScriptTransportAction::StopRepeatMidiOutput]
+        );
     }
 
     #[test]

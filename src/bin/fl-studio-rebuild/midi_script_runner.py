@@ -2,7 +2,6 @@ import json
 import math
 import runpy
 import sys
-import time
 import types
 
 
@@ -11,7 +10,6 @@ sys.stdout = sys.stderr
 _active_transport_actions = None
 _active_transport_state = {}
 _midi_out_new_messages = {}
-_repeat_midi_output = None
 
 
 def _emit(value):
@@ -211,34 +209,28 @@ def _direct_feedback(event):
 
 
 def _repeat_midi_event(event, delay=300, rate=300):
-    global _repeat_midi_output
     try:
         delay = int(delay)
         rate = int(rate)
     except (TypeError, ValueError, OverflowError) as error:
         raise ValueError("device.repeatMidiEvent() delay and rate must be integers") from error
-    if delay < 0 or rate <= 0:
+    if delay < 0 or rate <= 0 or delay > 0x7FFFFFFF or rate > 0x7FFFFFFF:
         raise ValueError("device.repeatMidiEvent() requires nonnegative delay and positive rate")
-    _repeat_midi_output = {
-        "bytes": _event_message_bytes(event),
-        "next": time.monotonic() + delay / 1000.0,
-        "rate": rate / 1000.0,
-    }
+    message = _event_message_bytes(event)
+    if _active_transport_actions is not None:
+        _active_transport_actions.append(
+            {
+                "action": "repeat_midi_event",
+                "bytes": list(message),
+                "delay_ms": delay,
+                "rate_ms": rate,
+            }
+        )
 
 
 def _stop_repeat_midi_event():
-    global _repeat_midi_output
-    _repeat_midi_output = None
-
-
-def _dispatch_repeating_midi_event():
-    if _repeat_midi_output is None:
-        return
-    now = time.monotonic()
-    if now < _repeat_midi_output["next"]:
-        return
-    _queue_midi_output(_repeat_midi_output["bytes"])
-    _repeat_midi_output["next"] = now + _repeat_midi_output["rate"]
+    if _active_transport_actions is not None:
+        _active_transport_actions.append({"action": "stop_repeat_midi_event"})
 
 
 def _bst_component(hint, mode, default):
@@ -708,7 +700,6 @@ def _dispatch(namespace, value):
         callback = namespace.get("OnIdle")
         if callback is not None:
             callback()
-        _dispatch_repeating_midi_event()
         return {"handled": False, "actions": _active_transport_actions}
 
     event = EventData(value)

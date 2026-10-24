@@ -54,6 +54,109 @@ enum MidiInputScriptMessage {
     Stop,
 }
 
+struct RepeatingMidiOutput {
+    bytes: Vec<u8>,
+    next_at: Instant,
+    rate: Duration,
+}
+
+impl RepeatingMidiOutput {
+    fn new(bytes: Vec<u8>, delay_ms: u32, rate_ms: u32, now: Instant) -> Self {
+        let delay = Duration::from_millis(u64::from(delay_ms));
+        let rate = Duration::from_millis(u64::from(rate_ms));
+        Self {
+            bytes,
+            next_at: now + delay,
+            rate,
+        }
+    }
+
+    fn wait_duration(&self, now: Instant) -> Duration {
+        self.next_at.saturating_duration_since(now)
+    }
+
+    fn take_due(&mut self, now: Instant) -> Option<Vec<u8>> {
+        if now < self.next_at {
+            return None;
+        }
+        let next_at = self.next_at + self.rate;
+        self.next_at = if next_at > now {
+            next_at
+        } else {
+            now + self.rate
+        };
+        Some(self.bytes.clone())
+    }
+}
+
+fn script_worker_wait_duration(
+    repeat: Option<&RepeatingMidiOutput>,
+    next_idle_at: Instant,
+    now: Instant,
+) -> Duration {
+    let until_idle = next_idle_at.saturating_duration_since(now);
+    repeat.map_or(until_idle, |repeat| {
+        repeat.wait_duration(now).min(until_idle)
+    })
+}
+
+fn apply_script_repeat_actions(
+    actions: impl IntoIterator<Item = ScriptTransportAction>,
+    repeat: &mut Option<RepeatingMidiOutput>,
+) -> Vec<ScriptTransportAction> {
+    let now = Instant::now();
+    let mut remaining = Vec::new();
+    for action in actions {
+        match action {
+            ScriptTransportAction::RepeatMidiOutput {
+                bytes,
+                delay_ms,
+                rate_ms,
+            } => *repeat = Some(RepeatingMidiOutput::new(bytes, delay_ms, rate_ms, now)),
+            ScriptTransportAction::StopRepeatMidiOutput => *repeat = None,
+            action => remaining.push(action),
+        }
+    }
+    remaining
+}
+
+fn send_due_repeating_midi_output(
+    repeat: &mut Option<RepeatingMidiOutput>,
+    midi_output_sender: &SyncSender<Vec<u8>>,
+    dropped_messages: &AtomicU64,
+    now: Instant,
+) {
+    let Some(repeat) = repeat.as_mut() else {
+        return;
+    };
+    if let Some(bytes) = repeat.take_due(now)
+        && midi_output_sender.try_send(bytes).is_err()
+    {
+        dropped_messages.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn queue_script_actions_with_repeat(
+    sender: &SyncSender<ReceivedMidiMessage>,
+    midi_output_sender: &SyncSender<Vec<u8>>,
+    dropped_messages: &AtomicU64,
+    timestamp_micros: u64,
+    received_at: Instant,
+    actions: impl IntoIterator<Item = ScriptTransportAction>,
+    repeat: &mut Option<RepeatingMidiOutput>,
+) {
+    let actions = apply_script_repeat_actions(actions, repeat);
+    queue_script_transport_actions(
+        sender,
+        midi_output_sender,
+        dropped_messages,
+        timestamp_micros,
+        received_at,
+        actions,
+    );
+    send_due_repeating_midi_output(repeat, midi_output_sender, dropped_messages, Instant::now());
+}
+
 struct MidiInputScriptWorker {
     sender: SyncSender<MidiInputScriptMessage>,
     errors: Receiver<String>,
@@ -98,6 +201,8 @@ impl MidiInputScriptWorker {
         )?;
         let startup_actions = runtime.take_startup_actions();
         let stop_handle = runtime.stop_handle();
+        let mut repeat_output = None;
+        let startup_actions = apply_script_repeat_actions(startup_actions, &mut repeat_output);
         queue_script_transport_actions(
             &output_sender,
             &midi_output_sender,
@@ -105,6 +210,12 @@ impl MidiInputScriptWorker {
             0,
             Instant::now(),
             startup_actions,
+        );
+        send_due_repeating_midi_output(
+            &mut repeat_output,
+            &midi_output_sender,
+            &dropped_messages,
+            Instant::now(),
         );
         let (sender, input_receiver) = mpsc::sync_channel(MIDI_INPUT_QUEUE_CAPACITY);
         let (error_sender, errors) = mpsc::sync_channel(16);
@@ -115,13 +226,29 @@ impl MidiInputScriptWorker {
             .name("midi-script-input".to_owned())
             .spawn(move || {
                 let mut runtime = Some(runtime);
+                let mut repeat_output = repeat_output;
                 let mut timestamp_reference_micros = 0_u64;
                 let mut timestamp_reference_at = Instant::now();
+                let mut next_idle_at = Instant::now() + Duration::from_millis(50);
                 while !worker_stop_requested.load(Ordering::Acquire) {
-                    let message = match input_receiver.recv_timeout(Duration::from_millis(50)) {
+                    let wait_duration = script_worker_wait_duration(
+                        repeat_output.as_ref(),
+                        next_idle_at,
+                        Instant::now(),
+                    );
+                    let message = match input_receiver.recv_timeout(wait_duration) {
                         Ok(message) => message,
                         Err(mpsc::RecvTimeoutError::Timeout) => {
                             let received_at = Instant::now();
+                            if received_at < next_idle_at {
+                                send_due_repeating_midi_output(
+                                    &mut repeat_output,
+                                    &midi_output_sender,
+                                    &dropped_messages,
+                                    received_at,
+                                );
+                                continue;
+                            }
                             let elapsed_micros = u64::try_from(
                                 received_at
                                     .duration_since(timestamp_reference_at)
@@ -132,22 +259,25 @@ impl MidiInputScriptWorker {
                                 timestamp_reference_micros.saturating_add(elapsed_micros);
                             let idle_result = runtime.as_mut().map(MidiScriptRuntime::process_idle);
                             match idle_result {
-                                Some(Ok(result)) => queue_script_transport_actions(
+                                Some(Ok(result)) => queue_script_actions_with_repeat(
                                     &output_sender,
                                     &midi_output_sender,
                                     &dropped_messages,
                                     timestamp_micros,
                                     received_at,
                                     result.actions,
+                                    &mut repeat_output,
                                 ),
                                 Some(Err(error)) => {
                                     let _ = error_sender.try_send(error);
+                                    repeat_output = None;
                                     if let Some(runtime) = runtime.take() {
                                         runtime.kill();
                                     }
                                 }
                                 None => {}
                             }
+                            next_idle_at = Instant::now() + Duration::from_millis(50);
                             continue;
                         }
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -168,16 +298,18 @@ impl MidiInputScriptWorker {
                                 .as_mut()
                                 .map(|runtime| runtime.process_project_load(status));
                             match callback_result {
-                                Some(Ok(result)) => queue_script_transport_actions(
+                                Some(Ok(result)) => queue_script_actions_with_repeat(
                                     &output_sender,
                                     &midi_output_sender,
                                     &dropped_messages,
                                     timestamp_micros,
                                     received_at,
                                     result.actions,
+                                    &mut repeat_output,
                                 ),
                                 Some(Err(error)) => {
                                     let _ = error_sender.try_send(error);
+                                    repeat_output = None;
                                     if let Some(runtime) = runtime.take() {
                                         runtime.kill();
                                     }
@@ -199,16 +331,18 @@ impl MidiInputScriptWorker {
                                 .as_mut()
                                 .map(|runtime| runtime.process_beat_indicator(value));
                             match callback_result {
-                                Some(Ok(result)) => queue_script_transport_actions(
+                                Some(Ok(result)) => queue_script_actions_with_repeat(
                                     &output_sender,
                                     &midi_output_sender,
                                     &dropped_messages,
                                     timestamp_micros,
                                     received_at,
                                     result.actions,
+                                    &mut repeat_output,
                                 ),
                                 Some(Err(error)) => {
                                     let _ = error_sender.try_send(error);
+                                    repeat_output = None;
                                     if let Some(runtime) = runtime.take() {
                                         runtime.kill();
                                     }
@@ -230,16 +364,18 @@ impl MidiInputScriptWorker {
                                 .as_mut()
                                 .map(MidiScriptRuntime::process_first_connect);
                             match callback_result {
-                                Some(Ok(result)) => queue_script_transport_actions(
+                                Some(Ok(result)) => queue_script_actions_with_repeat(
                                     &output_sender,
                                     &midi_output_sender,
                                     &dropped_messages,
                                     timestamp_micros,
                                     received_at,
                                     result.actions,
+                                    &mut repeat_output,
                                 ),
                                 Some(Err(error)) => {
                                     let _ = error_sender.try_send(error);
+                                    repeat_output = None;
                                     if let Some(runtime) = runtime.take() {
                                         runtime.kill();
                                     }
@@ -255,13 +391,14 @@ impl MidiInputScriptWorker {
                             });
                             match transformed {
                                 Some(Ok(result)) => {
-                                    queue_script_transport_actions(
+                                    queue_script_actions_with_repeat(
                                         &output_sender,
                                         &midi_output_sender,
                                         &dropped_messages,
                                         message.timestamp_micros,
                                         message.received_at,
                                         result.actions,
+                                        &mut repeat_output,
                                     );
                                     if !result.handled {
                                         forward_scripted_input(
@@ -276,6 +413,7 @@ impl MidiInputScriptWorker {
                                 }
                                 Some(Err(error)) => {
                                     let _ = error_sender.try_send(error);
+                                    repeat_output = None;
                                     if let Some(runtime) = runtime.take() {
                                         runtime.kill();
                                     }
@@ -299,6 +437,7 @@ impl MidiInputScriptWorker {
                             }
                         }
                     }
+                    next_idle_at = Instant::now() + Duration::from_millis(50);
                 }
                 if let Some(mut runtime) = runtime {
                     match runtime.shutdown() {
@@ -454,6 +593,8 @@ fn queue_script_transport_actions(
                 MidiTransportCommand::MarkerSelJog(increment)
             }
             ScriptTransportAction::MidiOutput(_) => unreachable!("handled above"),
+            ScriptTransportAction::RepeatMidiOutput { .. }
+            | ScriptTransportAction::StopRepeatMidiOutput => continue,
         };
         let transport_message = ReceivedMidiMessage {
             timestamp_micros,
@@ -1547,6 +1688,74 @@ mod tests {
             transport_receiver.try_recv().unwrap().event,
             MidiInputEvent::Transport(MidiTransportCommand::Start)
         );
+        assert_eq!(dropped_messages.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn script_midi_repeat_observes_millisecond_delay_and_rate() {
+        let start = Instant::now();
+        let mut repeat = RepeatingMidiOutput::new(vec![0xB0, 7, 99], 10, 20, start);
+
+        let idle_deadline = start + Duration::from_millis(50);
+        assert_eq!(
+            script_worker_wait_duration(Some(&repeat), idle_deadline, start),
+            Duration::from_millis(10)
+        );
+        assert!(repeat.take_due(start + Duration::from_millis(9)).is_none());
+        assert_eq!(
+            repeat.take_due(start + Duration::from_millis(10)),
+            Some(vec![0xB0, 7, 99])
+        );
+        assert_eq!(
+            script_worker_wait_duration(
+                Some(&repeat),
+                idle_deadline,
+                start + Duration::from_millis(10)
+            ),
+            Duration::from_millis(20)
+        );
+        assert!(repeat.take_due(start + Duration::from_millis(29)).is_none());
+        assert_eq!(
+            repeat.take_due(start + Duration::from_millis(30)),
+            Some(vec![0xB0, 7, 99])
+        );
+    }
+
+    #[test]
+    fn zero_delay_script_midi_repeat_queues_immediately_and_can_be_stopped() {
+        let (transport_sender, transport_receiver) = mpsc::sync_channel(2);
+        let (midi_output_sender, midi_output_receiver) = mpsc::sync_channel(2);
+        let dropped_messages = AtomicU64::new(0);
+        let mut repeat = None;
+
+        queue_script_actions_with_repeat(
+            &transport_sender,
+            &midi_output_sender,
+            &dropped_messages,
+            12,
+            Instant::now(),
+            [
+                ScriptTransportAction::RepeatMidiOutput {
+                    bytes: vec![0xB0, 7, 99],
+                    delay_ms: 0,
+                    rate_ms: 10,
+                },
+                ScriptTransportAction::Start,
+            ],
+            &mut repeat,
+        );
+
+        assert_eq!(midi_output_receiver.try_recv().unwrap(), vec![0xB0, 7, 99]);
+        assert_eq!(
+            transport_receiver.try_recv().unwrap().event,
+            MidiInputEvent::Transport(MidiTransportCommand::Start)
+        );
+        assert!(repeat.is_some());
+
+        let remaining =
+            apply_script_repeat_actions([ScriptTransportAction::StopRepeatMidiOutput], &mut repeat);
+        assert!(remaining.is_empty());
+        assert!(repeat.is_none());
         assert_eq!(dropped_messages.load(Ordering::Relaxed), 0);
     }
 
