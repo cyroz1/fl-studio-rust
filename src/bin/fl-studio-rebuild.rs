@@ -42275,6 +42275,7 @@ impl DawUi {
         let mut load_insert_state = None;
         let mut save_insert_state = None;
         let mut effect_slot_move = None;
+        let mut effect_editor_open = None;
         let available_height = ui.available_height();
         let inspector_width = 238.0_f32.min((ui.available_width() * 0.3).max(190.0));
         let bank_width = (ui.available_width() - inspector_width - 10.0).max(180.0);
@@ -43764,10 +43765,11 @@ impl DawUi {
                                     1 => "1 saved state record".to_owned(),
                                     count => format!("{count} saved state records"),
                                 };
-                                let saved_state = if self
+                                let loaded_effect_instance = self
                                     .mixer_effect_vst3_instances
-                                    .contains_key(&(insert.ordinal(), slot.slot_index()))
-                                {
+                                    .get(&(insert.ordinal(), slot.slot_index()))
+                                    .copied();
+                                let saved_state = if loaded_effect_instance.is_some() {
                                     format!("{saved_state} · VST3 loaded")
                                 } else {
                                     saved_state
@@ -43803,6 +43805,15 @@ impl DawUi {
                                                 });
                                             });
                                             ui.horizontal(|ui| {
+                                                if let Some(instance_id) = loaded_effect_instance
+                                                    && ui.small_button("Open editor").clicked()
+                                                {
+                                                    effect_editor_open = Some((
+                                                        insert.ordinal(),
+                                                        slot.slot_index(),
+                                                        instance_id,
+                                                    ));
+                                                }
                                                 if slot_index > 0
                                                     && ui.small_button("Move up").clicked()
                                                 {
@@ -43894,7 +43905,7 @@ impl DawUi {
                             }
                             ui.small(
                                 egui::RichText::new(
-                                    "Move up/down carries saved slot events with the effect. Recognized VST3 effect state loads into the isolated host and is saved back with the project; Mixer audio processing is not yet connected to playback.",
+                                    "Open editor controls a loaded VST3 effect through its native editor. Move up/down carries saved slot events with the effect. Mixer audio processing is not yet connected to playback.",
                                 )
                                 .color(MUTED),
                             );
@@ -44210,6 +44221,27 @@ impl DawUi {
                     self.status = format!("Could not move Mixer effect slot: {error}");
                 }
             }
+        }
+        if let Some((insert_ordinal, slot_index, instance_id)) = effect_editor_open {
+            if let Some(host) = &mut self.vst3_host {
+                match host.open_editor(instance_id) {
+                    Ok(()) => {
+                        self.status = format!(
+                            "Opened VST3 editor for Mixer insert {insert_ordinal} effect slot {}",
+                            slot_index + 1
+                        );
+                    }
+                    Err(error) => {
+                        self.status = format!(
+                            "Could not open VST3 editor for Mixer insert {insert_ordinal} effect slot {}: {error}",
+                            slot_index + 1
+                        );
+                    }
+                }
+            } else {
+                self.status = "The VST3 host is not running".to_owned();
+            }
+            self.last_plugin_action = Some(self.status.clone());
         }
     }
 
