@@ -706,6 +706,8 @@ pub(crate) struct SamplerFileMetadata {
     pub(crate) loop_points: Option<(usize, usize)>,
     /// AIFF `INST` loop mode when its sustain markers resolve to valid frame bounds.
     pub(crate) ping_pong_loop: Option<bool>,
+    /// WAVE `smpl` loop type 2 plays the loop region backward after reaching its end.
+    pub(crate) backward_loop: Option<bool>,
     /// AIFF `INST` release loop as half-open source-frame bounds.
     pub(crate) release_loop_points: Option<(usize, usize)>,
     /// AIFF `INST` loop mode when its release markers resolve to valid frame bounds.
@@ -743,6 +745,7 @@ pub(crate) fn wav_sampler_metadata(path: &Path) -> Option<SamplerFileMetadata> {
     let mut smpl_fine_tune_cents = None;
     let mut loop_points = None;
     let mut ping_pong_loop = None;
+    let mut backward_loop = None;
     while cursor.checked_add(8)? <= riff_end {
         file.seek(SeekFrom::Start(cursor)).ok()?;
         let mut chunk_header = [0; 8];
@@ -829,12 +832,13 @@ pub(crate) fn wav_sampler_metadata(path: &Path) -> Option<SamplerFileMetadata> {
                                 .try_into()
                                 .expect("the WAVE loop end has four bytes"),
                         );
-                        if matches!(loop_type, 0 | 1)
+                        if matches!(loop_type, 0..=2)
                             && let Some(end) = end_inclusive.checked_add(1)
                             && start < end
                         {
                             loop_points = Some((start as usize, end as usize));
                             ping_pong_loop = Some(loop_type == 1);
+                            backward_loop = Some(loop_type == 2);
                         }
                     }
                 }
@@ -856,6 +860,7 @@ pub(crate) fn wav_sampler_metadata(path: &Path) -> Option<SamplerFileMetadata> {
         velocity_range: inst_velocity_range,
         loop_points,
         ping_pong_loop,
+        backward_loop,
         release_loop_points: None,
         release_ping_pong_loop: None,
     };
@@ -980,6 +985,7 @@ pub(crate) fn aiff_sampler_metadata(path: &Path) -> Option<SamplerFileMetadata> 
         velocity_range,
         loop_points,
         ping_pong_loop,
+        backward_loop: None,
         release_loop_points,
         release_ping_pong_loop,
     };
@@ -2678,11 +2684,11 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("loop-direction.wav");
 
-        for (loop_type, expected_points, expected_ping_pong) in [
-            (0, Some((2, 5)), Some(false)),
-            (1, Some((2, 5)), Some(true)),
-            (2, None, None),
-            (32, None, None),
+        for (loop_type, expected_points, expected_ping_pong, expected_backward) in [
+            (0, Some((2, 5)), Some(false), Some(false)),
+            (1, Some((2, 5)), Some(true), Some(false)),
+            (2, Some((2, 5)), Some(false), Some(true)),
+            (32, None, None, None),
         ] {
             std::fs::write(&path, wav_with_sampler_loop_type_fixture(loop_type)).unwrap();
             let metadata = wav_sampler_metadata(&path).expect("WAVE sampler header should parse");
@@ -2692,6 +2698,10 @@ mod tests {
             );
             assert_eq!(
                 metadata.ping_pong_loop, expected_ping_pong,
+                "loop type {loop_type}"
+            );
+            assert_eq!(
+                metadata.backward_loop, expected_backward,
                 "loop type {loop_type}"
             );
         }

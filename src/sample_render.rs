@@ -7801,6 +7801,7 @@ fn prepare_sampler_arrangement(
                 ping_pong_loop: sample_metadata
                     .ping_pong_loop
                     .unwrap_or_else(|| channel.sampler_ping_pong_loop_enabled()),
+                backward_loop: sample_metadata.backward_loop.unwrap_or(false),
                 release_loop_bounds,
                 release_ping_pong_loop: sample_metadata.release_ping_pong_loop.unwrap_or(false),
             });
@@ -8044,6 +8045,7 @@ struct SamplerVoiceSource {
     fine_tune_cents: f64,
     loop_bounds: Option<SampleBounds>,
     ping_pong_loop: bool,
+    backward_loop: bool,
     release_loop_bounds: Option<SampleBounds>,
     release_ping_pong_loop: bool,
 }
@@ -10447,6 +10449,7 @@ fn prepare_sampler_pattern_for_channel_internal(
                 ping_pong_loop: sample_metadata
                     .ping_pong_loop
                     .unwrap_or_else(|| channel.sampler_ping_pong_loop_enabled()),
+                backward_loop: sample_metadata.backward_loop.unwrap_or(false),
                 release_loop_bounds,
                 release_ping_pong_loop: sample_metadata.release_ping_pong_loop.unwrap_or(false),
             });
@@ -10672,6 +10675,7 @@ struct SamplerVoice {
     envelope_release_start_gain: f32,
     loop_bounds: Option<SampleBounds>,
     ping_pong_loop: bool,
+    backward_loop: bool,
     release_loop_bounds: Option<SampleBounds>,
     release_ping_pong_loop: bool,
     stop_frame: Option<u64>,
@@ -11181,6 +11185,7 @@ impl<'a> SamplerVoiceEngine<'a> {
             envelope_release_start_gain: 1.0,
             loop_bounds: source.loop_bounds,
             ping_pong_loop: source.ping_pong_loop,
+            backward_loop: source.backward_loop,
             release_loop_bounds: source.release_loop_bounds,
             release_ping_pong_loop: source.release_ping_pong_loop,
             stop_frame: note.stop_frame,
@@ -11601,13 +11606,18 @@ fn begin_sampler_voice_fast_cut_declick(
 
 fn advance_sampler_voice_position(voice: &mut SamplerVoice) {
     let mut next_position = voice.source_position + voice.source_step;
-    let (loop_bounds, ping_pong_loop) = if voice.release_started && voice.volume_envelope_enabled {
-        (voice.release_loop_bounds, voice.release_ping_pong_loop)
-    } else if voice.release_started {
-        (None, false)
-    } else {
-        (voice.loop_bounds, voice.ping_pong_loop)
-    };
+    let (loop_bounds, ping_pong_loop, backward_loop) =
+        if voice.release_started && voice.volume_envelope_enabled {
+            (
+                voice.release_loop_bounds,
+                voice.release_ping_pong_loop,
+                false,
+            )
+        } else if voice.release_started {
+            (None, false, false)
+        } else {
+            (voice.loop_bounds, voice.ping_pong_loop, voice.backward_loop)
+        };
     let Some(bounds) = loop_bounds else {
         voice.source_position = next_position;
         return;
@@ -11619,6 +11629,18 @@ fn advance_sampler_voice_position(voice: &mut SamplerVoice) {
 
     let start = bounds.start as f64;
     let end = bounds.end as f64;
+    if backward_loop {
+        let high = end - 1.0;
+        if voice.source_step > 0.0 && next_position > high {
+            next_position = backward_loop_position(high - (next_position - high), bounds);
+            voice.source_step = -voice.source_step.abs();
+        } else if voice.source_step < 0.0 && next_position < start {
+            next_position = backward_loop_position(next_position, bounds);
+        }
+        voice.source_position = next_position;
+        return;
+    }
+
     if !ping_pong_loop {
         let loop_length = end - start;
         if (voice.source_step > 0.0 && next_position >= end)
@@ -11658,6 +11680,21 @@ fn advance_sampler_voice_position(voice: &mut SamplerVoice) {
         }
     } else {
         voice.source_position = next_position;
+    }
+}
+
+fn backward_loop_position(position: f64, bounds: SampleBounds) -> f64 {
+    let start = bounds.start as f64;
+    let end = bounds.end as f64;
+    let length = end - start;
+    if position >= start && position < end {
+        return position;
+    }
+    let distance_from_start = (start - position).rem_euclid(length);
+    if distance_from_start == 0.0 {
+        end - 1.0
+    } else {
+        end - distance_from_start
     }
 }
 
@@ -15551,6 +15588,7 @@ mod tests {
                     fine_tune_cents: 0.0,
                     loop_bounds: None,
                     ping_pong_loop: false,
+                    backward_loop: false,
                     release_loop_bounds: None,
                     release_ping_pong_loop: false,
                 },
@@ -16651,6 +16689,7 @@ mod tests {
             fine_tune_cents: 0.0,
             loop_bounds: None,
             ping_pong_loop: false,
+            backward_loop: false,
             release_loop_bounds: None,
             release_ping_pong_loop: false,
         };
@@ -16800,6 +16839,7 @@ mod tests {
                 fine_tune_cents: 0.0,
                 loop_bounds: None,
                 ping_pong_loop: false,
+                backward_loop: false,
                 release_loop_bounds: None,
                 release_ping_pong_loop: false,
             },
@@ -16862,6 +16902,7 @@ mod tests {
                 fine_tune_cents: 0.0,
                 loop_bounds: None,
                 ping_pong_loop: false,
+                backward_loop: false,
                 release_loop_bounds: None,
                 release_ping_pong_loop: false,
             },
@@ -16920,6 +16961,7 @@ mod tests {
                 fine_tune_cents: 0.0,
                 loop_bounds: Some(SampleBounds { start: 1, end: 3 }),
                 ping_pong_loop: false,
+                backward_loop: false,
                 release_loop_bounds: None,
                 release_ping_pong_loop: false,
             },
@@ -16993,6 +17035,7 @@ mod tests {
                 fine_tune_cents: 0.0,
                 loop_bounds: None,
                 ping_pong_loop: false,
+                backward_loop: false,
                 release_loop_bounds: None,
                 release_ping_pong_loop: false,
             },
@@ -17052,6 +17095,7 @@ mod tests {
                 fine_tune_cents: 0.0,
                 loop_bounds: None,
                 ping_pong_loop: false,
+                backward_loop: false,
                 release_loop_bounds: None,
                 release_ping_pong_loop: false,
             },
@@ -17133,6 +17177,7 @@ mod tests {
                 fine_tune_cents: 0.0,
                 loop_bounds: None,
                 ping_pong_loop: false,
+                backward_loop: false,
                 release_loop_bounds: None,
                 release_ping_pong_loop: false,
             },
@@ -17265,6 +17310,7 @@ mod tests {
                 fine_tune_cents: 0.0,
                 loop_bounds: None,
                 ping_pong_loop: false,
+                backward_loop: false,
                 release_loop_bounds: None,
                 release_ping_pong_loop: false,
             },
@@ -17346,6 +17392,7 @@ mod tests {
                 fine_tune_cents: 0.0,
                 loop_bounds: None,
                 ping_pong_loop: false,
+                backward_loop: false,
                 release_loop_bounds: None,
                 release_ping_pong_loop: false,
             },
@@ -17406,6 +17453,7 @@ mod tests {
                 fine_tune_cents: 0.0,
                 loop_bounds: None,
                 ping_pong_loop: false,
+                backward_loop: false,
                 release_loop_bounds: None,
                 release_ping_pong_loop: false,
             },
@@ -17459,6 +17507,7 @@ mod tests {
                 fine_tune_cents: 0.0,
                 loop_bounds: None,
                 ping_pong_loop: false,
+                backward_loop: false,
                 release_loop_bounds: None,
                 release_ping_pong_loop: false,
             },
@@ -17515,6 +17564,7 @@ mod tests {
                 fine_tune_cents: 0.0,
                 loop_bounds: None,
                 ping_pong_loop: false,
+                backward_loop: false,
                 release_loop_bounds: None,
                 release_ping_pong_loop: false,
             },
@@ -17567,6 +17617,7 @@ mod tests {
                 fine_tune_cents: 0.0,
                 loop_bounds: Some(SampleBounds { start: 1, end: 4 }),
                 ping_pong_loop: false,
+                backward_loop: false,
                 release_loop_bounds: None,
                 release_ping_pong_loop: false,
             },
@@ -17625,6 +17676,7 @@ mod tests {
                 fine_tune_cents: 0.0,
                 loop_bounds: Some(SampleBounds { start: 1, end: 4 }),
                 ping_pong_loop: true,
+                backward_loop: false,
                 release_loop_bounds: None,
                 release_ping_pong_loop: false,
             },
@@ -17660,6 +17712,65 @@ mod tests {
     }
 
     #[test]
+    fn held_sampler_voice_repeats_wave_loop_points_backward() {
+        let sources = HashMap::from([(
+            7,
+            SamplerVoiceSource {
+                audio: Arc::new(DecodedAudio {
+                    sample_rate: 4,
+                    channels: vec![vec![0.0, 1.0, 2.0, 3.0, 4.0]],
+                }),
+                gain: 1.0,
+                pan: -1.0,
+                reverse: false,
+                volume_envelope_enabled: false,
+                volume_envelope: None,
+                max_polyphony_raw: None,
+                mono_enabled: false,
+                channel_cut_groups: None,
+                fast_declick_for_cut_groups: false,
+                key_range: None,
+                velocity_range: None,
+                root_key: SAMPLER_ROOT_KEY,
+                fine_tune_cents: 0.0,
+                loop_bounds: Some(SampleBounds { start: 1, end: 4 }),
+                ping_pong_loop: false,
+                backward_loop: true,
+                release_loop_bounds: None,
+                release_ping_pong_loop: false,
+            },
+        )]);
+        let notes = [ScheduledSamplerNote {
+            clip_index: 0,
+            playlist_track_id: None,
+            start_tick: 0,
+            stop_tick: None,
+            start_frame: 0,
+            stop_frame: Some(100),
+            channel_id: 7,
+            key: SAMPLER_ROOT_KEY,
+            midi_channel: 0,
+            slide_note: false,
+            velocity: 127,
+            pan: 64,
+            fine_pitch_offset_cents: 0,
+            layer_gain: 1.0,
+            layer_pan_raw: 0,
+        }];
+        let mut engine = SamplerVoiceEngine::new(&sources, &notes, 1, 4, 4);
+        let mut output = vec![0.0; 20];
+        engine.render_block(0, 10, &mut output);
+
+        assert_eq!(
+            output,
+            vec![
+                0.0, 0.0, 1.0, 0.0, 2.0, 0.0, 3.0, 0.0, 2.0, 0.0, 1.0, 0.0, 3.0, 0.0, 2.0, 0.0,
+                1.0, 0.0, 3.0, 0.0,
+            ]
+        );
+    }
+
+    #[test]
     fn sampler_voice_switches_to_the_release_loop_when_the_note_ends() {
         let sources = HashMap::from([(
             7,
@@ -17683,6 +17794,7 @@ mod tests {
                 fine_tune_cents: 0.0,
                 loop_bounds: None,
                 ping_pong_loop: false,
+                backward_loop: false,
                 release_loop_bounds: Some(SampleBounds { start: 2, end: 4 }),
                 release_ping_pong_loop: false,
             },
@@ -17756,6 +17868,7 @@ mod tests {
                 fine_tune_cents: 0.0,
                 loop_bounds: None,
                 ping_pong_loop: false,
+                backward_loop: false,
                 release_loop_bounds: None,
                 release_ping_pong_loop: false,
             },
@@ -17810,6 +17923,7 @@ mod tests {
                 fine_tune_cents: 0.0,
                 loop_bounds: None,
                 ping_pong_loop: false,
+                backward_loop: false,
                 release_loop_bounds: None,
                 release_ping_pong_loop: false,
             },
@@ -17871,6 +17985,7 @@ mod tests {
             fine_tune_cents: 0.0,
             loop_bounds: None,
             ping_pong_loop: false,
+            backward_loop: false,
             release_loop_bounds: None,
             release_ping_pong_loop: false,
         };
@@ -17945,6 +18060,7 @@ mod tests {
                 fine_tune_cents: 0.0,
                 loop_bounds: None,
                 ping_pong_loop: false,
+                backward_loop: false,
                 release_loop_bounds: None,
                 release_ping_pong_loop: false,
             },
@@ -17999,6 +18115,7 @@ mod tests {
                 fine_tune_cents: 0.0,
                 loop_bounds: None,
                 ping_pong_loop: false,
+                backward_loop: false,
                 release_loop_bounds: None,
                 release_ping_pong_loop: false,
             },
@@ -18061,6 +18178,7 @@ mod tests {
                     fine_tune_cents: 0.0,
                     loop_bounds: None,
                     ping_pong_loop: false,
+                    backward_loop: false,
                     release_loop_bounds: None,
                     release_ping_pong_loop: false,
                 },
@@ -18084,6 +18202,7 @@ mod tests {
                     fine_tune_cents: 0.0,
                     loop_bounds: None,
                     ping_pong_loop: false,
+                    backward_loop: false,
                     release_loop_bounds: None,
                     release_ping_pong_loop: false,
                 },
@@ -18160,6 +18279,7 @@ mod tests {
                     fine_tune_cents: 0.0,
                     loop_bounds: None,
                     ping_pong_loop: false,
+                    backward_loop: false,
                     release_loop_bounds: None,
                     release_ping_pong_loop: false,
                 },
@@ -18186,6 +18306,7 @@ mod tests {
                     fine_tune_cents: 0.0,
                     loop_bounds: None,
                     ping_pong_loop: false,
+                    backward_loop: false,
                     release_loop_bounds: None,
                     release_ping_pong_loop: false,
                 },
@@ -18295,6 +18416,7 @@ mod tests {
                 fine_tune_cents: 0.0,
                 loop_bounds: None,
                 ping_pong_loop: false,
+                backward_loop: false,
                 release_loop_bounds: None,
                 release_ping_pong_loop: false,
             },
@@ -18381,6 +18503,7 @@ mod tests {
             fine_tune_cents: 0.0,
             loop_bounds: None,
             ping_pong_loop: false,
+            backward_loop: false,
             release_loop_bounds: None,
             release_ping_pong_loop: false,
         };
@@ -18457,6 +18580,7 @@ mod tests {
             fine_tune_cents: 0.0,
             loop_bounds: None,
             ping_pong_loop: false,
+            backward_loop: false,
             release_loop_bounds: None,
             release_ping_pong_loop: false,
         };
@@ -18532,6 +18656,7 @@ mod tests {
             fine_tune_cents: 0.0,
             loop_bounds: None,
             ping_pong_loop: false,
+            backward_loop: false,
             release_loop_bounds: None,
             release_ping_pong_loop: false,
         };
@@ -18622,6 +18747,7 @@ mod tests {
             fine_tune_cents: 0.0,
             loop_bounds: None,
             ping_pong_loop: false,
+            backward_loop: false,
             release_loop_bounds: None,
             release_ping_pong_loop: false,
         };
@@ -18683,6 +18809,7 @@ mod tests {
             fine_tune_cents: 0.0,
             loop_bounds: None,
             ping_pong_loop: false,
+            backward_loop: false,
             release_loop_bounds: None,
             release_ping_pong_loop: false,
         };
@@ -18754,6 +18881,7 @@ mod tests {
             fine_tune_cents: 0.0,
             loop_bounds: None,
             ping_pong_loop: false,
+            backward_loop: false,
             release_loop_bounds: None,
             release_ping_pong_loop: false,
         };
@@ -18836,6 +18964,7 @@ mod tests {
             fine_tune_cents: 0.0,
             loop_bounds: None,
             ping_pong_loop: false,
+            backward_loop: false,
             release_loop_bounds: None,
             release_ping_pong_loop: false,
         };
