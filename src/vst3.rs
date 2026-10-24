@@ -572,7 +572,8 @@ struct PlaylistMixerEffectStream {
     input_channels: usize,
     output_channels: usize,
     wet_mix: f32,
-    dry_block: Vec<[f32; 2]>,
+    dry_delay_line: StereoFrameDelay,
+    dry_delay_scratch: Vec<f32>,
 }
 
 struct PlaylistMixerEffectChain {
@@ -591,6 +592,7 @@ pub struct Vst3PlaylistStreamProcessor {
     mixer_effect_scratch: Vec<f32>,
     mixer_effect_dry_scratch: Vec<f32>,
     mixer_effect_tail_frames: u64,
+    mixer_effect_dry_delay_frames: u64,
     live_input_senders: BTreeMap<u16, Vst3PlaylistLiveInputSender>,
     performance_pattern_automation: BTreeMap<(u16, u16), Vec<Vst3ParameterAutomation>>,
     tempo_map: PlaylistTempoMap,
@@ -1037,6 +1039,9 @@ impl Vst3PlaylistStreamProcessor {
                 )
                 .ok_or_else(|| "PDC delay storage size overflow".to_owned())?;
         }
+        delay_frames = delay_frames
+            .checked_add(self.mixer_effect_dry_delay_frames)
+            .ok_or_else(|| "PDC delay storage size overflow".to_owned())?;
         let delay_bytes = delay_frames
             .checked_mul(std::mem::size_of::<[f32; 2]>() as u64)
             .ok_or_else(|| "PDC delay storage size overflow".to_owned())?;
@@ -1451,13 +1456,14 @@ fn process_playlist_mixer_effect_chain(
             for block in chain_block.chunks_mut(max_frames * 2) {
                 let frame_count = block.len() / 2;
                 for (frame_index, frame) in block.as_chunks::<2>().0.iter().enumerate() {
-                    effect.dry_block[frame_index] =
-                        [finite_sample(frame[0]), finite_sample(frame[1])];
+                    effect.dry_delay_scratch[frame_index * 2] = finite_sample(frame[0]);
+                    effect.dry_delay_scratch[frame_index * 2 + 1] = finite_sample(frame[1]);
                 }
                 resize_vst3_bus_audio_buffers(&mut effect.buffers, frame_count);
                 let input = &mut effect.buffers.inputs[0];
                 for frame_index in 0..frame_count {
-                    let [left, right] = effect.dry_block[frame_index];
+                    let left = effect.dry_delay_scratch[frame_index * 2];
+                    let right = effect.dry_delay_scratch[frame_index * 2 + 1];
                     if effect.input_channels == 1 {
                         input.channels[0][frame_index] = (left + right) * 0.5;
                     } else {
@@ -1487,19 +1493,22 @@ fn process_playlist_mixer_effect_chain(
                             )
                         })?;
                 }
+                effect
+                    .dry_delay_line
+                    .process_interleaved(&mut effect.dry_delay_scratch[..frame_count * 2])?;
                 let wet = &effect.buffers.outputs[0];
                 let dry_gain = 1.0 - effect.wet_mix;
                 for (frame_index, frame) in block.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+                    let dry_left = effect.dry_delay_scratch[frame_index * 2];
+                    let dry_right = effect.dry_delay_scratch[frame_index * 2 + 1];
                     let wet_left = finite_sample(wet.channels[0][frame_index]);
                     let wet_right = if effect.output_channels == 1 {
                         wet_left
                     } else {
                         finite_sample(wet.channels[1][frame_index])
                     };
-                    frame[0] =
-                        effect.dry_block[frame_index][0] * dry_gain + wet_left * effect.wet_mix;
-                    frame[1] =
-                        effect.dry_block[frame_index][1] * dry_gain + wet_right * effect.wet_mix;
+                    frame[0] = dry_left * dry_gain + wet_left * effect.wet_mix;
+                    frame[1] = dry_right * dry_gain + wet_right * effect.wet_mix;
                 }
             }
         }
@@ -3997,6 +4006,7 @@ impl Vst3HostRuntime {
             mixer_effect_scratch: Vec::new(),
             mixer_effect_dry_scratch: Vec::new(),
             mixer_effect_tail_frames: 0,
+            mixer_effect_dry_delay_frames: 0,
             live_input_senders,
             performance_pattern_automation: BTreeMap::new(),
             tempo_map,
@@ -4069,6 +4079,19 @@ impl Vst3HostRuntime {
         let output_sample_rate = processor.output_sample_rate;
         let max_tail_frames =
             u64::from(output_sample_rate).saturating_mul(MAX_REPORTED_TAIL_SECONDS.ceil() as u64);
+        let instrument_delay_frames = processor.streams.iter().try_fold(
+            processor.maximum_latency_frames,
+            |total, stream| {
+                total
+                    .checked_add(
+                        processor
+                            .maximum_latency_frames
+                            .saturating_sub(stream.latency_frames),
+                    )
+                    .ok_or_else(|| "PDC delay storage size overflow".to_owned())
+            },
+        )?;
+        let mut mixer_effect_dry_delay_frames = processor.mixer_effect_dry_delay_frames;
         for insert_ordinal in insert_order {
             let effects_enabled = inserts
                 .iter()
@@ -4163,10 +4186,36 @@ impl Vst3HostRuntime {
                         slot.slot_index() + 1
                     ));
                 }
+                let latency_frames = u64::from(latency_samples);
+                let maximum_latency_frames =
+                    (sample_rate * MAX_VST3_EFFECT_LATENCY_SECONDS).ceil() as u64;
+                if latency_frames > maximum_latency_frames {
+                    return Err(format!(
+                        "VST3 Mixer insert {insert_ordinal} effect slot {} reports {latency_frames} frames of latency, exceeding the {MAX_VST3_EFFECT_LATENCY_SECONDS}-second processing limit",
+                        slot.slot_index() + 1
+                    ));
+                }
+                let dry_delay_frames = if wet_mix < 1.0 { latency_frames } else { 0 };
+                let next_dry_delay_frames = mixer_effect_dry_delay_frames
+                    .checked_add(dry_delay_frames)
+                    .ok_or_else(|| "PDC delay storage size overflow".to_owned())?;
+                let total_delay_frames = instrument_delay_frames
+                    .checked_add(next_dry_delay_frames)
+                    .ok_or_else(|| "PDC delay storage size overflow".to_owned())?;
+                let delay_bytes = total_delay_frames
+                    .checked_mul(std::mem::size_of::<[f32; 2]>() as u64)
+                    .ok_or_else(|| "PDC delay storage size overflow".to_owned())?;
+                if delay_bytes > MAX_PDC_DELAY_BYTES {
+                    return Err(format!(
+                        "Mixer effect PDC needs {delay_bytes} bytes of delay storage, exceeding the 128 MiB limit"
+                    ));
+                }
+                let dry_delay_line = StereoFrameDelay::new(dry_delay_frames)?;
+                mixer_effect_dry_delay_frames = next_dry_delay_frames;
                 let reported_tail = reported_tail_seconds(tail_samples, sample_rate)
                     .map(|seconds| (seconds * f64::from(output_sample_rate)).ceil() as u64)
                     .unwrap_or(0);
-                let latency_tail = u64::from(latency_samples);
+                let latency_tail = latency_frames;
                 if include_effect_tails {
                     processor.mixer_effect_tail_frames = processor
                         .mixer_effect_tail_frames
@@ -4184,7 +4233,8 @@ impl Vst3HostRuntime {
                     input_channels,
                     output_channels,
                     wet_mix,
-                    dry_block: vec![[0.0; 2]; block_size],
+                    dry_delay_line,
+                    dry_delay_scratch: vec![0.0; block_size * 2],
                 });
             }
             let end_effect_index = processor.mixer_effects.len();
@@ -4208,6 +4258,7 @@ impl Vst3HostRuntime {
                     end_effect_index,
                 });
         }
+        processor.mixer_effect_dry_delay_frames = mixer_effect_dry_delay_frames;
         let content_frames = processor.content_frames;
         processor.extend_to_output_frames(content_frames)?;
         Ok(())
@@ -4527,6 +4578,7 @@ impl Vst3HostRuntime {
             mixer_effect_scratch: Vec::new(),
             mixer_effect_dry_scratch: Vec::new(),
             mixer_effect_tail_frames: 0,
+            mixer_effect_dry_delay_frames: 0,
             live_input_senders,
             performance_pattern_automation: BTreeMap::new(),
             tempo_map,
