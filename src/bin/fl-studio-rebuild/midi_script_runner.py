@@ -102,6 +102,12 @@ def _request_transport_action(action):
         _active_transport_actions.append(action)
 
 
+def _get_song_pos(mode=-1):
+    if mode != -1:
+        raise NotImplementedError("only normalized transport.getSongPos() is supported")
+    return float(_active_transport_state.get("song_position", 0.0))
+
+
 def _install_modules(script_name, device_name):
     midi = _module("midi")
     constants = {
@@ -148,6 +154,7 @@ def _install_modules(script_name, device_name):
     transport.setLoopMode = lambda: _request_transport_action("loop_mode")
     transport.isPlaying = lambda: int(bool(_active_transport_state.get("is_playing", False)))
     transport.isRecording = lambda: int(bool(_active_transport_state.get("is_recording", False)))
+    transport.getSongPos = _get_song_pos
     transport.getLoopMode = lambda: (
         0 if _active_transport_state.get("pattern_mode", False) else 1
     )

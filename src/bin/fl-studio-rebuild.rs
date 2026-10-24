@@ -107,6 +107,7 @@ use midi_output::{
 use midi_script::{
     MidiControllerScript, SCRIPT_TRANSPORT_PATTERN_MODE, SCRIPT_TRANSPORT_PLAYING,
     SCRIPT_TRANSPORT_RECORDING, discover_midi_scripts, find_script_for_device,
+    normalized_song_position,
 };
 use midi_thru::{MidiThruSettings, MidiThruWorker};
 
@@ -4601,6 +4602,7 @@ struct DawUi {
     midi_input_error: Option<String>,
     midi_input_connection: Option<ConnectedMidiInput>,
     midi_script_transport_state: Arc<AtomicU8>,
+    midi_script_song_position: Arc<AtomicU64>,
     midi_message_sender: SyncSender<ReceivedMidiMessage>,
     midi_message_receiver: Receiver<ReceivedMidiMessage>,
     midi_dropped_messages: Arc<AtomicU64>,
@@ -5981,6 +5983,7 @@ impl DawUi {
             midi_input_error,
             midi_input_connection: None,
             midi_script_transport_state: Arc::new(AtomicU8::new(0)),
+            midi_script_song_position: Arc::new(AtomicU64::new(0.0_f64.to_bits())),
             midi_message_sender,
             midi_message_receiver,
             midi_dropped_messages: Arc::new(AtomicU64::new(0)),
@@ -12761,6 +12764,91 @@ impl DawUi {
         }
         self.midi_script_transport_state
             .store(state, Ordering::Relaxed);
+        let song_position = if self
+            .midi_input_connection
+            .as_ref()
+            .is_some_and(|connection| connection.script_name.is_some())
+        {
+            self.midi_script_song_position_value()
+        } else {
+            0.0
+        };
+        self.midi_script_song_position
+            .store(song_position.to_bits(), Ordering::Relaxed);
+    }
+
+    fn midi_script_song_position_value(&self) -> f64 {
+        let Some(document) = self.document.as_ref() else {
+            return 0.0;
+        };
+        if self.pattern_playback_mode {
+            let active_loop = self.pattern_mode_playback_source;
+            let pattern_id = active_loop
+                .map(|(pattern_id, _)| pattern_id)
+                .or(self.selected_pattern);
+            let Some(pattern_id) = pattern_id else {
+                return 0.0;
+            };
+            let tick = self
+                .current_pattern_mode_playhead_tick()
+                .map(|(_, tick)| tick)
+                .unwrap_or(self.pattern_seek_tick as f64);
+            let Some(pattern) = document.patterns().ok().and_then(|patterns| {
+                patterns
+                    .into_iter()
+                    .find(|pattern| pattern.id == pattern_id)
+            }) else {
+                return 0.0;
+            };
+            let content_end = pattern
+                .notes
+                .iter()
+                .map(|note| u64::from(note.position) + u64::from(note.length))
+                .chain(
+                    pattern
+                        .controllers
+                        .iter()
+                        .map(|point| u64::from(point.position)),
+                )
+                .chain(
+                    pattern
+                        .time_markers
+                        .iter()
+                        .map(|marker| u64::from(marker.position_ticks())),
+                )
+                .max()
+                .unwrap_or(0);
+            let length = active_loop
+                .map(|(_, length)| length)
+                .or_else(|| pattern.length_ticks.map(u64::from))
+                .unwrap_or(content_end);
+            return normalized_song_position(tick, length);
+        }
+
+        let tick = self
+            .current_playhead_tick()
+            .unwrap_or(f64::from(self.playlist_seek_tick));
+        let arrangement_id = self.selected_arrangement.unwrap_or(0);
+        let Some(arrangement) = document.arrangements().ok().and_then(|arrangements| {
+            arrangements
+                .into_iter()
+                .find(|arrangement| arrangement.id == arrangement_id)
+        }) else {
+            return 0.0;
+        };
+        let length = arrangement
+            .clips
+            .iter()
+            .map(|clip| u64::from(clip.position_ticks) + u64::from(clip.length_ticks))
+            .chain(
+                arrangement
+                    .time_markers
+                    .iter()
+                    .map(|marker| u64::from(marker.position_ticks())),
+            )
+            .max()
+            .unwrap_or(0);
+        normalized_song_position(tick, length)
     }
 
     fn live_sampler_tempo_bpm_milli(&self) -> u32 {
@@ -43126,6 +43214,7 @@ impl DawUi {
             self.midi_thru_input_queue.clone(),
             Arc::clone(&self.midi_dropped_messages),
             Arc::clone(&self.midi_script_transport_state),
+            Arc::clone(&self.midi_script_song_position),
             selected_script.as_ref(),
         ) {
             Ok(connection) => {
