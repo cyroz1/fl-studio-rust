@@ -268,6 +268,12 @@ def _global_transport(command, value, pmeflags=2, flags=15):
     if command in (35, 36):
         _jog_marker("marker_jump_jog" if command == 35 else "marker_sel_jog", value)
         return 8
+    if command == 100:
+        if value != 0:
+            _request_transport_action(
+                {"action": "pattern_jog", "increment": value}
+            )
+        return 8
     return -1
 
 

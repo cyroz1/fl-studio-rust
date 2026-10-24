@@ -5558,6 +5558,39 @@ fn next_empty_pattern_id(patterns: &[Pattern], after_pattern_id: Option<u16>) ->
         })
 }
 
+fn midi_script_pattern_jog_target(
+    pattern_ids: &[u16],
+    selected_pattern_id: Option<u16>,
+    increment: i32,
+) -> Option<u16> {
+    let mut pattern_ids = pattern_ids.to_vec();
+    pattern_ids.sort_unstable();
+    pattern_ids.dedup();
+    if pattern_ids.is_empty() {
+        return None;
+    }
+
+    let target_index = if let Some(current_index) = selected_pattern_id.and_then(|selected| {
+        pattern_ids
+            .iter()
+            .position(|pattern_id| *pattern_id == selected)
+    }) {
+        (i64::try_from(current_index).ok()? + i64::from(increment))
+            .clamp(0, i64::try_from(pattern_ids.len() - 1).ok()?) as usize
+    } else if increment > 0 {
+        usize::try_from(i64::from(increment) - 1)
+            .ok()?
+            .min(pattern_ids.len() - 1)
+    } else if increment < 0 {
+        (i64::try_from(pattern_ids.len()).ok()? + i64::from(increment))
+            .clamp(0, i64::try_from(pattern_ids.len() - 1).ok()?) as usize
+    } else {
+        return None;
+    };
+
+    pattern_ids.get(target_index).copied()
+}
+
 impl DawUi {
     fn new(creation: &eframe::CreationContext<'_>, initial_project: Option<PathBuf>) -> Self {
         install_ui_fonts(&creation.egui_ctx);
@@ -13302,6 +13335,36 @@ impl DawUi {
         };
         self.selected_time_marker = Some(marker_index);
         self.status = format!("Selected Playlist marker at tick {tick}");
+    }
+
+    fn jog_midi_script_pattern(&mut self, increment: i32) {
+        if increment == 0 {
+            return;
+        }
+        let pattern_ids = match self.document.as_ref() {
+            Some(document) => match document.patterns() {
+                Ok(patterns) => patterns
+                    .into_iter()
+                    .map(|pattern| pattern.id)
+                    .collect::<Vec<_>>(),
+                Err(error) => {
+                    self.status = format!("Could not inspect patterns for MIDI script: {error}");
+                    return;
+                }
+            },
+            None => {
+                self.status = "MIDI script pattern selection requires an open project".to_owned();
+                return;
+            }
+        };
+        let Some(pattern_id) =
+            midi_script_pattern_jog_target(&pattern_ids, self.selected_pattern, increment)
+        else {
+            self.status = "No patterns are available for MIDI script selection".to_owned();
+            return;
+        };
+        self.selected_pattern = Some(pattern_id);
+        self.status = format!("Selected pattern {pattern_id}");
     }
 
     fn live_sampler_tempo_bpm_milli(&self) -> u32 {
@@ -44952,6 +45015,9 @@ impl DawUi {
             MidiTransportCommand::SetPlaybackSpeed(speed_millionths) => {
                 self.set_midi_script_playback_speed(speed_millionths);
             }
+            MidiTransportCommand::PatternJog(increment) => {
+                self.jog_midi_script_pattern(increment);
+            }
             MidiTransportCommand::MarkerJumpJog(increment) => {
                 self.jump_midi_script_marker(increment);
             }
@@ -61097,22 +61163,23 @@ mod tests {
         midi_controller_binding_for_device, midi_mixer_button_press_edge,
         midi_mixer_control_for_cc, midi_script_marker_jump_target,
         midi_script_marker_selection_target, midi_script_moved_song_position_tick,
-        midi_script_time_position_seconds_to_ticks, midi_vst3_parameter_mapping_for_target,
-        midi_vst3_parameter_mappings_for_cc, next_empty_pattern_id, next_piano_roll_note_group,
-        note_from_grid_position, parse_internal_lfo_parameter_links,
-        parse_midi_control_change_mapping, parse_midi_controller_templates,
-        parse_midi_device_selections, parse_midi_mixer_control_mappings,
-        parse_midi_output_programs, parse_midi_output_routes, parse_midi_output_values,
-        parse_midi_vst3_parameter_mappings, parse_pattern_vst3_parameter_links,
-        parse_playlist_audio_clip_envelopes, parse_playlist_vst3_parameter_links,
-        parse_window_layout_presets, pattern_color_from_random_index,
-        pattern_lfo_loop_length_ticks, pattern_loop_frame_at_tick, pattern_loop_tick_at_frame,
-        pattern_vst3_parameter_automation_for_channel, pattern_vst3_parameter_link_for_target,
-        piano_roll_color_group_note_ids, piano_roll_controller_stroke_points,
-        piano_roll_controller_value_at, piano_roll_controller_value_range,
-        piano_roll_cross_pattern_ghost_notes, piano_roll_discard_length_edit,
-        piano_roll_duplicate_offset, piano_roll_ghost_note_is_visible, piano_roll_key_at_y,
-        piano_roll_note_group_members, piano_roll_note_nudge_edit, piano_roll_odd_note_selection,
+        midi_script_pattern_jog_target, midi_script_time_position_seconds_to_ticks,
+        midi_vst3_parameter_mapping_for_target, midi_vst3_parameter_mappings_for_cc,
+        next_empty_pattern_id, next_piano_roll_note_group, note_from_grid_position,
+        parse_internal_lfo_parameter_links, parse_midi_control_change_mapping,
+        parse_midi_controller_templates, parse_midi_device_selections,
+        parse_midi_mixer_control_mappings, parse_midi_output_programs, parse_midi_output_routes,
+        parse_midi_output_values, parse_midi_vst3_parameter_mappings,
+        parse_pattern_vst3_parameter_links, parse_playlist_audio_clip_envelopes,
+        parse_playlist_vst3_parameter_links, parse_window_layout_presets,
+        pattern_color_from_random_index, pattern_lfo_loop_length_ticks, pattern_loop_frame_at_tick,
+        pattern_loop_tick_at_frame, pattern_vst3_parameter_automation_for_channel,
+        pattern_vst3_parameter_link_for_target, piano_roll_color_group_note_ids,
+        piano_roll_controller_stroke_points, piano_roll_controller_value_at,
+        piano_roll_controller_value_range, piano_roll_cross_pattern_ghost_notes,
+        piano_roll_discard_length_edit, piano_roll_duplicate_offset,
+        piano_roll_ghost_note_is_visible, piano_roll_key_at_y, piano_roll_note_group_members,
+        piano_roll_note_nudge_edit, piano_roll_odd_note_selection,
         piano_roll_overlap_note_selection, piano_roll_pitch_range_note_selection,
         piano_roll_random_note_selection, piano_roll_selection_time_range,
         piano_roll_shift_time_range, piano_roll_time_range_from_drag,
@@ -64618,6 +64685,38 @@ mod tests {
             midi_script_marker_selection_target(&markers, Some(4), -10),
             Some((4, 96))
         );
+    }
+
+    #[test]
+    fn midi_script_pattern_jog_selects_in_id_order_and_clamps_at_edges() {
+        let pattern_ids = [8, 2, 4, 4];
+
+        assert_eq!(
+            midi_script_pattern_jog_target(&pattern_ids, Some(4), 1),
+            Some(8)
+        );
+        assert_eq!(
+            midi_script_pattern_jog_target(&pattern_ids, Some(4), -1),
+            Some(2)
+        );
+        assert_eq!(
+            midi_script_pattern_jog_target(&pattern_ids, Some(8), 10),
+            Some(8)
+        );
+        assert_eq!(
+            midi_script_pattern_jog_target(&pattern_ids, Some(2), -10),
+            Some(2)
+        );
+        assert_eq!(
+            midi_script_pattern_jog_target(&pattern_ids, None, 1),
+            Some(2)
+        );
+        assert_eq!(
+            midi_script_pattern_jog_target(&pattern_ids, None, -1),
+            Some(8)
+        );
+        assert_eq!(midi_script_pattern_jog_target(&pattern_ids, None, 0), None);
+        assert_eq!(midi_script_pattern_jog_target(&[], Some(2), 1), None);
     }
 
     #[test]

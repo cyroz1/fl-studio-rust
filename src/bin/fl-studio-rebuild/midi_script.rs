@@ -38,6 +38,7 @@ pub enum ScriptTransportAction {
     SetSongPositionTimeUs(u64),
     MoveSongPosition { speed_millionths: i32, start: bool },
     SetPlaybackSpeed(u32),
+    PatternJog(i32),
     MarkerJumpJog(i32),
     MarkerSelJog(i32),
 }
@@ -579,6 +580,13 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
         } else {
             ScriptTransportAction::MarkerSelJog(increment)
         });
+    }
+    if name == Some("pattern_jog") {
+        let increment = action["increment"]
+            .as_i64()
+            .and_then(|increment| i32::try_from(increment).ok())
+            .ok_or_else(|| "MIDI script returned an invalid pattern jog increment".to_owned())?;
+        return Ok(ScriptTransportAction::PatternJog(increment));
     }
     Err("MIDI script returned an unknown transport action".to_owned())
 }
@@ -1271,6 +1279,24 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn python_global_transport_pattern_jog_dispatches_selection_action() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport midi\nimport transport\ndef OnMidiIn(event):\n    result = transport.globalTransport(midi.FPT_PatternJog, -2, event.pmeflags)\n    event.data1 = result\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let mut runtime = MidiScriptRuntime::start_for_device(&script, "Test Input").unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
+
+        assert_eq!(result.bytes, [0xB0, 8, 1]);
+        assert_eq!(result.actions, [ScriptTransportAction::PatternJog(-2)]);
     }
 
     #[test]
