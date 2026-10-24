@@ -2247,7 +2247,8 @@ pub fn stream_playlist_performance_with_vst3_to_device(
                 "arrangement has VST3 notes on channel(s) {channel_ids}, but no matching plug-in instance is loaded"
             ));
         }
-        processor.extend_to_output_frames(static_frames.max(vst3_summary.frames))?;
+        let content_frames = static_frames.max(processor.content_frames());
+        processor.extend_to_output_frames(content_frames)?;
     }
     let mut source_paths = audio.source_paths.iter().cloned().collect::<BTreeSet<_>>();
     source_paths.extend(sampler.source_paths.iter().cloned());
@@ -2391,8 +2392,9 @@ fn stream_playlist_with_vst3_to_device_from_frame_inner(
 
     let mut frames = audio.summary.frames.max(sampler.summary.frames);
     if let Some(processor) = vst3_processor.as_mut() {
-        frames = frames.max(processor.summary().frames);
+        frames = frames.max(processor.content_frames());
         processor.extend_to_output_frames(frames)?;
+        frames = frames.max(processor.summary().frames);
     }
     let mut source_paths: std::collections::BTreeSet<PathBuf> =
         audio.source_paths.iter().cloned().collect();
@@ -2703,7 +2705,7 @@ fn render_playlist_with_vst3_cancellable(
         .max(sampler.summary.frames)
         .max(minimum_content_frames);
     if let Some(processor) = vst3_processor.as_mut() {
-        content_frames = content_frames.max(processor.summary().frames);
+        content_frames = content_frames.max(processor.content_frames());
     }
     let mut wav_cue_points = if matches!(output, PlaylistRenderOutput::Wav)
         && (options.wav_save_playlist_markers || options.wav_save_note_markers)
@@ -2739,13 +2741,16 @@ fn render_playlist_with_vst3_cancellable(
             true
         });
     }
-    let frames = add_render_tail_frames(content_frames, options.sample_rate, options.tail_seconds)?;
+    let mut frames =
+        add_render_tail_frames(content_frames, options.sample_rate, options.tail_seconds)?;
     if output_start_frame >= frames {
         return Err("render output start is after the end of the Playlist content".to_owned());
     }
-    let output_frames = frames - output_start_frame;
+    let mut output_frames = frames - output_start_frame;
     if let Some(processor) = vst3_processor.as_mut() {
         processor.extend_to_output_frames(frames)?;
+        frames = frames.max(processor.summary().frames);
+        output_frames = frames - output_start_frame;
     }
     if matches!(output, PlaylistRenderOutput::Flac { .. }) && output_frames > FLAC_MAX_SAMPLE_FRAMES
     {
@@ -3097,7 +3102,7 @@ pub fn render_playlist_mixer_stems_with_vst3_cancellable(
 
     let mut content_frames = audio.summary.frames.max(sampler.summary.frames);
     if let Some(processor) = vst3_processor.as_mut() {
-        content_frames = content_frames.max(processor.summary().frames);
+        content_frames = content_frames.max(processor.content_frames());
     }
     let wav_cue_points = if options.wav_save_playlist_markers || options.wav_save_note_markers {
         playlist_wav_cue_points(
@@ -3118,9 +3123,11 @@ pub fn render_playlist_mixer_stems_with_vst3_cancellable(
     {
         content_frames = content_frames.max(last_cue_frame);
     }
-    let frames = add_render_tail_frames(content_frames, options.sample_rate, options.tail_seconds)?;
+    let mut frames =
+        add_render_tail_frames(content_frames, options.sample_rate, options.tail_seconds)?;
     if let Some(processor) = vst3_processor.as_mut() {
         processor.extend_to_output_frames(frames)?;
+        frames = frames.max(processor.summary().frames);
     }
     let frames_u32 =
         u32::try_from(frames).map_err(|_| "render is too long for a RIFF/WAVE file".to_owned())?;

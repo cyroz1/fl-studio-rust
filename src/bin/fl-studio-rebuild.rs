@@ -11178,10 +11178,11 @@ impl DawUi {
             .vst3_host
             .as_ref()
             .map(|host| {
-                host.prepare_playlist_stream_with_automation_sources(
+                host.prepare_playlist_stream_with_mixer_effects_and_automation_sources(
                     playback_document,
                     options.clone(),
                     &self.channel_vst3_instances,
+                    &self.mixer_effect_vst3_instances,
                     true,
                     &playlist_parameter_automation,
                 )
@@ -11626,11 +11627,12 @@ impl DawUi {
             .vst3_host
             .as_ref()
             .map(|host| {
-                host.prepare_playlist_performance_stream_with_automation_sources(
+                host.prepare_playlist_performance_stream_with_mixer_effects_and_automation_sources(
                     &static_document,
                     options.clone(),
                     &self.channel_vst3_instances,
                     &performance_vst3_channel_ids,
+                    &self.mixer_effect_vst3_instances,
                     true,
                     &playlist_parameter_automation,
                 )
@@ -35483,12 +35485,13 @@ impl DawUi {
             self.vst3_host
                 .as_ref()
                 .map(|host| {
-                    host.prepare_pattern_loop_stream_with_automation(
+                    host.prepare_pattern_loop_stream_with_mixer_effects_and_automation(
                         document,
                         pattern_id,
                         loop_length_ticks,
                         device_rate,
                         &self.channel_vst3_instances,
+                        &self.mixer_effect_vst3_instances,
                         &pattern_automations,
                     )
                 })
@@ -37327,10 +37330,11 @@ impl DawUi {
             .vst3_host
             .as_ref()
             .map(|host| {
-                host.prepare_playlist_stream_with_automation_sources(
+                host.prepare_playlist_stream_with_mixer_effects_and_automation_sources(
                     document,
                     options.clone(),
                     &self.channel_vst3_instances,
+                    &self.mixer_effect_vst3_instances,
                     self.playlist_render_include_plugin_tails,
                     &playlist_parameter_automation,
                 )
@@ -37465,10 +37469,11 @@ impl DawUi {
             .vst3_host
             .as_ref()
             .map(|host| {
-                host.prepare_playlist_stream_with_automation_sources(
+                host.prepare_playlist_stream_with_mixer_effects_and_automation_sources(
                     document,
                     options.clone(),
                     &self.channel_vst3_instances,
+                    &self.mixer_effect_vst3_instances,
                     self.playlist_render_include_plugin_tails,
                     &playlist_parameter_automation,
                 )
