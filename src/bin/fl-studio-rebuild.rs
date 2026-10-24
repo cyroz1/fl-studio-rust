@@ -4851,6 +4851,13 @@ struct PendingAudioRender {
     worker: thread::JoinHandle<()>,
     live_midi_senders: BTreeMap<u16, Vst3PlaylistLiveInputSender>,
     staged_streaming: Option<StagedStreamingPlayback>,
+    staged_handoff_reason: Option<PlaylistStreamHandoffReason>,
+}
+
+#[derive(Clone, Copy)]
+enum PlaylistStreamHandoffReason {
+    Vst3LatencyChange,
+    AutomaticPdcChange { enabled: bool },
 }
 
 struct PendingAudioClipExport {
@@ -11075,14 +11082,22 @@ impl DawUi {
     }
 
     fn start_project_playback(&mut self) {
-        self.start_project_playback_with_start_frame(None);
+        self.start_project_playback_with_start_frame(None, None);
     }
 
-    fn start_project_playback_handoff(&mut self, start_frame: u64) {
-        self.start_project_playback_with_start_frame(Some(start_frame));
+    fn start_project_playback_handoff(
+        &mut self,
+        start_frame: u64,
+        reason: PlaylistStreamHandoffReason,
+    ) {
+        self.start_project_playback_with_start_frame(Some(start_frame), Some(reason));
     }
 
-    fn start_project_playback_with_start_frame(&mut self, staged_start_frame: Option<u64>) {
+    fn start_project_playback_with_start_frame(
+        &mut self,
+        staged_start_frame: Option<u64>,
+        staged_handoff_reason: Option<PlaylistStreamHandoffReason>,
+    ) {
         self.midi_script_transport_move = None;
         if self.pending_song_render.is_some() {
             self.status = "Stop the Playlist render before starting playback".to_owned();
@@ -11307,6 +11322,7 @@ impl DawUi {
                     worker,
                     live_midi_senders,
                     staged_streaming,
+                    staged_handoff_reason,
                 });
                 self.stop_midi_pattern_preview();
                 self.status = if handoff_in_progress {
@@ -11335,7 +11351,7 @@ impl DawUi {
         }
     }
 
-    fn restart_playlist_stream_for_latency_change(&mut self) -> bool {
+    fn stage_playlist_stream_rebuild(&mut self, reason: PlaylistStreamHandoffReason) -> bool {
         let Some(engine) = self.audio_engine.as_ref() else {
             return false;
         };
@@ -11369,7 +11385,7 @@ impl DawUi {
         else {
             return false;
         };
-        self.start_project_playback_handoff(start_frame);
+        self.start_project_playback_handoff(start_frame, reason);
         self.pending_audio_render
             .as_ref()
             .is_some_and(|pending| pending.staged_streaming.is_some())
@@ -11803,6 +11819,7 @@ impl DawUi {
                     worker,
                     live_midi_senders,
                     staged_streaming: None,
+                    staged_handoff_reason: None,
                 });
                 self.stop_midi_pattern_preview();
                 self.status = format!(
@@ -11826,10 +11843,15 @@ impl DawUi {
             .as_ref()
             .and_then(|pending| pending.staged_streaming.as_ref())
             .is_some_and(StagedStreamingPlayback::is_committed);
-        if staged_handoff_committed {
-            if let Some(pending) = self.pending_audio_render.as_mut() {
+        let staged_handoff_reason = if staged_handoff_committed {
+            self.pending_audio_render.as_mut().and_then(|pending| {
                 pending.staged_streaming = None;
-            }
+                pending.staged_handoff_reason.take()
+            })
+        } else {
+            None
+        };
+        if staged_handoff_committed {
             if self.playing {
                 self.start_midi_playlist_playback_from_current_position();
             }
@@ -11837,12 +11859,16 @@ impl DawUi {
                 .current_playhead_tick()
                 .filter(|tick| tick.is_finite() && *tick >= 0.0)
                 .map(|tick| tick.round() as u64);
-            self.status = tick.map_or_else(
-                || "VST3 latency update applied through a live PDC handoff".to_owned(),
-                |tick| {
-                    format!("VST3 latency update applied through a live PDC handoff at tick {tick}")
-                },
-            );
+            let tick_suffix = tick.map_or_else(String::new, |tick| format!(" at tick {tick}"));
+            self.status = match staged_handoff_reason {
+                Some(PlaylistStreamHandoffReason::AutomaticPdcChange { enabled }) => format!(
+                    "Automatic PDC set to {}; applied through a live PDC handoff{tick_suffix}",
+                    u8::from(enabled)
+                ),
+                Some(PlaylistStreamHandoffReason::Vst3LatencyChange) | None => {
+                    format!("VST3 latency update applied through a live PDC handoff{tick_suffix}")
+                }
+            };
         }
         let completed = self.pending_audio_render.as_ref().and_then(|pending| {
             match pending.receiver.try_recv() {
@@ -42389,7 +42415,7 @@ impl DawUi {
                 if ui
                     .checkbox(&mut enabled, "Automatic PDC")
                     .on_hover_text(
-                        "Align supported direct and Mixer send paths using reported VST3 latency. Changing this stops active playback; start again to apply it.",
+                        "Align supported direct and Mixer send paths using reported VST3 latency. Song playback applies this change through a staged stream handoff; other active playback modes stop and require a new start.",
                     )
                     .changed()
                 {
@@ -44395,11 +44421,23 @@ impl DawUi {
             {
                 Ok(Some(())) => {
                     let playback_was_active = self.playing;
-                    if playback_was_active {
+                    let staged_playlist_handoff = playback_was_active
+                        && self.playlist_playback_loaded
+                        && !self.pattern_playback_mode
+                        && !self.performance_mode_active
+                        && self.stage_playlist_stream_rebuild(
+                            PlaylistStreamHandoffReason::AutomaticPdcChange { enabled },
+                        );
+                    if playback_was_active && !staged_playlist_handoff {
                         self.stop_project_playback();
                     }
                     self.dirty = true;
-                    self.status = if playback_was_active {
+                    self.status = if staged_playlist_handoff {
+                        format!(
+                            "Automatic PDC set to {}; preparing a live Playlist handoff…",
+                            u8::from(enabled)
+                        )
+                    } else if playback_was_active {
                         format!(
                             "Automatic PDC set to {}; playback stopped. Start again to apply it.",
                             u8::from(enabled)
@@ -52776,7 +52814,9 @@ impl eframe::App for DawUi {
                 let staged_playlist_handoff = changes.latency_changed
                     && !changes.io_changed
                     && resume_playlist_playback
-                    && self.restart_playlist_stream_for_latency_change();
+                    && self.stage_playlist_stream_rebuild(
+                        PlaylistStreamHandoffReason::Vst3LatencyChange,
+                    );
                 if staged_playlist_handoff {
                     self.pattern_seek_tick = pattern_resume_tick;
                     self.status = format!(
