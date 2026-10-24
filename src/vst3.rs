@@ -5,7 +5,7 @@
 //! Image-Line's FLP state envelope into the state stream expected by every VST3.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
@@ -1517,6 +1517,132 @@ struct HostedPlugin {
     editor: Option<PluginWindow>,
 }
 
+fn read_32bit_x86_binary(path: &Path) -> bool {
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut header = [0_u8; 64];
+    if file.read_exact(&mut header).is_err() {
+        return false;
+    }
+    if header.starts_with(b"\x7FELF") {
+        return header[4] == 1 && header[5] == 1 && header[18] == 3 && header[19] == 0;
+    }
+    if header.starts_with(b"MZ") {
+        let Some(offset_bytes) = header.get(0x3C..0x40) else {
+            return false;
+        };
+        let offset = u64::from(u32::from_le_bytes([
+            offset_bytes[0],
+            offset_bytes[1],
+            offset_bytes[2],
+            offset_bytes[3],
+        ]));
+        if file.seek(SeekFrom::Start(offset)).is_err() {
+            return false;
+        }
+        let mut pe_header = [0_u8; 6];
+        return file.read_exact(&mut pe_header).is_ok()
+            && pe_header[..4] == *b"PE\0\0"
+            && pe_header[4] == 0x4C
+            && pe_header[5] == 0x01;
+    }
+    // Thin 32-bit Mach-O. Universal binaries are intentionally left to the native loader,
+    // which can select an architecture slice appropriate to this process.
+    let magic = &header[..4];
+    let is_32bit_macho = matches!(magic, [0xFE, 0xED, 0xFA, 0xCE] | [0xCE, 0xFA, 0xED, 0xFE]);
+    if is_32bit_macho {
+        let cpu_type_bytes = [header[4], header[5], header[6], header[7]];
+        let cpu_type = if magic == [0xCE, 0xFA, 0xED, 0xFE] {
+            u32::from_le_bytes(cpu_type_bytes)
+        } else {
+            u32::from_be_bytes(cpu_type_bytes)
+        };
+        return cpu_type == 7;
+    }
+    false
+}
+
+#[cfg(target_os = "windows")]
+fn find_x86_bundle_binary(path: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(path.join("Contents").join("x86-win"))
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|candidate| {
+            candidate
+                .extension()
+                .is_some_and(|extension| extension == "vst3")
+                && read_32bit_x86_binary(candidate)
+        })
+}
+
+#[cfg(target_os = "linux")]
+fn find_x86_bundle_binary(path: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(path.join("Contents").join("i386-linux"))
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|candidate| {
+            candidate
+                .extension()
+                .is_some_and(|extension| extension == "so")
+                && read_32bit_x86_binary(candidate)
+        })
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+fn find_x86_bundle_binary(_path: &Path) -> Option<PathBuf> {
+    None
+}
+
+fn x86_vst3_binary(path: &Path) -> Option<PathBuf> {
+    if path.is_file() {
+        return read_32bit_x86_binary(path).then(|| path.to_path_buf());
+    }
+    if let Ok(native_binary) = vst3_host::discovery::get_vst3_binary_path(path) {
+        return read_32bit_x86_binary(&native_binary).then_some(native_binary);
+    }
+    find_x86_bundle_binary(path)
+}
+
+fn x86_helper_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("VST3_HOST_HELPER_X86_PATH") {
+        let path = PathBuf::from(path);
+        return path.is_file().then_some(path);
+    }
+    let helper_name = if cfg!(target_os = "windows") {
+        "vst3-host-helper-x86.exe"
+    } else {
+        "vst3-host-helper-x86"
+    };
+    let executable = std::env::current_exe().ok()?;
+    let directory = executable.parent()?;
+    [
+        Some(directory.to_path_buf()),
+        directory.parent().map(Path::to_path_buf),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|directory| directory.join(helper_name))
+    .find(|path| path.is_file())
+}
+
+fn build_isolated_vst3_host(
+    sample_rate: f64,
+    block_size: usize,
+    helper_path: Option<&Path>,
+) -> Result<Vst3Host, String> {
+    let mut builder = Vst3Host::builder()
+        .sample_rate(sample_rate)
+        .block_size(block_size)
+        .with_process_isolation(true);
+    if let Some(helper_path) = helper_path {
+        builder = builder.helper_path(helper_path);
+    }
+    builder.build().map_err(|error| error.to_string())
+}
+
 /// Owns active VST3 instances and their native editor windows.
 ///
 /// Plug-ins are loaded on demand. The host does not scan or execute every installed
@@ -1762,12 +1888,7 @@ impl Vst3HostRuntime {
         if block_size == 0 {
             return Err("block size must be greater than zero".to_owned());
         }
-        let host = Vst3Host::builder()
-            .sample_rate(sample_rate)
-            .block_size(block_size)
-            .with_process_isolation(true)
-            .build()
-            .map_err(|error| error.to_string())?;
+        let host = build_isolated_vst3_host(sample_rate, block_size, None)?;
         Ok(Self {
             host,
             loaded: Vec::new(),
@@ -1784,9 +1905,29 @@ impl Vst3HostRuntime {
         path: impl AsRef<Path>,
         class_id: Option<&str>,
     ) -> Result<HostedPluginInfo, String> {
-        let plugin = match class_id {
-            Some(class_id) => self.host.load_plugin_class(path, class_id),
-            None => self.host.load_plugin(path),
+        let path = path.as_ref();
+        let plugin = if x86_vst3_binary(path).is_some() {
+            let helper_path = x86_helper_path().ok_or_else(|| {
+                format!(
+                    "32-bit x86 VST3 plugin {} requires the bundled x86 helper, which is unavailable on this platform",
+                    path.display()
+                )
+            })?;
+            let config = self.host.config();
+            let mut helper_host = build_isolated_vst3_host(
+                config.sample_rate,
+                config.block_size,
+                Some(&helper_path),
+            )?;
+            match class_id {
+                Some(class_id) => helper_host.load_plugin_class(path, class_id),
+                None => helper_host.load_plugin(path),
+            }
+        } else {
+            match class_id {
+                Some(class_id) => self.host.load_plugin_class(path, class_id),
+                None => self.host.load_plugin(path),
+            }
         }
         .map_err(|error| error.to_string())?;
 
@@ -5374,6 +5515,78 @@ mod tests {
     use super::*;
     use crate::{MixerInsertSignalTransform, MixerLiveSourceRoutePlan};
     use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_BINARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    fn temporary_test_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "fl-studio-rebuild-vst3-{name}-{}-{}.bin",
+            std::process::id(),
+            TEST_BINARY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn x86_pe_header(machine: u16) -> Vec<u8> {
+        let mut bytes = vec![0_u8; 70];
+        bytes[0..2].copy_from_slice(b"MZ");
+        bytes[0x3C..0x40].copy_from_slice(&64_u32.to_le_bytes());
+        bytes[64..68].copy_from_slice(b"PE\0\0");
+        bytes[68..70].copy_from_slice(&machine.to_le_bytes());
+        bytes
+    }
+
+    fn x86_elf_header(class: u8, machine: u16) -> Vec<u8> {
+        let mut bytes = vec![0_u8; 64];
+        bytes[0..4].copy_from_slice(b"\x7FELF");
+        bytes[4] = class;
+        bytes[5] = 1;
+        bytes[18..20].copy_from_slice(&machine.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn detects_32_bit_x86_pe_and_elf_binaries() {
+        let pe32 = temporary_test_path("pe32");
+        let pe64 = temporary_test_path("pe64");
+        let elf32 = temporary_test_path("elf32");
+        let elf64 = temporary_test_path("elf64");
+        std::fs::write(&pe32, x86_pe_header(0x014C)).unwrap();
+        std::fs::write(&pe64, x86_pe_header(0x8664)).unwrap();
+        std::fs::write(&elf32, x86_elf_header(1, 3)).unwrap();
+        std::fs::write(&elf64, x86_elf_header(2, 62)).unwrap();
+
+        assert!(read_32bit_x86_binary(&pe32));
+        assert!(!read_32bit_x86_binary(&pe64));
+        assert!(read_32bit_x86_binary(&elf32));
+        assert!(!read_32bit_x86_binary(&elf64));
+
+        for path in [pe32, pe64, elf32, elf64] {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn finds_architecture_specific_32_bit_vst3_bundle_binary() {
+        let bundle = temporary_test_path("bundle");
+        let contents = bundle.join("Contents");
+        #[cfg(target_os = "linux")]
+        let (folder, extension) = ("i386-linux", "so");
+        #[cfg(target_os = "windows")]
+        let (folder, extension) = ("x86-win", "vst3");
+        let binary_directory = contents.join(folder);
+        std::fs::create_dir_all(&binary_directory).unwrap();
+        let binary = binary_directory.join(format!("Legacy.{extension}"));
+        #[cfg(target_os = "linux")]
+        std::fs::write(&binary, x86_elf_header(1, 3)).unwrap();
+        #[cfg(target_os = "windows")]
+        std::fs::write(&binary, x86_pe_header(0x014C)).unwrap();
+
+        assert_eq!(x86_vst3_binary(&bundle), Some(binary));
+
+        std::fs::remove_dir_all(bundle).unwrap();
+    }
 
     fn playlist_parameter_automation_fixture() -> FlpDocument {
         fn append_data_event(event_stream: &mut Vec<u8>, opcode: u8, payload: &[u8]) {

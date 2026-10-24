@@ -1,2 +1,7 @@
 /target/
 /dist/
+/Packager.bridge.toml
+/Packager.linux-appimage.toml
+/Packager.signed.toml
+/Packager.macos-smoke.toml
+/packaging/nfpm-bridge.yaml
