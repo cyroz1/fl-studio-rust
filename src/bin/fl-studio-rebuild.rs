@@ -4324,6 +4324,7 @@ struct DawUi {
     playlist_playback_loaded: bool,
     playlist_seek_tick: u32,
     playlist_tempo_map: Option<PlaylistTempoMap>,
+    midi_script_tempo_map_cache: Option<(u16, u64, Instant, PlaylistTempoMap)>,
     tempo_bpm: f64,
     selected_pattern: Option<u16>,
     channel_display_filter: ChannelDisplayFilter,
@@ -5704,6 +5705,7 @@ impl DawUi {
             playlist_playback_loaded: false,
             playlist_seek_tick: 0,
             playlist_tempo_map: None,
+            midi_script_tempo_map_cache: None,
             tempo_bpm: 140.0,
             selected_pattern: None,
             channel_display_filter: ChannelDisplayFilter::All,
@@ -12744,7 +12746,7 @@ impl DawUi {
         tempo_map.tick_at_frame(frames, engine.sample_rate())
     }
 
-    fn publish_midi_script_transport_state(&self) {
+    fn publish_midi_script_transport_state(&mut self) {
         let mut state = 0;
         if self.playing {
             state |= SCRIPT_TRANSPORT_PLAYING;
@@ -12767,18 +12769,35 @@ impl DawUi {
             .midi_input_connection
             .as_ref()
             .is_some_and(|connection| connection.script_name.is_some());
-        let (song_position, song_position_ticks, song_length_ticks) = if has_script {
-            self.midi_script_song_position_tick_and_length()
-                .map(|(tick, length)| {
-                    (
-                        normalized_song_position(tick, length),
-                        absolute_song_position_ticks(tick),
-                        length,
-                    )
-                })
-                .unwrap_or((0.0, 0, 0))
+        let (
+            song_position,
+            song_position_ticks,
+            song_length_ticks,
+            song_position_seconds,
+            song_length_seconds,
+        ) = if has_script {
+            if let Some((tick, length)) = self.midi_script_song_position_tick_and_length() {
+                let tempo_map = self.midi_script_tempo_map();
+                let position_seconds = tempo_map
+                    .as_ref()
+                    .and_then(|tempo_map| tempo_map.seconds_at_fractional_tick(tick).ok())
+                    .unwrap_or(0.0);
+                let length_seconds = tempo_map
+                    .as_ref()
+                    .and_then(|tempo_map| tempo_map.seconds_at_fractional_tick(length as f64).ok())
+                    .unwrap_or(0.0);
+                (
+                    normalized_song_position(tick, length),
+                    absolute_song_position_ticks(tick),
+                    length,
+                    position_seconds,
+                    length_seconds,
+                )
+            } else {
+                (0.0, 0, 0, 0.0, 0.0)
+            }
         } else {
-            (0.0, 0, 0)
+            (0.0, 0, 0, 0.0, 0.0)
         };
         self.midi_script_transport_state
             .song_position
@@ -12789,6 +12808,12 @@ impl DawUi {
         self.midi_script_transport_state
             .song_length_ticks
             .store(song_length_ticks, Ordering::Relaxed);
+        self.midi_script_transport_state
+            .song_position_seconds
+            .store(song_position_seconds.to_bits(), Ordering::Relaxed);
+        self.midi_script_transport_state
+            .song_length_seconds
+            .store(song_length_seconds.to_bits(), Ordering::Relaxed);
         let song_position_hint = if has_script {
             self.song_position_label()
         } else {
@@ -12864,6 +12889,43 @@ impl DawUi {
         Some((tick, length))
     }
 
+    fn midi_script_tempo_map(&mut self) -> Option<PlaylistTempoMap> {
+        let document = self.document.as_ref()?;
+        if self.pattern_playback_mode {
+            return PlaylistTempoMap::constant(
+                document.header().ppq(),
+                document.metadata().tempo_bpm().unwrap_or(140.0),
+            )
+            .ok();
+        }
+
+        if self.playlist_playback_loaded
+            && let Some(tempo_map) = self.playlist_tempo_map.as_ref()
+        {
+            return Some(tempo_map.clone());
+        }
+
+        let arrangement_id = self.selected_arrangement.unwrap_or(0);
+        let now = Instant::now();
+        if let Some((cached_arrangement, cached_generation, cached_at, tempo_map)) =
+            self.midi_script_tempo_map_cache.as_ref()
+            && *cached_arrangement == arrangement_id
+            && *cached_generation == self.project_generation
+            && now.duration_since(*cached_at) < Duration::from_millis(250)
+        {
+            return Some(tempo_map.clone());
+        }
+
+        let tempo_map = PlaylistTempoMap::for_arrangement(document, arrangement_id).ok()?;
+        self.midi_script_tempo_map_cache = Some((
+            arrangement_id,
+            self.project_generation,
+            now,
+            tempo_map.clone(),
+        ));
+        Some(tempo_map)
+    }
+
     fn set_midi_script_song_position(&mut self, position: u32) {
         let Some((_, length)) = self.midi_script_song_position_tick_and_length() else {
             self.status =
@@ -12880,6 +12942,27 @@ impl DawUi {
             return;
         };
         self.set_midi_script_song_position_tick(tick.min(length), length);
+    }
+
+    fn set_midi_script_song_position_time_us(&mut self, position_microseconds: u64) {
+        let Some((_, length)) = self.midi_script_song_position_tick_and_length() else {
+            self.status =
+                "Could not set MIDI script song position without a selected timeline".to_owned();
+            return;
+        };
+        let Some(tempo_map) = self.midi_script_tempo_map() else {
+            self.status =
+                "Could not map MIDI script song position to the selected timeline".to_owned();
+            return;
+        };
+        let seconds = position_microseconds as f64 / 1_000_000.0;
+        let Some(tick) = midi_script_time_position_seconds_to_ticks(&tempo_map, seconds, length)
+        else {
+            self.status =
+                "Could not map MIDI script song position to the selected timeline".to_owned();
+            return;
+        };
+        self.set_midi_script_song_position_tick(tick, length);
     }
 
     fn set_midi_script_song_position_tick(&mut self, tick: u64, length: u64) {
@@ -44597,6 +44680,9 @@ impl DawUi {
             MidiTransportCommand::SetSongPositionTicks(tick) => {
                 self.set_midi_script_song_position_absolute_ticks(tick);
             }
+            MidiTransportCommand::SetSongPositionTimeUs(position) => {
+                self.set_midi_script_song_position_time_us(position);
+            }
             MidiTransportCommand::MarkerJumpJog(increment) => {
                 self.jump_midi_script_marker(increment);
             }
@@ -59450,6 +59536,15 @@ fn midi_script_marker_selection_target(
     markers.get(target_index).copied()
 }
 
+fn midi_script_time_position_seconds_to_ticks(
+    tempo_map: &PlaylistTempoMap,
+    position_seconds: f64,
+    length_ticks: u64,
+) -> Option<u64> {
+    let tick = tempo_map.tick_at_seconds(position_seconds)?;
+    Some(absolute_song_position_ticks(tick).min(length_ticks))
+}
+
 fn playlist_measure_at_tick(
     ppq: u16,
     initial_time_signature: Option<(u8, u8)>,
@@ -60681,22 +60776,23 @@ mod tests {
         midi_cc_to_mixer_pan_raw, midi_cc_to_mixer_stereo_separation_raw,
         midi_controller_binding_for_device, midi_mixer_button_press_edge,
         midi_mixer_control_for_cc, midi_script_marker_jump_target,
-        midi_script_marker_selection_target, midi_vst3_parameter_mapping_for_target,
-        midi_vst3_parameter_mappings_for_cc, next_empty_pattern_id, next_piano_roll_note_group,
-        note_from_grid_position, parse_internal_lfo_parameter_links,
-        parse_midi_control_change_mapping, parse_midi_controller_templates,
-        parse_midi_device_selections, parse_midi_mixer_control_mappings,
-        parse_midi_output_programs, parse_midi_output_routes, parse_midi_output_values,
-        parse_midi_vst3_parameter_mappings, parse_pattern_vst3_parameter_links,
-        parse_playlist_audio_clip_envelopes, parse_playlist_vst3_parameter_links,
-        parse_window_layout_presets, pattern_color_from_random_index,
-        pattern_lfo_loop_length_ticks, pattern_loop_frame_at_tick, pattern_loop_tick_at_frame,
-        pattern_vst3_parameter_automation_for_channel, pattern_vst3_parameter_link_for_target,
-        piano_roll_color_group_note_ids, piano_roll_controller_stroke_points,
-        piano_roll_controller_value_at, piano_roll_controller_value_range,
-        piano_roll_cross_pattern_ghost_notes, piano_roll_discard_length_edit,
-        piano_roll_duplicate_offset, piano_roll_ghost_note_is_visible, piano_roll_key_at_y,
-        piano_roll_note_group_members, piano_roll_note_nudge_edit, piano_roll_odd_note_selection,
+        midi_script_marker_selection_target, midi_script_time_position_seconds_to_ticks,
+        midi_vst3_parameter_mapping_for_target, midi_vst3_parameter_mappings_for_cc,
+        next_empty_pattern_id, next_piano_roll_note_group, note_from_grid_position,
+        parse_internal_lfo_parameter_links, parse_midi_control_change_mapping,
+        parse_midi_controller_templates, parse_midi_device_selections,
+        parse_midi_mixer_control_mappings, parse_midi_output_programs, parse_midi_output_routes,
+        parse_midi_output_values, parse_midi_vst3_parameter_mappings,
+        parse_pattern_vst3_parameter_links, parse_playlist_audio_clip_envelopes,
+        parse_playlist_vst3_parameter_links, parse_window_layout_presets,
+        pattern_color_from_random_index, pattern_lfo_loop_length_ticks, pattern_loop_frame_at_tick,
+        pattern_loop_tick_at_frame, pattern_vst3_parameter_automation_for_channel,
+        pattern_vst3_parameter_link_for_target, piano_roll_color_group_note_ids,
+        piano_roll_controller_stroke_points, piano_roll_controller_value_at,
+        piano_roll_controller_value_range, piano_roll_cross_pattern_ghost_notes,
+        piano_roll_discard_length_edit, piano_roll_duplicate_offset,
+        piano_roll_ghost_note_is_visible, piano_roll_key_at_y, piano_roll_note_group_members,
+        piano_roll_note_nudge_edit, piano_roll_odd_note_selection,
         piano_roll_overlap_note_selection, piano_roll_pitch_range_note_selection,
         piano_roll_random_note_selection, piano_roll_selection_time_range,
         piano_roll_shift_time_range, piano_roll_time_range_from_drag,
@@ -64097,6 +64193,28 @@ mod tests {
                 96,
                 true,
             ),
+            None
+        );
+    }
+
+    #[test]
+    fn midi_script_time_seeks_use_elapsed_time_and_clamp_to_song_length() {
+        let tempo_map = PlaylistTempoMap::constant(96, 120.0).unwrap();
+
+        assert_eq!(
+            midi_script_time_position_seconds_to_ticks(&tempo_map, 0.5, 192),
+            Some(96)
+        );
+        assert_eq!(
+            midi_script_time_position_seconds_to_ticks(&tempo_map, 1.0, 192),
+            Some(192)
+        );
+        assert_eq!(
+            midi_script_time_position_seconds_to_ticks(&tempo_map, 10.0, 192),
+            Some(192)
+        );
+        assert_eq!(
+            midi_script_time_position_seconds_to_ticks(&tempo_map, -1.0, 192),
             None
         );
     }

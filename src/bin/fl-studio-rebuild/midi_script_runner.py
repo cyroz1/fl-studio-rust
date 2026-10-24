@@ -106,14 +106,18 @@ def _request_transport_action(action):
 def _get_song_pos(mode=-1):
     if mode == -1:
         return float(_active_transport_state.get("song_position", 0.0))
+    if mode == 0:
+        return float(_active_transport_state.get("song_position_seconds", 0.0)) * 1000.0
+    if mode == 1:
+        return float(_active_transport_state.get("song_position_seconds", 0.0))
     if mode == 2:
         return int(_active_transport_state.get("song_position_ticks", 0))
-    raise NotImplementedError("transport.getSongPos() supports normalized and absolute-tick modes")
+    raise NotImplementedError("transport.getSongPos() supports normalized, time, and absolute-tick modes")
 
 
 def _set_song_pos(position, mode=-1):
-    if mode not in (-1, 2):
-        raise NotImplementedError("transport.setSongPos() supports normalized and absolute-tick modes")
+    if mode not in (-1, 0, 1, 2):
+        raise NotImplementedError("transport.setSongPos() supports normalized, time, and absolute-tick modes")
     position = float(position)
     if not math.isfinite(position):
         raise ValueError("transport.setSongPos() requires a finite position")
@@ -124,15 +128,29 @@ def _set_song_pos(position, mode=-1):
             {"action": "set_song_position_ticks", "position": max(0, round(position))}
         )
         return
+    if mode in (0, 1):
+        seconds = position / 1000.0 if mode == 0 else position
+        microseconds = min((2**64) - 1, max(0, round(seconds * 1_000_000.0)))
+        _active_transport_actions.append(
+            {
+                "action": "set_song_position_seconds",
+                "position_microseconds": microseconds,
+            }
+        )
+        return
     _active_transport_actions.append(
         {"action": "set_song_position", "position": min(1.0, max(0.0, position))}
     )
 
 
 def _get_song_length(mode):
-    if mode != 2:
-        raise NotImplementedError("only absolute-tick transport.getSongLength(2) is supported")
-    return int(_active_transport_state.get("song_length_ticks", 0))
+    if mode == 0:
+        return round(float(_active_transport_state.get("song_length_seconds", 0.0)) * 1000.0)
+    if mode == 1:
+        return round(float(_active_transport_state.get("song_length_seconds", 0.0)))
+    if mode == 2:
+        return int(_active_transport_state.get("song_length_ticks", 0))
+    raise NotImplementedError("transport.getSongLength() supports milliseconds, seconds, and absolute ticks")
 
 
 def _get_song_pos_hint():
@@ -192,6 +210,12 @@ def _install_modules(script_name, device_name):
         "SS_Stop": 0,
         "SS_StartStep": 1,
         "SS_Start": 2,
+        "SONGLENGTH_MS": 0,
+        "SONGLENGTH_S": 1,
+        "SONGLENGTH_ABSTICKS": 2,
+        "SONGLENGTH_BARS": 3,
+        "SONGLENGTH_STEPS": 4,
+        "SONGLENGTH_TICKS": 5,
         "FPT_Jog": 0,
         "FPT_Jog2": 1,
         "FPT_Strip": 2,

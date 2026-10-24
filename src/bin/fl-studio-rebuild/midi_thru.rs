@@ -632,6 +632,7 @@ fn midi_input_thru_message(event: MidiInputEvent) -> Option<([u8; 3], usize)> {
             | MidiTransportCommand::ToggleLoopMode
             | MidiTransportCommand::SetSongPosition(_)
             | MidiTransportCommand::SetSongPositionTicks(_)
+            | MidiTransportCommand::SetSongPositionTimeUs(_)
             | MidiTransportCommand::MarkerJumpJog(_)
             | MidiTransportCommand::MarkerSelJog(_),
         ) => return None,

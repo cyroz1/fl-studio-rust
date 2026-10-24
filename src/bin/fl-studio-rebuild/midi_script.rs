@@ -35,13 +35,13 @@ pub enum ScriptTransportAction {
     ToggleLoopMode,
     SetSongPosition(u32),
     SetSongPositionTicks(u64),
+    SetSongPositionTimeUs(u64),
     MarkerJumpJog(i32),
     MarkerSelJog(i32),
 }
 
 const SCRIPT_SONG_POSITION_SCALE: f64 = 1_000_000.0;
 const SCRIPT_SONG_POSITION_SCALE_U32: u32 = 1_000_000;
-
 impl ScriptTransportAction {
     fn parse(value: &str) -> Option<Self> {
         match value {
@@ -72,6 +72,8 @@ pub struct MidiScriptTransportState {
     pub song_position: AtomicU64,
     pub song_position_ticks: AtomicU64,
     pub song_length_ticks: AtomicU64,
+    pub song_position_seconds: AtomicU64,
+    pub song_length_seconds: AtomicU64,
     pub song_position_hint: Mutex<String>,
 }
 
@@ -423,6 +425,16 @@ impl MidiScriptRuntime {
                         .transport_state
                         .song_length_ticks
                         .load(Ordering::Relaxed),
+                    "song_position_seconds": f64::from_bits(
+                        self.transport_state
+                            .song_position_seconds
+                            .load(Ordering::Relaxed),
+                    ),
+                    "song_length_seconds": f64::from_bits(
+                        self.transport_state
+                            .song_length_seconds
+                            .load(Ordering::Relaxed),
+                    ),
                     "song_position_hint": song_position_hint,
                 }),
             );
@@ -513,6 +525,12 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
             .as_u64()
             .ok_or_else(|| "MIDI script returned an invalid absolute song position".to_owned())?;
         return Ok(ScriptTransportAction::SetSongPositionTicks(position));
+    }
+    if name == Some("set_song_position_seconds") {
+        let position = action["position_microseconds"]
+            .as_u64()
+            .ok_or_else(|| "MIDI script returned an invalid time song position".to_owned())?;
+        return Ok(ScriptTransportAction::SetSongPositionTimeUs(position));
     }
     if name == Some("marker_jump_jog") || name == Some("marker_sel_jog") {
         let increment = action["increment"]
@@ -888,6 +906,58 @@ mod tests {
 
         assert_eq!(first.bytes, [0xB0, 96, 1]);
         assert_eq!(second.bytes, [0xB0, 120, 1]);
+    }
+
+    #[test]
+    fn python_transport_time_modes_report_live_song_position_and_length() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport midi\nimport transport\ndef OnMidiIn(event):\n    event.data1 = int(transport.getSongPos(midi.SONGLENGTH_MS) == 1234.5 and transport.getSongPos(midi.SONGLENGTH_S) == 1.2345)\n    event.data2 = int(transport.getSongLength(midi.SONGLENGTH_MS) == 2345 and transport.getSongLength(midi.SONGLENGTH_S) == 2)\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let transport_state = Arc::new(MidiScriptTransportState::default());
+        transport_state
+            .song_position_seconds
+            .store(1.2345_f64.to_bits(), Ordering::Relaxed);
+        transport_state
+            .song_length_seconds
+            .store(2.3454_f64.to_bits(), Ordering::Relaxed);
+        let mut runtime = MidiScriptRuntime::start_for_device_with_transport_state(
+            &script,
+            "Test Input",
+            transport_state,
+        )
+        .unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
+
+        assert_eq!(result.bytes, [0xB0, 1, 1]);
+    }
+
+    #[test]
+    fn python_transport_time_modes_seek_with_millisecond_precision() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport midi\nimport transport\ndef OnMidiIn(event):\n    transport.setSongPos(1500.25, midi.SONGLENGTH_MS)\n    transport.setSongPos(2.5, midi.SONGLENGTH_S)\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let mut runtime = MidiScriptRuntime::start_for_device(&script, "Test Input").unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
+
+        assert_eq!(
+            result.actions,
+            [
+                ScriptTransportAction::SetSongPositionTimeUs(1_500_250),
+                ScriptTransportAction::SetSongPositionTimeUs(2_500_000),
+            ]
+        );
     }
 
     #[test]

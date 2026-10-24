@@ -159,6 +159,40 @@ impl PlaylistTempoMap {
         Ok(frames.round() as u64)
     }
 
+    /// Convert a fractional Playlist tick to elapsed seconds.
+    pub fn seconds_at_fractional_tick(&self, tick: f64) -> Result<f64, String> {
+        if !tick.is_finite() || tick < 0.0 {
+            return Err("Playlist position must be finite and non-negative".to_owned());
+        }
+        let segment_index = self
+            .segments
+            .partition_point(|segment| segment.start_tick as f64 <= tick)
+            .saturating_sub(1);
+        let segment = self.segments[segment_index];
+        let elapsed_ticks = tick - segment.start_tick as f64;
+        let seconds = segment.start_seconds
+            + elapsed_ticks * 60.0 / (f64::from(self.ppq) * segment.tempo_bpm);
+        if !seconds.is_finite() || seconds < 0.0 {
+            return Err("Playlist position is outside the renderable timeline".to_owned());
+        }
+        Ok(seconds)
+    }
+
+    /// Convert elapsed seconds to a fractional Playlist tick.
+    pub fn tick_at_seconds(&self, seconds: f64) -> Option<f64> {
+        if !seconds.is_finite() || seconds < 0.0 {
+            return None;
+        }
+        let segment_index = self
+            .segments
+            .partition_point(|segment| segment.start_seconds <= seconds)
+            .saturating_sub(1);
+        let segment = self.segments[segment_index];
+        let tick = segment.start_tick as f64
+            + (seconds - segment.start_seconds) * segment.tempo_bpm * f64::from(self.ppq) / 60.0;
+        tick.is_finite().then_some(tick.max(0.0))
+    }
+
     /// Return the active tempo at an absolute Playlist tick.
     pub fn tempo_bpm_at_tick(&self, tick: u64) -> f64 {
         let segment_index = self
@@ -14584,6 +14618,10 @@ mod tests {
         assert_eq!(map.frame_at_tick(288, 48_000).unwrap(), 96_000);
         assert_eq!(map.frames_between_ticks(96, 192, 48_000).unwrap(), 48_000);
         assert!((map.tick_at_frame(48_000, 48_000).unwrap() - 144.0).abs() < 1e-9);
+        assert_eq!(map.seconds_at_fractional_tick(96.0), Ok(0.5));
+        assert_eq!(map.seconds_at_fractional_tick(192.0), Ok(1.5));
+        assert!((map.tick_at_seconds(1.0).unwrap() - 144.0).abs() < 1e-9);
+        assert_eq!(map.tick_at_seconds(f64::NAN), None);
     }
 
     #[test]
