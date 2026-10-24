@@ -1709,7 +1709,9 @@ impl MidiTrack {
 
     /// Pairs note events using the supplied velocity-zero and channel-selection options.
     /// CC 64 sustain defers each note's end tick until pedal-up on the same channel,
-    /// while retaining the release velocity from the original Note Off.
+    /// while retaining the release velocity from the original Note Off. CC 120 closes
+    /// all active and sustained notes immediately; CC 123–127 release active notes and
+    /// defer their end ticks while sustain is down.
     /// `realign_events` is applied by document import methods because aligning
     /// several tracks requires a shared project-time origin.
     pub fn notes_with_options(&self, options: MidiImportOptions) -> Vec<MidiNote> {
@@ -1750,9 +1752,43 @@ impl MidiTrack {
                                 }
                             }
                         }
+                        120 => {
+                            let mut note_indices = Vec::new();
+                            for ((active_channel, _), queue) in &mut active {
+                                if *active_channel == channel {
+                                    note_indices.extend(queue.drain(..));
+                                }
+                            }
+                            active.retain(|(active_channel, _), _| *active_channel != channel);
+                            if let Some(sustained) = sustained_note_offs.remove(&channel) {
+                                note_indices.extend(sustained);
+                            }
+                            for note_index in note_indices {
+                                notes[note_index].end_tick = Some(event.absolute_tick);
+                            }
+                        }
                         121 => {
                             *state = MidiChannelNoteState::default();
                             if let Some(note_indices) = sustained_note_offs.remove(&channel) {
+                                for note_index in note_indices {
+                                    notes[note_index].end_tick = Some(event.absolute_tick);
+                                }
+                            }
+                        }
+                        123..=127 => {
+                            let mut note_indices = Vec::new();
+                            for ((active_channel, _), queue) in &mut active {
+                                if *active_channel == channel {
+                                    note_indices.extend(queue.drain(..));
+                                }
+                            }
+                            active.retain(|(active_channel, _), _| *active_channel != channel);
+                            if state.sustain_pedal_down {
+                                sustained_note_offs
+                                    .entry(channel)
+                                    .or_default()
+                                    .extend(note_indices);
+                            } else {
                                 for note_index in note_indices {
                                     notes[note_index].end_tick = Some(event.absolute_tick);
                                 }
@@ -2672,6 +2708,82 @@ mod tests {
         assert_eq!(notes[1].mod_x(), 64);
         assert_eq!(notes[1].mod_y(), 64);
         assert_eq!(notes[1].pitch_bend_offset_cents(), 0);
+    }
+
+    #[test]
+    fn midi_import_all_sound_off_closes_active_and_sustained_notes_per_channel() {
+        let midi = MidiFile::parse(&midi_fixture(&[
+            0x00, 0xB0, 64, 127, // Channel 1 sustain on at tick 0.
+            0x00, 0x90, 0x3C, 0x64, // Channel 1 C4 on at tick 0.
+            0x00, 0x91, 0x3C, 0x64, // Channel 2 C4 on at tick 0.
+            0x0A, 0x80, 0x3C, 33, // Channel 1 C4 off at tick 10, held by sustain.
+            0x00, 0x90, 0x3E, 0x5A, // Channel 1 D4 on at tick 10.
+            0x0A, 0xB0, 120, 0, // All Sound Off on channel 1 at tick 20.
+            0x0A, 0x81, 0x3C, 44, // Channel 2 C4 remains active until tick 30.
+            0x00, 0x90, 0x40, 0x50, // Channel 1 E4 on at tick 30.
+            0x0A, 0x80, 0x40, 55, // Channel 1 E4 off at tick 40, held by sustain.
+            0x0A, 0xB0, 64, 0, // Channel 1 sustain off at tick 50.
+            0x00, 0xFF, 0x2F, 0x00,
+        ]))
+        .expect("All Sound Off fixture should parse");
+        let notes = midi.tracks()[0].notes();
+
+        assert_eq!(notes.len(), 4);
+        assert_eq!(notes[0].channel(), 0);
+        assert_eq!(notes[0].end_tick(), Some(20));
+        assert_eq!(notes[0].release_velocity(), Some(33));
+        assert_eq!(notes[1].channel(), 1);
+        assert_eq!(notes[1].end_tick(), Some(30));
+        assert_eq!(notes[1].release_velocity(), Some(44));
+        assert_eq!(notes[2].end_tick(), Some(20));
+        assert_eq!(notes[2].release_velocity(), None);
+        assert_eq!(notes[3].end_tick(), Some(50));
+        assert_eq!(notes[3].release_velocity(), Some(55));
+    }
+
+    #[test]
+    fn midi_import_all_notes_off_controllers_respect_sustain() {
+        for (controller, sustain_down) in (123..=127).zip([false, true, false, true, false]) {
+            let mut events = vec![0x00, 0x90, 0x3C, 0x64, 0x00, 0x91, 0x3C, 0x64];
+            if sustain_down {
+                events.extend([0x05, 0xB0, 64, 127]);
+            }
+            events.extend([if sustain_down { 0x05 } else { 0x0A }, 0xB0, controller, 0]);
+            if sustain_down {
+                events.extend([0x0A, 0xB0, 64, 0]);
+            }
+            events.extend([
+                if sustain_down { 0x0A } else { 0x14 },
+                0x81,
+                0x3C,
+                44,
+                0x00,
+                0xFF,
+                0x2F,
+                0x00,
+            ]);
+
+            let midi = MidiFile::parse(&midi_fixture(&events))
+                .expect("All Notes Off controller fixture should parse");
+            let notes = midi.tracks()[0].notes();
+            let expected_end = if sustain_down { 20 } else { 10 };
+
+            assert_eq!(notes.len(), 2, "controller {controller}");
+            assert_eq!(notes[0].channel(), 0, "controller {controller}");
+            assert_eq!(
+                notes[0].end_tick(),
+                Some(expected_end),
+                "controller {controller}"
+            );
+            assert_eq!(notes[0].release_velocity(), None, "controller {controller}");
+            assert_eq!(notes[1].channel(), 1, "controller {controller}");
+            assert_eq!(notes[1].end_tick(), Some(30), "controller {controller}");
+            assert_eq!(
+                notes[1].release_velocity(),
+                Some(44),
+                "controller {controller}"
+            );
+        }
     }
 
     #[test]
