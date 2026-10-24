@@ -24,8 +24,8 @@ use crate::sample_render::{
     schedule_playlist_pattern_notes_with_adjustments, swing_note_start_tick,
 };
 use crate::{
-    ChannelNoteRouter, ChannelPluginState, FlpDocument, MixerRouteAudibility,
-    MixerSourceRouteTransform, PlaylistClipTarget,
+    ChannelNoteRouter, ChannelPluginState, FlpDocument, MixerEffectSlotSummary,
+    MixerRouteAudibility, MixerSourceRouteTransform, PlaylistClipTarget,
 };
 use vst3_host::audio::{AudioBuffers, AudioBusLayout, BusAudioBuffers};
 use vst3_host::midi::{
@@ -2268,6 +2268,54 @@ impl Vst3HostRuntime {
         let nested_state = state
             .vst_state_bytes()
             .ok_or_else(|| "FLP VST3 state has no nested field 53".to_owned())?;
+        let host_snapshot = encode_flp_vst3_state_snapshot(nested_state)?;
+        self.restore_state(id, &host_snapshot)
+    }
+
+    /// Restore marker-12 VST3 state from one Mixer effect slot's unique `0xD5` event.
+    ///
+    /// Slots with multiple state events, VST2 envelopes, or a different VST wrapper marker are
+    /// rejected rather than guessing how their bytes should be combined.
+    pub fn restore_flp_mixer_effect_state(
+        &mut self,
+        id: u64,
+        slot: &MixerEffectSlotSummary,
+    ) -> Result<(), String> {
+        let metadata = slot.vst_metadata().ok_or_else(|| {
+            "Mixer effect slot has no unique recognized VST state envelope".to_owned()
+        })?;
+        if metadata.format_marker() != 12 {
+            return Err(format!(
+                "unsupported FLP VST wrapper marker {}; VST3 state restore requires marker 12",
+                metadata.format_marker()
+            ));
+        }
+        if metadata.fourcc().is_some() {
+            return Err("Mixer effect slot state identifies a VST2 plug-in, not VST3".to_owned());
+        }
+        let expected_uid = metadata
+            .class_uid()
+            .ok_or_else(|| "FLP Mixer effect state has no valid 16-byte class UID".to_owned())?;
+        let loaded = self
+            .loaded
+            .iter()
+            .find(|loaded| loaded.info.id == id)
+            .ok_or_else(|| format!("no loaded VST3 instance with id {id}"))?;
+        if loaded.info.audio_inputs == 0 || loaded.info.audio_outputs == 0 {
+            return Err(format!(
+                "{} is not a VST3 audio effect with both audio inputs and outputs",
+                loaded.info.name
+            ));
+        }
+        if !loaded.info.uid.eq_ignore_ascii_case(&expected_uid) {
+            return Err(format!(
+                "FLP Mixer effect class UID {expected_uid} does not match loaded plug-in UID {}",
+                loaded.info.uid
+            ));
+        }
+        let nested_state = slot
+            .vst_state_bytes()
+            .ok_or_else(|| "FLP Mixer effect state has no nested field 53".to_owned())?;
         let host_snapshot = encode_flp_vst3_state_snapshot(nested_state)?;
         self.restore_state(id, &host_snapshot)
     }

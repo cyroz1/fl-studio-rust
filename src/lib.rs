@@ -2904,6 +2904,8 @@ pub struct MixerEffectSlotSummary {
     plugin_identifier: Option<String>,
     display_name: Option<String>,
     state_event_count: usize,
+    state_payload: Option<Vec<u8>>,
+    vst_metadata: Option<VstPluginStateMetadata>,
     enabled: Option<bool>,
     enabled_parameter_location: Option<(usize, usize)>,
     mix_raw: Option<i32>,
@@ -2950,6 +2952,19 @@ impl MixerEffectSlotSummary {
     /// Number of opaque `0xD5` state events in this slot.
     pub fn state_event_count(&self) -> usize {
         self.state_event_count
+    }
+
+    /// Recognized VST wrapper metadata from the slot's only `0xD5` state event.
+    ///
+    /// Multiple state events remain opaque because their relationship is not established.
+    pub fn vst_metadata(&self) -> Option<&VstPluginStateMetadata> {
+        self.vst_metadata.as_ref()
+    }
+
+    /// Nested state bytes from recognized VST field 53, when this slot has one state event.
+    pub fn vst_state_bytes(&self) -> Option<&[u8]> {
+        let range = self.vst_metadata.as_ref()?.state_data_range.as_ref()?;
+        self.state_payload.as_deref()?.get(range.clone())
     }
 
     /// Saved slot enabled state when one unscoped boolean parameter record is recognized.
@@ -7960,10 +7975,16 @@ impl FlpDocument {
                     0xCB,
                     self.project_version.as_deref(),
                 );
-                let state_event_count = slot_events
+                let state_events = slot_events
                     .iter()
                     .filter(|event| event.opcode == 0xD5)
-                    .count();
+                    .collect::<Vec<_>>();
+                let state_event_count = state_events.len();
+                let state_payload =
+                    (state_event_count == 1).then(|| state_events[0].payload.clone());
+                let vst_metadata = state_payload
+                    .as_deref()
+                    .and_then(parse_vst_plugin_state_metadata);
                 let unique_slot_parameter = |kind| {
                     let mut matching = parameter_records.iter().filter(|record| {
                         record.kind() == kind
@@ -7983,6 +8004,8 @@ impl FlpDocument {
                     plugin_identifier,
                     display_name,
                     state_event_count,
+                    state_payload,
+                    vst_metadata,
                     enabled: enabled_record.map(|record| record.value != 0),
                     enabled_parameter_location: enabled_record
                         .map(|record| (record.event_index, record.record_index)),
@@ -24753,6 +24776,79 @@ mod tests {
         let incomplete_document =
             FlpDocument::parse(&flp_fixture(&incomplete, &[], &[])).expect("fixture parses");
         assert!(incomplete_document.mixer_effect_slots().is_empty());
+    }
+
+    #[test]
+    fn decodes_marker_12_vst3_state_from_a_unique_mixer_effect_state_event() {
+        let mut nested = 1_u32.to_le_bytes().to_vec();
+        nested.extend_from_slice(&3_u32.to_le_bytes());
+        nested.extend_from_slice(&2_u64.to_le_bytes());
+        nested.extend_from_slice(&[0xA1, 0xA2]);
+        nested.extend_from_slice(&4_u32.to_le_bytes());
+        nested.extend_from_slice(&1_u64.to_le_bytes());
+        nested.push(0xB1);
+
+        let mut payload = 12_u32.to_le_bytes().to_vec();
+        append_vst_field(
+            &mut payload,
+            52,
+            &[
+                0xDF, 0x55, 0x47, 0x32, 0xDF, 0x8F, 0x88, 0x47, 0xB4, 0xCE, 0x5B, 0x70, 0xA8, 0x03,
+                0x7E, 0xC4,
+            ],
+        );
+        append_vst_field(&mut payload, 53, &nested);
+
+        let mut event_stream = Vec::new();
+        append_complete_mixer_insert_state(&mut event_stream, -1, 0, 0, "Master", &payload);
+        let document = FlpDocument::parse(&flp_fixture(&event_stream, &[], &[]))
+            .expect("the fixture should parse");
+        let slot = document
+            .mixer_effect_slots()
+            .into_iter()
+            .find(|slot| slot.insert_ordinal() == 0 && slot.slot_index() == 0)
+            .expect("the complete insert should contain slot zero");
+
+        let metadata = slot
+            .vst_metadata()
+            .expect("the slot should expose its recognized VST envelope");
+        assert_eq!(metadata.format_marker(), 12);
+        assert_eq!(
+            metadata.class_uid().as_deref(),
+            Some("324755DF8FDF4788B4CE5B70A8037EC4")
+        );
+        assert_eq!(slot.vst_state_bytes(), Some(nested.as_slice()));
+    }
+
+    #[test]
+    fn leaves_multiple_mixer_effect_state_events_opaque() {
+        let mut event_stream = vec![0x9A];
+        event_stream.extend_from_slice(&(-1_i32).to_le_bytes());
+        event_stream.push(0x93);
+        event_stream.extend_from_slice(&(-1_i32).to_le_bytes());
+        event_stream.push(0x95);
+        event_stream.extend_from_slice(&0_u32.to_le_bytes());
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+        append_data_event(&mut event_stream, 0xD5, &12_u32.to_le_bytes());
+        append_data_event(&mut event_stream, 0xD5, &12_u32.to_le_bytes());
+        for slot_index in 1_u16..10 {
+            event_stream.push(0x62);
+            event_stream.extend_from_slice(&slot_index.to_le_bytes());
+        }
+        event_stream.push(0x93);
+        event_stream.extend_from_slice(&(-1_i32).to_le_bytes());
+
+        let document = FlpDocument::parse(&flp_fixture(&event_stream, &[], &[]))
+            .expect("the fixture should parse");
+        let slot = document
+            .mixer_effect_slots()
+            .into_iter()
+            .find(|slot| slot.insert_ordinal() == 0 && slot.slot_index() == 0)
+            .expect("the complete insert should contain slot zero");
+
+        assert_eq!(slot.state_event_count(), 2);
+        assert_eq!(slot.vst_metadata(), None);
+        assert_eq!(slot.vst_state_bytes(), None);
     }
 
     #[test]
