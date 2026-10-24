@@ -30925,6 +30925,32 @@ mod tests {
     }
 
     #[test]
+    fn midi_import_uses_sustain_pedal_up_as_the_note_end() {
+        let project_bytes = pattern_fixture(&[], &[]);
+        let midi_bytes = midi_fixture(
+            &[
+                0x00, 0xB0, 64, 127, // Sustain on at tick 0.
+                0x00, 0x90, 0x3C, 0x64, // C4 on at tick 0.
+                0x83, 0x60, 0x80, 0x3C, 32, // Note off at tick 480.
+                0x83, 0x60, 0xB0, 64, 0, // Sustain off at tick 960.
+                0x00, 0xFF, 0x2F, 0x00,
+            ],
+            480,
+        );
+        let midi = MidiFile::parse(&midi_bytes).expect("MIDI fixture should parse");
+        let mut document = FlpDocument::parse(&project_bytes).expect("project should parse");
+
+        assert_eq!(
+            document
+                .import_midi_track(&midi, 0, 7, 0)
+                .expect("sustained MIDI note should import"),
+            1
+        );
+        let note = &document.patterns().unwrap()[0].notes[0];
+        assert_eq!((note.position, note.length, note.release), (0, 192, 32));
+    }
+
+    #[test]
     fn midi_import_can_treat_zero_velocity_note_ons_as_notes() {
         let project_bytes = pattern_fixture(&[], &[]);
         let midi_bytes = midi_fixture(

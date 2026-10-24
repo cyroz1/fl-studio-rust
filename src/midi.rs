@@ -116,6 +116,7 @@ struct MidiChannelNoteState {
     pitch_bend_sensitivity_cents: u8,
     rpn_msb: u8,
     rpn_lsb: u8,
+    sustain_pedal_down: bool,
 }
 
 impl Default for MidiChannelNoteState {
@@ -129,6 +130,7 @@ impl Default for MidiChannelNoteState {
             pitch_bend_sensitivity_cents: 0,
             rpn_msb: 127,
             rpn_lsb: 127,
+            sustain_pedal_down: false,
         }
     }
 }
@@ -1706,12 +1708,15 @@ impl MidiTrack {
     }
 
     /// Pairs note events using the supplied velocity-zero and channel-selection options.
+    /// CC 64 sustain defers each note's end tick until pedal-up on the same channel,
+    /// while retaining the release velocity from the original Note Off.
     /// `realign_events` is applied by document import methods because aligning
     /// several tracks requires a shared project-time origin.
     pub fn notes_with_options(&self, options: MidiImportOptions) -> Vec<MidiNote> {
-        let mut notes = Vec::new();
+        let mut notes: Vec<MidiNote> = Vec::new();
         let mut active: BTreeMap<(u8, u8), VecDeque<usize>> = BTreeMap::new();
         let mut channel_state = BTreeMap::<u8, MidiChannelNoteState>::new();
+        let mut sustained_note_offs = BTreeMap::<u8, Vec<usize>>::new();
 
         for event in &self.events {
             let MidiEventKind::ChannelVoice { status, data } = &event.kind else {
@@ -1733,6 +1738,25 @@ impl MidiTrack {
                         10 => state.pan = data[1],
                         74 => state.mod_x = data[1].min(127),
                         71 => state.mod_y = data[1].min(127),
+                        64 => {
+                            let was_down = state.sustain_pedal_down;
+                            state.sustain_pedal_down = data[1] >= 64;
+                            if was_down && !state.sustain_pedal_down {
+                                if let Some(note_indices) = sustained_note_offs.remove(&channel) {
+                                    for note_index in note_indices {
+                                        notes[note_index].end_tick = Some(event.absolute_tick);
+                                    }
+                                }
+                            }
+                        }
+                        121 => {
+                            *state = MidiChannelNoteState::default();
+                            if let Some(note_indices) = sustained_note_offs.remove(&channel) {
+                                for note_index in note_indices {
+                                    notes[note_index].end_tick = Some(event.absolute_tick);
+                                }
+                            }
+                        }
                         101 => state.rpn_msb = data[1],
                         100 => state.rpn_lsb = data[1],
                         6 if (state.rpn_msb, state.rpn_lsb) == (0, 0) => {
@@ -1777,8 +1801,18 @@ impl MidiTrack {
                     let mut remove_key = false;
                     if let Some(queue) = active.get_mut(&note_key) {
                         if let Some(note_index) = queue.pop_front() {
-                            notes[note_index].end_tick = Some(event.absolute_tick);
                             notes[note_index].release_velocity = Some(data[1]);
+                            if channel_state
+                                .get(&channel)
+                                .is_some_and(|state| state.sustain_pedal_down)
+                            {
+                                sustained_note_offs
+                                    .entry(channel)
+                                    .or_default()
+                                    .push(note_index);
+                            } else {
+                                notes[note_index].end_tick = Some(event.absolute_tick);
+                            }
                         }
                         remove_key = queue.is_empty();
                     }
@@ -2583,6 +2617,60 @@ mod tests {
         assert_eq!(notes[0].end_tick(), Some(240));
         assert_eq!(notes[0].duration_ticks(), Some(240));
         assert_eq!(midi.encode_lossless(), input);
+    }
+
+    #[test]
+    fn midi_import_defers_note_off_until_sustain_pedal_up_per_channel() {
+        let midi = MidiFile::parse(&midi_fixture(&[
+            0x00, 0x90, 0x3C, 0x64, // Channel 1 note on at tick 0.
+            0x00, 0x91, 0x3C, 0x64, // Channel 2 note on at tick 0.
+            0x0A, 0xB0, 64, 127, // Channel 1 sustain on at tick 10.
+            0x0A, 0x80, 0x3C, 33, // Channel 1 note off at tick 20.
+            0x00, 0x81, 0x3C, 44, // Channel 2 note off at tick 20.
+            0x0A, 0xB0, 64, 63, // Channel 1 sustain off at tick 30.
+            0x00, 0xFF, 0x2F, 0x00,
+        ]))
+        .expect("sustain fixture should parse");
+        let notes = midi.tracks()[0].notes();
+
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes[0].channel(), 0);
+        assert_eq!(notes[0].start_tick(), 0);
+        assert_eq!(notes[0].end_tick(), Some(30));
+        assert_eq!(notes[0].release_velocity(), Some(33));
+        assert_eq!(notes[1].channel(), 1);
+        assert_eq!(notes[1].start_tick(), 0);
+        assert_eq!(notes[1].end_tick(), Some(20));
+        assert_eq!(notes[1].release_velocity(), Some(44));
+    }
+
+    #[test]
+    fn midi_import_reset_all_controllers_releases_sustain_and_resets_note_state() {
+        let midi = MidiFile::parse(&midi_fixture(&[
+            0x00, 0xB0, 64, 127, // Sustain on at tick 0.
+            0x00, 0x90, 0x3C, 0x64, // C4 on at tick 0.
+            0x0A, 0x80, 0x3C, 33, // C4 off at tick 10, held by sustain.
+            0x00, 0xB0, 10, 127, // Set pan right before reset.
+            0x00, 0xB0, 74, 127, // Set Mod X high before reset.
+            0x00, 0xB0, 71, 0, // Set Mod Y low before reset.
+            0x00, 0xE0, 0, 0, // Set pitch bend down before reset.
+            0x0A, 0xB0, 121, 0, // Reset all controllers at tick 20.
+            0x00, 0x90, 0x3E, 0x64, // D4 on at tick 20.
+            0x0A, 0x80, 0x3E, 44, // D4 off at tick 30.
+            0x00, 0xFF, 0x2F, 0x00,
+        ]))
+        .expect("controller reset fixture should parse");
+        let notes = midi.tracks()[0].notes();
+
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes[0].end_tick(), Some(20));
+        assert_eq!(notes[0].release_velocity(), Some(33));
+        assert_eq!(notes[1].end_tick(), Some(30));
+        assert_eq!(notes[1].release_velocity(), Some(44));
+        assert_eq!(notes[1].pan(), 64);
+        assert_eq!(notes[1].mod_x(), 64);
+        assert_eq!(notes[1].mod_y(), 64);
+        assert_eq!(notes[1].pitch_bend_offset_cents(), 0);
     }
 
     #[test]
