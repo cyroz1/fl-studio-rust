@@ -258,13 +258,22 @@ pub fn playlist_playback_messages(
     document: &FlpDocument,
     arrangement_id: u16,
     start_tick: u64,
+    soloed_playlist_track_range: Option<(u32, u32)>,
 ) -> Result<Vec<ScheduledMidiTickMessage>, String> {
     let excluded_project_channels = disabled_project_channel_ids(document);
-    let bytes = MidiFile::encode_project_song_excluding_channels(
+    let disabled_playlist_track_ids = document
+        .playlist_tracks()
+        .into_iter()
+        .filter(|track| track.enabled == Some(false))
+        .map(|track| track.id)
+        .collect::<BTreeSet<_>>();
+    let bytes = MidiFile::encode_project_song_with_live_filters(
         document,
         arrangement_id,
         MidiChannelMapping::PreserveNoteChannels,
         &excluded_project_channels,
+        &disabled_playlist_track_ids,
+        soloed_playlist_track_range,
     )
     .map_err(|error| error.to_string())?;
     let midi = MidiFile::parse(&bytes).map_err(|error| error.to_string())?;

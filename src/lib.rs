@@ -32435,6 +32435,83 @@ mod tests {
     }
 
     #[test]
+    fn live_song_export_respects_playlist_track_mute_and_solo_filters() {
+        let mut event_stream = vec![0x40, 4, 0, 0x15, 0, 0x41, 7, 0, 0xD0, 24];
+        event_stream.extend_from_slice(&note_record(0, 4, 4, 60, 100));
+        event_stream.extend_from_slice(&[0x63, 0, 0]);
+
+        let mut disabled_track = [0; 70];
+        disabled_track[..4].copy_from_slice(&1_u32.to_le_bytes());
+        disabled_track[12] = 0;
+        append_data_event(&mut event_stream, 0xEE, &disabled_track);
+        let mut enabled_track = [0; 70];
+        enabled_track[..4].copy_from_slice(&2_u32.to_le_bytes());
+        enabled_track[12] = 1;
+        append_data_event(&mut event_stream, 0xEE, &enabled_track);
+
+        let mut clips = Vec::new();
+        for (position, track_index) in [(0_u32, 0_u16), (24, 1)] {
+            let mut clip = [0; 80];
+            clip[..4].copy_from_slice(&position.to_le_bytes());
+            clip[4..6].copy_from_slice(&track_index.to_le_bytes());
+            clip[6..8].copy_from_slice(&7_u16.to_le_bytes());
+            clip[8..12].copy_from_slice(&24_u32.to_le_bytes());
+            clip[64..72].copy_from_slice(&1.0_f64.to_le_bytes());
+            clips.extend_from_slice(&clip);
+        }
+        append_data_event(&mut event_stream, 0xE9, &clips);
+
+        let document = FlpDocument::parse(&flp_fixture(&event_stream, &[], &[]))
+            .expect("arrangement fixture should parse");
+        let arrangement = document
+            .arrangements()
+            .expect("arrangements should decode")
+            .remove(0);
+        assert_eq!(
+            arrangement
+                .clips
+                .iter()
+                .map(PlaylistClip::playlist_track_id)
+                .collect::<Vec<_>>(),
+            vec![Some(1), Some(2)]
+        );
+        let disabled_track_ids = document
+            .playlist_tracks()
+            .into_iter()
+            .filter(|track| track.enabled == Some(false))
+            .map(|track| track.id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(disabled_track_ids, BTreeSet::from([1]));
+
+        let song_notes = |disabled_tracks: &BTreeSet<u32>, soloed_range| {
+            let bytes = MidiFile::encode_project_song_with_live_filters(
+                &document,
+                0,
+                MidiChannelMapping::PreserveNoteChannels,
+                &BTreeSet::new(),
+                disabled_tracks,
+                soloed_range,
+            )
+            .expect("live arrangement should encode");
+            MidiFile::parse(&bytes)
+                .expect("live arrangement MIDI should parse")
+                .tracks()
+                .iter()
+                .flat_map(|track| track.notes())
+                .map(|note| note.start_tick())
+                .collect::<BTreeSet<_>>()
+        };
+
+        assert_eq!(song_notes(&BTreeSet::new(), None), BTreeSet::from([0, 24]));
+        assert_eq!(song_notes(&disabled_track_ids, None), BTreeSet::from([24]));
+        assert_eq!(
+            song_notes(&disabled_track_ids, Some((1, 1))),
+            BTreeSet::from([0]),
+            "soloing a track should override its disabled track state"
+        );
+    }
+
+    #[test]
     fn exports_selected_raw_controller_stream_across_repeated_song_clips() {
         let mut note = note_record(0, 3, 48, 60, 100);
         note[18] = 32;

@@ -44303,7 +44303,12 @@ impl DawUi {
                     .map(AudioEngine::sample_rate)
                     .filter(|sample_rate| *sample_rate > 0)
                     .ok_or_else(|| "Audio sample rate is unavailable for MIDI output".to_owned())?;
-                let messages = playlist_playback_messages(document, arrangement_id, start_tick)?;
+                let messages = playlist_playback_messages(
+                    document,
+                    arrangement_id,
+                    start_tick,
+                    self.soloed_playlist_track_range,
+                )?;
                 messages
                     .into_iter()
                     .map(|message: ScheduledMidiTickMessage| {

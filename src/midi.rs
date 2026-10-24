@@ -867,11 +867,13 @@ impl MidiFile {
         arrangement_id: u16,
         channel_mapping: MidiChannelMapping,
     ) -> Result<Vec<u8>, MidiError> {
-        Self::encode_project_song_excluding_channels(
+        Self::encode_project_song_with_live_filters(
             document,
             arrangement_id,
             channel_mapping,
             &BTreeSet::new(),
+            &BTreeSet::new(),
+            None,
         )
     }
 
@@ -883,6 +885,26 @@ impl MidiFile {
         arrangement_id: u16,
         channel_mapping: MidiChannelMapping,
         excluded_project_channels: &BTreeSet<u16>,
+    ) -> Result<Vec<u8>, MidiError> {
+        Self::encode_project_song_with_live_filters(
+            document,
+            arrangement_id,
+            channel_mapping,
+            excluded_project_channels,
+            &BTreeSet::new(),
+            None,
+        )
+    }
+
+    /// Exports an arrangement for live MIDI output with project mute and solo filters.
+    /// These filters are separate from explicit MIDI file export behavior.
+    pub fn encode_project_song_with_live_filters(
+        document: &FlpDocument,
+        arrangement_id: u16,
+        channel_mapping: MidiChannelMapping,
+        excluded_project_channels: &BTreeSet<u16>,
+        disabled_playlist_track_ids: &BTreeSet<u32>,
+        soloed_playlist_track_range: Option<(u32, u32)>,
     ) -> Result<Vec<u8>, MidiError> {
         let arrangements = document
             .arrangements()
@@ -906,6 +928,18 @@ impl MidiFile {
 
         for clip in &arrangement.clips {
             if clip.is_muted() || clip.track_index.is_none() || clip.length_ticks == 0 {
+                continue;
+            }
+            let playlist_track_id = clip.playlist_track_id();
+            if let Some((first_track, last_track)) = soloed_playlist_track_range {
+                if !playlist_track_id
+                    .is_some_and(|track_id| (first_track..=last_track).contains(&track_id))
+                {
+                    continue;
+                }
+            } else if playlist_track_id
+                .is_some_and(|track_id| disabled_playlist_track_ids.contains(&track_id))
+            {
                 continue;
             }
             let clip_end = u64::from(clip.position_ticks)
