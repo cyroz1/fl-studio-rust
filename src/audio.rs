@@ -26,7 +26,11 @@ const INPUT_MONITOR_RING_CAPACITY: usize = AUDIO_RING_CAPACITY * 2;
 const INPUT_RECORDING_BUFFER_FRAMES: usize = 65_536;
 const AUDIO_ERROR_HISTORY_LIMIT: usize = 16;
 const AUDIO_COMMAND_QUEUE_CAPACITY: usize = 128;
+const RETIRED_STREAM_QUEUE_CAPACITY: usize = 4;
 const STREAM_PREFILL_FRAMES: usize = 512;
+const STREAM_HANDOFF_IDLE: u8 = 0;
+const STREAM_HANDOFF_COMMITTING: u8 = 1;
+const STREAM_HANDOFF_STOPPING: u8 = 2;
 const OUTPUT_GAIN_MAX: f32 = 2.0;
 const OUTPUT_GAIN_SMOOTHING_SECONDS: f32 = 0.02;
 const BROWSER_PREVIEW_ACTIVE_BIT: u64 = 1 << 63;
@@ -1384,6 +1388,9 @@ struct PlaybackState {
     commands: AudioCommandQueue,
     samples: ArcSwapOption<Vec<f32>>,
     streaming: ArcSwapOption<StreamingPlayback>,
+    pending_streaming: ArcSwapOption<StreamingPlayback>,
+    retired_streaming: ArrayQueue<Arc<StreamingPlayback>>,
+    stream_handoff_gate: AtomicU8,
     cursor_frames: AtomicU64,
     playback_speed: AtomicU32,
     playback_speed_phase: AtomicU32,
@@ -1426,6 +1433,8 @@ struct StreamingPlayback {
     paused: AtomicBool,
     finished: AtomicBool,
     cancelled: AtomicBool,
+    handoff_target_frame: AtomicU64,
+    handoff_committed: AtomicBool,
     underrun_frames: AtomicU64,
     consumed_frames: AtomicU64,
 }
@@ -1457,6 +1466,75 @@ impl StreamingPlayback {
                 || self.rings[index].available_stereo_frames() > 0
         })
     }
+
+    fn is_ready_at_frame(&self, frame: u64) -> bool {
+        let Some(index) = self.project_source_index else {
+            return false;
+        };
+        if self.cancelled.load(Ordering::Acquire) {
+            return false;
+        }
+        let start_frame = self.consumed_frames.load(Ordering::Acquire);
+        let frames_to_skip = frame.saturating_sub(start_frame);
+        let Ok(frames_to_skip) = usize::try_from(frames_to_skip) else {
+            return false;
+        };
+        if self.project_source_finished.load(Ordering::Acquire) {
+            return true;
+        }
+        let available_frames = self.rings[index].available_stereo_frames();
+        frames_to_skip
+            .checked_add(STREAM_PREFILL_FRAMES)
+            .is_some_and(|required| available_frames >= required)
+    }
+}
+
+fn create_streaming_playback(
+    initial_position_frames: u64,
+    ring_capacity_samples: usize,
+    source_count: usize,
+    project_source: bool,
+) -> (Arc<StreamingPlayback>, Vec<StreamingAudioWriter>) {
+    assert!((1..=MAX_LIVE_STREAM_SOURCES).contains(&source_count));
+    let playback = Arc::new(StreamingPlayback {
+        rings: (0..MAX_LIVE_STREAM_SOURCES)
+            .map(|index| {
+                let capacity = if index < source_count {
+                    ring_capacity_samples
+                } else {
+                    ring_capacity_samples.min(LIVE_STREAM_RING_CAPACITY)
+                };
+                AudioRingBuffer::new(capacity)
+            })
+            .collect(),
+        producer_finished: (0..MAX_LIVE_STREAM_SOURCES)
+            .map(|index| AtomicBool::new(index >= source_count))
+            .collect(),
+        producer_underrun_frames: (0..MAX_LIVE_STREAM_SOURCES)
+            .map(|_| AtomicU64::new(0))
+            .collect(),
+        producer_state: Mutex::new(StreamingProducerState {
+            active_count: source_count,
+        }),
+        project_source_index: project_source.then_some(0),
+        project_source_finished: AtomicBool::new(!project_source),
+        active: AtomicBool::new(false),
+        paused: AtomicBool::new(false),
+        finished: AtomicBool::new(false),
+        cancelled: AtomicBool::new(false),
+        handoff_target_frame: AtomicU64::new(u64::MAX),
+        handoff_committed: AtomicBool::new(false),
+        underrun_frames: AtomicU64::new(0),
+        consumed_frames: AtomicU64::new(initial_position_frames),
+    });
+    let writers = (0..source_count)
+        .map(|ring_index| StreamingAudioWriter {
+            playback: Arc::clone(&playback),
+            ring_index,
+            is_project_source: project_source && ring_index == 0,
+        })
+        .collect();
+    (playback, writers)
 }
 
 #[derive(Default)]
@@ -1509,6 +1587,26 @@ pub struct StreamingAudioWriter {
     playback: Arc<StreamingPlayback>,
     ring_index: usize,
     is_project_source: bool,
+}
+
+/// A newly rendered Playlist stream waiting to replace the current stream at an audio callback
+/// boundary. The host may keep the current stream audible while this stream prepares its buffer.
+#[derive(Clone)]
+pub struct StagedStreamingPlayback {
+    playback: Arc<PlaybackState>,
+    stream: Arc<StreamingPlayback>,
+}
+
+impl StagedStreamingPlayback {
+    /// Whether the staged producer has enough audio to begin a handoff at `frame`.
+    pub fn is_ready_at_frame(&self, frame: u64) -> bool {
+        self.stream.is_ready_at_frame(frame)
+    }
+
+    /// Whether the audio callback has switched to this stream.
+    pub fn is_committed(&self) -> bool {
+        self.stream.handoff_committed.load(Ordering::Acquire)
+    }
 }
 
 impl StreamingAudioWriter {
@@ -1691,6 +1789,9 @@ impl PlaybackState {
             },
             samples: ArcSwapOption::empty(),
             streaming: ArcSwapOption::empty(),
+            pending_streaming: ArcSwapOption::empty(),
+            retired_streaming: ArrayQueue::new(RETIRED_STREAM_QUEUE_CAPACITY),
+            stream_handoff_gate: AtomicU8::new(STREAM_HANDOFF_IDLE),
             cursor_frames: AtomicU64::new(0),
             playback_speed: AtomicU32::new(1.0_f32.to_bits()),
             playback_speed_phase: AtomicU32::new(0.0_f32.to_bits()),
@@ -1734,6 +1835,87 @@ impl PlaybackState {
             self.browser_preview_gain
                 .store(gain_bits, Ordering::Release);
         }
+    }
+
+    fn apply_pending_streaming_handoff(&self) {
+        if self
+            .stream_handoff_gate
+            .compare_exchange(
+                STREAM_HANDOFF_IDLE,
+                STREAM_HANDOFF_COMMITTING,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            return;
+        }
+        self.try_apply_pending_streaming_handoff();
+        self.stream_handoff_gate
+            .store(STREAM_HANDOFF_IDLE, Ordering::Release);
+    }
+
+    fn try_apply_pending_streaming_handoff(&self) {
+        // The UI thread reaps retired streams. Keeping this queue empty before a handoff means the
+        // callback can transfer ownership of the old Arc without dropping its ring buffers.
+        if !self.retired_streaming.is_empty() {
+            return;
+        }
+        let current_guard = self.streaming.load();
+        let Some(current) = current_guard.as_deref() else {
+            return;
+        };
+        let next_guard = self.pending_streaming.load();
+        let Some(next) = next_guard.as_deref() else {
+            return;
+        };
+        let target_frame = next.handoff_target_frame.load(Ordering::Acquire);
+        if target_frame == u64::MAX {
+            return;
+        }
+        let current_frame = current.consumed_frames.load(Ordering::Acquire);
+        if current_frame < target_frame || !next.is_ready_at_frame(current_frame) {
+            return;
+        }
+        let Some(source_index) = next.project_source_index else {
+            return;
+        };
+        let next_start_frame = next.consumed_frames.load(Ordering::Acquire);
+        let frames_to_skip = current_frame.saturating_sub(next_start_frame);
+        let Ok(frames_to_skip) = usize::try_from(frames_to_skip) else {
+            return;
+        };
+        let frames_to_discard = if next.project_source_finished.load(Ordering::Acquire) {
+            frames_to_skip.min(next.rings[source_index].available_stereo_frames())
+        } else {
+            frames_to_skip
+        };
+        let skipped = next.rings[source_index].advance_stereo_frames(frames_to_discard);
+        if skipped != frames_to_discard {
+            return;
+        }
+        next.consumed_frames.store(current_frame, Ordering::Release);
+        let paused = current.paused.load(Ordering::Acquire);
+        next.paused.store(paused, Ordering::Release);
+        next.active.store(!paused, Ordering::Release);
+
+        let Some(next_owned) = self.pending_streaming.swap(None) else {
+            return;
+        };
+        let previous = self.streaming.swap(Some(next_owned));
+        if let Some(previous) = previous {
+            // Only the audio callback publishes retired streams; UI calls drain the queue.
+            if let Err(previous) = self.retired_streaming.push(previous) {
+                // This is unreachable while the queue-empty guard above holds, but retaining the
+                // stream in the pending slot is safer than dropping it on the realtime thread.
+                if let Some(current) = self.streaming.swap(None) {
+                    self.pending_streaming.store(Some(current));
+                }
+                self.streaming.store(Some(previous));
+                return;
+            }
+        }
+        next.handoff_committed.store(true, Ordering::Release);
     }
 
     fn start(&self, samples: Vec<f32>) {
@@ -1887,43 +2069,14 @@ impl PlaybackState {
     ) -> Vec<StreamingAudioWriter> {
         assert!((1..=MAX_LIVE_STREAM_SOURCES).contains(&source_count));
         self.stop();
-        let playback = Arc::new(StreamingPlayback {
-            rings: (0..MAX_LIVE_STREAM_SOURCES)
-                .map(|index| {
-                    let capacity = if index < source_count {
-                        ring_capacity_samples
-                    } else {
-                        ring_capacity_samples.min(LIVE_STREAM_RING_CAPACITY)
-                    };
-                    AudioRingBuffer::new(capacity)
-                })
-                .collect(),
-            producer_finished: (0..MAX_LIVE_STREAM_SOURCES)
-                .map(|index| AtomicBool::new(index >= source_count))
-                .collect(),
-            producer_underrun_frames: (0..MAX_LIVE_STREAM_SOURCES)
-                .map(|_| AtomicU64::new(0))
-                .collect(),
-            producer_state: Mutex::new(StreamingProducerState {
-                active_count: source_count,
-            }),
-            project_source_index: project_source.then_some(0),
-            project_source_finished: AtomicBool::new(!project_source),
-            active: AtomicBool::new(false),
-            paused: AtomicBool::new(false),
-            finished: AtomicBool::new(false),
-            cancelled: AtomicBool::new(false),
-            underrun_frames: AtomicU64::new(0),
-            consumed_frames: AtomicU64::new(initial_position_frames),
-        });
+        let (playback, writers) = create_streaming_playback(
+            initial_position_frames,
+            ring_capacity_samples,
+            source_count,
+            project_source,
+        );
         self.streaming.store(Some(Arc::clone(&playback)));
-        (0..source_count)
-            .map(|ring_index| StreamingAudioWriter {
-                playback: Arc::clone(&playback),
-                ring_index,
-                is_project_source: project_source && ring_index == 0,
-            })
-            .collect()
+        writers
     }
 
     fn add_streaming_sources(
@@ -2036,10 +2189,28 @@ impl PlaybackState {
     }
 
     fn cancel_stream(&self) {
+        while self
+            .stream_handoff_gate
+            .compare_exchange(
+                STREAM_HANDOFF_IDLE,
+                STREAM_HANDOFF_STOPPING,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            std::thread::yield_now();
+        }
         if let Some(streaming) = self.streaming.swap(None) {
             streaming.cancelled.store(true, Ordering::Release);
             streaming.active.store(false, Ordering::Release);
         }
+        if let Some(streaming) = self.pending_streaming.swap(None) {
+            streaming.cancelled.store(true, Ordering::Release);
+            streaming.active.store(false, Ordering::Release);
+        }
+        self.stream_handoff_gate
+            .store(STREAM_HANDOFF_IDLE, Ordering::Release);
     }
 
     #[cfg(test)]
@@ -2060,10 +2231,22 @@ impl PlaybackState {
         if self.active.load(Ordering::Acquire) {
             return true;
         }
-        self.streaming
+        let current = self.streaming.load();
+        if let Some(current) = current.as_deref() {
+            if current.project_source_active() {
+                return true;
+            }
+            if current.paused.load(Ordering::Acquire) || current.cancelled.load(Ordering::Acquire) {
+                return false;
+            }
+        }
+        self.pending_streaming
             .load()
             .as_deref()
-            .is_some_and(StreamingPlayback::project_source_active)
+            .is_some_and(|pending| {
+                !pending.cancelled.load(Ordering::Acquire)
+                    && pending.handoff_target_frame.load(Ordering::Acquire) != u64::MAX
+            })
     }
 
     fn is_streaming(&self) -> bool {
@@ -2338,6 +2521,95 @@ impl AudioEngine {
         let writer = self.playback.start_streaming(start_frame);
         self.request_output_source(AUDIO_SOURCE_STREAM);
         Ok(writer)
+    }
+
+    /// Prepare a replacement Playlist stream without disturbing the currently audible stream.
+    ///
+    /// The caller should stop and join the old render producer before staging a replacement that
+    /// uses the same plug-in instances. Once the replacement has buffered enough audio, request a
+    /// handoff; the output callback switches streams at a buffer boundary and skips staged audio
+    /// that corresponds to frames already consumed by the old stream.
+    pub fn begin_staged_streaming_playback_from_frame(
+        &self,
+        start_frame: u64,
+    ) -> Result<(StreamingAudioWriter, StagedStreamingPlayback), String> {
+        if !self.output_active {
+            return Err("Start an output device before staging streamed audio".into());
+        }
+        let current_guard = self.playback.streaming.load();
+        let current = current_guard.as_ref().ok_or_else(|| {
+            "An active project stream is required for a staged handoff".to_owned()
+        })?;
+        if current.project_source_index.is_none()
+            || current.cancelled.load(Ordering::Acquire)
+            || self.playback.pending_streaming.load().is_some()
+        {
+            return Err("The current project stream cannot accept a staged handoff".to_owned());
+        }
+        let (stream, mut writers) =
+            create_streaming_playback(start_frame, AUDIO_RING_CAPACITY, 1, true);
+        let writer = writers
+            .pop()
+            .ok_or_else(|| "Could not allocate a staged project stream".to_owned())?;
+        let staged = StagedStreamingPlayback {
+            playback: Arc::clone(&self.playback),
+            stream,
+        };
+        Ok((writer, staged))
+    }
+
+    /// Let the output callback replace its current Playlist stream with a staged stream.
+    pub fn request_staged_streaming_handoff(
+        &self,
+        staged: &StagedStreamingPlayback,
+    ) -> Result<(), String> {
+        if !Arc::ptr_eq(&self.playback, &staged.playback) {
+            return Err("The staged stream belongs to a different audio engine".to_owned());
+        }
+        if staged.stream.cancelled.load(Ordering::Acquire) {
+            return Err("The staged stream was cancelled".to_owned());
+        }
+        if staged.stream.handoff_committed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if self.playback.pending_streaming.load().is_some() {
+            return Err("Another staged stream handoff is already pending".to_owned());
+        }
+        staged.stream.handoff_target_frame.store(
+            staged.stream.consumed_frames.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+        self.playback
+            .pending_streaming
+            .store(Some(Arc::clone(&staged.stream)));
+        self.request_output_source(AUDIO_SOURCE_STREAM);
+        Ok(())
+    }
+
+    /// Cancel a staged stream that has not yet replaced the current project stream.
+    pub fn cancel_staged_streaming_handoff(
+        &self,
+        staged: &StagedStreamingPlayback,
+    ) -> Result<(), String> {
+        if !Arc::ptr_eq(&self.playback, &staged.playback) {
+            return Err("The staged stream belongs to a different audio engine".to_owned());
+        }
+        if staged.is_committed() {
+            return Err("The staged stream has already been committed".to_owned());
+        }
+        if let Some(pending) = self.playback.pending_streaming.load_full()
+            && Arc::ptr_eq(&pending, &staged.stream)
+        {
+            self.playback.pending_streaming.store(None);
+        }
+        staged.stream.cancelled.store(true, Ordering::Release);
+        staged.stream.active.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    /// Release retired stream buffers on the control thread after the audio callback hands off.
+    pub fn reap_retired_streaming_playbacks(&self) {
+        while self.playback.retired_streaming.pop().is_some() {}
     }
 
     /// Begin a low-latency stream for interactive instrument audition.
@@ -3005,6 +3277,7 @@ where
             move |output, _| {
                 enable_denormal_protection();
                 playback_for_callback.apply_pending_commands(&source);
+                playback_for_callback.apply_pending_streaming_handoff();
                 let playback_samples = playback_for_callback.samples.load();
                 let streaming = playback_for_callback.streaming.load();
                 let browser_preview_samples = playback_for_callback.browser_preview_samples.load();
@@ -3925,6 +4198,7 @@ fn render_wasapi_buffer(
     output: &mut Vec<u8>,
 ) -> Result<(), String> {
     playback.apply_pending_commands(source);
+    playback.apply_pending_streaming_handoff();
     output.resize(frames.saturating_mul(format.frame_bytes), 0);
     let sample_rate = format.get_sample_rate();
     let gain_alpha = output_gain_smoothing_alpha(sample_rate);
@@ -3980,10 +4254,10 @@ mod tests {
         AUDIO_COMMAND_QUEUE_CAPACITY, AUDIO_SOURCE_INPUT_MONITOR, AUDIO_SOURCE_PROJECT,
         AUDIO_SOURCE_SILENT, AUDIO_SOURCE_STREAM, AUDIO_SOURCE_TEST_TONE, AudioAccess,
         AudioInputRecording, AudioRingBuffer, AudioSettings, InputRecordingState, ParameterCommand,
-        PlaybackState, ProjectPlaybackClock, STREAM_PREFILL_FRAMES, StereoFrameDelay,
-        TransportCommand, enable_denormal_protection, next_output_frame,
-        output_gain_smoothing_alpha, sanitize_output_sample, smooth_output_gain, tone_sample,
-        valid_project_playback_speed, validate_settings,
+        PlaybackState, ProjectPlaybackClock, STREAM_PREFILL_FRAMES, StagedStreamingPlayback,
+        StereoFrameDelay, TransportCommand, create_streaming_playback, enable_denormal_protection,
+        next_output_frame, output_gain_smoothing_alpha, sanitize_output_sample, smooth_output_gain,
+        tone_sample, valid_project_playback_speed, validate_settings,
     };
 
     #[test]
@@ -4474,6 +4748,107 @@ mod tests {
             [0.0, 0.0]
         );
         assert!(!playback.is_active());
+    }
+
+    #[test]
+    fn staged_stream_handoff_skips_already_consumed_frames() {
+        let playback = Arc::new(PlaybackState::new());
+        let old_writer = playback.start_streaming(1_000);
+        old_writer
+            .write_stereo_samples(&[0.25, -0.25].repeat(STREAM_PREFILL_FRAMES))
+            .unwrap();
+        let old_stream = playback.streaming.load_full().expect("old stream");
+        old_stream.consumed_frames.store(1_024, Ordering::Release);
+
+        let (next_stream, mut writers) = create_streaming_playback(1_000, 4_096, 1, true);
+        let next_writer = writers.pop().expect("staged project writer");
+        let mut next_samples = Vec::new();
+        for frame in 0..STREAM_PREFILL_FRAMES + 32 {
+            next_samples.extend([frame as f32, -(frame as f32)]);
+        }
+        next_writer.write_stereo_samples(&next_samples).unwrap();
+        next_writer.finish();
+        let staged = StagedStreamingPlayback {
+            playback: Arc::clone(&playback),
+            stream: Arc::clone(&next_stream),
+        };
+        next_stream
+            .handoff_target_frame
+            .store(1_000, Ordering::Release);
+        playback
+            .pending_streaming
+            .store(Some(Arc::clone(&next_stream)));
+
+        playback.apply_pending_streaming_handoff();
+
+        assert!(staged.is_committed());
+        assert_eq!(playback.position_frames(), 1_024);
+        assert_eq!(
+            next_stream.rings[0].peek_stereo_frame(0),
+            Some([24.0, -24.0])
+        );
+        assert_eq!(playback.retired_streaming.len(), 1);
+    }
+
+    #[test]
+    fn staged_stream_handoff_waits_for_target_and_prefill() {
+        let playback = Arc::new(PlaybackState::new());
+        let old_writer = playback.start_streaming(0);
+        let old_stream = playback.streaming.load_full().expect("old stream");
+        old_stream.consumed_frames.store(10, Ordering::Release);
+        old_writer.finish();
+        let (next_stream, mut writers) = create_streaming_playback(0, 4_096, 1, true);
+        let next_writer = writers.pop().expect("staged project writer");
+        next_writer
+            .write_stereo_samples(&[0.5, -0.5].repeat(STREAM_PREFILL_FRAMES - 1))
+            .unwrap();
+        let staged = StagedStreamingPlayback {
+            playback: Arc::clone(&playback),
+            stream: Arc::clone(&next_stream),
+        };
+        next_stream
+            .handoff_target_frame
+            .store(11, Ordering::Release);
+        playback
+            .pending_streaming
+            .store(Some(Arc::clone(&next_stream)));
+        assert!(playback.is_project_active());
+
+        playback.apply_pending_streaming_handoff();
+        assert!(!staged.is_committed());
+
+        old_stream.consumed_frames.store(11, Ordering::Release);
+        next_writer
+            .write_stereo_samples(&[0.5, -0.5].repeat(12))
+            .unwrap();
+        playback.apply_pending_streaming_handoff();
+
+        assert!(staged.is_committed());
+        assert_eq!(playback.position_frames(), 11);
+        drop(old_writer);
+    }
+
+    #[test]
+    fn stopping_cancels_a_pending_stream_handoff() {
+        let playback = Arc::new(PlaybackState::new());
+        let _old_writer = playback.start_streaming(0);
+        let (next_stream, _writers) = create_streaming_playback(0, 4_096, 1, true);
+        let staged = StagedStreamingPlayback {
+            playback: Arc::clone(&playback),
+            stream: Arc::clone(&next_stream),
+        };
+        next_stream.handoff_target_frame.store(0, Ordering::Release);
+        playback
+            .pending_streaming
+            .store(Some(Arc::clone(&next_stream)));
+
+        playback.stop();
+        playback.apply_pending_streaming_handoff();
+
+        assert!(next_stream.cancelled.load(Ordering::Acquire));
+        assert!(playback.streaming.load().is_none());
+        assert!(playback.pending_streaming.load().is_none());
+        assert!(!staged.is_committed());
     }
 
     #[test]

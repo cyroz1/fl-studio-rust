@@ -20,7 +20,7 @@ use clap_probe::{
 use eframe::egui::{self, Align2, Color32, FontId, Id, PointerButton, Sense, Stroke, Vec2};
 use flp_rebuild::audio::{
     AudioAccess, AudioDeviceCatalog, AudioEngine, AudioSettings, MIXER_TRACK_METER_COUNT,
-    MixerTrackPeakMeters, enumerate_devices,
+    MixerTrackPeakMeters, StagedStreamingPlayback, enumerate_devices,
 };
 use flp_rebuild::media::{
     AudioExportOptions, AudioWaveform, DecodedAudio, SamplePathResolver, WaveformPeak,
@@ -4850,6 +4850,7 @@ struct PendingAudioRender {
     cancelled: Arc<AtomicBool>,
     worker: thread::JoinHandle<()>,
     live_midi_senders: BTreeMap<u16, Vst3PlaylistLiveInputSender>,
+    staged_streaming: Option<StagedStreamingPlayback>,
 }
 
 struct PendingAudioClipExport {
@@ -11074,6 +11075,14 @@ impl DawUi {
     }
 
     fn start_project_playback(&mut self) {
+        self.start_project_playback_with_start_frame(None);
+    }
+
+    fn start_project_playback_handoff(&mut self, start_frame: u64) {
+        self.start_project_playback_with_start_frame(Some(start_frame));
+    }
+
+    fn start_project_playback_with_start_frame(&mut self, staged_start_frame: Option<u64>) {
         self.midi_script_transport_move = None;
         if self.pending_song_render.is_some() {
             self.status = "Stop the Playlist render before starting playback".to_owned();
@@ -11199,15 +11208,22 @@ impl DawUi {
             .as_ref()
             .map(Vst3PlaylistStreamProcessor::live_midi_input_senders)
             .unwrap_or_default();
-        let start_frame = match playlist_seek_tick_to_frame(
-            self.playlist_seek_tick,
-            &playlist_tempo_map,
-            sample_rate,
-        ) {
-            Ok(frame) => frame,
-            Err(error) => {
-                self.status = format!("Could not map Playlist seek position: {error}");
-                return;
+        let start_frame = if let Some(start_frame) = staged_start_frame {
+            if let Some(tick) = playlist_tempo_map.tick_at_frame(start_frame, sample_rate) {
+                self.playlist_seek_tick = tick.round().clamp(0.0, f64::from(u32::MAX)) as u32;
+            }
+            start_frame
+        } else {
+            match playlist_seek_tick_to_frame(
+                self.playlist_seek_tick,
+                &playlist_tempo_map,
+                sample_rate,
+            ) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    self.status = format!("Could not map Playlist seek position: {error}");
+                    return;
+                }
             }
         };
         if let Some(session) = self.live_sampler_input.take() {
@@ -11225,8 +11241,16 @@ impl DawUi {
             self.live_vst3_workers.push(session.worker);
         }
         self.midi_live_vst3_note_mapping.clear();
-        let writer = match engine.begin_streaming_playback_from_frame(start_frame) {
-            Ok(writer) => writer,
+        let staged_stream_result = match staged_start_frame {
+            Some(_) => engine
+                .begin_staged_streaming_playback_from_frame(start_frame)
+                .map(|(writer, staged)| (writer, Some(staged))),
+            None => engine
+                .begin_streaming_playback_from_frame(start_frame)
+                .map(|writer| (writer, None)),
+        };
+        let (writer, staged_streaming) = match staged_stream_result {
+            Ok(stream) => stream,
             Err(error) => {
                 self.status = format!("Could not start Playlist audio output: {error}");
                 return;
@@ -11263,6 +11287,16 @@ impl DawUi {
             });
         match worker {
             Ok(worker) => {
+                if let Some(staged) = staged_streaming.as_ref()
+                    && let Err(error) = engine.request_staged_streaming_handoff(staged)
+                {
+                    cancelled.store(true, Ordering::Release);
+                    let _ = worker.join();
+                    let _ = engine.cancel_staged_streaming_handoff(staged);
+                    self.status = format!("Could not hand off Playlist audio stream: {error}");
+                    return;
+                }
+                let handoff_in_progress = staged_streaming.is_some();
                 self.playing = true;
                 self.project_playback_loaded = true;
                 self.playlist_playback_loaded = true;
@@ -11272,22 +11306,73 @@ impl DawUi {
                     cancelled,
                     worker,
                     live_midi_senders,
+                    staged_streaming,
                 });
                 self.stop_midi_pattern_preview();
-                self.status =
-                    "Preparing Playlist audio, Samplers, and VST3 instruments…".to_owned();
-                self.start_midi_clock(false);
-                self.start_midi_playlist_playback(
-                    arrangement_id,
-                    u64::from(self.playlist_seek_tick),
-                    start_frame,
-                );
+                self.status = if handoff_in_progress {
+                    "Preparing updated Playlist PDC while current audio continues…".to_owned()
+                } else {
+                    "Preparing Playlist audio, Samplers, and VST3 instruments…".to_owned()
+                };
+                if !handoff_in_progress {
+                    self.start_midi_clock(false);
+                    self.start_midi_playlist_playback(
+                        arrangement_id,
+                        u64::from(self.playlist_seek_tick),
+                        start_frame,
+                    );
+                }
             }
             Err(error) => {
-                self.stop_project_playback();
-                self.status = format!("Could not start audio streaming: {error}");
+                if let Some(staged) = staged_streaming.as_ref() {
+                    let _ = engine.cancel_staged_streaming_handoff(staged);
+                    self.status = format!("Could not stage updated Playlist audio: {error}");
+                } else {
+                    self.stop_project_playback();
+                    self.status = format!("Could not start audio streaming: {error}");
+                }
             }
         }
+    }
+
+    fn restart_playlist_stream_for_latency_change(&mut self) -> bool {
+        let Some(engine) = self.audio_engine.as_ref() else {
+            return false;
+        };
+        let Some(pending) = self.pending_audio_render.take() else {
+            return false;
+        };
+        if let Some(staged) = pending.staged_streaming.as_ref()
+            && !staged.is_committed()
+        {
+            let _ = engine.cancel_staged_streaming_handoff(staged);
+        }
+        pending.cancelled.store(true, Ordering::Release);
+        if pending.worker.join().is_err() {
+            self.status = "Playlist audio worker panicked during a VST3 latency change".to_owned();
+            return false;
+        }
+        if let Some(host) = self.vst3_host.as_mut() {
+            match host.service_editors() {
+                Ok(changes) if changes.io_changed => return false,
+                Ok(_) => {}
+                Err(error) => {
+                    self.status = format!("Could not refresh VST3 latency reports: {error}");
+                    return false;
+                }
+            }
+        }
+        let Some(start_frame) = self
+            .audio_engine
+            .as_ref()
+            .map(AudioEngine::project_playback_position_frames)
+        else {
+            return false;
+        };
+        self.start_project_playback_handoff(start_frame);
+        self.pending_audio_render
+            .as_ref()
+            .is_some_and(|pending| pending.staged_streaming.is_some())
     }
 
     fn initialize_live_mixer_insert_fader_targets(&self, document: &FlpDocument) {
@@ -11717,6 +11802,7 @@ impl DawUi {
                     cancelled,
                     worker,
                     live_midi_senders,
+                    staged_streaming: None,
                 });
                 self.stop_midi_pattern_preview();
                 self.status = format!(
@@ -11732,6 +11818,32 @@ impl DawUi {
     }
 
     fn poll_project_audio_render(&mut self) {
+        if let Some(engine) = self.audio_engine.as_ref() {
+            engine.reap_retired_streaming_playbacks();
+        }
+        let staged_handoff_committed = self
+            .pending_audio_render
+            .as_ref()
+            .and_then(|pending| pending.staged_streaming.as_ref())
+            .is_some_and(StagedStreamingPlayback::is_committed);
+        if staged_handoff_committed {
+            if let Some(pending) = self.pending_audio_render.as_mut() {
+                pending.staged_streaming = None;
+            }
+            if self.playing {
+                self.start_midi_playlist_playback_from_current_position();
+            }
+            let tick = self
+                .current_playhead_tick()
+                .filter(|tick| tick.is_finite() && *tick >= 0.0)
+                .map(|tick| tick.round() as u64);
+            self.status = tick.map_or_else(
+                || "VST3 latency update applied through a live PDC handoff".to_owned(),
+                |tick| {
+                    format!("VST3 latency update applied through a live PDC handoff at tick {tick}")
+                },
+            );
+        }
         let completed = self.pending_audio_render.as_ref().and_then(|pending| {
             match pending.receiver.try_recv() {
                 Ok(result) => Some(result),
@@ -52661,54 +52773,66 @@ impl eframe::App for DawUi {
                     || self.pending_song_render.is_some()
                     || self.pending_vst3_stream.is_some()
                     || changes.latency_changed_while_processing;
-                if playback_active {
-                    self.stop_project_playback();
-                }
-                self.playlist_seek_tick = playlist_resume_tick;
-                self.pattern_seek_tick = pattern_resume_tick;
-
-                let restart_attempted = resume_pattern_playback || resume_playlist_playback;
-                let resumed_tick = if resume_pattern_playback {
-                    self.start_pattern_mode_playback();
-                    self.playing.then_some(self.pattern_seek_tick)
-                } else if resume_playlist_playback {
-                    self.start_project_playback();
-                    self.playing.then_some(u64::from(playlist_resume_tick))
-                } else {
-                    None
-                };
-
-                if resumed_tick.is_none() && resume_pattern_playback {
+                let staged_playlist_handoff = changes.latency_changed
+                    && !changes.io_changed
+                    && resume_playlist_playback
+                    && self.restart_playlist_stream_for_latency_change();
+                if staged_playlist_handoff {
                     self.pattern_seek_tick = pattern_resume_tick;
-                } else if resumed_tick.is_none() && resume_playlist_playback {
+                    self.status = format!(
+                        "VST3 latency changed; staging a PDC handoff while Playlist audio continues from tick {}",
+                        self.playlist_seek_tick
+                    );
+                } else {
+                    if playback_active {
+                        self.stop_project_playback();
+                    }
                     self.playlist_seek_tick = playlist_resume_tick;
-                }
+                    self.pattern_seek_tick = pattern_resume_tick;
 
-                if !restart_attempted || resumed_tick.is_some() {
-                    self.status = if let Some(tick) = resumed_tick {
-                        if changes.io_changed {
-                            format!(
-                                "A VST3 layout or latency report changed; playback resumed at tick {tick} with rebuilt routing and PDC"
-                            )
-                        } else {
-                            format!(
-                                "A VST3 latency report changed; playback resumed at tick {tick} with rebuilt PDC"
-                            )
-                        }
-                    } else if changes.io_changed {
-                        if playback_active {
-                            "A VST3 output layout changed; playback stopped to rebuild its routing"
-                                .to_owned()
-                        } else {
-                            "A VST3 output layout changed; routing will refresh on playback"
-                                .to_owned()
-                        }
-                    } else if playback_active {
-                        "A VST3 latency report changed; the active stream stopped. Stored transport position is retained for the next start.".to_owned()
+                    let restart_attempted = resume_pattern_playback || resume_playlist_playback;
+                    let resumed_tick = if resume_pattern_playback {
+                        self.start_pattern_mode_playback();
+                        self.playing.then_some(self.pattern_seek_tick)
+                    } else if resume_playlist_playback {
+                        self.start_project_playback();
+                        self.playing.then_some(u64::from(playlist_resume_tick))
                     } else {
-                        "A VST3 latency report changed; PDC will refresh on the next playback start"
-                            .to_owned()
+                        None
                     };
+
+                    if resumed_tick.is_none() && resume_pattern_playback {
+                        self.pattern_seek_tick = pattern_resume_tick;
+                    } else if resumed_tick.is_none() && resume_playlist_playback {
+                        self.playlist_seek_tick = playlist_resume_tick;
+                    }
+
+                    if !restart_attempted || resumed_tick.is_some() {
+                        self.status = if let Some(tick) = resumed_tick {
+                            if changes.io_changed {
+                                format!(
+                                    "A VST3 layout or latency report changed; playback resumed at tick {tick} with rebuilt routing and PDC"
+                                )
+                            } else {
+                                format!(
+                                    "A VST3 latency report changed; playback resumed at tick {tick} with rebuilt PDC"
+                                )
+                            }
+                        } else if changes.io_changed {
+                            if playback_active {
+                                "A VST3 output layout changed; playback stopped to rebuild its routing"
+                                    .to_owned()
+                            } else {
+                                "A VST3 output layout changed; routing will refresh on playback"
+                                    .to_owned()
+                            }
+                        } else if playback_active {
+                            "A VST3 latency report changed; the active stream stopped. Stored transport position is retained for the next start.".to_owned()
+                        } else {
+                            "A VST3 latency report changed; PDC will refresh on the next playback start"
+                                .to_owned()
+                        };
+                    }
                 }
             }
             Some(Err(error)) => {
