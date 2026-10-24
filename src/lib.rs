@@ -8038,6 +8038,182 @@ impl FlpDocument {
         self.set_mixer_parameter_record_value(event_index, record_index, mix_raw)
     }
 
+    /// Moves one effect slot within a recognized ten-slot Mixer insert while retaining its
+    /// opaque plug-in state and remapping recognized slot enable/Mix records. The edit is
+    /// rejected when an unknown `0xE1` parameter could belong to a slot in the moved range.
+    pub fn move_mixer_effect_slot(
+        &mut self,
+        insert_ordinal: usize,
+        from_slot_index: u16,
+        to_slot_index: u16,
+    ) -> Result<(), FlpError> {
+        const SLOT_COUNT: usize = 10;
+        if usize::from(from_slot_index) >= SLOT_COUNT || usize::from(to_slot_index) >= SLOT_COUNT {
+            return Err(FlpError::UnsupportedEdit(
+                "Mixer effect slot indexes must be between 0 and 9",
+            ));
+        }
+
+        let mut candidate = self.clone();
+        let mut slots = candidate
+            .mixer_effect_slots()
+            .into_iter()
+            .filter(|slot| slot.insert_ordinal() == insert_ordinal)
+            .collect::<Vec<_>>();
+        slots.sort_by_key(MixerEffectSlotSummary::slot_index);
+        if slots.len() != SLOT_COUNT
+            || slots
+                .iter()
+                .enumerate()
+                .any(|(expected, slot)| usize::from(slot.slot_index()) != expected)
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "Mixer effect reordering requires a complete ten-slot boundary sequence",
+            ));
+        }
+        let insert = candidate
+            .mixer_inserts()
+            .into_iter()
+            .find(|insert| insert.ordinal() == insert_ordinal)
+            .ok_or(FlpError::MixerInsertNotFound(insert_ordinal))?;
+        let insert_range = insert.event_range();
+        if slots[0].event_range().start < insert_range.start
+            || slots[SLOT_COUNT - 1].event_range().end > insert_range.end
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "Mixer effect slots do not fit within their recognized insert",
+            ));
+        }
+        if from_slot_index == to_slot_index {
+            return Ok(());
+        }
+
+        let first_slot = usize::from(from_slot_index.min(to_slot_index));
+        let last_slot = usize::from(from_slot_index.max(to_slot_index));
+        for slot_index in first_slot..last_slot {
+            let marker_range =
+                slots[slot_index].event_range().end..slots[slot_index + 1].event_range().start;
+            let marker_events = &candidate.events[marker_range];
+            let [marker] = marker_events else {
+                return Err(FlpError::UnsupportedEdit(
+                    "Mixer effect slots do not have unambiguous separating markers",
+                ));
+            };
+            if marker.opcode != 0x62
+                || marker.encoding != PayloadEncoding::Word
+                || marker.payload.as_slice() != ((slot_index + 1) as u16).to_le_bytes()
+            {
+                return Err(FlpError::UnsupportedEdit(
+                    "Mixer effect slots do not have unambiguous separating markers",
+                ));
+            }
+        }
+
+        let mut slot_ranges = slots
+            .iter()
+            .map(MixerEffectSlotSummary::event_range)
+            .collect::<Vec<_>>();
+        let first_slot_boundary =
+            (insert_range.start + 3..slot_ranges[0].end).find(|&event_index| {
+                let event = &candidate.events[event_index];
+                event.opcode == 0x62
+                    && event.encoding == PayloadEncoding::Word
+                    && event.payload.as_slice() == 0_u16.to_le_bytes()
+            });
+        let Some(first_slot_boundary) = first_slot_boundary else {
+            return Err(FlpError::UnsupportedEdit(
+                "Mixer effect slot zero has no recognized start marker",
+            ));
+        };
+        slot_ranges[0].start = first_slot_boundary + 1;
+
+        let parameter_records = candidate.mixer_parameter_records()?;
+        let is_affected_slot =
+            |slot_index: u8| (first_slot..=last_slot).contains(&usize::from(slot_index));
+        if parameter_records.iter().any(|record| {
+            record.candidate_insert_ordinal() == Some(insert_ordinal)
+                && is_affected_slot(record.slot_index())
+                && matches!(record.kind(), MixerParameterKind::Unknown(_))
+        }) {
+            return Err(FlpError::UnsupportedEdit(
+                "Mixer effect reordering is unsafe while unknown slot parameters are present",
+            ));
+        }
+
+        let moved_slot = usize::from(from_slot_index);
+        let destination_slot = usize::from(to_slot_index);
+        let remap_slot = |old_slot: usize| {
+            if moved_slot < destination_slot {
+                if old_slot == moved_slot {
+                    destination_slot
+                } else if (moved_slot..=destination_slot).contains(&old_slot) {
+                    old_slot - 1
+                } else {
+                    old_slot
+                }
+            } else if old_slot == moved_slot {
+                destination_slot
+            } else if (destination_slot..=moved_slot).contains(&old_slot) {
+                old_slot + 1
+            } else {
+                old_slot
+            }
+        };
+        for record in parameter_records.iter().filter(|record| {
+            record.candidate_insert_ordinal() == Some(insert_ordinal)
+                && is_affected_slot(record.slot_index())
+                && matches!(
+                    record.kind(),
+                    MixerParameterKind::SlotEnabled | MixerParameterKind::SlotMix
+                )
+        }) {
+            let old_slot = usize::from(record.slot_index());
+            let new_slot = remap_slot(old_slot);
+            if old_slot != new_slot {
+                let channel_data = (record.channel_data() & !0x3F) | new_slot as u16;
+                write_event_payload_bytes(
+                    &mut candidate.events[record.event_index()],
+                    record.record_index() * 12 + 6,
+                    &channel_data.to_le_bytes(),
+                )?;
+            }
+        }
+
+        let replace_start = slot_ranges[first_slot].start;
+        let replace_end = slot_ranges[last_slot].end;
+        let slot_chunks = slot_ranges[first_slot..=last_slot]
+            .iter()
+            .map(|range| candidate.events[range.clone()].to_vec())
+            .collect::<Vec<_>>();
+        let separator_chunks = (first_slot..last_slot)
+            .map(|slot_index| {
+                candidate.events[slot_ranges[slot_index].end..slot_ranges[slot_index + 1].start]
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        let mut reordered_slot_indexes = (first_slot..=last_slot).collect::<Vec<_>>();
+        let moved_position = reordered_slot_indexes
+            .iter()
+            .position(|slot_index| *slot_index == moved_slot)
+            .expect("the moved Mixer slot is within the affected range");
+        let moved_slot_index = reordered_slot_indexes.remove(moved_position);
+        reordered_slot_indexes.insert(destination_slot - first_slot, moved_slot_index);
+
+        let mut replacement = Vec::new();
+        for (position, slot_index) in reordered_slot_indexes.iter().enumerate() {
+            replacement.extend_from_slice(&slot_chunks[*slot_index - first_slot]);
+            if position < separator_chunks.len() {
+                replacement.extend_from_slice(&separator_chunks[position]);
+            }
+        }
+        candidate
+            .events
+            .splice(replace_start..replace_end, replacement);
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
     fn unique_mixer_effect_slot(
         &self,
         insert_ordinal: usize,
@@ -24566,6 +24742,96 @@ mod tests {
         assert!(document.set_mixer_effect_slot_mix_raw(0, 3, 6_401).is_err());
         assert_eq!(
             document.encode_lossless().expect("encoding should succeed"),
+            original
+        );
+    }
+
+    #[test]
+    fn mixer_effect_slot_move_carries_plugin_state_and_remaps_slot_controls() {
+        let mut event_stream = vec![0x9A];
+        event_stream.extend_from_slice(&(-1_i32).to_le_bytes());
+        event_stream.push(0x93);
+        event_stream.extend_from_slice(&(-1_i32).to_le_bytes());
+        event_stream.push(0x95);
+        event_stream.extend_from_slice(&0_u32.to_le_bytes());
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+        append_data_event(&mut event_stream, 0xC9, b"Fruity Parametric EQ 2\0");
+        append_data_event(&mut event_stream, 0xCB, b"Drum EQ\0");
+        append_data_event(&mut event_stream, 0xD5, &[0xA1, 0xB2, 0xC3]);
+        for slot_index in 1_u16..10 {
+            event_stream.push(0x62);
+            event_stream.extend_from_slice(&slot_index.to_le_bytes());
+        }
+        event_stream.push(0x93);
+        event_stream.extend_from_slice(&(-1_i32).to_le_bytes());
+
+        let mut parameters = Vec::new();
+        for (parameter_id, slot_index, value) in [
+            (0_u8, 0_u16, 1_i32),
+            (1_u8, 1_u16, 1_234_i32),
+            (0_u8, 2_u16, 0_i32),
+        ] {
+            parameters.extend_from_slice(&[0xA1, 0xB2, 0xC3, 0xD4, parameter_id, 0x5A]);
+            parameters.extend_from_slice(&((64_u16 << 6) | slot_index).to_le_bytes());
+            parameters.extend_from_slice(&value.to_le_bytes());
+        }
+        append_data_event(&mut event_stream, 0xE1, &parameters);
+
+        let original = flp_fixture(&event_stream, &[], &[]);
+        let mut document = FlpDocument::parse(&original).expect("the fixture should parse");
+        document
+            .move_mixer_effect_slot(0, 0, 2)
+            .expect("the complete ten-slot chain should be reorderable");
+
+        let slots = document.mixer_effect_slots();
+        assert_eq!(slots.len(), 10);
+        assert_eq!(slots[0].plugin_identifier(), None);
+        assert_eq!(slots[1].plugin_identifier(), None);
+        assert_eq!(slots[2].plugin_identifier(), Some("Fruity Parametric EQ 2"));
+        assert_eq!(slots[2].display_name(), Some("Drum EQ"));
+        assert_eq!(slots[2].state_event_count(), 1);
+        assert_eq!(slots[0].mix_raw(), Some(1_234));
+        assert_eq!(slots[1].enabled(), Some(false));
+        assert_eq!(slots[2].enabled(), Some(true));
+
+        let moved_state = slots[2]
+            .event_range()
+            .map(|event_index| &document.events()[event_index])
+            .find(|event| event.opcode() == 0xD5)
+            .expect("the opaque plug-in state should move with its slot");
+        assert_eq!(moved_state.payload(), [0xA1, 0xB2, 0xC3]);
+
+        let encoded = document
+            .encode_lossless()
+            .expect("the reordered project should encode losslessly");
+        let round_trip = FlpDocument::parse(&encoded).expect("the reordered project parses");
+        assert_eq!(round_trip.mixer_effect_slots(), slots);
+
+        let mut moved_back = round_trip;
+        moved_back
+            .move_mixer_effect_slot(0, 2, 0)
+            .expect("the effect can move back across the same range");
+        assert_eq!(
+            moved_back.encode_lossless().expect("encoding succeeds"),
+            original
+        );
+    }
+
+    #[test]
+    fn mixer_effect_slot_move_rejects_unknown_slot_parameters_without_mutation() {
+        let mut event_stream = Vec::new();
+        append_complete_mixer_insert_state(&mut event_stream, -1, 0, 0, "Master", &[0xAA]);
+        let mut parameters = Vec::new();
+        parameters.extend_from_slice(&[0, 0, 0, 0, 2, 0]);
+        parameters.extend_from_slice(&(64_u16 << 6).to_le_bytes());
+        parameters.extend_from_slice(&123_i32.to_le_bytes());
+        append_data_event(&mut event_stream, 0xE1, &parameters);
+
+        let original = flp_fixture(&event_stream, &[], &[]);
+        let mut document = FlpDocument::parse(&original).expect("the fixture should parse");
+        assert!(document.move_mixer_effect_slot(0, 0, 1).is_err());
+        assert_eq!(
+            document.encode_lossless().expect("encoding succeeds"),
             original
         );
     }

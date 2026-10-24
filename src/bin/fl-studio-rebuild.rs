@@ -42069,6 +42069,7 @@ impl DawUi {
         let mut send_flag_edits = Vec::new();
         let mut load_insert_state = None;
         let mut save_insert_state = None;
+        let mut effect_slot_move = None;
         let available_height = ui.available_height();
         let inspector_width = 238.0_f32.min((ui.available_width() * 0.3).max(190.0));
         let bank_width = (ui.available_width() - inspector_width - 10.0).max(180.0);
@@ -43511,6 +43512,26 @@ impl DawUi {
                                                 });
                                             });
                                             ui.horizontal(|ui| {
+                                                if slot_index > 0
+                                                    && ui.small_button("Move up").clicked()
+                                                {
+                                                    effect_slot_move = Some((
+                                                        insert.ordinal(),
+                                                        slot_index as u16,
+                                                        (slot_index - 1) as u16,
+                                                    ));
+                                                }
+                                                if slot_index < 9
+                                                    && ui.small_button("Move down").clicked()
+                                                {
+                                                    effect_slot_move = Some((
+                                                        insert.ordinal(),
+                                                        slot_index as u16,
+                                                        (slot_index + 1) as u16,
+                                                    ));
+                                                }
+                                            });
+                                            ui.horizontal(|ui| {
                                                 if let Some(mut enabled) = slot.enabled() {
                                                     if ui.checkbox(&mut enabled, "Enabled").changed()
                                                         && let Some((event_index, record_index)) =
@@ -43574,7 +43595,7 @@ impl DawUi {
                             }
                             ui.small(
                                 egui::RichText::new(
-                                    "State events are preserved and can be transferred from a Mixer preset; plug-ins are not hosted or processed in this view.",
+                                    "Move up/down carries saved slot events with the effect. State events can also be transferred from a Mixer preset; plug-ins are not hosted or processed in this view.",
                                 )
                                 .color(MUTED),
                             );
@@ -43866,6 +43887,23 @@ impl DawUi {
                     destination_track,
                     Some(enabled),
                 );
+            }
+        }
+        if let Some((insert_ordinal, from_slot, to_slot)) = effect_slot_move
+            && let Some(document) = self.document.as_mut()
+        {
+            match document.move_mixer_effect_slot(insert_ordinal, from_slot, to_slot) {
+                Ok(()) => {
+                    self.dirty = true;
+                    self.status = format!(
+                        "Moved Mixer insert {insert_ordinal} effect slot {} to {}",
+                        from_slot + 1,
+                        to_slot + 1
+                    );
+                }
+                Err(error) => {
+                    self.status = format!("Could not move Mixer effect slot: {error}");
+                }
             }
         }
     }
