@@ -1265,7 +1265,7 @@ impl Vst3PlaylistStreamProcessor {
             self.mixer_effect_dry_scratch.resize(samples_per_track, 0.0);
             let track_bus = &meter_buses[bus_start..bus_end];
             let mut invertible = true;
-            for (frame_index, samples) in track_bus.chunks_exact(2).enumerate() {
+            for (frame_index, samples) in track_bus.as_chunks::<2>().0.iter().enumerate() {
                 let mut frame = [samples[0], samples[1]];
                 if !chain.signal_transform.apply_inverse_frame(&mut frame) {
                     if frame[0] != 0.0 || frame[1] != 0.0 {
@@ -1292,8 +1292,10 @@ impl Vst3PlaylistStreamProcessor {
 
             for (frame_index, (processed, dry)) in self
                 .mixer_effect_scratch
-                .chunks_exact(2)
-                .zip(self.mixer_effect_dry_scratch.chunks_exact(2))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .zip(self.mixer_effect_dry_scratch.as_chunks::<2>().0.iter())
                 .enumerate()
             {
                 let mut delta = [processed[0] - dry[0], processed[1] - dry[1]];
@@ -1387,7 +1389,7 @@ fn process_playlist_mixer_effect_chain(
             let max_frames = effect.block_size.max(1);
             for block in chain_block.chunks_mut(max_frames * 2) {
                 let frame_count = block.len() / 2;
-                for (frame_index, frame) in block.chunks_exact(2).enumerate() {
+                for (frame_index, frame) in block.as_chunks::<2>().0.iter().enumerate() {
                     effect.dry_block[frame_index] =
                         [finite_sample(frame[0]), finite_sample(frame[1])];
                 }
@@ -1426,7 +1428,7 @@ fn process_playlist_mixer_effect_chain(
                 }
                 let wet = &effect.buffers.outputs[0];
                 let dry_gain = 1.0 - effect.wet_mix;
-                for (frame_index, frame) in block.chunks_exact_mut(2).enumerate() {
+                for (frame_index, frame) in block.as_chunks_mut::<2>().0.iter_mut().enumerate() {
                     let wet_left = finite_sample(wet.channels[0][frame_index]);
                     let wet_right = if effect.output_channels == 1 {
                         wet_left
