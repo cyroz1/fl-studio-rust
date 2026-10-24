@@ -4637,6 +4637,7 @@ struct DawUi {
     live_input_note_route_seed: u64,
     current_live_input_note_route_seed: Option<u64>,
     midi_live_sampler_sustain_channels: BTreeSet<u8>,
+    midi_live_sampler_sostenuto_channels: BTreeSet<u8>,
     midi_output_gain_mapping: Option<MidiControlChangeMapping>,
     midi_mixer_control_mappings: Vec<MidiMixerControlMapping>,
     midi_vst3_parameter_mappings: Vec<MidiVst3ParameterMapping>,
@@ -6072,6 +6073,7 @@ impl DawUi {
             live_input_note_route_seed: 0,
             current_live_input_note_route_seed: None,
             midi_live_sampler_sustain_channels: BTreeSet::new(),
+            midi_live_sampler_sostenuto_channels: BTreeSet::new(),
             midi_output_gain_mapping,
             midi_mixer_control_mappings,
             midi_vst3_parameter_mappings,
@@ -44832,6 +44834,16 @@ impl DawUi {
         ) {
             Ok(mut recorder) => {
                 recorder.set_channel_state(self.midi_input_channel_state);
+                recorder.set_pedal_state(
+                    std::array::from_fn(|channel| {
+                        self.midi_live_sampler_sustain_channels
+                            .contains(&(channel as u8))
+                    }),
+                    std::array::from_fn(|channel| {
+                        self.midi_live_sampler_sostenuto_channels
+                            .contains(&(channel as u8))
+                    }),
+                );
                 let scale_snap = (self.midi_record_snap_to_scale
                     && record_notes
                     && self.piano_roll_scale != PianoRollScale::None)
@@ -46403,6 +46415,14 @@ impl DawUi {
                             0
                         },
                     ),
+                    (
+                        66,
+                        if self.midi_live_sampler_sostenuto_channels.contains(&channel) {
+                            127
+                        } else {
+                            0
+                        },
+                    ),
                 ] {
                     let event = Vst3LiveInputEvent::ControlChange {
                         channel,
@@ -46808,6 +46828,14 @@ impl DawUi {
                     0
                 },
             );
+            send_control_change(
+                66,
+                if self.midi_live_sampler_sostenuto_channels.contains(&channel) {
+                    127
+                } else {
+                    0
+                },
+            );
             let _ = sender.send(Vst3LiveInputEvent::PitchBend {
                 channel,
                 value: state.raw_pitch_bend_value(),
@@ -46839,6 +46867,14 @@ impl DawUi {
             send_control_change(
                 64,
                 if self.midi_live_sampler_sustain_channels.contains(&channel) {
+                    127
+                } else {
+                    0
+                },
+            );
+            send_control_change(
+                66,
+                if self.midi_live_sampler_sostenuto_channels.contains(&channel) {
                     127
                 } else {
                     0
@@ -46971,6 +47007,11 @@ impl DawUi {
             .iter()
             .copied()
             .collect::<Vec<_>>();
+        let initial_sostenuto_channels = self
+            .midi_live_sampler_sostenuto_channels
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
         let worker = thread::Builder::new()
             .name("sampler-midi-input".to_owned())
             .spawn(move || {
@@ -47021,6 +47062,12 @@ impl DawUi {
                 }
                 for channel in initial_sustain_channels {
                     let _ = event_sender.send(SamplerLiveNoteEvent::Sustain {
+                        channel,
+                        down: true,
+                    });
+                }
+                for channel in initial_sostenuto_channels {
+                    let _ = event_sender.send(SamplerLiveNoteEvent::Sostenuto {
                         channel,
                         down: true,
                     });
@@ -47085,6 +47132,7 @@ impl DawUi {
         self.stop_live_sampler_input();
         self.stop_live_vst3_input();
         self.midi_live_sampler_sustain_channels.clear();
+        self.midi_live_sampler_sostenuto_channels.clear();
         if was_auditioning {
             self.stop_live_audition_playback_if_stopped();
         }
@@ -47410,6 +47458,17 @@ impl DawUi {
             ),
             MidiInputEvent::ControlChange {
                 channel,
+                controller: 66,
+                value,
+            } => (
+                SamplerLiveNoteEvent::Sostenuto {
+                    channel,
+                    down: value >= 64,
+                },
+                None,
+            ),
+            MidiInputEvent::ControlChange {
+                channel,
                 controller: 121,
                 ..
             } => (
@@ -47467,6 +47526,7 @@ impl DawUi {
     fn poll_live_sampler_input(&mut self) {
         if self.midi_input_connection.is_none() {
             self.midi_live_sampler_sustain_channels.clear();
+            self.midi_live_sampler_sostenuto_channels.clear();
         }
         if self.live_sampler_input.as_ref().is_some_and(|session| {
             !self.can_audition_live_midi_input()
@@ -48143,10 +48203,36 @@ impl DawUi {
                 }
                 MidiInputEvent::ControlChange {
                     channel,
-                    controller: 64 | 121,
+                    controller: 64,
                     ..
                 } => {
                     self.midi_live_sampler_sustain_channels
+                        .remove(&(channel & 0x0F));
+                }
+                MidiInputEvent::ControlChange {
+                    channel,
+                    controller: 66,
+                    value,
+                } if value >= 64 => {
+                    self.midi_live_sampler_sostenuto_channels
+                        .insert(channel & 0x0F);
+                }
+                MidiInputEvent::ControlChange {
+                    channel,
+                    controller: 66,
+                    ..
+                } => {
+                    self.midi_live_sampler_sostenuto_channels
+                        .remove(&(channel & 0x0F));
+                }
+                MidiInputEvent::ControlChange {
+                    channel,
+                    controller: 121,
+                    ..
+                } => {
+                    self.midi_live_sampler_sustain_channels
+                        .remove(&(channel & 0x0F));
+                    self.midi_live_sampler_sostenuto_channels
                         .remove(&(channel & 0x0F));
                 }
                 _ => {}

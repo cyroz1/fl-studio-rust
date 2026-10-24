@@ -686,6 +686,10 @@ pub enum SamplerLiveNoteEvent {
         channel: u8,
         down: bool,
     },
+    Sostenuto {
+        channel: u8,
+        down: bool,
+    },
     ResetControllers {
         channel: u8,
         pan: u8,
@@ -5525,12 +5529,16 @@ pub fn stream_sampler_midi_input_to_device(
                 Ok(SamplerLiveNoteEvent::Sustain { channel, down }) => {
                     engine.set_live_sustain(channel, down);
                 }
+                Ok(SamplerLiveNoteEvent::Sostenuto { channel, down }) => {
+                    engine.set_live_sostenuto(channel, down);
+                }
                 Ok(SamplerLiveNoteEvent::ResetControllers {
                     channel,
                     pan,
                     pitch_bend_cents,
                 }) => {
                     engine.set_live_sustain(channel, false);
+                    engine.set_live_sostenuto(channel, false);
                     engine.apply_live_pan(channel, pan);
                     engine.apply_live_expression(channel, 127);
                     engine.apply_live_pitch_bend(channel, pitch_bend_cents);
@@ -5768,6 +5776,7 @@ pub fn stream_mixed_layer_midi_input_to_device(
                             match controller {
                                 10 => sampler_engine.apply_live_pan(channel, value),
                                 64 => sampler_engine.set_live_sustain(channel, value >= 64),
+                                66 => sampler_engine.set_live_sostenuto(channel, value >= 64),
                                 120 => {
                                     note_targets.retain(|(midi_channel, _), _| {
                                         *midi_channel != (channel & 0x0F)
@@ -5797,6 +5806,7 @@ pub fn stream_mixed_layer_midi_input_to_device(
                         pitch_bend_cents,
                     }) => {
                         sampler_engine.set_live_sustain(channel, false);
+                        sampler_engine.set_live_sostenuto(channel, false);
                         sampler_engine.apply_live_pan(channel, pan);
                         sampler_engine.apply_live_pitch_bend(channel, pitch_bend_cents);
                     }
@@ -10469,6 +10479,7 @@ struct SamplerVoiceEngine<'a> {
     live_midi_pan: [u8; 16],
     live_midi_expression: [u8; 16],
     sustain_down: [bool; 16],
+    sostenuto_down: [bool; 16],
 }
 
 struct SamplerVoice {
@@ -10485,6 +10496,7 @@ struct SamplerVoice {
     pitch_offset_cents: f64,
     note_slide: Option<SamplerNoteSlide>,
     key_released: bool,
+    sostenuto_held: bool,
     release_started: bool,
     volume_envelope_enabled: bool,
     loop_bounds: Option<SampleBounds>,
@@ -10610,6 +10622,7 @@ impl<'a> SamplerVoiceEngine<'a> {
             live_midi_pan: [64; 16],
             live_midi_expression: [127; 16],
             sustain_down: [false; 16],
+            sostenuto_down: [false; 16],
         }
     }
 
@@ -10974,6 +10987,7 @@ impl<'a> SamplerVoiceEngine<'a> {
             pitch_offset_cents: 0.0,
             note_slide: None,
             key_released: false,
+            sostenuto_held: false,
             release_started: false,
             volume_envelope_enabled: source.volume_envelope_enabled,
             loop_bounds: source.loop_bounds,
@@ -11156,7 +11170,7 @@ impl<'a> SamplerVoiceEngine<'a> {
         let release_frames = self.release_frames;
         for voice in self.voices.iter_mut().filter_map(Option::as_mut) {
             if voice.input_midi_channel == Some(channel) && !voice.key_released {
-                if !sustain_down {
+                if !sustain_down && !voice.sostenuto_held {
                     begin_sampler_voice_release(voice, release_frames);
                 } else {
                     voice.key_released = true;
@@ -11186,9 +11200,34 @@ impl<'a> SamplerVoiceEngine<'a> {
             for voice in self.voices.iter_mut().filter_map(Option::as_mut) {
                 if voice.input_midi_channel == Some(channel)
                     && voice.key_released
+                    && !voice.sostenuto_held
                     && !voice.release_started
                 {
                     begin_sampler_voice_release(voice, self.release_frames);
+                }
+            }
+        }
+    }
+
+    fn set_live_sostenuto(&mut self, channel: u8, down: bool) {
+        let channel = channel & 0x0F;
+        let channel_index = usize::from(channel);
+        let was_down = self.sostenuto_down[channel_index];
+        self.sostenuto_down[channel_index] = down;
+        if !was_down && down {
+            for voice in self.voices.iter_mut().filter_map(Option::as_mut) {
+                if voice.input_midi_channel == Some(channel) && !voice.key_released {
+                    voice.sostenuto_held = true;
+                }
+            }
+        } else if was_down && !down {
+            let sustain_down = self.sustain_down[channel_index];
+            for voice in self.voices.iter_mut().filter_map(Option::as_mut) {
+                if voice.input_midi_channel == Some(channel) {
+                    voice.sostenuto_held = false;
+                    if voice.key_released && !sustain_down && !voice.release_started {
+                        begin_sampler_voice_release(voice, self.release_frames);
+                    }
                 }
             }
         }
@@ -11209,7 +11248,7 @@ impl<'a> SamplerVoiceEngine<'a> {
             })
             .min_by_key(|voice| voice.started_frame);
         if let Some(voice) = voice {
-            if !sustain_down {
+            if !sustain_down && !voice.sostenuto_held {
                 begin_sampler_voice_release(voice, self.release_frames);
             } else {
                 voice.key_released = true;
@@ -16675,6 +16714,85 @@ mod tests {
         engine.render_block(1, 1, &mut output[2..]);
         assert!((output[2] - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6);
         assert!((output[3] - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sampler_live_sostenuto_captures_only_voices_active_at_pedal_down() {
+        let sources = HashMap::from([(
+            7,
+            SamplerVoiceSource {
+                audio: Arc::new(DecodedAudio {
+                    sample_rate: 4,
+                    channels: vec![vec![1.0; 8]],
+                }),
+                gain: 1.0,
+                pan: 0.0,
+                reverse: false,
+                volume_envelope_enabled: false,
+                max_polyphony_raw: None,
+                mono_enabled: false,
+                channel_cut_groups: None,
+                fast_declick_for_cut_groups: false,
+                key_range: None,
+                velocity_range: None,
+                root_key: SAMPLER_ROOT_KEY,
+                fine_tune_cents: 0.0,
+                loop_bounds: None,
+                ping_pong_loop: false,
+                release_loop_bounds: None,
+                release_ping_pong_loop: false,
+            },
+        )]);
+        let mut engine = SamplerVoiceEngine::new(&sources, &[], 3, 4, 4);
+        let start_voice = |key| ScheduledSamplerNote {
+            clip_index: 0,
+            playlist_track_id: None,
+            start_tick: 0,
+            stop_tick: None,
+            start_frame: 0,
+            stop_frame: None,
+            channel_id: 7,
+            key,
+            midi_channel: 0,
+            slide_note: false,
+            velocity: 127,
+            pan: 64,
+            fine_pitch_offset_cents: 0,
+            layer_gain: 1.0,
+        };
+        let captured_slot = engine
+            .start_voice(start_voice(SAMPLER_ROOT_KEY))
+            .expect("first live voice should start");
+        engine.set_voice_input_midi_channel(captured_slot, 3);
+        engine.set_live_sostenuto(3, true);
+        engine.release_note(7, SAMPLER_ROOT_KEY, 3);
+        assert!(
+            engine.voices[captured_slot]
+                .as_ref()
+                .is_some_and(|voice| voice.key_released
+                    && voice.sostenuto_held
+                    && !voice.release_started)
+        );
+
+        let uncaptured_slot = engine
+            .start_voice(start_voice(SAMPLER_ROOT_KEY + 2))
+            .expect("second live voice should start");
+        engine.set_voice_input_midi_channel(uncaptured_slot, 3);
+        engine.release_note(7, SAMPLER_ROOT_KEY + 2, 3);
+        assert!(
+            engine.voices[uncaptured_slot]
+                .as_ref()
+                .is_some_and(|voice| voice.key_released
+                    && !voice.sostenuto_held
+                    && voice.release_started)
+        );
+
+        engine.set_live_sostenuto(3, false);
+        assert!(
+            engine.voices[captured_slot]
+                .as_ref()
+                .is_some_and(|voice| !voice.sostenuto_held && voice.release_started)
+        );
     }
 
     #[test]

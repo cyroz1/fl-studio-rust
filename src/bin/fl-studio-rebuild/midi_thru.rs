@@ -323,6 +323,7 @@ struct MidiThruProcessor {
     active_notes: BTreeMap<(u8, u8), u8>,
     note_mapping: BTreeMap<(u8, u8), VecDeque<(u8, u8)>>,
     sustain_channels: BTreeSet<u8>,
+    sostenuto_channels: BTreeSet<u8>,
 }
 
 impl MidiThruProcessor {
@@ -492,6 +493,24 @@ impl MidiThruProcessor {
             }
             (
                 ControlChange {
+                    controller: 66,
+                    value,
+                    ..
+                },
+                ControlChange {
+                    channel: output_channel,
+                    ..
+                },
+            ) => {
+                let channel = output_channel & 0x0F;
+                if value >= 64 {
+                    self.sostenuto_channels.insert(channel);
+                } else {
+                    self.sostenuto_channels.remove(&channel);
+                }
+            }
+            (
+                ControlChange {
                     controller: 120 | 123..=127,
                     ..
                 },
@@ -518,6 +537,7 @@ impl MidiThruProcessor {
                 },
             ) => {
                 self.sustain_channels.remove(&(output_channel & 0x0F));
+                self.sostenuto_channels.remove(&(output_channel & 0x0F));
             }
             _ => {}
         }
@@ -528,11 +548,20 @@ impl MidiThruProcessor {
         let active_notes = std::mem::take(&mut self.active_notes);
         self.note_mapping.clear();
         let sustain_channels = std::mem::take(&mut self.sustain_channels);
+        let sostenuto_channels = std::mem::take(&mut self.sostenuto_channels);
         let output = output?;
         let mut first_error = None;
         for channel in sustain_channels {
             let sustain_off = [0xB0 | (channel & 0x0F), 64, 0];
             if let Err(error) = output.send(&sustain_off)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        for channel in sostenuto_channels {
+            let sostenuto_off = [0xB0 | (channel & 0x0F), 66, 0];
+            if let Err(error) = output.send(&sostenuto_off)
                 && first_error.is_none()
             {
                 first_error = Some(error);
@@ -723,12 +752,28 @@ mod tests {
                 &mut output,
             )
             .unwrap();
+        processor
+            .process(
+                MidiInputEvent::ControlChange {
+                    channel: 1,
+                    controller: 66,
+                    value: 127,
+                },
+                MidiThruSettings::default(),
+                &mut output,
+            )
+            .unwrap();
         output.0.clear();
 
         assert_eq!(processor.release_active(Some(&mut output)), None);
         assert_eq!(
             output.0,
-            vec![vec![0xB1, 64, 0], vec![0x81, 64, 0], vec![0x81, 64, 0]]
+            vec![
+                vec![0xB1, 64, 0],
+                vec![0xB1, 66, 0],
+                vec![0x81, 64, 0],
+                vec![0x81, 64, 0]
+            ]
         );
         assert!(processor.active_notes.is_empty());
         assert!(processor.note_mapping.is_empty());

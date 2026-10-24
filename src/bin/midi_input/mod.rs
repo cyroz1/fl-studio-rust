@@ -1203,12 +1203,14 @@ struct ActiveMidiNote {
     mod_x: u8,
     mod_y: u8,
     fine_pitch: u8,
+    sostenuto_held: bool,
 }
 
 struct SustainedMidiNote {
     key: u8,
     note: ActiveMidiNote,
     release_velocity: Option<u8>,
+    sostenuto_held: bool,
 }
 
 pub struct MidiPatternRecorder {
@@ -1226,6 +1228,7 @@ pub struct MidiPatternRecorder {
     timestamp_origin_micros: Option<u64>,
     channel_state: [MidiInputChannelState; 16],
     sustain_channels: [bool; 16],
+    sostenuto_channels: [bool; 16],
     active_notes: BTreeMap<(u8, u8), VecDeque<ActiveMidiNote>>,
     sustained_notes: BTreeMap<u8, Vec<SustainedMidiNote>>,
     notes: Vec<PatternNote>,
@@ -1287,6 +1290,7 @@ impl MidiPatternRecorder {
             timestamp_origin_micros: None,
             channel_state: [MidiInputChannelState::default(); 16],
             sustain_channels: [false; 16],
+            sostenuto_channels: [false; 16],
             active_notes: BTreeMap::new(),
             sustained_notes: BTreeMap::new(),
             notes: Vec::new(),
@@ -1306,6 +1310,15 @@ impl MidiPatternRecorder {
 
     pub fn set_channel_state(&mut self, channel_state: [MidiInputChannelState; 16]) {
         self.channel_state = channel_state;
+    }
+
+    pub fn set_pedal_state(
+        &mut self,
+        sustain_channels: [bool; 16],
+        sostenuto_channels: [bool; 16],
+    ) {
+        self.sustain_channels = sustain_channels;
+        self.sostenuto_channels = sostenuto_channels;
     }
 
     /// Returns the Pattern-relative position for a received MIDI message using the same
@@ -1369,6 +1382,7 @@ impl MidiPatternRecorder {
                         mod_x: channel_state.note_mod_x(),
                         mod_y: channel_state.note_mod_y(),
                         fine_pitch: channel_state.note_fine_pitch(),
+                        sostenuto_held: false,
                     });
             }
             MidiInputEvent::NoteOff {
@@ -1408,7 +1422,41 @@ impl MidiPatternRecorder {
                 let was_enabled = *sustain;
                 *sustain = value >= 64;
                 if was_enabled && !*sustain {
-                    self.finish_sustained_notes(channel, tick);
+                    self.finish_unheld_sustained_notes(channel, tick);
+                }
+            }
+            MidiInputEvent::ControlChange {
+                channel,
+                controller: 66,
+                value,
+            } => {
+                let Some(sostenuto) = self.sostenuto_channels.get_mut(usize::from(channel)) else {
+                    return;
+                };
+                let was_enabled = *sostenuto;
+                *sostenuto = value >= 64;
+                if !was_enabled && *sostenuto {
+                    for ((active_channel, _), notes) in &mut self.active_notes {
+                        if *active_channel == channel {
+                            for note in notes {
+                                note.sostenuto_held = true;
+                            }
+                        }
+                    }
+                } else if was_enabled && !*sostenuto {
+                    for ((active_channel, _), notes) in &mut self.active_notes {
+                        if *active_channel == channel {
+                            for note in notes {
+                                note.sostenuto_held = false;
+                            }
+                        }
+                    }
+                    if let Some(notes) = self.sustained_notes.get_mut(&channel) {
+                        for note in notes {
+                            note.sostenuto_held = false;
+                        }
+                    }
+                    self.finish_unheld_sustained_notes(channel, tick);
                 }
             }
             MidiInputEvent::ControlChange {
@@ -1423,6 +1471,16 @@ impl MidiPatternRecorder {
             } => {
                 if let Some(sustain) = self.sustain_channels.get_mut(usize::from(channel)) {
                     *sustain = false;
+                }
+                if let Some(sostenuto) = self.sostenuto_channels.get_mut(usize::from(channel)) {
+                    *sostenuto = false;
+                }
+                for ((active_channel, _), notes) in &mut self.active_notes {
+                    if *active_channel == channel {
+                        for note in notes {
+                            note.sostenuto_held = false;
+                        }
+                    }
                 }
                 self.finish_sustained_notes(channel, tick);
             }
@@ -1443,11 +1501,13 @@ impl MidiPatternRecorder {
         key: u8,
         release_velocity: Option<u8>,
     ) {
+        let sostenuto_held = active_note.sostenuto_held;
         if self
             .sustain_channels
             .get(usize::from(channel))
             .copied()
             .unwrap_or(false)
+            || sostenuto_held
         {
             self.sustained_notes
                 .entry(channel)
@@ -1456,6 +1516,7 @@ impl MidiPatternRecorder {
                     key,
                     note: active_note,
                     release_velocity,
+                    sostenuto_held,
                 });
         } else {
             self.notes
@@ -1493,10 +1554,35 @@ impl MidiPatternRecorder {
         }
     }
 
-    fn stop_channel_notes(&mut self, channel: u8, end_tick: u32) {
-        if let Some(sustain) = self.sustain_channels.get_mut(usize::from(channel)) {
-            *sustain = false;
+    fn finish_unheld_sustained_notes(&mut self, channel: u8, end_tick: u32) {
+        let sustain_down = self
+            .sustain_channels
+            .get(usize::from(channel))
+            .copied()
+            .unwrap_or(false);
+        let Some(sustained) = self.sustained_notes.remove(&channel) else {
+            return;
+        };
+        let mut still_held = Vec::new();
+        for sustained_note in sustained {
+            if sustain_down || sustained_note.sostenuto_held {
+                still_held.push(sustained_note);
+            } else {
+                self.notes.push(self.make_note(
+                    sustained_note.note,
+                    end_tick,
+                    channel,
+                    sustained_note.key,
+                    sustained_note.release_velocity,
+                ));
+            }
         }
+        if !still_held.is_empty() {
+            self.sustained_notes.insert(channel, still_held);
+        }
+    }
+
+    fn stop_channel_notes(&mut self, channel: u8, end_tick: u32) {
         let active_keys = self
             .active_notes
             .keys()
@@ -2043,14 +2129,9 @@ mod tests {
             received_at: started_at + Duration::from_millis(elapsed_ms),
             event,
         };
-        recorder.record(message(
-            50,
-            MidiInputEvent::ControlChange {
-                channel: 0,
-                controller: 64,
-                value: 127,
-            },
-        ));
+        let mut sustain_channels = [false; 16];
+        sustain_channels[0] = true;
+        recorder.set_pedal_state(sustain_channels, [false; 16]);
         recorder.record(message(
             100,
             MidiInputEvent::NoteOn {
@@ -2112,6 +2193,117 @@ mod tests {
             .find(|note| note.key == 64)
             .expect("the note on the other channel should finish immediately");
         assert_eq!(other_channel.length, 19);
+    }
+
+    #[test]
+    fn sostenuto_captures_pedal_down_notes_and_composes_with_sustain() {
+        let started_at = Instant::now();
+        let mut recorder = MidiPatternRecorder::new(
+            MidiPatternRecorderSettings {
+                pattern_id: 1,
+                channel_id: 2,
+                project_path: None,
+                ppq: 96,
+                tempo_bpm: 120.0,
+                start_tick: 0,
+                snap_ticks: None,
+                timing_offset_ms: 0,
+                song_timeline_start: None,
+            },
+            started_at,
+        )
+        .expect("valid project timing should create a recorder");
+        let message = |elapsed_ms, event| ReceivedMidiMessage {
+            timestamp_micros: 1_000_000 + elapsed_ms * 1_000,
+            received_at: started_at + Duration::from_millis(elapsed_ms),
+            event,
+        };
+        recorder.record(message(
+            100,
+            MidiInputEvent::NoteOn {
+                channel: 0,
+                key: 60,
+                velocity: 100,
+            },
+        ));
+        recorder.record(message(
+            150,
+            MidiInputEvent::ControlChange {
+                channel: 0,
+                controller: 66,
+                value: 127,
+            },
+        ));
+        recorder.record(message(
+            175,
+            MidiInputEvent::NoteOn {
+                channel: 0,
+                key: 62,
+                velocity: 90,
+            },
+        ));
+        recorder.record(message(
+            200,
+            MidiInputEvent::NoteOff {
+                channel: 0,
+                key: 62,
+                velocity: 70,
+            },
+        ));
+        recorder.record(message(
+            210,
+            MidiInputEvent::ControlChange {
+                channel: 0,
+                controller: 64,
+                value: 127,
+            },
+        ));
+        recorder.record(message(
+            220,
+            MidiInputEvent::NoteOff {
+                channel: 0,
+                key: 60,
+                velocity: 88,
+            },
+        ));
+        recorder.record(message(
+            250,
+            MidiInputEvent::ControlChange {
+                channel: 0,
+                controller: 66,
+                value: 0,
+            },
+        ));
+        recorder.record(message(
+            300,
+            MidiInputEvent::ControlChange {
+                channel: 0,
+                controller: 64,
+                value: 0,
+            },
+        ));
+
+        let result = recorder.finish(None, started_at + Duration::from_millis(350));
+        let captured = result
+            .notes
+            .iter()
+            .find(|note| note.key == 60)
+            .expect("note held at pedal-down should be recorded");
+        let uncaptured = result
+            .notes
+            .iter()
+            .find(|note| note.key == 62)
+            .expect("note started after pedal-down should be recorded");
+        assert_eq!(captured.length, 39);
+        assert_eq!(
+            captured.release,
+            midi_release_velocity_to_fl_note_release(88)
+        );
+        assert_eq!(uncaptured.length, 4);
+        assert_eq!(
+            uncaptured.release,
+            midi_release_velocity_to_fl_note_release(70)
+        );
     }
 
     #[test]

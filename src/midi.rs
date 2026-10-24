@@ -117,6 +117,7 @@ struct MidiChannelNoteState {
     rpn_msb: u8,
     rpn_lsb: u8,
     sustain_pedal_down: bool,
+    sostenuto_pedal_down: bool,
 }
 
 impl Default for MidiChannelNoteState {
@@ -131,6 +132,7 @@ impl Default for MidiChannelNoteState {
             rpn_msb: 127,
             rpn_lsb: 127,
             sustain_pedal_down: false,
+            sostenuto_pedal_down: false,
         }
     }
 }
@@ -1708,17 +1710,47 @@ impl MidiTrack {
     }
 
     /// Pairs note events using the supplied velocity-zero and channel-selection options.
-    /// CC 64 sustain defers each note's end tick until pedal-up on the same channel,
-    /// while retaining the release velocity from the original Note Off. CC 120 closes
-    /// all active and sustained notes immediately; CC 123–127 release active notes and
-    /// defer their end ticks while sustain is down.
+    /// CC 64 sustain defers each note's end tick until pedal-up on the same channel.
+    /// CC 66 sostenuto captures notes that are active when the pedal goes down and
+    /// defers their ends until pedal-up. Both pedals can hold a note together, while
+    /// retaining the release velocity from the original Note Off. CC 120 closes all
+    /// active and sustained notes immediately; CC 123–127 release active notes and
+    /// defer their end ticks while either pedal holds them.
     /// `realign_events` is applied by document import methods because aligning
     /// several tracks requires a shared project-time origin.
     pub fn notes_with_options(&self, options: MidiImportOptions) -> Vec<MidiNote> {
         let mut notes: Vec<MidiNote> = Vec::new();
         let mut active: BTreeMap<(u8, u8), VecDeque<usize>> = BTreeMap::new();
         let mut channel_state = BTreeMap::<u8, MidiChannelNoteState>::new();
-        let mut sustained_note_offs = BTreeMap::<u8, Vec<usize>>::new();
+        let mut deferred_note_offs = BTreeMap::<u8, Vec<usize>>::new();
+        let mut sostenuto_captured_notes = BTreeMap::<u8, BTreeSet<usize>>::new();
+
+        fn finish_unheld_notes(
+            channel: u8,
+            end_tick: u64,
+            state: MidiChannelNoteState,
+            notes: &mut [MidiNote],
+            deferred_note_offs: &mut BTreeMap<u8, Vec<usize>>,
+            sostenuto_captured_notes: &BTreeMap<u8, BTreeSet<usize>>,
+        ) {
+            let Some(deferred) = deferred_note_offs.remove(&channel) else {
+                return;
+            };
+            let captured = sostenuto_captured_notes.get(&channel);
+            let mut still_held = Vec::new();
+            for note_index in deferred {
+                let held_by_sostenuto = state.sostenuto_pedal_down
+                    && captured.is_some_and(|captured| captured.contains(&note_index));
+                if state.sustain_pedal_down || held_by_sostenuto {
+                    still_held.push(note_index);
+                } else {
+                    notes[note_index].end_tick = Some(end_tick);
+                }
+            }
+            if !still_held.is_empty() {
+                deferred_note_offs.insert(channel, still_held);
+            }
+        }
 
         for event in &self.events {
             let MidiEventKind::ChannelVoice { status, data } = &event.kind else {
@@ -1743,13 +1775,40 @@ impl MidiTrack {
                         64 => {
                             let was_down = state.sustain_pedal_down;
                             state.sustain_pedal_down = data[1] >= 64;
-                            if was_down
-                                && !state.sustain_pedal_down
-                                && let Some(note_indices) = sustained_note_offs.remove(&channel)
-                            {
-                                for note_index in note_indices {
-                                    notes[note_index].end_tick = Some(event.absolute_tick);
+                            let state = *state;
+                            if was_down && !state.sustain_pedal_down {
+                                finish_unheld_notes(
+                                    channel,
+                                    event.absolute_tick,
+                                    state,
+                                    &mut notes,
+                                    &mut deferred_note_offs,
+                                    &sostenuto_captured_notes,
+                                );
+                            }
+                        }
+                        66 => {
+                            let was_down = state.sostenuto_pedal_down;
+                            state.sostenuto_pedal_down = data[1] >= 64;
+                            let is_down = state.sostenuto_pedal_down;
+                            let state = *state;
+                            if !was_down && is_down {
+                                let captured = sostenuto_captured_notes.entry(channel).or_default();
+                                for ((active_channel, _), queue) in &active {
+                                    if *active_channel == channel {
+                                        captured.extend(queue.iter().copied());
+                                    }
                                 }
+                            } else if was_down && !is_down {
+                                sostenuto_captured_notes.remove(&channel);
+                                finish_unheld_notes(
+                                    channel,
+                                    event.absolute_tick,
+                                    state,
+                                    &mut notes,
+                                    &mut deferred_note_offs,
+                                    &sostenuto_captured_notes,
+                                );
                             }
                         }
                         120 => {
@@ -1760,7 +1819,8 @@ impl MidiTrack {
                                 }
                             }
                             active.retain(|(active_channel, _), _| *active_channel != channel);
-                            if let Some(sustained) = sustained_note_offs.remove(&channel) {
+                            sostenuto_captured_notes.remove(&channel);
+                            if let Some(sustained) = deferred_note_offs.remove(&channel) {
                                 note_indices.extend(sustained);
                             }
                             for note_index in note_indices {
@@ -1769,7 +1829,8 @@ impl MidiTrack {
                         }
                         121 => {
                             *state = MidiChannelNoteState::default();
-                            if let Some(note_indices) = sustained_note_offs.remove(&channel) {
+                            sostenuto_captured_notes.remove(&channel);
+                            if let Some(note_indices) = deferred_note_offs.remove(&channel) {
                                 for note_index in note_indices {
                                     notes[note_index].end_tick = Some(event.absolute_tick);
                                 }
@@ -1783,13 +1844,18 @@ impl MidiTrack {
                                 }
                             }
                             active.retain(|(active_channel, _), _| *active_channel != channel);
-                            if state.sustain_pedal_down {
-                                sustained_note_offs
-                                    .entry(channel)
-                                    .or_default()
-                                    .extend(note_indices);
-                            } else {
-                                for note_index in note_indices {
+                            let state = *state;
+                            let captured = sostenuto_captured_notes.get(&channel);
+                            for note_index in note_indices {
+                                if state.sustain_pedal_down
+                                    || (state.sostenuto_pedal_down
+                                        && captured.is_some_and(|set| set.contains(&note_index)))
+                                {
+                                    deferred_note_offs
+                                        .entry(channel)
+                                        .or_default()
+                                        .push(note_index);
+                                } else {
                                     notes[note_index].end_tick = Some(event.absolute_tick);
                                 }
                             }
@@ -1839,11 +1905,13 @@ impl MidiTrack {
                     if let Some(queue) = active.get_mut(&note_key) {
                         if let Some(note_index) = queue.pop_front() {
                             notes[note_index].release_velocity = Some(data[1]);
-                            if channel_state
-                                .get(&channel)
-                                .is_some_and(|state| state.sustain_pedal_down)
-                            {
-                                sustained_note_offs
+                            let state = channel_state.get(&channel).copied().unwrap_or_default();
+                            let held_by_sostenuto = state.sostenuto_pedal_down
+                                && sostenuto_captured_notes
+                                    .get(&channel)
+                                    .is_some_and(|captured| captured.contains(&note_index));
+                            if state.sustain_pedal_down || held_by_sostenuto {
+                                deferred_note_offs
                                     .entry(channel)
                                     .or_default()
                                     .push(note_index);
@@ -2679,6 +2747,49 @@ mod tests {
         assert_eq!(notes[1].start_tick(), 0);
         assert_eq!(notes[1].end_tick(), Some(20));
         assert_eq!(notes[1].release_velocity(), Some(44));
+    }
+
+    #[test]
+    fn midi_import_sostenuto_holds_only_notes_already_active_when_pressed() {
+        let midi = MidiFile::parse(&midi_fixture(&[
+            0x00, 0x90, 0x3C, 0x64, // C4 starts at tick 0.
+            0x0A, 0xB0, 66, 127, // Sostenuto down at tick 10; captures C4.
+            0x0A, 0x90, 0x3E, 0x5A, // D4 starts at tick 20; not captured.
+            0x0A, 0x80, 0x3C, 31, // C4 released at tick 30, but remains held.
+            0x0A, 0x80, 0x3E, 41, // D4 released at tick 40 and ends immediately.
+            0x0A, 0xB0, 66, 63, // Sostenuto up at tick 50.
+            0x00, 0xFF, 0x2F, 0x00,
+        ]))
+        .expect("sostenuto fixture should parse");
+        let notes = midi.tracks()[0].notes();
+
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes[0].key(), 60);
+        assert_eq!(notes[0].end_tick(), Some(50));
+        assert_eq!(notes[0].release_velocity(), Some(31));
+        assert_eq!(notes[1].key(), 62);
+        assert_eq!(notes[1].end_tick(), Some(40));
+        assert_eq!(notes[1].release_velocity(), Some(41));
+    }
+
+    #[test]
+    fn midi_import_sustain_and_sostenuto_hold_notes_until_both_are_released() {
+        let midi = MidiFile::parse(&midi_fixture(&[
+            0x00, 0x90, 0x3C, 0x64, // C4 starts at tick 0.
+            0x05, 0xB0, 66, 127, // Sostenuto down at tick 5.
+            0x05, 0xB0, 64, 127, // Sustain down at tick 10.
+            0x05, 0xB0, 123, 0, // All Notes Off at tick 15; both pedals hold C4.
+            0x05, 0xB0, 66, 0, // Sostenuto up at tick 20; sustain still holds C4.
+            0x0A, 0xB0, 64, 0, // Sustain up at tick 30; C4 ends here.
+            0x00, 0xFF, 0x2F, 0x00,
+        ]))
+        .expect("combined pedal fixture should parse");
+        let notes = midi.tracks()[0].notes();
+
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].key(), 60);
+        assert_eq!(notes[0].end_tick(), Some(30));
+        assert_eq!(notes[0].release_velocity(), None);
     }
 
     #[test]
