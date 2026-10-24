@@ -4621,7 +4621,11 @@ fn stream_prepared_playlist_render_with_performance(
         Some(&render.sampler.mixer_meter_transforms_by_channel);
     let mut output = vec![0.0f32; STREAM_BLOCK_FRAMES * 2];
     let mut sampler_block = vec![0.0f32; STREAM_BLOCK_FRAMES * 2];
-    let mut meter_buses = if meters.is_some() {
+    let mixer_effect_buses_required = render
+        .vst3_processor
+        .as_deref()
+        .is_some_and(Vst3PlaylistStreamProcessor::needs_mixer_insert_buses);
+    let mut meter_buses = if meters.is_some() || mixer_effect_buses_required {
         vec![0.0f32; MIXER_TRACK_METER_COUNT * STREAM_BLOCK_FRAMES * 2]
     } else {
         Vec::new()
@@ -4674,7 +4678,7 @@ fn stream_prepared_playlist_render_with_performance(
                 let sample_count = frame_count * 2;
                 let block = &mut output[..sample_count];
                 block.fill(0.0);
-                let mut meter_buses = if meters.is_some() {
+                let mut meter_buses = if meters.is_some() || mixer_effect_buses_required {
                     let active_samples = MIXER_TRACK_METER_COUNT * sample_count;
                     let buses = &mut meter_buses[..active_samples];
                     buses.fill(0.0);
@@ -5085,6 +5089,7 @@ fn stream_sampler_pattern_loop_from_tick_with_vst3_to_device(
         render.pan_law,
     );
     engine.mixer_transforms_by_channel = Some(&render.mixer_transforms_by_channel);
+    engine.mixer_meter_transforms_by_channel = Some(&render.mixer_meter_transforms_by_channel);
     if let Some(meters) = live_master_meters {
         engine.live_mixer_source_routes_by_channel =
             Some(&render.live_mixer_source_routes_by_channel);
@@ -5101,8 +5106,20 @@ fn stream_sampler_pattern_loop_from_tick_with_vst3_to_device(
         Vst3PlaylistStreamProcessor::pdc_direct_source_delay_frames,
     );
     let mut sampler_delay = StereoFrameDelay::new(sampler_delay_frames)?;
+    let mixer_effect_buses_required = playback
+        .vst3_processor
+        .as_ref()
+        .is_some_and(Vst3PlaylistStreamProcessor::needs_mixer_insert_buses);
+    let mut mixer_buses = mixer_effect_buses_required
+        .then(|| vec![0.0f32; MIXER_TRACK_METER_COUNT * SAMPLER_BLOCK_FRAMES * 2]);
+    let mut mixer_bus_delays = if mixer_effect_buses_required {
+        (0..MIXER_TRACK_METER_COUNT)
+            .map(|_| StereoFrameDelay::new(sampler_delay_frames))
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        Vec::new()
+    };
     let mut block = vec![0.0f32; SAMPLER_BLOCK_FRAMES * 2];
-    let mut vst3_block = vec![0.0f32; SAMPLER_BLOCK_FRAMES * 2];
     let stream_result = (|| {
         let mut block_start = 0u64;
         while block_start < start_frame {
@@ -5111,11 +5128,36 @@ fn stream_sampler_pattern_loop_from_tick_with_vst3_to_device(
                 return Err("Sampler Pattern playback was stopped".to_owned());
             }
             let frame_count = (start_frame - block_start).min(SAMPLER_BLOCK_FRAMES as u64) as usize;
-            engine.render_block(block_start, frame_count, &mut block[..frame_count * 2]);
-            sampler_delay.process_interleaved(&mut block[..frame_count * 2])?;
+            let sample_count = frame_count * 2;
+            if let Some(mixer_buses) = mixer_buses.as_mut() {
+                let active_buses = &mut mixer_buses[..MIXER_TRACK_METER_COUNT * sample_count];
+                active_buses.fill(0.0);
+                engine.render_block_with_meters(
+                    block_start,
+                    frame_count,
+                    &mut block[..sample_count],
+                    Some(active_buses),
+                    sample_count,
+                );
+                for (track, delay) in mixer_bus_delays.iter_mut().enumerate() {
+                    let bus_start = track * sample_count;
+                    delay.process_interleaved(
+                        &mut active_buses[bus_start..bus_start + sample_count],
+                    )?;
+                }
+            } else {
+                engine.render_block(block_start, frame_count, &mut block[..sample_count]);
+            }
+            sampler_delay.process_interleaved(&mut block[..sample_count])?;
             if let Some(processor) = playback.vst3_processor.as_mut() {
-                vst3_block[..frame_count * 2].fill(0.0);
-                processor.mix_next_block(&mut vst3_block[..frame_count * 2])?;
+                if let Some(mixer_buses) = mixer_buses.as_mut() {
+                    processor.mix_next_block_with_meter_buses(
+                        &mut block[..sample_count],
+                        &mut mixer_buses[..MIXER_TRACK_METER_COUNT * sample_count],
+                    )?;
+                } else {
+                    processor.mix_next_block(&mut block[..sample_count])?;
+                }
             }
             block_start += frame_count as u64;
         }
@@ -5154,10 +5196,36 @@ fn stream_sampler_pattern_loop_from_tick_with_vst3_to_device(
             }
 
             let frame_count = SAMPLER_BLOCK_FRAMES;
-            engine.render_block(block_start, frame_count, &mut block);
+            let sample_count = frame_count * 2;
+            if let Some(mixer_buses) = mixer_buses.as_mut() {
+                let active_buses = &mut mixer_buses[..MIXER_TRACK_METER_COUNT * sample_count];
+                active_buses.fill(0.0);
+                engine.render_block_with_meters(
+                    block_start,
+                    frame_count,
+                    &mut block,
+                    Some(active_buses),
+                    sample_count,
+                );
+                for (track, delay) in mixer_bus_delays.iter_mut().enumerate() {
+                    let bus_start = track * sample_count;
+                    delay.process_interleaved(
+                        &mut active_buses[bus_start..bus_start + sample_count],
+                    )?;
+                }
+            } else {
+                engine.render_block(block_start, frame_count, &mut block);
+            }
             sampler_delay.process_interleaved(&mut block)?;
             if let Some(processor) = playback.vst3_processor.as_mut() {
-                processor.mix_next_block(&mut block)?;
+                if let Some(mixer_buses) = mixer_buses.as_mut() {
+                    processor.mix_next_block_with_meter_buses(
+                        &mut block,
+                        &mut mixer_buses[..MIXER_TRACK_METER_COUNT * sample_count],
+                    )?;
+                } else {
+                    processor.mix_next_block(&mut block)?;
+                }
             }
             master_output.apply(&mut block);
             writer.write_stereo_samples(&block)?;
@@ -5665,12 +5733,24 @@ pub fn stream_mixed_layer_midi_input_to_device(
         sampler_render.pan_law,
     );
     sampler_engine.mixer_transforms_by_channel = Some(&sampler_render.mixer_transforms_by_channel);
+    sampler_engine.mixer_meter_transforms_by_channel =
+        Some(&sampler_render.mixer_meter_transforms_by_channel);
 
     const LIVE_BLOCK_FRAMES: usize = 128;
     let mut block = vec![0.0f32; LIVE_BLOCK_FRAMES * 2];
     let mut sampler_block = vec![0.0f32; LIVE_BLOCK_FRAMES * 2];
-    let mut direct_source_delay =
-        crate::audio::StereoFrameDelay::new(processor.pdc_direct_source_delay_frames())?;
+    let direct_source_delay_frames = processor.pdc_direct_source_delay_frames();
+    let mut direct_source_delay = crate::audio::StereoFrameDelay::new(direct_source_delay_frames)?;
+    let mixer_effect_buses_required = processor.needs_mixer_insert_buses();
+    let mut mixer_buses = mixer_effect_buses_required
+        .then(|| vec![0.0f32; MIXER_TRACK_METER_COUNT * LIVE_BLOCK_FRAMES * 2]);
+    let mut mixer_bus_delays = if mixer_effect_buses_required {
+        (0..MIXER_TRACK_METER_COUNT)
+            .map(|_| StereoFrameDelay::new(direct_source_delay_frames))
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        Vec::new()
+    };
     let mut note_targets = HashMap::<(u8, u8), VecDeque<Vec<LiveLayerNoteDestination>>>::new();
     let mut note_seed = 0u64;
     processor.start_processing()?;
@@ -5883,13 +5963,34 @@ pub fn stream_mixed_layer_midi_input_to_device(
             if disconnected {
                 break;
             }
-            sampler_engine.render_block(block_start, LIVE_BLOCK_FRAMES, &mut sampler_block);
+            if let Some(mixer_buses) = mixer_buses.as_mut() {
+                mixer_buses.fill(0.0);
+                sampler_engine.render_block_with_meters(
+                    block_start,
+                    LIVE_BLOCK_FRAMES,
+                    &mut sampler_block,
+                    Some(mixer_buses),
+                    LIVE_BLOCK_FRAMES * 2,
+                );
+                for (track, delay) in mixer_bus_delays.iter_mut().enumerate() {
+                    let bus_start = track * LIVE_BLOCK_FRAMES * 2;
+                    delay.process_interleaved(
+                        &mut mixer_buses[bus_start..bus_start + LIVE_BLOCK_FRAMES * 2],
+                    )?;
+                }
+            } else {
+                sampler_engine.render_block(block_start, LIVE_BLOCK_FRAMES, &mut sampler_block);
+            }
             direct_source_delay.process_interleaved(&mut sampler_block)?;
             block.fill(0.0);
             for (mixed, sampler_sample) in block.iter_mut().zip(&sampler_block) {
                 *mixed += *sampler_sample;
             }
-            processor.mix_next_block(&mut block)?;
+            if let Some(mixer_buses) = mixer_buses.as_mut() {
+                processor.mix_next_block_with_meter_buses(&mut block, mixer_buses)?;
+            } else {
+                processor.mix_next_block(&mut block)?;
+            }
             master_output.apply(&mut block);
             writer.write_stereo_samples(&block)?;
             block_start = block_start.saturating_add(LIVE_BLOCK_FRAMES as u64);
@@ -5959,6 +6060,9 @@ pub fn stream_vst3_midi_input_to_device(
 
     const LIVE_BLOCK_FRAMES: usize = 128;
     let mut block = vec![0.0f32; LIVE_BLOCK_FRAMES * 2];
+    let mut mixer_buses = processor
+        .needs_mixer_insert_buses()
+        .then(|| vec![0.0f32; MIXER_TRACK_METER_COUNT * LIVE_BLOCK_FRAMES * 2]);
     let mut note_ids = HashMap::<(u8, u8), VecDeque<Vec<(u16, i32, u8)>>>::new();
     let mut note_seed = 0u64;
     let stream_result = (|| {
@@ -6062,7 +6166,12 @@ pub fn stream_vst3_midi_input_to_device(
             if disconnected {
                 break;
             }
-            processor.mix_next_block(&mut block)?;
+            if let Some(mixer_buses) = mixer_buses.as_mut() {
+                mixer_buses.fill(0.0);
+                processor.mix_next_block_with_meter_buses(&mut block, mixer_buses)?;
+            } else {
+                processor.mix_next_block(&mut block)?;
+            }
             master_output.apply(&mut block);
             writer.write_stereo_samples(&block)?;
         }
@@ -8028,6 +8137,7 @@ struct PreparedSamplerPattern {
     notes: Vec<ScheduledSamplerNote>,
     sources_by_channel: HashMap<u16, SamplerVoiceSource>,
     mixer_transforms_by_channel: HashMap<u16, MixerSourceRouteTransform>,
+    mixer_meter_transforms_by_channel: HashMap<u16, Vec<(usize, MixerSourceRouteTransform)>>,
     live_mixer_source_routes_by_channel: HashMap<u16, MixerLiveSourceRoutePlan>,
     master_output: MixerMasterOutput,
     voice_limit: usize,
@@ -10284,6 +10394,7 @@ fn prepare_sampler_pattern_for_channel_internal(
             notes: Vec::new(),
             sources_by_channel: HashMap::new(),
             mixer_transforms_by_channel: HashMap::new(),
+            mixer_meter_transforms_by_channel: HashMap::new(),
             live_mixer_source_routes_by_channel: HashMap::new(),
             master_output: MixerMasterOutput::from_document(document),
             voice_limit: options.voice_limit,
@@ -10297,6 +10408,8 @@ fn prepare_sampler_pattern_for_channel_internal(
         HashMap::<(PathBuf, Option<u16>, Option<u16>), Arc<DecodedAudio>>::new();
     let mut sources_by_channel = HashMap::<u16, SamplerVoiceSource>::new();
     let mut mixer_transforms_by_channel = HashMap::<u16, MixerSourceRouteTransform>::new();
+    let mut mixer_meter_transforms_by_channel =
+        HashMap::<u16, Vec<(usize, MixerSourceRouteTransform)>>::new();
     let mut live_mixer_source_routes_by_channel = HashMap::<u16, MixerLiveSourceRoutePlan>::new();
     let mut unresolved_sample_channels = std::collections::BTreeSet::new();
     let mut notes = Vec::with_capacity(sampler_note_count);
@@ -10463,6 +10576,10 @@ fn prepare_sampler_pattern_for_channel_internal(
             let route_plan =
                 mixer_route_audibility.source_route_plan_for_channel(channel.mixer_track());
             mixer_transforms_by_channel.insert(target_channel_id, route_plan.output_transform);
+            mixer_meter_transforms_by_channel.insert(
+                target_channel_id,
+                route_plan.insert_meter_transforms.clone(),
+            );
             if let Some(live_route_plan) =
                 mixer_route_audibility.live_source_route_plan_for_channel(channel.mixer_track())
             {
@@ -10627,6 +10744,7 @@ fn prepare_sampler_pattern_for_channel_internal(
         notes,
         sources_by_channel,
         mixer_transforms_by_channel,
+        mixer_meter_transforms_by_channel,
         live_mixer_source_routes_by_channel,
         master_output: MixerMasterOutput::from_document(document),
         voice_limit: options.voice_limit,

@@ -559,10 +559,11 @@ struct PatternLoopEventQueue {
     next_cycle: u64,
 }
 
-/// One prepared Master Mixer VST3 effect slot.
+/// One prepared Mixer VST3 effect slot.
 /// The plug-in instance is shared with its native editor.
 struct PlaylistMixerEffectStream {
     id: u64,
+    insert_ordinal: usize,
     slot_index: u16,
     plugin: Arc<Mutex<Plugin>>,
     buffers: BusAudioBuffers,
@@ -573,11 +574,22 @@ struct PlaylistMixerEffectStream {
     dry_block: Vec<[f32; 2]>,
 }
 
-/// Prepared VST3 instrument channels and Master Mixer effects for blockwise Playlist transport.
+struct PlaylistMixerEffectChain {
+    insert_ordinal: usize,
+    signal_transform: crate::MixerSourceRouteTransform,
+    route_plan: crate::MixerSourceRoutePlan,
+    first_effect_index: usize,
+    end_effect_index: usize,
+}
+
+/// Prepared VST3 instrument channels and Mixer effects for blockwise Playlist transport.
 /// The instances are the same objects used by the open editors.
 pub struct Vst3PlaylistStreamProcessor {
     streams: Vec<PlaylistPluginStream>,
     mixer_effects: Vec<PlaylistMixerEffectStream>,
+    mixer_effect_chains: Vec<PlaylistMixerEffectChain>,
+    mixer_effect_scratch: Vec<f32>,
+    mixer_effect_dry_scratch: Vec<f32>,
     mixer_effect_tail_frames: u64,
     live_input_senders: BTreeMap<u16, Vst3PlaylistLiveInputSender>,
     performance_pattern_automation: BTreeMap<(u16, u16), Vec<Vst3ParameterAutomation>>,
@@ -1062,6 +1074,12 @@ impl Vst3PlaylistStreamProcessor {
         self.maximum_latency_frames
     }
 
+    pub(crate) fn needs_mixer_insert_buses(&self) -> bool {
+        self.mixer_effect_chains
+            .iter()
+            .any(|chain| chain.insert_ordinal != 0)
+    }
+
     pub fn start_processing(&mut self) -> Result<(), String> {
         for index in 0..self.streams.len() {
             let channel_id = self.streams[index].channel_id;
@@ -1199,69 +1217,110 @@ impl Vst3PlaylistStreamProcessor {
                 }
             }
         }
-        self.process_mixer_effects(output)?;
+        self.process_mixer_effects(output, meter_buses)?;
         Ok(())
     }
 
-    fn process_mixer_effects(&mut self, output: &mut [f32]) -> Result<(), String> {
+    fn process_mixer_effects(
+        &mut self,
+        output: &mut [f32],
+        mut meter_buses: Option<&mut [f32]>,
+    ) -> Result<(), String> {
         if !output.len().is_multiple_of(2) {
             return Err("VST3 Mixer effect buffer must contain stereo frames".to_owned());
         }
-        for effect in &mut self.mixer_effects {
-            let max_frames = effect.block_size.max(1);
-            for block in output.chunks_mut(max_frames * 2) {
-                let frame_count = block.len() / 2;
-                for frame_index in 0..frame_count {
-                    effect.dry_block[frame_index] = [
-                        finite_sample(block[frame_index * 2]),
-                        finite_sample(block[frame_index * 2 + 1]),
-                    ];
-                }
-                resize_vst3_bus_audio_buffers(&mut effect.buffers, frame_count);
-                let input = &mut effect.buffers.inputs[0];
-                for frame_index in 0..frame_count {
-                    let [left, right] = effect.dry_block[frame_index];
-                    if effect.input_channels == 1 {
-                        input.channels[0][frame_index] = (left + right) * 0.5;
-                    } else {
-                        input.channels[0][frame_index] = left;
-                        input.channels[1][frame_index] = right;
+
+        for chain in &self.mixer_effect_chains {
+            let first_effect_index = chain.first_effect_index;
+            let end_effect_index = chain.end_effect_index;
+            if chain.insert_ordinal == 0 {
+                process_playlist_mixer_effect_chain(
+                    &mut self.mixer_effects[first_effect_index..end_effect_index],
+                    output,
+                )?;
+                continue;
+            }
+
+            let Some(meter_buses) = meter_buses.as_deref_mut() else {
+                // Pattern and live-input callers without Mixer buses can still render the
+                // Master chain; their insert-chain integration is handled by the bus-aware
+                // transport path.
+                continue;
+            };
+            let samples_per_track = output.len();
+            let bus_start = chain
+                .insert_ordinal
+                .checked_mul(samples_per_track)
+                .ok_or_else(|| "Mixer effect bus offset overflow".to_owned())?;
+            let bus_end = bus_start
+                .checked_add(samples_per_track)
+                .ok_or_else(|| "Mixer effect bus size overflow".to_owned())?;
+            if bus_end > meter_buses.len() {
+                return Err(format!(
+                    "Mixer effect insert {} exceeds the available bus buffer",
+                    chain.insert_ordinal
+                ));
+            }
+            self.mixer_effect_scratch.resize(samples_per_track, 0.0);
+            self.mixer_effect_dry_scratch.resize(samples_per_track, 0.0);
+            let track_bus = &meter_buses[bus_start..bus_end];
+            let mut invertible = true;
+            for (frame_index, samples) in track_bus.chunks_exact(2).enumerate() {
+                let mut frame = [samples[0], samples[1]];
+                if !chain.signal_transform.apply_inverse_frame(&mut frame) {
+                    if frame[0] != 0.0 || frame[1] != 0.0 {
+                        invertible = false;
+                        break;
                     }
+                    frame = [0.0; 2];
                 }
-                {
-                    let mut plugin = effect
-                        .plugin
-                        .lock()
-                        .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
-                    validate_vst3_audio_block(
-                        &effect.buffers,
-                        plugin.sample_rate(),
-                        plugin.block_size(),
-                    )?;
-                    plugin
-                        .process_bus_audio(&mut effect.buffers)
-                        .map_err(|error| error.to_string())
-                        .map_err(|error| {
-                            format!(
-                                "VST3 Mixer effect slot {} (instance {}) failed: {error}",
-                                effect.slot_index + 1,
-                                effect.id
-                            )
-                        })?;
-                }
-                let wet = &effect.buffers.outputs[0];
-                let dry_gain = 1.0 - effect.wet_mix;
-                for frame_index in 0..frame_count {
-                    let wet_left = finite_sample(wet.channels[0][frame_index]);
-                    let wet_right = if effect.output_channels == 1 {
-                        wet_left
-                    } else {
-                        finite_sample(wet.channels[1][frame_index])
-                    };
-                    block[frame_index * 2] =
-                        effect.dry_block[frame_index][0] * dry_gain + wet_left * effect.wet_mix;
-                    block[frame_index * 2 + 1] =
-                        effect.dry_block[frame_index][1] * dry_gain + wet_right * effect.wet_mix;
+                self.mixer_effect_scratch[frame_index * 2] = finite_sample(frame[0]);
+                self.mixer_effect_scratch[frame_index * 2 + 1] = finite_sample(frame[1]);
+            }
+            if !invertible {
+                return Err(format!(
+                    "cannot reconstruct the pre-effect signal for Mixer insert {} because its saved fader/pan transform is not invertible",
+                    chain.insert_ordinal
+                ));
+            }
+            self.mixer_effect_dry_scratch
+                .copy_from_slice(&self.mixer_effect_scratch);
+            process_playlist_mixer_effect_chain(
+                &mut self.mixer_effects[first_effect_index..end_effect_index],
+                &mut self.mixer_effect_scratch,
+            )?;
+
+            for (frame_index, (processed, dry)) in self
+                .mixer_effect_scratch
+                .chunks_exact(2)
+                .zip(self.mixer_effect_dry_scratch.chunks_exact(2))
+                .enumerate()
+            {
+                let mut delta = [processed[0] - dry[0], processed[1] - dry[1]];
+                chain.route_plan.output_transform.apply_frame(&mut delta);
+                output[frame_index * 2] += finite_sample(delta[0]);
+                output[frame_index * 2 + 1] += finite_sample(delta[1]);
+
+                for (track, transform) in &chain.route_plan.insert_meter_transforms {
+                    if *track == chain.insert_ordinal {
+                        continue;
+                    }
+                    if *track >= crate::audio::MIXER_TRACK_METER_COUNT {
+                        return Err(
+                            "VST3 Mixer meter route exceeds the supported track range".to_owned()
+                        );
+                    }
+                    let meter_offset = *track * samples_per_track + frame_index * 2;
+                    let meter_end = meter_offset
+                        .checked_add(2)
+                        .ok_or_else(|| "Mixer meter buffer offset overflow".to_owned())?;
+                    if meter_end > meter_buses.len() {
+                        return Err("Mixer meter buffer is too small for the VST3 route".to_owned());
+                    }
+                    let mut meter_delta = [processed[0] - dry[0], processed[1] - dry[1]];
+                    transform.apply_frame(&mut meter_delta);
+                    meter_buses[meter_offset] += finite_sample(meter_delta[0]);
+                    meter_buses[meter_offset + 1] += finite_sample(meter_delta[1]);
                 }
             }
         }
@@ -1310,6 +1369,79 @@ impl Vst3PlaylistStreamProcessor {
         }
         first_error.map_or(Ok(()), Err)
     }
+}
+
+fn process_playlist_mixer_effect_chain(
+    effects: &mut [PlaylistMixerEffectStream],
+    samples: &mut [f32],
+) -> Result<(), String> {
+    if effects.is_empty() {
+        return Ok(());
+    }
+    if !samples.len().is_multiple_of(2) {
+        return Err("VST3 Mixer effect buffer must contain stereo frames".to_owned());
+    }
+    let chain_block_frames = effects[0].block_size.max(1);
+    for chain_block in samples.chunks_mut(chain_block_frames * 2) {
+        for effect in effects.iter_mut() {
+            let max_frames = effect.block_size.max(1);
+            for block in chain_block.chunks_mut(max_frames * 2) {
+                let frame_count = block.len() / 2;
+                for (frame_index, frame) in block.chunks_exact(2).enumerate() {
+                    effect.dry_block[frame_index] =
+                        [finite_sample(frame[0]), finite_sample(frame[1])];
+                }
+                resize_vst3_bus_audio_buffers(&mut effect.buffers, frame_count);
+                let input = &mut effect.buffers.inputs[0];
+                for frame_index in 0..frame_count {
+                    let [left, right] = effect.dry_block[frame_index];
+                    if effect.input_channels == 1 {
+                        input.channels[0][frame_index] = (left + right) * 0.5;
+                    } else {
+                        input.channels[0][frame_index] = left;
+                        input.channels[1][frame_index] = right;
+                    }
+                }
+                {
+                    let mut plugin = effect
+                        .plugin
+                        .lock()
+                        .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
+                    validate_vst3_audio_block(
+                        &effect.buffers,
+                        plugin.sample_rate(),
+                        plugin.block_size(),
+                    )?;
+                    plugin
+                        .process_bus_audio(&mut effect.buffers)
+                        .map_err(|error| error.to_string())
+                        .map_err(|error| {
+                            format!(
+                                "VST3 Mixer insert {} effect slot {} (instance {}) failed: {error}",
+                                effect.insert_ordinal,
+                                effect.slot_index + 1,
+                                effect.id
+                            )
+                        })?;
+                }
+                let wet = &effect.buffers.outputs[0];
+                let dry_gain = 1.0 - effect.wet_mix;
+                for (frame_index, frame) in block.chunks_exact_mut(2).enumerate() {
+                    let wet_left = finite_sample(wet.channels[0][frame_index]);
+                    let wet_right = if effect.output_channels == 1 {
+                        wet_left
+                    } else {
+                        finite_sample(wet.channels[1][frame_index])
+                    };
+                    frame[0] =
+                        effect.dry_block[frame_index][0] * dry_gain + wet_left * effect.wet_mix;
+                    frame[1] =
+                        effect.dry_block[frame_index][1] * dry_gain + wet_right * effect.wet_mix;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn queue_live_vst3_input_event(stream: &mut PlaylistPluginStream, event: ScheduledMidiEvent) {
@@ -3401,7 +3533,7 @@ impl Vst3HostRuntime {
         )
     }
 
-    /// Prepare Playlist playback and attach the loaded VST3 effects on the Master Mixer insert.
+    /// Prepare Playlist playback and attach the loaded VST3 effects on Mixer inserts.
     ///
     /// Effect instances are matched by project insert and slot coordinates, keeping duplicate
     /// plug-in classes distinct and preserving the slot order from the FLP.
@@ -3421,7 +3553,7 @@ impl Vst3HostRuntime {
             include_plugin_reported_tails,
             automation_sources,
         )?;
-        self.attach_master_mixer_effects(document, mixer_effect_instances, &mut processor, true)?;
+        self.attach_mixer_effects(document, mixer_effect_instances, &mut processor, true)?;
         Ok(processor)
     }
 
@@ -3501,7 +3633,7 @@ impl Vst3HostRuntime {
         Ok(processor)
     }
 
-    /// Prepare Playlist and Performance playback with loaded Master Mixer VST3 effects.
+    /// Prepare Playlist and Performance playback with loaded Mixer VST3 effects.
     #[allow(clippy::too_many_arguments)]
     pub fn prepare_playlist_performance_stream_with_mixer_effects_and_automation_sources(
         &self,
@@ -3521,7 +3653,7 @@ impl Vst3HostRuntime {
             include_plugin_reported_tails,
             automation_sources,
         )?;
-        self.attach_master_mixer_effects(document, mixer_effect_instances, &mut processor, false)?;
+        self.attach_mixer_effects(document, mixer_effect_instances, &mut processor, false)?;
         Ok(processor)
     }
 
@@ -3797,6 +3929,9 @@ impl Vst3HostRuntime {
         let mut processor = Vst3PlaylistStreamProcessor {
             streams,
             mixer_effects: Vec::new(),
+            mixer_effect_chains: Vec::new(),
+            mixer_effect_scratch: Vec::new(),
+            mixer_effect_dry_scratch: Vec::new(),
             mixer_effect_tail_frames: 0,
             live_input_senders,
             performance_pattern_automation: BTreeMap::new(),
@@ -3814,7 +3949,7 @@ impl Vst3HostRuntime {
         Ok(processor)
     }
 
-    /// Prepare a repeating Pattern loop with loaded Master Mixer VST3 effects.
+    /// Prepare a repeating Pattern loop with loaded Mixer VST3 effects.
     #[allow(clippy::too_many_arguments)]
     pub fn prepare_pattern_loop_stream_with_mixer_effects_and_automation(
         &self,
@@ -3834,133 +3969,189 @@ impl Vst3HostRuntime {
             channel_instances,
             parameter_automation,
         )?;
-        self.attach_master_mixer_effects(document, mixer_effect_instances, &mut processor, false)?;
+        self.attach_mixer_effects(document, mixer_effect_instances, &mut processor, false)?;
         Ok(processor)
     }
 
-    fn attach_master_mixer_effects(
+    fn attach_mixer_effects(
         &self,
         document: &FlpDocument,
         mixer_effect_instances: &BTreeMap<(usize, u16), u64>,
         processor: &mut Vst3PlaylistStreamProcessor,
         include_effect_tails: bool,
     ) -> Result<(), String> {
-        let master_effects_enabled = document
-            .mixer_inserts()
-            .into_iter()
-            .find(|insert| insert.ordinal() == 0)
-            .is_none_or(|insert| insert.effects_enabled() != Some(false));
-        if !master_effects_enabled {
-            return Ok(());
-        }
-
+        let inserts = document.mixer_inserts();
+        let effect_slots = document.mixer_effect_slots();
+        let routing = crate::MixerRouteAudibility::from_document(document);
+        let has_loaded_non_master_effect = effect_slots.iter().any(|slot| {
+            if slot.insert_ordinal() == 0
+                || slot.enabled() == Some(false)
+                || mixer_effect_wet_mix(slot.mix_raw()) == 0.0
+                || !mixer_effect_instances.contains_key(&(slot.insert_ordinal(), slot.slot_index()))
+            {
+                return false;
+            }
+            inserts
+                .iter()
+                .find(|insert| insert.ordinal() == slot.insert_ordinal())
+                .is_none_or(|insert| insert.effects_enabled() != Some(false))
+        });
+        let mut insert_order = if has_loaded_non_master_effect {
+            routing.mixer_insert_processing_order()?
+        } else {
+            Vec::new()
+        };
+        insert_order.push(0);
         let output_sample_rate = processor.output_sample_rate;
         let max_tail_frames =
             u64::from(output_sample_rate).saturating_mul(MAX_REPORTED_TAIL_SECONDS.ceil() as u64);
-        for slot in document
-            .mixer_effect_slots()
-            .into_iter()
-            .filter(|slot| slot.insert_ordinal() == 0)
-        {
-            if slot.enabled() == Some(false) {
+        for insert_ordinal in insert_order {
+            let effects_enabled = inserts
+                .iter()
+                .find(|insert| insert.ordinal() == insert_ordinal)
+                .is_none_or(|insert| insert.effects_enabled() != Some(false));
+            if !effects_enabled {
                 continue;
             }
-            let key = (slot.insert_ordinal(), slot.slot_index());
-            let Some(id) = mixer_effect_instances.get(&key).copied() else {
-                continue;
-            };
-            let wet_mix = mixer_effect_wet_mix(slot.mix_raw());
-            if wet_mix == 0.0 {
-                continue;
-            }
-            let plugin = Arc::clone(self.plugin(id)?);
-            let (
-                buffers,
-                block_size,
-                input_channels,
-                output_channels,
-                sample_rate,
-                latency_samples,
-                tail_samples,
-            ) = {
-                let plugin_guard = plugin
-                    .lock()
-                    .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
-                let sample_rate = plugin_guard.sample_rate();
-                let rate_tolerance = sample_rate.abs().max(1.0) * 1e-12;
-                if (sample_rate - f64::from(output_sample_rate)).abs() > rate_tolerance {
+            let first_effect_index = processor.mixer_effects.len();
+            for slot in effect_slots
+                .iter()
+                .filter(|slot| slot.insert_ordinal() == insert_ordinal)
+            {
+                if slot.enabled() == Some(false) {
+                    continue;
+                }
+                let key = (slot.insert_ordinal(), slot.slot_index());
+                let Some(id) = mixer_effect_instances.get(&key).copied() else {
+                    continue;
+                };
+                let wet_mix = mixer_effect_wet_mix(slot.mix_raw());
+                if wet_mix == 0.0 {
+                    continue;
+                }
+                let plugin = Arc::clone(self.plugin(id)?);
+                let (
+                    buffers,
+                    block_size,
+                    input_channels,
+                    output_channels,
+                    sample_rate,
+                    latency_samples,
+                    tail_samples,
+                ) = {
+                    let plugin_guard = plugin
+                        .lock()
+                        .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
+                    let sample_rate = plugin_guard.sample_rate();
+                    let rate_tolerance = sample_rate.abs().max(1.0) * 1e-12;
+                    if (sample_rate - f64::from(output_sample_rate)).abs() > rate_tolerance {
+                        return Err(format!(
+                            "VST3 Mixer insert {} effect slot {} uses {sample_rate} Hz but Playlist output is {output_sample_rate} Hz",
+                            insert_ordinal,
+                            slot.slot_index() + 1
+                        ));
+                    }
+                    let layout = plugin_guard
+                        .audio_bus_layout()
+                        .map_err(|error| error.to_string())?;
+                    let input = layout
+                        .inputs
+                        .first()
+                        .filter(|bus| bus.active && matches!(bus.channel_count, 1 | 2))
+                        .ok_or_else(|| {
+                            format!(
+                                "VST3 Mixer insert {} effect slot {} has no active mono or stereo main input bus",
+                                insert_ordinal,
+                                slot.slot_index() + 1
+                            )
+                        })?;
+                    let output = layout
+                        .outputs
+                        .first()
+                        .filter(|bus| bus.active && matches!(bus.channel_count, 1 | 2))
+                        .ok_or_else(|| {
+                            format!(
+                                "VST3 Mixer insert {} effect slot {} has no active mono or stereo main output bus",
+                                insert_ordinal,
+                                slot.slot_index() + 1
+                            )
+                        })?;
+                    let block_size = plugin_guard
+                        .block_size()
+                        .clamp(1, VST3_EFFECT_RENDER_BLOCK_FRAMES);
+                    let buffers = plugin_guard
+                        .create_bus_audio_buffers(block_size)
+                        .map_err(|error| error.to_string())?;
+                    (
+                        buffers,
+                        block_size,
+                        input.channel_count,
+                        output.channel_count,
+                        sample_rate,
+                        plugin_guard.latency_samples(),
+                        plugin_guard.tail_samples(),
+                    )
+                };
+                if !sample_rate.is_finite() || sample_rate <= 0.0 {
                     return Err(format!(
-                        "VST3 Mixer effect slot {} uses {sample_rate} Hz but Playlist output is {output_sample_rate} Hz",
+                        "VST3 Mixer insert {} effect slot {} reports an invalid sample rate",
+                        insert_ordinal,
                         slot.slot_index() + 1
                     ));
                 }
-                let layout = plugin_guard
-                    .audio_bus_layout()
-                    .map_err(|error| error.to_string())?;
-                let input = layout
-                    .inputs
-                    .first()
-                    .filter(|bus| bus.active && matches!(bus.channel_count, 1 | 2))
-                    .ok_or_else(|| {
-                        format!(
-                            "VST3 Mixer effect slot {} has no active mono or stereo main input bus",
-                            slot.slot_index() + 1
-                        )
-                    })?;
-                let output = layout
-                    .outputs
-                    .first()
-                    .filter(|bus| bus.active && matches!(bus.channel_count, 1 | 2))
-                    .ok_or_else(|| {
-                        format!(
-                            "VST3 Mixer effect slot {} has no active mono or stereo main output bus",
-                            slot.slot_index() + 1
-                        )
-                    })?;
-                let block_size = plugin_guard
-                    .block_size()
-                    .clamp(1, VST3_EFFECT_RENDER_BLOCK_FRAMES);
-                let buffers = plugin_guard
-                    .create_bus_audio_buffers(block_size)
-                    .map_err(|error| error.to_string())?;
-                (
+                let reported_tail = reported_tail_seconds(tail_samples, sample_rate)
+                    .map(|seconds| (seconds * f64::from(output_sample_rate)).ceil() as u64)
+                    .unwrap_or(0);
+                let latency_tail = u64::from(latency_samples);
+                if include_effect_tails {
+                    processor.mixer_effect_tail_frames = processor
+                        .mixer_effect_tail_frames
+                        .saturating_add(reported_tail)
+                        .saturating_add(latency_tail)
+                        .min(max_tail_frames);
+                }
+                processor.mixer_effects.push(PlaylistMixerEffectStream {
+                    id,
+                    insert_ordinal,
+                    slot_index: slot.slot_index(),
+                    plugin,
                     buffers,
                     block_size,
-                    input.channel_count,
-                    output.channel_count,
-                    sample_rate,
-                    plugin_guard.latency_samples(),
-                    plugin_guard.tail_samples(),
+                    input_channels,
+                    output_channels,
+                    wet_mix,
+                    dry_block: vec![[0.0; 2]; block_size],
+                });
+            }
+            let end_effect_index = processor.mixer_effects.len();
+            if first_effect_index == end_effect_index {
+                continue;
+            }
+            let (signal_transform, route_plan) = if insert_ordinal == 0 {
+                (
+                    crate::MixerSourceRouteTransform::default(),
+                    crate::MixerSourceRoutePlan::default(),
+                )
+            } else {
+                let track = i8::try_from(insert_ordinal).map_err(|_| {
+                    format!("Mixer insert ordinal {insert_ordinal} exceeds the supported range")
+                })?;
+                (
+                    crate::MixerSourceRouteTransform::from_insert_transform(
+                        routing.transform_for_channel(Some(track)),
+                    ),
+                    routing.source_route_plan_for_channel(Some(track)),
                 )
             };
-            if !sample_rate.is_finite() || sample_rate <= 0.0 {
-                return Err(format!(
-                    "VST3 Mixer effect slot {} reports an invalid sample rate",
-                    slot.slot_index() + 1
-                ));
-            }
-            let reported_tail = reported_tail_seconds(tail_samples, sample_rate)
-                .map(|seconds| (seconds * f64::from(output_sample_rate)).ceil() as u64)
-                .unwrap_or(0);
-            let latency_tail = u64::from(latency_samples);
-            if include_effect_tails {
-                processor.mixer_effect_tail_frames = processor
-                    .mixer_effect_tail_frames
-                    .saturating_add(reported_tail)
-                    .saturating_add(latency_tail)
-                    .min(max_tail_frames);
-            }
-            processor.mixer_effects.push(PlaylistMixerEffectStream {
-                id,
-                slot_index: slot.slot_index(),
-                plugin,
-                buffers,
-                block_size,
-                input_channels,
-                output_channels,
-                wet_mix,
-                dry_block: vec![[0.0; 2]; block_size],
-            });
+            processor
+                .mixer_effect_chains
+                .push(PlaylistMixerEffectChain {
+                    insert_ordinal,
+                    signal_transform,
+                    route_plan,
+                    first_effect_index,
+                    end_effect_index,
+                });
         }
         let content_frames = processor.content_frames;
         processor.extend_to_output_frames(content_frames)?;
@@ -4275,6 +4466,9 @@ impl Vst3HostRuntime {
         let mut processor = Vst3PlaylistStreamProcessor {
             streams,
             mixer_effects: Vec::new(),
+            mixer_effect_chains: Vec::new(),
+            mixer_effect_scratch: Vec::new(),
+            mixer_effect_dry_scratch: Vec::new(),
             mixer_effect_tail_frames: 0,
             live_input_senders,
             performance_pattern_automation: BTreeMap::new(),

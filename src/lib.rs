@@ -3268,6 +3268,30 @@ impl MixerSourceRouteTransform {
         frame[0] = self.matrix[0] * input[0] + self.matrix[1] * input[1];
         frame[1] = self.matrix[2] * input[0] + self.matrix[3] * input[1];
     }
+
+    /// Recover the input frame when this route transform is invertible.
+    ///
+    /// Mixer peak buses currently contain the signal after the insert's integrated
+    /// fader/pan controls. Effect slots run before those controls, so effect processing
+    /// can use this inverse to reconstruct a pre-effect frame for ordinary non-singular
+    /// insert transforms.
+    pub(crate) fn apply_inverse_frame(self, frame: &mut [f32; 2]) -> bool {
+        let [a, b, c, d] = self.matrix;
+        let determinant = a * d - b * c;
+        if !determinant.is_finite() || determinant.abs() <= 1.0e-12 {
+            return false;
+        }
+        let [left, right] = *frame;
+        let input = [
+            (d * left - b * right) / determinant,
+            (-c * left + a * right) / determinant,
+        ];
+        if input.iter().any(|sample| !sample.is_finite()) {
+            return false;
+        }
+        *frame = input;
+        true
+    }
 }
 
 impl MixerInsertSignalTransform {
@@ -3990,6 +4014,76 @@ impl MixerRouteAudibility {
             output_transform: output,
             insert_meter_transforms: insert_meter_transforms.into_iter().collect(),
         }
+    }
+
+    /// Returns Mixer inserts in source-before-destination order for post-effect sends.
+    ///
+    /// The supported FLP route graph is acyclic. Rejecting a cycle here prevents the
+    /// effect pass from processing a destination before its incoming effect signal.
+    pub(crate) fn mixer_insert_processing_order(&self) -> Result<Vec<usize>, String> {
+        let tracks = self
+            .known_tracks
+            .iter()
+            .copied()
+            .filter(|track| *track > 0)
+            .map(|track| track as usize)
+            .collect::<BTreeSet<_>>();
+        let mut outgoing = BTreeMap::<usize, BTreeSet<usize>>::new();
+        let mut incoming_count = tracks
+            .iter()
+            .copied()
+            .map(|track| (track, 0usize))
+            .collect::<BTreeMap<_, _>>();
+
+        for source in &tracks {
+            let source_track = i8::try_from(*source)
+                .map_err(|_| "Mixer insert ordinal exceeds the supported range".to_owned())?;
+            if !self.complete_send_sources.contains(&source_track) {
+                continue;
+            }
+            for route in self
+                .send_routes_by_source
+                .get(&source_track)
+                .into_iter()
+                .flatten()
+            {
+                let gain = mixer_send_gain_raw(route.level_raw).unwrap_or_default();
+                if !route.enabled || gain <= 0.0 || route.destination_track <= 0 {
+                    continue;
+                }
+                let destination = route.destination_track as usize;
+                if !tracks.contains(&destination)
+                    || !outgoing.entry(*source).or_default().insert(destination)
+                {
+                    continue;
+                }
+                *incoming_count
+                    .get_mut(&destination)
+                    .expect("known Mixer insert has an incoming count") += 1;
+            }
+        }
+
+        let mut ready = incoming_count
+            .iter()
+            .filter_map(|(track, count)| (*count == 0).then_some(*track))
+            .collect::<BTreeSet<_>>();
+        let mut order = Vec::with_capacity(tracks.len());
+        while let Some(track) = ready.pop_first() {
+            order.push(track);
+            for destination in outgoing.get(&track).into_iter().flatten() {
+                let count = incoming_count
+                    .get_mut(destination)
+                    .expect("known Mixer insert has an incoming count");
+                *count -= 1;
+                if *count == 0 {
+                    ready.insert(*destination);
+                }
+            }
+        }
+        if order.len() != tracks.len() {
+            return Err("Mixer send graph contains a cycle".to_owned());
+        }
+        Ok(order)
     }
 
     fn accumulate_send_paths(
@@ -25492,6 +25586,74 @@ mod tests {
         );
         assert!(master_solo.allows_channel(None));
         assert!(master_solo.allows_channel(Some(1)));
+    }
+
+    #[test]
+    fn mixer_insert_route_transform_can_recover_pre_effect_frames() {
+        let transform = MixerSourceRouteTransform::from_insert_transform(
+            super::MixerInsertSignalTransform::new(true, true)
+                .with_fader_volume_raw(Some(6_500))
+                .with_mixer_pan_raw(Some(1_600))
+                .with_stereo_separation_raw(Some(12))
+                .with_mixer_pan_law_raw(Some(2)),
+        );
+        let expected = [0.75, -0.25];
+        let mut recovered = expected;
+        transform.apply_frame(&mut recovered);
+        assert!(transform.apply_inverse_frame(&mut recovered));
+        assert!((recovered[0] - expected[0]).abs() < 1.0e-5);
+        assert!((recovered[1] - expected[1]).abs() < 1.0e-5);
+
+        let hard_pan = MixerSourceRouteTransform::from_insert_transform(
+            super::MixerInsertSignalTransform::default().with_mixer_pan_raw(Some(6_400)),
+        );
+        let mut frame = [0.5, -0.25];
+        hard_pan.apply_frame(&mut frame);
+        assert!(!hard_pan.apply_inverse_frame(&mut frame));
+    }
+
+    #[test]
+    fn mixer_insert_processing_order_follows_send_destinations() {
+        let insert = |ordinal| MixerInsertSummary {
+            ordinal,
+            input_raw: -1,
+            output_raw: -1,
+            color_raw: 0,
+            icon_raw: None,
+            name: None,
+            flags: Some(1 << 3),
+            flags_event_index: None,
+            first_event_index: 0,
+            end_event_index: 0,
+        };
+        let send = |source_track: usize, destination_track: u8| MixerSendSummary {
+            insert_ordinal: source_track,
+            route_parameter_id: 64_u8 + destination_track,
+            value: 12_800,
+            enabled: Some(true),
+            routing_flag_location: None,
+            event_index: 0,
+            record_index: 0,
+        };
+        let mut routing = MixerRouteAudibility::from_inserts_with_parameters(
+            [insert(0), insert(1), insert(2), insert(3)],
+            &[],
+            None,
+        );
+        routing.add_send_summaries([send(1, 3), send(2, 3), send(3, 0)]);
+
+        assert_eq!(
+            routing
+                .mixer_insert_processing_order()
+                .expect("acyclic sends should produce an insert order"),
+            vec![1, 2, 3]
+        );
+
+        routing.add_send_summaries([send(3, 1)]);
+        assert_eq!(
+            routing.mixer_insert_processing_order(),
+            Err("Mixer send graph contains a cycle".to_owned())
+        );
     }
 
     #[test]
