@@ -674,7 +674,11 @@ pub enum MidiInputEvent {
 pub struct MidiInputChannelState {
     pan: u8,
     channel_volume: u8,
+    channel_volume_lsb: u8,
+    channel_volume_lsb_received: bool,
     expression: u8,
+    expression_lsb: u8,
+    expression_lsb_received: bool,
     mod_x: u8,
     mod_y: u8,
     pitch_bend_value: u16,
@@ -689,7 +693,11 @@ impl Default for MidiInputChannelState {
         Self {
             pan: 64,
             channel_volume: 127,
+            channel_volume_lsb: 0,
+            channel_volume_lsb_received: false,
             expression: 127,
+            expression_lsb: 0,
+            expression_lsb_received: false,
             mod_x: 64,
             mod_y: 64,
             pitch_bend_value: 8192,
@@ -710,6 +718,14 @@ impl MidiInputChannelState {
                 ..
             } => self.channel_volume = value.min(127),
             MidiInputEvent::ControlChange {
+                controller: 39,
+                value,
+                ..
+            } => {
+                self.channel_volume_lsb = value.min(127);
+                self.channel_volume_lsb_received = true;
+            }
+            MidiInputEvent::ControlChange {
                 controller: 10,
                 value,
                 ..
@@ -719,6 +735,14 @@ impl MidiInputChannelState {
                 value,
                 ..
             } => self.expression = value.min(127),
+            MidiInputEvent::ControlChange {
+                controller: 43,
+                value,
+                ..
+            } => {
+                self.expression_lsb = value.min(127);
+                self.expression_lsb_received = true;
+            }
             MidiInputEvent::ControlChange {
                 controller: 74,
                 value,
@@ -734,7 +758,11 @@ impl MidiInputChannelState {
             } => {
                 self.pan = 64;
                 self.channel_volume = 127;
+                self.channel_volume_lsb = 0;
+                self.channel_volume_lsb_received = false;
                 self.expression = 127;
+                self.expression_lsb = 0;
+                self.expression_lsb_received = false;
                 self.mod_x = 64;
                 self.mod_y = 64;
                 self.pitch_bend_value = 8192;
@@ -802,8 +830,24 @@ impl MidiInputChannelState {
         self.expression
     }
 
+    pub fn raw_expression_14bit(self) -> u16 {
+        (u16::from(self.expression) << 7) | u16::from(self.expression_lsb)
+    }
+
+    pub fn expression_lsb_received(self) -> bool {
+        self.expression_lsb_received
+    }
+
     pub fn raw_channel_volume(self) -> u8 {
         self.channel_volume
+    }
+
+    pub fn raw_channel_volume_14bit(self) -> u16 {
+        (u16::from(self.channel_volume) << 7) | u16::from(self.channel_volume_lsb)
+    }
+
+    pub fn channel_volume_lsb_received(self) -> bool {
+        self.channel_volume_lsb_received
     }
 
     fn note_mod_x(self) -> u8 {
@@ -2566,6 +2610,66 @@ mod tests {
             controller: 121,
             value: 0,
         });
+        assert_eq!(state.raw_channel_volume(), 127);
+        assert_eq!(state.raw_expression(), 127);
+    }
+
+    #[test]
+    fn channel_volume_and_expression_pair_received_lsb_as_14_bit_values() {
+        let mut state = MidiInputChannelState::default();
+        assert!(!state.channel_volume_lsb_received());
+        assert!(!state.expression_lsb_received());
+
+        state.update(MidiInputEvent::ControlChange {
+            channel: 0,
+            controller: 7,
+            value: 64,
+        });
+        state.update(MidiInputEvent::ControlChange {
+            channel: 0,
+            controller: 11,
+            value: 32,
+        });
+        assert_eq!(state.raw_channel_volume(), 64);
+        assert_eq!(state.raw_expression(), 32);
+        assert!(!state.channel_volume_lsb_received());
+        assert!(!state.expression_lsb_received());
+
+        state.update(MidiInputEvent::ControlChange {
+            channel: 0,
+            controller: 39,
+            value: 1,
+        });
+        state.update(MidiInputEvent::ControlChange {
+            channel: 0,
+            controller: 43,
+            value: 65,
+        });
+        assert_eq!(state.raw_channel_volume_14bit(), (64 << 7) | 1);
+        assert_eq!(state.raw_expression_14bit(), (32 << 7) | 65);
+        assert!(state.channel_volume_lsb_received());
+        assert!(state.expression_lsb_received());
+
+        state.update(MidiInputEvent::ControlChange {
+            channel: 0,
+            controller: 7,
+            value: 63,
+        });
+        state.update(MidiInputEvent::ControlChange {
+            channel: 0,
+            controller: 11,
+            value: 31,
+        });
+        assert_eq!(state.raw_channel_volume_14bit(), (63 << 7) | 1);
+        assert_eq!(state.raw_expression_14bit(), (31 << 7) | 65);
+
+        state.update(MidiInputEvent::ControlChange {
+            channel: 0,
+            controller: 121,
+            value: 0,
+        });
+        assert!(!state.channel_volume_lsb_received());
+        assert!(!state.expression_lsb_received());
         assert_eq!(state.raw_channel_volume(), 127);
         assert_eq!(state.raw_expression(), 127);
     }

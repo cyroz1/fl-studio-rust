@@ -676,9 +676,17 @@ pub enum SamplerLiveNoteEvent {
         channel: u8,
         value: u8,
     },
+    ChannelVolume14Bit {
+        channel: u8,
+        value: u16,
+    },
     Expression {
         channel: u8,
         value: u8,
+    },
+    Expression14Bit {
+        channel: u8,
+        value: u16,
     },
     AllNotesOff {
         channel: u8,
@@ -717,6 +725,10 @@ pub enum LayerLiveInputEvent {
     Midi(Vst3LiveInputEvent),
     /// Updated Sampler pitch-bend offset for an input MIDI channel.
     SamplerPitchBend { channel: u8, cents: i16 },
+    /// Updated 14-bit Sampler Channel Volume for an input MIDI channel.
+    SamplerChannelVolume14Bit { channel: u8, value: u16 },
+    /// Updated 14-bit Sampler Expression for an input MIDI channel.
+    SamplerExpression14Bit { channel: u8, value: u16 },
     /// Reset Sampler sustain, channel-volume, expression, pan, and pitch-bend state
     /// for an input MIDI channel.
     SamplerResetControllers {
@@ -5523,8 +5535,14 @@ pub fn stream_sampler_midi_input_to_device(
                 Ok(SamplerLiveNoteEvent::ChannelVolume { channel, value }) => {
                     engine.apply_live_channel_volume(channel, value);
                 }
+                Ok(SamplerLiveNoteEvent::ChannelVolume14Bit { channel, value }) => {
+                    engine.apply_live_channel_volume_14bit(channel, value);
+                }
                 Ok(SamplerLiveNoteEvent::Expression { channel, value }) => {
                     engine.apply_live_expression(channel, value);
+                }
+                Ok(SamplerLiveNoteEvent::Expression14Bit { channel, value }) => {
+                    engine.apply_live_expression_14bit(channel, value);
                 }
                 Ok(SamplerLiveNoteEvent::AllNotesOff { channel }) => {
                     note_targets.retain(|(midi_channel, _), _| *midi_channel != (channel & 0x0F));
@@ -5811,6 +5829,12 @@ pub fn stream_mixed_layer_midi_input_to_device(
                     }
                     Ok(LayerLiveInputEvent::SamplerPitchBend { channel, cents }) => {
                         sampler_engine.apply_live_pitch_bend(channel, cents);
+                    }
+                    Ok(LayerLiveInputEvent::SamplerChannelVolume14Bit { channel, value }) => {
+                        sampler_engine.apply_live_channel_volume_14bit(channel, value);
+                    }
+                    Ok(LayerLiveInputEvent::SamplerExpression14Bit { channel, value }) => {
+                        sampler_engine.apply_live_expression_14bit(channel, value);
                     }
                     Ok(LayerLiveInputEvent::SamplerResetControllers {
                         channel,
@@ -10577,8 +10601,8 @@ struct SamplerVoiceEngine<'a> {
     voices_stolen: usize,
     pitch_bend_cents: [i16; 16],
     live_midi_pan: [u8; 16],
-    live_midi_channel_volume: [u8; 16],
-    live_midi_expression: [u8; 16],
+    live_midi_channel_volume: [f32; 16],
+    live_midi_expression: [f32; 16],
     sustain_down: [bool; 16],
     sostenuto_down: [bool; 16],
 }
@@ -10725,8 +10749,8 @@ impl<'a> SamplerVoiceEngine<'a> {
             voices_stolen: 0,
             pitch_bend_cents: [0; 16],
             live_midi_pan: [64; 16],
-            live_midi_channel_volume: [127; 16],
-            live_midi_expression: [127; 16],
+            live_midi_channel_volume: [1.0; 16],
+            live_midi_expression: [1.0; 16],
             sustain_down: [false; 16],
             sostenuto_down: [false; 16],
         }
@@ -10870,15 +10894,11 @@ impl<'a> SamplerVoiceEngine<'a> {
                             self.resampling_quality,
                         )
                     };
-                    let expression = voice
-                        .input_midi_channel
-                        .map_or(127, |channel| live_midi_expression[usize::from(channel)]);
-                    let channel_volume = voice.input_midi_channel.map_or(127, |channel| {
-                        live_midi_channel_volume[usize::from(channel)]
-                    });
                     let envelope_gain = sampler_voice_volume_envelope_gain(voice, frame);
-                    let midi_gain =
-                        f32::from(expression) * f32::from(channel_volume) / (127.0 * 127.0);
+                    let midi_gain = voice.input_midi_channel.map_or(1.0, |channel| {
+                        live_midi_expression[usize::from(channel)]
+                            * live_midi_channel_volume[usize::from(channel)]
+                    });
                     let gain = voice.gain * envelope_gain * midi_gain * fade;
                     let mut routed_frame = [
                         left * gain * voice.left_gain,
@@ -11285,11 +11305,22 @@ impl<'a> SamplerVoiceEngine<'a> {
     }
 
     fn apply_live_expression(&mut self, channel: u8, value: u8) {
-        self.live_midi_expression[usize::from(channel & 0x0F)] = value.min(127);
+        self.live_midi_expression[usize::from(channel & 0x0F)] = f32::from(value.min(127)) / 127.0;
+    }
+
+    fn apply_live_expression_14bit(&mut self, channel: u8, value: u16) {
+        self.live_midi_expression[usize::from(channel & 0x0F)] =
+            f32::from(value.min(16_383)) / 16_383.0;
     }
 
     fn apply_live_channel_volume(&mut self, channel: u8, value: u8) {
-        self.live_midi_channel_volume[usize::from(channel & 0x0F)] = value.min(127);
+        self.live_midi_channel_volume[usize::from(channel & 0x0F)] =
+            f32::from(value.min(127)) / 127.0;
+    }
+
+    fn apply_live_channel_volume_14bit(&mut self, channel: u8, value: u16) {
+        self.live_midi_channel_volume[usize::from(channel & 0x0F)] =
+            f32::from(value.min(16_383)) / 16_383.0;
     }
 
     fn release_live_notes(&mut self, channel: u8) {
@@ -17057,7 +17088,7 @@ mod tests {
         engine.set_voice_input_midi_channel(slot_index, 2);
         apply_live_layer_sampler_controller(&mut engine, 2, 7, 64);
 
-        let mut output = [0.0; 8];
+        let mut output = [0.0; 10];
         engine.render_block(0, 1, &mut output[..2]);
         let full_pan_gain = std::f32::consts::FRAC_1_SQRT_2;
         let channel_volume_gain = full_pan_gain * (64.0 / 127.0);
@@ -17078,6 +17109,13 @@ mod tests {
         engine.render_block(3, 1, &mut output[6..]);
         assert!((output[6] - full_pan_gain).abs() < 1e-6);
         assert!((output[7] - full_pan_gain).abs() < 1e-6);
+
+        engine.apply_live_channel_volume_14bit(2, 8_192);
+        engine.apply_live_expression_14bit(2, 4_096);
+        engine.render_block(4, 1, &mut output[8..]);
+        let high_resolution_gain = full_pan_gain * (8_192.0 / 16_383.0) * (4_096.0 / 16_383.0);
+        assert!((output[8] - high_resolution_gain).abs() < 1e-6);
+        assert!((output[9] - high_resolution_gain).abs() < 1e-6);
     }
 
     #[test]

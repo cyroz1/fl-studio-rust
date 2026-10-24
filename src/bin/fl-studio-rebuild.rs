@@ -46814,10 +46814,16 @@ impl DawUi {
                 });
             };
             send_control_change(7, state.raw_channel_volume());
+            if state.channel_volume_lsb_received() {
+                send_control_change(39, state.raw_channel_volume_14bit() as u8 & 0x7F);
+            }
             send_control_change(10, state.raw_pan());
             send_control_change(74, state.raw_mod_x());
             send_control_change(71, state.raw_mod_y());
             send_control_change(11, state.raw_expression());
+            if state.expression_lsb_received() {
+                send_control_change(43, state.raw_expression_14bit() as u8 & 0x7F);
+            }
             send_control_change(101, 0);
             send_control_change(100, 0);
             send_control_change(6, state.raw_pitch_bend_sensitivity_semitones());
@@ -46860,10 +46866,24 @@ impl DawUi {
                 ));
             };
             send_control_change(7, state.raw_channel_volume());
+            if state.channel_volume_lsb_received() {
+                send_control_change(39, state.raw_channel_volume_14bit() as u8 & 0x7F);
+                let _ = sender.send(LayerLiveInputEvent::SamplerChannelVolume14Bit {
+                    channel,
+                    value: state.raw_channel_volume_14bit(),
+                });
+            }
             send_control_change(10, state.raw_pan());
             send_control_change(74, state.raw_mod_x());
             send_control_change(71, state.raw_mod_y());
             send_control_change(11, state.raw_expression());
+            if state.expression_lsb_received() {
+                send_control_change(43, state.raw_expression_14bit() as u8 & 0x7F);
+                let _ = sender.send(LayerLiveInputEvent::SamplerExpression14Bit {
+                    channel,
+                    value: state.raw_expression_14bit(),
+                });
+            }
             send_control_change(101, 0);
             send_control_change(100, 0);
             send_control_change(6, state.raw_pitch_bend_sensitivity_semitones());
@@ -47005,12 +47025,7 @@ impl DawUi {
         let initial_pan = self
             .midi_input_channel_state
             .map(MidiInputChannelState::raw_pan);
-        let initial_expression = self
-            .midi_input_channel_state
-            .map(MidiInputChannelState::raw_expression);
-        let initial_channel_volume = self
-            .midi_input_channel_state
-            .map(MidiInputChannelState::raw_channel_volume);
+        let initial_channel_state = self.midi_input_channel_state;
         let initial_sustain_channels = self
             .midi_live_sampler_sustain_channels
             .iter()
@@ -47063,17 +47078,30 @@ impl DawUi {
                         value,
                     });
                 }
-                for (channel, value) in initial_expression.into_iter().enumerate() {
-                    let _ = event_sender.send(SamplerLiveNoteEvent::Expression {
-                        channel: channel as u8,
-                        value,
-                    });
-                }
-                for (channel, value) in initial_channel_volume.into_iter().enumerate() {
-                    let _ = event_sender.send(SamplerLiveNoteEvent::ChannelVolume {
-                        channel: channel as u8,
-                        value,
-                    });
+                for (channel, state) in initial_channel_state.iter().copied().enumerate() {
+                    let channel = channel as u8;
+                    if state.expression_lsb_received() {
+                        let _ = event_sender.send(SamplerLiveNoteEvent::Expression14Bit {
+                            channel,
+                            value: state.raw_expression_14bit(),
+                        });
+                    } else {
+                        let _ = event_sender.send(SamplerLiveNoteEvent::Expression {
+                            channel,
+                            value: state.raw_expression(),
+                        });
+                    }
+                    if state.channel_volume_lsb_received() {
+                        let _ = event_sender.send(SamplerLiveNoteEvent::ChannelVolume14Bit {
+                            channel,
+                            value: state.raw_channel_volume_14bit(),
+                        });
+                    } else {
+                        let _ = event_sender.send(SamplerLiveNoteEvent::ChannelVolume {
+                            channel,
+                            value: state.raw_channel_volume(),
+                        });
+                    }
                 }
                 for channel in initial_sustain_channels {
                     let _ = event_sender.send(SamplerLiveNoteEvent::Sustain {
@@ -47245,6 +47273,19 @@ impl DawUi {
                         value,
                     },
                 ));
+                let channel_state = self.midi_input_channel_state[usize::from(channel & 0x0F)];
+                if matches!(controller, 7 | 39) && channel_state.channel_volume_lsb_received() {
+                    queued_events.push(LayerLiveInputEvent::SamplerChannelVolume14Bit {
+                        channel,
+                        value: channel_state.raw_channel_volume_14bit(),
+                    });
+                }
+                if matches!(controller, 11 | 43) && channel_state.expression_lsb_received() {
+                    queued_events.push(LayerLiveInputEvent::SamplerExpression14Bit {
+                        channel,
+                        value: channel_state.raw_expression_14bit(),
+                    });
+                }
                 if matches!(controller, 6 | 38 | 100 | 101) {
                     queued_events.push(LayerLiveInputEvent::SamplerPitchBend {
                         channel,
@@ -47447,14 +47488,42 @@ impl DawUi {
             } => (SamplerLiveNoteEvent::Pan { channel, value }, None),
             MidiInputEvent::ControlChange {
                 channel,
-                controller: 7,
-                value,
-            } => (SamplerLiveNoteEvent::ChannelVolume { channel, value }, None),
+                controller: 7 | 39,
+                ..
+            } => {
+                let state = self.midi_input_channel_state[usize::from(channel & 0x0F)];
+                let event = if state.channel_volume_lsb_received() {
+                    SamplerLiveNoteEvent::ChannelVolume14Bit {
+                        channel,
+                        value: state.raw_channel_volume_14bit(),
+                    }
+                } else {
+                    SamplerLiveNoteEvent::ChannelVolume {
+                        channel,
+                        value: state.raw_channel_volume(),
+                    }
+                };
+                (event, None)
+            }
             MidiInputEvent::ControlChange {
                 channel,
-                controller: 11,
-                value,
-            } => (SamplerLiveNoteEvent::Expression { channel, value }, None),
+                controller: 11 | 43,
+                ..
+            } => {
+                let state = self.midi_input_channel_state[usize::from(channel & 0x0F)];
+                let event = if state.expression_lsb_received() {
+                    SamplerLiveNoteEvent::Expression14Bit {
+                        channel,
+                        value: state.raw_expression_14bit(),
+                    }
+                } else {
+                    SamplerLiveNoteEvent::Expression {
+                        channel,
+                        value: state.raw_expression(),
+                    }
+                };
+                (event, None)
+            }
             MidiInputEvent::ControlChange {
                 channel,
                 controller: 120,
