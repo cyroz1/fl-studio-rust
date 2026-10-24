@@ -32,7 +32,11 @@ pub enum ScriptTransportAction {
     Stop,
     RecordToggle,
     ToggleLoopMode,
+    SetSongPosition(u32),
 }
+
+const SCRIPT_SONG_POSITION_SCALE: f64 = 1_000_000.0;
+const SCRIPT_SONG_POSITION_SCALE_U32: u32 = 1_000_000;
 
 impl ScriptTransportAction {
     fn parse(value: &str) -> Option<Self> {
@@ -63,6 +67,13 @@ pub fn normalized_song_position(position_ticks: f64, length_ticks: u64) -> f64 {
         return 0.0;
     }
     (position_ticks / length_ticks as f64).clamp(0.0, 1.0)
+}
+
+pub fn song_position_ticks(position: u32, length_ticks: u64) -> u64 {
+    let scaled =
+        u128::from(position.min(SCRIPT_SONG_POSITION_SCALE_U32)) * u128::from(length_ticks);
+    ((scaled + u128::from(SCRIPT_SONG_POSITION_SCALE_U32 / 2))
+        / u128::from(SCRIPT_SONG_POSITION_SCALE_U32)) as u64
 }
 
 #[derive(Clone)]
@@ -442,13 +453,28 @@ fn parse_transport_actions(response: &Value) -> Result<Vec<ScriptTransportAction
         .as_array()
         .into_iter()
         .flatten()
-        .map(|action| {
-            action
-                .as_str()
-                .and_then(ScriptTransportAction::parse)
-                .ok_or_else(|| "MIDI script returned an unknown transport action".to_owned())
-        })
+        .map(parse_transport_action)
         .collect()
+}
+
+fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, String> {
+    if let Some(name) = action.as_str() {
+        return ScriptTransportAction::parse(name)
+            .ok_or_else(|| "MIDI script returned an unknown transport action".to_owned());
+    }
+    let name = action["action"].as_str();
+    if name == Some("set_song_position") {
+        let position = action["position"]
+            .as_f64()
+            .filter(|position| position.is_finite())
+            .ok_or_else(|| "MIDI script returned an invalid song position".to_owned())?;
+        let normalized = position.clamp(0.0, 1.0);
+        let position = (normalized * SCRIPT_SONG_POSITION_SCALE).round() as u32;
+        return Ok(ScriptTransportAction::SetSongPosition(
+            position.min(SCRIPT_SONG_POSITION_SCALE_U32),
+        ));
+    }
+    Err("MIDI script returned an unknown transport action".to_owned())
 }
 
 fn transform_message(original: &[u8], response: &Value) -> Result<Vec<u8>, String> {
@@ -509,7 +535,8 @@ mod tests {
     use super::{
         MidiControllerScript, MidiScriptRuntime, SCRIPT_TRANSPORT_PATTERN_MODE,
         SCRIPT_TRANSPORT_PLAYING, SCRIPT_TRANSPORT_RECORDING, ScriptTransportAction,
-        discover_midi_scripts, find_script_for_device, normalized_song_position, transform_message,
+        discover_midi_scripts, find_script_for_device, normalized_song_position,
+        song_position_ticks, transform_message,
     };
     use serde_json::json;
     use std::fs;
@@ -611,6 +638,15 @@ mod tests {
     }
 
     #[test]
+    fn normalized_song_position_maps_to_ticks_and_clamps_inputs() {
+        assert_eq!(song_position_ticks(0, 96), 0);
+        assert_eq!(song_position_ticks(250_000, 96), 24);
+        assert_eq!(song_position_ticks(1_000_000, 96), 96);
+        assert_eq!(song_position_ticks(2_000_000, 96), 96);
+        assert_eq!(song_position_ticks(500_000, 0), 0);
+    }
+
+    #[test]
     fn python_callbacks_can_remap_and_suppress_input_events() {
         let temporary = TestDirectory::new();
         let script_path = temporary.path().join("device_test.py");
@@ -637,7 +673,7 @@ mod tests {
         let script_path = temporary.path().join("device_test.py");
         fs::write(
             &script_path,
-            "# name=Test Script\nimport transport\ndef OnMidiIn(event):\n    transport.start()\n    transport.record()\n    transport.setLoopMode()\n    event.handled = True\n",
+            "# name=Test Script\nimport transport\ndef OnMidiIn(event):\n    transport.start()\n    transport.record()\n    transport.setLoopMode()\n    transport.setSongPos(0.75)\n    event.handled = True\n",
         )
         .unwrap();
         let script = MidiControllerScript::parse(script_path).unwrap();
@@ -652,6 +688,7 @@ mod tests {
                 ScriptTransportAction::Start,
                 ScriptTransportAction::RecordToggle,
                 ScriptTransportAction::ToggleLoopMode,
+                ScriptTransportAction::SetSongPosition(750_000),
             ]
         );
     }

@@ -107,7 +107,7 @@ use midi_output::{
 use midi_script::{
     MidiControllerScript, SCRIPT_TRANSPORT_PATTERN_MODE, SCRIPT_TRANSPORT_PLAYING,
     SCRIPT_TRANSPORT_RECORDING, discover_midi_scripts, find_script_for_device,
-    normalized_song_position,
+    normalized_song_position, song_position_ticks,
 };
 use midi_thru::{MidiThruSettings, MidiThruWorker};
 
@@ -12778,28 +12778,30 @@ impl DawUi {
     }
 
     fn midi_script_song_position_value(&self) -> f64 {
-        let Some(document) = self.document.as_ref() else {
-            return 0.0;
-        };
+        self.midi_script_song_position_tick_and_length()
+            .map(|(tick, length)| normalized_song_position(tick, length))
+            .unwrap_or(0.0)
+    }
+
+    fn midi_script_song_position_tick_and_length(&self) -> Option<(f64, u64)> {
+        let document = self.document.as_ref()?;
         if self.pattern_playback_mode {
             let active_loop = self.pattern_mode_playback_source;
             let pattern_id = active_loop
                 .map(|(pattern_id, _)| pattern_id)
-                .or(self.selected_pattern);
-            let Some(pattern_id) = pattern_id else {
-                return 0.0;
-            };
+                .or(self.selected_pattern)?;
             let tick = self
                 .current_pattern_mode_playhead_tick()
                 .map(|(_, tick)| tick)
                 .unwrap_or(self.pattern_seek_tick as f64);
-            let Some(pattern) = document.patterns().ok().and_then(|patterns| {
+            if let Some((_, length)) = active_loop {
+                return Some((tick, length));
+            }
+            let pattern = document.patterns().ok().and_then(|patterns| {
                 patterns
                     .into_iter()
                     .find(|pattern| pattern.id == pattern_id)
-            }) else {
-                return 0.0;
-            };
+            })?;
             let content_end = pattern
                 .notes
                 .iter()
@@ -12818,24 +12820,19 @@ impl DawUi {
                 )
                 .max()
                 .unwrap_or(0);
-            let length = active_loop
-                .map(|(_, length)| length)
-                .or_else(|| pattern.length_ticks.map(u64::from))
-                .unwrap_or(content_end);
-            return normalized_song_position(tick, length);
+            let length = pattern.length_ticks.map(u64::from).unwrap_or(content_end);
+            return Some((tick, length));
         }
 
         let tick = self
             .current_playhead_tick()
             .unwrap_or(f64::from(self.playlist_seek_tick));
         let arrangement_id = self.selected_arrangement.unwrap_or(0);
-        let Some(arrangement) = document.arrangements().ok().and_then(|arrangements| {
+        let arrangement = document.arrangements().ok().and_then(|arrangements| {
             arrangements
                 .into_iter()
                 .find(|arrangement| arrangement.id == arrangement_id)
-        }) else {
-            return 0.0;
-        };
+        })?;
         let length = arrangement
             .clips
             .iter()
@@ -12848,7 +12845,43 @@ impl DawUi {
             )
             .max()
             .unwrap_or(0);
-        normalized_song_position(tick, length)
+        Some((tick, length))
+    }
+
+    fn set_midi_script_song_position(&mut self, position: u32) {
+        let Some((_, length)) = self.midi_script_song_position_tick_and_length() else {
+            self.status =
+                "Could not set MIDI script song position without a selected timeline".to_owned();
+            return;
+        };
+        if length == 0 {
+            self.status = "Could not set MIDI script song position on an empty timeline".to_owned();
+            return;
+        }
+        let tick = song_position_ticks(position, length);
+        if self.pattern_playback_mode {
+            let Some(pattern_id) = self
+                .pattern_mode_playback_source
+                .map(|(pattern_id, _)| pattern_id)
+                .or(self.selected_pattern)
+            else {
+                return;
+            };
+            self.seek_pattern_mode_to_tick(pattern_id, tick.min(u64::from(u32::MAX)) as u32);
+            return;
+        }
+
+        let restart_playback = self.playlist_playback_loaded && self.playing;
+        let stop_existing_playback =
+            self.playlist_playback_loaded || self.pending_audio_render.is_some();
+        if stop_existing_playback {
+            self.stop_project_playback();
+        }
+        self.playlist_seek_tick = tick.min(u64::from(u32::MAX)) as u32;
+        self.status = format!("Song position set to tick {}", self.playlist_seek_tick);
+        if restart_playback {
+            self.start_project_playback();
+        }
     }
 
     fn live_sampler_tempo_bpm_milli(&self) -> u32 {
@@ -44462,6 +44495,9 @@ impl DawUi {
             }
             MidiTransportCommand::ToggleLoopMode => {
                 self.set_pattern_playback_mode(!self.pattern_playback_mode);
+            }
+            MidiTransportCommand::SetSongPosition(position) => {
+                self.set_midi_script_song_position(position);
             }
         }
     }

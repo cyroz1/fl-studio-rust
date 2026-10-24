@@ -1,4 +1,5 @@
 import json
+import math
 import runpy
 import sys
 import types
@@ -108,6 +109,18 @@ def _get_song_pos(mode=-1):
     return float(_active_transport_state.get("song_position", 0.0))
 
 
+def _set_song_pos(position, mode=-1):
+    if mode != -1:
+        raise NotImplementedError("only normalized transport.setSongPos() is supported")
+    position = float(position)
+    if not math.isfinite(position):
+        raise ValueError("transport.setSongPos() requires a finite position")
+    if _active_transport_actions is not None:
+        _active_transport_actions.append(
+            {"action": "set_song_position", "position": min(1.0, max(0.0, position))}
+        )
+
+
 def _install_modules(script_name, device_name):
     midi = _module("midi")
     constants = {
@@ -155,6 +168,7 @@ def _install_modules(script_name, device_name):
     transport.isPlaying = lambda: int(bool(_active_transport_state.get("is_playing", False)))
     transport.isRecording = lambda: int(bool(_active_transport_state.get("is_recording", False)))
     transport.getSongPos = _get_song_pos
+    transport.setSongPos = _set_song_pos
     transport.getLoopMode = lambda: (
         0 if _active_transport_state.get("pattern_mode", False) else 1
     )
