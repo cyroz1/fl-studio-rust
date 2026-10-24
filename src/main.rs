@@ -5656,14 +5656,14 @@ fn list_mixer(path: &Path) -> Result<(), String> {
     println!("recognized effect slot records: {}", effect_slots.len());
     for slot in effect_slots {
         println!(
-            "insert={} slot={} plugin={} name={} enabled={:?} mix_raw={:?} state_events={}",
+            "insert={} slot={} plugin={} name={} state_events={} enabled={:?} mix_raw={:?}",
             slot.insert_ordinal(),
             slot.slot_index(),
             slot.plugin_identifier().unwrap_or("(unknown)"),
             slot.display_name().unwrap_or("(unnamed)"),
+            slot.state_event_count(),
             slot.enabled(),
             slot.mix_raw(),
-            slot.state_event_count()
         );
     }
     let count_kind = |kind| {
