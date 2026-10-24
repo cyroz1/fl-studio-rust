@@ -26,7 +26,7 @@ pub struct ScriptMidiResult {
     pub actions: Vec<ScriptTransportAction>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ScriptTransportAction {
     Start,
     Stop,
@@ -42,6 +42,7 @@ pub enum ScriptTransportAction {
     TempoJog(i32),
     MarkerJumpJog(i32),
     MarkerSelJog(i32),
+    MidiOutput(Vec<u8>),
 }
 
 const SCRIPT_SONG_POSITION_SCALE: f64 = 1_000_000.0;
@@ -64,6 +65,7 @@ pub struct MidiScriptRuntime {
     stdin: BufWriter<ChildStdin>,
     stdout: BufReader<ChildStdout>,
     transport_state: Arc<MidiScriptTransportState>,
+    startup_actions: Vec<ScriptTransportAction>,
 }
 
 pub const SCRIPT_TRANSPORT_PLAYING: u8 = 1 << 0;
@@ -76,9 +78,9 @@ pub const SCRIPT_BEAT_INDICATOR_OFF: i32 = 0;
 pub const SCRIPT_BEAT_INDICATOR_BAR: i32 = 1;
 pub const SCRIPT_BEAT_INDICATOR_BEAT: i32 = 2;
 
-#[derive(Default)]
 pub struct MidiScriptTransportState {
     pub state: AtomicU8,
+    pub midi_output_port_number: AtomicI32,
     pub song_position: AtomicU64,
     pub song_position_ticks: AtomicU64,
     pub ticks_per_quarter: AtomicU64,
@@ -92,6 +94,28 @@ pub struct MidiScriptTransportState {
     pub project_title: Mutex<String>,
     pub project_author: Mutex<String>,
     pub project_genre: Mutex<String>,
+}
+
+impl Default for MidiScriptTransportState {
+    fn default() -> Self {
+        Self {
+            state: AtomicU8::new(0),
+            midi_output_port_number: AtomicI32::new(-1),
+            song_position: AtomicU64::new(0.0_f64.to_bits()),
+            song_position_ticks: AtomicU64::new(0),
+            ticks_per_quarter: AtomicU64::new(96),
+            time_signature_numerator: AtomicU64::new(4),
+            song_length_ticks: AtomicU64::new(0),
+            song_position_seconds: AtomicU64::new(0.0_f64.to_bits()),
+            song_length_seconds: AtomicU64::new(0.0_f64.to_bits()),
+            hardware_beat_led_state: AtomicI32::new(SCRIPT_BEAT_INDICATOR_OFF),
+            song_position_hint: Mutex::new("1:01:000".to_owned()),
+            song_length_hint: Mutex::new("0:00:000".to_owned()),
+            project_title: Mutex::new(String::new()),
+            project_author: Mutex::new(String::new()),
+            project_genre: Mutex::new(String::new()),
+        }
+    }
 }
 
 pub fn normalized_song_position(position_ticks: f64, length_ticks: u64) -> f64 {
@@ -341,6 +365,7 @@ impl MidiScriptRuntime {
             stdin: BufWriter::new(stdin),
             stdout: BufReader::new(stdout),
             transport_state,
+            startup_actions: Vec::new(),
         };
         let mut ready = String::new();
         runtime.stdout.read_line(&mut ready).map_err(|error| {
@@ -364,7 +389,13 @@ impl MidiScriptRuntime {
                     .unwrap_or("script initialization failed")
             ));
         }
+        let startup_response = runtime.exchange(&json!({"initialize": true}))?;
+        runtime.startup_actions = parse_transport_actions(&startup_response)?;
         Ok(runtime)
+    }
+
+    pub fn take_startup_actions(&mut self) -> Vec<ScriptTransportAction> {
+        std::mem::take(&mut self.startup_actions)
     }
 
     pub fn process_event(
@@ -484,6 +515,10 @@ impl MidiScriptRuntime {
                     "is_playing": transport & SCRIPT_TRANSPORT_PLAYING != 0,
                     "is_recording": transport & SCRIPT_TRANSPORT_RECORDING != 0,
                     "pattern_mode": transport & SCRIPT_TRANSPORT_PATTERN_MODE != 0,
+                    "midi_output_port_number": self
+                        .transport_state
+                        .midi_output_port_number
+                        .load(Ordering::Relaxed),
                     "song_position": song_position,
                     "song_position_ticks": self
                         .transport_state
@@ -664,7 +699,49 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
             .ok_or_else(|| "MIDI script returned an invalid tempo jog increment".to_owned())?;
         return Ok(ScriptTransportAction::TempoJog(increment));
     }
+    if name == Some("midi_out_message") || name == Some("midi_out_sysex") {
+        let message = action["bytes"]
+            .as_array()
+            .filter(|message| message.len() <= 65_536)
+            .ok_or_else(|| "MIDI script returned an invalid output message".to_owned())?;
+        let bytes = message
+            .iter()
+            .map(|value| {
+                value
+                    .as_u64()
+                    .and_then(|value| u8::try_from(value).ok())
+                    .ok_or_else(|| "MIDI script returned an invalid output byte".to_owned())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if name == Some("midi_out_sysex") {
+            if bytes.len() < 2
+                || bytes.first() != Some(&0xF0)
+                || bytes.last() != Some(&0xF7)
+                || bytes[1..bytes.len() - 1].iter().any(|byte| *byte > 0x7F)
+            {
+                return Err("MIDI script returned incomplete SysEx output".to_owned());
+            }
+        } else if !valid_short_midi_output(&bytes) {
+            return Err("MIDI script returned an invalid short MIDI output message".to_owned());
+        }
+        return Ok(ScriptTransportAction::MidiOutput(bytes));
+    }
     Err("MIDI script returned an unknown transport action".to_owned())
+}
+
+fn valid_short_midi_output(bytes: &[u8]) -> bool {
+    let Some(&status) = bytes.first() else {
+        return false;
+    };
+    let expected_length = match status {
+        0x80..=0xEF if matches!(status & 0xF0, 0xC0 | 0xD0) => 2,
+        0x80..=0xEF => 3,
+        0xF1 | 0xF3 => 2,
+        0xF2 => 3,
+        0xF6 | 0xF8 | 0xFA..=0xFC | 0xFE..=0xFF => 1,
+        _ => return false,
+    };
+    bytes.len() == expected_length && bytes.iter().skip(1).all(|byte| *byte <= 0x7F)
 }
 
 fn transform_message(original: &[u8], response: &Value) -> Result<Vec<u8>, String> {
@@ -991,6 +1068,109 @@ mod tests {
         let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
 
         assert_eq!(result.bytes, [0xB0, 96, 1]);
+    }
+
+    #[test]
+    fn python_device_midi_out_message_emits_packed_channel_voice_bytes() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport device\ndef OnMidiIn(event):\n    event.data2 = device.isAssigned()\n    device.midiOutNewMsg(3, 0x00643C90)\n    device.midiOutNewMsg(3, 0x00643C90)\n    device.directFeedback(event)\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let transport_state = Arc::new(MidiScriptTransportState::default());
+        transport_state
+            .midi_output_port_number
+            .store(0, Ordering::Relaxed);
+        let mut runtime = MidiScriptRuntime::start_for_device_with_transport_state(
+            &script,
+            "Test Input",
+            transport_state,
+        )
+        .unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 0]).unwrap();
+
+        assert_eq!(result.bytes, [0xB0, 7, 1]);
+        assert_eq!(
+            result.actions,
+            [
+                ScriptTransportAction::MidiOutput(vec![0x90, 60, 100]),
+                ScriptTransportAction::MidiOutput(vec![0xB0, 7, 1]),
+            ]
+        );
+    }
+
+    #[test]
+    fn python_device_assignment_defaults_to_unassigned() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport device\ndef OnMidiIn(event):\n    event.data1 = device.getPortNumber() + 1\n    event.data2 = device.isAssigned()\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let mut runtime = MidiScriptRuntime::start_for_device(&script, "Test Input").unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 0, 0]).unwrap();
+
+        assert_eq!(result.bytes, [0xB0, 0, 0]);
+    }
+
+    #[test]
+    fn python_device_on_init_sends_channel_voice_and_sysex_messages() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport device\ndef OnInit():\n    if device.isAssigned() and device.getPortNumber() == 0:\n        device.midiOutMsg(0x90, 2, 60, 100)\n        device.midiOutSysex(bytes([0xF0, 0x7D, 0x01, 0xF7]))\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let transport_state = Arc::new(MidiScriptTransportState::default());
+        transport_state
+            .midi_output_port_number
+            .store(0, Ordering::Relaxed);
+        let mut runtime = MidiScriptRuntime::start_for_device_with_transport_state(
+            &script,
+            "Test Input",
+            transport_state,
+        )
+        .unwrap();
+
+        assert_eq!(
+            runtime.take_startup_actions(),
+            [
+                ScriptTransportAction::MidiOutput(vec![0x92, 60, 100]),
+                ScriptTransportAction::MidiOutput(vec![0xF0, 0x7D, 0x01, 0xF7]),
+            ]
+        );
+    }
+
+    #[test]
+    fn python_device_repeats_event_until_stopped() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport device\nidle_calls = 0\ndef OnMidiIn(event):\n    device.repeatMidiEvent(event, 0, 10)\ndef OnIdle():\n    global idle_calls\n    idle_calls += 1\n    if idle_calls == 2:\n        device.stopRepeatMidiEvent()\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let mut runtime = MidiScriptRuntime::start_for_device(&script, "Test Input").unwrap();
+
+        runtime.process_event(12, &[0xB0, 7, 99]).unwrap();
+        let first_idle = runtime.process_idle().unwrap();
+        let second_idle = runtime.process_idle().unwrap();
+
+        assert_eq!(
+            first_idle.actions,
+            [ScriptTransportAction::MidiOutput(vec![0xB0, 7, 99])]
+        );
+        assert!(second_idle.actions.is_empty());
     }
 
     #[test]

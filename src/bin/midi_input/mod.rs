@@ -86,16 +86,26 @@ impl MidiInputScriptWorker {
         script: &MidiControllerScript,
         device_name: &str,
         output_sender: SyncSender<ReceivedMidiMessage>,
+        midi_output_sender: SyncSender<Vec<u8>>,
         thru_queue: MidiThruInputQueue,
         dropped_messages: Arc<AtomicU64>,
         transport_state: Arc<MidiScriptTransportState>,
     ) -> Result<Self, String> {
-        let runtime = MidiScriptRuntime::start_for_device_with_transport_state(
+        let mut runtime = MidiScriptRuntime::start_for_device_with_transport_state(
             script,
             device_name,
             transport_state,
         )?;
+        let startup_actions = runtime.take_startup_actions();
         let stop_handle = runtime.stop_handle();
+        queue_script_transport_actions(
+            &output_sender,
+            &midi_output_sender,
+            &dropped_messages,
+            0,
+            Instant::now(),
+            startup_actions,
+        );
         let (sender, input_receiver) = mpsc::sync_channel(MIDI_INPUT_QUEUE_CAPACITY);
         let (error_sender, errors) = mpsc::sync_channel(16);
         let (finished_sender, finished) = mpsc::sync_channel(1);
@@ -124,6 +134,7 @@ impl MidiInputScriptWorker {
                             match idle_result {
                                 Some(Ok(result)) => queue_script_transport_actions(
                                     &output_sender,
+                                    &midi_output_sender,
                                     &dropped_messages,
                                     timestamp_micros,
                                     received_at,
@@ -159,6 +170,7 @@ impl MidiInputScriptWorker {
                             match callback_result {
                                 Some(Ok(result)) => queue_script_transport_actions(
                                     &output_sender,
+                                    &midi_output_sender,
                                     &dropped_messages,
                                     timestamp_micros,
                                     received_at,
@@ -189,6 +201,7 @@ impl MidiInputScriptWorker {
                             match callback_result {
                                 Some(Ok(result)) => queue_script_transport_actions(
                                     &output_sender,
+                                    &midi_output_sender,
                                     &dropped_messages,
                                     timestamp_micros,
                                     received_at,
@@ -219,6 +232,7 @@ impl MidiInputScriptWorker {
                             match callback_result {
                                 Some(Ok(result)) => queue_script_transport_actions(
                                     &output_sender,
+                                    &midi_output_sender,
                                     &dropped_messages,
                                     timestamp_micros,
                                     received_at,
@@ -243,6 +257,7 @@ impl MidiInputScriptWorker {
                                 Some(Ok(result)) => {
                                     queue_script_transport_actions(
                                         &output_sender,
+                                        &midi_output_sender,
                                         &dropped_messages,
                                         message.timestamp_micros,
                                         message.received_at,
@@ -369,12 +384,19 @@ fn forward_scripted_input(
 
 fn queue_script_transport_actions(
     sender: &SyncSender<ReceivedMidiMessage>,
+    midi_output_sender: &SyncSender<Vec<u8>>,
     dropped_messages: &AtomicU64,
     timestamp_micros: u64,
     received_at: Instant,
     actions: impl IntoIterator<Item = ScriptTransportAction>,
 ) {
     for action in actions {
+        if let ScriptTransportAction::MidiOutput(bytes) = action {
+            if midi_output_sender.try_send(bytes).is_err() {
+                dropped_messages.fetch_add(1, Ordering::Relaxed);
+            }
+            continue;
+        }
         let command = match action {
             ScriptTransportAction::Start => MidiTransportCommand::Start,
             ScriptTransportAction::Stop => MidiTransportCommand::Stop,
@@ -410,6 +432,7 @@ fn queue_script_transport_actions(
             ScriptTransportAction::MarkerSelJog(increment) => {
                 MidiTransportCommand::MarkerSelJog(increment)
             }
+            ScriptTransportAction::MidiOutput(_) => unreachable!("handled above"),
         };
         let transport_message = ReceivedMidiMessage {
             timestamp_micros,
@@ -738,6 +761,7 @@ pub fn enumerate_input_devices() -> Result<Vec<MidiInputDevice>, String> {
 pub fn connect_input_device(
     device_id: &str,
     sender: SyncSender<ReceivedMidiMessage>,
+    midi_output_sender: SyncSender<Vec<u8>>,
     thru_queue: MidiThruInputQueue,
     dropped_messages: Arc<AtomicU64>,
     transport_state: Arc<MidiScriptTransportState>,
@@ -760,6 +784,7 @@ pub fn connect_input_device(
                 script,
                 &device_name,
                 sender.clone(),
+                midi_output_sender.clone(),
                 thru_queue.clone(),
                 Arc::clone(&dropped_messages),
                 Arc::clone(&transport_state),

@@ -4618,6 +4618,8 @@ struct DawUi {
     last_midi_script_beat_position: Option<(String, String, u64, u64)>,
     midi_message_sender: SyncSender<ReceivedMidiMessage>,
     midi_message_receiver: Receiver<ReceivedMidiMessage>,
+    midi_script_output_sender: SyncSender<Vec<u8>>,
+    midi_script_output_receiver: Receiver<Vec<u8>>,
     midi_dropped_messages: Arc<AtomicU64>,
     midi_reported_dropped_messages: u64,
     midi_activity: Option<(String, Instant)>,
@@ -5636,6 +5638,8 @@ impl DawUi {
         let audio_catalog = enumerate_devices();
         let (midi_message_sender, midi_message_receiver) =
             mpsc::sync_channel(midi_input::MIDI_INPUT_QUEUE_CAPACITY);
+        let (midi_script_output_sender, midi_script_output_receiver) =
+            mpsc::sync_channel(midi_input::MIDI_INPUT_QUEUE_CAPACITY);
         let midi_thru_worker = MidiThruWorker::new();
         let midi_thru_input_queue = midi_thru_worker.input_queue();
         let (midi_input_devices, midi_input_error) = match enumerate_input_devices() {
@@ -6049,6 +6053,8 @@ impl DawUi {
             last_midi_script_beat_position: None,
             midi_message_sender,
             midi_message_receiver,
+            midi_script_output_sender,
+            midi_script_output_receiver,
             midi_dropped_messages: Arc::new(AtomicU64::new(0)),
             midi_reported_dropped_messages: 0,
             midi_activity: None,
@@ -12850,6 +12856,16 @@ impl DawUi {
     }
 
     fn publish_midi_script_transport_state(&mut self) {
+        self.midi_script_transport_state
+            .midi_output_port_number
+            .store(
+                if self.midi_output_connection.is_some() {
+                    0
+                } else {
+                    -1
+                },
+                Ordering::Relaxed,
+            );
         let mut state = 0;
         if self.playing {
             state |= SCRIPT_TRANSPORT_PLAYING;
@@ -43892,6 +43908,7 @@ impl DawUi {
         match connect_input_device(
             &device_id,
             self.midi_message_sender.clone(),
+            self.midi_script_output_sender.clone(),
             self.midi_thru_input_queue.clone(),
             Arc::clone(&self.midi_dropped_messages),
             Arc::clone(&self.midi_script_transport_state),
@@ -44031,6 +44048,9 @@ impl DawUi {
             Ok(mut connection) => {
                 let all_notes_off_error = connection.send_all_notes_off().err();
                 self.midi_output_connection = Some(connection);
+                self.midi_script_transport_state
+                    .midi_output_port_number
+                    .store(0, Ordering::Relaxed);
                 self.midi_selected_output_id = Some(device_id);
                 let setup_error = self.send_midi_output_channel_setup().err();
                 let connection_error = all_notes_off_error.or(setup_error);
@@ -44085,8 +44105,14 @@ impl DawUi {
         self.stop_midi_pattern_transport();
         self.stop_midi_clock();
         let Some(mut connection) = self.midi_output_connection.take() else {
+            self.midi_script_transport_state
+                .midi_output_port_number
+                .store(-1, Ordering::Relaxed);
             return;
         };
+        self.midi_script_transport_state
+            .midi_output_port_number
+            .store(-1, Ordering::Relaxed);
         let device_name = connection.device_name.clone();
         let all_notes_off_error = connection.send_all_notes_off().err();
         drop(connection);
@@ -48053,6 +48079,7 @@ impl DawUi {
 
     fn poll_midi_input(&mut self, history_snapshot_available: bool) {
         self.update_midi_thru_settings();
+        self.poll_midi_script_output();
         if let Some(error) = self
             .midi_input_connection
             .as_ref()
@@ -48123,8 +48150,24 @@ impl DawUi {
         if dropped > self.midi_reported_dropped_messages {
             let new_drops = dropped - self.midi_reported_dropped_messages;
             self.midi_reported_dropped_messages = dropped;
-            self.status =
-                format!("MIDI input queue dropped {new_drops} message(s) ({dropped} total)");
+            self.status = format!("MIDI queue dropped {new_drops} message(s) ({dropped} total)");
+        }
+    }
+
+    fn poll_midi_script_output(&mut self) {
+        for _ in 0..midi_input::MIDI_INPUT_QUEUE_CAPACITY {
+            let bytes = match self.midi_script_output_receiver.try_recv() {
+                Ok(bytes) => bytes,
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            };
+            let result = match self.midi_output_connection.as_mut() {
+                Some(connection) => connection.send(&bytes),
+                None => Err("Connect a MIDI output before scripts send messages".to_owned()),
+            };
+            if let Err(error) = result {
+                self.midi_output_error = Some(error.clone());
+                self.status = format!("Could not send MIDI script output: {error}");
+            }
         }
     }
 

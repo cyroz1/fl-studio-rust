@@ -2,6 +2,7 @@ import json
 import math
 import runpy
 import sys
+import time
 import types
 
 
@@ -9,6 +10,8 @@ _protocol_out = sys.stdout
 sys.stdout = sys.stderr
 _active_transport_actions = None
 _active_transport_state = {}
+_midi_out_new_messages = {}
+_repeat_midi_output = None
 
 
 def _emit(value):
@@ -101,6 +104,141 @@ def _module(name):
 def _request_transport_action(action):
     if _active_transport_actions is not None:
         _active_transport_actions.append(action)
+
+
+def _short_message_length(status):
+    if 0x80 <= status <= 0xEF:
+        return 2 if (status & 0xF0) in (0xC0, 0xD0) else 3
+    if status in (0xF1, 0xF3):
+        return 2
+    if status in (0xF2,):
+        return 3
+    if status in (0xF6, 0xF8, 0xFA, 0xFB, 0xFC, 0xFE, 0xFF):
+        return 1
+    return 0
+
+
+def _queue_midi_output(message_bytes, action="midi_out_message"):
+    if _active_transport_actions is not None:
+        _active_transport_actions.append(
+            {"action": action, "bytes": list(message_bytes)}
+        )
+
+
+def _midi_out_msg(*arguments):
+    if len(arguments) == 1:
+        try:
+            packed = int(arguments[0])
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError("device.midiOutMsg() requires a packed integer message") from error
+        if not 0 <= packed <= 0xFFFFFF:
+            raise ValueError("device.midiOutMsg() message must fit in 24 bits")
+        status = packed & 0xFF
+        data = [(packed >> 8) & 0xFF, (packed >> 16) & 0xFF]
+    elif len(arguments) == 4:
+        try:
+            midi_id, channel, data1, data2 = (int(value) for value in arguments)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError("device.midiOutMsg() arguments must be integers") from error
+        if not 0x80 <= midi_id <= 0xE0 or midi_id & 0x0F:
+            raise ValueError("device.midiOutMsg() midiId must be a channel-voice status type")
+        if not 0 <= channel <= 15:
+            raise ValueError("device.midiOutMsg() channel must be between 0 and 15")
+        status = midi_id | channel
+        data = [data1, data2]
+    else:
+        raise TypeError("device.midiOutMsg() expects one or four arguments")
+
+    length = _short_message_length(status)
+    if not length:
+        raise NotImplementedError("device.midiOutMsg() does not support this MIDI status")
+    data = data[: length - 1]
+    if any(value < 0 or value > 127 for value in data):
+        raise ValueError("device.midiOutMsg() data bytes must be between 0 and 127")
+    _queue_midi_output([status] + data)
+
+
+def _midi_out_new_msg(slot_index, message):
+    try:
+        slot_index = int(slot_index)
+        packed = int(message)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("device.midiOutNewMsg() requires integer arguments") from error
+    if _midi_out_new_messages.get(slot_index) == packed:
+        return
+    _midi_out_msg(packed)
+    _midi_out_new_messages[slot_index] = packed
+
+
+def _midi_out_sysex(message):
+    if isinstance(message, str):
+        try:
+            message = bytes(ord(character) for character in message)
+        except ValueError as error:
+            raise ValueError("device.midiOutSysex() string must contain byte characters") from error
+    elif isinstance(message, (bytes, bytearray)):
+        message = bytes(message)
+    else:
+        raise TypeError("device.midiOutSysex() expects a byte string")
+    if len(message) < 2 or len(message) > 65_536:
+        raise ValueError("device.midiOutSysex() requires 2–65,536 bytes")
+    if any(byte > 0x7F for byte in message[1:-1]):
+        raise ValueError("device.midiOutSysex() payload bytes must be between 0 and 127")
+    _queue_midi_output(message, "midi_out_sysex")
+
+
+def _event_message_bytes(event):
+    status = int(event.status)
+    if status == 0xF0:
+        message = bytes(event.sysex)
+        if len(message) < 2 or message[0] != 0xF0 or message[-1] != 0xF7:
+            raise ValueError("MIDI event does not contain a complete SysEx message")
+        if any(byte > 0x7F for byte in message[1:-1]):
+            raise ValueError("MIDI SysEx payload bytes must be between 0 and 127")
+        return message
+    length = _short_message_length(status)
+    if not length:
+        raise NotImplementedError("device.directFeedback() does not support this MIDI status")
+    data = [int(event.data1), int(event.data2)][: length - 1]
+    if any(value < 0 or value > 127 for value in data):
+        raise ValueError("MIDI event data bytes must be between 0 and 127")
+    return bytes([status] + data)
+
+
+def _direct_feedback(event):
+    message = _event_message_bytes(event)
+    _queue_midi_output(message, "midi_out_sysex" if message[0] == 0xF0 else "midi_out_message")
+
+
+def _repeat_midi_event(event, delay=300, rate=300):
+    global _repeat_midi_output
+    try:
+        delay = int(delay)
+        rate = int(rate)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("device.repeatMidiEvent() delay and rate must be integers") from error
+    if delay < 0 or rate <= 0:
+        raise ValueError("device.repeatMidiEvent() requires nonnegative delay and positive rate")
+    _repeat_midi_output = {
+        "bytes": _event_message_bytes(event),
+        "next": time.monotonic() + delay / 1000.0,
+        "rate": rate / 1000.0,
+    }
+
+
+def _stop_repeat_midi_event():
+    global _repeat_midi_output
+    _repeat_midi_output = None
+
+
+def _dispatch_repeating_midi_event():
+    if _repeat_midi_output is None:
+        return
+    now = time.monotonic()
+    if now < _repeat_midi_output["next"]:
+        return
+    _queue_midi_output(_repeat_midi_output["bytes"])
+    _repeat_midi_output["next"] = now + _repeat_midi_output["rate"]
 
 
 def _bst_component(hint, mode, default):
@@ -431,9 +569,19 @@ def _install_modules(script_name, device_name):
     midi.REC_MIDIController = midi.REC_Control | midi.REC_FromMIDI
 
     device = _module("device")
-    device.isAssigned = lambda: False
-    device.getPortNumber = lambda: -1
+    device.isAssigned = lambda: int(
+        int(_active_transport_state.get("midi_output_port_number", -1)) >= 0
+    )
+    device.getPortNumber = lambda: int(
+        _active_transport_state.get("midi_output_port_number", -1)
+    )
     device.getName = lambda: device_name
+    device.midiOutMsg = _midi_out_msg
+    device.midiOutNewMsg = _midi_out_new_msg
+    device.midiOutSysex = _midi_out_sysex
+    device.directFeedback = _direct_feedback
+    device.repeatMidiEvent = _repeat_midi_event
+    device.stopRepeatMidiEvent = _stop_repeat_midi_event
 
     mixer = _module("mixer")
     mixer.getSongStepPos = _get_song_step_pos
@@ -526,6 +674,11 @@ def _dispatch(namespace, value):
     global _active_transport_actions, _active_transport_state
     _active_transport_actions = []
     _active_transport_state = value.get("transport", {})
+    if value.get("initialize"):
+        callback = namespace.get("OnInit")
+        if callback is not None:
+            callback()
+        return {"handled": False, "actions": _active_transport_actions}
     if "project_load_status" in value:
         status = int(value["project_load_status"])
         callback = namespace.get("OnProjectLoad")
@@ -550,6 +703,7 @@ def _dispatch(namespace, value):
         callback = namespace.get("OnIdle")
         if callback is not None:
             callback()
+        _dispatch_repeating_midi_event()
         return {"handled": False, "actions": _active_transport_actions}
 
     event = EventData(value)
@@ -586,9 +740,6 @@ def main():
     _install_modules(script_name, device_name)
     try:
         namespace = runpy.run_path(script_path, run_name="__main__")
-        callback = namespace.get("OnInit")
-        if callback is not None:
-            callback()
     except Exception as error:
         _emit({"ready": False, "error": "{}: {}".format(type(error).__name__, error)})
         return
