@@ -424,6 +424,15 @@ impl MidiScriptRuntime {
         })
     }
 
+    pub fn process_first_connect(&mut self) -> Result<ScriptMidiResult, String> {
+        let response = self.exchange(&json!({"first_connect": true}))?;
+        Ok(ScriptMidiResult {
+            handled: false,
+            bytes: Vec::new(),
+            actions: parse_transport_actions(&response)?,
+        })
+    }
+
     fn exchange(&mut self, value: &Value) -> Result<Value, String> {
         let transport = self.transport_state.state.load(Ordering::Relaxed);
         let song_position =
@@ -1504,6 +1513,24 @@ mod tests {
                 .unwrap()
                 .actions,
             [ScriptTransportAction::RecordToggle]
+        );
+    }
+
+    #[test]
+    fn python_first_connect_callback_runs_without_arguments() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport transport\ndef OnFirstConnect():\n    transport.start()\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let mut runtime = MidiScriptRuntime::start_for_device(&script, "Test Input").unwrap();
+
+        assert_eq!(
+            runtime.process_first_connect().unwrap().actions,
+            [ScriptTransportAction::Start]
         );
     }
 

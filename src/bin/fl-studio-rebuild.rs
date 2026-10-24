@@ -4608,6 +4608,7 @@ struct DawUi {
     midi_selected_input_id: Option<String>,
     midi_controller_scripts: Vec<MidiControllerScript>,
     midi_selected_controller_script: Option<PathBuf>,
+    midi_first_connect_device_ids: BTreeSet<String>,
     midi_auto_detect_controller_script: bool,
     midi_script_discovery_error: Option<String>,
     midi_connect_input_on_startup: bool,
@@ -5661,6 +5662,7 @@ impl DawUi {
             input_script: midi_selected_controller_script,
             input_script_auto_detect: midi_auto_detect_controller_script,
             connect_input_on_startup: midi_connect_input_on_startup,
+            first_connect_device_ids: midi_first_connect_device_ids,
             output_id: midi_selected_output_id,
             connect_output_on_startup: midi_connect_output_on_startup,
             output_channel_routes: midi_output_channel_routes,
@@ -6037,6 +6039,7 @@ impl DawUi {
             midi_selected_input_id,
             midi_controller_scripts,
             midi_selected_controller_script,
+            midi_first_connect_device_ids,
             midi_auto_detect_controller_script,
             midi_script_discovery_error,
             midi_connect_input_on_startup,
@@ -43771,6 +43774,7 @@ impl DawUi {
             input_script: self.midi_selected_controller_script.clone(),
             input_script_auto_detect: self.midi_auto_detect_controller_script,
             connect_input_on_startup: self.midi_connect_input_on_startup,
+            first_connect_device_ids: self.midi_first_connect_device_ids.clone(),
             output_id: self.midi_selected_output_id.clone(),
             connect_output_on_startup: self.midi_connect_output_on_startup,
             output_channel_routes: self.midi_output_channel_routes.clone(),
@@ -43839,6 +43843,8 @@ impl DawUi {
                 .flatten()
                 .cloned()
         });
+        let dispatch_first_connect =
+            selected_script.is_some() && !self.midi_first_connect_device_ids.contains(&device_id);
         self.midi_output_gain_learning = false;
         self.finish_midi_script_transport_move();
         self.midi_mixer_control_learning = None;
@@ -43864,6 +43870,11 @@ impl DawUi {
         ) {
             Ok(connection) => {
                 let script_name = connection.script_name.clone();
+                let first_connect_callback_queued = dispatch_first_connect
+                    && connection.notify_script_first_connect() == Some(true);
+                if first_connect_callback_queued {
+                    self.midi_first_connect_device_ids.insert(device_id.clone());
+                }
                 self.midi_input_connection = Some(connection);
                 self.midi_selected_input_id = Some(device_id);
                 self.midi_input_error = None;
@@ -43880,6 +43891,12 @@ impl DawUi {
                     },
                     |script| format!("Connected MIDI input: {} ({script})", device.name),
                 );
+                if dispatch_first_connect && !first_connect_callback_queued {
+                    self.status
+                        .push_str(" · MIDI script first-connect callback queue is full");
+                } else if first_connect_callback_queued {
+                    self.persist_midi_device_selections();
+                }
             }
             Err(error) => {
                 self.midi_input_error = Some(error.clone());
@@ -55786,6 +55803,7 @@ struct MidiDeviceSelections {
     input_script: Option<PathBuf>,
     input_script_auto_detect: bool,
     connect_input_on_startup: bool,
+    first_connect_device_ids: BTreeSet<String>,
     output_id: Option<String>,
     connect_output_on_startup: bool,
     output_channel_routes: [Option<String>; 16],
@@ -55812,6 +55830,7 @@ impl Default for MidiDeviceSelections {
             input_script: None,
             input_script_auto_detect: false,
             connect_input_on_startup: false,
+            first_connect_device_ids: BTreeSet::new(),
             output_id: None,
             connect_output_on_startup: false,
             output_channel_routes: std::array::from_fn(|_| None),
@@ -55906,7 +55925,7 @@ fn parse_midi_thru_preferences(contents: &str) -> (bool, Option<u8>) {
 
 fn encode_midi_device_selections(selections: &MidiDeviceSelections) -> String {
     format!(
-        "input={}\ninput_script={}\ninput_script_auto_detect={}\nconnect_input_on_startup={}\noutput={}\nconnect_output_on_startup={}\noutput_routes={}\nbank_msb={}\nbank_lsb={}\nprograms={}\nclock={}\nplaylist_notes={}\npattern_notes={}\nfixed_velocity={}\nperformance_channel={}\nrecord_audio={}\nrecord_notes={}\nrecord_automation={}\nrecord_automation_controller={}\nrecord_automation_channel={}\nrecord_automation_flags={}\n",
+        "input={}\ninput_script={}\ninput_script_auto_detect={}\nconnect_input_on_startup={}\nfirst_connect_device_ids={}\noutput={}\nconnect_output_on_startup={}\noutput_routes={}\nbank_msb={}\nbank_lsb={}\nprograms={}\nclock={}\nplaylist_notes={}\npattern_notes={}\nfixed_velocity={}\nperformance_channel={}\nrecord_audio={}\nrecord_notes={}\nrecord_automation={}\nrecord_automation_controller={}\nrecord_automation_channel={}\nrecord_automation_flags={}\n",
         encode_midi_device_id(selections.input_id.as_deref().unwrap_or_default()),
         selections.input_script.as_ref().map_or_else(
             || "-".to_owned(),
@@ -55914,6 +55933,7 @@ fn encode_midi_device_selections(selections: &MidiDeviceSelections) -> String {
         ),
         u8::from(selections.input_script_auto_detect),
         u8::from(selections.connect_input_on_startup),
+        encode_midi_device_ids(&selections.first_connect_device_ids),
         encode_midi_device_id(selections.output_id.as_deref().unwrap_or_default()),
         u8::from(selections.connect_output_on_startup),
         encode_midi_output_routes(&selections.output_channel_routes),
@@ -55948,6 +55968,8 @@ fn parse_midi_device_selections(contents: &str) -> MidiDeviceSelections {
             selections.input_script_auto_detect = enabled == "1";
         } else if let Some(enabled) = line.strip_prefix("connect_input_on_startup=") {
             selections.connect_input_on_startup = enabled == "1";
+        } else if let Some(encoded_ids) = line.strip_prefix("first_connect_device_ids=") {
+            selections.first_connect_device_ids = parse_midi_device_ids(encoded_ids);
         } else if let Some(encoded_id) = line.strip_prefix("output=") {
             selections.output_id = decode_midi_device_id(encoded_id);
         } else if let Some(enabled) = line.strip_prefix("connect_output_on_startup=") {
@@ -56008,6 +56030,21 @@ fn parse_midi_device_selections(contents: &str) -> MidiDeviceSelections {
         selections.input_script = None;
     }
     selections
+}
+
+fn encode_midi_device_ids(ids: &BTreeSet<String>) -> String {
+    ids.iter()
+        .filter(|id| !id.is_empty())
+        .map(|id| encode_midi_device_id(id))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn parse_midi_device_ids(encoded: &str) -> BTreeSet<String> {
+    encoded
+        .split(',')
+        .filter_map(decode_midi_device_id)
+        .collect()
 }
 
 fn encode_midi_output_programs(programs: &[Option<u8>; 16]) -> String {
@@ -62661,6 +62698,10 @@ mod tests {
             input_script: Some(PathBuf::from("Scripts/Controller/device_test.py")),
             input_script_auto_detect: false,
             connect_input_on_startup: true,
+            first_connect_device_ids: std::collections::BTreeSet::from([
+                "alsa:first,device\n雪".to_owned(),
+                "CoreMIDI:port-2".to_owned(),
+            ]),
             output_id: Some(output_id.to_owned()),
             connect_output_on_startup: true,
             output_channel_routes: {
