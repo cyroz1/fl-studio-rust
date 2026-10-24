@@ -8719,10 +8719,11 @@ impl DawUi {
                 .iter()
                 .find(|channel| channel.kind() == Some(0))
                 .or_else(|| channels.iter().find(|channel| channel.kind() == Some(2)))
+                .or_else(|| channels.iter().find(|channel| channel.kind() == Some(3)))
                 .map(|channel| channel.id())
                 .ok_or_else(|| {
                     format!(
-                        "Project template {} has no Sampler or Native instrument channel to copy",
+                        "Project template {} has no Sampler, Native instrument, or Layer channel to copy",
                         template_path.display()
                     )
                 })?;
@@ -33219,13 +33220,14 @@ impl DawUi {
                 available_midi_channels
                     .iter()
                     .find(|channel| {
-                        channel.id() == channel_id && matches!(channel.kind(), Some(0 | 2))
+                        channel.id() == channel_id && matches!(channel.kind(), Some(0 | 2 | 3))
                     })
                     .map(|channel| (channel_id, channel.kind().unwrap_or_default()))
             });
             let template_type_name = match selected_midi_template.map(|(_, kind)| kind) {
                 Some(0) => "Sampler",
                 Some(2) => "Native",
+                Some(3) => "Layer",
                 _ => "instrument",
             };
             ui.horizontal(|ui| {
@@ -33411,7 +33413,7 @@ impl DawUi {
                                 }),
                             )
                             .on_hover_text(
-                                "Copy the selected Sampler or Native instrument channel state for each selected MIDI track, then import those tracks into the new channels.",
+                                "Copy the selected Sampler, Native instrument, or Layer channel state for each selected MIDI track, then import those tracks into the new channels. Layer copies retain their existing child channel references.",
                             )
                             .clicked()
                         && let Some((template_channel_id, _)) = selected_midi_template
@@ -33455,7 +33457,7 @@ impl DawUi {
                         egui::Button::new(format!("Create separate patterns + {template_type_name} channels")),
                     )
                     .on_hover_text(
-                        "Create one new Pattern and named channel from the selected Sampler or Native template for each selected independent Format-2 sequence.",
+                        "Create one new Pattern and named channel from the selected Sampler, Native instrument, or Layer template for each selected independent Format-2 sequence. Layer copies retain their existing child channel references.",
                     )
                     .clicked()
                     && let Some((template_channel_id, _)) = selected_midi_template
