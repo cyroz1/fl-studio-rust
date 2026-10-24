@@ -2,6 +2,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
@@ -47,7 +48,12 @@ pub struct MidiScriptRuntime {
     child: Arc<Mutex<Child>>,
     stdin: BufWriter<ChildStdin>,
     stdout: BufReader<ChildStdout>,
+    transport_state: Arc<AtomicU8>,
 }
+
+pub const SCRIPT_TRANSPORT_PLAYING: u8 = 1 << 0;
+pub const SCRIPT_TRANSPORT_RECORDING: u8 = 1 << 1;
+pub const SCRIPT_TRANSPORT_PATTERN_MODE: u8 = 1 << 2;
 
 #[derive(Clone)]
 pub struct MidiScriptStopHandle(Arc<Mutex<Child>>);
@@ -229,6 +235,14 @@ impl MidiScriptRuntime {
         script: &MidiControllerScript,
         device_name: &str,
     ) -> Result<Self, String> {
+        Self::start_for_device_with_transport_state(script, device_name, Arc::new(AtomicU8::new(0)))
+    }
+
+    pub fn start_for_device_with_transport_state(
+        script: &MidiControllerScript,
+        device_name: &str,
+        transport_state: Arc<AtomicU8>,
+    ) -> Result<Self, String> {
         let (program, prefix_args) = python_command()?;
         let mut command = Command::new(program);
         command
@@ -261,6 +275,7 @@ impl MidiScriptRuntime {
             child,
             stdin: BufWriter::new(stdin),
             stdout: BufReader::new(stdout),
+            transport_state,
         };
         let mut ready = String::new();
         runtime.stdout.read_line(&mut ready).map_err(|error| {
@@ -330,7 +345,19 @@ impl MidiScriptRuntime {
     }
 
     fn exchange(&mut self, value: &Value) -> Result<Value, String> {
-        serde_json::to_writer(&mut self.stdin, value)
+        let transport = self.transport_state.load(Ordering::Relaxed);
+        let mut request = value.clone();
+        if let Some(object) = request.as_object_mut() {
+            object.insert(
+                "transport".to_owned(),
+                json!({
+                    "is_playing": transport & SCRIPT_TRANSPORT_PLAYING != 0,
+                    "is_recording": transport & SCRIPT_TRANSPORT_RECORDING != 0,
+                    "pattern_mode": transport & SCRIPT_TRANSPORT_PATTERN_MODE != 0,
+                }),
+            );
+        }
+        serde_json::to_writer(&mut self.stdin, &request)
             .map_err(|error| format!("could not send MIDI to Python script: {error}"))?;
         self.stdin
             .write_all(b"\n")
@@ -455,13 +482,15 @@ fn byte_value(response: &Value, key: &str, default: u8) -> Result<u8, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MidiControllerScript, MidiScriptRuntime, ScriptTransportAction, discover_midi_scripts,
-        find_script_for_device, transform_message,
+        MidiControllerScript, MidiScriptRuntime, SCRIPT_TRANSPORT_PATTERN_MODE,
+        SCRIPT_TRANSPORT_PLAYING, SCRIPT_TRANSPORT_RECORDING, ScriptTransportAction,
+        discover_midi_scripts, find_script_for_device, transform_message,
     };
     use serde_json::json;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
     static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -607,6 +636,34 @@ mod tests {
         let result = runtime.process_event(12, &[0xB0, 7, 127]).unwrap();
 
         assert_eq!(result.bytes, [0xB0, b'M', 127]);
+    }
+
+    #[test]
+    fn python_transport_queries_report_live_playback_recording_and_loop_state() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport transport\ndef OnMidiIn(event):\n    event.data1 = transport.isPlaying() * 64 + transport.isRecording() * 32 + transport.getLoopMode() * 16\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let transport_state = Arc::new(AtomicU8::new(
+            SCRIPT_TRANSPORT_PLAYING | SCRIPT_TRANSPORT_RECORDING | SCRIPT_TRANSPORT_PATTERN_MODE,
+        ));
+        let mut runtime = MidiScriptRuntime::start_for_device_with_transport_state(
+            &script,
+            "Test Input",
+            Arc::clone(&transport_state),
+        )
+        .unwrap();
+
+        let pattern_mode = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
+        transport_state.store(SCRIPT_TRANSPORT_PLAYING, Ordering::Relaxed);
+        let song_mode = runtime.process_event(20, &[0xB0, 7, 1]).unwrap();
+
+        assert_eq!(pattern_mode.bytes, [0xB0, 96, 1]);
+        assert_eq!(song_mode.bytes, [0xB0, 80, 1]);
     }
 
     #[test]

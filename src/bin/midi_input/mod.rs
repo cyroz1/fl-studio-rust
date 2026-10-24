@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -66,8 +66,13 @@ impl MidiInputScriptWorker {
         output_sender: SyncSender<ReceivedMidiMessage>,
         thru_queue: MidiThruInputQueue,
         dropped_messages: Arc<AtomicU64>,
+        transport_state: Arc<AtomicU8>,
     ) -> Result<Self, String> {
-        let runtime = MidiScriptRuntime::start_for_device(script, device_name)?;
+        let runtime = MidiScriptRuntime::start_for_device_with_transport_state(
+            script,
+            device_name,
+            transport_state,
+        )?;
         let stop_handle = runtime.stop_handle();
         let (sender, input_receiver) = mpsc::sync_channel(MIDI_INPUT_QUEUE_CAPACITY);
         let (error_sender, errors) = mpsc::sync_channel(16);
@@ -569,6 +574,7 @@ pub fn connect_input_device(
     sender: SyncSender<ReceivedMidiMessage>,
     thru_queue: MidiThruInputQueue,
     dropped_messages: Arc<AtomicU64>,
+    transport_state: Arc<AtomicU8>,
     script: Option<&MidiControllerScript>,
 ) -> Result<ConnectedMidiInput, String> {
     let mut input = MidiInput::new("FL Studio Rebuild MIDI Input")
@@ -590,6 +596,7 @@ pub fn connect_input_device(
                 sender.clone(),
                 thru_queue.clone(),
                 Arc::clone(&dropped_messages),
+                Arc::clone(&transport_state),
             )
         })
         .transpose()?;

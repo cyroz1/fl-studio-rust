@@ -7,6 +7,7 @@ import types
 _protocol_out = sys.stdout
 sys.stdout = sys.stderr
 _active_transport_actions = None
+_active_transport_state = {}
 
 
 def _emit(value):
@@ -144,6 +145,11 @@ def _install_modules(script_name, device_name):
     transport.start = lambda: _request_transport_action("start")
     transport.stop = lambda: _request_transport_action("stop")
     transport.record = lambda: _request_transport_action("record")
+    transport.isPlaying = lambda: int(bool(_active_transport_state.get("is_playing", False)))
+    transport.isRecording = lambda: int(bool(_active_transport_state.get("is_recording", False)))
+    transport.getLoopMode = lambda: (
+        0 if _active_transport_state.get("pattern_mode", False) else 1
+    )
 
     for name in (
         "playlist",
@@ -179,8 +185,9 @@ def _specific_callback(event):
 
 
 def _dispatch(namespace, value):
-    global _active_transport_actions
+    global _active_transport_actions, _active_transport_state
     _active_transport_actions = []
+    _active_transport_state = value.get("transport", {})
     if value.get("idle"):
         callback = namespace.get("OnIdle")
         if callback is not None:

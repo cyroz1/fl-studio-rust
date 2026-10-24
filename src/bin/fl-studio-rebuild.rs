@@ -3,7 +3,7 @@ use std::fs;
 use std::hash::{BuildHasher, Hash, Hasher, RandomState};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -104,7 +104,10 @@ use midi_output::{
     enumerate_output_devices, midi_patch_setup_messages, pattern_loop_frame_messages,
     pattern_preview_messages, playlist_playback_messages,
 };
-use midi_script::{MidiControllerScript, discover_midi_scripts, find_script_for_device};
+use midi_script::{
+    MidiControllerScript, SCRIPT_TRANSPORT_PATTERN_MODE, SCRIPT_TRANSPORT_PLAYING,
+    SCRIPT_TRANSPORT_RECORDING, discover_midi_scripts, find_script_for_device,
+};
 use midi_thru::{MidiThruSettings, MidiThruWorker};
 
 const APP_BACKGROUND: Color32 = Color32::from_rgb(27, 27, 27);
@@ -4597,6 +4600,7 @@ struct DawUi {
     midi_connect_input_on_startup: bool,
     midi_input_error: Option<String>,
     midi_input_connection: Option<ConnectedMidiInput>,
+    midi_script_transport_state: Arc<AtomicU8>,
     midi_message_sender: SyncSender<ReceivedMidiMessage>,
     midi_message_receiver: Receiver<ReceivedMidiMessage>,
     midi_dropped_messages: Arc<AtomicU64>,
@@ -5976,6 +5980,7 @@ impl DawUi {
             midi_connect_input_on_startup,
             midi_input_error,
             midi_input_connection: None,
+            midi_script_transport_state: Arc::new(AtomicU8::new(0)),
             midi_message_sender,
             midi_message_receiver,
             midi_dropped_messages: Arc::new(AtomicU64::new(0)),
@@ -12736,6 +12741,26 @@ impl DawUi {
         let engine = self.audio_engine.as_ref()?;
         let frames = engine.project_playback_position_frames();
         tempo_map.tick_at_frame(frames, engine.sample_rate())
+    }
+
+    fn publish_midi_script_transport_state(&self) {
+        let mut state = 0;
+        if self.playing {
+            state |= SCRIPT_TRANSPORT_PLAYING;
+        }
+        if self.midi_recording.is_some()
+            || self
+                .audio_recording
+                .as_ref()
+                .is_some_and(|recording| recording.capture_active)
+        {
+            state |= SCRIPT_TRANSPORT_RECORDING;
+        }
+        if self.pattern_playback_mode {
+            state |= SCRIPT_TRANSPORT_PATTERN_MODE;
+        }
+        self.midi_script_transport_state
+            .store(state, Ordering::Relaxed);
     }
 
     fn live_sampler_tempo_bpm_milli(&self) -> u32 {
@@ -43100,6 +43125,7 @@ impl DawUi {
             self.midi_message_sender.clone(),
             self.midi_thru_input_queue.clone(),
             Arc::clone(&self.midi_dropped_messages),
+            Arc::clone(&self.midi_script_transport_state),
             selected_script.as_ref(),
         ) {
             Ok(connection) => {
@@ -50598,6 +50624,7 @@ impl eframe::App for DawUi {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.publish_midi_script_transport_state();
         // Reassert the app theme before building child Uis. Some native
         // window backends report a system appearance after startup.
         ui.ctx().set_theme(egui::Theme::Dark);
