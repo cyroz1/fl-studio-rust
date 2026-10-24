@@ -618,6 +618,7 @@ pub struct Vst3PlaylistStreamProcessor {
     content_frames: u64,
     output_frames: u64,
     maximum_latency_frames: u64,
+    automatic_pdc_enabled: bool,
     notes_scheduled: usize,
     unloaded_plugin_channels: Vec<u16>,
     started_count: usize,
@@ -1052,13 +1053,20 @@ impl Vst3PlaylistStreamProcessor {
         self.output_frames =
             pdc_aligned_output_frames(content_with_effect_tail, total_pdc_latency_frames)?;
 
-        let mut delay_frames = self.maximum_latency_frames;
+        let mut delay_frames = if self.automatic_pdc_enabled {
+            self.maximum_latency_frames
+        } else {
+            0
+        };
         for stream in &self.streams {
+            let compensation_frames = if self.automatic_pdc_enabled {
+                self.maximum_latency_frames
+                    .saturating_sub(stream.latency_frames)
+            } else {
+                0
+            };
             delay_frames = delay_frames
-                .checked_add(
-                    self.maximum_latency_frames
-                        .saturating_sub(stream.latency_frames),
-                )
+                .checked_add(compensation_frames)
                 .ok_or_else(|| "PDC delay storage size overflow".to_owned())?;
         }
         delay_frames = delay_frames
@@ -1077,9 +1085,12 @@ impl Vst3PlaylistStreamProcessor {
         }
 
         for stream in &mut self.streams {
-            let compensation_frames = self
-                .maximum_latency_frames
-                .saturating_sub(stream.latency_frames);
+            let compensation_frames = if self.automatic_pdc_enabled {
+                self.maximum_latency_frames
+                    .saturating_sub(stream.latency_frames)
+            } else {
+                0
+            };
             if stream.delay_line.delay_frames() != compensation_frames {
                 stream.delay_line = StereoFrameDelay::new(compensation_frames)?;
             }
@@ -1101,7 +1112,11 @@ impl Vst3PlaylistStreamProcessor {
     }
 
     pub(crate) fn pdc_direct_source_delay_frames(&self) -> u64 {
-        self.maximum_latency_frames
+        if self.automatic_pdc_enabled {
+            self.maximum_latency_frames
+        } else {
+            0
+        }
     }
 
     pub(crate) fn needs_mixer_insert_buses(&self) -> bool {
@@ -1664,24 +1679,30 @@ fn configure_mixer_effect_pdc(
         .checked_add(master_effect_latency_frames)
         .ok_or_else(|| "Mixer effect PDC latency overflow".to_owned())?;
 
-    let mut route_delay_frames = master_input_latency_frames;
-    for input_latency_frames in pdc_plan.input_latency_frames.values() {
-        add_delay_frames(&mut route_delay_frames, *input_latency_frames, 2)?;
+    let mut route_delay_frames = if processor.automatic_pdc_enabled {
+        master_input_latency_frames
+    } else {
+        0
+    };
+    if processor.automatic_pdc_enabled {
+        for input_latency_frames in pdc_plan.input_latency_frames.values() {
+            add_delay_frames(&mut route_delay_frames, *input_latency_frames, 2)?;
+        }
     }
     for chain in processor
         .mixer_effect_chains
         .iter()
         .filter(|chain| chain.insert_ordinal != 0)
     {
-        add_delay_frames(&mut route_delay_frames, chain.latency_frames, 1)?;
         let output_latency_frames = pdc_plan
             .output_latency_frames
             .get(&chain.insert_ordinal)
             .copied()
             .unwrap_or_default();
-        let output_alignment_frames = if pdc_plan
-            .tracks_reaching_master
-            .contains(&chain.insert_ordinal)
+        let output_alignment_frames = if processor.automatic_pdc_enabled
+            && pdc_plan
+                .tracks_reaching_master
+                .contains(&chain.insert_ordinal)
         {
             master_input_latency_frames
                 .checked_sub(output_latency_frames)
@@ -1689,7 +1710,10 @@ fn configure_mixer_effect_pdc(
         } else {
             0
         };
-        add_delay_frames(&mut route_delay_frames, output_alignment_frames, 1)?;
+        if processor.automatic_pdc_enabled {
+            add_delay_frames(&mut route_delay_frames, chain.latency_frames, 1)?;
+            add_delay_frames(&mut route_delay_frames, output_alignment_frames, 1)?;
+        }
         for (track, _) in &chain.route_plan.insert_effect_input_transforms {
             if *track == chain.insert_ordinal {
                 continue;
@@ -1701,9 +1725,13 @@ fn configure_mixer_effect_pdc(
                 .ok_or_else(|| {
                     format!("Mixer insert {track} has no latency entry in the route plan")
                 })?;
-            let branch_delay_frames = input_latency_frames
-                .checked_sub(output_latency_frames)
-                .ok_or_else(|| "Mixer send path exceeds its planned PDC latency".to_owned())?;
+            let branch_delay_frames = if processor.automatic_pdc_enabled {
+                input_latency_frames
+                    .checked_sub(output_latency_frames)
+                    .ok_or_else(|| "Mixer send path exceeds its planned PDC latency".to_owned())?
+            } else {
+                0
+            };
             add_delay_frames(&mut route_delay_frames, branch_delay_frames, 2)?;
         }
     }
@@ -1721,7 +1749,12 @@ fn configure_mixer_effect_pdc(
         ));
     }
 
-    processor.mixer_effect_output_delay = StereoFrameDelay::new(master_input_latency_frames)?;
+    processor.mixer_effect_output_delay =
+        StereoFrameDelay::new(if processor.automatic_pdc_enabled {
+            master_input_latency_frames
+        } else {
+            0
+        })?;
     processor.mixer_effect_meter_input_delays = Vec::new();
     processor.mixer_effect_input_delays = Vec::new();
     processor
@@ -1733,11 +1766,15 @@ fn configure_mixer_effect_pdc(
         .try_reserve_exact(crate::audio::MIXER_TRACK_METER_COUNT)
         .map_err(|error| format!("could not allocate Mixer input PDC delays: {error}"))?;
     for track in 0..crate::audio::MIXER_TRACK_METER_COUNT {
-        let delay_frames = pdc_plan
-            .input_latency_frames
-            .get(&track)
-            .copied()
-            .unwrap_or_default();
+        let delay_frames = if processor.automatic_pdc_enabled {
+            pdc_plan
+                .input_latency_frames
+                .get(&track)
+                .copied()
+                .unwrap_or_default()
+        } else {
+            0
+        };
         processor
             .mixer_effect_meter_input_delays
             .push(StereoFrameDelay::new(delay_frames)?);
@@ -1761,9 +1798,10 @@ fn configure_mixer_effect_pdc(
             .get(&chain.insert_ordinal)
             .copied()
             .unwrap_or_default();
-        let output_alignment_frames = if pdc_plan
-            .tracks_reaching_master
-            .contains(&chain.insert_ordinal)
+        let output_alignment_frames = if processor.automatic_pdc_enabled
+            && pdc_plan
+                .tracks_reaching_master
+                .contains(&chain.insert_ordinal)
         {
             master_input_latency_frames
                 .checked_sub(output_latency_frames)
@@ -1789,9 +1827,13 @@ fn configure_mixer_effect_pdc(
                 .ok_or_else(|| {
                     format!("Mixer insert {track} has no latency entry in the route plan")
                 })?;
-            let branch_delay_frames = input_latency_frames
-                .checked_sub(output_latency_frames)
-                .ok_or_else(|| "Mixer send path exceeds its planned PDC latency".to_owned())?;
+            let branch_delay_frames = if processor.automatic_pdc_enabled {
+                input_latency_frames
+                    .checked_sub(output_latency_frames)
+                    .ok_or_else(|| "Mixer send path exceeds its planned PDC latency".to_owned())?
+            } else {
+                0
+            };
             let meter_transform = meter_transforms.get(track).copied().ok_or_else(|| {
                 format!("Mixer insert {track} has no meter transform for its send route")
             })?;
@@ -4265,6 +4307,7 @@ impl Vst3HostRuntime {
             content_frames: loop_output_frames,
             output_frames: loop_output_frames,
             maximum_latency_frames,
+            automatic_pdc_enabled: document.mixer_automatic_pdc_enabled().unwrap_or(true),
             notes_scheduled,
             unloaded_plugin_channels: unloaded_plugin_channels.into_iter().collect(),
             started_count: 0,
@@ -4330,18 +4373,22 @@ impl Vst3HostRuntime {
         let output_sample_rate = processor.output_sample_rate;
         let max_tail_frames =
             u64::from(output_sample_rate).saturating_mul(MAX_REPORTED_TAIL_SECONDS.ceil() as u64);
-        let instrument_delay_frames = processor.streams.iter().try_fold(
-            processor.maximum_latency_frames,
-            |total, stream| {
-                total
-                    .checked_add(
-                        processor
-                            .maximum_latency_frames
-                            .saturating_sub(stream.latency_frames),
-                    )
-                    .ok_or_else(|| "PDC delay storage size overflow".to_owned())
-            },
-        )?;
+        let instrument_delay_frames = if processor.automatic_pdc_enabled {
+            processor.streams.iter().try_fold(
+                processor.maximum_latency_frames,
+                |total, stream| {
+                    total
+                        .checked_add(
+                            processor
+                                .maximum_latency_frames
+                                .saturating_sub(stream.latency_frames),
+                        )
+                        .ok_or_else(|| "PDC delay storage size overflow".to_owned())
+                },
+            )?
+        } else {
+            0
+        };
         let mut mixer_effect_dry_delay_frames = processor.mixer_effect_dry_delay_frames;
         for insert_ordinal in insert_order {
             let effects_enabled = inserts
@@ -4853,6 +4900,7 @@ impl Vst3HostRuntime {
             content_frames: output_frames,
             output_frames,
             maximum_latency_frames,
+            automatic_pdc_enabled: document.mixer_automatic_pdc_enabled().unwrap_or(true),
             notes_scheduled,
             unloaded_plugin_channels: unloaded_plugin_channels.into_iter().collect(),
             started_count: 0,

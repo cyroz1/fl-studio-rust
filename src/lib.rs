@@ -8201,6 +8201,47 @@ impl FlpDocument {
             .collect()
     }
 
+    /// Reads the candidate Mixer-level Automatic PDC flag from a one-byte `0xDD` event.
+    /// The event ID and boolean property follow PyFLP's Mixer model; native save verification
+    /// is still needed. Ambiguous or malformed records are left uninterpreted.
+    pub fn mixer_automatic_pdc_enabled(&self) -> Option<bool> {
+        self.candidate_mixer_automatic_pdc_event()
+            .map(|(_, enabled)| enabled)
+    }
+
+    /// Edits the candidate Mixer-level Automatic PDC flag without touching other events.
+    /// A unique one-byte `0xDD` Mixer event must already exist; no event layout is invented.
+    pub fn set_mixer_automatic_pdc_enabled(&mut self, enabled: bool) -> Result<(), FlpError> {
+        let (event_index, _) =
+            self.candidate_mixer_automatic_pdc_event()
+                .ok_or(FlpError::UnsupportedEdit(
+                    "the project has no recognized Mixer Automatic PDC flag",
+                ))?;
+
+        let mut candidate = self.clone();
+        candidate.events[event_index].replace_data_payload(vec![u8::from(enabled)])?;
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    fn candidate_mixer_automatic_pdc_event(&self) -> Option<(usize, bool)> {
+        let mut candidates = self
+            .events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| event.opcode == 0xDD);
+        let (event_index, event) = candidates.next()?;
+        if candidates.next().is_some()
+            || !matches!(event.encoding, PayloadEncoding::Data { .. })
+            || event.payload.len() != 1
+            || event.payload[0] > 1
+        {
+            return None;
+        }
+        Some((event_index, event.payload[0] != 0))
+    }
+
     /// Reads the ten Mixer effect slots for inserts whose `0x62` boundaries appear in
     /// zero-through-nine order. The first boundary precedes slot zero's data; boundaries one
     /// through nine close slots zero through eight, and the following `0x93` closes slot nine
@@ -25569,6 +25610,69 @@ mod tests {
             document.encode_lossless().expect("encoding succeeds"),
             original
         );
+    }
+
+    #[test]
+    fn mixer_automatic_pdc_flag_reads_and_edits_only_a_unique_boolean_event() {
+        let mut event_stream = Vec::new();
+        append_data_event(&mut event_stream, 0xDD, &[0]);
+        event_stream.push(0x62);
+        event_stream.extend_from_slice(&0_u16.to_le_bytes());
+        append_data_event(&mut event_stream, 0xCC, b"Keep this name\0");
+
+        let original = flp_fixture(&event_stream, &[], &[]);
+        let mut document = FlpDocument::parse(&original).expect("the fixture should parse");
+        assert_eq!(document.mixer_automatic_pdc_enabled(), Some(false));
+        let original_event_wires = document
+            .events()
+            .iter()
+            .map(|event| event.wire_bytes().to_vec())
+            .collect::<Vec<_>>();
+
+        document
+            .set_mixer_automatic_pdc_enabled(true)
+            .expect("the recognized Mixer APDC flag should be editable");
+        assert_eq!(document.mixer_automatic_pdc_enabled(), Some(true));
+        assert_eq!(document.events()[0].payload(), [1]);
+        for (index, event) in document.events().iter().enumerate().skip(1) {
+            assert_eq!(event.wire_bytes(), original_event_wires[index]);
+        }
+
+        let encoded = document
+            .encode_lossless()
+            .expect("the edited project should encode");
+        let reparsed = FlpDocument::parse(&encoded).expect("the edited project should parse");
+        assert_eq!(reparsed.mixer_automatic_pdc_enabled(), Some(true));
+
+        let mut duplicate_events = Vec::new();
+        append_data_event(&mut duplicate_events, 0xDD, &[1]);
+        append_data_event(&mut duplicate_events, 0xDD, &[0]);
+        let duplicate_bytes = flp_fixture(&duplicate_events, &[], &[]);
+        let mut duplicate = FlpDocument::parse(&duplicate_bytes).expect("the fixture should parse");
+        assert_eq!(duplicate.mixer_automatic_pdc_enabled(), None);
+        assert!(duplicate.set_mixer_automatic_pdc_enabled(false).is_err());
+        assert_eq!(
+            duplicate
+                .encode_lossless()
+                .expect("encoding should succeed"),
+            duplicate_bytes
+        );
+    }
+
+    #[test]
+    fn mixer_automatic_pdc_flag_rejects_malformed_and_unknown_values() {
+        for payload in [&[][..], &[2][..], &[0, 1][..]] {
+            let mut event_stream = Vec::new();
+            append_data_event(&mut event_stream, 0xDD, payload);
+            let bytes = flp_fixture(&event_stream, &[], &[]);
+            let mut document = FlpDocument::parse(&bytes).expect("the fixture should parse");
+            assert_eq!(document.mixer_automatic_pdc_enabled(), None);
+            assert!(document.set_mixer_automatic_pdc_enabled(true).is_err());
+            assert_eq!(
+                document.encode_lossless().expect("encoding should succeed"),
+                bytes
+            );
+        }
     }
 
     #[test]

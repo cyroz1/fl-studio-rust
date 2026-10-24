@@ -42233,7 +42233,9 @@ impl DawUi {
         let parameters = document.mixer_parameter_records().unwrap_or_default();
         let eq_parameters = document.mixer_eq_parameter_summaries().unwrap_or_default();
         let send_summaries = document.mixer_send_summaries().unwrap_or_default();
+        let automatic_pdc_enabled = document.mixer_automatic_pdc_enabled();
         let parameter_count = parameters.len();
+        let mut automatic_pdc_edit = None;
         ui.horizontal(|ui| {
             ui.strong("Mixer");
             ui.separator();
@@ -42244,6 +42246,15 @@ impl DawUi {
             ));
             ui.separator();
             ui.label(format!("{parameter_count} parameter records"));
+            ui.separator();
+            ui.label(match automatic_pdc_enabled {
+                Some(true) => "Automatic PDC: on",
+                Some(false) => "Automatic PDC: off",
+                None => "Automatic PDC: unrecognized (assumed on)",
+            })
+            .on_hover_text(
+                "Reads the unique one-byte Mixer APDC event. Playback assumes enabled when the event is missing or unrecognized.",
+            );
         });
         ui.separator();
         if inserts.is_empty() {
@@ -42259,6 +42270,21 @@ impl DawUi {
                 });
             });
             return;
+        }
+
+        if let Some(mut enabled) = automatic_pdc_enabled {
+            ui.horizontal(|ui| {
+                if ui
+                    .checkbox(&mut enabled, "Automatic PDC")
+                    .on_hover_text(
+                        "Align supported direct and Mixer send paths using reported VST3 latency. Changing this stops active playback; start again to apply it.",
+                    )
+                    .changed()
+                {
+                    automatic_pdc_edit = Some(enabled);
+                }
+            });
+            ui.separator();
         }
 
         let active_insert = self
@@ -44247,6 +44273,36 @@ impl DawUi {
                 self.status = "The VST3 host is not running".to_owned();
             }
             self.last_plugin_action = Some(self.status.clone());
+        }
+        if let Some(enabled) = automatic_pdc_edit {
+            match self
+                .document
+                .as_mut()
+                .map(|document| document.set_mixer_automatic_pdc_enabled(enabled))
+                .transpose()
+            {
+                Ok(Some(())) => {
+                    let playback_was_active = self.playing;
+                    if playback_was_active {
+                        self.stop_project_playback();
+                    }
+                    self.dirty = true;
+                    self.status = if playback_was_active {
+                        format!(
+                            "Automatic PDC set to {}; playback stopped. Start again to apply it.",
+                            u8::from(enabled)
+                        )
+                    } else {
+                        format!("Automatic PDC set to {}", u8::from(enabled))
+                    };
+                }
+                Ok(None) => {
+                    self.status = "Open a project before changing Automatic PDC".to_owned();
+                }
+                Err(error) => {
+                    self.status = format!("Could not update Automatic PDC: {error}");
+                }
+            }
         }
     }
 
