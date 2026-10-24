@@ -274,6 +274,10 @@ def _global_transport(command, value, pmeflags=2, flags=15):
                 {"action": "pattern_jog", "increment": value}
             )
         return 8
+    if command == 105:
+        if value != 0:
+            _request_transport_action({"action": "tempo_jog", "increment": value})
+        return 8
     return -1
 
 

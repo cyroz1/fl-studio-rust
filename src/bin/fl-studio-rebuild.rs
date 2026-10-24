@@ -5591,6 +5591,18 @@ fn midi_script_pattern_jog_target(
     pattern_ids.get(target_index).copied()
 }
 
+fn midi_script_tempo_jog_target(current_bpm: f64, increment: i32) -> Option<f64> {
+    if !current_bpm.is_finite() || current_bpm <= 0.0 {
+        return None;
+    }
+    let current_milli_bpm = (current_bpm * 1000.0)
+        .round()
+        .clamp(1.0, f64::from(u32::MAX)) as u32;
+    let adjusted_milli_bpm = i64::from(current_milli_bpm) + i64::from(increment) * 100;
+    let adjusted_milli_bpm = adjusted_milli_bpm.clamp(1, i64::from(u32::MAX)) as u32;
+    Some(f64::from(adjusted_milli_bpm) / 1000.0)
+}
+
 impl DawUi {
     fn new(creation: &eframe::CreationContext<'_>, initial_project: Option<PathBuf>) -> Self {
         install_ui_fonts(&creation.egui_ctx);
@@ -13365,6 +13377,25 @@ impl DawUi {
         };
         self.selected_pattern = Some(pattern_id);
         self.status = format!("Selected pattern {pattern_id}");
+    }
+
+    fn jog_midi_script_tempo(&mut self, increment: i32) {
+        if increment == 0 {
+            return;
+        }
+        if self.document.is_none() {
+            self.status = "MIDI script tempo changes require an open project".to_owned();
+            return;
+        }
+        let Some(bpm) = midi_script_tempo_jog_target(self.tempo_bpm, increment) else {
+            self.status = "MIDI script could not determine the project tempo".to_owned();
+            return;
+        };
+        if bpm == self.tempo_bpm {
+            return;
+        }
+        self.tempo_bpm = bpm;
+        self.update_tempo(bpm);
     }
 
     fn live_sampler_tempo_bpm_milli(&self) -> u32 {
@@ -45018,6 +45049,9 @@ impl DawUi {
             MidiTransportCommand::PatternJog(increment) => {
                 self.jog_midi_script_pattern(increment);
             }
+            MidiTransportCommand::TempoJog(increment) => {
+                self.jog_midi_script_tempo(increment);
+            }
             MidiTransportCommand::MarkerJumpJog(increment) => {
                 self.jump_midi_script_marker(increment);
             }
@@ -61163,23 +61197,23 @@ mod tests {
         midi_controller_binding_for_device, midi_mixer_button_press_edge,
         midi_mixer_control_for_cc, midi_script_marker_jump_target,
         midi_script_marker_selection_target, midi_script_moved_song_position_tick,
-        midi_script_pattern_jog_target, midi_script_time_position_seconds_to_ticks,
-        midi_vst3_parameter_mapping_for_target, midi_vst3_parameter_mappings_for_cc,
-        next_empty_pattern_id, next_piano_roll_note_group, note_from_grid_position,
-        parse_internal_lfo_parameter_links, parse_midi_control_change_mapping,
-        parse_midi_controller_templates, parse_midi_device_selections,
-        parse_midi_mixer_control_mappings, parse_midi_output_programs, parse_midi_output_routes,
-        parse_midi_output_values, parse_midi_vst3_parameter_mappings,
-        parse_pattern_vst3_parameter_links, parse_playlist_audio_clip_envelopes,
-        parse_playlist_vst3_parameter_links, parse_window_layout_presets,
-        pattern_color_from_random_index, pattern_lfo_loop_length_ticks, pattern_loop_frame_at_tick,
-        pattern_loop_tick_at_frame, pattern_vst3_parameter_automation_for_channel,
-        pattern_vst3_parameter_link_for_target, piano_roll_color_group_note_ids,
-        piano_roll_controller_stroke_points, piano_roll_controller_value_at,
-        piano_roll_controller_value_range, piano_roll_cross_pattern_ghost_notes,
-        piano_roll_discard_length_edit, piano_roll_duplicate_offset,
-        piano_roll_ghost_note_is_visible, piano_roll_key_at_y, piano_roll_note_group_members,
-        piano_roll_note_nudge_edit, piano_roll_odd_note_selection,
+        midi_script_pattern_jog_target, midi_script_tempo_jog_target,
+        midi_script_time_position_seconds_to_ticks, midi_vst3_parameter_mapping_for_target,
+        midi_vst3_parameter_mappings_for_cc, next_empty_pattern_id, next_piano_roll_note_group,
+        note_from_grid_position, parse_internal_lfo_parameter_links,
+        parse_midi_control_change_mapping, parse_midi_controller_templates,
+        parse_midi_device_selections, parse_midi_mixer_control_mappings,
+        parse_midi_output_programs, parse_midi_output_routes, parse_midi_output_values,
+        parse_midi_vst3_parameter_mappings, parse_pattern_vst3_parameter_links,
+        parse_playlist_audio_clip_envelopes, parse_playlist_vst3_parameter_links,
+        parse_window_layout_presets, pattern_color_from_random_index,
+        pattern_lfo_loop_length_ticks, pattern_loop_frame_at_tick, pattern_loop_tick_at_frame,
+        pattern_vst3_parameter_automation_for_channel, pattern_vst3_parameter_link_for_target,
+        piano_roll_color_group_note_ids, piano_roll_controller_stroke_points,
+        piano_roll_controller_value_at, piano_roll_controller_value_range,
+        piano_roll_cross_pattern_ghost_notes, piano_roll_discard_length_edit,
+        piano_roll_duplicate_offset, piano_roll_ghost_note_is_visible, piano_roll_key_at_y,
+        piano_roll_note_group_members, piano_roll_note_nudge_edit, piano_roll_odd_note_selection,
         piano_roll_overlap_note_selection, piano_roll_pitch_range_note_selection,
         piano_roll_random_note_selection, piano_roll_selection_time_range,
         piano_roll_shift_time_range, piano_roll_time_range_from_drag,
@@ -64717,6 +64751,19 @@ mod tests {
         );
         assert_eq!(midi_script_pattern_jog_target(&pattern_ids, None, 0), None);
         assert_eq!(midi_script_pattern_jog_target(&[], Some(2), 1), None);
+    }
+
+    #[test]
+    fn midi_script_tempo_jog_moves_in_tenths_and_clamps_to_serialized_range() {
+        assert_eq!(midi_script_tempo_jog_target(120.5, 1), Some(120.6));
+        assert_eq!(midi_script_tempo_jog_target(120.5, -1), Some(120.4));
+        assert_eq!(midi_script_tempo_jog_target(0.001, -1), Some(0.001));
+        assert_eq!(
+            midi_script_tempo_jog_target(f64::from(u32::MAX) / 1000.0, 1),
+            Some(f64::from(u32::MAX) / 1000.0)
+        );
+        assert_eq!(midi_script_tempo_jog_target(0.0, 1), None);
+        assert_eq!(midi_script_tempo_jog_target(f64::NAN, 1), None);
     }
 
     #[test]
