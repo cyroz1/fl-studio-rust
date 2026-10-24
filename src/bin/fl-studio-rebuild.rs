@@ -104,7 +104,7 @@ use midi_output::{
     enumerate_output_devices, midi_patch_setup_messages, pattern_loop_frame_messages,
     pattern_preview_messages, playlist_playback_messages,
 };
-use midi_script::{MidiControllerScript, discover_midi_scripts};
+use midi_script::{MidiControllerScript, discover_midi_scripts, find_script_for_device};
 use midi_thru::{MidiThruSettings, MidiThruWorker};
 
 const APP_BACKGROUND: Color32 = Color32::from_rgb(27, 27, 27);
@@ -4592,6 +4592,7 @@ struct DawUi {
     midi_selected_input_id: Option<String>,
     midi_controller_scripts: Vec<MidiControllerScript>,
     midi_selected_controller_script: Option<PathBuf>,
+    midi_auto_detect_controller_script: bool,
     midi_script_discovery_error: Option<String>,
     midi_connect_input_on_startup: bool,
     midi_input_error: Option<String>,
@@ -5595,6 +5596,7 @@ impl DawUi {
         let MidiDeviceSelections {
             input_id: midi_selected_input_id,
             input_script: midi_selected_controller_script,
+            input_script_auto_detect: midi_auto_detect_controller_script,
             connect_input_on_startup: midi_connect_input_on_startup,
             output_id: midi_selected_output_id,
             connect_output_on_startup: midi_connect_output_on_startup,
@@ -5969,6 +5971,7 @@ impl DawUi {
             midi_selected_input_id,
             midi_controller_scripts,
             midi_selected_controller_script,
+            midi_auto_detect_controller_script,
             midi_script_discovery_error,
             midi_connect_input_on_startup,
             midi_input_error,
@@ -43008,6 +43011,7 @@ impl DawUi {
         let selections = MidiDeviceSelections {
             input_id: self.midi_selected_input_id.clone(),
             input_script: self.midi_selected_controller_script.clone(),
+            input_script_auto_detect: self.midi_auto_detect_controller_script,
             connect_input_on_startup: self.midi_connect_input_on_startup,
             output_id: self.midi_selected_output_id.clone(),
             connect_output_on_startup: self.midi_connect_output_on_startup,
@@ -43056,7 +43060,7 @@ impl DawUi {
                 "The selected MIDI input is no longer available; refresh devices".to_owned();
             return;
         };
-        let selected_script = self
+        let explicit_script = self
             .midi_selected_controller_script
             .as_ref()
             .and_then(|path| {
@@ -43065,12 +43069,18 @@ impl DawUi {
                     .find(|script| &script.path == path)
             })
             .cloned();
-        if self.midi_selected_controller_script.is_some() && selected_script.is_none() {
+        if self.midi_selected_controller_script.is_some() && explicit_script.is_none() {
             let error = "The selected MIDI controller script is unavailable; refresh scripts";
             self.midi_input_error = Some(error.to_owned());
             self.status = error.to_owned();
             return;
         }
+        let selected_script = explicit_script.or_else(|| {
+            self.midi_auto_detect_controller_script
+                .then(|| find_script_for_device(&self.midi_controller_scripts, &device.name))
+                .flatten()
+                .cloned()
+        });
         self.midi_output_gain_learning = false;
         self.midi_mixer_control_learning = None;
         self.midi_play_pause_learning = false;
@@ -43098,7 +43108,16 @@ impl DawUi {
                 self.midi_selected_input_id = Some(device_id);
                 self.midi_input_error = None;
                 self.status = script_name.map_or_else(
-                    || format!("Connected MIDI input: {}", device.name),
+                    || {
+                        if self.midi_auto_detect_controller_script {
+                            format!(
+                                "Connected MIDI input: {} (no matching controller script; using Generic MIDI)",
+                                device.name
+                            )
+                        } else {
+                            format!("Connected MIDI input: {}", device.name)
+                        }
+                    },
                     |script| format!("Connected MIDI input: {} ({script})", device.name),
                 );
             }
@@ -47718,42 +47737,67 @@ impl DawUi {
         });
         ui.horizontal(|ui| {
             ui.label("Controller script");
-            let selected_name = self
-                .midi_selected_controller_script
-                .as_ref()
-                .and_then(|path| {
-                    self.midi_controller_scripts
-                        .iter()
-                        .find(|script| &script.path == path)
-                })
-                .map(|script| script.name.as_str())
-                .unwrap_or_else(|| {
-                    if self.midi_selected_controller_script.is_some() {
-                        "Saved script unavailable"
-                    } else {
-                        "Generic MIDI"
-                    }
-                });
+            let selected_name = if self.midi_auto_detect_controller_script {
+                "Auto-detect by device name"
+            } else {
+                self.midi_selected_controller_script
+                    .as_ref()
+                    .and_then(|path| {
+                        self.midi_controller_scripts
+                            .iter()
+                            .find(|script| &script.path == path)
+                    })
+                    .map(|script| script.name.as_str())
+                    .unwrap_or_else(|| {
+                        if self.midi_selected_controller_script.is_some() {
+                            "Saved script unavailable"
+                        } else {
+                            "Generic MIDI"
+                        }
+                    })
+            };
             let mut script_selection_changed = false;
             egui::ComboBox::from_id_salt("midi_controller_script")
                 .selected_text(selected_name)
                 .width(280.0)
                 .show_ui(ui, |ui| {
-                    script_selection_changed |= ui
-                        .selectable_value(
-                            &mut self.midi_selected_controller_script,
-                            None,
+                    if ui
+                        .selectable_label(
+                            self.midi_auto_detect_controller_script,
+                            "Auto-detect by device name",
+                        )
+                        .clicked()
+                    {
+                        self.midi_auto_detect_controller_script = true;
+                        self.midi_selected_controller_script = None;
+                        script_selection_changed = true;
+                    }
+                    if ui
+                        .selectable_label(
+                            !self.midi_auto_detect_controller_script
+                                && self.midi_selected_controller_script.is_none(),
                             "Generic MIDI",
                         )
-                        .changed();
+                        .clicked()
+                    {
+                        self.midi_auto_detect_controller_script = false;
+                        self.midi_selected_controller_script = None;
+                        script_selection_changed = true;
+                    }
                     for script in &self.midi_controller_scripts {
-                        script_selection_changed |= ui
-                            .selectable_value(
-                                &mut self.midi_selected_controller_script,
-                                Some(script.path.clone()),
+                        if ui
+                            .selectable_label(
+                                !self.midi_auto_detect_controller_script
+                                    && self.midi_selected_controller_script.as_ref()
+                                        == Some(&script.path),
                                 &script.name,
                             )
-                            .changed();
+                            .clicked()
+                        {
+                            self.midi_auto_detect_controller_script = false;
+                            self.midi_selected_controller_script = Some(script.path.clone());
+                            script_selection_changed = true;
+                        }
                     }
                 });
             if ui.button("Refresh scripts").clicked() {
@@ -47766,17 +47810,36 @@ impl DawUi {
                 }
             }
         });
-        if let Some(script) = self
-            .midi_selected_controller_script
+        let selected_input_name = self
+            .midi_selected_input_id
             .as_ref()
-            .and_then(|path| {
-                self.midi_controller_scripts
+            .and_then(|id| {
+                self.midi_input_devices
                     .iter()
-                    .find(|script| &script.path == path)
+                    .find(|device| &device.id == id)
             })
-            && !script.supported_devices.is_empty()
-        {
-            ui.small(format!("Supports: {}", script.supported_devices.join(", ")));
+            .map(|device| device.name.as_str());
+        let selected_script = if self.midi_auto_detect_controller_script {
+            selected_input_name
+                .and_then(|name| find_script_for_device(&self.midi_controller_scripts, name))
+        } else {
+            self.midi_selected_controller_script
+                .as_ref()
+                .and_then(|path| {
+                    self.midi_controller_scripts
+                        .iter()
+                        .find(|script| &script.path == path)
+                })
+        };
+        if let Some(script) = selected_script {
+            if !script.supported_devices.is_empty() {
+                ui.small(format!("Supports: {}", script.supported_devices.join(", ")));
+            }
+            if self.midi_auto_detect_controller_script {
+                ui.small(format!("Auto-matched {} by MIDI input name", script.name));
+            }
+        } else if self.midi_auto_detect_controller_script && selected_input_name.is_some() {
+            ui.small("No unique supported-device name match; Generic MIDI will be used.");
         }
         if let Some(error) = &self.midi_script_discovery_error {
             ui.colored_label(egui::Color32::LIGHT_RED, error);
@@ -54915,6 +54978,7 @@ fn recording_input_targets(
 struct MidiDeviceSelections {
     input_id: Option<String>,
     input_script: Option<PathBuf>,
+    input_script_auto_detect: bool,
     connect_input_on_startup: bool,
     output_id: Option<String>,
     connect_output_on_startup: bool,
@@ -54940,6 +55004,7 @@ impl Default for MidiDeviceSelections {
         Self {
             input_id: None,
             input_script: None,
+            input_script_auto_detect: false,
             connect_input_on_startup: false,
             output_id: None,
             connect_output_on_startup: false,
@@ -55035,12 +55100,13 @@ fn parse_midi_thru_preferences(contents: &str) -> (bool, Option<u8>) {
 
 fn encode_midi_device_selections(selections: &MidiDeviceSelections) -> String {
     format!(
-        "input={}\ninput_script={}\nconnect_input_on_startup={}\noutput={}\nconnect_output_on_startup={}\noutput_routes={}\nbank_msb={}\nbank_lsb={}\nprograms={}\nclock={}\nplaylist_notes={}\npattern_notes={}\nfixed_velocity={}\nperformance_channel={}\nrecord_audio={}\nrecord_notes={}\nrecord_automation={}\nrecord_automation_controller={}\nrecord_automation_channel={}\nrecord_automation_flags={}\n",
+        "input={}\ninput_script={}\ninput_script_auto_detect={}\nconnect_input_on_startup={}\noutput={}\nconnect_output_on_startup={}\noutput_routes={}\nbank_msb={}\nbank_lsb={}\nprograms={}\nclock={}\nplaylist_notes={}\npattern_notes={}\nfixed_velocity={}\nperformance_channel={}\nrecord_audio={}\nrecord_notes={}\nrecord_automation={}\nrecord_automation_controller={}\nrecord_automation_channel={}\nrecord_automation_flags={}\n",
         encode_midi_device_id(selections.input_id.as_deref().unwrap_or_default()),
         selections.input_script.as_ref().map_or_else(
             || "-".to_owned(),
             |path| encode_midi_device_id(&path.to_string_lossy()),
         ),
+        u8::from(selections.input_script_auto_detect),
         u8::from(selections.connect_input_on_startup),
         encode_midi_device_id(selections.output_id.as_deref().unwrap_or_default()),
         u8::from(selections.connect_output_on_startup),
@@ -55072,6 +55138,8 @@ fn parse_midi_device_selections(contents: &str) -> MidiDeviceSelections {
                 "-" => None,
                 _ => decode_midi_device_id(encoded_path).map(PathBuf::from),
             };
+        } else if let Some(enabled) = line.strip_prefix("input_script_auto_detect=") {
+            selections.input_script_auto_detect = enabled == "1";
         } else if let Some(enabled) = line.strip_prefix("connect_input_on_startup=") {
             selections.connect_input_on_startup = enabled == "1";
         } else if let Some(encoded_id) = line.strip_prefix("output=") {
@@ -55129,6 +55197,9 @@ fn parse_midi_device_selections(contents: &str) -> MidiDeviceSelections {
         {
             selections.record_automation_flags = flags;
         }
+    }
+    if selections.input_script_auto_detect {
+        selections.input_script = None;
     }
     selections
 }
@@ -61658,6 +61729,7 @@ mod tests {
         let selections = MidiDeviceSelections {
             input_id: Some(input_id.to_owned()),
             input_script: Some(PathBuf::from("Scripts/Controller/device_test.py")),
+            input_script_auto_detect: false,
             connect_input_on_startup: true,
             output_id: Some(output_id.to_owned()),
             connect_output_on_startup: true,
@@ -61692,6 +61764,25 @@ mod tests {
             Some(selections.output_channel_routes)
         );
         assert!(parse_midi_output_routes("broken").is_none());
+    }
+
+    #[test]
+    fn midi_script_auto_detect_setting_round_trips_and_clears_explicit_selection() {
+        let selections = MidiDeviceSelections {
+            input_script_auto_detect: true,
+            ..MidiDeviceSelections::default()
+        };
+        let encoded = encode_midi_device_selections(&selections);
+
+        assert_eq!(parse_midi_device_selections(&encoded), selections);
+        let conflicting =
+            parse_midi_device_selections(&encode_midi_device_selections(&MidiDeviceSelections {
+                input_script: Some(PathBuf::from("Scripts/Controller/device_test.py")),
+                input_script_auto_detect: true,
+                ..MidiDeviceSelections::default()
+            }));
+        assert!(conflicting.input_script_auto_detect);
+        assert!(conflicting.input_script.is_none());
     }
 
     #[test]

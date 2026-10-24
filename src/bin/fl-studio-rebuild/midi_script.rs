@@ -180,6 +180,31 @@ pub fn discover_midi_scripts(
     Ok(scripts)
 }
 
+pub fn find_script_for_device<'a>(
+    scripts: &'a [MidiControllerScript],
+    device_name: &str,
+) -> Option<&'a MidiControllerScript> {
+    let device_name = normalize_device_name(device_name);
+    if device_name.is_empty() {
+        return None;
+    }
+    let mut matches = scripts.iter().filter(|script| {
+        script
+            .supported_devices
+            .iter()
+            .any(|name| normalize_device_name(name) == device_name)
+    });
+    let matched = matches.next()?;
+    matches.next().is_none().then_some(matched)
+}
+
+fn normalize_device_name(name: &str) -> String {
+    name.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
 impl MidiScriptRuntime {
     pub fn start(script: &MidiControllerScript) -> Result<Self, String> {
         let (program, prefix_args) = python_command()?;
@@ -376,7 +401,8 @@ fn byte_value(response: &Value, key: &str, default: u8) -> Result<u8, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MidiControllerScript, MidiScriptRuntime, discover_midi_scripts, transform_message,
+        MidiControllerScript, MidiScriptRuntime, discover_midi_scripts, find_script_for_device,
+        transform_message,
     };
     use serde_json::json;
     use std::fs;
@@ -436,6 +462,35 @@ mod tests {
         );
         assert_eq!(scripts[0].supported_devices, ["Example", "Example XL"]);
         assert_eq!(scripts[0].supported_hardware_ids, ["00 01", "00 02"]);
+    }
+
+    #[test]
+    fn supported_device_names_match_case_and_spacing_but_reject_ambiguity() {
+        let temporary = TestDirectory::new();
+        let folder = temporary.path().join("Controller");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(
+            folder.join("device_first.py"),
+            "# name=First\n# supportedDevices=Example Controller\n",
+        )
+        .unwrap();
+        let scripts = discover_midi_scripts(temporary.path()).unwrap();
+
+        assert_eq!(
+            find_script_for_device(&scripts, "  EXAMPLE   controller ")
+                .map(|script| script.name.as_str()),
+            Some("First")
+        );
+        assert!(find_script_for_device(&scripts, "Other Controller").is_none());
+        assert!(find_script_for_device(&scripts, " ").is_none());
+
+        fs::write(
+            folder.join("device_second.py"),
+            "# name=Second\n# supportedDevices=example controller\n",
+        )
+        .unwrap();
+        let scripts = discover_midi_scripts(temporary.path()).unwrap();
+        assert!(find_script_for_device(&scripts, "Example Controller").is_none());
     }
 
     #[test]
