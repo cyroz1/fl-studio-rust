@@ -1482,6 +1482,32 @@ mod tests {
     }
 
     #[test]
+    fn python_full_refresh_runs_after_successful_project_load() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport transport\ndef OnDoFullRefresh():\n    transport.start()\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let mut runtime = MidiScriptRuntime::start_for_device(&script, "Test Input").unwrap();
+
+        assert!(runtime.process_project_load(0).unwrap().actions.is_empty());
+        assert_eq!(
+            runtime.process_project_load(100).unwrap().actions,
+            [ScriptTransportAction::Start]
+        );
+        assert!(
+            runtime
+                .process_project_load(101)
+                .unwrap()
+                .actions
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn python_beat_indicator_callback_receives_off_bar_and_beat_values() {
         let temporary = TestDirectory::new();
         let script_path = temporary.path().join("device_test.py");

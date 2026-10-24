@@ -505,9 +505,14 @@ def _dispatch(namespace, value):
     _active_transport_actions = []
     _active_transport_state = value.get("transport", {})
     if "project_load_status" in value:
+        status = int(value["project_load_status"])
         callback = namespace.get("OnProjectLoad")
         if callback is not None:
-            callback(int(value["project_load_status"]))
+            callback(status)
+        if status == 100:
+            callback = namespace.get("OnDoFullRefresh")
+            if callback is not None:
+                callback()
         return {"handled": False, "actions": _active_transport_actions}
     if "beat_indicator" in value:
         callback = namespace.get("OnUpdateBeatIndicator")
