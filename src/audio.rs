@@ -1248,15 +1248,22 @@ impl StereoFrameDelay {
             return Ok(());
         }
         for frame in samples.as_chunks_mut::<2>().0 {
-            let delayed = self.frames[self.cursor];
-            self.frames[self.cursor] = [frame[0], frame[1]];
-            frame.copy_from_slice(&delayed);
-            self.cursor += 1;
-            if self.cursor == self.frames.len() {
-                self.cursor = 0;
-            }
+            self.process_frame(frame);
         }
         Ok(())
+    }
+
+    pub(crate) fn process_frame(&mut self, frame: &mut [f32; 2]) {
+        if self.frames.is_empty() {
+            return;
+        }
+        let delayed = self.frames[self.cursor];
+        self.frames[self.cursor] = *frame;
+        frame.copy_from_slice(&delayed);
+        self.cursor += 1;
+        if self.cursor == self.frames.len() {
+            self.cursor = 0;
+        }
     }
 }
 

@@ -572,6 +572,7 @@ struct PlaylistMixerEffectStream {
     input_channels: usize,
     output_channels: usize,
     wet_mix: f32,
+    latency_frames: u64,
     dry_delay_line: StereoFrameDelay,
     dry_delay_scratch: Vec<f32>,
 }
@@ -581,6 +582,18 @@ struct PlaylistMixerEffectChain {
     route_plan: crate::MixerSourceRoutePlan,
     first_effect_index: usize,
     end_effect_index: usize,
+    latency_frames: u64,
+    output_alignment_delay: StereoFrameDelay,
+    dry_reference_delay: StereoFrameDelay,
+    downstream_delays: Vec<PlaylistMixerEffectBranchDelay>,
+}
+
+struct PlaylistMixerEffectBranchDelay {
+    track: usize,
+    meter_transform: MixerSourceRouteTransform,
+    effect_input_transform: MixerSourceRouteTransform,
+    meter_delay: StereoFrameDelay,
+    effect_input_delay: StereoFrameDelay,
 }
 
 /// Prepared VST3 instrument channels and Mixer effects for blockwise Playlist transport.
@@ -593,6 +606,11 @@ pub struct Vst3PlaylistStreamProcessor {
     mixer_effect_dry_scratch: Vec<f32>,
     mixer_effect_tail_frames: u64,
     mixer_effect_dry_delay_frames: u64,
+    mixer_effect_route_delay_frames: u64,
+    mixer_effect_pdc_latency_frames: u64,
+    mixer_effect_output_delay: StereoFrameDelay,
+    mixer_effect_meter_input_delays: Vec<StereoFrameDelay>,
+    mixer_effect_input_delays: Vec<StereoFrameDelay>,
     live_input_senders: BTreeMap<u16, Vst3PlaylistLiveInputSender>,
     performance_pattern_automation: BTreeMap<(u16, u16), Vec<Vst3ParameterAutomation>>,
     tempo_map: PlaylistTempoMap,
@@ -1027,8 +1045,12 @@ impl Vst3PlaylistStreamProcessor {
             .content_frames
             .checked_add(self.mixer_effect_tail_frames)
             .ok_or_else(|| "Playlist Mixer effect tail length overflow".to_owned())?;
+        let total_pdc_latency_frames = self
+            .maximum_latency_frames
+            .checked_add(self.mixer_effect_pdc_latency_frames)
+            .ok_or_else(|| "Playlist Mixer PDC latency overflow".to_owned())?;
         self.output_frames =
-            pdc_aligned_output_frames(content_with_effect_tail, self.maximum_latency_frames)?;
+            pdc_aligned_output_frames(content_with_effect_tail, total_pdc_latency_frames)?;
 
         let mut delay_frames = self.maximum_latency_frames;
         for stream in &self.streams {
@@ -1041,6 +1063,9 @@ impl Vst3PlaylistStreamProcessor {
         }
         delay_frames = delay_frames
             .checked_add(self.mixer_effect_dry_delay_frames)
+            .ok_or_else(|| "PDC delay storage size overflow".to_owned())?;
+        delay_frames = delay_frames
+            .checked_add(self.mixer_effect_route_delay_frames)
             .ok_or_else(|| "PDC delay storage size overflow".to_owned())?;
         let delay_bytes = delay_frames
             .checked_mul(std::mem::size_of::<[f32; 2]>() as u64)
@@ -1284,7 +1309,38 @@ impl Vst3PlaylistStreamProcessor {
             return Err("VST3 Mixer effect buffer must contain stereo frames".to_owned());
         }
 
-        for chain in &self.mixer_effect_chains {
+        self.mixer_effect_output_delay.process_interleaved(output)?;
+        let samples_per_track = output.len();
+        if let Some(meter_buses) = meter_buses.as_deref_mut() {
+            for (track, delay) in self.mixer_effect_meter_input_delays.iter_mut().enumerate() {
+                let start = track
+                    .checked_mul(samples_per_track)
+                    .ok_or_else(|| "Mixer meter PDC offset overflow".to_owned())?;
+                let end = start
+                    .checked_add(samples_per_track)
+                    .ok_or_else(|| "Mixer meter PDC size overflow".to_owned())?;
+                if end > meter_buses.len() {
+                    return Err("Mixer meter buffer is too small for PDC".to_owned());
+                }
+                delay.process_interleaved(&mut meter_buses[start..end])?;
+            }
+        }
+        if let Some(effect_input_buses) = effect_input_buses.as_deref_mut() {
+            for (track, delay) in self.mixer_effect_input_delays.iter_mut().enumerate() {
+                let start = track
+                    .checked_mul(samples_per_track)
+                    .ok_or_else(|| "Mixer effect input PDC offset overflow".to_owned())?;
+                let end = start
+                    .checked_add(samples_per_track)
+                    .ok_or_else(|| "Mixer effect input PDC size overflow".to_owned())?;
+                if end > effect_input_buses.len() {
+                    return Err("Mixer effect input buffer is too small for PDC".to_owned());
+                }
+                delay.process_interleaved(&mut effect_input_buses[start..end])?;
+            }
+        }
+
+        for chain in &mut self.mixer_effect_chains {
             let first_effect_index = chain.first_effect_index;
             let end_effect_index = chain.end_effect_index;
             if chain.insert_ordinal == 0 {
@@ -1301,7 +1357,6 @@ impl Vst3PlaylistStreamProcessor {
             let Some(effect_input_buses) = effect_input_buses.as_deref_mut() else {
                 return Err("VST3 Mixer insert effects require pre-effect input buses".to_owned());
             };
-            let samples_per_track = output.len();
             let bus_start = chain
                 .insert_ordinal
                 .checked_mul(samples_per_track)
@@ -1331,6 +1386,9 @@ impl Vst3PlaylistStreamProcessor {
                 &mut self.mixer_effects[first_effect_index..end_effect_index],
                 &mut self.mixer_effect_scratch,
             )?;
+            chain
+                .dry_reference_delay
+                .process_interleaved(&mut self.mixer_effect_dry_scratch)?;
 
             for (frame_index, (processed, dry)) in self
                 .mixer_effect_scratch
@@ -1340,43 +1398,43 @@ impl Vst3PlaylistStreamProcessor {
                 .zip(self.mixer_effect_dry_scratch.as_chunks::<2>().0.iter())
                 .enumerate()
             {
-                let mut delta = [processed[0] - dry[0], processed[1] - dry[1]];
-                chain.route_plan.output_transform.apply_frame(&mut delta);
-                output[frame_index * 2] += finite_sample(delta[0]);
-                output[frame_index * 2 + 1] += finite_sample(delta[1]);
+                let raw_delta = [processed[0] - dry[0], processed[1] - dry[1]];
+                let mut output_delta = raw_delta;
+                chain
+                    .output_alignment_delay
+                    .process_frame(&mut output_delta);
+                chain
+                    .route_plan
+                    .output_transform
+                    .apply_frame(&mut output_delta);
+                output[frame_index * 2] += finite_sample(output_delta[0]);
+                output[frame_index * 2 + 1] += finite_sample(output_delta[1]);
 
-                for (track, transform) in &chain.route_plan.insert_meter_transforms {
-                    if *track == chain.insert_ordinal {
-                        continue;
-                    }
-                    if *track >= crate::audio::MIXER_TRACK_METER_COUNT {
+                for branch in &mut chain.downstream_delays {
+                    if branch.track >= crate::audio::MIXER_TRACK_METER_COUNT {
                         return Err(
                             "VST3 Mixer meter route exceeds the supported track range".to_owned()
                         );
                     }
-                    let meter_offset = *track * samples_per_track + frame_index * 2;
+                    let meter_offset = branch.track * samples_per_track + frame_index * 2;
                     let meter_end = meter_offset
                         .checked_add(2)
                         .ok_or_else(|| "Mixer meter buffer offset overflow".to_owned())?;
                     if meter_end > meter_buses.len() {
                         return Err("Mixer meter buffer is too small for the VST3 route".to_owned());
                     }
-                    let mut meter_delta = [processed[0] - dry[0], processed[1] - dry[1]];
-                    transform.apply_frame(&mut meter_delta);
+                    let mut meter_delta = raw_delta;
+                    branch.meter_transform.apply_frame(&mut meter_delta);
+                    branch.meter_delay.process_frame(&mut meter_delta);
                     meter_buses[meter_offset] += finite_sample(meter_delta[0]);
                     meter_buses[meter_offset + 1] += finite_sample(meter_delta[1]);
-                }
-                for (track, transform) in &chain.route_plan.insert_effect_input_transforms {
-                    if *track == chain.insert_ordinal {
-                        continue;
-                    }
-                    if *track >= crate::audio::MIXER_TRACK_METER_COUNT {
+                    if branch.track >= crate::audio::MIXER_TRACK_METER_COUNT {
                         return Err(
                             "VST3 Mixer effect input route exceeds the supported track range"
                                 .to_owned(),
                         );
                     }
-                    let input_offset = *track * samples_per_track + frame_index * 2;
+                    let input_offset = branch.track * samples_per_track + frame_index * 2;
                     let input_end = input_offset
                         .checked_add(2)
                         .ok_or_else(|| "Mixer effect input buffer offset overflow".to_owned())?;
@@ -1385,8 +1443,13 @@ impl Vst3PlaylistStreamProcessor {
                             "Mixer effect input buffer is too small for the VST3 route".to_owned()
                         );
                     }
-                    let mut effect_input_delta = [processed[0] - dry[0], processed[1] - dry[1]];
-                    transform.apply_frame(&mut effect_input_delta);
+                    let mut effect_input_delta = raw_delta;
+                    branch
+                        .effect_input_transform
+                        .apply_frame(&mut effect_input_delta);
+                    branch
+                        .effect_input_delay
+                        .process_frame(&mut effect_input_delta);
                     effect_input_buses[input_offset] += finite_sample(effect_input_delta[0]);
                     effect_input_buses[input_offset + 1] += finite_sample(effect_input_delta[1]);
                 }
@@ -1563,6 +1626,189 @@ fn plan_pdc_delays(latencies: &[u64]) -> (u64, Vec<u64>) {
         .map(|latency| maximum.saturating_sub(*latency))
         .collect();
     (maximum, delays)
+}
+
+fn configure_mixer_effect_pdc(
+    processor: &mut Vst3PlaylistStreamProcessor,
+    routing: &MixerRouteAudibility,
+    instrument_delay_frames: u64,
+) -> Result<(), String> {
+    if processor.mixer_effect_chains.is_empty() {
+        return Ok(());
+    }
+
+    fn add_delay_frames(total: &mut u64, frames: u64, copies: u64) -> Result<(), String> {
+        let addition = frames
+            .checked_mul(copies)
+            .ok_or_else(|| "PDC delay storage size overflow".to_owned())?;
+        *total = total
+            .checked_add(addition)
+            .ok_or_else(|| "PDC delay storage size overflow".to_owned())?;
+        Ok(())
+    }
+
+    let mut effect_latency_by_track = HashMap::new();
+    let mut master_effect_latency_frames = 0_u64;
+    for chain in &processor.mixer_effect_chains {
+        if chain.insert_ordinal == 0 {
+            master_effect_latency_frames = master_effect_latency_frames
+                .checked_add(chain.latency_frames)
+                .ok_or_else(|| "Mixer Master effect latency overflow".to_owned())?;
+        } else {
+            effect_latency_by_track.insert(chain.insert_ordinal, chain.latency_frames);
+        }
+    }
+    let pdc_plan = routing.mixer_insert_pdc_plan(&effect_latency_by_track)?;
+    let master_input_latency_frames = pdc_plan.master_input_latency_frames;
+    let total_effect_latency_frames = master_input_latency_frames
+        .checked_add(master_effect_latency_frames)
+        .ok_or_else(|| "Mixer effect PDC latency overflow".to_owned())?;
+
+    let mut route_delay_frames = master_input_latency_frames;
+    for input_latency_frames in pdc_plan.input_latency_frames.values() {
+        add_delay_frames(&mut route_delay_frames, *input_latency_frames, 2)?;
+    }
+    for chain in processor
+        .mixer_effect_chains
+        .iter()
+        .filter(|chain| chain.insert_ordinal != 0)
+    {
+        add_delay_frames(&mut route_delay_frames, chain.latency_frames, 1)?;
+        let output_latency_frames = pdc_plan
+            .output_latency_frames
+            .get(&chain.insert_ordinal)
+            .copied()
+            .unwrap_or_default();
+        let output_alignment_frames = if pdc_plan
+            .tracks_reaching_master
+            .contains(&chain.insert_ordinal)
+        {
+            master_input_latency_frames
+                .checked_sub(output_latency_frames)
+                .ok_or_else(|| "Mixer output path exceeds its planned PDC latency".to_owned())?
+        } else {
+            0
+        };
+        add_delay_frames(&mut route_delay_frames, output_alignment_frames, 1)?;
+        for (track, _) in &chain.route_plan.insert_effect_input_transforms {
+            if *track == chain.insert_ordinal {
+                continue;
+            }
+            let input_latency_frames = pdc_plan
+                .input_latency_frames
+                .get(track)
+                .copied()
+                .ok_or_else(|| {
+                    format!("Mixer insert {track} has no latency entry in the route plan")
+                })?;
+            let branch_delay_frames = input_latency_frames
+                .checked_sub(output_latency_frames)
+                .ok_or_else(|| "Mixer send path exceeds its planned PDC latency".to_owned())?;
+            add_delay_frames(&mut route_delay_frames, branch_delay_frames, 2)?;
+        }
+    }
+
+    let total_delay_frames = instrument_delay_frames
+        .checked_add(processor.mixer_effect_dry_delay_frames)
+        .and_then(|frames| frames.checked_add(route_delay_frames))
+        .ok_or_else(|| "PDC delay storage size overflow".to_owned())?;
+    let delay_bytes = total_delay_frames
+        .checked_mul(std::mem::size_of::<[f32; 2]>() as u64)
+        .ok_or_else(|| "PDC delay storage size overflow".to_owned())?;
+    if delay_bytes > MAX_PDC_DELAY_BYTES {
+        return Err(format!(
+            "Mixer route PDC needs {delay_bytes} bytes of delay storage, exceeding the 128 MiB limit"
+        ));
+    }
+
+    processor.mixer_effect_output_delay = StereoFrameDelay::new(master_input_latency_frames)?;
+    processor.mixer_effect_meter_input_delays = Vec::new();
+    processor.mixer_effect_input_delays = Vec::new();
+    processor
+        .mixer_effect_meter_input_delays
+        .try_reserve_exact(crate::audio::MIXER_TRACK_METER_COUNT)
+        .map_err(|error| format!("could not allocate Mixer meter PDC delays: {error}"))?;
+    processor
+        .mixer_effect_input_delays
+        .try_reserve_exact(crate::audio::MIXER_TRACK_METER_COUNT)
+        .map_err(|error| format!("could not allocate Mixer input PDC delays: {error}"))?;
+    for track in 0..crate::audio::MIXER_TRACK_METER_COUNT {
+        let delay_frames = pdc_plan
+            .input_latency_frames
+            .get(&track)
+            .copied()
+            .unwrap_or_default();
+        processor
+            .mixer_effect_meter_input_delays
+            .push(StereoFrameDelay::new(delay_frames)?);
+        processor
+            .mixer_effect_input_delays
+            .push(StereoFrameDelay::new(delay_frames)?);
+    }
+
+    for chain in &mut processor.mixer_effect_chains {
+        if chain.insert_ordinal == 0 {
+            continue;
+        }
+        let meter_transforms = chain
+            .route_plan
+            .insert_meter_transforms
+            .iter()
+            .copied()
+            .collect::<BTreeMap<_, _>>();
+        let output_latency_frames = pdc_plan
+            .output_latency_frames
+            .get(&chain.insert_ordinal)
+            .copied()
+            .unwrap_or_default();
+        let output_alignment_frames = if pdc_plan
+            .tracks_reaching_master
+            .contains(&chain.insert_ordinal)
+        {
+            master_input_latency_frames
+                .checked_sub(output_latency_frames)
+                .ok_or_else(|| "Mixer output path exceeds its planned PDC latency".to_owned())?
+        } else {
+            0
+        };
+        chain.output_alignment_delay = StereoFrameDelay::new(output_alignment_frames)?;
+        chain.dry_reference_delay = StereoFrameDelay::new(chain.latency_frames)?;
+        chain.downstream_delays = Vec::new();
+        chain
+            .downstream_delays
+            .try_reserve_exact(chain.route_plan.insert_effect_input_transforms.len())
+            .map_err(|error| format!("could not allocate Mixer send PDC routes: {error}"))?;
+        for (track, transform) in &chain.route_plan.insert_effect_input_transforms {
+            if *track == chain.insert_ordinal {
+                continue;
+            }
+            let input_latency_frames = pdc_plan
+                .input_latency_frames
+                .get(track)
+                .copied()
+                .ok_or_else(|| {
+                    format!("Mixer insert {track} has no latency entry in the route plan")
+                })?;
+            let branch_delay_frames = input_latency_frames
+                .checked_sub(output_latency_frames)
+                .ok_or_else(|| "Mixer send path exceeds its planned PDC latency".to_owned())?;
+            let meter_transform = meter_transforms.get(track).copied().ok_or_else(|| {
+                format!("Mixer insert {track} has no meter transform for its send route")
+            })?;
+            chain
+                .downstream_delays
+                .push(PlaylistMixerEffectBranchDelay {
+                    track: *track,
+                    meter_transform,
+                    effect_input_transform: *transform,
+                    meter_delay: StereoFrameDelay::new(branch_delay_frames)?,
+                    effect_input_delay: StereoFrameDelay::new(branch_delay_frames)?,
+                });
+        }
+    }
+    processor.mixer_effect_route_delay_frames = route_delay_frames;
+    processor.mixer_effect_pdc_latency_frames = total_effect_latency_frames;
+    Ok(())
 }
 
 impl PlaylistPluginStream {
@@ -4007,6 +4253,11 @@ impl Vst3HostRuntime {
             mixer_effect_dry_scratch: Vec::new(),
             mixer_effect_tail_frames: 0,
             mixer_effect_dry_delay_frames: 0,
+            mixer_effect_route_delay_frames: 0,
+            mixer_effect_pdc_latency_frames: 0,
+            mixer_effect_output_delay: StereoFrameDelay::default(),
+            mixer_effect_meter_input_delays: Vec::new(),
+            mixer_effect_input_delays: Vec::new(),
             live_input_senders,
             performance_pattern_automation: BTreeMap::new(),
             tempo_map,
@@ -4215,12 +4466,10 @@ impl Vst3HostRuntime {
                 let reported_tail = reported_tail_seconds(tail_samples, sample_rate)
                     .map(|seconds| (seconds * f64::from(output_sample_rate)).ceil() as u64)
                     .unwrap_or(0);
-                let latency_tail = latency_frames;
                 if include_effect_tails {
                     processor.mixer_effect_tail_frames = processor
                         .mixer_effect_tail_frames
                         .saturating_add(reported_tail)
-                        .saturating_add(latency_tail)
                         .min(max_tail_frames);
                 }
                 processor.mixer_effects.push(PlaylistMixerEffectStream {
@@ -4233,6 +4482,7 @@ impl Vst3HostRuntime {
                     input_channels,
                     output_channels,
                     wet_mix,
+                    latency_frames,
                     dry_delay_line,
                     dry_delay_scratch: vec![0.0; block_size * 2],
                 });
@@ -4249,6 +4499,13 @@ impl Vst3HostRuntime {
                 })?;
                 routing.source_route_plan_for_channel(Some(track))
             };
+            let latency_frames = processor.mixer_effects[first_effect_index..end_effect_index]
+                .iter()
+                .try_fold(0_u64, |total, effect| {
+                    total
+                        .checked_add(effect.latency_frames)
+                        .ok_or_else(|| "Mixer effect chain latency overflow".to_owned())
+                })?;
             processor
                 .mixer_effect_chains
                 .push(PlaylistMixerEffectChain {
@@ -4256,9 +4513,14 @@ impl Vst3HostRuntime {
                     route_plan,
                     first_effect_index,
                     end_effect_index,
+                    latency_frames,
+                    output_alignment_delay: StereoFrameDelay::default(),
+                    dry_reference_delay: StereoFrameDelay::default(),
+                    downstream_delays: Vec::new(),
                 });
         }
         processor.mixer_effect_dry_delay_frames = mixer_effect_dry_delay_frames;
+        configure_mixer_effect_pdc(processor, &routing, instrument_delay_frames)?;
         let content_frames = processor.content_frames;
         processor.extend_to_output_frames(content_frames)?;
         Ok(())
@@ -4579,6 +4841,11 @@ impl Vst3HostRuntime {
             mixer_effect_dry_scratch: Vec::new(),
             mixer_effect_tail_frames: 0,
             mixer_effect_dry_delay_frames: 0,
+            mixer_effect_route_delay_frames: 0,
+            mixer_effect_pdc_latency_frames: 0,
+            mixer_effect_output_delay: StereoFrameDelay::default(),
+            mixer_effect_meter_input_delays: Vec::new(),
+            mixer_effect_input_delays: Vec::new(),
             live_input_senders,
             performance_pattern_automation: BTreeMap::new(),
             tempo_map,

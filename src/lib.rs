@@ -3180,6 +3180,14 @@ pub(crate) struct MixerSourceRoutePlan {
     pub(crate) insert_effect_input_transforms: Vec<(usize, MixerSourceRouteTransform)>,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct MixerInsertPdcPlan {
+    pub(crate) input_latency_frames: BTreeMap<usize, u64>,
+    pub(crate) output_latency_frames: BTreeMap<usize, u64>,
+    pub(crate) tracks_reaching_master: BTreeSet<usize>,
+    pub(crate) master_input_latency_frames: u64,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct MixerLiveSourceRoutePlan {
     pub(crate) track: usize,
@@ -4101,6 +4109,83 @@ impl MixerRouteAudibility {
             return Err("Mixer send graph contains a cycle".to_owned());
         }
         Ok(order)
+    }
+
+    pub(crate) fn mixer_insert_pdc_plan(
+        &self,
+        effect_latency_frames: &HashMap<usize, u64>,
+    ) -> Result<MixerInsertPdcPlan, String> {
+        let order = self.mixer_insert_processing_order()?;
+        let mut plan = MixerInsertPdcPlan::default();
+        for track in order {
+            let track_id = i8::try_from(track)
+                .map_err(|_| "Mixer insert ordinal exceeds the supported range".to_owned())?;
+            let mut input_latency_frames = 0_u64;
+            for (source_track, routes) in &self.send_routes_by_source {
+                if !self.complete_send_sources.contains(source_track) {
+                    continue;
+                }
+                if routes.iter().any(|route| {
+                    route.enabled
+                        && mixer_send_gain_raw(route.level_raw).unwrap_or_default() > 0.0
+                        && route.destination_track == track_id
+                }) {
+                    input_latency_frames = input_latency_frames.max(
+                        plan.output_latency_frames
+                            .get(&(*source_track as usize))
+                            .copied()
+                            .unwrap_or_default(),
+                    );
+                }
+            }
+            let output_latency_frames = input_latency_frames
+                .checked_add(
+                    effect_latency_frames
+                        .get(&track)
+                        .copied()
+                        .unwrap_or_default(),
+                )
+                .ok_or_else(|| "Mixer effect latency overflow".to_owned())?;
+            plan.input_latency_frames
+                .insert(track, input_latency_frames);
+            plan.output_latency_frames
+                .insert(track, output_latency_frames);
+        }
+
+        for track in self.known_tracks.iter().copied().filter(|track| *track > 0) {
+            if self.route_reaches_master_for_pdc(track, &mut HashSet::new()) {
+                plan.tracks_reaching_master.insert(track as usize);
+                plan.master_input_latency_frames = plan.master_input_latency_frames.max(
+                    plan.output_latency_frames
+                        .get(&(track as usize))
+                        .copied()
+                        .unwrap_or_default(),
+                );
+            }
+        }
+        Ok(plan)
+    }
+
+    fn route_reaches_master_for_pdc(&self, track: i8, visited: &mut HashSet<i8>) -> bool {
+        if track == 0 || !self.complete_send_sources.contains(&track) {
+            return true;
+        }
+        if !visited.insert(track) {
+            return false;
+        }
+        let reaches_master = self
+            .send_routes_by_source
+            .get(&track)
+            .into_iter()
+            .flatten()
+            .any(|route| {
+                route.enabled
+                    && mixer_send_gain_raw(route.level_raw).unwrap_or_default() > 0.0
+                    && route.destination_track >= 0
+                    && self.route_reaches_master_for_pdc(route.destination_track, visited)
+            });
+        visited.remove(&track);
+        reaches_master
     }
 
     #[allow(clippy::too_many_arguments)]
