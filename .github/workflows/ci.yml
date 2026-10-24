@@ -55,7 +55,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --yes cpio ffmpeg libasound2-dev libxcb1-dev libxkbcommon-x11-0 mesa-vulkan-drivers rpm xvfb xdotool zstd
+          sudo apt-get install --yes ffmpeg libasound2-dev libxcb1-dev libxkbcommon-x11-0 mesa-vulkan-drivers rpm xvfb xdotool zstd
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -349,7 +349,8 @@ jobs:
           mkdir -p "$package_root/deb" "$package_root/rpm" "$package_root/arch"
           dpkg-deb -x "${deb_packages[0]}" "$package_root/deb"
           rpm_package="$PWD/${rpm_packages[0]}"
-          (cd "$package_root/rpm" && rpm2cpio "$rpm_package" | cpio -id --quiet)
+          rpm --root "$package_root/rpm" --initdb
+          rpm --root "$package_root/rpm" --nodeps --noscripts --notriggers -i "$rpm_package"
           tar --zstd -xf "${arch_packages[0]}" -C "$package_root/arch"
 
           python3 - "$LINUX_ELF_MACHINE" \
