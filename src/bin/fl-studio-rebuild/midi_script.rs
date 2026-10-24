@@ -93,6 +93,7 @@ pub struct MidiScriptTransportState {
     pub song_position: AtomicU64,
     pub song_position_ticks: AtomicU64,
     pub ticks_per_quarter: AtomicU64,
+    pub current_tempo_milli_bpm: AtomicU64,
     pub time_signature_numerator: AtomicU64,
     pub song_length_ticks: AtomicU64,
     pub song_position_seconds: AtomicU64,
@@ -113,6 +114,7 @@ impl Default for MidiScriptTransportState {
             song_position: AtomicU64::new(0.0_f64.to_bits()),
             song_position_ticks: AtomicU64::new(0),
             ticks_per_quarter: AtomicU64::new(96),
+            current_tempo_milli_bpm: AtomicU64::new(140_000),
             time_signature_numerator: AtomicU64::new(4),
             song_length_ticks: AtomicU64::new(0),
             song_position_seconds: AtomicU64::new(0.0_f64.to_bits()),
@@ -536,6 +538,11 @@ impl MidiScriptRuntime {
                     "ticks_per_quarter": self
                         .transport_state
                         .ticks_per_quarter
+                        .load(Ordering::Relaxed)
+                        .max(1),
+                    "current_tempo_milli_bpm": self
+                        .transport_state
+                        .current_tempo_milli_bpm
                         .load(Ordering::Relaxed)
                         .max(1),
                     "time_signature_numerator": self
@@ -1380,6 +1387,32 @@ mod tests {
         let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
 
         assert_eq!(result.bytes, [0xB0, 1, 1]);
+    }
+
+    #[test]
+    fn python_mixer_current_tempo_returns_fractional_or_integer_bpm() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport mixer\ndef OnMidiIn(event):\n    event.data1 = int(mixer.getCurrentTempo() * 1000) % 128\n    event.data2 = mixer.getCurrentTempo(asInt=1)\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let transport_state = Arc::new(MidiScriptTransportState::default());
+        transport_state
+            .current_tempo_milli_bpm
+            .store(123_456, Ordering::Relaxed);
+        let mut runtime = MidiScriptRuntime::start_for_device_with_transport_state(
+            &script,
+            "Test Input",
+            transport_state,
+        )
+        .unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
+
+        assert_eq!(result.bytes, [0xB0, 64, 123]);
     }
 
     #[test]

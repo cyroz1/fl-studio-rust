@@ -327,6 +327,16 @@ def _get_song_tick_pos(mode=0):
     raise NotImplementedError("mixer.getSongTickPos() supports integer-tick and beat modes")
 
 
+def _get_current_tempo(asInt=0):
+    try:
+        asInt = int(asInt)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("mixer.getCurrentTempo() asInt must be an integer") from error
+    milli_bpm = max(1, int(_active_transport_state.get("current_tempo_milli_bpm", 140_000)))
+    tempo = milli_bpm / 1000.0
+    return int(tempo) if asInt else tempo
+
+
 def _get_song_step_pos():
     position_ticks = int(_active_transport_state.get("song_position_ticks", 0))
     ppq = max(1, int(_active_transport_state.get("ticks_per_quarter", 96)))
@@ -576,6 +586,7 @@ def _install_modules(script_name, device_name):
     device.stopRepeatMidiEvent = _stop_repeat_midi_event
 
     mixer = _module("mixer")
+    mixer.getCurrentTempo = _get_current_tempo
     mixer.getSongStepPos = _get_song_step_pos
     mixer.getSongTickPos = _get_song_tick_pos
 

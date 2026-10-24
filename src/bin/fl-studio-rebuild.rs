@@ -12966,6 +12966,12 @@ impl DawUi {
             .ticks_per_quarter
             .store(ticks_per_quarter, Ordering::Relaxed);
         self.midi_script_transport_state
+            .current_tempo_milli_bpm
+            .store(
+                u64::from(self.live_sampler_tempo_bpm_milli()),
+                Ordering::Relaxed,
+            );
+        self.midi_script_transport_state
             .time_signature_numerator
             .store(time_signature_numerator, Ordering::Relaxed);
         self.midi_script_transport_state
