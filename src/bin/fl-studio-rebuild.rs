@@ -101,8 +101,9 @@ use midi_output::{
     ConnectedMidiOutput, MIDI_TEST_NOTE_OFF, MIDI_TEST_NOTE_ON, MidiClockScheduler,
     MidiOutputDevice, MidiPatternLoopScheduler, MidiPlaylistScheduler, ScheduledMidiFrameMessage,
     ScheduledMidiMessage, ScheduledMidiTickMessage, connect_output_device_with_routes,
-    enumerate_output_devices, midi_patch_setup_messages, pattern_loop_frame_messages,
-    pattern_preview_messages, playlist_playback_messages,
+    disabled_project_channel_ids, enumerate_output_devices, midi_patch_setup_messages,
+    pattern_loop_frame_messages_excluding_channels, pattern_preview_messages_excluding_channels,
+    playlist_playback_messages,
 };
 use midi_script::{
     MidiControllerScript, MidiScriptTransportState, SCRIPT_BEAT_INDICATOR_BAR,
@@ -44467,12 +44468,14 @@ impl DawUi {
             self.status = error;
             return;
         };
-        let (messages, loop_frames) = match pattern_loop_frame_messages(
+        let excluded_project_channels = disabled_project_channel_ids(document);
+        let (messages, loop_frames) = match pattern_loop_frame_messages_excluding_channels(
             &pattern,
             ppq,
             tempo_bpm,
             sample_rate,
             loop_length_ticks,
+            &excluded_project_channels,
         ) {
             Ok(schedule) => schedule,
             Err(error) => {
@@ -44588,7 +44591,13 @@ impl DawUi {
             self.status = format!("Pattern {pattern_id} is no longer available");
             return;
         };
-        let messages = match pattern_preview_messages(&pattern, ppq, self.tempo_bpm) {
+        let excluded_project_channels = disabled_project_channel_ids(document);
+        let messages = match pattern_preview_messages_excluding_channels(
+            &pattern,
+            ppq,
+            self.tempo_bpm,
+            &excluded_project_channels,
+        ) {
             Ok(messages) => messages,
             Err(error) => {
                 self.status = format!("Could not prepare MIDI Pattern preview: {error}");

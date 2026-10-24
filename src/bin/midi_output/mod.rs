@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -93,10 +93,20 @@ pub fn midi_sixteenth_notes_from_tick(tick: f64, ppq: u16) -> u16 {
     (tick * 4.0 / f64::from(ppq)).floor().clamp(0.0, 16_383.0) as u16
 }
 
-pub fn pattern_preview_messages(
+#[cfg(test)]
+fn pattern_preview_messages(
     pattern: &Pattern,
     ppq: u16,
     tempo_bpm: f64,
+) -> Result<Vec<ScheduledMidiMessage>, String> {
+    pattern_preview_messages_excluding_channels(pattern, ppq, tempo_bpm, &BTreeSet::new())
+}
+
+pub fn pattern_preview_messages_excluding_channels(
+    pattern: &Pattern,
+    ppq: u16,
+    tempo_bpm: f64,
+    excluded_project_channels: &BTreeSet<u16>,
 ) -> Result<Vec<ScheduledMidiMessage>, String> {
     if ppq == 0 || !tempo_bpm.is_finite() || tempo_bpm <= 0.0 {
         return Err("project timing must have a positive PPQ and tempo".to_owned());
@@ -110,6 +120,9 @@ pub fn pattern_preview_messages(
 
     let mut ordered = Vec::with_capacity(pattern.notes.len().saturating_mul(2));
     for (note_index, note) in pattern.notes.iter().enumerate() {
+        if excluded_project_channels.contains(&note.channel_id) {
+            continue;
+        }
         let Some(key) = u8::try_from(note.key).ok().filter(|key| *key <= 127) else {
             continue;
         };
@@ -154,12 +167,31 @@ pub fn pattern_preview_messages(
         .collect()
 }
 
-pub fn pattern_loop_frame_messages(
+#[cfg(test)]
+fn pattern_loop_frame_messages(
     pattern: &Pattern,
     ppq: u16,
     tempo_bpm: f64,
     sample_rate: u32,
     loop_length_ticks: u64,
+) -> Result<(Vec<ScheduledMidiFrameMessage>, u64), String> {
+    pattern_loop_frame_messages_excluding_channels(
+        pattern,
+        ppq,
+        tempo_bpm,
+        sample_rate,
+        loop_length_ticks,
+        &BTreeSet::new(),
+    )
+}
+
+pub fn pattern_loop_frame_messages_excluding_channels(
+    pattern: &Pattern,
+    ppq: u16,
+    tempo_bpm: f64,
+    sample_rate: u32,
+    loop_length_ticks: u64,
+    excluded_project_channels: &BTreeSet<u16>,
 ) -> Result<(Vec<ScheduledMidiFrameMessage>, u64), String> {
     if loop_length_ticks == 0 {
         return Err("Pattern MIDI loop length must be greater than zero".to_owned());
@@ -178,6 +210,9 @@ pub fn pattern_loop_frame_messages(
 
     let mut ordered = Vec::with_capacity(pattern.notes.len().saturating_mul(2));
     for (note_index, note) in pattern.notes.iter().enumerate() {
+        if excluded_project_channels.contains(&note.channel_id) {
+            continue;
+        }
         let Some(key) = u8::try_from(note.key).ok().filter(|key| *key <= 127) else {
             continue;
         };
@@ -224,14 +259,25 @@ pub fn playlist_playback_messages(
     arrangement_id: u16,
     start_tick: u64,
 ) -> Result<Vec<ScheduledMidiTickMessage>, String> {
-    let bytes = MidiFile::encode_project_song(
+    let excluded_project_channels = disabled_project_channel_ids(document);
+    let bytes = MidiFile::encode_project_song_excluding_channels(
         document,
         arrangement_id,
         MidiChannelMapping::PreserveNoteChannels,
+        &excluded_project_channels,
     )
     .map_err(|error| error.to_string())?;
     let midi = MidiFile::parse(&bytes).map_err(|error| error.to_string())?;
     midi_tick_messages(&midi, start_tick)
+}
+
+pub(super) fn disabled_project_channel_ids(document: &FlpDocument) -> BTreeSet<u16> {
+    document
+        .channels()
+        .into_iter()
+        .filter(|channel| channel.enabled() == Some(false))
+        .map(|channel| channel.id())
+        .collect()
 }
 
 fn midi_tick_messages(
@@ -1119,6 +1165,7 @@ pub fn midi_patch_setup_messages(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::time::Duration;
 
     use flp_rebuild::sample_render::PlaylistTempoMap;
@@ -1130,7 +1177,8 @@ mod tests {
         midi_clock_pulse_frame, midi_control_change_message, midi_patch_setup_messages,
         midi_pattern_active_note_ons, midi_program_change_message, midi_sixteenth_notes_from_tick,
         midi_song_position_pointer_message, midi_tick_messages, pattern_loop_frame_messages,
-        pattern_preview_messages,
+        pattern_loop_frame_messages_excluding_channels, pattern_preview_messages,
+        pattern_preview_messages_excluding_channels,
     };
     use flp_rebuild::midi::{MidiChannelMapping, MidiExportNote, MidiExportTrack, MidiFile};
 
@@ -1260,6 +1308,72 @@ mod tests {
         assert_eq!(messages[1].bytes, [0x80, 60, 32]);
         assert_eq!(messages[2].bytes, [0x90, 60, 80]);
         assert_eq!(messages[3].bytes, [0x80, 60, 127]);
+    }
+
+    #[test]
+    fn pattern_midi_output_omits_notes_from_explicitly_disabled_channels() {
+        let pattern = Pattern {
+            notes: vec![
+                PatternNote {
+                    key: 60,
+                    channel_id: 3,
+                    velocity: 96,
+                    ..PatternNote::default()
+                },
+                PatternNote {
+                    position: 24,
+                    length: 24,
+                    key: 64,
+                    channel_id: 4,
+                    midi_channel: 1,
+                    velocity: 80,
+                    ..PatternNote::default()
+                },
+            ],
+            ..Pattern::default()
+        };
+        let disabled_channels = BTreeSet::from([3]);
+
+        let preview =
+            pattern_preview_messages_excluding_channels(&pattern, 96, 120.0, &disabled_channels)
+                .expect("Pattern preview should omit disabled channels");
+        assert_eq!(
+            preview,
+            [
+                super::ScheduledMidiMessage {
+                    after: Duration::from_micros(125_000),
+                    bytes: [0x91, 64, 80],
+                },
+                super::ScheduledMidiMessage {
+                    after: Duration::from_micros(250_000),
+                    bytes: [0x81, 64, 64],
+                },
+            ]
+        );
+
+        let (transport, loop_frames) = pattern_loop_frame_messages_excluding_channels(
+            &pattern,
+            96,
+            120.0,
+            48_000,
+            96,
+            &disabled_channels,
+        )
+        .expect("Pattern transport should omit disabled channels");
+        assert_eq!(loop_frames, 24_000);
+        assert_eq!(
+            transport,
+            [
+                ScheduledMidiFrameMessage {
+                    frame: 6_000,
+                    bytes: vec![0x91, 64, 80],
+                },
+                ScheduledMidiFrameMessage {
+                    frame: 12_000,
+                    bytes: vec![0x81, 64, 64],
+                },
+            ]
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
 use crate::{FlpDocument, PatternNote, PlaylistClip, PlaylistClipTarget};
@@ -867,6 +867,23 @@ impl MidiFile {
         arrangement_id: u16,
         channel_mapping: MidiChannelMapping,
     ) -> Result<Vec<u8>, MidiError> {
+        Self::encode_project_song_excluding_channels(
+            document,
+            arrangement_id,
+            channel_mapping,
+            &BTreeSet::new(),
+        )
+    }
+
+    /// Exports a Playlist arrangement while omitting notes from selected project channels.
+    /// This is used by live MIDI output to honor the Channel Rack enable state without
+    /// changing the behavior of explicit MIDI file exports.
+    pub fn encode_project_song_excluding_channels(
+        document: &FlpDocument,
+        arrangement_id: u16,
+        channel_mapping: MidiChannelMapping,
+        excluded_project_channels: &BTreeSet<u16>,
+    ) -> Result<Vec<u8>, MidiError> {
         let arrangements = document
             .arrangements()
             .map_err(|error| MidiError::Project(error.to_string()))?;
@@ -942,6 +959,9 @@ impl MidiFile {
                     .checked_mul(loop_length)
                     .ok_or(MidiError::LengthOverflow)?;
                 for note in &pattern.notes {
+                    if excluded_project_channels.contains(&note.channel_id) {
+                        continue;
+                    }
                     let relative_start = repeat_start
                         .checked_add(u64::from(note.position))
                         .ok_or(MidiError::LengthOverflow)?;

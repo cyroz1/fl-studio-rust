@@ -20673,6 +20673,8 @@ fn decode_vst_text(bytes: &[u8]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::{
         ArpeggioOptions, ArpeggioRangePattern, ArpeggioSyncMode, ArticulateOptions,
         ChannelGroupSummary, ChannelLevelAdjustmentsEdit, ChannelNoteRouter, ChannelSortOrder,
@@ -32359,6 +32361,77 @@ mod tests {
         assert_eq!(notes[2].start_tick(), 196);
         assert_eq!(notes[2].end_tick(), Some(200));
         assert!(notes.iter().all(|note| note.release_velocity() == Some(32)));
+    }
+
+    #[test]
+    fn live_song_export_can_omit_disabled_channels_without_changing_file_export() {
+        let mut event_stream = vec![
+            0x40, 3, 0, 0x15, 0, 0x00, 0, // Channel 3 is explicitly disabled.
+            0x40, 4, 0, 0x15, 0, // Channel 4 has no explicit enable state.
+            0x41, 7, 0, 0xD0, 48,
+        ];
+        event_stream.extend_from_slice(&note_record(0, 3, 48, 60, 100));
+        event_stream.extend_from_slice(&note_record(0, 4, 48, 64, 100));
+        event_stream.extend_from_slice(&[0x63, 0, 0]);
+
+        let mut clip = [0u8; 80];
+        clip[6..8].copy_from_slice(&7u16.to_le_bytes());
+        clip[8..12].copy_from_slice(&48u32.to_le_bytes());
+        clip[64..72].copy_from_slice(&1.0f64.to_le_bytes());
+        append_data_event(&mut event_stream, 0xE9, &clip);
+
+        let document = FlpDocument::parse(&flp_fixture(&event_stream, &[], &[]))
+            .expect("song fixture should parse");
+        let channels = document.channels();
+        assert_eq!(
+            channels
+                .iter()
+                .find(|channel| channel.id() == 3)
+                .and_then(ChannelSummary::enabled),
+            Some(false)
+        );
+        assert_eq!(
+            channels
+                .iter()
+                .find(|channel| channel.id() == 4)
+                .and_then(ChannelSummary::enabled),
+            None
+        );
+
+        let export_bytes =
+            MidiFile::encode_project_song(&document, 0, MidiChannelMapping::PreserveNoteChannels)
+                .expect("explicit MIDI file export should remain unchanged");
+        let exported = MidiFile::parse(&export_bytes).expect("MIDI export should parse");
+        let exported_keys = exported
+            .tracks()
+            .iter()
+            .flat_map(|track| track.notes())
+            .map(|note| note.key())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            exported_keys.iter().copied().collect::<BTreeSet<_>>(),
+            BTreeSet::from([60, 64])
+        );
+
+        let excluded_channels = BTreeSet::from([3]);
+        let live_bytes = MidiFile::encode_project_song_excluding_channels(
+            &document,
+            0,
+            MidiChannelMapping::PreserveNoteChannels,
+            &excluded_channels,
+        )
+        .expect("live MIDI output should omit disabled project channels");
+        let live = MidiFile::parse(&live_bytes).expect("live MIDI sequence should parse");
+        let live_keys = live
+            .tracks()
+            .iter()
+            .flat_map(|track| track.notes())
+            .map(|note| note.key())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            live_keys.iter().copied().collect::<BTreeSet<_>>(),
+            BTreeSet::from([64])
+        );
     }
 
     #[test]
