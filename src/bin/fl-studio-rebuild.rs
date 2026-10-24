@@ -46818,6 +46818,9 @@ impl DawUi {
                 send_control_change(39, state.raw_channel_volume_14bit() as u8 & 0x7F);
             }
             send_control_change(10, state.raw_pan());
+            if state.pan_lsb_received() {
+                send_control_change(42, state.raw_pan_14bit() as u8 & 0x7F);
+            }
             send_control_change(74, state.raw_mod_x());
             send_control_change(71, state.raw_mod_y());
             send_control_change(11, state.raw_expression());
@@ -46874,6 +46877,13 @@ impl DawUi {
                 });
             }
             send_control_change(10, state.raw_pan());
+            if state.pan_lsb_received() {
+                send_control_change(42, state.raw_pan_14bit() as u8 & 0x7F);
+                let _ = sender.send(LayerLiveInputEvent::SamplerPan14Bit {
+                    channel,
+                    value: state.raw_pan_14bit(),
+                });
+            }
             send_control_change(74, state.raw_mod_x());
             send_control_change(71, state.raw_mod_y());
             send_control_change(11, state.raw_expression());
@@ -47080,6 +47090,12 @@ impl DawUi {
                 }
                 for (channel, state) in initial_channel_state.iter().copied().enumerate() {
                     let channel = channel as u8;
+                    if state.pan_lsb_received() {
+                        let _ = event_sender.send(SamplerLiveNoteEvent::Pan14Bit {
+                            channel,
+                            value: state.raw_pan_14bit(),
+                        });
+                    }
                     if state.expression_lsb_received() {
                         let _ = event_sender.send(SamplerLiveNoteEvent::Expression14Bit {
                             channel,
@@ -47274,6 +47290,12 @@ impl DawUi {
                     },
                 ));
                 let channel_state = self.midi_input_channel_state[usize::from(channel & 0x0F)];
+                if matches!(controller, 10 | 42) && channel_state.pan_lsb_received() {
+                    queued_events.push(LayerLiveInputEvent::SamplerPan14Bit {
+                        channel,
+                        value: channel_state.raw_pan_14bit(),
+                    });
+                }
                 if matches!(controller, 7 | 39) && channel_state.channel_volume_lsb_received() {
                     queued_events.push(LayerLiveInputEvent::SamplerChannelVolume14Bit {
                         channel,
@@ -47483,9 +47505,23 @@ impl DawUi {
             ),
             MidiInputEvent::ControlChange {
                 channel,
-                controller: 10,
-                value,
-            } => (SamplerLiveNoteEvent::Pan { channel, value }, None),
+                controller: 10 | 42,
+                ..
+            } => {
+                let state = self.midi_input_channel_state[usize::from(channel & 0x0F)];
+                let event = if state.pan_lsb_received() {
+                    SamplerLiveNoteEvent::Pan14Bit {
+                        channel,
+                        value: state.raw_pan_14bit(),
+                    }
+                } else {
+                    SamplerLiveNoteEvent::Pan {
+                        channel,
+                        value: state.raw_pan(),
+                    }
+                };
+                (event, None)
+            }
             MidiInputEvent::ControlChange {
                 channel,
                 controller: 7 | 39,

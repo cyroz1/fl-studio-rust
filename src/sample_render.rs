@@ -672,6 +672,10 @@ pub enum SamplerLiveNoteEvent {
         channel: u8,
         value: u8,
     },
+    Pan14Bit {
+        channel: u8,
+        value: u16,
+    },
     ChannelVolume {
         channel: u8,
         value: u8,
@@ -725,6 +729,8 @@ pub enum LayerLiveInputEvent {
     Midi(Vst3LiveInputEvent),
     /// Updated Sampler pitch-bend offset for an input MIDI channel.
     SamplerPitchBend { channel: u8, cents: i16 },
+    /// Updated 14-bit Sampler Pan for an input MIDI channel.
+    SamplerPan14Bit { channel: u8, value: u16 },
     /// Updated 14-bit Sampler Channel Volume for an input MIDI channel.
     SamplerChannelVolume14Bit { channel: u8, value: u16 },
     /// Updated 14-bit Sampler Expression for an input MIDI channel.
@@ -5501,6 +5507,7 @@ pub fn stream_sampler_midi_input_to_device(
                             layer_gain,
                         }) {
                             engine.set_voice_input_midi_channel(slot_index, midi_channel);
+                            engine.refresh_live_pan_for_channel(midi_channel);
                             active_targets.push((target_channel_id, note_key));
                         }
                     }
@@ -5531,6 +5538,9 @@ pub fn stream_sampler_midi_input_to_device(
                 }
                 Ok(SamplerLiveNoteEvent::Pan { channel, value }) => {
                     engine.apply_live_pan(channel, value);
+                }
+                Ok(SamplerLiveNoteEvent::Pan14Bit { channel, value }) => {
+                    engine.apply_live_pan_14bit(channel, value);
                 }
                 Ok(SamplerLiveNoteEvent::ChannelVolume { channel, value }) => {
                     engine.apply_live_channel_volume(channel, value);
@@ -5717,6 +5727,7 @@ pub fn stream_mixed_layer_midi_input_to_device(
                                 {
                                     sampler_engine
                                         .set_voice_input_midi_channel(slot_index, channel);
+                                    sampler_engine.refresh_live_pan_for_channel(channel);
                                     active_targets.push(LiveLayerNoteDestination::Sampler {
                                         channel_id: target_channel_id,
                                         key: rendered_key,
@@ -5829,6 +5840,9 @@ pub fn stream_mixed_layer_midi_input_to_device(
                     }
                     Ok(LayerLiveInputEvent::SamplerPitchBend { channel, cents }) => {
                         sampler_engine.apply_live_pitch_bend(channel, cents);
+                    }
+                    Ok(LayerLiveInputEvent::SamplerPan14Bit { channel, value }) => {
+                        sampler_engine.apply_live_pan_14bit(channel, value);
                     }
                     Ok(LayerLiveInputEvent::SamplerChannelVolume14Bit { channel, value }) => {
                         sampler_engine.apply_live_channel_volume_14bit(channel, value);
@@ -10600,7 +10614,7 @@ struct SamplerVoiceEngine<'a> {
     resampling_quality: ResamplingQuality,
     voices_stolen: usize,
     pitch_bend_cents: [i16; 16],
-    live_midi_pan: [u8; 16],
+    live_midi_pan: [f32; 16],
     live_midi_channel_volume: [f32; 16],
     live_midi_expression: [f32; 16],
     sustain_down: [bool; 16],
@@ -10748,7 +10762,7 @@ impl<'a> SamplerVoiceEngine<'a> {
             resampling_quality,
             voices_stolen: 0,
             pitch_bend_cents: [0; 16],
-            live_midi_pan: [64; 16],
+            live_midi_pan: [64.0; 16],
             live_midi_channel_volume: [1.0; 16],
             live_midi_expression: [1.0; 16],
             sustain_down: [false; 16],
@@ -11283,12 +11297,22 @@ impl<'a> SamplerVoiceEngine<'a> {
     }
 
     fn live_midi_pan(&self, channel: u8) -> u8 {
-        self.live_midi_pan[usize::from(channel & 0x0F)]
+        self.live_midi_pan[usize::from(channel & 0x0F)].round() as u8
     }
 
     fn apply_live_pan(&mut self, channel: u8, value: u8) {
         let channel = channel & 0x0F;
-        let pan = value.min(127);
+        self.apply_live_pan_position(channel, f32::from(value.min(127)));
+    }
+
+    fn apply_live_pan_14bit(&mut self, channel: u8, value: u16) {
+        let pan = (f32::from(value.min(16_383)) / 128.0).min(127.0);
+        self.apply_live_pan_position(channel, pan);
+    }
+
+    fn apply_live_pan_position(&mut self, channel: u8, pan: f32) {
+        let channel = channel & 0x0F;
+        let pan = pan.clamp(0.0, 127.0);
         self.live_midi_pan[usize::from(channel)] = pan;
         let sources_by_channel = self.sources_by_channel;
         let pan_law = self.pan_law;
@@ -11296,12 +11320,18 @@ impl<'a> SamplerVoiceEngine<'a> {
             if voice.input_midi_channel == Some(channel)
                 && let Some(source) = sources_by_channel.get(&voice.channel_id)
             {
-                voice.note_pan_value = f32::from(pan.min(127));
+                voice.note_pan_value = pan;
                 let effective_pan = sampler_note_pan_value(voice.channel_pan, voice.note_pan_value);
                 (voice.left_gain, voice.right_gain) =
                     channel_pan_gains(effective_pan, source.audio.channels.len() == 1, pan_law);
             }
         }
+    }
+
+    fn refresh_live_pan_for_channel(&mut self, channel: u8) {
+        let channel = channel & 0x0F;
+        let pan = self.live_midi_pan[usize::from(channel)];
+        self.apply_live_pan_position(channel, pan);
     }
 
     fn apply_live_expression(&mut self, channel: u8, value: u8) {
@@ -17039,7 +17069,8 @@ mod tests {
     }
 
     #[test]
-    fn sampler_layer_live_volume_and_expression_scale_existing_voices_by_midi_channel() {
+    fn sampler_layer_live_volume_expression_and_pan_scale_existing_and_new_voices_by_midi_channel()
+    {
         let sources = HashMap::from([(
             7,
             SamplerVoiceSource {
@@ -17066,7 +17097,7 @@ mod tests {
                 release_ping_pong_loop: false,
             },
         )]);
-        let mut engine = SamplerVoiceEngine::new(&sources, &[], 1, 4, 4);
+        let mut engine = SamplerVoiceEngine::new(&sources, &[], 2, 4, 4);
         let slot_index = engine
             .start_voice(ScheduledSamplerNote {
                 clip_index: 0,
@@ -17088,7 +17119,7 @@ mod tests {
         engine.set_voice_input_midi_channel(slot_index, 2);
         apply_live_layer_sampler_controller(&mut engine, 2, 7, 64);
 
-        let mut output = [0.0; 10];
+        let mut output = [0.0; 12];
         engine.render_block(0, 1, &mut output[..2]);
         let full_pan_gain = std::f32::consts::FRAC_1_SQRT_2;
         let channel_volume_gain = full_pan_gain * (64.0 / 127.0);
@@ -17116,6 +17147,56 @@ mod tests {
         let high_resolution_gain = full_pan_gain * (8_192.0 / 16_383.0) * (4_096.0 / 16_383.0);
         assert!((output[8] - high_resolution_gain).abs() < 1e-6);
         assert!((output[9] - high_resolution_gain).abs() < 1e-6);
+
+        engine.apply_live_pan_14bit(2, 8_193);
+        engine.render_block(5, 1, &mut output[10..]);
+        let pan_position = 8_193.0 / 128.0;
+        let effective_pan = pan_position / 64.0 - 1.0;
+        let angle = (effective_pan + 1.0) * std::f32::consts::FRAC_PI_4;
+        let controller_gain = (8_192.0 / 16_383.0) * (4_096.0 / 16_383.0);
+        assert!(
+            (output[10] - controller_gain * angle.cos()).abs() < 1e-6,
+            "left output {} did not match expected {}",
+            output[10],
+            controller_gain * angle.cos()
+        );
+        assert!(
+            (output[11] - controller_gain * angle.sin()).abs() < 1e-6,
+            "right output {} did not match expected {}",
+            output[11],
+            controller_gain * angle.sin()
+        );
+
+        let new_slot_index = engine
+            .start_voice(ScheduledSamplerNote {
+                clip_index: 0,
+                playlist_track_id: None,
+                start_tick: 0,
+                stop_tick: None,
+                start_frame: 6,
+                stop_frame: None,
+                channel_id: 7,
+                key: SAMPLER_ROOT_KEY,
+                midi_channel: 0,
+                slide_note: false,
+                velocity: 127,
+                pan: engine.live_midi_pan(2),
+                fine_pitch_offset_cents: 0,
+                layer_gain: 1.0,
+            })
+            .expect("second live voice should start");
+        engine.set_voice_input_midi_channel(new_slot_index, 2);
+        engine.refresh_live_pan_for_channel(2);
+        let expected_pan = 8_193.0 / 128.0;
+        assert!(
+            (engine.voices[new_slot_index]
+                .as_ref()
+                .expect("second live voice should remain active")
+                .note_pan_value
+                - expected_pan)
+                .abs()
+                < 1e-6
+        );
     }
 
     #[test]

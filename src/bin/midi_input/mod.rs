@@ -673,6 +673,8 @@ pub enum MidiInputEvent {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MidiInputChannelState {
     pan: u8,
+    pan_lsb: u8,
+    pan_lsb_received: bool,
     channel_volume: u8,
     channel_volume_lsb: u8,
     channel_volume_lsb_received: bool,
@@ -692,6 +694,8 @@ impl Default for MidiInputChannelState {
     fn default() -> Self {
         Self {
             pan: 64,
+            pan_lsb: 0,
+            pan_lsb_received: false,
             channel_volume: 127,
             channel_volume_lsb: 0,
             channel_volume_lsb_received: false,
@@ -731,6 +735,14 @@ impl MidiInputChannelState {
                 ..
             } => self.pan = value.min(127),
             MidiInputEvent::ControlChange {
+                controller: 42,
+                value,
+                ..
+            } => {
+                self.pan_lsb = value.min(127);
+                self.pan_lsb_received = true;
+            }
+            MidiInputEvent::ControlChange {
                 controller: 11,
                 value,
                 ..
@@ -757,6 +769,8 @@ impl MidiInputChannelState {
                 controller: 121, ..
             } => {
                 self.pan = 64;
+                self.pan_lsb = 0;
+                self.pan_lsb_received = false;
                 self.channel_volume = 127;
                 self.channel_volume_lsb = 0;
                 self.channel_volume_lsb_received = false;
@@ -804,6 +818,14 @@ impl MidiInputChannelState {
 
     pub fn raw_pan(self) -> u8 {
         self.pan
+    }
+
+    pub fn raw_pan_14bit(self) -> u16 {
+        (u16::from(self.pan) << 7) | u16::from(self.pan_lsb)
+    }
+
+    pub fn pan_lsb_received(self) -> bool {
+        self.pan_lsb_received
     }
 
     pub fn raw_mod_x(self) -> u8 {
@@ -2615,11 +2637,17 @@ mod tests {
     }
 
     #[test]
-    fn channel_volume_and_expression_pair_received_lsb_as_14_bit_values() {
+    fn pan_volume_and_expression_pairs_receive_lsb_as_14_bit_values() {
         let mut state = MidiInputChannelState::default();
+        assert!(!state.pan_lsb_received());
         assert!(!state.channel_volume_lsb_received());
         assert!(!state.expression_lsb_received());
 
+        state.update(MidiInputEvent::ControlChange {
+            channel: 0,
+            controller: 10,
+            value: 64,
+        });
         state.update(MidiInputEvent::ControlChange {
             channel: 0,
             controller: 7,
@@ -2630,11 +2658,18 @@ mod tests {
             controller: 11,
             value: 32,
         });
+        assert_eq!(state.raw_pan(), 64);
         assert_eq!(state.raw_channel_volume(), 64);
         assert_eq!(state.raw_expression(), 32);
+        assert!(!state.pan_lsb_received());
         assert!(!state.channel_volume_lsb_received());
         assert!(!state.expression_lsb_received());
 
+        state.update(MidiInputEvent::ControlChange {
+            channel: 0,
+            controller: 42,
+            value: 1,
+        });
         state.update(MidiInputEvent::ControlChange {
             channel: 0,
             controller: 39,
@@ -2645,11 +2680,18 @@ mod tests {
             controller: 43,
             value: 65,
         });
+        assert_eq!(state.raw_pan_14bit(), (64 << 7) | 1);
         assert_eq!(state.raw_channel_volume_14bit(), (64 << 7) | 1);
         assert_eq!(state.raw_expression_14bit(), (32 << 7) | 65);
+        assert!(state.pan_lsb_received());
         assert!(state.channel_volume_lsb_received());
         assert!(state.expression_lsb_received());
 
+        state.update(MidiInputEvent::ControlChange {
+            channel: 0,
+            controller: 10,
+            value: 63,
+        });
         state.update(MidiInputEvent::ControlChange {
             channel: 0,
             controller: 7,
@@ -2660,6 +2702,7 @@ mod tests {
             controller: 11,
             value: 31,
         });
+        assert_eq!(state.raw_pan_14bit(), (63 << 7) | 1);
         assert_eq!(state.raw_channel_volume_14bit(), (63 << 7) | 1);
         assert_eq!(state.raw_expression_14bit(), (31 << 7) | 65);
 
@@ -2668,8 +2711,11 @@ mod tests {
             controller: 121,
             value: 0,
         });
+        assert!(!state.pan_lsb_received());
         assert!(!state.channel_volume_lsb_received());
         assert!(!state.expression_lsb_received());
+        assert_eq!(state.raw_pan(), 64);
+        assert_eq!(state.raw_pan_14bit(), 8192);
         assert_eq!(state.raw_channel_volume(), 127);
         assert_eq!(state.raw_expression(), 127);
     }
