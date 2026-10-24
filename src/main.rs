@@ -17,8 +17,8 @@ use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, ArpeggioRangePattern, ArpeggioSyncMode, ArticulateOptions,
     AutomationPointEdit, ChannelLevelAdjustmentsEdit, ChannelSortOrder, ChannelStretchSettingsEdit,
     ClawMachineOptions, FlamOptions, FlpDocument, FstPreset, HumanizerOptions, LimitNoteOptions,
-    LimitSnapDirection, MixerInsertEdit, PatternControllerEdit, PatternNote, PatternNoteEdit,
-    PatternNoteRotation, PlaylistClipEdit, PlaylistTrackEdit, PlaylistTrackMotion,
+    LimitSnapDirection, MixerInsertEdit, MixerParameterKind, PatternControllerEdit, PatternNote,
+    PatternNoteEdit, PatternNoteRotation, PlaylistClipEdit, PlaylistTrackEdit, PlaylistTrackMotion,
     PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit, QuantizeNoteMode,
     QuantizeNoteOptions, RandomNoteChordMap, RandomNoteGeneratorOptions, RandomizerOptions,
     RiffMachineOptions, RiffMachineQuantizeMode, SamplerEnvelopeLfoEdit, SamplerEnvelopeLfoTarget,
@@ -694,6 +694,21 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 Path::new(output),
                 parse_usize(event_index, "Mixer event index")?,
                 parse_usize(record_index, "Mixer record index")?,
+                value,
+            )
+        }
+        [command, input, output, insert_ordinal, kind, value]
+            if command == "set-mixer-eq-parameter-raw" =>
+        {
+            let kind = parse_mixer_eq_parameter_kind(kind)?;
+            let value = value
+                .parse::<i32>()
+                .map_err(|_| "Mixer EQ raw value must be a signed 32-bit integer".to_owned())?;
+            set_mixer_eq_parameter_raw(
+                Path::new(input),
+                Path::new(output),
+                parse_usize(insert_ordinal, "Mixer insert ordinal")?,
+                kind,
                 value,
             )
         }
@@ -3455,6 +3470,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild duplicate-channel <input.flp> <output.flp> <channel-id> <name>\n",
             "  flp-rebuild mixer <file.flp>\n",
             "  flp-rebuild set-mixer-parameter-record-value <input.flp> <output.flp> <event-index> <record-index> <signed-value>\n",
+            "  flp-rebuild set-mixer-eq-parameter-raw <input.flp> <output.flp> <insert-ordinal> <low-gain|mid-gain|high-gain|low-frequency|mid-frequency|high-frequency|low-q|mid-q|high-q> <raw-value>\n",
             "  flp-rebuild set-mixer-effect-slot-enabled <input.flp> <output.flp> <insert-ordinal> <slot-index> <0|1>\n",
             "  flp-rebuild set-mixer-effect-slot-mix-raw <input.flp> <output.flp> <insert-ordinal> <slot-index> <-6400..6400>\n",
             "  flp-rebuild move-mixer-effect-slot <input.flp> <output.flp> <insert-ordinal> <from-slot-0..9> <to-slot-0..9>\n",
@@ -5665,6 +5681,20 @@ fn list_mixer(path: &Path) -> Result<(), String> {
             insert.event_range()
         );
     }
+    let eq_parameters = document
+        .mixer_eq_parameter_summaries()
+        .map_err(|error| format!("could not decode Mixer EQ parameters: {error}"))?;
+    println!("recognized Mixer EQ values: {}", eq_parameters.len());
+    for parameter in eq_parameters {
+        println!(
+            "insert={} kind={:?} raw={} event={} record={}",
+            parameter.insert_ordinal(),
+            parameter.kind(),
+            parameter.value(),
+            parameter.parameter_location().0,
+            parameter.parameter_location().1,
+        );
+    }
     println!("recognized effect slot records: {}", effect_slots.len());
     for slot in effect_slots {
         println!(
@@ -6563,6 +6593,46 @@ fn set_mixer_parameter_record_value(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "set Mixer 0xE1 event {event_index} record {record_index} value to {value} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn parse_mixer_eq_parameter_kind(value: &str) -> Result<MixerParameterKind, String> {
+    match value {
+        "low-gain" => Ok(MixerParameterKind::LowEqGain),
+        "mid-gain" => Ok(MixerParameterKind::MidEqGain),
+        "high-gain" => Ok(MixerParameterKind::HighEqGain),
+        "low-frequency" => Ok(MixerParameterKind::LowEqFrequency),
+        "mid-frequency" => Ok(MixerParameterKind::MidEqFrequency),
+        "high-frequency" => Ok(MixerParameterKind::HighEqFrequency),
+        "low-q" => Ok(MixerParameterKind::LowEqQ),
+        "mid-q" => Ok(MixerParameterKind::MidEqQ),
+        "high-q" => Ok(MixerParameterKind::HighEqQ),
+        _ => Err(format!(
+            "unknown Mixer EQ parameter {value:?}; use low-gain, mid-gain, high-gain, low-frequency, mid-frequency, high-frequency, low-q, mid-q, or high-q"
+        )),
+    }
+}
+
+fn set_mixer_eq_parameter_raw(
+    input: &Path,
+    output: &Path,
+    insert_ordinal: usize,
+    kind: MixerParameterKind,
+    value: i32,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .set_mixer_eq_parameter_raw(insert_ordinal, kind, value)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "set Mixer insert {insert_ordinal} {kind:?} raw value to {value} in {}",
         output.display()
     );
     Ok(())
@@ -10200,11 +10270,29 @@ mod tests {
         parse_clip_indices, parse_midi_channel_filter, parse_midi_channel_mask,
         parse_midi_channel_number, parse_midi_import_options,
         parse_midi_import_options_with_channels, parse_midi_import_options_with_mixer_tracks,
-        parse_midi_pattern_target, parse_midi_track_selection, parse_mixer_track, parse_raw_byte,
-        parse_rgb_hex, parse_sampler_envelope_lfo_target, parse_scale_name, pattern_color_label,
-        playlist_pattern_color_label,
+        parse_midi_pattern_target, parse_midi_track_selection, parse_mixer_eq_parameter_kind,
+        parse_mixer_track, parse_raw_byte, parse_rgb_hex, parse_sampler_envelope_lfo_target,
+        parse_scale_name, pattern_color_label, playlist_pattern_color_label,
     };
-    use flp_rebuild::{SamplerEnvelopeLfoTarget, midi::MidiImportOptions};
+    use flp_rebuild::{MixerParameterKind, SamplerEnvelopeLfoTarget, midi::MidiImportOptions};
+
+    #[test]
+    fn parses_mixer_eq_parameter_kinds() {
+        for (name, expected) in [
+            ("low-gain", MixerParameterKind::LowEqGain),
+            ("mid-gain", MixerParameterKind::MidEqGain),
+            ("high-gain", MixerParameterKind::HighEqGain),
+            ("low-frequency", MixerParameterKind::LowEqFrequency),
+            ("mid-frequency", MixerParameterKind::MidEqFrequency),
+            ("high-frequency", MixerParameterKind::HighEqFrequency),
+            ("low-q", MixerParameterKind::LowEqQ),
+            ("mid-q", MixerParameterKind::MidEqQ),
+            ("high-q", MixerParameterKind::HighEqQ),
+        ] {
+            assert_eq!(parse_mixer_eq_parameter_kind(name), Ok(expected));
+        }
+        assert!(parse_mixer_eq_parameter_kind("frequency").is_err());
+    }
 
     #[test]
     fn parses_sampler_envelope_lfo_targets() {

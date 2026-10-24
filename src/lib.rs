@@ -4216,6 +4216,34 @@ pub struct MixerParameterRecord {
     value: i32,
 }
 
+/// One uniquely recognized, unscoped saved raw parameter for a Mixer insert's three-band EQ.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MixerEqParameterSummary {
+    insert_ordinal: usize,
+    kind: MixerParameterKind,
+    value: i32,
+    event_index: usize,
+    record_index: usize,
+}
+
+impl MixerEqParameterSummary {
+    pub fn insert_ordinal(&self) -> usize {
+        self.insert_ordinal
+    }
+
+    pub fn kind(&self) -> MixerParameterKind {
+        self.kind
+    }
+
+    pub fn value(&self) -> i32 {
+        self.value
+    }
+
+    pub fn parameter_location(&self) -> (usize, usize) {
+        (self.event_index, self.record_index)
+    }
+}
+
 /// Fields that can be toggled in an existing Mixer insert flag record.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct MixerInsertEdit {
@@ -4304,6 +4332,21 @@ impl MixerParameterRecord {
     pub fn value(&self) -> i32 {
         self.value
     }
+}
+
+fn is_mixer_eq_parameter(kind: MixerParameterKind) -> bool {
+    matches!(
+        kind,
+        MixerParameterKind::LowEqGain
+            | MixerParameterKind::MidEqGain
+            | MixerParameterKind::HighEqGain
+            | MixerParameterKind::LowEqFrequency
+            | MixerParameterKind::MidEqFrequency
+            | MixerParameterKind::HighEqFrequency
+            | MixerParameterKind::LowEqQ
+            | MixerParameterKind::MidEqQ
+            | MixerParameterKind::HighEqQ
+    )
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -8407,6 +8450,102 @@ impl FlpDocument {
             }
         }
         Ok(records)
+    }
+
+    /// Returns uniquely recognized, zero-scope three-band EQ values for recognized Mixer
+    /// inserts using the candidate `64 + insert ordinal` target mapping. Duplicate and
+    /// scoped values are omitted because their insert-level ownership is ambiguous.
+    pub fn mixer_eq_parameter_summaries(&self) -> Result<Vec<MixerEqParameterSummary>, FlpError> {
+        let inserts = self
+            .mixer_inserts()
+            .into_iter()
+            .map(|insert| insert.ordinal())
+            .collect::<HashSet<_>>();
+        let parameters = self.mixer_parameter_records()?;
+        let mut summaries = Vec::new();
+
+        for record in &parameters {
+            let kind = record.kind();
+            if !is_mixer_eq_parameter(kind) || record.target_scope_raw() != 0 {
+                continue;
+            }
+            let Some(insert_ordinal) = record.candidate_insert_ordinal() else {
+                continue;
+            };
+            if !inserts.contains(&insert_ordinal) {
+                continue;
+            }
+            let matching_count = parameters
+                .iter()
+                .filter(|candidate| {
+                    candidate.candidate_insert_ordinal() == Some(insert_ordinal)
+                        && candidate.target_scope_raw() == 0
+                        && candidate.kind() == kind
+                })
+                .count();
+            if matching_count == 1 {
+                summaries.push(MixerEqParameterSummary {
+                    insert_ordinal,
+                    kind,
+                    value: record.value(),
+                    event_index: record.event_index(),
+                    record_index: record.record_index(),
+                });
+            }
+        }
+
+        Ok(summaries)
+    }
+
+    /// Edits a unique, zero-scope saved Mixer three-band EQ value. Frequency and Q values
+    /// remain raw because their FL Studio scale is nonlinear; this does not process audio.
+    pub fn set_mixer_eq_parameter_raw(
+        &mut self,
+        insert_ordinal: usize,
+        kind: MixerParameterKind,
+        value: i32,
+    ) -> Result<(), FlpError> {
+        let valid_range = match kind {
+            MixerParameterKind::LowEqGain
+            | MixerParameterKind::MidEqGain
+            | MixerParameterKind::HighEqGain => -1_800..=1_800,
+            MixerParameterKind::LowEqFrequency
+            | MixerParameterKind::MidEqFrequency
+            | MixerParameterKind::HighEqFrequency
+            | MixerParameterKind::LowEqQ
+            | MixerParameterKind::MidEqQ
+            | MixerParameterKind::HighEqQ => 0..=65_536,
+            _ => {
+                return Err(FlpError::UnsupportedEdit(
+                    "the requested Mixer parameter is not a three-band EQ value",
+                ));
+            }
+        };
+        if !valid_range.contains(&value) {
+            return Err(FlpError::UnsupportedEdit(
+                "Mixer EQ gain must be between -1800 and 1800, and frequency/Q must be between 0 and 65536",
+            ));
+        }
+
+        let mut matching = self
+            .mixer_eq_parameter_summaries()?
+            .into_iter()
+            .filter(|summary| summary.insert_ordinal() == insert_ordinal && summary.kind() == kind);
+        let Some(summary) = matching.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested Mixer EQ parameter has no unique unscoped record",
+            ));
+        };
+        if matching.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested Mixer EQ parameter is ambiguous",
+            ));
+        }
+        self.set_mixer_parameter_record_value(
+            summary.parameter_location().0,
+            summary.parameter_location().1,
+            value,
+        )
     }
 
     /// Returns saved Mixer send-level records with a paired routing flag when available.
@@ -24740,6 +24879,166 @@ mod tests {
         assert!(document.set_mixer_effect_slot_enabled(0, 3, false).is_err());
         assert!(document.set_mixer_effect_slot_mix_raw(0, 3, 500).is_err());
         assert!(document.set_mixer_effect_slot_mix_raw(0, 3, 6_401).is_err());
+        assert_eq!(
+            document.encode_lossless().expect("encoding should succeed"),
+            original
+        );
+    }
+
+    #[test]
+    fn mixer_eq_summaries_edit_unique_unscoped_values_and_round_trip() {
+        let mut event_stream = Vec::new();
+        append_complete_mixer_insert_state(&mut event_stream, -1, 0, 0, "Master", &[0xAA, 0xBB]);
+        let target = 64_u16 << 6;
+        let eq_values = [
+            (208_u8, -250_i32),
+            (209, 300),
+            (210, 0),
+            (216, 5_777),
+            (217, 33_145),
+            (218, 55_825),
+            (224, 1_000),
+            (225, 2_000),
+            (226, 3_000),
+        ];
+        let mut parameters = Vec::new();
+        for (parameter_id, value) in eq_values {
+            parameters.extend_from_slice(&[0xA1, 0xB2, 0xC3, 0xD4, parameter_id, 0x5A]);
+            parameters.extend_from_slice(&target.to_le_bytes());
+            parameters.extend_from_slice(&value.to_le_bytes());
+        }
+        append_data_event(&mut event_stream, 0xE1, &parameters);
+
+        let original = flp_fixture(&event_stream, &[], &[]);
+        let original_document =
+            FlpDocument::parse(&original).expect("the original fixture should parse");
+        let mut document = FlpDocument::parse(&original).expect("the fixture should parse");
+        let summaries = document
+            .mixer_eq_parameter_summaries()
+            .expect("EQ values should be recognized");
+        assert_eq!(summaries.len(), 9);
+        assert!(
+            summaries
+                .iter()
+                .all(|summary| summary.insert_ordinal() == 0)
+        );
+        assert_eq!(
+            summaries
+                .iter()
+                .find(|summary| summary.kind() == MixerParameterKind::MidEqFrequency)
+                .map(|summary| summary.value()),
+            Some(33_145)
+        );
+
+        let edited = summaries
+            .iter()
+            .find(|summary| summary.kind() == MixerParameterKind::MidEqFrequency)
+            .expect("the mid frequency record should be unique");
+        let location = edited.parameter_location();
+        document
+            .set_mixer_eq_parameter_raw(0, MixerParameterKind::MidEqFrequency, 40_000)
+            .expect("a unique in-range frequency should be editable");
+
+        let parameter = document
+            .mixer_parameter_records()
+            .expect("parameter records should remain valid")
+            .into_iter()
+            .find(|record| (record.event_index(), record.record_index()) == location)
+            .expect("the selected EQ record should remain present");
+        assert_eq!(parameter.value(), 40_000);
+        assert_eq!(parameter.kind(), MixerParameterKind::MidEqFrequency);
+        assert_eq!(parameter.prefix(), [0xA1, 0xB2, 0xC3, 0xD4]);
+        assert_eq!(parameter.channel_data(), target);
+
+        let event_index = location.0;
+        let mut expected_payload = original_document.events()[event_index].payload().to_vec();
+        let value_start = location.1 * 12 + 8;
+        expected_payload[value_start..value_start + 4].copy_from_slice(&40_000_i32.to_le_bytes());
+        assert_eq!(document.events()[event_index].payload(), expected_payload);
+        for (index, (before, after)) in original_document
+            .events()
+            .iter()
+            .zip(document.events())
+            .enumerate()
+        {
+            if index != event_index {
+                assert_eq!(before.wire_bytes(), after.wire_bytes());
+            }
+        }
+
+        let encoded = document
+            .encode_lossless()
+            .expect("the edited project should encode");
+        let round_trip = FlpDocument::parse(&encoded).expect("the edited project should parse");
+        assert_eq!(
+            round_trip
+                .mixer_eq_parameter_summaries()
+                .expect("round-trip EQ values should parse")
+                .iter()
+                .find(|summary| {
+                    summary.insert_ordinal() == 0
+                        && summary.kind() == MixerParameterKind::MidEqFrequency
+                })
+                .map(|summary| summary.value()),
+            Some(40_000)
+        );
+    }
+
+    #[test]
+    fn mixer_eq_edits_reject_duplicate_scoped_missing_and_out_of_range_values() {
+        let mut event_stream = Vec::new();
+        append_complete_mixer_insert_state(&mut event_stream, -1, 0, 0, "Master", &[0xAA, 0xBB]);
+        let target = 64_u16 << 6;
+        let mut parameters = Vec::new();
+        for (parameter_id, channel_data, value) in [
+            (208_u8, target, -100_i32),
+            (208, target, 150),
+            (209, target | (1 << 13), 200),
+            (216, target, 5_777),
+        ] {
+            parameters.extend_from_slice(&[0, 0, 0, 0, parameter_id, 0]);
+            parameters.extend_from_slice(&channel_data.to_le_bytes());
+            parameters.extend_from_slice(&value.to_le_bytes());
+        }
+        append_data_event(&mut event_stream, 0xE1, &parameters);
+
+        let original = flp_fixture(&event_stream, &[], &[]);
+        let mut document = FlpDocument::parse(&original).expect("the fixture should parse");
+        let summaries = document
+            .mixer_eq_parameter_summaries()
+            .expect("EQ values should be recognized");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].kind(), MixerParameterKind::LowEqFrequency);
+        assert!(
+            document
+                .set_mixer_eq_parameter_raw(0, MixerParameterKind::LowEqGain, 50)
+                .is_err()
+        );
+        assert!(
+            document
+                .set_mixer_eq_parameter_raw(0, MixerParameterKind::MidEqGain, 50)
+                .is_err()
+        );
+        assert!(
+            document
+                .set_mixer_eq_parameter_raw(0, MixerParameterKind::HighEqQ, 50)
+                .is_err()
+        );
+        assert!(
+            document
+                .set_mixer_eq_parameter_raw(0, MixerParameterKind::LowEqFrequency, 65_537)
+                .is_err()
+        );
+        assert!(
+            document
+                .set_mixer_eq_parameter_raw(0, MixerParameterKind::LowEqGain, 1_801)
+                .is_err()
+        );
+        assert!(
+            document
+                .set_mixer_eq_parameter_raw(0, MixerParameterKind::SlotMix, 100)
+                .is_err()
+        );
         assert_eq!(
             document.encode_lossless().expect("encoding should succeed"),
             original

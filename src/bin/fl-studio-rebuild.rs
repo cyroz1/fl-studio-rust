@@ -42022,6 +42022,7 @@ impl DawUi {
         let inserts = document.mixer_inserts();
         let effect_slots = document.mixer_effect_slots();
         let parameters = document.mixer_parameter_records().unwrap_or_default();
+        let eq_parameters = document.mixer_eq_parameter_summaries().unwrap_or_default();
         let send_summaries = document.mixer_send_summaries().unwrap_or_default();
         let parameter_count = parameters.len();
         ui.horizontal(|ui| {
@@ -43405,6 +43406,72 @@ impl DawUi {
                         ui.small(format!("Color raw: 0x{:08X}", insert.color_raw()));
                         ui.small(format!("Icon raw: {:?}", insert.icon_raw()));
                         ui.small(format!("Events: {:?}", insert.event_range()));
+                        ui.collapsing("Saved 3-band EQ (raw values)", |ui| {
+                            ui.small(
+                                egui::RichText::new(
+                                    "G = gain, F = frequency, Q = resonance. These edit saved values only; frequency is nonlinear and effects are not processed.",
+                                )
+                                .color(MUTED),
+                            );
+                            for (band, gain_kind, frequency_kind, q_kind) in [
+                                (
+                                    "Low",
+                                    MixerParameterKind::LowEqGain,
+                                    MixerParameterKind::LowEqFrequency,
+                                    MixerParameterKind::LowEqQ,
+                                ),
+                                (
+                                    "Mid",
+                                    MixerParameterKind::MidEqGain,
+                                    MixerParameterKind::MidEqFrequency,
+                                    MixerParameterKind::MidEqQ,
+                                ),
+                                (
+                                    "High",
+                                    MixerParameterKind::HighEqGain,
+                                    MixerParameterKind::HighEqFrequency,
+                                    MixerParameterKind::HighEqQ,
+                                ),
+                            ] {
+                                ui.horizontal(|ui| {
+                                    ui.label(band);
+                                    for (label, kind, range) in [
+                                        ("G ", gain_kind, -1_800..=1_800),
+                                        ("F ", frequency_kind, 0..=65_536),
+                                        ("Q ", q_kind, 0..=65_536),
+                                    ] {
+                                        if let Some(parameter) = eq_parameters.iter().find(|item| {
+                                            item.insert_ordinal() == insert.ordinal()
+                                                && item.kind() == kind
+                                        }) {
+                                            let mut value = parameter.value();
+                                            if range.contains(&value) {
+                                                if ui
+                                                    .add(
+                                                        egui::DragValue::new(&mut value)
+                                                            .range(range)
+                                                            .prefix(label),
+                                                    )
+                                                    .changed()
+                                                {
+                                                    let (event_index, record_index) =
+                                                        parameter.parameter_location();
+                                                    parameter_edits.push((
+                                                        event_index,
+                                                        record_index,
+                                                        value,
+                                                    ));
+                                                }
+                                            } else {
+                                                ui.small(format!("{label}{value} · invalid"));
+                                            }
+                                        } else {
+                                            ui.small(format!("{label}—"));
+                                        }
+                                    }
+                                });
+                            }
+                        });
                         let insert_sends = send_summaries
                             .iter()
                             .filter(|send| send.insert_ordinal() == insert.ordinal())
