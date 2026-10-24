@@ -43494,15 +43494,27 @@ impl DawUi {
                                     count => format!("{count} saved state records"),
                                 };
                                 let width = ui.available_width();
-                                let response = egui::Frame::new()
+                                let slot_index_raw = slot_index as u16;
+                                let (response, dropped_slot) = ui.dnd_drop_zone::<(usize, u16), _>(
+                                    egui::Frame::new()
                                     .fill(PANEL_DARK)
                                     .stroke(Stroke::new(1.0, GRID))
-                                    .inner_margin(6.0)
-                                    .show(ui, |ui| {
+                                        .inner_margin(6.0),
+                                    |ui| {
                                         ui.set_min_width(width - 14.0);
                                         ui.vertical(|ui| {
                                             ui.horizontal(|ui| {
                                                 ui.monospace(format!("{:02}", slot_index + 1));
+                                                let drag_handle = ui.add(
+                                                    egui::Label::new("::")
+                                                        .sense(Sense::drag()),
+                                                );
+                                                drag_handle
+                                                    .on_hover_text("Drag to reorder this effect")
+                                                    .dnd_set_drag_payload((
+                                                        insert.ordinal(),
+                                                        slot_index_raw,
+                                                    ));
                                                 ui.vertical(|ui| {
                                                     ui.label(plugin_name);
                                                     ui.small(
@@ -43585,7 +43597,15 @@ impl DawUi {
                                                 }
                                             });
                                         });
-                                    });
+                                    },
+                                );
+                                if let Some(payload) = dropped_slot
+                                    && payload.0 == insert.ordinal()
+                                    && payload.1 != slot_index_raw
+                                {
+                                    effect_slot_move =
+                                        Some((insert.ordinal(), payload.1, slot_index_raw));
+                                }
                                 response.response.on_hover_text(format!(
                                     "{} · {} · {} preserved slot events",
                                     slot.display_name().unwrap_or("No display name"),
