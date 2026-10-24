@@ -337,6 +337,23 @@ def _get_current_tempo(asInt=0):
     return int(tempo) if asInt else tempo
 
 
+def _set_current_tempo(tempo, asInt=0):
+    try:
+        tempo = float(tempo)
+        asInt = int(asInt)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("mixer.setCurrentTempo() tempo and asInt must be numeric") from error
+    if not math.isfinite(tempo):
+        raise ValueError("mixer.setCurrentTempo() tempo must be finite")
+    if asInt:
+        tempo = float(int(tempo))
+    tempo = min(522.0, max(10.0, tempo))
+    milli_bpm = int(math.floor(tempo * 1000.0 + 0.5))
+    _request_transport_action(
+        {"action": "set_current_tempo", "tempo_milli_bpm": milli_bpm}
+    )
+
+
 def _get_song_step_pos():
     position_ticks = int(_active_transport_state.get("song_position_ticks", 0))
     ppq = max(1, int(_active_transport_state.get("ticks_per_quarter", 96)))
@@ -587,6 +604,7 @@ def _install_modules(script_name, device_name):
 
     mixer = _module("mixer")
     mixer.getCurrentTempo = _get_current_tempo
+    mixer.setCurrentTempo = _set_current_tempo
     mixer.getSongStepPos = _get_song_step_pos
     mixer.getSongTickPos = _get_song_tick_pos
 

@@ -582,6 +582,9 @@ fn queue_script_transport_actions(
             ScriptTransportAction::SetPlaybackSpeed(speed_millionths) => {
                 MidiTransportCommand::SetPlaybackSpeed(speed_millionths)
             }
+            ScriptTransportAction::SetCurrentTempoMilliBpm(milli_bpm) => {
+                MidiTransportCommand::SetCurrentTempo(milli_bpm)
+            }
             ScriptTransportAction::PatternJog(increment) => {
                 MidiTransportCommand::PatternJog(increment)
             }
@@ -623,6 +626,7 @@ pub enum MidiTransportCommand {
     SetSongPositionTimeUs(u64),
     MoveSongPosition { speed_millionths: i32, start: bool },
     SetPlaybackSpeed(u32),
+    SetCurrentTempo(u32),
     PatternJog(i32),
     TempoJog(i32),
     MarkerJumpJog(i32),
@@ -1238,6 +1242,7 @@ pub fn describe_event(event: MidiInputEvent) -> String {
                 "MIDI script Song Position Move".to_owned()
             }
             MidiTransportCommand::SetPlaybackSpeed(_) => "MIDI script Playback Speed".to_owned(),
+            MidiTransportCommand::SetCurrentTempo(_) => "MIDI script Tempo".to_owned(),
             MidiTransportCommand::PatternJog(_) => "MIDI script Pattern Selection".to_owned(),
             MidiTransportCommand::TempoJog(_) => "MIDI script Tempo".to_owned(),
             MidiTransportCommand::MarkerJumpJog(_) => "MIDI script Marker Jump".to_owned(),
@@ -1841,6 +1846,7 @@ mod tests {
             received_at,
             [
                 ScriptTransportAction::MidiOutput(vec![0x90, 60, 100]),
+                ScriptTransportAction::SetCurrentTempoMilliBpm(123_456),
                 ScriptTransportAction::Start,
             ],
         );
@@ -1848,6 +1854,10 @@ mod tests {
         assert_eq!(
             midi_output_receiver.try_recv().unwrap(),
             vec![0x90, 60, 100]
+        );
+        assert_eq!(
+            transport_receiver.try_recv().unwrap().event,
+            MidiInputEvent::Transport(MidiTransportCommand::SetCurrentTempo(123_456))
         );
         assert_eq!(
             transport_receiver.try_recv().unwrap().event,

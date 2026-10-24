@@ -664,6 +664,7 @@ fn midi_input_thru_message(event: MidiInputEvent) -> Option<([u8; 3], usize)> {
             | MidiTransportCommand::SetSongPositionTimeUs(_)
             | MidiTransportCommand::MoveSongPosition { .. }
             | MidiTransportCommand::SetPlaybackSpeed(_)
+            | MidiTransportCommand::SetCurrentTempo(_)
             | MidiTransportCommand::PatternJog(_)
             | MidiTransportCommand::TempoJog(_)
             | MidiTransportCommand::MarkerJumpJog(_)

@@ -41,6 +41,7 @@ pub enum ScriptTransportAction {
         start: bool,
     },
     SetPlaybackSpeed(u32),
+    SetCurrentTempoMilliBpm(u32),
     PatternJog(i32),
     TempoJog(i32),
     MarkerJumpJog(i32),
@@ -56,6 +57,8 @@ pub enum ScriptTransportAction {
 
 const SCRIPT_SONG_POSITION_SCALE: f64 = 1_000_000.0;
 const SCRIPT_SONG_POSITION_SCALE_U32: u32 = 1_000_000;
+const SCRIPT_MIN_TEMPO_MILLI_BPM: u32 = 10_000;
+const SCRIPT_MAX_TEMPO_MILLI_BPM: u32 = 522_000;
 impl ScriptTransportAction {
     fn parse(value: &str) -> Option<Self> {
         match value {
@@ -693,6 +696,16 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
             .filter(|speed| (250_000..=4_000_000).contains(speed))
             .ok_or_else(|| "MIDI script returned an invalid playback speed".to_owned())?;
         return Ok(ScriptTransportAction::SetPlaybackSpeed(speed_millionths));
+    }
+    if name == Some("set_current_tempo") {
+        let milli_bpm = action["tempo_milli_bpm"]
+            .as_u64()
+            .and_then(|tempo| u32::try_from(tempo).ok())
+            .filter(|tempo| {
+                (SCRIPT_MIN_TEMPO_MILLI_BPM..=SCRIPT_MAX_TEMPO_MILLI_BPM).contains(tempo)
+            })
+            .ok_or_else(|| "MIDI script returned an invalid project tempo".to_owned())?;
+        return Ok(ScriptTransportAction::SetCurrentTempoMilliBpm(milli_bpm));
     }
     if name == Some("marker_jump_jog") || name == Some("marker_sel_jog") {
         let increment = action["increment"]
@@ -1816,6 +1829,32 @@ mod tests {
 
         assert_eq!(result.bytes, [0xB0, 8, 1]);
         assert_eq!(result.actions, [ScriptTransportAction::TempoJog(3)]);
+    }
+
+    #[test]
+    fn python_mixer_set_current_tempo_supports_fractional_integer_and_bounded_values() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport mixer\ndef OnMidiIn(event):\n    mixer.setCurrentTempo(123.456)\n    mixer.setCurrentTempo(123.4565)\n    mixer.setCurrentTempo(120.9, asInt=1)\n    mixer.setCurrentTempo(1.0)\n    mixer.setCurrentTempo(600.0)\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let mut runtime = MidiScriptRuntime::start_for_device(&script, "Test Input").unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
+
+        assert_eq!(
+            result.actions,
+            [
+                ScriptTransportAction::SetCurrentTempoMilliBpm(123_456),
+                ScriptTransportAction::SetCurrentTempoMilliBpm(123_457),
+                ScriptTransportAction::SetCurrentTempoMilliBpm(120_000),
+                ScriptTransportAction::SetCurrentTempoMilliBpm(10_000),
+                ScriptTransportAction::SetCurrentTempoMilliBpm(522_000),
+            ]
+        );
     }
 
     #[test]

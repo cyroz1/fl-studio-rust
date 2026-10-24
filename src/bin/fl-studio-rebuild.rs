@@ -10036,9 +10036,9 @@ impl DawUi {
         Ok(backups)
     }
 
-    fn update_tempo(&mut self, bpm: f64) {
+    fn update_tempo(&mut self, bpm: f64) -> bool {
         if !bpm.is_finite() || bpm <= 0.0 {
-            return;
+            return false;
         }
         let milli_bpm = (bpm * 1000.0).round().clamp(1.0, f64::from(u32::MAX)) as u32;
         let changed = self
@@ -10050,6 +10050,7 @@ impl DawUi {
             self.dirty = true;
             self.status = format!("Tempo set to {:.3} BPM", f64::from(milli_bpm) / 1000.0);
         }
+        changed
     }
 
     fn queue_performance_track_stop(&mut self, track_id: u32) {
@@ -13562,6 +13563,22 @@ impl DawUi {
         }
         self.tempo_bpm = bpm;
         self.update_tempo(bpm);
+    }
+
+    fn set_midi_script_tempo(&mut self, milli_bpm: u32) {
+        if self.document.is_none() {
+            self.status = "MIDI script tempo changes require an open project".to_owned();
+            return;
+        }
+        let bpm = f64::from(milli_bpm) / 1000.0;
+        if (self.tempo_bpm * 1000.0).round() as u32 == milli_bpm {
+            return;
+        }
+        if self.update_tempo(bpm) {
+            self.tempo_bpm = bpm;
+        } else {
+            self.status = "MIDI script tempo could not be applied to this project".to_owned();
+        }
     }
 
     fn live_sampler_tempo_bpm_milli(&self) -> u32 {
@@ -45260,6 +45277,9 @@ impl DawUi {
             }
             MidiTransportCommand::SetPlaybackSpeed(speed_millionths) => {
                 self.set_midi_script_playback_speed(speed_millionths);
+            }
+            MidiTransportCommand::SetCurrentTempo(milli_bpm) => {
+                self.set_midi_script_tempo(milli_bpm);
             }
             MidiTransportCommand::PatternJog(increment) => {
                 self.jog_midi_script_pattern(increment);
