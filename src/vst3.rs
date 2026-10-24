@@ -2293,6 +2293,13 @@ pub struct HostedPluginInfo {
     pub sample_rate_hz: f64,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Vst3HostServiceChanges {
+    pub io_changed: bool,
+    pub latency_changed: bool,
+    pub latency_changed_while_processing: bool,
+}
+
 impl HostedPluginInfo {
     /// Convert the reported latency to milliseconds using the plug-in's configured rate.
     pub fn latency_milliseconds(&self) -> Option<f64> {
@@ -2440,6 +2447,7 @@ fn build_isolated_vst3_host(
 pub struct Vst3HostRuntime {
     host: Vst3Host,
     loaded: Vec<HostedPlugin>,
+    pending_latency_refresh: BTreeSet<u64>,
     next_id: u64,
 }
 
@@ -2682,6 +2690,7 @@ impl Vst3HostRuntime {
         Ok(Self {
             host,
             loaded: Vec::new(),
+            pending_latency_refresh: BTreeSet::new(),
             next_id: 1,
         })
     }
@@ -4912,9 +4921,12 @@ impl Vst3HostRuntime {
 
     /// Service editor/UI requests and VST3 restart requests on the control thread.
     ///
-    /// Returns `true` when a plug-in changes its audio bus layout so callers can rebuild routing.
-    pub fn service_editors(&mut self) -> Result<bool, String> {
-        let mut io_changed = false;
+    /// Latency reports are refreshed only after processing has stopped, as required before
+    /// rebuilding delay compensation. The caller should stop active streams when either
+    /// `io_changed` or `latency_changed` is returned; subsequent calls refresh reports once the
+    /// corresponding plug-in instances are no longer processing.
+    pub fn service_editors(&mut self) -> Result<Vst3HostServiceChanges, String> {
+        let mut changes = Vst3HostServiceChanges::default();
         for loaded in &mut self.loaded {
             if let Some(editor) = loaded.editor.as_ref() {
                 editor
@@ -4930,12 +4942,18 @@ impl Vst3HostRuntime {
                 .service_host_requests()
                 .map_err(|error| error.to_string())?;
             if restart_flags.latency_changed() {
+                self.pending_latency_refresh.insert(loaded.info.id);
+                changes.latency_changed = true;
+                changes.latency_changed_while_processing |= plugin.is_processing();
+            }
+            if self.pending_latency_refresh.contains(&loaded.info.id) && !plugin.is_processing() {
                 loaded.info.latency_samples = plugin.latency_samples();
                 loaded.info.sample_rate_hz = plugin.sample_rate();
+                self.pending_latency_refresh.remove(&loaded.info.id);
             }
-            io_changed |= restart_flags.io_changed();
+            changes.io_changed |= restart_flags.io_changed();
         }
-        Ok(io_changed)
+        Ok(changes)
     }
 
     pub fn loaded_plugins(&self) -> Vec<HostedPluginInfo> {

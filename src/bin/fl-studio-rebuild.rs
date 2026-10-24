@@ -52633,25 +52633,35 @@ impl eframe::App for DawUi {
             .as_mut()
             .map(Vst3HostRuntime::service_editors);
         match vst3_runtime_update {
-            Some(Ok(true)) => {
+            Some(Ok(changes)) if changes.io_changed || changes.latency_changed => {
                 let playback_active = self.playing
+                    || self.project_playback_loaded
                     || self.pending_audio_render.is_some()
                     || self.pending_song_render.is_some()
-                    || self.pending_vst3_stream.is_some();
+                    || self.pending_vst3_stream.is_some()
+                    || changes.latency_changed_while_processing;
                 if playback_active {
                     self.stop_project_playback();
-                    self.status =
-                        "A VST3 output layout changed; playback stopped to rebuild its routing"
-                            .to_owned();
-                } else {
-                    self.status =
-                        "A VST3 output layout changed; routing will refresh on playback".to_owned();
                 }
+                self.status = if changes.io_changed {
+                    if playback_active {
+                        "A VST3 output layout changed; playback stopped to rebuild its routing"
+                            .to_owned()
+                    } else {
+                        "A VST3 output layout changed; routing will refresh on playback".to_owned()
+                    }
+                } else if playback_active {
+                    "A VST3 latency report changed; playback stopped. Start again to rebuild PDC."
+                        .to_owned()
+                } else {
+                    "A VST3 latency report changed; PDC will refresh on the next playback start"
+                        .to_owned()
+                };
             }
             Some(Err(error)) => {
                 self.status = format!("VST3 editor update failed: {error}");
             }
-            Some(Ok(false)) | None => {}
+            Some(Ok(_)) | None => {}
         }
         if let Some(error) = self.audio_engine.as_ref().and_then(AudioEngine::take_error) {
             self.status = format!("Audio device error: {error}");
