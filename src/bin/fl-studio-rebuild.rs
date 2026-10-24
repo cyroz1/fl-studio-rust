@@ -105,7 +105,8 @@ use midi_output::{
     pattern_preview_messages, playlist_playback_messages,
 };
 use midi_script::{
-    MidiControllerScript, MidiScriptTransportState, SCRIPT_PROJECT_LOAD_ERROR,
+    MidiControllerScript, MidiScriptTransportState, SCRIPT_BEAT_INDICATOR_BAR,
+    SCRIPT_BEAT_INDICATOR_BEAT, SCRIPT_BEAT_INDICATOR_OFF, SCRIPT_PROJECT_LOAD_ERROR,
     SCRIPT_PROJECT_LOAD_OK, SCRIPT_PROJECT_LOAD_START, SCRIPT_TRANSPORT_PATTERN_MODE,
     SCRIPT_TRANSPORT_PLAYING, SCRIPT_TRANSPORT_RECORDING, absolute_song_position_ticks,
     discover_midi_scripts, find_script_for_device, normalized_song_position, song_position_ticks,
@@ -4613,6 +4614,7 @@ struct DawUi {
     midi_input_error: Option<String>,
     midi_input_connection: Option<ConnectedMidiInput>,
     midi_script_transport_state: Arc<MidiScriptTransportState>,
+    last_midi_script_beat_position: Option<(String, String, u64, u64)>,
     midi_message_sender: SyncSender<ReceivedMidiMessage>,
     midi_message_receiver: Receiver<ReceivedMidiMessage>,
     midi_dropped_messages: Arc<AtomicU64>,
@@ -6041,6 +6043,7 @@ impl DawUi {
             midi_input_error,
             midi_input_connection: None,
             midi_script_transport_state: Arc::new(MidiScriptTransportState::default()),
+            last_midi_script_beat_position: None,
             midi_message_sender,
             midi_message_receiver,
             midi_dropped_messages: Arc::new(AtomicU64::new(0)),
@@ -7053,6 +7056,13 @@ impl DawUi {
         self.midi_input_connection
             .as_ref()
             .and_then(|connection| connection.notify_script_project_load(status))
+            .unwrap_or(true)
+    }
+
+    fn notify_midi_script_beat_indicator(&self, value: i32) -> bool {
+        self.midi_input_connection
+            .as_ref()
+            .and_then(|connection| connection.notify_script_beat_indicator(value))
             .unwrap_or(true)
     }
 
@@ -12921,10 +12931,60 @@ impl DawUi {
             "1:01:000".to_owned()
         };
         if let Ok(mut hint) = self.midi_script_transport_state.song_position_hint.lock() {
-            *hint = song_position_hint;
+            *hint = song_position_hint.clone();
         }
         if let Ok(mut hint) = self.midi_script_transport_state.song_length_hint.lock() {
             *hint = song_length_hint;
+        }
+        self.publish_midi_script_beat_indicator(has_script, &song_position_hint);
+    }
+
+    fn publish_midi_script_beat_indicator(&mut self, has_script: bool, position_hint: &str) {
+        let Some(connection) = self
+            .midi_input_connection
+            .as_ref()
+            .filter(|connection| has_script && connection.script_name.is_some())
+        else {
+            self.last_midi_script_beat_position = None;
+            return;
+        };
+        let identity = (
+            connection.device_id.clone(),
+            connection.script_name.clone().unwrap_or_default(),
+        );
+        if !self.playing {
+            let was_playing_for_connection = self
+                .last_midi_script_beat_position
+                .as_ref()
+                .is_some_and(|(device_id, script_name, _, _)| {
+                    *device_id == identity.0 && *script_name == identity.1
+                });
+            if !was_playing_for_connection
+                || self.notify_midi_script_beat_indicator(SCRIPT_BEAT_INDICATOR_OFF)
+            {
+                self.last_midi_script_beat_position = None;
+            }
+            return;
+        }
+        let mut components = position_hint.split(':');
+        let Some((bar, beat)) = components
+            .next()
+            .and_then(|bar| bar.parse::<u64>().ok())
+            .zip(components.next().and_then(|beat| beat.parse::<u64>().ok()))
+        else {
+            return;
+        };
+        let position = (identity.0, identity.1, bar, beat);
+        if self.last_midi_script_beat_position.as_ref() == Some(&position) {
+            return;
+        }
+        let value = if beat == 1 {
+            SCRIPT_BEAT_INDICATOR_BAR
+        } else {
+            SCRIPT_BEAT_INDICATOR_BEAT
+        };
+        if self.notify_midi_script_beat_indicator(value) {
+            self.last_midi_script_beat_position = Some(position);
         }
     }
 

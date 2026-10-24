@@ -72,6 +72,9 @@ pub const SCRIPT_TRANSPORT_PATTERN_MODE: u8 = 1 << 2;
 pub const SCRIPT_PROJECT_LOAD_START: i32 = 0;
 pub const SCRIPT_PROJECT_LOAD_OK: i32 = 100;
 pub const SCRIPT_PROJECT_LOAD_ERROR: i32 = 101;
+pub const SCRIPT_BEAT_INDICATOR_OFF: i32 = 0;
+pub const SCRIPT_BEAT_INDICATOR_BAR: i32 = 1;
+pub const SCRIPT_BEAT_INDICATOR_BEAT: i32 = 2;
 
 #[derive(Default)]
 pub struct MidiScriptTransportState {
@@ -411,6 +414,15 @@ impl MidiScriptRuntime {
         })
     }
 
+    pub fn process_beat_indicator(&mut self, value: i32) -> Result<ScriptMidiResult, String> {
+        let response = self.exchange(&json!({"beat_indicator": value}))?;
+        Ok(ScriptMidiResult {
+            handled: false,
+            bytes: Vec::new(),
+            actions: parse_transport_actions(&response)?,
+        })
+    }
+
     fn exchange(&mut self, value: &Value) -> Result<Value, String> {
         let transport = self.transport_state.state.load(Ordering::Relaxed);
         let song_position =
@@ -668,6 +680,7 @@ fn byte_value(response: &Value, key: &str, default: u8) -> Result<u8, String> {
 mod tests {
     use super::{
         MidiControllerScript, MidiScriptRuntime, MidiScriptTransportState,
+        SCRIPT_BEAT_INDICATOR_BAR, SCRIPT_BEAT_INDICATOR_BEAT, SCRIPT_BEAT_INDICATOR_OFF,
         SCRIPT_TRANSPORT_PATTERN_MODE, SCRIPT_TRANSPORT_PLAYING, SCRIPT_TRANSPORT_RECORDING,
         ScriptTransportAction, absolute_song_position_ticks, discover_midi_scripts,
         find_script_for_device, normalized_song_position, song_position_ticks, transform_message,
@@ -1417,6 +1430,41 @@ mod tests {
         );
         assert_eq!(
             runtime.process_project_load(101).unwrap().actions,
+            [ScriptTransportAction::RecordToggle]
+        );
+    }
+
+    #[test]
+    fn python_beat_indicator_callback_receives_off_bar_and_beat_values() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport midi\nimport transport\ndef OnUpdateBeatIndicator(value):\n    if value == 0:\n        transport.stop()\n    elif value == 1:\n        transport.start()\n    elif value == 2:\n        transport.record()\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let mut runtime = MidiScriptRuntime::start_for_device(&script, "Test Input").unwrap();
+
+        assert_eq!(
+            runtime
+                .process_beat_indicator(SCRIPT_BEAT_INDICATOR_OFF)
+                .unwrap()
+                .actions,
+            [ScriptTransportAction::Stop]
+        );
+        assert_eq!(
+            runtime
+                .process_beat_indicator(SCRIPT_BEAT_INDICATOR_BAR)
+                .unwrap()
+                .actions,
+            [ScriptTransportAction::Start]
+        );
+        assert_eq!(
+            runtime
+                .process_beat_indicator(SCRIPT_BEAT_INDICATOR_BEAT)
+                .unwrap()
+                .actions,
             [ScriptTransportAction::RecordToggle]
         );
     }

@@ -506,6 +506,11 @@ def _dispatch(namespace, value):
         if callback is not None:
             callback(int(value["project_load_status"]))
         return {"handled": False, "actions": _active_transport_actions}
+    if "beat_indicator" in value:
+        callback = namespace.get("OnUpdateBeatIndicator")
+        if callback is not None:
+            callback(int(value["beat_indicator"]))
+        return {"handled": False, "actions": _active_transport_actions}
     if value.get("idle"):
         callback = namespace.get("OnIdle")
         if callback is not None:

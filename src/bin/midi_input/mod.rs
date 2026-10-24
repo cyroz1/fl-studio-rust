@@ -49,6 +49,7 @@ struct ScriptInputMessage {
 enum MidiInputScriptMessage {
     Input(ScriptInputMessage),
     ProjectLoad(i32),
+    BeatIndicator(i32),
     Stop,
 }
 
@@ -65,6 +66,12 @@ impl MidiInputScriptWorker {
     fn notify_project_load(&self, status: i32) -> bool {
         self.sender
             .try_send(MidiInputScriptMessage::ProjectLoad(status))
+            .is_ok()
+    }
+
+    fn notify_beat_indicator(&self, value: i32) -> bool {
+        self.sender
+            .try_send(MidiInputScriptMessage::BeatIndicator(value))
             .is_ok()
     }
 
@@ -142,6 +149,36 @@ impl MidiInputScriptWorker {
                             let callback_result = runtime
                                 .as_mut()
                                 .map(|runtime| runtime.process_project_load(status));
+                            match callback_result {
+                                Some(Ok(result)) => queue_script_transport_actions(
+                                    &output_sender,
+                                    &dropped_messages,
+                                    timestamp_micros,
+                                    received_at,
+                                    result.actions,
+                                ),
+                                Some(Err(error)) => {
+                                    let _ = error_sender.try_send(error);
+                                    if let Some(runtime) = runtime.take() {
+                                        runtime.kill();
+                                    }
+                                }
+                                None => {}
+                            }
+                        }
+                        MidiInputScriptMessage::BeatIndicator(value) => {
+                            let received_at = Instant::now();
+                            let elapsed_micros = u64::try_from(
+                                received_at
+                                    .duration_since(timestamp_reference_at)
+                                    .as_micros(),
+                            )
+                            .unwrap_or(u64::MAX);
+                            let timestamp_micros =
+                                timestamp_reference_micros.saturating_add(elapsed_micros);
+                            let callback_result = runtime
+                                .as_mut()
+                                .map(|runtime| runtime.process_beat_indicator(value));
                             match callback_result {
                                 Some(Ok(result)) => queue_script_transport_actions(
                                     &output_sender,
@@ -256,6 +293,10 @@ impl ConnectedMidiInput {
 
     pub fn notify_script_project_load(&self, status: i32) -> Option<bool> {
         Some(self.script_worker.as_ref()?.notify_project_load(status))
+    }
+
+    pub fn notify_script_beat_indicator(&self, value: i32) -> Option<bool> {
+        Some(self.script_worker.as_ref()?.notify_beat_indicator(value))
     }
 }
 
