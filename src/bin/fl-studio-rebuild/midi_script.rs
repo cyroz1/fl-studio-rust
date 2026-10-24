@@ -1245,6 +1245,35 @@ mod tests {
     }
 
     #[test]
+    fn python_transport_fast_forward_moves_while_held_and_stops_on_release() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport midi\nimport transport\ndef OnMidiIn(event):\n    transport.fastForward(midi.SS_Start)\n    transport.fastForward(midi.SS_Stop)\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let mut runtime = MidiScriptRuntime::start_for_device(&script, "Test Input").unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
+
+        assert_eq!(
+            result.actions,
+            [
+                ScriptTransportAction::MoveSongPosition {
+                    speed_millionths: 1_000_000,
+                    start: true,
+                },
+                ScriptTransportAction::MoveSongPosition {
+                    speed_millionths: 1_000_000,
+                    start: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn python_transport_set_playback_speed_accepts_the_documented_range() {
         let temporary = TestDirectory::new();
         let script_path = temporary.path().join("device_test.py");

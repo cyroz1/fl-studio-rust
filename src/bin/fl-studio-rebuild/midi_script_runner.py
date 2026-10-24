@@ -431,6 +431,7 @@ def _install_modules(script_name, device_name):
     transport.rewind = lambda startStop, flags=15: (
         _move_song_position(-1, startStop) if int(flags) & 8 else None
     )
+    transport.fastForward = lambda speed: _move_song_position(1, speed)
     transport.continuousMove = lambda speed, startStop: _move_song_position(
         speed, startStop
     )
