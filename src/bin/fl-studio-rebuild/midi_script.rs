@@ -75,6 +75,7 @@ pub struct MidiScriptTransportState {
     pub song_position_seconds: AtomicU64,
     pub song_length_seconds: AtomicU64,
     pub song_position_hint: Mutex<String>,
+    pub song_length_hint: Mutex<String>,
 }
 
 pub fn normalized_song_position(position_ticks: f64, length_ticks: u64) -> f64 {
@@ -408,6 +409,12 @@ impl MidiScriptRuntime {
             .lock()
             .map(|hint| hint.clone())
             .unwrap_or_else(|_| "1:01:000".to_owned());
+        let song_length_hint = self
+            .transport_state
+            .song_length_hint
+            .lock()
+            .map(|hint| hint.clone())
+            .unwrap_or_else(|_| "0:00:000".to_owned());
         let mut request = value.clone();
         if let Some(object) = request.as_object_mut() {
             object.insert(
@@ -436,6 +443,7 @@ impl MidiScriptRuntime {
                             .load(Ordering::Relaxed),
                     ),
                     "song_position_hint": song_position_hint,
+                    "song_length_hint": song_length_hint,
                 }),
             );
         }
@@ -935,6 +943,49 @@ mod tests {
         let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
 
         assert_eq!(result.bytes, [0xB0, 1, 1]);
+    }
+
+    #[test]
+    fn python_transport_bst_modes_report_position_and_length_components() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport midi\nimport transport\ndef OnMidiIn(event):\n    event.data1 = int((transport.getSongPos(midi.SONGLENGTH_BARS), transport.getSongPos(midi.SONGLENGTH_STEPS), transport.getSongPos(midi.SONGLENGTH_TICKS)) == (5, 3, 17))\n    event.data2 = int((transport.getSongLength(midi.SONGLENGTH_BARS), transport.getSongLength(midi.SONGLENGTH_STEPS), transport.getSongLength(midi.SONGLENGTH_TICKS)) == (4, 2, 9))\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let transport_state = Arc::new(MidiScriptTransportState::default());
+        *transport_state.song_position_hint.lock().unwrap() = "5:03:017".to_owned();
+        *transport_state.song_length_hint.lock().unwrap() = "4:02:009".to_owned();
+        let mut runtime = MidiScriptRuntime::start_for_device_with_transport_state(
+            &script,
+            "Test Input",
+            transport_state,
+        )
+        .unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
+
+        assert_eq!(result.bytes, [0xB0, 1, 1]);
+    }
+
+    #[test]
+    fn python_transport_bst_song_position_setting_remains_unsupported() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport midi\nimport transport\ndef OnMidiIn(event):\n    try:\n        transport.setSongPos(2, midi.SONGLENGTH_BARS)\n    except NotImplementedError:\n        event.data1 = 127\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let mut runtime = MidiScriptRuntime::start_for_device(&script, "Test Input").unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
+
+        assert_eq!(result.bytes, [0xB0, 127, 1]);
+        assert!(result.actions.is_empty());
     }
 
     #[test]

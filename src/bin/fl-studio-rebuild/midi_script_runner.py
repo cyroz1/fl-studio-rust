@@ -103,6 +103,13 @@ def _request_transport_action(action):
         _active_transport_actions.append(action)
 
 
+def _bst_component(hint, mode, default):
+    try:
+        return int(str(hint).split(":")[mode - 3])
+    except (IndexError, TypeError, ValueError):
+        return default
+
+
 def _get_song_pos(mode=-1):
     if mode == -1:
         return float(_active_transport_state.get("song_position", 0.0))
@@ -112,12 +119,20 @@ def _get_song_pos(mode=-1):
         return float(_active_transport_state.get("song_position_seconds", 0.0))
     if mode == 2:
         return int(_active_transport_state.get("song_position_ticks", 0))
-    raise NotImplementedError("transport.getSongPos() supports normalized, time, and absolute-tick modes")
+    if mode in (3, 4, 5):
+        return _bst_component(
+            _active_transport_state.get("song_position_hint", "1:01:000"),
+            mode,
+            (1, 1, 0)[mode - 3],
+        )
+    raise NotImplementedError("transport.getSongPos() supports normalized, time, tick, and BST modes")
 
 
 def _set_song_pos(position, mode=-1):
     if mode not in (-1, 0, 1, 2):
-        raise NotImplementedError("transport.setSongPos() supports normalized, time, and absolute-tick modes")
+        raise NotImplementedError(
+            "transport.setSongPos() supports normalized, time, and absolute-tick modes; BST setting is not implemented"
+        )
     position = float(position)
     if not math.isfinite(position):
         raise ValueError("transport.setSongPos() requires a finite position")
@@ -150,7 +165,13 @@ def _get_song_length(mode):
         return round(float(_active_transport_state.get("song_length_seconds", 0.0)))
     if mode == 2:
         return int(_active_transport_state.get("song_length_ticks", 0))
-    raise NotImplementedError("transport.getSongLength() supports milliseconds, seconds, and absolute ticks")
+    if mode in (3, 4, 5):
+        return _bst_component(
+            _active_transport_state.get("song_length_hint", "0:00:000"),
+            mode,
+            (0, 0, 0)[mode - 3],
+        )
+    raise NotImplementedError("transport.getSongLength() supports milliseconds, seconds, ticks, and BST modes")
 
 
 def _get_song_pos_hint():
