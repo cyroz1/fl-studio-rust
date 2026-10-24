@@ -12808,6 +12808,14 @@ impl DawUi {
         self.midi_script_transport_state
             .song_position_ticks
             .store(song_position_ticks, Ordering::Relaxed);
+        let ticks_per_quarter = self
+            .document
+            .as_ref()
+            .map(|document| u64::from(document.header().ppq().max(1)))
+            .unwrap_or(96);
+        self.midi_script_transport_state
+            .ticks_per_quarter
+            .store(ticks_per_quarter, Ordering::Relaxed);
         self.midi_script_transport_state
             .song_length_ticks
             .store(song_length_ticks, Ordering::Relaxed);

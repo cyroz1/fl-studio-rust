@@ -178,6 +178,22 @@ def _get_song_pos_hint():
     return str(_active_transport_state.get("song_position_hint", "1:01:000"))
 
 
+def _get_song_tick_pos(mode=0):
+    position_ticks = int(_active_transport_state.get("song_position_ticks", 0))
+    if mode == 0:
+        return position_ticks
+    if mode == 1:
+        ppq = max(1, int(_active_transport_state.get("ticks_per_quarter", 96)))
+        return float(position_ticks) / ppq
+    raise NotImplementedError("mixer.getSongTickPos() supports integer-tick and beat modes")
+
+
+def _get_song_step_pos():
+    position_ticks = int(_active_transport_state.get("song_position_ticks", 0))
+    ppq = max(1, int(_active_transport_state.get("ticks_per_quarter", 96)))
+    return position_ticks * 4 // ppq
+
+
 def _jog_marker(action, value, flags=None):
     if flags is not None:
         raise NotImplementedError("MIDI script marker jog flags are not supported")
@@ -237,6 +253,9 @@ def _install_modules(script_name, device_name):
         "SONGLENGTH_BARS": 3,
         "SONGLENGTH_STEPS": 4,
         "SONGLENGTH_TICKS": 5,
+        "ST_Int": 0,
+        "ST_Beat": 1,
+        "ST_PGB": 2,
         "FPT_Jog": 0,
         "FPT_Jog2": 1,
         "FPT_Strip": 2,
@@ -350,6 +369,10 @@ def _install_modules(script_name, device_name):
     device.getPortNumber = lambda: -1
     device.getName = lambda: device_name
 
+    mixer = _module("mixer")
+    mixer.getSongStepPos = _get_song_step_pos
+    mixer.getSongTickPos = _get_song_tick_pos
+
     transport = _module("transport")
     transport.start = lambda: _request_transport_action("start")
     transport.stop = lambda: _request_transport_action("stop")
@@ -383,7 +406,8 @@ def _install_modules(script_name, device_name):
         "general",
         "launchMapPages",
     ):
-        _module(name)
+        if name not in sys.modules:
+            _module(name)
 
 
 def _specific_callback(event):
