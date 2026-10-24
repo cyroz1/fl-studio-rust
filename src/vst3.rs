@@ -370,6 +370,7 @@ struct PlaylistPluginStream {
     right_pan_gain: f32,
     mixer_transform: MixerSourceRouteTransform,
     mixer_meter_transforms: Vec<(usize, MixerSourceRouteTransform)>,
+    mixer_effect_input_transforms: Vec<(usize, MixerSourceRouteTransform)>,
     live_mixer_source: Option<PlaylistLiveMixerSource>,
     live_performance: bool,
     active_performance_notes: HashMap<i32, ScheduledMidiEvent>,
@@ -576,7 +577,6 @@ struct PlaylistMixerEffectStream {
 
 struct PlaylistMixerEffectChain {
     insert_ordinal: usize,
-    signal_transform: crate::MixerSourceRouteTransform,
     route_plan: crate::MixerSourceRoutePlan,
     first_effect_index: usize,
     end_effect_index: usize,
@@ -1141,6 +1141,13 @@ impl Vst3PlaylistStreamProcessor {
         if !output.len().is_multiple_of(2) {
             return Err("VST3 Playlist mix buffer must contain stereo frames".to_owned());
         }
+        let (mut meter_buses, mut effect_input_buses) = if let Some(buses) = meter_buses.take() {
+            let (meter_buses, effect_input_buses) =
+                crate::audio::split_mixer_track_buses_mut(buses, output.len())?;
+            (Some(meter_buses), effect_input_buses)
+        } else {
+            (None, None)
+        };
         let frame_count = output.len() / 2;
         for stream in &mut self.streams {
             let mut plugin_output = Vec::new();
@@ -1161,6 +1168,14 @@ impl Vst3PlaylistStreamProcessor {
                         .ok_or_else(|| "Mixer meter buffer size overflow".to_owned())?;
                     if meter_end > meter_buses.len() {
                         return Err("Mixer meter buffer is too small for the VST3 route".to_owned());
+                    }
+                }
+                for (track, _) in &stream.mixer_effect_input_transforms {
+                    if *track >= crate::audio::MIXER_TRACK_METER_COUNT {
+                        return Err(
+                            "VST3 Mixer effect input route exceeds the supported track range"
+                                .to_owned(),
+                        );
                     }
                 }
             }
@@ -1215,9 +1230,42 @@ impl Vst3PlaylistStreamProcessor {
                         meter_buses[meter_offset + 1] += meter_frame[1];
                     }
                 }
+                if let Some(effect_input_buses) = effect_input_buses.as_deref_mut() {
+                    let effect_input_transforms =
+                        match (stream.live_mixer_source.as_ref(), live_controls) {
+                            (Some(source), Some(_)) => {
+                                source.control.insert_effect_input_transforms()
+                            }
+                            _ => stream.mixer_effect_input_transforms.as_slice(),
+                        };
+                    for (track, transform) in effect_input_transforms {
+                        if *track >= crate::audio::MIXER_TRACK_METER_COUNT {
+                            return Err(
+                                "VST3 Mixer effect input route exceeds the supported track range"
+                                    .to_owned(),
+                            );
+                        }
+                        let mut effect_input_frame = source_frame;
+                        if let (Some(source), Some(controls)) =
+                            (stream.live_mixer_source.as_ref(), live_controls)
+                        {
+                            source.control.apply_effect_input_frame(
+                                controls,
+                                *track,
+                                *transform,
+                                &mut effect_input_frame,
+                            );
+                        } else {
+                            transform.apply_frame(&mut effect_input_frame);
+                        }
+                        let effect_input_offset = *track * output.len() + frame_index * 2;
+                        effect_input_buses[effect_input_offset] += effect_input_frame[0];
+                        effect_input_buses[effect_input_offset + 1] += effect_input_frame[1];
+                    }
+                }
             }
         }
-        self.process_mixer_effects(output, meter_buses)?;
+        self.process_mixer_effects(output, meter_buses, effect_input_buses)?;
         Ok(())
     }
 
@@ -1225,6 +1273,7 @@ impl Vst3PlaylistStreamProcessor {
         &mut self,
         output: &mut [f32],
         mut meter_buses: Option<&mut [f32]>,
+        mut effect_input_buses: Option<&mut [f32]>,
     ) -> Result<(), String> {
         if !output.len().is_multiple_of(2) {
             return Err("VST3 Mixer effect buffer must contain stereo frames".to_owned());
@@ -1242,10 +1291,10 @@ impl Vst3PlaylistStreamProcessor {
             }
 
             let Some(meter_buses) = meter_buses.as_deref_mut() else {
-                // Pattern and live-input callers without Mixer buses can still render the
-                // Master chain; their insert-chain integration is handled by the bus-aware
-                // transport path.
-                continue;
+                return Err("VST3 Mixer insert effects require Mixer input buses".to_owned());
+            };
+            let Some(effect_input_buses) = effect_input_buses.as_deref_mut() else {
+                return Err("VST3 Mixer insert effects require pre-effect input buses".to_owned());
             };
             let samples_per_track = output.len();
             let bus_start = chain
@@ -1261,28 +1310,16 @@ impl Vst3PlaylistStreamProcessor {
                     chain.insert_ordinal
                 ));
             }
-            self.mixer_effect_scratch.resize(samples_per_track, 0.0);
-            self.mixer_effect_dry_scratch.resize(samples_per_track, 0.0);
-            let track_bus = &meter_buses[bus_start..bus_end];
-            let mut invertible = true;
-            for (frame_index, samples) in track_bus.as_chunks::<2>().0.iter().enumerate() {
-                let mut frame = [samples[0], samples[1]];
-                if !chain.signal_transform.apply_inverse_frame(&mut frame) {
-                    if frame[0] != 0.0 || frame[1] != 0.0 {
-                        invertible = false;
-                        break;
-                    }
-                    frame = [0.0; 2];
-                }
-                self.mixer_effect_scratch[frame_index * 2] = finite_sample(frame[0]);
-                self.mixer_effect_scratch[frame_index * 2 + 1] = finite_sample(frame[1]);
-            }
-            if !invertible {
+            if bus_end > effect_input_buses.len() {
                 return Err(format!(
-                    "cannot reconstruct the pre-effect signal for Mixer insert {} because its saved fader/pan transform is not invertible",
+                    "Mixer effect insert {} exceeds the available pre-effect bus buffer",
                     chain.insert_ordinal
                 ));
             }
+            self.mixer_effect_scratch.resize(samples_per_track, 0.0);
+            self.mixer_effect_dry_scratch.resize(samples_per_track, 0.0);
+            self.mixer_effect_scratch
+                .copy_from_slice(&effect_input_buses[bus_start..bus_end]);
             self.mixer_effect_dry_scratch
                 .copy_from_slice(&self.mixer_effect_scratch);
             process_playlist_mixer_effect_chain(
@@ -1323,6 +1360,30 @@ impl Vst3PlaylistStreamProcessor {
                     transform.apply_frame(&mut meter_delta);
                     meter_buses[meter_offset] += finite_sample(meter_delta[0]);
                     meter_buses[meter_offset + 1] += finite_sample(meter_delta[1]);
+                }
+                for (track, transform) in &chain.route_plan.insert_effect_input_transforms {
+                    if *track == chain.insert_ordinal {
+                        continue;
+                    }
+                    if *track >= crate::audio::MIXER_TRACK_METER_COUNT {
+                        return Err(
+                            "VST3 Mixer effect input route exceeds the supported track range"
+                                .to_owned(),
+                        );
+                    }
+                    let input_offset = *track * samples_per_track + frame_index * 2;
+                    let input_end = input_offset
+                        .checked_add(2)
+                        .ok_or_else(|| "Mixer effect input buffer offset overflow".to_owned())?;
+                    if input_end > effect_input_buses.len() {
+                        return Err(
+                            "Mixer effect input buffer is too small for the VST3 route".to_owned()
+                        );
+                    }
+                    let mut effect_input_delta = [processed[0] - dry[0], processed[1] - dry[1]];
+                    transform.apply_frame(&mut effect_input_delta);
+                    effect_input_buses[input_offset] += finite_sample(effect_input_delta[0]);
+                    effect_input_buses[input_offset + 1] += finite_sample(effect_input_delta[1]);
                 }
             }
         }
@@ -3911,6 +3972,7 @@ impl Vst3HostRuntime {
                 right_pan_gain,
                 mixer_transform: route_plan.output_transform,
                 mixer_meter_transforms: route_plan.insert_meter_transforms,
+                mixer_effect_input_transforms: route_plan.insert_effect_input_transforms,
                 live_mixer_source,
                 live_performance: true,
                 active_performance_notes: HashMap::new(),
@@ -4129,27 +4191,18 @@ impl Vst3HostRuntime {
             if first_effect_index == end_effect_index {
                 continue;
             }
-            let (signal_transform, route_plan) = if insert_ordinal == 0 {
-                (
-                    crate::MixerSourceRouteTransform::default(),
-                    crate::MixerSourceRoutePlan::default(),
-                )
+            let route_plan = if insert_ordinal == 0 {
+                crate::MixerSourceRoutePlan::default()
             } else {
                 let track = i8::try_from(insert_ordinal).map_err(|_| {
                     format!("Mixer insert ordinal {insert_ordinal} exceeds the supported range")
                 })?;
-                (
-                    crate::MixerSourceRouteTransform::from_insert_transform(
-                        routing.transform_for_channel(Some(track)),
-                    ),
-                    routing.source_route_plan_for_channel(Some(track)),
-                )
+                routing.source_route_plan_for_channel(Some(track))
             };
             processor
                 .mixer_effect_chains
                 .push(PlaylistMixerEffectChain {
                     insert_ordinal,
-                    signal_transform,
                     route_plan,
                     first_effect_index,
                     end_effect_index,
@@ -4355,6 +4408,7 @@ impl Vst3HostRuntime {
             });
             let mixer_transform = route_plan.output_transform;
             let mixer_meter_transforms = route_plan.insert_meter_transforms;
+            let mixer_effect_input_transforms = route_plan.insert_effect_input_transforms;
             let (mut render, latency_frames) = {
                 let plugin_guard = plugin
                     .lock()
@@ -4442,6 +4496,7 @@ impl Vst3HostRuntime {
                 right_pan_gain,
                 mixer_transform,
                 mixer_meter_transforms,
+                mixer_effect_input_transforms,
                 live_mixer_source,
                 live_performance: live_performance_channels.contains(&channel_id),
                 active_performance_notes: HashMap::new(),

@@ -37,6 +37,28 @@ const TEST_TONE_LEVEL: f32 = 0.12;
 /// Number of Mixer tracks that can be named by a channel's signed-byte assignment.
 pub const MIXER_TRACK_METER_COUNT: usize = i8::MAX as usize + 1;
 
+/// Split a track-major Mixer bus buffer into post-transform meter buses and, when
+/// present, pre-effect insert input buses.
+pub(crate) fn split_mixer_track_buses_mut(
+    buses: &mut [f32],
+    samples_per_track: usize,
+) -> Result<(&mut [f32], Option<&mut [f32]>), String> {
+    let meter_bus_len = MIXER_TRACK_METER_COUNT
+        .checked_mul(samples_per_track)
+        .ok_or_else(|| "Mixer bus size overflow".to_owned())?;
+    if buses.len() == meter_bus_len {
+        return Ok((buses, None));
+    }
+    let combined_bus_len = meter_bus_len
+        .checked_mul(2)
+        .ok_or_else(|| "Mixer bus size overflow".to_owned())?;
+    if buses.len() == combined_bus_len {
+        let (meter_buses, effect_input_buses) = buses.split_at_mut(meter_bus_len);
+        return Ok((meter_buses, Some(effect_input_buses)));
+    }
+    Err("Mixer buses do not match the expected block size".to_owned())
+}
+
 #[derive(Clone)]
 pub(crate) struct LiveMixerSendTargetAtomics {
     pub(crate) level_raw: Arc<AtomicI32>,
@@ -687,6 +709,12 @@ impl LiveMixerSourceControl {
         &self.route_plan.insert_meter_transforms
     }
 
+    pub(crate) fn insert_effect_input_transforms(
+        &self,
+    ) -> &[(usize, crate::MixerSourceRouteTransform)] {
+        &self.route_plan.insert_effect_input_transforms
+    }
+
     pub(crate) fn next_frame_controls(
         &self,
         targets: &LiveMixerSourceTargets,
@@ -1056,6 +1084,70 @@ impl LiveMixerSourceControl {
             }
             if found_path {
                 *frame = meter_frame;
+            } else {
+                route_transform.apply_frame(frame);
+            }
+        } else {
+            route_transform.apply_frame(frame);
+        }
+    }
+
+    pub(crate) fn apply_effect_input_frame(
+        &self,
+        controls: LiveMixerSourceFrameControls,
+        track: usize,
+        route_transform: crate::MixerSourceRouteTransform,
+        frame: &mut [f32; 2],
+    ) {
+        self.route_plan.source_transform.apply_frame(frame);
+        if let Some(enabled_gain) = controls.enabled_gain {
+            frame[0] *= enabled_gain;
+            frame[1] *= enabled_gain;
+        }
+        if let Some(solo_gain) = controls.solo_gain {
+            frame[0] *= solo_gain;
+            frame[1] *= solo_gain;
+        }
+        if let Some((polarity_mix, swap_mix)) = controls.signal_flags_mix {
+            crate::apply_mixer_signal_flags_f32(frame, polarity_mix, swap_mix);
+        }
+        if let Some(separation_raw) = controls.stereo_separation_raw {
+            crate::apply_mixer_stereo_separation_raw_f32(frame, separation_raw);
+        }
+        if let Some(pan_raw) = controls.pan_raw {
+            crate::apply_mixer_pan_raw_f32(frame, pan_raw, controls.pan_law_raw);
+        }
+        frame[0] *= controls.gain;
+        frame[1] *= controls.gain;
+
+        if self.route_plan.live_send_output_paths.is_some() {
+            let source_frame = *frame;
+            let mut input_frame = [0.0; 2];
+            let mut found_path = false;
+            for (path_index, path) in self
+                .route_plan
+                .live_send_effect_input_paths
+                .iter()
+                .enumerate()
+                .filter(|(_, path)| path.track == track)
+            {
+                found_path = true;
+                let solo_gain = self
+                    .current_send_meter_solo_gain_bits
+                    .get(path_index)
+                    .map_or(1.0, |gain| f32::from_bits(gain.load(Ordering::Relaxed)));
+                let gain =
+                    self.send_path_gain(&path.send_gains, &path.insert_enabled_gains, solo_gain);
+                if gain == 0.0 {
+                    continue;
+                }
+                let mut branch_frame = source_frame;
+                path.transform.apply_frame(&mut branch_frame);
+                input_frame[0] += branch_frame[0] * gain;
+                input_frame[1] += branch_frame[1] * gain;
+            }
+            if found_path {
+                *frame = input_frame;
             } else {
                 route_transform.apply_frame(frame);
             }

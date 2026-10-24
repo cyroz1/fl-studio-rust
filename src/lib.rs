@@ -3177,6 +3177,7 @@ pub(crate) struct MixerLiveSendMeterPath {
 pub(crate) struct MixerSourceRoutePlan {
     pub(crate) output_transform: MixerSourceRouteTransform,
     pub(crate) insert_meter_transforms: Vec<(usize, MixerSourceRouteTransform)>,
+    pub(crate) insert_effect_input_transforms: Vec<(usize, MixerSourceRouteTransform)>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -3191,6 +3192,7 @@ pub(crate) struct MixerLiveSourceRoutePlan {
     pub(crate) pan_law_raw: Option<u8>,
     pub(crate) output_transform: MixerSourceRouteTransform,
     pub(crate) insert_meter_transforms: Vec<(usize, MixerSourceRouteTransform)>,
+    pub(crate) insert_effect_input_transforms: Vec<(usize, MixerSourceRouteTransform)>,
     pub(crate) live_send_target_keys: Vec<MixerLiveSendTargetKey>,
     pub(crate) saved_live_send_gains: Vec<f32>,
     pub(crate) saved_live_send_enabled: Vec<bool>,
@@ -3202,6 +3204,7 @@ pub(crate) struct MixerLiveSourceRoutePlan {
     pub(crate) saved_live_insert_enabled: Vec<bool>,
     pub(crate) live_send_output_paths: Option<Vec<MixerLiveSendOutputPath>>,
     pub(crate) live_send_meter_paths: Vec<MixerLiveSendMeterPath>,
+    pub(crate) live_send_effect_input_paths: Vec<MixerLiveSendMeterPath>,
     pub(crate) live_solo: Option<MixerLiveSoloState>,
 }
 
@@ -3209,6 +3212,7 @@ struct MixerLiveSourceRouteData {
     route_plan: MixerSourceRoutePlan,
     output_paths: Option<Vec<MixerLiveSendOutputPath>>,
     meter_paths: Vec<MixerLiveSendMeterPath>,
+    effect_input_paths: Vec<MixerLiveSendMeterPath>,
     target_keys: Vec<MixerLiveSendTargetKey>,
     saved_target_gains: Vec<f32>,
     saved_target_enabled: Vec<bool>,
@@ -3267,30 +3271,6 @@ impl MixerSourceRouteTransform {
         let input = *frame;
         frame[0] = self.matrix[0] * input[0] + self.matrix[1] * input[1];
         frame[1] = self.matrix[2] * input[0] + self.matrix[3] * input[1];
-    }
-
-    /// Recover the input frame when this route transform is invertible.
-    ///
-    /// Mixer peak buses currently contain the signal after the insert's integrated
-    /// fader/pan controls. Effect slots run before those controls, so effect processing
-    /// can use this inverse to reconstruct a pre-effect frame for ordinary non-singular
-    /// insert transforms.
-    pub(crate) fn apply_inverse_frame(self, frame: &mut [f32; 2]) -> bool {
-        let [a, b, c, d] = self.matrix;
-        let determinant = a * d - b * c;
-        if !determinant.is_finite() || determinant.abs() <= 1.0e-12 {
-            return false;
-        }
-        let [left, right] = *frame;
-        let input = [
-            (d * left - b * right) / determinant,
-            (-c * left + a * right) / determinant,
-        ];
-        if input.iter().any(|sample| !sample.is_finite()) {
-            return false;
-        }
-        *frame = input;
-        true
     }
 }
 
@@ -3684,6 +3664,9 @@ impl MixerRouteAudibility {
             pan_law_raw: source_transform.mixer_pan_law_raw,
             output_transform: live_route_data.route_plan.output_transform,
             insert_meter_transforms: live_route_data.route_plan.insert_meter_transforms,
+            insert_effect_input_transforms: live_route_data
+                .route_plan
+                .insert_effect_input_transforms,
             live_send_target_keys: live_route_data.target_keys,
             saved_live_send_gains: live_route_data.saved_target_gains,
             saved_live_send_enabled: live_route_data.saved_target_enabled,
@@ -3695,6 +3678,7 @@ impl MixerRouteAudibility {
             saved_live_insert_enabled: live_route_data.saved_target_insert_enabled,
             live_send_output_paths: live_route_data.output_paths,
             live_send_meter_paths: live_route_data.meter_paths,
+            live_send_effect_input_paths: live_route_data.effect_input_paths,
             live_solo: live_direct_solo.then_some(MixerLiveSoloState {
                 any_soloed: !self.soloed_insert_tracks.is_empty(),
                 soloed: self.soloed_insert_tracks.contains(&track),
@@ -3708,6 +3692,7 @@ impl MixerRouteAudibility {
                 route_plan: self.source_route_plan_for_channel(Some(source_track)),
                 output_paths: None,
                 meter_paths: Vec::new(),
+                effect_input_paths: Vec::new(),
                 target_keys: Vec::new(),
                 saved_target_gains: Vec::new(),
                 saved_target_enabled: Vec::new(),
@@ -3722,6 +3707,7 @@ impl MixerRouteAudibility {
 
         let mut output_paths = Vec::new();
         let mut meter_paths = Vec::new();
+        let mut effect_input_paths = Vec::new();
         let mut send_gains = Vec::new();
         let mut insert_enabled_gains = Vec::new();
         let mut target_indices = HashMap::new();
@@ -3755,6 +3741,7 @@ impl MixerRouteAudibility {
             &mut saved_target_insert_enabled,
             &mut output_paths,
             &mut meter_paths,
+            &mut effect_input_paths,
         );
 
         let mut output_transform = MixerSourceRouteTransform::zero();
@@ -3774,13 +3761,27 @@ impl MixerRouteAudibility {
                         * saved_meter_solo_gains[index],
                 ));
         }
+        let mut insert_effect_input_transforms = BTreeMap::new();
+        for (index, path) in effect_input_paths.iter().enumerate() {
+            insert_effect_input_transforms
+                .entry(path.track)
+                .or_insert_with(MixerSourceRouteTransform::zero)
+                .add(path.transform.scaled(
+                    saved_live_route_path_gain(&path.send_gains, &path.insert_enabled_gains)
+                        * saved_meter_solo_gains[index],
+                ));
+        }
         MixerLiveSourceRouteData {
             route_plan: MixerSourceRoutePlan {
                 output_transform,
                 insert_meter_transforms: insert_meter_transforms.into_iter().collect(),
+                insert_effect_input_transforms: insert_effect_input_transforms
+                    .into_iter()
+                    .collect(),
             },
             output_paths: Some(output_paths),
             meter_paths,
+            effect_input_paths,
             target_keys,
             saved_target_gains,
             saved_target_enabled,
@@ -3815,6 +3816,7 @@ impl MixerRouteAudibility {
         saved_target_insert_enabled: &mut Vec<bool>,
         output_paths: &mut Vec<MixerLiveSendOutputPath>,
         meter_paths: &mut Vec<MixerLiveSendMeterPath>,
+        effect_input_paths: &mut Vec<MixerLiveSendMeterPath>,
     ) {
         if track == 0 {
             let solo_tracks = solo_path_tracks.clone();
@@ -3855,13 +3857,19 @@ impl MixerRouteAudibility {
             .get(&track)
             .copied()
             .unwrap_or_default();
-        let path = path.then(MixerSourceRouteTransform::from_insert_transform(
-            track_transform,
-        ));
         let mut meter_solos = solo_path_tracks.clone();
         self.append_live_solo_reachable_tracks(track, &mut HashSet::new(), &mut meter_solos);
         saved_meter_solo_gains.push(self.saved_solo_gain_for_path(&meter_solos));
         meter_solo_tracks.push(meter_solos);
+        effect_input_paths.push(MixerLiveSendMeterPath {
+            track: track as usize,
+            transform: path,
+            send_gains: send_gains.clone(),
+            insert_enabled_gains: insert_enabled_gains.clone(),
+        });
+        let path = path.then(MixerSourceRouteTransform::from_insert_transform(
+            track_transform,
+        ));
         meter_paths.push(MixerLiveSendMeterPath {
             track: track as usize,
             transform: path,
@@ -3917,6 +3925,7 @@ impl MixerRouteAudibility {
                         saved_target_insert_enabled,
                         output_paths,
                         meter_paths,
+                        effect_input_paths,
                     );
                     send_gains.pop();
                 }
@@ -3988,6 +3997,7 @@ impl MixerRouteAudibility {
             return MixerSourceRoutePlan {
                 output_transform: MixerSourceRouteTransform::default(),
                 insert_meter_transforms: Vec::new(),
+                insert_effect_input_transforms: Vec::new(),
             };
         };
         if !self.complete_send_sources.contains(&track) {
@@ -3997,11 +4007,16 @@ impl MixerRouteAudibility {
             return MixerSourceRoutePlan {
                 output_transform: transform,
                 insert_meter_transforms: vec![(track as usize, transform)],
+                insert_effect_input_transforms: vec![(
+                    track as usize,
+                    MixerSourceRouteTransform::default(),
+                )],
             };
         }
 
         let mut output = MixerSourceRouteTransform::zero();
         let mut insert_meter_transforms = BTreeMap::new();
+        let mut insert_effect_input_transforms = BTreeMap::new();
         self.accumulate_send_paths(
             track,
             MixerSourceRouteTransform::default(),
@@ -4009,10 +4024,12 @@ impl MixerRouteAudibility {
             false,
             &mut output,
             &mut insert_meter_transforms,
+            &mut insert_effect_input_transforms,
         );
         MixerSourceRoutePlan {
             output_transform: output,
             insert_meter_transforms: insert_meter_transforms.into_iter().collect(),
+            insert_effect_input_transforms: insert_effect_input_transforms.into_iter().collect(),
         }
     }
 
@@ -4086,6 +4103,7 @@ impl MixerRouteAudibility {
         Ok(order)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn accumulate_send_paths(
         &self,
         track: i8,
@@ -4094,6 +4112,7 @@ impl MixerRouteAudibility {
         reached_solo: bool,
         output: &mut MixerSourceRouteTransform,
         insert_meter_transforms: &mut BTreeMap<usize, MixerSourceRouteTransform>,
+        insert_effect_input_transforms: &mut BTreeMap<usize, MixerSourceRouteTransform>,
     ) {
         if track == 0 {
             if self.soloed_insert_tracks.is_empty() || reached_solo {
@@ -4106,6 +4125,15 @@ impl MixerRouteAudibility {
         }
 
         let reached_solo = reached_solo || self.soloed_insert_tracks.contains(&track);
+        if self.soloed_insert_tracks.is_empty()
+            || reached_solo
+            || self.route_can_reach_soloed_insert(track, &mut HashSet::new())
+        {
+            insert_effect_input_transforms
+                .entry(track as usize)
+                .or_insert_with(MixerSourceRouteTransform::zero)
+                .add(path);
+        }
         let track_transform = self
             .source_transforms
             .get(&track)
@@ -4137,6 +4165,7 @@ impl MixerRouteAudibility {
                         reached_solo,
                         output,
                         insert_meter_transforms,
+                        insert_effect_input_transforms,
                     );
                 }
             }
@@ -25586,30 +25615,6 @@ mod tests {
         );
         assert!(master_solo.allows_channel(None));
         assert!(master_solo.allows_channel(Some(1)));
-    }
-
-    #[test]
-    fn mixer_insert_route_transform_can_recover_pre_effect_frames() {
-        let transform = MixerSourceRouteTransform::from_insert_transform(
-            super::MixerInsertSignalTransform::new(true, true)
-                .with_fader_volume_raw(Some(6_500))
-                .with_mixer_pan_raw(Some(1_600))
-                .with_stereo_separation_raw(Some(12))
-                .with_mixer_pan_law_raw(Some(2)),
-        );
-        let expected = [0.75, -0.25];
-        let mut recovered = expected;
-        transform.apply_frame(&mut recovered);
-        assert!(transform.apply_inverse_frame(&mut recovered));
-        assert!((recovered[0] - expected[0]).abs() < 1.0e-5);
-        assert!((recovered[1] - expected[1]).abs() < 1.0e-5);
-
-        let hard_pan = MixerSourceRouteTransform::from_insert_transform(
-            super::MixerInsertSignalTransform::default().with_mixer_pan_raw(Some(6_400)),
-        );
-        let mut frame = [0.5, -0.25];
-        hard_pan.apply_frame(&mut frame);
-        assert!(!hard_pan.apply_inverse_frame(&mut frame));
     }
 
     #[test]
