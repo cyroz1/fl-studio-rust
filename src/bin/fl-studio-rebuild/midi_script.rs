@@ -88,6 +88,9 @@ pub struct MidiScriptTransportState {
     pub hardware_beat_led_state: AtomicI32,
     pub song_position_hint: Mutex<String>,
     pub song_length_hint: Mutex<String>,
+    pub project_title: Mutex<String>,
+    pub project_author: Mutex<String>,
+    pub project_genre: Mutex<String>,
 }
 
 pub fn normalized_song_position(position_ticks: f64, length_ticks: u64) -> f64 {
@@ -454,6 +457,24 @@ impl MidiScriptRuntime {
             .lock()
             .map(|hint| hint.clone())
             .unwrap_or_else(|_| "0:00:000".to_owned());
+        let project_title = self
+            .transport_state
+            .project_title
+            .lock()
+            .map(|value| value.clone())
+            .unwrap_or_default();
+        let project_author = self
+            .transport_state
+            .project_author
+            .lock()
+            .map(|value| value.clone())
+            .unwrap_or_default();
+        let project_genre = self
+            .transport_state
+            .project_genre
+            .lock()
+            .map(|value| value.clone())
+            .unwrap_or_default();
         let mut request = value.clone();
         if let Some(object) = request.as_object_mut() {
             object.insert(
@@ -492,6 +513,9 @@ impl MidiScriptRuntime {
                         .load(Ordering::Relaxed),
                     "song_position_hint": song_position_hint,
                     "song_length_hint": song_length_hint,
+                    "project_title": project_title,
+                    "project_author": project_author,
+                    "project_genre": project_genre,
                 }),
             );
         }
@@ -906,6 +930,32 @@ mod tests {
         assert_eq!(stopped.bytes, [0xB0, 0, 1]);
         assert_eq!(bar.bytes, [0xB0, 1, 1]);
         assert_eq!(beat.bytes, [0xB0, 2, 1]);
+    }
+
+    #[test]
+    fn python_general_project_info_getters_report_loaded_metadata() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport general\ndef OnMidiIn(event):\n    event.data1 = len(general.getProjectTitle())\n    event.data2 = len(general.getProjectAuthor()) + len(general.getProjectGenre())\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let transport_state = Arc::new(MidiScriptTransportState::default());
+        *transport_state.project_title.lock().unwrap() = "Album".to_owned();
+        *transport_state.project_author.lock().unwrap() = "Artist".to_owned();
+        *transport_state.project_genre.lock().unwrap() = "Jazz".to_owned();
+        let mut runtime = MidiScriptRuntime::start_for_device_with_transport_state(
+            &script,
+            "Test Input",
+            transport_state,
+        )
+        .unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
+
+        assert_eq!(result.bytes, [0xB0, 5, 10]);
     }
 
     #[test]

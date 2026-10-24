@@ -466,6 +466,17 @@ def _install_modules(script_name, device_name):
         0 if _active_transport_state.get("pattern_mode", False) else 1
     )
 
+    general = _module("general")
+    general.getProjectTitle = lambda: str(
+        _active_transport_state.get("project_title", "")
+    )
+    general.getProjectAuthor = lambda: str(
+        _active_transport_state.get("project_author", "")
+    )
+    general.getProjectGenre = lambda: str(
+        _active_transport_state.get("project_genre", "")
+    )
+
     for name in (
         "playlist",
         "channels",

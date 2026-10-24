@@ -12928,6 +12928,27 @@ impl DawUi {
         self.midi_script_transport_state
             .song_length_seconds
             .store(song_length_seconds.to_bits(), Ordering::Relaxed);
+        let (project_title, project_author, project_genre) = self
+            .document
+            .as_ref()
+            .map(|document| {
+                let metadata = document.metadata();
+                (
+                    metadata.title().unwrap_or_default().to_owned(),
+                    metadata.author().unwrap_or_default().to_owned(),
+                    metadata.genre().unwrap_or_default().to_owned(),
+                )
+            })
+            .unwrap_or_default();
+        if let Ok(mut value) = self.midi_script_transport_state.project_title.lock() {
+            *value = project_title;
+        }
+        if let Ok(mut value) = self.midi_script_transport_state.project_author.lock() {
+            *value = project_author;
+        }
+        if let Ok(mut value) = self.midi_script_transport_state.project_genre.lock() {
+            *value = project_genre;
+        }
         let song_position_hint = if has_script {
             self.song_position_label()
         } else {
