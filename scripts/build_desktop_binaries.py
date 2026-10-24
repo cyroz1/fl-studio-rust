@@ -195,14 +195,26 @@ def main() -> None:
         )
         if nfpm_config.count(native_entry) != 1:
             raise SystemExit("nfpm.yaml is missing its native VST3 helper entry")
-        for dependency, marker in [
-            ("libc6-i386", "      - libxkbcommon-x11-0\n"),
-            ("glibc.i686", "      - \"libxkbcommon-x11.so.0()(64bit)\"\n"),
-            ("lib32-glibc", "      - libxkbcommon-x11\n"),
+        for dependencies, marker in [
+            (
+                ["libc6-i386", "libxcb1:i386", "libgcc-s1:i386"],
+                "      - libxcb1\n",
+            ),
+            (
+                ["glibc.i686", "libxcb.i686", "libgcc.i686"],
+                "      - \"libxcb.so.1()(64bit)\"\n",
+            ),
+            (
+                ["lib32-glibc", "lib32-libxcb", "lib32-gcc-libs"],
+                "      - libxcb\n",
+            ),
         ]:
             if nfpm_config.count(marker) != 1:
-                raise SystemExit(f"nfpm.yaml is missing the {dependency} dependency insertion point")
-            nfpm_config = nfpm_config.replace(marker, marker + f"      - {dependency}\n", 1)
+                raise SystemExit(
+                    f"nfpm.yaml is missing the {dependencies[0]} dependency insertion point"
+                )
+            dependency_lines = "".join(f"      - {dependency}\n" for dependency in dependencies)
+            nfpm_config = nfpm_config.replace(marker, marker + dependency_lines, 1)
         (root / "packaging" / "nfpm-bridge.yaml").write_text(
             nfpm_config.replace(native_entry, native_entry + x86_entry, 1),
             encoding="utf-8",
