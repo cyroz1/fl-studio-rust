@@ -263,6 +263,12 @@ fn queue_script_transport_actions(
             ScriptTransportAction::SetSongPositionTicks(position) => {
                 MidiTransportCommand::SetSongPositionTicks(position)
             }
+            ScriptTransportAction::MarkerJumpJog(increment) => {
+                MidiTransportCommand::MarkerJumpJog(increment)
+            }
+            ScriptTransportAction::MarkerSelJog(increment) => {
+                MidiTransportCommand::MarkerSelJog(increment)
+            }
         };
         let transport_message = ReceivedMidiMessage {
             timestamp_micros,
@@ -287,6 +293,8 @@ pub enum MidiTransportCommand {
     ToggleLoopMode,
     SetSongPosition(u32),
     SetSongPositionTicks(u64),
+    MarkerJumpJog(i32),
+    MarkerSelJog(i32),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -809,6 +817,8 @@ pub fn describe_event(event: MidiInputEvent) -> String {
             MidiTransportCommand::ToggleLoopMode => "MIDI script Loop Mode".to_owned(),
             MidiTransportCommand::SetSongPosition(_) => "MIDI script Song Position".to_owned(),
             MidiTransportCommand::SetSongPositionTicks(_) => "MIDI script Song Position".to_owned(),
+            MidiTransportCommand::MarkerJumpJog(_) => "MIDI script Marker Jump".to_owned(),
+            MidiTransportCommand::MarkerSelJog(_) => "MIDI script Marker Selection".to_owned(),
         },
     }
 }

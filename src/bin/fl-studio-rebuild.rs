@@ -12913,6 +12913,70 @@ impl DawUi {
         }
     }
 
+    fn midi_script_marker_candidates(&self) -> Vec<(usize, u32)> {
+        let Some(document) = self.document.as_ref() else {
+            return Vec::new();
+        };
+        let arrangement_id = self.selected_arrangement.unwrap_or(0);
+        let mut markers = document
+            .arrangements()
+            .ok()
+            .and_then(|arrangements| {
+                arrangements
+                    .into_iter()
+                    .find(|arrangement| arrangement.id == arrangement_id)
+            })
+            .map(|arrangement| {
+                arrangement
+                    .time_markers
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, marker)| !marker.is_signature())
+                    .map(|(index, marker)| (index, marker.position_ticks()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        markers.sort_unstable_by_key(|(index, tick)| (*tick, *index));
+        markers
+    }
+
+    fn jump_midi_script_marker(&mut self, increment: i32) {
+        if increment == 0 {
+            return;
+        }
+        if self.pattern_playback_mode {
+            self.status = "MIDI script marker jumps require Song mode".to_owned();
+            return;
+        }
+        let markers = self.midi_script_marker_candidates();
+        let current_tick = self
+            .current_playhead_tick()
+            .unwrap_or(f64::from(self.playlist_seek_tick));
+        let Some((marker_index, tick)) =
+            midi_script_marker_jump_target(&markers, current_tick, increment)
+        else {
+            self.status = "No Playlist time markers are available to jump to".to_owned();
+            return;
+        };
+        self.selected_time_marker = Some(marker_index);
+        self.set_midi_script_song_position_absolute_ticks(u64::from(tick));
+    }
+
+    fn select_midi_script_marker(&mut self, increment: i32) {
+        if increment == 0 {
+            return;
+        }
+        let markers = self.midi_script_marker_candidates();
+        let Some((marker_index, tick)) =
+            midi_script_marker_selection_target(&markers, self.selected_time_marker, increment)
+        else {
+            self.status = "No Playlist time markers are available to select".to_owned();
+            return;
+        };
+        self.selected_time_marker = Some(marker_index);
+        self.status = format!("Selected Playlist marker at tick {tick}");
+    }
+
     fn live_sampler_tempo_bpm_milli(&self) -> u32 {
         let project_tempo_bpm = self
             .document
@@ -44530,6 +44594,12 @@ impl DawUi {
             MidiTransportCommand::SetSongPositionTicks(tick) => {
                 self.set_midi_script_song_position_absolute_ticks(tick);
             }
+            MidiTransportCommand::MarkerJumpJog(increment) => {
+                self.jump_midi_script_marker(increment);
+            }
+            MidiTransportCommand::MarkerSelJog(increment) => {
+                self.select_midi_script_marker(increment);
+            }
         }
     }
 
@@ -59320,6 +59390,63 @@ fn playlist_next_bar_tick(
     u32::try_from(next_signature_marker.unwrap_or(next_bar)).ok()
 }
 
+fn midi_script_marker_jump_target(
+    markers: &[(usize, u32)],
+    current_tick: f64,
+    increment: i32,
+) -> Option<(usize, u32)> {
+    if markers.is_empty() || increment == 0 {
+        return None;
+    }
+    let current_tick = if current_tick.is_finite() {
+        current_tick.max(0.0)
+    } else {
+        0.0
+    };
+    let last_index = markers.len() - 1;
+    let target_index = if increment > 0 {
+        let first_after = markers.partition_point(|(_, tick)| f64::from(*tick) <= current_tick);
+        let offset = usize::try_from(i64::from(increment) - 1).ok()?;
+        first_after.saturating_add(offset).min(last_index)
+    } else {
+        let preceding = markers.partition_point(|(_, tick)| f64::from(*tick) < current_tick);
+        let steps = usize::try_from(-i64::from(increment)).ok()?;
+        preceding.saturating_sub(steps).min(last_index)
+    };
+    markers.get(target_index).copied()
+}
+
+fn midi_script_marker_selection_target(
+    markers: &[(usize, u32)],
+    selected_marker: Option<usize>,
+    increment: i32,
+) -> Option<(usize, u32)> {
+    if markers.is_empty() {
+        return None;
+    }
+    let current_index = selected_marker.and_then(|selected| {
+        markers
+            .iter()
+            .position(|(marker_index, _)| *marker_index == selected)
+    });
+    let target_index = match (current_index, increment) {
+        (Some(index), 0) => index,
+        (Some(index), increment) => (i64::try_from(index).ok()? + i64::from(increment))
+            .clamp(0, i64::try_from(markers.len() - 1).ok()?)
+            as usize,
+        (None, 0) => return None,
+        (None, increment) if increment > 0 => usize::try_from(i64::from(increment) - 1)
+            .ok()?
+            .min(markers.len() - 1),
+        (None, increment) => {
+            let last_index = i64::try_from(markers.len() - 1).ok()?;
+            (i64::try_from(markers.len()).ok()? + i64::from(increment)).clamp(0, last_index)
+                as usize
+        }
+    };
+    markers.get(target_index).copied()
+}
+
 fn playlist_measure_at_tick(
     ppq: u16,
     initial_time_signature: Option<(u8, u8)>,
@@ -60550,7 +60677,8 @@ mod tests {
         live_playlist_vst3_note_targets, midi_button_press_edge, midi_cc_to_mixer_fader_raw,
         midi_cc_to_mixer_pan_raw, midi_cc_to_mixer_stereo_separation_raw,
         midi_controller_binding_for_device, midi_mixer_button_press_edge,
-        midi_mixer_control_for_cc, midi_vst3_parameter_mapping_for_target,
+        midi_mixer_control_for_cc, midi_script_marker_jump_target,
+        midi_script_marker_selection_target, midi_vst3_parameter_mapping_for_target,
         midi_vst3_parameter_mappings_for_cc, next_empty_pattern_id, next_piano_roll_note_group,
         note_from_grid_position, parse_internal_lfo_parameter_links,
         parse_midi_control_change_mapping, parse_midi_controller_templates,
@@ -63967,6 +64095,59 @@ mod tests {
                 true,
             ),
             None
+        );
+    }
+
+    #[test]
+    fn midi_script_marker_jump_jogs_from_the_playhead_and_clamps_to_edges() {
+        let markers = [(4, 96), (2, 288), (7, 576)];
+
+        assert_eq!(
+            midi_script_marker_jump_target(&markers, 0.0, 1),
+            Some((4, 96))
+        );
+        assert_eq!(
+            midi_script_marker_jump_target(&markers, 96.0, 2),
+            Some((7, 576))
+        );
+        assert_eq!(
+            midi_script_marker_jump_target(&markers, 400.0, -1),
+            Some((2, 288))
+        );
+        assert_eq!(
+            midi_script_marker_jump_target(&markers, 10_000.0, 1),
+            Some((7, 576))
+        );
+        assert_eq!(
+            midi_script_marker_jump_target(&markers, 0.0, -1),
+            Some((4, 96))
+        );
+        assert_eq!(midi_script_marker_jump_target(&markers, 300.0, 0), None);
+    }
+
+    #[test]
+    fn midi_script_marker_selection_jogs_selected_named_markers() {
+        let markers = [(4, 96), (2, 288), (7, 576)];
+
+        assert_eq!(
+            midi_script_marker_selection_target(&markers, None, 1),
+            Some((4, 96))
+        );
+        assert_eq!(
+            midi_script_marker_selection_target(&markers, Some(2), 1),
+            Some((7, 576))
+        );
+        assert_eq!(
+            midi_script_marker_selection_target(&markers, Some(7), -1),
+            Some((2, 288))
+        );
+        assert_eq!(
+            midi_script_marker_selection_target(&markers, None, -1),
+            Some((7, 576))
+        );
+        assert_eq!(
+            midi_script_marker_selection_target(&markers, Some(4), -10),
+            Some((4, 96))
         );
     }
 

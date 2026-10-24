@@ -139,6 +139,15 @@ def _get_song_pos_hint():
     return str(_active_transport_state.get("song_position_hint", "1:01:000"))
 
 
+def _jog_marker(action, value, flags=None):
+    if flags is not None:
+        raise NotImplementedError("MIDI script marker jog flags are not supported")
+    increment = int(value)
+    if not -(2**31) <= increment < 2**31:
+        raise ValueError("MIDI script marker jog increment is outside the supported range")
+    _request_transport_action({"action": action, "increment": increment})
+
+
 def _install_modules(script_name, device_name):
     midi = _module("midi")
     constants = {
@@ -189,6 +198,12 @@ def _install_modules(script_name, device_name):
     transport.setSongPos = _set_song_pos
     transport.getSongLength = _get_song_length
     transport.getSongPosHint = _get_song_pos_hint
+    transport.markerJumpJog = lambda value, flags=None: _jog_marker(
+        "marker_jump_jog", value, flags
+    )
+    transport.markerSelJog = lambda value, flags=None: _jog_marker(
+        "marker_sel_jog", value, flags
+    )
     transport.getLoopMode = lambda: (
         0 if _active_transport_state.get("pattern_mode", False) else 1
     )

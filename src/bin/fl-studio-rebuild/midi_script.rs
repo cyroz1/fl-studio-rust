@@ -34,6 +34,8 @@ pub enum ScriptTransportAction {
     ToggleLoopMode,
     SetSongPosition(u32),
     SetSongPositionTicks(u64),
+    MarkerJumpJog(i32),
+    MarkerSelJog(i32),
 }
 
 const SCRIPT_SONG_POSITION_SCALE: f64 = 1_000_000.0;
@@ -509,6 +511,17 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
             .ok_or_else(|| "MIDI script returned an invalid absolute song position".to_owned())?;
         return Ok(ScriptTransportAction::SetSongPositionTicks(position));
     }
+    if name == Some("marker_jump_jog") || name == Some("marker_sel_jog") {
+        let increment = action["increment"]
+            .as_i64()
+            .and_then(|increment| i32::try_from(increment).ok())
+            .ok_or_else(|| "MIDI script returned an invalid marker jog increment".to_owned())?;
+        return Ok(if name == Some("marker_jump_jog") {
+            ScriptTransportAction::MarkerJumpJog(increment)
+        } else {
+            ScriptTransportAction::MarkerSelJog(increment)
+        });
+    }
     Err("MIDI script returned an unknown transport action".to_owned())
 }
 
@@ -896,6 +909,29 @@ mod tests {
         let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
 
         assert_eq!(result.bytes, [0xB0, 127, 1]);
+    }
+
+    #[test]
+    fn python_transport_marker_jogs_request_global_marker_actions() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport transport\ndef OnMidiIn(event):\n    transport.markerJumpJog(2)\n    transport.markerSelJog(-1)\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let mut runtime = MidiScriptRuntime::start_for_device(&script, "Test Input").unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
+
+        assert_eq!(
+            result.actions,
+            [
+                ScriptTransportAction::MarkerJumpJog(2),
+                ScriptTransportAction::MarkerSelJog(-1),
+            ]
+        );
     }
 
     #[test]
