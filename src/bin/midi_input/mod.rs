@@ -301,7 +301,28 @@ impl MidiInputScriptWorker {
                     }
                 }
                 if let Some(mut runtime) = runtime {
-                    runtime.shutdown();
+                    match runtime.shutdown() {
+                        Ok(actions) => {
+                            let received_at = Instant::now();
+                            let elapsed_micros = u64::try_from(
+                                received_at
+                                    .duration_since(timestamp_reference_at)
+                                    .as_micros(),
+                            )
+                            .unwrap_or(u64::MAX);
+                            queue_script_transport_actions(
+                                &output_sender,
+                                &midi_output_sender,
+                                &dropped_messages,
+                                timestamp_reference_micros.saturating_add(elapsed_micros),
+                                received_at,
+                                actions,
+                            );
+                        }
+                        Err(error) => {
+                            let _ = error_sender.try_send(error);
+                        }
+                    }
                 }
                 let _ = finished_sender.try_send(());
             })
@@ -1498,6 +1519,36 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicU64;
     use std::sync::mpsc;
+
+    #[test]
+    fn script_midi_output_actions_reach_the_dedicated_output_queue() {
+        let (transport_sender, transport_receiver) = mpsc::sync_channel(2);
+        let (midi_output_sender, midi_output_receiver) = mpsc::sync_channel(2);
+        let dropped_messages = AtomicU64::new(0);
+        let received_at = Instant::now();
+
+        queue_script_transport_actions(
+            &transport_sender,
+            &midi_output_sender,
+            &dropped_messages,
+            12,
+            received_at,
+            [
+                ScriptTransportAction::MidiOutput(vec![0x90, 60, 100]),
+                ScriptTransportAction::Start,
+            ],
+        );
+
+        assert_eq!(
+            midi_output_receiver.try_recv().unwrap(),
+            vec![0x90, 60, 100]
+        );
+        assert_eq!(
+            transport_receiver.try_recv().unwrap().event,
+            MidiInputEvent::Transport(MidiTransportCommand::Start)
+        );
+        assert_eq!(dropped_messages.load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn parses_channel_voice_messages_and_zero_velocity_note_off() {

@@ -586,11 +586,9 @@ impl MidiScriptRuntime {
         MidiScriptStopHandle(Arc::clone(&self.child))
     }
 
-    pub fn shutdown(&mut self) {
-        let _ = serde_json::to_writer(&mut self.stdin, &json!({"shutdown": true}));
-        let _ = self.stdin.write_all(b"\n").and_then(|_| self.stdin.flush());
-        let mut response = String::new();
-        let _ = self.stdout.read_line(&mut response);
+    pub fn shutdown(&mut self) -> Result<Vec<ScriptTransportAction>, String> {
+        let response = self.exchange(&json!({"shutdown": true}))?;
+        parse_transport_actions(&response)
     }
 
     pub fn kill(&self) {
@@ -1171,6 +1169,35 @@ mod tests {
             [ScriptTransportAction::MidiOutput(vec![0xB0, 7, 99])]
         );
         assert!(second_idle.actions.is_empty());
+    }
+
+    #[test]
+    fn python_device_on_deinit_emits_final_midi_output() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport device\ndef OnDeInit():\n    device.midiOutMsg(0x00643C90)\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let transport_state = Arc::new(MidiScriptTransportState::default());
+        transport_state
+            .midi_output_port_number
+            .store(0, Ordering::Relaxed);
+        let mut runtime = MidiScriptRuntime::start_for_device_with_transport_state(
+            &script,
+            "Test Input",
+            transport_state,
+        )
+        .unwrap();
+
+        let actions = runtime.shutdown().unwrap();
+
+        assert_eq!(
+            actions,
+            [ScriptTransportAction::MidiOutput(vec![0x90, 60, 100])]
+        );
     }
 
     #[test]

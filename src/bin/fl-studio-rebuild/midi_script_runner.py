@@ -679,6 +679,11 @@ def _dispatch(namespace, value):
         if callback is not None:
             callback()
         return {"handled": False, "actions": _active_transport_actions}
+    if value.get("deinitialize"):
+        callback = namespace.get("OnDeInit")
+        if callback is not None:
+            callback()
+        return {"handled": False, "actions": _active_transport_actions}
     if "project_load_status" in value:
         status = int(value["project_load_status"])
         callback = namespace.get("OnProjectLoad")
@@ -753,9 +758,12 @@ def main():
             continue
         if request.get("shutdown"):
             try:
-                callback = namespace.get("OnDeInit")
-                if callback is not None:
-                    callback()
+                _emit(
+                    _dispatch(
+                        namespace,
+                        {"deinitialize": True, "transport": request.get("transport", {})},
+                    )
+                )
             except Exception as error:
                 _emit({"error": "{}: {}".format(type(error).__name__, error)})
             break
