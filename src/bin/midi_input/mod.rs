@@ -673,6 +673,7 @@ pub enum MidiInputEvent {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MidiInputChannelState {
     pan: u8,
+    channel_volume: u8,
     expression: u8,
     mod_x: u8,
     mod_y: u8,
@@ -687,6 +688,7 @@ impl Default for MidiInputChannelState {
     fn default() -> Self {
         Self {
             pan: 64,
+            channel_volume: 127,
             expression: 127,
             mod_x: 64,
             mod_y: 64,
@@ -702,6 +704,11 @@ impl Default for MidiInputChannelState {
 impl MidiInputChannelState {
     pub fn update(&mut self, event: MidiInputEvent) {
         match event {
+            MidiInputEvent::ControlChange {
+                controller: 7,
+                value,
+                ..
+            } => self.channel_volume = value.min(127),
             MidiInputEvent::ControlChange {
                 controller: 10,
                 value,
@@ -726,6 +733,7 @@ impl MidiInputChannelState {
                 controller: 121, ..
             } => {
                 self.pan = 64;
+                self.channel_volume = 127;
                 self.expression = 127;
                 self.mod_x = 64;
                 self.mod_y = 64;
@@ -791,6 +799,10 @@ impl MidiInputChannelState {
 
     pub fn raw_expression(self) -> u8 {
         self.expression
+    }
+
+    pub fn raw_channel_volume(self) -> u8 {
+        self.channel_volume
     }
 
     fn note_mod_x(self) -> u8 {
@@ -2468,15 +2480,22 @@ mod tests {
     }
 
     #[test]
-    fn expression_controller_resets_to_its_midi_default() {
+    fn channel_volume_and_expression_reset_to_live_defaults() {
         let mut state = MidiInputChannelState::default();
+        assert_eq!(state.raw_channel_volume(), 127);
         assert_eq!(state.raw_expression(), 127);
 
+        state.update(MidiInputEvent::ControlChange {
+            channel: 0,
+            controller: 7,
+            value: 63,
+        });
         state.update(MidiInputEvent::ControlChange {
             channel: 0,
             controller: 11,
             value: 48,
         });
+        assert_eq!(state.raw_channel_volume(), 63);
         assert_eq!(state.raw_expression(), 48);
 
         state.update(MidiInputEvent::ControlChange {
@@ -2484,6 +2503,7 @@ mod tests {
             controller: 121,
             value: 0,
         });
+        assert_eq!(state.raw_channel_volume(), 127);
         assert_eq!(state.raw_expression(), 127);
     }
 

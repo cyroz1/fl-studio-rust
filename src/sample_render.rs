@@ -672,6 +672,10 @@ pub enum SamplerLiveNoteEvent {
         channel: u8,
         value: u8,
     },
+    ChannelVolume {
+        channel: u8,
+        value: u8,
+    },
     Expression {
         channel: u8,
         value: u8,
@@ -713,7 +717,8 @@ pub enum LayerLiveInputEvent {
     Midi(Vst3LiveInputEvent),
     /// Updated Sampler pitch-bend offset for an input MIDI channel.
     SamplerPitchBend { channel: u8, cents: i16 },
-    /// Reset Sampler sustain, expression, pan, and pitch-bend state for an input MIDI channel.
+    /// Reset Sampler sustain, channel-volume, expression, pan, and pitch-bend state
+    /// for an input MIDI channel.
     SamplerResetControllers {
         channel: u8,
         pan: u8,
@@ -5515,6 +5520,9 @@ pub fn stream_sampler_midi_input_to_device(
                 Ok(SamplerLiveNoteEvent::Pan { channel, value }) => {
                     engine.apply_live_pan(channel, value);
                 }
+                Ok(SamplerLiveNoteEvent::ChannelVolume { channel, value }) => {
+                    engine.apply_live_channel_volume(channel, value);
+                }
                 Ok(SamplerLiveNoteEvent::Expression { channel, value }) => {
                     engine.apply_live_expression(channel, value);
                 }
@@ -5540,6 +5548,7 @@ pub fn stream_sampler_midi_input_to_device(
                     engine.set_live_sustain(channel, false);
                     engine.set_live_sostenuto(channel, false);
                     engine.apply_live_pan(channel, pan);
+                    engine.apply_live_channel_volume(channel, 127);
                     engine.apply_live_expression(channel, 127);
                     engine.apply_live_pitch_bend(channel, pitch_bend_cents);
                 }
@@ -5852,6 +5861,7 @@ fn apply_live_layer_sampler_controller(
 ) {
     match controller {
         10 => engine.apply_live_pan(channel, value),
+        7 => engine.apply_live_channel_volume(channel, value),
         11 => engine.apply_live_expression(channel, value),
         64 => engine.set_live_sustain(channel, value >= 64),
         66 => engine.set_live_sostenuto(channel, value >= 64),
@@ -5868,6 +5878,7 @@ fn reset_live_layer_sampler_controllers(
     engine.set_live_sustain(channel, false);
     engine.set_live_sostenuto(channel, false);
     engine.apply_live_pan(channel, pan);
+    engine.apply_live_channel_volume(channel, 127);
     engine.apply_live_expression(channel, 127);
     engine.apply_live_pitch_bend(channel, pitch_bend_cents);
 }
@@ -10566,6 +10577,7 @@ struct SamplerVoiceEngine<'a> {
     voices_stolen: usize,
     pitch_bend_cents: [i16; 16],
     live_midi_pan: [u8; 16],
+    live_midi_channel_volume: [u8; 16],
     live_midi_expression: [u8; 16],
     sustain_down: [bool; 16],
     sostenuto_down: [bool; 16],
@@ -10713,6 +10725,7 @@ impl<'a> SamplerVoiceEngine<'a> {
             voices_stolen: 0,
             pitch_bend_cents: [0; 16],
             live_midi_pan: [64; 16],
+            live_midi_channel_volume: [127; 16],
             live_midi_expression: [127; 16],
             sustain_down: [false; 16],
             sostenuto_down: [false; 16],
@@ -10761,6 +10774,7 @@ impl<'a> SamplerVoiceEngine<'a> {
         if let Some(output) = output.as_deref_mut() {
             output.fill(0.0);
         }
+        let live_midi_channel_volume = self.live_midi_channel_volume;
         let live_midi_expression = self.live_midi_expression;
         let mut last_active_output_frame = None;
         for offset in 0..frame_count {
@@ -10859,8 +10873,13 @@ impl<'a> SamplerVoiceEngine<'a> {
                     let expression = voice
                         .input_midi_channel
                         .map_or(127, |channel| live_midi_expression[usize::from(channel)]);
+                    let channel_volume = voice.input_midi_channel.map_or(127, |channel| {
+                        live_midi_channel_volume[usize::from(channel)]
+                    });
                     let envelope_gain = sampler_voice_volume_envelope_gain(voice, frame);
-                    let gain = voice.gain * envelope_gain * (f32::from(expression) / 127.0) * fade;
+                    let midi_gain =
+                        f32::from(expression) * f32::from(channel_volume) / (127.0 * 127.0);
+                    let gain = voice.gain * envelope_gain * midi_gain * fade;
                     let mut routed_frame = [
                         left * gain * voice.left_gain,
                         right * gain * voice.right_gain,
@@ -11267,6 +11286,10 @@ impl<'a> SamplerVoiceEngine<'a> {
 
     fn apply_live_expression(&mut self, channel: u8, value: u8) {
         self.live_midi_expression[usize::from(channel & 0x0F)] = value.min(127);
+    }
+
+    fn apply_live_channel_volume(&mut self, channel: u8, value: u8) {
+        self.live_midi_channel_volume[usize::from(channel & 0x0F)] = value.min(127);
     }
 
     fn release_live_notes(&mut self, channel: u8) {
@@ -16985,7 +17008,7 @@ mod tests {
     }
 
     #[test]
-    fn sampler_layer_live_expression_scales_existing_voices_by_midi_channel() {
+    fn sampler_layer_live_volume_and_expression_scale_existing_voices_by_midi_channel() {
         let sources = HashMap::from([(
             7,
             SamplerVoiceSource {
@@ -17032,22 +17055,29 @@ mod tests {
             })
             .expect("live voice should start");
         engine.set_voice_input_midi_channel(slot_index, 2);
-        apply_live_layer_sampler_controller(&mut engine, 2, 11, 64);
+        apply_live_layer_sampler_controller(&mut engine, 2, 7, 64);
 
-        let mut output = [0.0; 6];
+        let mut output = [0.0; 8];
         engine.render_block(0, 1, &mut output[..2]);
-        let expected_expression_gain = std::f32::consts::FRAC_1_SQRT_2 * (64.0 / 127.0);
-        assert!((output[0] - expected_expression_gain).abs() < 1e-6);
-        assert!((output[1] - expected_expression_gain).abs() < 1e-6);
+        let full_pan_gain = std::f32::consts::FRAC_1_SQRT_2;
+        let channel_volume_gain = full_pan_gain * (64.0 / 127.0);
+        assert!((output[0] - channel_volume_gain).abs() < 1e-6);
+        assert!((output[1] - channel_volume_gain).abs() < 1e-6);
 
-        apply_live_layer_sampler_controller(&mut engine, 2, 11, 0);
+        apply_live_layer_sampler_controller(&mut engine, 2, 11, 64);
         engine.render_block(1, 1, &mut output[2..4]);
-        assert_eq!(&output[2..4], &[0.0, 0.0]);
+        let combined_gain = channel_volume_gain * (64.0 / 127.0);
+        assert!((output[2] - combined_gain).abs() < 1e-6);
+        assert!((output[3] - combined_gain).abs() < 1e-6);
+
+        apply_live_layer_sampler_controller(&mut engine, 2, 7, 0);
+        engine.render_block(2, 1, &mut output[4..6]);
+        assert_eq!(&output[4..6], &[0.0, 0.0]);
 
         reset_live_layer_sampler_controllers(&mut engine, 2, 64, 0);
-        engine.render_block(2, 1, &mut output[4..]);
-        assert!((output[4] - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6);
-        assert!((output[5] - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6);
+        engine.render_block(3, 1, &mut output[6..]);
+        assert!((output[6] - full_pan_gain).abs() < 1e-6);
+        assert!((output[7] - full_pan_gain).abs() < 1e-6);
     }
 
     #[test]
