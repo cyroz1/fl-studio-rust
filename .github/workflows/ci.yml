@@ -55,7 +55,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --yes ffmpeg libasound2-dev libxcb1-dev libxkbcommon-x11-0 mesa-vulkan-drivers xvfb xdotool
+          sudo apt-get install --yes cpio ffmpeg libasound2-dev libxcb1-dev libxkbcommon-x11-0 mesa-vulkan-drivers rpm xvfb xdotool zstd
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -321,9 +321,21 @@ jobs:
             exit 1
           fi
 
+          rpm_arch="$(rpm -qp --qf '%{ARCH}' "${rpm_packages[0]}")"
+          if [[ "$rpm_arch" != "$LINUX_RPM_ARCH" ]]; then
+            echo "::error::RPM package architecture is $rpm_arch; expected $LINUX_RPM_ARCH."
+            exit 1
+          fi
+
           rpm_name="${rpm_packages[0]##*/}"
           if [[ "$rpm_name" != *".${LINUX_RPM_ARCH}.rpm" ]]; then
             echo "::error::RPM package filename does not identify $LINUX_RPM_ARCH: $rpm_name"
+            exit 1
+          fi
+
+          arch_package_arch="$(tar --zstd -xOf "${arch_packages[0]}" .PKGINFO | awk -F ' = ' '$1 == "arch" { print $2; exit }')"
+          if [[ "$arch_package_arch" != "$LINUX_ARCHLINUX_ARCH" ]]; then
+            echo "::error::Arch package architecture is $arch_package_arch; expected $LINUX_ARCHLINUX_ARCH."
             exit 1
           fi
 
@@ -333,30 +345,40 @@ jobs:
             exit 1
           fi
 
-          python3 - target/release/fl-studio-rebuild "$LINUX_ELF_MACHINE" <<'PY'
+          package_root="$RUNNER_TEMP/linux-package-contents"
+          mkdir -p "$package_root/deb" "$package_root/rpm" "$package_root/arch"
+          dpkg-deb -x "${deb_packages[0]}" "$package_root/deb"
+          rpm_package="$PWD/${rpm_packages[0]}"
+          (cd "$package_root/rpm" && rpm2cpio "$rpm_package" | cpio -id --quiet)
+          tar --zstd -xf "${arch_packages[0]}" -C "$package_root/arch"
+
+          python3 - "$LINUX_ELF_MACHINE" \
+            "$package_root/deb/usr/bin/fl-studio-rebuild" \
+            "$package_root/rpm/usr/bin/fl-studio-rebuild" \
+            "$package_root/arch/usr/bin/fl-studio-rebuild" <<'PY'
           import struct
           import sys
           from pathlib import Path
 
-          executable_path = Path(sys.argv[1])
-          expected_machine = int(sys.argv[2])
-          header = executable_path.read_bytes()[:64]
-          if len(header) < 20 or header[:4] != b"\x7fELF":
-              raise SystemExit(f"{executable_path} is not an ELF executable")
-          if header[4] != 2:
-              raise SystemExit(f"{executable_path} is not a 64-bit ELF executable")
-          byte_order = {1: "<", 2: ">"}.get(header[5])
-          if byte_order is None:
-              raise SystemExit(f"{executable_path} has an unknown ELF byte order")
-          actual_machine = struct.unpack_from(f"{byte_order}H", header, 18)[0]
-          if actual_machine != expected_machine:
-              raise SystemExit(
-                  f"{executable_path} ELF machine is {actual_machine}; "
-                  f"expected {expected_machine}"
-              )
-          print(f"Verified {executable_path} ELF machine {actual_machine}.")
+          expected_machine = int(sys.argv[1])
+          for executable in map(Path, sys.argv[2:]):
+              header = executable.read_bytes()[:64]
+              if len(header) < 20 or header[:4] != b"\x7fELF":
+                  raise SystemExit(f"{executable} is not an ELF executable")
+              if header[4] != 2:
+                  raise SystemExit(f"{executable} is not a 64-bit ELF executable")
+              byte_order = {1: "<", 2: ">"}.get(header[5])
+              if byte_order is None:
+                  raise SystemExit(f"{executable} has an unknown ELF byte order")
+              actual_machine = struct.unpack_from(f"{byte_order}H", header, 18)[0]
+              if actual_machine != expected_machine:
+                  raise SystemExit(
+                      f"{executable} ELF machine is {actual_machine}; "
+                      f"expected {expected_machine}"
+                  )
+              print(f"Verified {executable} ELF machine {actual_machine}.")
           PY
-          echo "Verified Debian, RPM, Arch, and executable architectures for $(uname -m)."
+          echo "Verified Debian, RPM, Arch package metadata and payload architectures for $(uname -m)."
 
       - name: Install Linux Debian package
         if: runner.os == 'Linux'
