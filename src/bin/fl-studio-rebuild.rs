@@ -4278,6 +4278,13 @@ struct MidiHeldPerformanceClip {
 
 type MidiPerformanceHoldMap = BTreeMap<(u8, u8), Vec<MidiHeldPerformanceClip>>;
 
+#[derive(Clone, Copy)]
+struct MidiScriptTransportMove {
+    speed_millionths: i32,
+    last_updated: Instant,
+    resume_playback: bool,
+}
+
 struct DawUi {
     document: Option<FlpDocument>,
     current_path: Option<PathBuf>,
@@ -4325,6 +4332,7 @@ struct DawUi {
     playlist_seek_tick: u32,
     playlist_tempo_map: Option<PlaylistTempoMap>,
     midi_script_tempo_map_cache: Option<(u16, u64, Instant, PlaylistTempoMap)>,
+    midi_script_transport_move: Option<MidiScriptTransportMove>,
     tempo_bpm: f64,
     selected_pattern: Option<u16>,
     channel_display_filter: ChannelDisplayFilter,
@@ -5706,6 +5714,7 @@ impl DawUi {
             playlist_seek_tick: 0,
             playlist_tempo_map: None,
             midi_script_tempo_map_cache: None,
+            midi_script_transport_move: None,
             tempo_bpm: 140.0,
             selected_pattern: None,
             channel_display_filter: ChannelDisplayFilter::All,
@@ -10752,6 +10761,7 @@ impl DawUi {
     }
 
     fn start_project_playback(&mut self) {
+        self.midi_script_transport_move = None;
         if self.pending_song_render.is_some() {
             self.status = "Stop the Playlist render before starting playback".to_owned();
             return;
@@ -11519,6 +11529,7 @@ impl DawUi {
     }
 
     fn toggle_project_playback(&mut self) {
+        self.midi_script_transport_move = None;
         if self.pending_song_render.is_some() {
             self.status = "Stop the Playlist render before starting playback".to_owned();
             return;
@@ -11588,6 +11599,7 @@ impl DawUi {
     }
 
     fn stop_project_playback(&mut self) {
+        self.midi_script_transport_move = None;
         self.held_performance_clips.clear();
         self.midi_held_performance_clips.clear();
         self.midi_performance_page_navigation = false;
@@ -13032,6 +13044,7 @@ impl DawUi {
             self.status = "Could not set MIDI script song position on an empty timeline".to_owned();
             return;
         }
+        self.midi_script_transport_move = None;
         let tick = tick.min(length);
         if self.pattern_playback_mode {
             let Some(pattern_id) = self
@@ -13054,6 +13067,133 @@ impl DawUi {
         self.playlist_seek_tick = tick.min(u64::from(u32::MAX)) as u32;
         self.status = format!("Song position set to tick {}", self.playlist_seek_tick);
         if restart_playback {
+            self.start_project_playback();
+        }
+    }
+
+    fn set_midi_script_transport_move(&mut self, speed_millionths: i32, start: bool) {
+        if !start {
+            self.advance_midi_script_transport_move();
+            let Some(movement) = self.midi_script_transport_move.take() else {
+                return;
+            };
+            if movement.resume_playback {
+                self.start_project_playback();
+            } else {
+                self.status = "MIDI script song-position move stopped".to_owned();
+            }
+            return;
+        }
+
+        if self.midi_script_transport_move.is_some() {
+            self.advance_midi_script_transport_move();
+            if let Some(movement) = self.midi_script_transport_move.as_mut() {
+                movement.speed_millionths = speed_millionths;
+                movement.last_updated = Instant::now();
+            }
+            return;
+        }
+        if speed_millionths == 0 {
+            return;
+        }
+
+        let Some((position_tick, length_ticks)) = self.midi_script_song_position_tick_and_length()
+        else {
+            self.status = "Could not move song position without a selected timeline".to_owned();
+            return;
+        };
+        if length_ticks == 0 {
+            self.status = "Could not move song position on an empty timeline".to_owned();
+            return;
+        }
+        if self.midi_script_tempo_map().is_none() {
+            self.status =
+                "Could not map MIDI script song-position movement to the timeline".to_owned();
+            return;
+        }
+
+        let resume_playback = self.playing;
+        let stop_existing_playback = self.playing
+            || self.project_playback_loaded
+            || self.pending_audio_render.is_some()
+            || self.pending_vst3_stream.is_some()
+            || self.pending_sampler_stream.is_some();
+        if stop_existing_playback {
+            self.stop_project_playback();
+        }
+        self.store_midi_script_seek_tick(absolute_song_position_ticks(position_tick));
+        self.midi_script_transport_move = Some(MidiScriptTransportMove {
+            speed_millionths,
+            last_updated: Instant::now(),
+            resume_playback,
+        });
+        self.status = if speed_millionths < 0 {
+            "MIDI script moving song position backward".to_owned()
+        } else {
+            "MIDI script moving song position forward".to_owned()
+        };
+    }
+
+    fn advance_midi_script_transport_move(&mut self) {
+        let Some(movement) = self.midi_script_transport_move else {
+            return;
+        };
+        let now = Instant::now();
+        let elapsed_seconds = now.duration_since(movement.last_updated).as_secs_f64();
+        if elapsed_seconds <= 0.0 {
+            return;
+        }
+        let Some((current_tick, length_ticks)) = self.midi_script_song_position_tick_and_length()
+        else {
+            self.midi_script_transport_move = None;
+            self.status =
+                "MIDI script song-position movement stopped because its timeline closed".to_owned();
+            return;
+        };
+        let Some(tempo_map) = self.midi_script_tempo_map() else {
+            self.midi_script_transport_move = None;
+            self.status =
+                "MIDI script song-position movement stopped because its tempo map is unavailable"
+                    .to_owned();
+            return;
+        };
+        let Some(next_tick) = midi_script_moved_song_position_tick(
+            &tempo_map,
+            current_tick,
+            length_ticks,
+            movement.speed_millionths,
+            elapsed_seconds,
+        ) else {
+            self.midi_script_transport_move = None;
+            self.status =
+                "MIDI script song-position movement stopped because its position is invalid"
+                    .to_owned();
+            return;
+        };
+        self.store_midi_script_seek_tick(next_tick);
+        if let Some(movement) = self.midi_script_transport_move.as_mut() {
+            movement.last_updated = now;
+        }
+    }
+
+    fn store_midi_script_seek_tick(&mut self, tick: u64) {
+        let tick = tick.min(u64::from(u32::MAX)) as u32;
+        if self.pattern_playback_mode {
+            self.pattern_seek_tick = u64::from(tick);
+        } else {
+            self.playlist_seek_tick = tick;
+        }
+    }
+
+    fn finish_midi_script_transport_move(&mut self) {
+        if self.midi_script_transport_move.is_none() {
+            return;
+        }
+        self.advance_midi_script_transport_move();
+        let Some(movement) = self.midi_script_transport_move.take() else {
+            return;
+        };
+        if movement.resume_playback {
             self.start_project_playback();
         }
     }
@@ -43466,6 +43606,7 @@ impl DawUi {
                 .cloned()
         });
         self.midi_output_gain_learning = false;
+        self.finish_midi_script_transport_move();
         self.midi_mixer_control_learning = None;
         self.midi_play_pause_learning = false;
         self.midi_play_pause_cc_active = false;
@@ -43514,6 +43655,7 @@ impl DawUi {
     }
 
     fn disconnect_midi_input(&mut self) {
+        self.finish_midi_script_transport_move();
         self.release_all_midi_performance_clips();
         self.stop_live_sampler_input_for_device_change();
         self.stop_midi_input_thru();
@@ -44744,6 +44886,12 @@ impl DawUi {
             }
             MidiTransportCommand::SetSongPositionTimeUs(position) => {
                 self.set_midi_script_song_position_time_us(position);
+            }
+            MidiTransportCommand::MoveSongPosition {
+                speed_millionths,
+                start,
+            } => {
+                self.set_midi_script_transport_move(speed_millionths, start);
             }
             MidiTransportCommand::MarkerJumpJog(increment) => {
                 self.jump_midi_script_marker(increment);
@@ -47621,6 +47769,7 @@ impl DawUi {
             .as_ref()
             .and_then(ConnectedMidiInput::take_script_error)
         {
+            self.finish_midi_script_transport_move();
             self.midi_input_error = Some(error.clone());
             self.status = format!("MIDI controller script stopped: {error}");
         }
@@ -51255,6 +51404,10 @@ impl eframe::App for DawUi {
         self.history_snapshot_available_this_frame =
             frame_snapshot.is_some() || self.pending_history_snapshot.is_some();
         self.poll_midi_input(self.history_snapshot_available_this_frame);
+        self.advance_midi_script_transport_move();
+        if self.midi_script_transport_move.is_some() {
+            ui.ctx().request_repaint_after(Duration::from_millis(16));
+        }
         self.finish_idle_midi_mixer_control_undo_session();
         self.poll_live_layer_input();
         self.poll_live_sampler_input();
@@ -59607,6 +59760,26 @@ fn midi_script_time_position_seconds_to_ticks(
     Some(absolute_song_position_ticks(tick).min(length_ticks))
 }
 
+fn midi_script_moved_song_position_tick(
+    tempo_map: &PlaylistTempoMap,
+    current_tick: f64,
+    length_ticks: u64,
+    speed_millionths: i32,
+    elapsed_seconds: f64,
+) -> Option<u64> {
+    if !elapsed_seconds.is_finite() || elapsed_seconds < 0.0 {
+        return None;
+    }
+    let current_seconds = tempo_map.seconds_at_fractional_tick(current_tick).ok()?;
+    let length_seconds = tempo_map
+        .seconds_at_fractional_tick(length_ticks as f64)
+        .ok()?;
+    let speed = f64::from(speed_millionths) / 1_000_000.0;
+    let position_seconds =
+        (current_seconds + speed * elapsed_seconds).clamp(0.0, length_seconds.max(0.0));
+    midi_script_time_position_seconds_to_ticks(tempo_map, position_seconds, length_ticks)
+}
+
 fn playlist_measure_at_tick(
     ppq: u16,
     initial_time_signature: Option<(u8, u8)>,
@@ -60864,23 +61037,23 @@ mod tests {
         midi_cc_to_mixer_pan_raw, midi_cc_to_mixer_stereo_separation_raw,
         midi_controller_binding_for_device, midi_mixer_button_press_edge,
         midi_mixer_control_for_cc, midi_script_marker_jump_target,
-        midi_script_marker_selection_target, midi_script_time_position_seconds_to_ticks,
-        midi_vst3_parameter_mapping_for_target, midi_vst3_parameter_mappings_for_cc,
-        next_empty_pattern_id, next_piano_roll_note_group, note_from_grid_position,
-        parse_internal_lfo_parameter_links, parse_midi_control_change_mapping,
-        parse_midi_controller_templates, parse_midi_device_selections,
-        parse_midi_mixer_control_mappings, parse_midi_output_programs, parse_midi_output_routes,
-        parse_midi_output_values, parse_midi_vst3_parameter_mappings,
-        parse_pattern_vst3_parameter_links, parse_playlist_audio_clip_envelopes,
-        parse_playlist_vst3_parameter_links, parse_window_layout_presets,
-        pattern_color_from_random_index, pattern_lfo_loop_length_ticks, pattern_loop_frame_at_tick,
-        pattern_loop_tick_at_frame, pattern_vst3_parameter_automation_for_channel,
-        pattern_vst3_parameter_link_for_target, piano_roll_color_group_note_ids,
-        piano_roll_controller_stroke_points, piano_roll_controller_value_at,
-        piano_roll_controller_value_range, piano_roll_cross_pattern_ghost_notes,
-        piano_roll_discard_length_edit, piano_roll_duplicate_offset,
-        piano_roll_ghost_note_is_visible, piano_roll_key_at_y, piano_roll_note_group_members,
-        piano_roll_note_nudge_edit, piano_roll_odd_note_selection,
+        midi_script_marker_selection_target, midi_script_moved_song_position_tick,
+        midi_script_time_position_seconds_to_ticks, midi_vst3_parameter_mapping_for_target,
+        midi_vst3_parameter_mappings_for_cc, next_empty_pattern_id, next_piano_roll_note_group,
+        note_from_grid_position, parse_internal_lfo_parameter_links,
+        parse_midi_control_change_mapping, parse_midi_controller_templates,
+        parse_midi_device_selections, parse_midi_mixer_control_mappings,
+        parse_midi_output_programs, parse_midi_output_routes, parse_midi_output_values,
+        parse_midi_vst3_parameter_mappings, parse_pattern_vst3_parameter_links,
+        parse_playlist_audio_clip_envelopes, parse_playlist_vst3_parameter_links,
+        parse_window_layout_presets, pattern_color_from_random_index,
+        pattern_lfo_loop_length_ticks, pattern_loop_frame_at_tick, pattern_loop_tick_at_frame,
+        pattern_vst3_parameter_automation_for_channel, pattern_vst3_parameter_link_for_target,
+        piano_roll_color_group_note_ids, piano_roll_controller_stroke_points,
+        piano_roll_controller_value_at, piano_roll_controller_value_range,
+        piano_roll_cross_pattern_ghost_notes, piano_roll_discard_length_edit,
+        piano_roll_duplicate_offset, piano_roll_ghost_note_is_visible, piano_roll_key_at_y,
+        piano_roll_note_group_members, piano_roll_note_nudge_edit, piano_roll_odd_note_selection,
         piano_roll_overlap_note_selection, piano_roll_pitch_range_note_selection,
         piano_roll_random_note_selection, piano_roll_selection_time_range,
         piano_roll_shift_time_range, piano_roll_time_range_from_drag,
@@ -64305,6 +64478,32 @@ mod tests {
         );
         assert_eq!(
             midi_script_time_position_seconds_to_ticks(&tempo_map, -1.0, 192),
+            None
+        );
+    }
+
+    #[test]
+    fn midi_script_transport_moves_follow_tempo_and_clamp_to_timeline_edges() {
+        let tempo_map = PlaylistTempoMap::constant(96, 120.0).unwrap();
+
+        assert_eq!(
+            midi_script_moved_song_position_tick(&tempo_map, 0.0, 384, 1_000_000, 1.0),
+            Some(192)
+        );
+        assert_eq!(
+            midi_script_moved_song_position_tick(&tempo_map, 192.0, 384, -500_000, 0.5),
+            Some(144)
+        );
+        assert_eq!(
+            midi_script_moved_song_position_tick(&tempo_map, 0.0, 384, -1_000_000, 1.0),
+            Some(0)
+        );
+        assert_eq!(
+            midi_script_moved_song_position_tick(&tempo_map, 384.0, 384, 1_000_000, 1.0),
+            Some(384)
+        );
+        assert_eq!(
+            midi_script_moved_song_position_tick(&tempo_map, 0.0, 384, 1_000_000, f64::NAN),
             None
         );
     }

@@ -203,6 +203,30 @@ def _jog_marker(action, value, flags=None):
     _request_transport_action({"action": action, "increment": increment})
 
 
+def _move_song_position(speed, start_stop):
+    try:
+        speed = float(speed)
+        start_stop = int(start_stop)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("song-position move speed and startStop must be numeric") from error
+    if not math.isfinite(speed):
+        raise ValueError("song-position move speed must be finite")
+    if start_stop == 1:
+        raise NotImplementedError("SS_StartStep song-position moves are not supported")
+    if start_stop not in (0, 2):
+        raise ValueError("song-position move startStop must be SS_Stop or SS_Start")
+    speed_millionths = int(round(speed * 1_000_000.0))
+    if not -(2**31) <= speed_millionths < 2**31:
+        raise ValueError("song-position move speed is outside the supported range")
+    _request_transport_action(
+        {
+            "action": "move_song_position",
+            "speed_millionths": speed_millionths,
+            "start": start_stop == 2,
+        }
+    )
+
+
 def _global_transport(command, value, pmeflags=2, flags=15):
     command = int(command)
     value = int(value)
@@ -220,6 +244,11 @@ def _global_transport(command, value, pmeflags=2, flags=15):
     if action is not None:
         if value != 0:
             _request_transport_action(action)
+        return 8
+    if command in (13, 14):
+        if value not in (0, 2):
+            return -1
+        _move_song_position(-1 if command == 13 else 1, value)
         return 8
     if command in (35, 36):
         _jog_marker("marker_jump_jog" if command == 35 else "marker_sel_jog", value)
@@ -384,6 +413,15 @@ def _install_modules(script_name, device_name):
     transport.setSongPos = _set_song_pos
     transport.getSongLength = _get_song_length
     transport.getSongPosHint = _get_song_pos_hint
+    transport.rewind = lambda startStop, flags=15: (
+        _move_song_position(-1, startStop) if int(flags) & 8 else None
+    )
+    transport.continuousMove = lambda speed, startStop: _move_song_position(
+        speed, startStop
+    )
+    transport.continuousMovePos = lambda speed, startStop: _move_song_position(
+        speed, startStop
+    )
     transport.markerJumpJog = lambda value, flags=None: _jog_marker(
         "marker_jump_jog", value, flags
     )

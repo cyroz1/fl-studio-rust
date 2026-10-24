@@ -36,6 +36,7 @@ pub enum ScriptTransportAction {
     SetSongPosition(u32),
     SetSongPositionTicks(u64),
     SetSongPositionTimeUs(u64),
+    MoveSongPosition { speed_millionths: i32, start: bool },
     MarkerJumpJog(i32),
     MarkerSelJog(i32),
 }
@@ -545,6 +546,19 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
             .as_u64()
             .ok_or_else(|| "MIDI script returned an invalid time song position".to_owned())?;
         return Ok(ScriptTransportAction::SetSongPositionTimeUs(position));
+    }
+    if name == Some("move_song_position") {
+        let speed_millionths = action["speed_millionths"]
+            .as_i64()
+            .and_then(|speed| i32::try_from(speed).ok())
+            .ok_or_else(|| "MIDI script returned an invalid song-position move speed".to_owned())?;
+        let start = action["start"]
+            .as_bool()
+            .ok_or_else(|| "MIDI script returned an invalid song-position move state".to_owned())?;
+        return Ok(ScriptTransportAction::MoveSongPosition {
+            speed_millionths,
+            start,
+        });
     }
     if name == Some("marker_jump_jog") || name == Some("marker_sel_jog") {
         let increment = action["increment"]
@@ -1127,7 +1141,7 @@ mod tests {
         let script_path = temporary.path().join("device_test.py");
         fs::write(
             &script_path,
-            "# name=Test Script\nimport midi\nimport transport\ndef OnMidiIn(event):\n    unsupported = transport.globalTransport(midi.FPT_Rewind, midi.SS_Start, event.pmeflags)\n    focused = transport.globalTransport(midi.FPT_Play, 1, event.pmeflags, midi.GT_Form)\n    event.data1 = int(unsupported == midi.GT_Cannot and focused == midi.GT_Cannot)\n",
+            "# name=Test Script\nimport midi\nimport transport\ndef OnMidiIn(event):\n    unsupported = transport.globalTransport(midi.FPT_MoveJog, 1, event.pmeflags)\n    focused = transport.globalTransport(midi.FPT_Play, 1, event.pmeflags, midi.GT_Form)\n    event.data1 = int(unsupported == midi.GT_Cannot and focused == midi.GT_Cannot)\n",
         )
         .unwrap();
         let script = MidiControllerScript::parse(script_path).unwrap();
@@ -1137,6 +1151,88 @@ mod tests {
 
         assert_eq!(result.bytes, [0xB0, 1, 1]);
         assert!(result.actions.is_empty());
+    }
+
+    #[test]
+    fn python_global_transport_rewind_and_fast_forward_are_hold_commands() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport midi\nimport transport\ndef OnMidiIn(event):\n    transport.globalTransport(midi.FPT_Rewind, midi.SS_Start, event.pmeflags)\n    transport.globalTransport(midi.FPT_Rewind, midi.SS_Stop, event.pmeflags)\n    transport.globalTransport(midi.FPT_FastForward, midi.SS_Start, event.pmeflags)\n    transport.globalTransport(midi.FPT_FastForward, midi.SS_Stop, event.pmeflags)\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let mut runtime = MidiScriptRuntime::start_for_device(&script, "Test Input").unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
+
+        assert_eq!(
+            result.actions,
+            [
+                ScriptTransportAction::MoveSongPosition {
+                    speed_millionths: -1_000_000,
+                    start: true,
+                },
+                ScriptTransportAction::MoveSongPosition {
+                    speed_millionths: -1_000_000,
+                    start: false,
+                },
+                ScriptTransportAction::MoveSongPosition {
+                    speed_millionths: 1_000_000,
+                    start: true,
+                },
+                ScriptTransportAction::MoveSongPosition {
+                    speed_millionths: 1_000_000,
+                    start: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn python_continuous_move_apis_dispatch_speed_and_start_state() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport midi\nimport transport\ndef OnMidiIn(event):\n    transport.rewind(midi.SS_Start)\n    transport.rewind(midi.SS_Stop)\n    transport.continuousMove(-0.5, midi.SS_Start)\n    transport.continuousMove(-0.5, midi.SS_Stop)\n    transport.continuousMovePos(2.0, midi.SS_Start)\n    transport.continuousMovePos(2.0, midi.SS_Stop)\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let mut runtime = MidiScriptRuntime::start_for_device(&script, "Test Input").unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
+
+        assert_eq!(
+            result.actions,
+            [
+                ScriptTransportAction::MoveSongPosition {
+                    speed_millionths: -1_000_000,
+                    start: true,
+                },
+                ScriptTransportAction::MoveSongPosition {
+                    speed_millionths: -1_000_000,
+                    start: false,
+                },
+                ScriptTransportAction::MoveSongPosition {
+                    speed_millionths: -500_000,
+                    start: true,
+                },
+                ScriptTransportAction::MoveSongPosition {
+                    speed_millionths: -500_000,
+                    start: false,
+                },
+                ScriptTransportAction::MoveSongPosition {
+                    speed_millionths: 2_000_000,
+                    start: true,
+                },
+                ScriptTransportAction::MoveSongPosition {
+                    speed_millionths: 2_000_000,
+                    start: false,
+                },
+            ]
+        );
     }
 
     #[test]
