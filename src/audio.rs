@@ -1286,6 +1286,8 @@ struct PlaybackState {
     samples: ArcSwapOption<Vec<f32>>,
     streaming: ArcSwapOption<StreamingPlayback>,
     cursor_frames: AtomicU64,
+    playback_speed: AtomicU32,
+    playback_speed_phase: AtomicU32,
     active: AtomicBool,
     browser_preview_samples: ArcSwapOption<Vec<f32>>,
     browser_preview_state: AtomicU64,
@@ -1591,6 +1593,8 @@ impl PlaybackState {
             samples: ArcSwapOption::empty(),
             streaming: ArcSwapOption::empty(),
             cursor_frames: AtomicU64::new(0),
+            playback_speed: AtomicU32::new(1.0_f32.to_bits()),
+            playback_speed_phase: AtomicU32::new(0.0_f32.to_bits()),
             active: AtomicBool::new(false),
             browser_preview_samples: ArcSwapOption::empty(),
             browser_preview_state: AtomicU64::new(0),
@@ -1637,6 +1641,8 @@ impl PlaybackState {
         self.cancel_stream();
         self.samples.store(Some(Arc::new(samples)));
         self.cursor_frames.store(0, Ordering::Release);
+        self.playback_speed_phase
+            .store(0.0_f32.to_bits(), Ordering::Release);
         self.active.store(true, Ordering::Release);
     }
 
@@ -1924,6 +1930,8 @@ impl PlaybackState {
     fn stop(&self) {
         self.active.store(false, Ordering::Release);
         self.cursor_frames.store(0, Ordering::Release);
+        self.playback_speed_phase
+            .store(0.0_f32.to_bits(), Ordering::Release);
         self.samples.store(None);
         self.cancel_stream();
     }
@@ -2196,6 +2204,17 @@ impl AudioEngine {
         self.playback
             .output_gain
             .store(gain.to_bits(), Ordering::Release);
+    }
+
+    /// Set the transport playback rate, changing both pitch and song duration.
+    pub fn set_project_playback_speed(&self, speed_multiplier: f32) -> Result<(), String> {
+        if !valid_project_playback_speed(speed_multiplier) {
+            return Err("Project playback speed must be between 0.25 and 4.0".to_owned());
+        }
+        self.playback
+            .playback_speed
+            .store(speed_multiplier.to_bits(), Ordering::Release);
+        Ok(())
     }
 
     /// Begin consuming interleaved stereo samples from a bounded producer ring.
@@ -3068,21 +3087,51 @@ fn next_output_frame(
             if !playback.active.load(Ordering::Acquire) {
                 return [0.0, 0.0];
             }
-            let frame = playback.cursor_frames.fetch_add(1, Ordering::Relaxed);
-            let Some(offset) = usize::try_from(frame)
+            let frame = playback.cursor_frames.load(Ordering::Relaxed);
+            let Some(frame_offset) = usize::try_from(frame)
                 .ok()
                 .and_then(|frame| frame.checked_mul(2))
             else {
                 playback.active.store(false, Ordering::Release);
                 return [0.0, 0.0];
             };
-            let Some(samples) =
-                project_samples.and_then(|samples| samples.get(offset..offset.saturating_add(2)))
-            else {
+            let Some(samples) = project_samples else {
                 playback.active.store(false, Ordering::Release);
                 return [0.0, 0.0];
             };
-            [samples[0], samples[1]]
+            let frame_count = (samples.len() / 2) as u64;
+            if frame >= frame_count {
+                playback.active.store(false, Ordering::Release);
+                return [0.0, 0.0];
+            }
+            let Some(current) = samples.get(frame_offset..frame_offset.saturating_add(2)) else {
+                playback.active.store(false, Ordering::Release);
+                return [0.0, 0.0];
+            };
+            let next_offset = usize::try_from((frame + 1).min(frame_count - 1))
+                .ok()
+                .and_then(|frame| frame.checked_mul(2))
+                .unwrap_or(frame_offset);
+            let next = samples
+                .get(next_offset..next_offset.saturating_add(2))
+                .unwrap_or(current);
+            let phase = f32::from_bits(playback.playback_speed_phase.load(Ordering::Relaxed));
+            let sample = [
+                current[0] + (next[0] - current[0]) * phase,
+                current[1] + (next[1] - current[1]) * phase,
+            ];
+            let speed = f32::from_bits(playback.playback_speed.load(Ordering::Acquire));
+            let total_phase = phase + speed;
+            let advance_frames = total_phase.floor() as u64;
+            playback.playback_speed_phase.store(
+                (total_phase - advance_frames as f32).to_bits(),
+                Ordering::Relaxed,
+            );
+            playback.cursor_frames.store(
+                frame.saturating_add(advance_frames).min(frame_count),
+                Ordering::Relaxed,
+            );
+            sample
         }
         AUDIO_SOURCE_STREAM => {
             let Some(streaming) = streaming else {
@@ -3103,15 +3152,34 @@ fn next_output_frame(
                 !streaming.project_source_finished.load(Ordering::Acquire)
                     || streaming.rings[index].available_stereo_frames() > 0
             });
+            let phase = f32::from_bits(playback.playback_speed_phase.load(Ordering::Relaxed));
+            let speed = f32::from_bits(playback.playback_speed.load(Ordering::Acquire));
+            let total_phase = phase + speed;
+            let requested_advance = total_phase.floor() as usize;
+            let next_phase = total_phase - requested_advance as f32;
             let mut mixed_frame = [0.0, 0.0];
             let mut source_underrun = false;
             let mut any_source_frame = false;
+            let mut max_available_frames = 0;
+            let mut project_available_frames = 0;
             for (index, ring) in streaming.rings.iter().enumerate() {
-                if let Some(frame) = ring.pop_stereo_frame() {
+                let available_frames = ring.available_stereo_frames();
+                max_available_frames = max_available_frames.max(available_frames);
+                if Some(index) == streaming.project_source_index {
+                    project_available_frames = available_frames;
+                }
+                let frame = ring.peek_stereo_frame(0);
+                if let Some(frame) = frame {
                     any_source_frame = true;
-                    mixed_frame[0] += frame[0];
-                    mixed_frame[1] += frame[1];
-                } else if !streaming.producer_finished[index].load(Ordering::Acquire) {
+                    let next = ring.peek_stereo_frame(1).unwrap_or(frame);
+                    mixed_frame[0] += frame[0] + (next[0] - frame[0]) * phase;
+                    mixed_frame[1] += frame[1] + (next[1] - frame[1]) * phase;
+                }
+                let producer_finished = streaming.producer_finished[index].load(Ordering::Acquire);
+                let needs_lookahead = phase > 0.0 && available_frames < 2;
+                if !producer_finished
+                    && (frame.is_none() || available_frames < requested_advance || needs_lookahead)
+                {
                     streaming.producer_underrun_frames[index].fetch_add(1, Ordering::Relaxed);
                     source_underrun = true;
                 }
@@ -3123,17 +3191,41 @@ fn next_output_frame(
                 streaming.active.store(false, Ordering::Release);
                 [0.0, 0.0]
             } else {
+                for ring in &streaming.rings {
+                    ring.advance_stereo_frames(requested_advance);
+                }
+                playback
+                    .playback_speed_phase
+                    .store(next_phase.to_bits(), Ordering::Relaxed);
                 if source_underrun {
                     streaming.underrun_frames.fetch_add(1, Ordering::Relaxed);
                 }
                 if project_source_advances {
-                    streaming.consumed_frames.fetch_add(1, Ordering::Relaxed);
+                    let position_advance = if streaming
+                        .project_source_index
+                        .is_some_and(|_| streaming.project_source_finished.load(Ordering::Acquire))
+                    {
+                        requested_advance.min(project_available_frames)
+                    } else if streaming.project_source_index.is_none()
+                        && streaming.finished.load(Ordering::Acquire)
+                    {
+                        requested_advance.min(max_available_frames)
+                    } else {
+                        requested_advance
+                    };
+                    streaming
+                        .consumed_frames
+                        .fetch_add(position_advance as u64, Ordering::Relaxed);
                 }
                 mixed_frame
             }
         }
         _ => [0.0, 0.0],
     }
+}
+
+fn valid_project_playback_speed(speed_multiplier: f32) -> bool {
+    speed_multiplier.is_finite() && (0.25..=4.0).contains(&speed_multiplier)
 }
 
 struct AudioFrameInputs<'a> {
@@ -3251,6 +3343,34 @@ impl AudioRingBuffer {
         self.read_index
             .store(read.wrapping_add(2), Ordering::Release);
         Some(frame)
+    }
+
+    fn peek_stereo_frame(&self, frame_offset: usize) -> Option<[f32; 2]> {
+        let read = self.read_index.load(Ordering::Relaxed);
+        let write = self.write_index.load(Ordering::Acquire);
+        let frame_offset = u64::try_from(frame_offset).ok()?;
+        let required_samples = frame_offset.checked_add(1)?.checked_mul(2)?;
+        if write.wrapping_sub(read) < required_samples {
+            return None;
+        }
+        let sample_offset = read.wrapping_add(frame_offset.wrapping_mul(2)) as usize;
+        let capacity = self.samples.len();
+        Some([
+            f32::from_bits(self.samples[sample_offset % capacity].load(Ordering::Relaxed)),
+            f32::from_bits(self.samples[(sample_offset + 1) % capacity].load(Ordering::Relaxed)),
+        ])
+    }
+
+    fn advance_stereo_frames(&self, frames: usize) -> usize {
+        let read = self.read_index.load(Ordering::Relaxed);
+        let write = self.write_index.load(Ordering::Acquire);
+        let available_frames = (write.wrapping_sub(read) / 2).min(usize::MAX as u64) as usize;
+        let consumed_frames = frames.min(available_frames);
+        self.read_index.store(
+            read.wrapping_add((consumed_frames as u64).wrapping_mul(2)),
+            Ordering::Release,
+        );
+        consumed_frames
     }
 
     fn available_stereo_frames(&self) -> usize {
@@ -3764,7 +3884,7 @@ mod tests {
         PlaybackState, ProjectPlaybackClock, STREAM_PREFILL_FRAMES, StereoFrameDelay,
         TransportCommand, enable_denormal_protection, next_output_frame,
         output_gain_smoothing_alpha, sanitize_output_sample, smooth_output_gain, tone_sample,
-        validate_settings,
+        valid_project_playback_speed, validate_settings,
     };
 
     #[test]
@@ -4124,6 +4244,63 @@ mod tests {
     }
 
     #[test]
+    fn project_output_resamples_at_fractional_playback_speeds() {
+        assert!(valid_project_playback_speed(0.25));
+        assert!(valid_project_playback_speed(1.0));
+        assert!(valid_project_playback_speed(4.0));
+        assert!(!valid_project_playback_speed(0.249));
+        assert!(!valid_project_playback_speed(4.001));
+        assert!(!valid_project_playback_speed(f32::NAN));
+        assert!(!valid_project_playback_speed(f32::INFINITY));
+
+        let playback = PlaybackState::new();
+        playback.start(vec![0.0, 0.0, 1.0, 1.0, 2.0, 2.0]);
+        playback
+            .playback_speed
+            .store(0.5_f32.to_bits(), Ordering::Release);
+        let source = AtomicU8::new(AUDIO_SOURCE_PROJECT);
+        let ring = AudioRingBuffer::new(2);
+        let mut phase = 0.0;
+        let samples = playback.samples.load();
+        let mut output = Vec::new();
+        for _ in 0..6 {
+            output.push(next_output_frame(
+                &source,
+                &ring,
+                samples.as_deref().map(Vec::as_slice),
+                None,
+                &playback,
+                48_000.0,
+                &mut phase,
+            ));
+        }
+        assert_eq!(
+            output,
+            [
+                [0.0, 0.0],
+                [0.5, 0.5],
+                [1.0, 1.0],
+                [1.5, 1.5],
+                [2.0, 2.0],
+                [2.0, 2.0],
+            ]
+        );
+        assert_eq!(playback.position_frames(), 3);
+        assert_eq!(
+            next_output_frame(
+                &source,
+                &ring,
+                samples.as_deref().map(Vec::as_slice),
+                None,
+                &playback,
+                48_000.0,
+                &mut phase,
+            ),
+            [0.0, 0.0]
+        );
+    }
+
+    #[test]
     fn stereo_ring_keeps_frames_atomic_and_in_order() {
         let ring = AudioRingBuffer::new(4);
         assert!(ring.push_stereo_frame(0.25, -0.5));
@@ -4185,6 +4362,52 @@ mod tests {
             ),
             [0.75, -1.0]
         );
+        assert_eq!(
+            next_output_frame(
+                &source,
+                &ring,
+                None,
+                stream.as_deref(),
+                &playback,
+                48_000.0,
+                &mut phase,
+            ),
+            [0.0, 0.0]
+        );
+        assert!(!playback.is_active());
+    }
+
+    #[test]
+    fn streamed_output_resamples_and_clamps_transport_at_end_of_source() {
+        let playback = PlaybackState::new();
+        let writer = playback.start_streaming(20);
+        playback
+            .playback_speed
+            .store(2.0_f32.to_bits(), Ordering::Release);
+        writer
+            .write_stereo_samples(&[0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0])
+            .unwrap();
+        writer.finish();
+        let source = AtomicU8::new(AUDIO_SOURCE_STREAM);
+        let ring = AudioRingBuffer::new(2);
+        let mut phase = 0.0;
+        let stream = playback.streaming.load();
+
+        for expected in [[0.0, 0.0], [2.0, 2.0], [4.0, 4.0]] {
+            assert_eq!(
+                next_output_frame(
+                    &source,
+                    &ring,
+                    None,
+                    stream.as_deref(),
+                    &playback,
+                    48_000.0,
+                    &mut phase,
+                ),
+                expected
+            );
+        }
+        assert_eq!(playback.position_frames(), 25);
         assert_eq!(
             next_output_frame(
                 &source,

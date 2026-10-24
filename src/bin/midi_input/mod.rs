@@ -274,6 +274,9 @@ fn queue_script_transport_actions(
                 speed_millionths,
                 start,
             },
+            ScriptTransportAction::SetPlaybackSpeed(speed_millionths) => {
+                MidiTransportCommand::SetPlaybackSpeed(speed_millionths)
+            }
             ScriptTransportAction::MarkerJumpJog(increment) => {
                 MidiTransportCommand::MarkerJumpJog(increment)
             }
@@ -307,6 +310,7 @@ pub enum MidiTransportCommand {
     SetSongPositionTicks(u64),
     SetSongPositionTimeUs(u64),
     MoveSongPosition { speed_millionths: i32, start: bool },
+    SetPlaybackSpeed(u32),
     MarkerJumpJog(i32),
     MarkerSelJog(i32),
 }
@@ -838,6 +842,7 @@ pub fn describe_event(event: MidiInputEvent) -> String {
             MidiTransportCommand::MoveSongPosition { .. } => {
                 "MIDI script Song Position Move".to_owned()
             }
+            MidiTransportCommand::SetPlaybackSpeed(_) => "MIDI script Playback Speed".to_owned(),
             MidiTransportCommand::MarkerJumpJog(_) => "MIDI script Marker Jump".to_owned(),
             MidiTransportCommand::MarkerSelJog(_) => "MIDI script Marker Selection".to_owned(),
         },

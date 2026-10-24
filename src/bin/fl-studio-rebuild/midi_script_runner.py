@@ -227,6 +227,21 @@ def _move_song_position(speed, start_stop):
     )
 
 
+def _set_playback_speed(speed_multiplier):
+    try:
+        speed_multiplier = float(speed_multiplier)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("playback speed must be numeric") from error
+    if not math.isfinite(speed_multiplier) or not 0.25 <= speed_multiplier <= 4.0:
+        raise ValueError("playback speed must be between 0.25 and 4.0")
+    _request_transport_action(
+        {
+            "action": "set_playback_speed",
+            "speed_millionths": int(round(speed_multiplier * 1_000_000.0)),
+        }
+    )
+
+
 def _global_transport(command, value, pmeflags=2, flags=15):
     command = int(command)
     value = int(value)
@@ -422,6 +437,7 @@ def _install_modules(script_name, device_name):
     transport.continuousMovePos = lambda speed, startStop: _move_song_position(
         speed, startStop
     )
+    transport.setPlaybackSpeed = _set_playback_speed
     transport.markerJumpJog = lambda value, flags=None: _jog_marker(
         "marker_jump_jog", value, flags
     )

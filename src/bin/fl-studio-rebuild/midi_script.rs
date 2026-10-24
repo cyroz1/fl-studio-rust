@@ -37,6 +37,7 @@ pub enum ScriptTransportAction {
     SetSongPositionTicks(u64),
     SetSongPositionTimeUs(u64),
     MoveSongPosition { speed_millionths: i32, start: bool },
+    SetPlaybackSpeed(u32),
     MarkerJumpJog(i32),
     MarkerSelJog(i32),
 }
@@ -559,6 +560,14 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
             speed_millionths,
             start,
         });
+    }
+    if name == Some("set_playback_speed") {
+        let speed_millionths = action["speed_millionths"]
+            .as_u64()
+            .and_then(|speed| u32::try_from(speed).ok())
+            .filter(|speed| (250_000..=4_000_000).contains(speed))
+            .ok_or_else(|| "MIDI script returned an invalid playback speed".to_owned())?;
+        return Ok(ScriptTransportAction::SetPlaybackSpeed(speed_millionths));
     }
     if name == Some("marker_jump_jog") || name == Some("marker_sel_jog") {
         let increment = action["increment"]
@@ -1233,6 +1242,47 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn python_transport_set_playback_speed_accepts_the_documented_range() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport transport\ndef OnMidiIn(event):\n    transport.setPlaybackSpeed(0.25)\n    transport.setPlaybackSpeed(1.5)\n    transport.setPlaybackSpeed(4.0)\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let mut runtime = MidiScriptRuntime::start_for_device(&script, "Test Input").unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
+
+        assert_eq!(
+            result.actions,
+            [
+                ScriptTransportAction::SetPlaybackSpeed(250_000),
+                ScriptTransportAction::SetPlaybackSpeed(1_500_000),
+                ScriptTransportAction::SetPlaybackSpeed(4_000_000),
+            ]
+        );
+    }
+
+    #[test]
+    fn python_transport_set_playback_speed_rejects_values_outside_the_documented_range() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport transport\ndef OnMidiIn(event):\n    transport.setPlaybackSpeed(0.1)\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let mut runtime = MidiScriptRuntime::start_for_device(&script, "Test Input").unwrap();
+
+        let error = runtime.process_event(12, &[0xB0, 7, 1]).unwrap_err();
+
+        assert!(error.contains("playback speed must be between 0.25 and 4.0"));
     }
 
     #[test]

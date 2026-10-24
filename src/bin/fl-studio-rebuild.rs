@@ -4333,6 +4333,7 @@ struct DawUi {
     playlist_tempo_map: Option<PlaylistTempoMap>,
     midi_script_tempo_map_cache: Option<(u16, u64, Instant, PlaylistTempoMap)>,
     midi_script_transport_move: Option<MidiScriptTransportMove>,
+    midi_script_playback_speed_millionths: u32,
     tempo_bpm: f64,
     selected_pattern: Option<u16>,
     channel_display_filter: ChannelDisplayFilter,
@@ -5715,6 +5716,7 @@ impl DawUi {
             playlist_tempo_map: None,
             midi_script_tempo_map_cache: None,
             midi_script_transport_move: None,
+            midi_script_playback_speed_millionths: 1_000_000,
             tempo_bpm: 140.0,
             selected_pattern: None,
             channel_display_filter: ChannelDisplayFilter::All,
@@ -10804,6 +10806,13 @@ impl DawUi {
             self.status = "Enable an output device in Audio settings before playing".to_owned();
             return;
         }
+        if let Err(error) = Self::apply_midi_script_playback_speed(
+            engine,
+            self.midi_script_playback_speed_millionths,
+        ) {
+            self.status = format!("Could not apply MIDI script playback speed: {error}");
+            return;
+        }
         if self.audio_test_tone {
             engine.set_test_tone(false);
             self.audio_test_tone = false;
@@ -11238,6 +11247,13 @@ impl DawUi {
         };
         if !engine.output_active() {
             self.status = "Enable an output device in Audio settings before playing".to_owned();
+            return;
+        }
+        if let Err(error) = Self::apply_midi_script_playback_speed(
+            engine,
+            self.midi_script_playback_speed_millionths,
+        ) {
+            self.status = format!("Could not apply MIDI script playback speed: {error}");
             return;
         }
         if self.audio_test_tone {
@@ -13132,6 +13148,32 @@ impl DawUi {
         } else {
             "MIDI script moving song position forward".to_owned()
         };
+    }
+
+    fn set_midi_script_playback_speed(&mut self, speed_millionths: u32) {
+        if !(250_000..=4_000_000).contains(&speed_millionths) {
+            self.status = "MIDI script playback speed must be between 0.25 and 4.0".to_owned();
+            return;
+        }
+        self.midi_script_playback_speed_millionths = speed_millionths;
+        if let Some(engine) = self.audio_engine.as_ref()
+            && let Err(error) = Self::apply_midi_script_playback_speed(
+                engine,
+                self.midi_script_playback_speed_millionths,
+            )
+        {
+            self.status = format!("Could not change MIDI script playback speed: {error}");
+            return;
+        }
+        let speed = f64::from(speed_millionths) / 1_000_000.0;
+        self.status = format!("MIDI script playback speed · {speed:.2}×");
+    }
+
+    fn apply_midi_script_playback_speed(
+        engine: &AudioEngine,
+        speed_millionths: u32,
+    ) -> Result<(), String> {
+        engine.set_project_playback_speed(speed_millionths as f32 / 1_000_000.0)
     }
 
     fn advance_midi_script_transport_move(&mut self) {
@@ -34767,6 +34809,13 @@ impl DawUi {
             self.status = "Enable an output device in Audio settings before previewing".to_owned();
             return;
         }
+        if let Err(error) = Self::apply_midi_script_playback_speed(
+            engine,
+            self.midi_script_playback_speed_millionths,
+        ) {
+            self.status = format!("Could not apply MIDI script playback speed: {error}");
+            return;
+        }
         let device_rate = engine.sample_rate();
 
         self.stop_project_playback();
@@ -34900,6 +34949,13 @@ impl DawUi {
         };
         if !engine.output_active() {
             self.status = "Enable an output device in Audio settings before previewing".to_owned();
+            return;
+        }
+        if let Err(error) = Self::apply_midi_script_playback_speed(
+            engine,
+            self.midi_script_playback_speed_millionths,
+        ) {
+            self.status = format!("Could not apply MIDI script playback speed: {error}");
             return;
         }
         let device_rate = engine.sample_rate();
@@ -44892,6 +44948,9 @@ impl DawUi {
                 start,
             } => {
                 self.set_midi_script_transport_move(speed_millionths, start);
+            }
+            MidiTransportCommand::SetPlaybackSpeed(speed_millionths) => {
+                self.set_midi_script_playback_speed(speed_millionths);
             }
             MidiTransportCommand::MarkerJumpJog(increment) => {
                 self.jump_midi_script_marker(increment);
