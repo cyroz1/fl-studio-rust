@@ -5550,6 +5550,53 @@ impl FlpDocument {
         Ok(())
     }
 
+    /// Replaces field 53 in a Mixer effect slot's marker-12 VST3 state event.
+    ///
+    /// The slot must contain exactly one recognized `0xD5` event. Wrapper identity fields and
+    /// every other envelope field remain byte-exact.
+    pub fn replace_vst3_mixer_effect_slot_state_bytes(
+        &mut self,
+        insert_ordinal: usize,
+        slot_index: u16,
+        nested_state: &[u8],
+    ) -> Result<(), FlpError> {
+        let mut candidate = self.clone();
+        let slot = candidate.unique_mixer_effect_slot(insert_ordinal, slot_index)?;
+        let state_events = slot
+            .event_range()
+            .filter(|index| candidate.events[*index].opcode == 0xD5)
+            .collect::<Vec<_>>();
+        let [state_event_index] = state_events.as_slice() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the Mixer effect slot must contain exactly one VST plug-in data event",
+            ));
+        };
+        let Some(metadata) = slot.vst_metadata() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the Mixer effect slot has an unsupported VST plug-in state envelope",
+            ));
+        };
+        if metadata.format_marker() != 12 || metadata.fourcc().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "VST3 state write-back requires a marker-12 VST3 envelope",
+            ));
+        }
+        if metadata.class_uid().is_none() {
+            return Err(FlpError::UnsupportedEdit(
+                "the Mixer effect VST3 state has no valid class UID",
+            ));
+        }
+        let replacement_payload = replace_vst_state_field(
+            &candidate.events[*state_event_index].payload,
+            metadata.state_data_range.as_ref(),
+            nested_state,
+        )?;
+        candidate.events[*state_event_index].replace_data_payload(replacement_payload)?;
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
     /// Returns pattern metadata, note records, and raw controller points.
     pub fn patterns(&self) -> Result<Vec<Pattern>, FlpError> {
         let mut patterns = Vec::<Pattern>::new();
@@ -24779,7 +24826,7 @@ mod tests {
     }
 
     #[test]
-    fn decodes_marker_12_vst3_state_from_a_unique_mixer_effect_state_event() {
+    fn decodes_and_replaces_marker_12_vst3_mixer_effect_state() {
         let mut nested = 1_u32.to_le_bytes().to_vec();
         nested.extend_from_slice(&3_u32.to_le_bytes());
         nested.extend_from_slice(&2_u64.to_le_bytes());
@@ -24789,6 +24836,7 @@ mod tests {
         nested.push(0xB1);
 
         let mut payload = 12_u32.to_le_bytes().to_vec();
+        append_vst_field(&mut payload, 50, &[0x50, 0x51]);
         append_vst_field(
             &mut payload,
             52,
@@ -24798,10 +24846,12 @@ mod tests {
             ],
         );
         append_vst_field(&mut payload, 53, &nested);
+        append_vst_field(&mut payload, 54, b"Mixer echo");
+        append_vst_field(&mut payload, 999, &[0xE1, 0xE2]);
 
         let mut event_stream = Vec::new();
         append_complete_mixer_insert_state(&mut event_stream, -1, 0, 0, "Master", &payload);
-        let document = FlpDocument::parse(&flp_fixture(&event_stream, &[], &[]))
+        let mut document = FlpDocument::parse(&flp_fixture(&event_stream, &[], &[]))
             .expect("the fixture should parse");
         let slot = document
             .mixer_effect_slots()
@@ -24818,6 +24868,74 @@ mod tests {
             Some("324755DF8FDF4788B4CE5B70A8037EC4")
         );
         assert_eq!(slot.vst_state_bytes(), Some(nested.as_slice()));
+
+        let original_payload = document
+            .events()
+            .iter()
+            .find(|event| event.opcode() == 0xD5)
+            .expect("the Mixer slot should have a state event")
+            .payload()
+            .to_vec();
+        let original_range = metadata
+            .state_data_range
+            .clone()
+            .expect("the VST envelope should have field 53");
+        let mut replacement = 1_u32.to_le_bytes().to_vec();
+        replacement.extend_from_slice(&3_u32.to_le_bytes());
+        replacement.extend_from_slice(&3_u64.to_le_bytes());
+        replacement.extend_from_slice(&[0xC1, 0xC2, 0xC3]);
+        replacement.extend_from_slice(&4_u32.to_le_bytes());
+        replacement.extend_from_slice(&2_u64.to_le_bytes());
+        replacement.extend_from_slice(&[0xD1, 0xD2]);
+
+        document
+            .replace_vst3_mixer_effect_slot_state_bytes(0, 0, &replacement)
+            .expect("marker-12 Mixer effect state should be replaceable");
+        let updated_slot = document
+            .mixer_effect_slots()
+            .into_iter()
+            .find(|slot| slot.insert_ordinal() == 0 && slot.slot_index() == 0)
+            .expect("the updated project should retain slot zero");
+        assert_eq!(updated_slot.vst_state_bytes(), Some(replacement.as_slice()));
+        assert_eq!(
+            updated_slot
+                .vst_metadata()
+                .and_then(|metadata| metadata.name()),
+            Some("Mixer echo")
+        );
+        let updated_payload = document
+            .events()
+            .iter()
+            .find(|event| event.opcode() == 0xD5)
+            .expect("the updated Mixer slot should retain its state event")
+            .payload();
+        let updated_range = updated_slot
+            .vst_metadata()
+            .and_then(|metadata| metadata.state_data_range.as_ref())
+            .expect("the updated envelope should retain field 53");
+        let original_field_start = original_range.start - 12;
+        let updated_field_start = updated_range.start - 12;
+        assert_eq!(
+            &updated_payload[..updated_field_start],
+            &original_payload[..original_field_start]
+        );
+        assert_eq!(
+            &updated_payload[updated_range.end..],
+            &original_payload[original_range.end..]
+        );
+        let encoded = document
+            .encode_lossless()
+            .expect("updated project should encode");
+        let reparsed = FlpDocument::parse(&encoded).expect("updated project should reparse");
+        let reparsed_slot = reparsed
+            .mixer_effect_slots()
+            .into_iter()
+            .find(|slot| slot.insert_ordinal() == 0 && slot.slot_index() == 0)
+            .expect("the reparsed project should retain slot zero");
+        assert_eq!(
+            reparsed_slot.vst_state_bytes(),
+            Some(replacement.as_slice())
+        );
     }
 
     #[test]
@@ -24838,7 +24956,7 @@ mod tests {
         event_stream.push(0x93);
         event_stream.extend_from_slice(&(-1_i32).to_le_bytes());
 
-        let document = FlpDocument::parse(&flp_fixture(&event_stream, &[], &[]))
+        let mut document = FlpDocument::parse(&flp_fixture(&event_stream, &[], &[]))
             .expect("the fixture should parse");
         let slot = document
             .mixer_effect_slots()
@@ -24849,6 +24967,20 @@ mod tests {
         assert_eq!(slot.state_event_count(), 2);
         assert_eq!(slot.vst_metadata(), None);
         assert_eq!(slot.vst_state_bytes(), None);
+        let before = document
+            .encode_lossless()
+            .expect("the original project should encode");
+        assert!(
+            document
+                .replace_vst3_mixer_effect_slot_state_bytes(0, 0, &[1, 2, 3])
+                .is_err()
+        );
+        assert_eq!(
+            document
+                .encode_lossless()
+                .expect("rejected edit should leave the project encodable"),
+            before
+        );
     }
 
     #[test]
