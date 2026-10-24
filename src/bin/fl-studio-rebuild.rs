@@ -87,6 +87,8 @@ mod audio_unit_probe;
 mod clap_probe;
 mod midi_input;
 mod midi_output;
+#[path = "fl-studio-rebuild/midi_script.rs"]
+mod midi_script;
 #[path = "fl-studio-rebuild/midi_thru.rs"]
 mod midi_thru;
 
@@ -102,6 +104,7 @@ use midi_output::{
     enumerate_output_devices, midi_patch_setup_messages, pattern_loop_frame_messages,
     pattern_preview_messages, playlist_playback_messages,
 };
+use midi_script::{MidiControllerScript, discover_midi_scripts};
 use midi_thru::{MidiThruSettings, MidiThruWorker};
 
 const APP_BACKGROUND: Color32 = Color32::from_rgb(27, 27, 27);
@@ -4587,6 +4590,9 @@ struct DawUi {
     audio_record_stop_requested: bool,
     midi_input_devices: Vec<MidiInputDevice>,
     midi_selected_input_id: Option<String>,
+    midi_controller_scripts: Vec<MidiControllerScript>,
+    midi_selected_controller_script: Option<PathBuf>,
+    midi_script_discovery_error: Option<String>,
     midi_connect_input_on_startup: bool,
     midi_input_error: Option<String>,
     midi_input_connection: Option<ConnectedMidiInput>,
@@ -5571,12 +5577,24 @@ impl DawUi {
             Ok(devices) => (devices, None),
             Err(error) => (Vec::new(), Some(error)),
         };
+        let (midi_controller_scripts, midi_script_discovery_error) =
+            match user_data_directory().map(|root| root.join("Settings").join("Hardware")) {
+                Some(root) => match discover_midi_scripts(&root) {
+                    Ok(scripts) => (scripts, None),
+                    Err(error) => (Vec::new(), Some(error)),
+                },
+                None => (
+                    Vec::new(),
+                    Some("the user data folder is not available".to_owned()),
+                ),
+            };
         let (midi_output_devices, midi_output_error) = match enumerate_output_devices() {
             Ok(devices) => (devices, None),
             Err(error) => (Vec::new(), Some(error)),
         };
         let MidiDeviceSelections {
             input_id: midi_selected_input_id,
+            input_script: midi_selected_controller_script,
             connect_input_on_startup: midi_connect_input_on_startup,
             output_id: midi_selected_output_id,
             connect_output_on_startup: midi_connect_output_on_startup,
@@ -5949,6 +5967,9 @@ impl DawUi {
             audio_record_stop_requested: false,
             midi_input_devices,
             midi_selected_input_id,
+            midi_controller_scripts,
+            midi_selected_controller_script,
+            midi_script_discovery_error,
             midi_connect_input_on_startup,
             midi_input_error,
             midi_input_connection: None,
@@ -15060,7 +15081,7 @@ impl DawUi {
             .browser_selected
             .as_ref()
             .filter(|path| browser_file_kind(path) == Some(BrowserFileKind::Audio))
-            .cloned();
+            .map(|path| path.to_path_buf());
         let path = self
             .browser_preview_pending
             .as_ref()
@@ -42962,9 +42983,31 @@ impl DawUi {
         }
     }
 
+    fn refresh_midi_controller_scripts(&mut self) {
+        let Some(root) = user_data_directory().map(|root| root.join("Settings").join("Hardware"))
+        else {
+            self.midi_controller_scripts.clear();
+            self.midi_script_discovery_error =
+                Some("the user data folder is not available".to_owned());
+            return;
+        };
+        match discover_midi_scripts(&root) {
+            Ok(scripts) => {
+                self.midi_controller_scripts = scripts;
+                self.midi_script_discovery_error = None;
+                self.status = format!(
+                    "Found {} MIDI controller script(s)",
+                    self.midi_controller_scripts.len()
+                );
+            }
+            Err(error) => self.midi_script_discovery_error = Some(error),
+        }
+    }
+
     fn persist_midi_device_selections(&mut self) {
         let selections = MidiDeviceSelections {
             input_id: self.midi_selected_input_id.clone(),
+            input_script: self.midi_selected_controller_script.clone(),
             connect_input_on_startup: self.midi_connect_input_on_startup,
             output_id: self.midi_selected_output_id.clone(),
             connect_output_on_startup: self.midi_connect_output_on_startup,
@@ -43013,6 +43056,21 @@ impl DawUi {
                 "The selected MIDI input is no longer available; refresh devices".to_owned();
             return;
         };
+        let selected_script = self
+            .midi_selected_controller_script
+            .as_ref()
+            .and_then(|path| {
+                self.midi_controller_scripts
+                    .iter()
+                    .find(|script| &script.path == path)
+            })
+            .cloned();
+        if self.midi_selected_controller_script.is_some() && selected_script.is_none() {
+            let error = "The selected MIDI controller script is unavailable; refresh scripts";
+            self.midi_input_error = Some(error.to_owned());
+            self.status = error.to_owned();
+            return;
+        }
         self.midi_output_gain_learning = false;
         self.midi_mixer_control_learning = None;
         self.midi_play_pause_learning = false;
@@ -43032,12 +43090,17 @@ impl DawUi {
             self.midi_message_sender.clone(),
             self.midi_thru_input_queue.clone(),
             Arc::clone(&self.midi_dropped_messages),
+            selected_script.as_ref(),
         ) {
             Ok(connection) => {
+                let script_name = connection.script_name.clone();
                 self.midi_input_connection = Some(connection);
                 self.midi_selected_input_id = Some(device_id);
                 self.midi_input_error = None;
-                self.status = format!("Connected MIDI input: {}", device.name);
+                self.status = script_name.map_or_else(
+                    || format!("Connected MIDI input: {}", device.name),
+                    |script| format!("Connected MIDI input: {} ({script})", device.name),
+                );
             }
             Err(error) => {
                 self.midi_input_error = Some(error.clone());
@@ -47125,6 +47188,14 @@ impl DawUi {
 
     fn poll_midi_input(&mut self, history_snapshot_available: bool) {
         self.update_midi_thru_settings();
+        if let Some(error) = self
+            .midi_input_connection
+            .as_ref()
+            .and_then(ConnectedMidiInput::take_script_error)
+        {
+            self.midi_input_error = Some(error.clone());
+            self.status = format!("MIDI controller script stopped: {error}");
+        }
         for error in self.midi_thru_worker.take_errors() {
             self.midi_input_thru_output = false;
             self.midi_output_error = Some(error.clone());
@@ -47645,6 +47716,71 @@ impl DawUi {
                 self.midi_input_toggle_requested = true;
             }
         });
+        ui.horizontal(|ui| {
+            ui.label("Controller script");
+            let selected_name = self
+                .midi_selected_controller_script
+                .as_ref()
+                .and_then(|path| {
+                    self.midi_controller_scripts
+                        .iter()
+                        .find(|script| &script.path == path)
+                })
+                .map(|script| script.name.as_str())
+                .unwrap_or_else(|| {
+                    if self.midi_selected_controller_script.is_some() {
+                        "Saved script unavailable"
+                    } else {
+                        "Generic MIDI"
+                    }
+                });
+            let mut script_selection_changed = false;
+            egui::ComboBox::from_id_salt("midi_controller_script")
+                .selected_text(selected_name)
+                .width(280.0)
+                .show_ui(ui, |ui| {
+                    script_selection_changed |= ui
+                        .selectable_value(
+                            &mut self.midi_selected_controller_script,
+                            None,
+                            "Generic MIDI",
+                        )
+                        .changed();
+                    for script in &self.midi_controller_scripts {
+                        script_selection_changed |= ui
+                            .selectable_value(
+                                &mut self.midi_selected_controller_script,
+                                Some(script.path.clone()),
+                                &script.name,
+                            )
+                            .changed();
+                    }
+                });
+            if ui.button("Refresh scripts").clicked() {
+                self.refresh_midi_controller_scripts();
+            }
+            if script_selection_changed {
+                self.persist_midi_device_selections();
+                if self.midi_input_connection.is_some() {
+                    self.connect_selected_midi_input();
+                }
+            }
+        });
+        if let Some(script) = self
+            .midi_selected_controller_script
+            .as_ref()
+            .and_then(|path| {
+                self.midi_controller_scripts
+                    .iter()
+                    .find(|script| &script.path == path)
+            })
+            && !script.supported_devices.is_empty()
+        {
+            ui.small(format!("Supports: {}", script.supported_devices.join(", ")));
+        }
+        if let Some(error) = &self.midi_script_discovery_error {
+            ui.colored_label(egui::Color32::LIGHT_RED, error);
+        }
         if ui
             .checkbox(
                 &mut self.midi_connect_input_on_startup,
@@ -54778,6 +54914,7 @@ fn recording_input_targets(
 #[derive(Debug, Eq, PartialEq)]
 struct MidiDeviceSelections {
     input_id: Option<String>,
+    input_script: Option<PathBuf>,
     connect_input_on_startup: bool,
     output_id: Option<String>,
     connect_output_on_startup: bool,
@@ -54802,6 +54939,7 @@ impl Default for MidiDeviceSelections {
     fn default() -> Self {
         Self {
             input_id: None,
+            input_script: None,
             connect_input_on_startup: false,
             output_id: None,
             connect_output_on_startup: false,
@@ -54897,8 +55035,12 @@ fn parse_midi_thru_preferences(contents: &str) -> (bool, Option<u8>) {
 
 fn encode_midi_device_selections(selections: &MidiDeviceSelections) -> String {
     format!(
-        "input={}\nconnect_input_on_startup={}\noutput={}\nconnect_output_on_startup={}\noutput_routes={}\nbank_msb={}\nbank_lsb={}\nprograms={}\nclock={}\nplaylist_notes={}\npattern_notes={}\nfixed_velocity={}\nperformance_channel={}\nrecord_audio={}\nrecord_notes={}\nrecord_automation={}\nrecord_automation_controller={}\nrecord_automation_channel={}\nrecord_automation_flags={}\n",
+        "input={}\ninput_script={}\nconnect_input_on_startup={}\noutput={}\nconnect_output_on_startup={}\noutput_routes={}\nbank_msb={}\nbank_lsb={}\nprograms={}\nclock={}\nplaylist_notes={}\npattern_notes={}\nfixed_velocity={}\nperformance_channel={}\nrecord_audio={}\nrecord_notes={}\nrecord_automation={}\nrecord_automation_controller={}\nrecord_automation_channel={}\nrecord_automation_flags={}\n",
         encode_midi_device_id(selections.input_id.as_deref().unwrap_or_default()),
+        selections.input_script.as_ref().map_or_else(
+            || "-".to_owned(),
+            |path| encode_midi_device_id(&path.to_string_lossy()),
+        ),
         u8::from(selections.connect_input_on_startup),
         encode_midi_device_id(selections.output_id.as_deref().unwrap_or_default()),
         u8::from(selections.connect_output_on_startup),
@@ -54925,6 +55067,11 @@ fn parse_midi_device_selections(contents: &str) -> MidiDeviceSelections {
     for line in contents.lines() {
         if let Some(encoded_id) = line.strip_prefix("input=") {
             selections.input_id = decode_midi_device_id(encoded_id);
+        } else if let Some(encoded_path) = line.strip_prefix("input_script=") {
+            selections.input_script = match encoded_path {
+                "-" => None,
+                _ => decode_midi_device_id(encoded_path).map(PathBuf::from),
+            };
         } else if let Some(enabled) = line.strip_prefix("connect_input_on_startup=") {
             selections.connect_input_on_startup = enabled == "1";
         } else if let Some(encoded_id) = line.strip_prefix("output=") {
@@ -61510,6 +61657,7 @@ mod tests {
         programs[15] = Some(127);
         let selections = MidiDeviceSelections {
             input_id: Some(input_id.to_owned()),
+            input_script: Some(PathBuf::from("Scripts/Controller/device_test.py")),
             connect_input_on_startup: true,
             output_id: Some(output_id.to_owned()),
             connect_output_on_startup: true,

@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{SyncSender, TrySendError};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use flp_rebuild::PatternNote;
@@ -13,6 +14,7 @@ use flp_rebuild::midi::{
 };
 use midir::{Ignore, MidiInput, MidiInputConnection as MidirInputConnection};
 
+use super::midi_script::{MidiControllerScript, MidiScriptRuntime, MidiScriptStopHandle};
 use flp_rebuild::sample_render::PlaylistTempoMap;
 
 pub const MIDI_INPUT_QUEUE_CAPACITY: usize = 4_096;
@@ -31,6 +33,164 @@ pub struct ConnectedMidiInput {
     _connection: MidirInputConnection<()>,
     pub device_id: String,
     pub device_name: String,
+    pub script_name: Option<String>,
+    script_worker: Option<MidiInputScriptWorker>,
+}
+
+struct ScriptInputMessage {
+    timestamp_micros: u64,
+    received_at: Instant,
+    bytes: Vec<u8>,
+}
+
+enum MidiInputScriptMessage {
+    Input(ScriptInputMessage),
+    Stop,
+}
+
+struct MidiInputScriptWorker {
+    sender: SyncSender<MidiInputScriptMessage>,
+    errors: Receiver<String>,
+    finished: Receiver<()>,
+    join: Option<JoinHandle<()>>,
+    stop_requested: Arc<AtomicBool>,
+    stop_handle: MidiScriptStopHandle,
+}
+
+impl MidiInputScriptWorker {
+    fn start(
+        script: &MidiControllerScript,
+        output_sender: SyncSender<ReceivedMidiMessage>,
+        thru_queue: MidiThruInputQueue,
+        dropped_messages: Arc<AtomicU64>,
+    ) -> Result<Self, String> {
+        let runtime = MidiScriptRuntime::start(script)?;
+        let stop_handle = runtime.stop_handle();
+        let (sender, input_receiver) = mpsc::sync_channel(MIDI_INPUT_QUEUE_CAPACITY);
+        let (error_sender, errors) = mpsc::sync_channel(16);
+        let (finished_sender, finished) = mpsc::sync_channel(1);
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let worker_stop_requested = Arc::clone(&stop_requested);
+        let join = thread::Builder::new()
+            .name("midi-script-input".to_owned())
+            .spawn(move || {
+                let mut runtime = Some(runtime);
+                while !worker_stop_requested.load(Ordering::Acquire) {
+                    let message = match input_receiver.recv_timeout(Duration::from_millis(50)) {
+                        Ok(message) => message,
+                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    };
+                    match message {
+                        MidiInputScriptMessage::Stop => break,
+                        MidiInputScriptMessage::Input(message) => {
+                            let transformed = runtime.as_mut().map(|runtime| {
+                                runtime.process_event(message.timestamp_micros, &message.bytes)
+                            });
+                            match transformed {
+                                Some(Ok(result)) if result.handled => continue,
+                                Some(Ok(result)) => forward_scripted_input(
+                                    &output_sender,
+                                    &thru_queue,
+                                    &dropped_messages,
+                                    message.timestamp_micros,
+                                    message.received_at,
+                                    &result.bytes,
+                                ),
+                                Some(Err(error)) => {
+                                    let _ = error_sender.try_send(error);
+                                    if let Some(runtime) = runtime.take() {
+                                        runtime.kill();
+                                    }
+                                    forward_scripted_input(
+                                        &output_sender,
+                                        &thru_queue,
+                                        &dropped_messages,
+                                        message.timestamp_micros,
+                                        message.received_at,
+                                        &message.bytes,
+                                    );
+                                }
+                                None => forward_scripted_input(
+                                    &output_sender,
+                                    &thru_queue,
+                                    &dropped_messages,
+                                    message.timestamp_micros,
+                                    message.received_at,
+                                    &message.bytes,
+                                ),
+                            }
+                        }
+                    }
+                }
+                if let Some(mut runtime) = runtime {
+                    runtime.shutdown();
+                }
+                let _ = finished_sender.try_send(());
+            })
+            .map_err(|error| format!("could not start MIDI script worker: {error}"))?;
+        Ok(Self {
+            sender,
+            errors,
+            finished,
+            join: Some(join),
+            stop_requested,
+            stop_handle,
+        })
+    }
+
+    fn take_error(&self) -> Option<String> {
+        self.errors.try_recv().ok()
+    }
+}
+
+impl Drop for MidiInputScriptWorker {
+    fn drop(&mut self) {
+        let _ = self.sender.try_send(MidiInputScriptMessage::Stop);
+        if self
+            .finished
+            .recv_timeout(Duration::from_millis(250))
+            .is_err()
+        {
+            self.stop_requested.store(true, Ordering::Release);
+            self.stop_handle.kill();
+        }
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+impl ConnectedMidiInput {
+    pub fn take_script_error(&self) -> Option<String> {
+        self.script_worker.as_ref()?.take_error()
+    }
+}
+
+fn forward_scripted_input(
+    sender: &SyncSender<ReceivedMidiMessage>,
+    thru_queue: &MidiThruInputQueue,
+    dropped_messages: &AtomicU64,
+    timestamp_micros: u64,
+    received_at: Instant,
+    bytes: &[u8],
+) {
+    let event = parse_midi_message(bytes);
+    if let Some(event) = event {
+        let message = ReceivedMidiMessage {
+            timestamp_micros,
+            received_at,
+            event,
+        };
+        if let Err(TrySendError::Full(_)) = sender.try_send(message) {
+            dropped_messages.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    if bytes.first() == Some(&0xF0) {
+        thru_queue.try_send_system_exclusive(bytes);
+    } else if let Some(event) = event {
+        thru_queue.try_send(event);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -339,6 +499,7 @@ pub fn connect_input_device(
     sender: SyncSender<ReceivedMidiMessage>,
     thru_queue: MidiThruInputQueue,
     dropped_messages: Arc<AtomicU64>,
+    script: Option<&MidiControllerScript>,
 ) -> Result<ConnectedMidiInput, String> {
     let mut input = MidiInput::new("FL Studio Rebuild MIDI Input")
         .map_err(|error| format!("could not initialize MIDI input: {error}"))?;
@@ -351,27 +512,48 @@ pub fn connect_input_device(
     let device_name = input
         .port_name(&port)
         .map_err(|error| format!("could not read MIDI input name: {error}"))?;
+    let script_worker = script
+        .map(|script| {
+            MidiInputScriptWorker::start(
+                script,
+                sender.clone(),
+                thru_queue.clone(),
+                Arc::clone(&dropped_messages),
+            )
+        })
+        .transpose()?;
+    let script_sender = script_worker.as_ref().map(|worker| worker.sender.clone());
     let connection = input
         .connect(
             &port,
             "FL Studio Rebuild MIDI Input",
             move |timestamp_micros, bytes, _| {
-                let event = parse_midi_message(bytes);
-                if let Some(event) = event {
-                    let message = ReceivedMidiMessage {
+                let received_at = Instant::now();
+                if let Some(script_sender) = &script_sender
+                    && bytes.len() <= 65_536
+                {
+                    let message = MidiInputScriptMessage::Input(ScriptInputMessage {
                         timestamp_micros,
-                        received_at: Instant::now(),
-                        event,
-                    };
-                    if let Err(TrySendError::Full(_)) = sender.try_send(message) {
-                        dropped_messages.fetch_add(1, Ordering::Relaxed);
+                        received_at,
+                        bytes: bytes.to_vec(),
+                    });
+                    match script_sender.try_send(message) {
+                        Ok(()) => return,
+                        Err(TrySendError::Full(_)) => {
+                            dropped_messages.fetch_add(1, Ordering::Relaxed);
+                            return;
+                        }
+                        Err(TrySendError::Disconnected(_)) => {}
                     }
                 }
-                if bytes.first() == Some(&0xF0) {
-                    thru_queue.try_send_system_exclusive(bytes);
-                } else if let Some(event) = event {
-                    thru_queue.try_send(event);
-                }
+                forward_scripted_input(
+                    &sender,
+                    &thru_queue,
+                    &dropped_messages,
+                    timestamp_micros,
+                    received_at,
+                    bytes,
+                );
             },
             (),
         )
@@ -380,6 +562,8 @@ pub fn connect_input_device(
         _connection: connection,
         device_id: device_id.to_owned(),
         device_name,
+        script_name: script.map(|script| script.name.clone()),
+        script_worker,
     })
 }
 
