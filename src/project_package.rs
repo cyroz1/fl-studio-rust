@@ -1,12 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use zip::write::SimpleFileOptions;
+use zip::write::{FullFileOptions, SimpleFileOptions};
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::FlpDocument;
@@ -90,6 +90,22 @@ struct WorkspaceInner {
     root: PathBuf,
     project_relative_path: PathBuf,
     sample_project_path: PathBuf,
+    archive_comment: Option<Vec<u8>>,
+    entry_metadata: HashMap<PathBuf, PackageEntryMetadata>,
+}
+
+#[derive(Clone)]
+struct PackageEntryMetadata {
+    options: SimpleFileOptions,
+    comment: String,
+}
+
+impl PackageEntryMetadata {
+    fn full_options(&self) -> FullFileOptions<'static> {
+        self.options
+            .into_full_options()
+            .with_file_comment(self.comment.clone())
+    }
 }
 
 struct WorkspaceDirectory(Option<PathBuf>);
@@ -136,6 +152,7 @@ impl ProjectPackageWorkspace {
     /// Opens a standard ZIP package, extracts its files, and reads the first FLP.
     /// Root-level projects are preferred when an archive contains more than one.
     pub fn open(path: impl AsRef<Path>) -> Result<(Self, Vec<u8>), String> {
+        let archive_comment = read_archive_comment(path.as_ref())?;
         let source = File::open(path.as_ref())
             .map_err(|error| format!("could not open {}: {error}", path.as_ref().display()))?;
         let mut archive = ZipArchive::new(source)
@@ -144,6 +161,7 @@ impl ProjectPackageWorkspace {
         let root = workspace_directory.path();
         let mut project_files = Vec::new();
         let mut extracted_files = HashSet::new();
+        let mut entry_metadata = HashMap::new();
 
         for index in 0..archive.len() {
             let mut entry = archive
@@ -158,6 +176,14 @@ impl ProjectPackageWorkspace {
                 return Err(format!("ZIP project contains an unsafe path {raw_name:?}"));
             }
             let target = root.join(&relative_path);
+            let mut options = entry.options();
+            if entry.is_dir() {
+                options = options.unix_permissions(entry.unix_mode().unwrap_or(0o755) | 0o040000);
+            }
+            let metadata = PackageEntryMetadata {
+                options,
+                comment: entry.comment().to_owned(),
+            };
 
             if entry.is_dir() {
                 fs::create_dir_all(&target).map_err(|error| {
@@ -166,6 +192,7 @@ impl ProjectPackageWorkspace {
                         target.display()
                     )
                 })?;
+                entry_metadata.insert(relative_path, metadata);
                 continue;
             }
 
@@ -200,6 +227,7 @@ impl ProjectPackageWorkspace {
                     target.display()
                 )
             })?;
+            entry_metadata.insert(relative_path.clone(), metadata);
 
             if relative_path
                 .extension()
@@ -233,6 +261,8 @@ impl ProjectPackageWorkspace {
                 root,
                 project_relative_path,
                 sample_project_path: project_path,
+                archive_comment,
+                entry_metadata,
             })),
             project_bytes,
         ))
@@ -268,6 +298,8 @@ impl ProjectPackageWorkspace {
             root,
             project_relative_path: name,
             sample_project_path: sample_project_path.as_ref().to_path_buf(),
+            archive_comment: None,
+            entry_metadata: HashMap::new(),
         })))
     }
 
@@ -458,9 +490,23 @@ impl ProjectPackageWorkspace {
         }
 
         let mut archive = ZipWriter::new(file);
-        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        if let Some(comment) = &self.0.archive_comment {
+            archive
+                .set_raw_comment(comment.clone().into_boxed_slice())
+                .map_err(|error| format!("could not preserve ZIP archive comment: {error}"))?;
+        }
         for entry in entries {
             let name = archive_name(&entry.relative);
+            let options = self
+                .0
+                .entry_metadata
+                .get(&entry.relative)
+                .map(PackageEntryMetadata::full_options)
+                .unwrap_or_else(|| {
+                    SimpleFileOptions::default()
+                        .compression_method(CompressionMethod::Deflated)
+                        .into_full_options()
+                });
             if entry.is_directory {
                 archive
                     .add_directory(format!("{name}/"), options)
@@ -490,6 +536,39 @@ impl ProjectPackageWorkspace {
         file.sync_all()
             .map_err(|error| format!("could not flush ZIP project: {error}"))
     }
+}
+
+fn read_archive_comment(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    const END_OF_CENTRAL_DIRECTORY: &[u8; 4] = b"PK\x05\x06";
+    const END_RECORD_LENGTH: usize = 22;
+    const MAX_COMMENT_LENGTH: usize = u16::MAX as usize;
+    let mut file = File::open(path)
+        .map_err(|error| format!("could not inspect ZIP project {}: {error}", path.display()))?;
+    let file_length = file
+        .metadata()
+        .map_err(|error| format!("could not inspect ZIP project {}: {error}", path.display()))?
+        .len();
+    let tail_length = file_length.min((END_RECORD_LENGTH + MAX_COMMENT_LENGTH) as u64) as usize;
+    if tail_length < END_RECORD_LENGTH {
+        return Ok(None);
+    }
+    file.seek(io::SeekFrom::End(-(tail_length as i64)))
+        .map_err(|error| format!("could not inspect ZIP project {}: {error}", path.display()))?;
+    let mut tail = Vec::with_capacity(tail_length);
+    file.read_to_end(&mut tail)
+        .map_err(|error| format!("could not inspect ZIP project {}: {error}", path.display()))?;
+
+    for offset in (0..=tail.len() - END_RECORD_LENGTH).rev() {
+        if &tail[offset..offset + END_OF_CENTRAL_DIRECTORY.len()] != END_OF_CENTRAL_DIRECTORY {
+            continue;
+        }
+        let comment_length = u16::from_le_bytes([tail[offset + 20], tail[offset + 21]]) as usize;
+        let comment_start = offset + END_RECORD_LENGTH;
+        if comment_start + comment_length == tail.len() {
+            return Ok(Some(tail[comment_start..].to_vec()));
+        }
+    }
+    Ok(None)
 }
 
 struct WorkspaceEntry {
@@ -685,12 +764,15 @@ fn replace_file(temporary: &Path, target: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::ProjectPackageWorkspace;
+    use super::{ProjectPackageWorkspace, read_archive_comment};
     use crate::FlpDocument;
     use crate::media::SamplePathResolver;
     use std::fs;
+    use std::io::{Read, Write};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::Ordering;
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, DateTime, ZipArchive, ZipWriter};
 
     struct TestDirectory(PathBuf);
 
@@ -838,5 +920,69 @@ mod tests {
             .unwrap();
         assert_eq!(fs::read(resolved).unwrap(), b"package sample data");
         assert!(copied_path.is_file());
+    }
+
+    #[test]
+    fn preserves_zip_comments_compression_timestamps_and_permissions() {
+        let temporary = TestDirectory::new();
+        let source_path = temporary.path().join("source.zip");
+        let output_path = temporary.path().join("saved.zip");
+        let timestamp = DateTime::from_date_and_time(2020, 2, 3, 4, 5, 6).unwrap();
+        let archive_comment = vec![0x80, b'p', b'a', b'c', b'k', b'a', b'g', b'e'];
+
+        let mut source = ZipWriter::new(fs::File::create(&source_path).unwrap());
+        let project_options = SimpleFileOptions::default()
+            .compression_method(CompressionMethod::Stored)
+            .last_modified_time(timestamp)
+            .unix_permissions(0o640)
+            .into_full_options()
+            .with_file_comment("project note");
+        source.start_file("song.flp", project_options).unwrap();
+        source.write_all(b"original project").unwrap();
+
+        let extra_options = SimpleFileOptions::default()
+            .compression_method(CompressionMethod::Deflated)
+            .last_modified_time(timestamp)
+            .unix_permissions(0o600)
+            .into_full_options()
+            .with_file_comment("keep this comment");
+        source
+            .start_file("extras/notes.txt", extra_options)
+            .unwrap();
+        source.write_all(b"supporting file").unwrap();
+        source
+            .set_raw_comment(archive_comment.clone().into_boxed_slice())
+            .unwrap();
+        source.finish().unwrap().sync_all().unwrap();
+
+        let (workspace, original_project) = ProjectPackageWorkspace::open(&source_path).unwrap();
+        assert_eq!(original_project, b"original project");
+        workspace
+            .write_to(&output_path, b"updated project")
+            .unwrap();
+
+        assert_eq!(
+            read_archive_comment(&output_path).unwrap().as_deref(),
+            Some(archive_comment.as_slice())
+        );
+        let mut saved = ZipArchive::new(fs::File::open(&output_path).unwrap()).unwrap();
+        let mut project = saved.by_name("song.flp").unwrap();
+        assert_eq!(project.compression(), CompressionMethod::Stored);
+        assert_eq!(project.last_modified(), Some(timestamp));
+        assert_eq!(project.unix_mode().unwrap() & 0o777, 0o640);
+        assert_eq!(project.comment(), "project note");
+        let mut project_bytes = Vec::new();
+        project.read_to_end(&mut project_bytes).unwrap();
+        assert_eq!(project_bytes, b"updated project");
+        drop(project);
+
+        let mut extra = saved.by_name("extras/notes.txt").unwrap();
+        assert_eq!(extra.compression(), CompressionMethod::Deflated);
+        assert_eq!(extra.last_modified(), Some(timestamp));
+        assert_eq!(extra.unix_mode().unwrap() & 0o777, 0o600);
+        assert_eq!(extra.comment(), "keep this comment");
+        let mut extra_bytes = Vec::new();
+        extra.read_to_end(&mut extra_bytes).unwrap();
+        assert_eq!(extra_bytes, b"supporting file");
     }
 }
