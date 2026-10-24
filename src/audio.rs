@@ -1589,7 +1589,7 @@ pub struct StreamingAudioWriter {
     is_project_source: bool,
 }
 
-/// A newly rendered Playlist stream waiting to replace the current stream at an audio callback
+/// A newly rendered project stream waiting to replace the current stream at an audio callback
 /// boundary. The host may keep the current stream audible while this stream prepares its buffer.
 #[derive(Clone)]
 pub struct StagedStreamingPlayback {
@@ -2523,7 +2523,7 @@ impl AudioEngine {
         Ok(writer)
     }
 
-    /// Prepare a replacement Playlist stream without disturbing the currently audible stream.
+    /// Prepare a replacement project stream without disturbing the currently audible stream.
     ///
     /// The caller should stop and join the old render producer before staging a replacement that
     /// uses the same plug-in instances. Once the replacement has buffered enough audio, request a

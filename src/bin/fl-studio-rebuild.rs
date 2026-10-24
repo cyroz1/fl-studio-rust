@@ -4851,11 +4851,11 @@ struct PendingAudioRender {
     worker: thread::JoinHandle<()>,
     live_midi_senders: BTreeMap<u16, Vst3PlaylistLiveInputSender>,
     staged_streaming: Option<StagedStreamingPlayback>,
-    staged_handoff_reason: Option<PlaylistStreamHandoffReason>,
+    staged_handoff_reason: Option<PdcStreamHandoffReason>,
 }
 
 #[derive(Clone, Copy)]
-enum PlaylistStreamHandoffReason {
+enum PdcStreamHandoffReason {
     Vst3LatencyChange,
     AutomaticPdcChange { enabled: bool },
 }
@@ -4948,6 +4948,8 @@ struct PendingSamplerStream {
     cancelled: Arc<AtomicBool>,
     worker: thread::JoinHandle<()>,
     live_midi_senders: BTreeMap<u16, Vst3PlaylistLiveInputSender>,
+    staged_streaming: Option<StagedStreamingPlayback>,
+    staged_handoff_reason: Option<PdcStreamHandoffReason>,
 }
 
 struct LiveSamplerInputSession {
@@ -11085,18 +11087,14 @@ impl DawUi {
         self.start_project_playback_with_start_frame(None, None);
     }
 
-    fn start_project_playback_handoff(
-        &mut self,
-        start_frame: u64,
-        reason: PlaylistStreamHandoffReason,
-    ) {
+    fn start_project_playback_handoff(&mut self, start_frame: u64, reason: PdcStreamHandoffReason) {
         self.start_project_playback_with_start_frame(Some(start_frame), Some(reason));
     }
 
     fn start_project_playback_with_start_frame(
         &mut self,
         staged_start_frame: Option<u64>,
-        staged_handoff_reason: Option<PlaylistStreamHandoffReason>,
+        staged_handoff_reason: Option<PdcStreamHandoffReason>,
     ) {
         self.midi_script_transport_move = None;
         if self.pending_song_render.is_some() {
@@ -11351,7 +11349,7 @@ impl DawUi {
         }
     }
 
-    fn stage_playlist_stream_rebuild(&mut self, reason: PlaylistStreamHandoffReason) -> bool {
+    fn stage_playlist_stream_rebuild(&mut self, reason: PdcStreamHandoffReason) -> bool {
         let Some(engine) = self.audio_engine.as_ref() else {
             return false;
         };
@@ -11387,6 +11385,67 @@ impl DawUi {
         };
         self.start_project_playback_handoff(start_frame, reason);
         self.pending_audio_render
+            .as_ref()
+            .is_some_and(|pending| pending.staged_streaming.is_some())
+    }
+
+    fn stage_pattern_stream_rebuild(&mut self, reason: PdcStreamHandoffReason) -> bool {
+        if !self.playing || !self.pattern_playback_mode || self.performance_mode_active {
+            return false;
+        }
+        let Some(engine) = self.audio_engine.as_ref() else {
+            return false;
+        };
+        let Some((pattern_id, loop_length_ticks)) = self.pattern_mode_playback_source else {
+            return false;
+        };
+        if self.selected_pattern != Some(pattern_id) {
+            return false;
+        }
+        let Some(pending) = self.pending_sampler_stream.take() else {
+            return false;
+        };
+        if let Some(staged) = pending.staged_streaming.as_ref()
+            && !staged.is_committed()
+        {
+            let _ = engine.cancel_staged_streaming_handoff(staged);
+        }
+        pending.cancelled.store(true, Ordering::Release);
+        if pending.worker.join().is_err() {
+            self.status = "Pattern audio worker panicked during a PDC change".to_owned();
+            return false;
+        }
+        if let Some(host) = self.vst3_host.as_mut() {
+            match host.service_editors() {
+                Ok(changes) if changes.io_changed => return false,
+                Ok(_) => {}
+                Err(error) => {
+                    self.status = format!("Could not refresh VST3 latency reports: {error}");
+                    return false;
+                }
+            }
+        }
+        let Some(document) = self.document.as_ref() else {
+            return false;
+        };
+        let start_frame = engine.project_playback_position_frames();
+        let Some(loop_start_tick) = pattern_loop_handoff_tick_at_frame(
+            start_frame,
+            engine.sample_rate(),
+            document.header().ppq(),
+            document.metadata().tempo_bpm().unwrap_or(140.0),
+            loop_length_ticks,
+        ) else {
+            return false;
+        };
+        self.pattern_seek_tick = loop_start_tick;
+        self.stream_selected_sampler_pattern_handoff(
+            loop_length_ticks,
+            loop_start_tick,
+            start_frame,
+            reason,
+        );
+        self.pending_sampler_stream
             .as_ref()
             .is_some_and(|pending| pending.staged_streaming.is_some())
     }
@@ -11861,11 +11920,11 @@ impl DawUi {
                 .map(|tick| tick.round() as u64);
             let tick_suffix = tick.map_or_else(String::new, |tick| format!(" at tick {tick}"));
             self.status = match staged_handoff_reason {
-                Some(PlaylistStreamHandoffReason::AutomaticPdcChange { enabled }) => format!(
+                Some(PdcStreamHandoffReason::AutomaticPdcChange { enabled }) => format!(
                     "Automatic PDC set to {}; applied through a live PDC handoff{tick_suffix}",
                     u8::from(enabled)
                 ),
-                Some(PlaylistStreamHandoffReason::Vst3LatencyChange) | None => {
+                Some(PdcStreamHandoffReason::Vst3LatencyChange) | None => {
                     format!("VST3 latency update applied through a live PDC handoff{tick_suffix}")
                 }
             };
@@ -11950,6 +12009,36 @@ impl DawUi {
     }
 
     fn poll_sampler_stream(&mut self) {
+        let staged_handoff_committed = self
+            .pending_sampler_stream
+            .as_ref()
+            .and_then(|stream| stream.staged_streaming.as_ref())
+            .is_some_and(StagedStreamingPlayback::is_committed);
+        let staged_handoff_reason = if staged_handoff_committed {
+            self.pending_sampler_stream.as_mut().and_then(|stream| {
+                stream.staged_streaming = None;
+                stream.staged_handoff_reason.take()
+            })
+        } else {
+            None
+        };
+        if staged_handoff_committed {
+            let tick = self
+                .current_pattern_mode_playhead_tick()
+                .map(|(_, tick)| tick)
+                .filter(|tick| tick.is_finite() && *tick >= 0.0)
+                .map(|tick| tick.round() as u64);
+            let tick_suffix = tick.map_or_else(String::new, |tick| format!(" at tick {tick}"));
+            self.status = match staged_handoff_reason {
+                Some(PdcStreamHandoffReason::AutomaticPdcChange { enabled }) => format!(
+                    "Automatic PDC set to {}; applied through a live Pattern PDC handoff{tick_suffix}",
+                    u8::from(enabled)
+                ),
+                Some(PdcStreamHandoffReason::Vst3LatencyChange) | None => format!(
+                    "VST3 latency update applied through a live Pattern PDC handoff{tick_suffix}"
+                ),
+            };
+        }
         let completed = self.pending_sampler_stream.as_ref().and_then(|stream| {
             match stream.receiver.try_recv() {
                 Ok(result) => Some(result),
@@ -35070,6 +35159,8 @@ impl DawUi {
                     cancelled,
                     worker,
                     live_midi_senders: BTreeMap::new(),
+                    staged_streaming: None,
+                    staged_handoff_reason: None,
                 });
                 self.playing = true;
                 self.project_playback_loaded = true;
@@ -35352,6 +35443,8 @@ impl DawUi {
                     cancelled,
                     worker,
                     live_midi_senders: BTreeMap::new(),
+                    staged_streaming: None,
+                    staged_handoff_reason: None,
                 });
                 self.playing = true;
                 self.project_playback_loaded = true;
@@ -35537,6 +35630,29 @@ impl DawUi {
         loop_length_ticks: Option<u64>,
         loop_start_tick: u64,
     ) {
+        self.stream_selected_sampler_pattern_with_handoff(loop_length_ticks, loop_start_tick, None);
+    }
+
+    fn stream_selected_sampler_pattern_handoff(
+        &mut self,
+        loop_length_ticks: u64,
+        loop_start_tick: u64,
+        start_frame: u64,
+        reason: PdcStreamHandoffReason,
+    ) {
+        self.stream_selected_sampler_pattern_with_handoff(
+            Some(loop_length_ticks),
+            loop_start_tick,
+            Some((start_frame, reason)),
+        );
+    }
+
+    fn stream_selected_sampler_pattern_with_handoff(
+        &mut self,
+        loop_length_ticks: Option<u64>,
+        loop_start_tick: u64,
+        staged_handoff: Option<(u64, PdcStreamHandoffReason)>,
+    ) {
         let Some(pattern_id) = self.selected_pattern else {
             self.status = "Select a pattern before previewing Sampler channels".to_owned();
             return;
@@ -35582,7 +35698,9 @@ impl DawUi {
             return;
         }
         let device_rate = engine.sample_rate();
-        let start_frame = if let Some(loop_length_ticks) = loop_length_ticks {
+        let start_frame = if let Some((start_frame, _)) = staged_handoff {
+            start_frame
+        } else if let Some(loop_length_ticks) = loop_length_ticks {
             let Some(start_frame) = pattern_loop_frame_at_tick(
                 loop_start_tick,
                 device_rate,
@@ -35656,7 +35774,9 @@ impl DawUi {
             self.initialize_live_master_mixer_targets(document);
         }
 
-        self.stop_project_playback();
+        if staged_handoff.is_none() {
+            self.stop_project_playback();
+        }
         if let Some(engine) = &self.audio_engine {
             engine.set_test_tone(false);
             if self.audio_monitor_input {
@@ -35666,13 +35786,20 @@ impl DawUi {
         self.audio_test_tone = false;
         self.audio_monitor_input = false;
 
-        let writer = match self
+        let stream_result = self
             .audio_engine
             .as_ref()
             .ok_or_else(|| "Audio output is not available".to_owned())
-            .and_then(|engine| engine.begin_streaming_playback_from_frame(start_frame))
-        {
-            Ok(writer) => writer,
+            .and_then(|engine| match staged_handoff {
+                Some((start_frame, _)) => engine
+                    .begin_staged_streaming_playback_from_frame(start_frame)
+                    .map(|(writer, staged)| (writer, Some(staged))),
+                None => engine
+                    .begin_streaming_playback_from_frame(start_frame)
+                    .map(|writer| (writer, None)),
+            });
+        let (writer, staged_streaming) = match stream_result {
+            Ok(stream) => stream,
             Err(error) => {
                 self.status = format!("Could not start Sampler output: {error}");
                 return;
@@ -35745,15 +35872,30 @@ impl DawUi {
             });
         match worker {
             Ok(worker) => {
+                if let Some(staged) = staged_streaming.as_ref()
+                    && let Some(engine) = self.audio_engine.as_ref()
+                    && let Err(error) = engine.request_staged_streaming_handoff(staged)
+                {
+                    cancelled.store(true, Ordering::Release);
+                    let _ = worker.join();
+                    let _ = engine.cancel_staged_streaming_handoff(staged);
+                    self.status = format!("Could not hand off Pattern audio stream: {error}");
+                    return;
+                }
+                let handoff_in_progress = staged_streaming.is_some();
                 self.pending_sampler_stream = Some(PendingSamplerStream {
                     receiver,
                     cancelled,
                     worker,
                     live_midi_senders,
+                    staged_streaming,
+                    staged_handoff_reason: staged_handoff.map(|(_, reason)| reason),
                 });
                 self.playing = true;
                 self.project_playback_loaded = true;
-                self.status = if loop_length_ticks.is_some() {
+                self.status = if handoff_in_progress {
+                    "Preparing updated Pattern PDC while current audio continues…".to_owned()
+                } else if loop_length_ticks.is_some() {
                     let vst3_status = vst3_summary.map_or_else(String::new, |summary| {
                         let unloaded = if summary.unloaded_plugin_channels.is_empty() {
                             String::new()
@@ -35778,8 +35920,15 @@ impl DawUi {
                 };
             }
             Err(error) => {
-                self.stop_project_playback();
-                self.status = format!("Could not start Sampler render worker: {error}");
+                if let Some(staged) = staged_streaming.as_ref() {
+                    if let Some(engine) = self.audio_engine.as_ref() {
+                        let _ = engine.cancel_staged_streaming_handoff(staged);
+                    }
+                    self.status = format!("Could not stage updated Pattern audio: {error}");
+                } else {
+                    self.stop_project_playback();
+                    self.status = format!("Could not start Sampler render worker: {error}");
+                }
             }
         }
     }
@@ -42415,7 +42564,7 @@ impl DawUi {
                 if ui
                     .checkbox(&mut enabled, "Automatic PDC")
                     .on_hover_text(
-                        "Align supported direct and Mixer send paths using reported VST3 latency. Song playback applies this change through a staged stream handoff; other active playback modes stop and require a new start.",
+                        "Align supported direct and Mixer send paths using reported VST3 latency. Song and selected Pattern playback apply this change through a staged stream handoff; other active playback modes stop and require a new start.",
                     )
                     .changed()
                 {
@@ -44421,21 +44570,34 @@ impl DawUi {
             {
                 Ok(Some(())) => {
                     let playback_was_active = self.playing;
-                    let staged_playlist_handoff = playback_was_active
+                    let staged_song_handoff = playback_was_active
                         && self.playlist_playback_loaded
                         && !self.pattern_playback_mode
                         && !self.performance_mode_active
                         && self.stage_playlist_stream_rebuild(
-                            PlaylistStreamHandoffReason::AutomaticPdcChange { enabled },
+                            PdcStreamHandoffReason::AutomaticPdcChange { enabled },
                         );
-                    if playback_was_active && !staged_playlist_handoff {
+                    let staged_pattern_handoff = playback_was_active
+                        && !staged_song_handoff
+                        && self.pattern_playback_mode
+                        && self.pattern_mode_playback_source.is_some()
+                        && !self.performance_mode_active
+                        && self.stage_pattern_stream_rebuild(
+                            PdcStreamHandoffReason::AutomaticPdcChange { enabled },
+                        );
+                    if playback_was_active && !staged_song_handoff && !staged_pattern_handoff {
                         self.stop_project_playback();
                     }
                     self.dirty = true;
-                    self.status = if staged_playlist_handoff {
+                    self.status = if staged_song_handoff || staged_pattern_handoff {
                         format!(
-                            "Automatic PDC set to {}; preparing a live Playlist handoff…",
-                            u8::from(enabled)
+                            "Automatic PDC set to {}; preparing a live {} handoff…",
+                            u8::from(enabled),
+                            if staged_pattern_handoff {
+                                "Pattern"
+                            } else {
+                                "Song"
+                            }
                         )
                     } else if playback_was_active {
                         format!(
@@ -52811,13 +52973,21 @@ impl eframe::App for DawUi {
                     || self.pending_song_render.is_some()
                     || self.pending_vst3_stream.is_some()
                     || changes.latency_changed_while_processing;
+                let staged_pattern_handoff = changes.latency_changed
+                    && !changes.io_changed
+                    && resume_pattern_playback
+                    && self.stage_pattern_stream_rebuild(PdcStreamHandoffReason::Vst3LatencyChange);
                 let staged_playlist_handoff = changes.latency_changed
                     && !changes.io_changed
                     && resume_playlist_playback
-                    && self.stage_playlist_stream_rebuild(
-                        PlaylistStreamHandoffReason::Vst3LatencyChange,
+                    && self
+                        .stage_playlist_stream_rebuild(PdcStreamHandoffReason::Vst3LatencyChange);
+                if staged_pattern_handoff {
+                    self.status = format!(
+                        "VST3 latency changed; staging a PDC handoff while Pattern audio continues from tick {}",
+                        self.pattern_seek_tick
                     );
-                if staged_playlist_handoff {
+                } else if staged_playlist_handoff {
                     self.pattern_seek_tick = pattern_resume_tick;
                     self.status = format!(
                         "VST3 latency changed; staging a PDC handoff while Playlist audio continues from tick {}",
@@ -61276,6 +61446,18 @@ fn pattern_loop_tick_at_frame(
     tempo_map.tick_at_frame(frame % loop_length_frames, sample_rate)
 }
 
+fn pattern_loop_handoff_tick_at_frame(
+    frame: u64,
+    sample_rate: u32,
+    ppq: u16,
+    tempo_bpm: f64,
+    loop_length_ticks: u64,
+) -> Option<u64> {
+    pattern_loop_tick_at_frame(frame, sample_rate, ppq, tempo_bpm, loop_length_ticks)
+        .filter(|tick| tick.is_finite() && *tick >= 0.0)
+        .map(|tick| tick.round() as u64 % loop_length_ticks)
+}
+
 fn pattern_loop_frame_at_tick(
     tick: u64,
     sample_rate: u32,
@@ -62422,7 +62604,8 @@ mod tests {
         parse_midi_vst3_parameter_mappings, parse_pattern_vst3_parameter_links,
         parse_playlist_audio_clip_envelopes, parse_playlist_vst3_parameter_links,
         parse_window_layout_presets, pattern_color_from_random_index,
-        pattern_lfo_loop_length_ticks, pattern_loop_frame_at_tick, pattern_loop_tick_at_frame,
+        pattern_lfo_loop_length_ticks, pattern_loop_frame_at_tick,
+        pattern_loop_handoff_tick_at_frame, pattern_loop_tick_at_frame,
         pattern_vst3_parameter_automation_for_channel, pattern_vst3_parameter_link_for_target,
         piano_roll_color_group_note_ids, piano_roll_controller_stroke_points,
         piano_roll_controller_value_at, piano_roll_controller_value_range,
@@ -66155,6 +66338,22 @@ mod tests {
         );
         assert_eq!(pattern_loop_tick_at_frame(0, 48_000, 96, 120.0, 0), None);
         assert_eq!(pattern_loop_tick_at_frame(0, 0, 96, 120.0, 384), None);
+    }
+
+    #[test]
+    fn pattern_pdc_handoff_rounds_and_wraps_the_live_loop_tick() {
+        assert_eq!(
+            pattern_loop_handoff_tick_at_frame(24_200, 48_000, 96, 120.0, 384),
+            Some(97)
+        );
+        assert_eq!(
+            pattern_loop_handoff_tick_at_frame(95_999, 48_000, 96, 120.0, 384),
+            Some(0)
+        );
+        assert_eq!(
+            pattern_loop_handoff_tick_at_frame(0, 48_000, 96, 120.0, 0),
+            None
+        );
     }
 
     #[test]
