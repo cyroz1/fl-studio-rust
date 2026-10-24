@@ -7672,14 +7672,20 @@ fn prepare_sampler_arrangement(
                     .insert(placed.target_channel_id, pitch_adjustment_cents);
             }
             let (gain, pan) = channel_gain_pan(channel.volume(), channel.pan());
+            let volume_envelope = sampler_volume_envelope_config(channel, options.sample_rate);
             source_entry.insert(SamplerVoiceSource {
                 audio,
                 gain: gain
                     * sampler_metadata_gain(sample_metadata.gain_db)
-                    * sampler_volume_envelope_sustain_gain(channel),
+                    * if volume_envelope.is_some() {
+                        1.0
+                    } else {
+                        sampler_volume_envelope_sustain_gain(channel)
+                    },
                 pan,
                 reverse: channel.sample_reversed(),
                 volume_envelope_enabled: channel.sampler_volume_envelope_enabled().unwrap_or(false),
+                volume_envelope,
                 max_polyphony_raw: channel.sampler_max_polyphony_raw(),
                 mono_enabled: channel.sampler_mono_enabled().unwrap_or(false),
                 channel_cut_groups: channel.channel_cut_groups(),
@@ -7851,7 +7857,7 @@ fn prepare_sampler_arrangement(
             None => natural_end_frame,
         };
         let tail_frames = if source.volume_envelope_enabled && stop_frame.is_some() {
-            release_frames
+            sampler_envelope_release_frames(source.volume_envelope, release_frames as usize) as u64
         } else {
             0
         };
@@ -7931,6 +7937,7 @@ struct SamplerVoiceSource {
     pan: f32,
     reverse: bool,
     volume_envelope_enabled: bool,
+    volume_envelope: Option<SamplerVolumeEnvelope>,
     max_polyphony_raw: Option<u32>,
     mono_enabled: bool,
     channel_cut_groups: Option<(u16, u16)>,
@@ -7943,6 +7950,48 @@ struct SamplerVoiceSource {
     ping_pong_loop: bool,
     release_loop_bounds: Option<SampleBounds>,
     release_ping_pong_loop: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SamplerVolumeEnvelope {
+    predelay_frames: u64,
+    attack_frames: u64,
+    hold_frames: u64,
+    decay_frames: u64,
+    release_frames: usize,
+    sustain_level: f32,
+    amount: f32,
+}
+
+impl SamplerVolumeEnvelope {
+    fn level_at_frame(self, note_start_frame: u64, frame: u64) -> f32 {
+        let elapsed = frame.saturating_sub(note_start_frame);
+        if elapsed < self.predelay_frames {
+            return 0.0;
+        }
+        let elapsed = elapsed - self.predelay_frames;
+        if self.attack_frames > 0 && elapsed < self.attack_frames {
+            return elapsed as f32 / self.attack_frames as f32;
+        }
+        let elapsed = elapsed.saturating_sub(self.attack_frames);
+        if elapsed < self.hold_frames {
+            return 1.0;
+        }
+        let elapsed = elapsed - self.hold_frames;
+        if self.decay_frames > 0 && elapsed < self.decay_frames {
+            let progress = elapsed as f32 / self.decay_frames as f32;
+            return 1.0 + (self.sustain_level - 1.0) * progress;
+        }
+        self.sustain_level
+    }
+
+    fn gain_at_level(self, level: f32) -> f32 {
+        (1.0 + self.amount * (level - 1.0)).clamp(0.0, 2.0)
+    }
+
+    fn gain_at_frame(self, note_start_frame: u64, frame: u64) -> f32 {
+        self.gain_at_level(self.level_at_frame(note_start_frame, frame))
+    }
 }
 
 impl SamplerVoiceSource {
@@ -10254,14 +10303,20 @@ fn prepare_sampler_pattern_for_channel_internal(
                 tempo_bpm,
             )?;
             let (gain, pan) = channel_gain_pan(channel.volume(), channel.pan());
+            let volume_envelope = sampler_volume_envelope_config(channel, options.sample_rate);
             source_entry.insert(SamplerVoiceSource {
                 audio,
                 gain: gain
                     * sampler_metadata_gain(sample_metadata.gain_db)
-                    * sampler_volume_envelope_sustain_gain(channel),
+                    * if volume_envelope.is_some() {
+                        1.0
+                    } else {
+                        sampler_volume_envelope_sustain_gain(channel)
+                    },
                 pan,
                 reverse: channel.sample_reversed(),
                 volume_envelope_enabled: channel.sampler_volume_envelope_enabled().unwrap_or(false),
+                volume_envelope,
                 max_polyphony_raw: channel.sampler_max_polyphony_raw(),
                 mono_enabled: channel.sampler_mono_enabled().unwrap_or(false),
                 channel_cut_groups: channel.channel_cut_groups(),
@@ -10388,7 +10443,7 @@ fn prepare_sampler_pattern_for_channel_internal(
             None => natural_end_frame,
         };
         let tail_frames = if source.volume_envelope_enabled && stop_frame.is_some() {
-            release_frames
+            sampler_envelope_release_frames(source.volume_envelope, release_frames as usize) as u64
         } else {
             0
         };
@@ -10468,6 +10523,7 @@ struct SamplerVoiceEngine<'a> {
     mixer_meter_transforms_by_channel:
         Option<&'a HashMap<u16, Vec<(usize, MixerSourceRouteTransform)>>>,
     pan_law: PanLaw,
+    current_frame: u64,
     next_note: usize,
     next_live_note: usize,
     voices: Vec<Option<SamplerVoice>>,
@@ -10499,6 +10555,9 @@ struct SamplerVoice {
     sostenuto_held: bool,
     release_started: bool,
     volume_envelope_enabled: bool,
+    volume_envelope: Option<SamplerVolumeEnvelope>,
+    envelope_release_start_frame: Option<u64>,
+    envelope_release_start_gain: f32,
     loop_bounds: Option<SampleBounds>,
     ping_pong_loop: bool,
     release_loop_bounds: Option<SampleBounds>,
@@ -10611,6 +10670,7 @@ impl<'a> SamplerVoiceEngine<'a> {
             live_mixer_source_targets: None,
             mixer_meter_transforms_by_channel: None,
             pan_law,
+            current_frame: 0,
             next_note: 0,
             next_live_note: 0,
             voices: std::iter::repeat_with(|| None).take(voice_limit).collect(),
@@ -10672,6 +10732,7 @@ impl<'a> SamplerVoiceEngine<'a> {
         let mut last_active_output_frame = None;
         for offset in 0..frame_count {
             let frame = block_start + offset as u64;
+            self.current_frame = frame;
             for voice in self.voices.iter_mut().filter_map(Option::as_mut) {
                 if voice.note_slide.is_some() {
                     update_sampler_voice_slide(voice, frame, self.pitch_bend_cents, self.pan_law);
@@ -10716,7 +10777,7 @@ impl<'a> SamplerVoiceEngine<'a> {
                         );
                     }
                     voice.note_slide = None;
-                    begin_sampler_voice_release(voice, self.release_frames);
+                    begin_sampler_voice_release(voice, frame, self.release_frames);
                 }
                 let fade = match voice.release_remaining {
                     Some(0) => {
@@ -10731,6 +10792,8 @@ impl<'a> SamplerVoiceEngine<'a> {
                         if voice.release_cosine {
                             let progress = 1.0 - remaining as f32 / total;
                             0.5 * (1.0 + (std::f32::consts::PI * progress).cos())
+                        } else if voice.volume_envelope.is_some() {
+                            1.0
                         } else {
                             remaining as f32 / total
                         }
@@ -10763,7 +10826,8 @@ impl<'a> SamplerVoiceEngine<'a> {
                     let expression = voice
                         .input_midi_channel
                         .map_or(127, |channel| live_midi_expression[usize::from(channel)]);
-                    let gain = voice.gain * (f32::from(expression) / 127.0) * fade;
+                    let envelope_gain = sampler_voice_volume_envelope_gain(voice, frame);
+                    let gain = voice.gain * envelope_gain * (f32::from(expression) / 127.0) * fade;
                     let mut routed_frame = [
                         left * gain * voice.left_gain,
                         right * gain * voice.right_gain,
@@ -10827,6 +10891,7 @@ impl<'a> SamplerVoiceEngine<'a> {
                 }
             }
         }
+        self.current_frame = block_start.saturating_add(frame_count as u64);
         last_active_output_frame
     }
 
@@ -10864,7 +10929,11 @@ impl<'a> SamplerVoiceEngine<'a> {
             for voice_index in voices_to_cut {
                 if source.fast_declick_for_cut_groups {
                     if let Some(voice) = self.voices[voice_index].as_mut() {
-                        begin_sampler_voice_fast_cut_declick(voice, fast_declick_frames);
+                        begin_sampler_voice_fast_cut_declick(
+                            voice,
+                            note.start_frame,
+                            fast_declick_frames,
+                        );
                     }
                 } else {
                     self.voices[voice_index] = None;
@@ -10878,7 +10947,7 @@ impl<'a> SamplerVoiceEngine<'a> {
                 .flatten()
                 .filter(|voice| voice.channel_id == note.channel_id && !voice.release_started)
             {
-                begin_sampler_voice_release(voice, self.release_frames);
+                begin_sampler_voice_release(voice, note.start_frame, self.release_frames);
             }
         } else if let Some(max_polyphony) = source
             .max_polyphony_raw
@@ -10990,6 +11059,9 @@ impl<'a> SamplerVoiceEngine<'a> {
             sostenuto_held: false,
             release_started: false,
             volume_envelope_enabled: source.volume_envelope_enabled,
+            volume_envelope: source.volume_envelope,
+            envelope_release_start_frame: None,
+            envelope_release_start_gain: 1.0,
             loop_bounds: source.loop_bounds,
             ping_pong_loop: source.ping_pong_loop,
             release_loop_bounds: source.release_loop_bounds,
@@ -11168,10 +11240,11 @@ impl<'a> SamplerVoiceEngine<'a> {
         let channel = channel & 0x0F;
         let sustain_down = self.sustain_down[usize::from(channel)];
         let release_frames = self.release_frames;
+        let current_frame = self.current_frame;
         for voice in self.voices.iter_mut().filter_map(Option::as_mut) {
             if voice.input_midi_channel == Some(channel) && !voice.key_released {
                 if !sustain_down && !voice.sostenuto_held {
-                    begin_sampler_voice_release(voice, release_frames);
+                    begin_sampler_voice_release(voice, current_frame, release_frames);
                 } else {
                     voice.key_released = true;
                 }
@@ -11197,13 +11270,14 @@ impl<'a> SamplerVoiceEngine<'a> {
         let was_down = self.sustain_down[channel_index];
         self.sustain_down[channel_index] = down;
         if was_down && !down {
+            let current_frame = self.current_frame;
             for voice in self.voices.iter_mut().filter_map(Option::as_mut) {
                 if voice.input_midi_channel == Some(channel)
                     && voice.key_released
                     && !voice.sostenuto_held
                     && !voice.release_started
                 {
-                    begin_sampler_voice_release(voice, self.release_frames);
+                    begin_sampler_voice_release(voice, current_frame, self.release_frames);
                 }
             }
         }
@@ -11222,11 +11296,12 @@ impl<'a> SamplerVoiceEngine<'a> {
             }
         } else if was_down && !down {
             let sustain_down = self.sustain_down[channel_index];
+            let current_frame = self.current_frame;
             for voice in self.voices.iter_mut().filter_map(Option::as_mut) {
                 if voice.input_midi_channel == Some(channel) {
                     voice.sostenuto_held = false;
                     if voice.key_released && !sustain_down && !voice.release_started {
-                        begin_sampler_voice_release(voice, self.release_frames);
+                        begin_sampler_voice_release(voice, current_frame, self.release_frames);
                     }
                 }
             }
@@ -11236,6 +11311,7 @@ impl<'a> SamplerVoiceEngine<'a> {
     fn release_note(&mut self, channel_id: u16, key: u16, midi_channel: u8) {
         let midi_channel = midi_channel & 0x0F;
         let sustain_down = self.sustain_down[usize::from(midi_channel)];
+        let current_frame = self.current_frame;
         let voice = self
             .voices
             .iter_mut()
@@ -11249,7 +11325,7 @@ impl<'a> SamplerVoiceEngine<'a> {
             .min_by_key(|voice| voice.started_frame);
         if let Some(voice) = voice {
             if !sustain_down && !voice.sostenuto_held {
-                begin_sampler_voice_release(voice, self.release_frames);
+                begin_sampler_voice_release(voice, current_frame, self.release_frames);
             } else {
                 voice.key_released = true;
             }
@@ -11307,21 +11383,69 @@ fn sampler_voice_render_end_frame(
     Ok(last_active_output_frame)
 }
 
-fn begin_sampler_voice_release(voice: &mut SamplerVoice, release_frames: usize) {
+fn sampler_voice_volume_envelope_gain(voice: &SamplerVoice, frame: u64) -> f32 {
+    let Some(envelope) = voice.volume_envelope else {
+        return 1.0;
+    };
+    if voice.release_started {
+        if voice.release_cosine {
+            return voice.envelope_release_start_gain;
+        }
+        let start_frame = voice.envelope_release_start_frame.unwrap_or(frame);
+        let total_frames = voice
+            .release_total_frames
+            .unwrap_or(envelope.release_frames)
+            .max(1);
+        let elapsed = frame.saturating_sub(start_frame);
+        let progress = if total_frames <= 1 {
+            1.0
+        } else {
+            (elapsed as f32 / (total_frames - 1) as f32).clamp(0.0, 1.0)
+        };
+        voice.envelope_release_start_gain * (1.0 - progress)
+    } else {
+        envelope.gain_at_frame(voice.started_frame, frame)
+    }
+}
+
+fn begin_sampler_voice_release(voice: &mut SamplerVoice, start_frame: u64, release_frames: usize) {
+    let envelope_start_gain = sampler_voice_volume_envelope_gain(voice, start_frame);
     voice.key_released = true;
     voice.release_started = true;
     voice.note_slide = None;
+    voice.envelope_release_start_frame = Some(start_frame);
+    voice.envelope_release_start_gain = envelope_start_gain;
     if voice.volume_envelope_enabled {
-        voice.release_remaining = Some(release_frames);
-        voice.release_total_frames = Some(release_frames);
+        let envelope_release_frames =
+            sampler_envelope_release_frames(voice.volume_envelope, release_frames);
+        voice.release_remaining = Some(envelope_release_frames);
+        voice.release_total_frames = Some(envelope_release_frames);
         voice.release_cosine = false;
     }
 }
 
-fn begin_sampler_voice_fast_cut_declick(voice: &mut SamplerVoice, fade_frames: usize) {
+fn sampler_envelope_release_frames(
+    envelope: Option<SamplerVolumeEnvelope>,
+    default_release_frames: usize,
+) -> usize {
+    envelope
+        .map(|envelope| envelope.release_frames)
+        .filter(|frames| *frames > 0)
+        .unwrap_or(default_release_frames)
+        .max(1)
+}
+
+fn begin_sampler_voice_fast_cut_declick(
+    voice: &mut SamplerVoice,
+    start_frame: u64,
+    fade_frames: usize,
+) {
+    let envelope_start_gain = sampler_voice_volume_envelope_gain(voice, start_frame);
     voice.key_released = true;
     voice.release_started = true;
     voice.note_slide = None;
+    voice.envelope_release_start_frame = Some(start_frame);
+    voice.envelope_release_start_gain = envelope_start_gain;
     voice.release_remaining = Some(fade_frames);
     voice.release_total_frames = Some(fade_frames);
     voice.release_cosine = true;
@@ -12399,12 +12523,12 @@ pub(crate) fn channel_gain_pan(volume: Option<u32>, pan: Option<i32>) -> (f32, f
     (gain, pan)
 }
 
-/// Returns the supported steady-state multiplier for a Sampler Volume envelope.
+/// Returns the steady-state fallback for a Sampler Volume envelope when full timing is unavailable.
 ///
 /// The envelope's saved raw time minimum (100) is documented as 0%, so an envelope whose
 /// pre-delay, attack, hold, and decay are all at that minimum reaches sustain immediately.
-/// Other timing shapes remain unsupported until their native time mapping and curves are
-/// verified. Amount is a bipolar multiplier around the unmodulated level: zero leaves volume
+/// Other timing shapes use `sampler_volume_envelope_config` when its fields and sync mode are
+/// supported. Amount is a bipolar multiplier around the unmodulated level: zero leaves volume
 /// unchanged, positive values move toward sustain, and negative values invert that movement.
 fn sampler_volume_envelope_sustain_gain(channel: &ChannelSummary) -> f32 {
     let Some(envelope) = channel.sampler_volume_envelope() else {
@@ -12449,6 +12573,74 @@ fn sampler_volume_envelope_sustain_gain_from_raw(
     let envelope_amount = amount as f32 / 128.0;
     let sustain_level = sustain as f32 / 128.0;
     (1.0 + envelope_amount * (sustain_level - 1.0)).clamp(0.0, 2.0)
+}
+
+fn sampler_volume_envelope_config(
+    channel: &ChannelSummary,
+    sample_rate: u32,
+) -> Option<SamplerVolumeEnvelope> {
+    let envelope = channel.sampler_volume_envelope()?;
+    if !envelope.enabled() {
+        return None;
+    }
+    let (
+        Some(predelay),
+        Some(attack),
+        Some(hold),
+        Some(decay),
+        Some(sustain),
+        Some(release),
+        Some(amount),
+    ) = (
+        envelope.predelay_raw(),
+        envelope.attack_raw(),
+        envelope.hold_raw(),
+        envelope.decay_raw(),
+        envelope.sustain_raw(),
+        envelope.release_raw(),
+        envelope.amount_raw(),
+    )
+    else {
+        return None;
+    };
+    if !(0..=128).contains(&sustain)
+        || !(-128..=128).contains(&amount)
+        || [predelay, attack, hold, decay, release]
+            .into_iter()
+            .any(|raw| !(100..=65_536).contains(&raw))
+    {
+        return None;
+    }
+    if envelope.tempo_sync_enabled()
+        && [predelay, attack, hold, decay, release]
+            .into_iter()
+            .any(|raw| raw != 100)
+    {
+        return None;
+    }
+    let frames = |raw| sampler_envelope_time_frames(raw, sample_rate);
+    Some(SamplerVolumeEnvelope {
+        predelay_frames: frames(predelay)?,
+        attack_frames: frames(attack)?,
+        hold_frames: frames(hold)?,
+        decay_frames: frames(decay)?,
+        release_frames: usize::try_from(frames(release)?).ok()?,
+        sustain_level: sustain as f32 / 128.0,
+        amount: amount as f32 / 128.0,
+    })
+}
+
+fn sampler_envelope_time_frames(raw: i32, sample_rate: u32) -> Option<u64> {
+    if !(100..=65_536).contains(&raw) || sample_rate == 0 {
+        return None;
+    }
+    // Candidate conversion: SatyrDiamond/flp-parser computes this squared 0..36-second mapping
+    // as an intermediate but returns the original raw value, so the mapping is unverified.
+    // Native FL Studio comparison remains open.
+    let normalized = f64::from(raw - 100) / 65_436.0;
+    let seconds = (normalized * 6.0).powi(2);
+    let frames = (seconds * f64::from(sample_rate)).round();
+    (frames.is_finite() && (0.0..=u64::MAX as f64).contains(&frames)).then_some(frames as u64)
 }
 
 fn check_cancelled(cancelled: Option<&AtomicBool>) -> Result<(), String> {
@@ -15199,6 +15391,7 @@ mod tests {
                     pan: -1.0,
                     reverse: false,
                     volume_envelope_enabled: false,
+                    volume_envelope: None,
                     max_polyphony_raw: None,
                     mono_enabled: false,
                     channel_cut_groups: None,
@@ -16248,6 +16441,104 @@ mod tests {
     }
 
     #[test]
+    fn sampler_envelope_time_candidate_maps_zero_and_maximum_raw_values() {
+        assert_eq!(sampler_envelope_time_frames(100, 100), Some(0));
+        assert_eq!(sampler_envelope_time_frames(65_536, 100), Some(3_600));
+        assert_eq!(sampler_envelope_time_frames(100, 0), None);
+        assert_eq!(sampler_envelope_time_frames(99, 100), None);
+    }
+
+    #[test]
+    fn sampler_volume_envelope_interpolates_linear_pahds_stages_and_amount() {
+        let envelope = SamplerVolumeEnvelope {
+            predelay_frames: 2,
+            attack_frames: 4,
+            hold_frames: 2,
+            decay_frames: 4,
+            release_frames: 4,
+            sustain_level: 0.25,
+            amount: 0.5,
+        };
+        let gain = |frame| envelope.gain_at_frame(5, frame);
+
+        assert_eq!(gain(5), 0.5);
+        assert_eq!(gain(7), 0.5);
+        assert_eq!(gain(8), 0.625);
+        assert_eq!(gain(11), 1.0);
+        assert_eq!(gain(12), 1.0);
+        assert_eq!(gain(13), 1.0);
+        assert_eq!(gain(14), 0.90625);
+        assert_eq!(gain(17), 0.625);
+    }
+
+    #[test]
+    fn sampler_volume_envelope_release_uses_saved_release_duration() {
+        let source = SamplerVoiceSource {
+            audio: Arc::new(DecodedAudio {
+                sample_rate: 4,
+                channels: vec![vec![1.0; 32]],
+            }),
+            gain: 1.0,
+            pan: -1.0,
+            reverse: false,
+            volume_envelope_enabled: true,
+            volume_envelope: Some(SamplerVolumeEnvelope {
+                predelay_frames: 0,
+                attack_frames: 4,
+                hold_frames: 0,
+                decay_frames: 0,
+                release_frames: 4,
+                sustain_level: 1.0,
+                amount: 1.0,
+            }),
+            max_polyphony_raw: None,
+            mono_enabled: false,
+            channel_cut_groups: None,
+            fast_declick_for_cut_groups: false,
+            key_range: None,
+            velocity_range: None,
+            root_key: SAMPLER_ROOT_KEY,
+            fine_tune_cents: 0.0,
+            loop_bounds: None,
+            ping_pong_loop: false,
+            release_loop_bounds: None,
+            release_ping_pong_loop: false,
+        };
+        let sources = HashMap::from([(7, source)]);
+        let notes = [ScheduledSamplerNote {
+            clip_index: 0,
+            playlist_track_id: None,
+            start_tick: 0,
+            stop_tick: None,
+            start_frame: 0,
+            stop_frame: Some(5),
+            channel_id: 7,
+            key: SAMPLER_ROOT_KEY,
+            midi_channel: 0,
+            slide_note: false,
+            velocity: 127,
+            pan: 64,
+            fine_pitch_offset_cents: 0,
+            layer_gain: 1.0,
+        }];
+        let mut engine = SamplerVoiceEngine::new(&sources, &notes, 1, 2, 4);
+        let mut output = vec![0.0; 20];
+        engine.render_block(0, 10, &mut output);
+
+        let left = (0..10).map(|frame| output[frame * 2]).collect::<Vec<_>>();
+        assert_eq!(left[0], 0.0);
+        assert_eq!(left[1], 0.25);
+        assert_eq!(left[2], 0.5);
+        assert_eq!(left[3], 0.75);
+        assert_eq!(left[4], 1.0);
+        assert_eq!(left[5], 1.0);
+        assert!((left[6] - 2.0 / 3.0).abs() < 1.0e-6);
+        assert!((left[7] - 1.0 / 3.0).abs() < 1.0e-6);
+        assert_eq!(left[8], 0.0);
+        assert_eq!(left[9], 0.0);
+    }
+
+    #[test]
     fn sampler_volume_envelope_ignores_disabled_incomplete_or_unsupported_stages() {
         assert_eq!(
             sampler_volume_envelope_sustain_gain_from_raw(
@@ -16347,6 +16638,7 @@ mod tests {
                 pan: 0.0,
                 reverse: false,
                 volume_envelope_enabled: true,
+                volume_envelope: None,
                 max_polyphony_raw: None,
                 mono_enabled: false,
                 channel_cut_groups: None,
@@ -16407,6 +16699,7 @@ mod tests {
                 pan: -1.0,
                 reverse: false,
                 volume_envelope_enabled: false,
+                volume_envelope: None,
                 max_polyphony_raw: None,
                 mono_enabled: false,
                 channel_cut_groups: None,
@@ -16463,6 +16756,7 @@ mod tests {
                 pan: -1.0,
                 reverse: false,
                 volume_envelope_enabled: false,
+                volume_envelope: None,
                 max_polyphony_raw: None,
                 mono_enabled: false,
                 channel_cut_groups: None,
@@ -16534,6 +16828,7 @@ mod tests {
                 pan: 0.0,
                 reverse: false,
                 volume_envelope_enabled: false,
+                volume_envelope: None,
                 max_polyphony_raw: None,
                 mono_enabled: false,
                 channel_cut_groups: None,
@@ -16591,6 +16886,7 @@ mod tests {
                 pan: 0.0,
                 reverse: false,
                 volume_envelope_enabled: false,
+                volume_envelope: None,
                 max_polyphony_raw: None,
                 mono_enabled: false,
                 channel_cut_groups: None,
@@ -16668,6 +16964,7 @@ mod tests {
                 pan: 0.0,
                 reverse: false,
                 volume_envelope_enabled: false,
+                volume_envelope: None,
                 max_polyphony_raw: None,
                 mono_enabled: false,
                 channel_cut_groups: None,
@@ -16729,6 +17026,7 @@ mod tests {
                 pan: 0.0,
                 reverse: false,
                 volume_envelope_enabled: false,
+                volume_envelope: None,
                 max_polyphony_raw: None,
                 mono_enabled: false,
                 channel_cut_groups: None,
@@ -16808,6 +17106,7 @@ mod tests {
                 pan: -1.0,
                 reverse: false,
                 volume_envelope_enabled: true,
+                volume_envelope: None,
                 max_polyphony_raw: None,
                 mono_enabled: false,
                 channel_cut_groups: None,
@@ -16866,6 +17165,7 @@ mod tests {
                 pan: -1.0,
                 reverse: false,
                 volume_envelope_enabled: false,
+                volume_envelope: None,
                 max_polyphony_raw: None,
                 mono_enabled: false,
                 channel_cut_groups: None,
@@ -16918,6 +17218,7 @@ mod tests {
                 pan: -1.0,
                 reverse: true,
                 volume_envelope_enabled: false,
+                volume_envelope: None,
                 max_polyphony_raw: None,
                 mono_enabled: false,
                 channel_cut_groups: None,
@@ -16968,6 +17269,7 @@ mod tests {
                 pan: -1.0,
                 reverse: false,
                 volume_envelope_enabled: false,
+                volume_envelope: None,
                 max_polyphony_raw: None,
                 mono_enabled: false,
                 channel_cut_groups: None,
@@ -17024,6 +17326,7 @@ mod tests {
                 pan: -1.0,
                 reverse: false,
                 volume_envelope_enabled: false,
+                volume_envelope: None,
                 max_polyphony_raw: None,
                 mono_enabled: false,
                 channel_cut_groups: None,
@@ -17080,6 +17383,7 @@ mod tests {
                 pan: -1.0,
                 reverse: false,
                 volume_envelope_enabled: true,
+                volume_envelope: None,
                 max_polyphony_raw: None,
                 mono_enabled: false,
                 channel_cut_groups: None,
@@ -17151,6 +17455,7 @@ mod tests {
                 pan: -1.0,
                 reverse: false,
                 volume_envelope_enabled: false,
+                volume_envelope: None,
                 max_polyphony_raw: None,
                 mono_enabled: false,
                 channel_cut_groups: None,
@@ -17203,6 +17508,7 @@ mod tests {
                 pan: -1.0,
                 reverse: false,
                 volume_envelope_enabled: false,
+                volume_envelope: None,
                 max_polyphony_raw: None,
                 mono_enabled: false,
                 channel_cut_groups: None,
@@ -17262,6 +17568,7 @@ mod tests {
             pan: 0.0,
             reverse: false,
             volume_envelope_enabled: false,
+            volume_envelope: None,
             max_polyphony_raw: None,
             mono_enabled: false,
             channel_cut_groups: None,
@@ -17335,6 +17642,7 @@ mod tests {
                 pan: 0.0,
                 reverse: false,
                 volume_envelope_enabled: false,
+                volume_envelope: None,
                 max_polyphony_raw: None,
                 mono_enabled: false,
                 channel_cut_groups: None,
@@ -17387,6 +17695,7 @@ mod tests {
                 pan: -1.0,
                 reverse: false,
                 volume_envelope_enabled: false,
+                volume_envelope: None,
                 max_polyphony_raw: None,
                 mono_enabled: false,
                 channel_cut_groups: None,
@@ -17447,6 +17756,7 @@ mod tests {
                     pan: -1.0,
                     reverse: false,
                     volume_envelope_enabled: false,
+                    volume_envelope: None,
                     max_polyphony_raw: None,
                     mono_enabled: false,
                     channel_cut_groups: None,
@@ -17469,6 +17779,7 @@ mod tests {
                     pan: -1.0,
                     reverse: false,
                     volume_envelope_enabled: false,
+                    volume_envelope: None,
                     max_polyphony_raw: None,
                     mono_enabled: false,
                     channel_cut_groups: None,
@@ -17542,6 +17853,7 @@ mod tests {
                     pan: -1.0,
                     reverse: false,
                     volume_envelope_enabled: false,
+                    volume_envelope: None,
                     max_polyphony_raw: Some(1),
                     mono_enabled: false,
                     channel_cut_groups: None,
@@ -17567,6 +17879,7 @@ mod tests {
                     pan: -1.0,
                     reverse: false,
                     volume_envelope_enabled: false,
+                    volume_envelope: None,
                     max_polyphony_raw: None,
                     mono_enabled: false,
                     channel_cut_groups: None,
@@ -17672,6 +17985,7 @@ mod tests {
                 pan: -1.0,
                 reverse: false,
                 volume_envelope_enabled: true,
+                volume_envelope: None,
                 max_polyphony_raw: Some(1),
                 mono_enabled: true,
                 channel_cut_groups: None,
@@ -17755,6 +18069,7 @@ mod tests {
             pan: -1.0,
             reverse: false,
             volume_envelope_enabled: false,
+            volume_envelope: None,
             max_polyphony_raw: None,
             mono_enabled: false,
             channel_cut_groups: groups,
@@ -17829,6 +18144,7 @@ mod tests {
             pan: -1.0,
             reverse: false,
             volume_envelope_enabled: false,
+            volume_envelope: None,
             max_polyphony_raw: None,
             mono_enabled: false,
             channel_cut_groups: groups,
@@ -17902,6 +18218,7 @@ mod tests {
             pan: -1.0,
             reverse: false,
             volume_envelope_enabled: false,
+            volume_envelope: None,
             max_polyphony_raw: None,
             mono_enabled: false,
             channel_cut_groups: None,
@@ -17990,6 +18307,7 @@ mod tests {
             pan: -1.0,
             reverse: false,
             volume_envelope_enabled: false,
+            volume_envelope: None,
             max_polyphony_raw: None,
             mono_enabled: false,
             channel_cut_groups: None,
@@ -18049,6 +18367,7 @@ mod tests {
             pan: 0.75,
             reverse: false,
             volume_envelope_enabled: false,
+            volume_envelope: None,
             max_polyphony_raw: None,
             mono_enabled: false,
             channel_cut_groups: None,
@@ -18118,6 +18437,7 @@ mod tests {
             pan: -1.0,
             reverse: false,
             volume_envelope_enabled: false,
+            volume_envelope: None,
             max_polyphony_raw: None,
             mono_enabled: false,
             channel_cut_groups: None,
@@ -18197,6 +18517,7 @@ mod tests {
             pan: -1.0,
             reverse: false,
             volume_envelope_enabled: false,
+            volume_envelope: None,
             max_polyphony_raw: None,
             mono_enabled: false,
             channel_cut_groups: None,
