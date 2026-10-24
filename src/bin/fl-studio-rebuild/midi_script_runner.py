@@ -181,6 +181,12 @@ def _specific_callback(event):
 def _dispatch(namespace, value):
     global _active_transport_actions
     _active_transport_actions = []
+    if value.get("idle"):
+        callback = namespace.get("OnIdle")
+        if callback is not None:
+            callback()
+        return {"handled": False, "actions": _active_transport_actions}
+
     event = EventData(value)
     for callback_name in ("OnMidiIn", "OnMidiMsg"):
         callback = namespace.get(callback_name)

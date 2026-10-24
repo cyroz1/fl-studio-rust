@@ -78,41 +78,59 @@ impl MidiInputScriptWorker {
             .name("midi-script-input".to_owned())
             .spawn(move || {
                 let mut runtime = Some(runtime);
+                let mut timestamp_reference_micros = 0_u64;
+                let mut timestamp_reference_at = Instant::now();
                 while !worker_stop_requested.load(Ordering::Acquire) {
                     let message = match input_receiver.recv_timeout(Duration::from_millis(50)) {
                         Ok(message) => message,
-                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            let received_at = Instant::now();
+                            let elapsed_micros = u64::try_from(
+                                received_at
+                                    .duration_since(timestamp_reference_at)
+                                    .as_micros(),
+                            )
+                            .unwrap_or(u64::MAX);
+                            let timestamp_micros =
+                                timestamp_reference_micros.saturating_add(elapsed_micros);
+                            let idle_result = runtime.as_mut().map(MidiScriptRuntime::process_idle);
+                            match idle_result {
+                                Some(Ok(result)) => queue_script_transport_actions(
+                                    &output_sender,
+                                    &dropped_messages,
+                                    timestamp_micros,
+                                    received_at,
+                                    result.actions,
+                                ),
+                                Some(Err(error)) => {
+                                    let _ = error_sender.try_send(error);
+                                    if let Some(runtime) = runtime.take() {
+                                        runtime.kill();
+                                    }
+                                }
+                                None => {}
+                            }
+                            continue;
+                        }
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     };
                     match message {
                         MidiInputScriptMessage::Stop => break,
                         MidiInputScriptMessage::Input(message) => {
+                            timestamp_reference_micros = message.timestamp_micros;
+                            timestamp_reference_at = message.received_at;
                             let transformed = runtime.as_mut().map(|runtime| {
                                 runtime.process_event(message.timestamp_micros, &message.bytes)
                             });
                             match transformed {
                                 Some(Ok(result)) => {
-                                    for action in result.actions {
-                                        let command = match action {
-                                            ScriptTransportAction::Start => {
-                                                MidiTransportCommand::Start
-                                            }
-                                            ScriptTransportAction::Stop => {
-                                                MidiTransportCommand::Stop
-                                            }
-                                            ScriptTransportAction::RecordToggle => {
-                                                MidiTransportCommand::RecordToggle
-                                            }
-                                        };
-                                        let transport_message = ReceivedMidiMessage {
-                                            timestamp_micros: message.timestamp_micros,
-                                            received_at: message.received_at,
-                                            event: MidiInputEvent::Transport(command),
-                                        };
-                                        if output_sender.try_send(transport_message).is_err() {
-                                            dropped_messages.fetch_add(1, Ordering::Relaxed);
-                                        }
-                                    }
+                                    queue_script_transport_actions(
+                                        &output_sender,
+                                        &dropped_messages,
+                                        message.timestamp_micros,
+                                        message.received_at,
+                                        result.actions,
+                                    );
                                     if !result.handled {
                                         forward_scripted_input(
                                             &output_sender,
@@ -217,6 +235,30 @@ fn forward_scripted_input(
         thru_queue.try_send_system_exclusive(bytes);
     } else if let Some(event) = event {
         thru_queue.try_send(event);
+    }
+}
+
+fn queue_script_transport_actions(
+    sender: &SyncSender<ReceivedMidiMessage>,
+    dropped_messages: &AtomicU64,
+    timestamp_micros: u64,
+    received_at: Instant,
+    actions: impl IntoIterator<Item = ScriptTransportAction>,
+) {
+    for action in actions {
+        let command = match action {
+            ScriptTransportAction::Start => MidiTransportCommand::Start,
+            ScriptTransportAction::Stop => MidiTransportCommand::Stop,
+            ScriptTransportAction::RecordToggle => MidiTransportCommand::RecordToggle,
+        };
+        let transport_message = ReceivedMidiMessage {
+            timestamp_micros,
+            received_at,
+            event: MidiInputEvent::Transport(command),
+        };
+        if let Err(TrySendError::Full(_)) = sender.try_send(transport_message) {
+            dropped_messages.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 

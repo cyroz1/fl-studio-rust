@@ -303,7 +303,34 @@ impl MidiScriptRuntime {
             "data2": bytes.get(2).copied().unwrap_or(0),
             "sysex": if status == 0xF0 { bytes } else { &[] },
         });
-        serde_json::to_writer(&mut self.stdin, &value)
+        let response = self.exchange(&value)?;
+        let actions = parse_transport_actions(&response)?;
+        if response["handled"].as_bool().unwrap_or(false) {
+            return Ok(ScriptMidiResult {
+                handled: true,
+                bytes: Vec::new(),
+                actions,
+            });
+        }
+        let transformed = transform_message(bytes, &response)?;
+        Ok(ScriptMidiResult {
+            handled: false,
+            bytes: transformed,
+            actions,
+        })
+    }
+
+    pub fn process_idle(&mut self) -> Result<ScriptMidiResult, String> {
+        let response = self.exchange(&json!({"idle": true}))?;
+        Ok(ScriptMidiResult {
+            handled: response["handled"].as_bool().unwrap_or(false),
+            bytes: Vec::new(),
+            actions: parse_transport_actions(&response)?,
+        })
+    }
+
+    fn exchange(&mut self, value: &Value) -> Result<Value, String> {
+        serde_json::to_writer(&mut self.stdin, value)
             .map_err(|error| format!("could not send MIDI to Python script: {error}"))?;
         self.stdin
             .write_all(b"\n")
@@ -322,30 +349,7 @@ impl MidiScriptRuntime {
         if let Some(error) = response["error"].as_str() {
             return Err(format!("Python MIDI script callback failed: {error}"));
         }
-        let actions = response["actions"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|action| {
-                action
-                    .as_str()
-                    .and_then(ScriptTransportAction::parse)
-                    .ok_or_else(|| "MIDI script returned an unknown transport action".to_owned())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if response["handled"].as_bool().unwrap_or(false) {
-            return Ok(ScriptMidiResult {
-                handled: true,
-                bytes: Vec::new(),
-                actions,
-            });
-        }
-        let transformed = transform_message(bytes, &response)?;
-        Ok(ScriptMidiResult {
-            handled: false,
-            bytes: transformed,
-            actions,
-        })
+        Ok(response)
     }
 
     pub fn stop_handle(&self) -> MidiScriptStopHandle {
@@ -379,6 +383,20 @@ fn python_command() -> Result<(PathBuf, Vec<String>), String> {
     } else {
         Ok((PathBuf::from("python3"), Vec::new()))
     }
+}
+
+fn parse_transport_actions(response: &Value) -> Result<Vec<ScriptTransportAction>, String> {
+    response["actions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|action| {
+            action
+                .as_str()
+                .and_then(ScriptTransportAction::parse)
+                .ok_or_else(|| "MIDI script returned an unknown transport action".to_owned())
+        })
+        .collect()
 }
 
 fn transform_message(original: &[u8], response: &Value) -> Result<Vec<u8>, String> {
@@ -589,6 +607,23 @@ mod tests {
         let result = runtime.process_event(12, &[0xB0, 7, 127]).unwrap();
 
         assert_eq!(result.bytes, [0xB0, b'M', 127]);
+    }
+
+    #[test]
+    fn python_idle_callback_can_request_transport_actions() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport transport\ndef OnIdle():\n    transport.stop()\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let mut runtime = MidiScriptRuntime::start_for_device(&script, "Test Input").unwrap();
+
+        let result = runtime.process_idle().unwrap();
+
+        assert_eq!(result.actions, [ScriptTransportAction::Stop]);
     }
 
     #[test]
