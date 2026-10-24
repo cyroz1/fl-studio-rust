@@ -737,6 +737,7 @@ impl MidiInputChannelState {
                 self.expression = 127;
                 self.mod_x = 64;
                 self.mod_y = 64;
+                self.pitch_bend_value = 8192;
                 self.pitch_bend_sensitivity_semitones = 2;
                 self.pitch_bend_sensitivity_cents = 0;
                 self.rpn_msb = 127;
@@ -2477,6 +2478,68 @@ mod tests {
             value: -8192,
         });
         assert_eq!(state.note_fine_pitch(), 100);
+    }
+
+    #[test]
+    fn reset_all_controllers_centers_pitch_bend_and_restores_its_default_range() {
+        let mut state = MidiInputChannelState::default();
+        for (controller, value) in [(7, 63), (10, 100), (11, 48), (71, 0), (74, 127)] {
+            state.update(MidiInputEvent::ControlChange {
+                channel: 0,
+                controller,
+                value,
+            });
+        }
+        state.update(MidiInputEvent::ControlChange {
+            channel: 0,
+            controller: 101,
+            value: 0,
+        });
+        state.update(MidiInputEvent::ControlChange {
+            channel: 0,
+            controller: 100,
+            value: 0,
+        });
+        state.update(MidiInputEvent::ControlChange {
+            channel: 0,
+            controller: 6,
+            value: 12,
+        });
+        state.update(MidiInputEvent::ControlChange {
+            channel: 0,
+            controller: 38,
+            value: 50,
+        });
+        state.update(MidiInputEvent::PitchBend {
+            channel: 0,
+            value: 8191,
+        });
+        assert_eq!(state.raw_pitch_bend_value(), 16_383);
+
+        state.update(MidiInputEvent::ControlChange {
+            channel: 0,
+            controller: 121,
+            value: 0,
+        });
+
+        assert_eq!(state.raw_pan(), 64);
+        assert_eq!(state.raw_channel_volume(), 127);
+        assert_eq!(state.raw_expression(), 127);
+        assert_eq!(state.raw_mod_x(), 64);
+        assert_eq!(state.raw_mod_y(), 64);
+        assert_eq!(state.raw_pitch_bend_value(), 8192);
+        assert_eq!(state.pitch_bend_offset_cents(), 0);
+        assert_eq!(state.note_fine_pitch(), 120);
+        assert_eq!(state.raw_pitch_bend_sensitivity_semitones(), 2);
+        assert_eq!(state.raw_pitch_bend_sensitivity_cents(), 0);
+
+        // Reset also nulls the selected RPN, so later Data Entry cannot change bend range.
+        state.update(MidiInputEvent::ControlChange {
+            channel: 0,
+            controller: 6,
+            value: 7,
+        });
+        assert_eq!(state.raw_pitch_bend_sensitivity_semitones(), 2);
     }
 
     #[test]
