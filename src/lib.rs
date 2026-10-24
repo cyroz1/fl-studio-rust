@@ -32471,7 +32471,7 @@ mod tests {
             arrangement
                 .clips
                 .iter()
-                .map(PlaylistClip::playlist_track_id)
+                .map(|clip| clip.playlist_track_id())
                 .collect::<Vec<_>>(),
             vec![Some(1), Some(2)]
         );
