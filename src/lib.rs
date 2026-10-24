@@ -32437,7 +32437,7 @@ mod tests {
     #[test]
     fn live_song_export_respects_playlist_track_mute_and_solo_filters() {
         let mut event_stream = vec![0x40, 4, 0, 0x15, 0, 0x41, 7, 0, 0xD0, 24];
-        event_stream.extend_from_slice(&note_record(0, 4, 4, 60, 100));
+        event_stream.extend_from_slice(&note_record(0, 4, 24, 60, 100));
         event_stream.extend_from_slice(&[0x63, 0, 0]);
 
         let mut disabled_track = [0; 70];
@@ -32453,12 +32453,13 @@ mod tests {
         for (position, track_index) in [(0_u32, 0_u16), (24, 1)] {
             let mut clip = [0; 80];
             clip[..4].copy_from_slice(&position.to_le_bytes());
-            clip[4..6].copy_from_slice(&track_index.to_le_bytes());
             clip[6..8].copy_from_slice(&7_u16.to_le_bytes());
             clip[8..12].copy_from_slice(&24_u32.to_le_bytes());
+            clip[12..14].copy_from_slice(&(499_u16 - track_index).to_le_bytes());
             clip[64..72].copy_from_slice(&1.0_f64.to_le_bytes());
             clips.extend_from_slice(&clip);
         }
+        append_data_event(&mut event_stream, 0xC7, b"25.0.0\0");
         append_data_event(&mut event_stream, 0xE9, &clips);
 
         let document = FlpDocument::parse(&flp_fixture(&event_stream, &[], &[]))
