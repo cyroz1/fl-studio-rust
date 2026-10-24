@@ -1741,11 +1741,12 @@ impl MidiTrack {
                         64 => {
                             let was_down = state.sustain_pedal_down;
                             state.sustain_pedal_down = data[1] >= 64;
-                            if was_down && !state.sustain_pedal_down {
-                                if let Some(note_indices) = sustained_note_offs.remove(&channel) {
-                                    for note_index in note_indices {
-                                        notes[note_index].end_tick = Some(event.absolute_tick);
-                                    }
+                            if was_down
+                                && !state.sustain_pedal_down
+                                && let Some(note_indices) = sustained_note_offs.remove(&channel)
+                            {
+                                for note_index in note_indices {
+                                    notes[note_index].end_tick = Some(event.absolute_tick);
                                 }
                             }
                         }
