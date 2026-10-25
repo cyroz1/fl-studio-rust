@@ -2567,15 +2567,16 @@ fn enumerate_wasapi_exclusive_capabilities(
 type WasapiExclusiveDeviceRates = (String, wasapi::Direction, Vec<u32>);
 
 #[cfg(windows)]
-fn enumerate_wasapi_exclusive_capabilities_on_mta() -> Result<
-    (
-        Vec<WasapiExclusiveDeviceRates>,
-        Vec<String>,
-        Option<String>,
-        Option<String>,
-    ),
-    String,
-> {
+type WasapiExclusiveCapabilitySnapshot = (
+    Vec<WasapiExclusiveDeviceRates>,
+    Vec<String>,
+    Option<String>,
+    Option<String>,
+);
+
+#[cfg(windows)]
+fn enumerate_wasapi_exclusive_capabilities_on_mta()
+-> Result<WasapiExclusiveCapabilitySnapshot, String> {
     wasapi::initialize_mta()
         .ok()
         .map_err(|error| format!("Could not initialize Windows audio COM: {error}"))?;
@@ -2662,13 +2663,13 @@ fn wasapi_exclusive_sample_rates(device: &wasapi::Device) -> Result<Vec<u32>, St
 fn wasapi_format_is_supported_by_stream_builder(format: &wasapi::WaveFormat) -> bool {
     let bits = format.get_bitspersample();
     let valid_bits = format.get_validbitspersample();
-    match (format.get_subformat(), bits, valid_bits) {
-        (Ok(wasapi::SampleType::Float), 32, 32) => true,
-        (Ok(wasapi::SampleType::Int), 16, 16)
-        | (Ok(wasapi::SampleType::Int), 24, 24)
-        | (Ok(wasapi::SampleType::Int), 32, 32) => true,
-        _ => false,
-    }
+    matches!(
+        (format.get_subformat(), bits, valid_bits),
+        (Ok(wasapi::SampleType::Float), 32, 32)
+            | (Ok(wasapi::SampleType::Int), 16, 16)
+            | (Ok(wasapi::SampleType::Int), 24, 24)
+            | (Ok(wasapi::SampleType::Int), 32, 32)
+    )
 }
 
 fn audio_device_config_ranges(
