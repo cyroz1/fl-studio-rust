@@ -5777,6 +5777,20 @@ impl DawUi {
         if let Some(rate) = audio_catalog.default_sample_rate {
             audio_settings.sample_rate = rate;
         }
+        if let Some(rate) = audio_catalog
+            .supported_sample_rates(&audio_settings)
+            .into_iter()
+            .min_by_key(|rate| rate.abs_diff(audio_settings.sample_rate))
+        {
+            audio_settings.sample_rate = rate;
+        }
+        if let Some(frames) = audio_catalog
+            .supported_buffer_sizes(&audio_settings, audio_settings.sample_rate)
+            .into_iter()
+            .min_by_key(|frames| frames.abs_diff(audio_settings.buffer_frames))
+        {
+            audio_settings.buffer_frames = frames;
+        }
         let midi_output_gain_mapping = load_midi_output_gain_mapping();
         let midi_mixer_control_mappings = load_midi_mixer_control_mappings();
         let midi_vst3_parameter_mappings = load_midi_vst3_parameter_mappings();
@@ -50904,27 +50918,63 @@ impl DawUi {
             }
         });
 
+        let supported_audio_sample_rates = self
+            .audio_catalog
+            .supported_sample_rates(&self.audio_settings);
+        let sample_rate_is_supported =
+            supported_audio_sample_rates.contains(&self.audio_settings.sample_rate);
+        let supported_audio_buffer_sizes = self
+            .audio_catalog
+            .supported_buffer_sizes(&self.audio_settings, self.audio_settings.sample_rate);
+        let buffer_size_is_supported =
+            supported_audio_buffer_sizes.contains(&self.audio_settings.buffer_frames);
         ui.horizontal(|ui| {
             ui.label("Sample rate");
             egui::ComboBox::from_id_salt("audio_sample_rate")
-                .selected_text(format!("{} Hz", self.audio_settings.sample_rate))
+                .selected_text(if sample_rate_is_supported {
+                    format!("{} Hz", self.audio_settings.sample_rate)
+                } else {
+                    format!("{} Hz · unsupported", self.audio_settings.sample_rate)
+                })
                 .show_ui(ui, |ui| {
-                    for rate in [44_100, 48_000, 88_200, 96_000, 176_400, 192_000] {
+                    if !sample_rate_is_supported {
+                        ui.add_enabled(
+                            false,
+                            egui::Label::new(format!(
+                                "{} Hz · unsupported by selected devices",
+                                self.audio_settings.sample_rate
+                            )),
+                        );
+                    }
+                    for rate in &supported_audio_sample_rates {
                         ui.selectable_value(
                             &mut self.audio_settings.sample_rate,
-                            rate,
+                            *rate,
                             format!("{rate} Hz"),
                         );
                     }
                 });
             ui.label("Buffer");
             egui::ComboBox::from_id_salt("audio_buffer_frames")
-                .selected_text(format!("{} frames", self.audio_settings.buffer_frames))
+                .selected_text(if buffer_size_is_supported {
+                    format!("{} frames", self.audio_settings.buffer_frames)
+                } else {
+                    format!("{} frames · unsupported", self.audio_settings.buffer_frames)
+                })
                 .show_ui(ui, |ui| {
-                    for frames in [64, 128, 256, 512, 1_024, 2_048] {
+                    if !buffer_size_is_supported {
+                        ui.add_enabled(
+                            false,
+                            egui::Label::new(format!(
+                                "{} frames · nearest supported size used",
+                                self.audio_settings.buffer_frames
+                            )),
+                        );
+                    }
+                    for frames in &supported_audio_buffer_sizes {
                         ui.selectable_value(
                             &mut self.audio_settings.buffer_frames,
-                            frames,
+                            *frames,
                             format!("{frames} frames"),
                         );
                     }

@@ -11,7 +11,10 @@ use std::time::Duration;
 
 use arc_swap::ArcSwapOption;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{FromSample, Sample, SampleFormat, Stream, StreamConfig, SupportedStreamConfig};
+use cpal::{
+    FromSample, Sample, SampleFormat, Stream, StreamConfig, SupportedBufferSize,
+    SupportedStreamConfig, SupportedStreamConfigRange,
+};
 use crossbeam_queue::ArrayQueue;
 
 const AUDIO_SOURCE_SILENT: u8 = 0;
@@ -1345,6 +1348,34 @@ impl AudioAccess {
 pub struct AudioDeviceInfo {
     pub id: String,
     pub name: String,
+    /// Stream formats reported by CPAL for this device and direction.
+    pub config_ranges: Vec<AudioDeviceConfigRange>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AudioDeviceConfigRange {
+    pub minimum_sample_rate: u32,
+    pub maximum_sample_rate: u32,
+    pub channels: u16,
+    /// `None` means the backend does not report a fixed-buffer range.
+    pub minimum_buffer_frames: Option<u32>,
+    pub maximum_buffer_frames: Option<u32>,
+}
+
+impl AudioDeviceConfigRange {
+    fn supports_sample_rate(self, sample_rate: u32) -> bool {
+        self.channels > 0
+            && self.minimum_sample_rate <= sample_rate
+            && sample_rate <= self.maximum_sample_rate
+    }
+
+    fn supports_buffer_frames(self, buffer_frames: u32) -> bool {
+        match (self.minimum_buffer_frames, self.maximum_buffer_frames) {
+            (Some(minimum), Some(maximum)) => minimum <= buffer_frames && buffer_frames <= maximum,
+            (None, None) => true,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1355,6 +1386,134 @@ pub struct AudioDeviceCatalog {
     pub default_output_id: Option<String>,
     pub default_sample_rate: Option<u32>,
     pub error: Option<String>,
+}
+
+const COMMON_AUDIO_SAMPLE_RATES: &[u32] = &[
+    8_000, 11_025, 16_000, 22_050, 32_000, 44_100, 48_000, 64_000, 88_200, 96_000, 176_400,
+    192_000, 352_800, 384_000,
+];
+const COMMON_AUDIO_BUFFER_FRAMES: &[u32] = &[32, 64, 128, 256, 512, 1_024, 2_048, 4_096, 8_192];
+
+impl AudioDeviceCatalog {
+    /// Returns common sample rates supported by every selected shared-mode endpoint.
+    /// Rates reported as ranges are represented by common audio rates and range endpoints.
+    pub fn supported_sample_rates(&self, settings: &AudioSettings) -> Vec<u32> {
+        if settings.access == AudioAccess::Exclusive {
+            let mut rates = COMMON_AUDIO_SAMPLE_RATES.to_vec();
+            rates.push(settings.sample_rate);
+            rates.sort_unstable();
+            rates.dedup();
+            rates.retain(|rate| (8_000..=384_000).contains(rate));
+            return rates;
+        }
+        let Ok(devices) = self.selected_device_capabilities(settings) else {
+            return Vec::new();
+        };
+        let mut candidates = COMMON_AUDIO_SAMPLE_RATES.to_vec();
+        candidates.push(settings.sample_rate);
+        candidates.extend(self.default_sample_rate);
+        for device in &devices {
+            for config in &device.config_ranges {
+                candidates.push(config.minimum_sample_rate);
+                candidates.push(config.maximum_sample_rate);
+            }
+        }
+        candidates.sort_unstable();
+        candidates.dedup();
+        candidates.retain(|rate| (8_000..=384_000).contains(rate));
+        candidates.retain(|rate| {
+            devices.is_empty()
+                || devices.iter().all(|device| {
+                    device
+                        .config_ranges
+                        .iter()
+                        .any(|config| config.supports_sample_rate(*rate))
+                })
+        });
+        candidates
+    }
+
+    /// Returns fixed buffer sizes supported by every selected shared-mode endpoint at `sample_rate`.
+    pub fn supported_buffer_sizes(&self, settings: &AudioSettings, sample_rate: u32) -> Vec<u32> {
+        if settings.access == AudioAccess::Exclusive {
+            let mut sizes = COMMON_AUDIO_BUFFER_FRAMES.to_vec();
+            sizes.push(settings.buffer_frames);
+            sizes.sort_unstable();
+            sizes.dedup();
+            sizes.retain(|frames| (32..=8_192).contains(frames));
+            return sizes;
+        }
+        let Ok(devices) = self.selected_device_capabilities(settings) else {
+            return Vec::new();
+        };
+        let mut candidates = COMMON_AUDIO_BUFFER_FRAMES.to_vec();
+        candidates.push(settings.buffer_frames);
+        for device in &devices {
+            for config in &device.config_ranges {
+                if config.supports_sample_rate(sample_rate) {
+                    candidates.extend(config.minimum_buffer_frames);
+                    candidates.extend(config.maximum_buffer_frames);
+                }
+            }
+        }
+        candidates.sort_unstable();
+        candidates.dedup();
+        candidates.retain(|frames| (32..=8_192).contains(frames));
+        candidates.retain(|frames| {
+            devices.is_empty()
+                || devices.iter().all(|device| {
+                    let configs = device
+                        .config_ranges
+                        .iter()
+                        .filter(|config| config.supports_sample_rate(sample_rate))
+                        .collect::<Vec<_>>();
+                    let preferred_channels = configs
+                        .iter()
+                        .map(|config| (config.channels == 2, config.channels))
+                        .max();
+                    preferred_channels.is_some_and(|preferred| {
+                        configs.iter().any(|config| {
+                            (config.channels == 2, config.channels) == preferred
+                                && config.supports_buffer_frames(*frames)
+                        })
+                    })
+                })
+        });
+        candidates
+    }
+
+    fn selected_device_capabilities(
+        &self,
+        settings: &AudioSettings,
+    ) -> Result<Vec<&AudioDeviceInfo>, ()> {
+        let mut devices = Vec::new();
+        for (enabled, selected_id, default_id, candidates) in [
+            (
+                settings.enable_input,
+                settings.input_device_id.as_deref(),
+                self.default_input_id.as_deref(),
+                self.inputs.as_slice(),
+            ),
+            (
+                settings.enable_output,
+                settings.output_device_id.as_deref(),
+                self.default_output_id.as_deref(),
+                self.outputs.as_slice(),
+            ),
+        ] {
+            if !enabled {
+                continue;
+            }
+            let Some(id) = selected_id.or(default_id) else {
+                continue;
+            };
+            let Some(device) = candidates.iter().find(|device| device.id == id) else {
+                return Err(());
+            };
+            devices.push(device);
+        }
+        Ok(devices)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2305,12 +2464,33 @@ pub fn enumerate_devices() -> AudioDeviceCatalog {
                     let info = AudioDeviceInfo {
                         id: id.to_string(),
                         name: format!("{} · {name}", host_id.to_string().to_ascii_uppercase()),
+                        config_ranges: Vec::new(),
                     };
                     if device.supports_input() {
-                        catalog.inputs.push(info.clone());
+                        let config_ranges = match device.supported_input_configs() {
+                            Ok(configs) => audio_device_config_ranges(configs),
+                            Err(error) => {
+                                errors.push(format!("{} input formats: {error}", info.name));
+                                Vec::new()
+                            }
+                        };
+                        catalog.inputs.push(AudioDeviceInfo {
+                            config_ranges,
+                            ..info.clone()
+                        });
                     }
                     if device.supports_output() {
-                        catalog.outputs.push(info);
+                        let config_ranges = match device.supported_output_configs() {
+                            Ok(configs) => audio_device_config_ranges(configs),
+                            Err(error) => {
+                                errors.push(format!("{} output formats: {error}", info.name));
+                                Vec::new()
+                            }
+                        };
+                        catalog.outputs.push(AudioDeviceInfo {
+                            config_ranges,
+                            ..info
+                        });
                     }
                 }
             }
@@ -2328,6 +2508,37 @@ pub fn enumerate_devices() -> AudioDeviceCatalog {
         .outputs
         .sort_by(|left, right| left.name.cmp(&right.name));
     catalog
+}
+
+fn audio_device_config_ranges(
+    configs: impl Iterator<Item = SupportedStreamConfigRange>,
+) -> Vec<AudioDeviceConfigRange> {
+    let mut ranges = configs
+        .map(|config| {
+            let (minimum_buffer_frames, maximum_buffer_frames) = match config.buffer_size() {
+                SupportedBufferSize::Range { min, max } => (Some(*min), Some(*max)),
+                SupportedBufferSize::Unknown => (None, None),
+            };
+            AudioDeviceConfigRange {
+                minimum_sample_rate: config.min_sample_rate(),
+                maximum_sample_rate: config.max_sample_rate(),
+                channels: config.channels(),
+                minimum_buffer_frames,
+                maximum_buffer_frames,
+            }
+        })
+        .collect::<Vec<_>>();
+    ranges.sort_unstable_by_key(|range| {
+        (
+            range.minimum_sample_rate,
+            range.maximum_sample_rate,
+            range.channels,
+            range.minimum_buffer_frames,
+            range.maximum_buffer_frames,
+        )
+    });
+    ranges.dedup();
+    ranges
 }
 
 /// An active pair of device streams. Input is captured into a lock-free mono
@@ -3134,6 +3345,7 @@ fn select_config(
     device: &cpal::Device,
     input: bool,
     sample_rate: u32,
+    requested_buffer_frames: u32,
 ) -> Result<SupportedStreamConfig, String> {
     let configs = if input {
         device
@@ -3162,7 +3374,15 @@ fn select_config(
                 SampleFormat::U16 => 3,
                 _ => 0,
             };
-            (channels == 2, format_score, channels)
+            let (buffer_score, buffer_distance) =
+                buffer_config_preference(config.buffer_size(), requested_buffer_frames);
+            (
+                channels == 2,
+                channels,
+                buffer_score,
+                std::cmp::Reverse(buffer_distance),
+                format_score,
+            )
         })
         .map(|config| config.with_sample_rate(sample_rate))
         .ok_or_else(|| {
@@ -3173,6 +3393,28 @@ fn select_config(
         })
 }
 
+fn buffer_config_preference(buffer_size: &SupportedBufferSize, requested: u32) -> (u8, u32) {
+    match buffer_size {
+        SupportedBufferSize::Range { min, max } if (*min..=*max).contains(&requested) => (3, 0),
+        SupportedBufferSize::Range { min, max } => {
+            let distance = if requested < *min {
+                min.saturating_sub(requested)
+            } else {
+                requested.saturating_sub(*max)
+            };
+            (1, distance)
+        }
+        SupportedBufferSize::Unknown => (2, 0),
+    }
+}
+
+fn negotiated_buffer_frames(buffer_size: &SupportedBufferSize, requested: u32) -> u32 {
+    match buffer_size {
+        SupportedBufferSize::Range { min, max } => requested.clamp(*min, *max),
+        SupportedBufferSize::Unknown => requested,
+    }
+}
+
 fn build_output_stream(
     device: &cpal::Device,
     settings: &AudioSettings,
@@ -3181,10 +3423,13 @@ fn build_output_stream(
     ring: Arc<AudioRingBuffer>,
     error: Arc<AudioErrorState>,
 ) -> Result<Stream, String> {
-    let supported = select_config(device, false, settings.sample_rate)?;
+    let supported = select_config(device, false, settings.sample_rate, settings.buffer_frames)?;
     let format = supported.sample_format();
     let mut config = supported.config();
-    config.buffer_size = cpal::BufferSize::Fixed(settings.buffer_frames);
+    config.buffer_size = cpal::BufferSize::Fixed(negotiated_buffer_frames(
+        supported.buffer_size(),
+        settings.buffer_frames,
+    ));
     match build_typed_output(
         device,
         config,
@@ -3335,10 +3580,13 @@ fn build_input_stream(
     settings: &AudioSettings,
     state: InputStreamState,
 ) -> Result<Stream, String> {
-    let supported = select_config(device, true, settings.sample_rate)?;
+    let supported = select_config(device, true, settings.sample_rate, settings.buffer_frames)?;
     let format = supported.sample_format();
     let mut config = supported.config();
-    config.buffer_size = cpal::BufferSize::Fixed(settings.buffer_frames);
+    config.buffer_size = cpal::BufferSize::Fixed(negotiated_buffer_frames(
+        supported.buffer_size(),
+        settings.buffer_frames,
+    ));
     match build_typed_input(device, config, format, state.clone()) {
         Ok(stream) => Ok(stream),
         Err(first_error) => {
@@ -4250,15 +4498,151 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU8, Ordering};
 
+    use cpal::SupportedBufferSize;
+
     use super::{
         AUDIO_COMMAND_QUEUE_CAPACITY, AUDIO_SOURCE_INPUT_MONITOR, AUDIO_SOURCE_PROJECT,
         AUDIO_SOURCE_SILENT, AUDIO_SOURCE_STREAM, AUDIO_SOURCE_TEST_TONE, AudioAccess,
-        AudioInputRecording, AudioRingBuffer, AudioSettings, InputRecordingState, ParameterCommand,
-        PlaybackState, ProjectPlaybackClock, STREAM_PREFILL_FRAMES, StagedStreamingPlayback,
-        StereoFrameDelay, TransportCommand, create_streaming_playback, enable_denormal_protection,
+        AudioDeviceCatalog, AudioDeviceConfigRange, AudioDeviceInfo, AudioInputRecording,
+        AudioRingBuffer, AudioSettings, InputRecordingState, ParameterCommand, PlaybackState,
+        ProjectPlaybackClock, STREAM_PREFILL_FRAMES, StagedStreamingPlayback, StereoFrameDelay,
+        TransportCommand, audio_device_config_ranges, buffer_config_preference,
+        create_streaming_playback, enable_denormal_protection, negotiated_buffer_frames,
         next_output_frame, output_gain_smoothing_alpha, sanitize_output_sample, smooth_output_gain,
         tone_sample, valid_project_playback_speed, validate_settings,
     };
+
+    #[test]
+    fn device_catalog_limits_sample_rates_and_buffers_to_common_capabilities() {
+        let input_range = AudioDeviceConfigRange {
+            minimum_sample_rate: 44_100,
+            maximum_sample_rate: 96_000,
+            channels: 2,
+            minimum_buffer_frames: Some(128),
+            maximum_buffer_frames: Some(512),
+        };
+        let output_range = AudioDeviceConfigRange {
+            minimum_sample_rate: 32_000,
+            maximum_sample_rate: 48_000,
+            channels: 2,
+            minimum_buffer_frames: Some(64),
+            maximum_buffer_frames: Some(1_024),
+        };
+        let catalog = AudioDeviceCatalog {
+            inputs: vec![AudioDeviceInfo {
+                id: "input".to_owned(),
+                name: "Input".to_owned(),
+                config_ranges: vec![
+                    input_range,
+                    AudioDeviceConfigRange {
+                        channels: 1,
+                        minimum_buffer_frames: Some(32),
+                        maximum_buffer_frames: Some(8_192),
+                        ..input_range
+                    },
+                ],
+            }],
+            outputs: vec![AudioDeviceInfo {
+                id: "output".to_owned(),
+                name: "Output".to_owned(),
+                config_ranges: vec![output_range],
+            }],
+            default_input_id: Some("input".to_owned()),
+            default_output_id: Some("output".to_owned()),
+            default_sample_rate: Some(48_000),
+            error: None,
+        };
+        let settings = AudioSettings {
+            sample_rate: 192_000,
+            buffer_frames: 2_048,
+            ..AudioSettings::default()
+        };
+
+        assert_eq!(catalog.supported_sample_rates(&settings), [44_100, 48_000]);
+        assert_eq!(
+            catalog.supported_buffer_sizes(&settings, 48_000),
+            [128, 256, 512]
+        );
+        assert!(catalog.supported_buffer_sizes(&settings, 96_000).is_empty());
+    }
+
+    #[test]
+    fn selected_device_change_reports_unknown_and_missing_capabilities_distinctly() {
+        let catalog = AudioDeviceCatalog {
+            outputs: vec![AudioDeviceInfo {
+                id: "output".to_owned(),
+                name: "Output".to_owned(),
+                config_ranges: vec![AudioDeviceConfigRange {
+                    minimum_sample_rate: 48_000,
+                    maximum_sample_rate: 48_000,
+                    channels: 2,
+                    minimum_buffer_frames: None,
+                    maximum_buffer_frames: None,
+                }],
+            }],
+            default_output_id: Some("output".to_owned()),
+            ..AudioDeviceCatalog::default()
+        };
+        let settings = AudioSettings {
+            enable_input: false,
+            ..AudioSettings::default()
+        };
+        assert_eq!(catalog.supported_sample_rates(&settings), [48_000]);
+        assert_eq!(
+            catalog.supported_buffer_sizes(&settings, 48_000),
+            [32, 64, 128, 256, 512, 1_024, 2_048, 4_096, 8_192]
+        );
+
+        let missing_device_settings = AudioSettings {
+            output_device_id: Some("removed-output".to_owned()),
+            ..settings
+        };
+        assert!(
+            catalog
+                .supported_sample_rates(&missing_device_settings)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn stream_buffer_negotiation_prefers_supported_and_clamps_known_ranges() {
+        let range = SupportedBufferSize::Range { min: 128, max: 512 };
+        assert_eq!(buffer_config_preference(&range, 256), (3, 0));
+        assert_eq!(buffer_config_preference(&range, 64), (1, 64));
+        assert_eq!(negotiated_buffer_frames(&range, 64), 128);
+        assert_eq!(negotiated_buffer_frames(&range, 1_024), 512);
+        assert_eq!(
+            negotiated_buffer_frames(&SupportedBufferSize::Unknown, 256),
+            256
+        );
+    }
+
+    #[test]
+    fn cpal_device_ranges_preserve_sample_rate_channel_and_buffer_limits() {
+        let ranges = audio_device_config_ranges(
+            [cpal::SupportedStreamConfigRange::new(
+                2,
+                44_100,
+                96_000,
+                SupportedBufferSize::Range {
+                    min: 64,
+                    max: 1_024,
+                },
+                cpal::SampleFormat::F32,
+            )]
+            .into_iter(),
+        );
+        assert_eq!(
+            ranges,
+            [AudioDeviceConfigRange {
+                minimum_sample_rate: 44_100,
+                maximum_sample_rate: 96_000,
+                channels: 2,
+                minimum_buffer_frames: Some(64),
+                maximum_buffer_frames: Some(1_024),
+            }]
+        );
+    }
 
     #[test]
     fn stereo_frame_delay_preserves_channels_across_block_boundaries() {
