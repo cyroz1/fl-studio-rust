@@ -389,6 +389,14 @@ def _jump_to_marker(delta, select):
     )
 
 
+def _selection_start():
+    return int(_active_transport_state.get("arrangement_selection_start", 0))
+
+
+def _selection_end():
+    return int(_active_transport_state.get("arrangement_selection_end", 0))
+
+
 def _get_song_tick_pos(mode=0):
     position_ticks = int(_active_transport_state.get("song_position_ticks", 0))
     if mode == 0:
@@ -776,6 +784,8 @@ def _install_modules(script_name, device_name):
     arrangement.addAutoTimeMarker = _add_auto_time_marker
     arrangement.getMarkerName = _get_marker_name
     arrangement.jumpToMarker = _jump_to_marker
+    arrangement.selectionStart = _selection_start
+    arrangement.selectionEnd = _selection_end
 
     for name in (
         "playlist",

@@ -13821,6 +13821,15 @@ impl DawUi {
         {
             *names = arrangement_marker_names;
         }
+        let (arrangement_selection_start, arrangement_selection_end) = self
+            .midi_script_arrangement_selection_bounds()
+            .unwrap_or((0, 0));
+        self.midi_script_transport_state
+            .arrangement_selection_start
+            .store(arrangement_selection_start, Ordering::Relaxed);
+        self.midi_script_transport_state
+            .arrangement_selection_end
+            .store(arrangement_selection_end, Ordering::Relaxed);
         let song_position_hint = if has_script {
             self.song_position_label()
         } else {
@@ -14298,6 +14307,34 @@ impl DawUi {
             .unwrap_or_default();
         markers.sort_unstable_by_key(|(index, tick)| (*tick, *index));
         markers
+    }
+
+    fn midi_script_arrangement_selection_bounds(&self) -> Option<(u64, u64)> {
+        let document = self.document.as_ref()?;
+        let arrangements = document.arrangements().ok()?;
+        let arrangement_id = self
+            .selected_arrangement
+            .filter(|selected| {
+                arrangements
+                    .iter()
+                    .any(|arrangement| arrangement.id == *selected)
+            })
+            .or_else(|| arrangements.first().map(|arrangement| arrangement.id))?;
+        if self.selected_arrangement != Some(arrangement_id) {
+            return None;
+        }
+        let arrangement = arrangements
+            .into_iter()
+            .find(|arrangement| arrangement.id == arrangement_id)?;
+        let selected_indices = if self.selected_playlist_clips.is_empty() {
+            self.selected_clip.into_iter().collect::<Vec<_>>()
+        } else {
+            self.selected_playlist_clips.iter().copied().collect()
+        };
+        midi_script_clip_selection_bounds(selected_indices.into_iter().filter_map(|index| {
+            let clip = arrangement.clips.get(index)?;
+            Some((clip.position_ticks, clip.length_ticks))
+        }))
     }
 
     fn jump_midi_script_marker(&mut self, increment: i32) {
@@ -62337,6 +62374,21 @@ fn midi_script_marker_jump_target(
     markers.get(target_index).copied()
 }
 
+fn midi_script_clip_selection_bounds(
+    clips: impl IntoIterator<Item = (u32, u32)>,
+) -> Option<(u64, u64)> {
+    let mut bounds: Option<(u64, u64)> = None;
+    for (position, length) in clips {
+        let start = u64::from(position);
+        let end = start.saturating_add(u64::from(length));
+        bounds = Some(match bounds {
+            Some((current_start, current_end)) => (current_start.min(start), current_end.max(end)),
+            None => (start, end),
+        });
+    }
+    bounds
+}
+
 fn midi_script_marker_selection_target(
     markers: &[(usize, u32)],
     selected_marker: Option<usize>,
@@ -67241,6 +67293,15 @@ mod tests {
             midi_script_marker_selection_target(&markers, Some(4), -10),
             Some((4, 96))
         );
+    }
+
+    #[test]
+    fn midi_script_selected_clip_bounds_span_earliest_start_to_latest_end() {
+        assert_eq!(
+            midi_script_clip_selection_bounds([(192, 96), (24, 48), (384, 0)]),
+            Some((24, 384))
+        );
+        assert_eq!(midi_script_clip_selection_bounds([]), None);
     }
 
     #[test]
