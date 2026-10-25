@@ -100,6 +100,8 @@ struct PackageEntryMetadata {
     comment: String,
     local_extra_fields: Vec<PackageExtraField>,
     central_extra_fields: Vec<PackageExtraField>,
+    local_extra_field_tail: Vec<u8>,
+    central_extra_field_tail: Vec<u8>,
     local_unicode_path_fields: Vec<PackageExtraField>,
     central_unicode_path_fields: Vec<PackageExtraField>,
     local_file_name_raw: Vec<u8>,
@@ -233,6 +235,7 @@ impl ProjectPackageWorkspace {
                     },
                 )?;
             let local_extra_fields = preserve_unknown_extra_fields(Some(&local_extra_data));
+            let local_extra_field_tail = unparsed_extra_field_tail(&local_extra_data);
             let local_unicode_path_fields =
                 preserve_extra_fields_with_id(&local_extra_data, 0x7075);
             let central_extra_data =
@@ -242,6 +245,7 @@ impl ProjectPackageWorkspace {
                             "could not inspect ZIP entry {raw_name:?} central extra fields: {error}"
                         )
                     })?;
+            let central_extra_field_tail = unparsed_extra_field_tail(&central_extra_data);
             let (central_file_name_raw, central_uses_utf8_name) = read_central_file_name(
                 &mut source_headers,
                 entry.central_header_start(),
@@ -264,6 +268,8 @@ impl ProjectPackageWorkspace {
                     &local_extra_fields,
                     &preserve_unknown_extra_fields(Some(&central_extra_data)),
                 ),
+                local_extra_field_tail,
+                central_extra_field_tail,
                 local_unicode_path_fields,
                 central_unicode_path_fields,
                 local_file_name_raw,
@@ -663,6 +669,24 @@ fn preserve_unknown_extra_fields(raw: Option<&[u8]>) -> Vec<PackageExtraField> {
     fields
 }
 
+fn unparsed_extra_field_tail(raw: &[u8]) -> Vec<u8> {
+    let mut offset = 0;
+    while offset + 4 <= raw.len() {
+        let data_length = usize::from(u16::from_le_bytes([raw[offset + 2], raw[offset + 3]]));
+        let Some(data_end) = offset
+            .checked_add(4)
+            .and_then(|start| start.checked_add(data_length))
+        else {
+            return raw[offset..].to_vec();
+        };
+        if data_end > raw.len() {
+            return raw[offset..].to_vec();
+        }
+        offset = data_end;
+    }
+    raw[offset..].to_vec()
+}
+
 fn preserve_extra_fields_with_id(raw: &[u8], requested_id: u16) -> Vec<PackageExtraField> {
     let mut fields = Vec::new();
     let mut offset = 0;
@@ -806,6 +830,12 @@ fn restore_raw_entry_names(
                 central_unicode_path_fields: entry_metadata
                     .map(|metadata| metadata.central_unicode_path_fields.clone())
                     .unwrap_or_default(),
+                local_extra_field_tail: entry_metadata
+                    .map(|metadata| metadata.local_extra_field_tail.clone())
+                    .unwrap_or_default(),
+                central_extra_field_tail: entry_metadata
+                    .map(|metadata| metadata.central_extra_field_tail.clone())
+                    .unwrap_or_default(),
                 local_file_name_raw: entry_metadata
                     .map(|metadata| metadata.local_file_name_raw.clone())
                     .unwrap_or(current_local_name),
@@ -837,6 +867,8 @@ fn restore_raw_entry_names(
             || current_local_utf8 != entry.local_uses_utf8_name
             || current_central_name != entry.central_file_name_raw
             || current_central_utf8 != entry.central_uses_utf8_name
+            || !entry.local_extra_field_tail.is_empty()
+            || !entry.central_extra_field_tail.is_empty()
             || !entry.local_unicode_path_fields.is_empty()
             || !entry.central_unicode_path_fields.is_empty();
     }
@@ -925,6 +957,8 @@ fn restore_raw_entry_names(
                 })?;
             append_extra_fields(&mut extra, &entry.local_unicode_path_fields)
                 .map_err(|error| format!("could not restore Unicode ZIP filename: {error}"))?;
+            append_raw_extra_tail(&mut extra, &entry.local_extra_field_tail)
+                .map_err(|error| format!("could not restore local ZIP extra bytes: {error}"))?;
             let new_name_length = u16::try_from(entry.local_file_name_raw.len())
                 .map_err(|_| "original ZIP local filename is too long".to_owned())?;
             let new_extra_length = u16::try_from(extra.len())
@@ -1013,6 +1047,8 @@ fn restore_raw_entry_names(
                 .map_err(|error| format!("could not read rewritten ZIP extra fields: {error}"))?;
             append_extra_fields(&mut extra, &entry.central_unicode_path_fields)
                 .map_err(|error| format!("could not restore Unicode ZIP filename: {error}"))?;
+            append_raw_extra_tail(&mut extra, &entry.central_extra_field_tail)
+                .map_err(|error| format!("could not restore central ZIP extra bytes: {error}"))?;
             let new_extra_length = u16::try_from(extra.len())
                 .map_err(|_| "restored ZIP central extra fields are too long".to_owned())?;
             let new_name_length = u16::try_from(entry.central_file_name_raw.len())
@@ -1198,6 +1234,17 @@ fn append_extra_fields(extra: &mut Vec<u8>, fields: &[PackageExtraField]) -> io:
             "combined ZIP extra fields are too long",
         ));
     }
+    Ok(())
+}
+
+fn append_raw_extra_tail(extra: &mut Vec<u8>, tail: &[u8]) -> io::Result<()> {
+    if extra.len().saturating_add(tail.len()) > u16::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "combined ZIP extra bytes are too long",
+        ));
+    }
+    extra.extend_from_slice(tail);
     Ok(())
 }
 
@@ -1460,6 +1507,8 @@ struct ArchiveRewriteEntry {
     central_header_start: u64,
     local_unicode_path_fields: Vec<PackageExtraField>,
     central_unicode_path_fields: Vec<PackageExtraField>,
+    local_extra_field_tail: Vec<u8>,
+    central_extra_field_tail: Vec<u8>,
     local_file_name_raw: Vec<u8>,
     local_uses_utf8_name: bool,
     central_file_name_raw: Vec<u8>,
@@ -2130,5 +2179,76 @@ mod tests {
         expected_central.extend_from_slice(&(central_payload.len() as u16).to_le_bytes());
         expected_central.extend_from_slice(central_payload);
         assert_eq!(central_extra_data, expected_central);
+    }
+
+    #[test]
+    fn preserves_tolerated_trailing_malformed_extra_field_bytes() {
+        let temporary = TestDirectory::new();
+        let source_path = temporary.path().join("source.zip");
+        let output_path = temporary.path().join("saved.zip");
+        let mut options: FullFileOptions<'static> = SimpleFileOptions::default()
+            .compression_method(CompressionMethod::Stored)
+            .into_full_options();
+        options.add_extra_data(0xcafe, b"abcd", false).unwrap();
+
+        let mut source = ZipWriter::new(fs::File::create(&source_path).unwrap());
+        source.start_file("song.flp", options).unwrap();
+        source.write_all(b"original project").unwrap();
+        source.finish().unwrap().sync_all().unwrap();
+
+        let mut archive = ZipArchive::new(fs::File::open(&source_path).unwrap()).unwrap();
+        let project = archive.by_name("song.flp").unwrap();
+        let local_header_start = project.header_start();
+        let central_header_start = project.central_header_start();
+        drop(project);
+        drop(archive);
+
+        let mut source = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&source_path)
+            .unwrap();
+        let local_extra_start = local_header_start + 30 + "song.flp".len() as u64;
+        let central_extra_start = central_header_start + 46 + "song.flp".len() as u64;
+        for length_offset in [local_extra_start + 2, central_extra_start + 2] {
+            source.seek(SeekFrom::Start(length_offset)).unwrap();
+            source.write_all(&2_u16.to_le_bytes()).unwrap();
+        }
+        source.sync_all().unwrap();
+        drop(source);
+
+        let mut source_archive = ZipArchive::new(fs::File::open(&source_path).unwrap()).unwrap();
+        let mut original = source_archive.by_name("song.flp").unwrap();
+        let mut original_bytes = Vec::new();
+        original.read_to_end(&mut original_bytes).unwrap();
+        assert_eq!(original_bytes, b"original project");
+        drop(original);
+        drop(source_archive);
+
+        let (workspace, original_project) = ProjectPackageWorkspace::open(&source_path).unwrap();
+        assert_eq!(original_project, b"original project");
+        workspace
+            .write_to(&output_path, b"updated project")
+            .unwrap();
+
+        let mut saved = ZipArchive::new(fs::File::open(&output_path).unwrap()).unwrap();
+        let mut project = saved.by_name("song.flp").unwrap();
+        let output_local_header_start = project.header_start();
+        let output_central_header_start = project.central_header_start();
+        let mut saved_bytes = Vec::new();
+        project.read_to_end(&mut saved_bytes).unwrap();
+        assert_eq!(saved_bytes, b"updated project");
+        drop(project);
+
+        let expected_extra = [0xfe, 0xca, 2, 0, b'a', b'b', b'c', b'd'];
+        let mut saved_file = fs::File::open(&output_path).unwrap();
+        assert_eq!(
+            read_local_extra_data(&mut saved_file, output_local_header_start).unwrap(),
+            expected_extra
+        );
+        assert_eq!(
+            read_central_extra_data(&mut saved_file, output_central_header_start).unwrap(),
+            expected_extra
+        );
     }
 }
