@@ -1416,6 +1416,7 @@ pub struct MidiRecordingResult {
     pub channel_id: u16,
     pub project_path: Option<PathBuf>,
     pub notes: Vec<PatternNote>,
+    pub elapsed_ticks: u32,
     pub overflowed: bool,
 }
 
@@ -1945,6 +1946,7 @@ impl MidiPatternRecorder {
             .saturating_add(self.start_tick)
             .min(MAX_NOTE_TICK);
         let finish_tick = finish_tick.max(self.last_position_tick);
+        let elapsed_ticks = finish_tick.saturating_sub(self.start_tick);
         for ((channel, key), active) in std::mem::take(&mut self.active_notes) {
             for active_note in active {
                 let note = self.make_note(active_note, finish_tick, channel, key, None);
@@ -1970,6 +1972,7 @@ impl MidiPatternRecorder {
             channel_id: self.channel_id,
             project_path: self.project_path,
             notes: self.notes,
+            elapsed_ticks,
             overflowed: self.overflowed,
         }
     }
@@ -3458,6 +3461,7 @@ mod tests {
         assert_eq!(result.notes.len(), 1);
         assert_eq!(result.notes[0].position, 72);
         assert_eq!(result.notes[0].length, 48);
+        assert_eq!(result.elapsed_ticks, 96);
     }
 
     #[test]

@@ -5726,6 +5726,7 @@ struct MidiPlaylistClipExtension {
     position_ticks: u32,
     length_ticks: u32,
     track_index: u16,
+    recording_start_offset_ticks: u32,
     source_start_tick: u32,
     pattern_loop_length_ticks: u32,
 }
@@ -46678,6 +46679,11 @@ impl DawUi {
                         &arrangement.clips,
                     ) {
                         let clip = arrangement.clips.get(clip_index)?;
+                        let recording_start_offset_ticks = playlist_clip_local_recording_offset(
+                            playhead_tick,
+                            clip.position_ticks,
+                            clip.length_ticks,
+                        )?;
                         let source_start_tick = playlist_pattern_recording_source_start(clip)?;
                         let pattern_loop_length_ticks = pattern_loop_length_ticks?;
                         Some(MidiPlaylistRecordingTarget::ExtendClip(
@@ -46687,6 +46693,7 @@ impl DawUi {
                                 position_ticks: clip.position_ticks,
                                 length_ticks: clip.length_ticks,
                                 track_index: clip.track_index?,
+                                recording_start_offset_ticks,
                                 source_start_tick,
                                 pattern_loop_length_ticks,
                             },
@@ -46824,6 +46831,7 @@ impl DawUi {
             ..
         } = recording;
         let result = recorder.finish(stop_timestamp_micros, finished_at);
+        let recorded_elapsed_ticks = result.elapsed_ticks;
         let mut notes = result.notes;
         let snapped_to_scale = scale_snap.is_some();
         if let Some(scale) = scale_snap {
@@ -46918,6 +46926,7 @@ impl DawUi {
                         result.pattern_id,
                         extension,
                         &notes,
+                        recorded_elapsed_ticks,
                     )
                     .map(|new_length_ticks| {
                         MidiPlaylistRecordingOutcome::ClipExtended {
@@ -64042,11 +64051,14 @@ fn extend_recorded_pattern_playlist_clip(
     pattern_id: u16,
     extension: MidiPlaylistClipExtension,
     notes: &[PatternNote],
+    recorded_elapsed_ticks: u32,
 ) -> Result<Option<u32>, String> {
     let required_length_ticks = recorded_pattern_clip_required_length(
         notes,
         extension.source_start_tick,
         extension.pattern_loop_length_ticks,
+        extension.recording_start_offset_ticks,
+        recorded_elapsed_ticks,
     )?;
     let arrangements = document
         .arrangements()
@@ -64098,12 +64110,14 @@ fn recorded_pattern_clip_required_length(
     notes: &[PatternNote],
     source_start_tick: u32,
     pattern_loop_length_ticks: u32,
+    recording_start_offset_ticks: u32,
+    recorded_elapsed_ticks: u32,
 ) -> Result<u32, String> {
     if pattern_loop_length_ticks == 0 {
         return Err("The recorded Pattern has no usable loop length".to_owned());
     }
     let loop_length = u64::from(pattern_loop_length_ticks);
-    notes.iter().try_fold(0_u32, |required_length, note| {
+    let notes_required_length = notes.iter().try_fold(0_u32, |required_length, note| {
         if note.length == 0 {
             return Ok(required_length);
         }
@@ -64115,7 +64129,11 @@ fn recorded_pattern_clip_required_length(
             .and_then(|end| u32::try_from(end).ok())
             .ok_or_else(|| "A recorded Pattern note exceeds the Playlist tick range".to_owned())?;
         Ok(required_length.max(note_end))
-    })
+    })?;
+    let take_required_length = recording_start_offset_ticks
+        .checked_add(recorded_elapsed_ticks)
+        .ok_or_else(|| "The recorded Pattern extends beyond the Playlist tick range".to_owned())?;
+    Ok(notes_required_length.max(take_required_length))
 }
 
 fn create_recorded_pattern_playlist_clip(
@@ -67252,24 +67270,25 @@ mod tests {
             playlist_pattern_recording_offset(430.0, 7, 96, &clips),
             Some(70)
         );
+        let recorded_notes = [
+            PatternNote {
+                position: 0,
+                length: 12,
+                ..PatternNote::default()
+            },
+            PatternNote {
+                position: 72,
+                length: 24,
+                ..PatternNote::default()
+            },
+        ];
         assert_eq!(
-            recorded_pattern_clip_required_length(
-                &[
-                    PatternNote {
-                        position: 0,
-                        length: 12,
-                        ..PatternNote::default()
-                    },
-                    PatternNote {
-                        position: 72,
-                        length: 24,
-                        ..PatternNote::default()
-                    },
-                ],
-                24,
-                96,
-            ),
+            recorded_pattern_clip_required_length(&recorded_notes, 24, 96, 0, 0),
             Ok(84)
+        );
+        assert_eq!(
+            recorded_pattern_clip_required_length(&recorded_notes, 24, 96, 24, 300),
+            Ok(324)
         );
 
         clips[1].source_window_ticks = Some((24, 192));
