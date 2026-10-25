@@ -46,16 +46,20 @@ jobs:
             rustup target add i686-pc-windows-msvc
           else
             sudo dpkg --add-architecture i386
-            sudo apt-get update
-            sudo apt-get install --yes gcc-multilib libxcb1-dev:i386
             rustup target add i686-unknown-linux-gnu
           fi
 
       - name: Install Linux native dependencies
         if: runner.os == 'Linux'
+        env:
+          TARGET_PLATFORM: ${{ matrix.platform }}
         run: |
+          packages=(ffmpeg libasound2-dev libclang-dev libjack-jackd2-dev libpipewire-0.3-dev libpulse-dev libxcb1-dev libxkbcommon-x11-0 mesa-vulkan-drivers rpm xvfb xdotool zstd)
+          if [[ "$TARGET_PLATFORM" == "linux-x64" ]]; then
+            packages+=(gcc-multilib libxcb1-dev:i386)
+          fi
           sudo apt-get update
-          sudo apt-get install --yes ffmpeg libasound2-dev libclang-dev libjack-jackd2-dev libpipewire-0.3-dev libpulse-dev libxcb1-dev libxkbcommon-x11-0 mesa-vulkan-drivers rpm xvfb xdotool zstd
+          sudo apt-get install --yes "${packages[@]}"
 
       - name: Check formatting
         run: cargo fmt --all -- --check
