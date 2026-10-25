@@ -102,7 +102,7 @@ struct PackageEntryMetadata {
     central_extra_fields: Vec<PackageExtraField>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct PackageExtraField {
     header_id: u16,
     data: Vec<u8>,
@@ -216,30 +216,25 @@ impl ProjectPackageWorkspace {
             if entry.is_dir() {
                 options = options.unix_permissions(entry.unix_mode().unwrap_or(0o755) | 0o040000);
             }
+            let local_extra_data = read_local_extra_data(&mut source_headers, entry.header_start())
+                .map_err(|error| {
+                    format!("could not inspect ZIP entry {raw_name:?} local extra fields: {error}")
+                })?;
+            let local_extra_fields = preserve_unknown_extra_fields(Some(&local_extra_data));
+            let central_extra_data =
+                read_central_extra_data(&mut source_headers, entry.central_header_start())
+                    .map_err(|error| {
+                        format!(
+                            "could not inspect ZIP entry {raw_name:?} central extra fields: {error}"
+                        )
+                    })?;
             let metadata = PackageEntryMetadata {
                 options,
                 comment: entry.comment().to_owned(),
-                local_extra_fields: preserve_unknown_extra_fields(Some(
-                    &read_local_extra_data(&mut source_headers, entry.header_start()).map_err(
-                        |error| {
-                            format!(
-                                "could not inspect ZIP entry {raw_name:?} local extra fields: {error}"
-                            )
-                        },
-                    )?,
-                )),
-                central_extra_fields: preserve_unknown_extra_fields(
-                    Some(
-                        &read_central_extra_data(
-                            &mut source_headers,
-                            entry.central_header_start(),
-                        )
-                            .map_err(|error| {
-                                format!(
-                                    "could not inspect ZIP entry {raw_name:?} central extra fields: {error}"
-                                )
-                            })?,
-                    ),
+                local_extra_fields: local_extra_fields.clone(),
+                central_extra_fields: remove_mirrored_local_extra_fields(
+                    &local_extra_fields,
+                    &preserve_unknown_extra_fields(Some(&central_extra_data)),
                 ),
             };
 
@@ -629,6 +624,17 @@ fn preserve_unknown_extra_fields(raw: Option<&[u8]>) -> Vec<PackageExtraField> {
         offset = data_end;
     }
     fields
+}
+
+fn remove_mirrored_local_extra_fields(
+    local_fields: &[PackageExtraField],
+    central_fields: &[PackageExtraField],
+) -> Vec<PackageExtraField> {
+    if central_fields.starts_with(local_fields) {
+        central_fields[local_fields.len()..].to_vec()
+    } else {
+        central_fields.to_vec()
+    }
 }
 
 fn read_central_extra_data(file: &mut File, header_start: u64) -> io::Result<Vec<u8>> {
@@ -1162,7 +1168,7 @@ mod tests {
         let mut central_file = fs::File::open(&output_path).unwrap();
         let central_extra_data =
             read_central_extra_data(&mut central_file, project.central_header_start()).unwrap();
-        let mut expected_central = Vec::new();
+        let mut expected_central = expected_local;
         expected_central.extend_from_slice(&0xbeef_u16.to_le_bytes());
         expected_central.extend_from_slice(&(central_payload.len() as u16).to_le_bytes());
         expected_central.extend_from_slice(central_payload);
