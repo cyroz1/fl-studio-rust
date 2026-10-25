@@ -55,7 +55,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --yes ffmpeg libasound2-dev libxcb1-dev libxkbcommon-x11-0 mesa-vulkan-drivers rpm xvfb xdotool zstd
+          sudo apt-get install --yes ffmpeg libasound2-dev libclang-dev libjack-jackd2-dev libpipewire-0.3-dev libpulse-dev libxcb1-dev libxkbcommon-x11-0 mesa-vulkan-drivers rpm xvfb xdotool zstd
 
       - name: Check formatting
         run: cargo fmt --all -- --check

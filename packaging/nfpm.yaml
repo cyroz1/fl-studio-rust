@@ -36,15 +36,24 @@ overrides:
   deb:
     depends:
       - libasound2
+      - libjack-jackd2-0
+      - "libpipewire-0.3-0 | libpipewire-0.3-0t64"
+      - libpulse0
       - libxcb1
       - libxkbcommon-x11-0
   rpm:
     depends:
       - "libasound.so.2()(64bit)"
+      - "libjack.so.0()(64bit)"
+      - "libpipewire-0.3.so.0()(64bit)"
+      - "libpulse.so.0()(64bit)"
       - "libxcb.so.1()(64bit)"
       - "libxkbcommon-x11.so.0()(64bit)"
   archlinux:
     depends:
       - alsa-lib
+      - jack2
+      - libpipewire
+      - libpulse
       - libxcb
       - libxkbcommon-x11

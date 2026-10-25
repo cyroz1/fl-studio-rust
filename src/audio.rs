@@ -1,8 +1,9 @@
 //! Live device input and output for the desktop application.
 //!
-//! Shared streams use CPAL (WASAPI or ASIO on Windows). Windows exclusive
-//! streams are opened directly with WASAPI so the requested endpoint format and
-//! exclusive-access errors are visible to the application.
+//! Shared streams use CPAL (ALSA, JACK, PipeWire, or PulseAudio on Linux;
+//! WASAPI or ASIO on Windows). Windows exclusive streams are opened directly
+//! with WASAPI so the requested endpoint format and exclusive-access errors are
+//! visible to the application.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering};
