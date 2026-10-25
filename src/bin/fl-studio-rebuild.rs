@@ -67,8 +67,8 @@ use flp_rebuild::vst3::{
 use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, ArpeggioRangePattern, ArpeggioSyncMode, Arrangement,
     ArticulateOptions, AutomationChannel, AutomationInterpolationMode, AutomationPoint,
-    AutomationPointEdit, ChannelGroupSummary, ChannelNoteRouter, ChannelSortOrder,
-    ChannelStretchMode, ChannelStretchSettingsEdit, ChannelSummary, ChannelType,
+    AutomationPointEdit, AutomationScaleLevelsOptions, ChannelGroupSummary, ChannelNoteRouter,
+    ChannelSortOrder, ChannelStretchMode, ChannelStretchSettingsEdit, ChannelSummary, ChannelType,
     ClawMachineOptions, FlamOptions, FlpDocument, FlpError, FstPreset, FstPresetKind,
     HumanizerOptions, LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerInsertSummary,
     MixerParameterKind, MixerParameterRecord, MixerSendSummary, PATTERN_NOTE_DEFAULT_FLAGS,
@@ -3950,6 +3950,9 @@ enum AutomationEditAction {
     CopyState {
         source_channel_id: u16,
     },
+    ScaleLevels {
+        options: AutomationScaleLevelsOptions,
+    },
     SetLfoAmount {
         amount: i32,
     },
@@ -4784,6 +4787,10 @@ struct DawUi {
     automation_interpolation_anchor: Option<usize>,
     automation_snap: bool,
     automation_visible_beats: f64,
+    automation_scale_center_percent: i16,
+    automation_scale_tension_percent: i16,
+    automation_scale_multiplier_percent: i16,
+    automation_scale_offset_percent: i16,
     last_plugin_action: Option<String>,
     timeline_zoom: f32,
     playlist_track_zoom: f32,
@@ -6296,6 +6303,10 @@ impl DawUi {
             automation_interpolation_anchor: None,
             automation_snap: true,
             automation_visible_beats: 16.0,
+            automation_scale_center_percent: 0,
+            automation_scale_tension_percent: 0,
+            automation_scale_multiplier_percent: 100,
+            automation_scale_offset_percent: 0,
             last_plugin_action: None,
             timeline_zoom: 0.10,
             playlist_track_zoom: 1.0,
@@ -29202,6 +29213,48 @@ impl DawUi {
             {
                 action = Some(AutomationEditAction::Normalize);
             }
+            ui.add_enabled_ui(has_blob, |ui| {
+                ui.menu_button("Scale levels", |ui| {
+                    ui.add(
+                        egui::Slider::new(&mut self.automation_scale_center_percent, -100..=100)
+                            .text("Center %"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.automation_scale_tension_percent, -100..=100)
+                            .text("Tension %"),
+                    );
+                    ui.add(
+                        egui::Slider::new(
+                            &mut self.automation_scale_multiplier_percent,
+                            -200..=200,
+                        )
+                        .text("Multiply %"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.automation_scale_offset_percent, -100..=100)
+                            .text("Offset %"),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.button("Reset").clicked() {
+                            self.automation_scale_center_percent = 0;
+                            self.automation_scale_tension_percent = 0;
+                            self.automation_scale_multiplier_percent = 100;
+                            self.automation_scale_offset_percent = 0;
+                        }
+                        if ui.button("Apply").clicked() {
+                            action = Some(AutomationEditAction::ScaleLevels {
+                                options: AutomationScaleLevelsOptions {
+                                    center_percent: self.automation_scale_center_percent,
+                                    tension_percent: self.automation_scale_tension_percent,
+                                    multiplier_percent: self.automation_scale_multiplier_percent,
+                                    offset_percent: self.automation_scale_offset_percent,
+                                },
+                            });
+                            ui.close();
+                        }
+                    });
+                });
+            });
             ui.checkbox(&mut self.automation_snap, "Snap 1/4 beat");
             ui.add(egui::Slider::new(&mut self.automation_visible_beats, 4.0..=64.0).text("Span"));
         });
@@ -29511,11 +29564,12 @@ impl DawUi {
         if let Some(action) = action
             && let Some(document) = self.document.as_mut()
         {
-            let mut interpolation_count = None;
+            let mut changed_point_count = None;
             let mut initialized_template = false;
             let mut copied_state_from = None;
             let mut flipped_points = false;
             let mut normalized_points = false;
+            let mut scaled_levels = false;
             let result = match action {
                 AutomationEditAction::InitializeFromTemplate {
                     template_channel_id,
@@ -29535,6 +29589,16 @@ impl DawUi {
                     self.automation_interpolation_anchor = None;
                     copied_state_from = Some(source_channel_id);
                     document.copy_automation_state(source_channel_id, channel_id)
+                }
+                AutomationEditAction::ScaleLevels { options } => {
+                    self.selected_automation_point = None;
+                    self.automation_add_mode = false;
+                    self.automation_interpolate_mode = false;
+                    self.automation_interpolation_anchor = None;
+                    scaled_levels = true;
+                    document
+                        .scale_automation_levels(channel_id, options)
+                        .map(|count| changed_point_count = Some(count))
                 }
                 AutomationEditAction::SetLfoAmount { amount } => {
                     document.set_automation_lfo_amount(channel_id, amount)
@@ -29573,7 +29637,7 @@ impl DawUi {
                     flipped_points = true;
                     document
                         .flip_automation_points(channel_id)
-                        .map(|count| interpolation_count = Some(count))
+                        .map(|count| changed_point_count = Some(count))
                 }
                 AutomationEditAction::Normalize => {
                     self.selected_automation_point = None;
@@ -29583,7 +29647,7 @@ impl DawUi {
                     normalized_points = true;
                     document
                         .normalize_automation_points(channel_id)
-                        .map(|count| interpolation_count = Some(count))
+                        .map(|count| changed_point_count = Some(count))
                 }
                 AutomationEditAction::Interpolate {
                     first_point_index,
@@ -29600,7 +29664,7 @@ impl DawUi {
                             last_point_index,
                             mode,
                         )
-                        .map(|count| interpolation_count = Some(count))
+                        .map(|count| changed_point_count = Some(count))
                 }
             };
             match result {
@@ -29610,13 +29674,15 @@ impl DawUi {
                         self.status = format!(
                             "Copied Automation curve state from channel {source_channel_id}"
                         );
-                    } else if let Some(count) = interpolation_count {
+                    } else if let Some(count) = changed_point_count {
                         if count == 0 {
                             self.status = if flipped_points {
                                 "There are no automation points to flip".to_owned()
                             } else if normalized_points {
                                 "The automation curve is flat; there is nothing to normalize"
                                     .to_owned()
+                            } else if scaled_levels {
+                                "Automation levels did not change".to_owned()
                             } else {
                                 "There are no automation points between those endpoints".to_owned()
                             };
@@ -29626,6 +29692,8 @@ impl DawUi {
                                 format!("Vertically flipped {count} automation point values")
                             } else if normalized_points {
                                 format!("Normalized {count} automation point values to 0–1")
+                            } else if scaled_levels {
+                                format!("Scaled {count} Automation point values")
                             } else {
                                 format!(
                                     "{} {count} automation point values",

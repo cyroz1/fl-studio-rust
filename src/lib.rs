@@ -1711,6 +1711,31 @@ pub enum AutomationInterpolationMode {
     Smooth,
 }
 
+/// Parameters for scaling normalized type-5 Automation point values.
+///
+/// The multiplier uses Automation Clip's documented -200..=200 range. Center,
+/// tension, and offset use local -100..=100 ranges; tension currently uses the
+/// bounded logarithmic transform used by Piano roll Scale Levels. The Automation
+/// tool's exact ranges and response still need comparison against FL Studio.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AutomationScaleLevelsOptions {
+    pub center_percent: i16,
+    pub tension_percent: i16,
+    pub multiplier_percent: i16,
+    pub offset_percent: i16,
+}
+
+impl Default for AutomationScaleLevelsOptions {
+    fn default() -> Self {
+        Self {
+            center_percent: 0,
+            tension_percent: 0,
+            multiplier_percent: 100,
+            offset_percent: 0,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Pattern {
     pub id: u16,
@@ -18710,6 +18735,104 @@ impl FlpDocument {
         Ok(points.len())
     }
 
+    /// Applies the Level Scale transform to every value in a type-5 Automation
+    /// channel. Point positions, saved per-segment tension, opaque point bytes,
+    /// and the `0xEA` header and trailer are retained.
+    pub fn scale_automation_levels(
+        &mut self,
+        channel_id: u16,
+        options: AutomationScaleLevelsOptions,
+    ) -> Result<usize, FlpError> {
+        if !(-100..=100).contains(&options.center_percent) {
+            return Err(FlpError::UnsupportedEdit(
+                "Automation Scale Levels center must be between -100 and 100 percent",
+            ));
+        }
+        if !(-100..=100).contains(&options.tension_percent) {
+            return Err(FlpError::UnsupportedEdit(
+                "Automation Scale Levels tension must be between -100 and 100 percent",
+            ));
+        }
+        if !(-200..=200).contains(&options.multiplier_percent) {
+            return Err(FlpError::UnsupportedEdit(
+                "Automation Scale Levels multiplier must be between -200 and 200 percent",
+            ));
+        }
+        if !(-100..=100).contains(&options.offset_percent) {
+            return Err(FlpError::UnsupportedEdit(
+                "Automation Scale Levels offset must be between -100 and 100 percent",
+            ));
+        }
+
+        let channels = self.channels();
+        let mut matching = channels.iter().filter(|channel| channel.id == channel_id);
+        let Some(channel) = matching.next() else {
+            return Err(FlpError::ChannelNotFound(channel_id));
+        };
+        if matching.next().is_some() {
+            return Err(FlpError::AmbiguousChannelId(channel_id));
+        }
+        if channel.kind != Some(5) {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel is not a type-5 automation channel",
+            ));
+        }
+        let mut automation_events = channel
+            .event_range()
+            .filter(|index| self.events[*index].opcode == 0xEA);
+        let Some(event_index) = automation_events.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected automation channel has no existing 0xEA point blob",
+            ));
+        };
+        if automation_events.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected automation channel has multiple 0xEA point blobs",
+            ));
+        }
+        if !matches!(
+            self.events[event_index].encoding,
+            PayloadEncoding::Data { .. }
+        ) {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected 0xEA automation blob is not a length-prefixed data event",
+            ));
+        }
+        let points = decode_automation_points(&self.events[event_index])?;
+        if points.is_empty() {
+            return Ok(0);
+        }
+        let mut edits = Vec::new();
+        for (point_index, point) in points.iter().enumerate() {
+            validate_automation_point_value(point.value)?;
+            let value = scale_automation_level(point.value, options);
+            validate_automation_point_value(value)?;
+            if value != point.value {
+                edits.push((point_index, value));
+            }
+        }
+        if edits.is_empty() {
+            return Ok(0);
+        }
+
+        let mut payload = self.events[event_index].payload.clone();
+        for (point_index, value) in &edits {
+            let point_offset = FLP_AUTOMATION_POINTS_OFFSET
+                .checked_add(
+                    point_index
+                        .checked_mul(FLP_AUTOMATION_POINT_SIZE)
+                        .ok_or(FlpError::LengthOverflow)?,
+                )
+                .ok_or(FlpError::LengthOverflow)?;
+            payload[point_offset + 8..point_offset + 16].copy_from_slice(&value.to_le_bytes());
+        }
+        let mut candidate = self.clone();
+        candidate.events[event_index].replace_data_payload(payload)?;
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(edits.len())
+    }
+
     /// Linearly interpolates the values of the points strictly between two
     /// existing type-5 automation points. Positions, tension, opaque point
     /// state, and the automation blob's header and trailer are retained.
@@ -21088,6 +21211,23 @@ fn validate_automation_point_value(value: f64) -> Result<(), FlpError> {
     Ok(())
 }
 
+fn scale_automation_level(value: f64, options: AutomationScaleLevelsOptions) -> f64 {
+    let pivot = f64::from(options.center_percent) / 100.0;
+    let distance = value - pivot;
+    let distance_scale = pivot.abs().max((1.0 - pivot).abs()).max(1.0);
+    let normalized_distance = (distance.abs() / distance_scale).clamp(0.0, 1.0);
+    let tension = f64::from(options.tension_percent) / 100.0 * std::f64::consts::LN_10;
+    let curved_distance = if tension == 0.0 {
+        distance.abs()
+    } else {
+        ((1.0 + (tension.exp() - 1.0) * normalized_distance).ln() / tension) * distance_scale
+    };
+    let tensioned = pivot + distance.signum() * curved_distance;
+    let multiplier = f64::from(options.multiplier_percent) / 100.0;
+    let offset = f64::from(options.offset_percent) / 100.0;
+    (pivot + (tensioned - pivot) * multiplier + offset).clamp(0.0, 1.0)
+}
+
 fn validate_automation_point_tension(tension: f32) -> Result<(), FlpError> {
     if !tension.is_finite() || !(-1.0..=1.0).contains(&tension) {
         return Err(FlpError::UnsupportedEdit(
@@ -21923,12 +22063,13 @@ mod tests {
 
     use super::{
         ArpeggioOptions, ArpeggioRangePattern, ArpeggioSyncMode, ArticulateOptions,
-        AutomationInterpolationMode, ChannelGroupSummary, ChannelLevelAdjustmentsEdit,
-        ChannelNoteRouter, ChannelSortOrder, ChannelStretchMode, ChannelStretchSettingsEdit,
-        ChannelSummary, ClawMachineOptions, FLP_AUTOMATION_COUNT_OFFSET,
-        FLP_AUTOMATION_LFO_AMOUNT_OFFSET, FLP_AUTOMATION_POINTS_OFFSET, FlpDocument, FlpError,
-        FlpEvent, FstPreset, FstPresetKind, LimitNoteOptions, LimitSnapDirection, MixerInsertEdit,
-        MixerInsertSummary, MixerLiveInsertEnabledGain, MixerLiveSendGain, MixerLiveSendOutputPath,
+        AutomationInterpolationMode, AutomationScaleLevelsOptions, ChannelGroupSummary,
+        ChannelLevelAdjustmentsEdit, ChannelNoteRouter, ChannelSortOrder, ChannelStretchMode,
+        ChannelStretchSettingsEdit, ChannelSummary, ClawMachineOptions,
+        FLP_AUTOMATION_COUNT_OFFSET, FLP_AUTOMATION_LFO_AMOUNT_OFFSET,
+        FLP_AUTOMATION_POINTS_OFFSET, FlpDocument, FlpError, FlpEvent, FstPreset, FstPresetKind,
+        LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerInsertSummary,
+        MixerLiveInsertEnabledGain, MixerLiveSendGain, MixerLiveSendOutputPath,
         MixerLiveSendTargetKey, MixerParameterKind, MixerParameterRecord, MixerRouteAudibility,
         MixerSendSummary, MixerSourceRouteTransform, PATTERN_NOTE_DEFAULT_FLAGS,
         PATTERN_NOTE_SLIDE_FLAG, PLAYLIST_CLIP_MUTED_FLAG, PatternController,
@@ -35371,6 +35512,116 @@ mod tests {
             FlpDocument::parse(&flat_bytes).expect("flat automation project should parse");
         assert_eq!(flat_document.normalize_automation_points(9).unwrap(), 0);
         assert_eq!(flat_document.encode_lossless().unwrap(), flat_bytes);
+    }
+
+    #[test]
+    fn automation_scale_levels_applies_pivot_tension_multiply_and_offset_losslessly() {
+        let source_points = [
+            (0.0, 0.25, 0.125, [1, 2, 3, 4]),
+            (1.0, 0.5, -0.25, [5, 6, 7, 8]),
+            (2.0, 0.75, 0.5, [9, 10, 11, 12]),
+        ];
+        let trailer = (0..136)
+            .map(|index| (index * 29 % 256) as u8)
+            .collect::<Vec<_>>();
+        let original = automation_channel_fixture(&source_points, &trailer);
+        let mut document = FlpDocument::parse(&original).expect("automation project should parse");
+        let event_index = document
+            .events()
+            .iter()
+            .position(|event| event.opcode() == 0xEA)
+            .expect("fixture should contain an automation event");
+        let original_payload = document.events()[event_index].payload().to_vec();
+        let mut unchanged = document.clone();
+        assert_eq!(
+            unchanged
+                .scale_automation_levels(9, AutomationScaleLevelsOptions::default())
+                .expect("default Scale Levels options should be a no-op"),
+            0
+        );
+        assert_eq!(unchanged.encode_lossless().unwrap(), original);
+        let options = AutomationScaleLevelsOptions {
+            center_percent: 50,
+            tension_percent: 0,
+            multiplier_percent: 200,
+            offset_percent: 10,
+        };
+
+        assert_eq!(
+            document
+                .scale_automation_levels(9, options)
+                .expect("documented Scale Levels ranges should be accepted"),
+            source_points.len()
+        );
+        let normalized = FlpDocument::parse(&document.encode_lossless().unwrap())
+            .expect("scaled automation should round-trip");
+        let points = normalized.automation_channels().unwrap().remove(0).points;
+        for (index, expected_value) in [0.1, 0.6, 1.0].into_iter().enumerate() {
+            assert!((points[index].value() - expected_value).abs() < 1e-12);
+            assert_eq!(points[index].position_beats(), source_points[index].0);
+            assert_eq!(points[index].tension(), source_points[index].2);
+            assert_eq!(points[index].trailing_bytes(), source_points[index].3);
+        }
+        let payload = normalized.events()[event_index].payload();
+        assert_eq!(
+            &payload[..FLP_AUTOMATION_POINTS_OFFSET],
+            &original_payload[..FLP_AUTOMATION_POINTS_OFFSET]
+        );
+        assert_eq!(&payload[payload.len() - trailer.len()..], trailer);
+
+        let mut inverted = FlpDocument::parse(&original).expect("automation project should parse");
+        assert_eq!(
+            inverted
+                .scale_automation_levels(
+                    9,
+                    AutomationScaleLevelsOptions {
+                        center_percent: 50,
+                        multiplier_percent: -100,
+                        ..AutomationScaleLevelsOptions::default()
+                    },
+                )
+                .expect("negative multiplication should invert levels"),
+            2
+        );
+        let inverted_points = inverted.automation_channels().unwrap().remove(0).points;
+        assert_eq!(
+            inverted_points
+                .iter()
+                .map(|point| point.value())
+                .collect::<Vec<_>>(),
+            [0.75, 0.5, 0.25]
+        );
+
+        let mut tensioned = FlpDocument::parse(&original).expect("automation project should parse");
+        assert_eq!(
+            tensioned
+                .scale_automation_levels(
+                    9,
+                    AutomationScaleLevelsOptions {
+                        tension_percent: 100,
+                        ..AutomationScaleLevelsOptions::default()
+                    },
+                )
+                .expect("the tension curve should scale point levels"),
+            source_points.len()
+        );
+        let tensioned_points = tensioned.automation_channels().unwrap().remove(0).points;
+        assert!(tensioned_points[0].value() > source_points[0].1);
+        assert!(tensioned_points[1].value() > source_points[1].1);
+        assert!(tensioned_points[2].value() > source_points[2].1);
+
+        let before_invalid = document.clone();
+        assert!(matches!(
+            document.scale_automation_levels(
+                9,
+                AutomationScaleLevelsOptions {
+                    multiplier_percent: 201,
+                    ..AutomationScaleLevelsOptions::default()
+                },
+            ),
+            Err(FlpError::UnsupportedEdit(_))
+        ));
+        assert_eq!(document, before_invalid);
     }
 
     #[test]

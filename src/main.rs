@@ -16,14 +16,14 @@ use flp_rebuild::sample_render::{
 use flp_rebuild::vst3::{Vst3AudioEffectRenderOptions, Vst3HostRuntime, Vst3PatternRenderOptions};
 use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, ArpeggioRangePattern, ArpeggioSyncMode, ArticulateOptions,
-    AutomationInterpolationMode, AutomationPointEdit, ChannelLevelAdjustmentsEdit,
-    ChannelSortOrder, ChannelStretchSettingsEdit, ClawMachineOptions, FlamOptions, FlpDocument,
-    FstPreset, HumanizerOptions, LimitNoteOptions, LimitSnapDirection, MixerInsertEdit,
-    MixerParameterKind, PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation,
-    PlaylistClipEdit, PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress,
-    PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit, QuantizeNoteMode, QuantizeNoteOptions,
-    RandomNoteChordMap, RandomNoteGeneratorOptions, RandomizerOptions, RiffMachineOptions,
-    RiffMachineQuantizeMode, SamplerEnvelopeLfoEdit, SamplerEnvelopeLfoTarget,
+    AutomationInterpolationMode, AutomationPointEdit, AutomationScaleLevelsOptions,
+    ChannelLevelAdjustmentsEdit, ChannelSortOrder, ChannelStretchSettingsEdit, ClawMachineOptions,
+    FlamOptions, FlpDocument, FstPreset, HumanizerOptions, LimitNoteOptions, LimitSnapDirection,
+    MixerInsertEdit, MixerParameterKind, PatternControllerEdit, PatternNote, PatternNoteEdit,
+    PatternNoteRotation, PlaylistClipEdit, PlaylistTrackEdit, PlaylistTrackMotion,
+    PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit, QuantizeNoteMode,
+    QuantizeNoteOptions, RandomNoteChordMap, RandomNoteGeneratorOptions, RandomizerOptions,
+    RiffMachineOptions, RiffMachineQuantizeMode, SamplerEnvelopeLfoEdit, SamplerEnvelopeLfoTarget,
     SamplerVolumeEnvelopeEdit, ScaleLevelsOptions, StrumOptions, TimeMarkerEdit,
 };
 
@@ -1066,6 +1066,21 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 Path::new(input),
                 Path::new(output),
                 parse_u16(channel_id, "automation channel id")?,
+            )
+        }
+        [command, input, output, channel_id, center, tension, multiplier, offset]
+            if command == "scale-automation-levels" =>
+        {
+            scale_automation_levels(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(channel_id, "automation channel id")?,
+                AutomationScaleLevelsOptions {
+                    center_percent: parse_i16(center, "Automation Scale Levels center")?,
+                    tension_percent: parse_i16(tension, "Automation Scale Levels tension")?,
+                    multiplier_percent: parse_i16(multiplier, "Automation Scale Levels multiplier")?,
+                    offset_percent: parse_i16(offset, "Automation Scale Levels offset")?,
+                },
             )
         }
         [command, input, output, source_channel_id, target_channel_id]
@@ -3646,6 +3661,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild edit-automation-point <input.flp> <output.flp> <channel-id> <point-index> <position-beats> <value> <tension>\n",
             "  flp-rebuild flip-automation-points <input.flp> <output.flp> <channel-id>\n",
             "  flp-rebuild normalize-automation-points <input.flp> <output.flp> <channel-id>\n",
+            "  flp-rebuild scale-automation-levels <input.flp> <output.flp> <channel-id> <center:-100..100> <tension:-100..100> <multiply:-200..200> <offset:-100..100>\n",
             "  flp-rebuild copy-automation-state <input.flp> <output.flp> <source-channel-id> <target-channel-id>\n",
             "  flp-rebuild set-automation-lfo-amount <input.flp> <output.flp> <channel-id> <-128..128>\n",
             "  flp-rebuild init-automation-points <input.flp> <output.flp> <channel-id> <template-channel-id>\n",
@@ -7609,6 +7625,28 @@ fn normalize_automation_points(input: &Path, output: &Path, channel_id: u16) -> 
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "normalized {point_count} automation point values to 0..=1 in channel {channel_id} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn scale_automation_levels(
+    input: &Path,
+    output: &Path,
+    channel_id: u16,
+    options: AutomationScaleLevelsOptions,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let point_count = document
+        .scale_automation_levels(channel_id, options)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "scaled {point_count} Automation levels in channel {channel_id} in {}",
         output.display()
     );
     Ok(())
