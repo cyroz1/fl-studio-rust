@@ -8152,7 +8152,7 @@ impl DawUi {
                     .iter()
                     .find(|entry| project_paths_equal(Path::new(&entry.project_path), project_path))
             })
-            .map_or(true, |entry| entry.enabled)
+            .is_none_or(|entry| entry.enabled)
     }
 
     fn save_playlist_automatic_crossfades_enabled(&mut self, enabled: bool) {
