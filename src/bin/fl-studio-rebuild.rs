@@ -13730,11 +13730,12 @@ impl DawUi {
         self.midi_script_transport_state
             .song_position_ticks
             .store(song_position_ticks, Ordering::Relaxed);
-        let ticks_per_quarter = self
+        let project_ppq = self
             .document
             .as_ref()
-            .map(|document| u64::from(document.header().ppq().max(1)))
+            .map(|document| document.header().ppq().max(1))
             .unwrap_or(96);
+        let ticks_per_quarter = u64::from(project_ppq);
         let time_signature_numerator = self
             .document
             .as_ref()
@@ -13743,6 +13744,18 @@ impl DawUi {
         self.midi_script_transport_state
             .ticks_per_quarter
             .store(ticks_per_quarter, Ordering::Relaxed);
+        let (arrangement_current_time, arrangement_current_time_snapped) =
+            midi_script_arrangement_time_ticks(
+                self.current_playhead_tick()
+                    .unwrap_or(f64::from(self.playlist_seek_tick)),
+                project_ppq,
+            );
+        self.midi_script_transport_state
+            .arrangement_current_time
+            .store(arrangement_current_time, Ordering::Relaxed);
+        self.midi_script_transport_state
+            .arrangement_current_time_snapped
+            .store(arrangement_current_time_snapped, Ordering::Relaxed);
         self.midi_script_transport_state
             .current_tempo_milli_bpm
             .store(
@@ -62389,6 +62402,17 @@ fn midi_script_clip_selection_bounds(
     bounds
 }
 
+fn midi_script_arrangement_time_ticks(current_time: f64, ppq: u16) -> (u64, u64) {
+    let current_time = absolute_song_position_ticks(current_time);
+    let snap_ticks = u64::from((ppq.max(1) / 4).max(1));
+    let snapped_time = current_time
+        .saturating_add(snap_ticks / 2)
+        .checked_div(snap_ticks)
+        .unwrap_or(0)
+        .saturating_mul(snap_ticks);
+    (current_time, snapped_time)
+}
+
 fn midi_script_marker_selection_target(
     markers: &[(usize, u32)],
     selected_marker: Option<usize>,
@@ -67302,6 +67326,14 @@ mod tests {
             Some((24, 384))
         );
         assert_eq!(midi_script_clip_selection_bounds([]), None);
+    }
+
+    #[test]
+    fn midi_script_arrangement_time_can_be_read_raw_or_snapped_to_sixteenth_grid() {
+        assert_eq!(midi_script_arrangement_time_ticks(56.0, 96), (56, 48));
+        assert_eq!(midi_script_arrangement_time_ticks(57.0, 96), (57, 72));
+        assert_eq!(midi_script_arrangement_time_ticks(57.0, 384), (57, 96));
+        assert_eq!(midi_script_arrangement_time_ticks(f64::NAN, 96), (0, 0));
     }
 
     #[test]

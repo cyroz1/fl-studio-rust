@@ -128,6 +128,8 @@ pub struct MidiScriptTransportState {
     pub song_position_hint: Mutex<String>,
     pub song_length_hint: Mutex<String>,
     pub arrangement_marker_names: Mutex<Vec<String>>,
+    pub arrangement_current_time: AtomicU64,
+    pub arrangement_current_time_snapped: AtomicU64,
     pub arrangement_selection_start: AtomicU64,
     pub arrangement_selection_end: AtomicU64,
     pub project_title: Mutex<String>,
@@ -153,6 +155,8 @@ impl Default for MidiScriptTransportState {
             song_position_hint: Mutex::new("1:01:000".to_owned()),
             song_length_hint: Mutex::new("0:00:000".to_owned()),
             arrangement_marker_names: Mutex::new(Vec::new()),
+            arrangement_current_time: AtomicU64::new(0),
+            arrangement_current_time_snapped: AtomicU64::new(0),
             arrangement_selection_start: AtomicU64::new(0),
             arrangement_selection_end: AtomicU64::new(0),
             project_title: Mutex::new(String::new()),
@@ -575,6 +579,14 @@ impl MidiScriptRuntime {
             .lock()
             .map(|names| names.clone())
             .unwrap_or_default();
+        let arrangement_current_time = self
+            .transport_state
+            .arrangement_current_time
+            .load(Ordering::Relaxed);
+        let arrangement_current_time_snapped = self
+            .transport_state
+            .arrangement_current_time_snapped
+            .load(Ordering::Relaxed);
         let arrangement_selection_start = self
             .transport_state
             .arrangement_selection_start
@@ -658,6 +670,8 @@ impl MidiScriptRuntime {
                     "song_position_hint": song_position_hint,
                     "song_length_hint": song_length_hint,
                     "arrangement_marker_names": arrangement_marker_names,
+                    "arrangement_current_time": arrangement_current_time,
+                    "arrangement_current_time_snapped": arrangement_current_time_snapped,
                     "arrangement_selection_start": arrangement_selection_start,
                     "arrangement_selection_end": arrangement_selection_end,
                     "project_title": project_title,
@@ -2053,6 +2067,35 @@ mod tests {
         let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
 
         assert_eq!(result.bytes, [0xB0, 24, 96]);
+    }
+
+    #[test]
+    fn python_arrangement_api_reads_current_time_snapped_or_raw() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport arrangement\ndef OnMidiIn(event):\n    event.data1 = arrangement.currentTime(0)\n    event.data2 = arrangement.currentTime(1)\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let transport_state = Arc::new(MidiScriptTransportState::default());
+        transport_state
+            .arrangement_current_time
+            .store(48, Ordering::Relaxed);
+        transport_state
+            .arrangement_current_time_snapped
+            .store(72, Ordering::Relaxed);
+        let mut runtime = MidiScriptRuntime::start_for_device_with_transport_state(
+            &script,
+            "Test Input",
+            transport_state,
+        )
+        .unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
+
+        assert_eq!(result.bytes, [0xB0, 48, 72]);
     }
 
     #[test]
