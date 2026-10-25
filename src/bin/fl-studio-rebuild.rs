@@ -40,13 +40,13 @@ use flp_rebuild::sample_render::{
     MP3_BITRATES_KBPS, MixerStemRenderOptions, PlaylistAudioClipEnvelope,
     PlaylistPerformanceCommand, PlaylistPerformanceLaunch, PlaylistPerformanceStream,
     PlaylistRenderOptions, PlaylistRenderRange, PlaylistRenderSummary, PlaylistStreamMonitor,
-    PlaylistTempoMap, ResamplingQuality, SamplerLiveInputRouting, SamplerLiveNoteEvent,
-    SamplerPatternLoopPlayback, SamplerPatternRenderOptions, SamplerPatternRenderSummary,
-    Vst3LiveInputEvent, Vst3PatternLoopPlayback, WavChannelMode, WavDitherMode, WavSampleFormat,
-    nearest_playlist_audio_clip_zero_crossing_tick, playlist_performance_clip_indices_with_vst3,
-    playlist_performance_static_document_with_vst3, playlist_performance_vst3_channel_ids,
-    playlist_performance_vst3_clip_indices, render_audio_clips_to_file,
-    render_playlist_mixer_stems_with_vst3_cancellable,
+    PlaylistTailMode, PlaylistTempoMap, ResamplingQuality, SamplerLiveInputRouting,
+    SamplerLiveNoteEvent, SamplerPatternLoopPlayback, SamplerPatternRenderOptions,
+    SamplerPatternRenderSummary, Vst3LiveInputEvent, Vst3PatternLoopPlayback, WavChannelMode,
+    WavDitherMode, WavSampleFormat, nearest_playlist_audio_clip_zero_crossing_tick,
+    playlist_performance_clip_indices_with_vst3, playlist_performance_static_document_with_vst3,
+    playlist_performance_vst3_channel_ids, playlist_performance_vst3_clip_indices,
+    render_audio_clips_to_file, render_playlist_mixer_stems_with_vst3_cancellable,
     render_playlist_with_vst3_to_file_from_frame_cancellable,
     render_playlist_with_vst3_to_flac_cancellable, render_playlist_with_vst3_to_mp3_cancellable,
     render_playlist_with_vst3_to_ogg_cancellable, render_playlist_with_vst3_to_wav_cancellable,
@@ -4988,6 +4988,7 @@ struct DawUi {
     playlist_render_quality: ResamplingQuality,
     playlist_render_channel_mode: WavChannelMode,
     playlist_render_tail_seconds: u8,
+    playlist_render_tail_mode: PlaylistTailMode,
     playlist_render_include_plugin_tails: bool,
 }
 
@@ -6497,6 +6498,7 @@ impl DawUi {
             playlist_render_quality,
             playlist_render_channel_mode: WavChannelMode::Stereo,
             playlist_render_tail_seconds: 0,
+            playlist_render_tail_mode: PlaylistTailMode::LeaveRemainder,
             playlist_render_include_plugin_tails: false,
         };
         if let Some((autosave_minutes, autosave_before_risky, backup_retention)) =
@@ -9905,7 +9907,33 @@ impl DawUi {
                 });
                 ui.label("Merged mono averages both channels; left/right modes select one side.");
                 ui.horizontal(|ui| {
-                    ui.label("Tail length");
+                    ui.label("Tail mode");
+                    ui.add_enabled_ui(!self.playlist_render_mixer_stems, |ui| {
+                        egui::ComboBox::from_id_salt("playlist-render-tail-mode")
+                            .selected_text(match self.playlist_render_tail_mode {
+                                PlaylistTailMode::LeaveRemainder => "Leave remainder",
+                                PlaylistTailMode::FixedDuration => "Fixed duration",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.playlist_render_tail_mode,
+                                    PlaylistTailMode::LeaveRemainder,
+                                    "Leave remainder",
+                                );
+                                ui.selectable_value(
+                                    &mut self.playlist_render_tail_mode,
+                                    PlaylistTailMode::FixedDuration,
+                                    "Fixed duration",
+                                );
+                            });
+                    });
+                });
+                ui.horizontal(|ui| {
+                    ui.label(if self.playlist_render_tail_mode == PlaylistTailMode::LeaveRemainder {
+                        "Minimum tail"
+                    } else {
+                        "Tail length"
+                    });
                     egui::ComboBox::from_id_salt("playlist-render-tail-length")
                         .selected_text(format!("{} seconds", self.playlist_render_tail_seconds))
                         .show_ui(ui, |ui| {
@@ -9918,7 +9946,13 @@ impl DawUi {
                             }
                         });
                 });
-                ui.label("Adds this much time after the last clip for instrument releases.");
+                if self.playlist_render_mixer_stems {
+                    ui.label("Mixer stem renders use the fixed tail length.");
+                } else if self.playlist_render_tail_mode == PlaylistTailMode::LeaveRemainder {
+                    ui.label("Continues the render until the mix stays quiet for two seconds, up to 60 seconds after the minimum tail.");
+                } else {
+                    ui.label("Stops after the selected time beyond the last scheduled clip.");
+                }
                 if self.playlist_render_mixer_stems {
                     ui.checkbox(
                         &mut self.playlist_render_include_master_stem,
@@ -37027,6 +37061,7 @@ impl DawUi {
             resampling_quality: self.playlist_render_quality,
             wav_channel_mode: self.playlist_render_channel_mode,
             tail_seconds: self.playlist_render_tail_seconds,
+            tail_mode: self.playlist_render_tail_mode,
             ..PlaylistRenderOptions::default()
         };
         let playlist_parameter_automation = self.vst3_playlist_automation_sources(&render_document);
@@ -37749,6 +37784,7 @@ impl DawUi {
             resampling_quality: self.playlist_render_quality,
             wav_channel_mode: self.playlist_render_channel_mode,
             tail_seconds: self.playlist_render_tail_seconds,
+            tail_mode: self.playlist_render_tail_mode,
             ..PlaylistRenderOptions::default()
         };
         let playlist_parameter_automation = self.vst3_playlist_automation_sources(document);
@@ -37913,6 +37949,7 @@ impl DawUi {
             resampling_quality: self.playlist_render_quality,
             wav_channel_mode: self.playlist_render_channel_mode,
             tail_seconds: self.playlist_render_tail_seconds,
+            tail_mode: self.playlist_render_tail_mode,
             ..PlaylistRenderOptions::default()
         };
         let playlist_parameter_automation = self.vst3_playlist_automation_sources(document);
@@ -38052,6 +38089,7 @@ impl DawUi {
             resampling_quality: self.playlist_render_quality,
             wav_channel_mode: self.playlist_render_channel_mode,
             tail_seconds: self.playlist_render_tail_seconds,
+            tail_mode: self.playlist_render_tail_mode,
             ..PlaylistRenderOptions::default()
         };
         let playlist_parameter_automation = self.vst3_playlist_automation_sources(document);

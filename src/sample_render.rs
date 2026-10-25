@@ -56,6 +56,9 @@ const FLAC_BLOCK_FRAMES: usize = 4_096;
 const FLAC_MAX_SAMPLE_FRAMES: u64 = (1_u64 << 36) - 1;
 const OGG_MIN_BITRATE_KBPS: u16 = 64;
 const OGG_MAX_BITRATE_KBPS: u16 = 450;
+const PLAYLIST_REMAINDER_MAX_SECONDS: u8 = 60;
+const PLAYLIST_REMAINDER_SILENCE_SECONDS: u64 = 2;
+const PLAYLIST_REMAINDER_SILENCE_THRESHOLD: f32 = 0.000_031_622_78;
 pub const MP3_BITRATES_KBPS: [u16; 13] =
     [32, 40, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320];
 const MP3_SAMPLE_RATES: [u32; 3] = [32_000, 44_100, 48_000];
@@ -1022,12 +1025,23 @@ pub struct PlaylistRenderOptions {
     pub wav_save_playlist_markers: bool,
     /// Write note onsets and Audio Clip starts as RIFF/WAVE cue points.
     pub wav_save_note_markers: bool,
+    /// Whether to stop a Playlist render after its post-content output has decayed to silence.
+    pub tail_mode: PlaylistTailMode,
     pub tail_seconds: u8,
     /// Render only this inclusive one-based Playlist track range when soloing.
     pub soloed_playlist_track_range: Option<(u32, u32)>,
     pub read_sample_root_note: bool,
     /// App-local per-instance Audio Clip controls applied in live playback and renders.
     pub clip_envelopes: Arc<Vec<PlaylistAudioClipEnvelope>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PlaylistTailMode {
+    /// Continue past the content endpoint until output stays below the render silence threshold.
+    #[default]
+    LeaveRemainder,
+    /// Render only the selected fixed duration after the content endpoint.
+    FixedDuration,
 }
 
 /// Output format and timeline range for a Playlist render that begins after song start.
@@ -1728,6 +1742,7 @@ impl Default for PlaylistRenderOptions {
             wav_channel_mode: WavChannelMode::Stereo,
             wav_save_playlist_markers: false,
             wav_save_note_markers: false,
+            tail_mode: PlaylistTailMode::LeaveRemainder,
             tail_seconds: 0,
             soloed_playlist_track_range: None,
             read_sample_root_note: true,
@@ -2290,6 +2305,7 @@ pub fn stream_playlist_performance_with_vst3_to_device(
             frames: u64::MAX,
             master_output,
             vst3_processor: vst3_processor.as_mut(),
+            remainder_stop: None,
         },
         Some(runtime),
         performance.meters.as_deref(),
@@ -2435,6 +2451,7 @@ fn stream_playlist_with_vst3_to_device_from_frame_inner(
             frames,
             master_output,
             vst3_processor: vst3_processor.as_mut(),
+            remainder_stop: None,
         },
         meters,
         cancelled,
@@ -2444,7 +2461,8 @@ fn stream_playlist_with_vst3_to_device_from_frame_inner(
             frames_to_skip -= skipped_frames as u64;
             writer.write_stereo_samples(&block[skipped_frames * 2..])
         },
-    )?;
+    )?
+    .voices_stolen;
     Ok(summary)
 }
 
@@ -2742,8 +2760,22 @@ fn render_playlist_with_vst3_cancellable(
             true
         });
     }
-    let mut frames =
+    let minimum_tail_end_frame =
         add_render_tail_frames(content_frames, options.sample_rate, options.tail_seconds)?;
+    let mut frames = match options.tail_mode {
+        PlaylistTailMode::LeaveRemainder => add_render_tail_frames(
+            minimum_tail_end_frame,
+            options.sample_rate,
+            PLAYLIST_REMAINDER_MAX_SECONDS,
+        )?,
+        PlaylistTailMode::FixedDuration => minimum_tail_end_frame,
+    };
+    let remainder_stop =
+        (options.tail_mode == PlaylistTailMode::LeaveRemainder).then(|| PlaylistRemainderStop {
+            start_frame: minimum_tail_end_frame.max(output_start_frame),
+            silence_frames: u64::from(options.sample_rate)
+                .saturating_mul(PLAYLIST_REMAINDER_SILENCE_SECONDS),
+        });
     if output_start_frame >= frames {
         return Err("render output start is after the end of the Playlist content".to_owned());
     }
@@ -2788,6 +2820,9 @@ fn render_playlist_with_vst3_cancellable(
 
     let mixer_track_meters = MixerTrackPeakMeters::default();
     let mut frames_to_skip = output_start_frame;
+    let rendered_output_frames;
+    let wav_sample_format = options.wav_sample_format;
+    let wav_channel_mode = options.wav_channel_mode;
     let mut temporary = TemporaryRenderFile::create(output_path)?;
     let file = temporary
         .file
@@ -2795,18 +2830,22 @@ fn render_playlist_with_vst3_cancellable(
         .expect("temporary render file is open");
     match output {
         PlaylistRenderOutput::Wav => {
-            let frames_u32 = u32::try_from(output_frames)
-                .map_err(|_| "render is too long for a RIFF/WAVE file".to_owned())?;
             let block_align = options.wav_sample_format.bytes_per_sample()
                 * options.wav_channel_mode.channel_count();
-            let data_bytes = frames_u32
+            let header_frames = if remainder_stop.is_some() {
+                1
+            } else {
+                u32::try_from(output_frames)
+                    .map_err(|_| "render is too long for a RIFF/WAVE file".to_owned())?
+            };
+            let data_bytes = header_frames
                 .checked_mul(u32::from(block_align))
                 .filter(|bytes| *bytes <= u32::MAX - 36)
                 .ok_or_else(|| "rendered WAV size exceeds the RIFF/WAVE limit".to_owned())?;
             write_wav_header(
                 file,
                 options.sample_rate,
-                frames_u32,
+                header_frames,
                 data_bytes,
                 options.wav_sample_format,
                 options.wav_channel_mode,
@@ -2818,7 +2857,7 @@ fn render_playlist_with_vst3_cancellable(
             );
             let mut dither_state =
                 WavDitherState::new(options.wav_dither_mode, options.wav_sample_format);
-            summary.voices_stolen = stream_prepared_playlist_render(
+            let render_result = stream_prepared_playlist_render(
                 PreparedPlaylistBlockMix {
                     audio: &audio,
                     sampler: &sampler,
@@ -2826,6 +2865,7 @@ fn render_playlist_with_vst3_cancellable(
                     frames,
                     master_output,
                     vst3_processor: vst3_processor.as_mut(),
+                    remainder_stop,
                 },
                 Some(&mixer_track_meters),
                 cancelled,
@@ -2847,6 +2887,13 @@ fn render_playlist_with_vst3_cancellable(
                         .map_err(|error| format!("could not write rendered WAV data: {error}"))
                 },
             )?;
+            summary.voices_stolen = render_result.voices_stolen;
+            rendered_output_frames = render_result
+                .frames_rendered
+                .checked_sub(output_start_frame)
+                .ok_or_else(|| {
+                    "render output start is after the rendered Playlist content".to_owned()
+                })?;
         }
         PlaylistRenderOutput::Flac { bits_per_sample } => {
             let mut encoder = StreamingFlacWriter::new(
@@ -2855,7 +2902,7 @@ fn render_playlist_with_vst3_cancellable(
                 options.wav_channel_mode,
                 bits_per_sample,
             )?;
-            summary.voices_stolen = stream_prepared_playlist_render(
+            let render_result = stream_prepared_playlist_render(
                 PreparedPlaylistBlockMix {
                     audio: &audio,
                     sampler: &sampler,
@@ -2863,6 +2910,7 @@ fn render_playlist_with_vst3_cancellable(
                     frames,
                     master_output,
                     vst3_processor: vst3_processor.as_mut(),
+                    remainder_stop,
                 },
                 Some(&mixer_track_meters),
                 cancelled,
@@ -2876,7 +2924,14 @@ fn render_playlist_with_vst3_cancellable(
                     }
                 },
             )?;
-            encoder.finalize(output_frames)?;
+            summary.voices_stolen = render_result.voices_stolen;
+            rendered_output_frames = render_result
+                .frames_rendered
+                .checked_sub(output_start_frame)
+                .ok_or_else(|| {
+                    "render output start is after the rendered Playlist content".to_owned()
+                })?;
+            encoder.finalize(rendered_output_frames)?;
         }
         PlaylistRenderOutput::Ogg { bitrate_kbps } => {
             let mut encoder = StreamingOggWriter::new(
@@ -2885,7 +2940,7 @@ fn render_playlist_with_vst3_cancellable(
                 options.wav_channel_mode,
                 bitrate_kbps,
             )?;
-            summary.voices_stolen = stream_prepared_playlist_render(
+            let render_result = stream_prepared_playlist_render(
                 PreparedPlaylistBlockMix {
                     audio: &audio,
                     sampler: &sampler,
@@ -2893,6 +2948,7 @@ fn render_playlist_with_vst3_cancellable(
                     frames,
                     master_output,
                     vst3_processor: vst3_processor.as_mut(),
+                    remainder_stop,
                 },
                 Some(&mixer_track_meters),
                 cancelled,
@@ -2906,6 +2962,13 @@ fn render_playlist_with_vst3_cancellable(
                     }
                 },
             )?;
+            summary.voices_stolen = render_result.voices_stolen;
+            rendered_output_frames = render_result
+                .frames_rendered
+                .checked_sub(output_start_frame)
+                .ok_or_else(|| {
+                    "render output start is after the rendered Playlist content".to_owned()
+                })?;
             encoder.finalize()?;
         }
         PlaylistRenderOutput::Mp3 { bitrate_kbps } => {
@@ -2916,7 +2979,7 @@ fn render_playlist_with_vst3_cancellable(
                 bitrate_kbps,
                 options.wav_dither_mode,
             )?;
-            summary.voices_stolen = stream_prepared_playlist_render(
+            let render_result = stream_prepared_playlist_render(
                 PreparedPlaylistBlockMix {
                     audio: &audio,
                     sampler: &sampler,
@@ -2924,6 +2987,7 @@ fn render_playlist_with_vst3_cancellable(
                     frames,
                     master_output,
                     vst3_processor: vst3_processor.as_mut(),
+                    remainder_stop,
                 },
                 Some(&mixer_track_meters),
                 cancelled,
@@ -2937,11 +3001,25 @@ fn render_playlist_with_vst3_cancellable(
                     }
                 },
             )?;
+            summary.voices_stolen = render_result.voices_stolen;
+            rendered_output_frames = render_result
+                .frames_rendered
+                .checked_sub(output_start_frame)
+                .ok_or_else(|| {
+                    "render output start is after the rendered Playlist content".to_owned()
+                })?;
             encoder.finalize()?;
         }
     }
+    summary.frames = rendered_output_frames;
     if matches!(output, PlaylistRenderOutput::Wav) {
         write_wav_cue_points(file, &wav_cue_points)?;
+        patch_wav_data_length(
+            file,
+            rendered_output_frames,
+            wav_sample_format,
+            wav_channel_mode,
+        )?;
     }
     summary.mixer_insert_peaks = Some(take_mixer_insert_peaks(&mixer_track_meters));
     temporary.commit(output_path)?;
@@ -3213,6 +3291,7 @@ pub fn render_playlist_mixer_stems_with_vst3_cancellable(
             frames,
             master_output,
             vst3_processor: vst3_processor.as_mut(),
+            remainder_stop: None,
         },
         Some(&meters),
         cancelled,
@@ -3256,7 +3335,8 @@ pub fn render_playlist_mixer_stems_with_vst3_cancellable(
             }
             Ok(())
         },
-    )?;
+    )?
+    .voices_stolen;
     summary.mixer_insert_peaks = Some(take_mixer_insert_peaks(&meters));
     summary.mixer_master_stem_rendered = outputs
         .iter()
@@ -3995,6 +4075,32 @@ fn write_wav_header(
     Ok(())
 }
 
+fn patch_wav_data_length(
+    file: &mut File,
+    frames: u64,
+    sample_format: WavSampleFormat,
+    channel_mode: WavChannelMode,
+) -> Result<(), String> {
+    let channels = channel_mode.channel_count();
+    let block_align = sample_format.bytes_per_sample() * channels;
+    let data_bytes = frames
+        .checked_mul(u64::from(block_align))
+        .and_then(|bytes| u32::try_from(bytes).ok())
+        .filter(|bytes| *bytes <= u32::MAX - 36)
+        .ok_or_else(|| "rendered WAV size exceeds the RIFF/WAVE limit".to_owned())?;
+    let file_length = file
+        .seek(SeekFrom::End(0))
+        .map_err(|error| format!("could not seek to the end of the WAV file: {error}"))?;
+    let riff_size = u32::try_from(file_length.saturating_sub(8))
+        .map_err(|_| "rendered WAV size exceeds the RIFF/WAVE limit".to_owned())?;
+    file.seek(SeekFrom::Start(4))
+        .and_then(|_| file.write_all(&riff_size.to_le_bytes()))
+        .and_then(|()| file.seek(SeekFrom::Start(40)).map(|_| ()))
+        .and_then(|()| file.write_all(&data_bytes.to_le_bytes()))
+        .and_then(|()| file.seek(SeekFrom::End(0)).map(|_| ()))
+        .map_err(|error| format!("could not patch rendered WAV length: {error}"))
+}
+
 fn append_riff_chunk(
     output: &mut Vec<u8>,
     identifier: &[u8; 4],
@@ -4301,6 +4407,63 @@ struct PreparedPlaylistBlockMix<'a> {
     frames: u64,
     master_output: MixerMasterOutput,
     vst3_processor: Option<&'a mut Vst3PlaylistStreamProcessor>,
+    remainder_stop: Option<PlaylistRemainderStop>,
+}
+
+#[derive(Clone, Copy)]
+struct PlaylistRemainderStop {
+    start_frame: u64,
+    silence_frames: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PlaylistBlockRenderSummary {
+    voices_stolen: usize,
+    frames_rendered: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PlaylistRemainderDetector {
+    start_frame: u64,
+    silence_frames: u64,
+    quiet_frames: u64,
+}
+
+impl PlaylistRemainderDetector {
+    fn new(stop: PlaylistRemainderStop) -> Self {
+        Self {
+            start_frame: stop.start_frame,
+            silence_frames: stop.silence_frames,
+            quiet_frames: 0,
+        }
+    }
+
+    /// Returns the number of frames to keep from this block, stopping at the first qualifying
+    /// quiet frame. The caller applies this only after the minimum rendered tail has elapsed.
+    fn frames_to_keep(&mut self, block_start: u64, stereo_samples: &[f32]) -> (usize, bool) {
+        let mut frames_to_keep = stereo_samples.len() / 2;
+        let mut should_stop = false;
+        for (index, frame) in stereo_samples.as_chunks::<2>().0.iter().enumerate() {
+            let frame_position = block_start.saturating_add(index as u64);
+            if frame_position < self.start_frame {
+                self.quiet_frames = 0;
+                continue;
+            }
+
+            if frame[0].abs().max(frame[1].abs()) <= PLAYLIST_REMAINDER_SILENCE_THRESHOLD {
+                self.quiet_frames = self.quiet_frames.saturating_add(1);
+            } else {
+                self.quiet_frames = 0;
+            }
+
+            if self.quiet_frames >= self.silence_frames {
+                frames_to_keep = index + 1;
+                should_stop = true;
+                break;
+            }
+        }
+        (frames_to_keep, should_stop)
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -4594,7 +4757,7 @@ fn stream_prepared_playlist_render(
     cancelled: &AtomicBool,
     stream_cancelled: impl FnMut() -> bool,
     write_block: impl FnMut(&[f32], PlaylistRenderMixerBuses<'_>) -> Result<(), String>,
-) -> Result<usize, String> {
+) -> Result<PlaylistBlockRenderSummary, String> {
     stream_prepared_playlist_render_with_performance(
         render,
         None,
@@ -4612,7 +4775,7 @@ fn stream_prepared_playlist_render_with_post_effect_stems(
     cancelled: &AtomicBool,
     stream_cancelled: impl FnMut() -> bool,
     write_block: impl FnMut(&[f32], PlaylistRenderMixerBuses<'_>) -> Result<(), String>,
-) -> Result<usize, String> {
+) -> Result<PlaylistBlockRenderSummary, String> {
     stream_prepared_playlist_render_with_performance(
         render,
         None,
@@ -4638,10 +4801,11 @@ fn stream_prepared_playlist_render_with_performance(
     mut stream_cancelled: impl FnMut() -> bool,
     capture_post_effect_buses: bool,
     mut write_block: impl FnMut(&[f32], PlaylistRenderMixerBuses<'_>) -> Result<(), String>,
-) -> Result<usize, String> {
+) -> Result<PlaylistBlockRenderSummary, String> {
     crate::audio::enable_denormal_protection();
     let frames = render.frames;
     let options = render.options;
+    let mut remainder_detector = render.remainder_stop.map(PlaylistRemainderDetector::new);
     let release_frames = (f64::from(options.sample_rate) * SAMPLER_RELEASE_SECONDS)
         .round()
         .max(1.0) as usize;
@@ -4733,6 +4897,7 @@ fn stream_prepared_playlist_render_with_performance(
         };
         let mix_result = (|| {
             let mut block_start = 0u64;
+            let mut frames_rendered = 0u64;
             while block_start < frames {
                 check_cancelled(Some(cancelled))?;
                 if stream_cancelled() {
@@ -4821,20 +4986,30 @@ fn stream_prepared_playlist_render_with_performance(
                     }
                 }
                 render.master_output.apply(block);
+                let (frames_to_write, stop_for_silence) = remainder_detector
+                    .as_mut()
+                    .map_or((frame_count, false), |detector| {
+                        detector.frames_to_keep(block_start, block)
+                    });
+                let samples_to_write = frames_to_write * 2;
                 write_block(
-                    block,
+                    &block[..samples_to_write],
                     PlaylistRenderMixerBuses {
                         pre_effect: meter_buses
                             .as_deref()
-                            .map(|buses| &buses[..meter_bus_samples]),
+                            .map(|buses| &buses[..MIXER_TRACK_METER_COUNT * samples_to_write]),
                         post_effect: post_effect_buses
                             .as_deref()
-                            .map(|buses| &buses[..meter_bus_samples]),
+                            .map(|buses| &buses[..MIXER_TRACK_METER_COUNT * samples_to_write]),
                     },
                 )?;
-                block_start += frame_count as u64;
+                frames_rendered = block_start.saturating_add(frames_to_write as u64);
+                block_start = block_start.saturating_add(frame_count as u64);
+                if stop_for_silence {
+                    break;
+                }
             }
-            Ok::<_, String>(())
+            Ok::<_, String>(frames_rendered)
         })();
         let worker_result = if let Some(parallel_mixer) = parallel_mixer.as_mut() {
             parallel_mixer.stop_and_join()
@@ -4843,8 +5018,8 @@ fn stream_prepared_playlist_render_with_performance(
         };
         match (mix_result, worker_result) {
             (Err(error), _) => Err(error),
-            (Ok(()), Err(error)) => Err(error),
-            (Ok(()), Ok(())) => Ok(()),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(frames_rendered), Ok(())) => Ok(frames_rendered),
         }
     });
     let stop_result = if let Some(processor) = render.vst3_processor.as_deref_mut() {
@@ -4852,12 +5027,15 @@ fn stream_prepared_playlist_render_with_performance(
     } else {
         Ok(())
     };
-    match (mix_result, stop_result) {
+    let frames_rendered = match (mix_result, stop_result) {
         (Err(error), _) => return Err(error),
-        (Ok(()), Err(error)) => return Err(error),
-        (Ok(()), Ok(())) => {}
-    }
-    Ok(sampler_engine.voices_stolen)
+        (Ok(_), Err(error)) => return Err(error),
+        (Ok(frames_rendered), Ok(())) => frames_rendered,
+    };
+    Ok(PlaylistBlockRenderSummary {
+        voices_stolen: sampler_engine.voices_stolen,
+        frames_rendered,
+    })
 }
 
 fn skip_render_block_prefix<'a>(block: &'a [f32], frames_to_skip: &mut u64) -> &'a [f32] {
@@ -15503,6 +15681,63 @@ mod tests {
     }
 
     #[test]
+    fn leave_remainder_waits_for_continuous_quiet_after_the_minimum_tail() {
+        let mut detector = PlaylistRemainderDetector::new(PlaylistRemainderStop {
+            start_frame: 2,
+            silence_frames: 4,
+        });
+
+        let (frames, stop) = detector.frames_to_keep(0, &[0.0, 0.0, 0.0, 0.0, 0.5, 0.5]);
+        assert_eq!(frames, 3);
+        assert!(!stop);
+
+        let (frames, stop) = detector.frames_to_keep(3, &[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(frames, 4);
+        assert!(stop);
+    }
+
+    #[test]
+    fn wav_tail_patch_updates_lengths_after_marker_chunks_are_written() {
+        let output_path = std::env::temp_dir().join(format!(
+            "flp-rebuild-tail-length-{}-{}.wav",
+            std::process::id(),
+            NEXT_TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut temporary = TemporaryRenderFile::create(&output_path).unwrap();
+        let file = temporary.file.as_mut().unwrap();
+        write_wav_header(
+            file,
+            48_000,
+            10,
+            80,
+            WavSampleFormat::Float32,
+            WavChannelMode::Stereo,
+        )
+        .unwrap();
+        file.write_all(&[0; 40]).unwrap();
+        write_wav_cue_points(
+            file,
+            &[WavCuePoint {
+                identifier: 1,
+                sample_offset: 2,
+                label: "Marker".to_owned(),
+            }],
+        )
+        .unwrap();
+        patch_wav_data_length(file, 5, WavSampleFormat::Float32, WavChannelMode::Stereo).unwrap();
+        temporary.commit(&output_path).unwrap();
+
+        let bytes = fs::read(&output_path).unwrap();
+        assert_eq!(u32::from_le_bytes(bytes[40..44].try_into().unwrap()), 40);
+        assert_eq!(
+            u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize,
+            bytes.len() - 8
+        );
+        assert_eq!(&bytes[84..88], b"cue ");
+        fs::remove_file(output_path).unwrap();
+    }
+
+    #[test]
     fn playlist_pattern_clips_place_repeat_and_clip_sampler_notes() {
         let pattern = Pattern {
             id: 5,
@@ -15989,6 +16224,7 @@ mod tests {
                     wav_channel_mode: WavChannelMode::Stereo,
                     wav_save_playlist_markers: false,
                     wav_save_note_markers: false,
+                    tail_mode: PlaylistTailMode::FixedDuration,
                     tail_seconds: 0,
                     soloed_playlist_track_range: None,
                     read_sample_root_note: true,
@@ -15997,6 +16233,7 @@ mod tests {
                 frames: 2,
                 master_output: MixerMasterOutput::default(),
                 vst3_processor: None,
+                remainder_stop: None,
             },
             Some(&meters),
             &AtomicBool::new(false),
@@ -16006,6 +16243,7 @@ mod tests {
                 Ok(())
             },
         )
+        .map(|result| result.voices_stolen)
         .unwrap();
 
         assert_eq!(voices_stolen, 0);
