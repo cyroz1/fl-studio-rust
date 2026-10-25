@@ -4903,6 +4903,7 @@ struct DawUi {
     playlist_vst3_parameter_links: Vec<PlaylistVst3ParameterLink>,
     internal_lfo_parameter_links: Vec<InternalLfoParameterLink>,
     playlist_audio_clip_envelopes: Vec<ProjectPlaylistAudioClipEnvelope>,
+    playlist_automatic_crossfades: Vec<ProjectPlaylistAutomaticCrossfades>,
     midi_vst3_parameter_learning: Option<MidiVst3ParameterMappingTarget>,
     midi_mixer_button_cc_active: BTreeSet<(String, u8, u8)>,
     midi_mixer_control_learning: Option<MidiMixerControlLearning>,
@@ -5551,6 +5552,14 @@ struct PatternVst3AutomationSources<'a> {
 struct ProjectPlaylistAudioClipEnvelope {
     project_path: String,
     envelope: PlaylistAudioClipEnvelope,
+    fade_in_manual: bool,
+    fade_out_manual: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProjectPlaylistAutomaticCrossfades {
+    project_path: String,
+    enabled: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -6035,6 +6044,7 @@ impl DawUi {
         let playlist_vst3_parameter_links = load_playlist_vst3_parameter_links();
         let internal_lfo_parameter_links = load_internal_lfo_parameter_links();
         let playlist_audio_clip_envelopes = load_playlist_audio_clip_envelopes();
+        let playlist_automatic_crossfades = load_playlist_automatic_crossfades();
         let midi_play_pause_mapping = load_midi_play_pause_mapping();
         let midi_controller_templates = load_midi_controller_templates();
         let live_resampling_quality = load_live_resampling_quality();
@@ -6428,6 +6438,7 @@ impl DawUi {
             playlist_vst3_parameter_links,
             internal_lfo_parameter_links,
             playlist_audio_clip_envelopes,
+            playlist_automatic_crossfades,
             midi_vst3_parameter_learning: None,
             midi_mixer_button_cc_active: BTreeSet::new(),
             midi_mixer_control_learning: None,
@@ -8013,19 +8024,75 @@ impl DawUi {
         &self,
         arrangement_id: u16,
     ) -> Arc<Vec<PlaylistAudioClipEnvelope>> {
-        let Some(project_path) = self.current_path.as_deref() else {
-            return Arc::new(Vec::new());
+        let stored_envelopes = self
+            .current_path
+            .as_deref()
+            .map(|project_path| {
+                self.playlist_audio_clip_envelopes
+                    .iter()
+                    .filter(|entry| {
+                        entry.envelope.arrangement_id == arrangement_id
+                            && project_paths_equal(Path::new(&entry.project_path), project_path)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !self.playlist_automatic_crossfades_enabled() {
+            return Arc::new(
+                stored_envelopes
+                    .iter()
+                    .map(|entry| entry.envelope)
+                    .collect(),
+            );
+        }
+        let Some(document) = self.document.as_ref() else {
+            return Arc::new(
+                stored_envelopes
+                    .iter()
+                    .map(|entry| entry.envelope)
+                    .collect(),
+            );
         };
-        Arc::new(
-            self.playlist_audio_clip_envelopes
-                .iter()
-                .filter(|entry| {
-                    entry.envelope.arrangement_id == arrangement_id
-                        && project_paths_equal(Path::new(&entry.project_path), project_path)
-                })
-                .map(|entry| entry.envelope)
-                .collect(),
-        )
+        let Ok(arrangements) = document.arrangements() else {
+            return Arc::new(
+                stored_envelopes
+                    .iter()
+                    .map(|entry| entry.envelope)
+                    .collect(),
+            );
+        };
+        let Some(arrangement) = arrangements
+            .iter()
+            .find(|arrangement| arrangement.id == arrangement_id)
+        else {
+            return Arc::new(
+                stored_envelopes
+                    .iter()
+                    .map(|entry| entry.envelope)
+                    .collect(),
+            );
+        };
+        let Ok(tempo_map) = PlaylistTempoMap::for_arrangement(document, arrangement_id) else {
+            return Arc::new(
+                stored_envelopes
+                    .iter()
+                    .map(|entry| entry.envelope)
+                    .collect(),
+            );
+        };
+        let audio_clip_channels = document
+            .channels()
+            .iter()
+            .filter(|channel| channel.kind() == Some(4) && channel.enabled() != Some(false))
+            .map(|channel| channel.id())
+            .collect::<BTreeSet<_>>();
+        Arc::new(playlist_audio_clip_auto_crossfade_envelopes(
+            arrangement,
+            &audio_clip_channels,
+            &stored_envelopes,
+            &tempo_map,
+        ))
     }
 
     fn playlist_audio_clip_envelope(
@@ -8058,7 +8125,71 @@ impl DawUi {
             })
     }
 
-    fn save_playlist_audio_clip_envelope(&mut self, envelope: PlaylistAudioClipEnvelope) {
+    fn playlist_audio_clip_fade_manual_flags(
+        &self,
+        arrangement_id: u16,
+        clip_id: u32,
+    ) -> (bool, bool) {
+        self.current_path
+            .as_deref()
+            .and_then(|project_path| {
+                self.playlist_audio_clip_envelopes.iter().find(|entry| {
+                    entry.envelope.arrangement_id == arrangement_id
+                        && entry.envelope.clip_id == clip_id
+                        && project_paths_equal(Path::new(&entry.project_path), project_path)
+                })
+            })
+            .map_or((false, false), |entry| {
+                (entry.fade_in_manual, entry.fade_out_manual)
+            })
+    }
+
+    fn playlist_automatic_crossfades_enabled(&self) -> bool {
+        self.current_path
+            .as_deref()
+            .and_then(|project_path| {
+                self.playlist_automatic_crossfades
+                    .iter()
+                    .find(|entry| project_paths_equal(Path::new(&entry.project_path), project_path))
+            })
+            .map_or(true, |entry| entry.enabled)
+    }
+
+    fn save_playlist_automatic_crossfades_enabled(&mut self, enabled: bool) {
+        let Some(project_path) = self.current_path.as_ref() else {
+            self.status = "Save the project before changing Automatic crossfades".to_owned();
+            return;
+        };
+        let mut updated = self.playlist_automatic_crossfades.clone();
+        if let Some(existing) = updated
+            .iter_mut()
+            .find(|entry| project_paths_equal(Path::new(&entry.project_path), project_path))
+        {
+            existing.enabled = enabled;
+        } else {
+            updated.push(ProjectPlaylistAutomaticCrossfades {
+                project_path: project_path.to_string_lossy().into_owned(),
+                enabled,
+            });
+        }
+        match save_playlist_automatic_crossfades(&updated) {
+            Ok(()) => {
+                self.playlist_automatic_crossfades = updated;
+                self.status = format!(
+                    "Automatic crossfades {} for this project; changes apply on the next playback start",
+                    if enabled { "enabled" } else { "disabled" }
+                );
+            }
+            Err(error) => self.status = error,
+        }
+    }
+
+    fn save_playlist_audio_clip_envelope(
+        &mut self,
+        envelope: PlaylistAudioClipEnvelope,
+        fade_in_manual: bool,
+        fade_out_manual: bool,
+    ) {
         let Some(project_path) = self.current_path.as_ref() else {
             self.status = "Save the project before editing instance gain or fades".to_owned();
             return;
@@ -8069,6 +8200,8 @@ impl DawUi {
             ProjectPlaylistAudioClipEnvelope {
                 project_path: project_path.to_string_lossy().into_owned(),
                 envelope,
+                fade_in_manual,
+                fade_out_manual,
             },
         );
         match save_playlist_audio_clip_envelopes(&updated) {
@@ -19036,6 +19169,8 @@ impl DawUi {
             return;
         };
         let waveform_tempo_map = self.playlist_tempo_map_for_arrangement(arrangement.id);
+        let waveform_clip_envelopes =
+            self.playlist_audio_clip_envelopes_for_current_project(arrangement.id);
         let has_project_pattern_clip_template = arrangements.iter().any(|candidate| {
             candidate
                 .clips
@@ -19269,6 +19404,17 @@ impl DawUi {
                 "Show fade/gain previews",
             )
             .on_hover_text("Hold Alt to show previews temporarily while this is off");
+            let mut automatic_crossfades_enabled =
+                self.playlist_automatic_crossfades_enabled();
+            if ui
+                .checkbox(&mut automatic_crossfades_enabled, "Automatic crossfades")
+                .on_hover_text(
+                    "Crossfade overlapping Audio Clips when their fade handles are at their defaults",
+                )
+                .changed()
+            {
+                self.save_playlist_automatic_crossfades_enabled(automatic_crossfades_enabled);
+            }
             ui.separator();
             ui.label("Clip focus");
             for focus in PlaylistClipFocus::ALL {
@@ -20930,11 +21076,11 @@ impl DawUi {
                             {
                                 if let Some(waveform) = self.audio_waveforms.get(path).cloned() {
                                     let envelope = if show_fade_gain_previews {
-                                        clip.clip_id.map(|clip_id| {
-                                            self.playlist_audio_clip_envelope(
-                                                arrangement.id,
-                                                clip_id,
-                                            )
+                                        clip.clip_id.and_then(|clip_id| {
+                                            waveform_clip_envelopes
+                                                .iter()
+                                                .find(|envelope| envelope.clip_id == clip_id)
+                                                .copied()
                                         })
                                     } else {
                                         None
@@ -21600,11 +21746,28 @@ impl DawUi {
                                     }
                                     if let Some(clip_id) = clip.clip_id {
                                         ui.menu_button("Audio Clip instance controls…", |ui| {
-                                            let mut envelope = self.playlist_audio_clip_envelope(
+                                            let stored_envelope = self.playlist_audio_clip_envelope(
                                                 arrangement.id,
                                                 clip_id,
                                             );
+                                            let effective_envelopes = self
+                                                .playlist_audio_clip_envelopes_for_current_project(
+                                                    arrangement.id,
+                                                );
+                                            let mut envelope = effective_envelopes
+                                                .iter()
+                                                .find(|envelope| envelope.clip_id == clip_id)
+                                                .copied()
+                                                .unwrap_or(stored_envelope);
+                                            let (mut fade_in_manual, mut fade_out_manual) = self
+                                                .playlist_audio_clip_fade_manual_flags(
+                                                    arrangement.id,
+                                                    clip_id,
+                                                );
                                             ui.label("App-local instance controls");
+                                            if self.playlist_automatic_crossfades_enabled() {
+                                                ui.small("When Manual fade-in/out is off, overlap lengths are automatic. Enable Manual to keep a chosen fade, including a zero-length fade.");
+                                            }
                                             let mut gain_is_silent = envelope.gain_centidb
                                                 == PLAYLIST_AUDIO_CLIP_GAIN_MINUS_INFINITY;
                                             let minus_infinity_changed = ui
@@ -21632,6 +21795,9 @@ impl DawUi {
                                                         .suffix(" ms fade in"),
                                                 )
                                                 .changed();
+                                            let fade_in_manual_changed = ui
+                                                .checkbox(&mut fade_in_manual, "Manual fade-in")
+                                                .changed();
                                             let fade_out_changed = ui
                                                 .add(
                                                     egui::DragValue::new(&mut envelope.fade_out_ms)
@@ -21639,6 +21805,9 @@ impl DawUi {
                                                         .speed(1.0)
                                                         .suffix(" ms fade out"),
                                                 )
+                                                .changed();
+                                            let fade_out_manual_changed = ui
+                                                .checkbox(&mut fade_out_manual, "Manual fade-out")
                                                 .changed();
                                             let mut fade_in_curve_changed = false;
                                             ui.horizontal(|ui| {
@@ -21739,7 +21908,9 @@ impl DawUi {
                                             if gain_changed
                                                 || minus_infinity_changed
                                                 || fade_in_changed
+                                                || fade_in_manual_changed
                                                 || fade_out_changed
+                                                || fade_out_manual_changed
                                                 || fade_in_curve_changed
                                                 || fade_in_tension_changed
                                                 || fade_out_curve_changed
@@ -21758,7 +21929,58 @@ impl DawUi {
                                                     envelope.gain_centidb =
                                                         (gain_db * 100.0).round() as i16;
                                                 }
-                                                self.save_playlist_audio_clip_envelope(envelope);
+                                                if fade_in_changed
+                                                    || fade_in_curve_changed
+                                                    || fade_in_tension_changed
+                                                {
+                                                    fade_in_manual = true;
+                                                }
+                                                if fade_out_changed
+                                                    || fade_out_curve_changed
+                                                    || fade_out_tension_changed
+                                                {
+                                                    fade_out_manual = true;
+                                                }
+                                                let mut saved_envelope = envelope;
+                                                if fade_in_manual_changed {
+                                                    saved_envelope.fade_in_ms = if fade_in_manual {
+                                                        envelope.fade_in_ms
+                                                    } else {
+                                                        0
+                                                    };
+                                                } else if !fade_in_changed
+                                                    && !fade_in_curve_changed
+                                                    && !fade_in_tension_changed
+                                                {
+                                                    saved_envelope.fade_in_ms =
+                                                        stored_envelope.fade_in_ms;
+                                                    saved_envelope.fade_in_curve =
+                                                        stored_envelope.fade_in_curve;
+                                                    saved_envelope.fade_in_tension =
+                                                        stored_envelope.fade_in_tension;
+                                                }
+                                                if fade_out_manual_changed {
+                                                    saved_envelope.fade_out_ms = if fade_out_manual {
+                                                        envelope.fade_out_ms
+                                                    } else {
+                                                        0
+                                                    };
+                                                } else if !fade_out_changed
+                                                    && !fade_out_curve_changed
+                                                    && !fade_out_tension_changed
+                                                {
+                                                    saved_envelope.fade_out_ms =
+                                                        stored_envelope.fade_out_ms;
+                                                    saved_envelope.fade_out_curve =
+                                                        stored_envelope.fade_out_curve;
+                                                    saved_envelope.fade_out_tension =
+                                                        stored_envelope.fade_out_tension;
+                                                }
+                                                self.save_playlist_audio_clip_envelope(
+                                                    saved_envelope,
+                                                    fade_in_manual,
+                                                    fade_out_manual,
+                                                );
                                             }
                                             if ui.button("Reset instance controls").clicked() {
                                                 self.save_playlist_audio_clip_envelope(
@@ -21777,6 +21999,8 @@ impl DawUi {
                                                         stretch_to_clip_duration: false,
                                                         stretch_pitch_cents: 0,
                                                     },
+                                                    false,
+                                                    false,
                                                 );
                                                 ui.close();
                                             }
@@ -57334,6 +57558,10 @@ fn playlist_audio_clip_envelopes_file() -> Option<PathBuf> {
     midi_control_change_mapping_file("playlist-audio-clip-envelopes.txt")
 }
 
+fn playlist_automatic_crossfades_file() -> Option<PathBuf> {
+    midi_control_change_mapping_file("playlist-automatic-crossfades.txt")
+}
+
 fn legacy_midi_mixer_fader_mapping_file() -> Option<PathBuf> {
     midi_control_change_mapping_file("midi-mixer-fader-mapping.txt")
 }
@@ -57400,6 +57628,81 @@ fn load_playlist_audio_clip_envelopes() -> Vec<ProjectPlaylistAudioClipEnvelope>
         .and_then(|path| fs::read_to_string(path).ok())
         .map(|contents| parse_playlist_audio_clip_envelopes(&contents))
         .unwrap_or_default()
+}
+
+fn load_playlist_automatic_crossfades() -> Vec<ProjectPlaylistAutomaticCrossfades> {
+    playlist_automatic_crossfades_file()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .map(|contents| parse_playlist_automatic_crossfades(&contents))
+        .unwrap_or_default()
+}
+
+fn parse_playlist_automatic_crossfades(contents: &str) -> Vec<ProjectPlaylistAutomaticCrossfades> {
+    let mut settings = Vec::<ProjectPlaylistAutomaticCrossfades>::new();
+    for line in contents.lines() {
+        let Some(encoded) = line.strip_prefix("crossfades=") else {
+            continue;
+        };
+        let mut fields = encoded.split('\t');
+        let Some(project_path) = fields.next().and_then(decode_midi_device_id) else {
+            continue;
+        };
+        let enabled = match fields.next() {
+            Some("0") => false,
+            Some("1") => true,
+            _ => continue,
+        };
+        if fields.next().is_some() {
+            continue;
+        }
+        if let Some(existing) = settings.iter_mut().find(|entry| {
+            project_paths_equal(Path::new(&entry.project_path), Path::new(&project_path))
+        }) {
+            existing.enabled = enabled;
+        } else {
+            settings.push(ProjectPlaylistAutomaticCrossfades {
+                project_path,
+                enabled,
+            });
+        }
+    }
+    settings
+}
+
+fn serialize_playlist_automatic_crossfades(
+    settings: &[ProjectPlaylistAutomaticCrossfades],
+) -> String {
+    let mut contents = String::from("version=1\n");
+    let mut normalized = Vec::<ProjectPlaylistAutomaticCrossfades>::new();
+    for entry in settings {
+        if let Some(existing) = normalized.iter_mut().find(|existing| {
+            project_paths_equal(
+                Path::new(&existing.project_path),
+                Path::new(&entry.project_path),
+            )
+        }) {
+            existing.enabled = entry.enabled;
+        } else {
+            normalized.push(entry.clone());
+        }
+    }
+    for entry in normalized {
+        contents.push_str("crossfades=");
+        contents.push_str(&encode_midi_device_id(&entry.project_path));
+        contents.push('\t');
+        contents.push(if entry.enabled { '1' } else { '0' });
+        contents.push('\n');
+    }
+    contents
+}
+
+fn save_playlist_automatic_crossfades(
+    settings: &[ProjectPlaylistAutomaticCrossfades],
+) -> Result<(), String> {
+    let path = playlist_automatic_crossfades_file()
+        .ok_or_else(|| "unable to locate the user settings directory".to_owned())?;
+    fs::write(&path, serialize_playlist_automatic_crossfades(settings))
+        .map_err(|error| format!("failed to save Playlist crossfade settings: {error}"))
 }
 
 fn load_midi_play_pause_mapping() -> Option<MidiControlChangeMapping> {
@@ -58222,6 +58525,140 @@ fn pattern_vst3_parameter_automation_for_channel(
     lanes
 }
 
+fn playlist_audio_clip_auto_crossfade_envelopes(
+    arrangement: &Arrangement,
+    audio_clip_channel_ids: &BTreeSet<u16>,
+    stored_envelopes: &[ProjectPlaylistAudioClipEnvelope],
+    tempo_map: &PlaylistTempoMap,
+) -> Vec<PlaylistAudioClipEnvelope> {
+    #[derive(Clone, Copy)]
+    struct Candidate {
+        clip_id: u32,
+        start_tick: u64,
+        end_tick: u64,
+    }
+
+    let mut envelopes = stored_envelopes
+        .iter()
+        .map(|entry| (entry.envelope.clip_id, entry.envelope))
+        .collect::<BTreeMap<_, _>>();
+    let stored_clip_ids = envelopes.keys().copied().collect::<BTreeSet<_>>();
+    let manual_fades = stored_envelopes
+        .iter()
+        .map(|entry| {
+            (
+                entry.envelope.clip_id,
+                (entry.fade_in_manual, entry.fade_out_manual),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut candidates = Vec::new();
+    for clip in &arrangement.clips {
+        let PlaylistClipTarget::Channel { id: channel_id } = clip.target() else {
+            continue;
+        };
+        let Some(clip_id) = clip.clip_id else {
+            continue;
+        };
+        if !audio_clip_channel_ids.contains(&channel_id) || clip.length_ticks == 0 {
+            continue;
+        }
+        envelopes
+            .entry(clip_id)
+            .or_insert(PlaylistAudioClipEnvelope {
+                arrangement_id: arrangement.id,
+                clip_id,
+                gain_centidb: 0,
+                fade_in_ms: 0,
+                fade_out_ms: 0,
+                fade_in_curve: PlaylistAudioClipFadeCurve::Linear,
+                fade_in_tension: 0,
+                fade_out_curve: PlaylistAudioClipFadeCurve::Linear,
+                fade_out_tension: 0,
+                stretch_to_clip_duration: false,
+                stretch_pitch_cents: 0,
+            });
+        candidates.push(Candidate {
+            clip_id,
+            start_tick: u64::from(clip.position_ticks),
+            end_tick: u64::from(clip.position_ticks) + u64::from(clip.length_ticks),
+        });
+    }
+    candidates
+        .sort_by_key(|candidate| (candidate.start_tick, candidate.end_tick, candidate.clip_id));
+
+    let mut auto_fade_in_ms = BTreeMap::<u32, u32>::new();
+    let mut auto_fade_out_ms = BTreeMap::<u32, u32>::new();
+    for left_index in 0..candidates.len() {
+        let left = candidates[left_index];
+        for right in candidates.iter().copied().skip(left_index + 1) {
+            if left.start_tick >= right.start_tick {
+                continue;
+            }
+            if left.end_tick <= right.start_tick {
+                break;
+            }
+            if left.clip_id == right.clip_id || left.end_tick > right.end_tick {
+                continue;
+            }
+            let Ok(overlap_start_seconds) =
+                tempo_map.seconds_at_fractional_tick(right.start_tick as f64)
+            else {
+                continue;
+            };
+            let Ok(overlap_end_seconds) =
+                tempo_map.seconds_at_fractional_tick(left.end_tick as f64)
+            else {
+                continue;
+            };
+            let overlap_ms = ((overlap_end_seconds - overlap_start_seconds) * 1_000.0)
+                .round()
+                .clamp(0.0, 600_000.0) as u32;
+            if overlap_ms == 0 {
+                continue;
+            }
+            auto_fade_out_ms
+                .entry(left.clip_id)
+                .and_modify(|duration| *duration = (*duration).max(overlap_ms))
+                .or_insert(overlap_ms);
+            auto_fade_in_ms
+                .entry(right.clip_id)
+                .and_modify(|duration| *duration = (*duration).max(overlap_ms))
+                .or_insert(overlap_ms);
+        }
+    }
+
+    for (clip_id, duration_ms) in auto_fade_in_ms {
+        if !manual_fades
+            .get(&clip_id)
+            .is_some_and(|(fade_in_manual, _)| *fade_in_manual)
+            && let Some(envelope) = envelopes.get_mut(&clip_id)
+            && envelope.fade_in_ms == 0
+        {
+            envelope.fade_in_ms = duration_ms;
+        }
+    }
+    for (clip_id, duration_ms) in auto_fade_out_ms {
+        if !manual_fades
+            .get(&clip_id)
+            .is_some_and(|(_, fade_out_manual)| *fade_out_manual)
+            && let Some(envelope) = envelopes.get_mut(&clip_id)
+            && envelope.fade_out_ms == 0
+        {
+            envelope.fade_out_ms = duration_ms;
+        }
+    }
+
+    envelopes
+        .into_values()
+        .filter(|envelope| {
+            stored_clip_ids.contains(&envelope.clip_id)
+                || envelope.fade_in_ms > 0
+                || envelope.fade_out_ms > 0
+        })
+        .collect()
+}
+
 fn valid_playlist_audio_clip_envelope(entry: &ProjectPlaylistAudioClipEnvelope) -> bool {
     !entry.project_path.is_empty()
         && entry.envelope.gain_centidb_is_supported()
@@ -58294,6 +58731,8 @@ fn parse_playlist_audio_clip_envelopes(contents: &str) -> Vec<ProjectPlaylistAud
             fade_out_tension,
             stretch_to_clip_duration,
             stretch_pitch_cents,
+            fade_in_manual,
+            fade_out_manual,
         ) = match remaining.as_slice() {
             [] => (
                 PlaylistAudioClipFadeCurve::Linear,
@@ -58302,6 +58741,8 @@ fn parse_playlist_audio_clip_envelopes(contents: &str) -> Vec<ProjectPlaylistAud
                 0,
                 false,
                 0,
+                fade_in_ms > 0,
+                fade_out_ms > 0,
             ),
             [fit, pitch] => {
                 let stretch_to_clip_duration = match *fit {
@@ -58319,6 +58760,8 @@ fn parse_playlist_audio_clip_envelopes(contents: &str) -> Vec<ProjectPlaylistAud
                     0,
                     stretch_to_clip_duration,
                     stretch_pitch_cents,
+                    fade_in_ms > 0,
+                    fade_out_ms > 0,
                 )
             }
             [in_curve, in_tension, out_curve, out_tension, fit, pitch] => {
@@ -58357,6 +58800,67 @@ fn parse_playlist_audio_clip_envelopes(contents: &str) -> Vec<ProjectPlaylistAud
                     fade_out_tension,
                     stretch_to_clip_duration,
                     stretch_pitch_cents,
+                    fade_in_ms > 0,
+                    fade_out_ms > 0,
+                )
+            }
+            [
+                in_curve,
+                in_tension,
+                out_curve,
+                out_tension,
+                fit,
+                pitch,
+                in_manual,
+                out_manual,
+            ] => {
+                let Some(fade_in_curve) = in_curve
+                    .parse::<u8>()
+                    .ok()
+                    .and_then(PlaylistAudioClipFadeCurve::from_code)
+                else {
+                    continue;
+                };
+                let Ok(fade_in_tension) = in_tension.parse::<i16>() else {
+                    continue;
+                };
+                let Some(fade_out_curve) = out_curve
+                    .parse::<u8>()
+                    .ok()
+                    .and_then(PlaylistAudioClipFadeCurve::from_code)
+                else {
+                    continue;
+                };
+                let Ok(fade_out_tension) = out_tension.parse::<i16>() else {
+                    continue;
+                };
+                let stretch_to_clip_duration = match *fit {
+                    "0" => false,
+                    "1" => true,
+                    _ => continue,
+                };
+                let Ok(stretch_pitch_cents) = pitch.parse::<i16>() else {
+                    continue;
+                };
+                let fade_in_manual = match *in_manual {
+                    "0" => false,
+                    "1" => true,
+                    _ => continue,
+                };
+                let fade_out_manual = match *out_manual {
+                    "0" => false,
+                    "1" => true,
+                    _ => continue,
+                };
+                (
+                    fade_in_curve,
+                    fade_in_tension,
+                    fade_out_curve,
+                    fade_out_tension,
+                    stretch_to_clip_duration,
+                    stretch_pitch_cents,
+                    fade_in_manual,
+                    fade_out_manual,
                 )
             }
             _ => continue,
@@ -58378,6 +58882,8 @@ fn parse_playlist_audio_clip_envelopes(contents: &str) -> Vec<ProjectPlaylistAud
                     stretch_to_clip_duration,
                     stretch_pitch_cents,
                 },
+                fade_in_manual,
+                fade_out_manual,
             },
         );
     }
@@ -58387,7 +58893,7 @@ fn parse_playlist_audio_clip_envelopes(contents: &str) -> Vec<ProjectPlaylistAud
 fn serialize_playlist_audio_clip_envelopes(
     envelopes: &[ProjectPlaylistAudioClipEnvelope],
 ) -> String {
-    let mut contents = String::from("version=3\n");
+    let mut contents = String::from("version=4\n");
     let mut normalized = Vec::new();
     for entry in envelopes {
         upsert_playlist_audio_clip_envelope(&mut normalized, entry.clone());
@@ -58421,6 +58927,10 @@ fn serialize_playlist_audio_clip_envelopes(
         });
         contents.push('\t');
         contents.push_str(&entry.envelope.stretch_pitch_cents.to_string());
+        contents.push('\t');
+        contents.push(if entry.fade_in_manual { '1' } else { '0' });
+        contents.push('\t');
+        contents.push(if entry.fade_out_manual { '1' } else { '0' });
         contents.push('\n');
     }
     contents
@@ -66418,6 +66928,8 @@ mod tests {
                 stretch_to_clip_duration: true,
                 stretch_pitch_cents: 350,
             },
+            fade_in_manual: true,
+            fade_out_manual: true,
         };
         let other_clip = ProjectPlaylistAudioClipEnvelope {
             envelope: PlaylistAudioClipEnvelope {
@@ -66433,6 +66945,8 @@ mod tests {
                 stretch_pitch_cents: 0,
                 ..entry.envelope
             },
+            fade_in_manual: false,
+            fade_out_manual: false,
             ..entry.clone()
         };
         let other_project = ProjectPlaylistAudioClipEnvelope {
@@ -66485,6 +66999,8 @@ mod tests {
                     stretch_to_clip_duration: false,
                     stretch_pitch_cents: 0,
                 },
+                fade_in_manual: true,
+                fade_out_manual: true,
             }]
         );
 
@@ -66507,6 +67023,8 @@ mod tests {
                     stretch_to_clip_duration: true,
                     stretch_pitch_cents: 75,
                 },
+                fade_in_manual: true,
+                fade_out_manual: true,
             }]
         );
 
@@ -66532,6 +67050,8 @@ mod tests {
                 stretch_to_clip_duration: false,
                 stretch_pitch_cents: 0,
             },
+            fade_in_manual: false,
+            fade_out_manual: false,
         };
         for envelope in [
             PlaylistAudioClipEnvelope {
