@@ -53086,17 +53086,22 @@ impl DawUi {
             .as_ref()
             .filter(|engine| engine.output_active())
             .map_or_else(
-                || "Output latency estimate requires an active shared output stream".to_owned(),
-                |engine| {
-                    if self.audio_settings.access == AudioAccess::Exclusive {
-                        "Output latency estimate is unavailable in WASAPI exclusive mode".to_owned()
-                    } else {
-                        engine.estimated_output_latency_ms().map_or_else(
-                            || "Output callback latency: waiting for timing samples".to_owned(),
-                            |latency_ms| {
-                                format!("Estimated output callback-to-playback latency: {latency_ms:.1} ms")
-                            },
-                        )
+                || "Output latency estimate requires an active output stream".to_owned(),
+                |engine| match (
+                    self.audio_settings.access,
+                    engine.estimated_output_latency_ms(),
+                ) {
+                    (AudioAccess::Exclusive, Some(latency_ms)) => format!(
+                        "Estimated WASAPI render-block-to-playback latency: {latency_ms:.1} ms"
+                    ),
+                    (AudioAccess::Exclusive, None) => {
+                        "WASAPI playback-clock latency: waiting for timing samples".to_owned()
+                    }
+                    (AudioAccess::Shared, Some(latency_ms)) => {
+                        format!("Estimated output callback-to-playback latency: {latency_ms:.1} ms")
+                    }
+                    (AudioAccess::Shared, None) => {
+                        "Output callback latency: waiting for timing samples".to_owned()
                     }
                 },
             );

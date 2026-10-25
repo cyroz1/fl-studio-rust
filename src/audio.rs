@@ -3736,7 +3736,7 @@ impl AudioEngine {
         self.input_latency_estimate.estimated_milliseconds()
     }
 
-    /// Estimated time from the output callback to predicted device playback.
+    /// Estimated time from the output render block to predicted device playback.
     pub fn estimated_output_latency_ms(&self) -> Option<f32> {
         self.playback
             .output_latency_estimate
@@ -4913,6 +4913,39 @@ fn query_performance_time_100ns(frequency: Option<i64>) -> Option<u64> {
 }
 
 #[cfg(windows)]
+fn wasapi_render_block_latency(
+    callback_time_100ns: u64,
+    device_position: u64,
+    device_position_time_100ns: u64,
+    clock_frequency: u64,
+    submitted_frames: u64,
+    sample_rate: u32,
+) -> Option<Duration> {
+    let clock_frequency = u128::from(clock_frequency);
+    let sample_rate = u128::from(sample_rate);
+    if clock_frequency == 0 || sample_rate == 0 {
+        return None;
+    }
+
+    // `submitted_frames` marks the first frame of the next block. The clock
+    // reports the currently presented stream position and its QPC timestamp.
+    let next_frame_position = u128::from(submitted_frames)
+        .checked_mul(clock_frequency)?
+        .checked_div(sample_rate)?;
+    let frames_until_playback = next_frame_position.checked_sub(u128::from(device_position))?;
+    let playback_offset_100ns = frames_until_playback
+        .checked_mul(10_000_000)?
+        .checked_div(clock_frequency)?;
+    let playback_time_100ns =
+        u128::from(device_position_time_100ns).checked_add(playback_offset_100ns)?;
+    let latency_100ns = playback_time_100ns.checked_sub(u128::from(callback_time_100ns))?;
+    let latency_nanoseconds = latency_100ns.checked_mul(100)?;
+    Some(Duration::from_nanos(
+        u64::try_from(latency_nanoseconds).ok()?,
+    ))
+}
+
+#[cfg(windows)]
 struct WasapiWorkerState {
     source: Arc<AtomicU8>,
     playback: Arc<PlaybackState>,
@@ -4979,6 +5012,11 @@ fn wasapi_exclusive_output_worker(
         let render = client
             .get_audiorenderclient()
             .map_err(|error| error.to_string())?;
+        let output_clock = client.get_audioclock().ok();
+        let output_clock_frequency = output_clock
+            .as_ref()
+            .and_then(|clock| clock.get_frequency().ok());
+        let qpc_frequency = query_performance_frequency();
         let mut render_state = WasapiRenderState {
             phase: 0.0,
             output_gain: settings.output_gain,
@@ -4986,6 +5024,7 @@ fn wasapi_exclusive_output_worker(
         let initial_frames = client
             .get_available_space_in_frames()
             .map_err(|error| error.to_string())? as usize;
+        let mut submitted_frames = u64::try_from(initial_frames).unwrap_or(u64::MAX);
         // Reuse this storage for each later event instead of allocating a
         // fresh byte buffer on every wake-up.
         let mut output = Vec::with_capacity(initial_frames.saturating_mul(format_spec.frame_bytes));
@@ -5010,6 +5049,7 @@ fn wasapi_exclusive_output_worker(
         while !stop.load(Ordering::Acquire) {
             match event.wait_for_event(100) {
                 Ok(()) => {
+                    let callback_time_100ns = query_performance_time_100ns(qpc_frequency);
                     let frames = client
                         .get_available_space_in_frames()
                         .map_err(|error| error.to_string())?
@@ -5026,6 +5066,27 @@ fn wasapi_exclusive_output_worker(
                     render
                         .write_to_device(frames, &output, None)
                         .map_err(|error| error.to_string())?;
+                    if frames > 0
+                        && let (Some(callback_time_100ns), Some(clock), Some(clock_frequency)) = (
+                            callback_time_100ns,
+                            output_clock.as_ref(),
+                            output_clock_frequency,
+                        )
+                        && let Ok((device_position, device_position_time_100ns)) =
+                            clock.get_position()
+                        && let Some(latency) = wasapi_render_block_latency(
+                            callback_time_100ns,
+                            device_position,
+                            device_position_time_100ns,
+                            clock_frequency,
+                            submitted_frames,
+                            format_spec.sample_rate,
+                        )
+                    {
+                        playback.output_latency_estimate.observe(Some(latency));
+                    }
+                    submitted_frames =
+                        submitted_frames.saturating_add(u64::try_from(frames).unwrap_or(u64::MAX));
                 }
                 Err(wasapi::WasapiError::EventTimeout) => {}
                 Err(error) => return Err(error.to_string()),
