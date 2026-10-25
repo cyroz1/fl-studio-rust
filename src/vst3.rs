@@ -1316,6 +1316,15 @@ impl Vst3PlaylistStreamProcessor {
         }
     }
 
+    /// Initial delay added to the final mix by supported automatic instrument and Mixer PDC.
+    pub(crate) fn pdc_render_start_trim_frames(&self) -> u64 {
+        pdc_render_start_trim_frames(
+            self.automatic_pdc_enabled,
+            self.maximum_latency_frames,
+            self.mixer_effect_pdc_latency_frames,
+        )
+    }
+
     pub(crate) fn needs_mixer_insert_buses(&self) -> bool {
         self.mixer_effect_chains
             .iter()
@@ -1928,6 +1937,18 @@ fn pdc_aligned_output_frames(
     content_frames
         .checked_add(maximum_latency_frames)
         .ok_or_else(|| "PDC-aligned Playlist length overflow".to_owned())
+}
+
+fn pdc_render_start_trim_frames(
+    automatic_pdc_enabled: bool,
+    instrument_latency_frames: u64,
+    mixer_effect_latency_frames: u64,
+) -> u64 {
+    if automatic_pdc_enabled {
+        instrument_latency_frames.saturating_add(mixer_effect_latency_frames)
+    } else {
+        0
+    }
 }
 
 fn plan_pdc_delays(latencies: &[u64]) -> (u64, Vec<u64>) {
@@ -8777,6 +8798,12 @@ mod tests {
         assert_eq!(maximum, 480);
         assert_eq!(delays, [480, 0, 240]);
         assert_eq!(plan_pdc_delays(&[]), (0, Vec::new()));
+    }
+
+    #[test]
+    fn pdc_render_start_trim_covers_instrument_and_mixer_latency_only_when_enabled() {
+        assert_eq!(pdc_render_start_trim_frames(true, 480, 240), 720);
+        assert_eq!(pdc_render_start_trim_frames(false, 480, 240), 0);
     }
 
     #[test]

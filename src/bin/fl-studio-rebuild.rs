@@ -4985,6 +4985,7 @@ struct DawUi {
     playlist_render_dither_mode: WavDitherMode,
     playlist_render_save_markers: bool,
     playlist_render_save_note_markers: bool,
+    playlist_render_trim_pdc_silence: bool,
     playlist_render_quality: ResamplingQuality,
     playlist_render_channel_mode: WavChannelMode,
     playlist_render_tail_seconds: u8,
@@ -6495,6 +6496,7 @@ impl DawUi {
             playlist_render_dither_mode: WavDitherMode::Off,
             playlist_render_save_markers: false,
             playlist_render_save_note_markers: false,
+            playlist_render_trim_pdc_silence: true,
             playlist_render_quality,
             playlist_render_channel_mode: WavChannelMode::Stereo,
             playlist_render_tail_seconds: 0,
@@ -9862,6 +9864,19 @@ impl DawUi {
                     ui.label(
                         "Playlist markers save time markers; note markers include note onsets and Audio Clip starts.",
                     );
+                }
+                let wav_master_render = !self.playlist_render_mixer_stems
+                    && render_format == PlaylistSongOutputFormat::Wav;
+                ui.add_enabled_ui(wav_master_render, |ui| {
+                    ui.checkbox(
+                        &mut self.playlist_render_trim_pdc_silence,
+                        "Trim PDC silence",
+                    )
+                });
+                if wav_master_render {
+                    ui.label("Removes automatic PDC delay from the start of the WAV render.");
+                } else if self.playlist_render_mixer_stems {
+                    ui.label("Per-track PDC silence trimming for Mixer stems is not supported yet.");
                 }
                 let mut render_quality_changed = false;
                 ui.horizontal(|ui| {
@@ -37946,6 +37961,7 @@ impl DawUi {
             wav_dither_mode: self.playlist_render_dither_mode,
             wav_save_playlist_markers: self.playlist_render_save_markers,
             wav_save_note_markers: self.playlist_render_save_note_markers,
+            wav_trim_pdc_silence: self.playlist_render_trim_pdc_silence,
             resampling_quality: self.playlist_render_quality,
             wav_channel_mode: self.playlist_render_channel_mode,
             tail_seconds: self.playlist_render_tail_seconds,

@@ -1025,6 +1025,8 @@ pub struct PlaylistRenderOptions {
     pub wav_save_playlist_markers: bool,
     /// Write note onsets and Audio Clip starts as RIFF/WAVE cue points.
     pub wav_save_note_markers: bool,
+    /// Remove the initial automatic PDC delay from full-song WAV renders.
+    pub wav_trim_pdc_silence: bool,
     /// Whether to stop a Playlist render after its post-content output has decayed to silence.
     pub tail_mode: PlaylistTailMode,
     pub tail_seconds: u8,
@@ -1742,6 +1744,7 @@ impl Default for PlaylistRenderOptions {
             wav_channel_mode: WavChannelMode::Stereo,
             wav_save_playlist_markers: false,
             wav_save_note_markers: false,
+            wav_trim_pdc_silence: true,
             tail_mode: PlaylistTailMode::LeaveRemainder,
             tail_seconds: 0,
             soloed_playlist_track_range: None,
@@ -2492,6 +2495,7 @@ pub fn render_playlist_with_vst3_to_wav_cancellable(
             output: PlaylistRenderOutput::Wav,
             output_start_frame: 0,
             minimum_content_frames: 0,
+            full_song_wav: true,
         },
         vst3_processor,
         cancelled,
@@ -2517,6 +2521,7 @@ pub fn render_playlist_with_vst3_to_flac_cancellable(
             output: PlaylistRenderOutput::Flac { bits_per_sample },
             output_start_frame: 0,
             minimum_content_frames: 0,
+            full_song_wav: false,
         },
         vst3_processor,
         cancelled,
@@ -2542,6 +2547,7 @@ pub fn render_playlist_with_vst3_to_ogg_cancellable(
             output: PlaylistRenderOutput::Ogg { bitrate_kbps },
             output_start_frame: 0,
             minimum_content_frames: 0,
+            full_song_wav: false,
         },
         vst3_processor,
         cancelled,
@@ -2567,6 +2573,7 @@ pub fn render_playlist_with_vst3_to_mp3_cancellable(
             output: PlaylistRenderOutput::Mp3 { bitrate_kbps },
             output_start_frame: 0,
             minimum_content_frames: 0,
+            full_song_wav: false,
         },
         vst3_processor,
         cancelled,
@@ -2602,6 +2609,7 @@ pub fn render_playlist_with_vst3_to_file_from_frame_cancellable(
             output,
             output_start_frame: range.output_start_frame,
             minimum_content_frames: range.minimum_content_frames,
+            full_song_wav: false,
         },
         vst3_processor,
         cancelled,
@@ -2621,6 +2629,7 @@ struct PlaylistRenderWindow {
     output: PlaylistRenderOutput,
     output_start_frame: u64,
     minimum_content_frames: u64,
+    full_song_wav: bool,
 }
 
 fn render_playlist_with_vst3_cancellable(
@@ -2636,6 +2645,7 @@ fn render_playlist_with_vst3_cancellable(
         output,
         output_start_frame,
         minimum_content_frames,
+        full_song_wav,
     } = window;
     let project_path = project_path.as_ref();
     let output_path = output_path.as_ref();
@@ -2779,12 +2789,26 @@ fn render_playlist_with_vst3_cancellable(
     if output_start_frame >= frames {
         return Err("render output start is after the end of the Playlist content".to_owned());
     }
-    let mut output_frames = frames - output_start_frame;
     if let Some(processor) = vst3_processor.as_mut() {
         processor.extend_to_output_frames(frames)?;
         frames = frames.max(processor.summary().frames);
-        output_frames = frames - output_start_frame;
     }
+    let pdc_trim_frames = if full_song_wav
+        && matches!(output, PlaylistRenderOutput::Wav)
+        && options.wav_trim_pdc_silence
+        && output_start_frame == 0
+    {
+        vst3_processor
+            .as_ref()
+            .map_or(0, Vst3PlaylistStreamProcessor::pdc_render_start_trim_frames)
+    } else {
+        0
+    };
+    let render_skip_frames = output_start_frame.saturating_add(pdc_trim_frames);
+    if render_skip_frames >= frames {
+        return Err("PDC trim removes the entire Playlist render".to_owned());
+    }
+    let output_frames = frames - render_skip_frames;
     if matches!(output, PlaylistRenderOutput::Flac { .. }) && output_frames > FLAC_MAX_SAMPLE_FRAMES
     {
         return Err("rendered FLAC exceeds the 36-bit sample-count limit".to_owned());
@@ -2819,7 +2843,7 @@ fn render_playlist_with_vst3_cancellable(
     };
 
     let mixer_track_meters = MixerTrackPeakMeters::default();
-    let mut frames_to_skip = output_start_frame;
+    let mut frames_to_skip = render_skip_frames;
     let rendered_output_frames;
     let wav_sample_format = options.wav_sample_format;
     let wav_channel_mode = options.wav_channel_mode;
@@ -2890,7 +2914,7 @@ fn render_playlist_with_vst3_cancellable(
             summary.voices_stolen = render_result.voices_stolen;
             rendered_output_frames = render_result
                 .frames_rendered
-                .checked_sub(output_start_frame)
+                .checked_sub(render_skip_frames)
                 .ok_or_else(|| {
                     "render output start is after the rendered Playlist content".to_owned()
                 })?;
@@ -2927,7 +2951,7 @@ fn render_playlist_with_vst3_cancellable(
             summary.voices_stolen = render_result.voices_stolen;
             rendered_output_frames = render_result
                 .frames_rendered
-                .checked_sub(output_start_frame)
+                .checked_sub(render_skip_frames)
                 .ok_or_else(|| {
                     "render output start is after the rendered Playlist content".to_owned()
                 })?;
@@ -2965,7 +2989,7 @@ fn render_playlist_with_vst3_cancellable(
             summary.voices_stolen = render_result.voices_stolen;
             rendered_output_frames = render_result
                 .frames_rendered
-                .checked_sub(output_start_frame)
+                .checked_sub(render_skip_frames)
                 .ok_or_else(|| {
                     "render output start is after the rendered Playlist content".to_owned()
                 })?;
@@ -3004,7 +3028,7 @@ fn render_playlist_with_vst3_cancellable(
             summary.voices_stolen = render_result.voices_stolen;
             rendered_output_frames = render_result
                 .frames_rendered
-                .checked_sub(output_start_frame)
+                .checked_sub(render_skip_frames)
                 .ok_or_else(|| {
                     "render output start is after the rendered Playlist content".to_owned()
                 })?;
@@ -16224,6 +16248,7 @@ mod tests {
                     wav_channel_mode: WavChannelMode::Stereo,
                     wav_save_playlist_markers: false,
                     wav_save_note_markers: false,
+                    wav_trim_pdc_silence: false,
                     tail_mode: PlaylistTailMode::FixedDuration,
                     tail_seconds: 0,
                     soloed_playlist_track_range: None,
