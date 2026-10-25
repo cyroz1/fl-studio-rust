@@ -61045,9 +61045,7 @@ fn draw_audio_clip_waveform(
             painter,
             clip_rect,
             waveform,
-            source_start,
-            source_end,
-            settings.reverse,
+            (source_start, source_end),
             clip,
             settings,
         );
@@ -61210,12 +61208,12 @@ fn draw_spectral_audio_clip(
     painter: &egui::Painter,
     clip_rect: egui::Rect,
     waveform: &AudioWaveform,
-    source_start: u64,
-    source_end: u64,
-    reverse: bool,
+    source_window: (u64, u64),
     clip: &PlaylistClip,
     settings: PlaylistWaveformSettings<'_>,
 ) {
+    let (source_start, source_end) = source_window;
+    let reverse = settings.reverse;
     if waveform.spectral_bands.is_empty() || source_start >= source_end {
         return;
     }
