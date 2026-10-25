@@ -5937,12 +5937,18 @@ fn stream_sampler_pattern_loop_from_tick_with_vst3_to_device(
     if start_frame >= loop_frames {
         return Err("Pattern seek position rounds outside its audio loop".to_owned());
     }
+    let vst3_volume_expression_channels = playback
+        .vst3_processor
+        .as_ref()
+        .map(|processor| processor.volume_expression_channel_ids().clone())
+        .unwrap_or_default();
     let render = if playback.allow_empty_sampler {
         prepare_sampler_pattern_allow_empty(
             document,
             project_path.as_ref(),
             options,
             live_master_meters.is_some(),
+            &vst3_volume_expression_channels,
             Some(cancelled),
         )?
     } else {
@@ -11196,6 +11202,7 @@ fn prepare_sampler_pattern(
             None,
             false,
             true,
+            None,
         )
     } else {
         prepare_sampler_pattern_for_channel(document, project_path, options, cancelled, None)
@@ -11217,6 +11224,7 @@ fn prepare_sampler_pattern_for_channel(
         channel_filter,
         false,
         false,
+        None,
     )
 }
 
@@ -11225,6 +11233,7 @@ fn prepare_sampler_pattern_allow_empty(
     project_path: &Path,
     options: SamplerPatternRenderOptions,
     include_muted_mixer_sources: bool,
+    vst3_volume_expression_channels: &BTreeSet<u16>,
     cancelled: Option<&AtomicBool>,
 ) -> Result<PreparedSamplerPattern, String> {
     prepare_sampler_pattern_for_channel_internal(
@@ -11235,6 +11244,7 @@ fn prepare_sampler_pattern_allow_empty(
         None,
         true,
         include_muted_mixer_sources,
+        Some(vst3_volume_expression_channels),
     )
 }
 
@@ -11246,6 +11256,7 @@ fn prepare_sampler_pattern_for_channel_internal(
     channel_filter: Option<&BTreeSet<u16>>,
     allow_empty: bool,
     include_muted_mixer_sources: bool,
+    vst3_volume_expression_channels: Option<&BTreeSet<u16>>,
 ) -> Result<PreparedSamplerPattern, String> {
     check_cancelled(cancelled)?;
     if !(8_000..=384_000).contains(&options.sample_rate) {
@@ -11288,12 +11299,21 @@ fn prepare_sampler_pattern_for_channel_internal(
         .enumerate()
         .filter(|(_, note)| !note.is_muted())
         .flat_map(|(note_index, note)| {
-            channel_router
-                .targets_for_note_with_layer_adjustments(
+            let routes = if let Some(volume_expression_channels) = vst3_volume_expression_channels {
+                channel_router.targets_for_note_with_mixed_crossfade(
+                    note.channel_id,
+                    note_index as u64,
+                    note.key,
+                    volume_expression_channels,
+                )
+            } else {
+                channel_router.targets_for_note_with_layer_adjustments(
                     note.channel_id,
                     note_index as u64,
                     note.key,
                 )
+            };
+            routes
                 .into_iter()
                 .filter(|(target_channel_id, _, _)| {
                     channels_by_id

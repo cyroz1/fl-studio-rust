@@ -4652,7 +4652,7 @@ impl Vst3HostRuntime {
                 .and_then(|tick| tick.checked_add(swing_offset))
                 .ok_or_else(|| "Pattern VST3 note end position overflow".to_owned())?;
             for (target_channel_id, layer_gain, layer_pan_raw) in router
-                .targets_for_note_with_vst3_crossfade(
+                .targets_for_note_with_mixed_crossfade(
                     note.channel_id,
                     note_index as u64,
                     note.key,
