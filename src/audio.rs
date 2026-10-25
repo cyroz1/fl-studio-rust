@@ -32,8 +32,8 @@ const LIVE_STREAM_RING_CAPACITY: usize = 4_096;
 const MAX_LIVE_STREAM_SOURCES: usize = 64;
 const INPUT_MONITOR_RING_CAPACITY: usize = AUDIO_RING_CAPACITY * 2;
 const INPUT_RECORDING_BUFFER_FRAMES: usize = 65_536;
-const INPUT_LATENCY_ESTIMATE_MIN_SAMPLES: u32 = 8;
-const INPUT_LATENCY_ESTIMATE_MAX_MICROSECONDS: u128 = 1_000_000;
+const LATENCY_ESTIMATE_MIN_SAMPLES: u32 = 8;
+const LATENCY_ESTIMATE_MAX_MICROSECONDS: u128 = 1_000_000;
 const AUDIO_ERROR_HISTORY_LIMIT: usize = 16;
 const AUDIO_COMMAND_QUEUE_CAPACITY: usize = 128;
 const RETIRED_STREAM_QUEUE_CAPACITY: usize = 4;
@@ -1812,6 +1812,7 @@ struct PlaybackState {
     output_gain: AtomicU32,
     output_peak: AtomicU32,
     output_callback_frames: AtomicU32,
+    output_latency_estimate: AudioLatencyEstimate,
     input_monitor_ring_flush_requested: AtomicBool,
     input_monitor_active: Arc<AtomicBool>,
 }
@@ -2090,12 +2091,12 @@ struct InputRecordingState {
     overflow_frames: AtomicU64,
 }
 
-struct InputLatencyEstimate {
+struct AudioLatencyEstimate {
     smoothed_microseconds: AtomicU32,
     sample_count: AtomicU32,
 }
 
-impl Default for InputLatencyEstimate {
+impl Default for AudioLatencyEstimate {
     fn default() -> Self {
         Self {
             smoothed_microseconds: AtomicU32::new(0),
@@ -2104,10 +2105,10 @@ impl Default for InputLatencyEstimate {
     }
 }
 
-impl InputLatencyEstimate {
+impl AudioLatencyEstimate {
     fn observe(&self, latency: Option<Duration>) {
-        let Some(latency) = latency
-            .filter(|latency| latency.as_micros() <= INPUT_LATENCY_ESTIMATE_MAX_MICROSECONDS)
+        let Some(latency) =
+            latency.filter(|latency| latency.as_micros() <= LATENCY_ESTIMATE_MAX_MICROSECONDS)
         else {
             return;
         };
@@ -2131,7 +2132,7 @@ impl InputLatencyEstimate {
             });
     }
 
-    fn observe_cpal_callback(&self, info: &cpal::InputCallbackInfo) {
+    fn observe_cpal_input_callback(&self, info: &cpal::InputCallbackInfo) {
         let timestamp = info.timestamp();
         if timestamp.callback.as_nanos() == 0 || timestamp.capture.as_nanos() == 0 {
             return;
@@ -2139,8 +2140,20 @@ impl InputLatencyEstimate {
         self.observe(timestamp.callback.checked_duration_since(timestamp.capture));
     }
 
+    fn observe_cpal_output_callback(&self, info: &cpal::OutputCallbackInfo) {
+        let timestamp = info.timestamp();
+        if timestamp.callback.as_nanos() == 0 || timestamp.playback.as_nanos() == 0 {
+            return;
+        }
+        self.observe(
+            timestamp
+                .playback
+                .checked_duration_since(timestamp.callback),
+        );
+    }
+
     fn estimated_milliseconds(&self) -> Option<f32> {
-        (self.sample_count.load(Ordering::Acquire) >= INPUT_LATENCY_ESTIMATE_MIN_SAMPLES)
+        (self.sample_count.load(Ordering::Acquire) >= LATENCY_ESTIMATE_MIN_SAMPLES)
             .then(|| self.smoothed_microseconds.load(Ordering::Relaxed) as f32 / 1_000.0)
     }
 
@@ -2372,6 +2385,7 @@ impl PlaybackState {
             output_gain: AtomicU32::new(1.0_f32.to_bits()),
             output_peak: AtomicU32::new(0.0_f32.to_bits()),
             output_callback_frames: AtomicU32::new(0),
+            output_latency_estimate: AudioLatencyEstimate::default(),
             input_monitor_ring_flush_requested: AtomicBool::new(false),
             input_monitor_active: Arc::new(AtomicBool::new(false)),
         }
@@ -3171,7 +3185,7 @@ pub struct AudioEngine {
     input_monitor_ring: Arc<AudioRingBuffer>,
     input_channel_pair: Arc<AtomicU16>,
     input_channel_count: u16,
-    input_latency_estimate: Arc<InputLatencyEstimate>,
+    input_latency_estimate: Arc<AudioLatencyEstimate>,
     error: Arc<AudioErrorState>,
     input_stream: Option<Stream>,
     output_stream: Option<Stream>,
@@ -3722,6 +3736,13 @@ impl AudioEngine {
         self.input_latency_estimate.estimated_milliseconds()
     }
 
+    /// Estimated time from the output callback to predicted device playback.
+    pub fn estimated_output_latency_ms(&self) -> Option<f32> {
+        self.playback
+            .output_latency_estimate
+            .estimated_milliseconds()
+    }
+
     /// Wait briefly for the active input stream to provide timing samples.
     pub fn wait_for_input_latency_estimate(&self, timeout: Duration) -> Option<f32> {
         self.input_latency_estimate.wait_for_estimate(timeout)
@@ -3762,7 +3783,7 @@ impl AudioEngine {
         let input_callback_frames = Arc::new(AtomicU32::new(0));
         let input_recording = Arc::new(ArcSwapOption::empty());
         let input_monitor_recording = Arc::new(ArcSwapOption::empty());
-        let input_latency_estimate = Arc::new(InputLatencyEstimate::default());
+        let input_latency_estimate = Arc::new(AudioLatencyEstimate::default());
         let input_channel_pair = Arc::new(AtomicU16::new(settings.input_channel_pair));
         let error = Arc::new(AudioErrorState::default());
 
@@ -3863,7 +3884,7 @@ impl AudioEngine {
         let input_callback_frames = Arc::new(AtomicU32::new(0));
         let input_recording = Arc::new(ArcSwapOption::empty());
         let input_monitor_recording = Arc::new(ArcSwapOption::empty());
-        let input_latency_estimate = Arc::new(InputLatencyEstimate::default());
+        let input_latency_estimate = Arc::new(AudioLatencyEstimate::default());
         let input_channel_pair = Arc::new(AtomicU16::new(settings.input_channel_pair));
         let input_channel_count = Arc::new(AtomicU16::new(0));
         let error = Arc::new(AudioErrorState::default());
@@ -4290,8 +4311,11 @@ where
     let stream = device
         .build_output_stream::<T, _, _>(
             config,
-            move |output, _| {
+            move |output, info| {
                 enable_denormal_protection();
+                playback_for_callback
+                    .output_latency_estimate
+                    .observe_cpal_output_callback(info);
                 playback_for_callback.apply_pending_commands(&source);
                 if playback_for_callback
                     .input_monitor_ring_flush_requested
@@ -4356,7 +4380,7 @@ struct InputStreamState {
     recording: Arc<ArcSwapOption<InputRecordingState>>,
     monitor_recording: Arc<ArcSwapOption<InputRecordingState>>,
     monitor_active: Arc<AtomicBool>,
-    input_latency_estimate: Arc<InputLatencyEstimate>,
+    input_latency_estimate: Arc<AudioLatencyEstimate>,
     error: Arc<AudioErrorState>,
     input_channel_pair: Arc<AtomicU16>,
 }
@@ -4449,7 +4473,7 @@ where
             config,
             move |input, info| {
                 enable_denormal_protection();
-                input_latency_estimate.observe_cpal_callback(info);
+                input_latency_estimate.observe_cpal_input_callback(info);
                 let mut max_peak = 0.0_f32;
                 callback_frames.store(
                     u32::try_from(input.len() / channels).unwrap_or(u32::MAX),
@@ -4897,7 +4921,7 @@ struct WasapiWorkerState {
     input_callback_frames: Arc<AtomicU32>,
     input_recording: Arc<ArcSwapOption<InputRecordingState>>,
     input_monitor_recording: Arc<ArcSwapOption<InputRecordingState>>,
-    input_latency_estimate: Arc<InputLatencyEstimate>,
+    input_latency_estimate: Arc<AudioLatencyEstimate>,
     input_channel_pair: Arc<AtomicU16>,
     input_channel_count: Arc<AtomicU16>,
     error: Arc<AudioErrorState>,

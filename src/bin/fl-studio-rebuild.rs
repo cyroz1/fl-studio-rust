@@ -53081,6 +53081,26 @@ impl DawUi {
             ))
             .color(MUTED),
         );
+        let output_latency_text = self
+            .audio_engine
+            .as_ref()
+            .filter(|engine| engine.output_active())
+            .map_or_else(
+                || "Output latency estimate requires an active shared output stream".to_owned(),
+                |engine| {
+                    if self.audio_settings.access == AudioAccess::Exclusive {
+                        "Output latency estimate is unavailable in WASAPI exclusive mode".to_owned()
+                    } else {
+                        engine.estimated_output_latency_ms().map_or_else(
+                            || "Output callback latency: waiting for timing samples".to_owned(),
+                            |latency_ms| {
+                                format!("Estimated output callback-to-playback latency: {latency_ms:.1} ms")
+                            },
+                        )
+                    }
+                },
+            );
+        ui.label(egui::RichText::new(output_latency_text).color(MUTED));
         let audio_recording_offset_changed = ui
             .add_enabled_ui(self.audio_recording.is_none(), |ui| {
                 ui.add(
@@ -53101,7 +53121,7 @@ impl DawUi {
         }
         ui.label(
             egui::RichText::new(
-                "Automatic compensation uses the active input backend's capture timing. The manual adjustment is added to it; positive totals move the clip earlier, and negative totals move it later. Neither changes the WAV capture.",
+                "Automatic compensation uses the active input backend's capture timing. The separate shared-mode output estimate is diagnostic only and is not added to Playlist placement. The manual adjustment is added to input latency; positive totals move the clip earlier, and negative totals move it later. Neither changes the WAV capture.",
             )
             .color(MUTED),
         );
