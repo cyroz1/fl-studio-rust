@@ -4781,6 +4781,7 @@ struct DawUi {
     playlist_selection_anchor: Option<usize>,
     selected_playlist_track: Option<u32>,
     selected_playlist_tracks: BTreeSet<u32>,
+    armed_audio_recording_tracks: BTreeMap<u16, u32>,
     playlist_track_selection_anchor: Option<u32>,
     playlist_track_name_editor: Option<(u32, String)>,
     playlist_clip_context_split: Option<(u16, usize, u32)>,
@@ -5333,6 +5334,7 @@ struct AudioRecordingSession {
     output_path: PathBuf,
     arrangement_id: u16,
     start_tick: u32,
+    playlist_track_id: Option<u32>,
     recording_offset_ms: i16,
     mixer_track: i8,
     tempo_map: PlaylistTempoMap,
@@ -6340,6 +6342,7 @@ impl DawUi {
             playlist_selection_anchor: None,
             selected_playlist_track: None,
             selected_playlist_tracks: BTreeSet::new(),
+            armed_audio_recording_tracks: BTreeMap::new(),
             playlist_track_selection_anchor: None,
             playlist_track_name_editor: None,
             playlist_clip_context_split: None,
@@ -7591,6 +7594,7 @@ impl DawUi {
             Ok((package_workspace, document)) => {
                 self.stop_project_playback();
                 self.project_generation = self.project_generation.wrapping_add(1);
+                self.armed_audio_recording_tracks.clear();
                 self.piano_roll_hidden_ghost_channels.clear();
                 self.piano_roll_hidden_ghost_tracks.clear();
                 self.piano_roll_hidden_ghost_clips.clear();
@@ -20339,6 +20343,10 @@ impl DawUi {
                     }
                     let track_state = tracks.iter().find(|track| track.id == track_id);
                     let track_selected = self.selected_playlist_tracks.contains(&track_id);
+                    let track_audio_armed = self
+                        .armed_audio_recording_tracks
+                        .get(&arrangement.id)
+                        .is_some_and(|armed_track_id| *armed_track_id == track_id);
                     let track_muted = track_state.is_some_and(|track| track.enabled == Some(false));
                     let track_grouped = track_state.is_some_and(|track| track.grouped == Some(true));
                     let track_group_range = playlist_track_group_range(track_id, &tracks);
@@ -20535,6 +20543,13 @@ impl DawUi {
                                 TEXT
                             },
                         );
+                        if track_audio_armed {
+                            ui.painter().circle_filled(
+                                egui::pos2(label_rect.right() - 7.0, label_rect.center().y),
+                                3.0,
+                                RED,
+                            );
+                        }
                         let context_left = if track_is_group_parent {
                             label_rect.left() + 51.0
                         } else {
@@ -20564,6 +20579,23 @@ impl DawUi {
                         context_response.context_menu(|ui| {
                             apply_local_ui_scale(ui, self.popup_menu_scale);
                             ui.label(track_name);
+                            ui.separator();
+                            let mut arm_for_audio = track_audio_armed;
+                            if ui
+                                .checkbox(&mut arm_for_audio, "Arm for audio recording")
+                                .changed()
+                            {
+                                if arm_for_audio {
+                                    self.armed_audio_recording_tracks
+                                        .insert(arrangement.id, track_id);
+                                    self.status = format!(
+                                        "Armed Playlist track {track_id} for audio recording"
+                                    );
+                                } else {
+                                    self.armed_audio_recording_tracks.remove(&arrangement.id);
+                                    self.status = "Disarmed Playlist audio recording track".to_owned();
+                                }
+                            }
                             ui.separator();
                             let ghost_track_keys = if self
                                 .selected_playlist_tracks
@@ -51255,6 +51287,11 @@ impl DawUi {
                 "The project has no recognized Playlist arrangement to record into".to_owned();
             return;
         };
+        let playlist_track_id = self
+            .armed_audio_recording_tracks
+            .get(&arrangement_id)
+            .copied()
+            .filter(|track_id| (1..=500).contains(track_id));
         if !project_has_audio_clip_template(document) {
             self.status = "Add an Audio Clip to the project before recording; its recognized FLP record is used as a safe template".to_owned();
             return;
@@ -51356,6 +51393,7 @@ impl DawUi {
             output_path: output_path.clone(),
             arrangement_id,
             start_tick,
+            playlist_track_id,
             recording_offset_ms: self.audio_recording_offset_ms,
             mixer_track: recording_mixer_track,
             tempo_map,
@@ -51513,9 +51551,24 @@ impl DawUi {
             );
             return;
         }
-        let Some(track_index) =
+        let track_index = if let Some(track_id) = session.playlist_track_id {
+            let Some(track_index) = track_id
+                .checked_sub(1)
+                .and_then(|index| u16::try_from(index).ok())
+                .filter(|index| *index <= 499)
+            else {
+                self.status = format!(
+                    "Saved {}, but the armed Playlist track is outside the supported range",
+                    session.output_path.display()
+                );
+                return;
+            };
+            track_index
+        } else if let Some(track_index) =
             first_available_playlist_track(&arrangement, placement_tick, length_ticks)
-        else {
+        {
+            track_index
+        } else {
             self.status = format!(
                 "Saved {}, but all Playlist tracks overlap the take",
                 session.output_path.display()
@@ -52635,6 +52688,42 @@ impl DawUi {
             )
             .color(MUTED),
         );
+        let recording_arrangement_id = self.selected_arrangement.or_else(|| {
+            self.document
+                .as_ref()
+                .and_then(|document| document.arrangements().ok())
+                .and_then(|arrangements| arrangements.first().map(|arrangement| arrangement.id))
+        });
+        let armed_recording_track = recording_arrangement_id.and_then(|arrangement_id| {
+            self.armed_audio_recording_tracks
+                .get(&arrangement_id)
+                .copied()
+                .map(|track_id| (arrangement_id, track_id))
+        });
+        if let Some((arrangement_id, track_id)) = armed_recording_track {
+            let track_name = self
+                .document
+                .as_ref()
+                .and_then(|document| {
+                    document
+                        .playlist_tracks_in_arrangement(arrangement_id)
+                        .into_iter()
+                        .find(|track| track.id == track_id)
+                        .and_then(|track| track.name)
+                })
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| format!("Track {track_id}"));
+            ui.label(format!(
+                "Armed recording destination: Playlist {arrangement_id} · {track_name}"
+            ));
+        } else {
+            ui.label(
+                egui::RichText::new(
+                    "No Playlist track is armed; recorded takes use the first non-overlapping lane.",
+                )
+                .color(MUTED),
+            );
+        }
         let audio_recording_offset_changed = ui
             .add_enabled_ui(self.audio_recording.is_none(), |ui| {
                 ui.add(
