@@ -14943,6 +14943,7 @@ impl DawUi {
                     });
             let mut record_filters_changed = false;
             let _ = record_response.context_menu(|ui| {
+                apply_local_ui_scale(ui, self.popup_menu_scale);
                 ui.strong("Recording filter");
                 ui.add_enabled_ui(!recording && !audio_recording_finalizing, |ui| {
                     record_filters_changed |= ui
@@ -17005,6 +17006,7 @@ impl DawUi {
                         apply_saved_search = Some(search.clone());
                     }
                     response.context_menu(|ui| {
+                        apply_local_ui_scale(ui, self.popup_menu_scale);
                         if ui.button("Rename, color and icon…").clicked() {
                             rename_saved_search = Some(index);
                             ui.close();
@@ -18463,6 +18465,7 @@ impl DawUi {
                             |tags| format!("{}\nTags: {tags}", entry.path.display()),
                         );
                         response.on_hover_text(hover_text).context_menu(|ui| {
+                            apply_local_ui_scale(ui, self.popup_menu_scale);
                             if !entry.is_directory
                                 && browser_file_kind(&entry.path) == Some(BrowserFileKind::Audio)
                                 && let Some((channel_id, channel_name)) = &sample_target
@@ -18745,6 +18748,7 @@ impl DawUi {
                         response
                             .on_hover_text(path.display().to_string())
                             .context_menu(|ui| {
+                                apply_local_ui_scale(ui, self.popup_menu_scale);
                                 if browser_file_kind(&path) == Some(BrowserFileKind::Audio)
                                     && let Some((channel_id, channel_name)) = &sample_target
                                     && ui
@@ -19172,6 +19176,7 @@ impl DawUi {
                     "Add a non-signature time marker named Start to define the Performance Zone. Right-click for the Performance MIDI channel and Global Snap settings."
                 });
             performance_mode_button.context_menu(|ui| {
+                apply_local_ui_scale(ui, self.popup_menu_scale);
                 ui.label("MIDI Channel (for Performance Mode clip controls)");
                 let mut performance_midi_channel = self.performance_midi_channel + 1;
                 egui::ComboBox::from_id_salt("playlist-performance-midi-channel")
@@ -19248,6 +19253,7 @@ impl DawUi {
                 ));
                 if focus == PlaylistClipFocus::Pattern {
                     response.context_menu(|ui| {
+                        apply_local_ui_scale(ui, self.popup_menu_scale);
                         ui.label("Pattern Clip source");
                         if patterns.is_empty() {
                             ui.weak("No patterns");
@@ -19277,6 +19283,7 @@ impl DawUi {
                     });
                 } else if focus == PlaylistClipFocus::Audio {
                     response.context_menu(|ui| {
+                        apply_local_ui_scale(ui, self.popup_menu_scale);
                         ui.label("Audio Clip source");
                         if audio_clip_channels.is_empty() {
                             ui.weak("No Audio Clip channels with a saved sample path");
@@ -19306,6 +19313,7 @@ impl DawUi {
                     });
                 } else if focus == PlaylistClipFocus::Automation {
                     response.context_menu(|ui| {
+                        apply_local_ui_scale(ui, self.popup_menu_scale);
                         ui.label("Automation Clip source");
                         if automation_channel_ids.is_empty() {
                             ui.weak("No Automation channels with a saved point blob");
@@ -20305,6 +20313,7 @@ impl DawUi {
                             );
                         }
                         context_response.context_menu(|ui| {
+                            apply_local_ui_scale(ui, self.popup_menu_scale);
                             ui.label(track_name);
                             ui.separator();
                             let ghost_track_keys = if self
@@ -21347,6 +21356,7 @@ impl DawUi {
                             );
                             let response = response.on_hover_text(drag_hint);
                             response.context_menu(|ui| {
+                                apply_local_ui_scale(ui, self.popup_menu_scale);
                                 if similar_clip_indices.len() > 1 {
                                     if ui.button("Select all similar clips").clicked() {
                                         self.selected_arrangement = Some(arrangement.id);
@@ -27151,6 +27161,7 @@ impl DawUi {
                                     vec![channel.id()]
                                 };
                             channel_button.context_menu(|ui| {
+                                apply_local_ui_scale(ui, self.popup_menu_scale);
                                 let channel_selected =
                                     self.selected_rack_channels.contains(&channel.id());
                                 let toggle_label = if channel_selected {
@@ -27540,6 +27551,7 @@ impl DawUi {
                                             ));
                                         }
                                         response.context_menu(|ui| {
+                                            apply_local_ui_scale(ui, self.popup_menu_scale);
                                             ui.label("Add another note at this step");
                                             ui.horizontal(|ui| {
                                                 ui.label("Key");
@@ -27950,6 +27962,7 @@ impl DawUi {
                                 ));
                             }
                             response.context_menu(|ui| {
+                                apply_local_ui_scale(ui, self.popup_menu_scale);
                                 ui.label("Add another note at this step");
                                 ui.horizontal(|ui| {
                                     ui.label("Key");
@@ -42459,6 +42472,7 @@ impl DawUi {
             let mut delete_requested = false;
             if self.piano_roll_controller_tool == PianoRollControllerTool::Edit {
                 response.clone().context_menu(|ui| {
+                    apply_local_ui_scale(ui, self.popup_menu_scale);
                     if ui.button("Delete raw point").clicked() {
                         delete_requested = true;
                         ui.close();
