@@ -4788,6 +4788,7 @@ struct DawUi {
     clap_note_preview_receiver: Receiver<ClapNotePreviewResponse>,
     clap_note_preview_states: BTreeMap<(PathBuf, String), ClapNotePreviewState>,
     vst3_host: Option<Vst3HostRuntime>,
+    vst3_manual_latency_offsets: BTreeMap<String, i32>,
     channel_vst3_instances: BTreeMap<u16, u64>,
     mixer_effect_vst3_instances: BTreeMap<(usize, u16), u64>,
     audio_catalog: AudioDeviceCatalog,
@@ -5960,6 +5961,7 @@ impl DawUi {
         let midi_output_gain_mapping = load_midi_output_gain_mapping();
         let midi_mixer_control_mappings = load_midi_mixer_control_mappings();
         let midi_vst3_parameter_mappings = load_midi_vst3_parameter_mappings();
+        let vst3_manual_latency_offsets = load_vst3_manual_latency_offsets();
         let pattern_vst3_parameter_links = load_pattern_vst3_parameter_links();
         let playlist_vst3_parameter_links = load_playlist_vst3_parameter_links();
         let internal_lfo_parameter_links = load_internal_lfo_parameter_links();
@@ -6295,6 +6297,7 @@ impl DawUi {
             clap_note_preview_receiver,
             clap_note_preview_states: BTreeMap::new(),
             vst3_host: None,
+            vst3_manual_latency_offsets,
             channel_vst3_instances: BTreeMap::new(),
             mixer_effect_vst3_instances: BTreeMap::new(),
             audio_catalog,
@@ -8395,6 +8398,7 @@ impl DawUi {
                 return Some(format!("VST3 host initialization failed: {error}"));
             }
         };
+        host.set_manual_latency_offsets(&self.vst3_manual_latency_offsets);
         let mut channel_instances = BTreeMap::new();
         let mut mixer_effect_instances = BTreeMap::new();
         let mut loaded_effect_count = 0usize;
@@ -51573,6 +51577,7 @@ impl DawUi {
         let mut open_id = None;
         let mut close_id = None;
         let mut parameter_edits = Vec::new();
+        let mut vst3_latency_offset_edits = BTreeMap::new();
         let mut midi_vst3_learn_request = None;
         let mut midi_vst3_cancel_learning = false;
         let mut midi_vst3_remove_mapping = None;
@@ -51689,6 +51694,11 @@ impl DawUi {
             .as_ref()
             .map(Vst3HostRuntime::loaded_plugins)
             .unwrap_or_default();
+        let loaded_vst3_ids_by_uid = loaded
+            .iter()
+            .map(|info| (info.uid.to_ascii_lowercase(), info.id))
+            .collect::<BTreeMap<_, _>>();
+        let mut latency_offset_uids_drawn = BTreeSet::new();
         let plugin_states = self
             .document
             .as_ref()
@@ -52415,6 +52425,45 @@ impl DawUi {
                         info.latency_samples
                     ));
                 }
+                let latency_offset_uid = info.uid.to_ascii_lowercase();
+                if latency_offset_uids_drawn.insert(latency_offset_uid.clone()) {
+                    let mut offset_samples = self
+                        .vst3_manual_latency_offsets
+                        .get(&latency_offset_uid)
+                        .copied()
+                        .unwrap_or_default();
+                    let performance_stream_active = self.playing && self.performance_mode_active;
+                    ui.horizontal(|ui| {
+                        ui.label("Manual PDC offset");
+                        let response = ui
+                            .add_enabled(
+                                !performance_stream_active,
+                                egui::DragValue::new(&mut offset_samples)
+                                    .range(-100_000..=100_000)
+                                    .speed(1.0)
+                                    .suffix(" samples"),
+                            )
+                            .on_hover_text(
+                                "Added to the plug-in's reported latency for PDC. Positive values add latency; negative values subtract it.",
+                            );
+                        if response.changed() {
+                            vst3_latency_offset_edits
+                                .insert(latency_offset_uid.clone(), offset_samples);
+                        }
+                        ui.small(format!(
+                            "PDC latency: {} samples",
+                            info.pdc_latency_samples()
+                        ));
+                    });
+                    if performance_stream_active {
+                        ui.small(
+                            egui::RichText::new(
+                                "Stop Performance playback to edit the PDC offset.",
+                            )
+                            .color(MUTED),
+                        );
+                    }
+                }
 
                 let project_channel_id =
                     self.channel_vst3_instances
@@ -53059,6 +53108,116 @@ impl DawUi {
                 }
             }
         }
+        if !vst3_latency_offset_edits.is_empty() {
+            let playlist_resume_tick = self
+                .current_playhead_tick()
+                .filter(|tick| tick.is_finite() && *tick >= 0.0)
+                .map(|tick| tick.round().clamp(0.0, f64::from(u32::MAX)) as u32)
+                .unwrap_or(self.playlist_seek_tick);
+            let pattern_resume_tick = self
+                .current_pattern_mode_playhead_tick()
+                .map(|(_, tick)| tick)
+                .filter(|tick| tick.is_finite() && *tick >= 0.0)
+                .map(|tick| tick.round() as u64)
+                .unwrap_or(self.pattern_seek_tick);
+            let resume_pattern_playback = self.playing
+                && self
+                    .pattern_mode_playback_source
+                    .is_some_and(|(pattern_id, _)| Some(pattern_id) == self.selected_pattern);
+            let resume_playlist_playback = self.playing
+                && self.playlist_playback_loaded
+                && !self.pattern_playback_mode
+                && !self.performance_mode_active;
+            let mut changed = false;
+            for (uid, offset_samples) in vst3_latency_offset_edits {
+                let Some(id) = loaded_vst3_ids_by_uid.get(&uid).copied() else {
+                    continue;
+                };
+                let Some(host) = self.vst3_host.as_mut() else {
+                    continue;
+                };
+                match host.set_manual_latency_offset(id, offset_samples) {
+                    Ok(true) => {
+                        self.vst3_manual_latency_offsets.insert(uid, offset_samples);
+                        changed = true;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        self.status = format!("Could not update VST3 PDC offset: {error}");
+                    }
+                }
+            }
+            if changed {
+                let staged_pattern_handoff = resume_pattern_playback
+                    && self.stage_pattern_stream_rebuild(PdcStreamHandoffReason::Vst3LatencyChange);
+                let staged_playlist_handoff = !staged_pattern_handoff
+                    && resume_playlist_playback
+                    && self
+                        .stage_playlist_stream_rebuild(PdcStreamHandoffReason::Vst3LatencyChange);
+                if staged_playlist_handoff {
+                    self.pattern_seek_tick = pattern_resume_tick;
+                }
+                let playback_active = self.playing
+                    || self.project_playback_loaded
+                    || self.pending_audio_render.is_some()
+                    || self.pending_song_render.is_some()
+                    || self.pending_vst3_stream.is_some();
+                let resumed_tick = if staged_pattern_handoff {
+                    Some(self.pattern_seek_tick)
+                } else if staged_playlist_handoff {
+                    Some(u64::from(playlist_resume_tick))
+                } else {
+                    if playback_active {
+                        self.stop_project_playback();
+                    }
+                    self.playlist_seek_tick = playlist_resume_tick;
+                    self.pattern_seek_tick = pattern_resume_tick;
+                    let resumed = if resume_pattern_playback {
+                        self.start_pattern_mode_playback();
+                        self.playing.then_some(self.pattern_seek_tick)
+                    } else if resume_playlist_playback {
+                        self.start_project_playback();
+                        self.playing.then_some(u64::from(playlist_resume_tick))
+                    } else {
+                        None
+                    };
+                    if resumed.is_none() && resume_pattern_playback {
+                        self.pattern_seek_tick = pattern_resume_tick;
+                    } else if resumed.is_none() && resume_playlist_playback {
+                        self.playlist_seek_tick = playlist_resume_tick;
+                    }
+                    resumed
+                };
+                let save_result =
+                    save_vst3_manual_latency_offsets(&self.vst3_manual_latency_offsets);
+                self.status = match (save_result, resumed_tick) {
+                    (Err(error), Some(tick)) if staged_pattern_handoff => format!(
+                        "Updated VST3 PDC offset and staged Pattern playback at tick {tick}; could not save it: {error}"
+                    ),
+                    (Err(error), Some(tick)) if staged_playlist_handoff => format!(
+                        "Updated VST3 PDC offset and staged Playlist playback at tick {tick}; could not save it: {error}"
+                    ),
+                    (Err(error), _) => format!(
+                        "Updated VST3 PDC offset for this session; could not save it: {error}"
+                    ),
+                    (Ok(()), Some(tick)) if staged_pattern_handoff => format!(
+                        "Updated VST3 PDC offset; staging a Pattern PDC handoff at tick {tick}"
+                    ),
+                    (Ok(()), Some(tick)) if staged_playlist_handoff => format!(
+                        "Updated VST3 PDC offset; staging a Playlist PDC handoff at tick {tick}"
+                    ),
+                    (Ok(()), Some(tick)) => format!(
+                        "Updated VST3 PDC offset; playback resumed at tick {tick} with rebuilt PDC"
+                    ),
+                    (Ok(()), None) if playback_active => {
+                        "Updated VST3 PDC offset; active playback stopped and transport position was retained".to_owned()
+                    }
+                    (Ok(()), None) => {
+                        "Updated VST3 PDC offset; it will apply on the next playback start".to_owned()
+                    }
+                };
+            }
+        }
         if let Some(host) = &self.vst3_host {
             let mut parameter_changed = false;
             for (id, parameter_id, value) in parameter_edits {
@@ -53094,7 +53253,10 @@ impl DawUi {
         self.backup_before_risky_operation("loading a VST3 plug-in");
         if self.vst3_host.is_none() {
             match Vst3HostRuntime::new(f64::from(self.audio_settings.sample_rate), 512) {
-                Ok(host) => self.vst3_host = Some(host),
+                Ok(mut host) => {
+                    host.set_manual_latency_offsets(&self.vst3_manual_latency_offsets);
+                    self.vst3_host = Some(host);
+                }
                 Err(error) => {
                     self.status = format!("Could not initialize the VST3 host: {error}");
                     self.last_plugin_action = Some(self.status.clone());
@@ -56198,6 +56360,10 @@ fn midi_vst3_parameter_mappings_file() -> Option<PathBuf> {
     midi_control_change_mapping_file("midi-vst3-parameter-mappings.txt")
 }
 
+fn vst3_manual_latency_offsets_file() -> Option<PathBuf> {
+    midi_control_change_mapping_file("vst3-manual-latency-offsets.txt")
+}
+
 fn pattern_vst3_parameter_links_file() -> Option<PathBuf> {
     midi_control_change_mapping_file("pattern-vst3-parameter-links.txt")
 }
@@ -56251,6 +56417,13 @@ fn load_midi_vst3_parameter_mappings() -> Vec<MidiVst3ParameterMapping> {
     midi_vst3_parameter_mappings_file()
         .and_then(|path| fs::read_to_string(path).ok())
         .map(|contents| parse_midi_vst3_parameter_mappings(&contents))
+        .unwrap_or_default()
+}
+
+fn load_vst3_manual_latency_offsets() -> BTreeMap<String, i32> {
+    vst3_manual_latency_offsets_file()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .map(|contents| parse_vst3_manual_latency_offsets(&contents))
         .unwrap_or_default()
 }
 
@@ -56425,6 +56598,18 @@ fn save_midi_vst3_parameter_mappings(mappings: &[MidiVst3ParameterMapping]) -> R
     fs::create_dir_all(parent)
         .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
     fs::write(&path, serialize_midi_vst3_parameter_mappings(mappings))
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
+fn save_vst3_manual_latency_offsets(offsets: &BTreeMap<String, i32>) -> Result<(), String> {
+    let path = vst3_manual_latency_offsets_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the VST3 latency offset path has no parent folder".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    fs::write(&path, serialize_vst3_manual_latency_offsets(offsets))
         .map_err(|error| format!("could not write {}: {error}", path.display()))
 }
 
@@ -56777,6 +56962,42 @@ fn serialize_midi_vst3_parameter_mappings(mappings: &[MidiVst3ParameterMapping])
                 contents.push_str(&encode_midi_device_id(&target.parameter_name));
             }
         }
+        contents.push('\n');
+    }
+    contents
+}
+
+fn parse_vst3_manual_latency_offsets(contents: &str) -> BTreeMap<String, i32> {
+    let mut offsets = BTreeMap::new();
+    for line in contents.lines() {
+        let Some(encoded) = line.strip_prefix("offset=") else {
+            continue;
+        };
+        let mut fields = encoded.split('\t');
+        let Some(plugin_uid) = fields.next().and_then(decode_midi_device_id) else {
+            continue;
+        };
+        let Some(offset_samples) = fields.next().and_then(|field| field.parse::<i32>().ok()) else {
+            continue;
+        };
+        if fields.next().is_some() || plugin_uid.is_empty() {
+            continue;
+        }
+        offsets.insert(plugin_uid.to_ascii_lowercase(), offset_samples);
+    }
+    offsets
+}
+
+fn serialize_vst3_manual_latency_offsets(offsets: &BTreeMap<String, i32>) -> String {
+    let mut contents = String::from("version=1\n");
+    for (plugin_uid, offset_samples) in offsets {
+        if plugin_uid.is_empty() {
+            continue;
+        }
+        contents.push_str("offset=");
+        contents.push_str(&encode_midi_device_id(plugin_uid));
+        contents.push('\t');
+        contents.push_str(&offset_samples.to_string());
         contents.push('\n');
     }
     contents
@@ -63288,8 +63509,8 @@ mod tests {
         parse_midi_output_programs, parse_midi_output_routes, parse_midi_output_values,
         parse_midi_vst3_parameter_mappings, parse_pattern_vst3_parameter_links,
         parse_playlist_audio_clip_envelopes, parse_playlist_vst3_parameter_links,
-        parse_window_layout_presets, pattern_color_from_random_index,
-        pattern_lfo_loop_length_ticks, pattern_loop_frame_at_tick,
+        parse_vst3_manual_latency_offsets, parse_window_layout_presets,
+        pattern_color_from_random_index, pattern_lfo_loop_length_ticks, pattern_loop_frame_at_tick,
         pattern_loop_handoff_tick_at_frame, pattern_loop_tick_at_frame,
         pattern_vst3_parameter_automation_for_channel, pattern_vst3_parameter_link_for_target,
         piano_roll_color_group_note_ids, piano_roll_controller_stroke_points,
@@ -63317,15 +63538,15 @@ mod tests {
         serialize_internal_lfo_parameter_links, serialize_midi_controller_templates,
         serialize_midi_mixer_control_mappings, serialize_midi_vst3_parameter_mappings,
         serialize_pattern_vst3_parameter_links, serialize_playlist_audio_clip_envelopes,
-        serialize_playlist_vst3_parameter_links, serialize_window_layout_presets,
-        should_auto_connect_midi_input, should_auto_connect_midi_output, snap_note_tick,
-        snap_piano_roll_key_to_scale, snap_recorded_midi_notes_to_scale,
-        toggle_piano_roll_note_group_selection, touch_pan_zoom_scroll_offset, track_two_finger_tap,
-        update_channel_rack_selection, update_layer_child_selection,
-        update_piano_roll_box_selection, upsert_internal_lfo_parameter_link,
-        upsert_midi_mixer_control_mapping, upsert_midi_vst3_parameter_mapping,
-        upsert_pattern_vst3_parameter_link, upsert_playlist_audio_clip_envelope,
-        upsert_playlist_vst3_parameter_link, zoom_to_fit,
+        serialize_playlist_vst3_parameter_links, serialize_vst3_manual_latency_offsets,
+        serialize_window_layout_presets, should_auto_connect_midi_input,
+        should_auto_connect_midi_output, snap_note_tick, snap_piano_roll_key_to_scale,
+        snap_recorded_midi_notes_to_scale, toggle_piano_roll_note_group_selection,
+        touch_pan_zoom_scroll_offset, track_two_finger_tap, update_channel_rack_selection,
+        update_layer_child_selection, update_piano_roll_box_selection,
+        upsert_internal_lfo_parameter_link, upsert_midi_mixer_control_mapping,
+        upsert_midi_vst3_parameter_mapping, upsert_pattern_vst3_parameter_link,
+        upsert_playlist_audio_clip_envelope, upsert_playlist_vst3_parameter_link, zoom_to_fit,
     };
 
     #[test]
@@ -64880,6 +65101,26 @@ mod tests {
             3
         );
         assert!(midi_vst3_parameter_mappings_for_cc(&mappings, "other", 15, 74).is_empty());
+    }
+
+    #[test]
+    fn vst3_manual_latency_offsets_round_trip_and_normalize_class_uids() {
+        let offsets = BTreeMap::from([
+            ("com.example.synth".to_owned(), -2_048),
+            ("org.example.fx".to_owned(), 256),
+        ]);
+        let encoded = serialize_vst3_manual_latency_offsets(&offsets);
+        assert_eq!(parse_vst3_manual_latency_offsets(&encoded), offsets);
+
+        let mixed_case = format!(
+            "version=1\noffset={}\t-16\noffset={}\t7\textra\n",
+            encode_midi_device_id("Com.Example.Plugin"),
+            encode_midi_device_id("org.example.bad")
+        );
+        assert_eq!(
+            parse_vst3_manual_latency_offsets(&mixed_case),
+            BTreeMap::from([("com.example.plugin".to_owned(), -16)])
+        );
     }
 
     #[test]

@@ -2609,6 +2609,8 @@ pub struct HostedPluginInfo {
     pub audio_outputs: u32,
     /// Latency most recently reported by `IAudioProcessor::getLatencySamples`.
     pub latency_samples: u32,
+    /// User-configured manual latency offset applied only to PDC planning.
+    pub manual_latency_offset_samples: i32,
     /// Sample rate configured for this plug-in instance when the report was read.
     pub sample_rate_hz: f64,
 }
@@ -2625,6 +2627,11 @@ impl HostedPluginInfo {
     pub fn latency_milliseconds(&self) -> Option<f64> {
         (self.sample_rate_hz.is_finite() && self.sample_rate_hz > 0.0)
             .then(|| f64::from(self.latency_samples) * 1000.0 / self.sample_rate_hz)
+    }
+
+    /// Effective latency used by PDC after the saved per-plugin offset is applied.
+    pub fn pdc_latency_samples(&self) -> u32 {
+        apply_manual_latency_offset(self.latency_samples, self.manual_latency_offset_samples)
     }
 }
 
@@ -2768,6 +2775,7 @@ pub struct Vst3HostRuntime {
     host: Vst3Host,
     loaded: Vec<HostedPlugin>,
     pending_latency_refresh: BTreeSet<u64>,
+    manual_latency_offsets_by_uid: BTreeMap<String, i32>,
     next_id: u64,
 }
 
@@ -3011,8 +3019,48 @@ impl Vst3HostRuntime {
             host,
             loaded: Vec::new(),
             pending_latency_refresh: BTreeSet::new(),
+            manual_latency_offsets_by_uid: BTreeMap::new(),
             next_id: 1,
         })
+    }
+
+    /// Install per-class manual latency offsets before loading project plug-ins.
+    pub fn set_manual_latency_offsets(&mut self, offsets: &BTreeMap<String, i32>) {
+        self.manual_latency_offsets_by_uid = offsets
+            .iter()
+            .map(|(uid, offset)| (uid.to_ascii_lowercase(), *offset))
+            .collect();
+        for loaded in &mut self.loaded {
+            loaded.info.manual_latency_offset_samples = self
+                .manual_latency_offsets_by_uid
+                .get(&loaded.info.uid.to_ascii_lowercase())
+                .copied()
+                .unwrap_or_default();
+        }
+    }
+
+    /// Update every loaded instance of one VST3 class and retain the offset for future loads.
+    pub fn set_manual_latency_offset(
+        &mut self,
+        id: u64,
+        offset_samples: i32,
+    ) -> Result<bool, String> {
+        let uid = self
+            .loaded
+            .iter()
+            .find(|loaded| loaded.info.id == id)
+            .map(|loaded| loaded.info.uid.to_ascii_lowercase())
+            .ok_or_else(|| format!("no loaded VST3 instance with id {id}"))?;
+        let changed = self
+            .manual_latency_offsets_by_uid
+            .insert(uid.clone(), offset_samples)
+            != Some(offset_samples);
+        for loaded in &mut self.loaded {
+            if loaded.info.uid.eq_ignore_ascii_case(&uid) {
+                loaded.info.manual_latency_offset_samples = offset_samples;
+            }
+        }
+        Ok(changed)
     }
 
     /// Load one audio class from an installed VST3 bundle.
@@ -3050,7 +3098,12 @@ impl Vst3HostRuntime {
         }
         .map_err(|error| error.to_string())?;
 
-        let info = hosted_info(self.next_id, &plugin);
+        let mut info = hosted_info(self.next_id, &plugin);
+        info.manual_latency_offset_samples = self
+            .manual_latency_offsets_by_uid
+            .get(&info.uid.to_ascii_lowercase())
+            .copied()
+            .unwrap_or_default();
         self.next_id = self.next_id.saturating_add(1);
         self.loaded.push(HostedPlugin {
             info: info.clone(),
@@ -4598,7 +4651,10 @@ impl Vst3HostRuntime {
                     .max(1);
                 let latency_frames = plugin_latency_in_output_frames(
                     channel_id,
-                    plugin_guard.latency_samples(),
+                    self.pdc_latency_samples_for_plugin(
+                        instance_id,
+                        plugin_guard.latency_samples(),
+                    ),
                     plugin_sample_rate,
                     output_sample_rate,
                 )?;
@@ -4875,7 +4931,7 @@ impl Vst3HostRuntime {
                         input.channel_count,
                         output.channel_count,
                         sample_rate,
-                        plugin_guard.latency_samples(),
+                        self.pdc_latency_samples_for_plugin(id, plugin_guard.latency_samples()),
                         plugin_guard.tail_samples(),
                     )
                 };
@@ -5219,7 +5275,10 @@ impl Vst3HostRuntime {
                 let plugin_sample_rate = plugin_guard.sample_rate();
                 let latency_frames = plugin_latency_in_output_frames(
                     channel_id,
-                    plugin_guard.latency_samples(),
+                    self.pdc_latency_samples_for_plugin(
+                        instance_id,
+                        plugin_guard.latency_samples(),
+                    ),
                     plugin_sample_rate,
                     output_sample_rate,
                 )?;
@@ -5404,6 +5463,18 @@ impl Vst3HostRuntime {
             .find(|loaded| loaded.info.id == id)
             .map(|loaded| &loaded.plugin)
             .ok_or_else(|| format!("no loaded VST3 instance with id {id}"))
+    }
+
+    fn pdc_latency_samples_for_plugin(&self, id: u64, reported_latency_samples: u32) -> u32 {
+        self.loaded
+            .iter()
+            .find(|loaded| loaded.info.id == id)
+            .map_or(reported_latency_samples, |loaded| {
+                apply_manual_latency_offset(
+                    reported_latency_samples,
+                    loaded.info.manual_latency_offset_samples,
+                )
+            })
     }
 }
 
@@ -7638,8 +7709,14 @@ fn hosted_info(id: u64, plugin: &Plugin) -> HostedPluginInfo {
         audio_inputs: info.audio_inputs,
         audio_outputs: info.audio_outputs,
         latency_samples: plugin.latency_samples(),
+        manual_latency_offset_samples: 0,
         sample_rate_hz: plugin.sample_rate(),
     }
+}
+
+fn apply_manual_latency_offset(reported_latency_samples: u32, offset_samples: i32) -> u32 {
+    (i64::from(reported_latency_samples) + i64::from(offset_samples)).clamp(0, i64::from(u32::MAX))
+        as u32
 }
 
 fn validate_vst3_audio_block(
@@ -8722,6 +8799,33 @@ mod tests {
     }
 
     #[test]
+    fn manual_plugin_latency_offsets_adjust_pdc_but_preserve_reported_latency() {
+        let mut info = HostedPluginInfo {
+            id: 1,
+            name: "Test effect".to_owned(),
+            vendor: "Test vendor".to_owned(),
+            version: "1.0".to_owned(),
+            category: "Fx|Delay".to_owned(),
+            uid: "00000000000000000000000000000000".to_owned(),
+            path: PathBuf::from("test.vst3"),
+            has_editor: false,
+            audio_inputs: 2,
+            audio_outputs: 2,
+            latency_samples: 480,
+            manual_latency_offset_samples: -120,
+            sample_rate_hz: 48_000.0,
+        };
+
+        assert_eq!(info.latency_samples, 480);
+        assert_eq!(info.pdc_latency_samples(), 360);
+        info.manual_latency_offset_samples = 96;
+        assert_eq!(info.pdc_latency_samples(), 576);
+        info.manual_latency_offset_samples = i32::MIN;
+        assert_eq!(info.pdc_latency_samples(), 0);
+        assert_eq!(apply_manual_latency_offset(u32::MAX, i32::MAX), u32::MAX);
+    }
+
+    #[test]
     fn reported_latency_uses_the_plugin_sample_rate() {
         let info = HostedPluginInfo {
             id: 1,
@@ -8735,6 +8839,7 @@ mod tests {
             audio_inputs: 0,
             audio_outputs: 2,
             latency_samples: 480,
+            manual_latency_offset_samples: 0,
             sample_rate_hz: 48_000.0,
         };
 
@@ -8813,6 +8918,7 @@ mod tests {
             audio_inputs: 0,
             audio_outputs: 2,
             latency_samples: 480,
+            manual_latency_offset_samples: 0,
             sample_rate_hz: 0.0,
         };
 
