@@ -92,6 +92,7 @@ struct WorkspaceInner {
     sample_project_path: PathBuf,
     archive_comment: Option<Vec<u8>>,
     entry_metadata: HashMap<PathBuf, PackageEntryMetadata>,
+    entry_order: Vec<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -205,6 +206,8 @@ impl ProjectPackageWorkspace {
         let root = workspace_directory.path();
         let mut project_files = Vec::new();
         let mut extracted_files = HashSet::new();
+        let mut entry_order = Vec::new();
+        let mut ordered_paths = HashSet::new();
         let mut entry_metadata = HashMap::new();
 
         for index in 0..archive.len() {
@@ -285,6 +288,9 @@ impl ProjectPackageWorkspace {
                         target.display()
                     )
                 })?;
+                if ordered_paths.insert(relative_path.clone()) {
+                    entry_order.push(relative_path.clone());
+                }
                 entry_metadata.insert(relative_path, metadata);
                 continue;
             }
@@ -298,6 +304,9 @@ impl ProjectPackageWorkspace {
             }
             if !extracted_files.insert(relative_path.clone()) {
                 return Err(format!("ZIP project contains duplicate file {raw_name:?}"));
+            }
+            if ordered_paths.insert(relative_path.clone()) {
+                entry_order.push(relative_path.clone());
             }
             let parent = target.parent().ok_or_else(|| {
                 format!("ZIP project entry has no parent directory: {raw_name:?}")
@@ -356,6 +365,7 @@ impl ProjectPackageWorkspace {
                 sample_project_path: project_path,
                 archive_comment,
                 entry_metadata,
+                entry_order,
             })),
             project_bytes,
         ))
@@ -393,6 +403,7 @@ impl ProjectPackageWorkspace {
             sample_project_path: sample_project_path.as_ref().to_path_buf(),
             archive_comment: None,
             entry_metadata: HashMap::new(),
+            entry_order: Vec::new(),
         })))
     }
 
@@ -574,9 +585,21 @@ impl ProjectPackageWorkspace {
     }
 
     fn write_archive(&self, file: File, project_bytes: &[u8]) -> Result<(), String> {
-        let mut entries = Vec::new();
-        collect_workspace_entries(&self.0.root, &self.0.root, &mut entries)?;
-        entries.sort_by(|left, right| left.relative.cmp(&right.relative));
+        let mut collected_entries = Vec::new();
+        collect_workspace_entries(&self.0.root, &self.0.root, &mut collected_entries)?;
+        let mut entries_by_path: HashMap<_, _> = collected_entries
+            .into_iter()
+            .map(|entry| (entry.relative.clone(), entry))
+            .collect();
+        let mut entries = Vec::with_capacity(entries_by_path.len());
+        for relative_path in &self.0.entry_order {
+            if let Some(entry) = entries_by_path.remove(relative_path) {
+                entries.push(entry);
+            }
+        }
+        let mut added_entries: Vec<_> = entries_by_path.into_values().collect();
+        added_entries.sort_by(|left, right| left.relative.cmp(&right.relative));
+        entries.extend(added_entries);
         if !entries
             .iter()
             .any(|entry| !entry.is_directory && entry.relative == self.0.project_relative_path)
