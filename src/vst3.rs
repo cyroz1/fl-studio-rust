@@ -3193,6 +3193,14 @@ impl Vst3HostRuntime {
         Ok(())
     }
 
+    pub fn close_all_editors(&mut self) {
+        for loaded in &mut self.loaded {
+            if let Some(mut editor) = loaded.editor.take() {
+                editor.close();
+            }
+        }
+    }
+
     pub fn set_parameter(&self, id: u64, parameter_id: u32, value: f64) -> Result<(), String> {
         if !value.is_finite() || !(0.0..=1.0).contains(&value) {
             return Err("VST3 parameter values must be finite and normalized to 0..1".to_owned());

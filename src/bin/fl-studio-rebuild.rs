@@ -4430,6 +4430,7 @@ struct DawUi {
     playlist_window_detached: bool,
     plugins_window_detached: bool,
     audio_window_detached: bool,
+    audio_settings_previous_view: Option<MainView>,
     automation_window_detached: bool,
     detached_window_placements: DetachedWindowPlacements,
     detached_window_current_placements: DetachedWindowPlacements,
@@ -4801,6 +4802,7 @@ struct DawUi {
     browser_preview_path: Option<PathBuf>,
     browser_preview_error: Option<String>,
     sample_editor: Option<SampleEditorState>,
+    sample_editor_window_visible: bool,
     sample_editor_pending: Option<PendingSampleEditor>,
     sample_editor_export_pending: Option<PendingSampleEditorExport>,
     sample_editor_preview_pending: Option<PendingSampleEditorPreview>,
@@ -5911,6 +5913,7 @@ impl DawUi {
             playlist_window_detached: false,
             plugins_window_detached: false,
             audio_window_detached: false,
+            audio_settings_previous_view: None,
             automation_window_detached: false,
             detached_window_placements,
             detached_window_current_placements: detached_window_placements,
@@ -6282,6 +6285,7 @@ impl DawUi {
             browser_preview_path: None,
             browser_preview_error: None,
             sample_editor: None,
+            sample_editor_window_visible: false,
             sample_editor_pending: None,
             sample_editor_export_pending: None,
             sample_editor_preview_pending: None,
@@ -6456,6 +6460,82 @@ impl DawUi {
                 format!("Detached views docked, but window positions could not be reset: {error}")
             }
         };
+    }
+
+    fn close_all_windows(&mut self) {
+        let mut placements = self.detached_window_placements;
+        for kind in DetachedWindowKind::ALL {
+            if let Some(placement) = self.detached_window_current_placements.get(kind) {
+                placements.set(kind, placement);
+            }
+        }
+        self.detached_window_placements = placements;
+        self.detached_window_current_placements = placements;
+        let placement_save = save_detached_window_placements(placements);
+
+        self.piano_roll_window_detached = false;
+        self.mixer_window_detached = false;
+        self.channel_rack_window_detached = false;
+        self.playlist_window_detached = false;
+        self.plugins_window_detached = false;
+        self.audio_window_detached = false;
+        self.audio_settings_previous_view = None;
+        self.automation_window_detached = false;
+        self.project_info_open = false;
+        self.project_settings_open = false;
+        self.playlist_render_options_open = false;
+        self.pattern_time_signature_dialog_open = false;
+        self.step_graph_editor_open = false;
+        self.piano_roll_event_editor_open = false;
+        self.channel_group_dialog = None;
+        self.pattern_rename_dialog = None;
+        self.pattern_delete_dialog = None;
+        self.playlist_track_name_editor = None;
+        self.browser_tag_editor = None;
+        self.browser_bulk_tag_editor = None;
+        self.browser_search_save_dialog = None;
+        self.browser_tab_customize_dialog = None;
+        self.browser_fst_details = None;
+        self.recovery_prompt = None;
+        self.pending_project_change = None;
+        self.sample_editor_window_visible = false;
+        self.sample_editor = None;
+        self.sample_editor_pending = None;
+        self.stop_sample_editor_preview();
+        if self.sample_editor_recording.is_some() {
+            self.stop_sample_editor_recording();
+        }
+        if let Some(host) = self.vst3_host.as_mut() {
+            host.close_all_editors();
+        }
+        self.status = placement_save.map_or_else(
+            |error| format!("All editor windows closed; could not save window positions: {error}"),
+            |_| "All editor windows closed".to_owned(),
+        );
+    }
+
+    fn toggle_audio_settings_window(&mut self) {
+        if self.audio_window_detached {
+            self.persist_detached_window_placements();
+            self.audio_window_detached = false;
+            if self.view == MainView::Audio {
+                self.view = self
+                    .audio_settings_previous_view
+                    .take()
+                    .unwrap_or(MainView::Playlist);
+            }
+            self.status = "Audio settings hidden".to_owned();
+        } else if self.view == MainView::Audio {
+            self.view = self
+                .audio_settings_previous_view
+                .take()
+                .unwrap_or(MainView::Playlist);
+            self.status = "Audio settings hidden".to_owned();
+        } else {
+            self.audio_settings_previous_view = Some(self.view);
+            self.view = MainView::Audio;
+            self.status = "Audio settings shown".to_owned();
+        }
     }
 
     fn capture_window_layout_preset(&self, name: String) -> WindowLayoutPreset {
@@ -9033,6 +9113,14 @@ impl DawUi {
             self.project_info_genre = metadata.genre().unwrap_or_default().to_owned();
             self.project_info_web_link = metadata.web_link().unwrap_or_default().to_owned();
             self.project_info_open = true;
+        }
+    }
+
+    fn toggle_project_info(&mut self) {
+        if self.project_info_open {
+            self.project_info_open = false;
+        } else {
+            self.open_project_info();
         }
     }
 
@@ -12295,10 +12383,13 @@ impl DawUi {
                     ui.close();
                 }
                 if ui
-                    .add_enabled(self.document.is_some(), egui::Button::new("Project Info…"))
+                    .add_enabled(
+                        self.document.is_some(),
+                        egui::Button::new("Project Info…  F11"),
+                    )
                     .clicked()
                 {
-                    self.open_project_info();
+                    self.toggle_project_info();
                     ui.close();
                 }
                 if ui
@@ -12929,9 +13020,12 @@ impl DawUi {
                         MainView::Playlist => "  F5",
                         MainView::ChannelRack => "  F6",
                         MainView::PianoRoll => "  F7",
+                        MainView::Plugins => "  F8",
                         MainView::Mixer => "  F9",
+                        MainView::Audio => "  F10",
                         _ => "",
                     };
+                    let previous_view = self.view;
                     if ui
                         .selectable_value(
                             &mut self.view,
@@ -12940,6 +13034,13 @@ impl DawUi {
                         )
                         .clicked()
                     {
+                        if previous_view != view {
+                            if view == MainView::Audio {
+                                self.audio_settings_previous_view = Some(previous_view);
+                            } else if previous_view == MainView::Audio {
+                                self.audio_settings_previous_view = None;
+                            }
+                        }
                         ui.close();
                     }
                 }
@@ -13067,7 +13168,11 @@ impl DawUi {
                     if self.audio_window_detached {
                         self.persist_detached_window_placements();
                     }
+                    let previous_view = self.view;
                     self.audio_window_detached = !self.audio_window_detached;
+                    if self.audio_window_detached && previous_view != MainView::Audio {
+                        self.audio_settings_previous_view = Some(previous_view);
+                    }
                     self.view = MainView::Audio;
                     self.status = if self.audio_window_detached {
                         "Audio settings opened in a separate window".to_owned()
@@ -13107,6 +13212,10 @@ impl DawUi {
                 ui.separator();
                 if ui.button("Dock all and reset window positions").clicked() {
                     self.dock_all_and_reset_detached_window_positions(ui.ctx());
+                    ui.close();
+                }
+                if ui.button("Close all windows  F12").clicked() {
+                    self.close_all_windows();
                     ui.close();
                 }
                 ui.separator();
@@ -13163,7 +13272,7 @@ impl DawUi {
                     ui.close();
                 }
                 if ui.button("Audio settings").clicked() {
-                    self.view = MainView::Audio;
+                    self.toggle_audio_settings_window();
                     ui.close();
                 }
                 ui.separator();
@@ -16523,6 +16632,7 @@ impl DawUi {
             self.status = "A sample is already loading in the editor".to_owned();
             return;
         }
+        self.sample_editor_window_visible = true;
         let worker_path = path.clone();
         let (sender, receiver) = mpsc::channel();
         let worker = match thread::Builder::new()
@@ -16775,6 +16885,9 @@ impl DawUi {
     }
 
     fn sample_editor_window(&mut self, ctx: &egui::Context) {
+        if !self.sample_editor_window_visible {
+            return;
+        }
         if self.sample_editor_pending.is_some() {
             egui::Window::new("Sample editor")
                 .collapsible(false)
@@ -16997,6 +17110,7 @@ impl DawUi {
                 }
             });
         if !open {
+            self.sample_editor_window_visible = false;
             self.sample_editor = None;
             self.stop_sample_editor_preview();
         }
@@ -17274,9 +17388,13 @@ impl DawUi {
                             summary.overflow_frames
                         )
                     };
-                    self.request_sample_editor(recording.output_path, ctx);
-                    if let Some(pending) = self.sample_editor_pending.as_mut() {
-                        pending.recording_notice = Some(notice);
+                    if self.sample_editor_window_visible {
+                        self.request_sample_editor(recording.output_path, ctx);
+                        if let Some(pending) = self.sample_editor_pending.as_mut() {
+                            pending.recording_notice = Some(notice);
+                        }
+                    } else {
+                        self.status = notice;
                     }
                 }
                 Err(error) => {
@@ -46136,11 +46254,14 @@ impl DawUi {
                     2 => MainView::PianoRoll,
                     3 => MainView::Plugins,
                     4 => MainView::Mixer,
-                    5 => MainView::Audio,
                     _ => return,
                 };
             }
-            MidiTransportCommand::OpenProjectInfo => self.open_project_info(),
+            MidiTransportCommand::ToggleAudioSettingsWindow => {
+                self.toggle_audio_settings_window();
+            }
+            MidiTransportCommand::ToggleProjectInfo => self.toggle_project_info(),
+            MidiTransportCommand::CloseAllWindows => self.close_all_windows(),
         }
     }
 
@@ -49441,6 +49562,9 @@ impl DawUi {
             capture_active: true,
         });
         self.status = format!("Recording audio to {}", output_path.display());
+        if self.view != MainView::Audio {
+            self.audio_settings_previous_view = Some(self.view);
+        }
         self.view = MainView::Audio;
     }
 
@@ -53066,11 +53190,21 @@ impl eframe::App for DawUi {
             (egui::Key::F5, MainView::Playlist),
             (egui::Key::F6, MainView::ChannelRack),
             (egui::Key::F7, MainView::PianoRoll),
+            (egui::Key::F8, MainView::Plugins),
             (egui::Key::F9, MainView::Mixer),
         ] {
             if ui.input(|input| input.key_pressed(key)) {
                 self.view = view;
             }
+        }
+        if ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F10)) {
+            self.toggle_audio_settings_window();
+        }
+        if ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F11)) {
+            self.toggle_project_info();
+        }
+        if ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F12)) {
+            self.close_all_windows();
         }
         if self.view == MainView::ChannelRack
             && ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::K))

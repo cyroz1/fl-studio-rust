@@ -693,7 +693,11 @@ fn queue_script_transport_actions(
                 MidiTransportCommand::MarkerSelJog(increment)
             }
             ScriptTransportAction::ShowMainView(view) => MidiTransportCommand::ShowMainView(view),
-            ScriptTransportAction::OpenProjectInfo => MidiTransportCommand::OpenProjectInfo,
+            ScriptTransportAction::ToggleAudioSettingsWindow => {
+                MidiTransportCommand::ToggleAudioSettingsWindow
+            }
+            ScriptTransportAction::ToggleProjectInfo => MidiTransportCommand::ToggleProjectInfo,
+            ScriptTransportAction::CloseAllWindows => MidiTransportCommand::CloseAllWindows,
             ScriptTransportAction::MidiOutput(_) => unreachable!("handled above"),
             ScriptTransportAction::RepeatMidiOutput { .. }
             | ScriptTransportAction::StopRepeatMidiOutput => continue,
@@ -731,7 +735,9 @@ pub enum MidiTransportCommand {
     MarkerJumpJog(i32),
     MarkerSelJog(i32),
     ShowMainView(u8),
-    OpenProjectInfo,
+    ToggleAudioSettingsWindow,
+    ToggleProjectInfo,
+    CloseAllWindows,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1349,7 +1355,11 @@ pub fn describe_event(event: MidiInputEvent) -> String {
             MidiTransportCommand::MarkerJumpJog(_) => "MIDI script Marker Jump".to_owned(),
             MidiTransportCommand::MarkerSelJog(_) => "MIDI script Marker Selection".to_owned(),
             MidiTransportCommand::ShowMainView(_) => "MIDI script View Selection".to_owned(),
-            MidiTransportCommand::OpenProjectInfo => "MIDI script Project Info".to_owned(),
+            MidiTransportCommand::ToggleAudioSettingsWindow => {
+                "MIDI script Audio Settings".to_owned()
+            }
+            MidiTransportCommand::ToggleProjectInfo => "MIDI script Project Info".to_owned(),
+            MidiTransportCommand::CloseAllWindows => "MIDI script Close All Windows".to_owned(),
         },
     }
 }
@@ -2032,7 +2042,9 @@ mod tests {
                 ScriptTransportAction::SetCurrentTempoMilliBpm(123_456),
                 ScriptTransportAction::Start,
                 ScriptTransportAction::ShowMainView(4),
-                ScriptTransportAction::OpenProjectInfo,
+                ScriptTransportAction::ToggleAudioSettingsWindow,
+                ScriptTransportAction::ToggleProjectInfo,
+                ScriptTransportAction::CloseAllWindows,
             ],
         );
 
@@ -2054,7 +2066,15 @@ mod tests {
         );
         assert_eq!(
             transport_receiver.try_recv().unwrap().event,
-            MidiInputEvent::Transport(MidiTransportCommand::OpenProjectInfo)
+            MidiInputEvent::Transport(MidiTransportCommand::ToggleAudioSettingsWindow)
+        );
+        assert_eq!(
+            transport_receiver.try_recv().unwrap().event,
+            MidiInputEvent::Transport(MidiTransportCommand::ToggleProjectInfo)
+        );
+        assert_eq!(
+            transport_receiver.try_recv().unwrap().event,
+            MidiInputEvent::Transport(MidiTransportCommand::CloseAllWindows)
         );
         assert_eq!(dropped_messages.load(Ordering::Relaxed), 0);
     }
