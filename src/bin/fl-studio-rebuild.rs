@@ -1576,11 +1576,13 @@ enum PlaylistWaveformMode {
 }
 
 #[derive(Clone, Copy)]
-struct PlaylistWaveformSettings {
+struct PlaylistWaveformSettings<'a> {
     reverse: bool,
     mode: PlaylistWaveformMode,
     ppq: u16,
     base_tempo_bpm: f64,
+    tempo_map: Option<&'a PlaylistTempoMap>,
+    envelope: Option<PlaylistAudioClipEnvelope>,
 }
 
 impl PlaylistWaveformMode {
@@ -14164,8 +14166,8 @@ impl DawUi {
     }
 
     fn midi_script_tempo_map(&mut self) -> Option<PlaylistTempoMap> {
-        let document = self.document.as_ref()?;
         if self.pattern_playback_mode {
+            let document = self.document.as_ref()?;
             return PlaylistTempoMap::constant(
                 document.header().ppq(),
                 document.metadata().tempo_bpm().unwrap_or(140.0),
@@ -14179,7 +14181,20 @@ impl DawUi {
             return Some(tempo_map.clone());
         }
 
-        let arrangement_id = self.selected_arrangement.unwrap_or(0);
+        self.playlist_tempo_map_for_arrangement(self.selected_arrangement.unwrap_or(0))
+    }
+
+    fn playlist_tempo_map_for_arrangement(
+        &mut self,
+        arrangement_id: u16,
+    ) -> Option<PlaylistTempoMap> {
+        if self.playlist_playback_loaded
+            && self.selected_arrangement == Some(arrangement_id)
+            && let Some(tempo_map) = self.playlist_tempo_map.as_ref()
+        {
+            return Some(tempo_map.clone());
+        }
+
         let now = Instant::now();
         if let Some((cached_arrangement, cached_generation, cached_at, tempo_map)) =
             self.midi_script_tempo_map_cache.as_ref()
@@ -14190,7 +14205,10 @@ impl DawUi {
             return Some(tempo_map.clone());
         }
 
-        let tempo_map = PlaylistTempoMap::for_arrangement(document, arrangement_id).ok()?;
+        let tempo_map = {
+            let document = self.document.as_ref()?;
+            PlaylistTempoMap::for_arrangement(document, arrangement_id).ok()?
+        };
         self.midi_script_tempo_map_cache = Some((
             arrangement_id,
             self.project_generation,
@@ -19010,6 +19028,7 @@ impl DawUi {
             empty_view(ui, "This project has no decoded Playlist arrangement");
             return;
         };
+        let waveform_tempo_map = self.playlist_tempo_map_for_arrangement(arrangement.id);
         let has_project_pattern_clip_template = arrangements.iter().any(|candidate| {
             candidate
                 .clips
@@ -20909,6 +20928,13 @@ impl DawUi {
                                             mode: self.playlist_waveform_mode,
                                             ppq,
                                             base_tempo_bpm,
+                                            tempo_map: waveform_tempo_map.as_ref(),
+                                            envelope: clip.clip_id.map(|clip_id| {
+                                                self.playlist_audio_clip_envelope(
+                                                    arrangement.id,
+                                                    clip_id,
+                                                )
+                                            }),
                                         },
                                     );
                                 } else if self.waveform_loads.contains_key(path) {
@@ -60972,7 +60998,7 @@ fn draw_audio_clip_waveform(
     clip_rect: egui::Rect,
     clip: &PlaylistClip,
     waveform: &AudioWaveform,
-    settings: PlaylistWaveformSettings,
+    settings: PlaylistWaveformSettings<'_>,
 ) {
     if waveform.peaks.is_empty() || waveform.frame_count == 0 || waveform.sample_rate == 0 {
         return;
@@ -61022,6 +61048,8 @@ fn draw_audio_clip_waveform(
             source_start,
             source_end,
             settings.reverse,
+            clip,
+            settings,
         );
         return;
     }
@@ -61100,6 +61128,14 @@ fn draw_audio_clip_waveform(
             if !minimum.is_finite() || !maximum.is_finite() {
                 continue;
             }
+            let progress = (column as f64 + 0.5) / columns as f64;
+            let gain = playlist_audio_clip_waveform_gain(clip, settings, progress);
+            minimum *= gain;
+            maximum *= gain;
+            if gain != 1.0 {
+                minimum = minimum.clamp(-1.0, 1.0);
+                maximum = maximum.clamp(-1.0, 1.0);
+            }
             let x = clip_rect.left() + (column as f32 + 0.5) * clip_rect.width() / columns as f32;
             painter.line_segment(
                 [
@@ -61112,6 +61148,64 @@ fn draw_audio_clip_waveform(
     }
 }
 
+fn playlist_audio_clip_waveform_gain(
+    clip: &PlaylistClip,
+    settings: PlaylistWaveformSettings<'_>,
+    progress: f64,
+) -> f32 {
+    let Some(envelope) = settings.envelope else {
+        return 1.0;
+    };
+    let gain = 10.0_f32.powf(f32::from(envelope.gain_centidb) / 2_000.0);
+    if envelope.fade_in_ms == 0 && envelope.fade_out_ms == 0 {
+        return gain;
+    }
+
+    let progress = if progress.is_finite() {
+        progress.clamp(0.0, 1.0)
+    } else {
+        return gain;
+    };
+    let start_tick = f64::from(clip.position_ticks);
+    let end_tick = start_tick + f64::from(clip.length_ticks);
+    let position_tick = start_tick + (end_tick - start_tick) * progress;
+    let timing = settings.tempo_map.and_then(|tempo_map| {
+        let start_seconds = tempo_map.seconds_at_fractional_tick(start_tick).ok()?;
+        let position_seconds = tempo_map.seconds_at_fractional_tick(position_tick).ok()?;
+        let end_seconds = tempo_map.seconds_at_fractional_tick(end_tick).ok()?;
+        (start_seconds <= position_seconds
+            && position_seconds <= end_seconds
+            && start_seconds < end_seconds)
+            .then_some((
+                position_seconds - start_seconds,
+                end_seconds - start_seconds,
+            ))
+    });
+    let (elapsed_seconds, duration_seconds) = timing.unwrap_or_else(|| {
+        let seconds_per_tick = 60.0 / (f64::from(settings.ppq.max(1)) * settings.base_tempo_bpm);
+        let duration_seconds = f64::from(clip.length_ticks) * seconds_per_tick;
+        (duration_seconds * progress, duration_seconds)
+    });
+    let duration_ms = duration_seconds * 1_000.0;
+    if !duration_ms.is_finite() || duration_ms <= 0.0 {
+        return gain;
+    }
+    let elapsed_ms = (elapsed_seconds * 1_000.0).clamp(0.0, duration_ms);
+    let fade_in_ms = f64::from(envelope.fade_in_ms).min(duration_ms);
+    let fade_out_ms = f64::from(envelope.fade_out_ms).min(duration_ms);
+    let fade_in_gain = if fade_in_ms == 0.0 {
+        1.0
+    } else {
+        (elapsed_ms / fade_in_ms).clamp(0.0, 1.0) as f32
+    };
+    let fade_out_gain = if fade_out_ms == 0.0 {
+        1.0
+    } else {
+        ((duration_ms - elapsed_ms) / fade_out_ms).clamp(0.0, 1.0) as f32
+    };
+    gain * fade_in_gain * fade_out_gain
+}
+
 fn draw_spectral_audio_clip(
     painter: &egui::Painter,
     clip_rect: egui::Rect,
@@ -61119,6 +61213,8 @@ fn draw_spectral_audio_clip(
     source_start: u64,
     source_end: u64,
     reverse: bool,
+    clip: &PlaylistClip,
+    settings: PlaylistWaveformSettings<'_>,
 ) {
     if waveform.spectral_bands.is_empty() || source_start >= source_end {
         return;
@@ -61156,8 +61252,17 @@ fn draw_spectral_audio_clip(
         if right <= left {
             continue;
         }
+        let progress = f64::from((x - clip_rect.left()) / clip_rect.width().max(f32::EPSILON));
+        let gain = playlist_audio_clip_waveform_gain(clip, settings, progress);
         for band in 0..band_count {
-            let intensity = f32::from(waveform.spectral_bands[column_index][band]) / 255.0;
+            let raw_intensity = waveform.spectral_bands[column_index][band];
+            let intensity = if raw_intensity == 0 || gain <= 0.0 {
+                0.0
+            } else {
+                let source_db = f32::from(raw_intensity) / 255.0 * 72.0 - 72.0;
+                let gain_db = 20.0 * gain.log10();
+                ((source_db + gain_db + 72.0) / 72.0).clamp(0.0, 1.0)
+            };
             if intensity < 0.02 {
                 continue;
             }
