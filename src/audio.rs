@@ -44,6 +44,12 @@ const TEST_TONE_LEVEL: f32 = 0.12;
 /// Number of Mixer tracks that can be named by a channel's signed-byte assignment.
 pub const MIXER_TRACK_METER_COUNT: usize = i8::MAX as usize + 1;
 
+pub(crate) fn mixer_effect_wet_mix(mix_raw: Option<i32>) -> f32 {
+    mix_raw.map_or(1.0, |raw| {
+        (raw.clamp(-6_400, 6_400) as f32 + 6_400.0) / 12_800.0
+    })
+}
+
 /// Split a track-major Mixer bus buffer into post-transform meter buses and, when
 /// present, pre-effect insert input buses.
 pub(crate) fn split_mixer_track_buses_mut(
@@ -85,6 +91,7 @@ pub struct MixerTrackPeakMeters {
     live_mixer_insert_enabled: [Arc<AtomicI32>; MIXER_TRACK_METER_COUNT],
     live_mixer_solo_mask: Arc<ArcSwapOption<[u64; 2]>>,
     live_mixer_send_targets: Mutex<HashMap<(usize, usize), LiveMixerSendTargetAtomics>>,
+    live_mixer_effect_mix_targets: Mutex<HashMap<(usize, u16), Arc<AtomicU32>>>,
     live_master_fader_gain: Arc<AtomicU32>,
     live_master_pan_raw: Arc<AtomicI32>,
     live_master_stereo_separation_raw: Arc<AtomicI32>,
@@ -109,6 +116,7 @@ impl Default for MixerTrackPeakMeters {
             live_mixer_insert_enabled: std::array::from_fn(|_| Arc::new(AtomicI32::new(i32::MIN))),
             live_mixer_solo_mask: Arc::new(ArcSwapOption::empty()),
             live_mixer_send_targets: Mutex::new(HashMap::new()),
+            live_mixer_effect_mix_targets: Mutex::new(HashMap::new()),
             live_master_fader_gain: Arc::new(AtomicU32::new(1.0_f32.to_bits())),
             live_master_pan_raw: Arc::new(AtomicI32::new(i32::MIN)),
             live_master_stereo_separation_raw: Arc::new(AtomicI32::new(i32::MIN)),
@@ -245,6 +253,47 @@ impl MixerTrackPeakMeters {
 
     pub(crate) fn live_mixer_insert_enabled(&self, track: usize) -> Option<Arc<AtomicI32>> {
         self.live_mixer_insert_enabled.get(track).cloned()
+    }
+
+    /// Set a loaded Mixer effect slot's live wet/dry target using its saved FLP Mix value.
+    ///
+    /// The render worker reads the normalized target without taking a lock. FL Studio's raw
+    /// Mix-to-wet curve has not been validated against a native render; the current mapping is
+    /// linear from the documented raw range `-6400..=6400`.
+    pub fn set_live_mixer_effect_mix_raw(
+        &self,
+        insert_ordinal: usize,
+        slot_index: u16,
+        mix_raw: Option<i32>,
+    ) {
+        let wet_mix = mixer_effect_wet_mix(mix_raw);
+        let Ok(mut targets) = self.live_mixer_effect_mix_targets.lock() else {
+            return;
+        };
+        let target = targets
+            .entry((insert_ordinal, slot_index))
+            .or_insert_with(|| Arc::new(AtomicU32::new(wet_mix.to_bits())));
+        target.store(wet_mix.to_bits(), Ordering::Release);
+    }
+
+    pub(crate) fn live_mixer_effect_mix_target(
+        &self,
+        insert_ordinal: usize,
+        slot_index: u16,
+        initial_wet_mix: f32,
+    ) -> Option<Arc<AtomicU32>> {
+        let initial_wet_mix = if initial_wet_mix.is_finite() {
+            initial_wet_mix.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let mut targets = self.live_mixer_effect_mix_targets.lock().ok()?;
+        let target = targets
+            .entry((insert_ordinal, slot_index))
+            .or_insert_with(|| Arc::new(AtomicU32::new(initial_wet_mix.to_bits())))
+            .clone();
+        target.store(initial_wet_mix.to_bits(), Ordering::Release);
+        Some(target)
     }
 
     /// Set the live solo state for every recognized Mixer insert.
@@ -4840,13 +4889,31 @@ mod tests {
         AUDIO_COMMAND_QUEUE_CAPACITY, AUDIO_SOURCE_INPUT_MONITOR, AUDIO_SOURCE_PROJECT,
         AUDIO_SOURCE_SILENT, AUDIO_SOURCE_STREAM, AUDIO_SOURCE_TEST_TONE, AudioAccess,
         AudioDeviceCatalog, AudioDeviceConfigRange, AudioDeviceInfo, AudioInputRecording,
-        AudioRingBuffer, AudioSettings, InputRecordingState, ParameterCommand, PlaybackState,
-        ProjectPlaybackClock, STREAM_PREFILL_FRAMES, StagedStreamingPlayback, StereoFrameDelay,
-        TransportCommand, audio_device_config_ranges, buffer_config_preference,
-        create_streaming_playback, enable_denormal_protection, negotiated_buffer_frames,
-        next_output_frame, output_gain_smoothing_alpha, sanitize_output_sample, smooth_output_gain,
-        tone_sample, valid_project_playback_speed, validate_settings,
+        AudioRingBuffer, AudioSettings, InputRecordingState, MixerTrackPeakMeters,
+        ParameterCommand, PlaybackState, ProjectPlaybackClock, STREAM_PREFILL_FRAMES,
+        StagedStreamingPlayback, StereoFrameDelay, TransportCommand, audio_device_config_ranges,
+        buffer_config_preference, create_streaming_playback, enable_denormal_protection,
+        mixer_effect_wet_mix, negotiated_buffer_frames, next_output_frame,
+        output_gain_smoothing_alpha, sanitize_output_sample, smooth_output_gain, tone_sample,
+        valid_project_playback_speed, validate_settings,
     };
+
+    #[test]
+    fn live_mixer_effect_mix_targets_track_each_slot_independently() {
+        let meters = MixerTrackPeakMeters::default();
+        let first = meters
+            .live_mixer_effect_mix_target(2, 3, mixer_effect_wet_mix(Some(-6_400)))
+            .expect("first effect should receive a live target");
+        let second = meters
+            .live_mixer_effect_mix_target(2, 4, mixer_effect_wet_mix(Some(6_400)))
+            .expect("second effect should receive a live target");
+        assert_eq!(f32::from_bits(first.load(Ordering::Acquire)), 0.0);
+        assert_eq!(f32::from_bits(second.load(Ordering::Acquire)), 1.0);
+
+        meters.set_live_mixer_effect_mix_raw(2, 3, Some(0));
+        assert_eq!(f32::from_bits(first.load(Ordering::Acquire)), 0.5);
+        assert_eq!(f32::from_bits(second.load(Ordering::Acquire)), 1.0);
+    }
 
     #[test]
     fn device_catalog_limits_sample_rates_and_buffers_to_common_capabilities() {

@@ -7,14 +7,14 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crate::audio::{
     LiveMixerSourceControl, LiveMixerSourceFrameControls, LiveMixerSourceTargets,
-    MixerTrackPeakMeters, StereoFrameDelay, StreamingAudioWriter,
+    MixerTrackPeakMeters, StereoFrameDelay, StreamingAudioWriter, mixer_effect_wet_mix,
 };
 use crate::media::DecodedAudio;
 use crate::sample_render::{
@@ -43,6 +43,7 @@ const VST3_NOTE_EXPRESSION_ID_COUNT: u64 = 1 << 30;
 const LIVE_VST3_INPUT_TRACK_ID: u32 = u32::MAX;
 const MAX_STEREO_BUFFER_BYTES: usize = 512 * 1024 * 1024;
 const VST3_EFFECT_RENDER_BLOCK_FRAMES: usize = 512;
+const MIXER_EFFECT_MIX_SMOOTHING_SECONDS: f32 = 0.02;
 const MAX_VST3_EFFECT_LATENCY_SECONDS: f64 = 60.0;
 const MAX_VST3_AUTOMATION_POINTS: usize = 1_000_000;
 const MAX_PDC_DELAY_BYTES: u64 = 128 * 1024 * 1024;
@@ -562,6 +563,51 @@ struct PatternLoopEventQueue {
 
 /// One prepared Mixer VST3 effect slot.
 /// The plug-in instance is shared with its native editor.
+struct LiveWetMixRamp {
+    current: f32,
+    target: f32,
+    step: f32,
+    remaining_frames: u32,
+    smoothing_frames: u32,
+}
+
+impl LiveWetMixRamp {
+    fn new(initial_mix: f32, smoothing_frames: u32) -> Self {
+        Self {
+            current: initial_mix,
+            target: initial_mix,
+            step: 0.0,
+            remaining_frames: 0,
+            smoothing_frames: smoothing_frames.max(1),
+        }
+    }
+
+    fn set_target(&mut self, target: f32) {
+        let target = if target.is_finite() {
+            target.clamp(0.0, 1.0)
+        } else {
+            self.target
+        };
+        if target == self.target {
+            return;
+        }
+        self.target = target;
+        self.remaining_frames = self.smoothing_frames;
+        self.step = (target - self.current) / self.remaining_frames as f32;
+    }
+
+    fn next(&mut self) -> f32 {
+        if self.remaining_frames > 0 {
+            self.current += self.step;
+            self.remaining_frames -= 1;
+            if self.remaining_frames == 0 {
+                self.current = self.target;
+            }
+        }
+        self.current
+    }
+}
+
 struct PlaylistMixerEffectStream {
     id: u64,
     insert_ordinal: usize,
@@ -572,9 +618,26 @@ struct PlaylistMixerEffectStream {
     input_channels: usize,
     output_channels: usize,
     wet_mix: f32,
+    live_wet_mix_target: Option<Arc<AtomicU32>>,
+    wet_mix_ramp: LiveWetMixRamp,
     latency_frames: u64,
     dry_delay_line: StereoFrameDelay,
     dry_delay_scratch: Vec<f32>,
+}
+
+impl PlaylistMixerEffectStream {
+    fn begin_wet_mix_block(&mut self) {
+        let Some(target) = self.live_wet_mix_target.as_ref() else {
+            return;
+        };
+        let requested = f32::from_bits(target.load(Ordering::Acquire));
+        let requested = if requested.is_finite() {
+            requested.clamp(0.0, 1.0)
+        } else {
+            self.wet_mix
+        };
+        self.wet_mix_ramp.set_target(requested);
+    }
 }
 
 struct PlaylistMixerEffectChain {
@@ -730,6 +793,13 @@ impl Vst3PlaylistStreamProcessor {
             if let Some(source) = chain.live_source.as_mut() {
                 source.targets = source.control.targets(meters);
             }
+        }
+        for effect in &mut self.mixer_effects {
+            effect.live_wet_mix_target = meters.live_mixer_effect_mix_target(
+                effect.insert_ordinal,
+                effect.slot_index,
+                effect.wet_mix,
+            );
         }
     }
 
@@ -1642,6 +1712,7 @@ fn process_playlist_mixer_effect_chain(
         for effect in effects.iter_mut() {
             let max_frames = effect.block_size.max(1);
             for block in chain_block.chunks_mut(max_frames * 2) {
+                effect.begin_wet_mix_block();
                 let frame_count = block.len() / 2;
                 for (frame_index, frame) in block.as_chunks::<2>().0.iter().enumerate() {
                     effect.dry_delay_scratch[frame_index * 2] = finite_sample(frame[0]);
@@ -1685,8 +1756,10 @@ fn process_playlist_mixer_effect_chain(
                     .dry_delay_line
                     .process_interleaved(&mut effect.dry_delay_scratch[..frame_count * 2])?;
                 let wet = &effect.buffers.outputs[0];
-                let dry_gain = 1.0 - effect.wet_mix;
+                let wet_mix_ramp = &mut effect.wet_mix_ramp;
                 for (frame_index, frame) in block.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+                    let wet_mix = wet_mix_ramp.next();
+                    let dry_gain = 1.0 - wet_mix;
                     let dry_left = effect.dry_delay_scratch[frame_index * 2];
                     let dry_right = effect.dry_delay_scratch[frame_index * 2 + 1];
                     let wet_left = finite_sample(wet.channels[0][frame_index]);
@@ -1695,8 +1768,8 @@ fn process_playlist_mixer_effect_chain(
                     } else {
                         finite_sample(wet.channels[1][frame_index])
                     };
-                    frame[0] = dry_left * dry_gain + wet_left * effect.wet_mix;
-                    frame[1] = dry_right * dry_gain + wet_right * effect.wet_mix;
+                    frame[0] = dry_left * dry_gain + wet_left * wet_mix;
+                    frame[1] = dry_right * dry_gain + wet_right * wet_mix;
                 }
             }
         }
@@ -4033,6 +4106,50 @@ impl Vst3HostRuntime {
         include_plugin_reported_tails: bool,
         automation_sources: &Vst3PlaylistAutomationSources,
     ) -> Result<Vst3PlaylistStreamProcessor, String> {
+        self.prepare_playlist_stream_with_mixer_effects_mode(
+            document,
+            options,
+            channel_instances,
+            mixer_effect_instances,
+            include_plugin_reported_tails,
+            automation_sources,
+            false,
+        )
+    }
+
+    /// Prepare a live Playlist stream whose loaded Mixer effect Mix controls can change while
+    /// playback continues, with latency and dry alignment prepared for the full Mix range.
+    pub fn prepare_live_playlist_stream_with_mixer_effects_and_automation_sources(
+        &self,
+        document: &FlpDocument,
+        options: PlaylistRenderOptions,
+        channel_instances: &BTreeMap<u16, u64>,
+        mixer_effect_instances: &BTreeMap<(usize, u16), u64>,
+        include_plugin_reported_tails: bool,
+        automation_sources: &Vst3PlaylistAutomationSources,
+    ) -> Result<Vst3PlaylistStreamProcessor, String> {
+        self.prepare_playlist_stream_with_mixer_effects_mode(
+            document,
+            options,
+            channel_instances,
+            mixer_effect_instances,
+            include_plugin_reported_tails,
+            automation_sources,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_playlist_stream_with_mixer_effects_mode(
+        &self,
+        document: &FlpDocument,
+        options: PlaylistRenderOptions,
+        channel_instances: &BTreeMap<u16, u64>,
+        mixer_effect_instances: &BTreeMap<(usize, u16), u64>,
+        include_plugin_reported_tails: bool,
+        automation_sources: &Vst3PlaylistAutomationSources,
+        live_mix_changes: bool,
+    ) -> Result<Vst3PlaylistStreamProcessor, String> {
         let mut processor = self.prepare_playlist_stream_with_automation_sources(
             document,
             options,
@@ -4040,7 +4157,13 @@ impl Vst3HostRuntime {
             include_plugin_reported_tails,
             automation_sources,
         )?;
-        self.attach_mixer_effects(document, mixer_effect_instances, &mut processor, true)?;
+        self.attach_mixer_effects(
+            document,
+            mixer_effect_instances,
+            &mut processor,
+            true,
+            live_mix_changes,
+        )?;
         Ok(processor)
     }
 
@@ -4140,7 +4263,13 @@ impl Vst3HostRuntime {
             include_plugin_reported_tails,
             automation_sources,
         )?;
-        self.attach_mixer_effects(document, mixer_effect_instances, &mut processor, false)?;
+        self.attach_mixer_effects(
+            document,
+            mixer_effect_instances,
+            &mut processor,
+            false,
+            true,
+        )?;
         Ok(processor)
     }
 
@@ -4464,7 +4593,13 @@ impl Vst3HostRuntime {
             channel_instances,
             parameter_automation,
         )?;
-        self.attach_mixer_effects(document, mixer_effect_instances, &mut processor, false)?;
+        self.attach_mixer_effects(
+            document,
+            mixer_effect_instances,
+            &mut processor,
+            false,
+            true,
+        )?;
         Ok(processor)
     }
 
@@ -4474,6 +4609,7 @@ impl Vst3HostRuntime {
         mixer_effect_instances: &BTreeMap<(usize, u16), u64>,
         processor: &mut Vst3PlaylistStreamProcessor,
         include_effect_tails: bool,
+        live_mix_changes: bool,
     ) -> Result<(), String> {
         let inserts = document.mixer_inserts();
         let effect_slots = document.mixer_effect_slots();
@@ -4481,7 +4617,7 @@ impl Vst3HostRuntime {
         let has_loaded_non_master_effect = effect_slots.iter().any(|slot| {
             if slot.insert_ordinal() == 0
                 || slot.enabled() == Some(false)
-                || mixer_effect_wet_mix(slot.mix_raw()) == 0.0
+                || (!live_mix_changes && mixer_effect_wet_mix(slot.mix_raw()) == 0.0)
                 || !mixer_effect_instances.contains_key(&(slot.insert_ordinal(), slot.slot_index()))
             {
                 return false;
@@ -4538,7 +4674,7 @@ impl Vst3HostRuntime {
                     continue;
                 };
                 let wet_mix = mixer_effect_wet_mix(slot.mix_raw());
-                if wet_mix == 0.0 {
+                if wet_mix == 0.0 && !live_mix_changes {
                     continue;
                 }
                 let plugin = Arc::clone(self.plugin(id)?);
@@ -4620,7 +4756,11 @@ impl Vst3HostRuntime {
                         slot.slot_index() + 1
                     ));
                 }
-                let dry_delay_frames = if wet_mix < 1.0 { latency_frames } else { 0 };
+                let dry_delay_frames = if live_mix_changes || wet_mix < 1.0 {
+                    latency_frames
+                } else {
+                    0
+                };
                 let next_dry_delay_frames = mixer_effect_dry_delay_frames
                     .checked_add(dry_delay_frames)
                     .ok_or_else(|| "PDC delay storage size overflow".to_owned())?;
@@ -4656,6 +4796,13 @@ impl Vst3HostRuntime {
                     input_channels,
                     output_channels,
                     wet_mix,
+                    live_wet_mix_target: None,
+                    wet_mix_ramp: LiveWetMixRamp::new(
+                        wet_mix,
+                        (sample_rate * f64::from(MIXER_EFFECT_MIX_SMOOTHING_SECONDS))
+                            .round()
+                            .clamp(1.0, f64::from(u32::MAX)) as u32,
+                    ),
                     latency_frames,
                     dry_delay_line,
                     dry_delay_scratch: vec![0.0; block_size * 2],
@@ -7392,12 +7539,6 @@ fn reported_tail_seconds(tail_samples: u32, sample_rate_hz: f64) -> Option<f64> 
     Some((f64::from(tail_samples) / sample_rate_hz).min(MAX_REPORTED_TAIL_SECONDS))
 }
 
-fn mixer_effect_wet_mix(mix_raw: Option<i32>) -> f32 {
-    mix_raw.map_or(1.0, |raw| {
-        (raw.clamp(-6_400, 6_400) as f32 + 6_400.0) / 12_800.0
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7431,6 +7572,22 @@ mod tests {
         bytes[5] = 1;
         bytes[18..20].copy_from_slice(&machine.to_le_bytes());
         bytes
+    }
+
+    #[test]
+    fn live_mixer_effect_mix_ramp_smooths_each_target_change() {
+        let mut ramp = LiveWetMixRamp::new(0.0, 4);
+        ramp.set_target(1.0);
+        assert!((ramp.next() - 0.25).abs() < f32::EPSILON);
+        assert!((ramp.next() - 0.5).abs() < f32::EPSILON);
+        assert!((ramp.next() - 0.75).abs() < f32::EPSILON);
+        assert_eq!(ramp.next(), 1.0);
+
+        ramp.set_target(0.5);
+        assert!((ramp.next() - 0.875).abs() < f32::EPSILON);
+        assert!((ramp.next() - 0.75).abs() < f32::EPSILON);
+        assert!((ramp.next() - 0.625).abs() < f32::EPSILON);
+        assert_eq!(ramp.next(), 0.5);
     }
 
     #[test]

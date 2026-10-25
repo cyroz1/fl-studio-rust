@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::hash::{BuildHasher, Hash, Hasher, RandomState};
 use std::path::{Component, Path, PathBuf};
@@ -11302,7 +11302,7 @@ impl DawUi {
             .vst3_host
             .as_ref()
             .map(|host| {
-                host.prepare_playlist_stream_with_mixer_effects_and_automation_sources(
+                host.prepare_live_playlist_stream_with_mixer_effects_and_automation_sources(
                     playback_document,
                     options.clone(),
                     &self.channel_vst3_instances,
@@ -42715,6 +42715,13 @@ impl DawUi {
         let mut rename_edits = Vec::new();
         let mut flag_edits = Vec::new();
         let mut parameter_edits = Vec::new();
+        let mixer_effect_mix_locations = effect_slots
+            .iter()
+            .filter_map(|slot| {
+                slot.mix_parameter_location()
+                    .map(|location| (location, (slot.insert_ordinal(), slot.slot_index())))
+            })
+            .collect::<HashMap<_, _>>();
         let mut live_master_fader_gain_edit = None;
         let mut live_mixer_insert_fader_edit = None;
         let mut live_mixer_insert_pan_edit = None;
@@ -43842,7 +43849,7 @@ impl DawUi {
                                         egui::Button::new("Learn Effects CC"),
                                     )
                                     .on_hover_text(
-                                        "Learn a CC to toggle this saved effect-chain enable state; effects are not processed yet",
+                                        "Learn a CC to toggle this saved effect-chain enable state; loaded VST3 effects follow it during supported playback",
                                     )
                                     .clicked()
                                 {
@@ -43977,7 +43984,7 @@ impl DawUi {
                                         egui::Checkbox::new(&mut effects_enabled, "Effects on"),
                                     )
                                     .on_hover_text(
-                                        "Edit the saved effect-chain enable state; effect audio processing is not supported yet",
+                                        "Edit this saved effect-chain enable state; loaded VST3 effects follow it during supported playback",
                                     )
                                     .changed()
                                 {
@@ -44064,7 +44071,7 @@ impl DawUi {
                         ui.collapsing("Saved 3-band EQ (raw values)", |ui| {
                             ui.small(
                                 egui::RichText::new(
-                                    "G = gain, F = frequency, Q = resonance. These edit saved values only; frequency is nonlinear and effects are not processed.",
+                                    "G = gain, F = frequency, Q = resonance. These edit saved values only; built-in EQ rendering and native frequency curves remain unsupported.",
                                 )
                                 .color(MUTED),
                             );
@@ -44355,7 +44362,7 @@ impl DawUi {
                             }
                             ui.small(
                                 egui::RichText::new(
-                                    "Open editor controls a loaded VST3 effect through its native editor. Move up/down carries saved slot events with the effect. Mixer audio processing is not yet connected to playback.",
+                                    "Open editor controls a loaded VST3 effect through its native editor. Move up/down carries saved slot events with the effect. Loaded VST3 effects process in saved slot order on supported playback streams; Mix edits use a 20 ms ramp, and native wet/dry response remains to be checked.",
                                 )
                                 .color(MUTED),
                             );
@@ -44513,9 +44520,19 @@ impl DawUi {
             let mut applied_live_master_pan = None;
             let mut applied_live_master_stereo_separation = None;
             let mut applied_live_mixer_send_levels = Vec::new();
+            let mut applied_live_mixer_effect_mixes = Vec::new();
             for (event_index, record_index, value) in parameter_edits {
                 match document.set_mixer_parameter_record_value(event_index, record_index, value) {
                     Ok(()) => {
+                        if let Some((insert_ordinal, slot_index)) =
+                            mixer_effect_mix_locations.get(&(event_index, record_index))
+                        {
+                            applied_live_mixer_effect_mixes.push((
+                                *insert_ordinal,
+                                *slot_index,
+                                value,
+                            ));
+                        }
                         if let Ok(sends) = document.mixer_send_summaries()
                             && let Some(send) = sends.iter().find(|send| {
                                 send.parameter_location() == (event_index, record_index)
@@ -44610,6 +44627,13 @@ impl DawUi {
                     source_track,
                     destination_track,
                     Some(level_raw),
+                );
+            }
+            for (insert_ordinal, slot_index, mix_raw) in applied_live_mixer_effect_mixes {
+                self.mixer_track_peak_meters.set_live_mixer_effect_mix_raw(
+                    insert_ordinal,
+                    slot_index,
+                    Some(mix_raw),
                 );
             }
         }
