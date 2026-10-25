@@ -48,6 +48,10 @@ pub enum ScriptTransportAction {
         tick: u32,
         name: String,
     },
+    JumpToMarker {
+        delta: i32,
+        select: bool,
+    },
     SelectNextEmptyPatternWithNameDialog,
     FocusSelectedMixerTrackName,
     PatternJog(i32),
@@ -123,6 +127,7 @@ pub struct MidiScriptTransportState {
     pub hardware_beat_led_state: AtomicI32,
     pub song_position_hint: Mutex<String>,
     pub song_length_hint: Mutex<String>,
+    pub arrangement_marker_names: Mutex<Vec<String>>,
     pub project_title: Mutex<String>,
     pub project_author: Mutex<String>,
     pub project_genre: Mutex<String>,
@@ -145,6 +150,7 @@ impl Default for MidiScriptTransportState {
             hardware_beat_led_state: AtomicI32::new(SCRIPT_BEAT_INDICATOR_OFF),
             song_position_hint: Mutex::new("1:01:000".to_owned()),
             song_length_hint: Mutex::new("0:00:000".to_owned()),
+            arrangement_marker_names: Mutex::new(Vec::new()),
             project_title: Mutex::new(String::new()),
             project_author: Mutex::new(String::new()),
             project_genre: Mutex::new(String::new()),
@@ -559,6 +565,12 @@ impl MidiScriptRuntime {
             .lock()
             .map(|hint| hint.clone())
             .unwrap_or_else(|_| "0:00:000".to_owned());
+        let arrangement_marker_names = self
+            .transport_state
+            .arrangement_marker_names
+            .lock()
+            .map(|names| names.clone())
+            .unwrap_or_default();
         let project_title = self
             .transport_state
             .project_title
@@ -633,6 +645,7 @@ impl MidiScriptRuntime {
                         .load(Ordering::Relaxed),
                     "song_position_hint": song_position_hint,
                     "song_length_hint": song_length_hint,
+                    "arrangement_marker_names": arrangement_marker_names,
                     "project_title": project_title,
                     "project_author": project_author,
                     "project_genre": project_genre,
@@ -798,6 +811,16 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
             tick,
             name: marker_name.to_owned(),
         });
+    }
+    if name == Some("jump_to_marker") {
+        let delta = action["delta"]
+            .as_i64()
+            .and_then(|delta| i32::try_from(delta).ok())
+            .ok_or_else(|| "MIDI script returned an invalid marker jump delta".to_owned())?;
+        let select = action["select"]
+            .as_bool()
+            .ok_or_else(|| "MIDI script returned an invalid marker selection flag".to_owned())?;
+        return Ok(ScriptTransportAction::JumpToMarker { delta, select });
     }
     if name == Some("marker_jump_jog") || name == Some("marker_sel_jog") {
         let increment = action["increment"]
@@ -1937,6 +1960,54 @@ mod tests {
             [ScriptTransportAction::AddArrangementTimeMarker {
                 tick: 960,
                 name: "Verse".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn python_arrangement_api_reads_marker_names_by_absolute_index() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport arrangement\ndef OnMidiIn(event):\n    event.data1 = ord(arrangement.getMarkerName(1)[0])\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let transport_state = Arc::new(MidiScriptTransportState::default());
+        *transport_state.arrangement_marker_names.lock().unwrap() =
+            vec!["Intro".to_owned(), "Verse".to_owned()];
+        let mut runtime = MidiScriptRuntime::start_for_device_with_transport_state(
+            &script,
+            "Test Input",
+            transport_state,
+        )
+        .unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
+
+        assert_eq!(result.bytes, [0xB0, b'V', 1]);
+    }
+
+    #[test]
+    fn python_arrangement_api_jumps_to_a_relative_marker_index() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport arrangement\ndef OnMidiIn(event):\n    arrangement.jumpToMarker(-2, False)\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let mut runtime = MidiScriptRuntime::start_for_device(&script, "Test Input").unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
+
+        assert_eq!(
+            result.actions,
+            [ScriptTransportAction::JumpToMarker {
+                delta: -2,
+                select: false,
             }]
         );
     }

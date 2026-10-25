@@ -366,6 +366,29 @@ def _add_auto_time_marker(time, name):
     )
 
 
+def _get_marker_name(index):
+    try:
+        index = int(index)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("arrangement.getMarkerName() index must be an integer") from error
+    marker_names = _active_transport_state.get("arrangement_marker_names", [])
+    if index < 0 or index >= len(marker_names):
+        raise IndexError("arrangement.getMarkerName() marker index is out of range")
+    return str(marker_names[index])
+
+
+def _jump_to_marker(delta, select):
+    try:
+        delta = int(delta)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("arrangement.jumpToMarker() delta must be an integer") from error
+    if not -(2**31) <= delta < 2**31:
+        raise ValueError("arrangement.jumpToMarker() delta is outside the supported range")
+    _request_transport_action(
+        {"action": "jump_to_marker", "delta": delta, "select": bool(select)}
+    )
+
+
 def _get_song_tick_pos(mode=0):
     position_ticks = int(_active_transport_state.get("song_position_ticks", 0))
     if mode == 0:
@@ -751,6 +774,8 @@ def _install_modules(script_name, device_name):
 
     arrangement = _module("arrangement")
     arrangement.addAutoTimeMarker = _add_auto_time_marker
+    arrangement.getMarkerName = _get_marker_name
+    arrangement.jumpToMarker = _jump_to_marker
 
     for name in (
         "playlist",

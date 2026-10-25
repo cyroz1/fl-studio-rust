@@ -13785,6 +13785,42 @@ impl DawUi {
         if let Ok(mut value) = self.midi_script_transport_state.project_genre.lock() {
             *value = project_genre;
         }
+        let arrangement_marker_names = self
+            .document
+            .as_ref()
+            .and_then(|document| {
+                let arrangements = document.arrangements().ok()?;
+                let arrangement_id = self
+                    .selected_arrangement
+                    .filter(|selected| {
+                        arrangements
+                            .iter()
+                            .any(|arrangement| arrangement.id == *selected)
+                    })
+                    .or_else(|| arrangements.first().map(|arrangement| arrangement.id))
+                    .unwrap_or(0);
+                Some(
+                    arrangements
+                        .into_iter()
+                        .find(|arrangement| arrangement.id == arrangement_id)
+                        .map(|arrangement| {
+                            arrangement
+                                .time_markers
+                                .iter()
+                                .map(|marker| marker.name().unwrap_or_default().to_owned())
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default(),
+                )
+            })
+            .unwrap_or_default();
+        if let Ok(mut names) = self
+            .midi_script_transport_state
+            .arrangement_marker_names
+            .lock()
+        {
+            *names = arrangement_marker_names;
+        }
         let song_position_hint = if has_script {
             self.song_position_label()
         } else {
@@ -14233,11 +14269,19 @@ impl DawUi {
         let Some(document) = self.document.as_ref() else {
             return Vec::new();
         };
-        let arrangement_id = self.selected_arrangement.unwrap_or(0);
         let mut markers = document
             .arrangements()
             .ok()
             .and_then(|arrangements| {
+                let arrangement_id = self
+                    .selected_arrangement
+                    .filter(|selected| {
+                        arrangements
+                            .iter()
+                            .any(|arrangement| arrangement.id == *selected)
+                    })
+                    .or_else(|| arrangements.first().map(|arrangement| arrangement.id))
+                    .unwrap_or(0);
                 arrangements
                     .into_iter()
                     .find(|arrangement| arrangement.id == arrangement_id)
@@ -14257,6 +14301,10 @@ impl DawUi {
     }
 
     fn jump_midi_script_marker(&mut self, increment: i32) {
+        self.jump_midi_script_marker_with_selection(increment, true);
+    }
+
+    fn jump_midi_script_marker_with_selection(&mut self, increment: i32, select: bool) {
         if increment == 0 {
             return;
         }
@@ -14274,7 +14322,9 @@ impl DawUi {
             self.status = "No Playlist time markers are available to jump to".to_owned();
             return;
         };
-        self.selected_time_marker = Some(marker_index);
+        if select {
+            self.selected_time_marker = Some(marker_index);
+        }
         self.set_midi_script_song_position_absolute_ticks(u64::from(tick));
     }
 
@@ -46625,6 +46675,9 @@ impl DawUi {
             }
             MidiTransportCommand::AddArrangementTimeMarker { tick, name } => {
                 self.add_midi_script_arrangement_time_marker(tick, name);
+            }
+            MidiTransportCommand::JumpToMarker { delta, select } => {
+                self.jump_midi_script_marker_with_selection(delta, select);
             }
             MidiTransportCommand::SelectNextEmptyPatternWithNameDialog => {
                 if let Some(pattern_id) = self.select_next_empty_pattern() {

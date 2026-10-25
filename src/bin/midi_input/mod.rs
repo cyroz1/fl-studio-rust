@@ -691,6 +691,9 @@ fn queue_script_transport_actions(
             ScriptTransportAction::AddArrangementTimeMarker { tick, name } => {
                 MidiTransportCommand::AddArrangementTimeMarker { tick, name }
             }
+            ScriptTransportAction::JumpToMarker { delta, select } => {
+                MidiTransportCommand::JumpToMarker { delta, select }
+            }
             ScriptTransportAction::SelectNextEmptyPatternWithNameDialog => {
                 MidiTransportCommand::SelectNextEmptyPatternWithNameDialog
             }
@@ -748,6 +751,7 @@ pub enum MidiTransportCommand {
     SetProjectTimeSignatureNumerator(u8),
     SetProjectTimeSignatureDenominator(u8),
     AddArrangementTimeMarker { tick: u32, name: String },
+    JumpToMarker { delta: i32, select: bool },
     SelectNextEmptyPatternWithNameDialog,
     FocusSelectedMixerTrackName,
     PatternJog(i32),
@@ -1377,6 +1381,7 @@ pub fn describe_event(event: MidiInputEvent) -> String {
             MidiTransportCommand::AddArrangementTimeMarker { .. } => {
                 "MIDI script Add Time Marker".to_owned()
             }
+            MidiTransportCommand::JumpToMarker { .. } => "MIDI script Jump to Marker".to_owned(),
             MidiTransportCommand::SelectNextEmptyPatternWithNameDialog => {
                 "MIDI script Next Empty Pattern".to_owned()
             }
@@ -2079,6 +2084,10 @@ mod tests {
                     tick: 960,
                     name: "Verse".to_owned(),
                 },
+                ScriptTransportAction::JumpToMarker {
+                    delta: -2,
+                    select: false,
+                },
                 ScriptTransportAction::SelectNextEmptyPatternWithNameDialog,
                 ScriptTransportAction::FocusSelectedMixerTrackName,
                 ScriptTransportAction::Start,
@@ -2110,6 +2119,13 @@ mod tests {
             MidiInputEvent::Transport(MidiTransportCommand::AddArrangementTimeMarker {
                 tick: 960,
                 name: "Verse".to_owned(),
+            })
+        );
+        assert_eq!(
+            transport_receiver.try_recv().unwrap().event,
+            MidiInputEvent::Transport(MidiTransportCommand::JumpToMarker {
+                delta: -2,
+                select: false,
             })
         );
         assert_eq!(
