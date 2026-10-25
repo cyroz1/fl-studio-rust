@@ -2111,7 +2111,7 @@ pub fn stream_input_monitor_through_mixer(
         .and_then(|control| control.targets(mixer_meters));
     let live_route_controls_active = live_source_control.is_some() && live_source_targets.is_some();
     let route_is_audible = live_route_controls_active || routing.allows_channel(Some(mixer_track));
-    let mut master_output = MixerMasterOutput::from_document(document)
+    let master_output = MixerMasterOutput::from_document(document)
         .with_live_master_targets(mixer_meters, sample_rate);
     let mixer_effect_buses_required = vst3_processor
         .as_ref()
