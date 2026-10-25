@@ -4832,6 +4832,7 @@ struct DawUi {
     timeline_zoom: f32,
     playlist_track_zoom: f32,
     playlist_waveform_mode: PlaylistWaveformMode,
+    playlist_show_fade_gain_previews: bool,
     plugin_candidates: Vec<PluginCandidate>,
     audio_unit_probe_sender: Sender<AudioUnitProbeRequest>,
     audio_unit_probe_receiver: Receiver<AudioUnitProbeResponse>,
@@ -6355,6 +6356,7 @@ impl DawUi {
             timeline_zoom: 0.10,
             playlist_track_zoom: 1.0,
             playlist_waveform_mode: PlaylistWaveformMode::Combined,
+            playlist_show_fade_gain_previews: true,
             playlist_zero_crossing_splits,
             plugin_candidates,
             audio_unit_probe_sender,
@@ -19262,6 +19264,11 @@ impl DawUi {
                         ui.selectable_value(&mut self.playlist_waveform_mode, mode, mode.label());
                     }
                 });
+            ui.checkbox(
+                &mut self.playlist_show_fade_gain_previews,
+                "Show fade/gain previews",
+            )
+            .on_hover_text("Hold Alt to show previews temporarily while this is off");
             ui.separator();
             ui.label("Clip focus");
             for focus in PlaylistClipFocus::ALL {
@@ -20871,6 +20878,8 @@ impl DawUi {
                             ));
                         }
 
+                        let show_fade_gain_previews = self.playlist_show_fade_gain_previews
+                            || ui.input(|input| input.modifiers.alt);
                         for clip_index in playlist_clip_draw_order.iter().copied() {
                             let clip = &arrangement.clips[clip_index];
                             if clip.track_index != Some(row) {
@@ -20920,6 +20929,16 @@ impl DawUi {
                                 && let Some(path) = self.audio_waveform_paths.get(&id)
                             {
                                 if let Some(waveform) = self.audio_waveforms.get(path).cloned() {
+                                    let envelope = if show_fade_gain_previews {
+                                        clip.clip_id.map(|clip_id| {
+                                            self.playlist_audio_clip_envelope(
+                                                arrangement.id,
+                                                clip_id,
+                                            )
+                                        })
+                                    } else {
+                                        None
+                                    };
                                     draw_audio_clip_waveform(
                                         &clip_painter,
                                         clip_rect,
@@ -20934,12 +20953,7 @@ impl DawUi {
                                             ppq,
                                             base_tempo_bpm,
                                             tempo_map: waveform_tempo_map.as_ref(),
-                                            envelope: clip.clip_id.map(|clip_id| {
-                                                self.playlist_audio_clip_envelope(
-                                                    arrangement.id,
-                                                    clip_id,
-                                                )
-                                            }),
+                                            envelope,
                                         },
                                     );
                                 } else if self.waveform_loads.contains_key(path) {
