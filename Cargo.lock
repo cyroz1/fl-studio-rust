@@ -1488,6 +1488,7 @@ dependencies = [
  "rfd",
  "serde_json",
  "symphonia",
+ "tempfile",
  "timestretch",
  "vorbis_rs",
  "vst3-host",

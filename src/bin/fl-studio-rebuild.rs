@@ -3947,6 +3947,9 @@ enum AutomationEditAction {
     InitializeFromTemplate {
         template_channel_id: u16,
     },
+    SetLfoAmount {
+        amount: i32,
+    },
     Insert {
         slot: usize,
         position_beats: f64,
@@ -29148,6 +29151,21 @@ impl DawUi {
             empty_view(ui, "Select an automation channel");
             return;
         };
+        if let Some(mut amount) = channel.lfo_amount() {
+            if (-128..=128).contains(&amount) {
+                if ui
+                    .add(egui::Slider::new(&mut amount, -128..=128).text("LFO amount"))
+                    .changed()
+                {
+                    action = Some(AutomationEditAction::SetLfoAmount { amount });
+                }
+            } else {
+                ui.colored_label(
+                    ORANGE,
+                    format!("Saved LFO amount {amount} is outside the editable range"),
+                );
+            }
+        }
         let points = channel.points();
         let points_are_editable = channel.data_event_index().is_some()
             && points.iter().all(|point| {
@@ -29430,6 +29448,9 @@ impl DawUi {
                     initialized_template = true;
                     document
                         .create_automation_point_blob_from_template(channel_id, template_channel_id)
+                }
+                AutomationEditAction::SetLfoAmount { amount } => {
+                    document.set_automation_lfo_amount(channel_id, amount)
                 }
                 AutomationEditAction::Insert {
                     slot,

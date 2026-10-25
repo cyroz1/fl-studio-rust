@@ -17,9 +17,11 @@ const FLP_NOTE_RECORD_SIZE: usize = 24;
 const FLP_PATTERN_CONTROLLER_RECORD_SIZE: usize = 12;
 const FLP_PLAYLIST_RECORD_SIZES: [usize; 4] = [88, 80, 60, 32];
 const MAX_MERGED_PATTERN_NOTES: usize = 2_000_000;
+const FLP_AUTOMATION_LFO_AMOUNT_OFFSET: usize = 4;
 const FLP_AUTOMATION_COUNT_OFFSET: usize = 17;
 const FLP_AUTOMATION_POINTS_OFFSET: usize = 21;
 const FLP_AUTOMATION_POINT_SIZE: usize = 24;
+const FLP_AUTOMATION_LFO_AMOUNT_RANGE: std::ops::RangeInclusive<i32> = -128..=128;
 const TIME_MARKER_SIGNATURE_BIT: u32 = 0x0800_0000;
 const TIME_MARKER_TICK_MASK: u32 = 0x07FF_FFFF;
 const PROJECT_INFO_STRING_EVENTS: [u8; 5] = [0xC2, 0xCE, 0xCF, 0xC3, 0xC5];
@@ -1662,6 +1664,7 @@ pub struct AutomationChannel {
     channel_id: u16,
     display_name: Option<String>,
     points: Vec<AutomationPoint>,
+    lfo_amount: Option<i32>,
     data_event_index: Option<usize>,
 }
 
@@ -1676,6 +1679,12 @@ impl AutomationChannel {
 
     pub fn points(&self) -> &[AutomationPoint] {
         &self.points
+    }
+
+    /// Saved raw LFO amount from the automation event, when the channel has a valid `0xEA` blob.
+    /// The documented bipolar range is -128 through 128.
+    pub fn lfo_amount(&self) -> Option<i32> {
+        self.lfo_amount
     }
 
     /// Source `0xEA` event index, or `None` when the channel has no point blob.
@@ -5656,14 +5665,81 @@ impl FlpDocument {
                     Some(index) => decode_automation_points(&self.events[index])?,
                     None => Vec::new(),
                 };
+                let lfo_amount = event_index.map(|index| {
+                    i32::from_le_bytes(
+                        self.events[index].payload[FLP_AUTOMATION_LFO_AMOUNT_OFFSET
+                            ..FLP_AUTOMATION_LFO_AMOUNT_OFFSET + 4]
+                            .try_into()
+                            .expect("a decoded automation event has a four-byte LFO amount"),
+                    )
+                });
                 Ok(AutomationChannel {
                     channel_id: channel.id,
                     display_name: channel.display_name,
                     points,
+                    lfo_amount,
                     data_event_index: event_index,
                 })
             })
             .collect()
+    }
+
+    /// Sets the raw bipolar LFO amount stored at offset 4 of a type-5 channel's `0xEA` event.
+    /// The rest of the event, including its point data and era-specific trailer, is retained.
+    pub fn set_automation_lfo_amount(
+        &mut self,
+        channel_id: u16,
+        amount: i32,
+    ) -> Result<(), FlpError> {
+        if !FLP_AUTOMATION_LFO_AMOUNT_RANGE.contains(&amount) {
+            return Err(FlpError::UnsupportedEdit(
+                "automation LFO amount must be in the -128..=128 range",
+            ));
+        }
+
+        self.require_unique_channel(channel_id)?;
+        let channel = self
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id() == channel_id)
+            .expect("the unique automation channel was checked above");
+        if channel.kind != Some(ChannelType::Automation.raw()) {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel is not a type-5 automation channel",
+            ));
+        }
+
+        let mut automation_events = channel
+            .event_range()
+            .filter(|index| self.events[*index].opcode == 0xEA);
+        let Some(event_index) = automation_events.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected automation channel has no existing 0xEA point blob",
+            ));
+        };
+        if automation_events.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected automation channel has multiple 0xEA point blobs",
+            ));
+        }
+        if !matches!(
+            self.events[event_index].encoding,
+            PayloadEncoding::Data { .. }
+        ) {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected 0xEA automation blob is not a length-prefixed data event",
+            ));
+        }
+        decode_automation_points(&self.events[event_index])?;
+
+        let mut candidate = self.clone();
+        let mut payload = candidate.events[event_index].payload.clone();
+        payload[FLP_AUTOMATION_LFO_AMOUNT_OFFSET..FLP_AUTOMATION_LFO_AMOUNT_OFFSET + 4]
+            .copy_from_slice(&amount.to_le_bytes());
+        candidate.events[event_index].replace_data_payload(payload)?;
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
     }
 
     /// Returns per-channel plug-in wrapper and data payloads when a `0xD5` event exists.
@@ -21601,9 +21677,10 @@ mod tests {
         ArpeggioOptions, ArpeggioRangePattern, ArpeggioSyncMode, ArticulateOptions,
         ChannelGroupSummary, ChannelLevelAdjustmentsEdit, ChannelNoteRouter, ChannelSortOrder,
         ChannelStretchMode, ChannelStretchSettingsEdit, ChannelSummary, ClawMachineOptions,
-        FLP_AUTOMATION_COUNT_OFFSET, FLP_AUTOMATION_POINTS_OFFSET, FlpDocument, FlpError, FlpEvent,
-        FstPreset, FstPresetKind, LimitNoteOptions, LimitSnapDirection, MixerInsertEdit,
-        MixerInsertSummary, MixerLiveInsertEnabledGain, MixerLiveSendGain, MixerLiveSendOutputPath,
+        FLP_AUTOMATION_COUNT_OFFSET, FLP_AUTOMATION_LFO_AMOUNT_OFFSET,
+        FLP_AUTOMATION_POINTS_OFFSET, FlpDocument, FlpError, FlpEvent, FstPreset, FstPresetKind,
+        LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerInsertSummary,
+        MixerLiveInsertEnabledGain, MixerLiveSendGain, MixerLiveSendOutputPath,
         MixerLiveSendTargetKey, MixerParameterKind, MixerParameterRecord, MixerRouteAudibility,
         MixerSendSummary, MixerSourceRouteTransform, PATTERN_NOTE_DEFAULT_FLAGS,
         PATTERN_NOTE_SLIDE_FLAG, PLAYLIST_CLIP_MUTED_FLAG, PatternController,
@@ -34709,6 +34786,73 @@ mod tests {
             .clone();
         assert_eq!(point.position_beats(), 0.5);
         assert_eq!(point.value(), 0.75);
+    }
+
+    #[test]
+    fn automation_lfo_amount_edits_preserve_curve_and_trailer() {
+        let source_points = [
+            (0.0, 0.2, 0.0, [1, 2, 3, 4]),
+            (2.0, 0.8, 0.25, [5, 6, 7, 8]),
+        ];
+        let trailer = (0..136)
+            .map(|index| (index * 11 % 256) as u8)
+            .collect::<Vec<_>>();
+        let original = automation_channel_fixture(&source_points, &trailer);
+        let mut document = FlpDocument::parse(&original).expect("automation project should parse");
+        let event_index = document
+            .events()
+            .iter()
+            .position(|event| event.opcode() == 0xEA)
+            .expect("fixture should contain an automation event");
+        let mut original_payload = document.events()[event_index].payload().to_vec();
+        original_payload[FLP_AUTOMATION_LFO_AMOUNT_OFFSET..FLP_AUTOMATION_LFO_AMOUNT_OFFSET + 4]
+            .copy_from_slice(&64_i32.to_le_bytes());
+        document.events[event_index]
+            .replace_data_payload(original_payload.clone())
+            .expect("automation fixture should retain its data encoding");
+        document
+            .refresh_event_offsets()
+            .expect("offsets should refresh");
+
+        let channel = document.automation_channels().unwrap().remove(0);
+        assert_eq!(channel.lfo_amount(), Some(64));
+        assert_eq!(channel.points().len(), 2);
+
+        let unchanged = document.clone();
+        assert!(matches!(
+            document.set_automation_lfo_amount(9, 129),
+            Err(FlpError::UnsupportedEdit(_))
+        ));
+        assert_eq!(document, unchanged);
+
+        for amount in [-128, 128] {
+            document
+                .set_automation_lfo_amount(9, amount)
+                .expect("the documented LFO range should be editable");
+            let payload = document.events()[event_index].payload();
+            assert_eq!(
+                i32::from_le_bytes(
+                    payload[FLP_AUTOMATION_LFO_AMOUNT_OFFSET..FLP_AUTOMATION_LFO_AMOUNT_OFFSET + 4]
+                        .try_into()
+                        .unwrap()
+                ),
+                amount
+            );
+            assert_eq!(
+                &payload[..FLP_AUTOMATION_LFO_AMOUNT_OFFSET],
+                &original_payload[..FLP_AUTOMATION_LFO_AMOUNT_OFFSET]
+            );
+            assert_eq!(
+                &payload[FLP_AUTOMATION_LFO_AMOUNT_OFFSET + 4..],
+                &original_payload[FLP_AUTOMATION_LFO_AMOUNT_OFFSET + 4..]
+            );
+            let reparsed = FlpDocument::parse(&document.encode_lossless().unwrap())
+                .expect("edited automation should round-trip");
+            assert_eq!(
+                reparsed.automation_channels().unwrap()[0].lfo_amount(),
+                Some(amount)
+            );
+        }
     }
 
     #[test]

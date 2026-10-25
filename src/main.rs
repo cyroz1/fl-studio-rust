@@ -1043,6 +1043,16 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_f32(tension, "automation point tension")?,
             )
         }
+        [command, input, output, channel_id, amount]
+            if command == "set-automation-lfo-amount" =>
+        {
+            set_automation_lfo_amount(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(channel_id, "automation channel id")?,
+                i32::from(parse_i16(amount, "automation LFO amount")?),
+            )
+        }
         [command, input, output, channel_id, template_channel_id]
             if command == "init-automation-points" =>
         {
@@ -3596,6 +3606,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild set-layer-flags <input.flp> <output.flp> <layer-channel-id> <random:0|1|-> <crossfade:0|1|->\n",
             "  flp-rebuild set-layer-fade <input.flp> <output.flp> <layer-channel-id> <fade:0..256>\n",
             "  flp-rebuild edit-automation-point <input.flp> <output.flp> <channel-id> <point-index> <position-beats> <value> <tension>\n",
+            "  flp-rebuild set-automation-lfo-amount <input.flp> <output.flp> <channel-id> <-128..128>\n",
             "  flp-rebuild init-automation-points <input.flp> <output.flp> <channel-id> <template-channel-id>\n",
             "  flp-rebuild insert-automation-point <input.flp> <output.flp> <channel-id> <insertion-slot> <position-beats> <value> <tension>\n",
             "  flp-rebuild delete-automation-point <input.flp> <output.flp> <channel-id> <point-index>\n",
@@ -5894,9 +5905,10 @@ fn list_automation(path: &Path) -> Result<(), String> {
     println!("automation channels: {}", channels.len());
     for channel in channels {
         println!(
-            "channel={} name={} points={} event={:?}",
+            "channel={} name={} lfo_amount={:?} points={} event={:?}",
             channel.channel_id(),
             channel.display_name().unwrap_or("(unnamed)"),
+            channel.lfo_amount(),
             channel.points().len(),
             channel.data_event_index()
         );
@@ -7370,6 +7382,28 @@ fn edit_automation_point(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "edited automation channel {channel_id} point {point_index} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn set_automation_lfo_amount(
+    input: &Path,
+    output: &Path,
+    channel_id: u16,
+    amount: i32,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .set_automation_lfo_amount(channel_id, amount)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "set automation channel {channel_id} LFO amount to {amount} in {}",
         output.display()
     );
     Ok(())

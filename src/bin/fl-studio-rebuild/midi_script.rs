@@ -97,6 +97,7 @@ pub struct MidiScriptRuntime {
     child: Arc<Mutex<Child>>,
     stdin: BufWriter<ChildStdin>,
     stdout: BufReader<ChildStdout>,
+    _runner_script: tempfile::TempPath,
     transport_state: Arc<MidiScriptTransportState>,
     startup_actions: Vec<ScriptTransportAction>,
     supports_midi_output: bool,
@@ -387,12 +388,20 @@ impl MidiScriptRuntime {
         transport_state: Arc<MidiScriptTransportState>,
     ) -> Result<Self, String> {
         let (program, prefix_args) = python_command()?;
+        let mut runner_script = tempfile::Builder::new()
+            .prefix("fl-studio-midi-script-runner-")
+            .suffix(".py")
+            .tempfile()
+            .map_err(|error| format!("could not create temporary MIDI script runner: {error}"))?;
+        runner_script
+            .write_all(MIDI_SCRIPT_RUNNER.as_bytes())
+            .map_err(|error| format!("could not write temporary MIDI script runner: {error}"))?;
+        let runner_script = runner_script.into_temp_path();
         let mut command = Command::new(program);
         command
             .args(prefix_args)
             .arg("-u")
-            .arg("-c")
-            .arg(MIDI_SCRIPT_RUNNER)
+            .arg(runner_script.as_os_str())
             .arg(&script.path)
             .arg(&script.name)
             .arg(device_name)
@@ -418,6 +427,7 @@ impl MidiScriptRuntime {
             child,
             stdin: BufWriter::new(stdin),
             stdout: BufReader::new(stdout),
+            _runner_script: runner_script,
             transport_state,
             startup_actions: Vec::new(),
             supports_midi_output: false,
