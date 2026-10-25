@@ -649,7 +649,6 @@ struct PlaylistMixerEffectChain {
     end_effect_index: usize,
     latency_frames: u64,
     output_alignment_delay: StereoFrameDelay,
-    post_effect_stem_delay: StereoFrameDelay,
     dry_reference_delay: StereoFrameDelay,
     downstream_delays: Vec<PlaylistMixerEffectBranchDelay>,
 }
@@ -762,6 +761,7 @@ pub struct Vst3PlaylistStreamProcessor {
     mixer_effect_output_delay: StereoFrameDelay,
     mixer_effect_meter_input_delays: Vec<StereoFrameDelay>,
     mixer_effect_input_delays: Vec<StereoFrameDelay>,
+    mixer_post_effect_stem_delays: Vec<StereoFrameDelay>,
     live_input_senders: BTreeMap<u16, Vst3PlaylistLiveInputSender>,
     performance_pattern_automation: BTreeMap<(u16, u16), Vec<Vst3ParameterAutomation>>,
     tempo_map: PlaylistTempoMap,
@@ -1633,9 +1633,6 @@ impl Vst3PlaylistStreamProcessor {
                         .ok_or_else(|| "post-effect Mixer bus is too small".to_owned())?;
                     let mut post_effect_frame = [processed[0], processed[1]];
                     chain
-                        .post_effect_stem_delay
-                        .process_frame(&mut post_effect_frame);
-                    chain
                         .post_effect_meter_transform
                         .apply_frame(&mut post_effect_frame);
                     post_effect_buses[post_effect_sample] = finite_sample(post_effect_frame[0]);
@@ -1710,6 +1707,26 @@ impl Vst3PlaylistStreamProcessor {
                     effect_input_buses[input_offset] += finite_sample(effect_input_delta[0]);
                     effect_input_buses[input_offset + 1] += finite_sample(effect_input_delta[1]);
                 }
+            }
+        }
+        if let Some(post_effect_buses) = post_effect_buses {
+            let expected_samples = crate::audio::MIXER_TRACK_METER_COUNT
+                .checked_mul(samples_per_track)
+                .ok_or_else(|| "post-effect Mixer bus size overflow".to_owned())?;
+            if post_effect_buses.len() != expected_samples {
+                return Err("post-effect Mixer buses do not match the render block".to_owned());
+            }
+            if self.mixer_post_effect_stem_delays.len() != crate::audio::MIXER_TRACK_METER_COUNT {
+                return Err("post-effect Mixer PDC delays were not prepared".to_owned());
+            }
+            for (track, delay) in self.mixer_post_effect_stem_delays.iter_mut().enumerate() {
+                let start = track
+                    .checked_mul(samples_per_track)
+                    .ok_or_else(|| "post-effect Mixer bus offset overflow".to_owned())?;
+                let end = start
+                    .checked_add(samples_per_track)
+                    .ok_or_else(|| "post-effect Mixer bus size overflow".to_owned())?;
+                delay.process_interleaved(&mut post_effect_buses[start..end])?;
             }
         }
         Ok(())
@@ -2027,6 +2044,30 @@ fn configure_mixer_effect_pdc(
             .mixer_effect_input_delays
             .push(StereoFrameDelay::new(delay_frames)?);
     }
+    processor.mixer_post_effect_stem_delays.clear();
+    processor
+        .mixer_post_effect_stem_delays
+        .try_reserve_exact(crate::audio::MIXER_TRACK_METER_COUNT)
+        .map_err(|error| format!("could not allocate post-effect Mixer PDC delays: {error}"))?;
+    for track in 0..crate::audio::MIXER_TRACK_METER_COUNT {
+        let output_latency_frames = pdc_plan
+            .output_latency_frames
+            .get(&track)
+            .copied()
+            .unwrap_or_default();
+        let delay_frames = if processor.automatic_pdc_enabled
+            && pdc_plan.tracks_reaching_master.contains(&track)
+        {
+            master_input_latency_frames
+                .checked_sub(output_latency_frames)
+                .ok_or_else(|| "post-effect Mixer output exceeds planned PDC".to_owned())?
+        } else {
+            0
+        };
+        processor
+            .mixer_post_effect_stem_delays
+            .push(StereoFrameDelay::new(delay_frames)?);
+    }
 
     for chain in &mut processor.mixer_effect_chains {
         if chain.insert_ordinal == 0 {
@@ -2055,7 +2096,6 @@ fn configure_mixer_effect_pdc(
             0
         };
         chain.output_alignment_delay = StereoFrameDelay::new(output_alignment_frames)?;
-        chain.post_effect_stem_delay = StereoFrameDelay::new(output_alignment_frames)?;
         chain.dry_reference_delay = StereoFrameDelay::new(chain.latency_frames)?;
         chain.downstream_delays = Vec::new();
         chain
@@ -4619,6 +4659,7 @@ impl Vst3HostRuntime {
             mixer_effect_output_delay: StereoFrameDelay::default(),
             mixer_effect_meter_input_delays: Vec::new(),
             mixer_effect_input_delays: Vec::new(),
+            mixer_post_effect_stem_delays: Vec::new(),
             live_input_senders,
             performance_pattern_automation: BTreeMap::new(),
             tempo_map,
@@ -4921,7 +4962,6 @@ impl Vst3HostRuntime {
                     end_effect_index,
                     latency_frames,
                     output_alignment_delay: StereoFrameDelay::default(),
-                    post_effect_stem_delay: StereoFrameDelay::default(),
                     dry_reference_delay: StereoFrameDelay::default(),
                     downstream_delays: Vec::new(),
                 });
@@ -5253,6 +5293,7 @@ impl Vst3HostRuntime {
             mixer_effect_output_delay: StereoFrameDelay::default(),
             mixer_effect_meter_input_delays: Vec::new(),
             mixer_effect_input_delays: Vec::new(),
+            mixer_post_effect_stem_delays: Vec::new(),
             live_input_senders,
             performance_pattern_automation: BTreeMap::new(),
             tempo_map,
@@ -7987,7 +8028,6 @@ mod tests {
             end_effect_index: 0,
             latency_frames: 0,
             output_alignment_delay: StereoFrameDelay::default(),
-            post_effect_stem_delay: StereoFrameDelay::default(),
             dry_reference_delay: StereoFrameDelay::default(),
             downstream_delays: Vec::new(),
         };
