@@ -1806,6 +1806,7 @@ struct PlaybackState {
     output_gain: AtomicU32,
     output_peak: AtomicU32,
     output_callback_frames: AtomicU32,
+    input_monitor_ring_flush_requested: AtomicBool,
 }
 
 struct AudioCommandQueue {
@@ -2140,6 +2141,37 @@ pub struct AudioInputRecording {
     recording: Arc<InputRecordingState>,
 }
 
+/// Worker-side sink for Mixer-processed input monitor frames.
+pub struct AudioInputMonitorOutput {
+    ring: Arc<AudioRingBuffer>,
+    recording: Arc<InputRecordingState>,
+}
+
+impl AudioInputMonitorOutput {
+    pub fn is_stopped(&self) -> bool {
+        !self.recording.active.load(Ordering::Acquire)
+    }
+
+    /// Queue interleaved stereo frames for the device output callback.
+    pub fn write_stereo_samples(&self, samples: &[f32]) -> Result<(), String> {
+        if !samples.len().is_multiple_of(2) {
+            return Err("input monitor audio must contain stereo sample frames".to_owned());
+        }
+        for &[left, right] in samples.as_chunks::<2>().0 {
+            loop {
+                if !self.recording.active.load(Ordering::Acquire) {
+                    return Err("input monitoring was stopped".to_owned());
+                }
+                if self.ring.push_stereo_frame(left, right) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl AudioInputRecording {
     #[cfg(test)]
     pub(crate) fn from_test_frames(sample_rate: u32, frames: &[[f32; 2]]) -> Self {
@@ -2208,6 +2240,7 @@ impl PlaybackState {
             output_gain: AtomicU32::new(1.0_f32.to_bits()),
             output_peak: AtomicU32::new(0.0_f32.to_bits()),
             output_callback_frames: AtomicU32::new(0),
+            input_monitor_ring_flush_requested: AtomicBool::new(false),
         }
     }
 
@@ -3001,6 +3034,8 @@ pub struct AudioEngine {
     input_peak: Arc<AtomicU32>,
     input_callback_frames: Arc<AtomicU32>,
     input_recording: Arc<ArcSwapOption<InputRecordingState>>,
+    input_monitor_recording: Arc<ArcSwapOption<InputRecordingState>>,
+    input_monitor_ring: Arc<AudioRingBuffer>,
     input_channel_pair: u16,
     error: Arc<AudioErrorState>,
     input_stream: Option<Stream>,
@@ -3056,8 +3091,21 @@ impl AudioEngine {
             );
         }
         if enabled {
+            if self
+                .input_monitor_recording
+                .load()
+                .as_deref()
+                .is_some_and(|recording| !recording.active.load(Ordering::Acquire))
+            {
+                self.input_monitor_recording.store(None);
+            }
             self.playback.pause();
+        } else if let Some(recording) = self.input_monitor_recording.load().as_deref() {
+            recording.stop();
         }
+        self.playback
+            .input_monitor_ring_flush_requested
+            .store(true, Ordering::Release);
         self.request_output_source(if enabled {
             AUDIO_SOURCE_INPUT_MONITOR
         } else {
@@ -3448,6 +3496,43 @@ impl AudioEngine {
         Ok(AudioInputRecording { recording })
     }
 
+    /// Start a separate capture queue for processing input through the Mixer before monitoring.
+    ///
+    /// The caller should then enable [`Self::set_input_monitor`] and drain the returned reader on
+    /// a worker thread, writing processed output through the paired sink.
+    pub fn start_input_monitor_processing(
+        &self,
+    ) -> Result<(AudioInputRecording, AudioInputMonitorOutput), String> {
+        if !self.input_active || !self.output_active {
+            return Err(
+                "Select and start both an input and an output device to monitor input".into(),
+            );
+        }
+        if self
+            .input_monitor_recording
+            .load()
+            .as_deref()
+            .is_some_and(|recording| recording.active.load(Ordering::Acquire))
+        {
+            return Err("Mixer input monitoring is already active".into());
+        }
+        let recording = Arc::new(InputRecordingState::new(
+            self.sample_rate,
+            INPUT_RECORDING_BUFFER_FRAMES,
+        ));
+        self.input_monitor_recording
+            .store(Some(Arc::clone(&recording)));
+        Ok((
+            AudioInputRecording {
+                recording: Arc::clone(&recording),
+            },
+            AudioInputMonitorOutput {
+                ring: Arc::clone(&self.input_monitor_ring),
+                recording,
+            },
+        ))
+    }
+
     /// Stop the active input recording without discarding its queued frames.
     pub fn stop_input_recording(&self) {
         if let Some(recording) = self.input_recording.load().as_deref() {
@@ -3508,6 +3593,7 @@ impl AudioEngine {
         let input_peak = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
         let input_callback_frames = Arc::new(AtomicU32::new(0));
         let input_recording = Arc::new(ArcSwapOption::empty());
+        let input_monitor_recording = Arc::new(ArcSwapOption::empty());
         let error = Arc::new(AudioErrorState::default());
 
         let output_device = if settings.enable_output {
@@ -3547,6 +3633,7 @@ impl AudioEngine {
                     peak: Arc::clone(&input_peak),
                     source: Arc::clone(&source),
                     recording: Arc::clone(&input_recording),
+                    monitor_recording: Arc::clone(&input_monitor_recording),
                     error: Arc::clone(&error),
                     callback_frames: Arc::clone(&input_callback_frames),
                     input_channel_pair: settings.input_channel_pair,
@@ -3570,6 +3657,8 @@ impl AudioEngine {
             input_peak,
             input_callback_frames,
             input_recording,
+            input_monitor_recording,
+            input_monitor_ring: Arc::clone(&ring),
             input_channel_pair: settings.input_channel_pair,
             error,
             input_active: input_stream.is_some(),
@@ -3597,6 +3686,7 @@ impl AudioEngine {
         let input_peak = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
         let input_callback_frames = Arc::new(AtomicU32::new(0));
         let input_recording = Arc::new(ArcSwapOption::empty());
+        let input_monitor_recording = Arc::new(ArcSwapOption::empty());
         let error = Arc::new(AudioErrorState::default());
         let stop = Arc::new(AtomicBool::new(false));
         let mut threads: Vec<thread::JoinHandle<()>> = Vec::new();
@@ -3614,6 +3704,7 @@ impl AudioEngine {
             let worker_peak = Arc::clone(&input_peak);
             let worker_input_callback_frames = Arc::clone(&input_callback_frames);
             let worker_recording = Arc::clone(&input_recording);
+            let worker_monitor_recording = Arc::clone(&input_monitor_recording);
             let worker_error = Arc::clone(&error);
             let worker_stop = Arc::clone(&stop);
             let output_thread = thread::Builder::new()
@@ -3629,6 +3720,7 @@ impl AudioEngine {
                             input_peak: worker_peak,
                             input_callback_frames: worker_input_callback_frames,
                             input_recording: worker_recording,
+                            input_monitor_recording: worker_monitor_recording,
                             error: worker_error,
                             stop: worker_stop,
                         },
@@ -3660,6 +3752,7 @@ impl AudioEngine {
             let worker_playback = Arc::clone(&playback);
             let worker_input_callback_frames = Arc::clone(&input_callback_frames);
             let worker_recording = Arc::clone(&input_recording);
+            let worker_monitor_recording = Arc::clone(&input_monitor_recording);
             let worker_error = Arc::clone(&error);
             let worker_stop = Arc::clone(&stop);
             let input_thread = thread::Builder::new()
@@ -3675,6 +3768,7 @@ impl AudioEngine {
                             input_peak: worker_peak,
                             input_callback_frames: worker_input_callback_frames,
                             input_recording: worker_recording,
+                            input_monitor_recording: worker_monitor_recording,
                             error: worker_error,
                             stop: worker_stop,
                         },
@@ -3734,6 +3828,8 @@ impl AudioEngine {
             input_peak,
             input_callback_frames,
             input_recording,
+            input_monitor_recording,
+            input_monitor_ring: Arc::clone(&ring),
             input_channel_pair: settings.input_channel_pair,
             error,
             input_active,
@@ -3755,6 +3851,9 @@ impl Drop for AudioEngine {
     fn drop(&mut self) {
         self.playback.stop();
         self.stop_input_recording();
+        if let Some(recording) = self.input_monitor_recording.load().as_deref() {
+            recording.stop();
+        }
         #[cfg(windows)]
         if let Some(stop) = &self.exclusive_stop {
             stop.store(true, Ordering::Release);
@@ -4000,6 +4099,12 @@ where
             move |output, _| {
                 enable_denormal_protection();
                 playback_for_callback.apply_pending_commands(&source);
+                if playback_for_callback
+                    .input_monitor_ring_flush_requested
+                    .swap(false, Ordering::AcqRel)
+                {
+                    ring.clear();
+                }
                 playback_for_callback.apply_pending_streaming_handoff();
                 let playback_samples = playback_for_callback.samples.load();
                 let streaming = playback_for_callback.streaming.load();
@@ -4055,6 +4160,7 @@ struct InputStreamState {
     callback_frames: Arc<AtomicU32>,
     source: Arc<AtomicU8>,
     recording: Arc<ArcSwapOption<InputRecordingState>>,
+    monitor_recording: Arc<ArcSwapOption<InputRecordingState>>,
     error: Arc<AudioErrorState>,
     input_channel_pair: u16,
 }
@@ -4129,6 +4235,7 @@ where
         callback_frames,
         source,
         recording: input_recording,
+        monitor_recording: input_monitor_recording,
         error,
         input_channel_pair,
     } = state;
@@ -4146,6 +4253,11 @@ where
                 );
                 let recording = input_recording.load();
                 let recording_callback = recording
+                    .as_deref()
+                    .and_then(InputRecordingState::begin_callback);
+                let monitor_recording = input_monitor_recording.load();
+                let monitor_queue_active = monitor_recording.is_some();
+                let monitor_callback = monitor_recording
                     .as_deref()
                     .and_then(InputRecordingState::begin_callback);
                 for frame in input.chunks(channels) {
@@ -4166,10 +4278,15 @@ where
                         .clamp(-1.0, 1.0);
                     max_peak = max_peak.max(left.abs()).max(right.abs());
                     let stereo = [left, right];
-                    if source.load(Ordering::Acquire) == AUDIO_SOURCE_INPUT_MONITOR {
+                    if source.load(Ordering::Acquire) == AUDIO_SOURCE_INPUT_MONITOR
+                        && !monitor_queue_active
+                    {
                         ring.push_stereo_frame(stereo[0], stereo[1]);
                     }
                     if let Some(recording) = recording_callback.as_ref() {
+                        recording.push_frame(stereo[0], stereo[1]);
+                    }
+                    if let Some(recording) = monitor_callback.as_ref() {
                         recording.push_frame(stereo[0], stereo[1]);
                     }
                 }
@@ -4483,6 +4600,11 @@ impl AudioRingBuffer {
         Some(frame)
     }
 
+    fn clear(&self) {
+        let write = self.write_index.load(Ordering::Acquire);
+        self.read_index.store(write, Ordering::Release);
+    }
+
     fn peek_stereo_frame(&self, frame_offset: usize) -> Option<[f32; 2]> {
         let read = self.read_index.load(Ordering::Relaxed);
         let write = self.write_index.load(Ordering::Acquire);
@@ -4538,6 +4660,7 @@ struct WasapiWorkerState {
     input_peak: Arc<AtomicU32>,
     input_callback_frames: Arc<AtomicU32>,
     input_recording: Arc<ArcSwapOption<InputRecordingState>>,
+    input_monitor_recording: Arc<ArcSwapOption<InputRecordingState>>,
     error: Arc<AudioErrorState>,
     stop: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -4672,6 +4795,7 @@ fn wasapi_exclusive_input_worker(
         input_peak: peak,
         input_callback_frames,
         input_recording,
+        input_monitor_recording,
         source,
         error,
         stop,
@@ -4737,6 +4861,11 @@ fn wasapi_exclusive_input_worker(
                     let recording_callback = recording
                         .as_deref()
                         .and_then(InputRecordingState::begin_callback);
+                    let monitor_recording = input_monitor_recording.load();
+                    let monitor_queue_active = monitor_recording.is_some();
+                    let monitor_callback = monitor_recording
+                        .as_deref()
+                        .and_then(InputRecordingState::begin_callback);
                     for frame in bytes[..active_bytes].chunks_exact(format_spec.frame_bytes) {
                         let mut stereo = [0.0_f32; 2];
                         for (channel, sample_bytes) in
@@ -4751,10 +4880,15 @@ fn wasapi_exclusive_input_worker(
                             }
                         }
                         max_peak = max_peak.max(stereo[0].abs()).max(stereo[1].abs());
-                        if source.load(Ordering::Acquire) == AUDIO_SOURCE_INPUT_MONITOR {
+                        if source.load(Ordering::Acquire) == AUDIO_SOURCE_INPUT_MONITOR
+                            && !monitor_queue_active
+                        {
                             ring.push_stereo_frame(stereo[0], stereo[1]);
                         }
                         if let Some(recording) = recording_callback.as_ref() {
+                            recording.push_frame(stereo[0], stereo[1]);
+                        }
+                        if let Some(recording) = monitor_callback.as_ref() {
                             recording.push_frame(stereo[0], stereo[1]);
                         }
                     }
@@ -4972,6 +5106,12 @@ fn render_wasapi_buffer(
         .output_callback_frames
         .store(u32::try_from(frames).unwrap_or(u32::MAX), Ordering::Release);
     playback.apply_pending_commands(source);
+    if playback
+        .input_monitor_ring_flush_requested
+        .swap(false, Ordering::AcqRel)
+    {
+        ring.clear();
+    }
     playback.apply_pending_streaming_handoff();
     output.resize(frames.saturating_mul(format.frame_bytes), 0);
     let sample_rate = format.get_sample_rate();

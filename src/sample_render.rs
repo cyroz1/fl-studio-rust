@@ -25,8 +25,8 @@ use vorbis_rs::{VorbisBitrateManagementStrategy, VorbisEncoder, VorbisEncoderBui
 use vst3_host::midi::{MidiChannel, MidiEvent};
 
 use crate::audio::{
-    AudioInputRecording, LiveMixerSourceControl, LiveMixerSourceTargets, MIXER_TRACK_METER_COUNT,
-    MixerTrackPeakMeters, StereoFrameDelay, StreamingAudioWriter,
+    AudioInputMonitorOutput, AudioInputRecording, LiveMixerSourceControl, LiveMixerSourceTargets,
+    MIXER_TRACK_METER_COUNT, MixerTrackPeakMeters, StereoFrameDelay, StreamingAudioWriter,
 };
 use crate::media::{
     DecodedAudio, SamplePathResolver, decode_audio_file, process_audio_range_for_playback,
@@ -2085,6 +2085,190 @@ pub fn write_input_recording_to_wav(
     };
     temporary.commit(output_path)?;
     Ok(summary)
+}
+
+/// Process live input through a selected Mixer route and loaded VST3 effects for monitoring.
+pub fn stream_input_monitor_through_mixer(
+    document: &FlpDocument,
+    mixer_track: i8,
+    recording: &AudioInputRecording,
+    output: &AudioInputMonitorOutput,
+    mixer_meters: &MixerTrackPeakMeters,
+    mut vst3_processor: Option<Vst3PlaylistStreamProcessor>,
+    cancelled: &AtomicBool,
+) -> Result<(), String> {
+    if mixer_track < 0 {
+        return Err("Mixer input monitoring requires Master or a recognized insert".to_owned());
+    }
+    let routing = MixerRouteAudibility::from_document(document);
+    let route_plan = routing.source_route_plan_for_channel(Some(mixer_track));
+    let sample_rate = recording.sample_rate();
+    let live_source_control = routing
+        .live_source_route_plan_for_channel(Some(mixer_track))
+        .map(|route_plan| LiveMixerSourceControl::new(route_plan, sample_rate));
+    let live_source_targets = live_source_control
+        .as_ref()
+        .and_then(|control| control.targets(mixer_meters));
+    let live_route_controls_active = live_source_control.is_some() && live_source_targets.is_some();
+    let route_is_audible = live_route_controls_active || routing.allows_channel(Some(mixer_track));
+    let mut master_output = MixerMasterOutput::from_document(document)
+        .with_live_master_targets(mixer_meters, sample_rate);
+    let mixer_effect_buses_required = vst3_processor
+        .as_deref()
+        .is_some_and(Vst3PlaylistStreamProcessor::needs_mixer_insert_buses);
+    let mixer_meter_buses_required = !route_plan.insert_meter_transforms.is_empty()
+        || live_source_control
+            .as_ref()
+            .is_some_and(|control| !control.insert_meter_transforms().is_empty());
+    let mixer_buses_required = mixer_meter_buses_required || mixer_effect_buses_required;
+    let mixer_bus_planes = 1 + usize::from(mixer_effect_buses_required);
+    const BLOCK_FRAMES: usize = 128;
+    let mut input_frames = vec![[0.0_f32; 2]; BLOCK_FRAMES];
+    let mut output_block = vec![0.0_f32; BLOCK_FRAMES * 2];
+    let mut mixer_buses = mixer_buses_required
+        .then(|| vec![0.0_f32; MIXER_TRACK_METER_COUNT * BLOCK_FRAMES * 2 * mixer_bus_planes]);
+    if let Some(processor) = vst3_processor.as_deref_mut() {
+        processor.start_processing()?;
+    }
+    let stream_result = (|| {
+        loop {
+            if cancelled.load(Ordering::Acquire) || output.is_stopped() {
+                return Err("Mixer input monitoring was stopped".to_owned());
+            }
+            let frame_count = recording.read_frames(&mut input_frames);
+            if frame_count == 0 {
+                if recording.is_finished() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            }
+            let sample_count = frame_count * 2;
+            let block = &mut output_block[..sample_count];
+            block.fill(0.0);
+            let active_bus_samples = MIXER_TRACK_METER_COUNT * sample_count * mixer_bus_planes;
+            let mut buses = mixer_buses
+                .as_deref_mut()
+                .map(|buses| &mut buses[..active_bus_samples]);
+            if let Some(buses) = buses.as_deref_mut() {
+                buses.fill(0.0);
+            }
+            for (frame_index, input_frame) in input_frames[..frame_count].iter().enumerate() {
+                if !route_is_audible {
+                    continue;
+                }
+                let mut routed_frame = *input_frame;
+                let live_controls = live_source_control
+                    .as_ref()
+                    .zip(live_source_targets.as_ref())
+                    .map(|(control, targets)| control.next_frame_controls(targets));
+                if let (Some(control), Some(controls)) =
+                    (live_source_control.as_ref(), live_controls)
+                {
+                    control.apply_output_frame(controls, &mut routed_frame);
+                } else {
+                    route_plan.output_transform.apply_frame(&mut routed_frame);
+                }
+                block[frame_index * 2] = routed_frame[0];
+                block[frame_index * 2 + 1] = routed_frame[1];
+                if let Some(buses) = buses.as_deref_mut() {
+                    let meter_bus_len = MIXER_TRACK_METER_COUNT * sample_count;
+                    let meter_transforms = live_source_control.as_ref().zip(live_controls).map_or(
+                        route_plan.insert_meter_transforms.as_slice(),
+                        |(control, _)| control.insert_meter_transforms(),
+                    );
+                    for (track, transform) in meter_transforms {
+                        if *track >= MIXER_TRACK_METER_COUNT {
+                            return Err(
+                                "Mixer input monitor meter route exceeds the supported track range"
+                                    .to_owned(),
+                            );
+                        }
+                        let mut meter_frame = *input_frame;
+                        if let (Some(control), Some(controls)) =
+                            (live_source_control.as_ref(), live_controls)
+                        {
+                            control.apply_meter_frame(
+                                controls,
+                                *track,
+                                *transform,
+                                &mut meter_frame,
+                            );
+                        } else {
+                            transform.apply_frame(&mut meter_frame);
+                        }
+                        let offset = *track * sample_count + frame_index * 2;
+                        buses[offset] += meter_frame[0];
+                        buses[offset + 1] += meter_frame[1];
+                    }
+                    if mixer_effect_buses_required {
+                        let Some(effect_input_buses) = buses.get_mut(meter_bus_len..) else {
+                            return Err(
+                                "Mixer input monitor effect buses are incomplete".to_owned()
+                            );
+                        };
+                        let effect_input_transforms =
+                            live_source_control.as_ref().zip(live_controls).map_or(
+                                route_plan.insert_effect_input_transforms.as_slice(),
+                                |(control, _)| control.insert_effect_input_transforms(),
+                            );
+                        for (track, transform) in effect_input_transforms {
+                            if *track >= MIXER_TRACK_METER_COUNT {
+                                return Err(
+                                    "Mixer input monitor effect route exceeds the supported track range"
+                                        .to_owned(),
+                                );
+                            }
+                            let mut effect_frame = *input_frame;
+                            if let (Some(control), Some(controls)) =
+                                (live_source_control.as_ref(), live_controls)
+                            {
+                                control.apply_effect_input_frame(
+                                    controls,
+                                    *track,
+                                    *transform,
+                                    &mut effect_frame,
+                                );
+                            } else {
+                                transform.apply_frame(&mut effect_frame);
+                            }
+                            let offset = *track * sample_count + frame_index * 2;
+                            effect_input_buses[offset] += effect_frame[0];
+                            effect_input_buses[offset + 1] += effect_frame[1];
+                        }
+                    }
+                }
+            }
+            if let Some(processor) = vst3_processor.as_deref_mut() {
+                if let Some(buses) = buses.as_deref_mut() {
+                    processor.mix_next_block_with_meter_buses(block, buses)?;
+                } else {
+                    processor.mix_next_block(block)?;
+                }
+            }
+            if let Some(buses) = buses.as_deref() {
+                for (track, track_samples) in buses[..MIXER_TRACK_METER_COUNT * sample_count]
+                    .chunks_exact(sample_count)
+                    .enumerate()
+                    .skip(1)
+                {
+                    let peak = track_samples
+                        .iter()
+                        .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+                    mixer_meters.publish_peak(track, peak);
+                }
+            }
+            master_output.apply(block);
+            output.write_stereo_samples(block)?;
+        }
+        Ok::<_, String>(())
+    })();
+    let stop_result = if let Some(processor) = vst3_processor.as_deref_mut() {
+        processor.stop_processing()
+    } else {
+        Ok(())
+    };
+    stream_result.and(stop_result)
 }
 
 /// Render enabled Playlist clips that reference audio channels into an interleaved stereo buffer.
