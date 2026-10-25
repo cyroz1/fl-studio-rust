@@ -498,6 +498,10 @@ def _global_transport(command, value, pmeflags=2, flags=15):
         if value != 0:
             _request_transport_action({"action": "close_all_windows"})
         return 8
+    if command == 63:  # FPT_F4: Select next empty pattern and open its name editor
+        if value != 0:
+            _request_transport_action("select_next_empty_pattern_with_name_dialog")
+        return 8
     return -1
 
 

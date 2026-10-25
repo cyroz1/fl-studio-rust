@@ -688,6 +688,9 @@ fn queue_script_transport_actions(
             ScriptTransportAction::SetProjectTimeSignatureDenominator(denominator) => {
                 MidiTransportCommand::SetProjectTimeSignatureDenominator(denominator)
             }
+            ScriptTransportAction::SelectNextEmptyPatternWithNameDialog => {
+                MidiTransportCommand::SelectNextEmptyPatternWithNameDialog
+            }
             ScriptTransportAction::PatternJog(increment) => {
                 MidiTransportCommand::PatternJog(increment)
             }
@@ -738,6 +741,7 @@ pub enum MidiTransportCommand {
     SetCurrentTempo(u32),
     SetProjectTimeSignatureNumerator(u8),
     SetProjectTimeSignatureDenominator(u8),
+    SelectNextEmptyPatternWithNameDialog,
     PatternJog(i32),
     TempoJog(i32),
     MarkerJumpJog(i32),
@@ -1361,6 +1365,9 @@ pub fn describe_event(event: MidiInputEvent) -> String {
             MidiTransportCommand::SetProjectTimeSignatureNumerator(_)
             | MidiTransportCommand::SetProjectTimeSignatureDenominator(_) => {
                 "MIDI script Project Time Signature".to_owned()
+            }
+            MidiTransportCommand::SelectNextEmptyPatternWithNameDialog => {
+                "MIDI script Next Empty Pattern".to_owned()
             }
             MidiTransportCommand::PatternJog(_) => "MIDI script Pattern Selection".to_owned(),
             MidiTransportCommand::TempoJog(_) => "MIDI script Tempo".to_owned(),
@@ -2054,6 +2061,7 @@ mod tests {
                 ScriptTransportAction::SetCurrentTempoMilliBpm(123_456),
                 ScriptTransportAction::SetProjectTimeSignatureNumerator(7),
                 ScriptTransportAction::SetProjectTimeSignatureDenominator(8),
+                ScriptTransportAction::SelectNextEmptyPatternWithNameDialog,
                 ScriptTransportAction::Start,
                 ScriptTransportAction::ShowMainView(4),
                 ScriptTransportAction::ToggleAudioSettingsWindow,
@@ -2077,6 +2085,10 @@ mod tests {
         assert_eq!(
             transport_receiver.try_recv().unwrap().event,
             MidiInputEvent::Transport(MidiTransportCommand::SetProjectTimeSignatureDenominator(8))
+        );
+        assert_eq!(
+            transport_receiver.try_recv().unwrap().event,
+            MidiInputEvent::Transport(MidiTransportCommand::SelectNextEmptyPatternWithNameDialog)
         );
         assert_eq!(
             transport_receiver.try_recv().unwrap().event,

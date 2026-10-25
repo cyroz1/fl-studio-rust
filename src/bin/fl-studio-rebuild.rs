@@ -46571,6 +46571,11 @@ impl DawUi {
             MidiTransportCommand::SetProjectTimeSignatureDenominator(denominator) => {
                 self.set_midi_script_project_time_signature(None, Some(denominator));
             }
+            MidiTransportCommand::SelectNextEmptyPatternWithNameDialog => {
+                if let Some(pattern_id) = self.select_next_empty_pattern() {
+                    self.open_pattern_rename_dialog(pattern_id);
+                }
+            }
             MidiTransportCommand::PatternJog(increment) => {
                 self.jog_midi_script_pattern(increment);
             }
