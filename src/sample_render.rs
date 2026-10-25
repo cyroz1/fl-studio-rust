@@ -6141,7 +6141,7 @@ fn stream_pattern_from_tick_with_vst3_to_device(
         let mut next_loop_start = loop_frames;
         loop {
             if finite_output_frames.is_some_and(|frames| block_start >= frames) {
-                break;
+                break Ok(());
             }
             check_cancelled(Some(cancelled))?;
             if writer.is_cancelled() {
