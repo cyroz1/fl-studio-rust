@@ -1453,6 +1453,27 @@ impl ChannelNoteRouter {
         )
     }
 
+    /// Returns Layer-adjusted routes for a render that combines Sampler and
+    /// VST3 output. Crossfade applies when each active child subtree ends in
+    /// enabled Sampler channels or loaded VST3 channels whose plug-ins
+    /// advertise Volume note expression.
+    pub fn targets_for_note_with_mixed_crossfade(
+        &self,
+        source_channel_id: u16,
+        note_seed: u64,
+        key: u16,
+        vst3_volume_expression_channels: &BTreeSet<u16>,
+    ) -> Vec<(u16, f32, i32)> {
+        self.targets_for_note_with_controls(
+            source_channel_id,
+            note_seed,
+            key,
+            true,
+            true,
+            Some(vst3_volume_expression_channels),
+        )
+    }
+
     fn targets_for_note_with_controls(
         &self,
         source_channel_id: u16,

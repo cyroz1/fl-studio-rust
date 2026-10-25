@@ -787,6 +787,7 @@ pub struct Vst3PlaylistStreamProcessor {
     mixer_effect_input_delays: Vec<StereoFrameDelay>,
     mixer_post_effect_stem_delays: Vec<StereoFrameDelay>,
     live_input_senders: BTreeMap<u16, Vst3PlaylistLiveInputSender>,
+    volume_expression_channel_ids: BTreeSet<u16>,
     performance_pattern_automation: BTreeMap<(u16, u16), Vec<Vst3ParameterAutomation>>,
     tempo_map: PlaylistTempoMap,
     output_sample_rate: u32,
@@ -853,6 +854,10 @@ impl Vst3PlaylistStreamProcessor {
             .filter(|stream| stream.live_performance && stream.render.supports_note_volume)
             .map(|stream| stream.channel_id)
             .collect()
+    }
+
+    pub(crate) fn volume_expression_channel_ids(&self) -> &BTreeSet<u16> {
+        &self.volume_expression_channel_ids
     }
 
     pub(crate) fn performance_pattern_automation(
@@ -4845,6 +4850,7 @@ impl Vst3HostRuntime {
             mixer_effect_input_delays: Vec::new(),
             mixer_post_effect_stem_delays: Vec::new(),
             live_input_senders,
+            volume_expression_channel_ids: vst3_volume_expression_channels,
             performance_pattern_automation: BTreeMap::new(),
             tempo_map,
             output_sample_rate,
@@ -5245,7 +5251,7 @@ impl Vst3HostRuntime {
             },
             |channel_id, seed, key| {
                 channel_router
-                    .targets_for_note_with_vst3_crossfade(
+                    .targets_for_note_with_mixed_crossfade(
                         channel_id,
                         seed,
                         key,
@@ -5497,6 +5503,7 @@ impl Vst3HostRuntime {
             mixer_effect_input_delays: Vec::new(),
             mixer_post_effect_stem_delays: Vec::new(),
             live_input_senders,
+            volume_expression_channel_ids: vst3_volume_expression_channels,
             performance_pattern_automation: BTreeMap::new(),
             tempo_map,
             output_sample_rate,

@@ -2433,6 +2433,10 @@ pub fn stream_playlist_performance_with_vst3_to_device(
         .as_ref()
         .map(Vst3PlaylistStreamProcessor::performance_volume_expression_channel_ids)
         .unwrap_or_default();
+    let vst3_crossfade_volume_expression_channels = vst3_processor
+        .as_ref()
+        .map(|processor| processor.volume_expression_channel_ids().clone())
+        .unwrap_or_default();
     let (static_document, performance_clip_indices) =
         playlist_performance_static_document_with_vst3(
             document,
@@ -2491,6 +2495,7 @@ pub fn stream_playlist_performance_with_vst3_to_device(
         project_path,
         options.clone(),
         performance.meters.is_some(),
+        &vst3_crossfade_volume_expression_channels,
         Some(cancelled),
     )?;
     let performance_pattern_automation = vst3_processor
@@ -2652,11 +2657,16 @@ fn stream_playlist_with_vst3_to_device_from_frame_inner(
         meters.is_some(),
         Some(cancelled),
     )?;
+    let vst3_crossfade_volume_expression_channels = vst3_processor
+        .as_ref()
+        .map(|processor| processor.volume_expression_channel_ids().clone())
+        .unwrap_or_default();
     let sampler = prepare_sampler_arrangement(
         document,
         project_path,
         options.clone(),
         meters.is_some(),
+        &vst3_crossfade_volume_expression_channels,
         Some(cancelled),
     )?;
     if audio.clips.is_empty()
@@ -2970,11 +2980,16 @@ fn render_playlist_with_vst3_cancellable(
         false,
         Some(cancelled),
     )?;
+    let vst3_crossfade_volume_expression_channels = vst3_processor
+        .as_ref()
+        .map(|processor| processor.volume_expression_channel_ids().clone())
+        .unwrap_or_default();
     let sampler = prepare_sampler_arrangement(
         document,
         project_path,
         options.clone(),
         false,
+        &vst3_crossfade_volume_expression_channels,
         Some(cancelled),
     )?;
     if audio.clips.is_empty()
@@ -3521,11 +3536,16 @@ pub fn render_playlist_mixer_stems_with_vst3_cancellable(
         false,
         Some(cancelled),
     )?;
+    let vst3_crossfade_volume_expression_channels = vst3_processor
+        .as_ref()
+        .map(|processor| processor.volume_expression_channel_ids().clone())
+        .unwrap_or_default();
     let sampler = prepare_sampler_arrangement(
         document,
         project_path,
         options.clone(),
         false,
+        &vst3_crossfade_volume_expression_channels,
         Some(cancelled),
     )?;
     if audio.clips.is_empty()
@@ -8531,6 +8551,7 @@ fn prepare_sampler_arrangement(
     project_path: &Path,
     options: PlaylistRenderOptions,
     include_muted_mixer_sources: bool,
+    vst3_volume_expression_channels: &BTreeSet<u16>,
     cancelled: Option<&AtomicBool>,
 ) -> Result<PreparedSamplerArrangement, String> {
     check_cancelled(cancelled)?;
@@ -8593,7 +8614,12 @@ fn prepare_sampler_arrangement(
         },
         |channel_id, seed, key| {
             channel_router
-                .targets_for_note_with_layer_adjustments(channel_id, seed, key)
+                .targets_for_note_with_mixed_crossfade(
+                    channel_id,
+                    seed,
+                    key,
+                    vst3_volume_expression_channels,
+                )
                 .into_iter()
                 .filter(|(target_channel_id, _, _)| {
                     channels_by_id
@@ -9462,7 +9488,7 @@ impl PlaylistPerformanceRuntime {
                 },
                 |channel_id, note_seed, key| {
                     channel_router
-                        .targets_for_note_with_vst3_crossfade(
+                        .targets_for_note_with_mixed_crossfade(
                             channel_id,
                             note_seed,
                             key,
