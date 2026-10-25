@@ -2414,6 +2414,24 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 )?,
             )
         }
+        [command, input, output, pattern_id, channel_id, step_ticks, range_octaves, gate, pattern, sync, group_notes]
+            if command == "arp-notes" =>
+        {
+            arpeggiate_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                ArpeggiatorCliOptions {
+                    step: step_ticks,
+                    range_octaves: parse_u8(range_octaves, "arpeggiator range")?,
+                    gate_percent: parse_u8(gate, "arpeggiator gate")?,
+                    range_pattern: parse_arpeggio_range_pattern(pattern)?,
+                    sync: parse_arpeggio_sync_mode(sync)?,
+                    group_notes: parse_bool(group_notes, "group notes")?,
+                },
+            )
+        }
         [command, input, output, pattern_id, channel_id, step_ticks, range_octaves, gate, pattern, sync]
             if command == "arp-notes" =>
         {
@@ -2428,6 +2446,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                     gate_percent: parse_u8(gate, "arpeggiator gate")?,
                     range_pattern: parse_arpeggio_range_pattern(pattern)?,
                     sync: parse_arpeggio_sync_mode(sync)?,
+                    group_notes: false,
                 },
             )
         }
@@ -2445,6 +2464,28 @@ fn run(args: Vec<String>) -> Result<(), String> {
                     gate_percent: parse_u8(gate, "arpeggiator gate")?,
                     range_pattern: parse_arpeggio_range_pattern(pattern)?,
                     sync: ArpeggioSyncMode::Block,
+                    group_notes: false,
+                },
+            )
+        }
+        [command, input, output, pattern_id, channel_id, note_indices, step_ticks, range_octaves,
+            gate, pattern, sync, group_notes]
+            if command == "arp-notes-selected" =>
+        {
+            let note_indices = parse_note_indices(note_indices)?;
+            arpeggiate_notes_with_scope(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                Some(&note_indices),
+                ArpeggiatorCliOptions {
+                    step: step_ticks,
+                    range_octaves: parse_u8(range_octaves, "arpeggiator range")?,
+                    gate_percent: parse_u8(gate, "arpeggiator gate")?,
+                    range_pattern: parse_arpeggio_range_pattern(pattern)?,
+                    sync: parse_arpeggio_sync_mode(sync)?,
+                    group_notes: parse_bool(group_notes, "group notes")?,
                 },
             )
         }
@@ -2465,6 +2506,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                     gate_percent: parse_u8(gate, "arpeggiator gate")?,
                     range_pattern: parse_arpeggio_range_pattern(pattern)?,
                     sync: parse_arpeggio_sync_mode(sync)?,
+                    group_notes: false,
                 },
             )
         }
@@ -2485,6 +2527,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                     gate_percent: parse_u8(gate, "arpeggiator gate")?,
                     range_pattern: parse_arpeggio_range_pattern(pattern)?,
                     sync: ArpeggioSyncMode::Block,
+                    group_notes: false,
                 },
             )
         }
@@ -3819,8 +3862,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "    Humanize timing accepts ticks or 1/1, 1/2, 1/4, 1/8, 1/16, 1/32, 1/64, or 1/128, rounded to project ticks using PPQ.\n",
             "  flp-rebuild limit-notes <input.flp> <output.flp> <pattern-id> <channel-id> <minimum-key-0..127> <maximum-key-0..127> [wrap-to-bottom:0|1 scale-name|none scale-root:0..11|-> snap-direction:up|down|alternate]\n",
             "  flp-rebuild limit-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <minimum-key-0..127> <maximum-key-0..127> [wrap-to-bottom:0|1 scale-name|none scale-root:0..11|-> snap-direction:up|down|alternate]\n",
-            "  flp-rebuild arp-notes <input.flp> <output.flp> <pattern-id> <channel-id> <step-ticks|1/n> <range-octaves-1..4> <gate-1..100> <up|down|up-down|alternate> [time|block|chord]\n",
-            "  flp-rebuild arp-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <step-ticks|1/n> <range-octaves-1..4> <gate-1..100> <up|down|up-down|alternate> [time|block|chord]\n",
+            "  flp-rebuild arp-notes <input.flp> <output.flp> <pattern-id> <channel-id> <step-ticks|1/n> <range-octaves-1..4> <gate-1..100> <up|down|up-down|alternate> [time|block|chord [group-notes:0|1]]\n",
+            "  flp-rebuild arp-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <step-ticks|1/n> <range-octaves-1..4> <gate-1..100> <up|down|up-down|alternate> [time|block|chord [group-notes:0|1]]\n",
             "    Arpeggiator step accepts ticks or 1/1, 1/2, 1/4, 1/8, 1/16, 1/32, 1/64, or 1/128, rounded to project ticks using PPQ.\n",
             "  flp-rebuild riff-machine-notes <input.flp> <output.flp> <pattern-id> <channel-id> [--option=value ...]\n",
             "  flp-rebuild riff-machine-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> [--option=value ...]\n",
@@ -8692,6 +8735,7 @@ struct ArpeggiatorCliOptions<'a> {
     gate_percent: u8,
     range_pattern: ArpeggioRangePattern,
     sync: ArpeggioSyncMode,
+    group_notes: bool,
 }
 
 fn arpeggiate_notes(
@@ -8719,6 +8763,7 @@ fn arpeggiate_notes_with_scope(
         gate_percent: options.gate_percent,
         range_pattern: options.range_pattern,
         sync: options.sync,
+        group_notes: options.group_notes,
     };
     let created = match note_indices {
         Some(note_indices) => document.arpeggiate_pattern_note_selection(

@@ -4756,6 +4756,7 @@ struct DawUi {
     arpeggiator_range_octaves: u8,
     arpeggiator_gate_percent: u8,
     arpeggiator_range_pattern: ArpeggioRangePattern,
+    arpeggiator_group_notes: bool,
     riff_machine_direction: ArpeggioDirection,
     arpeggiator_sync_mode: ArpeggioSyncMode,
     riff_seed: u64,
@@ -6335,6 +6336,7 @@ impl DawUi {
             arpeggiator_range_octaves: 1,
             arpeggiator_gate_percent: 80,
             arpeggiator_range_pattern: ArpeggioRangePattern::Up,
+            arpeggiator_group_notes: false,
             riff_machine_direction: ArpeggioDirection::Up,
             arpeggiator_sync_mode: ArpeggioSyncMode::Block,
             riff_seed: 1,
@@ -34479,6 +34481,20 @@ impl DawUi {
                             "Chord",
                         );
                     });
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.arpeggiator_group_notes, "Group notes")
+                        .on_hover_text("Keep the generated arpeggio notes together when editing.");
+                    if ui.button("Reset arpeggiator").clicked() {
+                        let defaults = ArpeggioOptions::default();
+                        self.arpeggiator_step_ticks = defaults.step_ticks;
+                        self.arpeggiator_step_note_division = None;
+                        self.arpeggiator_range_octaves = defaults.range_octaves;
+                        self.arpeggiator_gate_percent = defaults.gate_percent;
+                        self.arpeggiator_range_pattern = defaults.range_pattern;
+                        self.arpeggiator_sync_mode = defaults.sync;
+                        self.arpeggiator_group_notes = defaults.group_notes;
+                    }
+                });
                 ui.add(
                     egui::DragValue::new(&mut self.piano_roll_slice_position_ticks)
                         .prefix("Slice at tick ")
@@ -35182,6 +35198,7 @@ impl DawUi {
             let range_octaves = self.arpeggiator_range_octaves;
             let gate_percent = self.arpeggiator_gate_percent;
             let range_pattern = self.arpeggiator_range_pattern;
+            let group_notes = self.arpeggiator_group_notes;
             let sync = self.arpeggiator_sync_mode;
             let result = self
                 .document
@@ -35210,6 +35227,7 @@ impl DawUi {
                                 gate_percent,
                                 range_pattern,
                                 sync,
+                                group_notes,
                             },
                         )
                     } else {
@@ -35222,6 +35240,7 @@ impl DawUi {
                                 gate_percent,
                                 range_pattern,
                                 sync,
+                                group_notes,
                             },
                         )
                     };

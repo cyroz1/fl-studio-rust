@@ -2029,6 +2029,21 @@ pub struct ArpeggioOptions {
     pub gate_percent: u8,
     pub range_pattern: ArpeggioRangePattern,
     pub sync: ArpeggioSyncMode,
+    /// Assign generated notes to a new group so they move and edit together.
+    pub group_notes: bool,
+}
+
+impl Default for ArpeggioOptions {
+    fn default() -> Self {
+        Self {
+            step_ticks: 24,
+            range_octaves: 1,
+            gate_percent: 80,
+            range_pattern: ArpeggioRangePattern::Up,
+            sync: ArpeggioSyncMode::Block,
+            group_notes: false,
+        }
+    }
 }
 
 /// Timing mode for the Riff Machine's Groove stage.
@@ -13748,6 +13763,7 @@ impl FlpDocument {
             gate_percent,
             range_pattern,
             sync,
+            group_notes,
         } = options;
         if step_ticks == 0 {
             return Err(FlpError::UnsupportedEdit(
@@ -13878,6 +13894,23 @@ impl FlpDocument {
         }
         if additions.is_empty() {
             return Ok(0);
+        }
+
+        if group_notes {
+            let used_groups = pattern
+                .notes
+                .iter()
+                .filter(|note| note.channel_id == channel_id && note.group != 0)
+                .map(|note| note.group)
+                .collect::<BTreeSet<_>>();
+            let group = (1..=u16::MAX)
+                .find(|group| !used_groups.contains(group))
+                .ok_or(FlpError::UnsupportedEdit(
+                    "no free note group ID remains for this channel",
+                ))?;
+            for note in &mut additions {
+                note.group = group;
+            }
         }
 
         let mut updated = self.clone();
@@ -14113,6 +14146,7 @@ impl FlpDocument {
                     ArpeggioDirection::UpDown => ArpeggioRangePattern::UpDown,
                 },
                 sync: ArpeggioSyncMode::Block,
+                group_notes: false,
             },
         )?;
         if arpeggiated == 0 {
@@ -31360,6 +31394,7 @@ mod tests {
                         gate_percent: 100,
                         range_pattern: ArpeggioRangePattern::Up,
                         sync,
+                        group_notes: false,
                     },
                 )
                 .expect("sync mode should generate an arpeggio");
@@ -31395,6 +31430,7 @@ mod tests {
                     gate_percent: 100,
                     range_pattern: ArpeggioRangePattern::Up,
                     sync: ArpeggioSyncMode::Time,
+                    group_notes: false,
                 },
             )
             .expect("Time sync should complete its one-pass loop");
@@ -31437,6 +31473,7 @@ mod tests {
                         gate_percent: 100,
                         range_pattern,
                         sync: ArpeggioSyncMode::Time,
+                        group_notes: false,
                     },
                 )
                 .expect("range pattern should generate a riff");
