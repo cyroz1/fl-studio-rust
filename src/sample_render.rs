@@ -5913,6 +5913,13 @@ struct PatternLoopStreamConfig {
     allow_empty_sampler: bool,
 }
 
+struct SamplerPatternChannelOptions<'a> {
+    channel_filter: Option<&'a BTreeSet<u16>>,
+    allow_empty: bool,
+    include_muted_mixer_sources: bool,
+    vst3_volume_expression_channels: Option<&'a BTreeSet<u16>>,
+}
+
 fn stream_sampler_pattern_loop_from_tick_with_vst3_to_device(
     document: &FlpDocument,
     project_path: impl AsRef<Path>,
@@ -11199,10 +11206,12 @@ fn prepare_sampler_pattern(
             project_path,
             options,
             cancelled,
-            None,
-            false,
-            true,
-            None,
+            SamplerPatternChannelOptions {
+                channel_filter: None,
+                allow_empty: false,
+                include_muted_mixer_sources: true,
+                vst3_volume_expression_channels: None,
+            },
         )
     } else {
         prepare_sampler_pattern_for_channel(document, project_path, options, cancelled, None)
@@ -11221,10 +11230,12 @@ fn prepare_sampler_pattern_for_channel(
         project_path,
         options,
         cancelled,
-        channel_filter,
-        false,
-        false,
-        None,
+        SamplerPatternChannelOptions {
+            channel_filter,
+            allow_empty: false,
+            include_muted_mixer_sources: false,
+            vst3_volume_expression_channels: None,
+        },
     )
 }
 
@@ -11241,10 +11252,12 @@ fn prepare_sampler_pattern_allow_empty(
         project_path,
         options,
         cancelled,
-        None,
-        true,
-        include_muted_mixer_sources,
-        Some(vst3_volume_expression_channels),
+        SamplerPatternChannelOptions {
+            channel_filter: None,
+            allow_empty: true,
+            include_muted_mixer_sources,
+            vst3_volume_expression_channels: Some(vst3_volume_expression_channels),
+        },
     )
 }
 
@@ -11253,11 +11266,14 @@ fn prepare_sampler_pattern_for_channel_internal(
     project_path: &Path,
     options: SamplerPatternRenderOptions,
     cancelled: Option<&AtomicBool>,
-    channel_filter: Option<&BTreeSet<u16>>,
-    allow_empty: bool,
-    include_muted_mixer_sources: bool,
-    vst3_volume_expression_channels: Option<&BTreeSet<u16>>,
+    channel_options: SamplerPatternChannelOptions<'_>,
 ) -> Result<PreparedSamplerPattern, String> {
+    let SamplerPatternChannelOptions {
+        channel_filter,
+        allow_empty,
+        include_muted_mixer_sources,
+        vst3_volume_expression_channels,
+    } = channel_options;
     check_cancelled(cancelled)?;
     if !(8_000..=384_000).contains(&options.sample_rate) {
         return Err("sampler render rate must be between 8000 and 384000 Hz".to_owned());
