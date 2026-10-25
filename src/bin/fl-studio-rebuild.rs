@@ -38,12 +38,13 @@ use flp_rebuild::sample_render::{
     AudioClipRenderOptions, AudioClipRenderSummary, AudioFileRenderOptions, AudioRecordingSummary,
     AudioRenderEncodingOptions, AudioRenderOutput, LayerLiveInputConfig, LayerLiveInputEvent,
     MP3_BITRATES_KBPS, MixerStemRenderOptions, PlaylistAudioClipEnvelope,
-    PlaylistPerformanceCommand, PlaylistPerformanceLaunch, PlaylistPerformanceStream,
-    PlaylistRenderOptions, PlaylistRenderRange, PlaylistRenderSummary, PlaylistStreamMonitor,
-    PlaylistTailMode, PlaylistTempoMap, ResamplingQuality, SamplerLiveInputRouting,
-    SamplerLiveNoteEvent, SamplerPatternLoopPlayback, SamplerPatternRenderOptions,
-    SamplerPatternRenderSummary, Vst3LiveInputEvent, Vst3PatternLoopPlayback, WavChannelMode,
-    WavDitherMode, WavSampleFormat, nearest_playlist_audio_clip_zero_crossing_tick,
+    PlaylistAudioClipFadeCurve, PlaylistPerformanceCommand, PlaylistPerformanceLaunch,
+    PlaylistPerformanceStream, PlaylistRenderOptions, PlaylistRenderRange, PlaylistRenderSummary,
+    PlaylistStreamMonitor, PlaylistTailMode, PlaylistTempoMap, ResamplingQuality,
+    SamplerLiveInputRouting, SamplerLiveNoteEvent, SamplerPatternLoopPlayback,
+    SamplerPatternRenderOptions, SamplerPatternRenderSummary, Vst3LiveInputEvent,
+    Vst3PatternLoopPlayback, WavChannelMode, WavDitherMode, WavSampleFormat,
+    nearest_playlist_audio_clip_zero_crossing_tick, playlist_audio_clip_fade_gain,
     playlist_performance_clip_indices_with_vst3, playlist_performance_static_document_with_vst3,
     playlist_performance_vst3_channel_ids, playlist_performance_vst3_clip_indices,
     render_audio_clips_to_file, render_playlist_mixer_stems_with_vst3_cancellable,
@@ -8046,6 +8047,10 @@ impl DawUi {
                 gain_centidb: 0,
                 fade_in_ms: 0,
                 fade_out_ms: 0,
+                fade_in_curve: PlaylistAudioClipFadeCurve::Linear,
+                fade_in_tension: 0,
+                fade_out_curve: PlaylistAudioClipFadeCurve::Linear,
+                fade_out_tension: 0,
                 stretch_to_clip_duration: false,
                 stretch_pitch_cents: 0,
             })
@@ -21612,6 +21617,86 @@ impl DawUi {
                                                         .suffix(" ms fade out"),
                                                 )
                                                 .changed();
+                                            let mut fade_in_curve_changed = false;
+                                            ui.horizontal(|ui| {
+                                                ui.label("Fade-in curve");
+                                                egui::ComboBox::from_id_salt((
+                                                    "playlist-audio-fade-in-curve",
+                                                    arrangement.id,
+                                                    clip_id,
+                                                ))
+                                                .selected_text(envelope.fade_in_curve.label())
+                                                .show_ui(ui, |ui| {
+                                                    for curve in [
+                                                        PlaylistAudioClipFadeCurve::Linear,
+                                                        PlaylistAudioClipFadeCurve::Smooth,
+                                                        PlaylistAudioClipFadeCurve::Single,
+                                                    ] {
+                                                        fade_in_curve_changed |= ui
+                                                            .selectable_value(
+                                                                &mut envelope.fade_in_curve,
+                                                                curve,
+                                                                curve.label(),
+                                                            )
+                                                            .changed();
+                                                    }
+                                                });
+                                            });
+                                            let fade_in_tension_changed =
+                                                if envelope.fade_in_curve
+                                                    == PlaylistAudioClipFadeCurve::Single
+                                                {
+                                                    ui.add(
+                                                        egui::Slider::new(
+                                                            &mut envelope.fade_in_tension,
+                                                            -100..=100,
+                                                        )
+                                                        .text("Fade-in tension"),
+                                                    )
+                                                    .changed()
+                                                } else {
+                                                    false
+                                                };
+                                            let mut fade_out_curve_changed = false;
+                                            ui.horizontal(|ui| {
+                                                ui.label("Fade-out curve");
+                                                egui::ComboBox::from_id_salt((
+                                                    "playlist-audio-fade-out-curve",
+                                                    arrangement.id,
+                                                    clip_id,
+                                                ))
+                                                .selected_text(envelope.fade_out_curve.label())
+                                                .show_ui(ui, |ui| {
+                                                    for curve in [
+                                                        PlaylistAudioClipFadeCurve::Linear,
+                                                        PlaylistAudioClipFadeCurve::Smooth,
+                                                        PlaylistAudioClipFadeCurve::Single,
+                                                    ] {
+                                                        fade_out_curve_changed |= ui
+                                                            .selectable_value(
+                                                                &mut envelope.fade_out_curve,
+                                                                curve,
+                                                                curve.label(),
+                                                            )
+                                                            .changed();
+                                                    }
+                                                });
+                                            });
+                                            let fade_out_tension_changed =
+                                                if envelope.fade_out_curve
+                                                    == PlaylistAudioClipFadeCurve::Single
+                                                {
+                                                    ui.add(
+                                                        egui::Slider::new(
+                                                            &mut envelope.fade_out_tension,
+                                                            -100..=100,
+                                                        )
+                                                        .text("Fade-out tension"),
+                                                    )
+                                                    .changed()
+                                                } else {
+                                                    false
+                                                };
                                             let fit_to_clip_duration = ui
                                                 .checkbox(
                                                     &mut envelope.stretch_to_clip_duration,
@@ -21631,6 +21716,10 @@ impl DawUi {
                                             if gain_changed
                                                 || fade_in_changed
                                                 || fade_out_changed
+                                                || fade_in_curve_changed
+                                                || fade_in_tension_changed
+                                                || fade_out_curve_changed
+                                                || fade_out_tension_changed
                                                 || fit_to_clip_duration
                                                 || stretch_pitch_changed
                                             {
@@ -21648,6 +21737,12 @@ impl DawUi {
                                                         gain_centidb: 0,
                                                         fade_in_ms: 0,
                                                         fade_out_ms: 0,
+                                                        fade_in_curve:
+                                                            PlaylistAudioClipFadeCurve::Linear,
+                                                        fade_in_tension: 0,
+                                                        fade_out_curve:
+                                                            PlaylistAudioClipFadeCurve::Linear,
+                                                        fade_out_tension: 0,
                                                         stretch_to_clip_duration: false,
                                                         stretch_pitch_cents: 0,
                                                     },
@@ -21655,7 +21750,7 @@ impl DawUi {
                                                 ui.close();
                                             }
                                             ui.small(
-                                                "Fit uses the mode saved on the Audio Clip channel and the instance's visible Playlist duration. The local processor approximates duration-preserving modes. These values stay on this machine and apply when playback starts.",
+                                                "Fade curve shapes and tension use app-local approximations. Fit uses the mode saved on the Audio Clip channel and the instance's visible Playlist duration. These values stay on this machine and apply when playback starts.",
                                             );
                                         });
                                     } else {
@@ -58101,6 +58196,8 @@ fn valid_playlist_audio_clip_envelope(entry: &ProjectPlaylistAudioClipEnvelope) 
         && (-9_600..=3_600).contains(&entry.envelope.gain_centidb)
         && entry.envelope.fade_in_ms <= 600_000
         && entry.envelope.fade_out_ms <= 600_000
+        && (-100..=100).contains(&entry.envelope.fade_in_tension)
+        && (-100..=100).contains(&entry.envelope.fade_out_tension)
         && (-1_200..=1_200).contains(&entry.envelope.stretch_pitch_cents)
 }
 
@@ -58158,10 +58255,25 @@ fn parse_playlist_audio_clip_envelopes(contents: &str) -> Vec<ProjectPlaylistAud
         let Some(fade_out_ms) = fields.next().and_then(|value| value.parse::<u32>().ok()) else {
             continue;
         };
-        let (stretch_to_clip_duration, stretch_pitch_cents) = match (fields.next(), fields.next()) {
-            (None, None) => (false, 0),
-            (Some(fit), Some(pitch)) => {
-                let stretch_to_clip_duration = match fit {
+        let remaining = fields.collect::<Vec<_>>();
+        let (
+            fade_in_curve,
+            fade_in_tension,
+            fade_out_curve,
+            fade_out_tension,
+            stretch_to_clip_duration,
+            stretch_pitch_cents,
+        ) = match remaining.as_slice() {
+            [] => (
+                PlaylistAudioClipFadeCurve::Linear,
+                0,
+                PlaylistAudioClipFadeCurve::Linear,
+                0,
+                false,
+                0,
+            ),
+            [fit, pitch] => {
+                let stretch_to_clip_duration = match *fit {
                     "0" => false,
                     "1" => true,
                     _ => continue,
@@ -58169,13 +58281,55 @@ fn parse_playlist_audio_clip_envelopes(contents: &str) -> Vec<ProjectPlaylistAud
                 let Ok(stretch_pitch_cents) = pitch.parse::<i16>() else {
                     continue;
                 };
-                (stretch_to_clip_duration, stretch_pitch_cents)
+                (
+                    PlaylistAudioClipFadeCurve::Linear,
+                    0,
+                    PlaylistAudioClipFadeCurve::Linear,
+                    0,
+                    stretch_to_clip_duration,
+                    stretch_pitch_cents,
+                )
+            }
+            [in_curve, in_tension, out_curve, out_tension, fit, pitch] => {
+                let Some(fade_in_curve) = in_curve
+                    .parse::<u8>()
+                    .ok()
+                    .and_then(PlaylistAudioClipFadeCurve::from_code)
+                else {
+                    continue;
+                };
+                let Ok(fade_in_tension) = in_tension.parse::<i16>() else {
+                    continue;
+                };
+                let Some(fade_out_curve) = out_curve
+                    .parse::<u8>()
+                    .ok()
+                    .and_then(PlaylistAudioClipFadeCurve::from_code)
+                else {
+                    continue;
+                };
+                let Ok(fade_out_tension) = out_tension.parse::<i16>() else {
+                    continue;
+                };
+                let stretch_to_clip_duration = match *fit {
+                    "0" => false,
+                    "1" => true,
+                    _ => continue,
+                };
+                let Ok(stretch_pitch_cents) = pitch.parse::<i16>() else {
+                    continue;
+                };
+                (
+                    fade_in_curve,
+                    fade_in_tension,
+                    fade_out_curve,
+                    fade_out_tension,
+                    stretch_to_clip_duration,
+                    stretch_pitch_cents,
+                )
             }
             _ => continue,
         };
-        if fields.next().is_some() {
-            continue;
-        }
         upsert_playlist_audio_clip_envelope(
             &mut envelopes,
             ProjectPlaylistAudioClipEnvelope {
@@ -58186,6 +58340,10 @@ fn parse_playlist_audio_clip_envelopes(contents: &str) -> Vec<ProjectPlaylistAud
                     gain_centidb,
                     fade_in_ms,
                     fade_out_ms,
+                    fade_in_curve,
+                    fade_in_tension,
+                    fade_out_curve,
+                    fade_out_tension,
                     stretch_to_clip_duration,
                     stretch_pitch_cents,
                 },
@@ -58198,7 +58356,7 @@ fn parse_playlist_audio_clip_envelopes(contents: &str) -> Vec<ProjectPlaylistAud
 fn serialize_playlist_audio_clip_envelopes(
     envelopes: &[ProjectPlaylistAudioClipEnvelope],
 ) -> String {
-    let mut contents = String::from("version=2\n");
+    let mut contents = String::from("version=3\n");
     let mut normalized = Vec::new();
     for entry in envelopes {
         upsert_playlist_audio_clip_envelope(&mut normalized, entry.clone());
@@ -58216,6 +58374,14 @@ fn serialize_playlist_audio_clip_envelopes(
         contents.push_str(&entry.envelope.fade_in_ms.to_string());
         contents.push('\t');
         contents.push_str(&entry.envelope.fade_out_ms.to_string());
+        contents.push('\t');
+        contents.push_str(&entry.envelope.fade_in_curve.code().to_string());
+        contents.push('\t');
+        contents.push_str(&entry.envelope.fade_in_tension.to_string());
+        contents.push('\t');
+        contents.push_str(&entry.envelope.fade_out_curve.code().to_string());
+        contents.push('\t');
+        contents.push_str(&entry.envelope.fade_out_tension.to_string());
         contents.push('\t');
         contents.push_str(if entry.envelope.stretch_to_clip_duration {
             "1"
@@ -61194,12 +61360,20 @@ fn playlist_audio_clip_waveform_gain(
     let fade_in_gain = if fade_in_ms == 0.0 {
         1.0
     } else {
-        (elapsed_ms / fade_in_ms).clamp(0.0, 1.0) as f32
+        playlist_audio_clip_fade_gain(
+            (elapsed_ms / fade_in_ms) as f32,
+            envelope.fade_in_curve,
+            envelope.fade_in_tension,
+        )
     };
     let fade_out_gain = if fade_out_ms == 0.0 {
         1.0
     } else {
-        ((duration_ms - elapsed_ms) / fade_out_ms).clamp(0.0, 1.0) as f32
+        playlist_audio_clip_fade_gain(
+            ((duration_ms - elapsed_ms) / fade_out_ms) as f32,
+            envelope.fade_out_curve,
+            envelope.fade_out_tension,
+        )
     };
     gain * fade_in_gain * fade_out_gain
 }
@@ -66205,6 +66379,10 @@ mod tests {
                 gain_centidb: -1_250,
                 fade_in_ms: 225,
                 fade_out_ms: 480,
+                fade_in_curve: PlaylistAudioClipFadeCurve::Smooth,
+                fade_in_tension: 0,
+                fade_out_curve: PlaylistAudioClipFadeCurve::Single,
+                fade_out_tension: 35,
                 stretch_to_clip_duration: true,
                 stretch_pitch_cents: 350,
             },
@@ -66215,6 +66393,10 @@ mod tests {
                 gain_centidb: 600,
                 fade_in_ms: 0,
                 fade_out_ms: 0,
+                fade_in_curve: PlaylistAudioClipFadeCurve::Linear,
+                fade_in_tension: 0,
+                fade_out_curve: PlaylistAudioClipFadeCurve::Linear,
+                fade_out_tension: 0,
                 stretch_to_clip_duration: false,
                 stretch_pitch_cents: 0,
                 ..entry.envelope
@@ -66251,7 +66433,7 @@ mod tests {
     }
 
     #[test]
-    fn playlist_audio_clip_envelopes_read_legacy_v1_records() {
+    fn playlist_audio_clip_envelopes_read_legacy_v1_and_v2_records() {
         let project_path = encode_midi_device_id("legacy project.flp");
         let legacy = format!("version=1\nenvelope={project_path}\t2\t17\t-250\t120\t240\n");
         assert_eq!(
@@ -66264,8 +66446,34 @@ mod tests {
                     gain_centidb: -250,
                     fade_in_ms: 120,
                     fade_out_ms: 240,
+                    fade_in_curve: PlaylistAudioClipFadeCurve::Linear,
+                    fade_in_tension: 0,
+                    fade_out_curve: PlaylistAudioClipFadeCurve::Linear,
+                    fade_out_tension: 0,
                     stretch_to_clip_duration: false,
                     stretch_pitch_cents: 0,
+                },
+            }]
+        );
+
+        let legacy_v2 =
+            format!("version=2\nenvelope={project_path}\t2\t17\t-250\t120\t240\t1\t75\n");
+        assert_eq!(
+            parse_playlist_audio_clip_envelopes(&legacy_v2),
+            vec![ProjectPlaylistAudioClipEnvelope {
+                project_path: "legacy project.flp".to_owned(),
+                envelope: PlaylistAudioClipEnvelope {
+                    arrangement_id: 2,
+                    clip_id: 17,
+                    gain_centidb: -250,
+                    fade_in_ms: 120,
+                    fade_out_ms: 240,
+                    fade_in_curve: PlaylistAudioClipFadeCurve::Linear,
+                    fade_in_tension: 0,
+                    fade_out_curve: PlaylistAudioClipFadeCurve::Linear,
+                    fade_out_tension: 0,
+                    stretch_to_clip_duration: true,
+                    stretch_pitch_cents: 75,
                 },
             }]
         );
@@ -66285,6 +66493,10 @@ mod tests {
                 gain_centidb: 0,
                 fade_in_ms: 0,
                 fade_out_ms: 0,
+                fade_in_curve: PlaylistAudioClipFadeCurve::Linear,
+                fade_in_tension: 0,
+                fade_out_curve: PlaylistAudioClipFadeCurve::Linear,
+                fade_out_tension: 0,
                 stretch_to_clip_duration: false,
                 stretch_pitch_cents: 0,
             },
@@ -66308,6 +66520,14 @@ mod tests {
             },
             PlaylistAudioClipEnvelope {
                 stretch_pitch_cents: 1_201,
+                ..valid.envelope
+            },
+            PlaylistAudioClipEnvelope {
+                fade_in_tension: 101,
+                ..valid.envelope
+            },
+            PlaylistAudioClipEnvelope {
+                fade_out_tension: -101,
                 ..valid.envelope
             },
         ] {

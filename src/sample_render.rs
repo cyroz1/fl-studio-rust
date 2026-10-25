@@ -535,11 +535,72 @@ pub struct PlaylistAudioClipEnvelope {
     pub gain_centidb: i16,
     pub fade_in_ms: u32,
     pub fade_out_ms: u32,
+    pub fade_in_curve: PlaylistAudioClipFadeCurve,
+    pub fade_in_tension: i16,
+    pub fade_out_curve: PlaylistAudioClipFadeCurve,
+    pub fade_out_tension: i16,
     /// Fit this instance to its visible timeline duration using the Audio Clip channel's shared
     /// stretch mode.
     pub stretch_to_clip_duration: bool,
     /// App-local instance pitch offset in cents, limited to -1200 through +1200.
     pub stretch_pitch_cents: i16,
+}
+
+/// App-local shape for an Audio Clip instance's fade. FLP serialization remains opaque.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlaylistAudioClipFadeCurve {
+    Linear,
+    Smooth,
+    Single,
+}
+
+impl PlaylistAudioClipFadeCurve {
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Linear => 0,
+            Self::Smooth => 1,
+            Self::Single => 2,
+        }
+    }
+
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Linear),
+            1 => Some(Self::Smooth),
+            2 => Some(Self::Single),
+            _ => None,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Linear => "Linear",
+            Self::Smooth => "Smooth (S)",
+            Self::Single => "Single curve",
+        }
+    }
+}
+
+/// Maps a normalized position on one fade to its linear-amplitude gain.
+/// Single-curve tension is an app-local power curve with a neutral value of zero.
+pub fn playlist_audio_clip_fade_gain(
+    progress: f32,
+    curve: PlaylistAudioClipFadeCurve,
+    tension: i16,
+) -> f32 {
+    let progress = if progress.is_finite() {
+        progress.clamp(0.0, 1.0)
+    } else {
+        return 0.0;
+    };
+    match curve {
+        PlaylistAudioClipFadeCurve::Linear => progress,
+        PlaylistAudioClipFadeCurve::Smooth => progress * progress * (3.0 - 2.0 * progress),
+        PlaylistAudioClipFadeCurve::Single => {
+            let exponent = 2.0_f32.powf(f32::from(tension.clamp(-100, 100)) / 50.0);
+            progress.powf(exponent)
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -7777,12 +7838,18 @@ fn prepare_audio_clip_render(
                 gain_centidb: 0,
                 fade_in_ms: 0,
                 fade_out_ms: 0,
+                fade_in_curve: PlaylistAudioClipFadeCurve::Linear,
+                fade_in_tension: 0,
+                fade_out_curve: PlaylistAudioClipFadeCurve::Linear,
+                fade_out_tension: 0,
                 stretch_to_clip_duration: false,
                 stretch_pitch_cents: 0,
             });
         if !(-9_600..=3_600).contains(&clip_envelope.gain_centidb)
             || clip_envelope.fade_in_ms > 600_000
             || clip_envelope.fade_out_ms > 600_000
+            || !(-100..=100).contains(&clip_envelope.fade_in_tension)
+            || !(-100..=100).contains(&clip_envelope.fade_out_tension)
             || !(-1_200..=1_200).contains(&clip_envelope.stretch_pitch_cents)
         {
             return Err(format!(
@@ -7943,6 +8010,10 @@ fn prepare_audio_clip_render(
             envelope_gain,
             fade_in_frames,
             fade_out_frames,
+            fade_in_curve: clip_envelope.fade_in_curve,
+            fade_in_tension: clip_envelope.fade_in_tension,
+            fade_out_curve: clip_envelope.fade_out_curve,
+            fade_out_tension: clip_envelope.fade_out_tension,
             pan: *pan,
             pan_law,
             mixer_transform: mixer_route_plan.output_transform,
@@ -12776,6 +12847,10 @@ struct PreparedClip {
     envelope_gain: f32,
     fade_in_frames: u64,
     fade_out_frames: u64,
+    fade_in_curve: PlaylistAudioClipFadeCurve,
+    fade_in_tension: i16,
+    fade_out_curve: PlaylistAudioClipFadeCurve,
+    fade_out_tension: i16,
     pan: f32,
     pan_law: PanLaw,
     mixer_transform: MixerSourceRouteTransform,
@@ -13896,7 +13971,11 @@ fn playlist_audio_clip_envelope_gain(clip: &PreparedClip, output_offset: u64) ->
     let fade_in_gain = if clip.fade_in_frames == 0 {
         1.0
     } else {
-        (output_offset as f32 / clip.fade_in_frames as f32).clamp(0.0, 1.0)
+        playlist_audio_clip_fade_gain(
+            output_offset as f32 / clip.fade_in_frames as f32,
+            clip.fade_in_curve,
+            clip.fade_in_tension,
+        )
     };
     let fade_out_gain = if clip.fade_out_frames == 0 {
         1.0
@@ -13904,7 +13983,11 @@ fn playlist_audio_clip_envelope_gain(clip: &PreparedClip, output_offset: u64) ->
         let remaining_frames = clip
             .duration_frames
             .saturating_sub(output_offset.saturating_add(1));
-        (remaining_frames as f32 / clip.fade_out_frames as f32).clamp(0.0, 1.0)
+        playlist_audio_clip_fade_gain(
+            remaining_frames as f32 / clip.fade_out_frames as f32,
+            clip.fade_out_curve,
+            clip.fade_out_tension,
+        )
     };
     clip.envelope_gain * fade_in_gain * fade_out_gain
 }
@@ -15316,6 +15399,10 @@ mod tests {
             envelope_gain: 1.0,
             fade_in_frames: 0,
             fade_out_frames: 0,
+            fade_in_curve: PlaylistAudioClipFadeCurve::Linear,
+            fade_in_tension: 0,
+            fade_out_curve: PlaylistAudioClipFadeCurve::Linear,
+            fade_out_tension: 0,
             pan: 0.0,
             pan_law: PanLaw::Circular,
             mixer_transform: saved_transform,
@@ -15407,6 +15494,10 @@ mod tests {
             envelope_gain: 1.0,
             fade_in_frames: 0,
             fade_out_frames: 0,
+            fade_in_curve: PlaylistAudioClipFadeCurve::Linear,
+            fade_in_tension: 0,
+            fade_out_curve: PlaylistAudioClipFadeCurve::Linear,
+            fade_out_tension: 0,
             pan: 0.0,
             pan_law: PanLaw::Triangular,
             mixer_transform: MixerSourceRouteTransform::default(),
@@ -15511,6 +15602,10 @@ mod tests {
             envelope_gain: 1.0,
             fade_in_frames: 0,
             fade_out_frames: 0,
+            fade_in_curve: PlaylistAudioClipFadeCurve::Linear,
+            fade_in_tension: 0,
+            fade_out_curve: PlaylistAudioClipFadeCurve::Linear,
+            fade_out_tension: 0,
             pan: 0.0,
             pan_law: PanLaw::Circular,
             mixer_transform,
@@ -16481,6 +16576,10 @@ mod tests {
                 envelope_gain: 1.0,
                 fade_in_frames: 0,
                 fade_out_frames: 0,
+                fade_in_curve: PlaylistAudioClipFadeCurve::Linear,
+                fade_in_tension: 0,
+                fade_out_curve: PlaylistAudioClipFadeCurve::Linear,
+                fade_out_tension: 0,
                 pan: 0.0,
                 pan_law: PanLaw::Circular,
                 mixer_transform: MixerSourceRouteTransform::from_insert_transform(
@@ -16865,6 +16964,10 @@ mod tests {
                 envelope_gain: 1.0,
                 fade_in_frames: 0,
                 fade_out_frames: 0,
+                fade_in_curve: PlaylistAudioClipFadeCurve::Linear,
+                fade_in_tension: 0,
+                fade_out_curve: PlaylistAudioClipFadeCurve::Linear,
+                fade_out_tension: 0,
                 pan: 0.0,
                 pan_law: PanLaw::Circular,
                 mixer_transform: transform,
@@ -16945,6 +17048,10 @@ mod tests {
             envelope_gain: 1.0,
             fade_in_frames: 0,
             fade_out_frames: 0,
+            fade_in_curve: PlaylistAudioClipFadeCurve::Linear,
+            fade_in_tension: 0,
+            fade_out_curve: PlaylistAudioClipFadeCurve::Linear,
+            fade_out_tension: 0,
             pan: 0.0,
             pan_law: PanLaw::Circular,
             mixer_transform: MixerSourceRouteTransform::default(),
@@ -16992,6 +17099,10 @@ mod tests {
             envelope_gain: 0.5,
             fade_in_frames: 2,
             fade_out_frames: 2,
+            fade_in_curve: PlaylistAudioClipFadeCurve::Linear,
+            fade_in_tension: 0,
+            fade_out_curve: PlaylistAudioClipFadeCurve::Linear,
+            fade_out_tension: 0,
             pan: 0.0,
             pan_law: PanLaw::Circular,
             mixer_transform: MixerSourceRouteTransform::default(),
@@ -17009,6 +17120,36 @@ mod tests {
             assert!((mix[frame * 2] - expected_gain * center_gain).abs() < 1.0e-6);
             assert!((mix[frame * 2 + 1] - expected_gain * center_gain).abs() < 1.0e-6);
         }
+    }
+
+    #[test]
+    fn playlist_audio_clip_fade_shapes_follow_the_selected_curve_and_tension() {
+        assert_eq!(
+            playlist_audio_clip_fade_gain(0.25, PlaylistAudioClipFadeCurve::Linear, 0),
+            0.25
+        );
+        assert_eq!(
+            playlist_audio_clip_fade_gain(0.25, PlaylistAudioClipFadeCurve::Smooth, 0),
+            0.15625
+        );
+        assert_eq!(
+            playlist_audio_clip_fade_gain(0.5, PlaylistAudioClipFadeCurve::Single, 50),
+            0.25
+        );
+        assert!(
+            (playlist_audio_clip_fade_gain(0.5, PlaylistAudioClipFadeCurve::Single, -50)
+                - std::f32::consts::FRAC_1_SQRT_2)
+                .abs()
+                < 1.0e-6
+        );
+        assert_eq!(
+            playlist_audio_clip_fade_gain(2.0, PlaylistAudioClipFadeCurve::Linear, 0),
+            1.0
+        );
+        assert_eq!(
+            playlist_audio_clip_fade_gain(f32::NAN, PlaylistAudioClipFadeCurve::Linear, 0),
+            0.0
+        );
     }
 
     #[test]
@@ -17043,6 +17184,10 @@ mod tests {
             envelope_gain: 1.0,
             fade_in_frames: 0,
             fade_out_frames: 0,
+            fade_in_curve: PlaylistAudioClipFadeCurve::Linear,
+            fade_in_tension: 0,
+            fade_out_curve: PlaylistAudioClipFadeCurve::Linear,
+            fade_out_tension: 0,
             pan: 0.0,
             pan_law: PanLaw::Circular,
             mixer_transform: MixerSourceRouteTransform::default(),
@@ -17484,6 +17629,10 @@ mod tests {
             envelope_gain: 1.0,
             fade_in_frames: 0,
             fade_out_frames: 0,
+            fade_in_curve: PlaylistAudioClipFadeCurve::Linear,
+            fade_in_tension: 0,
+            fade_out_curve: PlaylistAudioClipFadeCurve::Linear,
+            fade_out_tension: 0,
             pan: 0.0,
             pan_law: PanLaw::Circular,
             mixer_transform: MixerSourceRouteTransform::from_insert_transform(
@@ -17526,6 +17675,10 @@ mod tests {
             envelope_gain: 1.0,
             fade_in_frames: 0,
             fade_out_frames: 0,
+            fade_in_curve: PlaylistAudioClipFadeCurve::Linear,
+            fade_in_tension: 0,
+            fade_out_curve: PlaylistAudioClipFadeCurve::Linear,
+            fade_out_tension: 0,
             pan: 0.5,
             pan_law: PanLaw::Circular,
             mixer_transform: MixerSourceRouteTransform::default(),
