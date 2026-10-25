@@ -34097,6 +34097,25 @@ impl DawUi {
                 ui.checkbox(&mut self.strum_trigger_ahead, "Trigger ahead");
                 ui.checkbox(&mut self.strum_alternate_direction, "Alternate direction");
                 ui.checkbox(&mut self.strum_chop_chords, "Chop chords");
+                ui.menu_button("Strum options", |ui| {
+                    if ui.button("Reset").clicked() {
+                        let defaults = StrumOptions::default();
+                        self.strum_spread_ticks = defaults.spread_ticks;
+                        self.strum_descending = defaults.descending;
+                        self.strum_preserve_end = defaults.preserve_end;
+                        self.strum_trigger_ahead = defaults.trigger_ahead;
+                        self.strum_alternate_direction = defaults.alternate_direction;
+                        self.strum_chop_chords = defaults.chop_chords;
+                        self.strum_start_tension_percent = defaults.start_tension_percent;
+                        self.strum_end_time_ticks = defaults.end_time_ticks;
+                        self.strum_end_tension_percent = defaults.end_tension_percent;
+                        self.strum_velocity_amount = defaults.velocity_amount;
+                        self.strum_velocity_tension_percent = defaults.velocity_tension_percent;
+                        ui.close();
+                    }
+                })
+                .response
+                .on_hover_text("Restore all Strum options to their defaults.");
                 egui::ComboBox::from_id_salt("piano-roll-strum-direction")
                     .selected_text(if self.strum_descending {
                         "Strum: Down"
