@@ -234,11 +234,13 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
 
-          source = Path("Packager.toml").read_text(encoding="utf-8")
+          bridge_config = Path("Packager.bridge.toml")
+          source_path = bridge_config if bridge_config.is_file() else Path("Packager.toml")
+          source = source_path.read_text(encoding="utf-8")
           old = 'formats = ["default"]'
           new = 'formats = ["appimage"]'
           if source.count(old) != 1:
-              raise SystemExit("Packager.toml must have one default formats setting")
+              raise SystemExit(f"{source_path} must have one default formats setting")
           Path("Packager.linux-appimage.toml").write_text(
               source.replace(old, new), encoding="utf-8"
           )
@@ -353,33 +355,105 @@ jobs:
           rpm --root "$package_root/rpm" --nodeps --noscripts --notriggers -i "$rpm_package"
           tar --zstd -xf "${arch_packages[0]}" -C "$package_root/arch"
 
-          python3 - "$LINUX_ELF_MACHINE" \
-            "$package_root/deb/usr/bin/fl-studio-rebuild" \
-            "$package_root/rpm/usr/bin/fl-studio-rebuild" \
-            "$package_root/arch/usr/bin/fl-studio-rebuild" <<'PY'
+          arch_check_args=(
+            "$LINUX_ELF_MACHINE"
+            "$TARGET_PLATFORM"
+            "$package_root/deb/usr/bin/fl-studio-rebuild"
+            "$package_root/rpm/usr/bin/fl-studio-rebuild"
+            "$package_root/arch/usr/bin/fl-studio-rebuild"
+          )
+          if [[ "$TARGET_PLATFORM" == "linux-x64" ]]; then
+            arch_check_args+=(
+              "$package_root/deb/usr/bin/vst3-host-helper-x86"
+              "$package_root/rpm/usr/bin/vst3-host-helper-x86"
+              "$package_root/arch/usr/bin/vst3-host-helper-x86"
+            )
+          fi
+
+          python3 - "${arch_check_args[@]}" <<'PY'
           import struct
           import sys
           from pathlib import Path
 
           expected_machine = int(sys.argv[1])
-          for executable in map(Path, sys.argv[2:]):
+          target_platform = sys.argv[2]
+
+          def elf_machine(executable: Path) -> tuple[int, int]:
               header = executable.read_bytes()[:64]
               if len(header) < 20 or header[:4] != b"\x7fELF":
                   raise SystemExit(f"{executable} is not an ELF executable")
-              if header[4] != 2:
-                  raise SystemExit(f"{executable} is not a 64-bit ELF executable")
+              elf_class = header[4]
               byte_order = {1: "<", 2: ">"}.get(header[5])
               if byte_order is None:
                   raise SystemExit(f"{executable} has an unknown ELF byte order")
               actual_machine = struct.unpack_from(f"{byte_order}H", header, 18)[0]
+              return elf_class, actual_machine
+
+          for executable in map(Path, sys.argv[3:6]):
+              elf_class, actual_machine = elf_machine(executable)
+              if elf_class != 2:
+                  raise SystemExit(f"{executable} is not a 64-bit ELF executable")
               if actual_machine != expected_machine:
                   raise SystemExit(
                       f"{executable} ELF machine is {actual_machine}; "
                       f"expected {expected_machine}"
                   )
               print(f"Verified {executable} ELF machine {actual_machine}.")
+
+          if target_platform == "linux-x64":
+              helpers = list(map(Path, sys.argv[6:]))
+              if len(helpers) != 3:
+                  raise SystemExit("Expected x86 VST3 helpers in Debian, RPM, and Arch packages")
+              for helper in helpers:
+                  elf_class, actual_machine = elf_machine(helper)
+                  if elf_class != 1 or actual_machine != 3:
+                      raise SystemExit(
+                          f"{helper} is not a 32-bit x86 ELF executable "
+                          f"(class={elf_class}, machine={actual_machine})"
+                      )
+                  print(f"Verified {helper} is 32-bit x86.")
           PY
           echo "Verified Debian, RPM, Arch package metadata and payload architectures for $(uname -m)."
+
+      - name: Verify Linux x64 AppImage includes its x86 VST3 helper
+        if: matrix.platform == 'linux-x64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          appimages=(dist/*.AppImage)
+          if (( ${#appimages[@]} != 1 )); then
+            echo "::error::Expected exactly one Linux x64 AppImage; found ${#appimages[@]}."
+            exit 1
+          fi
+          appimage_path="$PWD/${appimages[0]}"
+          appimage_dir="$RUNNER_TEMP/linux-x64-appimage"
+          mkdir -p "$appimage_dir"
+          (
+            cd "$appimage_dir"
+            "$appimage_path" --appimage-extract >/dev/null
+          )
+          helper="$appimage_dir/squashfs-root/usr/bin/vst3-host-helper-x86"
+          if [[ ! -x "$helper" ]]; then
+            echo "::error::Linux x64 AppImage does not contain an executable x86 VST3 helper at usr/bin/vst3-host-helper-x86."
+            exit 1
+          fi
+          python3 - "$helper" <<'PY'
+          import struct
+          import sys
+          from pathlib import Path
+
+          executable = Path(sys.argv[1])
+          header = executable.read_bytes()[:64]
+          if len(header) < 20 or header[:6] != b"\x7fELF\x01\x01":
+              raise SystemExit(f"{executable} is not a little-endian 32-bit ELF executable")
+          machine = struct.unpack_from("<H", header, 18)[0]
+          if machine != 3:
+              raise SystemExit(f"{executable} ELF machine is {machine}; expected 3 (x86)")
+          print(f"Verified {executable} is a 32-bit x86 ELF executable.")
+          PY
+          timeout 10 "$helper" </dev/null
+          rm -rf "$appimage_dir"
 
       - name: Install Linux Debian package
         if: runner.os == 'Linux'
