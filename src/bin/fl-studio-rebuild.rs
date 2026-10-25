@@ -46636,6 +46636,24 @@ impl DawUi {
                 playlist_pattern_recording_offset(playhead_tick, pattern_id, &arrangement.clips)
             })
             .unwrap_or(0);
+        let playlist_pattern_sources = song_timeline_start
+            .as_ref()
+            .and(playback_arrangement)
+            .and_then(|arrangement| {
+                let pattern = patterns.iter().find(|pattern| pattern.id == pattern_id)?;
+                let loop_length = pattern_lfo_loop_length_ticks(
+                    pattern,
+                    document.header().ppq(),
+                    document.metadata().time_signature().unwrap_or((4, 4)),
+                );
+                let loop_length = u32::try_from(loop_length).ok()?;
+                (loop_length > 0).then(|| {
+                    (
+                        loop_length,
+                        playlist_pattern_recording_source_clips(pattern_id, &arrangement.clips),
+                    )
+                })
+            });
         let playlist_recording_target = if record_notes {
             song_timeline_start
                 .as_ref()
@@ -46696,6 +46714,13 @@ impl DawUi {
             recording_started_at,
         ) {
             Ok(mut recorder) => {
+                if let Some((loop_length, clips)) = &playlist_pattern_sources
+                    && let Err(error) =
+                        recorder.set_playlist_pattern_clip_sources(*loop_length, clips)
+                {
+                    self.status = format!("Could not prepare Playlist MIDI recording: {error}");
+                    return;
+                }
                 recorder.set_channel_state(self.midi_input_channel_state);
                 recorder.set_pedal_state(
                     std::array::from_fn(|channel| {
@@ -63896,6 +63921,26 @@ fn playlist_pattern_recording_offset(
         .map(|(_, local_tick)| local_tick)
 }
 
+fn playlist_pattern_recording_source_clips(
+    pattern_id: u16,
+    clips: &[PlaylistClip],
+) -> Vec<(u32, u32)> {
+    clips
+        .iter()
+        .filter(|clip| {
+            clip.track_index.is_some()
+                && clip.length_ticks > 0
+                && clip.position_ticks.checked_add(clip.length_ticks).is_some()
+                && clip.uses_full_source_window()
+                && clip
+                    .scale
+                    .is_none_or(|scale| scale.is_finite() && (scale - 1.0).abs() <= 1e-9)
+                && matches!(clip.target(), PlaylistClipTarget::Pattern { id } if id == pattern_id)
+        })
+        .map(|clip| (clip.position_ticks, clip.length_ticks))
+        .collect()
+}
+
 fn playlist_pattern_recording_clip(
     playhead_tick: f64,
     pattern_id: u16,
@@ -64160,10 +64205,10 @@ mod tests {
         playlist_clip_local_recording_offset, playlist_clip_split_position,
         playlist_group_parent_ids, playlist_measure_boundaries,
         playlist_pattern_clip_join_candidates, playlist_pattern_clip_split_supported,
-        playlist_pattern_recording_placement_tick, playlist_seek_tick_to_frame,
-        playlist_signature_at_tick, playlist_song_length_bst_components,
-        playlist_song_position_bst_components, playlist_song_position_label,
-        playlist_track_group_range, playlist_track_is_hidden,
+        playlist_pattern_recording_placement_tick, playlist_pattern_recording_source_clips,
+        playlist_seek_tick_to_frame, playlist_signature_at_tick,
+        playlist_song_length_bst_components, playlist_song_position_bst_components,
+        playlist_song_position_label, playlist_track_group_range, playlist_track_is_hidden,
         playlist_vst3_parameter_link_for_target, random_pattern_color, recolor_piano_roll_notes,
         record_pattern_controller_points, recording_input_targets,
         remove_midi_vst3_parameter_mapping, remove_pattern_vst3_parameter_link,
@@ -67119,6 +67164,25 @@ mod tests {
             playlist_clip_local_recording_offset(f64::NAN, 100, 200),
             None
         );
+    }
+
+    #[test]
+    fn playlist_midi_recording_maps_only_full_source_clips_of_the_selected_pattern() {
+        let arrangement = playlist_pattern_ghost_arrangement_fixture(&[
+            (96, 192, 7, 0),
+            (384, 192, 7, 1),
+            (600, 192, 8, 2),
+        ]);
+        assert_eq!(
+            playlist_pattern_recording_source_clips(7, &arrangement.clips),
+            [(96, 192), (384, 192)]
+        );
+
+        let mut clips = arrangement.clips;
+        clips[0].scale = Some(0.5);
+        clips[1].record_size = 88;
+        clips[1].source_window_ticks = Some((24, 192));
+        assert!(playlist_pattern_recording_source_clips(7, &clips).is_empty());
     }
 
     #[test]

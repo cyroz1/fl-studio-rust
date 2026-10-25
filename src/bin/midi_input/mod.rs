@@ -1433,6 +1433,7 @@ pub struct MidiPatternRecorderSettings {
 
 struct ActiveMidiNote {
     start_tick: u32,
+    timeline_start_tick: u32,
     velocity: u8,
     pan: u8,
     mod_x: u8,
@@ -1458,6 +1459,7 @@ pub struct MidiPatternRecorder {
     snap_ticks: Option<u32>,
     timing_offset_ms: i16,
     song_timeline_start: Option<(PlaylistTempoMap, f64)>,
+    playlist_pattern_clip_sources: Option<(u32, Vec<(u32, u32)>)>,
     song_start_frame_micros: Option<u64>,
     started_at: Instant,
     timestamp_origin_micros: Option<u64>,
@@ -1470,6 +1472,12 @@ pub struct MidiPatternRecorder {
     started_note_count: usize,
     last_position_tick: u32,
     overflowed: bool,
+}
+
+#[derive(Clone, Copy)]
+struct MidiRecordingPosition {
+    pattern_tick: u32,
+    timeline_tick: u32,
 }
 
 impl MidiPatternRecorder {
@@ -1520,6 +1528,7 @@ impl MidiPatternRecorder {
             snap_ticks,
             timing_offset_ms,
             song_timeline_start,
+            playlist_pattern_clip_sources: None,
             song_start_frame_micros,
             started_at,
             timestamp_origin_micros: None,
@@ -1556,18 +1565,65 @@ impl MidiPatternRecorder {
         self.sostenuto_channels = sostenuto_channels;
     }
 
+    /// Map positions inside matching Playlist Pattern Clips back into the Pattern's source loop.
+    /// Each pair is a full-source, default-scale clip's (position, length) in song ticks.
+    pub fn set_playlist_pattern_clip_sources(
+        &mut self,
+        pattern_loop_length_ticks: u32,
+        clips: &[(u32, u32)],
+    ) -> Result<(), &'static str> {
+        if pattern_loop_length_ticks == 0 {
+            return Err("Playlist Pattern recording requires a non-zero Pattern loop length");
+        }
+        if clips
+            .iter()
+            .any(|(position, length)| *length == 0 || position.checked_add(*length).is_none())
+        {
+            return Err("Playlist Pattern recording clips must have valid non-zero ranges");
+        }
+        self.playlist_pattern_clip_sources =
+            (!clips.is_empty()).then(|| (pattern_loop_length_ticks, clips.to_vec()));
+        Ok(())
+    }
+
     /// Returns the Pattern-relative position for a received MIDI message using the same
     /// timestamp origin, tempo map, and input offset as recorded notes.
     pub fn position_for_message(&mut self, message: &ReceivedMidiMessage) -> Option<u32> {
+        self.position_for_message_with_timeline(message)
+            .map(|position| position.pattern_tick)
+    }
+
+    fn position_for_message_with_timeline(
+        &mut self,
+        message: &ReceivedMidiMessage,
+    ) -> Option<MidiRecordingPosition> {
         if message.received_at < self.started_at {
             return None;
         }
-        let tick = self
-            .tick_for_message(message.timestamp_micros, message.received_at)
+        let elapsed_tick = self.tick_for_message(message.timestamp_micros, message.received_at);
+        let timeline_tick = elapsed_tick
             .saturating_add(self.start_tick)
             .min(MAX_NOTE_TICK);
-        self.last_position_tick = self.last_position_tick.max(tick);
-        Some(tick)
+        self.last_position_tick = self.last_position_tick.max(timeline_tick);
+        let pattern_tick = self
+            .song_timeline_start
+            .as_ref()
+            .and_then(|(_, song_start_tick)| {
+                self.playlist_pattern_clip_sources.as_ref().and_then(
+                    |(pattern_loop_length_ticks, clips)| {
+                        playlist_pattern_recording_source_tick(
+                            *song_start_tick + f64::from(elapsed_tick),
+                            *pattern_loop_length_ticks,
+                            clips,
+                        )
+                    },
+                )
+            })
+            .unwrap_or(timeline_tick);
+        Some(MidiRecordingPosition {
+            pattern_tick,
+            timeline_tick,
+        })
     }
 
     pub fn record(&mut self, message: ReceivedMidiMessage) {
@@ -1588,9 +1644,10 @@ impl MidiPatternRecorder {
             }
             _ => {}
         }
-        let Some(tick) = self.position_for_message(&message) else {
+        let Some(position) = self.position_for_message_with_timeline(&message) else {
             return;
         };
+        let tick = position.pattern_tick;
         match message.event {
             MidiInputEvent::NoteOn {
                 channel,
@@ -1612,6 +1669,7 @@ impl MidiPatternRecorder {
                     .or_default()
                     .push_back(ActiveMidiNote {
                         start_tick: tick,
+                        timeline_start_tick: position.timeline_tick,
                         velocity: fixed_velocity.unwrap_or(velocity).min(127),
                         pan: channel_state.raw_pan(),
                         mod_x: channel_state.note_mod_x(),
@@ -1639,7 +1697,7 @@ impl MidiPatternRecorder {
                 if let Some(active_note) = ended_note {
                     self.finish_or_sustain_note(
                         active_note,
-                        tick,
+                        position.timeline_tick,
                         channel,
                         key,
                         Some(release_velocity),
@@ -1657,7 +1715,7 @@ impl MidiPatternRecorder {
                 let was_enabled = *sustain;
                 *sustain = value >= 64;
                 if was_enabled && !*sustain {
-                    self.finish_unheld_sustained_notes(channel, tick);
+                    self.finish_unheld_sustained_notes(channel, position.timeline_tick);
                 }
             }
             MidiInputEvent::ControlChange {
@@ -1691,14 +1749,14 @@ impl MidiPatternRecorder {
                             note.sostenuto_held = false;
                         }
                     }
-                    self.finish_unheld_sustained_notes(channel, tick);
+                    self.finish_unheld_sustained_notes(channel, position.timeline_tick);
                 }
             }
             MidiInputEvent::ControlChange {
                 channel,
                 controller: 120,
                 ..
-            } => self.stop_channel_notes(channel, tick),
+            } => self.stop_channel_notes(channel, position.timeline_tick),
             MidiInputEvent::ControlChange {
                 channel,
                 controller: 121,
@@ -1717,13 +1775,13 @@ impl MidiPatternRecorder {
                         }
                     }
                 }
-                self.finish_sustained_notes(channel, tick);
+                self.finish_sustained_notes(channel, position.timeline_tick);
             }
             MidiInputEvent::ControlChange {
                 channel,
                 controller: 123..=127,
                 ..
-            } => self.release_channel_notes(channel, tick),
+            } => self.release_channel_notes(channel, position.timeline_tick),
             _ => {}
         }
     }
@@ -1945,7 +2003,9 @@ impl MidiPatternRecorder {
         release_velocity: Option<u8>,
     ) -> PatternNote {
         let position = quantize_recording_tick(active_note.start_tick, self.snap_ticks);
-        let end_tick = quantize_recording_tick(end_tick, self.snap_ticks);
+        let duration_ticks = end_tick.saturating_sub(active_note.timeline_start_tick);
+        let unwrapped_end_tick = active_note.start_tick.saturating_add(duration_ticks);
+        let end_tick = quantize_recording_tick(unwrapped_end_tick, self.snap_ticks);
         let mut note = PatternNote {
             position,
             channel_id: self.channel_id,
@@ -1964,6 +2024,26 @@ impl MidiPatternRecorder {
         }
         note
     }
+}
+
+fn playlist_pattern_recording_source_tick(
+    song_tick: f64,
+    pattern_loop_length_ticks: u32,
+    clips: &[(u32, u32)],
+) -> Option<u32> {
+    if !song_tick.is_finite() || song_tick < 0.0 || pattern_loop_length_ticks == 0 {
+        return None;
+    }
+    let (clip_position, _) = clips
+        .iter()
+        .filter_map(|(position, length)| {
+            let end = position.checked_add(*length)?;
+            (song_tick >= f64::from(*position) && song_tick < f64::from(end))
+                .then_some((*position, *length))
+        })
+        .max_by_key(|(position, _)| *position)?;
+    let elapsed_ticks = (song_tick - f64::from(clip_position)).round().max(0.0) as u64;
+    Some((elapsed_ticks % u64::from(pattern_loop_length_ticks)) as u32)
 }
 
 fn quantize_recording_tick(tick: u32, snap_ticks: Option<u32>) -> u32 {
@@ -3348,6 +3428,68 @@ mod tests {
         assert_eq!(result.notes.len(), 1);
         assert_eq!(result.notes[0].position, 72);
         assert_eq!(result.notes[0].length, 48);
+    }
+
+    #[test]
+    fn maps_recorded_notes_into_repeated_playlist_pattern_sources() {
+        let started_at = Instant::now();
+        let mut recorder = MidiPatternRecorder::new(
+            MidiPatternRecorderSettings {
+                pattern_id: 1,
+                channel_id: 2,
+                project_path: None,
+                ppq: 96,
+                tempo_bpm: 120.0,
+                start_tick: 0,
+                snap_ticks: None,
+                timing_offset_ms: 0,
+                song_timeline_start: Some((
+                    PlaylistTempoMap::constant(96, 120.0).expect("valid constant tempo"),
+                    96.0,
+                )),
+            },
+            started_at,
+        )
+        .expect("valid Playlist timing should create a recorder");
+        recorder
+            .set_playlist_pattern_clip_sources(96, &[(96, 192), (384, 192)])
+            .expect("full-source repeated clips should map into the Pattern loop");
+
+        let timestamp_origin = 1_000_000_u64 - 468_750;
+        for (key, start_elapsed_ticks) in [(60, 90_u64), (62, 378_u64)] {
+            let start_micros = timestamp_origin + start_elapsed_ticks * 1_000_000 / 192;
+            let end_micros = start_micros + 20 * 1_000_000 / 192;
+            recorder.record(ReceivedMidiMessage {
+                timestamp_micros: start_micros,
+                received_at: started_at
+                    + Duration::from_micros(start_elapsed_ticks * 1_000_000 / 192),
+                event: MidiInputEvent::NoteOn {
+                    channel: 0,
+                    key,
+                    velocity: 90,
+                },
+            });
+            recorder.record(ReceivedMidiMessage {
+                timestamp_micros: end_micros,
+                received_at: started_at
+                    + Duration::from_micros((start_elapsed_ticks + 20) * 1_000_000 / 192),
+                event: MidiInputEvent::NoteOff {
+                    channel: 0,
+                    key,
+                    velocity: 0,
+                },
+            });
+        }
+
+        let result = recorder.finish(None, started_at + Duration::from_secs(3));
+        assert_eq!(
+            result
+                .notes
+                .iter()
+                .map(|note| (note.key, note.position, note.length))
+                .collect::<Vec<_>>(),
+            [(60, 90, 20), (62, 90, 20)]
+        );
     }
 
     #[test]
