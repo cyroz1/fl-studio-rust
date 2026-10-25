@@ -7712,6 +7712,9 @@ impl DawUi {
                     self.clear_untitled_autosave();
                 }
                 self.current_path = Some(target_path.to_path_buf());
+                let (armed_tracks, input_pairs) = load_audio_recording_track_settings(target_path);
+                self.armed_audio_recording_tracks = armed_tracks;
+                self.audio_recording_track_input_pairs = input_pairs;
                 self.new_project_template_path = None;
                 self.package_workspace = package_workspace;
                 self.document = Some(document);
@@ -8763,6 +8766,17 @@ impl DawUi {
         } else {
             self.save_as();
         }
+    }
+
+    fn persist_audio_recording_track_settings(&self) -> Result<(), String> {
+        let Some(project_path) = self.current_path.as_deref() else {
+            return Ok(());
+        };
+        save_audio_recording_track_settings(
+            project_path,
+            &self.armed_audio_recording_tracks,
+            &self.audio_recording_track_input_pairs,
+        )
     }
 
     fn save_as(&mut self) {
@@ -10778,6 +10792,11 @@ impl DawUi {
                 let saved_hash = hasher.finish();
                 self.clear_untitled_autosave();
                 self.current_path = Some(path.to_path_buf());
+                if let Err(error) = self.persist_audio_recording_track_settings() {
+                    self.status.push_str(&format!(
+                        " · audio recording track settings could not be saved: {error}"
+                    ));
+                }
                 self.new_project_template_path = None;
                 if let Some(workspace) = package_workspace_after_save {
                     self.package_workspace = Some(workspace);
@@ -20604,6 +20623,11 @@ impl DawUi {
                                     self.armed_audio_recording_tracks.remove(&arrangement.id);
                                     self.status = "Disarmed Playlist audio recording track".to_owned();
                                 }
+                                if let Err(error) = self.persist_audio_recording_track_settings() {
+                                    self.status.push_str(&format!(
+                                        " · track settings could not be saved: {error}"
+                                    ));
+                                }
                             }
                             let input_pair_count = self
                                 .audio_catalog
@@ -20676,6 +20700,11 @@ impl DawUi {
                                         .saturating_mul(2)
                                         .saturating_add(2)
                                 );
+                                if let Err(error) = self.persist_audio_recording_track_settings() {
+                                    self.status.push_str(&format!(
+                                        " · track settings could not be saved: {error}"
+                                    ));
+                                }
                             }
                             ui.label(
                                 egui::RichText::new(
@@ -61370,6 +61399,85 @@ fn audio_recording_offset_settings_file() -> Option<PathBuf> {
     browser_favorites_file()?
         .parent()
         .map(|directory| directory.join("audio-recording-offset-ms.txt"))
+}
+
+fn audio_recording_track_settings_file(project_path: &Path) -> Option<PathBuf> {
+    browser_favorites_file()?.parent().map(|directory| {
+        directory
+            .join("audio-recording-track-settings")
+            .join(format!("{}.txt", stable_project_id(project_path)))
+    })
+}
+
+fn load_audio_recording_track_settings(
+    project_path: &Path,
+) -> (BTreeMap<u16, u32>, BTreeMap<(u16, u32), u16>) {
+    let (mut armed_tracks, mut input_pairs) = (BTreeMap::new(), BTreeMap::new());
+    let Some(contents) = audio_recording_track_settings_file(project_path)
+        .and_then(|path| fs::read_to_string(path).ok())
+    else {
+        return (armed_tracks, input_pairs);
+    };
+    let mut lines = contents.lines();
+    if lines.next() != Some("audio-recording-track-settings-v1") {
+        return (armed_tracks, input_pairs);
+    }
+    for line in lines {
+        let mut fields = line.split('\t');
+        match fields.next() {
+            Some("arm") => {
+                let arrangement_id = fields.next().and_then(|value| value.parse::<u16>().ok());
+                let track_id = fields.next().and_then(|value| value.parse::<u32>().ok());
+                if let (Some(arrangement_id), Some(track_id), None) =
+                    (arrangement_id, track_id, fields.next())
+                {
+                    armed_tracks.insert(arrangement_id, track_id);
+                }
+            }
+            Some("input") => {
+                let arrangement_id = fields.next().and_then(|value| value.parse::<u16>().ok());
+                let track_id = fields.next().and_then(|value| value.parse::<u32>().ok());
+                let pair = fields.next().and_then(|value| value.parse::<u16>().ok());
+                if let (Some(arrangement_id), Some(track_id), Some(pair), None) =
+                    (arrangement_id, track_id, pair, fields.next())
+                {
+                    input_pairs.insert((arrangement_id, track_id), pair);
+                }
+            }
+            _ => {}
+        }
+    }
+    (armed_tracks, input_pairs)
+}
+
+fn save_audio_recording_track_settings(
+    project_path: &Path,
+    armed_tracks: &BTreeMap<u16, u32>,
+    input_pairs: &BTreeMap<(u16, u32), u16>,
+) -> Result<(), String> {
+    let path = audio_recording_track_settings_file(project_path)
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the audio recording track settings path has no parent folder".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    let mut lines = vec!["audio-recording-track-settings-v1".to_owned()];
+    lines.extend(
+        armed_tracks
+            .iter()
+            .map(|(arrangement_id, track_id)| format!("arm\t{arrangement_id}\t{track_id}")),
+    );
+    lines.extend(
+        input_pairs
+            .iter()
+            .map(|((arrangement_id, track_id), pair)| {
+                format!("input\t{arrangement_id}\t{track_id}\t{pair}")
+            }),
+    );
+    let contents = format!("{}\n", lines.join("\n"));
+    write_file_atomically(&path, contents.as_bytes())
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
 }
 
 fn live_resampling_quality_settings_file() -> Option<PathBuf> {
