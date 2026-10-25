@@ -4865,6 +4865,7 @@ struct DawUi {
     audio_recording: Option<AudioRecordingSession>,
     audio_monitor_session: Option<AudioInputMonitorSession>,
     audio_recording_offset_ms: i16,
+    audio_recording_auto_latency_compensation: bool,
     audio_recording_mixer_track: i8,
     audio_recording_post_effects: bool,
     record_audio_enabled: bool,
@@ -6086,6 +6087,8 @@ impl DawUi {
         let window_layout_presets = load_window_layout_presets();
         let read_sample_root_note = load_read_sample_root_note();
         let audio_recording_offset_ms = load_audio_recording_offset_ms();
+        let audio_recording_auto_latency_compensation =
+            load_audio_recording_auto_latency_compensation();
         let midi_recording_offset_ms = load_midi_recording_offset_ms();
         let piano_roll_nudge_notes_with_mouse_wheel =
             load_piano_roll_nudge_notes_with_mouse_wheel();
@@ -6431,6 +6434,7 @@ impl DawUi {
             audio_recording: None,
             audio_monitor_session: None,
             audio_recording_offset_ms,
+            audio_recording_auto_latency_compensation,
             audio_recording_mixer_track: 0,
             audio_recording_post_effects: false,
             record_audio_enabled,
@@ -51546,6 +51550,20 @@ impl DawUi {
             }
         }
 
+        let automatic_input_latency_ms = if self.audio_recording_auto_latency_compensation {
+            self.audio_engine
+                .as_ref()
+                .and_then(|engine| {
+                    engine.wait_for_input_latency_estimate(Duration::from_millis(250))
+                })
+                .map(|latency_ms| latency_ms.round() as i16)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let recording_offset_ms = self
+            .audio_recording_offset_ms
+            .saturating_add(automatic_input_latency_ms);
         let start_tick = self
             .current_playhead_tick()
             .unwrap_or(0.0)
@@ -51625,13 +51643,16 @@ impl DawUi {
             playlist_track_id,
             restore_input_channel_pair: previous_input_channel_pair,
             post_effect_capture,
-            recording_offset_ms: self.audio_recording_offset_ms,
+            recording_offset_ms,
             mixer_track: recording_mixer_track,
             tempo_map,
             project_generation,
             capture_active: true,
         });
-        self.status = format!("Recording audio to {}", output_path.display());
+        self.status = format!(
+            "Recording audio to {} · Playlist placement correction {recording_offset_ms:+} ms",
+            output_path.display()
+        );
         if self.view != MainView::Audio {
             self.audio_settings_previous_view = Some(self.view);
         }
@@ -53033,6 +53054,33 @@ impl DawUi {
                 .color(MUTED),
             );
         }
+        let auto_latency_compensation_changed = ui
+            .add_enabled_ui(self.audio_recording.is_none(), |ui| {
+                ui.checkbox(
+                    &mut self.audio_recording_auto_latency_compensation,
+                    "Automatically compensate measured input latency",
+                )
+            })
+            .inner
+            .changed();
+        if auto_latency_compensation_changed
+            && let Err(error) = save_audio_recording_auto_latency_compensation(
+                self.audio_recording_auto_latency_compensation,
+            )
+        {
+            self.status = format!("Could not save automatic input latency setting: {error}");
+        }
+        let measured_input_latency_ms = self
+            .audio_engine
+            .as_ref()
+            .and_then(AudioEngine::estimated_input_latency_ms);
+        ui.label(
+            egui::RichText::new(measured_input_latency_ms.map_or_else(
+                || "Input callback latency: waiting for timing samples".to_owned(),
+                |latency_ms| format!("Measured input callback latency: {latency_ms:.1} ms"),
+            ))
+            .color(MUTED),
+        );
         let audio_recording_offset_changed = ui
             .add_enabled_ui(self.audio_recording.is_none(), |ui| {
                 ui.add(
@@ -53040,7 +53088,7 @@ impl DawUi {
                         &mut self.audio_recording_offset_ms,
                         AUDIO_RECORDING_OFFSET_MIN_MS..=AUDIO_RECORDING_OFFSET_MAX_MS,
                     )
-                    .text("Input latency compensation")
+                    .text("Manual input-latency adjustment")
                     .suffix(" ms"),
                 )
             })
@@ -53053,7 +53101,7 @@ impl DawUi {
         }
         ui.label(
             egui::RichText::new(
-                "Positive values move recorded clips earlier; negative values move them later. This manual offset affects Playlist placement, not the WAV capture.",
+                "Automatic compensation uses the active input backend's capture timing. The manual adjustment is added to it; positive totals move the clip earlier, and negative totals move it later. Neither changes the WAV capture.",
             )
             .color(MUTED),
         );
@@ -61381,6 +61429,12 @@ fn audio_recording_offset_settings_file() -> Option<PathBuf> {
         .map(|directory| directory.join("audio-recording-offset-ms.txt"))
 }
 
+fn audio_recording_auto_latency_compensation_settings_file() -> Option<PathBuf> {
+    browser_favorites_file()?
+        .parent()
+        .map(|directory| directory.join("audio-recording-auto-latency-compensation.txt"))
+}
+
 fn audio_recording_track_settings_file(project_path: &Path) -> Option<PathBuf> {
     browser_favorites_file()?.parent().map(|directory| {
         directory
@@ -61547,6 +61601,25 @@ fn load_audio_recording_offset_ms() -> i16 {
             (AUDIO_RECORDING_OFFSET_MIN_MS..=AUDIO_RECORDING_OFFSET_MAX_MS).contains(offset_ms)
         })
         .unwrap_or(0)
+}
+
+fn load_audio_recording_auto_latency_compensation() -> bool {
+    audio_recording_auto_latency_compensation_settings_file()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|contents| contents.trim().parse::<bool>().ok())
+        .unwrap_or(true)
+}
+
+fn save_audio_recording_auto_latency_compensation(enabled: bool) -> Result<(), String> {
+    let path = audio_recording_auto_latency_compensation_settings_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path.parent().ok_or_else(|| {
+        "the automatic audio latency setting path has no parent folder".to_owned()
+    })?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    fs::write(&path, format!("{enabled}\n"))
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
 }
 
 fn save_audio_recording_offset_ms(offset_ms: i16) -> Result<(), String> {

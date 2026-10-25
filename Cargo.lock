@@ -1494,6 +1494,7 @@ dependencies = [
  "vst3-host",
  "wasapi",
  "wavicle",
+ "windows",
  "zip",
 ]
 

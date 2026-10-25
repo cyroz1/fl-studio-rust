@@ -19,6 +19,8 @@ use cpal::{
     SupportedStreamConfig, SupportedStreamConfigRange,
 };
 use crossbeam_queue::ArrayQueue;
+#[cfg(windows)]
+use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 
 const AUDIO_SOURCE_SILENT: u8 = 0;
 const AUDIO_SOURCE_TEST_TONE: u8 = 1;
@@ -30,6 +32,8 @@ const LIVE_STREAM_RING_CAPACITY: usize = 4_096;
 const MAX_LIVE_STREAM_SOURCES: usize = 64;
 const INPUT_MONITOR_RING_CAPACITY: usize = AUDIO_RING_CAPACITY * 2;
 const INPUT_RECORDING_BUFFER_FRAMES: usize = 65_536;
+const INPUT_LATENCY_ESTIMATE_MIN_SAMPLES: u32 = 8;
+const INPUT_LATENCY_ESTIMATE_MAX_MICROSECONDS: u128 = 1_000_000;
 const AUDIO_ERROR_HISTORY_LIMIT: usize = 16;
 const AUDIO_COMMAND_QUEUE_CAPACITY: usize = 128;
 const RETIRED_STREAM_QUEUE_CAPACITY: usize = 4;
@@ -2086,6 +2090,74 @@ struct InputRecordingState {
     overflow_frames: AtomicU64,
 }
 
+struct InputLatencyEstimate {
+    smoothed_microseconds: AtomicU32,
+    sample_count: AtomicU32,
+}
+
+impl Default for InputLatencyEstimate {
+    fn default() -> Self {
+        Self {
+            smoothed_microseconds: AtomicU32::new(0),
+            sample_count: AtomicU32::new(0),
+        }
+    }
+}
+
+impl InputLatencyEstimate {
+    fn observe(&self, latency: Option<Duration>) {
+        let Some(latency) = latency
+            .filter(|latency| latency.as_micros() <= INPUT_LATENCY_ESTIMATE_MAX_MICROSECONDS)
+        else {
+            return;
+        };
+        let observed = latency.as_micros() as u32;
+        let count = self.sample_count.load(Ordering::Relaxed);
+        let filtered = if count == 0 {
+            observed
+        } else {
+            self.smoothed_microseconds
+                .load(Ordering::Relaxed)
+                .saturating_mul(7)
+                .saturating_add(observed)
+                / 8
+        };
+        self.smoothed_microseconds
+            .store(filtered, Ordering::Relaxed);
+        let _ = self
+            .sample_count
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                Some(count.saturating_add(1))
+            });
+    }
+
+    fn observe_cpal_callback(&self, info: &cpal::InputCallbackInfo) {
+        let timestamp = info.timestamp();
+        if timestamp.callback.as_nanos() == 0 || timestamp.capture.as_nanos() == 0 {
+            return;
+        }
+        self.observe(timestamp.callback.checked_duration_since(timestamp.capture));
+    }
+
+    fn estimated_milliseconds(&self) -> Option<f32> {
+        (self.sample_count.load(Ordering::Acquire) >= INPUT_LATENCY_ESTIMATE_MIN_SAMPLES)
+            .then(|| self.smoothed_microseconds.load(Ordering::Relaxed) as f32 / 1_000.0)
+    }
+
+    fn wait_for_estimate(&self, timeout: Duration) -> Option<f32> {
+        let started = std::time::Instant::now();
+        loop {
+            if let Some(latency_ms) = self.estimated_milliseconds() {
+                return Some(latency_ms);
+            }
+            if started.elapsed() >= timeout {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+}
+
 impl InputRecordingState {
     fn new(sample_rate: u32, capacity_frames: usize) -> Self {
         Self {
@@ -3099,6 +3171,7 @@ pub struct AudioEngine {
     input_monitor_ring: Arc<AudioRingBuffer>,
     input_channel_pair: Arc<AtomicU16>,
     input_channel_count: u16,
+    input_latency_estimate: Arc<InputLatencyEstimate>,
     error: Arc<AudioErrorState>,
     input_stream: Option<Stream>,
     output_stream: Option<Stream>,
@@ -3644,6 +3717,16 @@ impl AudioEngine {
         self.sample_rate
     }
 
+    /// Estimated time between capture and delivery to the input processing callback.
+    pub fn estimated_input_latency_ms(&self) -> Option<f32> {
+        self.input_latency_estimate.estimated_milliseconds()
+    }
+
+    /// Wait briefly for the active input stream to provide timing samples.
+    pub fn wait_for_input_latency_estimate(&self, timeout: Duration) -> Option<f32> {
+        self.input_latency_estimate.wait_for_estimate(timeout)
+    }
+
     pub fn take_error(&self) -> Option<String> {
         self.error.take_latest()
     }
@@ -3679,6 +3762,7 @@ impl AudioEngine {
         let input_callback_frames = Arc::new(AtomicU32::new(0));
         let input_recording = Arc::new(ArcSwapOption::empty());
         let input_monitor_recording = Arc::new(ArcSwapOption::empty());
+        let input_latency_estimate = Arc::new(InputLatencyEstimate::default());
         let input_channel_pair = Arc::new(AtomicU16::new(settings.input_channel_pair));
         let error = Arc::new(AudioErrorState::default());
 
@@ -3722,6 +3806,7 @@ impl AudioEngine {
                     recording: Arc::clone(&input_recording),
                     monitor_recording: Arc::clone(&input_monitor_recording),
                     monitor_active: Arc::clone(&playback.input_monitor_active),
+                    input_latency_estimate: Arc::clone(&input_latency_estimate),
                     error: Arc::clone(&error),
                     callback_frames: Arc::clone(&input_callback_frames),
                     input_channel_pair: Arc::clone(&input_channel_pair),
@@ -3750,6 +3835,7 @@ impl AudioEngine {
             input_monitor_ring: Arc::clone(&ring),
             input_channel_pair,
             input_channel_count,
+            input_latency_estimate,
             error,
             input_active: input_stream.is_some(),
             output_active: output_stream.is_some(),
@@ -3777,6 +3863,7 @@ impl AudioEngine {
         let input_callback_frames = Arc::new(AtomicU32::new(0));
         let input_recording = Arc::new(ArcSwapOption::empty());
         let input_monitor_recording = Arc::new(ArcSwapOption::empty());
+        let input_latency_estimate = Arc::new(InputLatencyEstimate::default());
         let input_channel_pair = Arc::new(AtomicU16::new(settings.input_channel_pair));
         let input_channel_count = Arc::new(AtomicU16::new(0));
         let error = Arc::new(AudioErrorState::default());
@@ -3797,6 +3884,7 @@ impl AudioEngine {
             let worker_input_callback_frames = Arc::clone(&input_callback_frames);
             let worker_recording = Arc::clone(&input_recording);
             let worker_monitor_recording = Arc::clone(&input_monitor_recording);
+            let worker_input_latency_estimate = Arc::clone(&input_latency_estimate);
             let worker_input_channel_pair = Arc::clone(&input_channel_pair);
             let worker_input_channel_count = Arc::clone(&input_channel_count);
             let worker_error = Arc::clone(&error);
@@ -3815,6 +3903,7 @@ impl AudioEngine {
                             input_callback_frames: worker_input_callback_frames,
                             input_recording: worker_recording,
                             input_monitor_recording: worker_monitor_recording,
+                            input_latency_estimate: worker_input_latency_estimate,
                             input_channel_pair: worker_input_channel_pair,
                             input_channel_count: worker_input_channel_count,
                             error: worker_error,
@@ -3849,6 +3938,7 @@ impl AudioEngine {
             let worker_input_callback_frames = Arc::clone(&input_callback_frames);
             let worker_recording = Arc::clone(&input_recording);
             let worker_monitor_recording = Arc::clone(&input_monitor_recording);
+            let worker_input_latency_estimate = Arc::clone(&input_latency_estimate);
             let worker_input_channel_pair = Arc::clone(&input_channel_pair);
             let worker_input_channel_count = Arc::clone(&input_channel_count);
             let worker_error = Arc::clone(&error);
@@ -3867,6 +3957,7 @@ impl AudioEngine {
                             input_callback_frames: worker_input_callback_frames,
                             input_recording: worker_recording,
                             input_monitor_recording: worker_monitor_recording,
+                            input_latency_estimate: worker_input_latency_estimate,
                             input_channel_pair: worker_input_channel_pair,
                             input_channel_count: worker_input_channel_count,
                             error: worker_error,
@@ -3933,6 +4024,7 @@ impl AudioEngine {
             input_monitor_ring: Arc::clone(&ring),
             input_channel_pair,
             input_channel_count,
+            input_latency_estimate,
             error,
             input_active,
             output_active,
@@ -4264,6 +4356,7 @@ struct InputStreamState {
     recording: Arc<ArcSwapOption<InputRecordingState>>,
     monitor_recording: Arc<ArcSwapOption<InputRecordingState>>,
     monitor_active: Arc<AtomicBool>,
+    input_latency_estimate: Arc<InputLatencyEstimate>,
     error: Arc<AudioErrorState>,
     input_channel_pair: Arc<AtomicU16>,
 }
@@ -4343,6 +4436,7 @@ where
         recording: input_recording,
         monitor_recording: input_monitor_recording,
         monitor_active,
+        input_latency_estimate,
         error,
         input_channel_pair,
     } = state;
@@ -4353,8 +4447,9 @@ where
     let stream = device
         .build_input_stream::<T, _, _>(
             config,
-            move |input, _| {
+            move |input, info| {
                 enable_denormal_protection();
+                input_latency_estimate.observe_cpal_callback(info);
                 let mut max_peak = 0.0_f32;
                 callback_frames.store(
                     u32::try_from(input.len() / channels).unwrap_or(u32::MAX),
@@ -4777,6 +4872,23 @@ fn set_wasapi_error(error: &AudioErrorState, message: String) {
 }
 
 #[cfg(windows)]
+fn query_performance_frequency() -> Option<i64> {
+    let mut frequency = 0_i64;
+    unsafe { QueryPerformanceFrequency(&mut frequency).ok()? };
+    (frequency > 0).then_some(frequency)
+}
+
+#[cfg(windows)]
+fn query_performance_time_100ns(frequency: Option<i64>) -> Option<u64> {
+    let mut counter = 0_i64;
+    unsafe { QueryPerformanceCounter(&mut counter).ok()? };
+    let counter = u128::try_from(counter).ok()?;
+    let frequency = u128::try_from(frequency?).ok()?;
+    let time_100ns = counter.checked_mul(10_000_000)?.checked_div(frequency)?;
+    u64::try_from(time_100ns).ok()
+}
+
+#[cfg(windows)]
 struct WasapiWorkerState {
     source: Arc<AtomicU8>,
     playback: Arc<PlaybackState>,
@@ -4785,6 +4897,7 @@ struct WasapiWorkerState {
     input_callback_frames: Arc<AtomicU32>,
     input_recording: Arc<ArcSwapOption<InputRecordingState>>,
     input_monitor_recording: Arc<ArcSwapOption<InputRecordingState>>,
+    input_latency_estimate: Arc<InputLatencyEstimate>,
     input_channel_pair: Arc<AtomicU16>,
     input_channel_count: Arc<AtomicU16>,
     error: Arc<AudioErrorState>,
@@ -4923,6 +5036,7 @@ fn wasapi_exclusive_input_worker(
         input_callback_frames,
         input_recording,
         input_monitor_recording,
+        input_latency_estimate,
         input_channel_pair,
         input_channel_count,
         source,
@@ -4981,15 +5095,27 @@ fn wasapi_exclusive_input_worker(
         client
             .start_stream()
             .map_err(|error| format_exclusive_error("input", error.to_string()))?;
+        let qpc_frequency = query_performance_frequency();
         started = true;
         let _ = ready.send(Ok(()));
 
         while !stop.load(Ordering::Acquire) {
             match event.wait_for_event(100) {
                 Ok(()) => {
-                    let (frames, _) = capture
+                    let capture_event_time = query_performance_time_100ns(qpc_frequency);
+                    let (frames, buffer_info) = capture
                         .read_from_device(&mut bytes)
                         .map_err(|error| error.to_string())?;
+                    if frames > 0 && !buffer_info.flags.timestamp_error {
+                        if let Some(latency_100ns) = capture_event_time
+                            .filter(|capture_time| *capture_time >= buffer_info.timestamp)
+                            .map(|capture_time| capture_time - buffer_info.timestamp)
+                        {
+                            input_latency_estimate.observe(Some(Duration::from_nanos(
+                                latency_100ns.saturating_mul(100),
+                            )));
+                        }
+                    }
                     input_callback_frames.store(frames, Ordering::Release);
                     let active_bytes = (frames as usize).saturating_mul(format_spec.frame_bytes);
                     let mut max_peak = 0.0_f32;

@@ -29,6 +29,7 @@ plist = "1.10.1"
 [target.'cfg(windows)'.dependencies]
 cpal = { version = "0.18.2", features = ["asio"] }
 wasapi = "0.25.0"
+windows = { version = "0.62.2", features = ["Win32_System_Performance"] }
 
 [target.'cfg(all(target_os = "linux", not(target_arch = "x86")))'.dependencies]
 cpal = { version = "0.18.2", features = ["jack", "pipewire", "pulseaudio"] }
