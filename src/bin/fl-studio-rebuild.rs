@@ -3944,6 +3944,9 @@ struct StepGraphReset {
 }
 
 enum AutomationEditAction {
+    InitializeFromTemplate {
+        template_channel_id: u16,
+    },
     Insert {
         slot: usize,
         position_beats: f64,
@@ -29057,6 +29060,31 @@ impl DawUi {
                 .iter()
                 .find(|channel| channel.channel_id() == channel_id)
                 .is_some_and(|channel| channel.data_event_index().is_some());
+            if !has_blob {
+                ui.menu_button("Initialize from template", |ui| {
+                    let mut has_template = false;
+                    for template in automation_channels.iter().filter(|channel| {
+                        channel.channel_id() != channel_id && channel.data_event_index().is_some()
+                    }) {
+                        has_template = true;
+                        let label = template
+                            .display_name()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| format!("Channel {}", template.channel_id()));
+                        if ui.button(label).clicked() {
+                            action = Some(AutomationEditAction::InitializeFromTemplate {
+                                template_channel_id: template.channel_id(),
+                            });
+                            ui.close();
+                        }
+                    }
+                    if !has_template {
+                        ui.label(
+                            "No other Automation channel has a saved curve to use as a template",
+                        );
+                    }
+                });
+            }
             let can_interpolate = automation_channels
                 .iter()
                 .find(|channel| channel.channel_id() == channel_id)
@@ -29390,7 +29418,19 @@ impl DawUi {
             && let Some(document) = self.document.as_mut()
         {
             let mut interpolation_count = None;
+            let mut initialized_template = false;
             let result = match action {
+                AutomationEditAction::InitializeFromTemplate {
+                    template_channel_id,
+                } => {
+                    self.selected_automation_point = None;
+                    self.automation_add_mode = false;
+                    self.automation_interpolate_mode = false;
+                    self.automation_interpolation_anchor = None;
+                    initialized_template = true;
+                    document
+                        .create_automation_point_blob_from_template(channel_id, template_channel_id)
+                }
                 AutomationEditAction::Insert {
                     slot,
                     position_beats,
@@ -29446,7 +29486,12 @@ impl DawUi {
                         }
                     } else {
                         self.dirty = true;
-                        self.status = "Automation curve updated".to_owned();
+                        self.status = if initialized_template {
+                            "Initialized an empty automation curve from the selected template"
+                                .to_owned()
+                        } else {
+                            "Automation curve updated".to_owned()
+                        };
                     }
                 }
                 Err(error) => self.status = format!("Could not edit automation: {error}"),
@@ -63853,7 +63898,8 @@ mod tests {
         live_playlist_vst3_note_targets, midi_button_press_edge, midi_cc_to_mixer_fader_raw,
         midi_cc_to_mixer_pan_raw, midi_cc_to_mixer_stereo_separation_raw,
         midi_controller_binding_for_device, midi_mixer_button_press_edge,
-        midi_mixer_control_for_cc, midi_script_bar_beat, midi_script_marker_jump_target,
+        midi_mixer_control_for_cc, midi_script_arrangement_time_ticks, midi_script_bar_beat,
+        midi_script_clip_selection_bounds, midi_script_marker_jump_target,
         midi_script_marker_selection_target, midi_script_moved_song_position_tick,
         midi_script_pattern_jog_target, midi_script_tempo_jog_target,
         midi_script_time_position_seconds_to_ticks, midi_vst3_parameter_mapping_for_target,
@@ -67435,7 +67481,8 @@ mod tests {
     #[test]
     fn midi_script_arrangement_time_can_be_read_raw_or_snapped_to_sixteenth_grid() {
         assert_eq!(midi_script_arrangement_time_ticks(56.0, 96), (56, 48));
-        assert_eq!(midi_script_arrangement_time_ticks(57.0, 96), (57, 72));
+        assert_eq!(midi_script_arrangement_time_ticks(57.0, 96), (57, 48));
+        assert_eq!(midi_script_arrangement_time_ticks(60.0, 96), (60, 72));
         assert_eq!(midi_script_arrangement_time_ticks(57.0, 384), (57, 96));
         assert_eq!(midi_script_arrangement_time_ticks(f64::NAN, 96), (0, 0));
     }

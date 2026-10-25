@@ -1043,6 +1043,16 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_f32(tension, "automation point tension")?,
             )
         }
+        [command, input, output, channel_id, template_channel_id]
+            if command == "init-automation-points" =>
+        {
+            initialize_automation_points_from_template(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(channel_id, "automation channel id")?,
+                parse_u16(template_channel_id, "template automation channel id")?,
+            )
+        }
         [command, input, output, channel_id, point_index, position, value, tension]
             if command == "insert-automation-point" =>
         {
@@ -3586,6 +3596,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild set-layer-flags <input.flp> <output.flp> <layer-channel-id> <random:0|1|-> <crossfade:0|1|->\n",
             "  flp-rebuild set-layer-fade <input.flp> <output.flp> <layer-channel-id> <fade:0..256>\n",
             "  flp-rebuild edit-automation-point <input.flp> <output.flp> <channel-id> <point-index> <position-beats> <value> <tension>\n",
+            "  flp-rebuild init-automation-points <input.flp> <output.flp> <channel-id> <template-channel-id>\n",
             "  flp-rebuild insert-automation-point <input.flp> <output.flp> <channel-id> <insertion-slot> <position-beats> <value> <tension>\n",
             "  flp-rebuild delete-automation-point <input.flp> <output.flp> <channel-id> <point-index>\n",
             "  flp-rebuild interpolate-automation-points <input.flp> <output.flp> <channel-id> <first-point-index> <last-point-index>\n",
@@ -7359,6 +7370,28 @@ fn edit_automation_point(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "edited automation channel {channel_id} point {point_index} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn initialize_automation_points_from_template(
+    input: &Path,
+    output: &Path,
+    channel_id: u16,
+    template_channel_id: u16,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .create_automation_point_blob_from_template(channel_id, template_channel_id)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "initialized empty automation data in channel {channel_id} from template channel {template_channel_id} in {}",
         output.display()
     );
     Ok(())

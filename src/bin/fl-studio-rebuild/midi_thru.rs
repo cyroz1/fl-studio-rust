@@ -667,6 +667,8 @@ fn midi_input_thru_message(event: MidiInputEvent) -> Option<([u8; 3], usize)> {
             | MidiTransportCommand::SetCurrentTempo(_)
             | MidiTransportCommand::SetProjectTimeSignatureNumerator(_)
             | MidiTransportCommand::SetProjectTimeSignatureDenominator(_)
+            | MidiTransportCommand::AddArrangementTimeMarker { .. }
+            | MidiTransportCommand::JumpToMarker { .. }
             | MidiTransportCommand::SelectNextEmptyPatternWithNameDialog
             | MidiTransportCommand::FocusSelectedMixerTrackName
             | MidiTransportCommand::PatternJog(_)
@@ -685,7 +687,7 @@ fn midi_input_thru_message(event: MidiInputEvent) -> Option<([u8; 3], usize)> {
 #[cfg(test)]
 mod tests {
     use super::{MidiThruOutput, MidiThruProcessor, MidiThruSettings};
-    use crate::midi_input::MidiInputEvent;
+    use crate::midi_input::{MidiInputEvent, MidiTransportCommand};
 
     #[derive(Default)]
     struct TestOutput(Vec<Vec<u8>>);
@@ -820,6 +822,22 @@ mod tests {
             super::snap_key_to_pitch_classes(61, (1 << 0) | (1 << 2)),
             60
         );
+    }
+
+    #[test]
+    fn arrangement_marker_commands_are_not_forwarded_as_midi_messages() {
+        for command in [
+            MidiTransportCommand::AddArrangementTimeMarker {
+                tick: 960,
+                name: "Verse".to_owned(),
+            },
+            MidiTransportCommand::JumpToMarker {
+                delta: -1,
+                select: true,
+            },
+        ] {
+            assert!(super::midi_input_thru_message(MidiInputEvent::Transport(command)).is_none());
+        }
     }
 
     #[test]

@@ -18600,6 +18600,100 @@ impl FlpDocument {
         Ok(interpolated)
     }
 
+    /// Initializes an empty `0xEA` automation-point blob on a type-5 channel by copying the
+    /// opaque header and era-specific trailer from another type-5 channel in this project.
+    /// Existing points are intentionally omitted; use `insert_automation_point` to add points.
+    pub fn create_automation_point_blob_from_template(
+        &mut self,
+        channel_id: u16,
+        template_channel_id: u16,
+    ) -> Result<(), FlpError> {
+        let channels = self.channels();
+        let mut targets = channels.iter().filter(|channel| channel.id() == channel_id);
+        let Some(target) = targets.next() else {
+            return Err(FlpError::ChannelNotFound(channel_id));
+        };
+        if targets.next().is_some() {
+            return Err(FlpError::AmbiguousChannelId(channel_id));
+        }
+        if target.kind() != Some(5) {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel is not a type-5 automation channel",
+            ));
+        }
+        if target
+            .event_range()
+            .any(|index| self.events[index].opcode == 0xEA)
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected automation channel already has a 0xEA point blob",
+            ));
+        }
+
+        let mut templates = channels
+            .iter()
+            .filter(|channel| channel.id() == template_channel_id);
+        let Some(template) = templates.next() else {
+            return Err(FlpError::ChannelNotFound(template_channel_id));
+        };
+        if templates.next().is_some() {
+            return Err(FlpError::AmbiguousChannelId(template_channel_id));
+        }
+        if template.kind() != Some(5) {
+            return Err(FlpError::UnsupportedEdit(
+                "the template channel is not a type-5 automation channel",
+            ));
+        }
+        let mut template_events = template
+            .event_range()
+            .filter(|index| self.events[*index].opcode == 0xEA);
+        let Some(template_event_index) = template_events.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the template automation channel has no 0xEA point blob",
+            ));
+        };
+        if template_events.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the template automation channel has multiple 0xEA point blobs",
+            ));
+        }
+        let template_event = &self.events[template_event_index];
+        if !matches!(template_event.encoding, PayloadEncoding::Data { .. }) {
+            return Err(FlpError::UnsupportedEdit(
+                "the template 0xEA point blob is not a length-prefixed data event",
+            ));
+        }
+        decode_automation_points(template_event)?;
+        let point_count = usize::try_from(u32::from_le_bytes(
+            template_event.payload[FLP_AUTOMATION_COUNT_OFFSET..FLP_AUTOMATION_POINTS_OFFSET]
+                .try_into()
+                .expect("the automation point count has four bytes"),
+        ))
+        .map_err(|_| FlpError::LengthOverflow)?;
+        let point_bytes_length = point_count
+            .checked_mul(FLP_AUTOMATION_POINT_SIZE)
+            .ok_or(FlpError::LengthOverflow)?;
+        let points_end = FLP_AUTOMATION_POINTS_OFFSET
+            .checked_add(point_bytes_length)
+            .ok_or(FlpError::LengthOverflow)?;
+        let mut payload = Vec::with_capacity(
+            FLP_AUTOMATION_POINTS_OFFSET
+                .checked_add(template_event.payload.len() - points_end)
+                .ok_or(FlpError::LengthOverflow)?,
+        );
+        payload.extend_from_slice(&template_event.payload[..FLP_AUTOMATION_COUNT_OFFSET]);
+        payload.extend_from_slice(&0_u32.to_le_bytes());
+        payload.extend_from_slice(&template_event.payload[points_end..]);
+
+        let mut candidate = self.clone();
+        candidate
+            .events
+            .insert(target.end_event_index, FlpEvent::new_data(0xEA, payload)?);
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
     /// Inserts a point into an existing type-5 channel automation blob.
     ///
     /// `point_index` is an insertion slot and may equal the current point count.
@@ -34537,6 +34631,84 @@ mod tests {
                 .expect("deleting the inserted point should succeed");
             assert_eq!(document.encode_lossless().unwrap(), original);
         }
+    }
+
+    #[test]
+    fn initializes_empty_automation_blob_from_an_existing_channel_template() {
+        let template_points = [(1.0, 0.25, 0.0, [1, 2, 3, 4])];
+        let trailer = (0..136)
+            .map(|index| (index * 7 % 256) as u8)
+            .collect::<Vec<_>>();
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&[0x40, 9, 0, 0x15, 5]);
+        let template_payload = {
+            let fixture = automation_channel_fixture(&template_points, &trailer);
+            FlpDocument::parse(&fixture)
+                .expect("template channel should parse")
+                .events()
+                .iter()
+                .find(|event| event.opcode() == 0xEA)
+                .expect("template should contain automation data")
+                .payload()
+                .to_vec()
+        };
+        append_data_event(&mut stream, 0xEA, &template_payload);
+        stream.extend_from_slice(&[0x40, 10, 0, 0x15, 5, 0x62, 0, 0]);
+        let original = flp_fixture(&stream, &[], &[]);
+        let mut document = FlpDocument::parse(&original).expect("project should parse");
+        let before_missing_template = document.clone();
+        assert!(matches!(
+            document.create_automation_point_blob_from_template(10, 77),
+            Err(FlpError::ChannelNotFound(77))
+        ));
+        assert_eq!(document, before_missing_template);
+
+        document
+            .create_automation_point_blob_from_template(10, 9)
+            .expect("the empty channel should use the template layout");
+        let initialized = document.clone();
+        assert!(matches!(
+            document.create_automation_point_blob_from_template(10, 9),
+            Err(FlpError::UnsupportedEdit(_))
+        ));
+        assert_eq!(document, initialized);
+        let target = document
+            .automation_channels()
+            .expect("automation channels should decode")
+            .into_iter()
+            .find(|channel| channel.channel_id() == 10)
+            .expect("the target channel should exist");
+        assert!(target.points().is_empty());
+        let target_payload = document.events()[target.data_event_index().unwrap()].payload();
+        assert_eq!(
+            &target_payload[..FLP_AUTOMATION_COUNT_OFFSET],
+            &template_payload[..17]
+        );
+        assert_eq!(
+            u32::from_le_bytes(
+                target_payload[FLP_AUTOMATION_COUNT_OFFSET..FLP_AUTOMATION_POINTS_OFFSET]
+                    .try_into()
+                    .unwrap()
+            ),
+            0
+        );
+        assert_eq!(&target_payload[FLP_AUTOMATION_POINTS_OFFSET..], trailer);
+
+        document
+            .insert_automation_point(10, 0, 0.5, 0.75, 0.0)
+            .expect("the initialized channel should accept its first point");
+        let reparsed = FlpDocument::parse(&document.encode_lossless().unwrap())
+            .expect("initialized automation data should round-trip");
+        let point = reparsed
+            .automation_channels()
+            .unwrap()
+            .into_iter()
+            .find(|channel| channel.channel_id() == 10)
+            .unwrap()
+            .points()[0]
+            .clone();
+        assert_eq!(point.position_beats(), 0.5);
+        assert_eq!(point.value(), 0.75);
     }
 
     #[test]
