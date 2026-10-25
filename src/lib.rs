@@ -18646,6 +18646,70 @@ impl FlpDocument {
         Ok(points.len())
     }
 
+    /// Normalizes the values in a type-5 automation channel so the curve spans 0..=1.
+    /// Positions, tension, opaque point state, and the automation blob's header and trailer
+    /// are retained. Returns the number of points changed, or zero for a flat curve.
+    pub fn normalize_automation_points(&mut self, channel_id: u16) -> Result<usize, FlpError> {
+        let channels = self.channels();
+        let mut matching = channels.iter().filter(|channel| channel.id == channel_id);
+        let Some(channel) = matching.next() else {
+            return Err(FlpError::ChannelNotFound(channel_id));
+        };
+        if matching.next().is_some() {
+            return Err(FlpError::AmbiguousChannelId(channel_id));
+        }
+        if channel.kind != Some(5) {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel is not a type-5 automation channel",
+            ));
+        }
+        let mut automation_events = channel
+            .event_range()
+            .filter(|index| self.events[*index].opcode == 0xEA);
+        let Some(event_index) = automation_events.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected automation channel has no existing 0xEA point blob",
+            ));
+        };
+        if automation_events.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected automation channel has multiple 0xEA point blobs",
+            ));
+        }
+        let points = decode_automation_points(&self.events[event_index])?;
+        if points.is_empty() {
+            return Ok(0);
+        }
+        let mut minimum = f64::INFINITY;
+        let mut maximum = f64::NEG_INFINITY;
+        for point in &points {
+            validate_automation_point_value(point.value)?;
+            minimum = minimum.min(point.value);
+            maximum = maximum.max(point.value);
+        }
+        let span = maximum - minimum;
+        if span <= 0.0 {
+            return Ok(0);
+        }
+
+        let mut payload = self.events[event_index].payload.clone();
+        for (point_index, point) in points.iter().enumerate() {
+            let value = (point.value - minimum) / span;
+            validate_automation_point_value(value)?;
+            let point_offset = FLP_AUTOMATION_POINTS_OFFSET
+                .checked_add(
+                    point_index
+                        .checked_mul(FLP_AUTOMATION_POINT_SIZE)
+                        .ok_or(FlpError::LengthOverflow)?,
+                )
+                .ok_or(FlpError::LengthOverflow)?;
+            payload[point_offset + 8..point_offset + 16].copy_from_slice(&value.to_le_bytes());
+        }
+        self.events[event_index].replace_data_payload(payload)?;
+        self.refresh_event_offsets()?;
+        Ok(points.len())
+    }
+
     /// Linearly interpolates the values of the points strictly between two
     /// existing type-5 automation points. Positions, tension, opaque point
     /// state, and the automation blob's header and trailer are retained.
@@ -35043,6 +35107,70 @@ mod tests {
             .flip_automation_points(9)
             .expect("the same curve should flip back");
         assert_eq!(restored.encode_lossless().unwrap(), original);
+    }
+
+    #[test]
+    fn automation_normalize_spans_zero_to_one_and_preserves_curve_metadata() {
+        let source_points = [
+            (0.0, 0.25, 0.125, [1, 2, 3, 4]),
+            (1.0, 0.375, -0.25, [5, 6, 7, 8]),
+            (2.0, 0.625, 0.5, [9, 10, 11, 12]),
+            (4.0, 0.75, -0.75, [13, 14, 15, 16]),
+        ];
+        let trailer = (0..112)
+            .map(|index| (index * 23 % 256) as u8)
+            .collect::<Vec<_>>();
+        let original = automation_channel_fixture(&source_points, &trailer);
+        let mut document = FlpDocument::parse(&original).expect("automation project should parse");
+        let event_index = document
+            .events()
+            .iter()
+            .position(|event| event.opcode() == 0xEA)
+            .expect("fixture should contain an automation event");
+        let original_payload = document.events()[event_index].payload().to_vec();
+
+        assert_eq!(
+            document
+                .normalize_automation_points(9)
+                .expect("a valid automation curve should normalize"),
+            source_points.len()
+        );
+
+        let normalized_bytes = document.encode_lossless().unwrap();
+        let reparsed =
+            FlpDocument::parse(&normalized_bytes).expect("normalized automation should round-trip");
+        let points = reparsed.automation_channels().unwrap().remove(0).points;
+        for (index, (point, expected_value)) in
+            points.iter().zip([0.0, 0.25, 0.75, 1.0]).enumerate()
+        {
+            assert_eq!(point.position_beats(), source_points[index].0);
+            assert_eq!(point.value(), expected_value);
+            assert_eq!(point.tension(), source_points[index].2);
+            assert_eq!(point.trailing_bytes(), source_points[index].3);
+        }
+        let normalized_payload = reparsed.events()[event_index].payload();
+        assert_eq!(&normalized_payload[..17], &original_payload[..17]);
+        assert_eq!(
+            &normalized_payload[normalized_payload.len() - trailer.len()..],
+            trailer
+        );
+
+        let mut already_normalized = reparsed.clone();
+        assert_eq!(
+            already_normalized.normalize_automation_points(9).unwrap(),
+            4
+        );
+        assert_eq!(
+            already_normalized.encode_lossless().unwrap(),
+            normalized_bytes
+        );
+
+        let flat_points = [(0.0, 0.5, 0.0, [1, 1, 1, 1]), (1.0, 0.5, 0.0, [2, 2, 2, 2])];
+        let flat_bytes = automation_channel_fixture(&flat_points, &trailer);
+        let mut flat_document =
+            FlpDocument::parse(&flat_bytes).expect("flat automation project should parse");
+        assert_eq!(flat_document.normalize_automation_points(9).unwrap(), 0);
+        assert_eq!(flat_document.encode_lossless().unwrap(), flat_bytes);
     }
 
     #[test]

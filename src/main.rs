@@ -1061,6 +1061,13 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u16(channel_id, "automation channel id")?,
             )
         }
+        [command, input, output, channel_id] if command == "normalize-automation-points" => {
+            normalize_automation_points(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(channel_id, "automation channel id")?,
+            )
+        }
         [command, input, output, channel_id, template_channel_id]
             if command == "init-automation-points" =>
         {
@@ -3628,6 +3635,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild set-layer-fade <input.flp> <output.flp> <layer-channel-id> <fade:0..256>\n",
             "  flp-rebuild edit-automation-point <input.flp> <output.flp> <channel-id> <point-index> <position-beats> <value> <tension>\n",
             "  flp-rebuild flip-automation-points <input.flp> <output.flp> <channel-id>\n",
+            "  flp-rebuild normalize-automation-points <input.flp> <output.flp> <channel-id>\n",
             "  flp-rebuild set-automation-lfo-amount <input.flp> <output.flp> <channel-id> <-128..128>\n",
             "  flp-rebuild init-automation-points <input.flp> <output.flp> <channel-id> <template-channel-id>\n",
             "  flp-rebuild insert-automation-point <input.flp> <output.flp> <channel-id> <insertion-slot> <position-beats> <value> <tension>\n",
@@ -7551,6 +7559,23 @@ fn flip_automation_points(input: &Path, output: &Path, channel_id: u16) -> Resul
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "flipped {point_count} automation point values in channel {channel_id} to {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn normalize_automation_points(input: &Path, output: &Path, channel_id: u16) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let point_count = document
+        .normalize_automation_points(channel_id)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "normalized {point_count} automation point values to 0..=1 in channel {channel_id} in {}",
         output.display()
     );
     Ok(())

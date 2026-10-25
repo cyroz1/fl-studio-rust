@@ -3964,6 +3964,7 @@ enum AutomationEditAction {
         point_index: usize,
     },
     Flip,
+    Normalize,
     Interpolate {
         first_point_index: usize,
         last_point_index: usize,
@@ -29171,6 +29172,12 @@ impl DawUi {
             {
                 action = Some(AutomationEditAction::Flip);
             }
+            if ui
+                .add_enabled(can_flip, egui::Button::new("Normalize levels"))
+                .clicked()
+            {
+                action = Some(AutomationEditAction::Normalize);
+            }
             ui.checkbox(&mut self.automation_snap, "Snap 1/4 beat");
             ui.add(egui::Slider::new(&mut self.automation_visible_beats, 4.0..=64.0).text("Span"));
         });
@@ -29483,6 +29490,7 @@ impl DawUi {
             let mut interpolation_count = None;
             let mut initialized_template = false;
             let mut flipped_points = false;
+            let mut normalized_points = false;
             let result = match action {
                 AutomationEditAction::InitializeFromTemplate {
                     template_channel_id,
@@ -29534,6 +29542,16 @@ impl DawUi {
                         .flip_automation_points(channel_id)
                         .map(|count| interpolation_count = Some(count))
                 }
+                AutomationEditAction::Normalize => {
+                    self.selected_automation_point = None;
+                    self.automation_add_mode = false;
+                    self.automation_interpolate_mode = false;
+                    self.automation_interpolation_anchor = None;
+                    normalized_points = true;
+                    document
+                        .normalize_automation_points(channel_id)
+                        .map(|count| interpolation_count = Some(count))
+                }
                 AutomationEditAction::Interpolate {
                     first_point_index,
                     last_point_index,
@@ -29558,6 +29576,9 @@ impl DawUi {
                         if count == 0 {
                             self.status = if flipped_points {
                                 "There are no automation points to flip".to_owned()
+                            } else if normalized_points {
+                                "The automation curve is flat; there is nothing to normalize"
+                                    .to_owned()
                             } else {
                                 "There are no automation points between those endpoints".to_owned()
                             };
@@ -29565,6 +29586,8 @@ impl DawUi {
                             self.dirty = true;
                             self.status = if flipped_points {
                                 format!("Vertically flipped {count} automation point values")
+                            } else if normalized_points {
+                                format!("Normalized {count} automation point values to 0–1")
                             } else {
                                 format!(
                                     "{} {count} automation point values",
