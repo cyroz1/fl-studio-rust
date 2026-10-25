@@ -98,13 +98,43 @@ struct WorkspaceInner {
 struct PackageEntryMetadata {
     options: SimpleFileOptions,
     comment: String,
+    local_extra_fields: Vec<PackageExtraField>,
+    central_extra_fields: Vec<PackageExtraField>,
+}
+
+#[derive(Clone)]
+struct PackageExtraField {
+    header_id: u16,
+    data: Vec<u8>,
 }
 
 impl PackageEntryMetadata {
-    fn full_options(&self) -> FullFileOptions<'static> {
-        self.options
+    fn full_options(&self) -> Result<FullFileOptions<'static>, String> {
+        let mut options = self
+            .options
             .into_full_options()
-            .with_file_comment(self.comment.clone())
+            .with_file_comment(self.comment.clone());
+        for field in &self.local_extra_fields {
+            options
+                .add_extra_data(field.header_id, &field.data, false)
+                .map_err(|error| {
+                    format!(
+                        "could not preserve local ZIP extra field {:#06x}: {error}",
+                        field.header_id
+                    )
+                })?;
+        }
+        for field in &self.central_extra_fields {
+            options
+                .add_extra_data(field.header_id, &field.data, true)
+                .map_err(|error| {
+                    format!(
+                        "could not preserve central ZIP extra field {:#06x}: {error}",
+                        field.header_id
+                    )
+                })?;
+        }
+        Ok(options)
     }
 }
 
@@ -157,6 +187,12 @@ impl ProjectPackageWorkspace {
             .map_err(|error| format!("could not open {}: {error}", path.as_ref().display()))?;
         let mut archive = ZipArchive::new(source)
             .map_err(|error| format!("could not read ZIP project: {error}"))?;
+        let mut central_source = File::open(path.as_ref()).map_err(|error| {
+            format!(
+                "could not inspect ZIP project {}: {error}",
+                path.as_ref().display()
+            )
+        })?;
         let workspace_directory = WorkspaceDirectory::new(create_workspace_directory()?);
         let root = workspace_directory.path();
         let mut project_files = Vec::new();
@@ -183,6 +219,17 @@ impl ProjectPackageWorkspace {
             let metadata = PackageEntryMetadata {
                 options,
                 comment: entry.comment().to_owned(),
+                local_extra_fields: preserve_unknown_extra_fields(entry.extra_data()),
+                central_extra_fields: preserve_unknown_extra_fields(
+                    Some(
+                        &read_central_extra_data(&mut central_source, entry.central_header_start())
+                            .map_err(|error| {
+                                format!(
+                                    "could not inspect ZIP entry {raw_name:?} central extra fields: {error}"
+                                )
+                            })?,
+                    ),
+                ),
             };
 
             if entry.is_dir() {
@@ -497,16 +544,12 @@ impl ProjectPackageWorkspace {
         }
         for entry in entries {
             let name = archive_name(&entry.relative);
-            let options = self
-                .0
-                .entry_metadata
-                .get(&entry.relative)
-                .map(PackageEntryMetadata::full_options)
-                .unwrap_or_else(|| {
-                    SimpleFileOptions::default()
-                        .compression_method(CompressionMethod::Deflated)
-                        .into_full_options()
-                });
+            let options = match self.0.entry_metadata.get(&entry.relative) {
+                Some(metadata) => metadata.full_options()?,
+                None => SimpleFileOptions::default()
+                    .compression_method(CompressionMethod::Deflated)
+                    .into_full_options(),
+            };
             if entry.is_directory {
                 archive
                     .add_directory(format!("{name}/"), options)
@@ -536,6 +579,64 @@ impl ProjectPackageWorkspace {
         file.sync_all()
             .map_err(|error| format!("could not flush ZIP project: {error}"))
     }
+}
+
+fn preserve_unknown_extra_fields(raw: Option<&[u8]>) -> Vec<PackageExtraField> {
+    // These fields are interpreted by zip 8.x or depend on the original raw
+    // file name, so reusing their payloads after writing new headers can leave
+    // stale offsets, checksums, or names in the archive.
+    const ZIP_MANAGED_EXTRA_FIELD_IDS: &[u16] = &[
+        0x0001, // ZIP64 extended information
+        0x000a, // NTFS timestamps
+        0x5455, // Extended timestamps
+        0x6375, // Unicode comment
+        0x7075, // Unicode path
+        0x9901, // AES encryption
+        0xa11e, // Data stream alignment
+    ];
+    let Some(raw) = raw else {
+        return Vec::new();
+    };
+    let mut fields = Vec::new();
+    let mut offset = 0;
+    while offset + 4 <= raw.len() {
+        let header_id = u16::from_le_bytes([raw[offset], raw[offset + 1]]);
+        let data_length = u16::from_le_bytes([raw[offset + 2], raw[offset + 3]]) as usize;
+        let data_start = offset + 4;
+        let Some(data_end) = data_start.checked_add(data_length) else {
+            break;
+        };
+        if data_end > raw.len() {
+            break;
+        }
+        if !ZIP_MANAGED_EXTRA_FIELD_IDS.contains(&header_id) {
+            fields.push(PackageExtraField {
+                header_id,
+                data: raw[data_start..data_end].to_vec(),
+            });
+        }
+        offset = data_end;
+    }
+    fields
+}
+
+fn read_central_extra_data(file: &mut File, header_start: u64) -> io::Result<Vec<u8>> {
+    const CENTRAL_FILE_HEADER_LENGTH: usize = 46;
+    let mut fixed_header = [0_u8; CENTRAL_FILE_HEADER_LENGTH];
+    file.seek(io::SeekFrom::Start(header_start))?;
+    file.read_exact(&mut fixed_header)?;
+    if &fixed_header[..4] != b"PK\x01\x02" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid central directory file header signature",
+        ));
+    }
+    let name_length = u16::from_le_bytes([fixed_header[28], fixed_header[29]]) as usize;
+    let extra_length = u16::from_le_bytes([fixed_header[30], fixed_header[31]]) as usize;
+    file.seek(io::SeekFrom::Current(name_length as i64))?;
+    let mut extra_data = vec![0; extra_length];
+    file.read_exact(&mut extra_data)?;
+    Ok(extra_data)
 }
 
 fn read_archive_comment(path: &Path) -> Result<Option<Vec<u8>>, String> {
@@ -764,14 +865,14 @@ fn replace_file(temporary: &Path, target: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProjectPackageWorkspace, read_archive_comment};
+    use super::{ProjectPackageWorkspace, read_archive_comment, read_central_extra_data};
     use crate::FlpDocument;
     use crate::media::SamplePathResolver;
     use std::fs;
     use std::io::{Read, Write};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::Ordering;
-    use zip::write::SimpleFileOptions;
+    use zip::write::{FullFileOptions, SimpleFileOptions};
     use zip::{CompressionMethod, DateTime, ZipArchive, ZipWriter};
 
     struct TestDirectory(PathBuf);
@@ -984,5 +1085,51 @@ mod tests {
         let mut extra_bytes = Vec::new();
         extra.read_to_end(&mut extra_bytes).unwrap();
         assert_eq!(extra_bytes, b"supporting file");
+    }
+
+    #[test]
+    fn preserves_unrecognized_local_and_central_zip_extra_fields() {
+        let temporary = TestDirectory::new();
+        let source_path = temporary.path().join("source.zip");
+        let output_path = temporary.path().join("saved.zip");
+        let local_payload = b"vendor local metadata";
+        let central_payload = b"vendor central metadata";
+
+        let mut options: FullFileOptions<'static> = SimpleFileOptions::default()
+            .compression_method(CompressionMethod::Stored)
+            .into_full_options();
+        options
+            .add_extra_data(0xcafe, local_payload, false)
+            .unwrap();
+        options
+            .add_extra_data(0xbeef, central_payload, true)
+            .unwrap();
+        let mut source = ZipWriter::new(fs::File::create(&source_path).unwrap());
+        source.start_file("song.flp", options).unwrap();
+        source.write_all(b"original project").unwrap();
+        source.finish().unwrap().sync_all().unwrap();
+
+        let (workspace, original_project) = ProjectPackageWorkspace::open(&source_path).unwrap();
+        assert_eq!(original_project, b"original project");
+        workspace
+            .write_to(&output_path, b"updated project")
+            .unwrap();
+
+        let mut saved = ZipArchive::new(fs::File::open(&output_path).unwrap()).unwrap();
+        let project = saved.by_name("song.flp").unwrap();
+        let mut expected_local = Vec::new();
+        expected_local.extend_from_slice(&0xcafe_u16.to_le_bytes());
+        expected_local.extend_from_slice(&(local_payload.len() as u16).to_le_bytes());
+        expected_local.extend_from_slice(local_payload);
+        assert_eq!(project.extra_data(), Some(expected_local.as_slice()));
+
+        let mut central_file = fs::File::open(&output_path).unwrap();
+        let central_extra_data =
+            read_central_extra_data(&mut central_file, project.central_header_start()).unwrap();
+        let mut expected_central = Vec::new();
+        expected_central.extend_from_slice(&0xbeef_u16.to_le_bytes());
+        expected_central.extend_from_slice(&(central_payload.len() as u16).to_le_bytes());
+        expected_central.extend_from_slice(central_payload);
+        assert_eq!(central_extra_data, expected_central);
     }
 }
