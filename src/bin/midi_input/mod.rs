@@ -1459,7 +1459,7 @@ pub struct MidiPatternRecorder {
     snap_ticks: Option<u32>,
     timing_offset_ms: i16,
     song_timeline_start: Option<(PlaylistTempoMap, f64)>,
-    playlist_pattern_clip_sources: Option<(u32, Vec<(u32, u32)>)>,
+    playlist_pattern_clip_sources: Option<PlaylistPatternRecordingSources>,
     song_start_frame_micros: Option<u64>,
     started_at: Instant,
     timestamp_origin_micros: Option<u64>,
@@ -1478,6 +1478,18 @@ pub struct MidiPatternRecorder {
 struct MidiRecordingPosition {
     pattern_tick: u32,
     timeline_tick: u32,
+}
+
+struct PlaylistPatternRecordingSources {
+    pattern_loop_length_ticks: u32,
+    clips: Vec<PlaylistPatternRecordingClipSource>,
+}
+
+#[derive(Clone, Copy)]
+struct PlaylistPatternRecordingClipSource {
+    song_position_tick: u32,
+    song_length_ticks: u32,
+    source_start_tick: u32,
 }
 
 impl MidiPatternRecorder {
@@ -1566,23 +1578,39 @@ impl MidiPatternRecorder {
     }
 
     /// Map positions inside matching Playlist Pattern Clips back into the Pattern's source loop.
-    /// Each pair is a full-source, default-scale clip's (position, length) in song ticks.
+    /// Each tuple is (song position, song length, source start) for a default-scale clip whose
+    /// recognized source window has the same tick length as the clip.
     pub fn set_playlist_pattern_clip_sources(
         &mut self,
         pattern_loop_length_ticks: u32,
-        clips: &[(u32, u32)],
+        clips: &[(u32, u32, u32)],
     ) -> Result<(), &'static str> {
         if pattern_loop_length_ticks == 0 {
             return Err("Playlist Pattern recording requires a non-zero Pattern loop length");
         }
-        if clips
-            .iter()
-            .any(|(position, length)| *length == 0 || position.checked_add(*length).is_none())
-        {
-            return Err("Playlist Pattern recording clips must have valid non-zero ranges");
+        if clips.iter().any(|(position, length, source_start)| {
+            *length == 0
+                || position.checked_add(*length).is_none()
+                || source_start.checked_add(*length).is_none()
+        }) {
+            return Err("Playlist Pattern recording clips must have valid source and song ranges");
         }
         self.playlist_pattern_clip_sources =
-            (!clips.is_empty()).then(|| (pattern_loop_length_ticks, clips.to_vec()));
+            (!clips.is_empty()).then(|| PlaylistPatternRecordingSources {
+                pattern_loop_length_ticks,
+                clips: clips
+                    .iter()
+                    .map(
+                        |(song_position_tick, song_length_ticks, source_start_tick)| {
+                            PlaylistPatternRecordingClipSource {
+                                song_position_tick: *song_position_tick,
+                                song_length_ticks: *song_length_ticks,
+                                source_start_tick: *source_start_tick,
+                            }
+                        },
+                    )
+                    .collect(),
+            });
         Ok(())
     }
 
@@ -1609,15 +1637,15 @@ impl MidiPatternRecorder {
             .song_timeline_start
             .as_ref()
             .and_then(|(_, song_start_tick)| {
-                self.playlist_pattern_clip_sources.as_ref().and_then(
-                    |(pattern_loop_length_ticks, clips)| {
+                self.playlist_pattern_clip_sources
+                    .as_ref()
+                    .and_then(|sources| {
                         playlist_pattern_recording_source_tick(
                             *song_start_tick + f64::from(elapsed_tick),
-                            *pattern_loop_length_ticks,
-                            clips,
+                            sources.pattern_loop_length_ticks,
+                            &sources.clips,
                         )
-                    },
-                )
+                    })
             })
             .unwrap_or(timeline_tick);
         Some(MidiRecordingPosition {
@@ -2029,21 +2057,23 @@ impl MidiPatternRecorder {
 fn playlist_pattern_recording_source_tick(
     song_tick: f64,
     pattern_loop_length_ticks: u32,
-    clips: &[(u32, u32)],
+    clips: &[PlaylistPatternRecordingClipSource],
 ) -> Option<u32> {
     if !song_tick.is_finite() || song_tick < 0.0 || pattern_loop_length_ticks == 0 {
         return None;
     }
-    let (clip_position, _) = clips
+    let (clip_position, source_start) = clips
         .iter()
-        .filter_map(|(position, length)| {
-            let end = position.checked_add(*length)?;
-            (song_tick >= f64::from(*position) && song_tick < f64::from(end))
-                .then_some((*position, *length))
+        .filter_map(|clip| {
+            let clip_end = clip
+                .song_position_tick
+                .checked_add(clip.song_length_ticks)?;
+            (song_tick >= f64::from(clip.song_position_tick) && song_tick < f64::from(clip_end))
+                .then_some((clip.song_position_tick, clip.source_start_tick))
         })
         .max_by_key(|(position, _)| *position)?;
     let elapsed_ticks = (song_tick - f64::from(clip_position)).round().max(0.0) as u64;
-    Some((elapsed_ticks % u64::from(pattern_loop_length_ticks)) as u32)
+    Some(((u64::from(source_start) + elapsed_ticks) % u64::from(pattern_loop_length_ticks)) as u32)
 }
 
 fn quantize_recording_tick(tick: u32, snap_ticks: Option<u32>) -> u32 {
@@ -3452,7 +3482,7 @@ mod tests {
         )
         .expect("valid Playlist timing should create a recorder");
         recorder
-            .set_playlist_pattern_clip_sources(96, &[(96, 192), (384, 192)])
+            .set_playlist_pattern_clip_sources(96, &[(96, 192, 0), (384, 192, 0)])
             .expect("full-source repeated clips should map into the Pattern loop");
 
         let timestamp_origin = 1_000_000_u64 - 468_750;
@@ -3480,7 +3510,6 @@ mod tests {
                 },
             });
         }
-
         let result = recorder.finish(None, started_at + Duration::from_secs(3));
         assert_eq!(
             result
@@ -3489,6 +3518,81 @@ mod tests {
                 .map(|note| (note.key, note.position, note.length))
                 .collect::<Vec<_>>(),
             [(60, 90, 20), (62, 90, 20)]
+        );
+    }
+
+    #[test]
+    fn maps_recorded_notes_through_explicit_playlist_source_window_offsets() {
+        let started_at = Instant::now();
+        let mut recorder = MidiPatternRecorder::new(
+            MidiPatternRecorderSettings {
+                pattern_id: 1,
+                channel_id: 2,
+                project_path: None,
+                ppq: 96,
+                tempo_bpm: 120.0,
+                start_tick: 0,
+                snap_ticks: None,
+                timing_offset_ms: 0,
+                song_timeline_start: Some((
+                    PlaylistTempoMap::constant(96, 120.0).expect("valid constant tempo"),
+                    96.0,
+                )),
+            },
+            started_at,
+        )
+        .expect("valid Playlist timing should create a recorder");
+        recorder
+            .set_playlist_pattern_clip_sources(96, &[(96, 192, 48), (384, 192, 48)])
+            .expect("recognized one-to-one source windows should map into the Pattern loop");
+
+        let timestamp_origin = 1_000_000_u64 - 468_750;
+        for (key, start_elapsed_ticks) in [(60, 90_u64), (62, 378_u64)] {
+            let start_micros = timestamp_origin + start_elapsed_ticks * 1_000_000 / 192;
+            let end_micros = start_micros + 20 * 1_000_000 / 192;
+            recorder.record(ReceivedMidiMessage {
+                timestamp_micros: start_micros,
+                received_at: started_at
+                    + Duration::from_micros(start_elapsed_ticks * 1_000_000 / 192),
+                event: MidiInputEvent::NoteOn {
+                    channel: 0,
+                    key,
+                    velocity: 90,
+                },
+            });
+            recorder.record(ReceivedMidiMessage {
+                timestamp_micros: end_micros,
+                received_at: started_at
+                    + Duration::from_micros((start_elapsed_ticks + 20) * 1_000_000 / 192),
+                event: MidiInputEvent::NoteOff {
+                    channel: 0,
+                    key,
+                    velocity: 0,
+                },
+            });
+        }
+        let cc_elapsed_ticks = 100_u64;
+        assert_eq!(
+            recorder.position_for_message(&ReceivedMidiMessage {
+                timestamp_micros: timestamp_origin + cc_elapsed_ticks * 1_000_000 / 192,
+                received_at: started_at + Duration::from_micros(cc_elapsed_ticks * 1_000_000 / 192),
+                event: MidiInputEvent::ControlChange {
+                    channel: 0,
+                    controller: 74,
+                    value: 96,
+                },
+            }),
+            Some(52)
+        );
+
+        let result = recorder.finish(None, started_at + Duration::from_secs(3));
+        assert_eq!(
+            result
+                .notes
+                .iter()
+                .map(|note| (note.key, note.position, note.length))
+                .collect::<Vec<_>>(),
+            [(60, 42, 20), (62, 42, 20)]
         );
     }
 
