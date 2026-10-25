@@ -4693,6 +4693,7 @@ struct DawUi {
     chop_divisions: u8,
     strum_spread_ticks: u32,
     strum_descending: bool,
+    strum_preserve_end: bool,
     strum_velocity_amount: i16,
     strum_velocity_tension_percent: i16,
     flam_stroke_ticks: u32,
@@ -6265,6 +6266,7 @@ impl DawUi {
             chop_divisions: 4,
             strum_spread_ticks: 120,
             strum_descending: false,
+            strum_preserve_end: false,
             strum_velocity_amount: 0,
             strum_velocity_tension_percent: 0,
             flam_stroke_ticks: 12,
@@ -34067,6 +34069,7 @@ impl DawUi {
                     egui::Slider::new(&mut self.strum_velocity_tension_percent, -100..=100)
                         .text("Velocity tension (%)"),
                 );
+                ui.checkbox(&mut self.strum_preserve_end, "Preserve end");
                 egui::ComboBox::from_id_salt("piano-roll-strum-direction")
                     .selected_text(if self.strum_descending {
                         "Strum: Down"
@@ -34718,6 +34721,7 @@ impl DawUi {
             let options = StrumOptions {
                 spread_ticks: self.strum_spread_ticks,
                 descending: self.strum_descending,
+                preserve_end: self.strum_preserve_end,
                 velocity_amount: self.strum_velocity_amount,
                 velocity_tension_percent: self.strum_velocity_tension_percent,
             };

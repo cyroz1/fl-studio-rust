@@ -1398,6 +1398,27 @@ fn run(args: Vec<String>) -> Result<(), String> {
             )
         }
         [command, input, output, pattern_id, channel_id, spread_ticks, direction,
+            velocity_amount, velocity_tension, preserve_end]
+            if command == "strum-notes" =>
+        {
+            strum_notes_with_options(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                StrumOptions {
+                    spread_ticks: parse_u32(spread_ticks, "strum spread")?,
+                    descending: parse_strum_direction(direction)?,
+                    velocity_amount: parse_i16(velocity_amount, "strum velocity amount")?,
+                    velocity_tension_percent: parse_i16(
+                        velocity_tension,
+                        "strum velocity tension",
+                    )?,
+                    preserve_end: parse_bool(preserve_end, "preserve end")?,
+                },
+            )
+        }
+        [command, input, output, pattern_id, channel_id, spread_ticks, direction,
             velocity_amount, velocity_tension]
             if command == "strum-notes" =>
         {
@@ -1419,6 +1440,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                         velocity_tension,
                         "strum velocity tension",
                     )?,
+                    ..StrumOptions::default()
                 },
             )
         }
@@ -1440,6 +1462,29 @@ fn run(args: Vec<String>) -> Result<(), String> {
             )
         }
         [command, input, output, pattern_id, channel_id, note_indices, spread_ticks, direction,
+            velocity_amount, velocity_tension, preserve_end]
+            if command == "strum-notes-selected" =>
+        {
+            let note_indices = parse_note_indices(note_indices)?;
+            strum_notes_with_scope(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                Some(&note_indices),
+                StrumOptions {
+                    spread_ticks: parse_u32(spread_ticks, "strum spread")?,
+                    descending: parse_strum_direction(direction)?,
+                    velocity_amount: parse_i16(velocity_amount, "strum velocity amount")?,
+                    velocity_tension_percent: parse_i16(
+                        velocity_tension,
+                        "strum velocity tension",
+                    )?,
+                    preserve_end: parse_bool(preserve_end, "preserve end")?,
+                },
+            )
+        }
+        [command, input, output, pattern_id, channel_id, note_indices, spread_ticks, direction,
             velocity_amount, velocity_tension]
             if command == "strum-notes-selected" =>
         {
@@ -1458,6 +1503,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                         velocity_tension,
                         "strum velocity tension",
                     )?,
+                    ..StrumOptions::default()
                 },
             )
         }
@@ -3684,8 +3730,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild glue-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based>\n",
             "  flp-rebuild flip-notes <input.flp> <output.flp> <pattern-id> <channel-id>\n",
             "  flp-rebuild flip-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based>\n",
-            "  flp-rebuild strum-notes <input.flp> <output.flp> <pattern-id> <channel-id> <spread-ticks> <up|down> [velocity-amount:-127..127 velocity-tension:-100..100]\n",
-            "  flp-rebuild strum-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <spread-ticks> <up|down> [velocity-amount:-127..127 velocity-tension:-100..100]\n",
+            "  flp-rebuild strum-notes <input.flp> <output.flp> <pattern-id> <channel-id> <spread-ticks> <up|down> [velocity-amount:-127..127 velocity-tension:-100..100 preserve-end:0|1]\n",
+            "  flp-rebuild strum-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <spread-ticks> <up|down> [velocity-amount:-127..127 velocity-tension:-100..100 preserve-end:0|1]\n",
             "  flp-rebuild flam-notes <input.flp> <output.flp> <pattern-id> <channel-id> <stroke-ticks> <velocity-0..127> <before|after> [group-notes:0|1]\n",
             "  flp-rebuild flam-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <stroke-ticks> <velocity-0..127> <before|after> [group-notes:0|1]\n",
             "  flp-rebuild generate-random-notes <input.flp> <output.flp> <pattern-id> <channel-id> <start-ticks> <end-ticks-exclusive> <step-ticks> <note-length-ticks> <density-0..100> <minimum-key-0..127> <maximum-key-0..127> <seed> [stack-1..16 [length-variation:-100..100 [merge-same-notes:0|1 [base-octave-0..10 range-octaves-1..11 [chord-map-name chord-root-0..11]]]]]\n",
@@ -8180,7 +8226,7 @@ fn strum_notes_with_scope(
     fs::write(output, bytes)
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
-        "strummed {changed} notes in pattern {pattern_id}, channel {channel_id} ({}) with {} ticks of spread, velocity amount {}, and velocity tension {}% ({}) to {}",
+        "strummed {changed} notes in pattern {pattern_id}, channel {channel_id} ({}) with {} ticks of spread, velocity amount {}, velocity tension {}%, and preserve-end={} ({}) to {}",
         if note_indices.is_some() {
             "selected notes"
         } else {
@@ -8189,6 +8235,7 @@ fn strum_notes_with_scope(
         options.spread_ticks,
         options.velocity_amount,
         options.velocity_tension_percent,
+        options.preserve_end,
         if options.descending { "down" } else { "up" },
         output.display()
     );
