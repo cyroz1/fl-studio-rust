@@ -4702,7 +4702,9 @@ impl PlaylistClip {
             return true;
         }
         matches!(self.target(), PlaylistClipTarget::Pattern { .. })
-            && self.source_window_ticks == Some((0, self.length_ticks))
+            && self
+                .source_window_ticks
+                .is_some_and(|(start, end)| end.checked_sub(start) == Some(self.length_ticks))
     }
 
     /// The 88-byte Playlist record tail is preserved verbatim except for the
@@ -9311,12 +9313,29 @@ impl FlpDocument {
                     .is_some_and(|item_index| item_index < clip.pattern_base)
             {
                 return Err(FlpError::UnsupportedEdit(
-                    "this Playlist clip does not have a recognized full source window for resizing",
+                    "this Playlist clip does not have a recognized source window matching its timeline for resizing",
                 ));
             }
             writes.push((record_start + 8, value.to_le_bytes().to_vec()));
             if record_size == 88 && edit.source_window_ticks.is_none() {
-                writes.push((record_start + 28, value.to_le_bytes().to_vec()));
+                let source_end = match clip.target() {
+                    PlaylistClipTarget::Pattern { .. } => {
+                        let (source_start, source_end) =
+                            clip.source_window_ticks().ok_or(FlpError::UnsupportedEdit(
+                                "this Pattern Clip has no recognized tick source window",
+                            ))?;
+                        if source_end.checked_sub(source_start) != Some(clip.length_ticks) {
+                            return Err(FlpError::UnsupportedEdit(
+                                "this Pattern Clip source window does not match its timeline length",
+                            ));
+                        }
+                        source_start
+                            .checked_add(value)
+                            .ok_or(FlpError::LengthOverflow)?
+                    }
+                    PlaylistClipTarget::Channel { .. } => value,
+                };
+                writes.push((record_start + 28, source_end.to_le_bytes().to_vec()));
             }
         }
         if let Some(value) = edit.raw_track_index {
@@ -11387,7 +11406,7 @@ impl FlpDocument {
         };
         if !clip.can_resize_timeline_length() {
             return Err(FlpError::UnsupportedEdit(
-                "this Pattern Clip does not have a recognized full source window for splitting",
+                "this Pattern Clip does not have a recognized source window matching its timeline for splitting",
             ));
         }
         if clip
@@ -11436,7 +11455,11 @@ impl FlpDocument {
             .ok_or(FlpError::UnsupportedEdit(
                 "splitting Pattern Clips requires a known nonzero pattern repeat length",
             ))?;
-        if !u64::from(relative_split_ticks).is_multiple_of(repeat_length) {
+        let source_start_ticks = clip
+            .source_window_ticks()
+            .map(|(source_start, _)| u64::from(source_start))
+            .unwrap_or(0);
+        if !(source_start_ticks + u64::from(relative_split_ticks)).is_multiple_of(repeat_length) {
             return Err(FlpError::UnsupportedEdit(
                 "the split point must fall on a pattern repeat boundary",
             ));
@@ -11516,9 +11539,20 @@ impl FlpDocument {
         right_record[0..4].copy_from_slice(&split_position_ticks.to_le_bytes());
         right_record[8..12].copy_from_slice(&right_length.to_le_bytes());
         if record_size == 88 {
-            left_record[28..32].copy_from_slice(&left_length.to_le_bytes());
-            right_record[24..28].copy_from_slice(&0u32.to_le_bytes());
-            right_record[28..32].copy_from_slice(&right_length.to_le_bytes());
+            let (source_start, source_end) = clip.source_window_ticks().ok_or(
+                FlpError::UnsupportedEdit("this Pattern Clip has no recognized tick source window"),
+            )?;
+            let left_source_end = source_start
+                .checked_add(left_length)
+                .ok_or(FlpError::LengthOverflow)?;
+            if source_end.checked_sub(source_start) != Some(clip.length_ticks) {
+                return Err(FlpError::UnsupportedEdit(
+                    "this Pattern Clip source window does not match its timeline length",
+                ));
+            }
+            left_record[28..32].copy_from_slice(&left_source_end.to_le_bytes());
+            right_record[24..28].copy_from_slice(&left_source_end.to_le_bytes());
+            right_record[28..32].copy_from_slice(&source_end.to_le_bytes());
         }
         if playlist_record_has_clip_id(record_size) {
             right_record[32..36]
@@ -22772,7 +22806,10 @@ mod tests {
         clip[8..12].copy_from_slice(&length_ticks.to_le_bytes());
         clip[12..14].copy_from_slice(&499u16.to_le_bytes());
         clip[24..28].copy_from_slice(&source_start_ticks.to_le_bytes());
-        clip[28..32].copy_from_slice(&length_ticks.to_le_bytes());
+        let source_end_ticks = source_start_ticks
+            .checked_add(length_ticks)
+            .expect("modern Pattern Clip fixture source window should fit");
+        clip[28..32].copy_from_slice(&source_end_ticks.to_le_bytes());
         append_data_event(&mut event_stream, 0xC7, b"26.1.0.0\0");
         append_data_event(&mut event_stream, 0xE9, &clip);
         FlpDocument::parse(&flp_fixture(&event_stream, &[], &[]))
@@ -24134,7 +24171,7 @@ mod tests {
     }
 
     #[test]
-    fn resizing_full_window_modern_pattern_updates_its_tick_window() {
+    fn resizing_one_to_one_modern_pattern_windows_preserves_source_offsets() {
         let mut payload = Vec::new();
         let mut tails = Vec::new();
         for (index, window_start) in [0u32, 120].into_iter().enumerate() {
@@ -24146,7 +24183,7 @@ mod tests {
             record[12..14].copy_from_slice(&471u16.to_le_bytes());
             record[14..16].copy_from_slice(&0u16.to_le_bytes());
             record[24..28].copy_from_slice(&window_start.to_le_bytes());
-            record[28..32].copy_from_slice(&960u32.to_le_bytes());
+            record[28..32].copy_from_slice(&(window_start + 960).to_le_bytes());
             tails.push(record[16..].to_vec());
             payload.extend_from_slice(&record);
         }
@@ -24162,8 +24199,12 @@ mod tests {
         assert_eq!(arrangement.clips[0].source_window_ticks(), Some((0, 960)));
         assert!(arrangement.clips[0].uses_full_source_window());
         assert!(arrangement.clips[0].can_resize_timeline_length());
-        assert_eq!(arrangement.clips[1].source_window_ticks(), Some((120, 960)));
-        assert!(!arrangement.clips[1].can_resize_timeline_length());
+        assert_eq!(
+            arrangement.clips[1].source_window_ticks(),
+            Some((120, 1080))
+        );
+        assert!(!arrangement.clips[1].uses_full_source_window());
+        assert!(arrangement.clips[1].can_resize_timeline_length());
 
         document
             .edit_playlist_clip(
@@ -24182,19 +24223,46 @@ mod tests {
         assert_eq!(&clips[0].clips[0].reserved[..12], &tails[0][..12]);
         assert_eq!(&clips[0].clips[0].reserved[16..], &tails[0][16..]);
 
+        document
+            .edit_playlist_clip(
+                0,
+                1,
+                PlaylistClipEdit {
+                    length_ticks: Some(480),
+                    ..PlaylistClipEdit::default()
+                },
+            )
+            .expect("a one-to-one offset Pattern Clip should resize with its source window");
+        let clips = document.arrangements().unwrap();
+        assert_eq!(clips[0].clips[1].length_ticks, 480);
+        assert_eq!(clips[0].clips[1].source_window_ticks(), Some((120, 600)));
+        assert_eq!(&clips[0].clips[1].reserved[..12], &tails[1][..12]);
+        assert_eq!(&clips[0].clips[1].reserved[16..], &tails[1][16..]);
+
         let before_rejected_edit = document.encode_lossless().unwrap();
+        let mut mismatched_window = modern_pattern_clip_fixture(192, 24, 0, 48);
+        let mismatched_arrangement = mismatched_window.arrangements().unwrap();
+        assert_eq!(
+            mismatched_arrangement[0].clips[0].source_window_ticks(),
+            Some((24, 192))
+        );
+        assert!(!mismatched_arrangement[0].clips[0].can_resize_timeline_length());
+        let mismatch_before = mismatched_window.encode_lossless().unwrap();
         assert!(
-            document
+            mismatched_window
                 .edit_playlist_clip(
+                    3,
                     0,
-                    1,
                     PlaylistClipEdit {
-                        length_ticks: Some(480),
+                        length_ticks: Some(240),
                         ..PlaylistClipEdit::default()
                     },
                 )
-                .is_err(),
-            "a non-full source window must not be changed by timeline resizing"
+                .is_err()
+        );
+        assert_eq!(
+            mismatched_window.encode_lossless().unwrap(),
+            mismatch_before
         );
         assert_eq!(document.encode_lossless().unwrap(), before_rejected_edit);
     }
@@ -25063,16 +25131,44 @@ mod tests {
         assert!(crossing_note.split_playlist_pattern_clip(3, 0, 96).is_err());
         assert_eq!(crossing_note.encode_lossless().unwrap(), before_split);
 
-        let mut partial_modern_window = modern_pattern_clip_fixture(192, 24, 0, 48);
-        let before_split = partial_modern_window.encode_lossless().unwrap();
+        let mut offset_modern_window = modern_pattern_clip_fixture(192, 24, 0, 48);
+        let right_index = offset_modern_window
+            .split_playlist_pattern_clip(3, 0, 72)
+            .expect("a one-to-one offset Pattern Clip should split at a source repeat boundary");
+        assert_eq!(right_index, 1);
+        let arrangements = offset_modern_window.arrangements().unwrap();
+        assert_eq!(arrangements[0].clips[0].length_ticks, 72);
+        assert_eq!(
+            arrangements[0].clips[0].source_window_ticks(),
+            Some((24, 96))
+        );
+        assert_eq!(arrangements[0].clips[1].position_ticks, 72);
+        assert_eq!(arrangements[0].clips[1].length_ticks, 120);
+        assert_eq!(
+            arrangements[0].clips[1].source_window_ticks(),
+            Some((96, 216))
+        );
+
+        let mut mismatched_modern_window = FlpDocument::parse(&{
+            let mut fixture = modern_pattern_clip_fixture(192, 24, 0, 48);
+            let event = fixture
+                .events
+                .iter_mut()
+                .find(|event| event.opcode == 0xE9)
+                .expect("the Pattern Clip event should remain present");
+            event.payload[28..32].copy_from_slice(&192u32.to_le_bytes());
+            fixture.encode_lossless().unwrap()
+        })
+        .expect("the mismatched-window fixture should parse");
+        let mismatch_before = mismatched_modern_window.encode_lossless().unwrap();
         assert!(
-            partial_modern_window
-                .split_playlist_pattern_clip(3, 0, 96)
+            mismatched_modern_window
+                .split_playlist_pattern_clip(3, 0, 72)
                 .is_err()
         );
         assert_eq!(
-            partial_modern_window.encode_lossless().unwrap(),
-            before_split
+            mismatched_modern_window.encode_lossless().unwrap(),
+            mismatch_before
         );
     }
 

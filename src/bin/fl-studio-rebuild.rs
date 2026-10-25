@@ -5726,6 +5726,8 @@ struct MidiPlaylistClipExtension {
     position_ticks: u32,
     length_ticks: u32,
     track_index: u16,
+    source_start_tick: u32,
+    pattern_loop_length_ticks: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -21213,7 +21215,7 @@ impl DawUi {
                             } else if is_audio_clip {
                                 "Drag to move. Shift-drag either edge to trim or extend eligible legacy Audio Clips when the sample is loaded, the source window matches the timeline at base tempo, scale is default, and no Playlist tempo automation overlaps; selected eligible clips share the same trim change."
                             } else if clip.has_opaque_record_tail() {
-                                "Drag to move. Shift-drag the right edge to resize this Pattern Clip; its full source window will be kept in sync. Eligible selected clips can share the right-edge resize."
+                                "Drag to move. Shift-drag the right edge to resize this Pattern Clip; its recognized source window will stay aligned with its duration. Eligible selected clips can share the right-edge resize."
                             } else {
                                 "Drag to move. Shift-drag the right edge to resize. Hold Alt to ignore the 1/16 grid."
                             };
@@ -21954,7 +21956,7 @@ impl DawUi {
                                     );
                                     if split_pattern_button
                                         .on_disabled_hover_text(
-                                            "Requires a repeat boundary, cycle-contained notes, default scale, a full source window, and no Playlist tempo automation.",
+                                            "Requires a source-window repeat boundary, cycle-contained notes, default scale, a recognized full or one-to-one source window, and no Playlist tempo automation.",
                                         )
                                         .clicked()
                                         && let Some(split_position_ticks) = context_split_position
@@ -21984,7 +21986,7 @@ impl DawUi {
                                         );
                                         if button
                                             .on_disabled_hover_text(
-                                                "Each selected clip must contain this split on a repeat boundary, use default scale and a full source window, keep notes within repeat cycles, and avoid tempo automation.",
+                                                "Each selected clip must contain this split on a source-window repeat boundary, use default scale and a recognized full or one-to-one source window, keep notes within repeat cycles, and avoid tempo automation.",
                                             )
                                             .clicked()
                                             && let Some(split_position_ticks) =
@@ -46676,6 +46678,8 @@ impl DawUi {
                         &arrangement.clips,
                     ) {
                         let clip = arrangement.clips.get(clip_index)?;
+                        let source_start_tick = playlist_pattern_recording_source_start(clip)?;
+                        let pattern_loop_length_ticks = pattern_loop_length_ticks?;
                         Some(MidiPlaylistRecordingTarget::ExtendClip(
                             MidiPlaylistClipExtension {
                                 arrangement_id: arrangement.id,
@@ -46683,6 +46687,8 @@ impl DawUi {
                                 position_ticks: clip.position_ticks,
                                 length_ticks: clip.length_ticks,
                                 track_index: clip.track_index?,
+                                source_start_tick,
+                                pattern_loop_length_ticks,
                             },
                         ))
                     } else {
@@ -61471,7 +61477,11 @@ fn playlist_pattern_clip_split_supported(
     else {
         return false;
     };
-    if !u64::from(relative_split_ticks).is_multiple_of(repeat_length)
+    let source_start_ticks = clip
+        .source_window_ticks()
+        .map(|(source_start, _)| u64::from(source_start))
+        .unwrap_or(0);
+    if !(source_start_ticks + u64::from(relative_split_ticks)).is_multiple_of(repeat_length)
         || pattern.notes.iter().any(|note| {
             u64::from(note.position) >= repeat_length
                 || (note.length > 0
@@ -64033,14 +64043,11 @@ fn extend_recorded_pattern_playlist_clip(
     extension: MidiPlaylistClipExtension,
     notes: &[PatternNote],
 ) -> Result<Option<u32>, String> {
-    let required_length_ticks = notes
-        .iter()
-        .try_fold(0_u32, |length, note| {
-            note.position
-                .checked_add(note.length)
-                .map(|note_end| length.max(note_end))
-        })
-        .ok_or_else(|| "A recorded Pattern note exceeds the Playlist tick range".to_owned())?;
+    let required_length_ticks = recorded_pattern_clip_required_length(
+        notes,
+        extension.source_start_tick,
+        extension.pattern_loop_length_ticks,
+    )?;
     let arrangements = document
         .arrangements()
         .map_err(|error| format!("Could not inspect the recording Playlist: {error}"))?;
@@ -64085,6 +64092,30 @@ fn extend_recorded_pattern_playlist_clip(
         )
         .map_err(|error| format!("Could not extend the Playlist Pattern Clip: {error}"))?;
     Ok(Some(required_length_ticks))
+}
+
+fn recorded_pattern_clip_required_length(
+    notes: &[PatternNote],
+    source_start_tick: u32,
+    pattern_loop_length_ticks: u32,
+) -> Result<u32, String> {
+    if pattern_loop_length_ticks == 0 {
+        return Err("The recorded Pattern has no usable loop length".to_owned());
+    }
+    let loop_length = u64::from(pattern_loop_length_ticks);
+    notes.iter().try_fold(0_u32, |required_length, note| {
+        if note.length == 0 {
+            return Ok(required_length);
+        }
+        let source_position = u64::from(note.position % pattern_loop_length_ticks);
+        let source_start = u64::from(source_start_tick % pattern_loop_length_ticks);
+        let offset = (source_position + loop_length - source_start) % loop_length;
+        let note_end = offset
+            .checked_add(u64::from(note.length))
+            .and_then(|end| u32::try_from(end).ok())
+            .ok_or_else(|| "A recorded Pattern note exceeds the Playlist tick range".to_owned())?;
+        Ok(required_length.max(note_end))
+    })
 }
 
 fn create_recorded_pattern_playlist_clip(
@@ -67220,6 +67251,25 @@ mod tests {
         assert_eq!(
             playlist_pattern_recording_offset(430.0, 7, 96, &clips),
             Some(70)
+        );
+        assert_eq!(
+            recorded_pattern_clip_required_length(
+                &[
+                    PatternNote {
+                        position: 0,
+                        length: 12,
+                        ..PatternNote::default()
+                    },
+                    PatternNote {
+                        position: 72,
+                        length: 24,
+                        ..PatternNote::default()
+                    },
+                ],
+                24,
+                96,
+            ),
+            Ok(84)
         );
 
         clips[1].source_window_ticks = Some((24, 192));
