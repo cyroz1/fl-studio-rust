@@ -502,6 +502,10 @@ def _global_transport(command, value, pmeflags=2, flags=15):
         if value != 0:
             _request_transport_action("select_next_empty_pattern_with_name_dialog")
         return 8
+    if command == 61:  # FPT_F2: Rename selected Mixer track
+        if value != 0:
+            _request_transport_action("focus_selected_mixer_track_name")
+        return 8
     return -1
 
 

@@ -4749,6 +4749,7 @@ struct DawUi {
     selected_pattern_time_signature_pattern: Option<u16>,
     pattern_time_signature_dialog_open: bool,
     selected_mixer_insert: Option<usize>,
+    mixer_track_name_editor_requested: bool,
     mixer_master_peak_hold: f32,
     mixer_insert_peak_holds: [f32; MIXER_TRACK_METER_COUNT],
     mixer_track_peak_meters: Arc<MixerTrackPeakMeters>,
@@ -6259,6 +6260,7 @@ impl DawUi {
             selected_pattern_time_signature_pattern: None,
             pattern_time_signature_dialog_open: false,
             selected_mixer_insert: None,
+            mixer_track_name_editor_requested: false,
             mixer_master_peak_hold: 0.0,
             mixer_insert_peak_holds: [0.0; MIXER_TRACK_METER_COUNT],
             mixer_track_peak_meters: Arc::new(MixerTrackPeakMeters::default()),
@@ -43756,10 +43758,14 @@ impl DawUi {
                             format!("Insert {}", insert.ordinal())
                         });
                         let mut name = insert.name().unwrap_or_default().to_owned();
-                        if ui
-                            .add(egui::TextEdit::singleline(&mut name).hint_text("Insert name"))
-                            .changed()
-                        {
+                        let name_response = ui.add(
+                            egui::TextEdit::singleline(&mut name).hint_text("Insert name"),
+                        );
+                        if self.mixer_track_name_editor_requested {
+                            name_response.request_focus();
+                            self.mixer_track_name_editor_requested = false;
+                        }
+                        if name_response.changed() {
                             rename_edits.push((insert.ordinal(), name));
                         }
                         let insert_slots = effect_slots
@@ -46574,6 +46580,19 @@ impl DawUi {
             MidiTransportCommand::SelectNextEmptyPatternWithNameDialog => {
                 if let Some(pattern_id) = self.select_next_empty_pattern() {
                     self.open_pattern_rename_dialog(pattern_id);
+                }
+            }
+            MidiTransportCommand::FocusSelectedMixerTrackName => {
+                if self
+                    .document
+                    .as_ref()
+                    .is_some_and(|document| !document.mixer_inserts().is_empty())
+                {
+                    self.view = MainView::Mixer;
+                    self.mixer_track_name_editor_requested = true;
+                } else {
+                    self.status = "Open a project with a recognized Mixer track before renaming it"
+                        .to_owned();
                 }
             }
             MidiTransportCommand::PatternJog(increment) => {

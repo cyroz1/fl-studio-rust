@@ -45,6 +45,7 @@ pub enum ScriptTransportAction {
     SetProjectTimeSignatureNumerator(u8),
     SetProjectTimeSignatureDenominator(u8),
     SelectNextEmptyPatternWithNameDialog,
+    FocusSelectedMixerTrackName,
     PatternJog(i32),
     TempoJog(i32),
     MarkerJumpJog(i32),
@@ -77,6 +78,7 @@ impl ScriptTransportAction {
             "select_next_empty_pattern_with_name_dialog" => {
                 Some(Self::SelectNextEmptyPatternWithNameDialog)
             }
+            "focus_selected_mixer_track_name" => Some(Self::FocusSelectedMixerTrackName),
             _ => None,
         }
     }
@@ -1868,6 +1870,27 @@ mod tests {
         assert_eq!(
             result.actions,
             [ScriptTransportAction::SelectNextEmptyPatternWithNameDialog]
+        );
+    }
+
+    #[test]
+    fn python_global_transport_f2_focuses_the_selected_mixer_track_name() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport midi\nimport transport\ndef OnMidiIn(event):\n    result = transport.globalTransport(midi.FPT_F2, 1, event.pmeflags)\n    event.data1 = int(result == midi.GT_Global)\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let mut runtime = MidiScriptRuntime::start_for_device(&script, "Test Input").unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
+
+        assert_eq!(result.bytes, [0xB0, 1, 1]);
+        assert_eq!(
+            result.actions,
+            [ScriptTransportAction::FocusSelectedMixerTrackName]
         );
     }
 

@@ -668,6 +668,7 @@ fn midi_input_thru_message(event: MidiInputEvent) -> Option<([u8; 3], usize)> {
             | MidiTransportCommand::SetProjectTimeSignatureNumerator(_)
             | MidiTransportCommand::SetProjectTimeSignatureDenominator(_)
             | MidiTransportCommand::SelectNextEmptyPatternWithNameDialog
+            | MidiTransportCommand::FocusSelectedMixerTrackName
             | MidiTransportCommand::PatternJog(_)
             | MidiTransportCommand::TempoJog(_)
             | MidiTransportCommand::MarkerJumpJog(_)
