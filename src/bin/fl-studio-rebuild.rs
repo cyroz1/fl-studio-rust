@@ -46129,6 +46129,16 @@ impl DawUi {
             MidiTransportCommand::MarkerSelJog(increment) => {
                 self.select_midi_script_marker(increment);
             }
+            MidiTransportCommand::ShowMainView(view) => {
+                self.view = match view {
+                    0 => MainView::Playlist,
+                    1 => MainView::ChannelRack,
+                    2 => MainView::PianoRoll,
+                    3 => MainView::Plugins,
+                    4 => MainView::Mixer,
+                    _ => return,
+                };
+            }
         }
     }
 

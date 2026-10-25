@@ -692,6 +692,7 @@ fn queue_script_transport_actions(
             ScriptTransportAction::MarkerSelJog(increment) => {
                 MidiTransportCommand::MarkerSelJog(increment)
             }
+            ScriptTransportAction::ShowMainView(view) => MidiTransportCommand::ShowMainView(view),
             ScriptTransportAction::MidiOutput(_) => unreachable!("handled above"),
             ScriptTransportAction::RepeatMidiOutput { .. }
             | ScriptTransportAction::StopRepeatMidiOutput => continue,
@@ -728,6 +729,7 @@ pub enum MidiTransportCommand {
     TempoJog(i32),
     MarkerJumpJog(i32),
     MarkerSelJog(i32),
+    ShowMainView(u8),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1344,6 +1346,7 @@ pub fn describe_event(event: MidiInputEvent) -> String {
             MidiTransportCommand::TempoJog(_) => "MIDI script Tempo".to_owned(),
             MidiTransportCommand::MarkerJumpJog(_) => "MIDI script Marker Jump".to_owned(),
             MidiTransportCommand::MarkerSelJog(_) => "MIDI script Marker Selection".to_owned(),
+            MidiTransportCommand::ShowMainView(_) => "MIDI script View Selection".to_owned(),
         },
     }
 }
@@ -2010,7 +2013,7 @@ mod tests {
 
     #[test]
     fn script_midi_output_actions_reach_the_dedicated_output_queue() {
-        let (transport_sender, transport_receiver) = mpsc::sync_channel(2);
+        let (transport_sender, transport_receiver) = mpsc::sync_channel(4);
         let (midi_output_sender, midi_output_receiver) = mpsc::sync_channel(2);
         let dropped_messages = AtomicU64::new(0);
         let received_at = Instant::now();
@@ -2025,6 +2028,7 @@ mod tests {
                 ScriptTransportAction::MidiOutput(vec![0x90, 60, 100]),
                 ScriptTransportAction::SetCurrentTempoMilliBpm(123_456),
                 ScriptTransportAction::Start,
+                ScriptTransportAction::ShowMainView(4),
             ],
         );
 
@@ -2039,6 +2043,10 @@ mod tests {
         assert_eq!(
             transport_receiver.try_recv().unwrap().event,
             MidiInputEvent::Transport(MidiTransportCommand::Start)
+        );
+        assert_eq!(
+            transport_receiver.try_recv().unwrap().event,
+            MidiInputEvent::Transport(MidiTransportCommand::ShowMainView(4))
         );
         assert_eq!(dropped_messages.load(Ordering::Relaxed), 0);
     }
