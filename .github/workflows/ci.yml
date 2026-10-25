@@ -455,6 +455,51 @@ jobs:
           timeout 10 "$helper" </dev/null
           rm -rf "$appimage_dir"
 
+      - name: Verify Linux ARM64 AppImage executables
+        if: matrix.platform == 'linux-arm64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          appimages=(dist/*.AppImage)
+          if (( ${#appimages[@]} != 1 )); then
+            echo "::error::Expected exactly one Linux ARM64 AppImage; found ${#appimages[@]}."
+            exit 1
+          fi
+          appimage_path="$PWD/${appimages[0]}"
+          appimage_dir="$RUNNER_TEMP/linux-arm64-appimage"
+          mkdir -p "$appimage_dir"
+          (
+            cd "$appimage_dir"
+            "$appimage_path" --appimage-extract >/dev/null
+          )
+          python3 - \
+            "$appimage_dir/squashfs-root/usr/bin/fl-studio-rebuild" \
+            "$appimage_dir/squashfs-root/usr/bin/vst3-host-helper" <<'PY'
+          import struct
+          import sys
+          from pathlib import Path
+
+          for argument in sys.argv[1:]:
+              executable = Path(argument)
+              if not executable.is_file() or not executable.stat().st_mode & 0o111:
+                  raise SystemExit(f"{executable} is missing or not executable")
+              header = executable.read_bytes()[:64]
+              if len(header) < 20 or header[:4] != b"\x7fELF":
+                  raise SystemExit(f"{executable} is not an ELF executable")
+              if header[4] != 2 or header[5] != 1:
+                  raise SystemExit(
+                      f"{executable} is not a 64-bit little-endian ELF executable"
+                  )
+              machine = struct.unpack_from("<H", header, 18)[0]
+              if machine != 183:
+                  raise SystemExit(
+                      f"{executable} ELF machine is {machine}; expected 183 (AArch64)"
+                  )
+              print(f"Verified {executable} is a 64-bit AArch64 executable.")
+          PY
+          rm -rf "$appimage_dir"
+
       - name: Install Linux Debian package
         if: runner.os == 'Linux'
         shell: bash
