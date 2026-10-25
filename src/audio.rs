@@ -4952,6 +4952,61 @@ mod tests {
     }
 
     #[test]
+    fn custom_shared_sample_rates_and_buffer_sizes_use_reported_device_ranges() {
+        let catalog = AudioDeviceCatalog {
+            outputs: vec![AudioDeviceInfo {
+                id: "output".to_owned(),
+                name: "Output".to_owned(),
+                config_ranges: vec![AudioDeviceConfigRange {
+                    minimum_sample_rate: 32_000,
+                    maximum_sample_rate: 48_000,
+                    channels: 2,
+                    minimum_buffer_frames: Some(64),
+                    maximum_buffer_frames: Some(1_024),
+                }],
+                exclusive_sample_rates: Vec::new(),
+                exclusive_default_period_hns: None,
+                exclusive_minimum_period_hns: None,
+            }],
+            default_output_id: Some("output".to_owned()),
+            ..AudioDeviceCatalog::default()
+        };
+        let settings = AudioSettings {
+            enable_input: false,
+            sample_rate: 40_000,
+            buffer_frames: 300,
+            ..AudioSettings::default()
+        };
+
+        assert!(catalog.supported_sample_rates(&settings).contains(&40_000));
+        assert!(
+            catalog
+                .supported_buffer_sizes(&settings, 40_000)
+                .contains(&300)
+        );
+
+        let outside_rate = AudioSettings {
+            sample_rate: 49_000,
+            ..settings.clone()
+        };
+        assert!(
+            !catalog
+                .supported_sample_rates(&outside_rate)
+                .contains(&49_000)
+        );
+
+        let outside_buffer = AudioSettings {
+            buffer_frames: 1_025,
+            ..settings
+        };
+        assert!(
+            !catalog
+                .supported_buffer_sizes(&outside_buffer, 40_000)
+                .contains(&1_025)
+        );
+    }
+
+    #[test]
     fn exclusive_mode_sample_rates_are_intersected_for_selected_wasapi_devices() {
         let catalog = AudioDeviceCatalog {
             inputs: vec![AudioDeviceInfo {

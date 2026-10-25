@@ -50929,6 +50929,13 @@ impl DawUi {
             .supported_sample_rates(&self.audio_settings);
         let sample_rate_is_supported =
             supported_audio_sample_rates.contains(&self.audio_settings.sample_rate);
+        let sample_rate_text = if sample_rate_is_supported {
+            format!("{} Hz", self.audio_settings.sample_rate)
+        } else if self.audio_settings.access == AudioAccess::Exclusive {
+            format!("{} Hz · checked on start", self.audio_settings.sample_rate)
+        } else {
+            format!("{} Hz · unsupported", self.audio_settings.sample_rate)
+        };
         let buffer_sample_rate = self.audio_settings.sample_rate;
         let supported_audio_buffer_sizes = self
             .audio_catalog
@@ -50938,19 +50945,24 @@ impl DawUi {
         ui.horizontal(|ui| {
             ui.label("Sample rate");
             egui::ComboBox::from_id_salt("audio_sample_rate")
-                .selected_text(if sample_rate_is_supported {
-                    format!("{} Hz", self.audio_settings.sample_rate)
-                } else {
-                    format!("{} Hz · unsupported", self.audio_settings.sample_rate)
-                })
+                .selected_text(sample_rate_text)
                 .show_ui(ui, |ui| {
                     if !sample_rate_is_supported {
                         ui.add_enabled(
                             false,
-                            egui::Label::new(format!(
-                                "{} Hz · unsupported by selected devices",
-                                self.audio_settings.sample_rate
-                            )),
+                            egui::Label::new(
+                                if self.audio_settings.access == AudioAccess::Exclusive {
+                                    format!(
+                                        "{} Hz · WASAPI checks this custom rate on start",
+                                        self.audio_settings.sample_rate
+                                    )
+                                } else {
+                                    format!(
+                                        "{} Hz · unsupported by selected devices",
+                                        self.audio_settings.sample_rate
+                                    )
+                                },
+                            ),
                         );
                     }
                     for rate in &supported_audio_sample_rates {
@@ -50961,6 +50973,12 @@ impl DawUi {
                         );
                     }
                 });
+            ui.add(
+                egui::DragValue::new(&mut self.audio_settings.sample_rate)
+                    .range(8_000..=384_000)
+                    .speed(100.0)
+                    .suffix(" Hz"),
+            );
             ui.label("Buffer");
             egui::ComboBox::from_id_salt("audio_buffer_frames")
                 .selected_text(if buffer_size_is_supported {
@@ -50995,6 +51013,12 @@ impl DawUi {
                         );
                     }
                 });
+            ui.add(
+                egui::DragValue::new(&mut self.audio_settings.buffer_frames)
+                    .range(32..=8_192)
+                    .speed(1.0)
+                    .suffix(" frames"),
+            );
         });
         ui.add_space(8.0);
 
