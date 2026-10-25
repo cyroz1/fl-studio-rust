@@ -415,7 +415,7 @@ jobs:
           PY
           echo "Verified Debian, RPM, Arch package metadata and payload architectures for $(uname -m)."
 
-      - name: Verify Linux x64 AppImage includes its x86 VST3 helper
+      - name: Verify Linux x64 AppImage executables
         if: matrix.platform == 'linux-x64'
         shell: bash
         run: |
@@ -433,24 +433,38 @@ jobs:
             cd "$appimage_dir"
             "$appimage_path" --appimage-extract >/dev/null
           )
+          app="$appimage_dir/squashfs-root/usr/bin/fl-studio-rebuild"
           helper="$appimage_dir/squashfs-root/usr/bin/vst3-host-helper-x86"
-          if [[ ! -x "$helper" ]]; then
-            echo "::error::Linux x64 AppImage does not contain an executable x86 VST3 helper at usr/bin/vst3-host-helper-x86."
-            exit 1
-          fi
-          python3 - "$helper" <<'PY'
+          for executable in "$app" "$helper"; do
+            if [[ ! -x "$executable" ]]; then
+              echo "::error::Linux x64 AppImage does not contain executable $executable."
+              exit 1
+            fi
+          done
+          python3 - "$app" "$helper" <<'PY'
           import struct
           import sys
           from pathlib import Path
 
-          executable = Path(sys.argv[1])
-          header = executable.read_bytes()[:64]
-          if len(header) < 20 or header[:6] != b"\x7fELF\x01\x01":
-              raise SystemExit(f"{executable} is not a little-endian 32-bit ELF executable")
-          machine = struct.unpack_from("<H", header, 18)[0]
-          if machine != 3:
-              raise SystemExit(f"{executable} ELF machine is {machine}; expected 3 (x86)")
-          print(f"Verified {executable} is a 32-bit x86 ELF executable.")
+          app, helper = map(Path, sys.argv[1:])
+          for executable, elf_class, machine, architecture in (
+              (app, 2, 62, "64-bit x86-64"),
+              (helper, 1, 3, "32-bit x86"),
+          ):
+              header = executable.read_bytes()[:64]
+              if len(header) < 20 or header[:4] != b"\x7fELF" or header[5] != 1:
+                  raise SystemExit(
+                      f"{executable} is not a little-endian ELF executable"
+                  )
+              actual_class = header[4]
+              actual_machine = struct.unpack_from("<H", header, 18)[0]
+              if actual_class != elf_class or actual_machine != machine:
+                  raise SystemExit(
+                      f"{executable} is ELF class {actual_class}, machine "
+                      f"{actual_machine}; expected {architecture} "
+                      f"(class {elf_class}, machine {machine})"
+                  )
+              print(f"Verified {executable} is a {architecture} ELF executable.")
           PY
           timeout 10 "$helper" </dev/null
           rm -rf "$appimage_dir"
