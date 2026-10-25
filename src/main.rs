@@ -16,13 +16,14 @@ use flp_rebuild::sample_render::{
 use flp_rebuild::vst3::{Vst3AudioEffectRenderOptions, Vst3HostRuntime, Vst3PatternRenderOptions};
 use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, ArpeggioRangePattern, ArpeggioSyncMode, ArticulateOptions,
-    AutomationPointEdit, ChannelLevelAdjustmentsEdit, ChannelSortOrder, ChannelStretchSettingsEdit,
-    ClawMachineOptions, FlamOptions, FlpDocument, FstPreset, HumanizerOptions, LimitNoteOptions,
-    LimitSnapDirection, MixerInsertEdit, MixerParameterKind, PatternControllerEdit, PatternNote,
-    PatternNoteEdit, PatternNoteRotation, PlaylistClipEdit, PlaylistTrackEdit, PlaylistTrackMotion,
-    PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit, QuantizeNoteMode,
-    QuantizeNoteOptions, RandomNoteChordMap, RandomNoteGeneratorOptions, RandomizerOptions,
-    RiffMachineOptions, RiffMachineQuantizeMode, SamplerEnvelopeLfoEdit, SamplerEnvelopeLfoTarget,
+    AutomationInterpolationMode, AutomationPointEdit, ChannelLevelAdjustmentsEdit,
+    ChannelSortOrder, ChannelStretchSettingsEdit, ClawMachineOptions, FlamOptions, FlpDocument,
+    FstPreset, HumanizerOptions, LimitNoteOptions, LimitSnapDirection, MixerInsertEdit,
+    MixerParameterKind, PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation,
+    PlaylistClipEdit, PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress,
+    PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit, QuantizeNoteMode, QuantizeNoteOptions,
+    RandomNoteChordMap, RandomNoteGeneratorOptions, RandomizerOptions, RiffMachineOptions,
+    RiffMachineQuantizeMode, SamplerEnvelopeLfoEdit, SamplerEnvelopeLfoTarget,
     SamplerVolumeEnvelopeEdit, ScaleLevelsOptions, StrumOptions, TimeMarkerEdit,
 };
 
@@ -1095,6 +1096,19 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u16(channel_id, "channel id")?,
                 parse_usize(first_point_index, "first automation point index")?,
                 parse_usize(last_point_index, "last automation point index")?,
+                AutomationInterpolationMode::Linear,
+            )
+        }
+        [command, input, output, channel_id, first_point_index, last_point_index, mode]
+            if command == "interpolate-automation-points" =>
+        {
+            interpolate_automation_points(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(channel_id, "channel id")?,
+                parse_usize(first_point_index, "first automation point index")?,
+                parse_usize(last_point_index, "last automation point index")?,
+                parse_automation_interpolation_mode(mode)?,
             )
         }
         [command, input, output, pattern_id, channel_id, note_index, position, length, key, velocity]
@@ -3610,7 +3624,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild init-automation-points <input.flp> <output.flp> <channel-id> <template-channel-id>\n",
             "  flp-rebuild insert-automation-point <input.flp> <output.flp> <channel-id> <insertion-slot> <position-beats> <value> <tension>\n",
             "  flp-rebuild delete-automation-point <input.flp> <output.flp> <channel-id> <point-index>\n",
-            "  flp-rebuild interpolate-automation-points <input.flp> <output.flp> <channel-id> <first-point-index> <last-point-index>\n",
+            "  flp-rebuild interpolate-automation-points <input.flp> <output.flp> <channel-id> <first-point-index> <last-point-index> [linear|smooth]\n",
             "  flp-rebuild edit-note <input.flp> <output.flp> <pattern-id> <channel-id> <note-index> <position> <length> <key> <velocity>\n",
             "  flp-rebuild edit-note-properties <input.flp> <output.flp> <pattern-id> <channel-id> <note-index> <flags-raw|-> <group-raw|-> <fine-pitch|-> <release|-> <midi-channel-raw|-> <pan|-> <mod-x|-> <mod-y|->\n",
             "  flp-rebuild quantize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <grid-ticks> <start-strength-0..1> <swing-0..1> [sensitivity-0..1 duration-strength-0..1 leave-duration|leave-end|quantize-duration|quantize-end]\n",
@@ -4142,6 +4156,16 @@ fn parse_bool(value: &str, description: &str) -> Result<bool, String> {
         "0" | "false" => Ok(false),
         "1" | "true" => Ok(true),
         _ => Err(format!("{description} must be 0 or 1")),
+    }
+}
+
+fn parse_automation_interpolation_mode(value: &str) -> Result<AutomationInterpolationMode, String> {
+    match value {
+        "linear" => Ok(AutomationInterpolationMode::Linear),
+        "smooth" => Ok(AutomationInterpolationMode::Smooth),
+        _ => Err(format!(
+            "invalid automation interpolation mode {value:?}; expected linear or smooth"
+        )),
     }
 }
 
@@ -7484,10 +7508,16 @@ fn interpolate_automation_points(
     channel_id: u16,
     first_point_index: usize,
     last_point_index: usize,
+    mode: AutomationInterpolationMode,
 ) -> Result<(), String> {
     let (_, mut document) = load_document(input)?;
     let interpolated_count = document
-        .interpolate_automation_points(channel_id, first_point_index, last_point_index)
+        .interpolate_automation_points_with_mode(
+            channel_id,
+            first_point_index,
+            last_point_index,
+            mode,
+        )
         .map_err(|error| error.to_string())?;
     let bytes = document
         .encode_lossless()
@@ -7495,7 +7525,7 @@ fn interpolate_automation_points(
     fs::write(output, bytes)
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
-        "interpolated {interpolated_count} automation points between indices {first_point_index} and {last_point_index} in channel {channel_id} in {}",
+        "interpolated {interpolated_count} automation points ({mode:?}) between indices {first_point_index} and {last_point_index} in channel {channel_id} in {}",
         output.display()
     );
     Ok(())
@@ -10453,14 +10483,30 @@ fn delete_time_marker(
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_clip_indices, parse_midi_channel_filter, parse_midi_channel_mask,
-        parse_midi_channel_number, parse_midi_import_options,
+        parse_automation_interpolation_mode, parse_clip_indices, parse_midi_channel_filter,
+        parse_midi_channel_mask, parse_midi_channel_number, parse_midi_import_options,
         parse_midi_import_options_with_channels, parse_midi_import_options_with_mixer_tracks,
         parse_midi_pattern_target, parse_midi_track_selection, parse_mixer_eq_parameter_kind,
         parse_mixer_track, parse_raw_byte, parse_rgb_hex, parse_sampler_envelope_lfo_target,
         parse_scale_name, pattern_color_label, playlist_pattern_color_label,
     };
-    use flp_rebuild::{MixerParameterKind, SamplerEnvelopeLfoTarget, midi::MidiImportOptions};
+    use flp_rebuild::{
+        AutomationInterpolationMode, MixerParameterKind, SamplerEnvelopeLfoTarget,
+        midi::MidiImportOptions,
+    };
+
+    #[test]
+    fn parses_automation_interpolation_modes() {
+        assert_eq!(
+            parse_automation_interpolation_mode("linear"),
+            Ok(AutomationInterpolationMode::Linear)
+        );
+        assert_eq!(
+            parse_automation_interpolation_mode("smooth"),
+            Ok(AutomationInterpolationMode::Smooth)
+        );
+        assert!(parse_automation_interpolation_mode("ease").is_err());
+    }
 
     #[test]
     fn parses_mixer_eq_parameter_kinds() {

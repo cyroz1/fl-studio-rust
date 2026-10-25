@@ -66,12 +66,12 @@ use flp_rebuild::vst3::{
 };
 use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, ArpeggioRangePattern, ArpeggioSyncMode, Arrangement,
-    ArticulateOptions, AutomationChannel, AutomationPoint, AutomationPointEdit,
-    ChannelGroupSummary, ChannelNoteRouter, ChannelSortOrder, ChannelStretchMode,
-    ChannelStretchSettingsEdit, ChannelSummary, ChannelType, ClawMachineOptions, FlamOptions,
-    FlpDocument, FlpError, FstPreset, FstPresetKind, HumanizerOptions, LimitNoteOptions,
-    LimitSnapDirection, MixerInsertEdit, MixerInsertSummary, MixerParameterKind,
-    MixerParameterRecord, MixerSendSummary, PATTERN_NOTE_DEFAULT_FLAGS,
+    ArticulateOptions, AutomationChannel, AutomationInterpolationMode, AutomationPoint,
+    AutomationPointEdit, ChannelGroupSummary, ChannelNoteRouter, ChannelSortOrder,
+    ChannelStretchMode, ChannelStretchSettingsEdit, ChannelSummary, ChannelType,
+    ClawMachineOptions, FlamOptions, FlpDocument, FlpError, FstPreset, FstPresetKind,
+    HumanizerOptions, LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerInsertSummary,
+    MixerParameterKind, MixerParameterRecord, MixerSendSummary, PATTERN_NOTE_DEFAULT_FLAGS,
     PATTERN_NOTE_DEFAULT_RELEASE, PATTERN_NOTE_SLIDE_FLAG, Pattern, PatternController,
     PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation, PayloadEncoding,
     PlaylistClip, PlaylistClipEdit, PlaylistClipSelectionClipboard, PlaylistClipTarget,
@@ -3966,6 +3966,7 @@ enum AutomationEditAction {
     Interpolate {
         first_point_index: usize,
         last_point_index: usize,
+        mode: AutomationInterpolationMode,
     },
 }
 
@@ -4774,6 +4775,7 @@ struct DawUi {
     selected_automation_point: Option<usize>,
     automation_add_mode: bool,
     automation_interpolate_mode: bool,
+    automation_interpolation_mode: AutomationInterpolationMode,
     automation_interpolation_anchor: Option<usize>,
     automation_snap: bool,
     automation_visible_beats: f64,
@@ -6285,6 +6287,7 @@ impl DawUi {
             selected_automation_point: None,
             automation_add_mode: false,
             automation_interpolate_mode: false,
+            automation_interpolation_mode: AutomationInterpolationMode::Linear,
             automation_interpolation_anchor: None,
             automation_snap: true,
             automation_visible_beats: 16.0,
@@ -29124,6 +29127,25 @@ impl DawUi {
                 self.automation_interpolation_anchor = None;
                 self.selected_automation_point = None;
             }
+            if self.automation_interpolate_mode {
+                egui::ComboBox::from_id_salt(("automation-interpolation-mode", channel_id))
+                    .selected_text(match self.automation_interpolation_mode {
+                        AutomationInterpolationMode::Linear => "Linear",
+                        AutomationInterpolationMode::Smooth => "Smooth S-curve",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.automation_interpolation_mode,
+                            AutomationInterpolationMode::Linear,
+                            "Linear",
+                        );
+                        ui.selectable_value(
+                            &mut self.automation_interpolation_mode,
+                            AutomationInterpolationMode::Smooth,
+                            "Smooth S-curve",
+                        );
+                    });
+            }
             let can_delete = self.selected_automation_point.is_some();
             if ui
                 .add_enabled(can_delete, egui::Button::new("Delete point"))
@@ -29203,10 +29225,15 @@ impl DawUi {
                         format!("Start point {} selected · click an end point", anchor + 1),
                     );
                 } else {
-                    ui.colored_label(
-                        ORANGE,
-                        "Click two endpoints to linearly interpolate the points between them",
-                    );
+                    let description = match self.automation_interpolation_mode {
+                        AutomationInterpolationMode::Linear => {
+                            "Click two endpoints to linearly interpolate the points between them"
+                        }
+                        AutomationInterpolationMode::Smooth => {
+                            "Click two endpoints to interpolate the points with a smooth S-curve"
+                        }
+                    };
+                    ui.colored_label(ORANGE, description);
                 }
             } else {
                 ui.colored_label(MUTED, "Drag a point to edit its position and value");
@@ -29348,6 +29375,7 @@ impl DawUi {
                             action = Some(AutomationEditAction::Interpolate {
                                 first_point_index: anchor.min(point_index),
                                 last_point_index: anchor.max(point_index),
+                                mode: self.automation_interpolation_mode,
                             });
                         }
                     } else {
@@ -29481,15 +29509,17 @@ impl DawUi {
                 AutomationEditAction::Interpolate {
                     first_point_index,
                     last_point_index,
+                    mode,
                 } => {
                     self.selected_automation_point = Some(last_point_index);
                     self.automation_interpolate_mode = false;
                     self.automation_interpolation_anchor = None;
                     document
-                        .interpolate_automation_points(
+                        .interpolate_automation_points_with_mode(
                             channel_id,
                             first_point_index,
                             last_point_index,
+                            mode,
                         )
                         .map(|count| interpolation_count = Some(count))
                 }
@@ -29502,8 +29532,15 @@ impl DawUi {
                                 "There are no automation points between those endpoints".to_owned();
                         } else {
                             self.dirty = true;
-                            self.status =
-                                format!("Linearly interpolated {count} automation point values");
+                            self.status = format!(
+                                "{} {count} automation point values",
+                                match self.automation_interpolation_mode {
+                                    AutomationInterpolationMode::Linear => "Linearly interpolated",
+                                    AutomationInterpolationMode::Smooth => {
+                                        "Interpolated with a smooth S-curve"
+                                    }
+                                }
+                            );
                         }
                     } else {
                         self.dirty = true;

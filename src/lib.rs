@@ -1701,6 +1701,13 @@ pub struct AutomationPointEdit {
     pub tension: Option<f32>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AutomationInterpolationMode {
+    #[default]
+    Linear,
+    Smooth,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Pattern {
     pub id: u16,
@@ -18591,6 +18598,24 @@ impl FlpDocument {
         first_point_index: usize,
         last_point_index: usize,
     ) -> Result<usize, FlpError> {
+        self.interpolate_automation_points_with_mode(
+            channel_id,
+            first_point_index,
+            last_point_index,
+            AutomationInterpolationMode::Linear,
+        )
+    }
+
+    /// Interpolates values strictly between two existing type-5 automation points.
+    /// Positions, tension, opaque point state, and the automation blob's header and trailer
+    /// are retained. Smooth mode uses a cubic smoothstep S-curve between the endpoint values.
+    pub fn interpolate_automation_points_with_mode(
+        &mut self,
+        channel_id: u16,
+        first_point_index: usize,
+        last_point_index: usize,
+        mode: AutomationInterpolationMode,
+    ) -> Result<usize, FlpError> {
         let channels = self.channels();
         let mut matching = channels.iter().filter(|channel| channel.id == channel_id);
         let Some(channel) = matching.next() else {
@@ -18660,7 +18685,11 @@ impl FlpDocument {
             .skip(first_point_index + 1)
         {
             let fraction = (point.position_beats - first.position_beats) / point_span;
-            let value = first.value + (last.value - first.value) * fraction;
+            let shaped_fraction = match mode {
+                AutomationInterpolationMode::Linear => fraction,
+                AutomationInterpolationMode::Smooth => fraction * fraction * (3.0 - 2.0 * fraction),
+            };
+            let value = first.value + (last.value - first.value) * shaped_fraction;
             validate_automation_point_value(value)?;
             let point_offset = FLP_AUTOMATION_POINTS_OFFSET
                 .checked_add(
@@ -21675,12 +21704,12 @@ mod tests {
 
     use super::{
         ArpeggioOptions, ArpeggioRangePattern, ArpeggioSyncMode, ArticulateOptions,
-        ChannelGroupSummary, ChannelLevelAdjustmentsEdit, ChannelNoteRouter, ChannelSortOrder,
-        ChannelStretchMode, ChannelStretchSettingsEdit, ChannelSummary, ClawMachineOptions,
-        FLP_AUTOMATION_COUNT_OFFSET, FLP_AUTOMATION_LFO_AMOUNT_OFFSET,
-        FLP_AUTOMATION_POINTS_OFFSET, FlpDocument, FlpError, FlpEvent, FstPreset, FstPresetKind,
-        LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerInsertSummary,
-        MixerLiveInsertEnabledGain, MixerLiveSendGain, MixerLiveSendOutputPath,
+        AutomationInterpolationMode, ChannelGroupSummary, ChannelLevelAdjustmentsEdit,
+        ChannelNoteRouter, ChannelSortOrder, ChannelStretchMode, ChannelStretchSettingsEdit,
+        ChannelSummary, ClawMachineOptions, FLP_AUTOMATION_COUNT_OFFSET,
+        FLP_AUTOMATION_LFO_AMOUNT_OFFSET, FLP_AUTOMATION_POINTS_OFFSET, FlpDocument, FlpError,
+        FlpEvent, FstPreset, FstPresetKind, LimitNoteOptions, LimitSnapDirection, MixerInsertEdit,
+        MixerInsertSummary, MixerLiveInsertEnabledGain, MixerLiveSendGain, MixerLiveSendOutputPath,
         MixerLiveSendTargetKey, MixerParameterKind, MixerParameterRecord, MixerRouteAudibility,
         MixerSendSummary, MixerSourceRouteTransform, PATTERN_NOTE_DEFAULT_FLAGS,
         PATTERN_NOTE_SLIDE_FLAG, PLAYLIST_CLIP_MUTED_FLAG, PatternController,
@@ -34851,6 +34880,60 @@ mod tests {
             assert_eq!(
                 reparsed.automation_channels().unwrap()[0].lfo_amount(),
                 Some(amount)
+            );
+        }
+    }
+
+    #[test]
+    fn automation_point_interpolation_supports_linear_and_smooth_shapes_losslessly() {
+        let source_points = [
+            (0.0, 0.2, 0.125, [1, 2, 3, 4]),
+            (1.0, 0.0, -0.25, [5, 6, 7, 8]),
+            (2.0, 1.0, 0.5, [9, 10, 11, 12]),
+            (4.0, 0.8, -0.75, [13, 14, 15, 16]),
+        ];
+        let trailer = (0..112)
+            .map(|index| (index * 17 % 256) as u8)
+            .collect::<Vec<_>>();
+        let original = automation_channel_fixture(&source_points, &trailer);
+
+        for (mode, expected_values) in [
+            (AutomationInterpolationMode::Linear, [0.35, 0.5]),
+            (AutomationInterpolationMode::Smooth, [0.29375, 0.5]),
+        ] {
+            let mut document =
+                FlpDocument::parse(&original).expect("automation project should parse");
+            let event_index = document
+                .events()
+                .iter()
+                .position(|event| event.opcode() == 0xEA)
+                .expect("fixture should contain an automation event");
+            let original_payload = document.events()[event_index].payload().to_vec();
+
+            let interpolated = if mode == AutomationInterpolationMode::Linear {
+                document.interpolate_automation_points(9, 0, 3)
+            } else {
+                document.interpolate_automation_points_with_mode(9, 0, 3, mode)
+            }
+            .expect("valid automation points should interpolate");
+            assert_eq!(interpolated, 2);
+
+            let reparsed = FlpDocument::parse(&document.encode_lossless().unwrap())
+                .expect("interpolated automation should round-trip");
+            let points = reparsed.automation_channels().unwrap().remove(0).points;
+            assert_eq!(points.len(), source_points.len());
+            assert!((points[1].value() - expected_values[0]).abs() < 1.0e-10);
+            assert!((points[2].value() - expected_values[1]).abs() < 1.0e-10);
+            for (index, point) in points.iter().enumerate() {
+                assert_eq!(point.position_beats(), source_points[index].0);
+                assert_eq!(point.tension(), source_points[index].2);
+                assert_eq!(point.trailing_bytes(), source_points[index].3);
+            }
+            let edited_payload = reparsed.events()[event_index].payload();
+            assert_eq!(&edited_payload[..17], &original_payload[..17]);
+            assert_eq!(
+                &edited_payload[edited_payload.len() - trailer.len()..],
+                trailer
             );
         }
     }
