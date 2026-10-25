@@ -5210,6 +5210,7 @@ struct LivePlaylistVst3InputSession {
     pattern_mode: bool,
     performance_mode: bool,
     target_channel_ids: BTreeSet<u16>,
+    volume_expression_channel_ids: BTreeSet<u16>,
     sessions: BTreeMap<u16, Vst3PlaylistLiveInputSession>,
     router: ChannelNoteRouter,
 }
@@ -5232,15 +5233,17 @@ fn live_playlist_vst3_note_targets(
 fn live_playlist_vst3_note_layer_adjustments(
     router: &ChannelNoteRouter,
     target_channel_ids: &BTreeSet<u16>,
+    volume_expression_channel_ids: &BTreeSet<u16>,
     source_channel_id: u16,
     route_seed: u64,
     key: u8,
 ) -> BTreeMap<u16, (f32, i32)> {
     router
-        .targets_for_note_with_layer_adjustments(
+        .targets_for_note_with_vst3_crossfade(
             source_channel_id,
             route_seed,
             u16::from(key.min(127)),
+            volume_expression_channel_ids,
         )
         .into_iter()
         .filter(|(target_id, _, _)| target_channel_ids.contains(target_id))
@@ -49030,6 +49033,7 @@ impl DawUi {
         Some(live_playlist_vst3_note_layer_adjustments(
             &session.router,
             &session.target_channel_ids,
+            &session.volume_expression_channel_ids,
             source_channel_id,
             route_seed,
             key,
@@ -49137,6 +49141,11 @@ impl DawUi {
         }) else {
             return false;
         };
+        let volume_expression_channel_ids = self
+            .vst3_host
+            .as_ref()
+            .map(|host| host.volume_expression_channels(&self.channel_vst3_instances))
+            .unwrap_or_default();
         let Some(document) = self.document.as_ref() else {
             return false;
         };
@@ -49206,6 +49215,7 @@ impl DawUi {
             pattern_mode,
             performance_mode,
             target_channel_ids,
+            volume_expression_channel_ids,
             sessions,
             router,
         });

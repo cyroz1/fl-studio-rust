@@ -5565,7 +5565,10 @@ impl Vst3HostRuntime {
             .ok_or_else(|| format!("no loaded VST3 instance with id {id}"))
     }
 
-    fn volume_expression_channels(&self, channel_instances: &BTreeMap<u16, u64>) -> BTreeSet<u16> {
+    pub(crate) fn volume_expression_channels(
+        &self,
+        channel_instances: &BTreeMap<u16, u64>,
+    ) -> BTreeSet<u16> {
         channel_instances
             .iter()
             .filter_map(|(channel_id, instance_id)| {
