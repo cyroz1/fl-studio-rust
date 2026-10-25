@@ -1397,8 +1397,8 @@ pub struct AudioDeviceCatalog {
 }
 
 const COMMON_AUDIO_SAMPLE_RATES: &[u32] = &[
-    8_000, 11_025, 16_000, 22_050, 32_000, 44_100, 48_000, 64_000, 88_200, 96_000, 176_400,
-    192_000, 352_800, 384_000,
+    8_000, 11_025, 12_000, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000, 64_000, 88_200, 96_000,
+    176_400, 192_000, 352_800, 384_000,
 ];
 const COMMON_AUDIO_BUFFER_FRAMES: &[u32] = &[32, 64, 128, 256, 512, 1_024, 2_048, 4_096, 8_192];
 
@@ -4958,7 +4958,7 @@ mod tests {
                 id: "wasapi:capture".to_owned(),
                 name: "Capture".to_owned(),
                 config_ranges: Vec::new(),
-                exclusive_sample_rates: vec![44_100, 48_000, 96_000],
+                exclusive_sample_rates: vec![12_000, 24_000, 44_100, 48_000, 96_000],
                 exclusive_default_period_hns: None,
                 exclusive_minimum_period_hns: None,
             }],
@@ -4966,7 +4966,7 @@ mod tests {
                 id: "wasapi:render".to_owned(),
                 name: "Render".to_owned(),
                 config_ranges: Vec::new(),
-                exclusive_sample_rates: vec![48_000, 96_000, 192_000],
+                exclusive_sample_rates: vec![12_000, 24_000, 48_000, 96_000, 192_000],
                 exclusive_default_period_hns: None,
                 exclusive_minimum_period_hns: None,
             }],
@@ -4982,7 +4982,10 @@ mod tests {
             sample_rate: 192_000,
             ..AudioSettings::default()
         };
-        assert_eq!(catalog.supported_sample_rates(&settings), [48_000, 96_000]);
+        assert_eq!(
+            catalog.supported_sample_rates(&settings),
+            [12_000, 24_000, 48_000, 96_000]
+        );
 
         let output_only = AudioSettings {
             enable_input: false,
@@ -4990,7 +4993,7 @@ mod tests {
         };
         assert_eq!(
             catalog.supported_sample_rates(&output_only),
-            [48_000, 96_000, 192_000]
+            [12_000, 24_000, 48_000, 96_000, 192_000]
         );
     }
 
