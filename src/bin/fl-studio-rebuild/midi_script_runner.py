@@ -467,12 +467,17 @@ def _global_transport(command, value, pmeflags=2, flags=15):
         66: 2,  # FPT_F7: Piano roll
         67: 3,  # FPT_F8: Plug-ins
         68: 4,  # FPT_F9: Mixer
+        69: 5,  # FPT_F10: MIDI settings (Audio settings view)
     }
     if command in window_views:
         if value != 0:
             _request_transport_action(
                 {"action": "show_main_view", "view": window_views[command]}
             )
+        return 8
+    if command == 70:  # FPT_F11: Song info
+        if value != 0:
+            _request_transport_action({"action": "open_project_info"})
         return 8
     return -1
 

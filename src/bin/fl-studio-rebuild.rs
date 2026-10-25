@@ -46136,9 +46136,11 @@ impl DawUi {
                     2 => MainView::PianoRoll,
                     3 => MainView::Plugins,
                     4 => MainView::Mixer,
+                    5 => MainView::Audio,
                     _ => return,
                 };
             }
+            MidiTransportCommand::OpenProjectInfo => self.open_project_info(),
         }
     }
 

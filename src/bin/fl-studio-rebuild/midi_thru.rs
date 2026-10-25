@@ -669,7 +669,8 @@ fn midi_input_thru_message(event: MidiInputEvent) -> Option<([u8; 3], usize)> {
             | MidiTransportCommand::TempoJog(_)
             | MidiTransportCommand::MarkerJumpJog(_)
             | MidiTransportCommand::MarkerSelJog(_)
-            | MidiTransportCommand::ShowMainView(_),
+            | MidiTransportCommand::ShowMainView(_)
+            | MidiTransportCommand::OpenProjectInfo,
         ) => return None,
     };
     Some((bytes, length))

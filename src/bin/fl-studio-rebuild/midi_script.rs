@@ -47,6 +47,7 @@ pub enum ScriptTransportAction {
     MarkerJumpJog(i32),
     MarkerSelJog(i32),
     ShowMainView(u8),
+    OpenProjectInfo,
     MidiOutput(Vec<u8>),
     RepeatMidiOutput {
         bytes: Vec<u8>,
@@ -774,9 +775,12 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
         let view = action["view"]
             .as_u64()
             .and_then(|view| u8::try_from(view).ok())
-            .filter(|view| *view <= 4)
+            .filter(|view| *view <= 5)
             .ok_or_else(|| "MIDI script returned an invalid main view".to_owned())?;
         return Ok(ScriptTransportAction::ShowMainView(view));
+    }
+    if name == Some("open_project_info") {
+        return Ok(ScriptTransportAction::OpenProjectInfo);
     }
     if name == Some("midi_out_message") || name == Some("midi_out_sysex") {
         let message = action["bytes"]
@@ -1763,7 +1767,7 @@ mod tests {
         let script_path = temporary.path().join("device_test.py");
         fs::write(
             &script_path,
-            "# name=Test Script\nimport midi\nimport transport\ndef OnMidiIn(event):\n    if event.pmeflags == midi.PME_System | midi.PME_FromMIDI:\n        play = transport.globalTransport(midi.FPT_Play, 1, event.pmeflags)\n        transport.globalTransport(midi.FPT_Stop, 1, event.pmeflags)\n        transport.globalTransport(midi.FPT_Record, 1, event.pmeflags)\n        transport.globalTransport(midi.FPT_Loop, 1, event.pmeflags)\n        transport.globalTransport(midi.FPT_MarkerJumpJog, 2, event.pmeflags)\n        transport.globalTransport(midi.FPT_MarkerSelJog, -1, event.pmeflags)\n        transport.globalTransport(midi.FPT_F5, 1, event.pmeflags)\n        transport.globalTransport(midi.FPT_F9, 1, event.pmeflags)\n        event.data1 = play\n",
+            "# name=Test Script\nimport midi\nimport transport\ndef OnMidiIn(event):\n    if event.pmeflags == midi.PME_System | midi.PME_FromMIDI:\n        play = transport.globalTransport(midi.FPT_Play, 1, event.pmeflags)\n        transport.globalTransport(midi.FPT_Stop, 1, event.pmeflags)\n        transport.globalTransport(midi.FPT_Record, 1, event.pmeflags)\n        transport.globalTransport(midi.FPT_Loop, 1, event.pmeflags)\n        transport.globalTransport(midi.FPT_MarkerJumpJog, 2, event.pmeflags)\n        transport.globalTransport(midi.FPT_MarkerSelJog, -1, event.pmeflags)\n        transport.globalTransport(midi.FPT_F5, 1, event.pmeflags)\n        transport.globalTransport(midi.FPT_F9, 1, event.pmeflags)\n        transport.globalTransport(midi.FPT_F10, 1, event.pmeflags)\n        transport.globalTransport(midi.FPT_F11, 1, event.pmeflags)\n        event.data1 = play\n",
         )
         .unwrap();
         let script = MidiControllerScript::parse(script_path).unwrap();
@@ -1783,6 +1787,8 @@ mod tests {
                 ScriptTransportAction::MarkerSelJog(-1),
                 ScriptTransportAction::ShowMainView(0),
                 ScriptTransportAction::ShowMainView(4),
+                ScriptTransportAction::ShowMainView(5),
+                ScriptTransportAction::OpenProjectInfo,
             ]
         );
     }
