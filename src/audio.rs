@@ -6,7 +6,9 @@
 //! visible to the application.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{
+    AtomicBool, AtomicI32, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering,
+};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -3036,7 +3038,8 @@ pub struct AudioEngine {
     input_recording: Arc<ArcSwapOption<InputRecordingState>>,
     input_monitor_recording: Arc<ArcSwapOption<InputRecordingState>>,
     input_monitor_ring: Arc<AudioRingBuffer>,
-    input_channel_pair: u16,
+    input_channel_pair: Arc<AtomicU16>,
+    input_channel_count: u16,
     error: Arc<AudioErrorState>,
     input_stream: Option<Stream>,
     output_stream: Option<Stream>,
@@ -3466,9 +3469,31 @@ impl AudioEngine {
         self.input_active
     }
 
-    /// Stereo input pair selected when this engine started.
+    /// Stereo input pair currently selected from the active input device.
     pub fn input_channel_pair(&self) -> u16 {
+        self.input_channel_pair.load(Ordering::Acquire)
+    }
+
+    /// Number of valid stereo input pairs exposed by this engine's active input stream.
+    pub fn input_channel_pair_count(&self) -> u16 {
+        if self.input_channel_count == 0 {
+            0
+        } else if self.input_channel_count == 1 {
+            1
+        } else {
+            self.input_channel_count / 2
+        }
+    }
+
+    /// Select a stereo input pair without restarting the device stream.
+    pub fn set_input_channel_pair(&self, input_channel_pair: u16) -> Result<(), String> {
+        if !self.input_active {
+            return Err("Start an input device before selecting its channels".into());
+        }
+        selected_stereo_input_channels(usize::from(self.input_channel_count), input_channel_pair)?;
         self.input_channel_pair
+            .store(input_channel_pair, Ordering::Release);
+        Ok(())
     }
 
     /// Start capturing stereo frames from the active input device into a bounded queue.
@@ -3594,6 +3619,7 @@ impl AudioEngine {
         let input_callback_frames = Arc::new(AtomicU32::new(0));
         let input_recording = Arc::new(ArcSwapOption::empty());
         let input_monitor_recording = Arc::new(ArcSwapOption::empty());
+        let input_channel_pair = Arc::new(AtomicU16::new(settings.input_channel_pair));
         let error = Arc::new(AudioErrorState::default());
 
         let output_device = if settings.enable_output {
@@ -3608,6 +3634,7 @@ impl AudioEngine {
         };
         let mut output_stream = None;
         let mut input_stream = None;
+        let mut input_channel_count = 0;
 
         if let Some(device) = output_device {
             let stream = build_output_stream(
@@ -3625,7 +3652,7 @@ impl AudioEngine {
         }
 
         if let Some(device) = input_device {
-            let stream = build_input_stream(
+            let (stream, channel_count) = build_input_stream(
                 &device,
                 settings,
                 InputStreamState {
@@ -3636,13 +3663,14 @@ impl AudioEngine {
                     monitor_recording: Arc::clone(&input_monitor_recording),
                     error: Arc::clone(&error),
                     callback_frames: Arc::clone(&input_callback_frames),
-                    input_channel_pair: settings.input_channel_pair,
+                    input_channel_pair: Arc::clone(&input_channel_pair),
                 },
             )?;
             stream
                 .play()
                 .map_err(|error| format!("Could not start input stream: {error}"))?;
             input_stream = Some(stream);
+            input_channel_count = channel_count;
         }
 
         if output_stream.is_none() && input_stream.is_none() {
@@ -3659,7 +3687,8 @@ impl AudioEngine {
             input_recording,
             input_monitor_recording,
             input_monitor_ring: Arc::clone(&ring),
-            input_channel_pair: settings.input_channel_pair,
+            input_channel_pair,
+            input_channel_count,
             error,
             input_active: input_stream.is_some(),
             output_active: output_stream.is_some(),
@@ -3687,6 +3716,8 @@ impl AudioEngine {
         let input_callback_frames = Arc::new(AtomicU32::new(0));
         let input_recording = Arc::new(ArcSwapOption::empty());
         let input_monitor_recording = Arc::new(ArcSwapOption::empty());
+        let input_channel_pair = Arc::new(AtomicU16::new(settings.input_channel_pair));
+        let input_channel_count = Arc::new(AtomicU16::new(0));
         let error = Arc::new(AudioErrorState::default());
         let stop = Arc::new(AtomicBool::new(false));
         let mut threads: Vec<thread::JoinHandle<()>> = Vec::new();
@@ -3705,6 +3736,8 @@ impl AudioEngine {
             let worker_input_callback_frames = Arc::clone(&input_callback_frames);
             let worker_recording = Arc::clone(&input_recording);
             let worker_monitor_recording = Arc::clone(&input_monitor_recording);
+            let worker_input_channel_pair = Arc::clone(&input_channel_pair);
+            let worker_input_channel_count = Arc::clone(&input_channel_count);
             let worker_error = Arc::clone(&error);
             let worker_stop = Arc::clone(&stop);
             let output_thread = thread::Builder::new()
@@ -3721,6 +3754,8 @@ impl AudioEngine {
                             input_callback_frames: worker_input_callback_frames,
                             input_recording: worker_recording,
                             input_monitor_recording: worker_monitor_recording,
+                            input_channel_pair: worker_input_channel_pair,
+                            input_channel_count: worker_input_channel_count,
                             error: worker_error,
                             stop: worker_stop,
                         },
@@ -3753,6 +3788,8 @@ impl AudioEngine {
             let worker_input_callback_frames = Arc::clone(&input_callback_frames);
             let worker_recording = Arc::clone(&input_recording);
             let worker_monitor_recording = Arc::clone(&input_monitor_recording);
+            let worker_input_channel_pair = Arc::clone(&input_channel_pair);
+            let worker_input_channel_count = Arc::clone(&input_channel_count);
             let worker_error = Arc::clone(&error);
             let worker_stop = Arc::clone(&stop);
             let input_thread = thread::Builder::new()
@@ -3769,6 +3806,8 @@ impl AudioEngine {
                             input_callback_frames: worker_input_callback_frames,
                             input_recording: worker_recording,
                             input_monitor_recording: worker_monitor_recording,
+                            input_channel_pair: worker_input_channel_pair,
+                            input_channel_count: worker_input_channel_count,
                             error: worker_error,
                             stop: worker_stop,
                         },
@@ -3820,6 +3859,7 @@ impl AudioEngine {
         let input_active = settings.enable_input
             && (settings.input_device_id.is_some()
                 || cpal::default_host().default_input_device().is_some());
+        let input_channel_count = input_channel_count.load(Ordering::Acquire);
         Ok(Self {
             source,
             requested_source: AtomicU8::new(AUDIO_SOURCE_SILENT),
@@ -3830,7 +3870,8 @@ impl AudioEngine {
             input_recording,
             input_monitor_recording,
             input_monitor_ring: Arc::clone(&ring),
-            input_channel_pair: settings.input_channel_pair,
+            input_channel_pair,
+            input_channel_count,
             error,
             input_active,
             output_active,
@@ -4162,29 +4203,32 @@ struct InputStreamState {
     recording: Arc<ArcSwapOption<InputRecordingState>>,
     monitor_recording: Arc<ArcSwapOption<InputRecordingState>>,
     error: Arc<AudioErrorState>,
-    input_channel_pair: u16,
+    input_channel_pair: Arc<AtomicU16>,
 }
 
 fn build_input_stream(
     device: &cpal::Device,
     settings: &AudioSettings,
     state: InputStreamState,
-) -> Result<Stream, String> {
+) -> Result<(Stream, u16), String> {
     let supported = select_config(device, true, settings.sample_rate, settings.buffer_frames)?;
     let format = supported.sample_format();
     let mut config = supported.config();
+    let channel_count = config.channels;
     config.buffer_size = cpal::BufferSize::Fixed(negotiated_buffer_frames(
         supported.buffer_size(),
         settings.buffer_frames,
     ));
     match build_typed_input(device, config, format, state.clone()) {
-        Ok(stream) => Ok(stream),
+        Ok(stream) => Ok((stream, channel_count)),
         Err(first_error) => {
             let mut default_config = supported.config();
             default_config.buffer_size = cpal::BufferSize::Default;
-            build_typed_input(device, default_config, format, state).map_err(|error| {
-                format!("{error} (requested buffer was also rejected: {first_error})")
-            })
+            build_typed_input(device, default_config, format, state)
+                .map(|stream| (stream, channel_count))
+                .map_err(|error| {
+                    format!("{error} (requested buffer was also rejected: {first_error})")
+                })
         }
     }
 }
@@ -4239,8 +4283,10 @@ where
         error,
         input_channel_pair,
     } = state;
-    let (left_channel, right_channel) =
-        selected_stereo_input_channels(usize::from(config.channels), input_channel_pair)?;
+    let (fallback_left_channel, fallback_right_channel) = selected_stereo_input_channels(
+        usize::from(config.channels),
+        input_channel_pair.load(Ordering::Acquire),
+    )?;
     let stream = device
         .build_input_stream::<T, _, _>(
             config,
@@ -4260,6 +4306,11 @@ where
                 let monitor_callback = monitor_recording
                     .as_deref()
                     .and_then(InputRecordingState::begin_callback);
+                let (left_channel, right_channel) = selected_stereo_input_channels(
+                    channels,
+                    input_channel_pair.load(Ordering::Acquire),
+                )
+                .unwrap_or((fallback_left_channel, fallback_right_channel));
                 for frame in input.chunks(channels) {
                     if frame.is_empty() {
                         continue;
@@ -4661,6 +4712,8 @@ struct WasapiWorkerState {
     input_callback_frames: Arc<AtomicU32>,
     input_recording: Arc<ArcSwapOption<InputRecordingState>>,
     input_monitor_recording: Arc<ArcSwapOption<InputRecordingState>>,
+    input_channel_pair: Arc<AtomicU16>,
+    input_channel_count: Arc<AtomicU16>,
     error: Arc<AudioErrorState>,
     stop: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -4796,6 +4849,8 @@ fn wasapi_exclusive_input_worker(
         input_callback_frames,
         input_recording,
         input_monitor_recording,
+        input_channel_pair,
+        input_channel_count,
         source,
         error,
         stop,
@@ -4822,8 +4877,15 @@ fn wasapi_exclusive_input_worker(
             .map_err(|error| error.to_string())?;
         let format = select_exclusive_format(&mut client, &device, settings.sample_rate)?;
         let format_spec = WasapiSampleSpec::from_format(&format)?;
-        let (left_channel, right_channel) =
-            selected_stereo_input_channels(format_spec.channels, settings.input_channel_pair)?;
+        input_channel_count.store(
+            u16::try_from(format_spec.channels)
+                .map_err(|_| "WASAPI input channel count is out of range".to_owned())?,
+            Ordering::Release,
+        );
+        let (fallback_left_channel, fallback_right_channel) = selected_stereo_input_channels(
+            format_spec.channels,
+            input_channel_pair.load(Ordering::Acquire),
+        )?;
         let period = exclusive_period(&client, &format, settings.buffer_frames)?;
         client
             .initialize_client(
@@ -4866,6 +4928,11 @@ fn wasapi_exclusive_input_worker(
                     let monitor_callback = monitor_recording
                         .as_deref()
                         .and_then(InputRecordingState::begin_callback);
+                    let (left_channel, right_channel) = selected_stereo_input_channels(
+                        format_spec.channels,
+                        input_channel_pair.load(Ordering::Acquire),
+                    )
+                    .unwrap_or((fallback_left_channel, fallback_right_channel));
                     for frame in bytes[..active_bytes].chunks_exact(format_spec.frame_bytes) {
                         let mut stereo = [0.0_f32; 2];
                         for (channel, sample_bytes) in

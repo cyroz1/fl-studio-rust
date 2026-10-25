@@ -4782,6 +4782,7 @@ struct DawUi {
     selected_playlist_track: Option<u32>,
     selected_playlist_tracks: BTreeSet<u32>,
     armed_audio_recording_tracks: BTreeMap<u16, u32>,
+    audio_recording_track_input_pairs: BTreeMap<(u16, u32), u16>,
     playlist_track_selection_anchor: Option<u32>,
     playlist_track_name_editor: Option<(u32, String)>,
     playlist_clip_context_split: Option<(u16, usize, u32)>,
@@ -5335,6 +5336,7 @@ struct AudioRecordingSession {
     arrangement_id: u16,
     start_tick: u32,
     playlist_track_id: Option<u32>,
+    restore_input_channel_pair: u16,
     recording_offset_ms: i16,
     mixer_track: i8,
     tempo_map: PlaylistTempoMap,
@@ -6343,6 +6345,7 @@ impl DawUi {
             selected_playlist_track: None,
             selected_playlist_tracks: BTreeSet::new(),
             armed_audio_recording_tracks: BTreeMap::new(),
+            audio_recording_track_input_pairs: BTreeMap::new(),
             playlist_track_selection_anchor: None,
             playlist_track_name_editor: None,
             playlist_clip_context_split: None,
@@ -7595,6 +7598,7 @@ impl DawUi {
                 self.stop_project_playback();
                 self.project_generation = self.project_generation.wrapping_add(1);
                 self.armed_audio_recording_tracks.clear();
+                self.audio_recording_track_input_pairs.clear();
                 self.piano_roll_hidden_ghost_channels.clear();
                 self.piano_roll_hidden_ghost_tracks.clear();
                 self.piano_roll_hidden_ghost_clips.clear();
@@ -20596,6 +20600,84 @@ impl DawUi {
                                     self.status = "Disarmed Playlist audio recording track".to_owned();
                                 }
                             }
+                            let input_pair_count = self
+                                .audio_catalog
+                                .input_channel_pair_count(&self.audio_settings)
+                                .max(1);
+                            let input_pair_key = (arrangement.id, track_id);
+                            let mut selected_track_input_pair = self
+                                .audio_recording_track_input_pairs
+                                .get(&input_pair_key)
+                                .copied()
+                                .unwrap_or(self.audio_settings.input_channel_pair);
+                            let selected_input_pair_label = if selected_track_input_pair
+                                < input_pair_count
+                            {
+                                format!(
+                                    "{} / {}",
+                                    selected_track_input_pair
+                                        .saturating_mul(2)
+                                        .saturating_add(1),
+                                    selected_track_input_pair
+                                        .saturating_mul(2)
+                                        .saturating_add(2)
+                                )
+                            } else {
+                                format!("Unavailable pair {}", selected_track_input_pair)
+                            };
+                            let mut track_input_pair_changed = false;
+                            ui.horizontal(|ui| {
+                                ui.label("Input pair");
+                                egui::ComboBox::from_id_salt((
+                                    "playlist-track-audio-input",
+                                    arrangement.id,
+                                    track_id,
+                                ))
+                                .selected_text(selected_input_pair_label)
+                                .show_ui(ui, |ui| {
+                                    for pair in 0..input_pair_count {
+                                        let label = format!(
+                                            "{} / {}",
+                                            pair.saturating_mul(2).saturating_add(1),
+                                            pair.saturating_mul(2).saturating_add(2)
+                                        );
+                                        track_input_pair_changed |= ui
+                                            .selectable_value(
+                                                &mut selected_track_input_pair,
+                                                pair,
+                                                label,
+                                            )
+                                            .changed();
+                                    }
+                                });
+                            });
+                            if track_input_pair_changed {
+                                if selected_track_input_pair
+                                    == self.audio_settings.input_channel_pair
+                                {
+                                    self.audio_recording_track_input_pairs.remove(&input_pair_key);
+                                } else {
+                                    self.audio_recording_track_input_pairs.insert(
+                                        input_pair_key,
+                                        selected_track_input_pair,
+                                    );
+                                }
+                                self.status = format!(
+                                    "Set Playlist track {track_id} input to {} / {}",
+                                    selected_track_input_pair
+                                        .saturating_mul(2)
+                                        .saturating_add(1),
+                                    selected_track_input_pair
+                                        .saturating_mul(2)
+                                        .saturating_add(2)
+                                );
+                            }
+                            ui.label(
+                                egui::RichText::new(
+                                    "This pair is used when the track is armed; otherwise Audio settings' Input channels pair is used.",
+                                )
+                                .color(MUTED),
+                            );
                             ui.separator();
                             let ghost_track_keys = if self
                                 .selected_playlist_tracks
@@ -51292,6 +51374,29 @@ impl DawUi {
             .get(&arrangement_id)
             .copied()
             .filter(|track_id| (1..=500).contains(track_id));
+        let recording_input_channel_pair = playlist_track_id
+            .and_then(|track_id| {
+                self.audio_recording_track_input_pairs
+                    .get(&(arrangement_id, track_id))
+                    .copied()
+            })
+            .unwrap_or(self.audio_settings.input_channel_pair);
+        let available_input_pairs = self
+            .audio_catalog
+            .input_channel_pair_count(&self.audio_settings)
+            .max(1);
+        if recording_input_channel_pair >= available_input_pairs {
+            self.status = format!(
+                "Input pair {} / {} is not available on the selected audio device",
+                recording_input_channel_pair
+                    .saturating_mul(2)
+                    .saturating_add(1),
+                recording_input_channel_pair
+                    .saturating_mul(2)
+                    .saturating_add(2)
+            );
+            return;
+        }
         if !project_has_audio_clip_template(document) {
             self.status = "Add an Audio Clip to the project before recording; its recognized FLP record is used as a safe template".to_owned();
             return;
@@ -51330,8 +51435,15 @@ impl DawUi {
             output_path.set_extension("wav");
         }
 
+        let previous_input_channel_pair = self
+            .audio_engine
+            .as_ref()
+            .map(AudioEngine::input_channel_pair)
+            .unwrap_or(self.audio_settings.input_channel_pair);
         if self.audio_engine.is_none() {
-            match AudioEngine::start(&self.audio_settings) {
+            let mut engine_settings = self.audio_settings.clone();
+            engine_settings.input_channel_pair = recording_input_channel_pair;
+            match AudioEngine::start(&engine_settings) {
                 Ok(engine) => self.audio_engine = Some(engine),
                 Err(error) => {
                     self.status = format!("Could not start audio input: {error}");
@@ -51348,6 +51460,18 @@ impl DawUi {
                 "Audio input is not active; enable input and restart the audio engine before recording".to_owned();
             return;
         }
+        if let Err(error) = engine.set_input_channel_pair(recording_input_channel_pair) {
+            self.status = format!(
+                "Could not select input pair {} / {}: {error}",
+                recording_input_channel_pair
+                    .saturating_mul(2)
+                    .saturating_add(1),
+                recording_input_channel_pair
+                    .saturating_mul(2)
+                    .saturating_add(2)
+            );
+            return;
+        }
 
         let start_tick = self
             .current_playhead_tick()
@@ -51357,6 +51481,7 @@ impl DawUi {
         let tempo_map = match PlaylistTempoMap::for_arrangement(document, arrangement_id) {
             Ok(tempo_map) => tempo_map,
             Err(error) => {
+                let _ = engine.set_input_channel_pair(previous_input_channel_pair);
                 self.status =
                     format!("Could not prepare Playlist tempo map for recording: {error}");
                 return;
@@ -51366,6 +51491,7 @@ impl DawUi {
         let recording = match engine.start_input_recording() {
             Ok(recording) => recording,
             Err(error) => {
+                let _ = engine.set_input_channel_pair(previous_input_channel_pair);
                 self.status = format!("Could not start audio recording: {error}");
                 return;
             }
@@ -51382,6 +51508,7 @@ impl DawUi {
             Ok(worker) => worker,
             Err(error) => {
                 engine.stop_input_recording();
+                let _ = engine.set_input_channel_pair(previous_input_channel_pair);
                 self.status = format!("Could not start the recording writer: {error}");
                 return;
             }
@@ -51394,6 +51521,7 @@ impl DawUi {
             arrangement_id,
             start_tick,
             playlist_track_id,
+            restore_input_channel_pair: previous_input_channel_pair,
             recording_offset_ms: self.audio_recording_offset_ms,
             mixer_track: recording_mixer_track,
             tempo_map,
@@ -51414,6 +51542,7 @@ impl DawUi {
         if session.capture_active {
             if let Some(engine) = self.audio_engine.as_ref() {
                 engine.stop_input_recording();
+                let _ = engine.set_input_channel_pair(session.restore_input_channel_pair);
             }
             session.capture_active = false;
             self.status = "Finalizing audio recording…".to_owned();
@@ -51454,6 +51583,7 @@ impl DawUi {
         if session.capture_active {
             if let Some(engine) = self.audio_engine.as_ref() {
                 engine.stop_input_recording();
+                let _ = engine.set_input_channel_pair(session.restore_input_channel_pair);
             }
             session.capture_active = false;
         }
@@ -52600,35 +52730,58 @@ impl DawUi {
             selected_input_pair.saturating_mul(2).saturating_add(2)
         );
         let mut input_channel_pair_changed = false;
-        ui.horizontal(|ui| {
-            ui.label("Input channels");
-            egui::ComboBox::from_id_salt("audio_input_channel_pair")
-                .selected_text(selected_input_pair_label)
-                .show_ui(ui, |ui| {
-                    for pair in 0..input_channel_pair_count {
-                        let label = format!(
-                            "{} / {}",
-                            pair.saturating_mul(2).saturating_add(1),
-                            pair.saturating_mul(2).saturating_add(2)
-                        );
-                        input_channel_pair_changed |= ui
-                            .selectable_value(
-                                &mut self.audio_settings.input_channel_pair,
-                                pair,
-                                label,
-                            )
-                            .changed();
-                    }
-                });
-            ui.label(egui::RichText::new("Mono input is duplicated to both channels").color(MUTED));
+        ui.add_enabled_ui(self.audio_recording.is_none(), |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Input channels");
+                egui::ComboBox::from_id_salt("audio_input_channel_pair")
+                    .selected_text(selected_input_pair_label)
+                    .show_ui(ui, |ui| {
+                        for pair in 0..input_channel_pair_count {
+                            let label = format!(
+                                "{} / {}",
+                                pair.saturating_mul(2).saturating_add(1),
+                                pair.saturating_mul(2).saturating_add(2)
+                            );
+                            input_channel_pair_changed |= ui
+                                .selectable_value(
+                                    &mut self.audio_settings.input_channel_pair,
+                                    pair,
+                                    label,
+                                )
+                                .changed();
+                        }
+                    });
+                ui.label(
+                    egui::RichText::new("Mono input is duplicated to both channels").color(MUTED),
+                );
+            });
         });
         if input_channel_pair_changed
-            && self.audio_engine.as_ref().is_some_and(|engine| {
-                engine.input_active()
-                    && engine.input_channel_pair() != self.audio_settings.input_channel_pair
-            })
+            && let Some(engine) = self
+                .audio_engine
+                .as_ref()
+                .filter(|engine| engine.input_active())
         {
-            self.status = "Restart the audio engine to use the selected input channels".to_owned();
+            match engine.set_input_channel_pair(self.audio_settings.input_channel_pair) {
+                Ok(()) => {
+                    self.status = format!(
+                        "Switched active input to channels {} / {}",
+                        self.audio_settings
+                            .input_channel_pair
+                            .saturating_mul(2)
+                            .saturating_add(1),
+                        self.audio_settings
+                            .input_channel_pair
+                            .saturating_mul(2)
+                            .saturating_add(2)
+                    )
+                }
+                Err(error) => {
+                    self.status = format!(
+                        "Restart the audio engine to use the selected input channels: {error}"
+                    )
+                }
+            }
         }
 
         ui.separator();
@@ -52700,6 +52853,13 @@ impl DawUi {
                 .copied()
                 .map(|track_id| (arrangement_id, track_id))
         });
+        let recording_input_channel_pair = armed_recording_track
+            .and_then(|(arrangement_id, track_id)| {
+                self.audio_recording_track_input_pairs
+                    .get(&(arrangement_id, track_id))
+                    .copied()
+            })
+            .unwrap_or(self.audio_settings.input_channel_pair);
         if let Some((arrangement_id, track_id)) = armed_recording_track {
             let track_name = self
                 .document
@@ -52714,7 +52874,13 @@ impl DawUi {
                 .filter(|name| !name.trim().is_empty())
                 .unwrap_or_else(|| format!("Track {track_id}"));
             ui.label(format!(
-                "Armed recording destination: Playlist {arrangement_id} · {track_name}"
+                "Armed recording destination: Playlist {arrangement_id} · {track_name} · Input {} / {}",
+                recording_input_channel_pair
+                    .saturating_mul(2)
+                    .saturating_add(1),
+                recording_input_channel_pair
+                    .saturating_mul(2)
+                    .saturating_add(2)
             ));
         } else {
             ui.label(
@@ -52758,10 +52924,13 @@ impl DawUi {
             || recording_mixer_inserts
                 .iter()
                 .any(|insert| insert.ordinal() == self.audio_recording_mixer_track as usize);
-        let input_engine_ready = self.audio_engine.as_ref().is_none_or(|engine| {
-            engine.input_active()
-                && engine.input_channel_pair() == self.audio_settings.input_channel_pair
-        });
+        let recording_input_pair_available =
+            recording_input_channel_pair < input_channel_pair_count;
+        let input_engine_ready = recording_input_pair_available
+            && self.audio_engine.as_ref().is_none_or(|engine| {
+                engine.input_active()
+                    && recording_input_channel_pair < engine.input_channel_pair_count()
+            });
         let can_start_audio_recording = recording_template_available
             && self.audio_recording.is_none()
             && self.audio_settings.enable_input
@@ -52794,6 +52963,8 @@ impl DawUi {
                     "Add an Audio Clip to the Playlist before recording"
                 } else if !recording_mixer_route_available {
                     "Choose a Mixer insert available in this project"
+                } else if !recording_input_pair_available {
+                    "Choose an available input pair for the armed Playlist track"
                 } else {
                     "Restart the audio engine to use the selected input channels"
                 };
