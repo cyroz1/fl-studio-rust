@@ -1350,6 +1350,8 @@ pub struct AudioDeviceInfo {
     pub name: String,
     /// Stream formats reported by CPAL for this device and direction.
     pub config_ranges: Vec<AudioDeviceConfigRange>,
+    /// Sample rates accepted by the Windows WASAPI exclusive format probe.
+    pub exclusive_sample_rates: Vec<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1384,6 +1386,8 @@ pub struct AudioDeviceCatalog {
     pub outputs: Vec<AudioDeviceInfo>,
     pub default_input_id: Option<String>,
     pub default_output_id: Option<String>,
+    pub default_exclusive_input_id: Option<String>,
+    pub default_exclusive_output_id: Option<String>,
     pub default_sample_rate: Option<u32>,
     pub error: Option<String>,
 }
@@ -1398,24 +1402,20 @@ impl AudioDeviceCatalog {
     /// Returns common sample rates supported by every selected shared-mode endpoint.
     /// Rates reported as ranges are represented by common audio rates and range endpoints.
     pub fn supported_sample_rates(&self, settings: &AudioSettings) -> Vec<u32> {
-        if settings.access == AudioAccess::Exclusive {
-            let mut rates = COMMON_AUDIO_SAMPLE_RATES.to_vec();
-            rates.push(settings.sample_rate);
-            rates.sort_unstable();
-            rates.dedup();
-            rates.retain(|rate| (8_000..=384_000).contains(rate));
-            return rates;
-        }
-        let Ok(devices) = self.selected_device_capabilities(settings) else {
+        let Ok(devices) = self.selected_device_infos(settings) else {
             return Vec::new();
         };
         let mut candidates = COMMON_AUDIO_SAMPLE_RATES.to_vec();
         candidates.push(settings.sample_rate);
         candidates.extend(self.default_sample_rate);
         for device in &devices {
-            for config in &device.config_ranges {
-                candidates.push(config.minimum_sample_rate);
-                candidates.push(config.maximum_sample_rate);
+            if settings.access == AudioAccess::Exclusive {
+                candidates.extend(device.exclusive_sample_rates.iter().copied());
+            } else {
+                for config in &device.config_ranges {
+                    candidates.push(config.minimum_sample_rate);
+                    candidates.push(config.maximum_sample_rate);
+                }
             }
         }
         candidates.sort_unstable();
@@ -1424,10 +1424,14 @@ impl AudioDeviceCatalog {
         candidates.retain(|rate| {
             devices.is_empty()
                 || devices.iter().all(|device| {
-                    device
-                        .config_ranges
-                        .iter()
-                        .any(|config| config.supports_sample_rate(*rate))
+                    if settings.access == AudioAccess::Exclusive {
+                        device.exclusive_sample_rates.contains(rate)
+                    } else {
+                        device
+                            .config_ranges
+                            .iter()
+                            .any(|config| config.supports_sample_rate(*rate))
+                    }
                 })
         });
         candidates
@@ -1443,7 +1447,7 @@ impl AudioDeviceCatalog {
             sizes.retain(|frames| (32..=8_192).contains(frames));
             return sizes;
         }
-        let Ok(devices) = self.selected_device_capabilities(settings) else {
+        let Ok(devices) = self.selected_device_infos(settings) else {
             return Vec::new();
         };
         let mut candidates = COMMON_AUDIO_BUFFER_FRAMES.to_vec();
@@ -1482,22 +1486,29 @@ impl AudioDeviceCatalog {
         candidates
     }
 
-    fn selected_device_capabilities(
-        &self,
-        settings: &AudioSettings,
-    ) -> Result<Vec<&AudioDeviceInfo>, ()> {
+    fn selected_device_infos(&self, settings: &AudioSettings) -> Result<Vec<&AudioDeviceInfo>, ()> {
+        let (default_input_id, default_output_id) = match settings.access {
+            AudioAccess::Shared => (
+                self.default_input_id.as_deref(),
+                self.default_output_id.as_deref(),
+            ),
+            AudioAccess::Exclusive => (
+                self.default_exclusive_input_id.as_deref(),
+                self.default_exclusive_output_id.as_deref(),
+            ),
+        };
         let mut devices = Vec::new();
         for (enabled, selected_id, default_id, candidates) in [
             (
                 settings.enable_input,
                 settings.input_device_id.as_deref(),
-                self.default_input_id.as_deref(),
+                default_input_id,
                 self.inputs.as_slice(),
             ),
             (
                 settings.enable_output,
                 settings.output_device_id.as_deref(),
-                self.default_output_id.as_deref(),
+                default_output_id,
                 self.outputs.as_slice(),
             ),
         ] {
@@ -2465,6 +2476,7 @@ pub fn enumerate_devices() -> AudioDeviceCatalog {
                         id: id.to_string(),
                         name: format!("{} · {name}", host_id.to_string().to_ascii_uppercase()),
                         config_ranges: Vec::new(),
+                        exclusive_sample_rates: Vec::new(),
                     };
                     if device.supports_input() {
                         let config_ranges = match device.supported_input_configs() {
@@ -2497,6 +2509,8 @@ pub fn enumerate_devices() -> AudioDeviceCatalog {
             Err(error) => errors.push(format!("{host_id}: {error}")),
         }
     }
+    #[cfg(windows)]
+    enumerate_wasapi_exclusive_capabilities(&mut catalog, &mut errors);
     if !errors.is_empty() {
         catalog.error = Some(errors.join("; "));
     }
@@ -2508,6 +2522,153 @@ pub fn enumerate_devices() -> AudioDeviceCatalog {
         .outputs
         .sort_by(|left, right| left.name.cmp(&right.name));
     catalog
+}
+
+#[cfg(windows)]
+fn enumerate_wasapi_exclusive_capabilities(
+    catalog: &mut AudioDeviceCatalog,
+    errors: &mut Vec<String>,
+) {
+    if !catalog
+        .inputs
+        .iter()
+        .chain(&catalog.outputs)
+        .any(|device| device.id.starts_with("wasapi:"))
+    {
+        return;
+    }
+    let result = std::thread::spawn(enumerate_wasapi_exclusive_capabilities_on_mta).join();
+    let (device_rates, device_errors, default_input_id, default_output_id) = match result {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => {
+            errors.push(error);
+            return;
+        }
+        Err(_) => {
+            errors.push("WASAPI exclusive capability discovery worker panicked".to_owned());
+            return;
+        }
+    };
+    errors.extend(device_errors);
+    catalog.default_exclusive_input_id = default_input_id;
+    catalog.default_exclusive_output_id = default_output_id;
+    for (id, direction, rates) in device_rates {
+        let devices = match direction {
+            wasapi::Direction::Capture => &mut catalog.inputs,
+            wasapi::Direction::Render => &mut catalog.outputs,
+        };
+        if let Some(device) = devices.iter_mut().find(|device| device.id == id) {
+            device.exclusive_sample_rates = rates;
+        }
+    }
+}
+
+#[cfg(windows)]
+type WasapiExclusiveDeviceRates = (String, wasapi::Direction, Vec<u32>);
+
+#[cfg(windows)]
+fn enumerate_wasapi_exclusive_capabilities_on_mta() -> Result<
+    (
+        Vec<WasapiExclusiveDeviceRates>,
+        Vec<String>,
+        Option<String>,
+        Option<String>,
+    ),
+    String,
+> {
+    wasapi::initialize_mta()
+        .ok()
+        .map_err(|error| format!("Could not initialize Windows audio COM: {error}"))?;
+    let _com = WasapiComGuard;
+    let enumerator = wasapi::DeviceEnumerator::new().map_err(|error| error.to_string())?;
+    let mut device_rates = Vec::new();
+    let mut errors = Vec::new();
+    let default_input_id = enumerator
+        .get_default_device(&wasapi::Direction::Capture)
+        .ok()
+        .and_then(|device| device.get_id().ok())
+        .map(|id| format!("wasapi:{id}"));
+    let default_output_id = enumerator
+        .get_default_device(&wasapi::Direction::Render)
+        .ok()
+        .and_then(|device| device.get_id().ok())
+        .map(|id| format!("wasapi:{id}"));
+    for direction in [wasapi::Direction::Capture, wasapi::Direction::Render] {
+        let collection = match enumerator.get_device_collection(&direction) {
+            Ok(collection) => collection,
+            Err(error) => {
+                errors.push(format!("WASAPI {direction:?} device list: {error}"));
+                continue;
+            }
+        };
+        let count = match collection.get_nbr_devices() {
+            Ok(count) => count,
+            Err(error) => {
+                errors.push(format!("WASAPI {direction:?} device count: {error}"));
+                continue;
+            }
+        };
+        for index in 0..count {
+            let device = match collection.get_device_at_index(index) {
+                Ok(device) => device,
+                Err(error) => {
+                    errors.push(format!("WASAPI {direction:?} device {index}: {error}"));
+                    continue;
+                }
+            };
+            let id = match device.get_id() {
+                Ok(id) => format!("wasapi:{id}"),
+                Err(error) => {
+                    errors.push(format!("WASAPI {direction:?} device {index} ID: {error}"));
+                    continue;
+                }
+            };
+            match wasapi_exclusive_sample_rates(&device) {
+                Ok(rates) => device_rates.push((id, direction, rates)),
+                Err(error) => errors.push(format!("{id} exclusive capabilities: {error}")),
+            }
+        }
+    }
+    Ok((device_rates, errors, default_input_id, default_output_id))
+}
+
+#[cfg(windows)]
+fn wasapi_exclusive_sample_rates(device: &wasapi::Device) -> Result<Vec<u32>, String> {
+    let shared_format = device
+        .get_device_format()
+        .map_err(|error| format!("could not read shared device format: {error}"))?;
+    let channels = usize::from(shared_format.get_nchannels().max(1));
+    let mut probe = wasapi::CapabilityProbe::new(device)
+        .map_err(|error| format!("could not create format probe: {error}"))?;
+    // Probe the actual endpoint format checker instead of trusting potentially stale driver ranges.
+    probe.set_data_ranges(Vec::new());
+    let mut candidates = COMMON_AUDIO_SAMPLE_RATES.to_vec();
+    candidates.push(shared_format.get_samplespersec());
+    candidates.sort_unstable();
+    candidates.dedup();
+    candidates.retain(|rate| (8_000..=384_000).contains(rate));
+    Ok(candidates
+        .into_iter()
+        .filter(|rate| {
+            probe
+                .supported_formats(*rate as usize, channels)
+                .iter()
+                .any(wasapi_format_is_supported_by_stream_builder)
+        })
+        .collect())
+}
+
+#[cfg(windows)]
+fn wasapi_format_is_supported_by_stream_builder(format: &wasapi::WaveFormat) -> bool {
+    let bits = format.get_bitspersample();
+    let valid_bits = format.get_validbitspersample();
+    match (format.get_subformat(), bits, valid_bits) {
+        (Ok(wasapi::SampleType::Float), 32, 32) => true,
+        (Ok(wasapi::SampleType::Int), 16, 16)
+        | (Ok(wasapi::SampleType::Int), 24, 24)
+        | (Ok(wasapi::SampleType::Int), 32, 32) => true,
+        _ => false,
+    }
 }
 
 fn audio_device_config_ranges(
@@ -4532,6 +4693,7 @@ mod tests {
             inputs: vec![AudioDeviceInfo {
                 id: "input".to_owned(),
                 name: "Input".to_owned(),
+                exclusive_sample_rates: Vec::new(),
                 config_ranges: vec![
                     input_range,
                     AudioDeviceConfigRange {
@@ -4545,10 +4707,13 @@ mod tests {
             outputs: vec![AudioDeviceInfo {
                 id: "output".to_owned(),
                 name: "Output".to_owned(),
+                exclusive_sample_rates: Vec::new(),
                 config_ranges: vec![output_range],
             }],
             default_input_id: Some("input".to_owned()),
             default_output_id: Some("output".to_owned()),
+            default_exclusive_input_id: None,
+            default_exclusive_output_id: None,
             default_sample_rate: Some(48_000),
             error: None,
         };
@@ -4572,6 +4737,7 @@ mod tests {
             outputs: vec![AudioDeviceInfo {
                 id: "output".to_owned(),
                 name: "Output".to_owned(),
+                exclusive_sample_rates: Vec::new(),
                 config_ranges: vec![AudioDeviceConfigRange {
                     minimum_sample_rate: 48_000,
                     maximum_sample_rate: 48_000,
@@ -4601,6 +4767,45 @@ mod tests {
             catalog
                 .supported_sample_rates(&missing_device_settings)
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn exclusive_mode_sample_rates_are_intersected_for_selected_wasapi_devices() {
+        let catalog = AudioDeviceCatalog {
+            inputs: vec![AudioDeviceInfo {
+                id: "wasapi:capture".to_owned(),
+                name: "Capture".to_owned(),
+                config_ranges: Vec::new(),
+                exclusive_sample_rates: vec![44_100, 48_000, 96_000],
+            }],
+            outputs: vec![AudioDeviceInfo {
+                id: "wasapi:render".to_owned(),
+                name: "Render".to_owned(),
+                config_ranges: Vec::new(),
+                exclusive_sample_rates: vec![48_000, 96_000, 192_000],
+            }],
+            default_input_id: Some("wasapi:capture".to_owned()),
+            default_output_id: Some("wasapi:render".to_owned()),
+            default_exclusive_input_id: Some("wasapi:capture".to_owned()),
+            default_exclusive_output_id: Some("wasapi:render".to_owned()),
+            default_sample_rate: Some(48_000),
+            error: None,
+        };
+        let settings = AudioSettings {
+            access: AudioAccess::Exclusive,
+            sample_rate: 192_000,
+            ..AudioSettings::default()
+        };
+        assert_eq!(catalog.supported_sample_rates(&settings), [48_000, 96_000]);
+
+        let output_only = AudioSettings {
+            enable_input: false,
+            ..settings
+        };
+        assert_eq!(
+            catalog.supported_sample_rates(&output_only),
+            [48_000, 96_000, 192_000]
         );
     }
 

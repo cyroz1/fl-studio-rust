@@ -50502,6 +50502,16 @@ impl DawUi {
             self.status = format!("Could not save sample root-note preference: {error}");
         }
 
+        let default_input_id = if self.audio_settings.access == AudioAccess::Exclusive {
+            self.audio_catalog.default_exclusive_input_id.as_ref()
+        } else {
+            self.audio_catalog.default_input_id.as_ref()
+        };
+        let default_output_id = if self.audio_settings.access == AudioAccess::Exclusive {
+            self.audio_catalog.default_exclusive_output_id.as_ref()
+        } else {
+            self.audio_catalog.default_output_id.as_ref()
+        };
         let input_name = self
             .audio_settings
             .input_device_id
@@ -50514,9 +50524,7 @@ impl DawUi {
             })
             .map(|device| device.name.clone())
             .unwrap_or_else(|| {
-                self.audio_catalog
-                    .default_input_id
-                    .as_ref()
+                default_input_id
                     .and_then(|id| {
                         self.audio_catalog
                             .inputs
@@ -50652,9 +50660,7 @@ impl DawUi {
             })
             .map(|device| device.name.clone())
             .unwrap_or_else(|| {
-                self.audio_catalog
-                    .default_output_id
-                    .as_ref()
+                default_output_id
                     .and_then(|id| {
                         self.audio_catalog
                             .outputs
