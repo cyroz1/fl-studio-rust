@@ -1546,7 +1546,7 @@ impl AudioDeviceCatalog {
                     .max()
             })
             .unwrap_or(1);
-        u16::try_from((supported_channels / 2).max(1)).unwrap_or(u16::MAX)
+        (supported_channels / 2).max(1)
     }
 
     /// Returns common sample rates supported by every selected endpoint.
