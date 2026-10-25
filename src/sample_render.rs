@@ -6605,6 +6605,7 @@ pub fn stream_mixed_layer_midi_input_to_device(
     cancelled: &AtomicBool,
 ) -> Result<(), String> {
     let available_vst3_channels = processor.performance_channel_ids();
+    let vst3_volume_expression_channels = processor.performance_volume_expression_channel_ids();
     if !config
         .vst3_target_channel_ids
         .is_subset(&available_vst3_channels)
@@ -6688,10 +6689,11 @@ pub fn stream_mixed_layer_midi_input_to_device(
                     })) => {
                         let source_key = key.min(127);
                         let routed_targets = channel_router
-                            .targets_for_note_with_layer_adjustments(
+                            .targets_for_note_with_mixed_crossfade(
                                 config.source_channel_id,
                                 note_seed,
                                 u16::from(source_key),
+                                &vst3_volume_expression_channels,
                             )
                             .into_iter()
                             .filter(|(target_channel_id, _, _)| {
