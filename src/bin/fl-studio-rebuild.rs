@@ -38035,7 +38035,7 @@ impl DawUi {
                         insert_peaks.len(),
                     ),
                     PendingSongRenderKind::MixerStems => format!(
-                        "Rendered supported Mixer stems into {} at {} Hz; {}, {}. Mixer effects, automation, and route PDC were not rendered",
+                        "Rendered supported Mixer stems into {} at {} Hz; {}, {}. Loaded VST3 insert and Master effects with route PDC were included; native effect formats, effect automation, and PDC silence trimming were not rendered",
                         pending.output_path.display(),
                         summary.sample_rate,
                         if summary.mixer_master_stem_rendered {

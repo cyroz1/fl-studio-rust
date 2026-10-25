@@ -644,10 +644,12 @@ struct PlaylistMixerEffectChain {
     insert_ordinal: usize,
     route_plan: crate::MixerSourceRoutePlan,
     live_source: Option<PlaylistMixerEffectLiveSource>,
+    post_effect_meter_transform: MixerSourceRouteTransform,
     first_effect_index: usize,
     end_effect_index: usize,
     latency_frames: u64,
     output_alignment_delay: StereoFrameDelay,
+    post_effect_stem_delay: StereoFrameDelay,
     dry_reference_delay: StereoFrameDelay,
     downstream_delays: Vec<PlaylistMixerEffectBranchDelay>,
 }
@@ -1327,7 +1329,7 @@ impl Vst3PlaylistStreamProcessor {
     }
 
     pub fn mix_next_block(&mut self, output: &mut [f32]) -> Result<(), String> {
-        self.mix_next_block_with_optional_meter_buses(output, None)
+        self.mix_next_block_with_optional_meter_and_post_effect_buses(output, None, None)
     }
 
     pub(crate) fn mix_next_block_with_meter_buses(
@@ -1335,13 +1337,31 @@ impl Vst3PlaylistStreamProcessor {
         output: &mut [f32],
         meter_buses: &mut [f32],
     ) -> Result<(), String> {
-        self.mix_next_block_with_optional_meter_buses(output, Some(meter_buses))
+        self.mix_next_block_with_optional_meter_and_post_effect_buses(
+            output,
+            Some(meter_buses),
+            None,
+        )
     }
 
-    fn mix_next_block_with_optional_meter_buses(
+    pub(crate) fn mix_next_block_with_post_effect_buses(
+        &mut self,
+        output: &mut [f32],
+        meter_buses: &mut [f32],
+        post_effect_buses: &mut [f32],
+    ) -> Result<(), String> {
+        self.mix_next_block_with_optional_meter_and_post_effect_buses(
+            output,
+            Some(meter_buses),
+            Some(post_effect_buses),
+        )
+    }
+
+    fn mix_next_block_with_optional_meter_and_post_effect_buses(
         &mut self,
         output: &mut [f32],
         mut meter_buses: Option<&mut [f32]>,
+        post_effect_buses: Option<&mut [f32]>,
     ) -> Result<(), String> {
         crate::audio::enable_denormal_protection();
         if !output.len().is_multiple_of(2) {
@@ -1354,6 +1374,12 @@ impl Vst3PlaylistStreamProcessor {
         } else {
             (None, None)
         };
+        if let (Some(meter_buses), Some(post_effect_buses)) =
+            (meter_buses.as_deref(), post_effect_buses.as_deref())
+            && meter_buses.len() != post_effect_buses.len()
+        {
+            return Err("post-effect Mixer buses do not match the meter buses".to_owned());
+        }
         let frame_count = output.len() / 2;
         for stream in &mut self.streams {
             let mut plugin_output = Vec::new();
@@ -1471,7 +1497,7 @@ impl Vst3PlaylistStreamProcessor {
                 }
             }
         }
-        self.process_mixer_effects(output, meter_buses, effect_input_buses)?;
+        self.process_mixer_effects(output, meter_buses, effect_input_buses, post_effect_buses)?;
         Ok(())
     }
 
@@ -1480,6 +1506,7 @@ impl Vst3PlaylistStreamProcessor {
         output: &mut [f32],
         mut meter_buses: Option<&mut [f32]>,
         mut effect_input_buses: Option<&mut [f32]>,
+        mut post_effect_buses: Option<&mut [f32]>,
     ) -> Result<(), String> {
         if !output.len().is_multiple_of(2) {
             return Err("VST3 Mixer effect buffer must contain stereo frames".to_owned());
@@ -1514,6 +1541,14 @@ impl Vst3PlaylistStreamProcessor {
                 }
                 delay.process_interleaved(&mut effect_input_buses[start..end])?;
             }
+        }
+        if let (Some(meter_buses), Some(post_effect_buses)) =
+            (meter_buses.as_deref(), post_effect_buses.as_deref_mut())
+        {
+            if meter_buses.len() != post_effect_buses.len() {
+                return Err("post-effect Mixer buses do not match the meter buses".to_owned());
+            }
+            post_effect_buses.copy_from_slice(meter_buses);
         }
 
         for chain in &mut self.mixer_effect_chains {
@@ -1584,6 +1619,29 @@ impl Vst3PlaylistStreamProcessor {
                     live_controls,
                 );
                 let live_source = chain.live_source.as_ref();
+                if let Some(post_effect_buses) = post_effect_buses.as_deref_mut() {
+                    let post_effect_offset = chain
+                        .insert_ordinal
+                        .checked_mul(samples_per_track)
+                        .ok_or_else(|| "post-effect Mixer bus offset overflow".to_owned())?;
+                    let post_effect_sample = post_effect_offset
+                        .checked_add(frame_index * 2)
+                        .ok_or_else(|| "post-effect Mixer bus offset overflow".to_owned())?;
+                    let post_effect_end = post_effect_sample
+                        .checked_add(2)
+                        .filter(|end| *end <= post_effect_buses.len())
+                        .ok_or_else(|| "post-effect Mixer bus is too small".to_owned())?;
+                    let mut post_effect_frame = [processed[0], processed[1]];
+                    chain
+                        .post_effect_stem_delay
+                        .process_frame(&mut post_effect_frame);
+                    chain
+                        .post_effect_meter_transform
+                        .apply_frame(&mut post_effect_frame);
+                    post_effect_buses[post_effect_sample] = finite_sample(post_effect_frame[0]);
+                    post_effect_buses[post_effect_sample + 1] = finite_sample(post_effect_frame[1]);
+                    debug_assert_eq!(post_effect_end, post_effect_sample + 2);
+                }
                 output[frame_index * 2] += finite_sample(output_delta[0]);
                 output[frame_index * 2 + 1] += finite_sample(output_delta[1]);
 
@@ -1614,6 +1672,10 @@ impl Vst3PlaylistStreamProcessor {
                     branch.meter_delay.process_frame(&mut meter_delta);
                     meter_buses[meter_offset] += finite_sample(meter_delta[0]);
                     meter_buses[meter_offset + 1] += finite_sample(meter_delta[1]);
+                    if let Some(post_effect_buses) = post_effect_buses.as_deref_mut() {
+                        post_effect_buses[meter_offset] += finite_sample(meter_delta[0]);
+                        post_effect_buses[meter_offset + 1] += finite_sample(meter_delta[1]);
+                    }
                     if branch.track >= crate::audio::MIXER_TRACK_METER_COUNT {
                         return Err(
                             "VST3 Mixer effect input route exceeds the supported track range"
@@ -1993,6 +2055,7 @@ fn configure_mixer_effect_pdc(
             0
         };
         chain.output_alignment_delay = StereoFrameDelay::new(output_alignment_frames)?;
+        chain.post_effect_stem_delay = StereoFrameDelay::new(output_alignment_frames)?;
         chain.dry_reference_delay = StereoFrameDelay::new(chain.latency_frames)?;
         chain.downstream_delays = Vec::new();
         chain
@@ -4820,6 +4883,13 @@ impl Vst3HostRuntime {
                 })?;
                 routing.source_route_plan_for_channel(Some(track))
             };
+            let post_effect_meter_transform = route_plan
+                .insert_meter_transforms
+                .iter()
+                .find(|(track, _)| *track == insert_ordinal)
+                .map_or_else(MixerSourceRouteTransform::default, |(_, transform)| {
+                    *transform
+                });
             let live_source = if insert_ordinal == 0 {
                 None
             } else {
@@ -4846,10 +4916,12 @@ impl Vst3HostRuntime {
                     insert_ordinal,
                     route_plan,
                     live_source,
+                    post_effect_meter_transform,
                     first_effect_index,
                     end_effect_index,
                     latency_frames,
                     output_alignment_delay: StereoFrameDelay::default(),
+                    post_effect_stem_delay: StereoFrameDelay::default(),
                     dry_reference_delay: StereoFrameDelay::default(),
                     downstream_delays: Vec::new(),
                 });
@@ -7903,16 +7975,19 @@ mod tests {
             insert_ordinal: 1,
             route_plan: crate::MixerSourceRoutePlan {
                 output_transform: MixerSourceRouteTransform::default().scaled(0.5),
+                insert_meter_transforms: vec![(1, MixerSourceRouteTransform::default())],
                 ..crate::MixerSourceRoutePlan::default()
             },
             live_source: Some(PlaylistMixerEffectLiveSource {
                 control: live_control,
                 targets: Some(targets),
             }),
+            post_effect_meter_transform: MixerSourceRouteTransform::default(),
             first_effect_index: 0,
             end_effect_index: 0,
             latency_frames: 0,
             output_alignment_delay: StereoFrameDelay::default(),
+            post_effect_stem_delay: StereoFrameDelay::default(),
             dry_reference_delay: StereoFrameDelay::default(),
             downstream_delays: Vec::new(),
         };

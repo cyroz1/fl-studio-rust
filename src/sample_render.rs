@@ -2295,7 +2295,8 @@ pub fn stream_playlist_performance_with_vst3_to_device(
         performance.meters.as_deref(),
         cancelled,
         || writer.is_cancelled(),
-        |block, _meter_buses| {
+        false,
+        |block, _mixer_buses| {
             writer.write_stereo_samples(skip_render_block_prefix(block, &mut frames_to_skip))
         },
     )?;
@@ -2438,7 +2439,7 @@ fn stream_playlist_with_vst3_to_device_from_frame_inner(
         meters,
         cancelled,
         || writer.is_cancelled(),
-        |block, _meter_buses| {
+        |block, _mixer_buses| {
             let skipped_frames = frames_to_skip.min((block.len() / 2) as u64) as usize;
             frames_to_skip -= skipped_frames as u64;
             writer.write_stereo_samples(&block[skipped_frames * 2..])
@@ -2829,7 +2830,7 @@ fn render_playlist_with_vst3_cancellable(
                 Some(&mixer_track_meters),
                 cancelled,
                 || false,
-                |block, _meter_buses| {
+                |block, _mixer_buses| {
                     let block = skip_render_block_prefix(block, &mut frames_to_skip);
                     if block.is_empty() {
                         return Ok(());
@@ -2866,7 +2867,7 @@ fn render_playlist_with_vst3_cancellable(
                 Some(&mixer_track_meters),
                 cancelled,
                 || false,
-                |block, _meter_buses| {
+                |block, _mixer_buses| {
                     let block = skip_render_block_prefix(block, &mut frames_to_skip);
                     if block.is_empty() {
                         Ok(())
@@ -2896,7 +2897,7 @@ fn render_playlist_with_vst3_cancellable(
                 Some(&mixer_track_meters),
                 cancelled,
                 || false,
-                |block, _meter_buses| {
+                |block, _mixer_buses| {
                     let block = skip_render_block_prefix(block, &mut frames_to_skip);
                     if block.is_empty() {
                         Ok(())
@@ -2927,7 +2928,7 @@ fn render_playlist_with_vst3_cancellable(
                 Some(&mixer_track_meters),
                 cancelled,
                 || false,
-                |block, _meter_buses| {
+                |block, _mixer_buses| {
                     let block = skip_render_block_prefix(block, &mut frames_to_skip);
                     if block.is_empty() {
                         Ok(())
@@ -2949,11 +2950,12 @@ fn render_playlist_with_vst3_cancellable(
 
 /// Render supported Mixer insert buses to separate WAV files, optionally including Master and Current.
 ///
-/// Insert stems use the renderer's pre-effect buses, including supported direct routes, paired
-/// sends, insert level/pan transforms, and insert mute/solo state. Only recognized, enabled
+/// Insert stems include loaded VST3 insert effects in saved order, supported direct routes, paired
+/// sends, insert level/pan transforms, mute/solo state, and route PDC. Only recognized, enabled
 /// inserts routed from a project channel are written. The optional Master stem uses the final
-/// supported mix after Master controls. Mixer effects, parameter automation, and effect/send-chain
-/// PDC are not included.
+/// supported mix after Master controls and loaded VST3 Master effects. The optional Current stem
+/// uses its selected insert's pre-effect bus. Native effect formats, effect parameter automation,
+/// PDC silence trimming, and unsupported route types are not included.
 pub fn render_playlist_mixer_stems_with_vst3_cancellable(
     document: &FlpDocument,
     project_path: impl AsRef<Path>,
@@ -3203,7 +3205,7 @@ pub fn render_playlist_mixer_stems_with_vst3_cancellable(
         mixer_insert_peaks: Some(Vec::new()),
     };
     let meters = MixerTrackPeakMeters::default();
-    summary.voices_stolen = stream_prepared_playlist_render(
+    summary.voices_stolen = stream_prepared_playlist_render_with_post_effect_stems(
         PreparedPlaylistBlockMix {
             audio: &audio,
             sampler: &sampler,
@@ -3215,11 +3217,19 @@ pub fn render_playlist_mixer_stems_with_vst3_cancellable(
         Some(&meters),
         cancelled,
         || false,
-        |block, meter_buses| {
-            let meter_buses = meter_buses
+        |block, mixer_buses| {
+            let pre_effect_buses = mixer_buses
+                .pre_effect
                 .ok_or_else(|| "Mixer insert buses were not prepared for stem export".to_owned())?;
+            let post_effect_buses = mixer_buses.post_effect.unwrap_or(pre_effect_buses);
             for output in &mut outputs {
-                let stem_block = mixer_stem_block(output.track, block, meter_buses)?;
+                let stem_block = mixer_stem_block(
+                    output.track,
+                    block,
+                    pre_effect_buses,
+                    post_effect_buses,
+                    output.is_current_stem,
+                )?;
                 output.peak = stem_block
                     .iter()
                     .fold(output.peak, |peak, sample| peak.max(sample.abs()));
@@ -3277,7 +3287,9 @@ pub fn render_playlist_mixer_stems_with_vst3_cancellable(
 fn mixer_stem_block<'a>(
     track: usize,
     master_block: &'a [f32],
-    insert_meter_buses: &'a [f32],
+    pre_effect_insert_buses: &'a [f32],
+    post_effect_insert_buses: &'a [f32],
+    current_stem: bool,
 ) -> Result<&'a [f32], String> {
     if !master_block.len().is_multiple_of(2) {
         return Err("render block must contain interleaved stereo frames".into());
@@ -3289,7 +3301,12 @@ fn mixer_stem_block<'a>(
     if track >= MIXER_TRACK_METER_COUNT {
         return Err("Mixer stem track exceeds the supported insert range".into());
     }
-    if insert_meter_buses.len() != MIXER_TRACK_METER_COUNT.saturating_mul(samples_per_track) {
+    let insert_buses = if current_stem {
+        pre_effect_insert_buses
+    } else {
+        post_effect_insert_buses
+    };
+    if insert_buses.len() != MIXER_TRACK_METER_COUNT.saturating_mul(samples_per_track) {
         return Err("Mixer insert buses do not match the render block".into());
     }
     let start = track
@@ -3297,9 +3314,9 @@ fn mixer_stem_block<'a>(
         .ok_or_else(|| "Mixer stem offset overflow".to_owned())?;
     let end = start
         .checked_add(samples_per_track)
-        .filter(|end| *end <= insert_meter_buses.len())
+        .filter(|end| *end <= insert_buses.len())
         .ok_or_else(|| "Mixer stem block exceeds the insert meter buses".to_owned())?;
-    Ok(&insert_meter_buses[start..end])
+    Ok(&insert_buses[start..end])
 }
 
 fn safe_stem_filename_component(value: &str) -> String {
@@ -4576,7 +4593,7 @@ fn stream_prepared_playlist_render(
     meters: Option<&MixerTrackPeakMeters>,
     cancelled: &AtomicBool,
     stream_cancelled: impl FnMut() -> bool,
-    write_block: impl FnMut(&[f32], Option<&[f32]>) -> Result<(), String>,
+    write_block: impl FnMut(&[f32], PlaylistRenderMixerBuses<'_>) -> Result<(), String>,
 ) -> Result<usize, String> {
     stream_prepared_playlist_render_with_performance(
         render,
@@ -4584,8 +4601,33 @@ fn stream_prepared_playlist_render(
         meters,
         cancelled,
         stream_cancelled,
+        false,
         write_block,
     )
+}
+
+fn stream_prepared_playlist_render_with_post_effect_stems(
+    render: PreparedPlaylistBlockMix<'_>,
+    meters: Option<&MixerTrackPeakMeters>,
+    cancelled: &AtomicBool,
+    stream_cancelled: impl FnMut() -> bool,
+    write_block: impl FnMut(&[f32], PlaylistRenderMixerBuses<'_>) -> Result<(), String>,
+) -> Result<usize, String> {
+    stream_prepared_playlist_render_with_performance(
+        render,
+        None,
+        meters,
+        cancelled,
+        stream_cancelled,
+        true,
+        write_block,
+    )
+}
+
+#[derive(Clone, Copy)]
+struct PlaylistRenderMixerBuses<'a> {
+    pre_effect: Option<&'a [f32]>,
+    post_effect: Option<&'a [f32]>,
 }
 
 fn stream_prepared_playlist_render_with_performance(
@@ -4594,7 +4636,8 @@ fn stream_prepared_playlist_render_with_performance(
     meters: Option<&MixerTrackPeakMeters>,
     cancelled: &AtomicBool,
     mut stream_cancelled: impl FnMut() -> bool,
-    mut write_block: impl FnMut(&[f32], Option<&[f32]>) -> Result<(), String>,
+    capture_post_effect_buses: bool,
+    mut write_block: impl FnMut(&[f32], PlaylistRenderMixerBuses<'_>) -> Result<(), String>,
 ) -> Result<usize, String> {
     crate::audio::enable_denormal_protection();
     let frames = render.frames;
@@ -4627,6 +4670,7 @@ fn stream_prepared_playlist_render_with_performance(
         .vst3_processor
         .as_deref()
         .is_some_and(Vst3PlaylistStreamProcessor::needs_mixer_insert_buses);
+    let mixer_post_effect_stems_required = capture_post_effect_buses && mixer_effect_buses_required;
     let mixer_bus_planes = 1 + usize::from(mixer_effect_buses_required);
     let meter_plane_samples = MIXER_TRACK_METER_COUNT * STREAM_BLOCK_FRAMES * 2;
     let mut meter_buses = if meters.is_some() || mixer_effect_buses_required {
@@ -4634,6 +4678,8 @@ fn stream_prepared_playlist_render_with_performance(
     } else {
         Vec::new()
     };
+    let mut post_effect_buses =
+        mixer_post_effect_stems_required.then(|| vec![0.0f32; meter_plane_samples]);
     let direct_source_delay_frames = render.vst3_processor.as_deref().map_or(
         0,
         Vst3PlaylistStreamProcessor::pdc_direct_source_delay_frames,
@@ -4747,7 +4793,15 @@ fn stream_prepared_playlist_render_with_performance(
                     }
                 }
                 if let Some(processor) = render.vst3_processor.as_deref_mut() {
-                    if let Some(meter_buses) = meter_buses.as_deref_mut() {
+                    if let (Some(meter_buses), Some(post_effect_buses)) =
+                        (meter_buses.as_deref_mut(), post_effect_buses.as_deref_mut())
+                    {
+                        processor.mix_next_block_with_post_effect_buses(
+                            block,
+                            meter_buses,
+                            post_effect_buses,
+                        )?;
+                    } else if let Some(meter_buses) = meter_buses.as_deref_mut() {
                         processor.mix_next_block_with_meter_buses(block, meter_buses)?;
                     } else {
                         processor.mix_next_block(block)?;
@@ -4769,9 +4823,14 @@ fn stream_prepared_playlist_render_with_performance(
                 render.master_output.apply(block);
                 write_block(
                     block,
-                    meter_buses
-                        .as_deref()
-                        .map(|buses| &buses[..meter_bus_samples]),
+                    PlaylistRenderMixerBuses {
+                        pre_effect: meter_buses
+                            .as_deref()
+                            .map(|buses| &buses[..meter_bus_samples]),
+                        post_effect: post_effect_buses
+                            .as_deref()
+                            .map(|buses| &buses[..meter_bus_samples]),
+                    },
                 )?;
                 block_start += frame_count as u64;
             }
@@ -15942,7 +16001,7 @@ mod tests {
             Some(&meters),
             &AtomicBool::new(false),
             || false,
-            |block, _meter_buses| {
+            |block, _mixer_buses| {
                 rendered.extend_from_slice(block);
                 Ok(())
             },
@@ -19398,20 +19457,37 @@ mod tests {
     }
 
     #[test]
-    fn mixer_stem_block_reads_master_mix_and_insert_meter_bus() {
+    fn mixer_stem_block_reads_master_and_selects_post_effect_or_current_bus() {
         let master = [0.25_f32, -0.25, 0.5, -0.5];
-        let mut insert_buses = vec![0.0_f32; MIXER_TRACK_METER_COUNT * master.len()];
-        insert_buses[master.len()..2 * master.len()].copy_from_slice(&[0.125, -0.125, 0.75, -0.75]);
+        let mut pre_effect_buses = vec![0.0_f32; MIXER_TRACK_METER_COUNT * master.len()];
+        let mut post_effect_buses = vec![0.0_f32; MIXER_TRACK_METER_COUNT * master.len()];
+        pre_effect_buses[master.len()..2 * master.len()]
+            .copy_from_slice(&[0.125, -0.125, 0.75, -0.75]);
+        post_effect_buses[master.len()..2 * master.len()]
+            .copy_from_slice(&[0.25, -0.25, 0.5, -0.5]);
 
         assert_eq!(
-            mixer_stem_block(0, &master, &insert_buses).unwrap(),
+            mixer_stem_block(0, &master, &pre_effect_buses, &post_effect_buses, false).unwrap(),
             master.as_slice()
         );
         assert_eq!(
-            mixer_stem_block(1, &master, &insert_buses).unwrap(),
+            mixer_stem_block(1, &master, &pre_effect_buses, &post_effect_buses, false).unwrap(),
+            &[0.25, -0.25, 0.5, -0.5][..]
+        );
+        assert_eq!(
+            mixer_stem_block(1, &master, &pre_effect_buses, &post_effect_buses, true).unwrap(),
             &[0.125, -0.125, 0.75, -0.75][..]
         );
-        assert!(mixer_stem_block(MIXER_TRACK_METER_COUNT, &master, &insert_buses).is_err());
+        assert!(
+            mixer_stem_block(
+                MIXER_TRACK_METER_COUNT,
+                &master,
+                &pre_effect_buses,
+                &post_effect_buses,
+                false,
+            )
+            .is_err()
+        );
     }
 
     #[test]
