@@ -5284,10 +5284,18 @@ fn wrap_float_spool_remainder(
         tail_samples.clear();
         tail_samples.extend(
             tail_bytes[..byte_count]
-                .chunks_exact(4)
-                .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])),
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|bytes| f32::from_le_bytes(*bytes)),
         );
-        for (frame_offset, frame) in tail_samples.chunks_exact(2).enumerate() {
+        for (frame_offset, frame) in tail_samples
+            .as_slice()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .enumerate()
+        {
             let wrapped_frame = (rendered_tail_frames + frame_offset as u64) % content_frames;
             let sample_offset = usize::try_from(wrapped_frame)
                 .ok()
@@ -5322,8 +5330,10 @@ fn read_float_spool_samples(
             .map_err(|error| format!("could not read temporary render spool: {error}"))?;
         samples.extend(
             bytes[..byte_count]
-                .chunks_exact(4)
-                .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])),
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|bytes| f32::from_le_bytes(*bytes)),
         );
         remaining_samples -= chunk_samples;
     }
@@ -5356,8 +5366,10 @@ fn encode_float_spool(
         block.clear();
         block.extend(
             bytes[..byte_count]
-                .chunks_exact(4)
-                .map(|sample| f32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]])),
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|sample| f32::from_le_bytes(*sample)),
         );
         encoder.write_stereo_block(&block, options.wav_channel_mode)?;
         remaining_frames -= block_frames as u64;
