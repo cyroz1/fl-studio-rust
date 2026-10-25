@@ -407,6 +407,38 @@ fn install_ui_visuals(context: &egui::Context) {
     });
 }
 
+fn apply_local_ui_scale(ui: &mut egui::Ui, scale: f32) {
+    if !scale.is_finite() || scale <= 0.0 || (scale - 1.0).abs() < f32::EPSILON {
+        return;
+    }
+    let style = ui.style_mut();
+    for font_id in style.text_styles.values_mut() {
+        font_id.size *= scale;
+    }
+    if let Some(font_id) = &mut style.override_font_id {
+        font_id.size *= scale;
+    }
+
+    let spacing = &mut style.spacing;
+    spacing.item_spacing *= scale;
+    spacing.button_padding *= scale;
+    spacing.menu_margin *= scale;
+    spacing.interact_size *= scale;
+    spacing.indent *= scale;
+    spacing.slider_width *= scale;
+    spacing.slider_rail_height *= scale;
+    spacing.combo_width *= scale;
+    spacing.text_edit_width *= scale;
+    spacing.extra_text_line_spacing *= scale;
+    spacing.icon_width *= scale;
+    spacing.icon_width_inner *= scale;
+    spacing.icon_spacing *= scale;
+    spacing.tooltip_width *= scale;
+    spacing.menu_width *= scale;
+    spacing.menu_spacing *= scale;
+    spacing.combo_height *= scale;
+}
+
 fn unique_candidate_mixer_parameter(
     parameters: &[MixerParameterRecord],
     insert_ordinal: usize,
@@ -4507,6 +4539,8 @@ struct DawUi {
     package_workspace: Option<ProjectPackageWorkspace>,
     view: MainView,
     ui_scale: f32,
+    popup_menu_scale: f32,
+    toolbar_scale: f32,
     status: String,
     dirty: bool,
     undo_history: Vec<Vec<u8>>,
@@ -5896,6 +5930,8 @@ impl DawUi {
         install_ui_fonts(&creation.egui_ctx);
         install_ui_visuals(&creation.egui_ctx);
         let ui_scale = load_ui_scale();
+        let popup_menu_scale = load_popup_menu_scale();
+        let toolbar_scale = load_toolbar_scale();
         creation.egui_ctx.set_zoom_factor(ui_scale);
         creation
             .egui_ctx
@@ -6027,6 +6063,8 @@ impl DawUi {
             package_workspace: None,
             view: MainView::Playlist,
             ui_scale,
+            popup_menu_scale,
+            toolbar_scale,
             status: "Ready".to_owned(),
             dirty: false,
             undo_history: Vec::new(),
@@ -12614,6 +12652,8 @@ impl DawUi {
     }
 
     fn top_menu(&mut self, ui: &mut egui::Ui) {
+        let scale = self.popup_menu_scale;
+        apply_local_ui_scale(ui, scale);
         ui.horizontal_centered(|ui| {
             ui.strong("FL")
                 .on_hover_text("Independent FL Studio project editor");
@@ -13481,7 +13521,7 @@ impl DawUi {
                     ui.horizontal(|ui| {
                         ui.add(
                             egui::TextEdit::singleline(&mut self.window_layout_preset_name)
-                                .desired_width(140.0)
+                                .desired_width(140.0 * scale)
                                 .hint_text("Preset name"),
                         );
                         if ui
@@ -13550,6 +13590,36 @@ impl DawUi {
                                 )));
                             if let Err(error) = save_ui_scale(scale) {
                                 self.status = format!("Could not save UI scale: {error}");
+                            }
+                            ui.close();
+                        }
+                    }
+                });
+                ui.menu_button("Popup/menu scale", |ui| {
+                    for scale in UI_SCALE_STEPS {
+                        let selected = (self.popup_menu_scale - scale).abs() < f32::EPSILON;
+                        if ui
+                            .selectable_label(selected, format!("{:.0}%", scale * 100.0))
+                            .clicked()
+                        {
+                            self.popup_menu_scale = scale;
+                            if let Err(error) = save_popup_menu_scale(scale) {
+                                self.status = format!("Could not save popup/menu scale: {error}");
+                            }
+                            ui.close();
+                        }
+                    }
+                });
+                ui.menu_button("Toolbar scale", |ui| {
+                    for scale in UI_SCALE_STEPS {
+                        let selected = (self.toolbar_scale - scale).abs() < f32::EPSILON;
+                        if ui
+                            .selectable_label(selected, format!("{:.0}%", scale * 100.0))
+                            .clicked()
+                        {
+                            self.toolbar_scale = scale;
+                            if let Err(error) = save_toolbar_scale(scale) {
+                                self.status = format!("Could not save toolbar scale: {error}");
                             }
                             ui.close();
                         }
@@ -14789,13 +14859,15 @@ impl DawUi {
     }
 
     fn transport_bar(&mut self, ui: &mut egui::Ui) {
+        let scale = self.toolbar_scale;
+        apply_local_ui_scale(ui, scale);
         let patterns = self
             .document
             .as_ref()
             .and_then(|document| document.patterns().ok())
             .unwrap_or_default();
         ui.horizontal_centered(|ui| {
-            ui.add_space(4.0);
+            ui.add_space(4.0 * scale);
             let recording_midi = self.midi_recording.is_some();
             let recording_audio = self
                 .audio_recording
@@ -15018,7 +15090,7 @@ impl DawUi {
                     .unwrap_or_else(|| "No patterns".to_owned());
                 egui::ComboBox::from_id_salt("transport-pattern-picker")
                     .selected_text(selected_pattern_text)
-                    .width(132.0)
+                    .width(132.0 * scale)
                     .show_ui(ui, |ui| {
                         if patterns.is_empty() {
                             ui.weak("No patterns");
@@ -54540,24 +54612,29 @@ impl eframe::App for DawUi {
             ui.ctx().request_repaint_after(repaint_delay);
         }
         let width = ui.available_width();
+        let menu_scale = self.popup_menu_scale;
+        let toolbar_scale = self.toolbar_scale;
         ui.vertical(|ui| {
             ui.allocate_ui_with_layout(
-                Vec2::new(width, MENU_BAR_HEIGHT),
+                Vec2::new(width, MENU_BAR_HEIGHT * menu_scale),
                 egui::Layout::left_to_right(egui::Align::Center),
                 |ui| {
                     egui::Frame::new()
                         .fill(PANEL)
-                        .inner_margin(egui::Margin::symmetric(8, 0))
+                        .inner_margin(egui::Margin::symmetric((8.0 * menu_scale).round() as i8, 0))
                         .show(ui, |ui| self.top_menu(ui));
                 },
             );
             ui.allocate_ui_with_layout(
-                Vec2::new(width, TRANSPORT_BAR_HEIGHT),
+                Vec2::new(width, TRANSPORT_BAR_HEIGHT * toolbar_scale),
                 egui::Layout::left_to_right(egui::Align::Center),
                 |ui| {
                     egui::Frame::new()
                         .fill(PANEL)
-                        .inner_margin(egui::Margin::symmetric(8, 0))
+                        .inner_margin(egui::Margin::symmetric(
+                            (8.0 * toolbar_scale).round() as i8,
+                            0,
+                        ))
                         .show(ui, |ui| self.transport_bar(ui));
                 },
             );
@@ -59024,6 +59101,18 @@ fn ui_scale_settings_file() -> Option<PathBuf> {
         .map(|directory| directory.join("ui-scale.txt"))
 }
 
+fn popup_menu_scale_settings_file() -> Option<PathBuf> {
+    browser_favorites_file()?
+        .parent()
+        .map(|directory| directory.join("popup-menu-scale.txt"))
+}
+
+fn toolbar_scale_settings_file() -> Option<PathBuf> {
+    browser_favorites_file()?
+        .parent()
+        .map(|directory| directory.join("toolbar-scale.txt"))
+}
+
 fn detached_window_placements_settings_file() -> Option<PathBuf> {
     browser_favorites_file()?
         .parent()
@@ -59738,25 +59827,44 @@ fn save_browser_column_width(width: f32) -> Result<(), String> {
 }
 
 fn load_ui_scale() -> f32 {
-    let Some(path) = ui_scale_settings_file() else {
-        return 1.0;
-    };
-    fs::read_to_string(path)
-        .ok()
+    load_scale_setting(ui_scale_settings_file())
+}
+
+fn load_popup_menu_scale() -> f32 {
+    load_scale_setting(popup_menu_scale_settings_file())
+}
+
+fn load_toolbar_scale() -> f32 {
+    load_scale_setting(toolbar_scale_settings_file())
+}
+
+fn load_scale_setting(path: Option<PathBuf>) -> f32 {
+    path.and_then(|path| fs::read_to_string(path).ok())
         .and_then(|contents| contents.trim().parse::<f32>().ok())
         .filter(|scale| UI_SCALE_STEPS.contains(scale))
         .unwrap_or(1.0)
 }
 
 fn save_ui_scale(scale: f32) -> Result<(), String> {
+    save_scale_setting(ui_scale_settings_file(), "UI", scale)
+}
+
+fn save_popup_menu_scale(scale: f32) -> Result<(), String> {
+    save_scale_setting(popup_menu_scale_settings_file(), "popup/menu", scale)
+}
+
+fn save_toolbar_scale(scale: f32) -> Result<(), String> {
+    save_scale_setting(toolbar_scale_settings_file(), "toolbar", scale)
+}
+
+fn save_scale_setting(path: Option<PathBuf>, name: &str, scale: f32) -> Result<(), String> {
     if !UI_SCALE_STEPS.contains(&scale) {
-        return Err(format!("unsupported UI scale: {scale}"));
+        return Err(format!("unsupported {name} scale: {scale}"));
     }
-    let path = ui_scale_settings_file()
-        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let path = path.ok_or_else(|| "the user configuration folder is not available".to_owned())?;
     let parent = path
         .parent()
-        .ok_or_else(|| "the UI scale settings path has no parent folder".to_owned())?;
+        .ok_or_else(|| format!("the {name} scale settings path has no parent folder"))?;
     fs::create_dir_all(parent)
         .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
     fs::write(&path, format!("{scale:.1}\n"))
