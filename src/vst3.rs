@@ -3639,8 +3639,9 @@ impl Vst3HostRuntime {
     }
 
     /// Process a decoded mono or stereo source through one loaded VST3 audio effect and encode
-    /// the result to an audio file. The reported plug-in latency is removed from the output and
-    /// the output duration includes the longer of the selected tail and a finite reported tail.
+    /// the result to an audio file. Effective PDC latency, including any configured manual
+    /// offset, is removed from the output and the output duration includes the longer of the
+    /// selected tail and a finite reported tail.
     ///
     /// This is a standalone effect render; it does not apply FLP Mixer slot state, Mix controls,
     /// or project routing.
@@ -3718,7 +3719,8 @@ impl Vst3HostRuntime {
                     "VST3 effect must have an active mono or stereo main output bus".to_owned()
                 })?;
             let _ = (input_bus, output_bus);
-            let latency_frames = u64::from(plugin.latency_samples());
+            let latency_frames =
+                u64::from(self.pdc_latency_samples_for_plugin(id, plugin.latency_samples()));
             let maximum_compensated_latency =
                 (sample_rate * MAX_VST3_EFFECT_LATENCY_SECONDS).ceil() as u64;
             if latency_frames > maximum_compensated_latency {
