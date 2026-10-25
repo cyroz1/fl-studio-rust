@@ -2429,6 +2429,10 @@ pub fn stream_playlist_performance_with_vst3_to_device(
         .as_ref()
         .map(Vst3PlaylistStreamProcessor::performance_channel_ids)
         .unwrap_or_default();
+    let vst3_volume_expression_channels = vst3_processor
+        .as_ref()
+        .map(Vst3PlaylistStreamProcessor::performance_volume_expression_channel_ids)
+        .unwrap_or_default();
     let (static_document, performance_clip_indices) =
         playlist_performance_static_document_with_vst3(
             document,
@@ -2505,6 +2509,7 @@ pub fn stream_playlist_performance_with_vst3_to_device(
             audio_clip_indices: &performance_audio_clip_indices,
             vst3_clip_indices: &performance_vst3_clip_indices,
             vst3_channel_ids: &loaded_vst3_channels,
+            vst3_volume_expression_channel_ids: &vst3_volume_expression_channels,
             pattern_automation: &performance_pattern_automation,
             sampler: &sampler,
             audio: &audio,
@@ -9258,6 +9263,7 @@ struct PlaylistPerformanceSources<'a> {
     audio_clip_indices: &'a BTreeSet<usize>,
     vst3_clip_indices: &'a BTreeSet<usize>,
     vst3_channel_ids: &'a BTreeSet<u16>,
+    vst3_volume_expression_channel_ids: &'a BTreeSet<u16>,
     pattern_automation: &'a BTreeMap<(u16, u16), Vec<Vst3ParameterAutomation>>,
     sampler: &'a PreparedSamplerArrangement,
     audio: &'a PreparedAudioClipRender,
@@ -9456,7 +9462,12 @@ impl PlaylistPerformanceRuntime {
                 },
                 |channel_id, note_seed, key| {
                     channel_router
-                        .targets_for_note_with_layer_adjustments(channel_id, note_seed, key)
+                        .targets_for_note_with_vst3_crossfade(
+                            channel_id,
+                            note_seed,
+                            key,
+                            &sources.vst3_volume_expression_channel_ids,
+                        )
                         .into_iter()
                         .filter(|(target_channel_id, _, _)| {
                             sources.vst3_channel_ids.contains(target_channel_id)

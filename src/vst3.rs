@@ -847,6 +847,14 @@ impl Vst3PlaylistStreamProcessor {
             .collect()
     }
 
+    pub(crate) fn performance_volume_expression_channel_ids(&self) -> BTreeSet<u16> {
+        self.streams
+            .iter()
+            .filter(|stream| stream.live_performance && stream.render.supports_note_volume)
+            .map(|stream| stream.channel_id)
+            .collect()
+    }
+
     pub(crate) fn performance_pattern_automation(
         &self,
     ) -> &BTreeMap<(u16, u16), Vec<Vst3ParameterAutomation>> {
@@ -4033,6 +4041,11 @@ impl Vst3HostRuntime {
             .map(|channel| (channel.id(), channel))
             .collect::<BTreeMap<_, _>>();
         let note_router = ChannelNoteRouter::new(project_channels.clone());
+        let channel_instances = channels
+            .iter()
+            .map(|channel| (channel.options.channel_id, channel.instance_id))
+            .collect::<BTreeMap<_, _>>();
+        let vst3_volume_expression_channels = self.volume_expression_channels(&channel_instances);
         let mixer_route_audibility = MixerRouteAudibility::from_document(document);
         let global_swing_mix_raw = document.metadata().global_swing_mix();
         let mut routed_notes_by_channel = BTreeMap::<u16, Vec<(PatternNote, f32, i32)>>::new();
@@ -4056,10 +4069,11 @@ impl Vst3HostRuntime {
             if note.is_muted() {
                 continue;
             }
-            let targets = note_router.targets_for_note_with_layer_adjustments(
+            let targets = note_router.targets_for_note_with_vst3_crossfade(
                 note.channel_id,
                 note_index as u64,
                 note.key,
+                &vst3_volume_expression_channels,
             );
             if !targets
                 .iter()
@@ -4608,6 +4622,7 @@ impl Vst3HostRuntime {
                 .filter(|channel| channel.plugin_identifier().is_some())
                 .map(|channel| channel.id()),
         );
+        let vst3_volume_expression_channels = self.volume_expression_channels(channel_instances);
         let router = ChannelNoteRouter::new(channels.clone());
         let mixer_route_audibility = MixerRouteAudibility::from_document(document);
         let global_swing_mix_raw = document.metadata().global_swing_mix();
@@ -4632,10 +4647,11 @@ impl Vst3HostRuntime {
                 .and_then(|tick| tick.checked_add(swing_offset))
                 .ok_or_else(|| "Pattern VST3 note end position overflow".to_owned())?;
             for (target_channel_id, layer_gain, layer_pan_raw) in router
-                .targets_for_note_with_layer_adjustments(
+                .targets_for_note_with_vst3_crossfade(
                     note.channel_id,
                     note_index as u64,
                     note.key,
+                    &vst3_volume_expression_channels,
                 )
             {
                 if !plugin_channels.contains(&target_channel_id)
@@ -5189,6 +5205,7 @@ impl Vst3HostRuntime {
         let project_master_pitch_cents = document.metadata().master_pitch_cents();
         let mixer_route_audibility = MixerRouteAudibility::from_document(document);
         let channel_router = ChannelNoteRouter::new(channels.clone());
+        let vst3_volume_expression_channels = self.volume_expression_channels(channel_instances);
         let mut plugin_channels: BTreeSet<_> = document
             .channel_plugin_states()
             .into_iter()
@@ -5228,7 +5245,12 @@ impl Vst3HostRuntime {
             },
             |channel_id, seed, key| {
                 channel_router
-                    .targets_for_note_with_layer_adjustments(channel_id, seed, key)
+                    .targets_for_note_with_vst3_crossfade(
+                        channel_id,
+                        seed,
+                        key,
+                        &vst3_volume_expression_channels,
+                    )
                     .into_iter()
                     .filter(|(target_channel_id, _, _)| {
                         plugin_channels.contains(target_channel_id)
@@ -5541,6 +5563,18 @@ impl Vst3HostRuntime {
             .find(|loaded| loaded.info.id == id)
             .map(|loaded| &loaded.plugin)
             .ok_or_else(|| format!("no loaded VST3 instance with id {id}"))
+    }
+
+    fn volume_expression_channels(&self, channel_instances: &BTreeMap<u16, u64>) -> BTreeSet<u16> {
+        channel_instances
+            .iter()
+            .filter_map(|(channel_id, instance_id)| {
+                let plugin = self.plugin(*instance_id).ok()?.lock().ok()?;
+                plugin_note_expression_support(&plugin)
+                    .1
+                    .then_some(*channel_id)
+            })
+            .collect()
     }
 
     fn pdc_latency_samples_for_plugin(&self, id: u64, reported_latency_samples: u32) -> u32 {

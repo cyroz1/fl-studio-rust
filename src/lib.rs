@@ -1387,10 +1387,12 @@ pub struct ChannelNoteRouter {
     channels_by_id: HashMap<u16, ChannelSummary>,
 }
 
-struct ChannelRouteState {
+struct ChannelRouteState<'a> {
     note_seed: u64,
     key: u16,
     apply_layer_level_adjustments: bool,
+    crossfade_samplers: bool,
+    vst3_volume_expression_channels: Option<&'a BTreeSet<u16>>,
     active_layers: HashSet<u16>,
     seen_targets: HashSet<u16>,
     targets: Vec<(u16, f32, i32)>,
@@ -1418,15 +1420,37 @@ impl ChannelNoteRouter {
 
     /// Returns Layer-adjusted routes as `(channel_id, gain, pan_raw)`.
     /// Layer volume and pan adjustments compose through nested Layers. The
-    /// playback ranges are provisional and intended for Sampler descendants;
-    /// VST3 descendants need plug-in-specific routing support.
+    /// playback ranges are provisional. VST3 descendants receive these values
+    /// only through supported note-expression dimensions; use
+    /// [`Self::targets_for_note_with_vst3_crossfade`] for VST3-only crossfade.
     pub fn targets_for_note_with_layer_adjustments(
         &self,
         source_channel_id: u16,
         note_seed: u64,
         key: u16,
     ) -> Vec<(u16, f32, i32)> {
-        self.targets_for_note_with_controls(source_channel_id, note_seed, key, true)
+        self.targets_for_note_with_controls(source_channel_id, note_seed, key, true, true, None)
+    }
+
+    /// Returns Layer-adjusted routes for a VST3-only render path, applying
+    /// Layer Crossfade when every active child leaf is a VST3 channel whose
+    /// plug-in advertises Volume note expression. Mixed Sampler/VST3 child
+    /// trees retain the normal fan-out gains.
+    pub fn targets_for_note_with_vst3_crossfade(
+        &self,
+        source_channel_id: u16,
+        note_seed: u64,
+        key: u16,
+        vst3_volume_expression_channels: &BTreeSet<u16>,
+    ) -> Vec<(u16, f32, i32)> {
+        self.targets_for_note_with_controls(
+            source_channel_id,
+            note_seed,
+            key,
+            true,
+            false,
+            Some(vst3_volume_expression_channels),
+        )
     }
 
     fn targets_for_note_with_controls(
@@ -1435,11 +1459,15 @@ impl ChannelNoteRouter {
         note_seed: u64,
         key: u16,
         apply_layer_level_adjustments: bool,
+        crossfade_samplers: bool,
+        vst3_volume_expression_channels: Option<&BTreeSet<u16>>,
     ) -> Vec<(u16, f32, i32)> {
         let mut state = ChannelRouteState {
             note_seed,
             key,
             apply_layer_level_adjustments,
+            crossfade_samplers,
+            vst3_volume_expression_channels,
             active_layers: HashSet::new(),
             seen_targets: HashSet::new(),
             targets: Vec::new(),
@@ -1457,7 +1485,7 @@ impl ChannelNoteRouter {
         note_seed: u64,
         key: u16,
     ) -> Vec<(u16, f32)> {
-        self.targets_for_note_with_controls(source_channel_id, note_seed, key, false)
+        self.targets_for_note_with_controls(source_channel_id, note_seed, key, false, true, None)
             .into_iter()
             .map(|(channel_id, gain, _)| (channel_id, gain))
             .collect()
@@ -1468,7 +1496,7 @@ impl ChannelNoteRouter {
         channel_id: u16,
         route_gain: f32,
         route_pan_raw: i32,
-        state: &mut ChannelRouteState,
+        state: &mut ChannelRouteState<'_>,
     ) {
         let Some(channel) = self.channels_by_id.get(&channel_id) else {
             return;
@@ -1527,7 +1555,13 @@ impl ChannelNoteRouter {
             && !children.is_empty()
             && children.iter().all(|child_id| {
                 let mut active_layers = state.active_layers.clone();
-                self.layer_subtree_targets_only_samplers(*child_id, state.key, &mut active_layers)
+                self.layer_subtree_supports_crossfade(
+                    *child_id,
+                    state.key,
+                    state.crossfade_samplers,
+                    state.vst3_volume_expression_channels,
+                    &mut active_layers,
+                )
             })
         {
             let fade = f32::from(channel.layer_fade_raw().unwrap_or_default()) / 256.0;
@@ -1554,10 +1588,12 @@ impl ChannelNoteRouter {
         state.active_layers.remove(&channel_id);
     }
 
-    fn layer_subtree_targets_only_samplers(
+    fn layer_subtree_supports_crossfade(
         &self,
         channel_id: u16,
         key: u16,
+        crossfade_samplers: bool,
+        vst3_volume_expression_channels: Option<&BTreeSet<u16>>,
         active_layers: &mut HashSet<u16>,
     ) -> bool {
         let Some(channel) = self.channels_by_id.get(&channel_id) else {
@@ -1567,7 +1603,12 @@ impl ChannelNoteRouter {
             return false;
         }
         match channel.channel_type() {
-            Some(ChannelType::Sampler) => true,
+            Some(ChannelType::Sampler) => crossfade_samplers,
+            Some(ChannelType::Native) => {
+                channel.plugin_identifier().is_some()
+                    && vst3_volume_expression_channels
+                        .is_some_and(|channels| channels.contains(&channel_id))
+            }
             Some(ChannelType::Layer) => {
                 if !active_layers.insert(channel_id) {
                     return false;
@@ -1589,7 +1630,13 @@ impl ChannelNoteRouter {
                     .collect::<Vec<_>>();
                 let supports_crossfade = !children.is_empty()
                     && children.iter().all(|child_id| {
-                        self.layer_subtree_targets_only_samplers(*child_id, key, active_layers)
+                        self.layer_subtree_supports_crossfade(
+                            *child_id,
+                            key,
+                            crossfade_samplers,
+                            vst3_volume_expression_channels,
+                            active_layers,
+                        )
                     });
                 active_layers.remove(&channel_id);
                 supports_crossfade
