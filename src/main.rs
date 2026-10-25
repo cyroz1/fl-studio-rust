@@ -1398,6 +1398,31 @@ fn run(args: Vec<String>) -> Result<(), String> {
             )
         }
         [command, input, output, pattern_id, channel_id, spread_ticks, direction,
+            velocity_amount, velocity_tension, preserve_end, alternate_direction,
+            start_tension, end_time_ticks, end_tension, trigger_ahead, chop_chords]
+            if command == "strum-notes" =>
+        {
+            strum_notes_with_options(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                parse_strum_options(
+                    spread_ticks,
+                    direction,
+                    velocity_amount,
+                    velocity_tension,
+                    preserve_end,
+                    alternate_direction,
+                    start_tension,
+                    end_time_ticks,
+                    end_tension,
+                    trigger_ahead,
+                    chop_chords,
+                )?,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, spread_ticks, direction,
             velocity_amount, velocity_tension, preserve_end, alternate_direction]
             if command == "strum-notes" =>
         {
@@ -1416,6 +1441,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                     )?,
                     preserve_end: parse_bool(preserve_end, "preserve end")?,
                     alternate_direction: parse_bool(alternate_direction, "alternate direction")?,
+                    ..StrumOptions::default()
                 },
             )
         }
@@ -1485,6 +1511,33 @@ fn run(args: Vec<String>) -> Result<(), String> {
             )
         }
         [command, input, output, pattern_id, channel_id, note_indices, spread_ticks, direction,
+            velocity_amount, velocity_tension, preserve_end, alternate_direction,
+            start_tension, end_time_ticks, end_tension, trigger_ahead, chop_chords]
+            if command == "strum-notes-selected" =>
+        {
+            let note_indices = parse_note_indices(note_indices)?;
+            strum_notes_with_scope(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                Some(&note_indices),
+                parse_strum_options(
+                    spread_ticks,
+                    direction,
+                    velocity_amount,
+                    velocity_tension,
+                    preserve_end,
+                    alternate_direction,
+                    start_tension,
+                    end_time_ticks,
+                    end_tension,
+                    trigger_ahead,
+                    chop_chords,
+                )?,
+            )
+        }
+        [command, input, output, pattern_id, channel_id, note_indices, spread_ticks, direction,
             velocity_amount, velocity_tension, preserve_end, alternate_direction]
             if command == "strum-notes-selected" =>
         {
@@ -1505,6 +1558,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                     )?,
                     preserve_end: parse_bool(preserve_end, "preserve end")?,
                     alternate_direction: parse_bool(alternate_direction, "alternate direction")?,
+                    ..StrumOptions::default()
                 },
             )
         }
@@ -3778,8 +3832,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild glue-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based>\n",
             "  flp-rebuild flip-notes <input.flp> <output.flp> <pattern-id> <channel-id>\n",
             "  flp-rebuild flip-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based>\n",
-            "  flp-rebuild strum-notes <input.flp> <output.flp> <pattern-id> <channel-id> <spread-ticks> <up|down> [velocity-amount:-127..127 velocity-tension:-100..100 preserve-end:0|1 alternate-direction:0|1]\n",
-            "  flp-rebuild strum-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <spread-ticks> <up|down> [velocity-amount:-127..127 velocity-tension:-100..100 preserve-end:0|1 alternate-direction:0|1]\n",
+            "  flp-rebuild strum-notes <input.flp> <output.flp> <pattern-id> <channel-id> <spread-ticks> <up|down> [velocity-amount:-127..127 velocity-tension:-100..100 preserve-end:0|1 alternate-direction:0|1 start-tension:-100..100 end-shift:i32 end-tension:-100..100 trigger-ahead:0|1 chop-chords:0|1]\n",
+            "  flp-rebuild strum-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <spread-ticks> <up|down> [velocity-amount:-127..127 velocity-tension:-100..100 preserve-end:0|1 alternate-direction:0|1 start-tension:-100..100 end-shift:i32 end-tension:-100..100 trigger-ahead:0|1 chop-chords:0|1]\n",
             "  flp-rebuild flam-notes <input.flp> <output.flp> <pattern-id> <channel-id> <stroke-ticks> <velocity-0..127> <before|after> [group-notes:0|1]\n",
             "  flp-rebuild flam-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <stroke-ticks> <velocity-0..127> <before|after> [group-notes:0|1]\n",
             "  flp-rebuild generate-random-notes <input.flp> <output.flp> <pattern-id> <channel-id> <start-ticks> <end-ticks-exclusive> <step-ticks> <note-length-ticks> <density-0..100> <minimum-key-0..127> <maximum-key-0..127> <seed> [stack-1..16 [length-variation:-100..100 [merge-same-notes:0|1 [base-octave-0..10 range-octaves-1..11 [chord-map-name chord-root-0..11]]]]]\n",
@@ -4267,6 +4321,12 @@ fn parse_i16(value: &str, description: &str) -> Result<i16, String> {
     value
         .parse::<i16>()
         .map_err(|_| format!("{description} must be an integer from -32768 through 32767"))
+}
+
+fn parse_i32(value: &str, description: &str) -> Result<i32, String> {
+    value
+        .parse::<i32>()
+        .map_err(|_| format!("{description} must be a signed 32-bit integer"))
 }
 
 fn parse_mixer_track(value: &str) -> Result<i8, String> {
@@ -8274,17 +8334,22 @@ fn strum_notes_with_scope(
     fs::write(output, bytes)
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
-        "strummed {changed} notes in pattern {pattern_id}, channel {channel_id} ({}) with {} ticks of spread, velocity amount {}, velocity tension {}%, preserve-end={}, alternate-direction={} ({}) to {}",
+        "strummed {changed} notes in pattern {pattern_id}, channel {channel_id} ({}) with {} ticks of spread, start tension {}%, end shift {} ticks with {}% tension, velocity amount {}, velocity tension {}%, preserve-end={}, trigger-ahead={}, alternate-direction={}, chop-chords={} ({}) to {}",
         if note_indices.is_some() {
             "selected notes"
         } else {
             "all channel notes"
         },
         options.spread_ticks,
+        options.start_tension_percent,
+        options.end_time_ticks,
+        options.end_tension_percent,
         options.velocity_amount,
         options.velocity_tension_percent,
         options.preserve_end,
+        options.trigger_ahead,
         options.alternate_direction,
+        options.chop_chords,
         if options.descending { "down" } else { "up" },
         output.display()
     );
@@ -8297,6 +8362,34 @@ fn parse_strum_direction(value: &str) -> Result<bool, String> {
         "down" => Ok(true),
         _ => Err("strum direction must be 'up' or 'down'".to_owned()),
     }
+}
+
+fn parse_strum_options(
+    spread_ticks: &str,
+    direction: &str,
+    velocity_amount: &str,
+    velocity_tension: &str,
+    preserve_end: &str,
+    alternate_direction: &str,
+    start_tension: &str,
+    end_time_ticks: &str,
+    end_tension: &str,
+    trigger_ahead: &str,
+    chop_chords: &str,
+) -> Result<StrumOptions, String> {
+    Ok(StrumOptions {
+        spread_ticks: parse_u32(spread_ticks, "strum spread")?,
+        descending: parse_strum_direction(direction)?,
+        velocity_amount: parse_i16(velocity_amount, "strum velocity amount")?,
+        velocity_tension_percent: parse_i16(velocity_tension, "strum velocity tension")?,
+        preserve_end: parse_bool(preserve_end, "preserve end")?,
+        alternate_direction: parse_bool(alternate_direction, "alternate direction")?,
+        start_tension_percent: parse_i16(start_tension, "strum start tension")?,
+        end_time_ticks: parse_i32(end_time_ticks, "strum end time shift")?,
+        end_tension_percent: parse_i16(end_tension, "strum end tension")?,
+        trigger_ahead: parse_bool(trigger_ahead, "trigger ahead")?,
+        chop_chords: parse_bool(chop_chords, "chop chords")?,
+    })
 }
 
 fn flam_notes(

@@ -4694,7 +4694,12 @@ struct DawUi {
     strum_spread_ticks: u32,
     strum_descending: bool,
     strum_preserve_end: bool,
+    strum_trigger_ahead: bool,
     strum_alternate_direction: bool,
+    strum_chop_chords: bool,
+    strum_start_tension_percent: i16,
+    strum_end_time_ticks: i32,
+    strum_end_tension_percent: i16,
     strum_velocity_amount: i16,
     strum_velocity_tension_percent: i16,
     flam_stroke_ticks: u32,
@@ -6268,7 +6273,12 @@ impl DawUi {
             strum_spread_ticks: 120,
             strum_descending: false,
             strum_preserve_end: false,
+            strum_trigger_ahead: false,
             strum_alternate_direction: false,
+            strum_chop_chords: false,
+            strum_start_tension_percent: 0,
+            strum_end_time_ticks: 0,
+            strum_end_tension_percent: 0,
             strum_velocity_amount: 0,
             strum_velocity_tension_percent: 0,
             flam_stroke_ticks: 12,
@@ -34064,6 +34074,18 @@ impl DawUi {
                         .text("Strum spread (ticks)"),
                 );
                 ui.add(
+                    egui::Slider::new(&mut self.strum_start_tension_percent, -100..=100)
+                        .text("Start-time tension (%)"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.strum_end_time_ticks, -1536..=1536)
+                        .text("End-time shift (ticks)"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.strum_end_tension_percent, -100..=100)
+                        .text("End tension (%)"),
+                );
+                ui.add(
                     egui::Slider::new(&mut self.strum_velocity_amount, -127..=127)
                         .text("Strum velocity"),
                 );
@@ -34072,7 +34094,9 @@ impl DawUi {
                         .text("Velocity tension (%)"),
                 );
                 ui.checkbox(&mut self.strum_preserve_end, "Preserve end");
+                ui.checkbox(&mut self.strum_trigger_ahead, "Trigger ahead");
                 ui.checkbox(&mut self.strum_alternate_direction, "Alternate direction");
+                ui.checkbox(&mut self.strum_chop_chords, "Chop chords");
                 egui::ComboBox::from_id_salt("piano-roll-strum-direction")
                     .selected_text(if self.strum_descending {
                         "Strum: Down"
@@ -34725,7 +34749,12 @@ impl DawUi {
                 spread_ticks: self.strum_spread_ticks,
                 descending: self.strum_descending,
                 preserve_end: self.strum_preserve_end,
+                trigger_ahead: self.strum_trigger_ahead,
                 alternate_direction: self.strum_alternate_direction,
+                chop_chords: self.strum_chop_chords,
+                start_tension_percent: self.strum_start_tension_percent,
+                end_time_ticks: self.strum_end_time_ticks,
+                end_tension_percent: self.strum_end_tension_percent,
                 velocity_amount: self.strum_velocity_amount,
                 velocity_tension_percent: self.strum_velocity_tension_percent,
             };

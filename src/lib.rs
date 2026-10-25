@@ -1972,10 +1972,20 @@ pub enum PatternNoteRotation {
 pub struct StrumOptions {
     pub spread_ticks: u32,
     pub descending: bool,
-    /// Shortens strummed notes so their original end positions stay fixed.
+    /// Keeps strummed notes' original end positions fixed before any end-time shift.
     pub preserve_end: bool,
+    /// Spreads the strum before and after the chord onset.
+    pub trigger_ahead: bool,
     /// Reverses the strum direction at each successive chord onset.
     pub alternate_direction: bool,
+    /// Cuts earlier overlapping notes when a new strummed chord starts.
+    pub chop_chords: bool,
+    /// Curves note start-time offsets from gradual to accelerated/decelerated.
+    pub start_tension_percent: i16,
+    /// Shifts successive note end times in ticks; negative values shorten the chord.
+    pub end_time_ticks: i32,
+    /// Curves end-time shifts from gradual to accelerated/decelerated.
+    pub end_tension_percent: i16,
     /// Positive values lower successive note velocities; negative values raise them.
     pub velocity_amount: i16,
     /// Curves the velocity change from gradual to accelerated/decelerated.
@@ -1988,7 +1998,12 @@ impl Default for StrumOptions {
             spread_ticks: 120,
             descending: false,
             preserve_end: false,
+            trigger_ahead: false,
             alternate_direction: false,
+            chop_chords: false,
+            start_tension_percent: 0,
+            end_time_ticks: 0,
+            end_tension_percent: 0,
             velocity_amount: 0,
             velocity_tension_percent: 0,
         }
@@ -13459,7 +13474,7 @@ impl FlpDocument {
         )
     }
 
-    /// Strums channel chords with configurable start-time and velocity shaping.
+    /// Strums channel chords with configurable start/end time and velocity shaping.
     pub fn strum_pattern_notes_with_options(
         &mut self,
         pattern_id: u16,
@@ -13490,7 +13505,7 @@ impl FlpDocument {
         )
     }
 
-    /// Strums only the supplied channel-local notes with configurable velocity shaping.
+    /// Strums only the supplied channel-local notes with configurable start/end time and velocity shaping.
     pub fn strum_pattern_note_selection_with_options(
         &mut self,
         pattern_id: u16,
@@ -13518,6 +13533,16 @@ impl FlpDocument {
                 "strum velocity tension must be between -100 and 100 percent",
             ));
         }
+        if !(-100..=100).contains(&options.start_tension_percent) {
+            return Err(FlpError::UnsupportedEdit(
+                "strum start tension must be between -100 and 100 percent",
+            ));
+        }
+        if !(-100..=100).contains(&options.end_tension_percent) {
+            return Err(FlpError::UnsupportedEdit(
+                "strum end tension must be between -100 and 100 percent",
+            ));
+        }
         let patterns = self.patterns()?;
         let pattern = patterns
             .iter()
@@ -13526,6 +13551,7 @@ impl FlpDocument {
                 "the requested pattern does not exist",
             ))?;
         let mut onset_groups = std::collections::BTreeMap::<u32, Vec<(usize, u16, u8, u32)>>::new();
+        let mut scoped_notes = Vec::new();
         let selected_indices =
             note_indices.map(|indices| indices.iter().copied().collect::<HashSet<_>>());
         for (note_index, note) in pattern
@@ -13537,6 +13563,7 @@ impl FlpDocument {
             if !note_index_in_scope(note_index, selected_indices.as_ref()) {
                 continue;
             }
+            scoped_notes.push((note_index, note.position, note.velocity, note.length));
             onset_groups.entry(note.position).or_default().push((
                 note_index,
                 note.key,
@@ -13545,53 +13572,123 @@ impl FlpDocument {
             ));
         }
 
-        let mut edits = Vec::new();
+        let mut edits = BTreeMap::<usize, (u32, u8, u32)>::new();
+        let mut chord_cut_positions = Vec::new();
         let mut chord_index = 0usize;
-        for (onset, mut group) in onset_groups {
-            if group.len() < 2 || (options.spread_ticks == 0 && options.velocity_amount == 0) {
-                continue;
+        let tension_progress = |rank: u64, steps: u64, tension_percent: i16| {
+            if steps == 0 {
+                return 0.0;
             }
-            let descending =
-                options.descending ^ (options.alternate_direction && chord_index % 2 == 1);
-            chord_index = chord_index.saturating_add(1);
-            group.sort_by_key(|(note_index, key, _, _)| {
-                (if descending { u16::MAX - *key } else { *key }, *note_index)
-            });
-            let steps = u64::try_from(group.len() - 1).map_err(|_| FlpError::LengthOverflow)?;
-            let tension = f64::from(options.velocity_tension_percent) / 100.0;
+            let tension = f64::from(tension_percent) / 100.0;
             let exponent = if tension >= 0.0 {
                 1.0 + 3.0 * tension
             } else {
                 1.0 / (1.0 + 3.0 * tension.abs())
             };
+            (rank as f64 / steps as f64).powf(exponent)
+        };
+        for (onset, mut group) in onset_groups {
+            if group.len() < 2 {
+                continue;
+            }
+            let descending =
+                options.descending ^ (options.alternate_direction && chord_index % 2 == 1);
+            chord_index = chord_index.saturating_add(1);
+            if options.spread_ticks == 0
+                && options.velocity_amount == 0
+                && options.end_time_ticks == 0
+                && !options.chop_chords
+            {
+                continue;
+            }
+            group.sort_by_key(|(note_index, key, _, _)| {
+                (if descending { u16::MAX - *key } else { *key }, *note_index)
+            });
+            let steps = u64::try_from(group.len() - 1).map_err(|_| FlpError::LengthOverflow)?;
             for (rank, (note_index, _, original_velocity, original_length)) in
-                group.into_iter().enumerate()
+                group.iter().enumerate()
             {
                 let rank = u64::try_from(rank).map_err(|_| FlpError::LengthOverflow)?;
-                let offset = u64::from(options.spread_ticks) * rank / steps;
-                let applied_offset = if options.preserve_end {
-                    offset.min(u64::from(original_length))
+                let offset = if options.start_tension_percent == 0 {
+                    u64::from(options.spread_ticks) * rank / steps
                 } else {
-                    offset
+                    (f64::from(options.spread_ticks)
+                        * tension_progress(rank, steps, options.start_tension_percent))
+                    .round() as u64
                 };
-                let position = u64::from(onset) + applied_offset;
-                let position = u32::try_from(position).map_err(|_| FlpError::LengthOverflow)?;
-                let length = if options.preserve_end {
-                    original_length - applied_offset as u32
+                let trigger_ahead_offset = if options.trigger_ahead {
+                    i64::from(options.spread_ticks / 2)
                 } else {
-                    original_length
+                    0
                 };
-                let progress = (rank as f64 / steps as f64).powf(exponent);
-                let velocity_delta = -f64::from(options.velocity_amount) * progress;
+                let requested_position = i64::from(onset)
+                    + i64::try_from(offset).map_err(|_| FlpError::LengthOverflow)?
+                    - trigger_ahead_offset;
+                let velocity_progress =
+                    tension_progress(rank, steps, options.velocity_tension_percent);
+                let velocity_delta = -f64::from(options.velocity_amount) * velocity_progress;
                 let velocity = if velocity_delta == 0.0 {
-                    original_velocity
+                    *original_velocity
                 } else {
-                    (f64::from(original_velocity) + velocity_delta)
+                    (f64::from(*original_velocity) + velocity_delta)
                         .round()
                         .clamp(0.0, 127.0) as u8
                 };
-                if position != onset || velocity != original_velocity || length != original_length {
-                    edits.push((note_index, position, velocity, length));
+                let end_progress = tension_progress(rank, steps, options.end_tension_percent);
+                let end_delta = (f64::from(options.end_time_ticks) * end_progress).round() as i64;
+                let requested_position = requested_position.max(0);
+                let (position, length) = if options.preserve_end {
+                    let end = (i64::from(onset) + i64::from(*original_length) + end_delta).max(0);
+                    let position = requested_position.min(end);
+                    let position = u32::try_from(position).map_err(|_| FlpError::LengthOverflow)?;
+                    let length = u32::try_from(end.saturating_sub(i64::from(position)))
+                        .map_err(|_| FlpError::LengthOverflow)?;
+                    (position, length)
+                } else {
+                    let position =
+                        u32::try_from(requested_position).map_err(|_| FlpError::LengthOverflow)?;
+                    let length =
+                        (i64::from(*original_length) + end_delta).clamp(0, i64::from(u32::MAX));
+                    let length = u32::try_from(length).map_err(|_| FlpError::LengthOverflow)?;
+                    (position, length)
+                };
+                if position != onset || velocity != *original_velocity || length != *original_length
+                {
+                    edits.insert(*note_index, (position, velocity, length));
+                }
+            }
+            if options.chop_chords {
+                let cut_position = group
+                    .iter()
+                    .map(|(note_index, _, _, _)| {
+                        edits
+                            .get(note_index)
+                            .map(|(position, _, _)| *position)
+                            .unwrap_or(onset)
+                    })
+                    .min()
+                    .unwrap_or(onset);
+                chord_cut_positions.push(cut_position);
+            }
+        }
+
+        if options.chop_chords {
+            chord_cut_positions.sort_unstable();
+            chord_cut_positions.dedup();
+            for (note_index, original_position, original_velocity, original_length) in scoped_notes
+            {
+                let (position, velocity, length) = edits.get(&note_index).copied().unwrap_or((
+                    original_position,
+                    original_velocity,
+                    original_length,
+                ));
+                let end = u64::from(position) + u64::from(length);
+                if let Some(cut_position) = chord_cut_positions
+                    .iter()
+                    .copied()
+                    .find(|cut_position| position < *cut_position && u64::from(*cut_position) < end)
+                {
+                    edits.insert(note_index, (position, velocity, cut_position - position));
                 }
             }
         }
@@ -13600,7 +13697,7 @@ impl FlpDocument {
         }
 
         let mut updated = self.clone();
-        for (note_index, position, velocity, length) in &edits {
+        for (note_index, (position, velocity, length)) in &edits {
             updated.edit_pattern_note(
                 pattern_id,
                 channel_id,
