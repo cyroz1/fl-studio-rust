@@ -3234,6 +3234,31 @@ pub fn render_playlist_mixer_stems_with_vst3_cancellable(
         processor.extend_to_output_frames(frames)?;
         frames = frames.max(processor.summary().frames);
     }
+    let stem_pdc_trim_frames = stem_specs
+        .iter()
+        .map(|spec| {
+            if options.wav_trim_pdc_silence {
+                vst3_processor.as_ref().map_or(0, |processor| {
+                    processor.pdc_mixer_stem_start_trim_frames(spec.track, !spec.is_current_stem)
+                })
+            } else {
+                0
+            }
+        })
+        .collect::<Vec<_>>();
+    let master_pdc_trim_frames = if options.wav_trim_pdc_silence {
+        vst3_processor
+            .as_ref()
+            .map_or(0, Vst3PlaylistStreamProcessor::pdc_render_start_trim_frames)
+    } else {
+        0
+    };
+    let logical_output_frames = frames.saturating_sub(master_pdc_trim_frames);
+    let longest_stem_delay = stem_pdc_trim_frames.iter().copied().max().unwrap_or(0);
+    let longest_stem_frames = logical_output_frames
+        .checked_add(longest_stem_delay)
+        .ok_or_else(|| "Mixer stem output length overflow".to_owned())?;
+    frames = frames.max(longest_stem_frames);
     let frames_u32 =
         u32::try_from(frames).map_err(|_| "render is too long for a RIFF/WAVE file".to_owned())?;
     let block_align =
@@ -3245,14 +3270,8 @@ pub fn render_playlist_mixer_stems_with_vst3_cancellable(
 
     let mut outputs = stem_specs
         .into_iter()
-        .map(|spec| {
-            let frames_to_skip = if options.wav_trim_pdc_silence {
-                vst3_processor.as_ref().map_or(0, |processor| {
-                    processor.pdc_mixer_stem_start_trim_frames(spec.track, !spec.is_current_stem)
-                })
-            } else {
-                0
-            };
+        .zip(stem_pdc_trim_frames)
+        .map(|(spec, frames_to_skip)| {
             let output_path = output_directory.join(format!("{}.wav", spec.label));
             let mut temporary = TemporaryRenderFile::create(&output_path)?;
             write_wav_header(
@@ -3271,6 +3290,7 @@ pub fn render_playlist_mixer_stems_with_vst3_cancellable(
                 is_master_stem: spec.is_master_stem,
                 is_current_stem: spec.is_current_stem,
                 frames_to_skip,
+                frames_to_write: logical_output_frames,
                 frames_written: 0,
                 output_path,
                 temporary,
@@ -3293,7 +3313,7 @@ pub fn render_playlist_mixer_stems_with_vst3_cancellable(
     source_paths.extend(sampler.source_paths.iter().cloned());
     let vst3_summary = vst3_processor.as_ref().map(|processor| processor.summary());
     let mut summary = PlaylistRenderSummary {
-        frames,
+        frames: logical_output_frames,
         sample_rate: options.sample_rate,
         audio_clips_rendered: audio.summary.clips_rendered,
         sampler_pattern_clips_rendered: sampler.pattern_clips_rendered,
@@ -3344,6 +3364,9 @@ pub fn render_playlist_mixer_stems_with_vst3_cancellable(
                     output.is_current_stem,
                 )?;
                 let stem_block = skip_render_block_prefix(stem_block, &mut output.frames_to_skip);
+                let frames_to_write = output.frames_to_write.saturating_sub(output.frames_written);
+                let block_frames = ((stem_block.len() / 2) as u64).min(frames_to_write) as usize;
+                let stem_block = &stem_block[..block_frames * 2];
                 output.frames_written = output
                     .frames_written
                     .checked_add((stem_block.len() / 2) as u64)
@@ -3491,6 +3514,7 @@ struct MixerStemTemporaryOutput {
     is_master_stem: bool,
     is_current_stem: bool,
     frames_to_skip: u64,
+    frames_to_write: u64,
     frames_written: u64,
     output_path: PathBuf,
     temporary: TemporaryRenderFile,

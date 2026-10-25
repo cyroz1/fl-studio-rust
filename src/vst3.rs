@@ -1342,9 +1342,18 @@ impl Vst3PlaylistStreamProcessor {
             .get(track)
             .map_or(0, crate::audio::StereoFrameDelay::delay_frames);
         let post_effect_delay = if post_effect_bus && self.needs_mixer_insert_buses() {
-            self.mixer_post_effect_stem_delays
+            let chain_latency = self
+                .mixer_effect_chains
+                .iter()
+                .filter(|chain| chain.insert_ordinal == track)
+                .fold(0_u64, |total, chain| {
+                    total.saturating_add(chain.latency_frames)
+                });
+            let output_alignment = self
+                .mixer_post_effect_stem_delays
                 .get(track)
-                .map_or(0, crate::audio::StereoFrameDelay::delay_frames)
+                .map_or(0, crate::audio::StereoFrameDelay::delay_frames);
+            chain_latency.saturating_add(output_alignment)
         } else {
             0
         };
@@ -1986,12 +1995,12 @@ fn pdc_mixer_stem_start_trim_frames(
     automatic_pdc_enabled: bool,
     instrument_latency_frames: u64,
     meter_input_latency_frames: u64,
-    post_effect_alignment_frames: u64,
+    post_effect_latency_frames: u64,
 ) -> u64 {
     if automatic_pdc_enabled {
         instrument_latency_frames
             .saturating_add(meter_input_latency_frames)
-            .saturating_add(post_effect_alignment_frames)
+            .saturating_add(post_effect_latency_frames)
     } else {
         0
     }
