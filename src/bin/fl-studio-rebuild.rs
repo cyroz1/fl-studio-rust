@@ -3963,6 +3963,7 @@ enum AutomationEditAction {
     Delete {
         point_index: usize,
     },
+    Flip,
     Interpolate {
         first_point_index: usize,
         last_point_index: usize,
@@ -29066,6 +29067,16 @@ impl DawUi {
                 .iter()
                 .find(|channel| channel.channel_id() == channel_id)
                 .is_some_and(|channel| channel.data_event_index().is_some());
+            let can_flip = automation_channels
+                .iter()
+                .find(|channel| channel.channel_id() == channel_id)
+                .is_some_and(|channel| {
+                    channel.data_event_index().is_some()
+                        && !channel.points().is_empty()
+                        && channel.points().iter().all(|point| {
+                            point.value().is_finite() && (-0.001..=1.001).contains(&point.value())
+                        })
+                });
             if !has_blob {
                 ui.menu_button("Initialize from template", |ui| {
                     let mut has_template = false;
@@ -29153,6 +29164,12 @@ impl DawUi {
                 && let Some(point_index) = self.selected_automation_point
             {
                 action = Some(AutomationEditAction::Delete { point_index });
+            }
+            if ui
+                .add_enabled(can_flip, egui::Button::new("Flip vertically"))
+                .clicked()
+            {
+                action = Some(AutomationEditAction::Flip);
             }
             ui.checkbox(&mut self.automation_snap, "Snap 1/4 beat");
             ui.add(egui::Slider::new(&mut self.automation_visible_beats, 4.0..=64.0).text("Span"));
@@ -29465,6 +29482,7 @@ impl DawUi {
         {
             let mut interpolation_count = None;
             let mut initialized_template = false;
+            let mut flipped_points = false;
             let result = match action {
                 AutomationEditAction::InitializeFromTemplate {
                     template_channel_id,
@@ -29506,6 +29524,16 @@ impl DawUi {
                     self.automation_interpolation_anchor = None;
                     document.delete_automation_point(channel_id, point_index)
                 }
+                AutomationEditAction::Flip => {
+                    self.selected_automation_point = None;
+                    self.automation_add_mode = false;
+                    self.automation_interpolate_mode = false;
+                    self.automation_interpolation_anchor = None;
+                    flipped_points = true;
+                    document
+                        .flip_automation_points(channel_id)
+                        .map(|count| interpolation_count = Some(count))
+                }
                 AutomationEditAction::Interpolate {
                     first_point_index,
                     last_point_index,
@@ -29528,19 +29556,27 @@ impl DawUi {
                 Ok(()) => {
                     if let Some(count) = interpolation_count {
                         if count == 0 {
-                            self.status =
-                                "There are no automation points between those endpoints".to_owned();
+                            self.status = if flipped_points {
+                                "There are no automation points to flip".to_owned()
+                            } else {
+                                "There are no automation points between those endpoints".to_owned()
+                            };
                         } else {
                             self.dirty = true;
-                            self.status = format!(
-                                "{} {count} automation point values",
-                                match self.automation_interpolation_mode {
-                                    AutomationInterpolationMode::Linear => "Linearly interpolated",
-                                    AutomationInterpolationMode::Smooth => {
-                                        "Interpolated with a smooth S-curve"
+                            self.status = if flipped_points {
+                                format!("Vertically flipped {count} automation point values")
+                            } else {
+                                format!(
+                                    "{} {count} automation point values",
+                                    match self.automation_interpolation_mode {
+                                        AutomationInterpolationMode::Linear =>
+                                            "Linearly interpolated",
+                                        AutomationInterpolationMode::Smooth => {
+                                            "Interpolated with a smooth S-curve"
+                                        }
                                     }
-                                }
-                            );
+                                )
+                            };
                         }
                     } else {
                         self.dirty = true;

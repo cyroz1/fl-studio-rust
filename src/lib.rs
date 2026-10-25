@@ -1701,10 +1701,13 @@ pub struct AutomationPointEdit {
     pub tension: Option<f32>,
 }
 
+/// Value profile used to fill the points between two Automation endpoints.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum AutomationInterpolationMode {
+    /// Values change at a constant rate between the endpoints.
     #[default]
     Linear,
+    /// Values follow cubic smoothstep, creating a smooth S-shaped transition.
     Smooth,
 }
 
@@ -18589,6 +18592,60 @@ impl FlpDocument {
         Ok(())
     }
 
+    /// Vertically flips every value in a type-5 automation channel around 0.5.
+    /// Positions, tension, opaque point state, and the automation blob's header and trailer
+    /// are retained. Returns the number of points changed.
+    pub fn flip_automation_points(&mut self, channel_id: u16) -> Result<usize, FlpError> {
+        let channels = self.channels();
+        let mut matching = channels.iter().filter(|channel| channel.id == channel_id);
+        let Some(channel) = matching.next() else {
+            return Err(FlpError::ChannelNotFound(channel_id));
+        };
+        if matching.next().is_some() {
+            return Err(FlpError::AmbiguousChannelId(channel_id));
+        }
+        if channel.kind != Some(5) {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel is not a type-5 automation channel",
+            ));
+        }
+        let mut automation_events = channel
+            .event_range()
+            .filter(|index| self.events[*index].opcode == 0xEA);
+        let Some(event_index) = automation_events.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected automation channel has no existing 0xEA point blob",
+            ));
+        };
+        if automation_events.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected automation channel has multiple 0xEA point blobs",
+            ));
+        }
+        let points = decode_automation_points(&self.events[event_index])?;
+        if points.is_empty() {
+            return Ok(0);
+        }
+
+        let mut payload = self.events[event_index].payload.clone();
+        for (point_index, point) in points.iter().enumerate() {
+            validate_automation_point_value(point.value)?;
+            let value = 1.0 - point.value;
+            validate_automation_point_value(value)?;
+            let point_offset = FLP_AUTOMATION_POINTS_OFFSET
+                .checked_add(
+                    point_index
+                        .checked_mul(FLP_AUTOMATION_POINT_SIZE)
+                        .ok_or(FlpError::LengthOverflow)?,
+                )
+                .ok_or(FlpError::LengthOverflow)?;
+            payload[point_offset + 8..point_offset + 16].copy_from_slice(&value.to_le_bytes());
+        }
+        self.events[event_index].replace_data_payload(payload)?;
+        self.refresh_event_offsets()?;
+        Ok(points.len())
+    }
+
     /// Linearly interpolates the values of the points strictly between two
     /// existing type-5 automation points. Positions, tension, opaque point
     /// state, and the automation blob's header and trailer are retained.
@@ -34936,6 +34993,56 @@ mod tests {
                 trailer
             );
         }
+    }
+
+    #[test]
+    fn automation_flip_inverts_values_and_preserves_all_other_curve_state() {
+        let source_points = [
+            (0.0, 0.0, 0.125, [1, 2, 3, 4]),
+            (1.0, 0.25, -0.25, [5, 6, 7, 8]),
+            (2.0, 0.75, 0.5, [9, 10, 11, 12]),
+            (4.0, 1.0, -0.75, [13, 14, 15, 16]),
+        ];
+        let trailer = (0..136)
+            .map(|index| (index * 19 % 256) as u8)
+            .collect::<Vec<_>>();
+        let original = automation_channel_fixture(&source_points, &trailer);
+        let mut document = FlpDocument::parse(&original).expect("automation project should parse");
+        let event_index = document
+            .events()
+            .iter()
+            .position(|event| event.opcode() == 0xEA)
+            .expect("fixture should contain an automation event");
+        let original_payload = document.events()[event_index].payload().to_vec();
+
+        assert_eq!(
+            document
+                .flip_automation_points(9)
+                .expect("a valid automation curve should flip"),
+            source_points.len()
+        );
+
+        let reparsed = FlpDocument::parse(&document.encode_lossless().unwrap())
+            .expect("flipped automation should round-trip");
+        let points = reparsed.automation_channels().unwrap().remove(0).points;
+        for (index, point) in points.iter().enumerate() {
+            assert_eq!(point.position_beats(), source_points[index].0);
+            assert_eq!(point.value(), 1.0 - source_points[index].1);
+            assert_eq!(point.tension(), source_points[index].2);
+            assert_eq!(point.trailing_bytes(), source_points[index].3);
+        }
+        let flipped_payload = reparsed.events()[event_index].payload();
+        assert_eq!(&flipped_payload[..17], &original_payload[..17]);
+        assert_eq!(
+            &flipped_payload[flipped_payload.len() - trailer.len()..],
+            trailer
+        );
+
+        let mut restored = reparsed;
+        restored
+            .flip_automation_points(9)
+            .expect("the same curve should flip back");
+        assert_eq!(restored.encode_lossless().unwrap(), original);
     }
 
     #[test]
