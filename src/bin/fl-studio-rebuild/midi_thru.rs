@@ -341,19 +341,19 @@ impl MidiThruProcessor {
         settings: MidiThruSettings,
         output: &mut impl MidiThruOutput,
     ) -> Result<(), String> {
-        let input_channel = match event {
+        let input_channel = match &event {
             NoteOn { channel, .. }
             | NoteOff { channel, .. }
             | PolyphonicPressure { channel, .. }
             | ControlChange { channel, .. }
             | ProgramChange { channel, .. }
             | ChannelPressure { channel, .. }
-            | PitchBend { channel, .. } => Some(channel & 0x0F),
+            | PitchBend { channel, .. } => Some(*channel & 0x0F),
             _ => None,
         };
         let output_channel =
             input_channel.map(|channel| settings.output_channel.unwrap_or(channel) & 0x0F);
-        let output_event = match event {
+        let output_event = match event.clone() {
             NoteOn {
                 channel,
                 key,
@@ -414,7 +414,7 @@ impl MidiThruProcessor {
             },
             event => event,
         };
-        let Some((bytes, length)) = midi_input_thru_message(output_event) else {
+        let Some((bytes, length)) = midi_input_thru_message(output_event.clone()) else {
             return Ok(());
         };
         output.send(&bytes[..length])?;

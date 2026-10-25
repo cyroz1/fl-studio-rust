@@ -622,11 +622,11 @@ fn forward_scripted_input(
     bytes: &[u8],
 ) {
     let event = parse_midi_message(bytes);
-    if let Some(event) = event {
+    if let Some(event) = event.clone() {
         let message = ReceivedMidiMessage {
             timestamp_micros,
             received_at,
-            event,
+            event: event.clone(),
         };
         if let Err(TrySendError::Full(_)) = sender.try_send(message) {
             dropped_messages.fetch_add(1, Ordering::Relaxed);
@@ -688,6 +688,9 @@ fn queue_script_transport_actions(
             ScriptTransportAction::SetProjectTimeSignatureDenominator(denominator) => {
                 MidiTransportCommand::SetProjectTimeSignatureDenominator(denominator)
             }
+            ScriptTransportAction::AddArrangementTimeMarker { tick, name } => {
+                MidiTransportCommand::AddArrangementTimeMarker { tick, name }
+            }
             ScriptTransportAction::SelectNextEmptyPatternWithNameDialog => {
                 MidiTransportCommand::SelectNextEmptyPatternWithNameDialog
             }
@@ -725,7 +728,7 @@ fn queue_script_transport_actions(
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MidiTransportCommand {
     Start,
     Continue,
@@ -744,6 +747,7 @@ pub enum MidiTransportCommand {
     SetCurrentTempo(u32),
     SetProjectTimeSignatureNumerator(u8),
     SetProjectTimeSignatureDenominator(u8),
+    AddArrangementTimeMarker { tick: u32, name: String },
     SelectNextEmptyPatternWithNameDialog,
     FocusSelectedMixerTrackName,
     PatternJog(i32),
@@ -756,7 +760,7 @@ pub enum MidiTransportCommand {
     CloseAllWindows,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MidiInputEvent {
     NoteOn {
         channel: u8,
@@ -1020,7 +1024,7 @@ impl MidiInputChannelState {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct ReceivedMidiMessage {
     pub timestamp_micros: u64,
     pub received_at: Instant,
@@ -1370,6 +1374,9 @@ pub fn describe_event(event: MidiInputEvent) -> String {
             | MidiTransportCommand::SetProjectTimeSignatureDenominator(_) => {
                 "MIDI script Project Time Signature".to_owned()
             }
+            MidiTransportCommand::AddArrangementTimeMarker { .. } => {
+                "MIDI script Add Time Marker".to_owned()
+            }
             MidiTransportCommand::SelectNextEmptyPatternWithNameDialog => {
                 "MIDI script Next Empty Pattern".to_owned()
             }
@@ -1546,7 +1553,7 @@ impl MidiPatternRecorder {
 
     /// Returns the Pattern-relative position for a received MIDI message using the same
     /// timestamp origin, tempo map, and input offset as recorded notes.
-    pub fn position_for_message(&mut self, message: ReceivedMidiMessage) -> Option<u32> {
+    pub fn position_for_message(&mut self, message: &ReceivedMidiMessage) -> Option<u32> {
         if message.received_at < self.started_at {
             return None;
         }
@@ -1567,16 +1574,16 @@ impl MidiPatternRecorder {
         message: ReceivedMidiMessage,
         fixed_velocity: Option<u8>,
     ) {
-        match message.event {
+        match &message.event {
             MidiInputEvent::ControlChange { channel, .. }
             | MidiInputEvent::PitchBend { channel, .. } => {
-                if let Some(state) = self.channel_state.get_mut(usize::from(channel)) {
-                    state.update(message.event);
+                if let Some(state) = self.channel_state.get_mut(usize::from(*channel)) {
+                    state.update(message.event.clone());
                 }
             }
             _ => {}
         }
-        let Some(tick) = self.position_for_message(message) else {
+        let Some(tick) = self.position_for_message(&message) else {
             return;
         };
         match message.event {
@@ -2068,6 +2075,10 @@ mod tests {
                 ScriptTransportAction::SetCurrentTempoMilliBpm(123_456),
                 ScriptTransportAction::SetProjectTimeSignatureNumerator(7),
                 ScriptTransportAction::SetProjectTimeSignatureDenominator(8),
+                ScriptTransportAction::AddArrangementTimeMarker {
+                    tick: 960,
+                    name: "Verse".to_owned(),
+                },
                 ScriptTransportAction::SelectNextEmptyPatternWithNameDialog,
                 ScriptTransportAction::FocusSelectedMixerTrackName,
                 ScriptTransportAction::Start,
@@ -2093,6 +2104,13 @@ mod tests {
         assert_eq!(
             transport_receiver.try_recv().unwrap().event,
             MidiInputEvent::Transport(MidiTransportCommand::SetProjectTimeSignatureDenominator(8))
+        );
+        assert_eq!(
+            transport_receiver.try_recv().unwrap().event,
+            MidiInputEvent::Transport(MidiTransportCommand::AddArrangementTimeMarker {
+                tick: 960,
+                name: "Verse".to_owned(),
+            })
         );
         assert_eq!(
             transport_receiver.try_recv().unwrap().event,

@@ -346,6 +346,26 @@ def _set_project_time_signature_part(part, value):
     )
 
 
+def _add_auto_time_marker(time, name):
+    try:
+        time_ticks = int(time)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("arrangement.addAutoTimeMarker() time must be an integer") from error
+    if not 0 <= time_ticks <= 0x07FFFFFF:
+        raise ValueError("arrangement.addAutoTimeMarker() time must fit in the Playlist tick range")
+    if not isinstance(name, str):
+        raise TypeError("arrangement.addAutoTimeMarker() name must be a string")
+    if "\0" in name:
+        raise ValueError("arrangement.addAutoTimeMarker() name cannot contain an embedded NUL")
+    _request_transport_action(
+        {
+            "action": "add_arrangement_time_marker",
+            "time_ticks": time_ticks,
+            "name": name,
+        }
+    )
+
+
 def _get_song_tick_pos(mode=0):
     position_ticks = int(_active_transport_state.get("song_position_ticks", 0))
     if mode == 0:
@@ -728,6 +748,9 @@ def _install_modules(script_name, device_name):
     general.getProjectGenre = lambda: str(
         _active_transport_state.get("project_genre", "")
     )
+
+    arrangement = _module("arrangement")
+    arrangement.addAutoTimeMarker = _add_auto_time_marker
 
     for name in (
         "playlist",

@@ -5670,16 +5670,16 @@ fn midi_cc_to_mixer_stereo_separation_raw(value: u8) -> i32 {
 impl ActiveMidiRecording {
     fn record(&mut self, message: ReceivedMidiMessage) {
         if let Some(automation) = &mut self.automation {
-            let position = self.recorder.position_for_message(message);
+            let position = self.recorder.position_for_message(&message);
             if let (
                 Some(position),
                 MidiInputEvent::ControlChange {
                     controller, value, ..
                 },
-            ) = (position, message.event)
-                && controller == automation.controller
+            ) = (position, &message.event)
+                && *controller == automation.controller
             {
-                automation.record(position, value);
+                automation.record(position, *value);
             }
         }
         if self.record_notes {
@@ -14392,6 +14392,52 @@ impl DawUi {
             }
             Err(error) => {
                 self.status = format!("MIDI script could not set project time signature: {error}");
+            }
+        }
+    }
+
+    fn add_midi_script_arrangement_time_marker(&mut self, tick: u32, name: String) {
+        let arrangements = self
+            .document
+            .as_ref()
+            .and_then(|document| document.arrangements().ok())
+            .unwrap_or_default();
+        let arrangement_id = self
+            .selected_arrangement
+            .filter(|selected| {
+                arrangements
+                    .iter()
+                    .any(|arrangement| arrangement.id == *selected)
+            })
+            .or_else(|| arrangements.first().map(|arrangement| arrangement.id))
+            .unwrap_or(0);
+        let result = self
+            .document
+            .as_mut()
+            .ok_or_else(|| "no project is open".to_owned())
+            .and_then(|document| {
+                document
+                    .create_time_marker(
+                        arrangement_id,
+                        TimeMarkerEdit {
+                            position_ticks: Some(tick),
+                            is_signature: Some(false),
+                            name: (!name.is_empty()).then_some(name),
+                            ..TimeMarkerEdit::default()
+                        },
+                    )
+                    .map_err(|error| error.to_string())
+            });
+        match result {
+            Ok(marker_index) => {
+                self.stop_project_playback();
+                self.selected_arrangement = Some(arrangement_id);
+                self.selected_time_marker = Some(marker_index);
+                self.dirty = true;
+                self.status = format!("MIDI script added Playlist marker at tick {tick}");
+            }
+            Err(error) => {
+                self.status = format!("MIDI script could not add Playlist marker: {error}");
             }
         }
     }
@@ -46478,8 +46524,8 @@ impl DawUi {
                 Ok(message) => message,
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
             };
-            self.midi_activity = Some((describe_event(message.event), message.received_at));
-            if !matches!(message.event, MidiInputEvent::Transport(_))
+            self.midi_activity = Some((describe_event(message.event.clone()), message.received_at));
+            if !matches!(&message.event, MidiInputEvent::Transport(_))
                 && let Some(recording) = self.midi_recording.as_mut()
             {
                 recording.record(message);
@@ -46576,6 +46622,9 @@ impl DawUi {
             }
             MidiTransportCommand::SetProjectTimeSignatureDenominator(denominator) => {
                 self.set_midi_script_project_time_signature(None, Some(denominator));
+            }
+            MidiTransportCommand::AddArrangementTimeMarker { tick, name } => {
+                self.add_midi_script_arrangement_time_marker(tick, name);
             }
             MidiTransportCommand::SelectNextEmptyPatternWithNameDialog => {
                 if let Some(pattern_id) = self.select_next_empty_pattern() {
@@ -48790,7 +48839,10 @@ impl DawUi {
     fn handle_live_sampler_input(&mut self, event: MidiInputEvent) {
         if !self.can_audition_live_midi_input()
             || (self.performance_launch_sender.is_some()
-                && is_performance_clip_trigger_channel_event(event, self.performance_midi_channel))
+                && is_performance_clip_trigger_channel_event(
+                    event.clone(),
+                    self.performance_midi_channel,
+                ))
         {
             return;
         }
@@ -49135,7 +49187,7 @@ impl DawUi {
         channel_id: u16,
     ) {
         if self.live_playlist_vst3_input.is_none()
-            && matches!(event, MidiInputEvent::NoteOn { velocity: 1.., .. })
+            && matches!(&event, MidiInputEvent::NoteOn { velocity: 1.., .. })
             && !self.start_live_playlist_vst3_input(pattern_id, channel_id)
         {
             return;
@@ -49369,7 +49421,10 @@ impl DawUi {
     fn handle_live_vst3_input(&mut self, event: MidiInputEvent) {
         if !self.can_audition_live_midi_input()
             || (self.performance_launch_sender.is_some()
-                && is_performance_clip_trigger_channel_event(event, self.performance_midi_channel))
+                && is_performance_clip_trigger_channel_event(
+                    event.clone(),
+                    self.performance_midi_channel,
+                ))
         {
             return;
         }
@@ -49711,9 +49766,10 @@ impl DawUi {
                 Ok(message) => message,
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
             };
-            self.midi_activity = Some((describe_event(message.event), message.received_at));
+            let event = message.event.clone();
+            self.midi_activity = Some((describe_event(event.clone()), message.received_at));
             self.current_live_input_note_route_seed =
-                if matches!(message.event, MidiInputEvent::NoteOn { velocity: 1.., .. }) {
+                if matches!(&event, MidiInputEvent::NoteOn { velocity: 1.., .. }) {
                     let route_seed = self.live_input_note_route_seed;
                     self.live_input_note_route_seed = route_seed.wrapping_add(1);
                     Some(route_seed)
@@ -49721,12 +49777,12 @@ impl DawUi {
                     None
                 };
             if let MidiInputEvent::ControlChange { channel, .. }
-            | MidiInputEvent::PitchBend { channel, .. } = message.event
-                && let Some(state) = self.midi_input_channel_state.get_mut(usize::from(channel))
+            | MidiInputEvent::PitchBend { channel, .. } = &event
+                && let Some(state) = self.midi_input_channel_state.get_mut(usize::from(*channel))
             {
-                state.update(message.event);
+                state.update(event.clone());
             }
-            match message.event {
+            match event.clone() {
                 MidiInputEvent::ControlChange {
                     channel,
                     controller: 64,
@@ -49771,14 +49827,14 @@ impl DawUi {
                 }
                 _ => {}
             }
-            if !self.handle_live_layer_input(message.event) {
-                self.handle_live_sampler_input(message.event);
-                self.handle_live_vst3_input(message.event);
+            if !self.handle_live_layer_input(event.clone()) {
+                self.handle_live_sampler_input(event.clone());
+                self.handle_live_vst3_input(event.clone());
             }
             self.current_live_input_note_route_seed = None;
-            self.handle_midi_performance_note(message);
-            self.handle_midi_control_change(message, history_snapshot_available);
-            if let MidiInputEvent::Transport(command) = message.event {
+            self.handle_midi_performance_note(message.clone());
+            self.handle_midi_control_change(message.clone(), history_snapshot_available);
+            if let MidiInputEvent::Transport(command) = event {
                 self.handle_midi_transport(command, message, history_snapshot_available);
             } else if let Some(recording) = self.midi_recording.as_mut() {
                 recording.record(message);

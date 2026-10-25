@@ -44,6 +44,10 @@ pub enum ScriptTransportAction {
     SetCurrentTempoMilliBpm(u32),
     SetProjectTimeSignatureNumerator(u8),
     SetProjectTimeSignatureDenominator(u8),
+    AddArrangementTimeMarker {
+        tick: u32,
+        name: String,
+    },
     SelectNextEmptyPatternWithNameDialog,
     FocusSelectedMixerTrackName,
     PatternJog(i32),
@@ -67,6 +71,7 @@ const SCRIPT_SONG_POSITION_SCALE: f64 = 1_000_000.0;
 const SCRIPT_SONG_POSITION_SCALE_U32: u32 = 1_000_000;
 const SCRIPT_MIN_TEMPO_MILLI_BPM: u32 = 10_000;
 const SCRIPT_MAX_TEMPO_MILLI_BPM: u32 = 522_000;
+const SCRIPT_MAX_ARRANGEMENT_MARKER_TICK: u32 = 0x07FF_FFFF;
 impl ScriptTransportAction {
     fn parse(value: &str) -> Option<Self> {
         match value {
@@ -773,6 +778,25 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
             ScriptTransportAction::SetProjectTimeSignatureNumerator(value)
         } else {
             ScriptTransportAction::SetProjectTimeSignatureDenominator(value)
+        });
+    }
+    if name == Some("add_arrangement_time_marker") {
+        let tick = action["time_ticks"]
+            .as_u64()
+            .and_then(|tick| u32::try_from(tick).ok())
+            .filter(|tick| *tick <= SCRIPT_MAX_ARRANGEMENT_MARKER_TICK)
+            .ok_or_else(|| {
+                "MIDI script returned an invalid Playlist time-marker position".to_owned()
+            })?;
+        let marker_name = action["name"]
+            .as_str()
+            .filter(|name| !name.contains('\0'))
+            .ok_or_else(|| {
+                "MIDI script returned an invalid Playlist time-marker name".to_owned()
+            })?;
+        return Ok(ScriptTransportAction::AddArrangementTimeMarker {
+            tick,
+            name: marker_name.to_owned(),
         });
     }
     if name == Some("marker_jump_jog") || name == Some("marker_sel_jog") {
@@ -1891,6 +1915,29 @@ mod tests {
         assert_eq!(
             result.actions,
             [ScriptTransportAction::FocusSelectedMixerTrackName]
+        );
+    }
+
+    #[test]
+    fn python_arrangement_api_adds_a_named_time_marker_at_absolute_ticks() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport arrangement\ndef OnMidiIn(event):\n    arrangement.addAutoTimeMarker(960, 'Verse')\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let mut runtime = MidiScriptRuntime::start_for_device(&script, "Test Input").unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
+
+        assert_eq!(
+            result.actions,
+            [ScriptTransportAction::AddArrangementTimeMarker {
+                tick: 960,
+                name: "Verse".to_owned(),
+            }]
         );
     }
 
