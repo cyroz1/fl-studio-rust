@@ -50929,9 +50929,10 @@ impl DawUi {
             .supported_sample_rates(&self.audio_settings);
         let sample_rate_is_supported =
             supported_audio_sample_rates.contains(&self.audio_settings.sample_rate);
+        let buffer_sample_rate = self.audio_settings.sample_rate;
         let supported_audio_buffer_sizes = self
             .audio_catalog
-            .supported_buffer_sizes(&self.audio_settings, self.audio_settings.sample_rate);
+            .supported_buffer_sizes(&self.audio_settings, buffer_sample_rate);
         let buffer_size_is_supported =
             supported_audio_buffer_sizes.contains(&self.audio_settings.buffer_frames);
         ui.horizontal(|ui| {
@@ -50963,7 +50964,11 @@ impl DawUi {
             ui.label("Buffer");
             egui::ComboBox::from_id_salt("audio_buffer_frames")
                 .selected_text(if buffer_size_is_supported {
-                    format!("{} frames", self.audio_settings.buffer_frames)
+                    self.audio_catalog.buffer_size_option_label(
+                        &self.audio_settings,
+                        buffer_sample_rate,
+                        self.audio_settings.buffer_frames,
+                    )
                 } else {
                     format!("{} frames · unsupported", self.audio_settings.buffer_frames)
                 })
@@ -50978,10 +50983,15 @@ impl DawUi {
                         );
                     }
                     for frames in &supported_audio_buffer_sizes {
+                        let option_label = self.audio_catalog.buffer_size_option_label(
+                            &self.audio_settings,
+                            buffer_sample_rate,
+                            *frames,
+                        );
                         ui.selectable_value(
                             &mut self.audio_settings.buffer_frames,
                             *frames,
-                            format!("{frames} frames"),
+                            option_label,
                         );
                     }
                 });

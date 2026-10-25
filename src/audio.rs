@@ -1352,6 +1352,10 @@ pub struct AudioDeviceInfo {
     pub config_ranges: Vec<AudioDeviceConfigRange>,
     /// Sample rates accepted by the Windows WASAPI exclusive format probe.
     pub exclusive_sample_rates: Vec<u32>,
+    /// WASAPI default device period in 100-nanosecond units.
+    pub exclusive_default_period_hns: Option<u64>,
+    /// WASAPI minimum device period in 100-nanosecond units.
+    pub exclusive_minimum_period_hns: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1399,8 +1403,8 @@ const COMMON_AUDIO_SAMPLE_RATES: &[u32] = &[
 const COMMON_AUDIO_BUFFER_FRAMES: &[u32] = &[32, 64, 128, 256, 512, 1_024, 2_048, 4_096, 8_192];
 
 impl AudioDeviceCatalog {
-    /// Returns common sample rates supported by every selected shared-mode endpoint.
-    /// Rates reported as ranges are represented by common audio rates and range endpoints.
+    /// Returns common sample rates supported by every selected endpoint.
+    /// Shared-mode ranges contribute their endpoints; exclusive mode uses probed rates.
     pub fn supported_sample_rates(&self, settings: &AudioSettings) -> Vec<u32> {
         let Ok(devices) = self.selected_device_infos(settings) else {
             return Vec::new();
@@ -1437,21 +1441,40 @@ impl AudioDeviceCatalog {
         candidates
     }
 
-    /// Returns fixed buffer sizes supported by every selected shared-mode endpoint at `sample_rate`.
+    /// Returns buffer-size choices supported by every selected endpoint at `sample_rate`.
+    /// WASAPI exclusive choices include endpoint periods and exclude sizes below minimum periods.
     pub fn supported_buffer_sizes(&self, settings: &AudioSettings, sample_rate: u32) -> Vec<u32> {
-        if settings.access == AudioAccess::Exclusive {
-            let mut sizes = COMMON_AUDIO_BUFFER_FRAMES.to_vec();
-            sizes.push(settings.buffer_frames);
-            sizes.sort_unstable();
-            sizes.dedup();
-            sizes.retain(|frames| (32..=8_192).contains(frames));
-            return sizes;
-        }
         let Ok(devices) = self.selected_device_infos(settings) else {
             return Vec::new();
         };
         let mut candidates = COMMON_AUDIO_BUFFER_FRAMES.to_vec();
         candidates.push(settings.buffer_frames);
+        if settings.access == AudioAccess::Exclusive {
+            for device in &devices {
+                candidates.extend(
+                    device
+                        .exclusive_minimum_period_hns
+                        .and_then(|period| minimum_period_frames(period, sample_rate)),
+                );
+                candidates.extend(
+                    device
+                        .exclusive_default_period_hns
+                        .and_then(|period| nearest_period_frames(period, sample_rate)),
+                );
+            }
+            candidates.sort_unstable();
+            candidates.dedup();
+            candidates.retain(|frames| (32..=8_192).contains(frames));
+            candidates.retain(|frames| {
+                devices.iter().all(|device| {
+                    device
+                        .exclusive_minimum_period_hns
+                        .and_then(|period| minimum_period_frames(period, sample_rate))
+                        .is_none_or(|minimum| *frames >= minimum)
+                })
+            });
+            return candidates;
+        }
         for device in &devices {
             for config in &device.config_ranges {
                 if config.supports_sample_rate(sample_rate) {
@@ -1484,6 +1507,41 @@ impl AudioDeviceCatalog {
                 })
         });
         candidates
+    }
+
+    /// Labels device-period buffer choices so Audio Settings can identify them.
+    pub fn buffer_size_option_label(
+        &self,
+        settings: &AudioSettings,
+        sample_rate: u32,
+        buffer_frames: u32,
+    ) -> String {
+        let mut labels = Vec::new();
+        if settings.access == AudioAccess::Exclusive
+            && let Ok(devices) = self.selected_device_infos(settings)
+        {
+            if devices.iter().any(|device| {
+                device
+                    .exclusive_minimum_period_hns
+                    .and_then(|period| minimum_period_frames(period, sample_rate))
+                    == Some(buffer_frames)
+            }) {
+                labels.push("WASAPI minimum period");
+            }
+            if devices.iter().any(|device| {
+                device
+                    .exclusive_default_period_hns
+                    .and_then(|period| nearest_period_frames(period, sample_rate))
+                    == Some(buffer_frames)
+            }) {
+                labels.push("WASAPI default period");
+            }
+        }
+        if labels.is_empty() {
+            format!("{buffer_frames} frames")
+        } else {
+            format!("{buffer_frames} frames · {}", labels.join(" · "))
+        }
     }
 
     fn selected_device_infos(&self, settings: &AudioSettings) -> Result<Vec<&AudioDeviceInfo>, ()> {
@@ -1525,6 +1583,29 @@ impl AudioDeviceCatalog {
         }
         Ok(devices)
     }
+}
+
+fn nearest_period_frames(period_hns: u64, sample_rate: u32) -> Option<u32> {
+    period_frames(period_hns, sample_rate, false)
+}
+
+fn minimum_period_frames(period_hns: u64, sample_rate: u32) -> Option<u32> {
+    period_frames(period_hns, sample_rate, true)
+}
+
+fn period_frames(period_hns: u64, sample_rate: u32, round_up: bool) -> Option<u32> {
+    if sample_rate == 0 {
+        return None;
+    }
+    let numerator = period_hns.checked_mul(u64::from(sample_rate))?;
+    const HUNDRED_NS_PER_SECOND: u64 = 10_000_000;
+    let frames = if round_up {
+        numerator / HUNDRED_NS_PER_SECOND
+            + u64::from(!numerator.is_multiple_of(HUNDRED_NS_PER_SECOND))
+    } else {
+        numerator.checked_add(HUNDRED_NS_PER_SECOND / 2)? / HUNDRED_NS_PER_SECOND
+    };
+    u32::try_from(frames.max(1)).ok()
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2477,6 +2558,8 @@ pub fn enumerate_devices() -> AudioDeviceCatalog {
                         name: format!("{} · {name}", host_id.to_string().to_ascii_uppercase()),
                         config_ranges: Vec::new(),
                         exclusive_sample_rates: Vec::new(),
+                        exclusive_default_period_hns: None,
+                        exclusive_minimum_period_hns: None,
                     };
                     if device.supports_input() {
                         let config_ranges = match device.supported_input_configs() {
@@ -2538,8 +2621,8 @@ fn enumerate_wasapi_exclusive_capabilities(
         return;
     }
     let result = std::thread::spawn(enumerate_wasapi_exclusive_capabilities_on_mta).join();
-    let (device_rates, device_errors, default_input_id, default_output_id) = match result {
-        Ok(Ok(result)) => result,
+    let snapshot = match result {
+        Ok(Ok(snapshot)) => snapshot,
         Ok(Err(error)) => {
             errors.push(error);
             return;
@@ -2549,30 +2632,38 @@ fn enumerate_wasapi_exclusive_capabilities(
             return;
         }
     };
-    errors.extend(device_errors);
-    catalog.default_exclusive_input_id = default_input_id;
-    catalog.default_exclusive_output_id = default_output_id;
-    for (id, direction, rates) in device_rates {
-        let devices = match direction {
+    errors.extend(snapshot.errors);
+    catalog.default_exclusive_input_id = snapshot.default_input_id;
+    catalog.default_exclusive_output_id = snapshot.default_output_id;
+    for capability in snapshot.devices {
+        let devices = match capability.direction {
             wasapi::Direction::Capture => &mut catalog.inputs,
             wasapi::Direction::Render => &mut catalog.outputs,
         };
-        if let Some(device) = devices.iter_mut().find(|device| device.id == id) {
-            device.exclusive_sample_rates = rates;
+        if let Some(device) = devices.iter_mut().find(|device| device.id == capability.id) {
+            device.exclusive_sample_rates = capability.sample_rates;
+            device.exclusive_default_period_hns = capability.default_period_hns;
+            device.exclusive_minimum_period_hns = capability.minimum_period_hns;
         }
     }
 }
 
 #[cfg(windows)]
-type WasapiExclusiveDeviceRates = (String, wasapi::Direction, Vec<u32>);
+struct WasapiExclusiveDeviceCapabilities {
+    id: String,
+    direction: wasapi::Direction,
+    sample_rates: Vec<u32>,
+    default_period_hns: Option<u64>,
+    minimum_period_hns: Option<u64>,
+}
 
 #[cfg(windows)]
-type WasapiExclusiveCapabilitySnapshot = (
-    Vec<WasapiExclusiveDeviceRates>,
-    Vec<String>,
-    Option<String>,
-    Option<String>,
-);
+struct WasapiExclusiveCapabilitySnapshot {
+    devices: Vec<WasapiExclusiveDeviceCapabilities>,
+    errors: Vec<String>,
+    default_input_id: Option<String>,
+    default_output_id: Option<String>,
+}
 
 #[cfg(windows)]
 fn enumerate_wasapi_exclusive_capabilities_on_mta()
@@ -2582,7 +2673,7 @@ fn enumerate_wasapi_exclusive_capabilities_on_mta()
         .map_err(|error| format!("Could not initialize Windows audio COM: {error}"))?;
     let _com = WasapiComGuard;
     let enumerator = wasapi::DeviceEnumerator::new().map_err(|error| error.to_string())?;
-    let mut device_rates = Vec::new();
+    let mut devices = Vec::new();
     let mut errors = Vec::new();
     let default_input_id = enumerator
         .get_default_device(&wasapi::Direction::Capture)
@@ -2624,13 +2715,54 @@ fn enumerate_wasapi_exclusive_capabilities_on_mta()
                     continue;
                 }
             };
-            match wasapi_exclusive_sample_rates(&device) {
-                Ok(rates) => device_rates.push((id, direction, rates)),
-                Err(error) => errors.push(format!("{id} exclusive capabilities: {error}")),
-            }
+            let sample_rates = match wasapi_exclusive_sample_rates(&device) {
+                Ok(rates) => rates,
+                Err(error) => {
+                    errors.push(format!("{id} exclusive sample rates: {error}"));
+                    Vec::new()
+                }
+            };
+            let (default_period_hns, minimum_period_hns) = match wasapi_device_periods(&device) {
+                Ok((default, minimum)) => (Some(default), Some(minimum)),
+                Err(error) => {
+                    errors.push(format!("{id} exclusive device periods: {error}"));
+                    (None, None)
+                }
+            };
+            devices.push(WasapiExclusiveDeviceCapabilities {
+                id,
+                direction,
+                sample_rates,
+                default_period_hns,
+                minimum_period_hns,
+            });
         }
     }
-    Ok((device_rates, errors, default_input_id, default_output_id))
+    Ok(WasapiExclusiveCapabilitySnapshot {
+        devices,
+        errors,
+        default_input_id,
+        default_output_id,
+    })
+}
+
+#[cfg(windows)]
+fn wasapi_device_periods(device: &wasapi::Device) -> Result<(u64, u64), String> {
+    let client = device
+        .get_iaudioclient()
+        .map_err(|error| format!("could not create an audio client: {error}"))?;
+    let (default_period_hns, minimum_period_hns) = client
+        .get_device_period()
+        .map_err(|error| format!("could not read endpoint periods: {error}"))?;
+    let default_period_hns = u64::try_from(default_period_hns)
+        .ok()
+        .filter(|period| *period > 0)
+        .ok_or_else(|| "WASAPI returned an invalid default period".to_owned())?;
+    let minimum_period_hns = u64::try_from(minimum_period_hns)
+        .ok()
+        .filter(|period| *period > 0)
+        .ok_or_else(|| "WASAPI returned an invalid minimum period".to_owned())?;
+    Ok((default_period_hns, minimum_period_hns))
 }
 
 #[cfg(windows)]
@@ -4695,6 +4827,8 @@ mod tests {
                 id: "input".to_owned(),
                 name: "Input".to_owned(),
                 exclusive_sample_rates: Vec::new(),
+                exclusive_default_period_hns: None,
+                exclusive_minimum_period_hns: None,
                 config_ranges: vec![
                     input_range,
                     AudioDeviceConfigRange {
@@ -4709,6 +4843,8 @@ mod tests {
                 id: "output".to_owned(),
                 name: "Output".to_owned(),
                 exclusive_sample_rates: Vec::new(),
+                exclusive_default_period_hns: None,
+                exclusive_minimum_period_hns: None,
                 config_ranges: vec![output_range],
             }],
             default_input_id: Some("input".to_owned()),
@@ -4739,6 +4875,8 @@ mod tests {
                 id: "output".to_owned(),
                 name: "Output".to_owned(),
                 exclusive_sample_rates: Vec::new(),
+                exclusive_default_period_hns: None,
+                exclusive_minimum_period_hns: None,
                 config_ranges: vec![AudioDeviceConfigRange {
                     minimum_sample_rate: 48_000,
                     maximum_sample_rate: 48_000,
@@ -4779,12 +4917,16 @@ mod tests {
                 name: "Capture".to_owned(),
                 config_ranges: Vec::new(),
                 exclusive_sample_rates: vec![44_100, 48_000, 96_000],
+                exclusive_default_period_hns: None,
+                exclusive_minimum_period_hns: None,
             }],
             outputs: vec![AudioDeviceInfo {
                 id: "wasapi:render".to_owned(),
                 name: "Render".to_owned(),
                 config_ranges: Vec::new(),
                 exclusive_sample_rates: vec![48_000, 96_000, 192_000],
+                exclusive_default_period_hns: None,
+                exclusive_minimum_period_hns: None,
             }],
             default_input_id: Some("wasapi:capture".to_owned()),
             default_output_id: Some("wasapi:render".to_owned()),
@@ -4808,6 +4950,59 @@ mod tests {
             catalog.supported_sample_rates(&output_only),
             [48_000, 96_000, 192_000]
         );
+    }
+
+    #[test]
+    fn exclusive_buffer_sizes_include_device_periods_and_respect_the_largest_minimum() {
+        let catalog = AudioDeviceCatalog {
+            inputs: vec![AudioDeviceInfo {
+                id: "wasapi:capture".to_owned(),
+                name: "Capture".to_owned(),
+                config_ranges: Vec::new(),
+                exclusive_sample_rates: vec![48_000, 96_000],
+                exclusive_default_period_hns: Some(100_000),
+                exclusive_minimum_period_hns: Some(25_000),
+            }],
+            outputs: vec![AudioDeviceInfo {
+                id: "wasapi:render".to_owned(),
+                name: "Render".to_owned(),
+                config_ranges: Vec::new(),
+                exclusive_sample_rates: vec![48_000, 96_000],
+                exclusive_default_period_hns: Some(50_000),
+                exclusive_minimum_period_hns: Some(10_000),
+            }],
+            default_exclusive_input_id: Some("wasapi:capture".to_owned()),
+            default_exclusive_output_id: Some("wasapi:render".to_owned()),
+            ..AudioDeviceCatalog::default()
+        };
+        let settings = AudioSettings {
+            access: AudioAccess::Exclusive,
+            sample_rate: 48_000,
+            buffer_frames: 96,
+            ..AudioSettings::default()
+        };
+
+        let sizes = catalog.supported_buffer_sizes(&settings, settings.sample_rate);
+        assert!(sizes.contains(&120));
+        assert!(sizes.contains(&240));
+        assert!(sizes.contains(&480));
+        assert!(sizes.contains(&128));
+        assert!(!sizes.contains(&96));
+        assert!(!sizes.contains(&64));
+        assert_eq!(
+            catalog.buffer_size_option_label(&settings, 48_000, 120),
+            "120 frames · WASAPI minimum period"
+        );
+        assert_eq!(
+            catalog.buffer_size_option_label(&settings, 48_000, 480),
+            "480 frames · WASAPI default period"
+        );
+
+        let doubled_rate = catalog.supported_buffer_sizes(&settings, 96_000);
+        assert!(doubled_rate.contains(&240));
+        assert!(doubled_rate.contains(&480));
+        assert!(doubled_rate.contains(&960));
+        assert!(!doubled_rate.contains(&96));
     }
 
     #[test]
