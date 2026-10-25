@@ -37,13 +37,13 @@ use flp_rebuild::project_package::{ProjectPackageWorkspace, copy_unique_sample_f
 use flp_rebuild::sample_render::{
     AudioClipRenderOptions, AudioClipRenderSummary, AudioFileRenderOptions, AudioRecordingSummary,
     AudioRenderEncodingOptions, AudioRenderOutput, LayerLiveInputConfig, LayerLiveInputEvent,
-    MP3_BITRATES_KBPS, MixerStemRenderOptions, PlaylistAudioClipEnvelope,
-    PlaylistAudioClipFadeCurve, PlaylistPerformanceCommand, PlaylistPerformanceLaunch,
-    PlaylistPerformanceStream, PlaylistRenderOptions, PlaylistRenderRange, PlaylistRenderSummary,
-    PlaylistStreamMonitor, PlaylistTailMode, PlaylistTempoMap, ResamplingQuality,
-    SamplerLiveInputRouting, SamplerLiveNoteEvent, SamplerPatternLoopPlayback,
-    SamplerPatternRenderOptions, SamplerPatternRenderSummary, Vst3LiveInputEvent,
-    Vst3PatternLoopPlayback, WavChannelMode, WavDitherMode, WavSampleFormat,
+    MP3_BITRATES_KBPS, MixerStemRenderOptions, PLAYLIST_AUDIO_CLIP_GAIN_MINUS_INFINITY,
+    PlaylistAudioClipEnvelope, PlaylistAudioClipFadeCurve, PlaylistPerformanceCommand,
+    PlaylistPerformanceLaunch, PlaylistPerformanceStream, PlaylistRenderOptions,
+    PlaylistRenderRange, PlaylistRenderSummary, PlaylistStreamMonitor, PlaylistTailMode,
+    PlaylistTempoMap, ResamplingQuality, SamplerLiveInputRouting, SamplerLiveNoteEvent,
+    SamplerPatternLoopPlayback, SamplerPatternRenderOptions, SamplerPatternRenderSummary,
+    Vst3LiveInputEvent, Vst3PatternLoopPlayback, WavChannelMode, WavDitherMode, WavSampleFormat,
     nearest_playlist_audio_clip_zero_crossing_tick, playlist_audio_clip_fade_gain,
     playlist_performance_clip_indices_with_vst3, playlist_performance_static_document_with_vst3,
     playlist_performance_vst3_channel_ids, playlist_performance_vst3_clip_indices,
@@ -21591,10 +21591,19 @@ impl DawUi {
                                                 clip_id,
                                             );
                                             ui.label("App-local instance controls");
-                                            let mut gain_db =
-                                                f32::from(envelope.gain_centidb) / 100.0;
+                                            let mut gain_is_silent = envelope.gain_centidb
+                                                == PLAYLIST_AUDIO_CLIP_GAIN_MINUS_INFINITY;
+                                            let minus_infinity_changed = ui
+                                                .checkbox(&mut gain_is_silent, "−∞ gain (silence)")
+                                                .changed();
+                                            let mut gain_db = if gain_is_silent {
+                                                -96.0
+                                            } else {
+                                                f32::from(envelope.gain_centidb) / 100.0
+                                            };
                                             let gain_changed = ui
-                                                .add(
+                                                .add_enabled(
+                                                    !gain_is_silent,
                                                     egui::DragValue::new(&mut gain_db)
                                                         .range(-96.0..=36.0)
                                                         .speed(0.1)
@@ -21714,6 +21723,7 @@ impl DawUi {
                                                 )
                                                 .changed();
                                             if gain_changed
+                                                || minus_infinity_changed
                                                 || fade_in_changed
                                                 || fade_out_changed
                                                 || fade_in_curve_changed
@@ -21723,6 +21733,13 @@ impl DawUi {
                                                 || fit_to_clip_duration
                                                 || stretch_pitch_changed
                                             {
+                                                if minus_infinity_changed {
+                                                    envelope.gain_centidb = if gain_is_silent {
+                                                        PLAYLIST_AUDIO_CLIP_GAIN_MINUS_INFINITY
+                                                    } else {
+                                                        -9_600
+                                                    };
+                                                }
                                                 if gain_changed {
                                                     envelope.gain_centidb =
                                                         (gain_db * 100.0).round() as i16;
@@ -58193,7 +58210,7 @@ fn pattern_vst3_parameter_automation_for_channel(
 
 fn valid_playlist_audio_clip_envelope(entry: &ProjectPlaylistAudioClipEnvelope) -> bool {
     !entry.project_path.is_empty()
-        && (-9_600..=3_600).contains(&entry.envelope.gain_centidb)
+        && entry.envelope.gain_centidb_is_supported()
         && entry.envelope.fade_in_ms <= 600_000
         && entry.envelope.fade_out_ms <= 600_000
         && (-100..=100).contains(&entry.envelope.fade_in_tension)
@@ -61320,7 +61337,7 @@ fn playlist_audio_clip_waveform_gain(
     let Some(envelope) = settings.envelope else {
         return 1.0;
     };
-    let gain = 10.0_f32.powf(f32::from(envelope.gain_centidb) / 2_000.0);
+    let gain = envelope.linear_gain();
     if envelope.fade_in_ms == 0 && envelope.fade_out_ms == 0 {
         return gain;
     }
@@ -66390,7 +66407,7 @@ mod tests {
         let other_clip = ProjectPlaylistAudioClipEnvelope {
             envelope: PlaylistAudioClipEnvelope {
                 clip_id: 42,
-                gain_centidb: 600,
+                gain_centidb: PLAYLIST_AUDIO_CLIP_GAIN_MINUS_INFINITY,
                 fade_in_ms: 0,
                 fade_out_ms: 0,
                 fade_in_curve: PlaylistAudioClipFadeCurve::Linear,

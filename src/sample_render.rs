@@ -531,7 +531,7 @@ pub struct AudioClipRenderOptions {
 pub struct PlaylistAudioClipEnvelope {
     pub arrangement_id: u16,
     pub clip_id: u32,
-    /// Gain in hundredths of a decibel, limited by the editor to -96 dB through +36 dB.
+    /// Gain in hundredths of a decibel; `i16::MIN` represents FL Studio's -infinity silence state.
     pub gain_centidb: i16,
     pub fade_in_ms: u32,
     pub fade_out_ms: u32,
@@ -544,6 +544,23 @@ pub struct PlaylistAudioClipEnvelope {
     pub stretch_to_clip_duration: bool,
     /// App-local instance pitch offset in cents, limited to -1200 through +1200.
     pub stretch_pitch_cents: i16,
+}
+
+pub const PLAYLIST_AUDIO_CLIP_GAIN_MINUS_INFINITY: i16 = i16::MIN;
+
+impl PlaylistAudioClipEnvelope {
+    pub const fn gain_centidb_is_supported(self) -> bool {
+        self.gain_centidb == PLAYLIST_AUDIO_CLIP_GAIN_MINUS_INFINITY
+            || (-9_600 <= self.gain_centidb && self.gain_centidb <= 3_600)
+    }
+
+    pub fn linear_gain(self) -> f32 {
+        if self.gain_centidb == PLAYLIST_AUDIO_CLIP_GAIN_MINUS_INFINITY {
+            0.0
+        } else {
+            10.0_f32.powf(f32::from(self.gain_centidb) / 2_000.0)
+        }
+    }
 }
 
 /// App-local shape for an Audio Clip instance's fade. FLP serialization remains opaque.
@@ -7845,7 +7862,7 @@ fn prepare_audio_clip_render(
                 stretch_to_clip_duration: false,
                 stretch_pitch_cents: 0,
             });
-        if !(-9_600..=3_600).contains(&clip_envelope.gain_centidb)
+        if !clip_envelope.gain_centidb_is_supported()
             || clip_envelope.fade_in_ms > 600_000
             || clip_envelope.fade_out_ms > 600_000
             || !(-100..=100).contains(&clip_envelope.fade_in_tension)
@@ -7977,7 +7994,7 @@ fn prepare_audio_clip_render(
             u64::from(milliseconds).saturating_mul(u64::from(options.sample_rate)) / 1_000
         };
         let (envelope_gain, fade_in_frames, fade_out_frames) = (
-            10.0_f32.powf(f32::from(clip_envelope.gain_centidb) / 2_000.0),
+            clip_envelope.linear_gain(),
             fade_frames(clip_envelope.fade_in_ms).min(duration_frames),
             fade_frames(clip_envelope.fade_out_ms).min(duration_frames),
         );
@@ -17150,6 +17167,26 @@ mod tests {
             playlist_audio_clip_fade_gain(f32::NAN, PlaylistAudioClipFadeCurve::Linear, 0),
             0.0
         );
+    }
+
+    #[test]
+    fn playlist_audio_clip_minus_infinity_gain_is_silence() {
+        let envelope = PlaylistAudioClipEnvelope {
+            arrangement_id: 0,
+            clip_id: 1,
+            gain_centidb: PLAYLIST_AUDIO_CLIP_GAIN_MINUS_INFINITY,
+            fade_in_ms: 0,
+            fade_out_ms: 0,
+            fade_in_curve: PlaylistAudioClipFadeCurve::Linear,
+            fade_in_tension: 0,
+            fade_out_curve: PlaylistAudioClipFadeCurve::Linear,
+            fade_out_tension: 0,
+            stretch_to_clip_duration: false,
+            stretch_pitch_cents: 0,
+        };
+
+        assert!(envelope.gain_centidb_is_supported());
+        assert_eq!(envelope.linear_gain(), 0.0);
     }
 
     #[test]
