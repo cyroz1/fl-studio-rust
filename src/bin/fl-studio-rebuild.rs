@@ -42722,6 +42722,13 @@ impl DawUi {
                     .map(|location| (location, (slot.insert_ordinal(), slot.slot_index())))
             })
             .collect::<HashMap<_, _>>();
+        let mixer_effect_enabled_locations = effect_slots
+            .iter()
+            .filter_map(|slot| {
+                slot.enabled_parameter_location()
+                    .map(|location| (location, (slot.insert_ordinal(), slot.slot_index())))
+            })
+            .collect::<HashMap<_, _>>();
         let mut live_master_fader_gain_edit = None;
         let mut live_mixer_insert_fader_edit = None;
         let mut live_mixer_insert_pan_edit = None;
@@ -44521,6 +44528,7 @@ impl DawUi {
             let mut applied_live_master_stereo_separation = None;
             let mut applied_live_mixer_send_levels = Vec::new();
             let mut applied_live_mixer_effect_mixes = Vec::new();
+            let mut applied_live_mixer_effect_enabled = Vec::new();
             for (event_index, record_index, value) in parameter_edits {
                 match document.set_mixer_parameter_record_value(event_index, record_index, value) {
                     Ok(()) => {
@@ -44531,6 +44539,15 @@ impl DawUi {
                                 *insert_ordinal,
                                 *slot_index,
                                 value,
+                            ));
+                        }
+                        if let Some((insert_ordinal, slot_index)) =
+                            mixer_effect_enabled_locations.get(&(event_index, record_index))
+                        {
+                            applied_live_mixer_effect_enabled.push((
+                                *insert_ordinal,
+                                *slot_index,
+                                value != 0,
                             ));
                         }
                         if let Ok(sends) = document.mixer_send_summaries()
@@ -44635,6 +44652,10 @@ impl DawUi {
                     slot_index,
                     Some(mix_raw),
                 );
+            }
+            for (insert_ordinal, slot_index, enabled) in applied_live_mixer_effect_enabled {
+                self.mixer_track_peak_meters
+                    .set_live_mixer_effect_slot_enabled(insert_ordinal, slot_index, enabled);
             }
         }
         if !send_flag_edits.is_empty()

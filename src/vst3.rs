@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -618,7 +618,9 @@ struct PlaylistMixerEffectStream {
     input_channels: usize,
     output_channels: usize,
     wet_mix: f32,
+    saved_enabled: bool,
     live_wet_mix_target: Option<Arc<AtomicU32>>,
+    live_enabled_target: Option<Arc<AtomicI32>>,
     wet_mix_ramp: LiveWetMixRamp,
     latency_frames: u64,
     dry_delay_line: StereoFrameDelay,
@@ -627,16 +629,23 @@ struct PlaylistMixerEffectStream {
 
 impl PlaylistMixerEffectStream {
     fn begin_wet_mix_block(&mut self) {
-        let Some(target) = self.live_wet_mix_target.as_ref() else {
+        if self.live_wet_mix_target.is_none() && self.live_enabled_target.is_none() {
             return;
-        };
-        let requested = f32::from_bits(target.load(Ordering::Acquire));
-        let requested = if requested.is_finite() {
-            requested.clamp(0.0, 1.0)
-        } else {
-            self.wet_mix
-        };
-        self.wet_mix_ramp.set_target(requested);
+        }
+        let requested_mix = self
+            .live_wet_mix_target
+            .as_ref()
+            .map(|target| f32::from_bits(target.load(Ordering::Acquire)))
+            .filter(|mix| mix.is_finite())
+            .map_or(self.wet_mix, |mix| mix.clamp(0.0, 1.0));
+        let enabled = self
+            .live_enabled_target
+            .as_ref()
+            .map_or(self.saved_enabled, |target| {
+                target.load(Ordering::Acquire) != 0
+            });
+        self.wet_mix_ramp
+            .set_target(if enabled { requested_mix } else { 0.0 });
     }
 }
 
@@ -801,6 +810,11 @@ impl Vst3PlaylistStreamProcessor {
                 effect.insert_ordinal,
                 effect.slot_index,
                 effect.wet_mix,
+            );
+            effect.live_enabled_target = meters.live_mixer_effect_slot_enabled_target(
+                effect.insert_ordinal,
+                effect.slot_index,
+                effect.saved_enabled,
             );
         }
     }
@@ -4720,7 +4734,7 @@ impl Vst3HostRuntime {
         let routing = crate::MixerRouteAudibility::from_document(document);
         let has_loaded_non_master_effect = effect_slots.iter().any(|slot| {
             if slot.insert_ordinal() == 0
-                || slot.enabled() == Some(false)
+                || (slot.enabled() == Some(false) && !live_mix_changes)
                 || (!live_mix_changes && mixer_effect_wet_mix(slot.mix_raw()) == 0.0)
                 || !mixer_effect_instances.contains_key(&(slot.insert_ordinal(), slot.slot_index()))
             {
@@ -4770,7 +4784,7 @@ impl Vst3HostRuntime {
                 .iter()
                 .filter(|slot| slot.insert_ordinal() == insert_ordinal)
             {
-                if slot.enabled() == Some(false) {
+                if slot.enabled() == Some(false) && !live_mix_changes {
                     continue;
                 }
                 let key = (slot.insert_ordinal(), slot.slot_index());
@@ -4781,6 +4795,7 @@ impl Vst3HostRuntime {
                 if wet_mix == 0.0 && !live_mix_changes {
                     continue;
                 }
+                let saved_enabled = slot.enabled() != Some(false);
                 let plugin = Arc::clone(self.plugin(id)?);
                 let (
                     buffers,
@@ -4900,9 +4915,11 @@ impl Vst3HostRuntime {
                     input_channels,
                     output_channels,
                     wet_mix,
+                    saved_enabled,
                     live_wet_mix_target: None,
+                    live_enabled_target: None,
                     wet_mix_ramp: LiveWetMixRamp::new(
-                        wet_mix,
+                        if saved_enabled { wet_mix } else { 0.0 },
                         (sample_rate * f64::from(MIXER_EFFECT_MIX_SMOOTHING_SECONDS))
                             .round()
                             .clamp(1.0, f64::from(u32::MAX)) as u32,

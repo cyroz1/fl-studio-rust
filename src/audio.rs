@@ -92,6 +92,7 @@ pub struct MixerTrackPeakMeters {
     live_mixer_solo_mask: Arc<ArcSwapOption<[u64; 2]>>,
     live_mixer_send_targets: Mutex<HashMap<(usize, usize), LiveMixerSendTargetAtomics>>,
     live_mixer_effect_mix_targets: Mutex<HashMap<(usize, u16), Arc<AtomicU32>>>,
+    live_mixer_effect_slot_enabled_targets: Mutex<HashMap<(usize, u16), Arc<AtomicI32>>>,
     live_master_fader_gain: Arc<AtomicU32>,
     live_master_pan_raw: Arc<AtomicI32>,
     live_master_stereo_separation_raw: Arc<AtomicI32>,
@@ -117,6 +118,7 @@ impl Default for MixerTrackPeakMeters {
             live_mixer_solo_mask: Arc::new(ArcSwapOption::empty()),
             live_mixer_send_targets: Mutex::new(HashMap::new()),
             live_mixer_effect_mix_targets: Mutex::new(HashMap::new()),
+            live_mixer_effect_slot_enabled_targets: Mutex::new(HashMap::new()),
             live_master_fader_gain: Arc::new(AtomicU32::new(1.0_f32.to_bits())),
             live_master_pan_raw: Arc::new(AtomicI32::new(i32::MIN)),
             live_master_stereo_separation_raw: Arc::new(AtomicI32::new(i32::MIN)),
@@ -293,6 +295,37 @@ impl MixerTrackPeakMeters {
             .or_insert_with(|| Arc::new(AtomicU32::new(initial_wet_mix.to_bits())))
             .clone();
         target.store(initial_wet_mix.to_bits(), Ordering::Release);
+        Some(target)
+    }
+
+    /// Set a loaded Mixer effect slot's enabled target without locking the audio callback.
+    pub fn set_live_mixer_effect_slot_enabled(
+        &self,
+        insert_ordinal: usize,
+        slot_index: u16,
+        enabled: bool,
+    ) {
+        let Ok(mut targets) = self.live_mixer_effect_slot_enabled_targets.lock() else {
+            return;
+        };
+        let target = targets
+            .entry((insert_ordinal, slot_index))
+            .or_insert_with(|| Arc::new(AtomicI32::new(i32::from(enabled))));
+        target.store(i32::from(enabled), Ordering::Release);
+    }
+
+    pub(crate) fn live_mixer_effect_slot_enabled_target(
+        &self,
+        insert_ordinal: usize,
+        slot_index: u16,
+        initial_enabled: bool,
+    ) -> Option<Arc<AtomicI32>> {
+        let mut targets = self.live_mixer_effect_slot_enabled_targets.lock().ok()?;
+        let target = targets
+            .entry((insert_ordinal, slot_index))
+            .or_insert_with(|| Arc::new(AtomicI32::new(i32::from(initial_enabled))))
+            .clone();
+        target.store(i32::from(initial_enabled), Ordering::Release);
         Some(target)
     }
 
@@ -4913,6 +4946,23 @@ mod tests {
         meters.set_live_mixer_effect_mix_raw(2, 3, Some(0));
         assert_eq!(f32::from_bits(first.load(Ordering::Acquire)), 0.5);
         assert_eq!(f32::from_bits(second.load(Ordering::Acquire)), 1.0);
+    }
+
+    #[test]
+    fn live_mixer_effect_enabled_targets_track_each_slot_independently() {
+        let meters = MixerTrackPeakMeters::default();
+        let first = meters
+            .live_mixer_effect_slot_enabled_target(2, 3, true)
+            .expect("first effect should receive a live enabled target");
+        let second = meters
+            .live_mixer_effect_slot_enabled_target(2, 4, false)
+            .expect("second effect should receive a live enabled target");
+        assert_eq!(first.load(Ordering::Acquire), 1);
+        assert_eq!(second.load(Ordering::Acquire), 0);
+
+        meters.set_live_mixer_effect_slot_enabled(2, 3, false);
+        assert_eq!(first.load(Ordering::Acquire), 0);
+        assert_eq!(second.load(Ordering::Acquire), 0);
     }
 
     #[test]
