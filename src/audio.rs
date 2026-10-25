@@ -4133,7 +4133,7 @@ where
         input_channel_pair,
     } = state;
     let (left_channel, right_channel) =
-        selected_stereo_input_channels(config.channels, input_channel_pair)?;
+        selected_stereo_input_channels(usize::from(config.channels), input_channel_pair)?;
     let stream = device
         .build_input_stream::<T, _, _>(
             config,
@@ -4183,10 +4183,9 @@ where
 }
 
 fn selected_stereo_input_channels(
-    channel_count: u16,
+    channel_count: usize,
     input_channel_pair: u16,
 ) -> Result<(usize, usize), String> {
-    let channel_count = usize::from(channel_count);
     if channel_count == 1 && input_channel_pair == 0 {
         return Ok((0, 0));
     }
