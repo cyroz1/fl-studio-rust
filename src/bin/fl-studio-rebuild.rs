@@ -64117,19 +64117,24 @@ fn recorded_pattern_clip_required_length(
         return Err("The recorded Pattern has no usable loop length".to_owned());
     }
     let loop_length = u64::from(pattern_loop_length_ticks);
-    let notes_required_length = notes.iter().try_fold(0_u32, |required_length, note| {
-        if note.length == 0 {
-            return Ok(required_length);
-        }
-        let source_position = u64::from(note.position % pattern_loop_length_ticks);
-        let source_start = u64::from(source_start_tick % pattern_loop_length_ticks);
-        let offset = (source_position + loop_length - source_start) % loop_length;
-        let note_end = offset
-            .checked_add(u64::from(note.length))
-            .and_then(|end| u32::try_from(end).ok())
-            .ok_or_else(|| "A recorded Pattern note exceeds the Playlist tick range".to_owned())?;
-        Ok(required_length.max(note_end))
-    })?;
+    let notes_required_length =
+        notes
+            .iter()
+            .try_fold(0_u32, |required_length, note| -> Result<u32, String> {
+                if note.length == 0 {
+                    return Ok(required_length);
+                }
+                let source_position = u64::from(note.position % pattern_loop_length_ticks);
+                let source_start = u64::from(source_start_tick % pattern_loop_length_ticks);
+                let offset = (source_position + loop_length - source_start) % loop_length;
+                let note_end = offset
+                    .checked_add(u64::from(note.length))
+                    .and_then(|end| u32::try_from(end).ok())
+                    .ok_or_else(|| {
+                        "A recorded Pattern note exceeds the Playlist tick range".to_owned()
+                    })?;
+                Ok(required_length.max(note_end))
+            })?;
     let take_required_length = recording_start_offset_ticks
         .checked_add(recorded_elapsed_ticks)
         .ok_or_else(|| "The recorded Pattern extends beyond the Playlist tick range".to_owned())?;
