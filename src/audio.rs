@@ -2139,6 +2139,7 @@ impl Drop for InputRecordingCallback<'_> {
 /// Audio callbacks write to a bounded lock-free queue. A worker thread should drain
 /// frames with [`Self::read_frames`] and monitor [`Self::overflow_frames`] while
 /// recording.
+#[derive(Clone)]
 pub struct AudioInputRecording {
     recording: Arc<InputRecordingState>,
 }
@@ -2147,9 +2148,48 @@ pub struct AudioInputRecording {
 pub struct AudioInputMonitorOutput {
     ring: Arc<AudioRingBuffer>,
     recording: Arc<InputRecordingState>,
+    processed_recording: AudioInputMonitorRecorder,
+}
+
+/// Recording tap for the signal after the selected Mixer route and effects.
+#[derive(Clone)]
+pub struct AudioInputMonitorRecorder {
+    sample_rate: u32,
+    recording: Arc<ArcSwapOption<InputRecordingState>>,
+}
+
+impl AudioInputMonitorRecorder {
+    /// Start a bounded recording tap for the Mixer-processed monitor signal.
+    pub fn start_recording(&self) -> Result<AudioInputRecording, String> {
+        if self
+            .recording
+            .load()
+            .as_deref()
+            .is_some_and(|recording| recording.active.load(Ordering::Acquire))
+        {
+            return Err("Mixer output recording is already active".to_owned());
+        }
+        let recording = Arc::new(InputRecordingState::new(
+            self.sample_rate,
+            INPUT_RECORDING_BUFFER_FRAMES,
+        ));
+        self.recording.store(Some(Arc::clone(&recording)));
+        Ok(AudioInputRecording { recording })
+    }
+
+    pub fn stop_recording(&self) {
+        if let Some(recording) = self.recording.load().as_deref() {
+            recording.stop();
+        }
+        self.recording.store(None);
+    }
 }
 
 impl AudioInputMonitorOutput {
+    pub fn processed_recording(&self) -> AudioInputMonitorRecorder {
+        self.processed_recording.clone()
+    }
+
     pub fn is_stopped(&self) -> bool {
         !self.recording.active.load(Ordering::Acquire)
     }
@@ -2159,6 +2199,10 @@ impl AudioInputMonitorOutput {
         if !samples.len().is_multiple_of(2) {
             return Err("input monitor audio must contain stereo sample frames".to_owned());
         }
+        let recording = self.processed_recording.recording.load();
+        let recording_callback = recording
+            .as_deref()
+            .and_then(InputRecordingState::begin_callback);
         for &[left, right] in samples.as_chunks::<2>().0 {
             loop {
                 if !self.recording.active.load(Ordering::Acquire) {
@@ -2169,8 +2213,17 @@ impl AudioInputMonitorOutput {
                 }
                 std::thread::sleep(Duration::from_millis(1));
             }
+            if let Some(recording) = recording_callback.as_ref() {
+                recording.push_frame(left, right);
+            }
         }
         Ok(())
+    }
+}
+
+impl Drop for AudioInputMonitorOutput {
+    fn drop(&mut self) {
+        self.processed_recording.stop_recording();
     }
 }
 
@@ -2191,6 +2244,10 @@ impl AudioInputRecording {
 
     pub fn sample_rate(&self) -> u32 {
         self.recording.sample_rate
+    }
+
+    pub fn stop(&self) {
+        self.recording.stop();
     }
 
     /// Copy as many queued stereo frames as fit in `frames`, returning the number read.
@@ -3554,6 +3611,10 @@ impl AudioEngine {
             AudioInputMonitorOutput {
                 ring: Arc::clone(&self.input_monitor_ring),
                 recording,
+                processed_recording: AudioInputMonitorRecorder {
+                    sample_rate: self.sample_rate,
+                    recording: Arc::new(ArcSwapOption::empty()),
+                },
             },
         ))
     }

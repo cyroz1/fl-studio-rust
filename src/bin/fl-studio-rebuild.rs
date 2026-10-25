@@ -19,8 +19,9 @@ use clap_probe::{
 };
 use eframe::egui::{self, Align2, Color32, FontId, Id, PointerButton, Sense, Stroke, Vec2};
 use flp_rebuild::audio::{
-    AudioAccess, AudioDeviceCatalog, AudioEngine, AudioSettings, MIXER_TRACK_METER_COUNT,
-    MixerTrackPeakMeters, StagedStreamingPlayback, enumerate_devices,
+    AudioAccess, AudioDeviceCatalog, AudioEngine, AudioInputMonitorRecorder, AudioInputRecording,
+    AudioSettings, MIXER_TRACK_METER_COUNT, MixerTrackPeakMeters, StagedStreamingPlayback,
+    enumerate_devices,
 };
 use flp_rebuild::media::{
     AudioExportOptions, AudioWaveform, DecodedAudio, SamplePathResolver, WaveformPeak,
@@ -4865,6 +4866,7 @@ struct DawUi {
     audio_monitor_session: Option<AudioInputMonitorSession>,
     audio_recording_offset_ms: i16,
     audio_recording_mixer_track: i8,
+    audio_recording_post_effects: bool,
     record_audio_enabled: bool,
     audio_record_start_requested: bool,
     audio_record_stop_requested: bool,
@@ -5337,6 +5339,7 @@ struct AudioRecordingSession {
     start_tick: u32,
     playlist_track_id: Option<u32>,
     restore_input_channel_pair: u16,
+    post_effect_capture: Option<AudioInputRecording>,
     recording_offset_ms: i16,
     mixer_track: i8,
     tempo_map: PlaylistTempoMap,
@@ -5346,6 +5349,7 @@ struct AudioRecordingSession {
 
 struct AudioInputMonitorSession {
     cancelled: Arc<AtomicBool>,
+    processed_recording: AudioInputMonitorRecorder,
     worker: thread::JoinHandle<Result<(), String>>,
 }
 
@@ -6428,6 +6432,7 @@ impl DawUi {
             audio_monitor_session: None,
             audio_recording_offset_ms,
             audio_recording_mixer_track: 0,
+            audio_recording_post_effects: false,
             record_audio_enabled,
             audio_record_start_requested: false,
             audio_record_stop_requested: false,
@@ -51170,17 +51175,50 @@ impl DawUi {
         }
     }
 
-    fn start_audio_input_monitor(&mut self) {
+    fn start_audio_input_monitor(
+        &mut self,
+        record_post_effects: bool,
+    ) -> Option<AudioInputRecording> {
+        if record_post_effects && self.playing {
+            self.toggle_project_playback();
+        }
+        if record_post_effects
+            && self.audio_monitor_input
+            && self
+                .audio_monitor_session
+                .as_ref()
+                .is_none_or(|session| session.worker.is_finished())
+        {
+            self.stop_audio_input_monitor();
+        }
         if self.audio_monitor_input {
-            return;
+            if record_post_effects {
+                return match self
+                    .audio_monitor_session
+                    .as_ref()
+                    .map(|session| session.processed_recording.start_recording())
+                {
+                    Some(Ok(recording)) => Some(recording),
+                    Some(Err(error)) => {
+                        self.status = format!("Could not start post-effect recording: {error}");
+                        None
+                    }
+                    None => {
+                        self.status =
+                            "Post-effect recording requires Mixer input monitoring".to_owned();
+                        None
+                    }
+                };
+            }
+            return None;
         }
         let Some(engine) = self.audio_engine.as_ref() else {
             self.status = "Start the audio engine before monitoring input".to_owned();
-            return;
+            return None;
         };
         if !engine.input_active() || !engine.output_active() {
             self.status = "Start both audio input and output before monitoring".to_owned();
-            return;
+            return None;
         }
         if let Some(previous) = self.audio_monitor_session.take() {
             previous.cancelled.store(true, Ordering::Release);
@@ -51192,12 +51230,12 @@ impl DawUi {
         let Some(document) = self.document.as_ref() else {
             if let Err(error) = engine.set_input_monitor(true) {
                 self.status = error;
-                return;
+                return None;
             }
             self.audio_monitor_input = true;
             self.status =
                 "Monitoring device input directly; open a project to use Mixer effects".to_owned();
-            return;
+            return None;
         };
         let mixer_track = self.audio_recording_mixer_track;
         let inserts = document.mixer_inserts();
@@ -51207,13 +51245,13 @@ impl DawUi {
                 .any(|insert| insert.ordinal() == mixer_track as usize)
         {
             self.status = format!("Mixer insert {mixer_track} is not available in this project");
-            return;
+            return None;
         }
         let project_bytes = match document.encode_lossless() {
             Ok(bytes) => bytes,
             Err(error) => {
                 self.status = format!("Could not prepare Mixer input monitoring: {error}");
-                return;
+                return None;
             }
         };
         let sample_rate = engine.sample_rate();
@@ -51250,20 +51288,34 @@ impl DawUi {
             Ok(processor) => processor,
             Err(error) => {
                 self.status = format!("Could not prepare Mixer input effects: {error}");
-                return;
+                return None;
             }
         };
         let (recording, output) = match engine.start_input_monitor_processing() {
             Ok(streams) => streams,
             Err(error) => {
                 self.status = error;
-                return;
+                return None;
             }
+        };
+        let processed_recording = output.processed_recording();
+        let post_effect_capture = if record_post_effects {
+            match processed_recording.start_recording() {
+                Ok(recording) => Some(recording),
+                Err(error) => {
+                    let _ = engine.set_input_monitor(false);
+                    self.status = format!("Could not start post-effect recording: {error}");
+                    return None;
+                }
+            }
+        } else {
+            None
         };
         if let Err(error) = engine.set_input_monitor(true) {
             let _ = engine.set_input_monitor(false);
+            processed_recording.stop_recording();
             self.status = error;
-            return;
+            return None;
         }
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
@@ -51286,7 +51338,11 @@ impl DawUi {
             });
         match worker {
             Ok(worker) => {
-                self.audio_monitor_session = Some(AudioInputMonitorSession { cancelled, worker });
+                self.audio_monitor_session = Some(AudioInputMonitorSession {
+                    cancelled,
+                    processed_recording,
+                    worker,
+                });
                 self.audio_monitor_input = true;
                 let route = if mixer_track == 0 {
                     "Master".to_owned()
@@ -51294,10 +51350,16 @@ impl DawUi {
                     format!("Insert {mixer_track}")
                 };
                 self.status = format!("Monitoring input through Mixer {route}");
+                post_effect_capture
             }
             Err(error) => {
                 let _ = engine.set_input_monitor(false);
+                processed_recording.stop_recording();
+                if let Some(recording) = &post_effect_capture {
+                    recording.stop();
+                }
                 self.status = format!("Could not start Mixer input monitor: {error}");
+                None
             }
         }
     }
@@ -51451,26 +51513,28 @@ impl DawUi {
                 }
             }
         }
-        let Some(engine) = self.audio_engine.as_ref() else {
-            self.status = "Audio input is not available".to_owned();
-            return;
-        };
-        if !engine.input_active() {
-            self.status =
-                "Audio input is not active; enable input and restart the audio engine before recording".to_owned();
-            return;
-        }
-        if let Err(error) = engine.set_input_channel_pair(recording_input_channel_pair) {
-            self.status = format!(
-                "Could not select input pair {} / {}: {error}",
-                recording_input_channel_pair
-                    .saturating_mul(2)
-                    .saturating_add(1),
-                recording_input_channel_pair
-                    .saturating_mul(2)
-                    .saturating_add(2)
-            );
-            return;
+        {
+            let Some(engine) = self.audio_engine.as_ref() else {
+                self.status = "Audio input is not available".to_owned();
+                return;
+            };
+            if !engine.input_active() {
+                self.status =
+                    "Audio input is not active; enable input and restart the audio engine before recording".to_owned();
+                return;
+            }
+            if let Err(error) = engine.set_input_channel_pair(recording_input_channel_pair) {
+                self.status = format!(
+                    "Could not select input pair {} / {}: {error}",
+                    recording_input_channel_pair
+                        .saturating_mul(2)
+                        .saturating_add(1),
+                    recording_input_channel_pair
+                        .saturating_mul(2)
+                        .saturating_add(2)
+                );
+                return;
+            }
         }
 
         let start_tick = self
@@ -51481,19 +51545,42 @@ impl DawUi {
         let tempo_map = match PlaylistTempoMap::for_arrangement(document, arrangement_id) {
             Ok(tempo_map) => tempo_map,
             Err(error) => {
-                let _ = engine.set_input_channel_pair(previous_input_channel_pair);
+                if let Some(engine) = self.audio_engine.as_ref() {
+                    let _ = engine.set_input_channel_pair(previous_input_channel_pair);
+                }
                 self.status =
                     format!("Could not prepare Playlist tempo map for recording: {error}");
                 return;
             }
         };
         let project_generation = self.project_generation;
-        let recording = match engine.start_input_recording() {
-            Ok(recording) => recording,
-            Err(error) => {
-                let _ = engine.set_input_channel_pair(previous_input_channel_pair);
-                self.status = format!("Could not start audio recording: {error}");
+        let post_effect_capture = if self.audio_recording_post_effects {
+            match self.start_audio_input_monitor(true) {
+                Some(recording) => Some(recording),
+                None => {
+                    if let Some(engine) = self.audio_engine.as_ref() {
+                        let _ = engine.set_input_channel_pair(previous_input_channel_pair);
+                    }
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let recording = if let Some(post_effect_capture) = &post_effect_capture {
+            post_effect_capture.clone()
+        } else {
+            let Some(engine) = self.audio_engine.as_ref() else {
+                self.status = "Audio input is not available".to_owned();
                 return;
+            };
+            match engine.start_input_recording() {
+                Ok(recording) => recording,
+                Err(error) => {
+                    let _ = engine.set_input_channel_pair(previous_input_channel_pair);
+                    self.status = format!("Could not start audio recording: {error}");
+                    return;
+                }
             }
         };
         let worker_path = output_path.clone();
@@ -51507,8 +51594,14 @@ impl DawUi {
         let worker = match worker {
             Ok(worker) => worker,
             Err(error) => {
-                engine.stop_input_recording();
-                let _ = engine.set_input_channel_pair(previous_input_channel_pair);
+                if let Some(recording) = &post_effect_capture {
+                    recording.stop();
+                } else if let Some(engine) = self.audio_engine.as_ref() {
+                    engine.stop_input_recording();
+                }
+                if let Some(engine) = self.audio_engine.as_ref() {
+                    let _ = engine.set_input_channel_pair(previous_input_channel_pair);
+                }
                 self.status = format!("Could not start the recording writer: {error}");
                 return;
             }
@@ -51522,6 +51615,7 @@ impl DawUi {
             start_tick,
             playlist_track_id,
             restore_input_channel_pair: previous_input_channel_pair,
+            post_effect_capture,
             recording_offset_ms: self.audio_recording_offset_ms,
             mixer_track: recording_mixer_track,
             tempo_map,
@@ -51540,8 +51634,12 @@ impl DawUi {
             return;
         };
         if session.capture_active {
-            if let Some(engine) = self.audio_engine.as_ref() {
+            if let Some(recording) = &session.post_effect_capture {
+                recording.stop();
+            } else if let Some(engine) = self.audio_engine.as_ref() {
                 engine.stop_input_recording();
+            }
+            if let Some(engine) = self.audio_engine.as_ref() {
                 let _ = engine.set_input_channel_pair(session.restore_input_channel_pair);
             }
             session.capture_active = false;
@@ -51581,8 +51679,12 @@ impl DawUi {
             return;
         };
         if session.capture_active {
-            if let Some(engine) = self.audio_engine.as_ref() {
+            if let Some(recording) = &session.post_effect_capture {
+                recording.stop();
+            } else if let Some(engine) = self.audio_engine.as_ref() {
                 engine.stop_input_recording();
+            }
+            if let Some(engine) = self.audio_engine.as_ref() {
                 let _ = engine.set_input_channel_pair(session.restore_input_channel_pair);
             }
             session.capture_active = false;
@@ -51777,15 +51879,20 @@ impl DawUi {
         } else {
             format!("Insert {}", session.mixer_track)
         };
+        let recording_source_label = if session.post_effect_capture.is_some() {
+            "post-effect"
+        } else {
+            "dry-input"
+        };
         self.status = if summary.overflow_frames == 0 {
             format!(
-                "Recorded {seconds:.1} s to Playlist track {} · Mixer {mixer_route_label} · {}",
+                "Recorded {seconds:.1} s ({recording_source_label}) to Playlist track {} · Mixer {mixer_route_label} · {}",
                 track_index + 1,
                 session.output_path.display()
             )
         } else {
             format!(
-                "Recorded {seconds:.1} s to Playlist track {} · Mixer {mixer_route_label} · {} input frames overflowed · {}",
+                "Recorded {seconds:.1} s ({recording_source_label}) to Playlist track {} · Mixer {mixer_route_label} · {} frames overflowed · {}",
                 track_index + 1,
                 summary.overflow_frames,
                 session.output_path.display()
@@ -52835,9 +52942,36 @@ impl DawUi {
                     });
             });
         });
+        ui.add_enabled_ui(self.audio_recording.is_none(), |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Record source");
+                egui::ComboBox::from_id_salt("audio_recording_source")
+                    .selected_text(if self.audio_recording_post_effects {
+                        "Post Mixer effects"
+                    } else {
+                        "Dry hardware input"
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.audio_recording_post_effects,
+                            false,
+                            "Dry hardware input",
+                        );
+                        ui.selectable_value(
+                            &mut self.audio_recording_post_effects,
+                            true,
+                            "Post Mixer effects",
+                        );
+                    });
+            });
+        });
         ui.label(
             egui::RichText::new(
-                "The WAV capture stays dry. Live monitoring and the inserted Audio Clip use the selected Mixer route, including supported routing and loaded VST3 effects.",
+                if self.audio_recording_post_effects {
+                    "Post-effect recording starts Mixer monitoring through the selected route and captures its processed output."
+                } else {
+                    "Dry recording keeps the WAV unprocessed. Live monitoring and the inserted Audio Clip use the selected Mixer route, including supported routing and loaded VST3 effects."
+                },
             )
             .color(MUTED),
         );
@@ -53469,7 +53603,7 @@ impl DawUi {
                 self.toggle_project_playback();
             }
             if !self.playing {
-                self.start_audio_input_monitor();
+                let _ = self.start_audio_input_monitor(false);
             }
         }
 
