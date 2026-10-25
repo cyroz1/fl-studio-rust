@@ -9466,7 +9466,7 @@ impl PlaylistPerformanceRuntime {
                             channel_id,
                             note_seed,
                             key,
-                            &sources.vst3_volume_expression_channel_ids,
+                            sources.vst3_volume_expression_channel_ids,
                         )
                         .into_iter()
                         .filter(|(target_channel_id, _, _)| {
