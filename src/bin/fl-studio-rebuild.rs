@@ -51132,16 +51132,13 @@ impl DawUi {
                 )
             })
             .transpose();
-        let mut processor = match processor {
+        let processor = match processor {
             Ok(processor) => processor,
             Err(error) => {
                 self.status = format!("Could not prepare Mixer input effects: {error}");
                 return;
             }
         };
-        if let Some(processor) = processor.as_mut() {
-            processor.set_live_mixer_source_targets(&worker_mixer_meters);
-        }
         let (recording, output) = match engine.start_input_monitor_processing() {
             Ok(streams) => streams,
             Err(error) => {

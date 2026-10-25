@@ -2128,6 +2128,7 @@ pub fn stream_input_monitor_through_mixer(
     let mut mixer_buses = mixer_buses_required
         .then(|| vec![0.0_f32; MIXER_TRACK_METER_COUNT * BLOCK_FRAMES * 2 * mixer_bus_planes]);
     if let Some(processor) = vst3_processor.as_mut() {
+        processor.set_live_mixer_source_targets(mixer_meters);
         processor.start_processing()?;
     }
     let stream_result = (|| {
