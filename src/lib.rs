@@ -8227,11 +8227,21 @@ impl FlpDocument {
     }
 
     fn candidate_mixer_automatic_pdc_event(&self) -> Option<(usize, bool)> {
+        let channel_event_ranges = self
+            .channels()
+            .iter()
+            .map(ChannelSummary::event_range)
+            .collect::<Vec<_>>();
         let mut candidates = self
             .events
             .iter()
             .enumerate()
-            .filter(|(_, event)| event.opcode == 0xDD);
+            .filter(|(event_index, event)| {
+                event.opcode == 0xDD
+                    && !channel_event_ranges
+                        .iter()
+                        .any(|range| range.contains(event_index))
+            });
         let (event_index, event) = candidates.next()?;
         if candidates.next().is_some()
             || !matches!(event.encoding, PayloadEncoding::Data { .. })
@@ -25658,6 +25668,33 @@ mod tests {
                 .expect("encoding should succeed"),
             duplicate_bytes
         );
+    }
+
+    #[test]
+    fn mixer_automatic_pdc_ignores_channel_scoped_polyphony_events() {
+        let channel_polyphony = [0x2A, 0, 0, 0, 0, 0, 0, 0, 1];
+        let mut event_stream = Vec::new();
+        append_data_event(&mut event_stream, 0xDD, &[0]);
+        event_stream.extend_from_slice(&[0x40, 7, 0]);
+        append_data_event(&mut event_stream, 0xDD, &channel_polyphony);
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+
+        let original = flp_fixture(&event_stream, &[], &[]);
+        let mut document = FlpDocument::parse(&original).expect("fixture should parse");
+        assert_eq!(document.mixer_automatic_pdc_enabled(), Some(false));
+
+        document
+            .set_mixer_automatic_pdc_enabled(true)
+            .expect("the global Mixer APDC flag should remain editable");
+        assert_eq!(document.events()[0].payload(), [1]);
+        assert_eq!(document.events()[2].payload(), channel_polyphony);
+
+        let encoded = document
+            .encode_lossless()
+            .expect("the edited project should encode");
+        let reparsed = FlpDocument::parse(&encoded).expect("edited project should parse");
+        assert_eq!(reparsed.mixer_automatic_pdc_enabled(), Some(true));
+        assert_eq!(reparsed.events()[2].payload(), channel_polyphony);
     }
 
     #[test]
