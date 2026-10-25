@@ -228,6 +228,11 @@ impl ProjectPackageWorkspace {
                             "could not inspect ZIP entry {raw_name:?} central extra fields: {error}"
                         )
                     })?;
+            if contains_zip64_extra_field(&local_extra_data)
+                || contains_zip64_extra_field(&central_extra_data)
+            {
+                options = options.large_file(true);
+            }
             let metadata = PackageEntryMetadata {
                 options,
                 comment: entry.comment().to_owned(),
@@ -542,7 +547,7 @@ impl ProjectPackageWorkspace {
             return Err("the bundled FLP is missing from its package workspace".to_owned());
         }
 
-        let mut archive = ZipWriter::new(file);
+        let mut archive = ZipWriter::new(file).set_auto_large_file();
         if let Some(comment) = &self.0.archive_comment {
             archive
                 .set_raw_comment(comment.clone().into_boxed_slice())
@@ -624,6 +629,28 @@ fn preserve_unknown_extra_fields(raw: Option<&[u8]>) -> Vec<PackageExtraField> {
         offset = data_end;
     }
     fields
+}
+
+fn contains_zip64_extra_field(raw: &[u8]) -> bool {
+    let mut offset = 0usize;
+    while offset + 4 <= raw.len() {
+        let header_id = u16::from_le_bytes([raw[offset], raw[offset + 1]]);
+        let data_length = usize::from(u16::from_le_bytes([raw[offset + 2], raw[offset + 3]]));
+        let Some(data_end) = offset
+            .checked_add(4)
+            .and_then(|start| start.checked_add(data_length))
+        else {
+            return false;
+        };
+        if data_end > raw.len() {
+            return false;
+        }
+        if header_id == 0x0001 {
+            return true;
+        }
+        offset = data_end;
+    }
+    false
 }
 
 fn remove_mirrored_local_extra_fields(
@@ -902,8 +929,8 @@ fn replace_file(temporary: &Path, target: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ProjectPackageWorkspace, read_archive_comment, read_central_extra_data,
-        read_local_extra_data,
+        ProjectPackageWorkspace, contains_zip64_extra_field, read_archive_comment,
+        read_central_extra_data, read_local_extra_data,
     };
     use crate::FlpDocument;
     use crate::media::SamplePathResolver;
@@ -1124,6 +1151,44 @@ mod tests {
         let mut extra_bytes = Vec::new();
         extra.read_to_end(&mut extra_bytes).unwrap();
         assert_eq!(extra_bytes, b"supporting file");
+    }
+
+    #[test]
+    fn preserves_forced_zip64_entry_sizes_when_rewriting_small_packages() {
+        let temporary = TestDirectory::new();
+        let source_path = temporary.path().join("source.zip");
+        let output_path = temporary.path().join("saved.zip");
+
+        let options = SimpleFileOptions::default()
+            .compression_method(CompressionMethod::Stored)
+            .large_file(true)
+            .into_full_options();
+        let mut source = ZipWriter::new(fs::File::create(&source_path).unwrap());
+        source.start_file("song.flp", options).unwrap();
+        source.write_all(b"original project").unwrap();
+        source.finish().unwrap().sync_all().unwrap();
+
+        let (workspace, original_project) = ProjectPackageWorkspace::open(&source_path).unwrap();
+        assert_eq!(original_project, b"original project");
+        workspace
+            .write_to(&output_path, b"updated project")
+            .unwrap();
+
+        let mut saved = ZipArchive::new(fs::File::open(&output_path).unwrap()).unwrap();
+        let project = saved.by_name("song.flp").unwrap();
+        let header_start = project.header_start();
+        let central_header_start = project.central_header_start();
+        drop(project);
+        let mut file = fs::File::open(&output_path).unwrap();
+        let local_extra_data = read_local_extra_data(&mut file, header_start).unwrap();
+        let central_extra_data = read_central_extra_data(&mut file, central_header_start).unwrap();
+        assert!(contains_zip64_extra_field(&local_extra_data));
+        assert!(contains_zip64_extra_field(&central_extra_data));
+
+        let mut project = saved.by_name("song.flp").unwrap();
+        let mut project_bytes = Vec::new();
+        project.read_to_end(&mut project_bytes).unwrap();
+        assert_eq!(project_bytes, b"updated project");
     }
 
     #[test]
