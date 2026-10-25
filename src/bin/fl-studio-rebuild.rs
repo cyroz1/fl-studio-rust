@@ -817,9 +817,50 @@ fn remap_mixer_effect_instances_after_move(
     }
 }
 
+fn remap_midi_vst3_mixer_effect_parameter_targets_after_move(
+    mappings: &mut [MidiVst3ParameterMapping],
+    insert_ordinal: usize,
+    from_slot: u16,
+    to_slot: u16,
+) -> bool {
+    if from_slot == to_slot {
+        return false;
+    }
+    let mut changed = false;
+    for mapping in mappings {
+        let MidiVst3ParameterMappingTarget::MixerEffect(target) = &mut mapping.target else {
+            continue;
+        };
+        if target.insert_ordinal != insert_ordinal {
+            continue;
+        }
+        let next_slot = if target.slot_index == from_slot {
+            to_slot
+        } else if from_slot < to_slot
+            && (from_slot < target.slot_index && target.slot_index <= to_slot)
+        {
+            target.slot_index - 1
+        } else if to_slot < from_slot
+            && (to_slot <= target.slot_index && target.slot_index < from_slot)
+        {
+            target.slot_index + 1
+        } else {
+            target.slot_index
+        };
+        changed |= next_slot != target.slot_index;
+        target.slot_index = next_slot;
+    }
+    changed
+}
+
 #[cfg(test)]
 mod mixer_effect_instance_tests {
-    use super::remap_mixer_effect_instances_after_move;
+    use super::{
+        MidiVst3MixerEffectParameterTarget, MidiVst3ParameterMapping,
+        MidiVst3ParameterMappingTarget, MidiVst3ParameterTarget,
+        remap_midi_vst3_mixer_effect_parameter_targets_after_move,
+        remap_mixer_effect_instances_after_move,
+    };
     use std::collections::BTreeMap;
 
     #[test]
@@ -838,6 +879,105 @@ mod mixer_effect_instance_tests {
             instances,
             BTreeMap::from([((2, 0), 21), ((2, 1), 20), ((2, 3), 23), ((4, 5), 45),])
         );
+    }
+
+    #[test]
+    fn learned_mixer_effect_parameter_targets_follow_slot_moves() {
+        let mut mappings = vec![
+            MidiVst3ParameterMapping {
+                input_device_id: "surface".to_owned(),
+                channel: 0,
+                controller: 1,
+                target: MidiVst3ParameterMappingTarget::MixerEffect(
+                    MidiVst3MixerEffectParameterTarget {
+                        insert_ordinal: 2,
+                        slot_index: 1,
+                        plugin_uid: "effect-a".to_owned(),
+                        parameter_id: 10,
+                        parameter_name: "Mix".to_owned(),
+                    },
+                ),
+            },
+            MidiVst3ParameterMapping {
+                input_device_id: "surface".to_owned(),
+                channel: 0,
+                controller: 2,
+                target: MidiVst3ParameterMappingTarget::MixerEffect(
+                    MidiVst3MixerEffectParameterTarget {
+                        insert_ordinal: 2,
+                        slot_index: 3,
+                        plugin_uid: "effect-b".to_owned(),
+                        parameter_id: 11,
+                        parameter_name: "Mix".to_owned(),
+                    },
+                ),
+            },
+            MidiVst3ParameterMapping {
+                input_device_id: "surface".to_owned(),
+                channel: 0,
+                controller: 3,
+                target: MidiVst3ParameterMappingTarget::MixerEffect(
+                    MidiVst3MixerEffectParameterTarget {
+                        insert_ordinal: 4,
+                        slot_index: 1,
+                        plugin_uid: "other-insert".to_owned(),
+                        parameter_id: 12,
+                        parameter_name: "Mix".to_owned(),
+                    },
+                ),
+            },
+            MidiVst3ParameterMapping {
+                input_device_id: "surface".to_owned(),
+                channel: 0,
+                controller: 4,
+                target: MidiVst3ParameterMappingTarget::Channel(MidiVst3ParameterTarget {
+                    project_channel_id: 7,
+                    plugin_uid: "instrument".to_owned(),
+                    parameter_id: 13,
+                    parameter_name: "Cutoff".to_owned(),
+                }),
+            },
+        ];
+
+        assert!(remap_midi_vst3_mixer_effect_parameter_targets_after_move(
+            &mut mappings,
+            2,
+            1,
+            3,
+        ));
+        let slots = mappings
+            .iter()
+            .map(|mapping| match &mapping.target {
+                MidiVst3ParameterMappingTarget::MixerEffect(target) => {
+                    Some((target.insert_ordinal, target.slot_index))
+                }
+                MidiVst3ParameterMappingTarget::Channel(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(slots, vec![Some((2, 3)), Some((2, 2)), Some((4, 1)), None]);
+
+        assert!(remap_midi_vst3_mixer_effect_parameter_targets_after_move(
+            &mut mappings,
+            2,
+            3,
+            1,
+        ));
+        let slots = mappings
+            .iter()
+            .map(|mapping| match &mapping.target {
+                MidiVst3ParameterMappingTarget::MixerEffect(target) => {
+                    Some((target.insert_ordinal, target.slot_index))
+                }
+                MidiVst3ParameterMappingTarget::Channel(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(slots, vec![Some((2, 1)), Some((2, 3)), Some((4, 1)), None]);
+        assert!(!remap_midi_vst3_mixer_effect_parameter_targets_after_move(
+            &mut mappings,
+            2,
+            1,
+            1,
+        ));
     }
 }
 
@@ -4700,7 +4840,7 @@ struct DawUi {
     playlist_vst3_parameter_links: Vec<PlaylistVst3ParameterLink>,
     internal_lfo_parameter_links: Vec<InternalLfoParameterLink>,
     playlist_audio_clip_envelopes: Vec<ProjectPlaylistAudioClipEnvelope>,
-    midi_vst3_parameter_learning: Option<MidiVst3ParameterTarget>,
+    midi_vst3_parameter_learning: Option<MidiVst3ParameterMappingTarget>,
     midi_mixer_button_cc_active: BTreeSet<(String, u8, u8)>,
     midi_mixer_control_learning: Option<MidiMixerControlLearning>,
     midi_mixer_control_undo_snapshot: Option<Vec<u8>>,
@@ -5240,11 +5380,35 @@ struct MidiVst3ParameterTarget {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct MidiVst3MixerEffectParameterTarget {
+    insert_ordinal: usize,
+    slot_index: u16,
+    plugin_uid: String,
+    parameter_id: u32,
+    parameter_name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum MidiVst3ParameterMappingTarget {
+    Channel(MidiVst3ParameterTarget),
+    MixerEffect(MidiVst3MixerEffectParameterTarget),
+}
+
+impl MidiVst3ParameterMappingTarget {
+    fn parameter_name(&self) -> &str {
+        match self {
+            Self::Channel(target) => &target.parameter_name,
+            Self::MixerEffect(target) => &target.parameter_name,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct MidiVst3ParameterMapping {
     input_device_id: String,
     channel: u8,
     controller: u8,
-    target: MidiVst3ParameterTarget,
+    target: MidiVst3ParameterMappingTarget,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -44712,12 +44876,27 @@ impl DawUi {
                         from_slot,
                         to_slot,
                     );
+                    let mappings_changed =
+                        remap_midi_vst3_mixer_effect_parameter_targets_after_move(
+                            &mut self.midi_vst3_parameter_mappings,
+                            insert_ordinal,
+                            from_slot,
+                            to_slot,
+                        );
+                    let mapping_save_error = mappings_changed
+                        .then(|| {
+                            save_midi_vst3_parameter_mappings(&self.midi_vst3_parameter_mappings)
+                        })
+                        .and_then(Result::err);
                     self.dirty = true;
-                    self.status = format!(
+                    let moved_status = format!(
                         "Moved Mixer insert {insert_ordinal} effect slot {} to {}",
                         from_slot + 1,
-                        to_slot + 1
+                        to_slot + 1,
                     );
+                    self.status = mapping_save_error.map_or(moved_status.clone(), |error| {
+                        format!("{moved_status}; could not save learned MIDI CC links: {error}")
+                    });
                 }
                 Err(error) => {
                     self.status = format!("Could not move Mixer effect slot: {error}");
@@ -46925,7 +47104,7 @@ impl DawUi {
                     format!(
                         "Learned MIDI CC {controller} · channel {} for {}",
                         channel + 1,
-                        mapping.target.parameter_name
+                        mapping.target.parameter_name()
                     )
                 },
                 |error| {
@@ -47163,11 +47342,17 @@ impl DawUi {
         mapping: &MidiVst3ParameterMapping,
         value: u8,
     ) -> Result<bool, String> {
-        let Some(instance_id) = self
-            .channel_vst3_instances
-            .get(&mapping.target.project_channel_id)
-            .copied()
-        else {
+        let instance_id = match &mapping.target {
+            MidiVst3ParameterMappingTarget::Channel(target) => self
+                .channel_vst3_instances
+                .get(&target.project_channel_id)
+                .copied(),
+            MidiVst3ParameterMappingTarget::MixerEffect(target) => self
+                .mixer_effect_vst3_instances
+                .get(&(target.insert_ordinal, target.slot_index))
+                .copied(),
+        };
+        let Some(instance_id) = instance_id else {
             return Ok(false);
         };
         let Some(host) = self.vst3_host.as_ref() else {
@@ -47180,14 +47365,18 @@ impl DawUi {
         else {
             return Ok(false);
         };
-        if plugin.uid != mapping.target.plugin_uid {
+        let (plugin_uid, parameter_id) = match &mapping.target {
+            MidiVst3ParameterMappingTarget::Channel(target) => {
+                (&target.plugin_uid, target.parameter_id)
+            }
+            MidiVst3ParameterMappingTarget::MixerEffect(target) => {
+                (&target.plugin_uid, target.parameter_id)
+            }
+        };
+        if plugin.uid != *plugin_uid {
             return Ok(false);
         }
-        host.set_parameter(
-            instance_id,
-            mapping.target.parameter_id,
-            f64::from(value) / 127.0,
-        )?;
+        host.set_parameter(instance_id, parameter_id, f64::from(value) / 127.0)?;
         self.dirty = true;
         Ok(true)
     }
@@ -52233,6 +52422,10 @@ impl DawUi {
                         .find_map(|(channel_id, instance_id)| {
                             (*instance_id == info.id).then_some(*channel_id)
                         });
+                let mixer_effect_key = self
+                    .mixer_effect_vst3_instances
+                    .iter()
+                    .find_map(|(key, instance_id)| (*instance_id == info.id).then_some(*key));
                 egui::CollapsingHeader::new("Parameters").show(ui, |ui| {
                     if let Some(hint) = pattern_vst3_link_hint {
                         ui.small(egui::RichText::new(hint).color(MUTED));
@@ -52247,14 +52440,33 @@ impl DawUi {
                         .unwrap_or_default();
                     for parameter in parameters {
                         let mut value = parameter.value.clamp(0.0, 1.0) as f32;
-                        let target =
+                        let channel_target =
                             project_channel_id.map(|project_channel_id| MidiVst3ParameterTarget {
                                 project_channel_id,
                                 plugin_uid: info.uid.clone(),
                                 parameter_id: parameter.id,
                                 parameter_name: parameter.name.clone(),
                             });
-                        let mapping = target.as_ref().and_then(|target| {
+                        let effect_target = mixer_effect_key.map(|(insert_ordinal, slot_index)| {
+                            MidiVst3MixerEffectParameterTarget {
+                                insert_ordinal,
+                                slot_index,
+                                plugin_uid: info.uid.clone(),
+                                parameter_id: parameter.id,
+                                parameter_name: parameter.name.clone(),
+                            }
+                        });
+                        let mapping_target = channel_target
+                            .as_ref()
+                            .cloned()
+                            .map(MidiVst3ParameterMappingTarget::Channel)
+                            .or_else(|| {
+                                effect_target
+                                    .as_ref()
+                                    .cloned()
+                                    .map(MidiVst3ParameterMappingTarget::MixerEffect)
+                            });
+                        let mapping = mapping_target.as_ref().and_then(|target| {
                             midi_vst3_parameter_mapping_for_target(
                                 &self.midi_vst3_parameter_mappings,
                                 target,
@@ -52265,7 +52477,7 @@ impl DawUi {
                             .as_deref()
                             .zip(self.selected_pattern)
                             .and_then(|(project_path, pattern_id)| {
-                                target.as_ref().and_then(|target| {
+                                channel_target.as_ref().and_then(|target| {
                                     pattern_vst3_parameter_link_for_target(
                                         &self.pattern_vst3_parameter_links,
                                         project_path,
@@ -52279,7 +52491,7 @@ impl DawUi {
                             .as_deref()
                             .zip(self.selected_pattern)
                             .and_then(|(project_path, pattern_id)| {
-                                target.as_ref().and_then(|target| {
+                                channel_target.as_ref().and_then(|target| {
                                     internal_lfo_parameter_link_for_target(
                                         &self.internal_lfo_parameter_links,
                                         project_path,
@@ -52305,9 +52517,12 @@ impl DawUi {
                                 parameter_edits.push((info.id, parameter.id, f64::from(value)));
                             }
 
-                            if let Some(target) = target.as_ref() {
-                                let learning =
-                                    self.midi_vst3_parameter_learning.as_ref() == Some(target);
+                            if let Some(target) = channel_target.as_ref() {
+                                let mapping_target = MidiVst3ParameterMappingTarget::Channel(
+                                    target.clone(),
+                                );
+                                let learning = self.midi_vst3_parameter_learning.as_ref()
+                                    == Some(&mapping_target);
                                 if learning {
                                     if ui.button("Cancel learn").clicked() {
                                         midi_vst3_cancel_learning = true;
@@ -52324,7 +52539,7 @@ impl DawUi {
                                     )
                                     .clicked()
                                 {
-                                    midi_vst3_learn_request = Some(target.clone());
+                                    midi_vst3_learn_request = Some(mapping_target.clone());
                                 }
                                 if let Some(mapping) = mapping {
                                     ui.small(format!(
@@ -52333,7 +52548,7 @@ impl DawUi {
                                         mapping.channel + 1
                                     ));
                                     if ui.small_button("Clear").clicked() {
-                                        midi_vst3_remove_mapping = Some(target.clone());
+                                        midi_vst3_remove_mapping = Some(mapping_target.clone());
                                     }
                                 }
 
@@ -52401,8 +52616,44 @@ impl DawUi {
                                         Some((project_path.clone(), pattern_id, target.clone()));
                                 }
                             }
+                            if channel_target.is_none()
+                                && let Some(target) = effect_target.as_ref()
+                            {
+                                let mapping_target =
+                                    MidiVst3ParameterMappingTarget::MixerEffect(target.clone());
+                                let learning = self.midi_vst3_parameter_learning.as_ref()
+                                    == Some(&mapping_target);
+                                if learning {
+                                    if ui.button("Cancel learn").clicked() {
+                                        midi_vst3_cancel_learning = true;
+                                    }
+                                } else if ui
+                                    .add_enabled(
+                                        !parameter.is_read_only
+                                            && self.midi_input_connection.is_some(),
+                                        egui::Button::new(if mapping.is_some() {
+                                            "Relearn CC"
+                                        } else {
+                                            "Learn CC"
+                                        }),
+                                    )
+                                    .clicked()
+                                {
+                                    midi_vst3_learn_request = Some(mapping_target.clone());
+                                }
+                                if let Some(mapping) = mapping {
+                                    ui.small(format!(
+                                        "CC {} · channel {}",
+                                        mapping.controller,
+                                        mapping.channel + 1
+                                    ));
+                                    if ui.small_button("Clear").clicked() {
+                                        midi_vst3_remove_mapping = Some(mapping_target);
+                                    }
+                                }
+                            }
                         });
-                        if let Some(target) = target.as_ref() {
+                        if let Some(target) = channel_target.as_ref() {
                             if let Some((
                                 project_path,
                                 automation_channel_id,
@@ -52573,10 +52824,10 @@ impl DawUi {
                                 );
                             }
                         }
-                        if target.is_none() {
+                        if mapping_target.is_none() {
                             ui.small(
                                 egui::RichText::new(
-                                    "Load this plug-in from a project channel to enable MIDI Learn",
+                                    "Load this plug-in from a project channel or Mixer effect slot to enable MIDI Learn",
                                 )
                                 .color(MUTED),
                             );
@@ -52606,7 +52857,7 @@ impl DawUi {
             self.status = save_midi_vst3_parameter_mappings(&self.midi_vst3_parameter_mappings)
                 .err()
                 .map_or_else(
-                    || format!("Cleared MIDI CC link for {}", target.parameter_name),
+                    || format!("Cleared MIDI CC link for {}", target.parameter_name()),
                     |error| {
                         format!("Cleared MIDI CC link for this session; could not save it: {error}")
                     },
@@ -52614,7 +52865,7 @@ impl DawUi {
         }
         if let Some(target) = midi_vst3_learn_request {
             self.midi_vst3_parameter_learning = Some(target.clone());
-            self.status = format!("Move a MIDI CC to link it to {}", target.parameter_name);
+            self.status = format!("Move a MIDI CC to link it to {}", target.parameter_name());
         }
 
         if let Some((project_path, pattern_id, stream_channel, stream_flags, target)) =
@@ -56291,8 +56542,16 @@ fn valid_midi_vst3_parameter_mapping(mapping: &MidiVst3ParameterMapping) -> bool
     !mapping.input_device_id.is_empty()
         && mapping.channel < 16
         && mapping.controller < 128
-        && !mapping.target.plugin_uid.is_empty()
-        && !mapping.target.parameter_name.is_empty()
+        && match &mapping.target {
+            MidiVst3ParameterMappingTarget::Channel(target) => {
+                !target.plugin_uid.is_empty() && !target.parameter_name.is_empty()
+            }
+            MidiVst3ParameterMappingTarget::MixerEffect(target) => {
+                !target.plugin_uid.is_empty()
+                    && !target.parameter_name.is_empty()
+                    && target.slot_index < 10
+            }
+        }
 }
 
 fn same_midi_vst3_parameter_target(
@@ -56304,6 +56563,28 @@ fn same_midi_vst3_parameter_target(
         && left.parameter_id == right.parameter_id
 }
 
+fn same_midi_vst3_parameter_mapping_target(
+    left: &MidiVst3ParameterMappingTarget,
+    right: &MidiVst3ParameterMappingTarget,
+) -> bool {
+    match (left, right) {
+        (
+            MidiVst3ParameterMappingTarget::Channel(left),
+            MidiVst3ParameterMappingTarget::Channel(right),
+        ) => same_midi_vst3_parameter_target(left, right),
+        (
+            MidiVst3ParameterMappingTarget::MixerEffect(left),
+            MidiVst3ParameterMappingTarget::MixerEffect(right),
+        ) => {
+            left.insert_ordinal == right.insert_ordinal
+                && left.slot_index == right.slot_index
+                && left.plugin_uid == right.plugin_uid
+                && left.parameter_id == right.parameter_id
+        }
+        _ => false,
+    }
+}
+
 fn upsert_midi_vst3_parameter_mapping(
     mappings: &mut Vec<MidiVst3ParameterMapping>,
     mapping: MidiVst3ParameterMapping,
@@ -56311,24 +56592,26 @@ fn upsert_midi_vst3_parameter_mapping(
     if !valid_midi_vst3_parameter_mapping(&mapping) {
         return;
     }
-    mappings.retain(|existing| !same_midi_vst3_parameter_target(&existing.target, &mapping.target));
+    mappings.retain(|existing| {
+        !same_midi_vst3_parameter_mapping_target(&existing.target, &mapping.target)
+    });
     mappings.push(mapping);
 }
 
 fn remove_midi_vst3_parameter_mapping(
     mappings: &mut Vec<MidiVst3ParameterMapping>,
-    target: &MidiVst3ParameterTarget,
+    target: &MidiVst3ParameterMappingTarget,
 ) {
-    mappings.retain(|mapping| !same_midi_vst3_parameter_target(&mapping.target, target));
+    mappings.retain(|mapping| !same_midi_vst3_parameter_mapping_target(&mapping.target, target));
 }
 
 fn midi_vst3_parameter_mapping_for_target<'a>(
     mappings: &'a [MidiVst3ParameterMapping],
-    target: &MidiVst3ParameterTarget,
+    target: &MidiVst3ParameterMappingTarget,
 ) -> Option<&'a MidiVst3ParameterMapping> {
     mappings
         .iter()
-        .find(|mapping| same_midi_vst3_parameter_target(&mapping.target, target))
+        .find(|mapping| same_midi_vst3_parameter_mapping_target(&mapping.target, target))
 }
 
 fn midi_vst3_parameter_mappings_for_cc<'a>(
@@ -56363,18 +56646,82 @@ fn parse_midi_vst3_parameter_mappings(contents: &str) -> Vec<MidiVst3ParameterMa
         let Some(controller) = fields.next().and_then(|field| field.parse::<u8>().ok()) else {
             continue;
         };
-        let Some(project_channel_id) = fields.next().and_then(|field| field.parse::<u16>().ok())
-        else {
+        let Some(target_kind) = fields.next() else {
             continue;
         };
-        let Some(plugin_uid) = fields.next().and_then(decode_midi_device_id) else {
-            continue;
-        };
-        let Some(parameter_id) = fields.next().and_then(|field| field.parse::<u32>().ok()) else {
-            continue;
-        };
-        let Some(parameter_name) = fields.next().and_then(decode_midi_device_id) else {
-            continue;
+        let target = match target_kind {
+            "channel" => {
+                let Some(project_channel_id) =
+                    fields.next().and_then(|field| field.parse::<u16>().ok())
+                else {
+                    continue;
+                };
+                let Some(plugin_uid) = fields.next().and_then(decode_midi_device_id) else {
+                    continue;
+                };
+                let Some(parameter_id) = fields.next().and_then(|field| field.parse::<u32>().ok())
+                else {
+                    continue;
+                };
+                let Some(parameter_name) = fields.next().and_then(decode_midi_device_id) else {
+                    continue;
+                };
+                MidiVst3ParameterMappingTarget::Channel(MidiVst3ParameterTarget {
+                    project_channel_id,
+                    plugin_uid,
+                    parameter_id,
+                    parameter_name,
+                })
+            }
+            "effect" => {
+                let Some(insert_ordinal) =
+                    fields.next().and_then(|field| field.parse::<usize>().ok())
+                else {
+                    continue;
+                };
+                let Some(slot_index) = fields.next().and_then(|field| field.parse::<u16>().ok())
+                else {
+                    continue;
+                };
+                let Some(plugin_uid) = fields.next().and_then(decode_midi_device_id) else {
+                    continue;
+                };
+                let Some(parameter_id) = fields.next().and_then(|field| field.parse::<u32>().ok())
+                else {
+                    continue;
+                };
+                let Some(parameter_name) = fields.next().and_then(decode_midi_device_id) else {
+                    continue;
+                };
+                MidiVst3ParameterMappingTarget::MixerEffect(MidiVst3MixerEffectParameterTarget {
+                    insert_ordinal,
+                    slot_index,
+                    plugin_uid,
+                    parameter_id,
+                    parameter_name,
+                })
+            }
+            legacy_channel_id => {
+                let Some(project_channel_id) = legacy_channel_id.parse::<u16>().ok() else {
+                    continue;
+                };
+                let Some(plugin_uid) = fields.next().and_then(decode_midi_device_id) else {
+                    continue;
+                };
+                let Some(parameter_id) = fields.next().and_then(|field| field.parse::<u32>().ok())
+                else {
+                    continue;
+                };
+                let Some(parameter_name) = fields.next().and_then(decode_midi_device_id) else {
+                    continue;
+                };
+                MidiVst3ParameterMappingTarget::Channel(MidiVst3ParameterTarget {
+                    project_channel_id,
+                    plugin_uid,
+                    parameter_id,
+                    parameter_name,
+                })
+            }
         };
         if fields.next().is_some() {
             continue;
@@ -56385,12 +56732,7 @@ fn parse_midi_vst3_parameter_mappings(contents: &str) -> Vec<MidiVst3ParameterMa
                 input_device_id,
                 channel,
                 controller,
-                target: MidiVst3ParameterTarget {
-                    project_channel_id,
-                    plugin_uid,
-                    parameter_id,
-                    parameter_name,
-                },
+                target,
             },
         );
     }
@@ -56398,7 +56740,7 @@ fn parse_midi_vst3_parameter_mappings(contents: &str) -> Vec<MidiVst3ParameterMa
 }
 
 fn serialize_midi_vst3_parameter_mappings(mappings: &[MidiVst3ParameterMapping]) -> String {
-    let mut contents = String::from("version=1\n");
+    let mut contents = String::from("version=2\n");
     let mut normalized = Vec::new();
     for mapping in mappings {
         upsert_midi_vst3_parameter_mapping(&mut normalized, mapping.clone());
@@ -56411,13 +56753,30 @@ fn serialize_midi_vst3_parameter_mappings(mappings: &[MidiVst3ParameterMapping])
         contents.push('\t');
         contents.push_str(&mapping.controller.to_string());
         contents.push('\t');
-        contents.push_str(&mapping.target.project_channel_id.to_string());
-        contents.push('\t');
-        contents.push_str(&encode_midi_device_id(&mapping.target.plugin_uid));
-        contents.push('\t');
-        contents.push_str(&mapping.target.parameter_id.to_string());
-        contents.push('\t');
-        contents.push_str(&encode_midi_device_id(&mapping.target.parameter_name));
+        match &mapping.target {
+            MidiVst3ParameterMappingTarget::Channel(target) => {
+                contents.push_str("channel\t");
+                contents.push_str(&target.project_channel_id.to_string());
+                contents.push('\t');
+                contents.push_str(&encode_midi_device_id(&target.plugin_uid));
+                contents.push('\t');
+                contents.push_str(&target.parameter_id.to_string());
+                contents.push('\t');
+                contents.push_str(&encode_midi_device_id(&target.parameter_name));
+            }
+            MidiVst3ParameterMappingTarget::MixerEffect(target) => {
+                contents.push_str("effect\t");
+                contents.push_str(&target.insert_ordinal.to_string());
+                contents.push('\t');
+                contents.push_str(&target.slot_index.to_string());
+                contents.push('\t');
+                contents.push_str(&encode_midi_device_id(&target.plugin_uid));
+                contents.push('\t');
+                contents.push_str(&target.parameter_id.to_string());
+                contents.push('\t');
+                contents.push_str(&encode_midi_device_id(&target.parameter_name));
+            }
+        }
         contents.push('\n');
     }
     contents
@@ -62899,8 +63258,9 @@ mod tests {
         MAX_INTERNAL_LFO_AUTOMATION_POINTS, MainView, MidiAutomationRecording,
         MidiControlChangeMapping, MidiControllerCcBinding, MidiControllerTemplate,
         MidiDeviceSelections, MidiInputDevice, MidiInputEvent, MidiMixerControlMapping,
-        MidiMixerControlTarget, MidiOutputDevice, MidiVst3ParameterMapping,
-        MidiVst3ParameterTarget, PIANO_ROLL_RULER_HEIGHT, Pattern, PatternController, PatternNote,
+        MidiMixerControlTarget, MidiOutputDevice, MidiVst3MixerEffectParameterTarget,
+        MidiVst3ParameterMapping, MidiVst3ParameterMappingTarget, MidiVst3ParameterTarget,
+        PIANO_ROLL_RULER_HEIGHT, Pattern, PatternController, PatternNote,
         PatternVst3AutomationSources, PatternVst3ParameterLink, PianoRollChordStamp, PianoRollGrid,
         PianoRollScale, PianoRollSnap, PlaylistAudioClipEnvelope, PlaylistClip,
         PlaylistClipDragKind, PlaylistClipEdit, PlaylistClipResizeEdge, PlaylistTempoMap,
@@ -64457,31 +64817,67 @@ mod tests {
                 input_device_id: "alsa:keyboard\t雪".to_owned(),
                 channel: 15,
                 controller: 74,
-                target: MidiVst3ParameterTarget {
+                target: MidiVst3ParameterMappingTarget::Channel(MidiVst3ParameterTarget {
                     project_channel_id: 23,
                     plugin_uid: "com.example.synth\tuid".to_owned(),
                     parameter_id: 7,
                     parameter_name: "Cutoff 雪".to_owned(),
-                },
+                }),
             },
             MidiVst3ParameterMapping {
                 input_device_id: "alsa:keyboard\t雪".to_owned(),
                 channel: 15,
                 controller: 74,
-                target: MidiVst3ParameterTarget {
+                target: MidiVst3ParameterMappingTarget::Channel(MidiVst3ParameterTarget {
                     project_channel_id: 24,
                     plugin_uid: "com.example.synth\tuid".to_owned(),
                     parameter_id: 8,
                     parameter_name: "Resonance".to_owned(),
-                },
+                }),
+            },
+            MidiVst3ParameterMapping {
+                input_device_id: "alsa:keyboard\t雪".to_owned(),
+                channel: 15,
+                controller: 74,
+                target: MidiVst3ParameterMappingTarget::MixerEffect(
+                    MidiVst3MixerEffectParameterTarget {
+                        insert_ordinal: 12,
+                        slot_index: 3,
+                        plugin_uid: "com.example.effect\tuid".to_owned(),
+                        parameter_id: 35,
+                        parameter_name: "Room size".to_owned(),
+                    },
+                ),
             },
         ];
 
         let encoded = serialize_midi_vst3_parameter_mappings(&mappings);
+        assert!(encoded.starts_with("version=2\n"));
         assert_eq!(parse_midi_vst3_parameter_mappings(&encoded), mappings);
+        let legacy_channel_mapping = MidiVst3ParameterMapping {
+            input_device_id: "alsa:keyboard\t雪".to_owned(),
+            channel: 15,
+            controller: 74,
+            target: MidiVst3ParameterMappingTarget::Channel(MidiVst3ParameterTarget {
+                project_channel_id: 23,
+                plugin_uid: "com.example.synth\tuid".to_owned(),
+                parameter_id: 7,
+                parameter_name: "Cutoff 雪".to_owned(),
+            }),
+        };
+        let legacy_encoded = format!(
+            "version=1\nmapping={}\t15\t74\t23\t{}\t7\t{}\n",
+            encode_midi_device_id("alsa:keyboard\t雪"),
+            encode_midi_device_id("com.example.synth\tuid"),
+            encode_midi_device_id("Cutoff 雪"),
+        );
+        assert_eq!(
+            parse_midi_vst3_parameter_mappings(&legacy_encoded),
+            vec![legacy_channel_mapping]
+        );
         assert_eq!(
             midi_vst3_parameter_mappings_for_cc(&mappings, "alsa:keyboard\t雪", 15, 74).len(),
-            2
+            3
         );
         assert!(midi_vst3_parameter_mappings_for_cc(&mappings, "other", 15, 74).is_empty());
     }
@@ -64992,12 +65388,12 @@ mod tests {
 
     #[test]
     fn midi_vst3_parameter_mapping_replaces_by_target_and_can_be_removed() {
-        let target = MidiVst3ParameterTarget {
+        let target = MidiVst3ParameterMappingTarget::Channel(MidiVst3ParameterTarget {
             project_channel_id: 4,
             plugin_uid: "com.example.synth".to_owned(),
             parameter_id: 11,
             parameter_name: "Cutoff".to_owned(),
-        };
+        });
         let first = MidiVst3ParameterMapping {
             input_device_id: "surface-a".to_owned(),
             channel: 0,
@@ -65008,21 +65404,24 @@ mod tests {
             input_device_id: "surface-a".to_owned(),
             channel: 0,
             controller: 7,
-            target: MidiVst3ParameterTarget {
+            target: MidiVst3ParameterMappingTarget::Channel(MidiVst3ParameterTarget {
                 project_channel_id: 4,
                 plugin_uid: "com.example.synth".to_owned(),
                 parameter_id: 12,
                 parameter_name: "Resonance".to_owned(),
-            },
+            }),
         };
         let replacement = MidiVst3ParameterMapping {
             input_device_id: "surface-b".to_owned(),
             channel: 2,
             controller: 21,
-            target: MidiVst3ParameterTarget {
+            target: MidiVst3ParameterMappingTarget::Channel(MidiVst3ParameterTarget {
                 parameter_name: "Filter cutoff".to_owned(),
-                ..target.clone()
-            },
+                ..match &target {
+                    MidiVst3ParameterMappingTarget::Channel(target) => target.clone(),
+                    MidiVst3ParameterMappingTarget::MixerEffect(_) => unreachable!(),
+                }
+            }),
         };
         let mut mappings = vec![first, second.clone()];
         upsert_midi_vst3_parameter_mapping(&mut mappings, replacement.clone());
