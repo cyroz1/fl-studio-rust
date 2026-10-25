@@ -2114,7 +2114,7 @@ pub fn stream_input_monitor_through_mixer(
     let mut master_output = MixerMasterOutput::from_document(document)
         .with_live_master_targets(mixer_meters, sample_rate);
     let mixer_effect_buses_required = vst3_processor
-        .as_deref()
+        .as_ref()
         .is_some_and(Vst3PlaylistStreamProcessor::needs_mixer_insert_buses);
     let mixer_meter_buses_required = !route_plan.insert_meter_transforms.is_empty()
         || live_source_control
@@ -2127,7 +2127,7 @@ pub fn stream_input_monitor_through_mixer(
     let mut output_block = vec![0.0_f32; BLOCK_FRAMES * 2];
     let mut mixer_buses = mixer_buses_required
         .then(|| vec![0.0_f32; MIXER_TRACK_METER_COUNT * BLOCK_FRAMES * 2 * mixer_bus_planes]);
-    if let Some(processor) = vst3_processor.as_deref_mut() {
+    if let Some(processor) = vst3_processor.as_mut() {
         processor.start_processing()?;
     }
     let stream_result = (|| {
@@ -2239,7 +2239,7 @@ pub fn stream_input_monitor_through_mixer(
                     }
                 }
             }
-            if let Some(processor) = vst3_processor.as_deref_mut() {
+            if let Some(processor) = vst3_processor.as_mut() {
                 if let Some(buses) = buses.as_deref_mut() {
                     processor.mix_next_block_with_meter_buses(block, buses)?;
                 } else {
@@ -2263,7 +2263,7 @@ pub fn stream_input_monitor_through_mixer(
         }
         Ok::<_, String>(())
     })();
-    let stop_result = if let Some(processor) = vst3_processor.as_deref_mut() {
+    let stop_result = if let Some(processor) = vst3_processor.as_mut() {
         processor.stop_processing()
     } else {
         Ok(())
