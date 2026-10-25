@@ -52277,6 +52277,51 @@ impl DawUi {
                 });
         });
 
+        let input_channel_pair_count = self
+            .audio_catalog
+            .input_channel_pair_count(&self.audio_settings)
+            .max(1);
+        if self.audio_settings.input_channel_pair >= input_channel_pair_count {
+            self.audio_settings.input_channel_pair = 0;
+        }
+        let selected_input_pair = self.audio_settings.input_channel_pair;
+        let selected_input_pair_label = format!(
+            "{} / {}",
+            selected_input_pair.saturating_mul(2).saturating_add(1),
+            selected_input_pair.saturating_mul(2).saturating_add(2)
+        );
+        let mut input_channel_pair_changed = false;
+        ui.horizontal(|ui| {
+            ui.label("Input channels");
+            egui::ComboBox::from_id_salt("audio_input_channel_pair")
+                .selected_text(selected_input_pair_label)
+                .show_ui(ui, |ui| {
+                    for pair in 0..input_channel_pair_count {
+                        let label = format!(
+                            "{} / {}",
+                            pair.saturating_mul(2).saturating_add(1),
+                            pair.saturating_mul(2).saturating_add(2)
+                        );
+                        input_channel_pair_changed |= ui
+                            .selectable_value(
+                                &mut self.audio_settings.input_channel_pair,
+                                pair,
+                                label,
+                            )
+                            .changed();
+                    }
+                });
+            ui.label(egui::RichText::new("Mono input is duplicated to both channels").color(MUTED));
+        });
+        if input_channel_pair_changed
+            && self.audio_engine.as_ref().is_some_and(|engine| {
+                engine.input_active()
+                    && engine.input_channel_pair() != self.audio_settings.input_channel_pair
+            })
+        {
+            self.status = "Restart the audio engine to use the selected input channels".to_owned();
+        }
+
         ui.separator();
         ui.strong("Audio recording");
         ui.label(
@@ -52315,10 +52360,10 @@ impl DawUi {
             .is_some_and(|recording| recording.capture_active);
         let recording_finalizing = self.audio_recording.is_some() && !recording_active;
         let recording_template_available = self.audio_recording_template_available();
-        let input_engine_ready = self
-            .audio_engine
-            .as_ref()
-            .is_none_or(AudioEngine::input_active);
+        let input_engine_ready = self.audio_engine.as_ref().is_none_or(|engine| {
+            engine.input_active()
+                && engine.input_channel_pair() == self.audio_settings.input_channel_pair
+        });
         let can_start_audio_recording = recording_template_available
             && self.audio_recording.is_none()
             && self.audio_settings.enable_input
@@ -52349,7 +52394,7 @@ impl DawUi {
                 } else if !recording_template_available {
                     "Add an Audio Clip to the Playlist before recording"
                 } else {
-                    "Restart the audio engine to record"
+                    "Restart the audio engine to use the selected input channels"
                 };
                 ui.label(egui::RichText::new(reason).color(MUTED));
             }

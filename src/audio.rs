@@ -1513,6 +1513,42 @@ const COMMON_AUDIO_SAMPLE_RATES: &[u32] = &[
 const COMMON_AUDIO_BUFFER_FRAMES: &[u32] = &[32, 64, 128, 256, 512, 1_024, 2_048, 4_096, 8_192];
 
 impl AudioDeviceCatalog {
+    /// Number of stereo input pairs available at the selected sample rate.
+    /// Mono devices expose one selectable pair and duplicate their input to stereo.
+    pub fn input_channel_pair_count(&self, settings: &AudioSettings) -> u16 {
+        let default_id = if settings.access == AudioAccess::Exclusive {
+            self.default_exclusive_input_id.as_ref()
+        } else {
+            self.default_input_id.as_ref()
+        };
+        let device = settings
+            .input_device_id
+            .as_ref()
+            .or(default_id)
+            .and_then(|id| self.inputs.iter().find(|device| &device.id == id));
+        let Some(device) = device else {
+            return 1;
+        };
+        let supported_channels = device
+            .config_ranges
+            .iter()
+            .filter(|range| {
+                range.minimum_sample_rate <= settings.sample_rate
+                    && settings.sample_rate <= range.maximum_sample_rate
+            })
+            .map(|range| range.channels)
+            .max()
+            .or_else(|| {
+                device
+                    .config_ranges
+                    .iter()
+                    .map(|range| range.channels)
+                    .max()
+            })
+            .unwrap_or(1);
+        u16::try_from((supported_channels / 2).max(1)).unwrap_or(u16::MAX)
+    }
+
     /// Returns common sample rates supported by every selected endpoint.
     /// Shared-mode ranges contribute their endpoints; exclusive mode uses probed rates.
     pub fn supported_sample_rates(&self, settings: &AudioSettings) -> Vec<u32> {
@@ -1727,6 +1763,8 @@ pub struct AudioSettings {
     pub enable_input: bool,
     pub enable_output: bool,
     pub input_device_id: Option<String>,
+    /// Zero-based stereo pair index. Mono inputs duplicate channel zero.
+    pub input_channel_pair: u16,
     pub output_device_id: Option<String>,
     pub output_gain: f32,
     pub sample_rate: u32,
@@ -1740,6 +1778,7 @@ impl Default for AudioSettings {
             enable_input: true,
             enable_output: true,
             input_device_id: None,
+            input_channel_pair: 0,
             output_device_id: None,
             output_gain: 1.0,
             sample_rate: 48_000,
@@ -2951,9 +2990,9 @@ fn audio_device_config_ranges(
     ranges
 }
 
-/// An active pair of device streams. Input is captured into a lock-free mono
-/// ring buffer and exposed as a peak meter; output can play project audio, a
-/// test tone, or monitor that input.
+/// Active device streams. Input is captured from the selected channel pair into
+/// a lock-free stereo ring buffer and exposed as a peak meter; output can play
+/// project audio, a test tone, or monitor that input.
 pub struct AudioEngine {
     source: Arc<AtomicU8>,
     requested_source: AtomicU8,
@@ -2962,6 +3001,7 @@ pub struct AudioEngine {
     input_peak: Arc<AtomicU32>,
     input_callback_frames: Arc<AtomicU32>,
     input_recording: Arc<ArcSwapOption<InputRecordingState>>,
+    input_channel_pair: u16,
     error: Arc<AudioErrorState>,
     input_stream: Option<Stream>,
     output_stream: Option<Stream>,
@@ -3378,6 +3418,11 @@ impl AudioEngine {
         self.input_active
     }
 
+    /// Stereo input pair selected when this engine started.
+    pub fn input_channel_pair(&self) -> u16 {
+        self.input_channel_pair
+    }
+
     /// Start capturing stereo frames from the active input device into a bounded queue.
     ///
     /// The returned reader is intended for a worker thread. It must be drained regularly;
@@ -3504,6 +3549,7 @@ impl AudioEngine {
                     recording: Arc::clone(&input_recording),
                     error: Arc::clone(&error),
                     callback_frames: Arc::clone(&input_callback_frames),
+                    input_channel_pair: settings.input_channel_pair,
                 },
             )?;
             stream
@@ -3524,6 +3570,7 @@ impl AudioEngine {
             input_peak,
             input_callback_frames,
             input_recording,
+            input_channel_pair: settings.input_channel_pair,
             error,
             input_active: input_stream.is_some(),
             output_active: output_stream.is_some(),
@@ -3687,6 +3734,7 @@ impl AudioEngine {
             input_peak,
             input_callback_frames,
             input_recording,
+            input_channel_pair: settings.input_channel_pair,
             error,
             input_active,
             output_active,
@@ -4008,6 +4056,7 @@ struct InputStreamState {
     source: Arc<AtomicU8>,
     recording: Arc<ArcSwapOption<InputRecordingState>>,
     error: Arc<AudioErrorState>,
+    input_channel_pair: u16,
 }
 
 fn build_input_stream(
@@ -4081,7 +4130,10 @@ where
         source,
         recording: input_recording,
         error,
+        input_channel_pair,
     } = state;
+    let (left_channel, right_channel) =
+        selected_stereo_input_channels(config.channels, input_channel_pair)?;
     let stream = device
         .build_input_stream::<T, _, _>(
             config,
@@ -4100,17 +4152,20 @@ where
                     if frame.is_empty() {
                         continue;
                     }
-                    let mut stereo = [0.0_f32; 2];
-                    for (channel, sample) in frame.iter().enumerate() {
-                        let value = f32::from_sample(*sample).clamp(-1.0, 1.0);
-                        max_peak = max_peak.max(value.abs());
-                        if channel < stereo.len() {
-                            stereo[channel] = value;
-                        }
-                    }
-                    if frame.len() == 1 {
-                        stereo[1] = stereo[0];
-                    }
+                    let left = frame
+                        .get(left_channel)
+                        .copied()
+                        .map(f32::from_sample)
+                        .unwrap_or_default()
+                        .clamp(-1.0, 1.0);
+                    let right = frame
+                        .get(right_channel)
+                        .copied()
+                        .map(f32::from_sample)
+                        .unwrap_or(left)
+                        .clamp(-1.0, 1.0);
+                    max_peak = max_peak.max(left.abs()).max(right.abs());
+                    let stereo = [left, right];
                     if source.load(Ordering::Acquire) == AUDIO_SOURCE_INPUT_MONITOR {
                         ring.push_stereo_frame(stereo[0], stereo[1]);
                     }
@@ -4125,6 +4180,30 @@ where
         )
         .map_err(|error| format!("Could not build input stream: {error}"))?;
     Ok(stream)
+}
+
+fn selected_stereo_input_channels(
+    channel_count: u16,
+    input_channel_pair: u16,
+) -> Result<(usize, usize), String> {
+    let channel_count = usize::from(channel_count);
+    if channel_count == 1 && input_channel_pair == 0 {
+        return Ok((0, 0));
+    }
+    let left_channel = usize::from(input_channel_pair)
+        .checked_mul(2)
+        .ok_or_else(|| "Selected input channel pair is out of range".to_owned())?;
+    let right_channel = left_channel
+        .checked_add(1)
+        .ok_or_else(|| "Selected input channel pair is out of range".to_owned())?;
+    if right_channel >= channel_count {
+        return Err(format!(
+            "Selected input channel pair {} / {} is unavailable on a {channel_count}-channel device",
+            left_channel + 1,
+            right_channel + 1
+        ));
+    }
+    Ok((left_channel, right_channel))
 }
 
 fn next_output_frame(
@@ -4620,6 +4699,8 @@ fn wasapi_exclusive_input_worker(
             .map_err(|error| error.to_string())?;
         let format = select_exclusive_format(&mut client, &device, settings.sample_rate)?;
         let format_spec = WasapiSampleSpec::from_format(&format)?;
+        let (left_channel, right_channel) =
+            selected_stereo_input_channels(format_spec.channels, settings.input_channel_pair)?;
         let period = exclusive_period(&client, &format, settings.buffer_frames)?;
         client
             .initialize_client(
@@ -4663,14 +4744,14 @@ fn wasapi_exclusive_input_worker(
                             frame.chunks_exact(format_spec.sample_bytes).enumerate()
                         {
                             let sample = format_spec.decode(sample_bytes)?;
-                            max_peak = max_peak.max(sample.abs());
-                            if channel < stereo.len() {
-                                stereo[channel] = sample;
+                            if channel == left_channel {
+                                stereo[0] = sample;
+                            }
+                            if channel == right_channel {
+                                stereo[1] = sample;
                             }
                         }
-                        if format_spec.channels == 1 {
-                            stereo[1] = stereo[0];
-                        }
+                        max_peak = max_peak.max(stereo[0].abs()).max(stereo[1].abs());
                         if source.load(Ordering::Acquire) == AUDIO_SOURCE_INPUT_MONITOR {
                             ring.push_stereo_frame(stereo[0], stereo[1]);
                         }
