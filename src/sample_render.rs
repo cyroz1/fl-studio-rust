@@ -524,9 +524,9 @@ pub struct AudioClipRenderOptions {
     pub clip_envelopes: Arc<Vec<PlaylistAudioClipEnvelope>>,
 }
 
-/// Local per-instance Audio Clip gain, edge fades, duration fitting, and pitch. Values are kept
-/// separate from opaque FLP records until the native Clip Properties serialization has been
-/// verified.
+/// Local per-instance Audio Clip gain, edge fades, duration fitting, pitch, pan, and playback
+/// direction. Values are kept separate from opaque FLP records until native Clip Properties
+/// serialization has been verified.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PlaylistAudioClipEnvelope {
     pub arrangement_id: u16,
@@ -546,6 +546,8 @@ pub struct PlaylistAudioClipEnvelope {
     pub stretch_pitch_cents: i16,
     /// App-local absolute pan override in percent (-100 left through +100 right).
     pub pan_override: Option<i16>,
+    /// App-local playback direction override for this instance.
+    pub reverse_override: Option<bool>,
 }
 
 pub const PLAYLIST_AUDIO_CLIP_GAIN_MINUS_INFINITY: i16 = i16::MIN;
@@ -7864,6 +7866,7 @@ fn prepare_audio_clip_render(
                 stretch_to_clip_duration: false,
                 stretch_pitch_cents: 0,
                 pan_override: None,
+                reverse_override: None,
             });
         if !clip_envelope.gain_centidb_is_supported()
             || clip_envelope.fade_in_ms > 600_000
@@ -8026,7 +8029,7 @@ fn prepare_audio_clip_render(
             source_id,
             start_frame,
             source_bounds,
-            reverse: *reverse,
+            reverse: clip_envelope.reverse_override.unwrap_or(*reverse),
             pitch_ratio: effective_pitch_ratio,
             duration_frames,
             gain: *gain,
@@ -17192,6 +17195,7 @@ mod tests {
             stretch_to_clip_duration: false,
             stretch_pitch_cents: 0,
             pan_override: None,
+            reverse_override: None,
         };
 
         assert!(envelope.gain_centidb_is_supported());

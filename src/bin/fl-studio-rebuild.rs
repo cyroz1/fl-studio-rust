@@ -8123,6 +8123,7 @@ impl DawUi {
                 stretch_to_clip_duration: false,
                 stretch_pitch_cents: 0,
                 pan_override: None,
+                reverse_override: None,
             })
     }
 
@@ -8217,6 +8218,33 @@ impl DawUi {
                 self.status = format!("Could not save Audio Clip instance controls: {error}");
             }
         }
+    }
+
+    fn clear_playlist_audio_clip_reverse_overrides(
+        &mut self,
+        arrangement_id: u16,
+        clip_ids: &BTreeSet<u32>,
+    ) -> Result<(), String> {
+        let Some(project_path) = self.current_path.as_deref() else {
+            return Ok(());
+        };
+        let mut updated = self.playlist_audio_clip_envelopes.clone();
+        let mut changed = false;
+        for entry in &mut updated {
+            if entry.envelope.arrangement_id == arrangement_id
+                && clip_ids.contains(&entry.envelope.clip_id)
+                && project_paths_equal(Path::new(&entry.project_path), project_path)
+                && entry.envelope.reverse_override.is_some()
+            {
+                entry.envelope.reverse_override = None;
+                changed = true;
+            }
+        }
+        if changed {
+            save_playlist_audio_clip_envelopes(&updated)?;
+            self.playlist_audio_clip_envelopes = updated;
+        }
+        Ok(())
     }
 
     fn audio_clip_render_source_details(
@@ -19172,6 +19200,14 @@ impl DawUi {
         let waveform_tempo_map = self.playlist_tempo_map_for_arrangement(arrangement.id);
         let waveform_clip_envelopes =
             self.playlist_audio_clip_envelopes_for_current_project(arrangement.id);
+        let playlist_reverse_overrides = waveform_clip_envelopes
+            .iter()
+            .filter_map(|envelope| {
+                envelope
+                    .reverse_override
+                    .map(|reversed| (envelope.clip_id, reversed))
+            })
+            .collect::<BTreeMap<_, _>>();
         let has_project_pattern_clip_template = arrangements.iter().any(|candidate| {
             candidate
                 .clips
@@ -19250,14 +19286,13 @@ impl DawUi {
             let clip_edits = selected_clip_indices
                 .into_iter()
                 .filter_map(|clip_index| {
-                    let PlaylistClipTarget::Channel { id } =
-                        arrangement.clips.get(clip_index)?.target()
-                    else {
-                        return None;
-                    };
-                    channel_audio_clip_reverse
-                        .get(&id)
-                        .map(|reversed| (clip_index, !*reversed))
+                    let clip = arrangement.clips.get(clip_index)?;
+                    playlist_audio_clip_effective_reverse(
+                        clip,
+                        &channel_audio_clip_reverse,
+                        &playlist_reverse_overrides,
+                    )
+                    .map(|reversed| (clip_index, !reversed))
                 })
                 .collect::<Vec<_>>();
             if clip_edits.is_empty() {
@@ -21092,10 +21127,12 @@ impl DawUi {
                                         clip,
                                         &waveform,
                                         PlaylistWaveformSettings {
-                                            reverse: channel_audio_clip_reverse
-                                                .get(&id)
-                                                .copied()
-                                                .unwrap_or(false),
+                                            reverse: playlist_audio_clip_effective_reverse(
+                                                clip,
+                                                &channel_audio_clip_reverse,
+                                                &playlist_reverse_overrides,
+                                            )
+                                            .unwrap_or(false),
                                             mode: self.playlist_waveform_mode,
                                             ppq,
                                             base_tempo_bpm,
@@ -21526,14 +21563,12 @@ impl DawUi {
                                 .iter()
                                 .filter_map(|index| {
                                     let clip = arrangement.clips.get(*index)?;
-                                    let flp_rebuild::PlaylistClipTarget::Channel { id } =
-                                        clip.target()
-                                    else {
-                                        return None;
-                                    };
-                                    channel_audio_clip_reverse
-                                        .get(&id)
-                                        .map(|reversed| (*index, *reversed))
+                                    playlist_audio_clip_effective_reverse(
+                                        clip,
+                                        &channel_audio_clip_reverse,
+                                        &playlist_reverse_overrides,
+                                    )
+                                    .map(|reversed| (*index, reversed))
                                 })
                                 .collect::<Vec<_>>();
                             let can_group_clip_selection =
@@ -21785,6 +21820,18 @@ impl DawUi {
                                             let mut pan_override_percent = envelope
                                                 .pan_override
                                                 .unwrap_or(channel_pan_percent);
+                                            let channel_reverse = match clip.target() {
+                                                PlaylistClipTarget::Channel { id } => channel_audio_clip_reverse
+                                                    .get(&id)
+                                                    .copied()
+                                                    .unwrap_or(false),
+                                                PlaylistClipTarget::Pattern { .. } => false,
+                                            };
+                                            let mut reverse_override_enabled =
+                                                envelope.reverse_override.is_some();
+                                            let mut reverse_instance = envelope
+                                                .reverse_override
+                                                .unwrap_or(channel_reverse);
                                             let pan_override_enabled_changed = ui
                                                 .checkbox(
                                                     &mut pan_override_enabled,
@@ -21799,6 +21846,21 @@ impl DawUi {
                                                         -100..=100,
                                                     )
                                                     .text("Instance pan"),
+                                                )
+                                                .changed();
+                                            let reverse_override_enabled_changed = ui
+                                                .checkbox(
+                                                    &mut reverse_override_enabled,
+                                                    "Override channel Reverse",
+                                                )
+                                                .changed();
+                                            let reverse_instance_changed = ui
+                                                .add_enabled(
+                                                    reverse_override_enabled,
+                                                    egui::Checkbox::new(
+                                                        &mut reverse_instance,
+                                                        "Reverse this instance",
+                                                    ),
                                                 )
                                                 .changed();
                                             let (mut fade_in_manual, mut fade_out_manual) = self
@@ -21951,6 +22013,8 @@ impl DawUi {
                                                 || minus_infinity_changed
                                                 || pan_override_enabled_changed
                                                 || pan_override_value_changed
+                                                || reverse_override_enabled_changed
+                                                || reverse_instance_changed
                                                 || fade_in_changed
                                                 || fade_in_manual_changed
                                                 || fade_out_changed
@@ -21978,6 +22042,13 @@ impl DawUi {
                                                 {
                                                     envelope.pan_override = pan_override_enabled
                                                         .then_some(pan_override_percent);
+                                                }
+                                                if reverse_override_enabled_changed
+                                                    || reverse_instance_changed
+                                                {
+                                                    envelope.reverse_override =
+                                                        reverse_override_enabled
+                                                            .then_some(reverse_instance);
                                                 }
                                                 if fade_in_changed
                                                     || fade_in_curve_changed
@@ -22049,6 +22120,7 @@ impl DawUi {
                                                         stretch_to_clip_duration: false,
                                                         stretch_pitch_cents: 0,
                                                         pan_override: None,
+                                                        reverse_override: None,
                                                     },
                                                     false,
                                                     false,
@@ -22056,7 +22128,7 @@ impl DawUi {
                                                 ui.close();
                                             }
                                             ui.small(
-                                                "The optional pan override replaces channel pan for this instance. Fade curve shapes and tension use app-local approximations. Fit uses the mode saved on the Audio Clip channel and the instance's visible Playlist duration. These values stay on this machine and apply when playback starts.",
+                                                "Pan and Reverse overrides apply to this instance and stay on this machine. Fade curve shapes and tension use app-local approximations. Fit uses the mode saved on the Audio Clip channel and the instance's visible Playlist duration. These values apply when playback starts.",
                                             );
                                         });
                                     } else {
@@ -24315,29 +24387,44 @@ impl DawUi {
             });
             match result {
                 Some(Ok((updated, channel_ids))) => {
-                    self.document = Some(updated);
-                    self.stop_project_playback();
-                    self.selected_arrangement = Some(arrangement.id);
-                    self.selected_clip = clip_edits.first().map(|(index, _)| *index);
-                    self.selected_playlist_clips =
-                        clip_edits.iter().map(|(index, _)| *index).collect();
-                    self.dirty = true;
-                    ui.ctx().request_repaint();
-                    if clip_edits.len() == 1 {
-                        let (clip_index, reversed) = clip_edits[0];
-                        self.status = format!(
-                            "{} Reverse for Audio Clip {} on channel {}",
-                            if reversed { "Enabled" } else { "Disabled" },
-                            clip_index + 1,
-                            channel_ids[0]
-                        );
-                    } else {
-                        self.status = format!(
-                            "Updated Reverse for {} selected Audio Clips",
-                            clip_edits.len()
-                        );
+                    let clip_ids = clip_edits
+                        .iter()
+                        .filter_map(|(clip_index, _)| arrangement.clips.get(*clip_index)?.clip_id)
+                        .collect::<BTreeSet<_>>();
+                    match self
+                        .clear_playlist_audio_clip_reverse_overrides(arrangement.id, &clip_ids)
+                    {
+                        Ok(()) => {
+                            self.document = Some(updated);
+                            self.stop_project_playback();
+                            self.selected_arrangement = Some(arrangement.id);
+                            self.selected_clip = clip_edits.first().map(|(index, _)| *index);
+                            self.selected_playlist_clips =
+                                clip_edits.iter().map(|(index, _)| *index).collect();
+                            self.dirty = true;
+                            ui.ctx().request_repaint();
+                            if clip_edits.len() == 1 {
+                                let (clip_index, reversed) = clip_edits[0];
+                                self.status = format!(
+                                    "{} Reverse for Audio Clip {} on channel {}",
+                                    if reversed { "Enabled" } else { "Disabled" },
+                                    clip_index + 1,
+                                    channel_ids[0]
+                                );
+                            } else {
+                                self.status = format!(
+                                    "Updated Reverse for {} selected Audio Clips",
+                                    clip_edits.len()
+                                );
+                            }
+                            self.refresh_audio_waveform_paths();
+                        }
+                        Err(error) => {
+                            self.status = format!(
+                                "Could not clear Audio Clip instance Reverse overrides: {error}"
+                            );
+                        }
                     }
-                    self.refresh_audio_waveform_paths();
                 }
                 Some(Err(error)) => {
                     self.status = format!("Could not change Audio Clip Reverse: {error}");
@@ -58576,6 +58663,21 @@ fn pattern_vst3_parameter_automation_for_channel(
     lanes
 }
 
+fn playlist_audio_clip_effective_reverse(
+    clip: &PlaylistClip,
+    channel_reverse: &BTreeMap<u16, bool>,
+    instance_reverse: &BTreeMap<u32, bool>,
+) -> Option<bool> {
+    let PlaylistClipTarget::Channel { id } = clip.target() else {
+        return None;
+    };
+    let channel_reversed = channel_reverse.get(&id).copied().unwrap_or(false);
+    let instance_override = clip
+        .clip_id
+        .and_then(|clip_id| instance_reverse.get(&clip_id).copied());
+    Some(instance_override.unwrap_or(channel_reversed))
+}
+
 fn playlist_audio_clip_auto_crossfade_envelopes(
     arrangement: &Arrangement,
     audio_clip_channel_ids: &BTreeSet<u16>,
@@ -58629,6 +58731,7 @@ fn playlist_audio_clip_auto_crossfade_envelopes(
                 stretch_to_clip_duration: false,
                 stretch_pitch_cents: 0,
                 pan_override: None,
+                reverse_override: None,
             });
         candidates.push(Candidate {
             clip_id,
@@ -58790,6 +58893,7 @@ fn parse_playlist_audio_clip_envelopes(contents: &str) -> Vec<ProjectPlaylistAud
             fade_in_manual,
             fade_out_manual,
             pan_override,
+            reverse_override,
         ) = match remaining.as_slice() {
             [] => (
                 PlaylistAudioClipFadeCurve::Linear,
@@ -58800,6 +58904,7 @@ fn parse_playlist_audio_clip_envelopes(contents: &str) -> Vec<ProjectPlaylistAud
                 0,
                 fade_in_ms > 0,
                 fade_out_ms > 0,
+                None,
                 None,
             ),
             [fit, pitch] => {
@@ -58820,6 +58925,7 @@ fn parse_playlist_audio_clip_envelopes(contents: &str) -> Vec<ProjectPlaylistAud
                     stretch_pitch_cents,
                     fade_in_ms > 0,
                     fade_out_ms > 0,
+                    None,
                     None,
                 )
             }
@@ -58862,6 +58968,7 @@ fn parse_playlist_audio_clip_envelopes(contents: &str) -> Vec<ProjectPlaylistAud
                     fade_in_ms > 0,
                     fade_out_ms > 0,
                     None,
+                    None,
                 )
             }
             [
@@ -58873,8 +58980,8 @@ fn parse_playlist_audio_clip_envelopes(contents: &str) -> Vec<ProjectPlaylistAud
                 pitch,
                 in_manual,
                 out_manual,
-                pan_override_fields @ ..,
-            ] if pan_override_fields.len() <= 1 => {
+                instance_fields @ ..,
+            ] if instance_fields.len() <= 2 => {
                 let Some(fade_in_curve) = in_curve
                     .parse::<u8>()
                     .ok()
@@ -58913,10 +59020,9 @@ fn parse_playlist_audio_clip_envelopes(contents: &str) -> Vec<ProjectPlaylistAud
                     "1" => true,
                     _ => continue,
                 };
-                let pan_override = match pan_override_fields {
-                    [] => None,
-                    [value] if *value == "-" => None,
-                    [value] => {
+                let pan_override = match instance_fields.first().copied() {
+                    None | Some("-") => None,
+                    Some(value) => {
                         let Ok(value) = value.parse::<i16>() else {
                             continue;
                         };
@@ -58925,6 +59031,11 @@ fn parse_playlist_audio_clip_envelopes(contents: &str) -> Vec<ProjectPlaylistAud
                         }
                         Some(value)
                     }
+                };
+                let reverse_override = match instance_fields.get(1).copied() {
+                    None | Some("-") => None,
+                    Some("0") => Some(false),
+                    Some("1") => Some(true),
                     _ => continue,
                 };
                 (
@@ -58937,6 +59048,7 @@ fn parse_playlist_audio_clip_envelopes(contents: &str) -> Vec<ProjectPlaylistAud
                     fade_in_manual,
                     fade_out_manual,
                     pan_override,
+                    reverse_override,
                 )
             }
             _ => continue,
@@ -58958,6 +59070,7 @@ fn parse_playlist_audio_clip_envelopes(contents: &str) -> Vec<ProjectPlaylistAud
                     stretch_to_clip_duration,
                     stretch_pitch_cents,
                     pan_override,
+                    reverse_override,
                 },
                 fade_in_manual,
                 fade_out_manual,
@@ -58970,7 +59083,7 @@ fn parse_playlist_audio_clip_envelopes(contents: &str) -> Vec<ProjectPlaylistAud
 fn serialize_playlist_audio_clip_envelopes(
     envelopes: &[ProjectPlaylistAudioClipEnvelope],
 ) -> String {
-    let mut contents = String::from("version=5\n");
+    let mut contents = String::from("version=6\n");
     let mut normalized = Vec::new();
     for entry in envelopes {
         upsert_playlist_audio_clip_envelope(&mut normalized, entry.clone());
@@ -59011,6 +59124,12 @@ fn serialize_playlist_audio_clip_envelopes(
         contents.push('\t');
         match entry.envelope.pan_override {
             Some(pan) => contents.push_str(&pan.to_string()),
+            None => contents.push('-'),
+        }
+        contents.push('\t');
+        match entry.envelope.reverse_override {
+            Some(false) => contents.push('0'),
+            Some(true) => contents.push('1'),
             None => contents.push('-'),
         }
         contents.push('\n');
@@ -67010,6 +67129,7 @@ mod tests {
                 stretch_to_clip_duration: true,
                 stretch_pitch_cents: 350,
                 pan_override: None,
+                reverse_override: None,
             },
             fade_in_manual: true,
             fade_out_manual: true,
@@ -67082,6 +67202,7 @@ mod tests {
                     stretch_to_clip_duration: false,
                     stretch_pitch_cents: 0,
                     pan_override: None,
+                    reverse_override: None,
                 },
                 fade_in_manual: true,
                 fade_out_manual: true,
@@ -67107,6 +67228,7 @@ mod tests {
                     stretch_to_clip_duration: true,
                     stretch_pitch_cents: 75,
                     pan_override: None,
+                    reverse_override: None,
                 },
                 fade_in_manual: true,
                 fade_out_manual: true,
@@ -67135,6 +67257,7 @@ mod tests {
                 stretch_to_clip_duration: false,
                 stretch_pitch_cents: 0,
                 pan_override: None,
+                reverse_override: None,
             },
             fade_in_manual: false,
             fade_out_manual: false,
