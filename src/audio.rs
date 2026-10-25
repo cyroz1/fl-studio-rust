@@ -2126,7 +2126,7 @@ impl InputLatencyEstimate {
             .store(filtered, Ordering::Relaxed);
         let _ = self
             .sample_count
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
                 Some(count.saturating_add(1))
             });
     }
@@ -5106,15 +5106,15 @@ fn wasapi_exclusive_input_worker(
                     let (frames, buffer_info) = capture
                         .read_from_device(&mut bytes)
                         .map_err(|error| error.to_string())?;
-                    if frames > 0 && !buffer_info.flags.timestamp_error {
-                        if let Some(latency_100ns) = capture_event_time
+                    if frames > 0
+                        && !buffer_info.flags.timestamp_error
+                        && let Some(latency_100ns) = capture_event_time
                             .filter(|capture_time| *capture_time >= buffer_info.timestamp)
                             .map(|capture_time| capture_time - buffer_info.timestamp)
-                        {
-                            input_latency_estimate.observe(Some(Duration::from_nanos(
-                                latency_100ns.saturating_mul(100),
-                            )));
-                        }
+                    {
+                        input_latency_estimate.observe(Some(Duration::from_nanos(
+                            latency_100ns.saturating_mul(100),
+                        )));
                     }
                     input_callback_frames.store(frames, Ordering::Release);
                     let active_bytes = (frames as usize).saturating_mul(format_spec.frame_bytes);
