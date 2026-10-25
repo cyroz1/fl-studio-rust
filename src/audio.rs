@@ -1608,6 +1608,10 @@ fn period_frames(period_hns: u64, sample_rate: u32, round_up: bool) -> Option<u3
     u32::try_from(frames.max(1)).ok()
 }
 
+fn nonzero_callback_frames(frames: u32) -> Option<u32> {
+    (frames > 0).then_some(frames)
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct AudioSettings {
     pub enable_input: bool,
@@ -1652,6 +1656,7 @@ struct PlaybackState {
     browser_preview_gain: AtomicU32,
     output_gain: AtomicU32,
     output_peak: AtomicU32,
+    output_callback_frames: AtomicU32,
 }
 
 struct AudioCommandQueue {
@@ -2053,6 +2058,7 @@ impl PlaybackState {
             browser_preview_gain: AtomicU32::new(1.0_f32.to_bits()),
             output_gain: AtomicU32::new(1.0_f32.to_bits()),
             output_peak: AtomicU32::new(0.0_f32.to_bits()),
+            output_callback_frames: AtomicU32::new(0),
         }
     }
 
@@ -2844,6 +2850,7 @@ pub struct AudioEngine {
     playback: Arc<PlaybackState>,
     sample_rate: u32,
     input_peak: Arc<AtomicU32>,
+    input_callback_frames: Arc<AtomicU32>,
     input_recording: Arc<ArcSwapOption<InputRecordingState>>,
     error: Arc<AudioErrorState>,
     input_stream: Option<Stream>,
@@ -3247,6 +3254,16 @@ impl AudioEngine {
         f32::from_bits(self.playback.output_peak.load(Ordering::Acquire)).clamp(0.0, 1.0)
     }
 
+    /// Frame count from the most recent output-device callback, if one has arrived.
+    pub fn last_output_callback_frames(&self) -> Option<u32> {
+        nonzero_callback_frames(self.playback.output_callback_frames.load(Ordering::Acquire))
+    }
+
+    /// Frame count from the most recent input-device callback, if one has arrived.
+    pub fn last_input_callback_frames(&self) -> Option<u32> {
+        nonzero_callback_frames(self.input_callback_frames.load(Ordering::Acquire))
+    }
+
     pub fn input_active(&self) -> bool {
         self.input_active
     }
@@ -3334,6 +3351,7 @@ impl AudioEngine {
             .output_gain
             .store(settings.output_gain.to_bits(), Ordering::Release);
         let input_peak = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
+        let input_callback_frames = Arc::new(AtomicU32::new(0));
         let input_recording = Arc::new(ArcSwapOption::empty());
         let error = Arc::new(AudioErrorState::default());
 
@@ -3375,6 +3393,7 @@ impl AudioEngine {
                     source: Arc::clone(&source),
                     recording: Arc::clone(&input_recording),
                     error: Arc::clone(&error),
+                    callback_frames: Arc::clone(&input_callback_frames),
                 },
             )?;
             stream
@@ -3393,6 +3412,7 @@ impl AudioEngine {
             playback,
             sample_rate: settings.sample_rate,
             input_peak,
+            input_callback_frames,
             input_recording,
             error,
             input_active: input_stream.is_some(),
@@ -3418,6 +3438,7 @@ impl AudioEngine {
             .output_gain
             .store(settings.output_gain.to_bits(), Ordering::Release);
         let input_peak = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
+        let input_callback_frames = Arc::new(AtomicU32::new(0));
         let input_recording = Arc::new(ArcSwapOption::empty());
         let error = Arc::new(AudioErrorState::default());
         let stop = Arc::new(AtomicBool::new(false));
@@ -3448,6 +3469,7 @@ impl AudioEngine {
                             playback: worker_playback,
                             ring: worker_ring,
                             input_peak: worker_peak,
+                            input_callback_frames: Arc::clone(&input_callback_frames),
                             input_recording: worker_recording,
                             error: worker_error,
                             stop: worker_stop,
@@ -3492,6 +3514,7 @@ impl AudioEngine {
                             playback: worker_playback,
                             ring: worker_ring,
                             input_peak: worker_peak,
+                            input_callback_frames: Arc::clone(&input_callback_frames),
                             input_recording: worker_recording,
                             error: worker_error,
                             stop: worker_stop,
@@ -3550,6 +3573,7 @@ impl AudioEngine {
             playback,
             sample_rate: settings.sample_rate,
             input_peak,
+            input_callback_frames,
             input_recording,
             error,
             input_active,
@@ -3852,6 +3876,10 @@ where
                 playback_for_callback
                     .output_peak
                     .store(output_peak.to_bits(), Ordering::Release);
+                playback_for_callback.output_callback_frames.store(
+                    u32::try_from(output.len() / channels).unwrap_or(u32::MAX),
+                    Ordering::Release,
+                );
             },
             move |stream_error| set_error(&error, stream_error.to_string()),
             Some(Duration::from_secs(5)),
@@ -3864,6 +3892,7 @@ where
 struct InputStreamState {
     ring: Arc<AudioRingBuffer>,
     peak: Arc<AtomicU32>,
+    callback_frames: Arc<AtomicU32>,
     source: Arc<AtomicU8>,
     recording: Arc<ArcSwapOption<InputRecordingState>>,
     error: Arc<AudioErrorState>,
@@ -3936,6 +3965,7 @@ where
     let InputStreamState {
         ring,
         peak,
+        callback_frames,
         source,
         recording: input_recording,
         error,
@@ -3946,6 +3976,10 @@ where
             move |input, _| {
                 enable_denormal_protection();
                 let mut max_peak = 0.0_f32;
+                callback_frames.store(
+                    u32::try_from(input.len() / channels).unwrap_or(u32::MAX),
+                    Ordering::Release,
+                );
                 let recording = input_recording.load();
                 let recording_callback = recording
                     .as_deref()
@@ -4312,6 +4346,7 @@ struct WasapiWorkerState {
     playback: Arc<PlaybackState>,
     ring: Arc<AudioRingBuffer>,
     input_peak: Arc<AtomicU32>,
+    input_callback_frames: Arc<AtomicU32>,
     input_recording: Arc<ArcSwapOption<InputRecordingState>>,
     error: Arc<AudioErrorState>,
     stop: Arc<std::sync::atomic::AtomicBool>,
@@ -4445,6 +4480,7 @@ fn wasapi_exclusive_input_worker(
     let WasapiWorkerState {
         ring,
         input_peak: peak,
+        input_callback_frames,
         input_recording,
         source,
         error,
@@ -4502,6 +4538,7 @@ fn wasapi_exclusive_input_worker(
                     let (frames, _) = capture
                         .read_from_device(&mut bytes)
                         .map_err(|error| error.to_string())?;
+                    input_callback_frames.store(frames, Ordering::Release);
                     let active_bytes = (frames as usize).saturating_mul(format_spec.frame_bytes);
                     let mut max_peak = 0.0_f32;
                     let recording = input_recording.load();
@@ -4739,6 +4776,9 @@ fn render_wasapi_buffer(
     render_state: &mut WasapiRenderState,
     output: &mut Vec<u8>,
 ) -> Result<(), String> {
+    playback
+        .output_callback_frames
+        .store(u32::try_from(frames).unwrap_or(u32::MAX), Ordering::Release);
     playback.apply_pending_commands(source);
     playback.apply_pending_streaming_handoff();
     output.resize(frames.saturating_mul(format.frame_bytes), 0);

@@ -51016,6 +51016,22 @@ impl DawUi {
                     ui.label(format!("Stream underruns: {underrun_frames} frames"));
                 }
             });
+            ui.horizontal(|ui| {
+                if engine.input_active() {
+                    let input_callback = engine.last_input_callback_frames().map_or_else(
+                        || "waiting for input callback".to_owned(),
+                        |frames| format!("input callback: {frames} frames"),
+                    );
+                    ui.label(input_callback);
+                }
+                if engine.output_active() {
+                    let output_callback = engine.last_output_callback_frames().map_or_else(
+                        || "waiting for output callback".to_owned(),
+                        |frames| format!("output callback: {frames} frames"),
+                    );
+                    ui.label(output_callback);
+                }
+            });
             if stream_error_count > 0 {
                 ui.collapsing("Recent device errors", |ui| {
                     for message in engine.stream_error_history().iter().rev().take(6) {
