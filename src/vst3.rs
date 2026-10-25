@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crate::audio::{
-    LiveMixerSourceControl, LiveMixerSourceTargets, MixerTrackPeakMeters, StereoFrameDelay,
-    StreamingAudioWriter,
+    LiveMixerSourceControl, LiveMixerSourceFrameControls, LiveMixerSourceTargets,
+    MixerTrackPeakMeters, StereoFrameDelay, StreamingAudioWriter,
 };
 use crate::media::DecodedAudio;
 use crate::sample_render::{
@@ -580,12 +580,98 @@ struct PlaylistMixerEffectStream {
 struct PlaylistMixerEffectChain {
     insert_ordinal: usize,
     route_plan: crate::MixerSourceRoutePlan,
+    live_source: Option<PlaylistMixerEffectLiveSource>,
     first_effect_index: usize,
     end_effect_index: usize,
     latency_frames: u64,
     output_alignment_delay: StereoFrameDelay,
     dry_reference_delay: StereoFrameDelay,
     downstream_delays: Vec<PlaylistMixerEffectBranchDelay>,
+}
+
+struct PlaylistMixerEffectLiveSource {
+    control: LiveMixerSourceControl,
+    targets: Option<LiveMixerSourceTargets>,
+}
+
+impl PlaylistMixerEffectLiveSource {
+    fn next_frame_controls(&self) -> Option<LiveMixerSourceFrameControls> {
+        self.targets
+            .as_ref()
+            .map(|targets| self.control.next_frame_controls(targets))
+    }
+
+    fn insert_meter_transform(
+        &self,
+        track: usize,
+        fallback: MixerSourceRouteTransform,
+    ) -> MixerSourceRouteTransform {
+        self.control
+            .insert_meter_transforms()
+            .iter()
+            .find(|(meter_track, _)| *meter_track == track)
+            .map_or(fallback, |(_, transform)| *transform)
+    }
+
+    fn insert_effect_input_transform(
+        &self,
+        track: usize,
+        fallback: MixerSourceRouteTransform,
+    ) -> MixerSourceRouteTransform {
+        self.control
+            .insert_effect_input_transforms()
+            .iter()
+            .find(|(input_track, _)| *input_track == track)
+            .map_or(fallback, |(_, transform)| *transform)
+    }
+
+    fn apply_meter_frame(
+        &self,
+        controls: LiveMixerSourceFrameControls,
+        track: usize,
+        fallback: MixerSourceRouteTransform,
+        frame: &mut [f32; 2],
+    ) {
+        let route_transform = self.insert_meter_transform(track, fallback);
+        self.control
+            .apply_meter_frame(controls, track, route_transform, frame);
+    }
+
+    fn apply_effect_input_frame(
+        &self,
+        controls: LiveMixerSourceFrameControls,
+        track: usize,
+        fallback: MixerSourceRouteTransform,
+        frame: &mut [f32; 2],
+    ) {
+        let route_transform = self.insert_effect_input_transform(track, fallback);
+        self.control
+            .apply_effect_input_frame(controls, track, route_transform, frame);
+    }
+}
+
+impl PlaylistMixerEffectChain {
+    fn next_live_frame_controls(&self) -> Option<LiveMixerSourceFrameControls> {
+        self.live_source
+            .as_ref()
+            .and_then(PlaylistMixerEffectLiveSource::next_frame_controls)
+    }
+}
+
+fn route_playlist_mixer_effect_output_delta(
+    output_delay: &mut StereoFrameDelay,
+    route_plan: &crate::MixerSourceRoutePlan,
+    live_source: Option<&PlaylistMixerEffectLiveSource>,
+    mut frame: [f32; 2],
+    live_controls: Option<LiveMixerSourceFrameControls>,
+) -> [f32; 2] {
+    output_delay.process_frame(&mut frame);
+    if let (Some(source), Some(controls)) = (live_source, live_controls) {
+        source.control.apply_output_frame(controls, &mut frame);
+    } else {
+        route_plan.output_transform.apply_frame(&mut frame);
+    }
+    frame
 }
 
 struct PlaylistMixerEffectBranchDelay {
@@ -637,6 +723,11 @@ impl Vst3PlaylistStreamProcessor {
     pub(crate) fn set_live_mixer_source_targets(&mut self, meters: &MixerTrackPeakMeters) {
         for stream in &mut self.streams {
             if let Some(source) = stream.live_mixer_source.as_mut() {
+                source.targets = source.control.targets(meters);
+            }
+        }
+        for chain in &mut self.mixer_effect_chains {
+            if let Some(source) = chain.live_source.as_mut() {
                 source.targets = source.control.targets(meters);
             }
         }
@@ -1414,14 +1505,15 @@ impl Vst3PlaylistStreamProcessor {
                 .enumerate()
             {
                 let raw_delta = [processed[0] - dry[0], processed[1] - dry[1]];
-                let mut output_delta = raw_delta;
-                chain
-                    .output_alignment_delay
-                    .process_frame(&mut output_delta);
-                chain
-                    .route_plan
-                    .output_transform
-                    .apply_frame(&mut output_delta);
+                let live_controls = chain.next_live_frame_controls();
+                let output_delta = route_playlist_mixer_effect_output_delta(
+                    &mut chain.output_alignment_delay,
+                    &chain.route_plan,
+                    chain.live_source.as_ref(),
+                    raw_delta,
+                    live_controls,
+                );
+                let live_source = chain.live_source.as_ref();
                 output[frame_index * 2] += finite_sample(output_delta[0]);
                 output[frame_index * 2 + 1] += finite_sample(output_delta[1]);
 
@@ -1439,7 +1531,16 @@ impl Vst3PlaylistStreamProcessor {
                         return Err("Mixer meter buffer is too small for the VST3 route".to_owned());
                     }
                     let mut meter_delta = raw_delta;
-                    branch.meter_transform.apply_frame(&mut meter_delta);
+                    if let (Some(source), Some(controls)) = (live_source, live_controls) {
+                        source.apply_meter_frame(
+                            controls,
+                            branch.track,
+                            branch.meter_transform,
+                            &mut meter_delta,
+                        );
+                    } else {
+                        branch.meter_transform.apply_frame(&mut meter_delta);
+                    }
                     branch.meter_delay.process_frame(&mut meter_delta);
                     meter_buses[meter_offset] += finite_sample(meter_delta[0]);
                     meter_buses[meter_offset + 1] += finite_sample(meter_delta[1]);
@@ -1459,9 +1560,18 @@ impl Vst3PlaylistStreamProcessor {
                         );
                     }
                     let mut effect_input_delta = raw_delta;
-                    branch
-                        .effect_input_transform
-                        .apply_frame(&mut effect_input_delta);
+                    if let (Some(source), Some(controls)) = (live_source, live_controls) {
+                        source.apply_effect_input_frame(
+                            controls,
+                            branch.track,
+                            branch.effect_input_transform,
+                            &mut effect_input_delta,
+                        );
+                    } else {
+                        branch
+                            .effect_input_transform
+                            .apply_frame(&mut effect_input_delta);
+                    }
                     branch
                         .effect_input_delay
                         .process_frame(&mut effect_input_delta);
@@ -4555,6 +4665,19 @@ impl Vst3HostRuntime {
                 })?;
                 routing.source_route_plan_for_channel(Some(track))
             };
+            let live_source = if insert_ordinal == 0 {
+                None
+            } else {
+                let track = i8::try_from(insert_ordinal).map_err(|_| {
+                    format!("Mixer insert ordinal {insert_ordinal} exceeds the supported range")
+                })?;
+                routing
+                    .live_source_route_plan_for_channel(Some(track))
+                    .map(|route_plan| PlaylistMixerEffectLiveSource {
+                        control: LiveMixerSourceControl::new(route_plan, output_sample_rate),
+                        targets: None,
+                    })
+            };
             let latency_frames = processor.mixer_effects[first_effect_index..end_effect_index]
                 .iter()
                 .try_fold(0_u64, |total, effect| {
@@ -4567,6 +4690,7 @@ impl Vst3HostRuntime {
                 .push(PlaylistMixerEffectChain {
                     insert_ordinal,
                     route_plan,
+                    live_source,
                     first_effect_index,
                     end_effect_index,
                     latency_frames,
@@ -7554,6 +7678,145 @@ mod tests {
             };
             assert!((meter_frame[0] - route_gain).abs() < f32::EPSILON);
             assert!((meter_frame[1] + route_gain * 0.5).abs() < f32::EPSILON);
+        }
+    }
+
+    #[test]
+    fn playlist_mixer_effect_return_uses_live_send_bus_fader_and_pan() {
+        let meters = MixerTrackPeakMeters::default();
+        meters.set_live_mixer_insert_fader_raw(1, Some(10_000));
+        meters.set_live_mixer_insert_pan_raw(1, Some(0));
+        meters.set_live_mixer_send_level_raw(1, 0, Some(12_800));
+        meters.set_live_mixer_send_enabled(1, 0, Some(true));
+
+        let live_control = LiveMixerSourceControl::new(
+            MixerLiveSourceRoutePlan {
+                track: 1,
+                source_transform: MixerSourceRouteTransform::default(),
+                saved_fader_gain: 1.0,
+                saved_pan_raw: Some(0),
+                saved_stereo_separation_raw: None,
+                saved_signal_flags: None,
+                saved_enabled: None,
+                pan_law_raw: Some(2),
+                output_transform: MixerSourceRouteTransform::default(),
+                insert_meter_transforms: vec![(1, MixerSourceRouteTransform::default())],
+                live_send_target_keys: vec![crate::MixerLiveSendTargetKey {
+                    source_track: 1,
+                    destination_track: 0,
+                }],
+                saved_live_send_gains: vec![1.0],
+                saved_live_send_enabled: vec![true],
+                live_send_output_solo_tracks: vec![vec![1]],
+                saved_live_send_output_solo_gains: vec![1.0],
+                live_send_meter_solo_tracks: vec![vec![1]],
+                saved_live_send_meter_solo_gains: vec![1.0],
+                live_send_output_paths: Some(vec![crate::MixerLiveSendOutputPath {
+                    transform: MixerSourceRouteTransform::default().scaled(0.5),
+                    send_gains: vec![crate::MixerLiveSendGain {
+                        target_index: Some(0),
+                        saved_gain: 1.0,
+                        enabled_target_index: Some(0),
+                        saved_enabled: true,
+                    }],
+                    insert_enabled_gains: Vec::new(),
+                }]),
+                live_send_meter_paths: vec![crate::MixerLiveSendMeterPath {
+                    track: 1,
+                    transform: MixerSourceRouteTransform::default(),
+                    send_gains: Vec::new(),
+                    insert_enabled_gains: Vec::new(),
+                }],
+                ..MixerLiveSourceRoutePlan::default()
+            },
+            48_000,
+        );
+        let targets = live_control
+            .targets(&meters)
+            .expect("the effect return should resolve its live Mixer controls");
+        let mut chain = PlaylistMixerEffectChain {
+            insert_ordinal: 1,
+            route_plan: crate::MixerSourceRoutePlan {
+                output_transform: MixerSourceRouteTransform::default().scaled(0.5),
+                ..crate::MixerSourceRoutePlan::default()
+            },
+            live_source: Some(PlaylistMixerEffectLiveSource {
+                control: live_control,
+                targets: Some(targets),
+            }),
+            first_effect_index: 0,
+            end_effect_index: 0,
+            latency_frames: 0,
+            output_alignment_delay: StereoFrameDelay::default(),
+            dry_reference_delay: StereoFrameDelay::default(),
+            downstream_delays: Vec::new(),
+        };
+
+        let aggregate_effect_delta = [3.5, -0.75];
+        let initial_controls = chain
+            .next_live_frame_controls()
+            .expect("live controls should be attached");
+        let initial_output = route_playlist_mixer_effect_output_delta(
+            &mut chain.output_alignment_delay,
+            &chain.route_plan,
+            chain.live_source.as_ref(),
+            aggregate_effect_delta,
+            Some(initial_controls),
+        );
+        let mut expected_initial = aggregate_effect_delta;
+        crate::apply_mixer_pan_raw_f32(&mut expected_initial, 0.0, Some(2));
+        MixerSourceRouteTransform::default()
+            .scaled(0.5)
+            .apply_frame(&mut expected_initial);
+        for (actual, expected) in initial_output.into_iter().zip(expected_initial) {
+            assert!((actual - expected).abs() < 0.0001);
+        }
+
+        meters.set_live_mixer_insert_fader_raw(1, Some(5_000));
+        meters.set_live_mixer_insert_pan_raw(1, Some(6_400));
+        let mut output = initial_output;
+        let mut meter = initial_output;
+        for _ in 0..100_000 {
+            let controls = chain
+                .next_live_frame_controls()
+                .expect("live controls should remain attached");
+            output = route_playlist_mixer_effect_output_delta(
+                &mut chain.output_alignment_delay,
+                &chain.route_plan,
+                chain.live_source.as_ref(),
+                aggregate_effect_delta,
+                Some(controls),
+            );
+            meter = aggregate_effect_delta;
+            chain
+                .live_source
+                .as_ref()
+                .expect("effect return live source")
+                .apply_meter_frame(
+                    controls,
+                    1,
+                    MixerSourceRouteTransform::default(),
+                    &mut meter,
+                );
+        }
+
+        let mut expected_output = aggregate_effect_delta;
+        crate::apply_mixer_pan_raw_f32(&mut expected_output, 6_400.0, Some(2));
+        expected_output[0] *= 0.5;
+        expected_output[1] *= 0.5;
+        MixerSourceRouteTransform::default()
+            .scaled(0.5)
+            .apply_frame(&mut expected_output);
+        for (actual, expected) in output.into_iter().zip(expected_output) {
+            assert!((actual - expected).abs() < 0.0001);
+        }
+
+        let mut expected_meter = aggregate_effect_delta;
+        crate::apply_mixer_pan_raw_f32(&mut expected_meter, 6_400.0, Some(2));
+        expected_meter[0] *= 0.5;
+        expected_meter[1] *= 0.5;
+        for (actual, expected) in meter.into_iter().zip(expected_meter) {
+            assert!((actual - expected).abs() < 0.0001);
         }
     }
 
