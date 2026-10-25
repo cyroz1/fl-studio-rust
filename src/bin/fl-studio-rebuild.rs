@@ -9954,6 +9954,7 @@ impl DawUi {
                             .selected_text(match self.playlist_render_tail_mode {
                                 PlaylistTailMode::LeaveRemainder => "Leave remainder",
                                 PlaylistTailMode::FixedDuration => "Fixed duration",
+                                PlaylistTailMode::WrapRemainder => "Wrap remainder",
                             })
                             .show_ui(ui, |ui| {
                                 ui.selectable_value(
@@ -9966,14 +9967,20 @@ impl DawUi {
                                     PlaylistTailMode::FixedDuration,
                                     "Fixed duration",
                                 );
+                                ui.selectable_value(
+                                    &mut self.playlist_render_tail_mode,
+                                    PlaylistTailMode::WrapRemainder,
+                                    "Wrap remainder",
+                                );
                             });
                     });
                 });
                 ui.horizontal(|ui| {
-                    ui.label(if self.playlist_render_tail_mode == PlaylistTailMode::LeaveRemainder {
-                        "Minimum tail"
-                    } else {
-                        "Tail length"
+                    ui.label(match self.playlist_render_tail_mode {
+                        PlaylistTailMode::LeaveRemainder | PlaylistTailMode::WrapRemainder => {
+                            "Minimum tail"
+                        }
+                        PlaylistTailMode::FixedDuration => "Tail length",
                     });
                     egui::ComboBox::from_id_salt("playlist-render-tail-length")
                         .selected_text(format!("{} seconds", self.playlist_render_tail_seconds))
@@ -9991,6 +9998,8 @@ impl DawUi {
                     ui.label("Mixer stem renders use the fixed tail length.");
                 } else if self.playlist_render_tail_mode == PlaylistTailMode::LeaveRemainder {
                     ui.label("Continues the render until the mix stays quiet for two seconds, up to 60 seconds after the minimum tail.");
+                } else if self.playlist_render_tail_mode == PlaylistTailMode::WrapRemainder {
+                    ui.label("Mixes decaying audio after the render endpoint onto the start without extending its length.");
                 } else {
                     ui.label("Stops after the selected time beyond the last scheduled clip.");
                 }

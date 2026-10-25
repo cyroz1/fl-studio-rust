@@ -3,7 +3,7 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -1044,6 +1044,8 @@ pub enum PlaylistTailMode {
     LeaveRemainder,
     /// Render only the selected fixed duration after the content endpoint.
     FixedDuration,
+    /// Mix the rendered tail after the content endpoint onto the beginning of the output.
+    WrapRemainder,
 }
 
 /// Output format and timeline range for a Playlist render that begins after song start.
@@ -2773,19 +2775,24 @@ fn render_playlist_with_vst3_cancellable(
     let minimum_tail_end_frame =
         add_render_tail_frames(content_frames, options.sample_rate, options.tail_seconds)?;
     let mut frames = match options.tail_mode {
-        PlaylistTailMode::LeaveRemainder => add_render_tail_frames(
-            minimum_tail_end_frame,
-            options.sample_rate,
-            PLAYLIST_REMAINDER_MAX_SECONDS,
-        )?,
+        PlaylistTailMode::LeaveRemainder | PlaylistTailMode::WrapRemainder => {
+            add_render_tail_frames(
+                minimum_tail_end_frame,
+                options.sample_rate,
+                PLAYLIST_REMAINDER_MAX_SECONDS,
+            )?
+        }
         PlaylistTailMode::FixedDuration => minimum_tail_end_frame,
     };
-    let remainder_stop =
-        (options.tail_mode == PlaylistTailMode::LeaveRemainder).then(|| PlaylistRemainderStop {
-            start_frame: minimum_tail_end_frame.max(output_start_frame),
-            silence_frames: u64::from(options.sample_rate)
-                .saturating_mul(PLAYLIST_REMAINDER_SILENCE_SECONDS),
-        });
+    let remainder_stop = matches!(
+        options.tail_mode,
+        PlaylistTailMode::LeaveRemainder | PlaylistTailMode::WrapRemainder
+    )
+    .then(|| PlaylistRemainderStop {
+        start_frame: minimum_tail_end_frame.max(output_start_frame),
+        silence_frames: u64::from(options.sample_rate)
+            .saturating_mul(PLAYLIST_REMAINDER_SILENCE_SECONDS),
+    });
     if output_start_frame >= frames {
         return Err("render output start is after the end of the Playlist content".to_owned());
     }
@@ -2808,7 +2815,16 @@ fn render_playlist_with_vst3_cancellable(
     if render_skip_frames >= frames {
         return Err("PDC trim removes the entire Playlist render".to_owned());
     }
-    let output_frames = frames - render_skip_frames;
+    let output_frames = if options.tail_mode == PlaylistTailMode::WrapRemainder {
+        content_frames
+            .checked_sub(render_skip_frames)
+            .filter(|frames| *frames > 0)
+            .ok_or_else(|| {
+                "render output start is after the end of the Playlist content".to_owned()
+            })?
+    } else {
+        frames - render_skip_frames
+    };
     if matches!(output, PlaylistRenderOutput::Flac { .. }) && output_frames > FLAC_MAX_SAMPLE_FRAMES
     {
         return Err("rendered FLAC exceeds the 36-bit sample-count limit".to_owned());
@@ -2843,15 +2859,75 @@ fn render_playlist_with_vst3_cancellable(
     };
 
     let mixer_track_meters = MixerTrackPeakMeters::default();
-    let mut frames_to_skip = render_skip_frames;
-    let rendered_output_frames;
-    let wav_sample_format = options.wav_sample_format;
-    let wav_channel_mode = options.wav_channel_mode;
     let mut temporary = TemporaryRenderFile::create(output_path)?;
     let file = temporary
         .file
         .as_mut()
         .expect("temporary render file is open");
+    if options.tail_mode == PlaylistTailMode::WrapRemainder {
+        let mut wrap_frames_to_skip = render_skip_frames;
+        let mut float_spool = tempfile::tempfile()
+            .map_err(|error| format!("could not create temporary render spool: {error}"))?;
+        let render_result = stream_prepared_playlist_render(
+            PreparedPlaylistBlockMix {
+                audio: &audio,
+                sampler: &sampler,
+                options: options.clone(),
+                frames,
+                master_output,
+                vst3_processor: vst3_processor.as_mut(),
+                remainder_stop,
+            },
+            Some(&mixer_track_meters),
+            cancelled,
+            || false,
+            |block, _mixer_buses| {
+                let block = skip_render_block_prefix(block, &mut wrap_frames_to_skip);
+                write_float_spool_block(&mut float_spool, block)
+            },
+        )?;
+        summary.voices_stolen = render_result.voices_stolen;
+        let spool_frames = render_result
+            .frames_rendered
+            .checked_sub(render_skip_frames)
+            .ok_or_else(|| {
+                "render output start is after the rendered Playlist content".to_owned()
+            })?;
+        if spool_frames < output_frames {
+            return Err("wrapped render ended before the Playlist content endpoint".to_owned());
+        }
+        wrap_float_spool_remainder(&mut float_spool, output_frames, spool_frames)?;
+        encode_float_spool(
+            file,
+            &mut float_spool,
+            output_frames,
+            options.sample_rate,
+            AudioRenderEncodingOptions {
+                wav_sample_format: options.wav_sample_format,
+                wav_dither_mode: options.wav_dither_mode,
+                wav_channel_mode: options.wav_channel_mode,
+            },
+            playlist_audio_render_output(output),
+        )?;
+        summary.frames = output_frames;
+        if matches!(output, PlaylistRenderOutput::Wav) {
+            write_wav_cue_points(file, &wav_cue_points)?;
+            patch_wav_data_length(
+                file,
+                output_frames,
+                options.wav_sample_format,
+                options.wav_channel_mode,
+            )?;
+        }
+        summary.mixer_insert_peaks = Some(take_mixer_insert_peaks(&mixer_track_meters));
+        temporary.commit(output_path)?;
+        return Ok(summary);
+    }
+
+    let mut frames_to_skip = render_skip_frames;
+    let rendered_output_frames;
+    let wav_sample_format = options.wav_sample_format;
+    let wav_channel_mode = options.wav_channel_mode;
     match output {
         PlaylistRenderOutput::Wav => {
             let block_align = options.wav_sample_format.bytes_per_sample()
@@ -5117,6 +5193,176 @@ fn skip_render_block_prefix<'a>(block: &'a [f32], frames_to_skip: &mut u64) -> &
     let skipped = (*frames_to_skip).min(frames);
     *frames_to_skip -= skipped;
     &block[skipped as usize * 2..]
+}
+
+fn playlist_audio_render_output(output: PlaylistRenderOutput) -> AudioRenderOutput {
+    match output {
+        PlaylistRenderOutput::Wav => AudioRenderOutput::Wav,
+        PlaylistRenderOutput::Flac { bits_per_sample } => {
+            AudioRenderOutput::Flac { bits_per_sample }
+        }
+        PlaylistRenderOutput::Ogg { bitrate_kbps } => AudioRenderOutput::Ogg { bitrate_kbps },
+        PlaylistRenderOutput::Mp3 { bitrate_kbps } => AudioRenderOutput::Mp3 { bitrate_kbps },
+    }
+}
+
+fn write_float_spool_block(file: &mut File, block: &[f32]) -> Result<(), String> {
+    if !block.len().is_multiple_of(2) {
+        return Err("render block must contain interleaved stereo frames".to_owned());
+    }
+    write_float_spool_samples(file, block)
+}
+
+fn write_float_spool_samples(file: &mut File, samples: &[f32]) -> Result<(), String> {
+    let samples_per_chunk = STREAM_BLOCK_FRAMES * 2;
+    for sample_chunk in samples.chunks(samples_per_chunk) {
+        let byte_capacity = sample_chunk
+            .len()
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| "render spool block size overflow".to_owned())?;
+        let mut bytes = Vec::with_capacity(byte_capacity);
+        for sample in sample_chunk {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        file.write_all(&bytes)
+            .map_err(|error| format!("could not write temporary render spool: {error}"))?;
+    }
+    Ok(())
+}
+
+/// Adds post-content render frames onto the start of a float PCM spool and keeps its loop length.
+fn wrap_float_spool_remainder(
+    file: &mut File,
+    content_frames: u64,
+    rendered_frames: u64,
+) -> Result<(), String> {
+    if content_frames == 0 || rendered_frames < content_frames {
+        return Err("wrapped render must include its full content range".to_owned());
+    }
+    let tail_frames = rendered_frames - content_frames;
+    if tail_frames == 0 {
+        return Ok(());
+    }
+    let head_frames = content_frames.min(tail_frames);
+    let head_samples = usize::try_from(head_frames)
+        .ok()
+        .and_then(|frames| frames.checked_mul(2))
+        .ok_or_else(|| "wrapped render head is too large for this platform".to_owned())?;
+    let head_bytes = head_samples
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| "wrapped render head size overflow".to_owned())?;
+    if head_bytes > MAX_MIX_BYTES {
+        return Err(format!(
+            "wrapped render remainder exceeds the {} MiB working limit",
+            MAX_MIX_BYTES / (1024 * 1024)
+        ));
+    }
+
+    let mut head = Vec::new();
+    head.try_reserve_exact(head_samples)
+        .map_err(|error| format!("could not allocate wrapped render head: {error}"))?;
+    head.resize(head_samples, 0.0_f32);
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| format!("could not seek to wrapped render start: {error}"))?;
+    read_float_spool_samples(file, head_samples, &mut head)?;
+
+    let tail_offset_bytes = content_frames
+        .checked_mul(2 * std::mem::size_of::<f32>() as u64)
+        .ok_or_else(|| "wrapped render tail offset overflow".to_owned())?;
+    file.seek(SeekFrom::Start(tail_offset_bytes))
+        .map_err(|error| format!("could not seek to wrapped render tail: {error}"))?;
+    let mut remaining_frames = tail_frames;
+    let mut tail_bytes = vec![0_u8; STREAM_BLOCK_FRAMES * 2 * std::mem::size_of::<f32>()];
+    let mut tail_samples = Vec::with_capacity(tail_bytes.len() / 4);
+    let mut rendered_tail_frames = 0_u64;
+    while remaining_frames > 0 {
+        let frames = remaining_frames.min(STREAM_BLOCK_FRAMES as u64) as usize;
+        let sample_count = frames * 2;
+        let byte_count = sample_count * std::mem::size_of::<f32>();
+        file.read_exact(&mut tail_bytes[..byte_count])
+            .map_err(|error| format!("could not read wrapped render tail: {error}"))?;
+        tail_samples.clear();
+        tail_samples.extend(
+            tail_bytes[..byte_count]
+                .chunks_exact(4)
+                .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])),
+        );
+        for (frame_offset, frame) in tail_samples.chunks_exact(2).enumerate() {
+            let wrapped_frame = (rendered_tail_frames + frame_offset as u64) % content_frames;
+            let sample_offset = usize::try_from(wrapped_frame)
+                .ok()
+                .and_then(|frame| frame.checked_mul(2))
+                .ok_or_else(|| "wrapped render destination offset overflow".to_owned())?;
+            head[sample_offset] += frame[0];
+            head[sample_offset + 1] += frame[1];
+        }
+        rendered_tail_frames = rendered_tail_frames.saturating_add(frames as u64);
+        remaining_frames -= frames as u64;
+    }
+
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| format!("could not seek to wrapped render start: {error}"))?;
+    write_float_spool_samples(file, &head)
+}
+
+fn read_float_spool_samples(
+    file: &mut File,
+    sample_count: usize,
+    samples: &mut Vec<f32>,
+) -> Result<(), String> {
+    samples.clear();
+    let mut remaining_samples = sample_count;
+    let mut bytes = vec![0_u8; STREAM_BLOCK_FRAMES * 2 * std::mem::size_of::<f32>()];
+    while remaining_samples > 0 {
+        let chunk_samples = remaining_samples.min(bytes.len() / 4);
+        let byte_count = chunk_samples
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| "render spool read size overflow".to_owned())?;
+        file.read_exact(&mut bytes[..byte_count])
+            .map_err(|error| format!("could not read temporary render spool: {error}"))?;
+        samples.extend(
+            bytes[..byte_count]
+                .chunks_exact(4)
+                .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])),
+        );
+        remaining_samples -= chunk_samples;
+    }
+    Ok(())
+}
+
+fn encode_float_spool(
+    output_file: &mut File,
+    spool: &mut File,
+    frames: u64,
+    sample_rate: u32,
+    options: AudioRenderEncodingOptions,
+    output_format: AudioRenderOutput,
+) -> Result<(), String> {
+    let mut encoder =
+        AudioFileStreamEncoder::new(output_file, sample_rate, frames, options, output_format)?;
+    spool
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| format!("could not seek to temporary render spool: {error}"))?;
+    let mut remaining_frames = frames;
+    let mut bytes = vec![0_u8; STREAM_BLOCK_FRAMES * 2 * std::mem::size_of::<f32>()];
+    let mut block = Vec::with_capacity(bytes.len() / 4);
+    while remaining_frames > 0 {
+        let block_frames = remaining_frames.min(STREAM_BLOCK_FRAMES as u64) as usize;
+        let sample_count = block_frames * 2;
+        let byte_count = sample_count * std::mem::size_of::<f32>();
+        spool
+            .read_exact(&mut bytes[..byte_count])
+            .map_err(|error| format!("could not read temporary render spool: {error}"))?;
+        block.clear();
+        block.extend(
+            bytes[..byte_count]
+                .chunks_exact(4)
+                .map(|sample| f32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]])),
+        );
+        encoder.write_stereo_block(&block, options.wav_channel_mode)?;
+        remaining_frames -= block_frames as u64;
+    }
+    encoder.finalize(frames)
 }
 
 /// Render the sample voices in one FLP pattern to a WAV using the selected bit depth and channel mode.
@@ -15752,6 +15998,40 @@ mod tests {
             add_render_tail_frames(u64::MAX, 48_000, 1),
             Err("render length overflow".to_owned())
         );
+    }
+
+    #[test]
+    fn wraps_playlist_remainder_onto_the_content_start_and_preserves_loop_length() {
+        let mut spool = tempfile::tempfile().expect("temporary float spool should open");
+        write_float_spool_block(
+            &mut spool,
+            &[1.0, 10.0, 2.0, 20.0, 3.0, 30.0, 4.0, 40.0, 5.0, 50.0],
+        )
+        .expect("float samples should write");
+        wrap_float_spool_remainder(&mut spool, 3, 5).expect("tail should wrap to the start");
+
+        assert_eq!(
+            spool.seek(SeekFrom::End(0)).unwrap(),
+            5 * 2 * std::mem::size_of::<f32>() as u64,
+            "the raw render keeps its original storage length"
+        );
+        spool.seek(SeekFrom::Start(0)).unwrap();
+        let mut samples = Vec::new();
+        read_float_spool_samples(&mut spool, 6, &mut samples).unwrap();
+        assert_eq!(samples, [5.0, 50.0, 7.0, 70.0, 3.0, 30.0]);
+
+        let mut multi_loop = tempfile::tempfile().expect("temporary float spool should open");
+        write_float_spool_block(
+            &mut multi_loop,
+            &[1.0, 10.0, 2.0, 20.0, 3.0, 30.0, 4.0, 40.0, 5.0, 50.0],
+        )
+        .expect("float samples should write");
+        wrap_float_spool_remainder(&mut multi_loop, 2, 5)
+            .expect("long tail should wrap over the full content more than once");
+        multi_loop.seek(SeekFrom::Start(0)).unwrap();
+        let mut samples = Vec::new();
+        read_float_spool_samples(&mut multi_loop, 4, &mut samples).unwrap();
+        assert_eq!(samples, [9.0, 90.0, 6.0, 60.0]);
     }
 
     #[test]
