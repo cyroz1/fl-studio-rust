@@ -544,6 +544,8 @@ pub struct PlaylistAudioClipEnvelope {
     pub stretch_to_clip_duration: bool,
     /// App-local instance pitch offset in cents, limited to -1200 through +1200.
     pub stretch_pitch_cents: i16,
+    /// App-local absolute pan override in percent (-100 left through +100 right).
+    pub pan_override: Option<i16>,
 }
 
 pub const PLAYLIST_AUDIO_CLIP_GAIN_MINUS_INFINITY: i16 = i16::MIN;
@@ -7861,6 +7863,7 @@ fn prepare_audio_clip_render(
                 fade_out_tension: 0,
                 stretch_to_clip_duration: false,
                 stretch_pitch_cents: 0,
+                pan_override: None,
             });
         if !clip_envelope.gain_centidb_is_supported()
             || clip_envelope.fade_in_ms > 600_000
@@ -7868,9 +7871,12 @@ fn prepare_audio_clip_render(
             || !(-100..=100).contains(&clip_envelope.fade_in_tension)
             || !(-100..=100).contains(&clip_envelope.fade_out_tension)
             || !(-1_200..=1_200).contains(&clip_envelope.stretch_pitch_cents)
+            || clip_envelope
+                .pan_override
+                .is_some_and(|pan| !(-100..=100).contains(&pan))
         {
             return Err(format!(
-                "Playlist clip {clip_index} gain, fade, or pitch value is outside the supported range"
+                "Playlist clip {clip_index} gain, fade, pan, or pitch value is outside the supported range"
             ));
         }
         let source_dimensions = AudioSourceDimensions {
@@ -8031,7 +8037,9 @@ fn prepare_audio_clip_render(
             fade_in_tension: clip_envelope.fade_in_tension,
             fade_out_curve: clip_envelope.fade_out_curve,
             fade_out_tension: clip_envelope.fade_out_tension,
-            pan: *pan,
+            pan: clip_envelope
+                .pan_override
+                .map_or(*pan, |pan| f32::from(pan) / 100.0),
             pan_law,
             mixer_transform: mixer_route_plan.output_transform,
             live_mixer_source_control,
@@ -17183,6 +17191,7 @@ mod tests {
             fade_out_tension: 0,
             stretch_to_clip_duration: false,
             stretch_pitch_cents: 0,
+            pan_override: None,
         };
 
         assert!(envelope.gain_centidb_is_supported());

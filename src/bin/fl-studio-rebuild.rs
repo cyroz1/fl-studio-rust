@@ -8122,6 +8122,7 @@ impl DawUi {
                 fade_out_tension: 0,
                 stretch_to_clip_duration: false,
                 stretch_pitch_cents: 0,
+                pan_override: None,
             })
     }
 
@@ -8191,7 +8192,7 @@ impl DawUi {
         fade_out_manual: bool,
     ) {
         let Some(project_path) = self.current_path.as_ref() else {
-            self.status = "Save the project before editing instance gain or fades".to_owned();
+            self.status = "Save the project before editing Audio Clip instance controls".to_owned();
             return;
         };
         let mut updated = self.playlist_audio_clip_envelopes.clone();
@@ -21759,6 +21760,47 @@ impl DawUi {
                                                 .find(|envelope| envelope.clip_id == clip_id)
                                                 .copied()
                                                 .unwrap_or(stored_envelope);
+                                            let channel_pan_percent = match clip.target() {
+                                                PlaylistClipTarget::Channel { id } => self
+                                                    .document
+                                                    .as_ref()
+                                                    .and_then(|document| {
+                                                        document.channels().into_iter().find(|channel| {
+                                                            channel.id() == id
+                                                        })
+                                                    })
+                                                    .and_then(|channel| channel.pan())
+                                                    .map(|pan| {
+                                                        (((pan.clamp(0, 12_800) as f32 / 6_400.0)
+                                                            - 1.0)
+                                                            * 100.0)
+                                                            .round()
+                                                            as i16
+                                                    })
+                                                    .unwrap_or(0),
+                                                PlaylistClipTarget::Pattern { .. } => 0,
+                                            };
+                                            let mut pan_override_enabled =
+                                                envelope.pan_override.is_some();
+                                            let mut pan_override_percent = envelope
+                                                .pan_override
+                                                .unwrap_or(channel_pan_percent);
+                                            let pan_override_enabled_changed = ui
+                                                .checkbox(
+                                                    &mut pan_override_enabled,
+                                                    "Override channel pan",
+                                                )
+                                                .changed();
+                                            let pan_override_value_changed = ui
+                                                .add_enabled(
+                                                    pan_override_enabled,
+                                                    egui::Slider::new(
+                                                        &mut pan_override_percent,
+                                                        -100..=100,
+                                                    )
+                                                    .text("Instance pan"),
+                                                )
+                                                .changed();
                                             let (mut fade_in_manual, mut fade_out_manual) = self
                                                 .playlist_audio_clip_fade_manual_flags(
                                                     arrangement.id,
@@ -21907,6 +21949,8 @@ impl DawUi {
                                                 .changed();
                                             if gain_changed
                                                 || minus_infinity_changed
+                                                || pan_override_enabled_changed
+                                                || pan_override_value_changed
                                                 || fade_in_changed
                                                 || fade_in_manual_changed
                                                 || fade_out_changed
@@ -21928,6 +21972,12 @@ impl DawUi {
                                                 if gain_changed {
                                                     envelope.gain_centidb =
                                                         (gain_db * 100.0).round() as i16;
+                                                }
+                                                if pan_override_enabled_changed
+                                                    || pan_override_value_changed
+                                                {
+                                                    envelope.pan_override = pan_override_enabled
+                                                        .then_some(pan_override_percent);
                                                 }
                                                 if fade_in_changed
                                                     || fade_in_curve_changed
@@ -21998,6 +22048,7 @@ impl DawUi {
                                                         fade_out_tension: 0,
                                                         stretch_to_clip_duration: false,
                                                         stretch_pitch_cents: 0,
+                                                        pan_override: None,
                                                     },
                                                     false,
                                                     false,
@@ -22005,7 +22056,7 @@ impl DawUi {
                                                 ui.close();
                                             }
                                             ui.small(
-                                                "Fade curve shapes and tension use app-local approximations. Fit uses the mode saved on the Audio Clip channel and the instance's visible Playlist duration. These values stay on this machine and apply when playback starts.",
+                                                "The optional pan override replaces channel pan for this instance. Fade curve shapes and tension use app-local approximations. Fit uses the mode saved on the Audio Clip channel and the instance's visible Playlist duration. These values stay on this machine and apply when playback starts.",
                                             );
                                         });
                                     } else {
@@ -58577,6 +58628,7 @@ fn playlist_audio_clip_auto_crossfade_envelopes(
                 fade_out_tension: 0,
                 stretch_to_clip_duration: false,
                 stretch_pitch_cents: 0,
+                pan_override: None,
             });
         candidates.push(Candidate {
             clip_id,
@@ -58667,6 +58719,10 @@ fn valid_playlist_audio_clip_envelope(entry: &ProjectPlaylistAudioClipEnvelope) 
         && (-100..=100).contains(&entry.envelope.fade_in_tension)
         && (-100..=100).contains(&entry.envelope.fade_out_tension)
         && (-1_200..=1_200).contains(&entry.envelope.stretch_pitch_cents)
+        && entry
+            .envelope
+            .pan_override
+            .is_none_or(|pan| (-100..=100).contains(&pan))
 }
 
 fn same_playlist_audio_clip_envelope_key(
@@ -58733,6 +58789,7 @@ fn parse_playlist_audio_clip_envelopes(contents: &str) -> Vec<ProjectPlaylistAud
             stretch_pitch_cents,
             fade_in_manual,
             fade_out_manual,
+            pan_override,
         ) = match remaining.as_slice() {
             [] => (
                 PlaylistAudioClipFadeCurve::Linear,
@@ -58743,6 +58800,7 @@ fn parse_playlist_audio_clip_envelopes(contents: &str) -> Vec<ProjectPlaylistAud
                 0,
                 fade_in_ms > 0,
                 fade_out_ms > 0,
+                None,
             ),
             [fit, pitch] => {
                 let stretch_to_clip_duration = match *fit {
@@ -58762,6 +58820,7 @@ fn parse_playlist_audio_clip_envelopes(contents: &str) -> Vec<ProjectPlaylistAud
                     stretch_pitch_cents,
                     fade_in_ms > 0,
                     fade_out_ms > 0,
+                    None,
                 )
             }
             [in_curve, in_tension, out_curve, out_tension, fit, pitch] => {
@@ -58802,6 +58861,7 @@ fn parse_playlist_audio_clip_envelopes(contents: &str) -> Vec<ProjectPlaylistAud
                     stretch_pitch_cents,
                     fade_in_ms > 0,
                     fade_out_ms > 0,
+                    None,
                 )
             }
             [
@@ -58813,7 +58873,8 @@ fn parse_playlist_audio_clip_envelopes(contents: &str) -> Vec<ProjectPlaylistAud
                 pitch,
                 in_manual,
                 out_manual,
-            ] => {
+                pan_override_fields @ ..,
+            ] if pan_override_fields.len() <= 1 => {
                 let Some(fade_in_curve) = in_curve
                     .parse::<u8>()
                     .ok()
@@ -58852,6 +58913,20 @@ fn parse_playlist_audio_clip_envelopes(contents: &str) -> Vec<ProjectPlaylistAud
                     "1" => true,
                     _ => continue,
                 };
+                let pan_override = match pan_override_fields {
+                    [] => None,
+                    [value] if *value == "-" => None,
+                    [value] => {
+                        let Ok(value) = value.parse::<i16>() else {
+                            continue;
+                        };
+                        if !(-100..=100).contains(&value) {
+                            continue;
+                        }
+                        Some(value)
+                    }
+                    _ => continue,
+                };
                 (
                     fade_in_curve,
                     fade_in_tension,
@@ -58861,6 +58936,7 @@ fn parse_playlist_audio_clip_envelopes(contents: &str) -> Vec<ProjectPlaylistAud
                     stretch_pitch_cents,
                     fade_in_manual,
                     fade_out_manual,
+                    pan_override,
                 )
             }
             _ => continue,
@@ -58881,6 +58957,7 @@ fn parse_playlist_audio_clip_envelopes(contents: &str) -> Vec<ProjectPlaylistAud
                     fade_out_tension,
                     stretch_to_clip_duration,
                     stretch_pitch_cents,
+                    pan_override,
                 },
                 fade_in_manual,
                 fade_out_manual,
@@ -58893,7 +58970,7 @@ fn parse_playlist_audio_clip_envelopes(contents: &str) -> Vec<ProjectPlaylistAud
 fn serialize_playlist_audio_clip_envelopes(
     envelopes: &[ProjectPlaylistAudioClipEnvelope],
 ) -> String {
-    let mut contents = String::from("version=4\n");
+    let mut contents = String::from("version=5\n");
     let mut normalized = Vec::new();
     for entry in envelopes {
         upsert_playlist_audio_clip_envelope(&mut normalized, entry.clone());
@@ -58931,6 +59008,11 @@ fn serialize_playlist_audio_clip_envelopes(
         contents.push(if entry.fade_in_manual { '1' } else { '0' });
         contents.push('\t');
         contents.push(if entry.fade_out_manual { '1' } else { '0' });
+        contents.push('\t');
+        match entry.envelope.pan_override {
+            Some(pan) => contents.push_str(&pan.to_string()),
+            None => contents.push('-'),
+        }
         contents.push('\n');
     }
     contents
@@ -66927,6 +67009,7 @@ mod tests {
                 fade_out_tension: 35,
                 stretch_to_clip_duration: true,
                 stretch_pitch_cents: 350,
+                pan_override: None,
             },
             fade_in_manual: true,
             fade_out_manual: true,
@@ -66998,6 +67081,7 @@ mod tests {
                     fade_out_tension: 0,
                     stretch_to_clip_duration: false,
                     stretch_pitch_cents: 0,
+                    pan_override: None,
                 },
                 fade_in_manual: true,
                 fade_out_manual: true,
@@ -67022,6 +67106,7 @@ mod tests {
                     fade_out_tension: 0,
                     stretch_to_clip_duration: true,
                     stretch_pitch_cents: 75,
+                    pan_override: None,
                 },
                 fade_in_manual: true,
                 fade_out_manual: true,
@@ -67049,6 +67134,7 @@ mod tests {
                 fade_out_tension: 0,
                 stretch_to_clip_duration: false,
                 stretch_pitch_cents: 0,
+                pan_override: None,
             },
             fade_in_manual: false,
             fade_out_manual: false,
