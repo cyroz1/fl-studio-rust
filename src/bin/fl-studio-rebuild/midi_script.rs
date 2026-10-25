@@ -78,6 +78,7 @@ pub struct MidiScriptRuntime {
     stdout: BufReader<ChildStdout>,
     transport_state: Arc<MidiScriptTransportState>,
     startup_actions: Vec<ScriptTransportAction>,
+    supports_midi_output: bool,
 }
 
 pub const SCRIPT_TRANSPORT_PLAYING: u8 = 1 << 0;
@@ -382,6 +383,7 @@ impl MidiScriptRuntime {
             stdout: BufReader::new(stdout),
             transport_state,
             startup_actions: Vec::new(),
+            supports_midi_output: false,
         };
         let mut ready = String::new();
         runtime.stdout.read_line(&mut ready).map_err(|error| {
@@ -405,6 +407,7 @@ impl MidiScriptRuntime {
                     .unwrap_or("script initialization failed")
             ));
         }
+        runtime.supports_midi_output = ready["on_midi_out_msg"].as_bool().unwrap_or(false);
         let startup_response = runtime.exchange(&json!({"initialize": true}))?;
         runtime.startup_actions = parse_transport_actions(&startup_response)?;
         Ok(runtime)
@@ -412,6 +415,10 @@ impl MidiScriptRuntime {
 
     pub fn take_startup_actions(&mut self) -> Vec<ScriptTransportAction> {
         std::mem::take(&mut self.startup_actions)
+    }
+
+    pub fn supports_midi_output(&self) -> bool {
+        self.supports_midi_output
     }
 
     pub fn process_event(
@@ -444,6 +451,36 @@ impl MidiScriptRuntime {
         Ok(ScriptMidiResult {
             handled: false,
             bytes: transformed,
+            actions,
+        })
+    }
+
+    pub fn process_midi_output(&mut self, bytes: &[u8]) -> Result<ScriptMidiResult, String> {
+        if !valid_short_midi_output(bytes) {
+            return Err("MIDI script output callback requires a short MIDI message".to_owned());
+        }
+        let status = bytes[0];
+        let response = self.exchange(&json!({
+            "midi_output": true,
+            "status": status,
+            "data1": bytes.get(1).copied().unwrap_or(0),
+            "data2": bytes.get(2).copied().unwrap_or(0),
+            "port": self.transport_state.midi_output_port_number.load(Ordering::Relaxed),
+            "midi_id": status & 0xF0,
+            "midi_chan": status & 0x0F,
+            "midi_chan_ex": 0,
+        }))?;
+        let actions = parse_transport_actions(&response)?;
+        if response["handled"].as_bool().unwrap_or(false) {
+            return Ok(ScriptMidiResult {
+                handled: true,
+                bytes: Vec::new(),
+                actions,
+            });
+        }
+        Ok(ScriptMidiResult {
+            handled: false,
+            bytes: transform_midi_output_message(bytes, &response)?,
             actions,
         })
     }
@@ -808,15 +845,37 @@ fn valid_short_midi_output(bytes: &[u8]) -> bool {
     let Some(&status) = bytes.first() else {
         return false;
     };
-    let expected_length = match status {
-        0x80..=0xEF if matches!(status & 0xF0, 0xC0 | 0xD0) => 2,
-        0x80..=0xEF => 3,
-        0xF1 | 0xF3 => 2,
-        0xF2 => 3,
-        0xF6 | 0xF8 | 0xFA..=0xFC | 0xFE..=0xFF => 1,
-        _ => return false,
-    };
-    bytes.len() == expected_length && bytes.iter().skip(1).all(|byte| *byte <= 0x7F)
+    short_midi_output_length(status).is_some_and(|expected_length| {
+        bytes.len() == expected_length && bytes.iter().skip(1).all(|byte| *byte <= 0x7F)
+    })
+}
+
+fn short_midi_output_length(status: u8) -> Option<usize> {
+    match status {
+        0x80..=0xEF if matches!(status & 0xF0, 0xC0 | 0xD0) => Some(2),
+        0x80..=0xEF => Some(3),
+        0xF1 | 0xF3 => Some(2),
+        0xF2 => Some(3),
+        0xF6 | 0xF8 | 0xFA..=0xFC | 0xFE..=0xFF => Some(1),
+        _ => None,
+    }
+}
+
+fn transform_midi_output_message(original: &[u8], response: &Value) -> Result<Vec<u8>, String> {
+    let status = byte_value(response, "status", original[0])?;
+    let length = short_midi_output_length(status)
+        .ok_or_else(|| "MIDI script returned an invalid short-message status".to_owned())?;
+    let mut transformed = Vec::with_capacity(length);
+    transformed.push(status);
+    for (index, key) in ["data1", "data2"].into_iter().enumerate().take(length - 1) {
+        let default = original.get(index + 1).copied().unwrap_or(0);
+        let data = byte_value(response, key, default)?;
+        if data > 0x7F {
+            return Err(format!("MIDI script returned {key} outside 0–127"));
+        }
+        transformed.push(data);
+    }
+    Ok(transformed)
 }
 
 fn transform_message(original: &[u8], response: &Value) -> Result<Vec<u8>, String> {
@@ -1003,6 +1062,7 @@ mod tests {
         .unwrap();
         let script = MidiControllerScript::parse(script_path).unwrap();
         let mut runtime = MidiScriptRuntime::start_for_device(&script, "Test Input").unwrap();
+        assert!(!runtime.supports_midi_output());
 
         let controller = runtime.process_event(12, &[0xB2, 7, 25]).unwrap();
         let note_on = runtime.process_event(20, &[0x92, 60, 90]).unwrap();
@@ -1011,6 +1071,56 @@ mod tests {
         assert_eq!(controller.bytes, [0xB2, 7, 102]);
         assert_eq!(note_on.bytes, [0x92, 64, 90]);
         assert!(note_off.handled);
+    }
+
+    #[test]
+    fn python_midi_out_callback_can_edit_messages_and_reads_output_port() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\ndef OnMidiOutMsg(event):\n    if event.port != 3:\n        raise RuntimeError('wrong output port')\n    event.midiId = 0xB0\n    event.midiChan = 2\n    event.data1 = 7\n    event.data2 = 99\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let transport_state = Arc::new(MidiScriptTransportState::default());
+        transport_state
+            .midi_output_port_number
+            .store(3, Ordering::Relaxed);
+        let mut runtime = MidiScriptRuntime::start_for_device_with_transport_state(
+            &script,
+            "Test Input",
+            transport_state,
+        )
+        .unwrap();
+        assert!(runtime.supports_midi_output());
+
+        let result = runtime.process_midi_output(&[0x91, 60, 42]).unwrap();
+
+        assert!(!result.handled);
+        assert_eq!(result.bytes, [0xB2, 7, 99]);
+    }
+
+    #[test]
+    fn python_midi_out_callback_can_consume_messages_and_queue_script_output() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport device\ndef OnMidiOutMsg(event):\n    device.midiOutMsg(0xB0, 0, 1, 2)\n    event.handled = event.data1 == 60\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let mut runtime = MidiScriptRuntime::start_for_device(&script, "Test Input").unwrap();
+
+        let result = runtime.process_midi_output(&[0x91, 60, 42]).unwrap();
+
+        assert!(result.handled);
+        assert!(result.bytes.is_empty());
+        assert_eq!(
+            result.actions,
+            [ScriptTransportAction::MidiOutput(vec![0xB0, 1, 2])]
+        );
     }
 
     #[test]

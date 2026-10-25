@@ -45206,7 +45206,16 @@ impl DawUi {
                     .map(AudioEngine::project_playback_clock);
                 match (output, playback_clock) {
                     (Some(output), Some(playback_clock)) => {
-                        match MidiPlaylistScheduler::start(output, messages, playback_clock) {
+                        let script_output = self
+                            .midi_input_connection
+                            .as_ref()
+                            .and_then(ConnectedMidiInput::midi_script_output_handle);
+                        match MidiPlaylistScheduler::start(
+                            output,
+                            messages,
+                            playback_clock,
+                            script_output,
+                        ) {
                             Ok(scheduler) => {
                                 self.midi_playlist_playback = Some(ActiveMidiPlaylistPlayback {
                                     arrangement_id,
@@ -45370,7 +45379,17 @@ impl DawUi {
         let Some(output) = self.midi_output_connection.as_ref().cloned() else {
             return;
         };
-        match MidiPatternLoopScheduler::start(output, messages, loop_frames, playback_clock) {
+        let script_output = self
+            .midi_input_connection
+            .as_ref()
+            .and_then(ConnectedMidiInput::midi_script_output_handle);
+        match MidiPatternLoopScheduler::start(
+            output,
+            messages,
+            loop_frames,
+            playback_clock,
+            script_output,
+        ) {
             Ok(scheduler) => {
                 self.midi_pattern_transport = Some(ActiveMidiPatternTransport {
                     pattern_id,

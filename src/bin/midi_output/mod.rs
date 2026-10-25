@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use super::midi_input::MidiScriptOutputHandle;
 use flp_rebuild::audio::ProjectPlaybackClock;
 use flp_rebuild::midi::{
     MidiChannelMapping, MidiEventKind, MidiFile, fl_note_release_to_midi_velocity,
@@ -590,12 +591,24 @@ pub struct MidiPatternLoopScheduler {
     worker: Option<JoinHandle<()>>,
 }
 
+struct MidiPatternLoopSchedule {
+    output: ConnectedMidiOutput,
+    messages: Vec<ScheduledMidiFrameMessage>,
+    loop_frames: u64,
+    playback_clock: ProjectPlaybackClock,
+    stop_receiver: Receiver<()>,
+    error_sender: Sender<String>,
+    completion_sender: Sender<()>,
+    script_output: Option<MidiScriptOutputHandle>,
+}
+
 impl MidiPatternLoopScheduler {
     pub fn start(
         output: ConnectedMidiOutput,
         messages: Vec<ScheduledMidiFrameMessage>,
         loop_frames: u64,
         playback_clock: ProjectPlaybackClock,
+        script_output: Option<MidiScriptOutputHandle>,
     ) -> Result<Self, String> {
         if loop_frames == 0 {
             return Err("Pattern MIDI loop must contain at least one audio frame".to_owned());
@@ -614,7 +627,7 @@ impl MidiPatternLoopScheduler {
         let worker = thread::Builder::new()
             .name("Pattern MIDI scheduler".to_owned())
             .spawn(move || {
-                schedule_midi_pattern_loop(
+                schedule_midi_pattern_loop(MidiPatternLoopSchedule {
                     output,
                     messages,
                     loop_frames,
@@ -622,7 +635,8 @@ impl MidiPatternLoopScheduler {
                     stop_receiver,
                     error_sender,
                     completion_sender,
-                )
+                    script_output,
+                })
             })
             .map_err(|error| format!("could not start Pattern MIDI scheduler: {error}"))?;
 
@@ -678,6 +692,7 @@ impl MidiPlaylistScheduler {
         output: ConnectedMidiOutput,
         messages: Vec<ScheduledMidiFrameMessage>,
         playback_clock: ProjectPlaybackClock,
+        script_output: Option<MidiScriptOutputHandle>,
     ) -> Result<Self, String> {
         if messages
             .windows(2)
@@ -699,6 +714,7 @@ impl MidiPlaylistScheduler {
                     stop_receiver,
                     error_sender,
                     completion_sender,
+                    script_output,
                 )
             })
             .map_err(|error| format!("could not start Playlist MIDI scheduler: {error}"))?;
@@ -757,6 +773,7 @@ fn schedule_midi_playlist(
     stop_receiver: Receiver<()>,
     error_sender: Sender<String>,
     completion_sender: Sender<()>,
+    script_output: Option<MidiScriptOutputHandle>,
 ) {
     let result = 'scheduler: {
         let mut next_message = 0;
@@ -771,7 +788,11 @@ fn schedule_midi_playlist(
                 if midi_playlist_stop_requested(&stop_receiver) {
                     break 'scheduler Ok(());
                 }
-                if let Err(error) = output.send(&messages[next_message].bytes) {
+                if let Err(error) = send_scheduled_midi_message(
+                    &mut output,
+                    script_output.as_ref(),
+                    &messages[next_message].bytes,
+                ) {
                     break 'scheduler Err(error);
                 }
                 next_message += 1;
@@ -800,6 +821,19 @@ fn schedule_midi_playlist(
     let _ = completion_sender.send(());
 }
 
+fn send_scheduled_midi_message(
+    output: &mut ConnectedMidiOutput,
+    script_output: Option<&MidiScriptOutputHandle>,
+    bytes: &[u8],
+) -> Result<(), String> {
+    match script_output {
+        Some(script_output) => script_output
+            .process_message(bytes)?
+            .map_or(Ok(()), |message| output.send(&message)),
+        None => output.send(bytes),
+    }
+}
+
 fn midi_playlist_stop_requested(stop_receiver: &Receiver<()>) -> bool {
     matches!(
         stop_receiver.try_recv(),
@@ -815,15 +849,17 @@ fn due_midi_playlist_message_end(
     start + messages[start..].partition_point(|message| message.frame <= current_frame)
 }
 
-fn schedule_midi_pattern_loop(
-    mut output: ConnectedMidiOutput,
-    messages: Vec<ScheduledMidiFrameMessage>,
-    loop_frames: u64,
-    playback_clock: ProjectPlaybackClock,
-    stop_receiver: Receiver<()>,
-    error_sender: Sender<String>,
-    completion_sender: Sender<()>,
-) {
+fn schedule_midi_pattern_loop(schedule: MidiPatternLoopSchedule) {
+    let MidiPatternLoopSchedule {
+        mut output,
+        messages,
+        loop_frames,
+        playback_clock,
+        stop_receiver,
+        error_sender,
+        completion_sender,
+        script_output,
+    } = schedule;
     let result = 'scheduler: {
         let mut next_message = 0;
         let mut was_active = false;
@@ -854,7 +890,9 @@ fn schedule_midi_pattern_loop(
                     break Err(error);
                 }
                 for note_on in midi_pattern_active_note_ons(&messages, phase_frame) {
-                    if let Err(error) = output.send(&note_on) {
+                    if let Err(error) =
+                        send_scheduled_midi_message(&mut output, script_output.as_ref(), &note_on)
+                    {
                         break 'scheduler Err(error);
                     }
                 }
@@ -868,7 +906,11 @@ fn schedule_midi_pattern_loop(
                 if midi_playlist_stop_requested(&stop_receiver) {
                     break 'scheduler Ok(());
                 }
-                if let Err(error) = output.send(&messages[next_message].bytes) {
+                if let Err(error) = send_scheduled_midi_message(
+                    &mut output,
+                    script_output.as_ref(),
+                    &messages[next_message].bytes,
+                ) {
                     break 'scheduler Err(error);
                 }
                 next_message += 1;

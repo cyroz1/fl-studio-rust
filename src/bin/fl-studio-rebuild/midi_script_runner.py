@@ -24,15 +24,15 @@ class EventData:
         self.status = value.get("status", 0)
         self.data1 = value.get("data1", 0)
         self.data2 = value.get("data2", 0)
-        self.port = 0
+        self.port = value.get("port", 0)
         self.sysex = bytes(value.get("sysex", []))
         self.pmeflags = int(value.get("pmeflags", 0))
         self.isIncrement = False
         self.res = 0.0
         self.inEv = 0
         self.outEv = 0
-        self.midiId = 0
-        self.midiChanEx = 0
+        self._midi_id = value.get("midi_id", self.status & 0xF0)
+        self._midi_chan_ex = value.get("midi_chan_ex", 0)
 
     @property
     def note(self):
@@ -91,6 +91,23 @@ class EventData:
     @midiChan.setter
     def midiChan(self, value):
         self.status = (self.status & 0xF0) | (int(value) & 0x0F)
+
+    @property
+    def midiId(self):
+        return self._midi_id
+
+    @midiId.setter
+    def midiId(self, value):
+        self._midi_id = int(value) & 0xF0
+        self.status = self._midi_id | (self.status & 0x0F)
+
+    @property
+    def midiChanEx(self):
+        return self._midi_chan_ex
+
+    @midiChanEx.setter
+    def midiChanEx(self, value):
+        self._midi_chan_ex = int(value)
 
 
 def _module(name):
@@ -729,6 +746,18 @@ def _dispatch(namespace, value):
         if callback is not None:
             callback()
         return {"handled": False, "actions": _active_transport_actions}
+    if value.get("midi_output"):
+        event = EventData(value)
+        callback = namespace.get("OnMidiOutMsg")
+        if callback is not None:
+            callback(event)
+        return {
+            "handled": bool(event.handled),
+            "status": int(event.status),
+            "data1": int(event.data1),
+            "data2": int(event.data2),
+            "actions": _active_transport_actions,
+        }
     if value.get("idle"):
         callback = namespace.get("OnIdle")
         if callback is not None:
@@ -772,7 +801,7 @@ def main():
     except Exception as error:
         _emit({"ready": False, "error": "{}: {}".format(type(error).__name__, error)})
         return
-    _emit({"ready": True})
+    _emit({"ready": True, "on_midi_out_msg": callable(namespace.get("OnMidiOutMsg"))})
 
     for line in sys.stdin:
         try:

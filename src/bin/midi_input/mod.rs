@@ -48,6 +48,11 @@ struct ScriptInputMessage {
 
 enum MidiInputScriptMessage {
     Input(ScriptInputMessage),
+    MidiOutput {
+        bytes: Vec<u8>,
+        cancelled: Arc<AtomicBool>,
+        reply: SyncSender<Result<Option<Vec<u8>>, String>>,
+    },
     ProjectLoad(i32),
     BeatIndicator(i32),
     FirstConnect,
@@ -164,6 +169,39 @@ struct MidiInputScriptWorker {
     join: Option<JoinHandle<()>>,
     stop_requested: Arc<AtomicBool>,
     stop_handle: MidiScriptStopHandle,
+    supports_midi_output: bool,
+}
+
+#[derive(Clone)]
+pub struct MidiScriptOutputHandle {
+    sender: SyncSender<MidiInputScriptMessage>,
+}
+
+impl MidiScriptOutputHandle {
+    pub fn process_message(&self, bytes: &[u8]) -> Result<Option<Vec<u8>>, String> {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (reply, response) = mpsc::sync_channel(1);
+        self.sender
+            .try_send(MidiInputScriptMessage::MidiOutput {
+                bytes: bytes.to_vec(),
+                cancelled: Arc::clone(&cancelled),
+                reply,
+            })
+            .map_err(|error| match error {
+                TrySendError::Full(_) => "MIDI script callback queue is full".to_owned(),
+                TrySendError::Disconnected(_) => "MIDI script worker is unavailable".to_owned(),
+            })?;
+        match response.recv_timeout(Duration::from_millis(500)) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                cancelled.store(true, Ordering::Release);
+                Err("MIDI script OnMidiOutMsg callback timed out".to_owned())
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err("MIDI script OnMidiOutMsg callback stopped unexpectedly".to_owned())
+            }
+        }
+    }
 }
 
 impl MidiInputScriptWorker {
@@ -199,6 +237,7 @@ impl MidiInputScriptWorker {
             device_name,
             transport_state,
         )?;
+        let supports_midi_output = runtime.supports_midi_output();
         let startup_actions = runtime.take_startup_actions();
         let stop_handle = runtime.stop_handle();
         let mut repeat_output = None;
@@ -284,6 +323,54 @@ impl MidiInputScriptWorker {
                     };
                     match message {
                         MidiInputScriptMessage::Stop => break,
+                        MidiInputScriptMessage::MidiOutput {
+                            bytes,
+                            cancelled,
+                            reply,
+                        } => {
+                            if cancelled.load(Ordering::Acquire) {
+                                let _ = reply.try_send(Ok(Some(bytes)));
+                                continue;
+                            }
+                            let callback_result = runtime
+                                .as_mut()
+                                .map(|runtime| runtime.process_midi_output(&bytes));
+                            match callback_result {
+                                Some(Ok(result)) => {
+                                    if cancelled.load(Ordering::Acquire) {
+                                        continue;
+                                    }
+                                    queue_script_actions_with_repeat(
+                                        &output_sender,
+                                        &midi_output_sender,
+                                        &dropped_messages,
+                                        0,
+                                        Instant::now(),
+                                        result.actions,
+                                        &mut repeat_output,
+                                    );
+                                    let output = if result.handled {
+                                        None
+                                    } else {
+                                        Some(result.bytes)
+                                    };
+                                    let _ = reply.try_send(Ok(output));
+                                }
+                                Some(Err(error)) => {
+                                    if !cancelled.load(Ordering::Acquire) {
+                                        let _ = error_sender.try_send(error.clone());
+                                        let _ = reply.try_send(Err(error));
+                                    }
+                                    repeat_output = None;
+                                    if let Some(runtime) = runtime.take() {
+                                        runtime.kill();
+                                    }
+                                }
+                                None => {
+                                    let _ = reply.try_send(Ok(Some(bytes)));
+                                }
+                            }
+                        }
                         MidiInputScriptMessage::ProjectLoad(status) => {
                             let received_at = Instant::now();
                             let elapsed_micros = u64::try_from(
@@ -473,6 +560,7 @@ impl MidiInputScriptWorker {
             join: Some(join),
             stop_requested,
             stop_handle,
+            supports_midi_output,
         })
     }
 
@@ -513,6 +601,15 @@ impl ConnectedMidiInput {
 
     pub fn notify_script_first_connect(&self) -> Option<bool> {
         Some(self.script_worker.as_ref()?.notify_first_connect())
+    }
+
+    pub fn midi_script_output_handle(&self) -> Option<MidiScriptOutputHandle> {
+        if !self.script_worker.as_ref()?.supports_midi_output {
+            return None;
+        }
+        Some(MidiScriptOutputHandle {
+            sender: self.script_worker.as_ref()?.sender.clone(),
+        })
     }
 }
 
@@ -1828,8 +1925,88 @@ fn quantize_recording_tick(tick: u32, snap_ticks: Option<u32>) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use std::sync::atomic::AtomicU64;
     use std::sync::mpsc;
+
+    static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "fl-midi-input-script-test-{}-{}",
+                std::process::id(),
+                TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn midi_script_output_handle_applies_callback_and_queues_script_messages() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.0.join("device_test.py");
+        std::fs::write(
+            &script_path,
+            "# name=Test Script\nimport device\ndef OnMidiOutMsg(event):\n    if event.port != 5:\n        raise RuntimeError('wrong output port')\n    device.midiOutMsg(0xB0, 0, 1, 2)\n    if event.data1 == 60:\n        event.handled = True\n    else:\n        event.data2 = 10\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript {
+            path: script_path,
+            name: "Test Script".to_owned(),
+            url: None,
+            supported_devices: Vec::new(),
+            supported_hardware_ids: Vec::new(),
+        };
+        let (transport_sender, _transport_receiver) = mpsc::sync_channel(4);
+        let (midi_output_sender, midi_output_receiver) = mpsc::sync_channel(4);
+        let (thru_sender, _thru_receiver) = mpsc::sync_channel(4);
+        let enabled = Arc::new(AtomicBool::new(true));
+        let generation = Arc::new(AtomicU64::new(0));
+        let dropped_messages = Arc::new(AtomicU64::new(0));
+        let thru_queue = MidiThruInputQueue::new(
+            thru_sender,
+            enabled,
+            generation,
+            Arc::clone(&dropped_messages),
+        );
+        let transport_state = Arc::new(MidiScriptTransportState::default());
+        transport_state
+            .midi_output_port_number
+            .store(5, Ordering::Relaxed);
+        let worker = MidiInputScriptWorker::start(
+            &script,
+            "Test Input",
+            transport_sender,
+            midi_output_sender,
+            thru_queue,
+            dropped_messages,
+            transport_state,
+        )
+        .unwrap();
+        let handle = MidiScriptOutputHandle {
+            sender: worker.sender.clone(),
+        };
+
+        assert_eq!(handle.process_message(&[0x90, 60, 100]).unwrap(), None);
+        assert_eq!(
+            handle.process_message(&[0x90, 61, 100]).unwrap(),
+            Some(vec![0x90, 61, 10])
+        );
+        assert_eq!(
+            midi_output_receiver.try_iter().collect::<Vec<_>>(),
+            [vec![0xB0, 1, 2], vec![0xB0, 1, 2]]
+        );
+    }
 
     #[test]
     fn script_midi_output_actions_reach_the_dedicated_output_queue() {
