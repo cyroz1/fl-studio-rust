@@ -11551,8 +11551,13 @@ impl FlpDocument {
                 ));
             }
             left_record[28..32].copy_from_slice(&left_source_end.to_le_bytes());
-            right_record[24..28].copy_from_slice(&left_source_end.to_le_bytes());
-            right_record[28..32].copy_from_slice(&source_end.to_le_bytes());
+            let (right_source_start, right_source_end) = if source_start == 0 {
+                (0, right_length)
+            } else {
+                (left_source_end, source_end)
+            };
+            right_record[24..28].copy_from_slice(&right_source_start.to_le_bytes());
+            right_record[28..32].copy_from_slice(&right_source_end.to_le_bytes());
         }
         if playlist_record_has_clip_id(record_size) {
             right_record[32..36]
@@ -22792,6 +22797,25 @@ mod tests {
         note_position: u32,
         note_length: u32,
     ) -> FlpDocument {
+        let source_end_ticks = source_start_ticks
+            .checked_add(length_ticks)
+            .expect("modern Pattern Clip fixture source window should fit");
+        modern_pattern_clip_fixture_with_source_end(
+            length_ticks,
+            source_start_ticks,
+            source_end_ticks,
+            note_position,
+            note_length,
+        )
+    }
+
+    fn modern_pattern_clip_fixture_with_source_end(
+        length_ticks: u32,
+        source_start_ticks: u32,
+        source_end_ticks: u32,
+        note_position: u32,
+        note_length: u32,
+    ) -> FlpDocument {
         let note = note_record(note_position, 0, note_length, 60, 100);
         let mut event_stream = vec![0x40, 0, 0, 0x41, 7, 0, 0xD0, 24];
         event_stream.extend_from_slice(&note);
@@ -22806,9 +22830,6 @@ mod tests {
         clip[8..12].copy_from_slice(&length_ticks.to_le_bytes());
         clip[12..14].copy_from_slice(&499u16.to_le_bytes());
         clip[24..28].copy_from_slice(&source_start_ticks.to_le_bytes());
-        let source_end_ticks = source_start_ticks
-            .checked_add(length_ticks)
-            .expect("modern Pattern Clip fixture source window should fit");
         clip[28..32].copy_from_slice(&source_end_ticks.to_le_bytes());
         append_data_event(&mut event_stream, 0xC7, b"26.1.0.0\0");
         append_data_event(&mut event_stream, 0xE9, &clip);
@@ -24240,7 +24261,8 @@ mod tests {
         assert_eq!(&clips[0].clips[1].reserved[16..], &tails[1][16..]);
 
         let before_rejected_edit = document.encode_lossless().unwrap();
-        let mut mismatched_window = modern_pattern_clip_fixture(192, 24, 0, 48);
+        let mut mismatched_window =
+            modern_pattern_clip_fixture_with_source_end(192, 24, 192, 0, 48);
         let mismatched_arrangement = mismatched_window.arrangements().unwrap();
         assert_eq!(
             mismatched_arrangement[0].clips[0].source_window_ticks(),
@@ -25149,17 +25171,8 @@ mod tests {
             Some((96, 216))
         );
 
-        let mut mismatched_modern_window = FlpDocument::parse(&{
-            let mut fixture = modern_pattern_clip_fixture(192, 24, 0, 48);
-            let event = fixture
-                .events
-                .iter_mut()
-                .find(|event| event.opcode == 0xE9)
-                .expect("the Pattern Clip event should remain present");
-            event.payload[28..32].copy_from_slice(&192u32.to_le_bytes());
-            fixture.encode_lossless().unwrap()
-        })
-        .expect("the mismatched-window fixture should parse");
+        let mut mismatched_modern_window =
+            modern_pattern_clip_fixture_with_source_end(192, 24, 192, 0, 48);
         let mismatch_before = mismatched_modern_window.encode_lossless().unwrap();
         assert!(
             mismatched_modern_window
