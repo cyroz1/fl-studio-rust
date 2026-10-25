@@ -1974,6 +1974,8 @@ pub struct StrumOptions {
     pub descending: bool,
     /// Shortens strummed notes so their original end positions stay fixed.
     pub preserve_end: bool,
+    /// Reverses the strum direction at each successive chord onset.
+    pub alternate_direction: bool,
     /// Positive values lower successive note velocities; negative values raise them.
     pub velocity_amount: i16,
     /// Curves the velocity change from gradual to accelerated/decelerated.
@@ -1986,6 +1988,7 @@ impl Default for StrumOptions {
             spread_ticks: 120,
             descending: false,
             preserve_end: false,
+            alternate_direction: false,
             velocity_amount: 0,
             velocity_tension_percent: 0,
         }
@@ -13543,19 +13546,16 @@ impl FlpDocument {
         }
 
         let mut edits = Vec::new();
+        let mut chord_index = 0usize;
         for (onset, mut group) in onset_groups {
             if group.len() < 2 || (options.spread_ticks == 0 && options.velocity_amount == 0) {
                 continue;
             }
+            let descending =
+                options.descending ^ (options.alternate_direction && chord_index % 2 == 1);
+            chord_index = chord_index.saturating_add(1);
             group.sort_by_key(|(note_index, key, _, _)| {
-                (
-                    if options.descending {
-                        u16::MAX - *key
-                    } else {
-                        *key
-                    },
-                    *note_index,
-                )
+                (if descending { u16::MAX - *key } else { *key }, *note_index)
             });
             let steps = u64::try_from(group.len() - 1).map_err(|_| FlpError::LengthOverflow)?;
             let tension = f64::from(options.velocity_tension_percent) / 100.0;
