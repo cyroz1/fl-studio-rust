@@ -4860,6 +4860,7 @@ struct DawUi {
     audio_engine: Option<AudioEngine>,
     audio_recording: Option<AudioRecordingSession>,
     audio_recording_offset_ms: i16,
+    audio_recording_mixer_track: i8,
     record_audio_enabled: bool,
     audio_record_start_requested: bool,
     audio_record_stop_requested: bool,
@@ -5331,6 +5332,7 @@ struct AudioRecordingSession {
     arrangement_id: u16,
     start_tick: u32,
     recording_offset_ms: i16,
+    mixer_track: i8,
     tempo_map: PlaylistTempoMap,
     project_generation: u64,
     capture_active: bool,
@@ -6395,6 +6397,7 @@ impl DawUi {
             audio_engine: None,
             audio_recording: None,
             audio_recording_offset_ms,
+            audio_recording_mixer_track: 0,
             record_audio_enabled,
             audio_record_start_requested: false,
             audio_record_stop_requested: false,
@@ -51032,6 +51035,17 @@ impl DawUi {
             self.status = "Add an Audio Clip to the project before recording; its recognized FLP record is used as a safe template".to_owned();
             return;
         }
+        let recording_mixer_track = self.audio_recording_mixer_track;
+        if recording_mixer_track > 0
+            && !document
+                .mixer_inserts()
+                .iter()
+                .any(|insert| insert.ordinal() == recording_mixer_track as usize)
+        {
+            self.status =
+                format!("Mixer insert {recording_mixer_track} is not available in this project");
+            return;
+        }
 
         let mut dialog = rfd::FileDialog::new()
             .set_title("Record audio to Playlist")
@@ -51119,6 +51133,7 @@ impl DawUi {
             arrangement_id,
             start_tick,
             recording_offset_ms: self.audio_recording_offset_ms,
+            mixer_track: recording_mixer_track,
             tempo_map,
             project_generation,
             capture_active: true,
@@ -51313,6 +51328,14 @@ impl DawUi {
                 return;
             }
         };
+        if let Err(error) = updated.set_channel_mixer_track(channel_id, session.mixer_track) {
+            self.status = format!(
+                "Saved {}, but could not route its Audio Clip to Mixer track {}: {error}",
+                session.output_path.display(),
+                session.mixer_track
+            );
+            return;
+        }
         let clip_index = match updated.create_playlist_audio_clip(
             session.arrangement_id,
             channel_id,
@@ -51342,17 +51365,23 @@ impl DawUi {
         self.view = MainView::Playlist;
         self.refresh_audio_waveform_paths();
         let seconds = summary.frames as f64 / f64::from(summary.sample_rate.max(1));
+        let mixer_route_label = if session.mixer_track == 0 {
+            "Master".to_owned()
+        } else {
+            format!("Insert {}", session.mixer_track)
+        };
         self.status = if summary.overflow_frames == 0 {
             format!(
-                "Recorded {seconds:.1} s to Playlist track {} · {}",
+                "Recorded {seconds:.1} s to Playlist track {} · Mixer {mixer_route_label} · {}",
                 track_index + 1,
                 session.output_path.display()
             )
         } else {
             format!(
-                "Recorded {seconds:.1} s to Playlist track {} · {} input frames overflowed",
+                "Recorded {seconds:.1} s to Playlist track {} · Mixer {mixer_route_label} · {} input frames overflowed · {}",
                 track_index + 1,
-                summary.overflow_frames
+                summary.overflow_frames,
+                session.output_path.display()
             )
         };
     }
@@ -52324,9 +52353,58 @@ impl DawUi {
 
         ui.separator();
         ui.strong("Audio recording");
+        let recording_mixer_inserts = self
+            .document
+            .as_ref()
+            .map(FlpDocument::mixer_inserts)
+            .unwrap_or_default();
+        let selected_recording_mixer_track_name = if self.audio_recording_mixer_track == 0 {
+            "Master".to_owned()
+        } else {
+            recording_mixer_inserts
+                .iter()
+                .find(|insert| insert.ordinal() == self.audio_recording_mixer_track as usize)
+                .map(|insert| {
+                    insert.name().map_or_else(
+                        || format!("Insert {}", insert.ordinal()),
+                        |name| format!("Insert {} · {name}", insert.ordinal()),
+                    )
+                })
+                .unwrap_or_else(|| {
+                    format!("Unavailable insert {}", self.audio_recording_mixer_track)
+                })
+        };
+        ui.add_enabled_ui(self.audio_recording.is_none(), |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Recorded clip Mixer route");
+                egui::ComboBox::from_id_salt("audio_recording_mixer_track")
+                    .selected_text(selected_recording_mixer_track_name)
+                    .width(240.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.audio_recording_mixer_track, 0, "Master");
+                        for insert in &recording_mixer_inserts {
+                            let Ok(track) = i8::try_from(insert.ordinal()) else {
+                                continue;
+                            };
+                            if track <= 0 {
+                                continue;
+                            }
+                            let label = insert.name().map_or_else(
+                                || format!("Insert {}", insert.ordinal()),
+                                |name| format!("Insert {} · {name}", insert.ordinal()),
+                            );
+                            ui.selectable_value(
+                                &mut self.audio_recording_mixer_track,
+                                track,
+                                label,
+                            );
+                        }
+                    });
+            });
+        });
         ui.label(
             egui::RichText::new(
-                "Records the selected input to WAV and adds the take to the Playlist. This path records the direct device input without Mixer effects.",
+                "The WAV capture is dry. Its Audio Clip is routed through the selected Mixer track when played, including supported routing and VST3 effects. Live input monitoring still bypasses Mixer effects.",
             )
             .color(MUTED),
         );
@@ -52360,6 +52438,10 @@ impl DawUi {
             .is_some_and(|recording| recording.capture_active);
         let recording_finalizing = self.audio_recording.is_some() && !recording_active;
         let recording_template_available = self.audio_recording_template_available();
+        let recording_mixer_route_available = self.audio_recording_mixer_track == 0
+            || recording_mixer_inserts
+                .iter()
+                .any(|insert| insert.ordinal() == self.audio_recording_mixer_track as usize);
         let input_engine_ready = self.audio_engine.as_ref().is_none_or(|engine| {
             engine.input_active()
                 && engine.input_channel_pair() == self.audio_settings.input_channel_pair
@@ -52367,6 +52449,7 @@ impl DawUi {
         let can_start_audio_recording = recording_template_available
             && self.audio_recording.is_none()
             && self.audio_settings.enable_input
+            && recording_mixer_route_available
             && input_engine_ready;
         ui.horizontal(|ui| {
             if ui
@@ -52393,6 +52476,8 @@ impl DawUi {
                     "Enable audio input to record"
                 } else if !recording_template_available {
                     "Add an Audio Clip to the Playlist before recording"
+                } else if !recording_mixer_route_available {
+                    "Choose a Mixer insert available in this project"
                 } else {
                     "Restart the audio engine to use the selected input channels"
                 };
