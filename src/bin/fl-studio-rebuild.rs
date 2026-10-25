@@ -44,17 +44,19 @@ use flp_rebuild::sample_render::{
     PlaylistRenderRange, PlaylistRenderSummary, PlaylistStreamMonitor, PlaylistTailMode,
     PlaylistTempoMap, ResamplingQuality, SamplerLiveInputRouting, SamplerLiveNoteEvent,
     SamplerPatternLoopPlayback, SamplerPatternRenderOptions, SamplerPatternRenderSummary,
-    Vst3LiveInputEvent, Vst3PatternLoopPlayback, WavChannelMode, WavDitherMode, WavSampleFormat,
-    nearest_playlist_audio_clip_zero_crossing_tick, playlist_audio_clip_fade_gain,
-    playlist_performance_clip_indices_with_vst3, playlist_performance_static_document_with_vst3,
-    playlist_performance_vst3_channel_ids, playlist_performance_vst3_clip_indices,
-    render_audio_clips_to_file, render_playlist_mixer_stems_with_vst3_cancellable,
+    Vst3LiveInputEvent, Vst3PatternLoopPlayback, Vst3PatternPlayback, WavChannelMode,
+    WavDitherMode, WavSampleFormat, nearest_playlist_audio_clip_zero_crossing_tick,
+    playlist_audio_clip_fade_gain, playlist_performance_clip_indices_with_vst3,
+    playlist_performance_static_document_with_vst3, playlist_performance_vst3_channel_ids,
+    playlist_performance_vst3_clip_indices, render_audio_clips_to_file,
+    render_playlist_mixer_stems_with_vst3_cancellable,
     render_playlist_with_vst3_to_file_from_frame_cancellable,
     render_playlist_with_vst3_to_flac_cancellable, render_playlist_with_vst3_to_mp3_cancellable,
     render_playlist_with_vst3_to_ogg_cancellable, render_playlist_with_vst3_to_wav_cancellable,
     render_sampler_pattern_to_file, stream_input_monitor_through_mixer,
     stream_mixed_layer_midi_input_to_device,
     stream_pattern_loop_with_vst3_from_tick_to_device_with_live_master_controls,
+    stream_pattern_with_vst3_to_device_with_live_master_controls,
     stream_playlist_performance_with_vst3_to_device,
     stream_playlist_with_vst3_to_device_with_monitor, stream_sampler_midi_input_to_device,
     stream_sampler_pattern_loop_from_tick_to_device_with_live_master_controls,
@@ -37418,36 +37420,53 @@ impl DawUi {
         } else {
             0
         };
-        let pattern_automations = if loop_length_ticks.is_some() {
-            let pattern = match document.patterns() {
-                Ok(patterns) => patterns
-                    .into_iter()
-                    .find(|pattern| pattern.id == pattern_id),
-                Err(error) => {
-                    self.status = format!("Could not decode Pattern automation: {error}");
+        let pattern_for_vst3 =
+            if loop_length_ticks.is_some() || !self.channel_vst3_instances.is_empty() {
+                let pattern = match document.patterns() {
+                    Ok(patterns) => patterns
+                        .into_iter()
+                        .find(|pattern| pattern.id == pattern_id),
+                    Err(error) => {
+                        self.status = format!("Could not decode Pattern automation: {error}");
+                        return;
+                    }
+                };
+                let Some(pattern) = pattern else {
+                    self.status = format!("Pattern {pattern_id} was not found");
                     return;
-                }
+                };
+                Some(pattern)
+            } else {
+                None
             };
-            let Some(pattern) = pattern else {
-                self.status = format!("Pattern {pattern_id} was not found");
-                return;
-            };
+        let vst3_stream_duration_ticks = loop_length_ticks.or_else(|| {
+            pattern_for_vst3.as_ref().map(|pattern| {
+                pattern_lfo_loop_length_ticks(
+                    pattern,
+                    document.header().ppq(),
+                    document.metadata().time_signature().unwrap_or((4, 4)),
+                )
+            })
+        });
+        let pattern_automations = if let (Some(pattern), Some(duration_ticks)) =
+            (pattern_for_vst3.as_ref(), vst3_stream_duration_ticks)
+        {
             self.pattern_vst3_parameter_automations_for_pattern(
-                &pattern,
+                pattern,
                 document.header().ppq(),
-                loop_length_ticks.unwrap_or_default(),
+                duration_ticks,
             )
         } else {
             BTreeMap::new()
         };
-        let vst3_processor = if let Some(loop_length_ticks) = loop_length_ticks {
+        let vst3_processor = if let Some(duration_ticks) = vst3_stream_duration_ticks {
             self.vst3_host
                 .as_ref()
                 .map(|host| {
                     host.prepare_pattern_loop_stream_with_mixer_effects_and_automation(
                         document,
                         pattern_id,
-                        loop_length_ticks,
+                        duration_ticks,
                         device_rate,
                         &self.channel_vst3_instances,
                         &self.mixer_effect_vst3_instances,
@@ -37473,7 +37492,7 @@ impl DawUi {
             .as_ref()
             .map(Vst3PlaylistStreamProcessor::summary);
 
-        if loop_length_ticks.is_some() {
+        if vst3_processor.is_some() {
             self.initialize_live_master_mixer_targets(document);
         }
 
@@ -37534,8 +37553,8 @@ impl DawUi {
                             read_sample_root_note,
                             ..SamplerPatternRenderOptions::default()
                         };
-                        if let Some(loop_length_ticks) = loop_length_ticks {
-                            if let Some(vst3_processor) = vst3_processor {
+                        if let Some(vst3_processor) = vst3_processor {
+                            if let Some(loop_length_ticks) = loop_length_ticks {
                                 stream_pattern_loop_with_vst3_from_tick_to_device_with_live_master_controls(
                                     &document,
                                     &project_path,
@@ -37550,19 +37569,32 @@ impl DawUi {
                                     &worker_cancelled,
                                 )
                             } else {
-                                stream_sampler_pattern_loop_from_tick_to_device_with_live_master_controls(
+                                stream_pattern_with_vst3_to_device_with_live_master_controls(
                                     &document,
                                     &project_path,
                                     options,
-                                    SamplerPatternLoopPlayback {
-                                        loop_length_ticks,
-                                        start_tick: loop_start_tick,
+                                    Vst3PatternPlayback {
+                                        duration_ticks: vst3_stream_duration_ticks.unwrap_or(1),
+                                        processor: vst3_processor,
                                     },
                                     &worker_mixer_meters,
                                     &writer,
                                     &worker_cancelled,
                                 )
                             }
+                        } else if let Some(loop_length_ticks) = loop_length_ticks {
+                            stream_sampler_pattern_loop_from_tick_to_device_with_live_master_controls(
+                                &document,
+                                &project_path,
+                                options,
+                                SamplerPatternLoopPlayback {
+                                    loop_length_ticks,
+                                    start_tick: loop_start_tick,
+                                },
+                                &worker_mixer_meters,
+                                &writer,
+                                &worker_cancelled,
+                            )
                         } else {
                             stream_sampler_pattern_to_device(
                                 &document,
@@ -37617,7 +37649,14 @@ impl DawUi {
                         )
                     });
                     format!(
-                        "Looping Pattern {pattern_id} through enabled Sampler channels{vst3_status}; Audio Clips and Mixer effects are not included"
+                        "Looping Pattern {pattern_id} through enabled Sampler channels{vst3_status}; Audio Clips are not included"
+                    )
+                } else if let Some(summary) = vst3_summary
+                    && summary.plugin_channels_rendered > 0
+                {
+                    format!(
+                        "Playing Pattern {pattern_id} through Sampler and {} loaded VST3 channel(s) at {device_rate} Hz",
+                        summary.plugin_channels_rendered
                     )
                 } else {
                     format!(

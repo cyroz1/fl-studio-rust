@@ -1250,6 +1250,12 @@ impl Vst3PlaylistStreamProcessor {
         self.content_frames
     }
 
+    pub(crate) fn stop_pattern_repetition_after_first_pass(&mut self) {
+        for stream in &mut self.streams {
+            stream.pattern_loop = None;
+        }
+    }
+
     pub fn extend_to_output_frames(&mut self, frames: u64) -> Result<(), String> {
         self.content_frames = self.content_frames.max(frames);
         let content_with_effect_tail = self
