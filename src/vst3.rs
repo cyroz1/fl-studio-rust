@@ -5565,7 +5565,8 @@ impl Vst3HostRuntime {
             .ok_or_else(|| format!("no loaded VST3 instance with id {id}"))
     }
 
-    pub(crate) fn volume_expression_channels(
+    /// Returns loaded project channels whose plug-ins advertise Volume note expression.
+    pub fn volume_expression_channels(
         &self,
         channel_instances: &BTreeMap<u16, u64>,
     ) -> BTreeSet<u16> {
