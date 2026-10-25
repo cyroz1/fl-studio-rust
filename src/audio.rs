@@ -3455,6 +3455,7 @@ impl AudioEngine {
             let worker_playback = Arc::clone(&playback);
             let worker_ring = Arc::clone(&ring);
             let worker_peak = Arc::clone(&input_peak);
+            let worker_input_callback_frames = Arc::clone(&input_callback_frames);
             let worker_recording = Arc::clone(&input_recording);
             let worker_error = Arc::clone(&error);
             let worker_stop = Arc::clone(&stop);
@@ -3469,7 +3470,7 @@ impl AudioEngine {
                             playback: worker_playback,
                             ring: worker_ring,
                             input_peak: worker_peak,
-                            input_callback_frames: Arc::clone(&input_callback_frames),
+                            input_callback_frames: worker_input_callback_frames,
                             input_recording: worker_recording,
                             error: worker_error,
                             stop: worker_stop,
@@ -3500,6 +3501,7 @@ impl AudioEngine {
             let worker_peak = Arc::clone(&input_peak);
             let worker_source = Arc::clone(&source);
             let worker_playback = Arc::clone(&playback);
+            let worker_input_callback_frames = Arc::clone(&input_callback_frames);
             let worker_recording = Arc::clone(&input_recording);
             let worker_error = Arc::clone(&error);
             let worker_stop = Arc::clone(&stop);
@@ -3514,7 +3516,7 @@ impl AudioEngine {
                             playback: worker_playback,
                             ring: worker_ring,
                             input_peak: worker_peak,
-                            input_callback_frames: Arc::clone(&input_callback_frames),
+                            input_callback_frames: worker_input_callback_frames,
                             input_recording: worker_recording,
                             error: worker_error,
                             stop: worker_stop,
