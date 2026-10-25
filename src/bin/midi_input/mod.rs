@@ -682,6 +682,12 @@ fn queue_script_transport_actions(
             ScriptTransportAction::SetCurrentTempoMilliBpm(milli_bpm) => {
                 MidiTransportCommand::SetCurrentTempo(milli_bpm)
             }
+            ScriptTransportAction::SetProjectTimeSignatureNumerator(numerator) => {
+                MidiTransportCommand::SetProjectTimeSignatureNumerator(numerator)
+            }
+            ScriptTransportAction::SetProjectTimeSignatureDenominator(denominator) => {
+                MidiTransportCommand::SetProjectTimeSignatureDenominator(denominator)
+            }
             ScriptTransportAction::PatternJog(increment) => {
                 MidiTransportCommand::PatternJog(increment)
             }
@@ -730,6 +736,8 @@ pub enum MidiTransportCommand {
     MoveSongPosition { speed_millionths: i32, start: bool },
     SetPlaybackSpeed(u32),
     SetCurrentTempo(u32),
+    SetProjectTimeSignatureNumerator(u8),
+    SetProjectTimeSignatureDenominator(u8),
     PatternJog(i32),
     TempoJog(i32),
     MarkerJumpJog(i32),
@@ -1350,6 +1358,10 @@ pub fn describe_event(event: MidiInputEvent) -> String {
             }
             MidiTransportCommand::SetPlaybackSpeed(_) => "MIDI script Playback Speed".to_owned(),
             MidiTransportCommand::SetCurrentTempo(_) => "MIDI script Tempo".to_owned(),
+            MidiTransportCommand::SetProjectTimeSignatureNumerator(_)
+            | MidiTransportCommand::SetProjectTimeSignatureDenominator(_) => {
+                "MIDI script Project Time Signature".to_owned()
+            }
             MidiTransportCommand::PatternJog(_) => "MIDI script Pattern Selection".to_owned(),
             MidiTransportCommand::TempoJog(_) => "MIDI script Tempo".to_owned(),
             MidiTransportCommand::MarkerJumpJog(_) => "MIDI script Marker Jump".to_owned(),
@@ -2040,6 +2052,8 @@ mod tests {
             [
                 ScriptTransportAction::MidiOutput(vec![0x90, 60, 100]),
                 ScriptTransportAction::SetCurrentTempoMilliBpm(123_456),
+                ScriptTransportAction::SetProjectTimeSignatureNumerator(7),
+                ScriptTransportAction::SetProjectTimeSignatureDenominator(8),
                 ScriptTransportAction::Start,
                 ScriptTransportAction::ShowMainView(4),
                 ScriptTransportAction::ToggleAudioSettingsWindow,
@@ -2055,6 +2069,14 @@ mod tests {
         assert_eq!(
             transport_receiver.try_recv().unwrap().event,
             MidiInputEvent::Transport(MidiTransportCommand::SetCurrentTempo(123_456))
+        );
+        assert_eq!(
+            transport_receiver.try_recv().unwrap().event,
+            MidiInputEvent::Transport(MidiTransportCommand::SetProjectTimeSignatureNumerator(7))
+        );
+        assert_eq!(
+            transport_receiver.try_recv().unwrap().event,
+            MidiInputEvent::Transport(MidiTransportCommand::SetProjectTimeSignatureDenominator(8))
         );
         assert_eq!(
             transport_receiver.try_recv().unwrap().event,

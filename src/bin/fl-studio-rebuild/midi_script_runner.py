@@ -334,6 +334,18 @@ def _get_rec_ppb():
     return _get_rec_ppq() * numerator
 
 
+def _set_project_time_signature_part(part, value):
+    try:
+        value = int(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("project time-signature value must be an integer") from error
+    if not 1 <= value <= 255:
+        raise ValueError("project time-signature value must be between 1 and 255")
+    _request_transport_action(
+        {"action": "set_project_time_signature_" + part, part: value}
+    )
+
+
 def _get_song_tick_pos(mode=0):
     position_ticks = int(_active_transport_state.get("song_position_ticks", 0))
     if mode == 0:
@@ -689,6 +701,12 @@ def _install_modules(script_name, device_name):
     general = _module("general")
     general.getRecPPQ = _get_rec_ppq
     general.getRecPPB = _get_rec_ppb
+    general.setNumerator = lambda value: _set_project_time_signature_part(
+        "numerator", value
+    )
+    general.setDenominator = lambda value: _set_project_time_signature_part(
+        "denominator", value
+    )
     general.getVersion = lambda: 1
     general.getChangedFlag = lambda: int(
         _active_transport_state.get("project_changed_flag", 0)

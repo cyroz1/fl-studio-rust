@@ -42,6 +42,8 @@ pub enum ScriptTransportAction {
     },
     SetPlaybackSpeed(u32),
     SetCurrentTempoMilliBpm(u32),
+    SetProjectTimeSignatureNumerator(u8),
+    SetProjectTimeSignatureDenominator(u8),
     PatternJog(i32),
     TempoJog(i32),
     MarkerJumpJog(i32),
@@ -748,6 +750,25 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
             .ok_or_else(|| "MIDI script returned an invalid project tempo".to_owned())?;
         return Ok(ScriptTransportAction::SetCurrentTempoMilliBpm(milli_bpm));
     }
+    if name == Some("set_project_time_signature_numerator")
+        || name == Some("set_project_time_signature_denominator")
+    {
+        let key = if name == Some("set_project_time_signature_numerator") {
+            "numerator"
+        } else {
+            "denominator"
+        };
+        let value = action[key]
+            .as_u64()
+            .and_then(|value| u8::try_from(value).ok())
+            .filter(|value| *value > 0)
+            .ok_or_else(|| "MIDI script returned an invalid project time signature".to_owned())?;
+        return Ok(if name == Some("set_project_time_signature_numerator") {
+            ScriptTransportAction::SetProjectTimeSignatureNumerator(value)
+        } else {
+            ScriptTransportAction::SetProjectTimeSignatureDenominator(value)
+        });
+    }
     if name == Some("marker_jump_jog") || name == Some("marker_sel_jog") {
         let increment = action["increment"]
             .as_i64()
@@ -1305,6 +1326,29 @@ mod tests {
         let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
 
         assert_eq!(result.bytes, [0xB0, 96, 1]);
+    }
+
+    #[test]
+    fn python_general_time_signature_setters_emit_project_edit_actions() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport general\ndef OnMidiIn(event):\n    general.setNumerator(7)\n    general.setDenominator(8)\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let mut runtime = MidiScriptRuntime::start_for_device(&script, "Test Input").unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
+
+        assert_eq!(
+            result.actions,
+            [
+                ScriptTransportAction::SetProjectTimeSignatureNumerator(7),
+                ScriptTransportAction::SetProjectTimeSignatureDenominator(8),
+            ]
+        );
     }
 
     #[test]

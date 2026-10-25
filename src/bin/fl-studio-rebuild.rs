@@ -14356,6 +14356,44 @@ impl DawUi {
         }
     }
 
+    fn set_midi_script_project_time_signature(
+        &mut self,
+        numerator: Option<u8>,
+        denominator: Option<u8>,
+    ) {
+        let Some(document) = self.document.as_mut() else {
+            self.status = "MIDI script time-signature edits require an open project".to_owned();
+            return;
+        };
+        let existing_signature = document.metadata().time_signature();
+        let (current_numerator, current_denominator) = existing_signature.unwrap_or((4, 4));
+        let signature = (
+            numerator.unwrap_or(current_numerator),
+            denominator.unwrap_or(current_denominator),
+        );
+        if existing_signature == Some(signature) {
+            return;
+        }
+        match document.set_project_settings(ProjectSettingsEdit {
+            time_signature: Some(signature),
+            ..ProjectSettingsEdit::default()
+        }) {
+            Ok(()) => {
+                self.dirty = true;
+                self.project_settings_time_signature_enabled = true;
+                self.project_settings_time_signature_numerator = signature.0;
+                self.project_settings_time_signature_denominator = signature.1;
+                self.status = format!(
+                    "MIDI script set project time signature to {}/{}",
+                    signature.0, signature.1
+                );
+            }
+            Err(error) => {
+                self.status = format!("MIDI script could not set project time signature: {error}");
+            }
+        }
+    }
+
     fn live_sampler_tempo_bpm_milli(&self) -> u32 {
         let project_tempo_bpm = self
             .document
@@ -46526,6 +46564,12 @@ impl DawUi {
             }
             MidiTransportCommand::SetCurrentTempo(milli_bpm) => {
                 self.set_midi_script_tempo(milli_bpm);
+            }
+            MidiTransportCommand::SetProjectTimeSignatureNumerator(numerator) => {
+                self.set_midi_script_project_time_signature(Some(numerator), None);
+            }
+            MidiTransportCommand::SetProjectTimeSignatureDenominator(denominator) => {
+                self.set_midi_script_project_time_signature(None, Some(denominator));
             }
             MidiTransportCommand::PatternJog(increment) => {
                 self.jog_midi_script_pattern(increment);
