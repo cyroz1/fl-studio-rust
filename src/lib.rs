@@ -4,6 +4,7 @@ use std::fmt;
 pub mod audio;
 pub mod media;
 pub mod midi;
+pub mod plugin_settings;
 pub mod plugins;
 pub mod project_package;
 pub mod sample_render;

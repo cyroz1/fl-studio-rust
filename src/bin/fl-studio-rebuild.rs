@@ -29,6 +29,9 @@ use flp_rebuild::media::{
     summarize_audio_waveform, write_audio_range_to_wav_with_options,
 };
 use flp_rebuild::midi::{MidiChannelMapping, MidiFile, MidiImportOptions};
+use flp_rebuild::plugin_settings::{
+    load_vst3_manual_latency_offsets, save_vst3_manual_latency_offsets,
+};
 use flp_rebuild::plugins::{PluginCandidate, PluginFormat, scan_installed_plugins};
 use flp_rebuild::project_package::{ProjectPackageWorkspace, copy_unique_sample_file};
 use flp_rebuild::sample_render::{
@@ -56360,10 +56363,6 @@ fn midi_vst3_parameter_mappings_file() -> Option<PathBuf> {
     midi_control_change_mapping_file("midi-vst3-parameter-mappings.txt")
 }
 
-fn vst3_manual_latency_offsets_file() -> Option<PathBuf> {
-    midi_control_change_mapping_file("vst3-manual-latency-offsets.txt")
-}
-
 fn pattern_vst3_parameter_links_file() -> Option<PathBuf> {
     midi_control_change_mapping_file("pattern-vst3-parameter-links.txt")
 }
@@ -56417,13 +56416,6 @@ fn load_midi_vst3_parameter_mappings() -> Vec<MidiVst3ParameterMapping> {
     midi_vst3_parameter_mappings_file()
         .and_then(|path| fs::read_to_string(path).ok())
         .map(|contents| parse_midi_vst3_parameter_mappings(&contents))
-        .unwrap_or_default()
-}
-
-fn load_vst3_manual_latency_offsets() -> BTreeMap<String, i32> {
-    vst3_manual_latency_offsets_file()
-        .and_then(|path| fs::read_to_string(path).ok())
-        .map(|contents| parse_vst3_manual_latency_offsets(&contents))
         .unwrap_or_default()
 }
 
@@ -56598,18 +56590,6 @@ fn save_midi_vst3_parameter_mappings(mappings: &[MidiVst3ParameterMapping]) -> R
     fs::create_dir_all(parent)
         .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
     fs::write(&path, serialize_midi_vst3_parameter_mappings(mappings))
-        .map_err(|error| format!("could not write {}: {error}", path.display()))
-}
-
-fn save_vst3_manual_latency_offsets(offsets: &BTreeMap<String, i32>) -> Result<(), String> {
-    let path = vst3_manual_latency_offsets_file()
-        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| "the VST3 latency offset path has no parent folder".to_owned())?;
-    fs::create_dir_all(parent)
-        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
-    fs::write(&path, serialize_vst3_manual_latency_offsets(offsets))
         .map_err(|error| format!("could not write {}: {error}", path.display()))
 }
 
@@ -56962,42 +56942,6 @@ fn serialize_midi_vst3_parameter_mappings(mappings: &[MidiVst3ParameterMapping])
                 contents.push_str(&encode_midi_device_id(&target.parameter_name));
             }
         }
-        contents.push('\n');
-    }
-    contents
-}
-
-fn parse_vst3_manual_latency_offsets(contents: &str) -> BTreeMap<String, i32> {
-    let mut offsets = BTreeMap::new();
-    for line in contents.lines() {
-        let Some(encoded) = line.strip_prefix("offset=") else {
-            continue;
-        };
-        let mut fields = encoded.split('\t');
-        let Some(plugin_uid) = fields.next().and_then(decode_midi_device_id) else {
-            continue;
-        };
-        let Some(offset_samples) = fields.next().and_then(|field| field.parse::<i32>().ok()) else {
-            continue;
-        };
-        if fields.next().is_some() || plugin_uid.is_empty() {
-            continue;
-        }
-        offsets.insert(plugin_uid.to_ascii_lowercase(), offset_samples);
-    }
-    offsets
-}
-
-fn serialize_vst3_manual_latency_offsets(offsets: &BTreeMap<String, i32>) -> String {
-    let mut contents = String::from("version=1\n");
-    for (plugin_uid, offset_samples) in offsets {
-        if plugin_uid.is_empty() {
-            continue;
-        }
-        contents.push_str("offset=");
-        contents.push_str(&encode_midi_device_id(plugin_uid));
-        contents.push('\t');
-        contents.push_str(&offset_samples.to_string());
         contents.push('\n');
     }
     contents
@@ -63509,8 +63453,8 @@ mod tests {
         parse_midi_output_programs, parse_midi_output_routes, parse_midi_output_values,
         parse_midi_vst3_parameter_mappings, parse_pattern_vst3_parameter_links,
         parse_playlist_audio_clip_envelopes, parse_playlist_vst3_parameter_links,
-        parse_vst3_manual_latency_offsets, parse_window_layout_presets,
-        pattern_color_from_random_index, pattern_lfo_loop_length_ticks, pattern_loop_frame_at_tick,
+        parse_window_layout_presets, pattern_color_from_random_index,
+        pattern_lfo_loop_length_ticks, pattern_loop_frame_at_tick,
         pattern_loop_handoff_tick_at_frame, pattern_loop_tick_at_frame,
         pattern_vst3_parameter_automation_for_channel, pattern_vst3_parameter_link_for_target,
         piano_roll_color_group_note_ids, piano_roll_controller_stroke_points,
@@ -63538,15 +63482,15 @@ mod tests {
         serialize_internal_lfo_parameter_links, serialize_midi_controller_templates,
         serialize_midi_mixer_control_mappings, serialize_midi_vst3_parameter_mappings,
         serialize_pattern_vst3_parameter_links, serialize_playlist_audio_clip_envelopes,
-        serialize_playlist_vst3_parameter_links, serialize_vst3_manual_latency_offsets,
-        serialize_window_layout_presets, should_auto_connect_midi_input,
-        should_auto_connect_midi_output, snap_note_tick, snap_piano_roll_key_to_scale,
-        snap_recorded_midi_notes_to_scale, toggle_piano_roll_note_group_selection,
-        touch_pan_zoom_scroll_offset, track_two_finger_tap, update_channel_rack_selection,
-        update_layer_child_selection, update_piano_roll_box_selection,
-        upsert_internal_lfo_parameter_link, upsert_midi_mixer_control_mapping,
-        upsert_midi_vst3_parameter_mapping, upsert_pattern_vst3_parameter_link,
-        upsert_playlist_audio_clip_envelope, upsert_playlist_vst3_parameter_link, zoom_to_fit,
+        serialize_playlist_vst3_parameter_links, serialize_window_layout_presets,
+        should_auto_connect_midi_input, should_auto_connect_midi_output, snap_note_tick,
+        snap_piano_roll_key_to_scale, snap_recorded_midi_notes_to_scale,
+        toggle_piano_roll_note_group_selection, touch_pan_zoom_scroll_offset, track_two_finger_tap,
+        update_channel_rack_selection, update_layer_child_selection,
+        update_piano_roll_box_selection, upsert_internal_lfo_parameter_link,
+        upsert_midi_mixer_control_mapping, upsert_midi_vst3_parameter_mapping,
+        upsert_pattern_vst3_parameter_link, upsert_playlist_audio_clip_envelope,
+        upsert_playlist_vst3_parameter_link, zoom_to_fit,
     };
 
     #[test]
@@ -65101,26 +65045,6 @@ mod tests {
             3
         );
         assert!(midi_vst3_parameter_mappings_for_cc(&mappings, "other", 15, 74).is_empty());
-    }
-
-    #[test]
-    fn vst3_manual_latency_offsets_round_trip_and_normalize_class_uids() {
-        let offsets = BTreeMap::from([
-            ("com.example.synth".to_owned(), -2_048),
-            ("org.example.fx".to_owned(), 256),
-        ]);
-        let encoded = serialize_vst3_manual_latency_offsets(&offsets);
-        assert_eq!(parse_vst3_manual_latency_offsets(&encoded), offsets);
-
-        let mixed_case = format!(
-            "version=1\noffset={}\t-16\noffset={}\t7\textra\n",
-            encode_midi_device_id("Com.Example.Plugin"),
-            encode_midi_device_id("org.example.bad")
-        );
-        assert_eq!(
-            parse_vst3_manual_latency_offsets(&mixed_case),
-            BTreeMap::from([("com.example.plugin".to_owned(), -16)])
-        );
     }
 
     #[test]

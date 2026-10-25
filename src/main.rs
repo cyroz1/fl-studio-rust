@@ -6,6 +6,7 @@ use std::process::ExitCode;
 
 use flp_rebuild::media::{SamplePathResolver, decode_audio_file};
 use flp_rebuild::midi::{MidiChannelMapping, MidiFile, MidiImportOptions};
+use flp_rebuild::plugin_settings::load_vst3_manual_latency_offsets;
 use flp_rebuild::plugins::scan_installed_plugins;
 use flp_rebuild::project_package::copy_unique_sample_file;
 use flp_rebuild::sample_render::{
@@ -4932,6 +4933,7 @@ fn render_audio_vst3(
         _ => return Err("VST3 effect output must use .wav, .flac, .ogg, or .mp3".to_owned()),
     };
     let mut host = Vst3HostRuntime::new(f64::from(audio.sample_rate), 512)?;
+    host.set_manual_latency_offsets(&load_vst3_manual_latency_offsets());
     let effect = host.load_audio_effect(bundle_path, class_uid)?;
     let summary = host.render_audio_through_effect_to_file(
         effect.id,
