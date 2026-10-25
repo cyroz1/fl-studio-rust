@@ -187,7 +187,7 @@ impl ProjectPackageWorkspace {
             .map_err(|error| format!("could not open {}: {error}", path.as_ref().display()))?;
         let mut archive = ZipArchive::new(source)
             .map_err(|error| format!("could not read ZIP project: {error}"))?;
-        let mut central_source = File::open(path.as_ref()).map_err(|error| {
+        let mut source_headers = File::open(path.as_ref()).map_err(|error| {
             format!(
                 "could not inspect ZIP project {}: {error}",
                 path.as_ref().display()
@@ -219,10 +219,21 @@ impl ProjectPackageWorkspace {
             let metadata = PackageEntryMetadata {
                 options,
                 comment: entry.comment().to_owned(),
-                local_extra_fields: preserve_unknown_extra_fields(entry.extra_data()),
+                local_extra_fields: preserve_unknown_extra_fields(Some(
+                    &read_local_extra_data(&mut source_headers, entry.header_start()).map_err(
+                        |error| {
+                            format!(
+                                "could not inspect ZIP entry {raw_name:?} local extra fields: {error}"
+                            )
+                        },
+                    )?,
+                )),
                 central_extra_fields: preserve_unknown_extra_fields(
                     Some(
-                        &read_central_extra_data(&mut central_source, entry.central_header_start())
+                        &read_central_extra_data(
+                            &mut source_headers,
+                            entry.central_header_start(),
+                        )
                             .map_err(|error| {
                                 format!(
                                     "could not inspect ZIP entry {raw_name:?} central extra fields: {error}"
@@ -639,6 +650,25 @@ fn read_central_extra_data(file: &mut File, header_start: u64) -> io::Result<Vec
     Ok(extra_data)
 }
 
+fn read_local_extra_data(file: &mut File, header_start: u64) -> io::Result<Vec<u8>> {
+    const LOCAL_FILE_HEADER_LENGTH: usize = 30;
+    let mut fixed_header = [0_u8; LOCAL_FILE_HEADER_LENGTH];
+    file.seek(io::SeekFrom::Start(header_start))?;
+    file.read_exact(&mut fixed_header)?;
+    if &fixed_header[..4] != b"PK\x03\x04" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid local file header signature",
+        ));
+    }
+    let name_length = u16::from_le_bytes([fixed_header[26], fixed_header[27]]) as usize;
+    let extra_length = u16::from_le_bytes([fixed_header[28], fixed_header[29]]) as usize;
+    file.seek(io::SeekFrom::Current(name_length as i64))?;
+    let mut extra_data = vec![0; extra_length];
+    file.read_exact(&mut extra_data)?;
+    Ok(extra_data)
+}
+
 fn read_archive_comment(path: &Path) -> Result<Option<Vec<u8>>, String> {
     const END_OF_CENTRAL_DIRECTORY: &[u8; 4] = b"PK\x05\x06";
     const END_RECORD_LENGTH: usize = 22;
@@ -865,7 +895,10 @@ fn replace_file(temporary: &Path, target: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProjectPackageWorkspace, read_archive_comment, read_central_extra_data};
+    use super::{
+        ProjectPackageWorkspace, read_archive_comment, read_central_extra_data,
+        read_local_extra_data,
+    };
     use crate::FlpDocument;
     use crate::media::SamplePathResolver;
     use std::fs;
@@ -1121,7 +1154,10 @@ mod tests {
         expected_local.extend_from_slice(&0xcafe_u16.to_le_bytes());
         expected_local.extend_from_slice(&(local_payload.len() as u16).to_le_bytes());
         expected_local.extend_from_slice(local_payload);
-        assert_eq!(project.extra_data(), Some(expected_local.as_slice()));
+        let mut local_file = fs::File::open(&output_path).unwrap();
+        let local_extra_data =
+            read_local_extra_data(&mut local_file, project.header_start()).unwrap();
+        assert_eq!(local_extra_data, expected_local);
 
         let mut central_file = fs::File::open(&output_path).unwrap();
         let central_extra_data =
