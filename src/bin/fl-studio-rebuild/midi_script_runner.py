@@ -406,6 +406,88 @@ def _arrangement_current_time(snap):
     return int(_active_transport_state.get(key, 0))
 
 
+def _hint_bar_ticks(ppq, signature):
+    numerator = max(1, int(signature[0]))
+    denominator = max(1, int(signature[1]))
+    return max(1, math.floor(max(1, ppq) * numerator * 4 / denominator + 0.5))
+
+
+def _hint_time_components(time_ticks, ppq, initial_signature, signature_changes):
+    tick = min(2**32 - 1, max(0, int(time_ticks)))
+    changes = sorted(
+        (int(position), max(1, int(numerator)), max(1, int(denominator)))
+        for position, numerator, denominator in signature_changes
+    )
+    signature = (max(1, int(initial_signature[0])), max(1, int(initial_signature[1])))
+    segment_start = 0
+    measure = 1
+    index = 0
+    while index < len(changes):
+        position = changes[index][0]
+        if position > tick:
+            break
+        if position > segment_start:
+            elapsed = position - segment_start
+            bar_ticks = _hint_bar_ticks(ppq, signature)
+            completed_bars = elapsed // bar_ticks
+            measure += completed_bars
+            last_boundary = segment_start + completed_bars * bar_ticks
+            if last_boundary < position:
+                measure += 1
+            segment_start = position
+        while index < len(changes) and changes[index][0] == position:
+            _, numerator, denominator = changes[index]
+            signature = (numerator, denominator)
+            index += 1
+
+    bar_ticks = _hint_bar_ticks(ppq, signature)
+    elapsed = tick - segment_start
+    completed_bars = elapsed // bar_ticks
+    bar_start = segment_start + completed_bars * bar_ticks
+    measure += completed_bars
+    beat_ticks = max(1, ppq) * 4.0 / max(1, signature[1])
+    within_bar = tick - bar_start
+    beat = math.floor(within_bar / beat_ticks) + 1
+    tick_in_beat = math.floor(within_bar % beat_ticks)
+    return measure, beat, tick_in_beat
+
+
+def _current_time_hint(mode, time_ticks, setRecPPB=0, isLength=0):
+    try:
+        mode = int(mode)
+        time_ticks = int(time_ticks)
+        set_rec_ppb = int(setRecPPB)
+        is_length = int(isLength)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("arrangement.currentTimeHint() arguments must be integers") from error
+    if mode not in (0, 1):
+        raise ValueError("arrangement.currentTimeHint() mode must be 0 (Pattern) or 1 (Song)")
+    if set_rec_ppb != 0:
+        raise NotImplementedError(
+            "arrangement.currentTimeHint() setRecPPB override is not implemented"
+        )
+    ppq = max(1, int(_active_transport_state.get("ticks_per_quarter", 96)))
+    initial_signature = (
+        max(1, int(_active_transport_state.get("time_signature_numerator", 4))),
+        max(1, int(_active_transport_state.get("time_signature_denominator", 4))),
+    )
+    changes_key = (
+        "pattern_time_signature_changes"
+        if mode == 0
+        else "arrangement_time_signature_changes"
+    )
+    bar, beat, tick = _hint_time_components(
+        time_ticks,
+        ppq,
+        initial_signature,
+        _active_transport_state.get(changes_key, []),
+    )
+    if is_length:
+        bar = max(0, bar - 1)
+        beat = max(0, beat - 1)
+    return f"{bar}:{beat:02d}:{tick:03d}"
+
+
 def _get_song_tick_pos(mode=0):
     position_ticks = int(_active_transport_state.get("song_position_ticks", 0))
     if mode == 0:
@@ -794,6 +876,7 @@ def _install_modules(script_name, device_name):
     arrangement.getMarkerName = _get_marker_name
     arrangement.jumpToMarker = _jump_to_marker
     arrangement.currentTime = _arrangement_current_time
+    arrangement.currentTimeHint = _current_time_hint
     arrangement.selectionStart = _selection_start
     arrangement.selectionEnd = _selection_end
 

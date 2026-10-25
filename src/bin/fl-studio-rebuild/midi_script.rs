@@ -121,6 +121,7 @@ pub struct MidiScriptTransportState {
     pub current_tempo_milli_bpm: AtomicU64,
     pub project_changed_flag: AtomicI32,
     pub time_signature_numerator: AtomicU64,
+    pub time_signature_denominator: AtomicU64,
     pub song_length_ticks: AtomicU64,
     pub song_position_seconds: AtomicU64,
     pub song_length_seconds: AtomicU64,
@@ -128,6 +129,8 @@ pub struct MidiScriptTransportState {
     pub song_position_hint: Mutex<String>,
     pub song_length_hint: Mutex<String>,
     pub arrangement_marker_names: Mutex<Vec<String>>,
+    pub pattern_time_signature_changes: Mutex<Vec<(u32, u8, u8)>>,
+    pub arrangement_time_signature_changes: Mutex<Vec<(u32, u8, u8)>>,
     pub arrangement_current_time: AtomicU64,
     pub arrangement_current_time_snapped: AtomicU64,
     pub arrangement_selection_start: AtomicU64,
@@ -148,6 +151,7 @@ impl Default for MidiScriptTransportState {
             current_tempo_milli_bpm: AtomicU64::new(140_000),
             project_changed_flag: AtomicI32::new(0),
             time_signature_numerator: AtomicU64::new(4),
+            time_signature_denominator: AtomicU64::new(4),
             song_length_ticks: AtomicU64::new(0),
             song_position_seconds: AtomicU64::new(0.0_f64.to_bits()),
             song_length_seconds: AtomicU64::new(0.0_f64.to_bits()),
@@ -155,6 +159,8 @@ impl Default for MidiScriptTransportState {
             song_position_hint: Mutex::new("1:01:000".to_owned()),
             song_length_hint: Mutex::new("0:00:000".to_owned()),
             arrangement_marker_names: Mutex::new(Vec::new()),
+            pattern_time_signature_changes: Mutex::new(Vec::new()),
+            arrangement_time_signature_changes: Mutex::new(Vec::new()),
             arrangement_current_time: AtomicU64::new(0),
             arrangement_current_time_snapped: AtomicU64::new(0),
             arrangement_selection_start: AtomicU64::new(0),
@@ -579,6 +585,18 @@ impl MidiScriptRuntime {
             .lock()
             .map(|names| names.clone())
             .unwrap_or_default();
+        let pattern_time_signature_changes = self
+            .transport_state
+            .pattern_time_signature_changes
+            .lock()
+            .map(|changes| changes.clone())
+            .unwrap_or_default();
+        let arrangement_time_signature_changes = self
+            .transport_state
+            .arrangement_time_signature_changes
+            .lock()
+            .map(|changes| changes.clone())
+            .unwrap_or_default();
         let arrangement_current_time = self
             .transport_state
             .arrangement_current_time
@@ -649,6 +667,11 @@ impl MidiScriptRuntime {
                         .time_signature_numerator
                         .load(Ordering::Relaxed)
                         .max(1),
+                    "time_signature_denominator": self
+                        .transport_state
+                        .time_signature_denominator
+                        .load(Ordering::Relaxed)
+                        .max(1),
                     "song_length_ticks": self
                         .transport_state
                         .song_length_ticks
@@ -670,6 +693,8 @@ impl MidiScriptRuntime {
                     "song_position_hint": song_position_hint,
                     "song_length_hint": song_length_hint,
                     "arrangement_marker_names": arrangement_marker_names,
+                    "pattern_time_signature_changes": pattern_time_signature_changes,
+                    "arrangement_time_signature_changes": arrangement_time_signature_changes,
                     "arrangement_current_time": arrangement_current_time,
                     "arrangement_current_time_snapped": arrangement_current_time_snapped,
                     "arrangement_selection_start": arrangement_selection_start,
@@ -2096,6 +2121,82 @@ mod tests {
         let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
 
         assert_eq!(result.bytes, [0xB0, 48, 72]);
+    }
+
+    #[test]
+    fn python_arrangement_api_formats_arbitrary_time_in_bar_step_tick_units() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport arrangement\ndef OnMidiIn(event):\n    bar, step, tick = map(int, arrangement.currentTimeHint(1, 200).split(':'))\n    event.data1 = bar\n    event.data2 = step * 24 + tick\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let transport_state = Arc::new(MidiScriptTransportState::default());
+        transport_state
+            .ticks_per_quarter
+            .store(96, Ordering::Relaxed);
+        transport_state
+            .time_signature_numerator
+            .store(4, Ordering::Relaxed);
+        transport_state
+            .time_signature_denominator
+            .store(4, Ordering::Relaxed);
+        let mut runtime = MidiScriptRuntime::start_for_device_with_transport_state(
+            &script,
+            "Test Input",
+            transport_state,
+        )
+        .unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
+
+        assert_eq!(result.bytes, [0xB0, 1, 80]);
+    }
+
+    #[test]
+    fn python_arrangement_api_formats_time_with_pattern_signature_changes() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport arrangement\ndef OnMidiIn(event):\n    bar, step, tick = map(int, arrangement.currentTimeHint(0, 192).split(':'))\n    event.data1 = bar\n    event.data2 = step * 24 + tick\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let transport_state = Arc::new(MidiScriptTransportState::default());
+        *transport_state
+            .pattern_time_signature_changes
+            .lock()
+            .unwrap() = vec![(96, 3, 4)];
+        let mut runtime = MidiScriptRuntime::start_for_device_with_transport_state(
+            &script,
+            "Test Input",
+            transport_state,
+        )
+        .unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
+
+        assert_eq!(result.bytes, [0xB0, 2, 48]);
+    }
+
+    #[test]
+    fn python_arrangement_api_formats_lengths_from_zero() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport arrangement\ndef OnMidiIn(event):\n    bar, step, tick = map(int, arrangement.currentTimeHint(1, 400, 0, 1).split(':'))\n    event.data1 = bar\n    event.data2 = step * 24 + tick\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let mut runtime = MidiScriptRuntime::start_for_device(&script, "Test Input").unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
+
+        assert_eq!(result.bytes, [0xB0, 1, 16]);
     }
 
     #[test]

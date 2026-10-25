@@ -13741,6 +13741,11 @@ impl DawUi {
             .as_ref()
             .map(|document| u64::from(document.metadata().time_signature().unwrap_or((4, 4)).0))
             .unwrap_or(4);
+        let time_signature_denominator = self
+            .document
+            .as_ref()
+            .map(|document| u64::from(document.metadata().time_signature().unwrap_or((4, 4)).1))
+            .unwrap_or(4);
         self.midi_script_transport_state
             .ticks_per_quarter
             .store(ticks_per_quarter, Ordering::Relaxed);
@@ -13768,6 +13773,9 @@ impl DawUi {
         self.midi_script_transport_state
             .time_signature_numerator
             .store(time_signature_numerator, Ordering::Relaxed);
+        self.midi_script_transport_state
+            .time_signature_denominator
+            .store(time_signature_denominator, Ordering::Relaxed);
         self.midi_script_transport_state
             .song_length_ticks
             .store(song_length_ticks, Ordering::Relaxed);
@@ -13833,6 +13841,28 @@ impl DawUi {
             .lock()
         {
             *names = arrangement_marker_names;
+        }
+        let (pattern_time_signature_changes, arrangement_time_signature_changes) = if has_script {
+            (
+                self.midi_script_pattern_time_signature_changes(),
+                self.midi_script_arrangement_time_signature_changes(),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        if let Ok(mut changes) = self
+            .midi_script_transport_state
+            .pattern_time_signature_changes
+            .lock()
+        {
+            *changes = pattern_time_signature_changes;
+        }
+        if let Ok(mut changes) = self
+            .midi_script_transport_state
+            .arrangement_time_signature_changes
+            .lock()
+        {
+            *changes = arrangement_time_signature_changes;
         }
         let (arrangement_selection_start, arrangement_selection_end) = self
             .midi_script_arrangement_selection_bounds()
@@ -14348,6 +14378,80 @@ impl DawUi {
             let clip = arrangement.clips.get(index)?;
             Some((clip.position_ticks, clip.length_ticks))
         }))
+    }
+
+    fn midi_script_pattern_time_signature_changes(&self) -> Vec<(u32, u8, u8)> {
+        let Some(document) = self.document.as_ref() else {
+            return Vec::new();
+        };
+        let Some(pattern_id) = self
+            .pattern_mode_playback_source
+            .map(|(pattern_id, _)| pattern_id)
+            .or(self.selected_pattern)
+        else {
+            return Vec::new();
+        };
+        document
+            .patterns()
+            .ok()
+            .and_then(|patterns| {
+                patterns
+                    .into_iter()
+                    .find(|pattern| pattern.id == pattern_id)
+            })
+            .map(|pattern| {
+                pattern
+                    .time_markers
+                    .iter()
+                    .filter(|marker| marker.is_signature())
+                    .filter_map(|marker| {
+                        Some((
+                            marker.position_ticks(),
+                            marker.numerator()?,
+                            marker.denominator()?,
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn midi_script_arrangement_time_signature_changes(&self) -> Vec<(u32, u8, u8)> {
+        let Some(document) = self.document.as_ref() else {
+            return Vec::new();
+        };
+        let Ok(arrangements) = document.arrangements() else {
+            return Vec::new();
+        };
+        let Some(arrangement_id) = self
+            .selected_arrangement
+            .filter(|selected| {
+                arrangements
+                    .iter()
+                    .any(|arrangement| arrangement.id == *selected)
+            })
+            .or_else(|| arrangements.first().map(|arrangement| arrangement.id))
+        else {
+            return Vec::new();
+        };
+        arrangements
+            .into_iter()
+            .find(|arrangement| arrangement.id == arrangement_id)
+            .map(|arrangement| {
+                arrangement
+                    .time_markers
+                    .iter()
+                    .filter(|marker| marker.is_signature())
+                    .filter_map(|marker| {
+                        Some((
+                            marker.position_ticks(),
+                            marker.numerator()?,
+                            marker.denominator()?,
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn jump_midi_script_marker(&mut self, increment: i32) {
