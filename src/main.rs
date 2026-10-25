@@ -1397,9 +1397,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 Some(&note_indices),
             )
         }
-        [command, input, output, pattern_id, channel_id, spread_ticks, direction,
-            velocity_amount, velocity_tension, preserve_end, alternate_direction,
-            start_tension, end_time_ticks, end_tension, trigger_ahead, chop_chords]
+        [command, input, output, pattern_id, channel_id, _, _, _, _, _, _, _, _, _, _, _]
             if command == "strum-notes" =>
         {
             strum_notes_with_options(
@@ -1407,19 +1405,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 Path::new(output),
                 parse_u16(pattern_id, "pattern id")?,
                 parse_u16(channel_id, "channel id")?,
-                parse_strum_options(
-                    spread_ticks,
-                    direction,
-                    velocity_amount,
-                    velocity_tension,
-                    preserve_end,
-                    alternate_direction,
-                    start_tension,
-                    end_time_ticks,
-                    end_tension,
-                    trigger_ahead,
-                    chop_chords,
-                )?,
+                parse_strum_options(&args[5..])?,
             )
         }
         [command, input, output, pattern_id, channel_id, spread_ticks, direction,
@@ -1510,9 +1496,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 descending,
             )
         }
-        [command, input, output, pattern_id, channel_id, note_indices, spread_ticks, direction,
-            velocity_amount, velocity_tension, preserve_end, alternate_direction,
-            start_tension, end_time_ticks, end_tension, trigger_ahead, chop_chords]
+        [command, input, output, pattern_id, channel_id, note_indices, _, _, _, _, _, _, _, _, _, _, _]
             if command == "strum-notes-selected" =>
         {
             let note_indices = parse_note_indices(note_indices)?;
@@ -1522,19 +1506,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u16(pattern_id, "pattern id")?,
                 parse_u16(channel_id, "channel id")?,
                 Some(&note_indices),
-                parse_strum_options(
-                    spread_ticks,
-                    direction,
-                    velocity_amount,
-                    velocity_tension,
-                    preserve_end,
-                    alternate_direction,
-                    start_tension,
-                    end_time_ticks,
-                    end_tension,
-                    trigger_ahead,
-                    chop_chords,
-                )?,
+                parse_strum_options(&args[6..])?,
             )
         }
         [command, input, output, pattern_id, channel_id, note_indices, spread_ticks, direction,
@@ -8364,19 +8336,23 @@ fn parse_strum_direction(value: &str) -> Result<bool, String> {
     }
 }
 
-fn parse_strum_options(
-    spread_ticks: &str,
-    direction: &str,
-    velocity_amount: &str,
-    velocity_tension: &str,
-    preserve_end: &str,
-    alternate_direction: &str,
-    start_tension: &str,
-    end_time_ticks: &str,
-    end_tension: &str,
-    trigger_ahead: &str,
-    chop_chords: &str,
-) -> Result<StrumOptions, String> {
+fn parse_strum_options(arguments: &[String]) -> Result<StrumOptions, String> {
+    let [
+        spread_ticks,
+        direction,
+        velocity_amount,
+        velocity_tension,
+        preserve_end,
+        alternate_direction,
+        start_tension,
+        end_time_ticks,
+        end_tension,
+        trigger_ahead,
+        chop_chords,
+    ] = arguments
+    else {
+        return Err("advanced Strum options require eleven values".to_owned());
+    };
     Ok(StrumOptions {
         spread_ticks: parse_u32(spread_ticks, "strum spread")?,
         descending: parse_strum_direction(direction)?,
