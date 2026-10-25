@@ -1809,6 +1809,7 @@ struct PlaybackState {
     output_peak: AtomicU32,
     output_callback_frames: AtomicU32,
     input_monitor_ring_flush_requested: AtomicBool,
+    input_monitor_active: Arc<AtomicBool>,
 }
 
 struct AudioCommandQueue {
@@ -2300,6 +2301,7 @@ impl PlaybackState {
             output_peak: AtomicU32::new(0.0_f32.to_bits()),
             output_callback_frames: AtomicU32::new(0),
             input_monitor_ring_flush_requested: AtomicBool::new(false),
+            input_monitor_active: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -3084,7 +3086,7 @@ fn audio_device_config_ranges(
 
 /// Active device streams. Input is captured from the selected channel pair into
 /// a lock-free stereo ring buffer and exposed as a peak meter; output can play
-/// project audio, a test tone, or monitor that input.
+/// project audio, a test tone, and monitored input together.
 pub struct AudioEngine {
     source: Arc<AtomicU8>,
     requested_source: AtomicU8,
@@ -3159,18 +3161,15 @@ impl AudioEngine {
             {
                 self.input_monitor_recording.store(None);
             }
-            self.playback.pause();
         } else if let Some(recording) = self.input_monitor_recording.load().as_deref() {
             recording.stop();
         }
         self.playback
+            .input_monitor_active
+            .store(enabled, Ordering::Release);
+        self.playback
             .input_monitor_ring_flush_requested
             .store(true, Ordering::Release);
-        self.request_output_source(if enabled {
-            AUDIO_SOURCE_INPUT_MONITOR
-        } else {
-            AUDIO_SOURCE_SILENT
-        });
         Ok(())
     }
 
@@ -3722,6 +3721,7 @@ impl AudioEngine {
                     source: Arc::clone(&source),
                     recording: Arc::clone(&input_recording),
                     monitor_recording: Arc::clone(&input_monitor_recording),
+                    monitor_active: Arc::clone(&playback.input_monitor_active),
                     error: Arc::clone(&error),
                     callback_frames: Arc::clone(&input_callback_frames),
                     input_channel_pair: Arc::clone(&input_channel_pair),
@@ -4263,6 +4263,7 @@ struct InputStreamState {
     source: Arc<AtomicU8>,
     recording: Arc<ArcSwapOption<InputRecordingState>>,
     monitor_recording: Arc<ArcSwapOption<InputRecordingState>>,
+    monitor_active: Arc<AtomicBool>,
     error: Arc<AudioErrorState>,
     input_channel_pair: Arc<AtomicU16>,
 }
@@ -4341,6 +4342,7 @@ where
         source,
         recording: input_recording,
         monitor_recording: input_monitor_recording,
+        monitor_active,
         error,
         input_channel_pair,
     } = state;
@@ -4390,7 +4392,8 @@ where
                         .clamp(-1.0, 1.0);
                     max_peak = max_peak.max(left.abs()).max(right.abs());
                     let stereo = [left, right];
-                    if source.load(Ordering::Acquire) == AUDIO_SOURCE_INPUT_MONITOR
+                    if (source.load(Ordering::Acquire) == AUDIO_SOURCE_INPUT_MONITOR
+                        || monitor_active.load(Ordering::Acquire))
                         && !monitor_queue_active
                     {
                         ring.push_stereo_frame(stereo[0], stereo[1]);
@@ -4443,13 +4446,14 @@ fn next_output_frame(
     sample_rate: f32,
     phase: &mut f32,
 ) -> [f32; 2] {
-    match source.load(Ordering::Acquire) {
+    let output_source = source.load(Ordering::Acquire);
+    let mut output = (|| match output_source {
         AUDIO_SOURCE_TEST_TONE => {
             let (value, next_phase) = tone_sample(*phase, sample_rate);
             *phase = next_phase;
             [value, value]
         }
-        AUDIO_SOURCE_INPUT_MONITOR => ring.pop_stereo_frame().unwrap_or([0.0, 0.0]),
+        AUDIO_SOURCE_INPUT_MONITOR => [0.0, 0.0],
         AUDIO_SOURCE_PROJECT => {
             if !playback.active.load(Ordering::Acquire) {
                 return [0.0, 0.0];
@@ -4588,7 +4592,15 @@ fn next_output_frame(
             }
         }
         _ => [0.0, 0.0],
+    })();
+    if playback.input_monitor_active.load(Ordering::Acquire)
+        || output_source == AUDIO_SOURCE_INPUT_MONITOR
+    {
+        let monitored = ring.pop_stereo_frame().unwrap_or([0.0, 0.0]);
+        output[0] += monitored[0];
+        output[1] += monitored[1];
     }
+    output
 }
 
 fn valid_project_playback_speed(speed_multiplier: f32) -> bool {
@@ -4906,6 +4918,7 @@ fn wasapi_exclusive_input_worker(
     enable_denormal_protection();
     let WasapiWorkerState {
         ring,
+        playback,
         input_peak: peak,
         input_callback_frames,
         input_recording,
@@ -5008,7 +5021,8 @@ fn wasapi_exclusive_input_worker(
                             }
                         }
                         max_peak = max_peak.max(stereo[0].abs()).max(stereo[1].abs());
-                        if source.load(Ordering::Acquire) == AUDIO_SOURCE_INPUT_MONITOR
+                        if (source.load(Ordering::Acquire) == AUDIO_SOURCE_INPUT_MONITOR
+                            || playback.input_monitor_active.load(Ordering::Acquire))
                             && !monitor_queue_active
                         {
                             ring.push_stereo_frame(stereo[0], stereo[1]);

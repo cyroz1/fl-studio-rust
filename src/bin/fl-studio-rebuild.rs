@@ -11778,13 +11778,6 @@ impl DawUi {
             engine.set_test_tone(false);
             self.audio_test_tone = false;
         }
-        if self.audio_monitor_input {
-            stop_audio_input_monitor_with_engine(
-                &mut self.audio_monitor_input,
-                &mut self.audio_monitor_session,
-                engine,
-            );
-        }
         let sample_rate = engine.sample_rate();
         let project_bytes = match self
             .document
@@ -12363,13 +12356,6 @@ impl DawUi {
             engine.set_test_tone(false);
             self.audio_test_tone = false;
         }
-        if self.audio_monitor_input {
-            stop_audio_input_monitor_with_engine(
-                &mut self.audio_monitor_input,
-                &mut self.audio_monitor_session,
-                engine,
-            );
-        }
         let sample_rate = engine.sample_rate();
         let options = PlaylistRenderOptions {
             arrangement_id,
@@ -12723,9 +12709,6 @@ impl DawUi {
         if self.pending_song_render.is_some() {
             self.status = "Stop the Playlist render before starting playback".to_owned();
             return;
-        }
-        if self.audio_monitor_input {
-            self.stop_audio_input_monitor();
         }
         if self.playing {
             self.stop_live_sampler_input();
@@ -51208,9 +51191,6 @@ impl DawUi {
         &mut self,
         record_post_effects: bool,
     ) -> Option<AudioInputRecording> {
-        if record_post_effects && self.playing {
-            self.toggle_project_playback();
-        }
         if record_post_effects
             && self.audio_monitor_input
             && self
