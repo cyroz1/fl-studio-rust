@@ -619,8 +619,10 @@ struct PlaylistMixerEffectStream {
     output_channels: usize,
     wet_mix: f32,
     saved_enabled: bool,
+    saved_insert_effects_enabled: bool,
     live_wet_mix_target: Option<Arc<AtomicU32>>,
     live_enabled_target: Option<Arc<AtomicI32>>,
+    live_insert_effects_enabled_target: Option<Arc<AtomicI32>>,
     wet_mix_ramp: LiveWetMixRamp,
     latency_frames: u64,
     dry_delay_line: StereoFrameDelay,
@@ -629,7 +631,10 @@ struct PlaylistMixerEffectStream {
 
 impl PlaylistMixerEffectStream {
     fn begin_wet_mix_block(&mut self) {
-        if self.live_wet_mix_target.is_none() && self.live_enabled_target.is_none() {
+        if self.live_wet_mix_target.is_none()
+            && self.live_enabled_target.is_none()
+            && self.live_insert_effects_enabled_target.is_none()
+        {
             return;
         }
         let requested_mix = self
@@ -638,14 +643,24 @@ impl PlaylistMixerEffectStream {
             .map(|target| f32::from_bits(target.load(Ordering::Acquire)))
             .filter(|mix| mix.is_finite())
             .map_or(self.wet_mix, |mix| mix.clamp(0.0, 1.0));
-        let enabled = self
+        let slot_enabled = self
             .live_enabled_target
             .as_ref()
             .map_or(self.saved_enabled, |target| {
                 target.load(Ordering::Acquire) != 0
             });
+        let insert_effects_enabled = self
+            .live_insert_effects_enabled_target
+            .as_ref()
+            .map_or(self.saved_insert_effects_enabled, |target| {
+                target.load(Ordering::Acquire) != 0
+            });
         self.wet_mix_ramp
-            .set_target(if enabled { requested_mix } else { 0.0 });
+            .set_target(if slot_enabled && insert_effects_enabled {
+                requested_mix
+            } else {
+                0.0
+            });
     }
 }
 
@@ -816,6 +831,11 @@ impl Vst3PlaylistStreamProcessor {
                 effect.slot_index,
                 effect.saved_enabled,
             );
+            effect.live_insert_effects_enabled_target = meters
+                .live_mixer_insert_effects_enabled_target(
+                    effect.insert_ordinal,
+                    effect.saved_insert_effects_enabled,
+                );
         }
     }
 
@@ -4743,7 +4763,7 @@ impl Vst3HostRuntime {
             inserts
                 .iter()
                 .find(|insert| insert.ordinal() == slot.insert_ordinal())
-                .is_none_or(|insert| insert.effects_enabled() != Some(false))
+                .is_none_or(|insert| live_mix_changes || insert.effects_enabled() != Some(false))
         });
         let mut insert_order = if has_loaded_non_master_effect {
             routing.mixer_insert_processing_order()?
@@ -4772,11 +4792,11 @@ impl Vst3HostRuntime {
         };
         let mut mixer_effect_dry_delay_frames = processor.mixer_effect_dry_delay_frames;
         for insert_ordinal in insert_order {
-            let effects_enabled = inserts
+            let saved_insert_effects_enabled = inserts
                 .iter()
                 .find(|insert| insert.ordinal() == insert_ordinal)
                 .is_none_or(|insert| insert.effects_enabled() != Some(false));
-            if !effects_enabled {
+            if !saved_insert_effects_enabled && !live_mix_changes {
                 continue;
             }
             let first_effect_index = processor.mixer_effects.len();
@@ -4916,10 +4936,16 @@ impl Vst3HostRuntime {
                     output_channels,
                     wet_mix,
                     saved_enabled,
+                    saved_insert_effects_enabled,
                     live_wet_mix_target: None,
                     live_enabled_target: None,
+                    live_insert_effects_enabled_target: None,
                     wet_mix_ramp: LiveWetMixRamp::new(
-                        if saved_enabled { wet_mix } else { 0.0 },
+                        if saved_enabled && saved_insert_effects_enabled {
+                            wet_mix
+                        } else {
+                            0.0
+                        },
                         (sample_rate * f64::from(MIXER_EFFECT_MIX_SMOOTHING_SECONDS))
                             .round()
                             .clamp(1.0, f64::from(u32::MAX)) as u32,

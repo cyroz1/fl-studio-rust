@@ -43991,7 +43991,7 @@ impl DawUi {
                                         egui::Checkbox::new(&mut effects_enabled, "Effects on"),
                                     )
                                     .on_hover_text(
-                                        "Edit this saved effect-chain enable state; loaded VST3 effects follow it during supported playback",
+                                        "Loaded VST3 effects follow this toggle during Song, Pattern, and Performance playback with a 20 ms wet/dry ramp",
                                     )
                                     .changed()
                                 {
@@ -44473,6 +44473,13 @@ impl DawUi {
             for (insert_ordinal, edit) in flag_edits {
                 match document.edit_mixer_insert_flags(insert_ordinal, edit) {
                     Ok(()) => {
+                        if let Some(effects_enabled) = edit.effects_enabled {
+                            self.mixer_track_peak_meters
+                                .set_live_mixer_insert_effects_enabled(
+                                    insert_ordinal,
+                                    effects_enabled,
+                                );
+                        }
                         if insert_ordinal == 0
                             && let Some(enabled) = edit.enabled
                         {
@@ -46695,7 +46702,9 @@ impl DawUi {
                 self.mixer_track_peak_meters
                     .set_live_mixer_insert_signal_flags(insert_ordinal, live_flags);
             }
-            MidiMixerControlTarget::EffectsEnabled => {}
+            MidiMixerControlTarget::EffectsEnabled => self
+                .mixer_track_peak_meters
+                .set_live_mixer_insert_effects_enabled(insert_ordinal, active),
             _ => unreachable!("toggle target was checked above"),
         }
         self.dirty = true;
