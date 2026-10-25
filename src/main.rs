@@ -1068,6 +1068,16 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u16(channel_id, "automation channel id")?,
             )
         }
+        [command, input, output, source_channel_id, target_channel_id]
+            if command == "copy-automation-state" =>
+        {
+            copy_automation_state(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(source_channel_id, "source automation channel id")?,
+                parse_u16(target_channel_id, "target automation channel id")?,
+            )
+        }
         [command, input, output, channel_id, template_channel_id]
             if command == "init-automation-points" =>
         {
@@ -3636,6 +3646,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild edit-automation-point <input.flp> <output.flp> <channel-id> <point-index> <position-beats> <value> <tension>\n",
             "  flp-rebuild flip-automation-points <input.flp> <output.flp> <channel-id>\n",
             "  flp-rebuild normalize-automation-points <input.flp> <output.flp> <channel-id>\n",
+            "  flp-rebuild copy-automation-state <input.flp> <output.flp> <source-channel-id> <target-channel-id>\n",
             "  flp-rebuild set-automation-lfo-amount <input.flp> <output.flp> <channel-id> <-128..128>\n",
             "  flp-rebuild init-automation-points <input.flp> <output.flp> <channel-id> <template-channel-id>\n",
             "  flp-rebuild insert-automation-point <input.flp> <output.flp> <channel-id> <insertion-slot> <position-beats> <value> <tension>\n",
@@ -7444,6 +7455,28 @@ fn set_automation_lfo_amount(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "set automation channel {channel_id} LFO amount to {amount} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn copy_automation_state(
+    input: &Path,
+    output: &Path,
+    source_channel_id: u16,
+    target_channel_id: u16,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .copy_automation_state(source_channel_id, target_channel_id)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "copied Automation curve state from channel {source_channel_id} to channel {target_channel_id} in {}",
         output.display()
     );
     Ok(())

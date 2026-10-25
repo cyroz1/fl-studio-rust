@@ -3947,6 +3947,9 @@ enum AutomationEditAction {
     InitializeFromTemplate {
         template_channel_id: u16,
     },
+    CopyState {
+        source_channel_id: u16,
+    },
     SetLfoAmount {
         amount: i32,
     },
@@ -29103,6 +29106,27 @@ impl DawUi {
                     }
                 });
             }
+            ui.menu_button("Copy state from", |ui| {
+                let mut has_source = false;
+                for source in automation_channels.iter().filter(|channel| {
+                    channel.channel_id() != channel_id && channel.data_event_index().is_some()
+                }) {
+                    has_source = true;
+                    let label = source
+                        .display_name()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("Channel {}", source.channel_id()));
+                    if ui.button(label).clicked() {
+                        action = Some(AutomationEditAction::CopyState {
+                            source_channel_id: source.channel_id(),
+                        });
+                        ui.close();
+                    }
+                }
+                if !has_source {
+                    ui.label("No other Automation channel has curve state to copy");
+                }
+            });
             let can_interpolate = automation_channels
                 .iter()
                 .find(|channel| channel.channel_id() == channel_id)
@@ -29489,6 +29513,7 @@ impl DawUi {
         {
             let mut interpolation_count = None;
             let mut initialized_template = false;
+            let mut copied_state_from = None;
             let mut flipped_points = false;
             let mut normalized_points = false;
             let result = match action {
@@ -29502,6 +29527,14 @@ impl DawUi {
                     initialized_template = true;
                     document
                         .create_automation_point_blob_from_template(channel_id, template_channel_id)
+                }
+                AutomationEditAction::CopyState { source_channel_id } => {
+                    self.selected_automation_point = None;
+                    self.automation_add_mode = false;
+                    self.automation_interpolate_mode = false;
+                    self.automation_interpolation_anchor = None;
+                    copied_state_from = Some(source_channel_id);
+                    document.copy_automation_state(source_channel_id, channel_id)
                 }
                 AutomationEditAction::SetLfoAmount { amount } => {
                     document.set_automation_lfo_amount(channel_id, amount)
@@ -29572,7 +29605,12 @@ impl DawUi {
             };
             match result {
                 Ok(()) => {
-                    if let Some(count) = interpolation_count {
+                    if let Some(source_channel_id) = copied_state_from {
+                        self.dirty = true;
+                        self.status = format!(
+                            "Copied Automation curve state from channel {source_channel_id}"
+                        );
+                    } else if let Some(count) = interpolation_count {
                         if count == 0 {
                             self.status = if flipped_points {
                                 "There are no automation points to flip".to_owned()

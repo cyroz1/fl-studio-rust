@@ -18920,6 +18920,104 @@ impl FlpDocument {
         Ok(())
     }
 
+    /// Copies the complete saved Automation curve state (`0xEA` payload) from one
+    /// type-5 channel to another. Existing target data is replaced; a missing target
+    /// blob is inserted at the end of the target channel. The copied payload retains
+    /// its LFO amount, opaque header, point bytes, and era-specific trailer exactly.
+    pub fn copy_automation_state(
+        &mut self,
+        source_channel_id: u16,
+        target_channel_id: u16,
+    ) -> Result<(), FlpError> {
+        let channels = self.channels();
+        let mut source_matches = channels
+            .iter()
+            .filter(|channel| channel.id == source_channel_id);
+        let Some(source) = source_matches.next() else {
+            return Err(FlpError::ChannelNotFound(source_channel_id));
+        };
+        if source_matches.next().is_some() {
+            return Err(FlpError::AmbiguousChannelId(source_channel_id));
+        }
+        if source.kind != Some(5) {
+            return Err(FlpError::UnsupportedEdit(
+                "the source channel is not a type-5 automation channel",
+            ));
+        }
+        let mut source_events = source
+            .event_range()
+            .filter(|index| self.events[*index].opcode == 0xEA);
+        let Some(source_event_index) = source_events.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the source automation channel has no existing 0xEA state blob",
+            ));
+        };
+        if source_events.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the source automation channel has multiple 0xEA state blobs",
+            ));
+        }
+        let source_event = &self.events[source_event_index];
+        if !matches!(source_event.encoding, PayloadEncoding::Data { .. }) {
+            return Err(FlpError::UnsupportedEdit(
+                "the source 0xEA state blob is not a length-prefixed data event",
+            ));
+        }
+        decode_automation_points(source_event)?;
+        let source_payload = source_event.payload.clone();
+
+        let mut target_matches = channels
+            .iter()
+            .filter(|channel| channel.id == target_channel_id);
+        let Some(target) = target_matches.next() else {
+            return Err(FlpError::ChannelNotFound(target_channel_id));
+        };
+        if target_matches.next().is_some() {
+            return Err(FlpError::AmbiguousChannelId(target_channel_id));
+        }
+        if target.kind != Some(5) {
+            return Err(FlpError::UnsupportedEdit(
+                "the target channel is not a type-5 automation channel",
+            ));
+        }
+        if source_channel_id == target_channel_id {
+            return Ok(());
+        }
+        let mut target_events = target
+            .event_range()
+            .filter(|index| self.events[*index].opcode == 0xEA);
+        let target_event_index = target_events.next();
+        if target_events.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the target automation channel has multiple 0xEA state blobs",
+            ));
+        }
+        if let Some(target_event_index) = target_event_index {
+            let target_event = &self.events[target_event_index];
+            if !matches!(target_event.encoding, PayloadEncoding::Data { .. }) {
+                return Err(FlpError::UnsupportedEdit(
+                    "the target 0xEA state blob is not a length-prefixed data event",
+                ));
+            }
+            if target_event.payload == source_payload {
+                return Ok(());
+            }
+        }
+
+        let mut candidate = self.clone();
+        if let Some(target_event_index) = target_event_index {
+            candidate.events[target_event_index].replace_data_payload(source_payload)?;
+        } else {
+            candidate.events.insert(
+                target.end_event_index,
+                FlpEvent::new_data(0xEA, source_payload)?,
+            );
+        }
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
     /// Inserts a point into an existing type-5 channel automation blob.
     ///
     /// `point_index` is an insertion slot and may equal the current point count.
@@ -34936,6 +35034,108 @@ mod tests {
             .clone();
         assert_eq!(point.position_beats(), 0.5);
         assert_eq!(point.value(), 0.75);
+    }
+
+    #[test]
+    fn copies_full_automation_state_to_existing_and_empty_channels() {
+        let source_fixture = automation_channel_fixture(
+            &[
+                (0.0, 0.2, -0.5, [1, 2, 3, 4]),
+                (2.5, 0.9, 0.75, [5, 6, 7, 8]),
+            ],
+            &(0..112)
+                .map(|index| (index * 19 % 256) as u8)
+                .collect::<Vec<_>>(),
+        );
+        let mut source_payload = FlpDocument::parse(&source_fixture)
+            .expect("source Automation channel should parse")
+            .events()
+            .iter()
+            .find(|event| event.opcode() == 0xEA)
+            .expect("source should have curve state")
+            .payload()
+            .to_vec();
+        source_payload[FLP_AUTOMATION_LFO_AMOUNT_OFFSET..FLP_AUTOMATION_LFO_AMOUNT_OFFSET + 4]
+            .copy_from_slice(&64_i32.to_le_bytes());
+        let target_fixture = automation_channel_fixture(
+            &[(1.0, 0.6, 0.0, [9, 10, 11, 12])],
+            &(0..136)
+                .map(|index| (index * 23 % 256) as u8)
+                .collect::<Vec<_>>(),
+        );
+        let target_payload = FlpDocument::parse(&target_fixture)
+            .expect("target Automation channel should parse")
+            .events()
+            .iter()
+            .find(|event| event.opcode() == 0xEA)
+            .expect("target should have initial curve state")
+            .payload()
+            .to_vec();
+        let mut stream = vec![0x40, 9, 0, 0x15, 5];
+        append_data_event(&mut stream, 0xEA, &source_payload);
+        stream.extend_from_slice(&[0x40, 10, 0, 0x15, 5, 0x00, 1]);
+        append_data_event(&mut stream, 0xEA, &target_payload);
+        stream.extend_from_slice(&[0x40, 11, 0, 0x15, 5, 0x00, 0]);
+        stream.extend_from_slice(&[0x40, 0, 0, 0x15, 0, 0x62, 0, 0]);
+        let original = flp_fixture(&stream, &[], &[]);
+        let mut document =
+            FlpDocument::parse(&original).expect("multi-channel Automation project should parse");
+
+        document
+            .copy_automation_state(9, 10)
+            .expect("copy should replace an existing target curve");
+        document
+            .copy_automation_state(9, 11)
+            .expect("copy should create a missing target curve");
+        let reparsed = FlpDocument::parse(&document.encode_lossless().unwrap())
+            .expect("copied Automation state should round-trip");
+        let automation_channels = reparsed.automation_channels().unwrap();
+        for channel_id in [9, 10, 11] {
+            let channel = automation_channels
+                .iter()
+                .find(|channel| channel.channel_id() == channel_id)
+                .expect("Automation channel should remain present");
+            assert_eq!(
+                reparsed.events()[channel.data_event_index().unwrap()].payload(),
+                source_payload,
+                "channel {channel_id} should retain the exact source state"
+            );
+            assert_eq!(channel.lfo_amount(), Some(64));
+        }
+        let channels = reparsed.channels();
+        assert_eq!(
+            channels
+                .iter()
+                .find(|channel| channel.id() == 10)
+                .unwrap()
+                .enabled(),
+            Some(true),
+            "copying curve state should preserve unrelated target channel events"
+        );
+        assert_eq!(
+            channels
+                .iter()
+                .find(|channel| channel.id() == 11)
+                .unwrap()
+                .enabled(),
+            Some(false)
+        );
+
+        let unchanged = reparsed.clone();
+        assert!(matches!(
+            document.copy_automation_state(9, 77),
+            Err(FlpError::ChannelNotFound(77))
+        ));
+        assert_eq!(document, unchanged);
+        assert!(matches!(
+            document.copy_automation_state(9, 0),
+            Err(FlpError::UnsupportedEdit(_))
+        ));
+        assert_eq!(document, unchanged);
+        document
+            .copy_automation_state(9, 9)
+            .expect("copying state to the same channel should be a no-op");
+        assert_eq!(document, unchanged);
     }
 
     #[test]
