@@ -1325,6 +1325,37 @@ impl Vst3PlaylistStreamProcessor {
         )
     }
 
+    /// Initial PDC delay on one Mixer stem, including post-effect alignment when present.
+    pub(crate) fn pdc_mixer_stem_start_trim_frames(
+        &self,
+        track: usize,
+        post_effect_bus: bool,
+    ) -> u64 {
+        if track == 0 {
+            return self.pdc_render_start_trim_frames();
+        }
+        if !self.automatic_pdc_enabled {
+            return 0;
+        }
+        let meter_input_delay = self
+            .mixer_effect_meter_input_delays
+            .get(track)
+            .map_or(0, crate::audio::StereoFrameDelay::delay_frames);
+        let post_effect_delay = if post_effect_bus && self.needs_mixer_insert_buses() {
+            self.mixer_post_effect_stem_delays
+                .get(track)
+                .map_or(0, crate::audio::StereoFrameDelay::delay_frames)
+        } else {
+            0
+        };
+        pdc_mixer_stem_start_trim_frames(
+            self.automatic_pdc_enabled,
+            self.maximum_latency_frames,
+            meter_input_delay,
+            post_effect_delay,
+        )
+    }
+
     pub(crate) fn needs_mixer_insert_buses(&self) -> bool {
         self.mixer_effect_chains
             .iter()
@@ -1946,6 +1977,21 @@ fn pdc_render_start_trim_frames(
 ) -> u64 {
     if automatic_pdc_enabled {
         instrument_latency_frames.saturating_add(mixer_effect_latency_frames)
+    } else {
+        0
+    }
+}
+
+fn pdc_mixer_stem_start_trim_frames(
+    automatic_pdc_enabled: bool,
+    instrument_latency_frames: u64,
+    meter_input_latency_frames: u64,
+    post_effect_alignment_frames: u64,
+) -> u64 {
+    if automatic_pdc_enabled {
+        instrument_latency_frames
+            .saturating_add(meter_input_latency_frames)
+            .saturating_add(post_effect_alignment_frames)
     } else {
         0
     }
@@ -8804,6 +8850,12 @@ mod tests {
     fn pdc_render_start_trim_covers_instrument_and_mixer_latency_only_when_enabled() {
         assert_eq!(pdc_render_start_trim_frames(true, 480, 240), 720);
         assert_eq!(pdc_render_start_trim_frames(false, 480, 240), 0);
+    }
+
+    #[test]
+    fn mixer_stem_pdc_trim_uses_each_tracks_input_and_post_effect_alignment() {
+        assert_eq!(pdc_mixer_stem_start_trim_frames(true, 480, 96, 48), 624);
+        assert_eq!(pdc_mixer_stem_start_trim_frames(false, 480, 96, 48), 0);
     }
 
     #[test]

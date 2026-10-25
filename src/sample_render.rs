@@ -1025,7 +1025,7 @@ pub struct PlaylistRenderOptions {
     pub wav_save_playlist_markers: bool,
     /// Write note onsets and Audio Clip starts as RIFF/WAVE cue points.
     pub wav_save_note_markers: bool,
-    /// Remove the initial automatic PDC delay from full-song WAV renders.
+    /// Remove the initial automatic PDC delay from Playlist WAV and stem renders.
     pub wav_trim_pdc_silence: bool,
     /// Whether to stop a Playlist render after its post-content output has decayed to silence.
     pub tail_mode: PlaylistTailMode,
@@ -3057,7 +3057,8 @@ fn render_playlist_with_vst3_cancellable(
 /// inserts routed from a project channel are written. The optional Master stem uses the final
 /// supported mix after Master controls and loaded VST3 Master effects. The optional Current stem
 /// uses its selected insert's pre-effect bus. Native effect formats, effect parameter automation,
-/// PDC silence trimming, and unsupported route types are not included.
+/// PDC silence trimming uses each supported route's known startup delay, and unsupported route types
+/// are not included.
 pub fn render_playlist_mixer_stems_with_vst3_cancellable(
     document: &FlpDocument,
     project_path: impl AsRef<Path>,
@@ -3245,6 +3246,13 @@ pub fn render_playlist_mixer_stems_with_vst3_cancellable(
     let mut outputs = stem_specs
         .into_iter()
         .map(|spec| {
+            let frames_to_skip = if options.wav_trim_pdc_silence {
+                vst3_processor.as_ref().map_or(0, |processor| {
+                    processor.pdc_mixer_stem_start_trim_frames(spec.track, !spec.is_current_stem)
+                })
+            } else {
+                0
+            };
             let output_path = output_directory.join(format!("{}.wav", spec.label));
             let mut temporary = TemporaryRenderFile::create(&output_path)?;
             write_wav_header(
@@ -3262,6 +3270,8 @@ pub fn render_playlist_mixer_stems_with_vst3_cancellable(
                 track: spec.track,
                 is_master_stem: spec.is_master_stem,
                 is_current_stem: spec.is_current_stem,
+                frames_to_skip,
+                frames_written: 0,
                 output_path,
                 temporary,
                 peak: 0.0,
@@ -3333,6 +3343,11 @@ pub fn render_playlist_mixer_stems_with_vst3_cancellable(
                     post_effect_buses,
                     output.is_current_stem,
                 )?;
+                let stem_block = skip_render_block_prefix(stem_block, &mut output.frames_to_skip);
+                output.frames_written = output
+                    .frames_written
+                    .checked_add((stem_block.len() / 2) as u64)
+                    .ok_or_else(|| "Mixer stem frame count overflow".to_owned())?;
                 output.peak = stem_block
                     .iter()
                     .fold(output.peak, |peak, sample| peak.max(sample.abs()));
@@ -3372,15 +3387,24 @@ pub fn render_playlist_mixer_stems_with_vst3_cancellable(
     if rendered_stems == 0 {
         return Err("render contained no non-silent selected Mixer stems".into());
     }
+    summary.frames = outputs
+        .iter()
+        .map(|output| output.frames_written)
+        .max()
+        .unwrap_or(frames);
     for mut output in outputs {
         if output.peak > 0.0 {
-            write_wav_cue_points(
-                output
-                    .temporary
-                    .file
-                    .as_mut()
-                    .expect("temporary Mixer stem file is open"),
-                &wav_cue_points,
+            let file = output
+                .temporary
+                .file
+                .as_mut()
+                .expect("temporary Mixer stem file is open");
+            write_wav_cue_points(file, &wav_cue_points)?;
+            patch_wav_data_length(
+                file,
+                output.frames_written,
+                options.wav_sample_format,
+                options.wav_channel_mode,
             )?;
             output.temporary.commit(&output.output_path)?;
         }
@@ -3466,6 +3490,8 @@ struct MixerStemTemporaryOutput {
     track: usize,
     is_master_stem: bool,
     is_current_stem: bool,
+    frames_to_skip: u64,
+    frames_written: u64,
     output_path: PathBuf,
     temporary: TemporaryRenderFile,
     peak: f32,
@@ -15718,6 +15744,26 @@ mod tests {
         let (frames, stop) = detector.frames_to_keep(3, &[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
         assert_eq!(frames, 4);
         assert!(stop);
+    }
+
+    #[test]
+    fn render_prefix_skip_spans_blocks_for_pdc_trim() {
+        let first_block = [1.0, 1.0, 2.0, 2.0];
+        let second_block = [3.0, 3.0, 4.0, 4.0];
+        let mut frames_to_skip = 3;
+
+        assert!(skip_render_block_prefix(&first_block, &mut frames_to_skip).is_empty());
+        assert_eq!(frames_to_skip, 1);
+        assert_eq!(
+            skip_render_block_prefix(&second_block, &mut frames_to_skip),
+            &[4.0, 4.0]
+        );
+        assert_eq!(frames_to_skip, 0);
+    }
+
+    #[test]
+    fn playlist_wav_pdc_trim_is_enabled_by_default() {
+        assert!(PlaylistRenderOptions::default().wav_trim_pdc_silence);
     }
 
     #[test]
