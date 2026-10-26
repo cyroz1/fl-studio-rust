@@ -2685,8 +2685,12 @@ fn run(args: Vec<String>) -> Result<(), String> {
         [command, input, output, pattern_id, channel_id, options @ ..]
             if command == "riff-machine-notes" =>
         {
-            let (options, groove_score_path, arpeggio_score_path, progression_score_path) =
-                parse_riff_machine_options(options)?;
+            let ParsedRiffMachineOptions {
+                options,
+                groove_score_path,
+                arpeggio_score_path,
+                progression_score_path,
+            } = parse_riff_machine_options(options)?;
             let groove_score = groove_score_path
                 .as_deref()
                 .map(load_riff_machine_score)
@@ -2718,8 +2722,12 @@ fn run(args: Vec<String>) -> Result<(), String> {
             if command == "riff-machine-notes-selected" =>
         {
             let note_indices = parse_note_indices(note_indices)?;
-            let (options, groove_score_path, arpeggio_score_path, progression_score_path) =
-                parse_riff_machine_options(options)?;
+            let ParsedRiffMachineOptions {
+                options,
+                groove_score_path,
+                arpeggio_score_path,
+                progression_score_path,
+            } = parse_riff_machine_options(options)?;
             let groove_score = groove_score_path
                 .as_deref()
                 .map(load_riff_machine_score)
@@ -5028,17 +5036,14 @@ fn parse_riff_machine_quantize_mode(value: &str) -> Result<RiffMachineQuantizeMo
     }
 }
 
-fn parse_riff_machine_options(
-    values: &[String],
-) -> Result<
-    (
-        RiffMachineOptions<'static>,
-        Option<PathBuf>,
-        Option<PathBuf>,
-        Option<PathBuf>,
-    ),
-    String,
-> {
+struct ParsedRiffMachineOptions {
+    options: RiffMachineOptions<'static>,
+    groove_score_path: Option<PathBuf>,
+    arpeggio_score_path: Option<PathBuf>,
+    progression_score_path: Option<PathBuf>,
+}
+
+fn parse_riff_machine_options(values: &[String]) -> Result<ParsedRiffMachineOptions, String> {
     let mut options = RiffMachineOptions::default();
     let mut groove_score_path = None;
     let mut arpeggio_score_path = None;
@@ -5200,12 +5205,12 @@ fn parse_riff_machine_options(
             _ => return Err(format!("unknown Riff Machine option: --{name}")),
         }
     }
-    Ok((
+    Ok(ParsedRiffMachineOptions {
         options,
         groove_score_path,
         arpeggio_score_path,
         progression_score_path,
-    ))
+    })
 }
 
 fn load_riff_machine_score(path: &Path) -> Result<FscScore, String> {
