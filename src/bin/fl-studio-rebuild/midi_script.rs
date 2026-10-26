@@ -2340,6 +2340,23 @@ mod tests {
     }
 
     #[test]
+    fn python_mixer_track_dock_side_matches_centered_workspace() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport mixer\ndef OnMidiIn(event):\n    event.data1 = mixer.getTrackDockSide(0)\n    event.data2 = mixer.getTrackDockSide(127)\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let mut runtime = MidiScriptRuntime::start_for_device(&script, "Test Input").unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
+
+        assert_eq!(result.bytes, [0xB0, 1, 1]);
+    }
+
+    #[test]
     fn python_mixer_current_tempo_returns_fractional_or_integer_bpm() {
         let temporary = TestDirectory::new();
         let script_path = temporary.path().join("device_test.py");
