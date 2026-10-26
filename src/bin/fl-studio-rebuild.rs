@@ -5219,9 +5219,9 @@ struct PendingAudioRender {
 
 #[derive(Clone, Copy)]
 enum PdcStreamHandoffReason {
-    Vst3LatencyChange,
-    AutomaticPdcChange { enabled: bool },
-    MixerRouteGraphChange,
+    Vst3Latency,
+    AutomaticPdc { enabled: bool },
+    MixerRouting,
 }
 
 struct PendingAudioClipExport {
@@ -12185,7 +12185,7 @@ impl DawUi {
                 self.stop_midi_pattern_preview();
                 self.status = if handoff_in_progress {
                     match staged_handoff_reason {
-                        Some(PdcStreamHandoffReason::MixerRouteGraphChange) => {
+                        Some(PdcStreamHandoffReason::MixerRouting) => {
                             "Preparing updated Playlist routing while current audio continues…"
                                 .to_owned()
                         }
@@ -12781,14 +12781,14 @@ impl DawUi {
                 .map(|tick| tick.round() as u64);
             let tick_suffix = tick.map_or_else(String::new, |tick| format!(" at tick {tick}"));
             self.status = match staged_handoff_reason {
-                Some(PdcStreamHandoffReason::AutomaticPdcChange { enabled }) => format!(
+                Some(PdcStreamHandoffReason::AutomaticPdc { enabled }) => format!(
                     "Automatic PDC set to {}; applied through a live PDC handoff{tick_suffix}",
                     u8::from(enabled)
                 ),
-                Some(PdcStreamHandoffReason::MixerRouteGraphChange) => format!(
+                Some(PdcStreamHandoffReason::MixerRouting) => format!(
                     "Mixer routing change applied through a live Playlist handoff{tick_suffix}"
                 ),
-                Some(PdcStreamHandoffReason::Vst3LatencyChange) | None => {
+                Some(PdcStreamHandoffReason::Vst3Latency) | None => {
                     format!("VST3 latency update applied through a live PDC handoff{tick_suffix}")
                 }
             };
@@ -12894,14 +12894,14 @@ impl DawUi {
                 .map(|tick| tick.round() as u64);
             let tick_suffix = tick.map_or_else(String::new, |tick| format!(" at tick {tick}"));
             self.status = match staged_handoff_reason {
-                Some(PdcStreamHandoffReason::AutomaticPdcChange { enabled }) => format!(
+                Some(PdcStreamHandoffReason::AutomaticPdc { enabled }) => format!(
                     "Automatic PDC set to {}; applied through a live Pattern PDC handoff{tick_suffix}",
                     u8::from(enabled)
                 ),
-                Some(PdcStreamHandoffReason::MixerRouteGraphChange) => format!(
+                Some(PdcStreamHandoffReason::MixerRouting) => format!(
                     "Mixer routing change applied through a live Pattern handoff{tick_suffix}"
                 ),
-                Some(PdcStreamHandoffReason::Vst3LatencyChange) | None => format!(
+                Some(PdcStreamHandoffReason::Vst3Latency) | None => format!(
                     "VST3 latency update applied through a live Pattern PDC handoff{tick_suffix}"
                 ),
             };
@@ -15637,9 +15637,9 @@ impl DawUi {
             Some(enabled),
         );
         let stream_rebuilt = if route_created && self.playing && self.pattern_playback_mode {
-            self.stage_pattern_stream_rebuild(PdcStreamHandoffReason::MixerRouteGraphChange)
+            self.stage_pattern_stream_rebuild(PdcStreamHandoffReason::MixerRouting)
         } else if route_created && self.playing && !self.performance_mode_active {
-            self.stage_playlist_stream_rebuild(PdcStreamHandoffReason::MixerRouteGraphChange)
+            self.stage_playlist_stream_rebuild(PdcStreamHandoffReason::MixerRouting)
         } else {
             false
         };
@@ -39762,7 +39762,7 @@ impl DawUi {
                 self.project_playback_loaded = true;
                 self.status = if handoff_in_progress {
                     match staged_handoff {
-                        Some((_, PdcStreamHandoffReason::MixerRouteGraphChange)) => {
+                        Some((_, PdcStreamHandoffReason::MixerRouting)) => {
                             "Preparing updated Pattern routing while current audio continues…"
                                 .to_owned()
                         }
@@ -48720,7 +48720,7 @@ impl DawUi {
                         && !self.pattern_playback_mode
                         && !self.performance_mode_active
                         && self.stage_playlist_stream_rebuild(
-                            PdcStreamHandoffReason::AutomaticPdcChange { enabled },
+                            PdcStreamHandoffReason::AutomaticPdc { enabled },
                         );
                     let staged_pattern_handoff = playback_was_active
                         && !staged_song_handoff
@@ -48728,7 +48728,7 @@ impl DawUi {
                         && self.pattern_mode_playback_source.is_some()
                         && !self.performance_mode_active
                         && self.stage_pattern_stream_rebuild(
-                            PdcStreamHandoffReason::AutomaticPdcChange { enabled },
+                            PdcStreamHandoffReason::AutomaticPdc { enabled },
                         );
                     if playback_was_active && !staged_song_handoff && !staged_pattern_handoff {
                         self.stop_project_playback();
@@ -57823,11 +57823,10 @@ impl DawUi {
             }
             if changed {
                 let staged_pattern_handoff = resume_pattern_playback
-                    && self.stage_pattern_stream_rebuild(PdcStreamHandoffReason::Vst3LatencyChange);
+                    && self.stage_pattern_stream_rebuild(PdcStreamHandoffReason::Vst3Latency);
                 let staged_playlist_handoff = !staged_pattern_handoff
                     && resume_playlist_playback
-                    && self
-                        .stage_playlist_stream_rebuild(PdcStreamHandoffReason::Vst3LatencyChange);
+                    && self.stage_playlist_stream_rebuild(PdcStreamHandoffReason::Vst3Latency);
                 if staged_playlist_handoff {
                     self.pattern_seek_tick = pattern_resume_tick;
                 }
@@ -58388,12 +58387,11 @@ impl eframe::App for DawUi {
                 let staged_pattern_handoff = changes.latency_changed
                     && !changes.io_changed
                     && resume_pattern_playback
-                    && self.stage_pattern_stream_rebuild(PdcStreamHandoffReason::Vst3LatencyChange);
+                    && self.stage_pattern_stream_rebuild(PdcStreamHandoffReason::Vst3Latency);
                 let staged_playlist_handoff = changes.latency_changed
                     && !changes.io_changed
                     && resume_playlist_playback
-                    && self
-                        .stage_playlist_stream_rebuild(PdcStreamHandoffReason::Vst3LatencyChange);
+                    && self.stage_playlist_stream_rebuild(PdcStreamHandoffReason::Vst3Latency);
                 if staged_pattern_handoff {
                     self.status = format!(
                         "VST3 latency changed; staging a PDC handoff while Pattern audio continues from tick {}",
