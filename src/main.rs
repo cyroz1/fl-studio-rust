@@ -2426,14 +2426,16 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u16(channel_id, "channel id")?,
                 None,
                 parse_arpeggio_score_options(
-                    range_octaves,
-                    gate,
-                    range_pattern,
-                    sync,
-                    group_notes,
-                    mode,
-                    multiplier,
-                    levels,
+                    [
+                        range_octaves,
+                        gate,
+                        range_pattern,
+                        sync,
+                        group_notes,
+                        mode,
+                        multiplier,
+                        levels,
+                    ],
                 )?,
             )
         }
@@ -2449,14 +2451,16 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u16(channel_id, "channel id")?,
                 Some(&note_indices),
                 parse_arpeggio_score_options(
-                    range_octaves,
-                    gate,
-                    range_pattern,
-                    sync,
-                    group_notes,
-                    mode,
-                    multiplier,
-                    levels,
+                    [
+                        range_octaves,
+                        gate,
+                        range_pattern,
+                        sync,
+                        group_notes,
+                        mode,
+                        multiplier,
+                        levels,
+                    ],
                 )?,
             )
         }
@@ -4809,16 +4813,17 @@ fn parse_arpeggio_score_time_multiplier(
     }
 }
 
-fn parse_arpeggio_score_options(
-    range_octaves: &str,
-    gate: &str,
-    range_pattern: &str,
-    sync: &str,
-    group_notes: &str,
-    pattern_mode: &str,
-    time_multiplier: &str,
-    levels: &str,
-) -> Result<ArpeggioScoreOptions, String> {
+fn parse_arpeggio_score_options(values: [&str; 8]) -> Result<ArpeggioScoreOptions, String> {
+    let [
+        range_octaves,
+        gate,
+        range_pattern,
+        sync,
+        group_notes,
+        pattern_mode,
+        time_multiplier,
+        levels,
+    ] = values;
     Ok(ArpeggioScoreOptions {
         arpeggio: ArpeggioOptions {
             range_octaves: parse_u8(range_octaves, "arpeggiator range")?,
