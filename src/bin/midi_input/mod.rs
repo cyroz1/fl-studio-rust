@@ -1461,6 +1461,7 @@ pub fn describe_event(event: MidiInputEvent) -> String {
                 MixerTrackFlag::EffectsEnabled => "MIDI script Set Mixer Track Effects".to_owned(),
             },
             MidiTransportCommand::SetMixerTrackParameter { parameter, .. } => match parameter {
+                MixerTrackParameter::Volume => "MIDI script Set Mixer Track Volume".to_owned(),
                 MixerTrackParameter::Pan => "MIDI script Set Mixer Track Pan".to_owned(),
                 MixerTrackParameter::StereoSeparation => {
                     "MIDI script Set Mixer Track Stereo Separation".to_owned()

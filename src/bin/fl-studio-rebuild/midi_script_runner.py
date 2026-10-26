@@ -269,6 +269,49 @@ def _mixer_set_track_parameter(index, parameter, value, pickupMode, scale, state
     )
 
 
+def _mixer_get_track_volume(index, mode=0):
+    index = _mixer_track_index(index)
+    try:
+        mode = int(mode)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("Mixer volume mode must be 0 (normalized) or 1 (decibels)") from error
+    if mode not in (0, 1):
+        raise ValueError("Mixer volume mode must be 0 (normalized) or 1 (decibels)")
+    values = _active_transport_state.get("mixer_track_volume_raw", [])
+    raw_value = values[index] if index < len(values) else None
+    volume = 0.8 if raw_value is None else max(0.0, min(1.0, float(raw_value) / 10_000.0))
+    if mode == 1:
+        return -math.inf if volume == 0.0 else 20.0 * math.log10(volume)
+    return volume
+
+
+def _mixer_set_track_volume(index, volume, pickupMode=0):
+    index = _mixer_track_index(index)
+    try:
+        volume = float(volume)
+        pickupMode = int(pickupMode)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("Mixer volume and pickup mode must be numeric") from error
+    if not math.isfinite(volume):
+        raise ValueError("Mixer volume must be finite")
+    if pickupMode not in (0, 1, 2):
+        raise ValueError(
+            "Mixer pickup mode must be midi.PIM_None, PIM_AlwaysPickup, or PIM_FollowGlobal"
+        )
+    if pickupMode != 0:
+        raise NotImplementedError("Mixer track pickup behavior is unsupported")
+    value_raw = int(round(max(0.0, min(1.0, volume)) * 10_000))
+    _mixer_store_track_parameter(index, "mixer_track_volume_raw", value_raw)
+    _request_transport_action(
+        {
+            "action": "set_mixer_track_parameter",
+            "index": index,
+            "parameter": "volume",
+            "value_raw": value_raw,
+        }
+    )
+
+
 def _mixer_get_track_pan(index):
     return _mixer_track_parameter(index, "mixer_track_pan_raw", 6400)
 
@@ -1114,6 +1157,8 @@ def _install_modules(script_name, device_name):
     mixer.swapTrackChannels = _mixer_swap_track_channels
     mixer.isTrackSlotsEnabled = _mixer_is_track_slots_enabled
     mixer.enableTrackSlots = _mixer_enable_track_slots
+    mixer.getTrackVolume = _mixer_get_track_volume
+    mixer.setTrackVolume = _mixer_set_track_volume
     mixer.getTrackPan = _mixer_get_track_pan
     mixer.setTrackPan = _mixer_set_track_pan
     mixer.getTrackStereoSep = _mixer_get_track_stereo_separation

@@ -107,6 +107,7 @@ pub enum MixerTrackFlag {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MixerTrackParameter {
+    Volume,
     Pan,
     StereoSeparation,
 }
@@ -185,6 +186,7 @@ pub struct MidiScriptTransportState {
     pub mixer_track_polarity_reversed: Mutex<Vec<Option<bool>>>,
     pub mixer_track_swap_left_right: Mutex<Vec<Option<bool>>>,
     pub mixer_track_effects_enabled: Mutex<Vec<Option<bool>>>,
+    pub mixer_track_volume_raw: Mutex<Vec<Option<i32>>>,
     pub mixer_track_pan_raw: Mutex<Vec<Option<i32>>>,
     pub mixer_track_stereo_separation_raw: Mutex<Vec<Option<i32>>>,
     pub project_title: Mutex<String>,
@@ -226,6 +228,7 @@ impl Default for MidiScriptTransportState {
             mixer_track_polarity_reversed: Mutex::new(vec![None]),
             mixer_track_swap_left_right: Mutex::new(vec![None]),
             mixer_track_effects_enabled: Mutex::new(vec![None]),
+            mixer_track_volume_raw: Mutex::new(vec![None]),
             mixer_track_pan_raw: Mutex::new(vec![None]),
             mixer_track_stereo_separation_raw: Mutex::new(vec![None]),
             project_title: Mutex::new(String::new()),
@@ -705,6 +708,12 @@ impl MidiScriptRuntime {
             .lock()
             .map(|values| values.clone())
             .unwrap_or_else(|_| vec![None]);
+        let mixer_track_volume_raw = self
+            .transport_state
+            .mixer_track_volume_raw
+            .lock()
+            .map(|values| values.clone())
+            .unwrap_or_else(|_| vec![None]);
         let mixer_track_stereo_separation_raw = self
             .transport_state
             .mixer_track_stereo_separation_raw
@@ -827,6 +836,7 @@ impl MidiScriptRuntime {
                     "mixer_track_swap_left_right": mixer_track_swap_left_right,
                     "mixer_track_effects_enabled": mixer_track_effects_enabled,
                     "mixer_track_pan_raw": mixer_track_pan_raw,
+                    "mixer_track_volume_raw": mixer_track_volume_raw,
                     "mixer_track_stereo_separation_raw": mixer_track_stereo_separation_raw,
                     "pattern_time_signature_changes": pattern_time_signature_changes,
                     "arrangement_time_signature_changes": arrangement_time_signature_changes,
@@ -1076,6 +1086,7 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
             .and_then(|index| u16::try_from(index).ok())
             .ok_or_else(|| "MIDI script returned an invalid Mixer track index".to_owned())?;
         let parameter = match action["parameter"].as_str() {
+            Some("volume") => MixerTrackParameter::Volume,
             Some("pan") => MixerTrackParameter::Pan,
             Some("stereo_separation") => MixerTrackParameter::StereoSeparation,
             _ => return Err("MIDI script returned an invalid Mixer track parameter".to_owned()),

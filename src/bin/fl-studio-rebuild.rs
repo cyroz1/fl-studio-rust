@@ -14492,7 +14492,7 @@ impl DawUi {
         {
             *effects = mixer_track_flags.iter().map(|flags| flags.3).collect();
         }
-        let (mixer_track_pan_raw, mixer_track_stereo_separation_raw) = self
+        let (mixer_track_volume_raw, mixer_track_pan_raw, mixer_track_stereo_separation_raw) = self
             .document
             .as_ref()
             .map(|document| {
@@ -14503,10 +14503,20 @@ impl DawUi {
                     .map(|insert| insert.ordinal())
                     .max()
                     .unwrap_or(0);
+                let mut volume = vec![None; max_ordinal.saturating_add(1)];
                 let mut pan = vec![None; max_ordinal.saturating_add(1)];
                 let mut separation = vec![None; max_ordinal.saturating_add(1)];
                 for insert in inserts {
                     let ordinal = insert.ordinal();
+                    if let Some(value) = volume.get_mut(ordinal) {
+                        *value = unique_candidate_mixer_parameter(
+                            &parameters,
+                            ordinal,
+                            MixerParameterKind::Volume,
+                        )
+                        .map(MixerParameterRecord::value)
+                        .filter(|volume_raw| (0..=16_000).contains(volume_raw));
+                    }
                     if let Some(value) = pan.get_mut(ordinal) {
                         *value = unique_candidate_mixer_parameter(
                             &parameters,
@@ -14521,9 +14531,16 @@ impl DawUi {
                             .map(MixerParameterRecord::value);
                     }
                 }
-                (pan, separation)
+                (volume, pan, separation)
             })
-            .unwrap_or_else(|| (vec![None], vec![None]));
+            .unwrap_or_else(|| (vec![None], vec![None], vec![None]));
+        if let Ok(mut volume) = self
+            .midi_script_transport_state
+            .mixer_track_volume_raw
+            .lock()
+        {
+            *volume = mixer_track_volume_raw;
+        }
         if let Ok(mut pan) = self.midi_script_transport_state.mixer_track_pan_raw.lock() {
             *pan = mixer_track_pan_raw;
         }
@@ -15382,6 +15399,7 @@ impl DawUi {
     ) {
         let insert_ordinal = usize::from(index);
         let (kind, range, label) = match parameter {
+            MixerTrackParameter::Volume => (MixerParameterKind::Volume, 0..=10_000, "volume"),
             MixerTrackParameter::Pan => (MixerParameterKind::Pan, -6_400..=6_400, "pan"),
             MixerTrackParameter::StereoSeparation => (
                 MixerParameterKind::StereoSeparation,
@@ -15452,6 +15470,12 @@ impl DawUi {
             return;
         }
         match (parameter, insert_ordinal) {
+            (MixerTrackParameter::Volume, 0) => self
+                .mixer_track_peak_meters
+                .set_live_master_fader_gain(value_raw as f32 / 10_000.0),
+            (MixerTrackParameter::Volume, _) => self
+                .mixer_track_peak_meters
+                .set_live_mixer_insert_fader_raw(insert_ordinal, Some(value_raw)),
             (MixerTrackParameter::Pan, 0) => self
                 .mixer_track_peak_meters
                 .set_live_master_pan_raw(Some(value_raw)),
