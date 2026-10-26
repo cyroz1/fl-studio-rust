@@ -4792,6 +4792,8 @@ struct DawUi {
     arpeggiator_score_time_multiplier: ArpeggioScoreTimeMultiplier,
     arpeggiator_score_levels_percent: u8,
     riff_use_custom_arpeggio_score: bool,
+    riff_progression_score: Option<FscScore>,
+    riff_progression_score_path: Option<PathBuf>,
     riff_chord_progression_enabled: bool,
     riff_arpeggiation_enabled: bool,
     riff_mirroring_enabled: bool,
@@ -6407,6 +6409,8 @@ impl DawUi {
             arpeggiator_score_time_multiplier: ArpeggioScoreTimeMultiplier::Normal,
             arpeggiator_score_levels_percent: 0,
             riff_use_custom_arpeggio_score: false,
+            riff_progression_score: None,
+            riff_progression_score_path: None,
             riff_chord_progression_enabled: true,
             riff_arpeggiation_enabled: true,
             riff_mirroring_enabled: true,
@@ -31819,6 +31823,7 @@ impl DawUi {
         let mut arpeggiate_requested = false;
         let mut load_arpeggiator_score_requested = false;
         let mut riff_machine_requested = false;
+        let mut load_riff_progression_score_requested = false;
         let mut load_riff_groove_score_requested = false;
         let mut claw_requested = false;
         let mut slice_requested = false;
@@ -33011,9 +33016,11 @@ impl DawUi {
                         });
                     });
                     ui.menu_button("Riff machine", |ui| {
-                        ui.small(
-                            "Use the targeted notes as chord roots, then create a fitted arpeggio.",
-                        );
+                        ui.small(if self.riff_progression_score.is_some() {
+                            "Use the loaded .fsc score as the note progression."
+                        } else {
+                            "Use the targeted notes as chord roots, then create a fitted arpeggio."
+                        });
                         ui.small("Stages run in order; turn off any pass to keep its input unchanged.");
                         ui.horizontal_wrapped(|ui| {
                             ui.checkbox(
@@ -33037,6 +33044,33 @@ impl DawUi {
                             ui.checkbox(&mut self.riff_fit_enabled, "Fit")
                                 .on_hover_text("Fit notes to the configured scale and key range.");
                         });
+                        egui::CollapsingHeader::new("Note Progression")
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    if ui.button("Load .fsc pattern…").clicked() {
+                                        load_riff_progression_score_requested = true;
+                                        ui.close();
+                                    }
+                                    if let Some(path) = &self.riff_progression_score_path {
+                                        ui.label(path.display().to_string());
+                                        if ui.small_button("Clear").clicked() {
+                                            self.riff_progression_score = None;
+                                            self.riff_progression_score_path = None;
+                                        }
+                                    }
+                                });
+                                if let Some(score) = &self.riff_progression_score {
+                                    ui.small(format!(
+                                        "Using {} score notes; pattern starts at its first note and timing scales to project PPQ.",
+                                        score.notes().iter().filter(|note| note.length > 0).count()
+                                    ));
+                                } else {
+                                    ui.small(
+                                        "Load a score to replace the target progression with its note pattern.",
+                                    );
+                                }
+                            });
                         ui.add(
                             egui::Slider::new(&mut self.arpeggiator_step_ticks, 1..=384)
                                 .text("Arpeggio step (ticks)"),
@@ -33483,6 +33517,8 @@ impl DawUi {
                                     defaults.mod_y_variation_percent;
                                 self.riff_pitch_variation_semitones =
                                     defaults.pitch_variation_semitones;
+                                self.riff_progression_score = None;
+                                self.riff_progression_score_path = None;
                                 self.riff_reset_levels = defaults.reset_levels;
                                 self.riff_bipolar_levels = defaults.bipolar_levels;
                                 self.riff_length_multiplier_percent =
@@ -35112,6 +35148,27 @@ impl DawUi {
                 }
             }
         }
+        if load_riff_progression_score_requested
+            && let Some(path) = rfd::FileDialog::new()
+                .set_title("Load Riff Machine progression score")
+                .add_filter("FL Studio score files", &["fsc"])
+                .pick_file()
+        {
+            let result = fs::read(&path)
+                .map_err(|error| format!("could not read {}: {error}", path.display()))
+                .and_then(|bytes| FscScore::parse(&bytes).map_err(|error| error.to_string()));
+            match result {
+                Ok(score) => {
+                    self.riff_progression_score = Some(score);
+                    self.riff_progression_score_path = Some(path.clone());
+                    self.status =
+                        format!("Loaded Riff Machine progression score {}", path.display());
+                }
+                Err(error) => {
+                    self.status = format!("Could not load Riff Machine progression score: {error}");
+                }
+            }
+        }
         if load_riff_groove_score_requested
             && let Some(path) = rfd::FileDialog::new()
                 .set_title("Load Riff Machine groove score")
@@ -35935,6 +35992,7 @@ impl DawUi {
         {
             let scale_intervals = self.piano_roll_scale.intervals();
             let riff_groove_score = self.riff_groove_score.clone();
+            let riff_progression_score = self.riff_progression_score.clone();
             let riff_arpeggio_score = self
                 .riff_use_custom_arpeggio_score
                 .then(|| self.arpeggiator_score.clone())
@@ -35957,6 +36015,7 @@ impl DawUi {
                 articulation_enabled: self.riff_articulation_enabled,
                 groove_enabled: self.riff_groove_enabled,
                 fit_enabled: self.riff_fit_enabled,
+                progression_score: riff_progression_score.as_ref(),
                 arpeggio_score: riff_arpeggio_score.as_ref(),
                 arpeggio_score_mode: self.riff_arpeggio_score_mode,
                 arpeggio_score_time_multiplier: self.riff_arpeggio_score_time_multiplier,

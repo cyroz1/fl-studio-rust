@@ -2523,6 +2523,8 @@ pub struct RiffMachineOptions<'a> {
     pub mirror_vertical: bool,
     /// Assign all generated notes one fresh channel-local note group.
     pub group_notes: bool,
+    /// Optional `.fsc` pattern for the Riff Machine's Note Progression stage.
+    pub progression_score: Option<&'a FscScore>,
     /// Optional `.fsc` pattern for the Riff Machine's Arpeggiation stage.
     pub arpeggio_score: Option<&'a FscScore>,
     pub arpeggio_score_mode: ArpeggioScorePatternMode,
@@ -2592,6 +2594,7 @@ impl<'a> Default for RiffMachineOptions<'a> {
             preserve_start_times: false,
             mirror_vertical: false,
             group_notes: false,
+            progression_score: None,
             arpeggio_score: None,
             arpeggio_score_mode: ArpeggioScorePatternMode::Normal,
             arpeggio_score_time_multiplier: ArpeggioScoreTimeMultiplier::Normal,
@@ -15110,11 +15113,83 @@ impl FlpDocument {
             .filter(|(note_index, _)| note_index_in_scope(*note_index, selected_indices.as_ref()))
             .map(|(note_index, note)| (note_index, note.clone()))
             .collect::<Vec<_>>();
-        if target_notes.is_empty() {
+        if target_notes.is_empty()
+            && (options.progression_score.is_none() || note_indices.is_some())
+        {
             return Err(FlpError::UnsupportedEdit(
                 "Riff Machine needs a note progression in the target scope",
             ));
         }
+        let progression_notes = if let Some(score) = options.progression_score {
+            let progression_origin = score
+                .notes()
+                .iter()
+                .filter(|note| note.length > 0)
+                .map(|note| u64::from(note.position))
+                .min()
+                .ok_or(FlpError::UnsupportedEdit(
+                    "Riff Machine progression score contains no positive-length notes",
+                ))?;
+            let anchor = if note_indices.is_some() {
+                target_notes
+                    .iter()
+                    .map(|(_, note)| u64::from(note.position))
+                    .min()
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            let mut progression_notes = Vec::new();
+            for score_note in score.notes().iter().filter(|note| note.length > 0) {
+                if score_note.key > 127 {
+                    return Err(FlpError::UnsupportedEdit(
+                        "Riff Machine progression score contains a pitch outside the MIDI key range",
+                    ));
+                }
+                let relative_start = u64::from(score_note.position) - progression_origin;
+                let start = scale_score_tick(
+                    relative_start,
+                    score.ppq(),
+                    self.header.ppq,
+                    ArpeggioScoreTimeMultiplier::Normal,
+                )?;
+                let raw_end = u64::from(score_note.position)
+                    .checked_add(u64::from(score_note.length))
+                    .ok_or(FlpError::LengthOverflow)?;
+                let relative_end = raw_end - progression_origin;
+                let mut end = scale_score_tick(
+                    relative_end,
+                    score.ppq(),
+                    self.header.ppq,
+                    ArpeggioScoreTimeMultiplier::Normal,
+                )?;
+                if end <= start {
+                    end = start.checked_add(1).ok_or(FlpError::LengthOverflow)?;
+                }
+                let position = anchor.checked_add(start).ok_or(FlpError::LengthOverflow)?;
+                let mut progression_note = score_note.clone();
+                progression_note.channel_id = channel_id;
+                progression_note.position =
+                    u32::try_from(position).map_err(|_| FlpError::LengthOverflow)?;
+                progression_note.length =
+                    u32::try_from(end - start).map_err(|_| FlpError::LengthOverflow)?;
+                progression_note.group = 0;
+                progression_notes.push(progression_note);
+                if progression_notes.len() > MAX_MERGED_PATTERN_NOTES {
+                    return Err(FlpError::UnsupportedEdit(
+                        "Riff Machine progression score contains more than two million notes",
+                    ));
+                }
+            }
+            if progression_notes.is_empty() {
+                return Err(FlpError::UnsupportedEdit(
+                    "Riff Machine progression score contains no positive-length notes",
+                ));
+            }
+            progression_notes
+        } else {
+            target_notes.iter().map(|(_, note)| note.clone()).collect()
+        };
         let stage_will_run = options.chord_progression_enabled
             || options.arpeggiation_enabled
             || (options.mirroring_enabled
@@ -15126,7 +15201,8 @@ impl FlpDocument {
                     || !options.use_original_lengths))
             || groove_enabled
             || options.fit_enabled
-            || options.group_notes;
+            || options.group_notes
+            || options.progression_score.is_some();
         if !stage_will_run {
             return Ok(0);
         }
@@ -15139,7 +15215,7 @@ impl FlpDocument {
         let unaffected_note_count = channel_note_count.saturating_sub(target_notes.len());
         let riff_notes = if options.chord_progression_enabled {
             let mut progression = std::collections::BTreeMap::<u32, PatternNote>::new();
-            for (_, note) in &target_notes {
+            for note in &progression_notes {
                 progression
                     .entry(note.position)
                     .and_modify(|root| {
@@ -15180,7 +15256,7 @@ impl FlpDocument {
             }
             chord_notes
         } else {
-            target_notes.iter().map(|(_, note)| note.clone()).collect()
+            progression_notes
         };
         if riff_notes.is_empty() {
             return Err(FlpError::UnsupportedEdit(
@@ -15189,7 +15265,9 @@ impl FlpDocument {
         }
 
         let mut updated = self.clone();
-        let riff_indices = if options.chord_progression_enabled {
+        let riff_indices = if options.chord_progression_enabled
+            || options.progression_score.is_some()
+        {
             let mut remove_indices = target_notes
                 .iter()
                 .map(|(note_index, _)| *note_index)
