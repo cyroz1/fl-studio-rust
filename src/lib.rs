@@ -9628,6 +9628,44 @@ impl FlpDocument {
         Ok(())
     }
 
+    /// Sets the RGB portion of a recognized Mixer insert's `0x95` color value.
+    /// The upper saved byte and every unrelated event remain unchanged.
+    pub fn set_mixer_insert_color(
+        &mut self,
+        insert_ordinal: usize,
+        color: u32,
+    ) -> Result<(), FlpError> {
+        let insert = self
+            .mixer_inserts()
+            .into_iter()
+            .find(|insert| insert.ordinal() == insert_ordinal)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested Mixer insert does not exist",
+            ))?;
+        let event_index = insert.first_event_index + 2;
+        let event = self
+            .events
+            .get(event_index)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested Mixer insert color event does not exist",
+            ))?;
+        if event.opcode != 0x95
+            || event.encoding != PayloadEncoding::Dword
+            || event.payload.len() != 4
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested Mixer insert color event has an unsupported layout",
+            ));
+        }
+        let saved_color = u32::from_le_bytes(
+            event.payload[..4]
+                .try_into()
+                .expect("Mixer insert color has four bytes"),
+        );
+        let updated_color = (saved_color & 0xFF00_0000) | (color & 0x00FF_FFFF);
+        self.events[event_index].replace_dword_payload(updated_color)
+    }
+
     /// Decodes only the fixed 12-byte framing observed in Mixer `0xE1` parameter records.
     /// Unknown fields remain raw, and a different record size is reported instead of guessed.
     pub fn mixer_parameter_records(&self) -> Result<Vec<MixerParameterRecord>, FlpError> {

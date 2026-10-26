@@ -14377,12 +14377,18 @@ impl DawUi {
                     .map(|insert| insert.ordinal())
                     .max()
                     .unwrap_or(0);
-                let mut names = Vec::with_capacity(max_ordinal.saturating_add(2));
-                names.push("Master".to_owned());
-                names.extend((0..=max_ordinal).map(|ordinal| format!("Insert {}", ordinal + 1)));
+                let mut names = (0..=max_ordinal)
+                    .map(|ordinal| {
+                        if ordinal == 0 {
+                            "Master".to_owned()
+                        } else {
+                            format!("Insert {ordinal}")
+                        }
+                    })
+                    .collect::<Vec<_>>();
                 for insert in inserts {
                     if let Some(name) = insert.name().filter(|name| !name.is_empty())
-                        && let Some(track_name) = names.get_mut(insert.ordinal() + 1)
+                        && let Some(track_name) = names.get_mut(insert.ordinal())
                     {
                         *track_name = name.to_owned();
                     }
@@ -14392,6 +14398,28 @@ impl DawUi {
             .unwrap_or_else(|| vec!["Master".to_owned()]);
         if let Ok(mut names) = self.midi_script_transport_state.mixer_track_names.lock() {
             *names = mixer_track_names;
+        }
+        let mixer_track_colors = self
+            .document
+            .as_ref()
+            .map(|document| {
+                let inserts = document.mixer_inserts();
+                let max_ordinal = inserts
+                    .iter()
+                    .map(|insert| insert.ordinal())
+                    .max()
+                    .unwrap_or(0);
+                let mut colors = vec![0; max_ordinal.saturating_add(1)];
+                for insert in inserts {
+                    if let Some(track_color) = colors.get_mut(insert.ordinal()) {
+                        *track_color = insert.color_raw() & 0x00FF_FFFF;
+                    }
+                }
+                colors
+            })
+            .unwrap_or_else(|| vec![0]);
+        if let Ok(mut colors) = self.midi_script_transport_state.mixer_track_colors.lock() {
+            *colors = mixer_track_colors;
         }
         let arrangement_marker_names = self
             .document
@@ -15166,10 +15194,8 @@ impl DawUi {
     }
 
     fn set_midi_script_mixer_track_name(&mut self, index: u16, name: String) {
-        let result = if index == 0 {
-            Err("the Master Mixer track cannot be renamed".to_owned())
-        } else if let Some(document) = self.document.as_mut() {
-            let insert_ordinal = usize::from(index - 1);
+        let result = if let Some(document) = self.document.as_mut() {
+            let insert_ordinal = usize::from(index);
             let insert = document
                 .mixer_inserts()
                 .into_iter()
@@ -15181,8 +15207,7 @@ impl DawUi {
                     .map(|()| true)
                     .map_err(|error| error.to_string()),
                 None => Err(format!(
-                    "Mixer insert {} does not have a recognized project record",
-                    insert_ordinal + 1
+                    "Mixer track {insert_ordinal} does not have a recognized project record"
                 )),
             }
         } else {
@@ -15192,11 +15217,46 @@ impl DawUi {
             Ok(true) => {
                 self.dirty = true;
                 self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
-                self.status = format!("MIDI script renamed Mixer insert {index}");
+                self.status = format!("MIDI script renamed Mixer track {index}");
             }
             Ok(false) => {}
             Err(error) => {
                 self.status = format!("MIDI script could not rename Mixer track: {error}");
+            }
+        }
+    }
+
+    fn set_midi_script_mixer_track_color(&mut self, index: u16, color: u32) {
+        let result = if let Some(document) = self.document.as_mut() {
+            let track_ordinal = usize::from(index);
+            let insert = document
+                .mixer_inserts()
+                .into_iter()
+                .find(|insert| insert.ordinal() == track_ordinal);
+            match insert {
+                Some(insert) if insert.color_raw() & 0x00FF_FFFF == color & 0x00FF_FFFF => {
+                    Ok(false)
+                }
+                Some(_) => document
+                    .set_mixer_insert_color(track_ordinal, color)
+                    .map(|()| true)
+                    .map_err(|error| error.to_string()),
+                None => Err(format!(
+                    "Mixer track {track_ordinal} does not have a recognized project record"
+                )),
+            }
+        } else {
+            Err("MIDI script Mixer track edits require an open project".to_owned())
+        };
+        match result {
+            Ok(true) => {
+                self.dirty = true;
+                self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+                self.status = format!("MIDI script recolored Mixer track {index}");
+            }
+            Ok(false) => {}
+            Err(error) => {
+                self.status = format!("MIDI script could not recolor Mixer track: {error}");
             }
         }
     }
@@ -49680,6 +49740,9 @@ impl DawUi {
             }
             MidiTransportCommand::SetMixerTrackName { index, name } => {
                 self.set_midi_script_mixer_track_name(index, name);
+            }
+            MidiTransportCommand::SetMixerTrackColor { index, color } => {
+                self.set_midi_script_mixer_track_color(index, color);
             }
             MidiTransportCommand::JumpToMarker { delta, select } => {
                 self.jump_midi_script_marker_with_selection(delta, select);

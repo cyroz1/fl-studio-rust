@@ -133,18 +133,16 @@ def _mixer_track_index(index):
 
 def _mixer_get_track_name(index):
     index = _mixer_track_index(index)
-    if index == 0:
-        return "Master"
     track_names = _active_transport_state.get("mixer_track_names", [])
     if index < len(track_names):
         return str(track_names[index])
+    if index == 0:
+        return "Master"
     return "Insert {}".format(index)
 
 
 def _mixer_set_track_name(index, name):
     index = _mixer_track_index(index)
-    if index == 0:
-        raise ValueError("the Master Mixer track cannot be renamed")
     if not isinstance(name, str):
         raise TypeError("Mixer track name must be a string")
     if "\0" in name:
@@ -152,6 +150,50 @@ def _mixer_set_track_name(index, name):
     _request_transport_action(
         {"action": "set_mixer_track_name", "index": index, "name": name}
     )
+
+
+def _mixer_get_track_color(index):
+    index = _mixer_track_index(index)
+    track_colors = _active_transport_state.get("mixer_track_colors", [])
+    if index < len(track_colors):
+        return int(track_colors[index]) & 0x00FFFFFF
+    return 0
+
+
+def _mixer_set_track_color(index, color):
+    index = _mixer_track_index(index)
+    try:
+        color = int(color)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("Mixer track color must be an integer") from error
+    if not 0 <= color <= 0xFFFFFFFF:
+        raise ValueError("Mixer track color is outside the supported range")
+    _request_transport_action(
+        {"action": "set_mixer_track_color", "index": index, "color": color}
+    )
+
+
+def _color_to_rgb(color):
+    try:
+        color = int(color)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("color must be an integer") from error
+    if not 0 <= color <= 0xFFFFFFFF:
+        raise ValueError("color is outside the supported range")
+    return color & 0xFF, (color >> 8) & 0xFF, (color >> 16) & 0xFF
+
+
+def _rgb_to_color(red, green, blue):
+    components = []
+    for component in (red, green, blue):
+        try:
+            component = int(component)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError("RGB components must be integers") from error
+        if not 0 <= component <= 255:
+            raise ValueError("RGB components must be between 0 and 255")
+        components.append(component)
+    return components[0] | (components[1] << 8) | (components[2] << 16)
 
 
 def _short_message_length(status):
@@ -868,6 +910,8 @@ def _install_modules(script_name, device_name):
     mixer.setCurrentTempo = _set_current_tempo
     mixer.getTrackName = _mixer_get_track_name
     mixer.setTrackName = _mixer_set_track_name
+    mixer.getTrackColor = _mixer_get_track_color
+    mixer.setTrackColor = _mixer_set_track_color
     mixer.getSongStepPos = _get_song_step_pos
     mixer.getSongTickPos = _get_song_tick_pos
 
@@ -929,6 +973,10 @@ def _install_modules(script_name, device_name):
     general.getProjectGenre = lambda: str(
         _active_transport_state.get("project_genre", "")
     )
+
+    utils = _module("utils")
+    utils.ColorToRGB = _color_to_rgb
+    utils.RGBToColor = _rgb_to_color
 
     arrangement = _module("arrangement")
     arrangement.addAutoTimeMarker = _add_auto_time_marker

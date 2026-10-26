@@ -697,6 +697,9 @@ fn queue_script_transport_actions(
             ScriptTransportAction::SetMixerTrackName { index, name } => {
                 MidiTransportCommand::SetMixerTrackName { index, name }
             }
+            ScriptTransportAction::SetMixerTrackColor { index, color } => {
+                MidiTransportCommand::SetMixerTrackColor { index, color }
+            }
             ScriptTransportAction::JumpToMarker { delta, select } => {
                 MidiTransportCommand::JumpToMarker { delta, select }
             }
@@ -759,6 +762,7 @@ pub enum MidiTransportCommand {
     AddArrangementTimeMarker { tick: u32, name: String },
     SetArrangementLiveSelection { tick: u32, stop: bool },
     SetMixerTrackName { index: u16, name: String },
+    SetMixerTrackColor { index: u16, color: u32 },
     JumpToMarker { delta: i32, select: bool },
     SelectNextEmptyPatternWithNameDialog,
     FocusSelectedMixerTrackName,
@@ -1394,6 +1398,9 @@ pub fn describe_event(event: MidiInputEvent) -> String {
             }
             MidiTransportCommand::SetMixerTrackName { .. } => {
                 "MIDI script Rename Mixer Track".to_owned()
+            }
+            MidiTransportCommand::SetMixerTrackColor { .. } => {
+                "MIDI script Recolor Mixer Track".to_owned()
             }
             MidiTransportCommand::JumpToMarker { .. } => "MIDI script Jump to Marker".to_owned(),
             MidiTransportCommand::SelectNextEmptyPatternWithNameDialog => {
