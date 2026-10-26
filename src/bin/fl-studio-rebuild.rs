@@ -630,6 +630,19 @@ fn project_hash(document: &FlpDocument) -> Option<u64> {
     Some(hasher.finish())
 }
 
+fn midi_script_mixer_recording_file_names(
+    track_count: usize,
+    active_recording: Option<(usize, &Path)>,
+) -> Vec<String> {
+    let mut file_names = vec![String::new(); track_count];
+    if let Some((track_index, path)) = active_recording
+        && let Some(file_name) = file_names.get_mut(track_index)
+    {
+        *file_name = path.to_string_lossy().into_owned();
+    }
+    file_names
+}
+
 fn project_channel_swing_mix_raw(document: &FlpDocument, channel_id: u16) -> u16 {
     document
         .channels()
@@ -14496,8 +14509,26 @@ impl DawUi {
                 names
             })
             .unwrap_or_else(|| vec!["Master".to_owned()]);
+        let active_recording = self
+            .audio_recording
+            .as_ref()
+            .filter(|recording| recording.capture_active)
+            .and_then(|recording| {
+                usize::try_from(recording.mixer_track)
+                    .ok()
+                    .map(|track_index| (track_index, recording.output_path.as_path()))
+            });
+        let mixer_track_recording_file_names =
+            midi_script_mixer_recording_file_names(mixer_track_names.len(), active_recording);
         if let Ok(mut names) = self.midi_script_transport_state.mixer_track_names.lock() {
             *names = mixer_track_names;
+        }
+        if let Ok(mut file_names) = self
+            .midi_script_transport_state
+            .mixer_track_recording_file_names
+            .lock()
+        {
+            *file_names = mixer_track_recording_file_names;
         }
         self.midi_script_transport_state.mixer_selected_track.store(
             u64::try_from(self.selected_mixer_insert.unwrap_or(0)).unwrap_or(0),
@@ -69027,18 +69058,18 @@ mod tests {
         midi_controller_binding_for_device, midi_mixer_button_press_edge,
         midi_mixer_control_for_cc, midi_script_arrangement_time_ticks, midi_script_bar_beat,
         midi_script_clip_selection_bounds, midi_script_marker_jump_target,
-        midi_script_marker_selection_target, midi_script_moved_song_position_tick,
-        midi_script_pattern_jog_target, midi_script_tempo_jog_target,
-        midi_script_time_position_seconds_to_ticks, midi_vst3_parameter_mapping_for_target,
-        midi_vst3_parameter_mappings_for_cc, next_empty_pattern_id, next_piano_roll_note_group,
-        note_from_grid_position, parse_internal_lfo_parameter_links,
-        parse_midi_control_change_mapping, parse_midi_controller_templates,
-        parse_midi_device_selections, parse_midi_mixer_control_mappings,
-        parse_midi_output_programs, parse_midi_output_routes, parse_midi_output_values,
-        parse_midi_vst3_parameter_mappings, parse_pattern_vst3_parameter_links,
-        parse_playlist_audio_clip_envelopes, parse_playlist_vst3_parameter_links,
-        parse_window_layout_presets, pattern_color_from_random_index,
-        pattern_lfo_loop_length_ticks, pattern_loop_frame_at_tick,
+        midi_script_marker_selection_target, midi_script_mixer_recording_file_names,
+        midi_script_moved_song_position_tick, midi_script_pattern_jog_target,
+        midi_script_tempo_jog_target, midi_script_time_position_seconds_to_ticks,
+        midi_vst3_parameter_mapping_for_target, midi_vst3_parameter_mappings_for_cc,
+        next_empty_pattern_id, next_piano_roll_note_group, note_from_grid_position,
+        parse_internal_lfo_parameter_links, parse_midi_control_change_mapping,
+        parse_midi_controller_templates, parse_midi_device_selections,
+        parse_midi_mixer_control_mappings, parse_midi_output_programs, parse_midi_output_routes,
+        parse_midi_output_values, parse_midi_vst3_parameter_mappings,
+        parse_pattern_vst3_parameter_links, parse_playlist_audio_clip_envelopes,
+        parse_playlist_vst3_parameter_links, parse_window_layout_presets,
+        pattern_color_from_random_index, pattern_lfo_loop_length_ticks, pattern_loop_frame_at_tick,
         pattern_loop_handoff_tick_at_frame, pattern_loop_tick_at_frame,
         pattern_vst3_parameter_automation_for_channel, pattern_vst3_parameter_link_for_target,
         piano_roll_color_group_note_ids, piano_roll_controller_stroke_points,
@@ -72628,6 +72659,27 @@ mod tests {
         assert_eq!(
             midi_script_time_position_seconds_to_ticks(&tempo_map, -1.0, 192),
             None
+        );
+    }
+
+    #[test]
+    fn midi_script_mixer_recording_filename_is_scoped_to_active_track() {
+        let path = PathBuf::from("/tmp/audio-take.wav");
+        assert_eq!(
+            midi_script_mixer_recording_file_names(3, Some((1, path.as_path()))),
+            vec![
+                String::new(),
+                path.to_string_lossy().into_owned(),
+                String::new()
+            ]
+        );
+        assert_eq!(
+            midi_script_mixer_recording_file_names(3, None),
+            vec![String::new(), String::new(), String::new()]
+        );
+        assert_eq!(
+            midi_script_mixer_recording_file_names(2, Some((2, path.as_path()))),
+            vec![String::new(), String::new()]
         );
     }
 
