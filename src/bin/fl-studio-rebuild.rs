@@ -14556,6 +14556,34 @@ impl DawUi {
         if let Ok(mut colors) = self.midi_script_transport_state.mixer_track_colors.lock() {
             *colors = mixer_track_colors;
         }
+        let mixer_track_slot_colors = self
+            .document
+            .as_ref()
+            .map(|document| {
+                let inserts = document.mixer_inserts();
+                let max_ordinal = inserts
+                    .iter()
+                    .map(|insert| insert.ordinal())
+                    .max()
+                    .unwrap_or(0);
+                let mut colors = vec![vec![None; 10]; max_ordinal.saturating_add(1)];
+                for slot in document.mixer_effect_slots() {
+                    if let Some(track_colors) = colors.get_mut(slot.insert_ordinal())
+                        && let Some(color) = track_colors.get_mut(usize::from(slot.slot_index()))
+                    {
+                        *color = slot.color_raw().map(|raw| raw & 0x00FF_FFFF);
+                    }
+                }
+                colors
+            })
+            .unwrap_or_else(|| vec![vec![None; 10]]);
+        if let Ok(mut colors) = self
+            .midi_script_transport_state
+            .mixer_track_slot_colors
+            .lock()
+        {
+            *colors = mixer_track_slot_colors;
+        }
         let mixer_send_routes = self
             .document
             .as_ref()
@@ -15685,6 +15713,45 @@ impl DawUi {
             Ok(false) => {}
             Err(error) => {
                 self.status = format!("MIDI script could not recolor Mixer track: {error}");
+            }
+        }
+    }
+
+    fn set_midi_script_mixer_slot_color(&mut self, index: u16, slot: u8, color: u32) {
+        let result = if let Some(document) = self.document.as_mut() {
+            let track_ordinal = usize::from(index);
+            let slot_index = u16::from(slot);
+            let existing = document.mixer_effect_slots().into_iter().find(|summary| {
+                summary.insert_ordinal() == track_ordinal && summary.slot_index() == slot_index
+            });
+            match existing {
+                Some(summary)
+                    if summary.color_raw().map(|raw| raw & 0x00FF_FFFF)
+                        == Some(color & 0x00FF_FFFF) =>
+                {
+                    Ok(false)
+                }
+                Some(_) => document
+                    .set_mixer_effect_slot_color(track_ordinal, slot_index, color)
+                    .map(|()| true)
+                    .map_err(|error| error.to_string()),
+                None => Err(format!(
+                    "Mixer track {track_ordinal} effect slot {slot} does not have a recognized project record"
+                )),
+            }
+        } else {
+            Err("MIDI script Mixer effect-slot edits require an open project".to_owned())
+        };
+        match result {
+            Ok(true) => {
+                self.dirty = true;
+                self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+                self.status =
+                    format!("MIDI script recolored Mixer track {index} effect slot {slot}");
+            }
+            Ok(false) => {}
+            Err(error) => {
+                self.status = format!("MIDI script could not recolor Mixer effect slot: {error}");
             }
         }
     }
@@ -48392,12 +48459,22 @@ impl DawUi {
                                 } else {
                                     saved_state
                                 };
+                                let slot_color_stroke = slot.color_raw().map_or(GRID, |raw| {
+                                    Color32::from_rgb(
+                                        (raw & 0xFF) as u8,
+                                        ((raw >> 8) & 0xFF) as u8,
+                                        ((raw >> 16) & 0xFF) as u8,
+                                    )
+                                });
                                 let width = ui.available_width();
                                 let slot_index_raw = slot_index as u16;
                                 let (response, dropped_slot) = ui.dnd_drop_zone::<(usize, u16), _>(
                                     egui::Frame::new()
                                     .fill(PANEL_DARK)
-                                    .stroke(Stroke::new(1.0, GRID))
+                                    .stroke(Stroke::new(
+                                        if slot.color_raw().is_some() { 1.5 } else { 1.0 },
+                                        slot_color_stroke,
+                                    ))
                                         .inner_margin(6.0),
                                     |ui| {
                                         ui.set_min_width(width - 14.0);
@@ -50544,6 +50621,9 @@ impl DawUi {
             }
             MidiTransportCommand::SetMixerTrackColor { index, color } => {
                 self.set_midi_script_mixer_track_color(index, color);
+            }
+            MidiTransportCommand::SetMixerSlotColor { index, slot, color } => {
+                self.set_midi_script_mixer_slot_color(index, slot, color);
             }
             MidiTransportCommand::SetMixerTrackEnabled { index, enabled } => {
                 if let Err(error) = self.apply_midi_mixer_toggle_state(
