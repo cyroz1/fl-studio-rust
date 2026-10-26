@@ -29011,6 +29011,7 @@ mod tests {
                     polarity_reversed: Some(false),
                     swap_left_right: Some(true),
                     effects_enabled: None,
+                    mute_locked: None,
                 },
             )
             .expect("known Mixer flags should be editable");
