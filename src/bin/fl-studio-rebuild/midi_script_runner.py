@@ -227,6 +227,75 @@ def _mixer_set_track_flag(index, flag, value):
     )
 
 
+def _mixer_track_parameter(index, state_name, scale):
+    index = _mixer_track_index(index)
+    values = _active_transport_state.get(state_name, [])
+    if index >= len(values) or values[index] is None:
+        return 0.0
+    return max(-1.0, min(1.0, float(values[index]) / scale))
+
+
+def _mixer_store_track_parameter(index, state_name, value_raw):
+    values = _active_transport_state.setdefault(state_name, [])
+    if len(values) <= index:
+        values.extend([None] * (index + 1 - len(values)))
+    values[index] = value_raw
+
+
+def _mixer_set_track_parameter(index, parameter, value, pickupMode, scale, state_name):
+    index = _mixer_track_index(index)
+    try:
+        value = float(value)
+        pickupMode = int(pickupMode)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("Mixer track value and pickup mode must be numeric") from error
+    if not math.isfinite(value):
+        raise ValueError("Mixer track value must be finite")
+    if pickupMode not in (0, 1, 2):
+        raise ValueError(
+            "Mixer pickup mode must be midi.PIM_None, PIM_AlwaysPickup, or PIM_FollowGlobal"
+        )
+    if pickupMode != 0:
+        raise NotImplementedError("Mixer track pickup behavior is unsupported")
+    value_raw = int(round(max(-1.0, min(1.0, value)) * scale))
+    _mixer_store_track_parameter(index, state_name, value_raw)
+    _request_transport_action(
+        {
+            "action": "set_mixer_track_parameter",
+            "index": index,
+            "parameter": parameter,
+            "value_raw": value_raw,
+        }
+    )
+
+
+def _mixer_get_track_pan(index):
+    return _mixer_track_parameter(index, "mixer_track_pan_raw", 6400)
+
+
+def _mixer_set_track_pan(index, pan, pickupMode=0):
+    _mixer_set_track_parameter(
+        index, "pan", pan, pickupMode, 6400, "mixer_track_pan_raw"
+    )
+
+
+def _mixer_get_track_stereo_separation(index):
+    return _mixer_track_parameter(
+        index, "mixer_track_stereo_separation_raw", 64
+    )
+
+
+def _mixer_set_track_stereo_separation(index, pan, pickupMode=0):
+    _mixer_set_track_parameter(
+        index,
+        "stereo_separation",
+        pan,
+        pickupMode,
+        64,
+        "mixer_track_stereo_separation_raw",
+    )
+
+
 def _mixer_enable_track(index):
     index = _mixer_track_index(index)
     _mixer_set_track_enabled(index, not _mixer_track_enabled(index))
@@ -994,6 +1063,9 @@ def _install_modules(script_name, device_name):
         "REC_Smoothed": 16384,
         "REC_NoLastTweaked": 32768,
         "REC_NoSaveUndo": 65536,
+        "PIM_None": 0,
+        "PIM_AlwaysPickup": 1,
+        "PIM_FollowGlobal": 2,
     }
     for key, value in constants.items():
         setattr(midi, key, value)
@@ -1042,6 +1114,10 @@ def _install_modules(script_name, device_name):
     mixer.swapTrackChannels = _mixer_swap_track_channels
     mixer.isTrackSlotsEnabled = _mixer_is_track_slots_enabled
     mixer.enableTrackSlots = _mixer_enable_track_slots
+    mixer.getTrackPan = _mixer_get_track_pan
+    mixer.setTrackPan = _mixer_set_track_pan
+    mixer.getTrackStereoSep = _mixer_get_track_stereo_separation
+    mixer.setTrackStereoSep = _mixer_set_track_stereo_separation
     mixer.getSongStepPos = _get_song_step_pos
     mixer.getSongTickPos = _get_song_tick_pos
 

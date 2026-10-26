@@ -16,7 +16,7 @@ use midir::{Ignore, MidiInput, MidiInputConnection as MidirInputConnection};
 
 use super::midi_script::{
     MidiControllerScript, MidiScriptRuntime, MidiScriptStopHandle, MidiScriptTransportState,
-    MixerTrackFlag, ScriptTransportAction,
+    MixerTrackFlag, MixerTrackParameter, ScriptTransportAction,
 };
 use flp_rebuild::sample_render::PlaylistTempoMap;
 
@@ -706,6 +706,15 @@ fn queue_script_transport_actions(
             ScriptTransportAction::SetMixerTrackFlag { index, flag, value } => {
                 MidiTransportCommand::SetMixerTrackFlag { index, flag, value }
             }
+            ScriptTransportAction::SetMixerTrackParameter {
+                index,
+                parameter,
+                value_raw,
+            } => MidiTransportCommand::SetMixerTrackParameter {
+                index,
+                parameter,
+                value_raw,
+            },
             ScriptTransportAction::JumpToMarker { delta, select } => {
                 MidiTransportCommand::JumpToMarker { delta, select }
             }
@@ -792,6 +801,11 @@ pub enum MidiTransportCommand {
         index: u16,
         flag: MixerTrackFlag,
         value: bool,
+    },
+    SetMixerTrackParameter {
+        index: u16,
+        parameter: MixerTrackParameter,
+        value_raw: i32,
     },
     JumpToMarker {
         delta: i32,
@@ -1445,6 +1459,12 @@ pub fn describe_event(event: MidiInputEvent) -> String {
                     "MIDI script Set Mixer Track Channel Swap".to_owned()
                 }
                 MixerTrackFlag::EffectsEnabled => "MIDI script Set Mixer Track Effects".to_owned(),
+            },
+            MidiTransportCommand::SetMixerTrackParameter { parameter, .. } => match parameter {
+                MixerTrackParameter::Pan => "MIDI script Set Mixer Track Pan".to_owned(),
+                MixerTrackParameter::StereoSeparation => {
+                    "MIDI script Set Mixer Track Stereo Separation".to_owned()
+                }
             },
             MidiTransportCommand::JumpToMarker { .. } => "MIDI script Jump to Marker".to_owned(),
             MidiTransportCommand::SelectNextEmptyPatternWithNameDialog => {

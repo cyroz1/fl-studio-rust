@@ -69,6 +69,11 @@ pub enum ScriptTransportAction {
         flag: MixerTrackFlag,
         value: bool,
     },
+    SetMixerTrackParameter {
+        index: u16,
+        parameter: MixerTrackParameter,
+        value_raw: i32,
+    },
     JumpToMarker {
         delta: i32,
         select: bool,
@@ -98,6 +103,12 @@ pub enum MixerTrackFlag {
     PolarityReversed,
     SwapLeftRight,
     EffectsEnabled,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MixerTrackParameter {
+    Pan,
+    StereoSeparation,
 }
 
 const SCRIPT_SONG_POSITION_SCALE: f64 = 1_000_000.0;
@@ -174,6 +185,8 @@ pub struct MidiScriptTransportState {
     pub mixer_track_polarity_reversed: Mutex<Vec<Option<bool>>>,
     pub mixer_track_swap_left_right: Mutex<Vec<Option<bool>>>,
     pub mixer_track_effects_enabled: Mutex<Vec<Option<bool>>>,
+    pub mixer_track_pan_raw: Mutex<Vec<Option<i32>>>,
+    pub mixer_track_stereo_separation_raw: Mutex<Vec<Option<i32>>>,
     pub project_title: Mutex<String>,
     pub project_author: Mutex<String>,
     pub project_genre: Mutex<String>,
@@ -213,6 +226,8 @@ impl Default for MidiScriptTransportState {
             mixer_track_polarity_reversed: Mutex::new(vec![None]),
             mixer_track_swap_left_right: Mutex::new(vec![None]),
             mixer_track_effects_enabled: Mutex::new(vec![None]),
+            mixer_track_pan_raw: Mutex::new(vec![None]),
+            mixer_track_stereo_separation_raw: Mutex::new(vec![None]),
             project_title: Mutex::new(String::new()),
             project_author: Mutex::new(String::new()),
             project_genre: Mutex::new(String::new()),
@@ -684,6 +699,18 @@ impl MidiScriptRuntime {
             .lock()
             .map(|flags| flags.clone())
             .unwrap_or_else(|_| vec![None]);
+        let mixer_track_pan_raw = self
+            .transport_state
+            .mixer_track_pan_raw
+            .lock()
+            .map(|values| values.clone())
+            .unwrap_or_else(|_| vec![None]);
+        let mixer_track_stereo_separation_raw = self
+            .transport_state
+            .mixer_track_stereo_separation_raw
+            .lock()
+            .map(|values| values.clone())
+            .unwrap_or_else(|_| vec![None]);
         let pattern_time_signature_changes = self
             .transport_state
             .pattern_time_signature_changes
@@ -799,6 +826,8 @@ impl MidiScriptRuntime {
                     "mixer_track_polarity_reversed": mixer_track_polarity_reversed,
                     "mixer_track_swap_left_right": mixer_track_swap_left_right,
                     "mixer_track_effects_enabled": mixer_track_effects_enabled,
+                    "mixer_track_pan_raw": mixer_track_pan_raw,
+                    "mixer_track_stereo_separation_raw": mixer_track_stereo_separation_raw,
                     "pattern_time_signature_changes": pattern_time_signature_changes,
                     "arrangement_time_signature_changes": arrangement_time_signature_changes,
                     "arrangement_current_time": arrangement_current_time,
@@ -1040,6 +1069,26 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
             .as_bool()
             .ok_or_else(|| "MIDI script returned an invalid Mixer track flag value".to_owned())?;
         return Ok(ScriptTransportAction::SetMixerTrackFlag { index, flag, value });
+    }
+    if name == Some("set_mixer_track_parameter") {
+        let index = action["index"]
+            .as_u64()
+            .and_then(|index| u16::try_from(index).ok())
+            .ok_or_else(|| "MIDI script returned an invalid Mixer track index".to_owned())?;
+        let parameter = match action["parameter"].as_str() {
+            Some("pan") => MixerTrackParameter::Pan,
+            Some("stereo_separation") => MixerTrackParameter::StereoSeparation,
+            _ => return Err("MIDI script returned an invalid Mixer track parameter".to_owned()),
+        };
+        let value_raw = action["value_raw"]
+            .as_i64()
+            .and_then(|value| i32::try_from(value).ok())
+            .ok_or_else(|| "MIDI script returned an invalid Mixer parameter value".to_owned())?;
+        return Ok(ScriptTransportAction::SetMixerTrackParameter {
+            index,
+            parameter,
+            value_raw,
+        });
     }
     if name == Some("jump_to_marker") {
         let delta = action["delta"]

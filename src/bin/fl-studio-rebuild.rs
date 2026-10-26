@@ -117,11 +117,12 @@ use midi_output::{
     playlist_playback_messages,
 };
 use midi_script::{
-    MidiControllerScript, MidiScriptTransportState, MixerTrackFlag, SCRIPT_BEAT_INDICATOR_BAR,
-    SCRIPT_BEAT_INDICATOR_BEAT, SCRIPT_BEAT_INDICATOR_OFF, SCRIPT_PROJECT_LOAD_ERROR,
-    SCRIPT_PROJECT_LOAD_OK, SCRIPT_PROJECT_LOAD_START, SCRIPT_TRANSPORT_PATTERN_MODE,
-    SCRIPT_TRANSPORT_PLAYING, SCRIPT_TRANSPORT_RECORDING, absolute_song_position_ticks,
-    discover_midi_scripts, find_script_for_device, normalized_song_position, song_position_ticks,
+    MidiControllerScript, MidiScriptTransportState, MixerTrackFlag, MixerTrackParameter,
+    SCRIPT_BEAT_INDICATOR_BAR, SCRIPT_BEAT_INDICATOR_BEAT, SCRIPT_BEAT_INDICATOR_OFF,
+    SCRIPT_PROJECT_LOAD_ERROR, SCRIPT_PROJECT_LOAD_OK, SCRIPT_PROJECT_LOAD_START,
+    SCRIPT_TRANSPORT_PATTERN_MODE, SCRIPT_TRANSPORT_PLAYING, SCRIPT_TRANSPORT_RECORDING,
+    absolute_song_position_ticks, discover_midi_scripts, find_script_for_device,
+    normalized_song_position, song_position_ticks,
 };
 use midi_thru::{MidiThruSettings, MidiThruWorker};
 
@@ -14491,6 +14492,41 @@ impl DawUi {
         {
             *effects = mixer_track_flags.iter().map(|flags| flags.3).collect();
         }
+        let (mixer_track_pan_raw, mixer_track_stereo_separation_raw) = self
+            .document
+            .as_ref()
+            .map(|document| {
+                let inserts = document.mixer_inserts();
+                let parameters = document.mixer_parameter_records().unwrap_or_default();
+                let max_ordinal = inserts
+                    .iter()
+                    .map(|insert| insert.ordinal())
+                    .max()
+                    .unwrap_or(0);
+                let mut pan = vec![None; max_ordinal.saturating_add(1)];
+                let mut separation = vec![None; max_ordinal.saturating_add(1)];
+                for insert in inserts {
+                    let ordinal = insert.ordinal();
+                    if let Some(value) = pan.get_mut(ordinal) {
+                        *value = candidate_mixer_pan(&parameters, ordinal);
+                    }
+                    if let Some(value) = separation.get_mut(ordinal) {
+                        *value = candidate_mixer_stereo_separation(&parameters, ordinal);
+                    }
+                }
+                (pan, separation)
+            })
+            .unwrap_or_else(|| (vec![None], vec![None]));
+        if let Ok(mut pan) = self.midi_script_transport_state.mixer_track_pan_raw.lock() {
+            *pan = mixer_track_pan_raw;
+        }
+        if let Ok(mut separation) = self
+            .midi_script_transport_state
+            .mixer_track_stereo_separation_raw
+            .lock()
+        {
+            *separation = mixer_track_stereo_separation_raw;
+        }
         let arrangement_marker_names = self
             .document
             .as_ref()
@@ -15329,6 +15365,102 @@ impl DawUi {
                 self.status = format!("MIDI script could not recolor Mixer track: {error}");
             }
         }
+    }
+
+    fn set_midi_script_mixer_track_parameter(
+        &mut self,
+        index: u16,
+        parameter: MixerTrackParameter,
+        value_raw: i32,
+    ) {
+        let insert_ordinal = usize::from(index);
+        let (kind, range, label) = match parameter {
+            MixerTrackParameter::Pan => (MixerParameterKind::Pan, -6_400..=6_400, "pan"),
+            MixerTrackParameter::StereoSeparation => (
+                MixerParameterKind::StereoSeparation,
+                -64..=64,
+                "stereo separation",
+            ),
+        };
+        if !range.contains(&value_raw) {
+            self.status = format!("MIDI script Mixer {label} is outside the supported raw range");
+            return;
+        }
+        let location = match self.document.as_ref() {
+            Some(document) => {
+                if !document
+                    .mixer_inserts()
+                    .iter()
+                    .any(|insert| insert.ordinal() == insert_ordinal)
+                {
+                    Err(format!(
+                        "Mixer track {insert_ordinal} does not have a recognized project record"
+                    ))
+                } else {
+                    match document.mixer_parameter_records() {
+                        Ok(parameters) => {
+                            let mut matches = parameters.iter().filter(|record| {
+                                record.kind() == kind
+                                    && record.candidate_insert_ordinal() == Some(insert_ordinal)
+                                    && record.target_scope_raw() == 0
+                            });
+                            match matches.next() {
+                                Some(record) if matches.next().is_none() => {
+                                    if record.value() == value_raw {
+                                        Ok(None)
+                                    } else {
+                                        Ok(Some((record.event_index(), record.record_index())))
+                                    }
+                                }
+                                Some(_) => Err(format!(
+                                    "Mixer track {insert_ordinal} has ambiguous {label} records"
+                                )),
+                                None => Err(format!(
+                                    "Mixer track {insert_ordinal} has no recognized {label} record"
+                                )),
+                            }
+                        }
+                        Err(error) => Err(error.to_string()),
+                    }
+                }
+            }
+            None => Err("MIDI script Mixer edits require an open project".to_owned()),
+        };
+        let location = match location {
+            Ok(Some(location)) => location,
+            Ok(None) => return,
+            Err(error) => {
+                self.status = format!("MIDI script could not set Mixer {label}: {error}");
+                return;
+            }
+        };
+        let Some(document) = self.document.as_mut() else {
+            self.status = "MIDI script Mixer edits require an open project".to_owned();
+            return;
+        };
+        if let Err(error) =
+            document.set_mixer_parameter_record_value(location.0, location.1, value_raw)
+        {
+            self.status = format!("MIDI script could not set Mixer {label}: {error}");
+            return;
+        }
+        match (parameter, insert_ordinal) {
+            (MixerTrackParameter::Pan, 0) => self
+                .mixer_track_peak_meters
+                .set_live_master_pan_raw(Some(value_raw)),
+            (MixerTrackParameter::Pan, _) => self
+                .mixer_track_peak_meters
+                .set_live_mixer_insert_pan_raw(insert_ordinal, Some(value_raw)),
+            (MixerTrackParameter::StereoSeparation, 0) => self
+                .mixer_track_peak_meters
+                .set_live_master_stereo_separation_raw(Some(value_raw)),
+            (MixerTrackParameter::StereoSeparation, _) => self
+                .mixer_track_peak_meters
+                .set_live_mixer_insert_stereo_separation_raw(insert_ordinal, Some(value_raw)),
+        }
+        self.dirty = true;
+        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+        self.status = format!("MIDI script set Mixer track {index} {label}");
     }
 
     fn set_midi_script_project_time_signature(
@@ -49843,6 +49975,11 @@ impl DawUi {
                     );
                 }
             }
+            MidiTransportCommand::SetMixerTrackParameter {
+                index,
+                parameter,
+                value_raw,
+            } => self.set_midi_script_mixer_track_parameter(index, parameter, value_raw),
             MidiTransportCommand::JumpToMarker { delta, select } => {
                 self.jump_midi_script_marker_with_selection(delta, select);
             }
