@@ -840,6 +840,80 @@ impl Vst3PlaylistStreamProcessor {
         }
     }
 
+    pub(crate) fn apply_live_mixer_routing(
+        &mut self,
+        document: &FlpDocument,
+        meters: Option<&MixerTrackPeakMeters>,
+    ) -> Result<(), String> {
+        let routing = MixerRouteAudibility::from_document(document);
+        let channels_by_id = document
+            .channels()
+            .into_iter()
+            .map(|channel| (channel.id(), channel))
+            .collect::<HashMap<_, _>>();
+        for stream in &mut self.streams {
+            let Some(channel) = channels_by_id.get(&stream.channel_id) else {
+                continue;
+            };
+            let route_plan = routing.source_route_plan_for_channel(channel.mixer_track());
+            stream.mixer_transform = route_plan.output_transform;
+            stream.mixer_meter_transforms = route_plan.insert_meter_transforms;
+            stream.mixer_effect_input_transforms = route_plan.insert_effect_input_transforms;
+            stream.live_mixer_source = routing
+                .live_source_route_plan_for_channel(channel.mixer_track())
+                .map(|route_plan| PlaylistLiveMixerSource {
+                    control: LiveMixerSourceControl::new(route_plan, self.output_sample_rate),
+                    targets: None,
+                });
+        }
+        for chain in &mut self.mixer_effect_chains {
+            if chain.insert_ordinal == 0 {
+                continue;
+            }
+            let track = i8::try_from(chain.insert_ordinal).map_err(|_| {
+                format!(
+                    "Mixer insert ordinal {} exceeds the supported range",
+                    chain.insert_ordinal
+                )
+            })?;
+            let route_plan = routing.source_route_plan_for_channel(Some(track));
+            chain.post_effect_meter_transform = route_plan
+                .insert_meter_transforms
+                .iter()
+                .find(|(meter_track, _)| *meter_track == chain.insert_ordinal)
+                .map_or_else(MixerSourceRouteTransform::default, |(_, transform)| {
+                    *transform
+                });
+            chain.live_source =
+                routing
+                    .live_source_route_plan_for_channel(Some(track))
+                    .map(|route_plan| PlaylistMixerEffectLiveSource {
+                        control: LiveMixerSourceControl::new(route_plan, self.output_sample_rate),
+                        targets: None,
+                    });
+            chain.route_plan = route_plan;
+        }
+        let instrument_delay_frames = if self.automatic_pdc_enabled {
+            self.streams
+                .iter()
+                .try_fold(self.maximum_latency_frames, |total, stream| {
+                    total
+                        .checked_add(
+                            self.maximum_latency_frames
+                                .saturating_sub(stream.latency_frames),
+                        )
+                        .ok_or_else(|| "PDC delay storage size overflow".to_owned())
+                })?
+        } else {
+            0
+        };
+        configure_mixer_effect_pdc(self, &routing, instrument_delay_frames)?;
+        if let Some(meters) = meters {
+            self.set_live_mixer_source_targets(meters);
+        }
+        Ok(())
+    }
+
     pub(crate) fn performance_channel_ids(&self) -> BTreeSet<u16> {
         self.streams
             .iter()

@@ -4674,6 +4674,7 @@ struct DawUi {
     midi_performance_plus_scene_mode: bool,
     performance_scene_round_robin: BTreeMap<(u16, PlaylistPerformanceSceneKey, u32), usize>,
     performance_launch_sender: Option<Sender<PlaylistPerformanceCommand>>,
+    performance_mixer_routing_sender: Option<Sender<FlpDocument>>,
     project_playback_loaded: bool,
     playlist_playback_loaded: bool,
     playlist_seek_tick: u32,
@@ -6302,6 +6303,7 @@ impl DawUi {
             midi_performance_plus_scene_mode: false,
             performance_scene_round_robin: BTreeMap::new(),
             performance_launch_sender: None,
+            performance_mixer_routing_sender: None,
             project_playback_loaded: false,
             playlist_playback_loaded: false,
             playlist_seek_tick: 0,
@@ -12699,6 +12701,7 @@ impl DawUi {
         self.midi_script_mixer_peak_holds.fill((0.0, 0.0));
         self.midi_script_mixer_peak_updated_at = Instant::now();
         let (launch_sender, launch_receiver) = mpsc::channel();
+        let (routing_update_sender, routing_update_receiver) = mpsc::channel();
         let (sender, receiver) = mpsc::sync_channel(1);
         let worker_options = options.clone();
         let worker = thread::Builder::new()
@@ -12718,6 +12721,7 @@ impl DawUi {
                                 performance_zone_end_tick: start_tick,
                                 start_frame,
                                 launches: launch_receiver,
+                                mixer_routing_updates: routing_update_receiver,
                                 meters: Some(worker_mixer_meters),
                             },
                         )
@@ -12733,6 +12737,7 @@ impl DawUi {
                 self.playlist_seek_tick = start_tick;
                 self.playlist_tempo_map = Some(playlist_tempo_map);
                 self.performance_launch_sender = Some(launch_sender);
+                self.performance_mixer_routing_sender = Some(routing_update_sender);
                 self.pending_audio_render = Some(PendingAudioRender {
                     receiver,
                     cancelled,
@@ -13031,6 +13036,7 @@ impl DawUi {
         self.midi_performance_plus_scene_mode = false;
         self.performance_scene_round_robin.clear();
         self.performance_launch_sender = None;
+        self.performance_mixer_routing_sender = None;
         self.stop_midi_playlist_playback();
         self.stop_midi_pattern_transport();
         self.pattern_mode_playback_source = None;
@@ -15594,7 +15600,7 @@ impl DawUi {
                 })
             })
         });
-        let route_created = enabled && !route_existed;
+        let route_created = !route_existed;
         let result = self
             .document
             .as_mut()
@@ -15636,6 +15642,15 @@ impl DawUi {
             destination,
             Some(enabled),
         );
+        let performance_route_updated =
+            if route_created && self.playing && self.performance_mode_active {
+                self.document
+                    .as_ref()
+                    .zip(self.performance_mixer_routing_sender.as_ref())
+                    .is_some_and(|(document, sender)| sender.send(document.clone()).is_ok())
+            } else {
+                false
+            };
         let stream_rebuilt = if route_created && self.playing && self.pattern_playback_mode {
             self.stage_pattern_stream_rebuild(PdcStreamHandoffReason::MixerRouting)
         } else if route_created && self.playing && !self.performance_mode_active {
@@ -15646,9 +15661,15 @@ impl DawUi {
         self.dirty = true;
         self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
         if route_created && self.playing && self.performance_mode_active {
-            self.status = format!(
-                "MIDI script created Mixer route {source} to {destination}; stop and restart Performance Mode to apply its routing"
-            );
+            self.status = if performance_route_updated {
+                format!(
+                    "MIDI script created Mixer route {source} to {destination}; applying it during Performance Mode"
+                )
+            } else {
+                format!(
+                    "MIDI script created Mixer route {source} to {destination}; stop and restart Performance Mode to apply its routing"
+                )
+            };
         } else if route_created && self.playing && !stream_rebuilt {
             self.status = format!(
                 "MIDI script created Mixer route {source} to {destination}; stop and restart playback to apply its routing"
