@@ -49442,6 +49442,18 @@ impl DawUi {
             MidiTransportCommand::AddArrangementTimeMarker { tick, name } => {
                 self.add_midi_script_arrangement_time_marker(tick, name);
             }
+            MidiTransportCommand::SetArrangementLiveSelection { tick, stop } => {
+                let selection_point = if stop {
+                    &self
+                        .midi_script_transport_state
+                        .arrangement_live_selection_end
+                } else {
+                    &self
+                        .midi_script_transport_state
+                        .arrangement_live_selection_start
+                };
+                selection_point.store(u64::from(tick), Ordering::Relaxed);
+            }
             MidiTransportCommand::JumpToMarker { delta, select } => {
                 self.jump_midi_script_marker_with_selection(delta, select);
             }

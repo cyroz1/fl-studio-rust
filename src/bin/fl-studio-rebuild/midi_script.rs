@@ -48,6 +48,10 @@ pub enum ScriptTransportAction {
         tick: u32,
         name: String,
     },
+    SetArrangementLiveSelection {
+        tick: u32,
+        stop: bool,
+    },
     JumpToMarker {
         delta: i32,
         select: bool,
@@ -136,6 +140,8 @@ pub struct MidiScriptTransportState {
     pub arrangement_current_time_snapped: AtomicU64,
     pub arrangement_selection_start: AtomicU64,
     pub arrangement_selection_end: AtomicU64,
+    pub arrangement_live_selection_start: AtomicU64,
+    pub arrangement_live_selection_end: AtomicU64,
     pub project_title: Mutex<String>,
     pub project_author: Mutex<String>,
     pub project_genre: Mutex<String>,
@@ -166,6 +172,8 @@ impl Default for MidiScriptTransportState {
             arrangement_current_time_snapped: AtomicU64::new(0),
             arrangement_selection_start: AtomicU64::new(0),
             arrangement_selection_end: AtomicU64::new(0),
+            arrangement_live_selection_start: AtomicU64::new(0),
+            arrangement_live_selection_end: AtomicU64::new(0),
             project_title: Mutex::new(String::new()),
             project_author: Mutex::new(String::new()),
             project_genre: Mutex::new(String::new()),
@@ -709,6 +717,14 @@ impl MidiScriptRuntime {
                     "arrangement_current_time_snapped": arrangement_current_time_snapped,
                     "arrangement_selection_start": arrangement_selection_start,
                     "arrangement_selection_end": arrangement_selection_end,
+                    "arrangement_live_selection_start": self
+                        .transport_state
+                        .arrangement_live_selection_start
+                        .load(Ordering::Relaxed),
+                    "arrangement_live_selection_end": self
+                        .transport_state
+                        .arrangement_live_selection_end
+                        .load(Ordering::Relaxed),
                     "project_title": project_title,
                     "project_author": project_author,
                     "project_genre": project_genre,
@@ -874,6 +890,16 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
             tick,
             name: marker_name.to_owned(),
         });
+    }
+    if name == Some("set_arrangement_live_selection") {
+        let tick = action["time_ticks"]
+            .as_u64()
+            .and_then(|tick| u32::try_from(tick).ok())
+            .ok_or_else(|| "MIDI script returned an invalid live-selection position".to_owned())?;
+        let stop = action["stop"]
+            .as_bool()
+            .ok_or_else(|| "MIDI script returned an invalid live-selection endpoint".to_owned())?;
+        return Ok(ScriptTransportAction::SetArrangementLiveSelection { tick, stop });
     }
     if name == Some("jump_to_marker") {
         let delta = action["delta"]

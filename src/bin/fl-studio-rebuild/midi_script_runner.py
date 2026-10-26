@@ -397,6 +397,30 @@ def _selection_end():
     return int(_active_transport_state.get("arrangement_selection_end", 0))
 
 
+def _live_selection(time_ticks, stop):
+    try:
+        time_ticks = int(time_ticks)
+        stop = int(stop)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("arrangement.liveSelection() arguments must be integers") from error
+    if not 0 <= time_ticks <= 0xFFFFFFFF:
+        raise ValueError("arrangement.liveSelection() time must fit in the Playlist tick range")
+    endpoint = bool(stop)
+    key = "arrangement_live_selection_end" if endpoint else "arrangement_live_selection_start"
+    _active_transport_state[key] = time_ticks
+    _request_transport_action(
+        {
+            "action": "set_arrangement_live_selection",
+            "time_ticks": time_ticks,
+            "stop": endpoint,
+        }
+    )
+
+
+def _live_selection_start():
+    return int(_active_transport_state.get("arrangement_live_selection_start", 0))
+
+
 def _arrangement_current_time(snap):
     try:
         snap = int(snap)
@@ -879,6 +903,8 @@ def _install_modules(script_name, device_name):
     arrangement.currentTimeHint = _current_time_hint
     arrangement.selectionStart = _selection_start
     arrangement.selectionEnd = _selection_end
+    arrangement.liveSelection = _live_selection
+    arrangement.liveSelectionStart = _live_selection_start
 
     for name in (
         "playlist",

@@ -691,6 +691,9 @@ fn queue_script_transport_actions(
             ScriptTransportAction::AddArrangementTimeMarker { tick, name } => {
                 MidiTransportCommand::AddArrangementTimeMarker { tick, name }
             }
+            ScriptTransportAction::SetArrangementLiveSelection { tick, stop } => {
+                MidiTransportCommand::SetArrangementLiveSelection { tick, stop }
+            }
             ScriptTransportAction::JumpToMarker { delta, select } => {
                 MidiTransportCommand::JumpToMarker { delta, select }
             }
@@ -751,6 +754,7 @@ pub enum MidiTransportCommand {
     SetProjectTimeSignatureNumerator(u8),
     SetProjectTimeSignatureDenominator(u8),
     AddArrangementTimeMarker { tick: u32, name: String },
+    SetArrangementLiveSelection { tick: u32, stop: bool },
     JumpToMarker { delta: i32, select: bool },
     SelectNextEmptyPatternWithNameDialog,
     FocusSelectedMixerTrackName,
@@ -1380,6 +1384,9 @@ pub fn describe_event(event: MidiInputEvent) -> String {
             }
             MidiTransportCommand::AddArrangementTimeMarker { .. } => {
                 "MIDI script Add Time Marker".to_owned()
+            }
+            MidiTransportCommand::SetArrangementLiveSelection { .. } => {
+                "MIDI script Live Selection".to_owned()
             }
             MidiTransportCommand::JumpToMarker { .. } => "MIDI script Jump to Marker".to_owned(),
             MidiTransportCommand::SelectNextEmptyPatternWithNameDialog => {
