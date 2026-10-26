@@ -160,6 +160,40 @@ def _mixer_get_track_color(index):
     return 0
 
 
+def _mixer_get_track_peaks(index, mode):
+    index = _mixer_track_index(index)
+    try:
+        mode = int(mode)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("Mixer peak mode must be PEAK_L, PEAK_R, or PEAK_LR") from error
+    if mode not in (0, 1, 2):
+        raise ValueError("Mixer peak mode must be PEAK_L, PEAK_R, or PEAK_LR")
+    peaks = _active_transport_state.get("mixer_track_peaks", [])
+    if index >= len(peaks):
+        return 0.0
+    try:
+        left, right = (float(value) for value in peaks[index])
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    if not math.isfinite(left) or not math.isfinite(right):
+        return 0.0
+    if mode == 0:
+        return left
+    if mode == 1:
+        return right
+    return max(left, right)
+
+
+def _mixer_get_last_peak_vol(section):
+    try:
+        section = int(section)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("Audio channel section must be 0 (left) or 1 (right)") from error
+    if section not in (0, 1):
+        raise ValueError("Audio channel section must be 0 (left) or 1 (right)")
+    return _mixer_get_track_peaks(0, section)
+
+
 def _mixer_get_track_info(mode):
     try:
         mode = int(mode)
@@ -1123,6 +1157,9 @@ def _install_modules(script_name, device_name):
         "TN_FirstIns": 1,
         "TN_LastIns": 2,
         "TN_Sel": 3,
+        "PEAK_L": 0,
+        "PEAK_R": 1,
+        "PEAK_LR": 2,
         "curfxScrollToMakeVisible": 1,
         "StartcurfxCancelSmoothing": 2,
         "curfxNoDeselectAll": 4,
@@ -1287,6 +1324,8 @@ def _install_modules(script_name, device_name):
     mixer.getTrackName = _mixer_get_track_name
     mixer.setTrackName = _mixer_set_track_name
     mixer.getTrackColor = _mixer_get_track_color
+    mixer.getTrackPeaks = _mixer_get_track_peaks
+    mixer.getLastPeakVol = _mixer_get_last_peak_vol
     mixer.setTrackColor = _mixer_set_track_color
     mixer.getTrackInfo = _mixer_get_track_info
     mixer.getRouteSendActive = _mixer_get_route_send_active

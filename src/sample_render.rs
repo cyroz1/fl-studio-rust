@@ -2259,10 +2259,16 @@ pub fn stream_input_monitor_through_mixer(
                     .enumerate()
                     .skip(1)
                 {
-                    let peak = track_samples
-                        .iter()
-                        .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
-                    mixer_meters.publish_peak(track, peak);
+                    let (left_peak, right_peak) = track_samples.chunks_exact(2).fold(
+                        (0.0_f32, 0.0_f32),
+                        |(left_peak, right_peak), frame| {
+                            (
+                                left_peak.max(frame[0].abs()),
+                                right_peak.max(frame[1].abs()),
+                            )
+                        },
+                    );
+                    mixer_meters.publish_stereo_peak(track, left_peak, right_peak);
                 }
             }
             master_output.apply(block);
@@ -5427,10 +5433,16 @@ fn stream_prepared_playlist_render_with_performance(
                         if track == 0 {
                             continue;
                         }
-                        let peak = track_samples
-                            .iter()
-                            .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
-                        meters.publish_peak(track, peak);
+                        let (left_peak, right_peak) = track_samples.chunks_exact(2).fold(
+                            (0.0_f32, 0.0_f32),
+                            |(left_peak, right_peak), frame| {
+                                (
+                                    left_peak.max(frame[0].abs()),
+                                    right_peak.max(frame[1].abs()),
+                                )
+                            },
+                        );
+                        meters.publish_stereo_peak(track, left_peak, right_peak);
                     }
                 }
                 render.master_output.apply(block);

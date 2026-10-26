@@ -4955,6 +4955,8 @@ struct DawUi {
     mixer_insert_peak_holds: [f32; MIXER_TRACK_METER_COUNT],
     mixer_track_peak_meters: Arc<MixerTrackPeakMeters>,
     mixer_master_peak_updated_at: Instant,
+    midi_script_mixer_peak_holds: [(f32, f32); MIXER_TRACK_METER_COUNT],
+    midi_script_mixer_peak_updated_at: Instant,
     new_time_marker_position: u32,
     new_time_marker_is_signature: bool,
     new_time_marker_numerator: u8,
@@ -6579,6 +6581,8 @@ impl DawUi {
             mixer_insert_peak_holds: [0.0; MIXER_TRACK_METER_COUNT],
             mixer_track_peak_meters: Arc::new(MixerTrackPeakMeters::default()),
             mixer_master_peak_updated_at: Instant::now(),
+            midi_script_mixer_peak_holds: [(0.0, 0.0); MIXER_TRACK_METER_COUNT],
+            midi_script_mixer_peak_updated_at: Instant::now(),
             new_time_marker_position: 0,
             new_time_marker_is_signature: false,
             new_time_marker_numerator: 4,
@@ -12129,6 +12133,8 @@ impl DawUi {
         let worker_mixer_meters = Arc::clone(&self.mixer_track_peak_meters);
         worker_mixer_meters.clear();
         self.mixer_insert_peak_holds.fill(0.0);
+        self.midi_script_mixer_peak_holds.fill((0.0, 0.0));
+        self.midi_script_mixer_peak_updated_at = Instant::now();
         let (sender, receiver) = mpsc::sync_channel(1);
         let worker_options = options.clone();
         let worker = thread::Builder::new()
@@ -12685,6 +12691,8 @@ impl DawUi {
         let worker_mixer_meters = Arc::clone(&self.mixer_track_peak_meters);
         worker_mixer_meters.clear();
         self.mixer_insert_peak_holds.fill(0.0);
+        self.midi_script_mixer_peak_holds.fill((0.0, 0.0));
+        self.midi_script_mixer_peak_updated_at = Instant::now();
         let (launch_sender, launch_receiver) = mpsc::channel();
         let (sender, receiver) = mpsc::sync_channel(1);
         let worker_options = options.clone();
@@ -14216,6 +14224,27 @@ impl DawUi {
     }
 
     fn publish_midi_script_transport_state(&mut self) {
+        let now = Instant::now();
+        let elapsed = now
+            .duration_since(self.midi_script_mixer_peak_updated_at)
+            .as_secs_f32()
+            .min(5.0);
+        let decay = 10.0_f32.powf(-elapsed);
+        let master_peaks = self
+            .audio_engine
+            .as_ref()
+            .map_or((0.0, 0.0), AudioEngine::output_peak_channels);
+        self.midi_script_mixer_peak_holds[0] = master_peaks;
+        for track in 1..MIXER_TRACK_METER_COUNT {
+            let (left, right) = self.mixer_track_peak_meters.take_peak_channels(track);
+            let held = &mut self.midi_script_mixer_peak_holds[track];
+            held.0 = left.max(held.0 * decay);
+            held.1 = right.max(held.1 * decay);
+        }
+        self.midi_script_mixer_peak_updated_at = now;
+        if let Ok(mut peaks) = self.midi_script_transport_state.mixer_track_peaks.lock() {
+            *peaks = self.midi_script_mixer_peak_holds.to_vec();
+        }
         self.midi_script_transport_state
             .midi_output_port_number
             .store(

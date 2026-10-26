@@ -88,9 +88,13 @@ pub(crate) struct LiveMixerSendTargetAtomics {
 /// Block-peak snapshots for the supported live Playlist Mixer routes.
 ///
 /// The render worker publishes the maximum sample for each insert between UI reads. The UI
-/// consumes each value with [`take_peak`](Self::take_peak), keeping the audio thread lock-free.
+/// consumes the combined values with [`take_peak`](Self::take_peak); MIDI scripts can consume
+/// channel-specific values independently with [`take_peak_channels`](Self::take_peak_channels).
+/// Both paths keep the audio thread lock-free.
 pub struct MixerTrackPeakMeters {
     peaks: [AtomicU32; MIXER_TRACK_METER_COUNT],
+    script_peaks_left: [AtomicU32; MIXER_TRACK_METER_COUNT],
+    script_peaks_right: [AtomicU32; MIXER_TRACK_METER_COUNT],
     live_mixer_insert_fader_raw: [Arc<AtomicI32>; MIXER_TRACK_METER_COUNT],
     live_mixer_insert_pan_raw: [Arc<AtomicI32>; MIXER_TRACK_METER_COUNT],
     live_mixer_insert_stereo_separation_raw: [Arc<AtomicI32>; MIXER_TRACK_METER_COUNT],
@@ -112,6 +116,8 @@ impl Default for MixerTrackPeakMeters {
     fn default() -> Self {
         Self {
             peaks: std::array::from_fn(|_| AtomicU32::new(0.0_f32.to_bits())),
+            script_peaks_left: std::array::from_fn(|_| AtomicU32::new(0.0_f32.to_bits())),
+            script_peaks_right: std::array::from_fn(|_| AtomicU32::new(0.0_f32.to_bits())),
             live_mixer_insert_fader_raw: std::array::from_fn(|_| {
                 Arc::new(AtomicI32::new(i32::MIN))
             }),
@@ -146,9 +152,30 @@ impl MixerTrackPeakMeters {
             .unwrap_or(0.0)
     }
 
+    /// Consume left and right insert peaks published since the previous script-state update.
+    pub(crate) fn take_peak_channels(&self, track: usize) -> (f32, f32) {
+        let take = |peaks: &[AtomicU32; MIXER_TRACK_METER_COUNT]| {
+            peaks
+                .get(track)
+                .map(|peak| f32::from_bits(peak.swap(0.0_f32.to_bits(), Ordering::AcqRel)))
+                .unwrap_or(0.0)
+        };
+        (
+            take(&self.script_peaks_left),
+            take(&self.script_peaks_right),
+        )
+    }
+
     /// Clear all pending meter peaks before starting a new live stream.
     pub fn clear(&self) {
         for peak in &self.peaks {
+            peak.store(0.0_f32.to_bits(), Ordering::Release);
+        }
+        for peak in self
+            .script_peaks_left
+            .iter()
+            .chain(self.script_peaks_right.iter())
+        {
             peak.store(0.0_f32.to_bits(), Ordering::Release);
         }
     }
@@ -507,12 +534,26 @@ impl MixerTrackPeakMeters {
     }
 
     pub(crate) fn publish_peak(&self, track: usize, peak: f32) {
-        if !peak.is_finite() || peak <= 0.0 {
+        self.publish_stereo_peak(track, peak, peak);
+    }
+
+    pub(crate) fn publish_stereo_peak(&self, track: usize, left: f32, right: f32) {
+        let Some(combined) = self.peaks.get(track) else {
             return;
+        };
+        publish_positive_peak(combined, left.max(right));
+        if let Some(slot) = self.script_peaks_left.get(track) {
+            publish_positive_peak(slot, left);
         }
-        if let Some(slot) = self.peaks.get(track) {
-            slot.fetch_max(peak.to_bits(), Ordering::Release);
+        if let Some(slot) = self.script_peaks_right.get(track) {
+            publish_positive_peak(slot, right);
         }
+    }
+}
+
+fn publish_positive_peak(slot: &AtomicU32, peak: f32) {
+    if peak.is_finite() && peak > 0.0 {
+        slot.fetch_max(peak.to_bits(), Ordering::Release);
     }
 }
 
@@ -1811,6 +1852,8 @@ struct PlaybackState {
     browser_preview_gain: AtomicU32,
     output_gain: AtomicU32,
     output_peak: AtomicU32,
+    output_peak_left: AtomicU32,
+    output_peak_right: AtomicU32,
     output_callback_frames: AtomicU32,
     output_latency_estimate: AudioLatencyEstimate,
     input_monitor_ring_flush_requested: AtomicBool,
@@ -2384,6 +2427,8 @@ impl PlaybackState {
             browser_preview_gain: AtomicU32::new(1.0_f32.to_bits()),
             output_gain: AtomicU32::new(1.0_f32.to_bits()),
             output_peak: AtomicU32::new(0.0_f32.to_bits()),
+            output_peak_left: AtomicU32::new(0.0_f32.to_bits()),
+            output_peak_right: AtomicU32::new(0.0_f32.to_bits()),
             output_callback_frames: AtomicU32::new(0),
             output_latency_estimate: AudioLatencyEstimate::default(),
             input_monitor_ring_flush_requested: AtomicBool::new(false),
@@ -3598,6 +3643,18 @@ impl AudioEngine {
         f32::from_bits(self.playback.output_peak.load(Ordering::Acquire)).clamp(0.0, 1.0)
     }
 
+    /// Left and right peaks from the most recent output-device buffer before device clipping.
+    pub fn output_peak_channels(&self) -> (f32, f32) {
+        let peak = |value: &AtomicU32| {
+            let peak = f32::from_bits(value.load(Ordering::Acquire));
+            if peak.is_finite() { peak.max(0.0) } else { 0.0 }
+        };
+        (
+            peak(&self.playback.output_peak_left),
+            peak(&self.playback.output_peak_right),
+        )
+    }
+
     /// Frame count from the most recent output-device callback, if one has arrived.
     pub fn last_output_callback_frames(&self) -> Option<u32> {
         nonzero_callback_frames(self.playback.output_callback_frames.load(Ordering::Acquire))
@@ -4330,6 +4387,8 @@ where
                 let target_gain =
                     f32::from_bits(playback_for_callback.output_gain.load(Ordering::Relaxed));
                 let mut output_peak = 0.0_f32;
+                let mut output_peak_left = 0.0_f32;
+                let mut output_peak_right = 0.0_f32;
                 for frame in output.chunks_mut(channels) {
                     output_gain = smooth_output_gain(output_gain, target_gain, gain_alpha);
                     let [left, right] = next_output_frame_with_browser_preview(AudioFrameInputs {
@@ -4345,20 +4404,35 @@ where
                         phase: &mut phase,
                     });
                     for (channel, destination) in frame.iter_mut().enumerate() {
-                        let sample = sanitize_output_sample(
-                            match channel {
-                                0 => left,
-                                1 => right,
-                                _ => 0.0,
-                            } * output_gain,
-                        );
+                        let raw_sample = match channel {
+                            0 => left,
+                            1 => right,
+                            _ => 0.0,
+                        } * output_gain;
+                        let sample = sanitize_output_sample(raw_sample);
                         output_peak = output_peak.max(sample.abs());
+                        let meter_peak = if raw_sample.is_finite() {
+                            raw_sample.abs()
+                        } else {
+                            0.0
+                        };
+                        match channel {
+                            0 => output_peak_left = output_peak_left.max(meter_peak),
+                            1 => output_peak_right = output_peak_right.max(meter_peak),
+                            _ => {}
+                        }
                         *destination = T::from_sample(sample);
                     }
                 }
                 playback_for_callback
                     .output_peak
                     .store(output_peak.to_bits(), Ordering::Release);
+                playback_for_callback
+                    .output_peak_left
+                    .store(output_peak_left.to_bits(), Ordering::Release);
+                playback_for_callback
+                    .output_peak_right
+                    .store(output_peak_right.to_bits(), Ordering::Release);
                 playback_for_callback.output_callback_frames.store(
                     u32::try_from(output.len() / channels).unwrap_or(u32::MAX),
                     Ordering::Release,
@@ -5474,6 +5548,8 @@ fn render_wasapi_buffer(
     let streaming = playback.streaming.load();
     let browser_preview_samples = playback.browser_preview_samples.load();
     let mut output_peak = 0.0_f32;
+    let mut output_peak_left = 0.0_f32;
+    let mut output_peak_right = 0.0_f32;
     for frame in output.chunks_exact_mut(format.frame_bytes) {
         render_state.output_gain =
             smooth_output_gain(render_state.output_gain, target_gain, gain_alpha);
@@ -5488,20 +5564,35 @@ fn render_wasapi_buffer(
             phase: &mut render_state.phase,
         });
         for (channel_index, channel) in frame.chunks_exact_mut(format.sample_bytes).enumerate() {
-            let sample = sanitize_output_sample(
-                match channel_index {
-                    0 => stereo[0],
-                    1 => stereo[1],
-                    _ => 0.0,
-                } * render_state.output_gain,
-            );
+            let raw_sample = match channel_index {
+                0 => stereo[0],
+                1 => stereo[1],
+                _ => 0.0,
+            } * render_state.output_gain;
+            let sample = sanitize_output_sample(raw_sample);
             output_peak = output_peak.max(sample.abs());
+            let meter_peak = if raw_sample.is_finite() {
+                raw_sample.abs()
+            } else {
+                0.0
+            };
+            match channel_index {
+                0 => output_peak_left = output_peak_left.max(meter_peak),
+                1 => output_peak_right = output_peak_right.max(meter_peak),
+                _ => {}
+            }
             format.encode(sample, channel)?;
         }
     }
     playback
         .output_peak
         .store(output_peak.to_bits(), Ordering::Release);
+    playback
+        .output_peak_left
+        .store(output_peak_left.to_bits(), Ordering::Release);
+    playback
+        .output_peak_right
+        .store(output_peak_right.to_bits(), Ordering::Release);
     Ok(())
 }
 
@@ -5531,6 +5622,18 @@ mod tests {
         output_gain_smoothing_alpha, sanitize_output_sample, smooth_output_gain, tone_sample,
         valid_project_playback_speed, validate_settings,
     };
+
+    #[test]
+    fn mixer_meter_ui_and_script_reads_keep_independent_stereo_peaks() {
+        let meters = MixerTrackPeakMeters::default();
+
+        meters.publish_stereo_peak(3, 0.25, 0.75);
+
+        assert_eq!(meters.take_peak(3), 0.75);
+        assert_eq!(meters.take_peak_channels(3), (0.25, 0.75));
+        assert_eq!(meters.take_peak(3), 0.0);
+        assert_eq!(meters.take_peak_channels(3), (0.0, 0.0));
+    }
 
     #[test]
     fn live_mixer_effect_mix_targets_track_each_slot_independently() {

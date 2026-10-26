@@ -211,6 +211,7 @@ pub struct MidiScriptTransportState {
     pub mixer_track_names: Mutex<Vec<String>>,
     pub mixer_selected_track: AtomicU64,
     pub mixer_track_colors: Mutex<Vec<u32>>,
+    pub mixer_track_peaks: Mutex<Vec<(f32, f32)>>,
     pub mixer_send_routes: Mutex<Vec<MixerSendRouteSnapshot>>,
     pub mixer_track_enabled: Mutex<Vec<Option<bool>>>,
     pub mixer_track_soloed: Mutex<Vec<Option<bool>>>,
@@ -255,6 +256,7 @@ impl Default for MidiScriptTransportState {
             mixer_track_names: Mutex::new(vec!["Master".to_owned()]),
             mixer_selected_track: AtomicU64::new(0),
             mixer_track_colors: Mutex::new(vec![0]),
+            mixer_track_peaks: Mutex::new(vec![(0.0, 0.0)]),
             mixer_send_routes: Mutex::new(Vec::new()),
             mixer_track_enabled: Mutex::new(vec![None]),
             mixer_track_soloed: Mutex::new(vec![None]),
@@ -705,6 +707,12 @@ impl MidiScriptRuntime {
             .lock()
             .map(|colors| colors.clone())
             .unwrap_or_else(|_| vec![0]);
+        let mixer_track_peaks = self
+            .transport_state
+            .mixer_track_peaks
+            .lock()
+            .map(|peaks| peaks.clone())
+            .unwrap_or_else(|_| vec![(0.0, 0.0)]);
         let mixer_send_routes = self
             .transport_state
             .mixer_send_routes
@@ -873,6 +881,7 @@ impl MidiScriptRuntime {
                         .mixer_selected_track
                         .load(Ordering::Relaxed),
                     "mixer_track_colors": mixer_track_colors,
+                    "mixer_track_peaks": mixer_track_peaks,
                     "mixer_send_routes": mixer_send_routes
                         .iter()
                         .map(|route| {
@@ -2083,6 +2092,31 @@ mod tests {
         let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
 
         assert_eq!(result.bytes, [0xB0, 1, 1]);
+    }
+
+    #[test]
+    fn python_mixer_peak_getters_report_stereo_insert_and_master_levels() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport midi\nimport mixer\ndef OnMidiIn(event):\n    assert mixer.getTrackPeaks(2, midi.PEAK_L) == 0.25\n    assert mixer.getTrackPeaks(2, midi.PEAK_R) == 0.5\n    assert mixer.getTrackPeaks(2, midi.PEAK_LR) == 0.5\n    assert mixer.getTrackPeaks(0, midi.PEAK_L) == 0.75\n    assert mixer.getLastPeakVol(0) == 0.75\n    assert mixer.getLastPeakVol(1) == 0.875\n    assert mixer.getTrackPeaks(127, midi.PEAK_LR) == 0.0\n    event.data1 = int(mixer.getTrackPeaks(2, midi.PEAK_LR) * 100)\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let transport_state = Arc::new(MidiScriptTransportState::default());
+        *transport_state.mixer_track_peaks.lock().unwrap() =
+            vec![(0.75, 0.875), (0.0, 0.0), (0.25, 0.5)];
+        let mut runtime = MidiScriptRuntime::start_for_device_with_transport_state(
+            &script,
+            "Test Input",
+            transport_state,
+        )
+        .unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
+
+        assert_eq!(result.bytes, [0xB0, 50, 1]);
     }
 
     #[test]
