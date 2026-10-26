@@ -774,6 +774,19 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_bool(enabled, "effect-slot enabled setting")?,
             )
         }
+        [command, input, output, insert_ordinal, slot_index, color]
+            if command == "set-mixer-effect-slot-color" =>
+        {
+            let [red, green, blue] = parse_rgb_hex(color)?;
+            let color_raw = u32::from(red) | (u32::from(green) << 8) | (u32::from(blue) << 16);
+            set_mixer_effect_slot_color(
+                Path::new(input),
+                Path::new(output),
+                parse_usize(insert_ordinal, "Mixer insert ordinal")?,
+                parse_u16(slot_index, "Mixer effect slot index")?,
+                color_raw,
+            )
+        }
         [command, input, output, insert_ordinal, slot_index, value]
             if command == "set-mixer-effect-slot-mix-raw" =>
         {
@@ -4025,6 +4038,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild set-mixer-parameter-record-value <input.flp> <output.flp> <event-index> <record-index> <signed-value>\n",
             "  flp-rebuild set-mixer-eq-parameter-raw <input.flp> <output.flp> <insert-ordinal> <low-gain|mid-gain|high-gain|low-frequency|mid-frequency|high-frequency|low-q|mid-q|high-q> <raw-value>\n",
             "  flp-rebuild set-mixer-effect-slot-enabled <input.flp> <output.flp> <insert-ordinal> <slot-index> <0|1>\n",
+            "  flp-rebuild set-mixer-effect-slot-color <input.flp> <output.flp> <insert-ordinal> <slot-index> <RRGGBB>\n",
             "  flp-rebuild set-mixer-effect-slot-mix-raw <input.flp> <output.flp> <insert-ordinal> <slot-index> <-6400..6400>\n",
             "  flp-rebuild move-mixer-effect-slot <input.flp> <output.flp> <insert-ordinal> <from-slot-0..9> <to-slot-0..9>\n",
             "  flp-rebuild rename-mixer-insert <input.flp> <output.flp> <insert-ordinal> <name>\n",
@@ -7457,6 +7471,32 @@ fn set_mixer_effect_slot_enabled(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "set Mixer insert {insert_ordinal} effect slot {slot_index} enabled to {enabled} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn set_mixer_effect_slot_color(
+    input: &Path,
+    output: &Path,
+    insert_ordinal: usize,
+    slot_index: u16,
+    color_raw: u32,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .set_mixer_effect_slot_color(insert_ordinal, slot_index, color_raw)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "set Mixer insert {insert_ordinal} effect slot {slot_index} color to #{:02X}{:02X}{:02X} in {}",
+        (color_raw & 0xFF) as u8,
+        ((color_raw >> 8) & 0xFF) as u8,
+        ((color_raw >> 16) & 0xFF) as u8,
         output.display()
     );
     Ok(())
