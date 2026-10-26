@@ -5221,6 +5221,7 @@ struct PendingAudioRender {
 enum PdcStreamHandoffReason {
     Vst3LatencyChange,
     AutomaticPdcChange { enabled: bool },
+    MixerRouteGraphChange,
 }
 
 struct PendingAudioClipExport {
@@ -12183,7 +12184,14 @@ impl DawUi {
                 });
                 self.stop_midi_pattern_preview();
                 self.status = if handoff_in_progress {
-                    "Preparing updated Playlist PDC while current audio continues…".to_owned()
+                    match staged_handoff_reason {
+                        Some(PdcStreamHandoffReason::MixerRouteGraphChange) => {
+                            "Preparing updated Playlist routing while current audio continues…"
+                                .to_owned()
+                        }
+                        _ => "Preparing updated Playlist PDC while current audio continues…"
+                            .to_owned(),
+                    }
                 } else {
                     "Preparing Playlist audio, Samplers, and VST3 instruments…".to_owned()
                 };
@@ -12777,6 +12785,9 @@ impl DawUi {
                     "Automatic PDC set to {}; applied through a live PDC handoff{tick_suffix}",
                     u8::from(enabled)
                 ),
+                Some(PdcStreamHandoffReason::MixerRouteGraphChange) => format!(
+                    "Mixer routing change applied through a live Playlist handoff{tick_suffix}"
+                ),
                 Some(PdcStreamHandoffReason::Vst3LatencyChange) | None => {
                     format!("VST3 latency update applied through a live PDC handoff{tick_suffix}")
                 }
@@ -12886,6 +12897,9 @@ impl DawUi {
                 Some(PdcStreamHandoffReason::AutomaticPdcChange { enabled }) => format!(
                     "Automatic PDC set to {}; applied through a live Pattern PDC handoff{tick_suffix}",
                     u8::from(enabled)
+                ),
+                Some(PdcStreamHandoffReason::MixerRouteGraphChange) => format!(
+                    "Mixer routing change applied through a live Pattern handoff{tick_suffix}"
                 ),
                 Some(PdcStreamHandoffReason::Vst3LatencyChange) | None => format!(
                     "VST3 latency update applied through a live Pattern PDC handoff{tick_suffix}"
@@ -15569,6 +15583,18 @@ impl DawUi {
     ) {
         let source = usize::from(source_index);
         let destination = usize::from(destination_index);
+        let route_parameter_id = u8::try_from(destination + 64).ok();
+        let route_existed = self.document.as_ref().is_some_and(|document| {
+            let Some(parameter_id) = route_parameter_id else {
+                return false;
+            };
+            document.mixer_send_summaries().is_ok_and(|routes| {
+                routes.iter().any(|route| {
+                    route.insert_ordinal() == source && route.route_parameter_id() == parameter_id
+                })
+            })
+        });
+        let route_created = enabled && !route_existed;
         let result = self
             .document
             .as_mut()
@@ -15610,12 +15636,29 @@ impl DawUi {
             destination,
             Some(enabled),
         );
+        let stream_rebuilt = if route_created && self.playing && self.pattern_playback_mode {
+            self.stage_pattern_stream_rebuild(PdcStreamHandoffReason::MixerRouteGraphChange)
+        } else if route_created && self.playing && !self.performance_mode_active {
+            self.stage_playlist_stream_rebuild(PdcStreamHandoffReason::MixerRouteGraphChange)
+        } else {
+            false
+        };
         self.dirty = true;
         self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
-        self.status = format!(
-            "MIDI script set Mixer route {source} to {destination} {}",
-            if enabled { "enabled" } else { "disabled" },
-        );
+        if route_created && self.playing && self.performance_mode_active {
+            self.status = format!(
+                "MIDI script created Mixer route {source} to {destination}; stop and restart Performance Mode to apply its routing"
+            );
+        } else if route_created && self.playing && !stream_rebuilt {
+            self.status = format!(
+                "MIDI script created Mixer route {source} to {destination}; stop and restart playback to apply its routing"
+            );
+        } else if !stream_rebuilt {
+            self.status = format!(
+                "MIDI script set Mixer route {source} to {destination} {}",
+                if enabled { "enabled" } else { "disabled" },
+            );
+        }
     }
 
     fn set_midi_script_mixer_route_level(
@@ -39718,7 +39761,14 @@ impl DawUi {
                 self.playing = true;
                 self.project_playback_loaded = true;
                 self.status = if handoff_in_progress {
-                    "Preparing updated Pattern PDC while current audio continues…".to_owned()
+                    match staged_handoff {
+                        Some((_, PdcStreamHandoffReason::MixerRouteGraphChange)) => {
+                            "Preparing updated Pattern routing while current audio continues…"
+                                .to_owned()
+                        }
+                        _ => "Preparing updated Pattern PDC while current audio continues…"
+                            .to_owned(),
+                    }
                 } else if loop_length_ticks.is_some() {
                     let vst3_status = vst3_summary.map_or_else(String::new, |summary| {
                         let unloaded = if summary.unloaded_plugin_channels.is_empty() {
