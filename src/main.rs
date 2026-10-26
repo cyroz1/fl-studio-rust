@@ -6491,8 +6491,11 @@ fn list_mixer(path: &Path) -> Result<(), String> {
             .and_then(|metadata| metadata.class_uid())
             .unwrap_or_else(|| "-".to_owned());
         let vst_state_bytes = vst3_metadata.and_then(|_| slot.vst_state_bytes().map(<[u8]>::len));
+        let color_raw = slot
+            .color_raw()
+            .map_or_else(|| "none".to_owned(), |raw| format!("0x{raw:08X}"));
         println!(
-            "insert={} slot={} plugin={} name={} state_events={} vst3_class_uid={} vst_field_53_bytes={:?} enabled={:?} mix_raw={:?}",
+            "insert={} slot={} plugin={} name={} state_events={} vst3_class_uid={} vst_field_53_bytes={:?} color_raw={} enabled={:?} mix_raw={:?}",
             slot.insert_ordinal(),
             slot.slot_index(),
             slot.plugin_identifier().unwrap_or("(unknown)"),
@@ -6500,6 +6503,7 @@ fn list_mixer(path: &Path) -> Result<(), String> {
             slot.state_event_count(),
             vst_class_uid,
             vst_state_bytes,
+            color_raw,
             slot.enabled(),
             slot.mix_raw(),
         );
