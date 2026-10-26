@@ -232,6 +232,49 @@ def _mixer_get_route_level(index, destIndex):
     return max(0.0, min(1.0, float(route[3]) / 12_800.0))
 
 
+def _mixer_set_route_to(index, destIndex, value, updateUI=False):
+    index = _mixer_track_index(index)
+    destIndex = _mixer_track_index(destIndex)
+    route = _mixer_route_summary(index, destIndex)
+    if route is None or route[2] is None:
+        raise NotImplementedError("Creating or editing an unrecognized Mixer route is unsupported")
+    enabled = bool(value)
+    route[2] = enabled
+    _request_transport_action(
+        {
+            "action": "set_mixer_route",
+            "source_index": index,
+            "destination_index": destIndex,
+            "enabled": enabled,
+            "update_ui": bool(updateUI),
+        }
+    )
+
+
+def _mixer_set_route_level(index, destIndex, level):
+    index = _mixer_track_index(index)
+    destIndex = _mixer_track_index(destIndex)
+    route = _mixer_route_summary(index, destIndex)
+    if route is None or route[2] is None:
+        raise ValueError("Mixer route must exist before setting its level")
+    try:
+        level = float(level)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("Mixer route level must be numeric") from error
+    if not math.isfinite(level):
+        raise ValueError("Mixer route level must be finite")
+    value_raw = int(round(max(0.0, min(1.0, level)) * 12_800))
+    route[3] = value_raw
+    _request_transport_action(
+        {
+            "action": "set_mixer_route_level",
+            "source_index": index,
+            "destination_index": destIndex,
+            "value_raw": value_raw,
+        }
+    )
+
+
 def _mixer_set_track_color(index, color):
     index = _mixer_track_index(index)
     try:
@@ -1228,6 +1271,9 @@ def _install_modules(script_name, device_name):
     mixer.getTrackInfo = _mixer_get_track_info
     mixer.getRouteSendActive = _mixer_get_route_send_active
     mixer.getRouteToLevel = _mixer_get_route_level
+    mixer.setRouteTo = _mixer_set_route_to
+    mixer.setRouteToLevel = _mixer_set_route_level
+    mixer.afterRoutingChanged = lambda: None
     mixer.trackNumber = _mixer_track_number
     mixer.setTrackNumber = _mixer_set_track_number
     mixer.isTrackSelected = _mixer_is_track_selected

@@ -117,12 +117,12 @@ use midi_output::{
     playlist_playback_messages,
 };
 use midi_script::{
-    MidiControllerScript, MidiScriptTransportState, MixerTrackFlag, MixerTrackParameter,
-    SCRIPT_BEAT_INDICATOR_BAR, SCRIPT_BEAT_INDICATOR_BEAT, SCRIPT_BEAT_INDICATOR_OFF,
-    SCRIPT_PROJECT_LOAD_ERROR, SCRIPT_PROJECT_LOAD_OK, SCRIPT_PROJECT_LOAD_START,
-    SCRIPT_TRANSPORT_PATTERN_MODE, SCRIPT_TRANSPORT_PLAYING, SCRIPT_TRANSPORT_RECORDING,
-    absolute_song_position_ticks, discover_midi_scripts, find_script_for_device,
-    normalized_song_position, song_position_ticks,
+    MidiControllerScript, MidiScriptTransportState, MixerSendRouteSnapshot, MixerTrackFlag,
+    MixerTrackParameter, SCRIPT_BEAT_INDICATOR_BAR, SCRIPT_BEAT_INDICATOR_BEAT,
+    SCRIPT_BEAT_INDICATOR_OFF, SCRIPT_PROJECT_LOAD_ERROR, SCRIPT_PROJECT_LOAD_OK,
+    SCRIPT_PROJECT_LOAD_START, SCRIPT_TRANSPORT_PATTERN_MODE, SCRIPT_TRANSPORT_PLAYING,
+    SCRIPT_TRANSPORT_RECORDING, absolute_song_position_ticks, discover_midi_scripts,
+    find_script_for_device, normalized_song_position, song_position_ticks,
 };
 use midi_thru::{MidiThruSettings, MidiThruWorker};
 
@@ -14436,12 +14436,12 @@ impl DawUi {
                     .into_iter()
                     .filter_map(|route| {
                         let destination = route.route_parameter_id().checked_sub(64)?;
-                        Some((
-                            u16::try_from(route.insert_ordinal()).ok()?,
-                            u16::from(destination),
-                            route.enabled(),
-                            route.value(),
-                        ))
+                        Some(MixerSendRouteSnapshot {
+                            source_index: u16::try_from(route.insert_ordinal()).ok()?,
+                            destination_index: u16::from(destination),
+                            enabled: route.enabled(),
+                            value_raw: route.value(),
+                        })
                     })
                     .collect::<Vec<_>>()
             })
@@ -15438,6 +15438,123 @@ impl DawUi {
                 self.status = format!("MIDI script could not recolor Mixer track: {error}");
             }
         }
+    }
+
+    fn set_midi_script_mixer_route(
+        &mut self,
+        source_index: u16,
+        destination_index: u16,
+        enabled: bool,
+    ) {
+        let source = usize::from(source_index);
+        let destination = usize::from(destination_index);
+        let parameter_id = destination
+            .checked_add(64)
+            .and_then(|id| u8::try_from(id).ok());
+        let route = self.document.as_ref().and_then(|document| {
+            let parameter_id = parameter_id?;
+            let mut matches = document
+                .mixer_send_summaries()
+                .ok()?
+                .into_iter()
+                .filter(|route| {
+                    route.insert_ordinal() == source && route.route_parameter_id() == parameter_id
+                });
+            let route = matches.next()?;
+            if matches.next().is_some() {
+                return None;
+            }
+            Some((route.routing_flag_location()?, route.enabled()?))
+        });
+        let Some(((event_index, flag_index), old_enabled)) = route else {
+            self.status = format!(
+                "MIDI script cannot update missing or ambiguous Mixer route {source} to {destination}"
+            );
+            return;
+        };
+        if old_enabled == enabled {
+            return;
+        }
+        let Some(document) = self.document.as_mut() else {
+            self.status = "MIDI script Mixer routing edits require an open project".to_owned();
+            return;
+        };
+        if let Err(error) = document.set_mixer_routing_flag(event_index, flag_index, enabled) {
+            self.status = format!("MIDI script could not update Mixer route: {error}");
+            return;
+        }
+        self.mixer_track_peak_meters.set_live_mixer_send_enabled(
+            source,
+            destination,
+            Some(enabled),
+        );
+        self.dirty = true;
+        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+        self.status = format!(
+            "MIDI script set Mixer route {source} to {destination} {}",
+            if enabled { "enabled" } else { "disabled" }
+        );
+    }
+
+    fn set_midi_script_mixer_route_level(
+        &mut self,
+        source_index: u16,
+        destination_index: u16,
+        value_raw: i32,
+    ) {
+        let source = usize::from(source_index);
+        let destination = usize::from(destination_index);
+        if !(0..=12_800).contains(&value_raw) {
+            self.status = "MIDI script Mixer route level is outside the supported range".to_owned();
+            return;
+        }
+        let parameter_id = destination
+            .checked_add(64)
+            .and_then(|id| u8::try_from(id).ok());
+        let route = self.document.as_ref().and_then(|document| {
+            let parameter_id = parameter_id?;
+            let mut matches = document
+                .mixer_send_summaries()
+                .ok()?
+                .into_iter()
+                .filter(|route| {
+                    route.insert_ordinal() == source
+                        && route.route_parameter_id() == parameter_id
+                        && route.enabled().is_some()
+                });
+            let route = matches.next()?;
+            if matches.next().is_some() {
+                return None;
+            }
+            Some((route.parameter_location(), route.value()))
+        });
+        let Some(((event_index, record_index), old_value)) = route else {
+            self.status = format!(
+                "MIDI script cannot set missing or ambiguous Mixer route {source} to {destination}"
+            );
+            return;
+        };
+        if old_value == value_raw {
+            return;
+        }
+        let Some(document) = self.document.as_mut() else {
+            self.status = "MIDI script Mixer routing edits require an open project".to_owned();
+            return;
+        };
+        if let Err(error) =
+            document.set_mixer_parameter_record_value(event_index, record_index, value_raw)
+        {
+            self.status = format!("MIDI script could not set Mixer route level: {error}");
+            return;
+        }
+        self.mixer_track_peak_meters.set_live_mixer_send_level_raw(
+            source,
+            destination,
+            Some(value_raw),
+        );
+        self.dirty = true;
+        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+        self.status = format!("MIDI script set Mixer route {source} to {destination} level");
     }
 
     fn set_midi_script_mixer_track_parameter(
@@ -50063,6 +50180,17 @@ impl DawUi {
                 parameter,
                 value_raw,
             } => self.set_midi_script_mixer_track_parameter(index, parameter, value_raw),
+            MidiTransportCommand::SetMixerRoute {
+                source_index,
+                destination_index,
+                enabled,
+                update_ui: _,
+            } => self.set_midi_script_mixer_route(source_index, destination_index, enabled),
+            MidiTransportCommand::SetMixerRouteLevel {
+                source_index,
+                destination_index,
+                value_raw,
+            } => self.set_midi_script_mixer_route_level(source_index, destination_index, value_raw),
             MidiTransportCommand::JumpToMarker { delta, select } => {
                 self.jump_midi_script_marker_with_selection(delta, select);
             }

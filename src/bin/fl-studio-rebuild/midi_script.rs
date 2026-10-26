@@ -27,6 +27,14 @@ pub struct ScriptMidiResult {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MixerSendRouteSnapshot {
+    pub source_index: u16,
+    pub destination_index: u16,
+    pub enabled: Option<bool>,
+    pub value_raw: i32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ScriptTransportAction {
     Start,
     Stop,
@@ -76,6 +84,17 @@ pub enum ScriptTransportAction {
     SetMixerTrackParameter {
         index: u16,
         parameter: MixerTrackParameter,
+        value_raw: i32,
+    },
+    SetMixerRoute {
+        source_index: u16,
+        destination_index: u16,
+        enabled: bool,
+        update_ui: bool,
+    },
+    SetMixerRouteLevel {
+        source_index: u16,
+        destination_index: u16,
         value_raw: i32,
     },
     JumpToMarker {
@@ -186,7 +205,7 @@ pub struct MidiScriptTransportState {
     pub mixer_track_names: Mutex<Vec<String>>,
     pub mixer_selected_track: AtomicU64,
     pub mixer_track_colors: Mutex<Vec<u32>>,
-    pub mixer_send_routes: Mutex<Vec<(u16, u16, Option<bool>, i32)>>,
+    pub mixer_send_routes: Mutex<Vec<MixerSendRouteSnapshot>>,
     pub mixer_track_enabled: Mutex<Vec<Option<bool>>>,
     pub mixer_track_soloed: Mutex<Vec<Option<bool>>>,
     pub mixer_track_polarity_reversed: Mutex<Vec<Option<bool>>>,
@@ -848,7 +867,17 @@ impl MidiScriptRuntime {
                         .mixer_selected_track
                         .load(Ordering::Relaxed),
                     "mixer_track_colors": mixer_track_colors,
-                    "mixer_send_routes": mixer_send_routes,
+                    "mixer_send_routes": mixer_send_routes
+                        .iter()
+                        .map(|route| {
+                            json!([
+                                route.source_index,
+                                route.destination_index,
+                                route.enabled,
+                                route.value_raw
+                            ])
+                        })
+                        .collect::<Vec<_>>(),
                     "mixer_track_enabled": mixer_track_enabled,
                     "mixer_track_soloed": mixer_track_soloed,
                     "mixer_track_polarity_reversed": mixer_track_polarity_reversed,
@@ -1128,6 +1157,51 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
         return Ok(ScriptTransportAction::SetMixerTrackParameter {
             index,
             parameter,
+            value_raw,
+        });
+    }
+    if name == Some("set_mixer_route") {
+        let source_index = action["source_index"]
+            .as_u64()
+            .and_then(|index| u16::try_from(index).ok())
+            .ok_or_else(|| "MIDI script returned an invalid Mixer source track index".to_owned())?;
+        let destination_index = action["destination_index"]
+            .as_u64()
+            .and_then(|index| u16::try_from(index).ok())
+            .ok_or_else(|| {
+                "MIDI script returned an invalid Mixer destination track index".to_owned()
+            })?;
+        let enabled = action["enabled"]
+            .as_bool()
+            .ok_or_else(|| "MIDI script returned an invalid Mixer route state".to_owned())?;
+        let update_ui = action["update_ui"]
+            .as_bool()
+            .ok_or_else(|| "MIDI script returned an invalid Mixer route UI flag".to_owned())?;
+        return Ok(ScriptTransportAction::SetMixerRoute {
+            source_index,
+            destination_index,
+            enabled,
+            update_ui,
+        });
+    }
+    if name == Some("set_mixer_route_level") {
+        let source_index = action["source_index"]
+            .as_u64()
+            .and_then(|index| u16::try_from(index).ok())
+            .ok_or_else(|| "MIDI script returned an invalid Mixer source track index".to_owned())?;
+        let destination_index = action["destination_index"]
+            .as_u64()
+            .and_then(|index| u16::try_from(index).ok())
+            .ok_or_else(|| {
+                "MIDI script returned an invalid Mixer destination track index".to_owned()
+            })?;
+        let value_raw = action["value_raw"]
+            .as_i64()
+            .and_then(|value| i32::try_from(value).ok())
+            .ok_or_else(|| "MIDI script returned an invalid Mixer route level".to_owned())?;
+        return Ok(ScriptTransportAction::SetMixerRouteLevel {
+            source_index,
+            destination_index,
             value_raw,
         });
     }

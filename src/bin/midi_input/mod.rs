@@ -718,6 +718,26 @@ fn queue_script_transport_actions(
                 parameter,
                 value_raw,
             },
+            ScriptTransportAction::SetMixerRoute {
+                source_index,
+                destination_index,
+                enabled,
+                update_ui,
+            } => MidiTransportCommand::SetMixerRoute {
+                source_index,
+                destination_index,
+                enabled,
+                update_ui,
+            },
+            ScriptTransportAction::SetMixerRouteLevel {
+                source_index,
+                destination_index,
+                value_raw,
+            } => MidiTransportCommand::SetMixerRouteLevel {
+                source_index,
+                destination_index,
+                value_raw,
+            },
             ScriptTransportAction::JumpToMarker { delta, select } => {
                 MidiTransportCommand::JumpToMarker { delta, select }
             }
@@ -812,6 +832,17 @@ pub enum MidiTransportCommand {
     SetMixerTrackParameter {
         index: u16,
         parameter: MixerTrackParameter,
+        value_raw: i32,
+    },
+    SetMixerRoute {
+        source_index: u16,
+        destination_index: u16,
+        enabled: bool,
+        update_ui: bool,
+    },
+    SetMixerRouteLevel {
+        source_index: u16,
+        destination_index: u16,
         value_raw: i32,
     },
     JumpToMarker {
@@ -1477,6 +1508,10 @@ pub fn describe_event(event: MidiInputEvent) -> String {
                     "MIDI script Set Mixer Track Stereo Separation".to_owned()
                 }
             },
+            MidiTransportCommand::SetMixerRoute { .. } => "MIDI script Set Mixer Route".to_owned(),
+            MidiTransportCommand::SetMixerRouteLevel { .. } => {
+                "MIDI script Set Mixer Route Level".to_owned()
+            }
             MidiTransportCommand::JumpToMarker { .. } => "MIDI script Jump to Marker".to_owned(),
             MidiTransportCommand::SelectNextEmptyPatternWithNameDialog => {
                 "MIDI script Next Empty Pattern".to_owned()
