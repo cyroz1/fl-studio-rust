@@ -2,6 +2,7 @@ import json
 import math
 import runpy
 import sys
+import time
 import types
 
 
@@ -11,6 +12,7 @@ _active_transport_actions = None
 _active_transport_state = {}
 _midi_out_new_messages = {}
 _mixer_pickup_previous_values = {}
+_tap_tempo_times = []
 _active_midi_input_callback = False
 _has_meters = False
 
@@ -1246,6 +1248,28 @@ def _global_transport(command, value, pmeflags=2, flags=15):
     if command == 105:
         if value != 0:
             _request_transport_action({"action": "tempo_jog", "increment": value})
+        return 8
+    if command == 106:  # FPT_TapTempo
+        if value != 0:
+            now = time.monotonic()
+            if _tap_tempo_times and not 0.0 < now - _tap_tempo_times[-1] <= 8.0:
+                _tap_tempo_times.clear()
+            _tap_tempo_times.append(now)
+            del _tap_tempo_times[:-5]
+            if len(_tap_tempo_times) >= 2:
+                intervals = [
+                    later - earlier
+                    for earlier, later in zip(_tap_tempo_times, _tap_tempo_times[1:])
+                ]
+                average_interval = sum(intervals) / len(intervals)
+                tempo_milli_bpm = int(60_000.0 / average_interval + 0.5)
+                tempo_milli_bpm = min(522_000, max(10_000, tempo_milli_bpm))
+                _request_transport_action(
+                    {
+                        "action": "set_current_tempo",
+                        "tempo_milli_bpm": tempo_milli_bpm,
+                    }
+                )
         return 8
     window_views = {
         64: 0,  # FPT_F5: Playlist
