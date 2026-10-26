@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use flp_rebuild::media::{SamplePathResolver, decode_audio_file};
@@ -2685,26 +2685,38 @@ fn run(args: Vec<String>) -> Result<(), String> {
         [command, input, output, pattern_id, channel_id, options @ ..]
             if command == "riff-machine-notes" =>
         {
+            let (options, groove_score_path) = parse_riff_machine_options(options)?;
+            let groove_score = groove_score_path
+                .as_deref()
+                .map(load_riff_machine_groove_score)
+                .transpose()?;
             riff_machine_notes_with_scope(
                 Path::new(input),
                 Path::new(output),
                 parse_u16(pattern_id, "pattern id")?,
                 parse_u16(channel_id, "channel id")?,
                 None,
-                parse_riff_machine_options(options)?,
+                options,
+                groove_score.as_ref(),
             )
         }
         [command, input, output, pattern_id, channel_id, note_indices, options @ ..]
             if command == "riff-machine-notes-selected" =>
         {
             let note_indices = parse_note_indices(note_indices)?;
+            let (options, groove_score_path) = parse_riff_machine_options(options)?;
+            let groove_score = groove_score_path
+                .as_deref()
+                .map(load_riff_machine_groove_score)
+                .transpose()?;
             riff_machine_notes_with_scope(
                 Path::new(input),
                 Path::new(output),
                 parse_u16(pattern_id, "pattern id")?,
                 parse_u16(channel_id, "channel id")?,
                 Some(&note_indices),
-                parse_riff_machine_options(options)?,
+                options,
+                groove_score.as_ref(),
             )
         }
         [command, input, output, pattern_id, channel_id, position_ticks]
@@ -4988,8 +5000,11 @@ fn parse_riff_machine_quantize_mode(value: &str) -> Result<RiffMachineQuantizeMo
     }
 }
 
-fn parse_riff_machine_options(values: &[String]) -> Result<RiffMachineOptions<'static>, String> {
+fn parse_riff_machine_options(
+    values: &[String],
+) -> Result<(RiffMachineOptions<'static>, Option<PathBuf>), String> {
     let mut options = RiffMachineOptions::default();
+    let mut groove_score_path = None;
     let mut seen = std::collections::HashSet::new();
     for argument in values {
         let option = argument.strip_prefix("--").ok_or_else(|| {
@@ -5046,6 +5061,7 @@ fn parse_riff_machine_options(values: &[String]) -> Result<RiffMachineOptions<'s
                 options.preserve_start_times = parse_bool(value, "preserve start times")?
             }
             "mirror-vertical" => options.mirror_vertical = parse_bool(value, "vertical mirror")?,
+            "groove-score" => groove_score_path = Some(PathBuf::from(value)),
             "groove-snap-ticks" => {
                 options.groove_snap_ticks = if value == "none" {
                     None
@@ -5093,7 +5109,13 @@ fn parse_riff_machine_options(values: &[String]) -> Result<RiffMachineOptions<'s
             _ => return Err(format!("unknown Riff Machine option: --{name}")),
         }
     }
-    Ok(options)
+    Ok((options, groove_score_path))
+}
+
+fn load_riff_machine_groove_score(path: &Path) -> Result<FscScore, String> {
+    let bytes = fs::read(path)
+        .map_err(|error| format!("could not read Riff Machine groove score: {error}"))?;
+    FscScore::parse(&bytes).map_err(|error| format!("invalid Riff Machine groove score: {error}"))
 }
 
 fn parse_note_rotation(value: &str) -> Result<PatternNoteRotation, String> {
@@ -9164,8 +9186,13 @@ fn riff_machine_notes_with_scope(
     channel_id: u16,
     note_indices: Option<&[usize]>,
     options: RiffMachineOptions<'_>,
+    groove_score: Option<&FscScore>,
 ) -> Result<(), String> {
     let (_, mut document) = load_document(input)?;
+    let options = RiffMachineOptions {
+        groove_score,
+        ..options
+    };
     let created = match note_indices {
         Some(note_indices) => document.riff_machine_pattern_note_selection(
             pattern_id,

@@ -2494,6 +2494,8 @@ pub struct RiffMachineOptions<'a> {
     pub preserve_start_times: bool,
     /// Reflect generated pitches around the midpoint of their current pitch range.
     pub mirror_vertical: bool,
+    /// Optional `.fsc` timing template for the Groove stage.
+    pub groove_score: Option<&'a FscScore>,
     /// Optional Piano roll snap grid for the Groove stage; `None` means snap is disabled.
     pub groove_snap_ticks: Option<u32>,
     /// Mix from original starts toward quantized starts, from 0 through 100 percent.
@@ -2536,6 +2538,7 @@ impl<'a> Default for RiffMachineOptions<'a> {
             mirror_horizontal: false,
             preserve_start_times: false,
             mirror_vertical: false,
+            groove_score: None,
             groove_snap_ticks: Some(24),
             groove_start_percent: 0,
             groove_sensitivity_percent: 50,
@@ -2614,6 +2617,52 @@ fn riff_machine_groove_note_timing(
             let end = mix(original_end, target_end, options.groove_duration_percent);
             start = start.min(end.saturating_sub(1));
             end.saturating_sub(start)
+        }
+    };
+    let start = u32::try_from(start).map_err(|_| FlpError::LengthOverflow)?;
+    let length =
+        u32::try_from(length.min(u64::from(u32::MAX))).map_err(|_| FlpError::LengthOverflow)?;
+    Ok((start, length.max(1)))
+}
+
+fn riff_machine_score_groove_note_timing(
+    note: &PatternNote,
+    groove: &QuantizeGroove,
+    options: RiffMachineOptions<'_>,
+) -> Result<(u32, u32), FlpError> {
+    let original_start = u64::from(note.position);
+    let original_length = u64::from(note.length);
+    let original_end = original_start
+        .checked_add(original_length)
+        .ok_or(FlpError::LengthOverflow)?;
+    let sensitivity = f64::from(options.groove_sensitivity_percent.min(100)) / 100.0;
+    let (target_start, _, _) = groove.nearest_anchor(original_start, &groove.starts, sensitivity);
+    let (target_end, _, _) = groove.nearest_anchor(original_end, &groove.ends, sensitivity);
+    let mix = |original: u64, target: u64, amount: u8| {
+        let delta = target as i64 - original as i64;
+        (original as i64 + delta * i64::from(amount.min(100)) / 100).max(0) as u64
+    };
+
+    let mut start = mix(original_start, target_start, options.groove_start_percent);
+    let length = match options.groove_quantize_mode {
+        RiffMachineQuantizeMode::LeaveDuration => original_length,
+        RiffMachineQuantizeMode::LeaveEnd => {
+            start = start.min(original_end.saturating_sub(1));
+            original_end.saturating_sub(start)
+        }
+        RiffMachineQuantizeMode::QuantizeDuration => {
+            let target_length = target_end.saturating_sub(target_start).max(1);
+            mix(
+                original_length,
+                target_length,
+                options.groove_duration_percent,
+            )
+            .max(1)
+        }
+        RiffMachineQuantizeMode::QuantizeEnd => {
+            let end = mix(original_end, target_end, options.groove_duration_percent);
+            start = start.min(end.saturating_sub(1));
+            end.saturating_sub(start).max(1)
         }
     };
     let start = u32::try_from(start).map_err(|_| FlpError::LengthOverflow)?;
@@ -14915,8 +14964,9 @@ impl FlpDocument {
                 "Riff Machine Groove percentages must be between 0 and 100",
             ));
         }
-        let groove_enabled =
-            options.groove_start_percent > 0 || options.groove_duration_percent > 0;
+        let groove_enabled = options.groove_score.is_some()
+            || options.groove_start_percent > 0
+            || options.groove_duration_percent > 0;
         let levels_enabled = options.reset_levels
             || options.velocity_variation_percent > 0
             || options.pan_variation_percent > 0
@@ -14924,7 +14974,10 @@ impl FlpDocument {
             || options.mod_x_variation_percent > 0
             || options.mod_y_variation_percent > 0
             || options.pitch_variation_semitones > 0;
-        if groove_enabled && options.groove_snap_ticks.is_none_or(|ticks| ticks == 0) {
+        if groove_enabled
+            && options.groove_score.is_none()
+            && options.groove_snap_ticks.is_none_or(|ticks| ticks == 0)
+        {
             return Err(FlpError::UnsupportedEdit(
                 "Riff Machine Groove needs an enabled Piano roll snap grid",
             ));
@@ -15292,9 +15345,16 @@ impl FlpDocument {
         note_indices: &[usize],
         options: RiffMachineOptions<'_>,
     ) -> Result<(), FlpError> {
-        let snap_ticks = options.groove_snap_ticks.filter(|ticks| *ticks > 0).ok_or(
-            FlpError::UnsupportedEdit("Riff Machine Groove needs an enabled Piano roll snap grid"),
-        )?;
+        let score_groove = options
+            .groove_score
+            .map(|score| QuantizeGroove::from_score(score, self.header.ppq))
+            .transpose()?;
+        let snap_ticks = options.groove_snap_ticks.filter(|ticks| *ticks > 0);
+        if score_groove.is_none() && snap_ticks.is_none() {
+            return Err(FlpError::UnsupportedEdit(
+                "Riff Machine Groove needs an enabled Piano roll snap grid or score template",
+            ));
+        }
         let selected_indices = note_indices.iter().copied().collect::<HashSet<_>>();
         let patterns = self.patterns()?;
         let pattern = patterns
@@ -15311,7 +15371,14 @@ impl FlpDocument {
             .enumerate()
             .filter(|(note_index, _)| selected_indices.contains(note_index))
         {
-            let (position, length) = riff_machine_groove_note_timing(note, snap_ticks, options)?;
+            let (position, length) = if let Some(score_groove) = &score_groove {
+                riff_machine_score_groove_note_timing(note, score_groove, options)?
+            } else {
+                let snap_ticks = snap_ticks.ok_or(FlpError::UnsupportedEdit(
+                    "Riff Machine Groove needs an enabled Piano roll snap grid or score template",
+                ))?;
+                riff_machine_groove_note_timing(note, snap_ticks, options)?
+            };
             if position != note.position || length != note.length {
                 edits.insert(
                     note_index,

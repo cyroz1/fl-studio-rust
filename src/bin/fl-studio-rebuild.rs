@@ -4791,6 +4791,8 @@ struct DawUi {
     riff_groove_sensitivity_percent: u8,
     riff_groove_duration_percent: u8,
     riff_groove_quantize_mode: RiffMachineQuantizeMode,
+    riff_groove_score: Option<FscScore>,
+    riff_groove_score_path: Option<PathBuf>,
     claw_period_ticks: u32,
     claw_trash_every: u8,
     claw_time_distortion_percent: i16,
@@ -6384,6 +6386,8 @@ impl DawUi {
             riff_groove_sensitivity_percent: 50,
             riff_groove_duration_percent: 0,
             riff_groove_quantize_mode: RiffMachineQuantizeMode::LeaveDuration,
+            riff_groove_score: None,
+            riff_groove_score_path: None,
             claw_period_ticks: 384,
             claw_trash_every: 4,
             claw_time_distortion_percent: 0,
@@ -31758,6 +31762,7 @@ impl DawUi {
         let mut arpeggiate_requested = false;
         let mut load_arpeggiator_score_requested = false;
         let mut riff_machine_requested = false;
+        let mut load_riff_groove_score_requested = false;
         let mut claw_requested = false;
         let mut slice_requested = false;
         let mut delete_selection_requested = false;
@@ -33064,7 +33069,21 @@ impl DawUi {
                         egui::CollapsingHeader::new("Groove")
                             .default_open(false)
                             .show(ui, |ui| {
-                                ui.add_enabled_ui(groove_grid_available, |ui| {
+                                ui.horizontal(|ui| {
+                                    if ui.button("Load groove score…").clicked() {
+                                        load_riff_groove_score_requested = true;
+                                    }
+                                    if let Some(path) = &self.riff_groove_score_path {
+                                        ui.label(format!("{}", path.display()));
+                                        if ui.small_button("Clear").clicked() {
+                                            self.riff_groove_score = None;
+                                            self.riff_groove_score_path = None;
+                                        }
+                                    }
+                                });
+                                let groove_source_available =
+                                    groove_grid_available || self.riff_groove_score.is_some();
+                                ui.add_enabled_ui(groove_source_available, |ui| {
                                     ui.add(
                                         egui::Slider::new(
                                             &mut self.riff_groove_start_percent,
@@ -33127,9 +33146,9 @@ impl DawUi {
                                             );
                                         });
                                 });
-                                if !groove_grid_available {
+                                if !groove_source_available {
                                     ui.small(
-                                        "Choose a Piano roll snap grid to enable groove timing.",
+                                        "Choose a snap grid or load an FSC score to enable groove timing.",
                                     );
                                 }
                             });
@@ -33219,6 +33238,8 @@ impl DawUi {
                                 self.riff_groove_duration_percent =
                                     defaults.groove_duration_percent;
                                 self.riff_groove_quantize_mode = defaults.groove_quantize_mode;
+                                self.riff_groove_score = None;
+                                self.riff_groove_score_path = None;
                             }
                             if level_seed_active && ui.button("New seed").clicked() {
                                 self.riff_seed = self.riff_seed.saturating_add(1);
@@ -33228,6 +33249,7 @@ impl DawUi {
                                     edit_scope_available
                                         && self.piano_roll_scale != PianoRollScale::None
                                         && (groove_grid_available
+                                            || self.riff_groove_score.is_some()
                                             || (self.riff_groove_start_percent == 0
                                                 && self.riff_groove_duration_percent == 0)),
                                     egui::Button::new(format!("Generate for {edit_target}")),
@@ -34799,6 +34821,26 @@ impl DawUi {
                 }
             }
         }
+        if load_riff_groove_score_requested
+            && let Some(path) = rfd::FileDialog::new()
+                .set_title("Load Riff Machine groove score")
+                .add_filter("FL Studio score files", &["fsc"])
+                .pick_file()
+        {
+            let result = fs::read(&path)
+                .map_err(|error| format!("could not read {}: {error}", path.display()))
+                .and_then(|bytes| FscScore::parse(&bytes).map_err(|error| error.to_string()));
+            match result {
+                Ok(score) => {
+                    self.riff_groove_score = Some(score);
+                    self.riff_groove_score_path = Some(path.clone());
+                    self.status = format!("Loaded Riff Machine groove score {}", path.display());
+                }
+                Err(error) => {
+                    self.status = format!("Could not load Riff Machine groove score: {error}");
+                }
+            }
+        }
         if (quantize_requested || quantize_selected_requested)
             && let (Some(pattern_id), Some(channel_id)) =
                 (self.selected_pattern, self.selected_note_channel)
@@ -35601,6 +35643,7 @@ impl DawUi {
                 (self.selected_pattern, self.selected_note_channel)
         {
             let scale_intervals = self.piano_roll_scale.intervals();
+            let riff_groove_score = self.riff_groove_score.clone();
             let options = RiffMachineOptions {
                 scale_root: self.piano_roll_scale_root,
                 scale_intervals,
@@ -35615,6 +35658,7 @@ impl DawUi {
                 mirror_horizontal: self.riff_mirror_horizontal,
                 preserve_start_times: self.riff_preserve_start_times,
                 mirror_vertical: self.riff_mirror_vertical,
+                groove_score: riff_groove_score.as_ref(),
                 groove_snap_ticks: (self.piano_roll_snap != PianoRollSnap::None)
                     .then(|| self.piano_roll_snap.ticks(ppq, time_signature)),
                 groove_start_percent: self.riff_groove_start_percent,
