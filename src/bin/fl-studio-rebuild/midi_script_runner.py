@@ -410,6 +410,10 @@ def _mixer_track_enabled(index):
     return _mixer_track_flag_state(index, "mixer_track_enabled", True)
 
 
+def _mixer_is_track_mute_lock(index):
+    return _mixer_track_flag_state(index, "mixer_track_mute_locked", False)
+
+
 def _mixer_track_flag(index, state_name):
     return _mixer_track_flag_state(index, state_name, False)
 
@@ -1401,6 +1405,7 @@ def _install_modules(script_name, device_name):
     mixer.isTrackSelected = _mixer_is_track_selected
     mixer.setActiveTrack = _mixer_set_active_track
     mixer.isTrackEnabled = _mixer_track_enabled
+    mixer.isTrackMuteLock = _mixer_is_track_mute_lock
     mixer.enableTrack = _mixer_enable_track
     mixer.isTrackMuted = _mixer_is_track_muted
     mixer.muteTrack = _mixer_mute_track

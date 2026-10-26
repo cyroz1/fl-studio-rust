@@ -14601,6 +14601,32 @@ impl DawUi {
         if let Ok(mut enabled) = self.midi_script_transport_state.mixer_track_enabled.lock() {
             *enabled = mixer_track_enabled;
         }
+        let mixer_track_mute_locked = self
+            .document
+            .as_ref()
+            .map(|document| {
+                let inserts = document.mixer_inserts();
+                let max_ordinal = inserts
+                    .iter()
+                    .map(|insert| insert.ordinal())
+                    .max()
+                    .unwrap_or(0);
+                let mut locked = vec![None; max_ordinal.saturating_add(1)];
+                for insert in inserts {
+                    if let Some(track_locked) = locked.get_mut(insert.ordinal()) {
+                        *track_locked = insert.mute_locked();
+                    }
+                }
+                locked
+            })
+            .unwrap_or_else(|| vec![None]);
+        if let Ok(mut locked) = self
+            .midi_script_transport_state
+            .mixer_track_mute_locked
+            .lock()
+        {
+            *locked = mixer_track_mute_locked;
+        }
         let mixer_track_flags = self
             .document
             .as_ref()
