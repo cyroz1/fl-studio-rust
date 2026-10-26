@@ -24286,7 +24286,7 @@ fn decode_vst_text(bytes: &[u8]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeSet, HashSet};
 
     use super::{
         ArpeggioOptions, ArpeggioRangePattern, ArpeggioSyncMode, ArticulateOptions,
