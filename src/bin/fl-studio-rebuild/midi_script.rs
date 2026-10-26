@@ -1963,6 +1963,30 @@ mod tests {
     }
 
     #[test]
+    fn python_device_meter_updates_are_opt_in_and_read_live_mixer_peaks() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport device\nimport midi\nimport mixer\nimport transport\ndef OnInit():\n    device.setHasMeters()\ndef OnUpdateMeters():\n    if mixer.getTrackPeaks(1, midi.PEAK_R) >= 0.75:\n        transport.stop()\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let transport_state = Arc::new(MidiScriptTransportState::default());
+        *transport_state.mixer_track_peaks.lock().unwrap() = vec![(0.0, 0.0), (0.25, 0.75)];
+        let mut runtime = MidiScriptRuntime::start_for_device_with_transport_state(
+            &script,
+            "Test Input",
+            transport_state,
+        )
+        .unwrap();
+
+        let result = runtime.process_idle().unwrap();
+
+        assert_eq!(result.actions, [ScriptTransportAction::Stop]);
+    }
+
+    #[test]
     fn python_device_on_deinit_emits_final_midi_output() {
         let temporary = TestDirectory::new();
         let script_path = temporary.path().join("device_test.py");
