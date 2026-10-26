@@ -75,17 +75,18 @@ use flp_rebuild::{
     ArticulateOptions, AutomationChannel, AutomationInterpolationMode, AutomationPoint,
     AutomationPointEdit, AutomationScaleLevelsOptions, ChannelGroupSummary, ChannelNoteRouter,
     ChannelSortOrder, ChannelStretchMode, ChannelStretchSettingsEdit, ChannelSummary, ChannelType,
-    ClawMachineOptions, FlamOptions, FlpDocument, FlpError, FscScore, FstPreset, FstPresetKind,
-    HumanizerOptions, LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerInsertSummary,
-    MixerParameterKind, MixerParameterRecord, MixerSendSummary, PATTERN_NOTE_DEFAULT_FLAGS,
-    PATTERN_NOTE_DEFAULT_RELEASE, PATTERN_NOTE_SLIDE_FLAG, Pattern, PatternController,
-    PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation, PayloadEncoding,
-    PlaylistClip, PlaylistClipEdit, PlaylistClipSelectionClipboard, PlaylistClipTarget,
-    PlaylistTrack, PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync,
-    ProjectInfoEdit, ProjectSettingsEdit, QuantizeNoteMode, QuantizeNoteOptions,
-    RandomNoteChordMap, RandomNoteGeneratorOptions, RandomizerOptions, RiffMachineOptions,
-    RiffMachineQuantizeMode, SamplerEnvelopeLfo, SamplerEnvelopeLfoEdit, SamplerEnvelopeLfoTarget,
-    ScaleLevelsOptions, StrumOptions, TimeMarker, TimeMarkerEdit, VstPluginStateMetadata,
+    ClawMachineOptions, FlamOptions, FlpDocument, FlpError, FscControllerStreamImportOptions,
+    FscScore, FstPreset, FstPresetKind, HumanizerOptions, LimitNoteOptions, LimitSnapDirection,
+    MixerInsertEdit, MixerInsertSummary, MixerParameterKind, MixerParameterRecord,
+    MixerSendSummary, PATTERN_NOTE_DEFAULT_FLAGS, PATTERN_NOTE_DEFAULT_RELEASE,
+    PATTERN_NOTE_SLIDE_FLAG, Pattern, PatternController, PatternControllerEdit, PatternNote,
+    PatternNoteEdit, PatternNoteRotation, PayloadEncoding, PlaylistClip, PlaylistClipEdit,
+    PlaylistClipSelectionClipboard, PlaylistClipTarget, PlaylistTrack, PlaylistTrackEdit,
+    PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit,
+    ProjectSettingsEdit, QuantizeNoteMode, QuantizeNoteOptions, RandomNoteChordMap,
+    RandomNoteGeneratorOptions, RandomizerOptions, RiffMachineOptions, RiffMachineQuantizeMode,
+    SamplerEnvelopeLfo, SamplerEnvelopeLfoEdit, SamplerEnvelopeLfoTarget, ScaleLevelsOptions,
+    StrumOptions, TimeMarker, TimeMarkerEdit, VstPluginStateMetadata,
 };
 use md5::{Digest, Md5};
 use vst3_host::midi::{MidiChannel as Vst3MidiChannel, MidiEvent as Vst3MidiEvent};
@@ -43213,6 +43214,8 @@ impl DawUi {
         }
 
         let mut create_stream_requested = false;
+        let mut open_score_automation_requested = false;
+        let mut save_score_automation_requested = false;
         let mut open_midi_cc_import_requested = false;
         let mut open_midi_cc_new_stream_requested = false;
         let mut open_midi_cc_export_requested = false;
@@ -43273,6 +43276,18 @@ impl DawUi {
                             );
                         }
                     });
+            }
+            if ui.button("Open automation score…").clicked() {
+                open_score_automation_requested = true;
+            }
+            if ui
+                .add_enabled(
+                    self.piano_roll_controller_stream.is_some(),
+                    egui::Button::new("Save automation as…"),
+                )
+                .clicked()
+            {
+                save_score_automation_requested = true;
             }
             if ui
                 .add_enabled(
@@ -43356,6 +43371,106 @@ impl DawUi {
         }
 
         let selected_stream = self.piano_roll_controller_stream;
+        if open_score_automation_requested
+            && let Some(path) = rfd::FileDialog::new()
+                .set_title("Open Event Editor automation score")
+                .add_filter("FL Studio score files", &["fsc"])
+                .pick_file()
+        {
+            let result = (|| {
+                let bytes = fs::read(&path)
+                    .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+                let score = FscScore::parse(&bytes).map_err(|error| error.to_string())?;
+                let source_streams = score
+                    .controllers()
+                    .iter()
+                    .map(|controller| (controller.channel, controller.flags))
+                    .collect::<BTreeSet<_>>();
+                if source_streams.len() != 1 {
+                    return Err(
+                        "the automation score must contain exactly one raw controller stream"
+                            .to_owned(),
+                    );
+                }
+                let source_stream = *source_streams.iter().next().expect("one source stream");
+                let target_stream = selected_stream.unwrap_or(source_stream);
+                let replace_target_stream =
+                    selected_stream.is_some() || streams.contains(&target_stream);
+                let imported = self
+                    .document
+                    .as_mut()
+                    .ok_or_else(|| "no project is open".to_owned())?
+                    .import_score_controller_stream(
+                        pattern.id,
+                        &score,
+                        FscControllerStreamImportOptions {
+                            source_stream,
+                            target_stream,
+                            replace_target_stream,
+                        },
+                    )
+                    .map_err(|error| error.to_string())?;
+                Ok::<_, String>((imported, target_stream))
+            })();
+            match result {
+                Ok((imported, target_stream)) => {
+                    self.piano_roll_controller_stream = Some(target_stream);
+                    if imported > 0 {
+                        self.stop_project_playback();
+                        self.dirty = true;
+                    }
+                    self.status = format!(
+                        "Imported {imported} automation points into Pattern {} stream {} / 0x{:02X}",
+                        pattern.id, target_stream.0, target_stream.1
+                    );
+                }
+                Err(error) => {
+                    self.status = format!("Could not open automation score: {error}");
+                }
+            }
+        }
+        if save_score_automation_requested
+            && let Some(stream) = selected_stream
+            && let Some(mut path) = rfd::FileDialog::new()
+                .set_title("Save Event Editor automation score")
+                .set_file_name("Automation.fsc")
+                .add_filter("FL Studio score files", &["fsc"])
+                .save_file()
+        {
+            if !path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("fsc"))
+            {
+                path.set_extension("fsc");
+            }
+            let result = self
+                .document
+                .as_ref()
+                .ok_or_else(|| "no project is open".to_owned())
+                .and_then(|document| {
+                    document
+                        .export_score_controller_stream(pattern.id, stream)
+                        .map_err(|error| error.to_string())
+                })
+                .and_then(|bytes| {
+                    fs::write(&path, bytes)
+                        .map_err(|error| format!("could not write {}: {error}", path.display()))
+                });
+            match result {
+                Ok(()) => {
+                    self.status = format!(
+                        "Saved Pattern {} automation stream {} / 0x{:02X} as {}",
+                        pattern.id,
+                        stream.0,
+                        stream.1,
+                        path.display()
+                    );
+                }
+                Err(error) => {
+                    self.status = format!("Could not save automation score: {error}");
+                }
+            }
+        }
         self.draw_pending_midi_cc_import_ui(
             ui,
             pattern.id,

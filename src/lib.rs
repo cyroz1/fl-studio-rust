@@ -1970,44 +1970,73 @@ pub struct PatternNoteEdit {
     pub mod_y: Option<u8>,
 }
 
-/// Note data loaded from a FL Studio score file.
+/// Note and Event Editor automation data loaded from a FL Studio score file.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FscScore {
     notes: Vec<PatternNote>,
+    controllers: Vec<PatternController>,
     ppq: u16,
 }
 
 impl FscScore {
-    /// Parses score note records while retaining all saved note properties.
+    /// Parses score notes and raw Event Editor automation points.
     pub fn parse(bytes: &[u8]) -> Result<Self, FlpError> {
         let document = FlpDocument::parse(bytes)?;
         let ppq = document.header.ppq;
-        let mut notes = document
-            .patterns()?
-            .into_iter()
-            .flat_map(|pattern| pattern.notes)
+        let patterns = document.patterns()?;
+        let mut notes = patterns
+            .iter()
+            .flat_map(|pattern| pattern.notes.iter().cloned())
             .collect::<Vec<_>>();
-        if notes.is_empty() {
+        let controllers = patterns
+            .iter()
+            .flat_map(|pattern| pattern.controllers.iter().copied())
+            .collect::<Vec<_>>();
+        if notes.is_empty() && controllers.is_empty() {
             return Err(FlpError::UnsupportedEdit(
-                "the score file does not contain Pattern notes",
+                "the score file does not contain Pattern notes or automation points",
             ));
         }
-        if notes.len() > MAX_MERGED_PATTERN_NOTES {
+        if notes
+            .len()
+            .checked_add(controllers.len())
+            .is_none_or(|count| count > MAX_MERGED_PATTERN_NOTES)
+        {
             return Err(FlpError::UnsupportedEdit(
-                "the score file contains more than two million notes",
+                "the score file contains more than two million note and automation records",
             ));
         }
         notes.sort_by_key(|note| (note.position, note.key));
-        Ok(Self { notes, ppq })
+        Ok(Self {
+            notes,
+            controllers,
+            ppq,
+        })
     }
 
     pub fn notes(&self) -> &[PatternNote] {
         &self.notes
     }
 
+    /// Raw Event Editor automation points, including uninterpreted stream fields.
+    pub fn controllers(&self) -> &[PatternController] {
+        &self.controllers
+    }
+
     pub fn ppq(&self) -> u16 {
         self.ppq
     }
+}
+
+/// Source and destination stream selection for importing Event Editor score data.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FscControllerStreamImportOptions {
+    /// Raw channel/flags pair in the score file.
+    pub source_stream: (u8, u8),
+    /// Raw channel/flags pair to write in the destination Pattern.
+    pub target_stream: (u8, u8),
+    /// Remove existing destination points before importing.
+    pub replace_target_stream: bool,
 }
 
 /// Direction used by the Riff Machine's built-in arpeggiation.
@@ -6349,6 +6378,89 @@ impl FlpDocument {
         Ok(patterns)
     }
 
+    fn append_pattern_controller_records(
+        &mut self,
+        pattern_id: u16,
+        controllers: &[PatternController],
+    ) -> Result<(), FlpError> {
+        if controllers.is_empty() {
+            return Ok(());
+        }
+        let pattern = self
+            .patterns()?
+            .into_iter()
+            .find(|pattern| pattern.id == pattern_id)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested Pattern does not exist",
+            ))?;
+        if pattern
+            .controllers
+            .len()
+            .checked_add(controllers.len())
+            .is_none_or(|count| count > MAX_MERGED_PATTERN_NOTES)
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "the Pattern would contain more than two million controller points",
+            ));
+        }
+
+        let mut matching_markers = self.events.iter().enumerate().filter_map(|(index, event)| {
+            (event.opcode == 0x41
+                && event.payload.len() == 2
+                && event.payload.as_slice() == pattern_id.to_le_bytes())
+            .then_some(index)
+        });
+        let marker_index = matching_markers.next().ok_or(FlpError::UnsupportedEdit(
+            "the requested Pattern has no source marker",
+        ))?;
+        if matching_markers.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested Pattern ID is ambiguous",
+            ));
+        }
+
+        let region_start = marker_index + 1;
+        let region_end = self.events[region_start..]
+            .iter()
+            .position(|event| {
+                (event.opcode == 0x41 && event.payload.len() == 2)
+                    || matches!(event.opcode, 0x40 | 0x62 | 0x63)
+            })
+            .map_or(self.events.len(), |offset| region_start + offset);
+        let records_length = controllers
+            .len()
+            .checked_mul(FLP_PATTERN_CONTROLLER_RECORD_SIZE)
+            .ok_or(FlpError::LengthOverflow)?;
+        let mut records = Vec::with_capacity(records_length);
+        for controller in controllers {
+            records.extend_from_slice(&controller.encode());
+        }
+
+        let mut candidate = self.clone();
+        if let Some(event_index) = (region_start..region_end).rev().find(|index| {
+            candidate.events[*index].opcode == 0xDF
+                && candidate.events[*index]
+                    .payload
+                    .len()
+                    .is_multiple_of(FLP_PATTERN_CONTROLLER_RECORD_SIZE)
+        }) {
+            let mut payload = candidate.events[event_index].payload.clone();
+            payload
+                .len()
+                .checked_add(records.len())
+                .ok_or(FlpError::LengthOverflow)?;
+            payload.extend_from_slice(&records);
+            candidate.events[event_index].replace_data_payload(payload)?;
+        } else {
+            candidate
+                .events
+                .insert(region_end, FlpEvent::new_data(0xDF, records)?);
+        }
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
     /// Creates one raw point in a new controller stream, inserting a `0xDF` event if needed.
     /// The new point starts with zeroed reserved bytes; channel and flags are kept uninterpreted.
     pub fn create_pattern_controller_stream(
@@ -6381,30 +6493,6 @@ impl FlpDocument {
                 "the requested raw Pattern controller stream already exists",
             ));
         }
-
-        let mut matching_markers = self.events.iter().enumerate().filter_map(|(index, event)| {
-            (event.opcode == 0x41
-                && event.payload.len() == 2
-                && event.payload.as_slice() == pattern_id.to_le_bytes())
-            .then_some(index)
-        });
-        let marker_index = matching_markers.next().ok_or(FlpError::UnsupportedEdit(
-            "the requested Pattern has no source marker",
-        ))?;
-        if matching_markers.next().is_some() {
-            return Err(FlpError::UnsupportedEdit(
-                "the requested Pattern ID is ambiguous",
-            ));
-        }
-
-        let region_start = marker_index + 1;
-        let region_end = self.events[region_start..]
-            .iter()
-            .position(|event| {
-                (event.opcode == 0x41 && event.payload.len() == 2)
-                    || matches!(event.opcode, 0x40 | 0x62 | 0x63)
-            })
-            .map_or(self.events.len(), |offset| region_start + offset);
         let new_index = pattern.controllers.len();
         let controller = PatternController {
             position,
@@ -6413,27 +6501,7 @@ impl FlpDocument {
             flags,
             value_bits: value.to_bits(),
         };
-
-        let mut candidate = self.clone();
-        if let Some(event_index) = (region_start..region_end)
-            .rev()
-            .find(|index| candidate.events[*index].opcode == 0xDF)
-        {
-            let mut payload = candidate.events[event_index].payload.clone();
-            payload
-                .len()
-                .checked_add(FLP_PATTERN_CONTROLLER_RECORD_SIZE)
-                .ok_or(FlpError::LengthOverflow)?;
-            payload.extend_from_slice(&controller.encode());
-            candidate.events[event_index].replace_data_payload(payload)?;
-        } else {
-            candidate.events.insert(
-                region_end,
-                FlpEvent::new_data(0xDF, controller.encode().to_vec())?,
-            );
-        }
-        candidate.refresh_event_offsets()?;
-        *self = candidate;
+        self.append_pattern_controller_records(pattern_id, &[controller])?;
         Ok(new_index)
     }
 
@@ -16582,6 +16650,11 @@ impl FlpDocument {
         score: &FscScore,
         replace_channel_notes: bool,
     ) -> Result<usize, FlpError> {
+        if score.notes.is_empty() {
+            return Err(FlpError::UnsupportedEdit(
+                "the score file does not contain note data",
+            ));
+        }
         if score.notes.len() > MAX_MERGED_PATTERN_NOTES {
             return Err(FlpError::UnsupportedEdit(
                 "the score file contains more than two million notes",
@@ -16597,6 +16670,58 @@ impl FlpDocument {
             candidate.delete_pattern_notes(pattern_id, channel_id)?;
         }
         candidate.add_pattern_notes(pattern_id, &imported)?;
+        *self = candidate;
+        Ok(imported.len())
+    }
+
+    /// Imports one raw Event Editor automation stream from a score file.
+    ///
+    /// The source stream's values and opaque record bytes are retained. Its channel/flags pair is
+    /// mapped to the selected destination stream, and point positions are converted from score
+    /// PPQ to project PPQ. Replacing affects only the selected destination stream.
+    pub fn import_score_controller_stream(
+        &mut self,
+        pattern_id: u16,
+        score: &FscScore,
+        options: FscControllerStreamImportOptions,
+    ) -> Result<usize, FlpError> {
+        let mut imported = score
+            .controllers
+            .iter()
+            .filter(|controller| (controller.channel, controller.flags) == options.source_stream)
+            .copied()
+            .collect::<Vec<_>>();
+        if imported.is_empty() {
+            return Err(FlpError::UnsupportedEdit(
+                "the score file does not contain points in the selected source stream",
+            ));
+        }
+        if imported.len() > MAX_MERGED_PATTERN_NOTES {
+            return Err(FlpError::UnsupportedEdit(
+                "the score stream contains more than two million controller points",
+            ));
+        }
+
+        let mut candidate = self.clone();
+        if options.replace_target_stream {
+            candidate.delete_pattern_controller_range(
+                pattern_id,
+                options.target_stream,
+                0,
+                u32::MAX,
+            )?;
+        }
+        for controller in &mut imported {
+            controller.position = u32::try_from(scale_arpeggio_score_tick(
+                u64::from(controller.position),
+                score.ppq,
+                self.header.ppq,
+                ArpeggioScoreTimeMultiplier::Normal,
+            )?)
+            .map_err(|_| FlpError::LengthOverflow)?;
+            (controller.channel, controller.flags) = options.target_stream;
+        }
+        candidate.append_pattern_controller_records(pattern_id, &imported)?;
         *self = candidate;
         Ok(imported.len())
     }
@@ -16685,6 +16810,80 @@ impl FlpDocument {
         score_document.events = vec![
             FlpEvent::new_word(0x41, pattern_id),
             FlpEvent::new_data(note_event_opcode, records)?,
+        ];
+        score_document.project_version = None;
+        score_document.metadata = ProjectMetadata::default();
+        score_document.trailing_bytes.clear();
+        score_document.refresh_event_offsets()?;
+        score_document.encode_lossless()
+    }
+
+    /// Encodes one raw Event Editor automation stream as a standalone FL Studio score file.
+    ///
+    /// The score retains the source project's header and the stream's uninterpreted point bytes.
+    /// Native `.fsc` compatibility still needs comparison with a score saved by FL Studio.
+    pub fn export_score_controller_stream(
+        &self,
+        pattern_id: u16,
+        stream: (u8, u8),
+    ) -> Result<Vec<u8>, FlpError> {
+        if self.header.format != 0 {
+            return Err(FlpError::UnsupportedEdit(
+                "score export requires a standard FL Studio project",
+            ));
+        }
+        let pattern = self
+            .patterns()?
+            .into_iter()
+            .find(|pattern| pattern.id == pattern_id)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested pattern does not exist",
+            ))?;
+        let controllers = pattern
+            .controllers
+            .into_iter()
+            .filter(|controller| (controller.channel, controller.flags) == stream)
+            .collect::<Vec<_>>();
+        if controllers.is_empty() {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected Pattern has no points in that controller stream",
+            ));
+        }
+        if controllers.len() > MAX_MERGED_PATTERN_NOTES {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected controller stream contains more than two million points",
+            ));
+        }
+        let mut matching_markers = self.events.iter().filter(|event| {
+            event.opcode == 0x41
+                && event.payload.len() == 2
+                && event.payload.as_slice() == pattern_id.to_le_bytes()
+        });
+        if matching_markers.next().is_none() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested pattern has no source marker",
+            ));
+        }
+        if matching_markers.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested Pattern ID is ambiguous",
+            ));
+        }
+
+        let records_length = controllers
+            .len()
+            .checked_mul(FLP_PATTERN_CONTROLLER_RECORD_SIZE)
+            .ok_or(FlpError::LengthOverflow)?;
+        let mut records = Vec::with_capacity(records_length);
+        for controller in &controllers {
+            records.extend_from_slice(&controller.encode());
+        }
+
+        let mut score_document = self.clone();
+        score_document.header.legacy_channel_count = 0;
+        score_document.events = vec![
+            FlpEvent::new_word(0x41, pattern_id),
+            FlpEvent::new_data(0xDF, records)?,
         ];
         score_document.project_version = None;
         score_document.metadata = ProjectMetadata::default();

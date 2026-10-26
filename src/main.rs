@@ -19,13 +19,14 @@ use flp_rebuild::{
     ArpeggioScorePatternMode, ArpeggioScoreTimeMultiplier, ArpeggioSyncMode, ArticulateOptions,
     AutomationInterpolationMode, AutomationPointEdit, AutomationScaleLevelsOptions,
     ChannelLevelAdjustmentsEdit, ChannelSortOrder, ChannelStretchSettingsEdit, ClawMachineOptions,
-    FlamOptions, FlpDocument, FscScore, FstPreset, HumanizerOptions, LimitNoteOptions,
-    LimitSnapDirection, MixerInsertEdit, MixerParameterKind, PatternControllerEdit, PatternNote,
-    PatternNoteEdit, PatternNoteRotation, PlaylistClipEdit, PlaylistTrackEdit, PlaylistTrackMotion,
-    PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit, QuantizeNoteMode,
-    QuantizeNoteOptions, RandomNoteChordMap, RandomNoteGeneratorOptions, RandomizerOptions,
-    RiffMachineOptions, RiffMachineQuantizeMode, SamplerEnvelopeLfoEdit, SamplerEnvelopeLfoTarget,
-    SamplerVolumeEnvelopeEdit, ScaleLevelsOptions, StrumOptions, TimeMarkerEdit,
+    FlamOptions, FlpDocument, FscControllerStreamImportOptions, FscScore, FstPreset,
+    HumanizerOptions, LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerParameterKind,
+    PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation, PlaylistClipEdit,
+    PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit,
+    ProjectSettingsEdit, QuantizeNoteMode, QuantizeNoteOptions, RandomNoteChordMap,
+    RandomNoteGeneratorOptions, RandomizerOptions, RiffMachineOptions, RiffMachineQuantizeMode,
+    SamplerEnvelopeLfoEdit, SamplerEnvelopeLfoTarget, SamplerVolumeEnvelopeEdit,
+    ScaleLevelsOptions, StrumOptions, TimeMarkerEdit,
 };
 
 struct MidiControlChangeImport<'a> {
@@ -3288,12 +3289,46 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_bool(replace, "replace channel notes")?,
             )
         }
+        [command, input, score_path, output, pattern_id, source_channel, source_flags, target_channel, target_flags, replace]
+            if command == "import-score-automation" =>
+        {
+            import_score_automation(
+                Path::new(input),
+                Path::new(score_path),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                FscControllerStreamImportOptions {
+                    source_stream: (
+                        parse_raw_byte(source_channel, "source stream channel")?,
+                        parse_raw_byte(source_flags, "source stream flags")?,
+                    ),
+                    target_stream: (
+                        parse_raw_byte(target_channel, "target stream channel")?,
+                        parse_raw_byte(target_flags, "target stream flags")?,
+                    ),
+                    replace_target_stream: parse_bool(replace, "replace target stream")?,
+                },
+            )
+        }
         [command, input, output, pattern_id, channel_id] if command == "export-score" => {
             export_score_notes(
                 Path::new(input),
                 Path::new(output),
                 parse_u16(pattern_id, "pattern id")?,
                 parse_u16(channel_id, "channel id")?,
+            )
+        }
+        [command, input, output, pattern_id, stream_channel, stream_flags]
+            if command == "export-score-automation" =>
+        {
+            export_score_automation(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                (
+                    parse_raw_byte(stream_channel, "controller stream channel")?,
+                    parse_raw_byte(stream_flags, "controller stream flags")?,
+                ),
             )
         }
         [command, input, midi_path, output, track, pattern_id, channel_id]
@@ -3980,6 +4015,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild import-midi <input.flp> <input.mid> <output.flp> <track> <pattern-id|new> <channel-id> [zero-velocity-note-ons:0|1] [realign-events:0|1] [midi-channels:all|none|1,2,...,16]\n",
             "  flp-rebuild import-score <input.flp> <input.fsc> <output.flp> <pattern-id> <channel-id> [replace-channel-notes:0|1]\n",
             "  flp-rebuild export-score <input.flp> <output.fsc> <pattern-id> <channel-id>\n",
+            "  flp-rebuild import-score-automation <input.flp> <input.fsc> <output.flp> <pattern-id> <source-channel-0..255> <source-flags-0..255> <target-channel-0..255> <target-flags-0..255> <replace-target-stream:0|1>\n",
+            "  flp-rebuild export-score-automation <input.flp> <output.fsc> <pattern-id> <stream-channel-0..255> <stream-flags-0..255>\n",
             "  flp-rebuild import-midi-cc <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <raw-channel> <raw-flags> <cc-0..127> <midi-channel-1..16|all>\n",
             "  flp-rebuild import-midi-cc-new-stream <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <raw-channel> <raw-flags> <cc-0..127> <midi-channel-1..16|all>\n",
             "  flp-rebuild import-midi-all <input.flp> <input.mid> <output.flp> <pattern-id|new> <channel-ids-comma-separated> [zero-velocity-note-ons:0|1] [realign-events:0|1] [midi-channels:all|none|1,2,...,16]\n",
@@ -9555,6 +9592,42 @@ fn import_score_notes(
     Ok(())
 }
 
+fn import_score_automation(
+    input: &Path,
+    score_path: &Path,
+    output: &Path,
+    pattern_id: u16,
+    options: FscControllerStreamImportOptions,
+) -> Result<(), String> {
+    let score_bytes = fs::read(score_path)
+        .map_err(|error| format!("could not read {}: {error}", score_path.display()))?;
+    let score = FscScore::parse(&score_bytes)
+        .map_err(|error| format!("could not parse {}: {error}", score_path.display()))?;
+    let (_, mut document) = load_document(input)?;
+    let imported = document
+        .import_score_controller_stream(pattern_id, &score, options)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "imported {imported} automation points from stream {} / 0x{:02X} into Pattern {pattern_id}, stream {} / 0x{:02X} ({}) to {}",
+        options.source_stream.0,
+        options.source_stream.1,
+        options.target_stream.0,
+        options.target_stream.1,
+        if options.replace_target_stream {
+            "replaced target stream"
+        } else {
+            "appended to target stream"
+        },
+        output.display()
+    );
+    Ok(())
+}
+
 fn export_score_notes(
     input: &Path,
     output: &Path,
@@ -9569,6 +9642,27 @@ fn export_score_notes(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "exported pattern {pattern_id}, channel {channel_id} as score to {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn export_score_automation(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    stream: (u8, u8),
+) -> Result<(), String> {
+    let (_, document) = load_document(input)?;
+    let bytes = document
+        .export_score_controller_stream(pattern_id, stream)
+        .map_err(|error| error.to_string())?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "exported Pattern {pattern_id} raw automation stream {} / 0x{:02X} as score to {}",
+        stream.0,
+        stream.1,
         output.display()
     );
     Ok(())
