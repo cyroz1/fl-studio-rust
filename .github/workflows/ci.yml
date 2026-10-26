@@ -51,7 +51,7 @@ jobs:
 
       - name: Install Linux native dependencies
         if: runner.os == 'Linux'
-        timeout-minutes: 15
+        timeout-minutes: 30
         env:
           TARGET_PLATFORM: ${{ matrix.platform }}
         run: |
