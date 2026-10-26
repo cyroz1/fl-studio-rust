@@ -1693,7 +1693,7 @@ fn channel_accepts_key(channel: &ChannelSummary, key: u16) -> bool {
         .is_none_or(|(low, high)| (low..=high).contains(&key))
 }
 
-fn scale_arpeggio_score_tick(
+fn scale_score_tick(
     tick: u64,
     score_ppq: u16,
     project_ppq: u16,
@@ -14237,7 +14237,7 @@ impl FlpDocument {
         }
         let project_ppq = self.header.ppq.max(1);
         let score_ppq = score.ppq().max(1);
-        let pattern_length = scale_arpeggio_score_tick(
+        let pattern_length = scale_score_tick(
             raw_pattern_length,
             score_ppq,
             project_ppq,
@@ -14256,7 +14256,7 @@ impl FlpDocument {
             if !(0..=2).contains(&color) || note.length == 0 {
                 continue;
             }
-            let start = scale_arpeggio_score_tick(
+            let start = scale_score_tick(
                 u64::from(note.position),
                 score_ppq,
                 project_ppq,
@@ -14266,13 +14266,9 @@ impl FlpDocument {
                 continue;
             }
             let raw_end = u64::from(note.position) + u64::from(note.length);
-            let mut end = scale_arpeggio_score_tick(
-                raw_end,
-                score_ppq,
-                project_ppq,
-                options.time_multiplier,
-            )?
-            .min(pattern_length);
+            let mut end =
+                scale_score_tick(raw_end, score_ppq, project_ppq, options.time_multiplier)?
+                    .min(pattern_length);
             if end <= start {
                 end = (start + 1).min(pattern_length);
             }
@@ -16642,7 +16638,8 @@ impl FlpDocument {
     }
 
     /// Imports FL Studio score notes into one Pattern channel, appending by default or replacing
-    /// that channel's existing notes when `replace_channel_notes` is enabled.
+    /// that channel's existing notes when `replace_channel_notes` is enabled. Note positions and
+    /// lengths are converted from the score PPQ to the destination project's PPQ.
     pub fn import_score_notes(
         &mut self,
         pattern_id: u16,
@@ -16663,6 +16660,20 @@ impl FlpDocument {
         let mut imported = score.notes.clone();
         for note in &mut imported {
             note.channel_id = channel_id;
+            note.position = u32::try_from(scale_score_tick(
+                u64::from(note.position),
+                score.ppq,
+                self.header.ppq,
+                ArpeggioScoreTimeMultiplier::Normal,
+            )?)
+            .map_err(|_| FlpError::LengthOverflow)?;
+            note.length = u32::try_from(scale_score_tick(
+                u64::from(note.length),
+                score.ppq,
+                self.header.ppq,
+                ArpeggioScoreTimeMultiplier::Normal,
+            )?)
+            .map_err(|_| FlpError::LengthOverflow)?;
         }
 
         let mut candidate = self.clone();
@@ -16712,7 +16723,7 @@ impl FlpDocument {
             )?;
         }
         for controller in &mut imported {
-            controller.position = u32::try_from(scale_arpeggio_score_tick(
+            controller.position = u32::try_from(scale_score_tick(
                 u64::from(controller.position),
                 score.ppq,
                 self.header.ppq,
