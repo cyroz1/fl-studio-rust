@@ -275,6 +275,26 @@ def _mixer_set_route_level(index, destIndex, level):
     )
 
 
+def _mixer_link_channel_to_track(channel, track, select=False):
+    try:
+        channel = int(channel)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("Channel Rack index must be an integer") from error
+    if not 0 <= channel <= 65535:
+        raise IndexError("Channel Rack index is outside the supported range")
+    track = _mixer_track_index(track)
+    if track > 127:
+        raise IndexError("Mixer track index is outside the supported range")
+    _request_transport_action(
+        {
+            "action": "link_channel_to_mixer_track",
+            "channel_index": channel,
+            "track_index": track,
+            "select": bool(select),
+        }
+    )
+
+
 def _mixer_set_track_color(index, color):
     index = _mixer_track_index(index)
     try:
@@ -1273,6 +1293,7 @@ def _install_modules(script_name, device_name):
     mixer.getRouteToLevel = _mixer_get_route_level
     mixer.setRouteTo = _mixer_set_route_to
     mixer.setRouteToLevel = _mixer_set_route_level
+    mixer.linkChannelToTrack = _mixer_link_channel_to_track
     mixer.afterRoutingChanged = lambda: None
     mixer.trackNumber = _mixer_track_number
     mixer.setTrackNumber = _mixer_set_track_number

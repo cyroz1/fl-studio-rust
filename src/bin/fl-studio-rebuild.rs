@@ -15376,6 +15376,97 @@ impl DawUi {
             .store(u64::from(index), Ordering::Relaxed);
     }
 
+    fn link_midi_script_channel_to_mixer_track(
+        &mut self,
+        channel_index: u16,
+        track_index: u8,
+        select: bool,
+    ) {
+        let channel_id = self.document.as_ref().and_then(|document| {
+            let known_groups = document
+                .channel_groups()
+                .iter()
+                .map(ChannelGroupSummary::index)
+                .collect::<BTreeSet<_>>();
+            document
+                .channels()
+                .into_iter()
+                .filter(|channel| {
+                    self.channel_display_filter
+                        .shows(channel.group_number(), &known_groups)
+                })
+                .nth(usize::from(channel_index))
+                .map(|channel| channel.id())
+        });
+        let Some(channel_id) = channel_id else {
+            self.status = format!(
+                "MIDI script cannot link missing Channel Rack channel {channel_index} in the current group"
+            );
+            return;
+        };
+
+        let track = usize::from(track_index);
+        let track_assignment = i8::try_from(track_index)
+            .expect("MIDI script Mixer track indices are bounded to 0 through 127");
+        let track_exists = track == 0
+            || self.document.as_ref().is_some_and(|document| {
+                document
+                    .mixer_inserts()
+                    .iter()
+                    .any(|insert| insert.ordinal() == track)
+            });
+        if !track_exists {
+            self.status =
+                format!("MIDI script cannot link a channel to unrecognized Mixer track {track}");
+            return;
+        }
+
+        let current_track = self.document.as_ref().and_then(|document| {
+            let mut matches = document
+                .channels()
+                .into_iter()
+                .filter(|channel| channel.id() == channel_id);
+            let channel = matches.next()?;
+            if matches.next().is_some() {
+                return None;
+            }
+            channel.mixer_track()
+        });
+        if current_track == Some(track_assignment) {
+            if select {
+                self.selected_mixer_insert = Some(track);
+                self.midi_script_transport_state
+                    .mixer_selected_track
+                    .store(u64::from(track_index), Ordering::Relaxed);
+            }
+            return;
+        }
+
+        let Some(document) = self.document.as_mut() else {
+            self.status = "MIDI script channel linking requires an open project".to_owned();
+            return;
+        };
+        match document.set_channel_mixer_track(channel_id, track_assignment) {
+            Ok(()) => {
+                self.stop_project_playback();
+                if select {
+                    self.selected_mixer_insert = Some(track);
+                    self.midi_script_transport_state
+                        .mixer_selected_track
+                        .store(u64::from(track_index), Ordering::Relaxed);
+                }
+                self.dirty = true;
+                self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+                self.status = format!(
+                    "MIDI script linked Channel Rack channel {channel_index} to Mixer track {track}"
+                );
+            }
+            Err(error) => {
+                self.status = format!("MIDI script could not link the channel: {error}");
+            }
+        }
+    }
+
     fn set_midi_script_mixer_track_name(&mut self, index: u16, name: String) {
         let result = if let Some(document) = self.document.as_mut() {
             let insert_ordinal = usize::from(index);
@@ -50202,6 +50293,11 @@ impl DawUi {
                 destination_index,
                 value_raw,
             } => self.set_midi_script_mixer_route_level(source_index, destination_index, value_raw),
+            MidiTransportCommand::LinkChannelToMixerTrack {
+                channel_index,
+                track_index,
+                select,
+            } => self.link_midi_script_channel_to_mixer_track(channel_index, track_index, select),
             MidiTransportCommand::JumpToMarker { delta, select } => {
                 self.jump_midi_script_marker_with_selection(delta, select);
             }

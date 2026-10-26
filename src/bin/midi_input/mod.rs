@@ -738,6 +738,15 @@ fn queue_script_transport_actions(
                 destination_index,
                 value_raw,
             },
+            ScriptTransportAction::LinkChannelToMixerTrack {
+                channel_index,
+                track_index,
+                select,
+            } => MidiTransportCommand::LinkChannelToMixerTrack {
+                channel_index,
+                track_index,
+                select,
+            },
             ScriptTransportAction::JumpToMarker { delta, select } => {
                 MidiTransportCommand::JumpToMarker { delta, select }
             }
@@ -844,6 +853,11 @@ pub enum MidiTransportCommand {
         source_index: u16,
         destination_index: u16,
         value_raw: i32,
+    },
+    LinkChannelToMixerTrack {
+        channel_index: u16,
+        track_index: u8,
+        select: bool,
     },
     JumpToMarker {
         delta: i32,
@@ -1511,6 +1525,9 @@ pub fn describe_event(event: MidiInputEvent) -> String {
             MidiTransportCommand::SetMixerRoute { .. } => "MIDI script Set Mixer Route".to_owned(),
             MidiTransportCommand::SetMixerRouteLevel { .. } => {
                 "MIDI script Set Mixer Route Level".to_owned()
+            }
+            MidiTransportCommand::LinkChannelToMixerTrack { .. } => {
+                "MIDI script Link Channel to Mixer Track".to_owned()
             }
             MidiTransportCommand::JumpToMarker { .. } => "MIDI script Jump to Marker".to_owned(),
             MidiTransportCommand::SelectNextEmptyPatternWithNameDialog => {

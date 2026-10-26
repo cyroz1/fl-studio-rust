@@ -97,6 +97,11 @@ pub enum ScriptTransportAction {
         destination_index: u16,
         value_raw: i32,
     },
+    LinkChannelToMixerTrack {
+        channel_index: u16,
+        track_index: u8,
+        select: bool,
+    },
     JumpToMarker {
         delta: i32,
         select: bool,
@@ -1204,6 +1209,25 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
             source_index,
             destination_index,
             value_raw,
+        });
+    }
+    if name == Some("link_channel_to_mixer_track") {
+        let channel_index = action["channel_index"]
+            .as_u64()
+            .and_then(|index| u16::try_from(index).ok())
+            .ok_or_else(|| "MIDI script returned an invalid Channel Rack index".to_owned())?;
+        let track_index = action["track_index"]
+            .as_u64()
+            .and_then(|index| u8::try_from(index).ok())
+            .filter(|index| *index <= 127)
+            .ok_or_else(|| "MIDI script returned an invalid Mixer track index".to_owned())?;
+        let select = action["select"]
+            .as_bool()
+            .ok_or_else(|| "MIDI script returned an invalid Mixer selection flag".to_owned())?;
+        return Ok(ScriptTransportAction::LinkChannelToMixerTrack {
+            channel_index,
+            track_index,
+            select,
         });
     }
     if name == Some("jump_to_marker") {
@@ -2873,6 +2897,30 @@ mod tests {
                 .unwrap()
                 .actions,
             [ScriptTransportAction::RecordToggle]
+        );
+    }
+
+    #[test]
+    fn python_mixer_link_channel_to_track_queues_group_channel_and_track_indexes() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport mixer\ndef OnMidiIn(event):\n    mixer.linkChannelToTrack(2, 127, True)\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let mut runtime = MidiScriptRuntime::start_for_device(&script, "Test Input").unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
+
+        assert_eq!(
+            result.actions,
+            [ScriptTransportAction::LinkChannelToMixerTrack {
+                channel_index: 2,
+                track_index: 127,
+                select: true,
+            }]
         );
     }
 
