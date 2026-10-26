@@ -259,6 +259,15 @@ def _mixer_route_summary(index, destIndex):
     return matches[0] if len(matches) == 1 else None
 
 
+def _mixer_route_matches(index, destIndex):
+    routes = _active_transport_state.get("mixer_send_routes", [])
+    return [
+        route
+        for route in routes
+        if len(route) == 4 and int(route[0]) == index and int(route[1]) == destIndex
+    ]
+
+
 def _mixer_get_route_send_active(index, destIndex):
     route = _mixer_route_summary(index, destIndex)
     return bool(route[2]) if route is not None and route[2] is not None else False
@@ -274,11 +283,22 @@ def _mixer_get_route_level(index, destIndex):
 def _mixer_set_route_to(index, destIndex, value, updateUI=False):
     index = _mixer_track_index(index)
     destIndex = _mixer_track_index(destIndex)
-    route = _mixer_route_summary(index, destIndex)
-    if route is None or route[2] is None:
-        raise NotImplementedError("Creating or editing an unrecognized Mixer route is unsupported")
     enabled = bool(value)
-    route[2] = enabled
+    matches = _mixer_route_matches(index, destIndex)
+    if len(matches) > 1:
+        raise ValueError("Mixer route is ambiguous")
+    if matches:
+        route = matches[0]
+        if route[2] is None:
+            raise NotImplementedError("Editing an unrecognized Mixer route is unsupported")
+        route[2] = enabled
+    elif not enabled:
+        return
+    else:
+        # Image-Line documents 0.8 as the default send level. Keep the optimistic
+        # snapshot in sync so setRouteToLevel() can follow in the same callback.
+        routes = _active_transport_state.setdefault("mixer_send_routes", [])
+        routes.append([index, destIndex, True, 10_240])
     _request_transport_action(
         {
             "action": "set_mixer_route",

@@ -10082,6 +10082,244 @@ impl FlpDocument {
         Ok(())
     }
 
+    /// Creates, enables, or disables a saved Mixer send between two recognized inserts.
+    /// New routes use the observed 0xE1 route-volume record and the project's 0xE7 routing
+    /// stream, or the legacy source-insert 0xEB flags. The candidate track and destination
+    /// mappings still need a controlled FL Studio save comparison.
+    pub fn set_mixer_send_route_enabled(
+        &mut self,
+        source_ordinal: usize,
+        destination_ordinal: usize,
+        enabled: bool,
+    ) -> Result<bool, FlpError> {
+        const ROUTE_LEVEL_DEFAULT_RAW: i32 = 10_240;
+
+        let inserts = self.mixer_inserts();
+        if source_ordinal >= inserts.len() || destination_ordinal >= inserts.len() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested Mixer send source or destination does not exist",
+            ));
+        }
+        if source_ordinal > 127 || destination_ordinal > 127 {
+            return Err(FlpError::UnsupportedEdit(
+                "Mixer send routes are supported only for track indices 0 through 127",
+            ));
+        }
+        if source_ordinal == destination_ordinal {
+            return Err(FlpError::UnsupportedEdit(
+                "a Mixer track cannot be routed to itself",
+            ));
+        }
+
+        let route_parameter_id = u8::try_from(destination_ordinal + 64)
+            .expect("the checked Mixer destination index fits its parameter ID");
+        let sends = self.mixer_send_summaries()?;
+        let mut matching_routes = sends.iter().filter(|route| {
+            route.insert_ordinal() == source_ordinal
+                && route.route_parameter_id() == route_parameter_id
+        });
+        if let Some(route) = matching_routes.next() {
+            if matching_routes.next().is_some() {
+                return Err(FlpError::UnsupportedEdit(
+                    "the requested Mixer send route is ambiguous",
+                ));
+            }
+            let Some(old_enabled) = route.enabled() else {
+                return Err(FlpError::UnsupportedEdit(
+                    "the requested Mixer send route has no unique routing flag",
+                ));
+            };
+            if old_enabled == enabled {
+                return Ok(false);
+            }
+            let Some((event_index, routing_flag_index)) = route.routing_flag_location() else {
+                return Err(FlpError::UnsupportedEdit(
+                    "the requested Mixer send route has no unique routing flag",
+                ));
+            };
+            let mut candidate = self.clone();
+            candidate.set_mixer_routing_flag(event_index, routing_flag_index, enabled)?;
+            *self = candidate;
+            return Ok(true);
+        }
+        if !enabled {
+            return Ok(false);
+        }
+
+        let parameters = self.mixer_parameter_records()?;
+        let route_record_count = parameters
+            .iter()
+            .filter(|record| record.kind() == MixerParameterKind::RouteVolume)
+            .count();
+        if route_record_count != sends.len() || sends.iter().any(|route| route.enabled().is_none())
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "new Mixer send routes require complete, unambiguous saved route records",
+            ));
+        }
+
+        let mut route_flags_by_event = Vec::new();
+        let first_channel = self
+            .events
+            .iter()
+            .position(|event| event.opcode == 0x40)
+            .unwrap_or(self.events.len());
+        let has_project_routing_stream = self.events[first_channel..].iter().any(|event| {
+            event.opcode == 0xE7 && matches!(event.encoding, PayloadEncoding::Data { .. })
+        });
+        if has_project_routing_stream {
+            let mut flag_count = 0usize;
+            for (event_index, event) in self.events[first_channel..].iter().enumerate() {
+                if event.opcode == 0xE7 && matches!(event.encoding, PayloadEncoding::Data { .. }) {
+                    flag_count = flag_count
+                        .checked_add(event.payload.len())
+                        .ok_or(FlpError::LengthOverflow)?;
+                    route_flags_by_event.push((first_channel + event_index, event.payload.len()));
+                }
+            }
+            if flag_count != route_record_count {
+                return Err(FlpError::UnsupportedEdit(
+                    "the project Mixer routing stream does not pair with every send record",
+                ));
+            }
+        } else {
+            let source_route_count = sends
+                .iter()
+                .filter(|route| route.insert_ordinal() == source_ordinal)
+                .count();
+            let source_range = inserts[source_ordinal].event_range();
+            let source_flag_events = self.events[source_range.clone()]
+                .iter()
+                .enumerate()
+                .filter(|(_, event)| {
+                    event.opcode == 0xEB && matches!(event.encoding, PayloadEncoding::Data { .. })
+                })
+                .map(|(offset, event)| (source_range.start + offset, event.payload.len()))
+                .collect::<Vec<_>>();
+            let source_flag_count = source_flag_events
+                .iter()
+                .try_fold(0usize, |count, (_, length)| count.checked_add(*length))
+                .ok_or(FlpError::LengthOverflow)?;
+            if source_flag_events.len() > 1 || source_flag_count != source_route_count {
+                return Err(FlpError::UnsupportedEdit(
+                    "the source insert routing flags do not pair with every send record",
+                ));
+            }
+            route_flags_by_event = source_flag_events;
+        }
+
+        // FL Studio prevents a send from returning to its own source through another send.
+        let mut pending = vec![destination_ordinal];
+        let mut visited = HashSet::new();
+        while let Some(track) = pending.pop() {
+            if track == source_ordinal {
+                return Err(FlpError::UnsupportedEdit(
+                    "the requested Mixer send would create a routing feedback loop",
+                ));
+            }
+            if !visited.insert(track) {
+                continue;
+            }
+            pending.extend(
+                sends
+                    .iter()
+                    .filter(|route| {
+                        route.insert_ordinal() == track && route.enabled() == Some(true)
+                    })
+                    .filter_map(|route| route.route_parameter_id().checked_sub(64))
+                    .map(usize::from),
+            );
+        }
+
+        let source_target = u16::try_from(source_ordinal + 64)
+            .expect("the checked Mixer source index fits its target ID");
+        let mut route_record = Vec::with_capacity(12);
+        route_record.extend_from_slice(&[0; 4]);
+        route_record.push(route_parameter_id);
+        route_record.push(0);
+        route_record.extend_from_slice(&(source_target << 6).to_le_bytes());
+        route_record.extend_from_slice(&ROUTE_LEVEL_DEFAULT_RAW.to_le_bytes());
+
+        let mut candidate = self.clone();
+        if let Some(event_index) = candidate
+            .events
+            .iter()
+            .rposition(|event| event.opcode == 0xE1)
+        {
+            let event = &candidate.events[event_index];
+            if !matches!(event.encoding, PayloadEncoding::Data { .. }) {
+                return Err(FlpError::UnsupportedEdit(
+                    "the Mixer parameter event is not a length-prefixed data event",
+                ));
+            }
+            if !event.payload.len().is_multiple_of(12) {
+                return Err(FlpError::InvalidEvent {
+                    offset: event.file_offset,
+                    detail: "Mixer parameter payload is not a whole number of 12-byte records",
+                });
+            }
+            let mut payload = event.payload.clone();
+            payload
+                .len()
+                .checked_add(route_record.len())
+                .and_then(|length| u32::try_from(length).ok())
+                .ok_or(FlpError::LengthOverflow)?;
+            payload.extend_from_slice(&route_record);
+            candidate.events[event_index].replace_data_payload(payload)?;
+        } else {
+            let insertion_index = candidate
+                .events
+                .iter()
+                .position(|event| event.opcode == 0x40)
+                .unwrap_or(candidate.events.len());
+            candidate
+                .events
+                .insert(insertion_index, FlpEvent::new_data(0xE1, route_record)?);
+        }
+
+        if has_project_routing_stream {
+            let first_channel = candidate
+                .events
+                .iter()
+                .position(|event| event.opcode == 0x40)
+                .unwrap_or(candidate.events.len());
+            if let Some(event_index) = candidate.events[first_channel..]
+                .iter()
+                .rposition(|event| {
+                    event.opcode == 0xE7 && matches!(event.encoding, PayloadEncoding::Data { .. })
+                })
+                .map(|offset| first_channel + offset)
+            {
+                let mut payload = candidate.events[event_index].payload.clone();
+                payload
+                    .len()
+                    .checked_add(1)
+                    .and_then(|length| u32::try_from(length).ok())
+                    .ok_or(FlpError::LengthOverflow)?;
+                payload.push(1);
+                candidate.events[event_index].replace_data_payload(payload)?;
+            }
+        } else if let Some((event_index, _)) = route_flags_by_event.last().copied() {
+            let mut payload = candidate.events[event_index].payload.clone();
+            payload
+                .len()
+                .checked_add(1)
+                .and_then(|length| u32::try_from(length).ok())
+                .ok_or(FlpError::LengthOverflow)?;
+            payload.push(1);
+            candidate.events[event_index].replace_data_payload(payload)?;
+        } else {
+            let source_start = inserts[source_ordinal].event_range().start;
+            candidate
+                .events
+                .insert(source_start + 3, FlpEvent::new_data(0xEB, vec![1])?);
+        }
+
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(true)
+    }
+
     /// Edits fields with established playlist record offsets while preserving every other byte.
     /// `clip_index` is zero-based in the selected arrangement's stored clip order. Candidate
     /// source-window ticks can be edited for 88-byte Audio Clips.

@@ -15569,11 +15569,27 @@ impl DawUi {
     ) {
         let source = usize::from(source_index);
         let destination = usize::from(destination_index);
-        let parameter_id = destination
-            .checked_add(64)
-            .and_then(|id| u8::try_from(id).ok());
-        let route = self.document.as_ref().and_then(|document| {
-            let parameter_id = parameter_id?;
+        let result = self
+            .document
+            .as_mut()
+            .ok_or_else(|| "MIDI script Mixer routing edits require an open project".to_owned())
+            .and_then(|document| {
+                document
+                    .set_mixer_send_route_enabled(source, destination, enabled)
+                    .map_err(|error| error.to_string())
+            });
+        let changed = match result {
+            Ok(changed) => changed,
+            Err(error) => {
+                self.status = format!("MIDI script could not update Mixer route: {error}");
+                return;
+            }
+        };
+        if !changed {
+            return;
+        }
+        let route_level = self.document.as_ref().and_then(|document| {
+            let parameter_id = u8::try_from(destination + 64).ok()?;
             let mut matches = document
                 .mixer_send_summaries()
                 .ok()?
@@ -15582,28 +15598,13 @@ impl DawUi {
                     route.insert_ordinal() == source && route.route_parameter_id() == parameter_id
                 });
             let route = matches.next()?;
-            if matches.next().is_some() {
-                return None;
-            }
-            Some((route.routing_flag_location()?, route.enabled()?))
+            matches.next().is_none().then_some(route.value())
         });
-        let Some(((event_index, flag_index), old_enabled)) = route else {
-            self.status = format!(
-                "MIDI script cannot update missing or ambiguous Mixer route {source} to {destination}"
-            );
-            return;
-        };
-        if old_enabled == enabled {
-            return;
-        }
-        let Some(document) = self.document.as_mut() else {
-            self.status = "MIDI script Mixer routing edits require an open project".to_owned();
-            return;
-        };
-        if let Err(error) = document.set_mixer_routing_flag(event_index, flag_index, enabled) {
-            self.status = format!("MIDI script could not update Mixer route: {error}");
-            return;
-        }
+        self.mixer_track_peak_meters.set_live_mixer_send_level_raw(
+            source,
+            destination,
+            route_level,
+        );
         self.mixer_track_peak_meters.set_live_mixer_send_enabled(
             source,
             destination,
@@ -15613,7 +15614,7 @@ impl DawUi {
         self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
         self.status = format!(
             "MIDI script set Mixer route {source} to {destination} {}",
-            if enabled { "enabled" } else { "disabled" }
+            if enabled { "enabled" } else { "disabled" },
         );
     }
 
