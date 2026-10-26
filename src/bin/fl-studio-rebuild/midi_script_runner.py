@@ -173,6 +173,46 @@ def _mixer_set_track_color(index, color):
     )
 
 
+def _mixer_track_enabled(index):
+    index = _mixer_track_index(index)
+    states = _active_transport_state.get("mixer_track_enabled", [])
+    if index < len(states) and states[index] is not None:
+        return bool(states[index])
+    return True
+
+
+def _mixer_set_track_enabled(index, enabled):
+    index = _mixer_track_index(index)
+    _request_transport_action(
+        {
+            "action": "set_mixer_track_enabled",
+            "index": index,
+            "enabled": bool(enabled),
+        }
+    )
+
+
+def _mixer_enable_track(index):
+    index = _mixer_track_index(index)
+    _mixer_set_track_enabled(index, not _mixer_track_enabled(index))
+
+
+def _mixer_is_track_muted(index):
+    return not _mixer_track_enabled(index)
+
+
+def _mixer_mute_track(index, value=-1):
+    index = _mixer_track_index(index)
+    try:
+        value = int(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("Mixer mute value must be -1, 0, or 1") from error
+    if value not in (-1, 0, 1):
+        raise ValueError("Mixer mute value must be -1, 0, or 1")
+    muted = not _mixer_track_enabled(index) if value == -1 else value == 1
+    _mixer_set_track_enabled(index, not muted)
+
+
 def _color_to_rgb(color):
     try:
         color = int(color)
@@ -912,6 +952,10 @@ def _install_modules(script_name, device_name):
     mixer.setTrackName = _mixer_set_track_name
     mixer.getTrackColor = _mixer_get_track_color
     mixer.setTrackColor = _mixer_set_track_color
+    mixer.isTrackEnabled = _mixer_track_enabled
+    mixer.enableTrack = _mixer_enable_track
+    mixer.isTrackMuted = _mixer_is_track_muted
+    mixer.muteTrack = _mixer_mute_track
     mixer.getSongStepPos = _get_song_step_pos
     mixer.getSongTickPos = _get_song_tick_pos
 

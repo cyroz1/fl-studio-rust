@@ -671,6 +671,7 @@ fn midi_input_thru_message(event: MidiInputEvent) -> Option<([u8; 3], usize)> {
             | MidiTransportCommand::SetArrangementLiveSelection { .. }
             | MidiTransportCommand::SetMixerTrackName { .. }
             | MidiTransportCommand::SetMixerTrackColor { .. }
+            | MidiTransportCommand::SetMixerTrackEnabled { .. }
             | MidiTransportCommand::JumpToMarker { .. }
             | MidiTransportCommand::SelectNextEmptyPatternWithNameDialog
             | MidiTransportCommand::FocusSelectedMixerTrackName

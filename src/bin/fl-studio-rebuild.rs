@@ -14421,6 +14421,28 @@ impl DawUi {
         if let Ok(mut colors) = self.midi_script_transport_state.mixer_track_colors.lock() {
             *colors = mixer_track_colors;
         }
+        let mixer_track_enabled = self
+            .document
+            .as_ref()
+            .map(|document| {
+                let inserts = document.mixer_inserts();
+                let max_ordinal = inserts
+                    .iter()
+                    .map(|insert| insert.ordinal())
+                    .max()
+                    .unwrap_or(0);
+                let mut enabled = vec![None; max_ordinal.saturating_add(1)];
+                for insert in inserts {
+                    if let Some(track_enabled) = enabled.get_mut(insert.ordinal()) {
+                        *track_enabled = insert.enabled();
+                    }
+                }
+                enabled
+            })
+            .unwrap_or_else(|| vec![None]);
+        if let Ok(mut enabled) = self.midi_script_transport_state.mixer_track_enabled.lock() {
+            *enabled = mixer_track_enabled;
+        }
         let arrangement_marker_names = self
             .document
             .as_ref()
@@ -49743,6 +49765,16 @@ impl DawUi {
             }
             MidiTransportCommand::SetMixerTrackColor { index, color } => {
                 self.set_midi_script_mixer_track_color(index, color);
+            }
+            MidiTransportCommand::SetMixerTrackEnabled { index, enabled } => {
+                if let Err(error) = self.apply_midi_mixer_toggle_state(
+                    usize::from(index),
+                    MidiMixerControlTarget::Mute,
+                    enabled,
+                    history_snapshot_available,
+                ) {
+                    self.status = format!("MIDI script could not update Mixer track mute: {error}");
+                }
             }
             MidiTransportCommand::JumpToMarker { delta, select } => {
                 self.jump_midi_script_marker_with_selection(delta, select);
