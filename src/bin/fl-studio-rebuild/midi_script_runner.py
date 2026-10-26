@@ -968,6 +968,7 @@ def _add_auto_time_marker(time, name):
             "action": "add_arrangement_time_marker",
             "time_ticks": time_ticks,
             "name": name,
+            "stop_playback": True,
         }
     )
 
@@ -1234,6 +1235,21 @@ def _global_transport(command, value, pmeflags=2, flags=15):
         return 8
     if command in (35, 36):
         _jog_marker("marker_jump_jog" if command == 35 else "marker_sel_jog", value)
+        return 8
+    if command == 33:  # FPT_AddMarker: add an unnamed marker at the song position
+        if value != 0:
+            tick = min(
+                0x07FFFFFF,
+                max(0, int(_active_transport_state.get("song_position_ticks", 0))),
+            )
+            _request_transport_action(
+                {
+                    "action": "add_arrangement_time_marker",
+                    "time_ticks": tick,
+                    "name": "",
+                    "stop_playback": False,
+                }
+            )
         return 8
     if command == 101:  # FPT_TrackJog: select a Mixer track
         track_names = _active_transport_state.get("mixer_track_names", ["Master"])

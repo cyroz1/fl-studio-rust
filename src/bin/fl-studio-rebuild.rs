@@ -16084,7 +16084,12 @@ impl DawUi {
         }
     }
 
-    fn add_midi_script_arrangement_time_marker(&mut self, tick: u32, name: String) {
+    fn add_midi_script_arrangement_time_marker(
+        &mut self,
+        tick: u32,
+        name: String,
+        stop_playback: bool,
+    ) {
         let arrangements = self
             .document
             .as_ref()
@@ -16118,7 +16123,9 @@ impl DawUi {
             });
         match result {
             Ok(marker_index) => {
-                self.stop_project_playback();
+                if stop_playback {
+                    self.stop_project_playback();
+                }
                 self.selected_arrangement = Some(arrangement_id);
                 self.selected_time_marker = Some(marker_index);
                 self.dirty = true;
@@ -50669,8 +50676,12 @@ impl DawUi {
             MidiTransportCommand::SetProjectTimeSignatureDenominator(denominator) => {
                 self.set_midi_script_project_time_signature(None, Some(denominator));
             }
-            MidiTransportCommand::AddArrangementTimeMarker { tick, name } => {
-                self.add_midi_script_arrangement_time_marker(tick, name);
+            MidiTransportCommand::AddArrangementTimeMarker {
+                tick,
+                name,
+                stop_playback,
+            } => {
+                self.add_midi_script_arrangement_time_marker(tick, name, stop_playback);
             }
             MidiTransportCommand::SetArrangementLiveSelection { tick, stop } => {
                 let selection_point = if stop {

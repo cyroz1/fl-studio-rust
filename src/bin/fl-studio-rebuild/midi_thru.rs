@@ -842,6 +842,7 @@ mod tests {
             MidiTransportCommand::AddArrangementTimeMarker {
                 tick: 960,
                 name: "Verse".to_owned(),
+                stop_playback: true,
             },
             MidiTransportCommand::JumpToMarker {
                 delta: -1,

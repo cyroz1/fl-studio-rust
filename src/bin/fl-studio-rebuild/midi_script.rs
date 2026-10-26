@@ -55,6 +55,7 @@ pub enum ScriptTransportAction {
     AddArrangementTimeMarker {
         tick: u32,
         name: String,
+        stop_playback: bool,
     },
     SetArrangementLiveSelection {
         tick: u32,
@@ -1133,9 +1134,14 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
             .ok_or_else(|| {
                 "MIDI script returned an invalid Playlist time-marker name".to_owned()
             })?;
+        let stop_playback = action
+            .get("stop_playback")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
         return Ok(ScriptTransportAction::AddArrangementTimeMarker {
             tick,
             name: marker_name.to_owned(),
+            stop_playback,
         });
     }
     if name == Some("set_arrangement_live_selection") {
@@ -2750,6 +2756,7 @@ mod tests {
             [ScriptTransportAction::AddArrangementTimeMarker {
                 tick: 960,
                 name: "Verse".to_owned(),
+                stop_playback: true,
             }]
         );
     }

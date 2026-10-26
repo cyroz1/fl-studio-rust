@@ -688,9 +688,15 @@ fn queue_script_transport_actions(
             ScriptTransportAction::SetProjectTimeSignatureDenominator(denominator) => {
                 MidiTransportCommand::SetProjectTimeSignatureDenominator(denominator)
             }
-            ScriptTransportAction::AddArrangementTimeMarker { tick, name } => {
-                MidiTransportCommand::AddArrangementTimeMarker { tick, name }
-            }
+            ScriptTransportAction::AddArrangementTimeMarker {
+                tick,
+                name,
+                stop_playback,
+            } => MidiTransportCommand::AddArrangementTimeMarker {
+                tick,
+                name,
+                stop_playback,
+            },
             ScriptTransportAction::SetArrangementLiveSelection { tick, stop } => {
                 MidiTransportCommand::SetArrangementLiveSelection { tick, stop }
             }
@@ -824,6 +830,7 @@ pub enum MidiTransportCommand {
     AddArrangementTimeMarker {
         tick: u32,
         name: String,
+        stop_playback: bool,
     },
     SetArrangementLiveSelection {
         tick: u32,
@@ -2367,6 +2374,7 @@ mod tests {
                 ScriptTransportAction::AddArrangementTimeMarker {
                     tick: 960,
                     name: "Verse".to_owned(),
+                    stop_playback: true,
                 },
                 ScriptTransportAction::JumpToMarker {
                     delta: -2,
@@ -2404,6 +2412,7 @@ mod tests {
             MidiInputEvent::Transport(MidiTransportCommand::AddArrangementTimeMarker {
                 tick: 960,
                 name: "Verse".to_owned(),
+                stop_playback: true,
             })
         );
         assert_eq!(
