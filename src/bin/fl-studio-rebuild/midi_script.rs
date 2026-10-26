@@ -72,6 +72,11 @@ pub enum ScriptTransportAction {
         index: u16,
         color: u32,
     },
+    SetMixerSlotColor {
+        index: u16,
+        slot: u8,
+        color: u32,
+    },
     SetMixerTrackEnabled {
         index: u16,
         enabled: bool,
@@ -213,6 +218,7 @@ pub struct MidiScriptTransportState {
     pub mixer_track_recording_file_names: Mutex<Vec<String>>,
     pub mixer_selected_track: AtomicU64,
     pub mixer_track_colors: Mutex<Vec<u32>>,
+    pub mixer_track_slot_colors: Mutex<Vec<Vec<Option<u32>>>>,
     pub mixer_track_peaks: Mutex<Vec<(f32, f32)>>,
     pub mixer_send_routes: Mutex<Vec<MixerSendRouteSnapshot>>,
     pub mixer_track_enabled: Mutex<Vec<Option<bool>>>,
@@ -261,6 +267,7 @@ impl Default for MidiScriptTransportState {
             mixer_track_recording_file_names: Mutex::new(vec![String::new()]),
             mixer_selected_track: AtomicU64::new(0),
             mixer_track_colors: Mutex::new(vec![0]),
+            mixer_track_slot_colors: Mutex::new(vec![vec![None; 10]]),
             mixer_track_peaks: Mutex::new(vec![(0.0, 0.0)]),
             mixer_send_routes: Mutex::new(Vec::new()),
             mixer_track_enabled: Mutex::new(vec![None]),
@@ -720,6 +727,12 @@ impl MidiScriptRuntime {
             .lock()
             .map(|colors| colors.clone())
             .unwrap_or_else(|_| vec![0]);
+        let mixer_track_slot_colors = self
+            .transport_state
+            .mixer_track_slot_colors
+            .lock()
+            .map(|colors| colors.clone())
+            .unwrap_or_else(|_| vec![vec![None; 10]]);
         let mixer_track_peaks = self
             .transport_state
             .mixer_track_peaks
@@ -938,6 +951,10 @@ impl MidiScriptRuntime {
             if let Some(transport_object) = transport.as_object_mut() {
                 transport_object.insert("mixer_track_peaks".to_owned(), json!(mixer_track_peaks));
                 transport_object.insert(
+                    "mixer_track_slot_colors".to_owned(),
+                    json!(mixer_track_slot_colors),
+                );
+                transport_object.insert(
                     "mixer_track_mute_locked".to_owned(),
                     json!(mixer_track_mute_locked),
                 );
@@ -1153,6 +1170,22 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
             .and_then(|color| u32::try_from(color).ok())
             .ok_or_else(|| "MIDI script returned an invalid Mixer track color".to_owned())?;
         return Ok(ScriptTransportAction::SetMixerTrackColor { index, color });
+    }
+    if name == Some("set_mixer_slot_color") {
+        let index = action["index"]
+            .as_u64()
+            .and_then(|index| u16::try_from(index).ok())
+            .ok_or_else(|| "MIDI script returned an invalid Mixer track index".to_owned())?;
+        let slot = action["slot"]
+            .as_u64()
+            .and_then(|slot| u8::try_from(slot).ok())
+            .filter(|slot| *slot < 10)
+            .ok_or_else(|| "MIDI script returned an invalid Mixer effect slot".to_owned())?;
+        let color = action["color"]
+            .as_u64()
+            .and_then(|color| u32::try_from(color).ok())
+            .ok_or_else(|| "MIDI script returned an invalid Mixer effect-slot color".to_owned())?;
+        return Ok(ScriptTransportAction::SetMixerSlotColor { index, slot, color });
     }
     if name == Some("set_mixer_track_enabled") {
         let index = action["index"]

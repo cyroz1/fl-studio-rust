@@ -3684,6 +3684,9 @@ pub struct MixerEffectSlotSummary {
     slot_index: u16,
     plugin_identifier: Option<String>,
     display_name: Option<String>,
+    color_raw: Option<u32>,
+    color_event_index: Option<usize>,
+    color_event_count: usize,
     state_event_count: usize,
     state_payload: Option<Vec<u8>>,
     vst_metadata: Option<VstPluginStateMetadata>,
@@ -3728,6 +3731,11 @@ impl MixerEffectSlotSummary {
     /// User-facing plug-in name from the slot's unique `0xCB` event, when recognized.
     pub fn display_name(&self) -> Option<&str> {
         self.display_name.as_deref()
+    }
+
+    /// Saved raw slot color from one valid `0x80` dword event, when present.
+    pub fn color_raw(&self) -> Option<u32> {
+        self.color_raw
     }
 
     /// Number of opaque `0xD5` state events in this slot.
@@ -9257,6 +9265,27 @@ impl FlpDocument {
                     0xCB,
                     self.project_version.as_deref(),
                 );
+                let color_events = slot_events
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, event)| event.opcode == 0x80)
+                    .collect::<Vec<_>>();
+                let color_event_count = color_events.len();
+                let color_event_index = color_events
+                    .first()
+                    .filter(|(_, event)| {
+                        color_event_count == 1
+                            && event.encoding == PayloadEncoding::Dword
+                            && event.payload.len() == 4
+                    })
+                    .map(|(offset, _)| start + offset);
+                let color_raw = color_event_index.map(|event_index| {
+                    u32::from_le_bytes(
+                        self.events[event_index].payload[..4]
+                            .try_into()
+                            .expect("a Mixer slot color dword has four bytes"),
+                    )
+                });
                 let state_events = slot_events
                     .iter()
                     .filter(|event| event.opcode == 0xD5)
@@ -9285,6 +9314,9 @@ impl FlpDocument {
                     slot_index,
                     plugin_identifier,
                     display_name,
+                    color_raw,
+                    color_event_index,
+                    color_event_count,
                     state_event_count,
                     state_payload,
                     vst_metadata,
@@ -9341,6 +9373,58 @@ impl FlpDocument {
             }
         }
         slots
+    }
+
+    /// Sets an effect-slot's RGB color while preserving the saved high byte.
+    /// A missing `0x80` color event is inserted inside the recognized slot boundary;
+    /// duplicate or malformed color events are rejected.
+    pub fn set_mixer_effect_slot_color(
+        &mut self,
+        insert_ordinal: usize,
+        slot_index: u16,
+        color: u32,
+    ) -> Result<(), FlpError> {
+        let slot = self.unique_mixer_effect_slot(insert_ordinal, slot_index)?;
+        match slot.color_event_count {
+            0 => {
+                if slot.end_event_index > self.events.len() {
+                    return Err(FlpError::UnsupportedEdit(
+                        "the requested Mixer effect slot boundary is invalid",
+                    ));
+                }
+                let mut candidate = self.clone();
+                candidate.events.insert(
+                    slot.end_event_index,
+                    FlpEvent::new_dword(0x80, color & 0x00FF_FFFF),
+                );
+                candidate.refresh_event_offsets()?;
+                *self = candidate;
+            }
+            1 => {
+                let event_index = slot.color_event_index.ok_or(FlpError::UnsupportedEdit(
+                    "the requested Mixer effect slot color has an unsupported layout",
+                ))?;
+                let event = self
+                    .events
+                    .get(event_index)
+                    .ok_or(FlpError::UnsupportedEdit(
+                        "the requested Mixer effect slot color event does not exist",
+                    ))?;
+                let saved_color = u32::from_le_bytes(
+                    event.payload[..4]
+                        .try_into()
+                        .expect("the slot color layout has four bytes"),
+                );
+                let updated_color = (saved_color & 0xFF00_0000) | (color & 0x00FF_FFFF);
+                self.events[event_index].replace_dword_payload(updated_color)?;
+            }
+            _ => {
+                return Err(FlpError::UnsupportedEdit(
+                    "the requested Mixer effect slot has duplicate color events",
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Sets an effect-slot enabled parameter only when the candidate Mixer target and slot
@@ -28194,6 +28278,67 @@ mod tests {
         let incomplete_document =
             FlpDocument::parse(&flp_fixture(&incomplete, &[], &[])).expect("fixture parses");
         assert!(incomplete_document.mixer_effect_slots().is_empty());
+    }
+
+    #[test]
+    fn mixer_effect_slot_colors_read_edit_and_insert_losslessly() {
+        let mut event_stream = vec![0x9A];
+        event_stream.extend_from_slice(&(-1_i32).to_le_bytes());
+        event_stream.push(0x93);
+        event_stream.extend_from_slice(&(-1_i32).to_le_bytes());
+        event_stream.push(0x95);
+        event_stream.extend_from_slice(&0_u32.to_le_bytes());
+        event_stream.push(0x62);
+        event_stream.extend_from_slice(&0_u16.to_le_bytes());
+        event_stream.push(0x80);
+        event_stream.extend_from_slice(&0xAA12_3456_u32.to_le_bytes());
+        for slot_index in 1_u16..10 {
+            event_stream.push(0x62);
+            event_stream.extend_from_slice(&slot_index.to_le_bytes());
+        }
+        event_stream.push(0x93);
+        event_stream.extend_from_slice(&(-1_i32).to_le_bytes());
+
+        let original = flp_fixture(&event_stream, &[], &[]);
+        let mut document = FlpDocument::parse(&original).expect("the fixture should parse");
+        let slots = document.mixer_effect_slots();
+        assert_eq!(slots.len(), 10);
+        assert_eq!(slots[0].color_raw(), Some(0xAA12_3456));
+        assert_eq!(slots[1].color_raw(), None);
+
+        document
+            .set_mixer_effect_slot_color(0, 0, 0x0011_2233)
+            .expect("an existing slot color should be editable");
+        document
+            .set_mixer_effect_slot_color(0, 1, 0x0044_5566)
+            .expect("a missing slot color should be inserted");
+
+        let slots = document.mixer_effect_slots();
+        assert_eq!(slots[0].color_raw(), Some(0xAA11_2233));
+        assert_eq!(slots[1].color_raw(), Some(0x0044_5566));
+        let encoded = document
+            .encode_lossless()
+            .expect("edited slot colors should encode");
+        let reparsed = FlpDocument::parse(&encoded).expect("edited project should parse");
+        let slots = reparsed.mixer_effect_slots();
+        assert_eq!(slots[0].color_raw(), Some(0xAA11_2233));
+        assert_eq!(slots[1].color_raw(), Some(0x0044_5566));
+
+        let mut duplicate_stream = event_stream;
+        duplicate_stream.insert(23, 0x80);
+        duplicate_stream.splice(24..24, 0xBB66_7788_u32.to_le_bytes());
+        let original_duplicate = flp_fixture(&duplicate_stream, &[], &[]);
+        let mut duplicate =
+            FlpDocument::parse(&original_duplicate).expect("duplicate fixture should parse");
+        assert!(
+            duplicate
+                .set_mixer_effect_slot_color(0, 0, 0x0011_2233)
+                .is_err()
+        );
+        assert_eq!(
+            duplicate.encode_lossless().expect("project should encode"),
+            original_duplicate
+        );
     }
 
     #[test]

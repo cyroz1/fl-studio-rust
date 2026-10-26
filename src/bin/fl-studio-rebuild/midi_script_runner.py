@@ -187,6 +187,27 @@ def _mixer_get_track_color(index):
     return 0
 
 
+def _mixer_slot_index(slot):
+    try:
+        slot = int(slot)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("Mixer effect-slot index must be an integer") from error
+    if not 0 <= slot < 10:
+        raise IndexError("Mixer effect-slot index is outside the supported range")
+    return slot
+
+
+def _mixer_get_slot_color(index, slot):
+    index = _mixer_track_index(index)
+    slot = _mixer_slot_index(slot)
+    track_colors = _active_transport_state.get("mixer_track_slot_colors", [])
+    if index < len(track_colors) and slot < len(track_colors[index]):
+        color = track_colors[index][slot]
+        if color is not None:
+            return int(color) & 0x00FFFFFF
+    return 0
+
+
 def _mixer_track_count():
     track_names = _active_transport_state.get("mixer_track_names", [])
     return max(2, len(track_names) + 1)
@@ -395,6 +416,20 @@ def _mixer_set_track_color(index, color):
         raise ValueError("Mixer track color is outside the supported range")
     _request_transport_action(
         {"action": "set_mixer_track_color", "index": index, "color": color}
+    )
+
+
+def _mixer_set_slot_color(index, slot, color):
+    index = _mixer_track_index(index)
+    slot = _mixer_slot_index(slot)
+    try:
+        color = int(color)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("Mixer effect-slot color must be an integer") from error
+    if not 0 <= color <= 0xFFFFFFFF:
+        raise ValueError("Mixer effect-slot color is outside the supported range")
+    _request_transport_action(
+        {"action": "set_mixer_slot_color", "index": index, "slot": slot, "color": color}
     )
 
 
@@ -1386,6 +1421,7 @@ def _install_modules(script_name, device_name):
     mixer.getTrackName = _mixer_get_track_name
     mixer.setTrackName = _mixer_set_track_name
     mixer.getTrackColor = _mixer_get_track_color
+    mixer.getSlotColor = _mixer_get_slot_color
     mixer.getTrackRecordingFileName = _mixer_get_track_recording_file_name
     mixer.getTrackDockSide = _mixer_get_track_dock_side
     mixer.getTrackPeaks = _mixer_get_track_peaks
@@ -1393,6 +1429,7 @@ def _install_modules(script_name, device_name):
     mixer.trackCount = _mixer_track_count
     mixer.getTrackCount = _mixer_get_track_count
     mixer.setTrackColor = _mixer_set_track_color
+    mixer.setSlotColor = _mixer_set_slot_color
     mixer.getTrackInfo = _mixer_get_track_info
     mixer.getRouteSendActive = _mixer_get_route_send_active
     mixer.getRouteToLevel = _mixer_get_route_level

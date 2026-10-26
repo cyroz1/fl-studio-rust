@@ -703,6 +703,9 @@ fn queue_script_transport_actions(
             ScriptTransportAction::SetMixerTrackColor { index, color } => {
                 MidiTransportCommand::SetMixerTrackColor { index, color }
             }
+            ScriptTransportAction::SetMixerSlotColor { index, slot, color } => {
+                MidiTransportCommand::SetMixerSlotColor { index, slot, color }
+            }
             ScriptTransportAction::SetMixerTrackEnabled { index, enabled } => {
                 MidiTransportCommand::SetMixerTrackEnabled { index, enabled }
             }
@@ -835,6 +838,11 @@ pub enum MidiTransportCommand {
     },
     SetMixerTrackColor {
         index: u16,
+        color: u32,
+    },
+    SetMixerSlotColor {
+        index: u16,
+        slot: u8,
         color: u32,
     },
     SetMixerTrackEnabled {
@@ -1512,6 +1520,9 @@ pub fn describe_event(event: MidiInputEvent) -> String {
             }
             MidiTransportCommand::SetMixerTrackColor { .. } => {
                 "MIDI script Recolor Mixer Track".to_owned()
+            }
+            MidiTransportCommand::SetMixerSlotColor { .. } => {
+                "MIDI script Recolor Mixer Effect Slot".to_owned()
             }
             MidiTransportCommand::SetMixerTrackEnabled { .. } => {
                 "MIDI script Set Mixer Track Mute".to_owned()
