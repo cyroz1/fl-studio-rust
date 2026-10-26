@@ -4694,6 +4694,7 @@ struct DawUi {
     quantize_mode: QuantizeNoteMode,
     quantize_score: Option<FscScore>,
     quantize_score_path: Option<PathBuf>,
+    quantize_score_grid_cache: Option<(u16, u64, Vec<u64>)>,
     chop_divisions: u8,
     strum_spread_ticks: u32,
     strum_descending: bool,
@@ -6281,6 +6282,7 @@ impl DawUi {
             quantize_mode: QuantizeNoteMode::LeaveDuration,
             quantize_score: None,
             quantize_score_path: None,
+            quantize_score_grid_cache: None,
             chop_divisions: 4,
             strum_spread_ticks: 120,
             strum_descending: false,
@@ -34145,6 +34147,7 @@ impl DawUi {
                     if ui.small_button("Clear groove").clicked() {
                         self.quantize_score = None;
                         self.quantize_score_path = None;
+                        self.quantize_score_grid_cache = None;
                     }
                 }
                 ui.add(egui::Slider::new(&mut self.chop_divisions, 2..=16).text("Chop divisions"));
@@ -34735,6 +34738,7 @@ impl DawUi {
                 Ok(score) => {
                     self.quantize_score = Some(score);
                     self.quantize_score_path = Some(path.clone());
+                    self.quantize_score_grid_cache = None;
                     self.status = format!("Loaded Quantizer groove score {}", path.display());
                 }
                 Err(error) => {
@@ -40914,6 +40918,44 @@ impl DawUi {
                     BLUE,
                 );
                 segment_start = position;
+            }
+            let rebuild_groove_grid = self.quantize_score.is_some()
+                && self
+                    .quantize_score_grid_cache
+                    .as_ref()
+                    .is_none_or(|(cached_ppq, _, _)| *cached_ppq != ppq);
+            if rebuild_groove_grid {
+                self.quantize_score_grid_cache = Some(
+                    self.quantize_score
+                        .as_ref()
+                        .and_then(|score| score.quantizer_groove_grid(ppq).ok())
+                        .map_or((ppq, 0, Vec::new()), |(period_ticks, ticks)| {
+                            (ppq, period_ticks, ticks)
+                        }),
+                );
+            }
+            if let Some((_, period_ticks, ticks)) = &self.quantize_score_grid_cache {
+                let max_tick_u64 = u64::from(max_tick);
+                for anchor_tick in ticks {
+                    let mut tick = *anchor_tick;
+                    while tick <= max_tick_u64 {
+                        let x = rect.left() + keyboard_width + tick as f32 * tick_scale;
+                        painter.line_segment(
+                            [
+                                egui::pos2(x, grid_rect.top()),
+                                egui::pos2(x, grid_rect.bottom()),
+                            ],
+                            Stroke::new(1.0, RED),
+                        );
+                        let Some(next_tick) = tick.checked_add(*period_ticks) else {
+                            break;
+                        };
+                        if next_tick <= tick {
+                            break;
+                        }
+                        tick = next_tick;
+                    }
+                }
             }
             for key in key_low..=key_high {
                 let row = key_high - key;

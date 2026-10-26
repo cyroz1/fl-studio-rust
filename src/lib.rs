@@ -2161,6 +2161,20 @@ impl FscScore {
     pub fn ppq(&self) -> u16 {
         self.ppq
     }
+
+    /// Returns the repeating quantizer-groove period and sorted start/end grid points in project ticks.
+    pub fn quantizer_groove_grid(&self, project_ppq: u16) -> Result<(u64, Vec<u64>), FlpError> {
+        let groove = QuantizeGroove::from_score(self, project_ppq)?;
+        let ticks = groove
+            .starts
+            .iter()
+            .chain(&groove.ends)
+            .map(|anchor| anchor.tick)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        Ok((groove.period_ticks, ticks))
+    }
 }
 
 /// Source and destination stream selection for importing Event Editor score data.
