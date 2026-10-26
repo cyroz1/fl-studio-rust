@@ -1715,10 +1715,32 @@ fn scale_score_tick(
     Ok(if tick > 0 { scaled.max(1) } else { scaled })
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct QuantizeGrooveLevels {
+    velocity: u8,
+    pan: u8,
+    release: u8,
+    mod_x: u8,
+    mod_y: u8,
+}
+
+impl From<&PatternNote> for QuantizeGrooveLevels {
+    fn from(note: &PatternNote) -> Self {
+        Self {
+            velocity: note.velocity,
+            pan: note.pan,
+            release: note.release,
+            mod_x: note.mod_x,
+            mod_y: note.mod_y,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct QuantizeGrooveAnchor {
     tick: u64,
     delete_note: bool,
+    levels: QuantizeGrooveLevels,
 }
 
 #[derive(Clone, Debug)]
@@ -1736,8 +1758,24 @@ impl QuantizeGroove {
             ));
         }
 
-        let mut scaled = Vec::with_capacity(score.notes().len());
         let mut period_ticks = 0_u64;
+        for note in score.notes() {
+            let end = scale_score_tick(
+                u64::from(note.position).saturating_add(u64::from(note.length)),
+                score.ppq(),
+                project_ppq,
+                ArpeggioScoreTimeMultiplier::Normal,
+            )?;
+            period_ticks = period_ticks.max(end);
+        }
+        if period_ticks == 0 {
+            return Err(FlpError::UnsupportedEdit(
+                "the quantize groove score must have a note with a positive end time",
+            ));
+        }
+
+        let mut starts = BTreeMap::<u64, QuantizeGrooveAnchor>::new();
+        let mut ends = BTreeMap::<u64, QuantizeGrooveAnchor>::new();
         for note in score.notes() {
             let start = scale_score_tick(
                 u64::from(note.position),
@@ -1751,40 +1789,30 @@ impl QuantizeGroove {
                 project_ppq,
                 ArpeggioScoreTimeMultiplier::Normal,
             )?;
-            period_ticks = period_ticks.max(end);
-            scaled.push((start, end, note.velocity == 0));
-        }
-        if period_ticks == 0 {
-            return Err(FlpError::UnsupportedEdit(
-                "the quantize groove score must have a note with a positive end time",
-            ));
-        }
-
-        let mut starts = BTreeMap::<u64, bool>::new();
-        let mut ends = BTreeMap::<u64, bool>::new();
-        for (start, end, delete_note) in scaled {
+            let delete_note = note.velocity == 0;
+            let levels = QuantizeGrooveLevels::from(note);
             let start = start % period_ticks;
             let end = end % period_ticks;
+            let start_anchor = QuantizeGrooveAnchor {
+                tick: start,
+                delete_note,
+                levels,
+            };
             starts
                 .entry(start)
-                .and_modify(|existing| *existing |= delete_note)
-                .or_insert(delete_note);
-            ends.entry(end).or_insert(false);
+                .and_modify(|existing| existing.delete_note |= delete_note)
+                .or_insert(start_anchor);
+            ends.entry(end).or_insert(QuantizeGrooveAnchor {
+                tick: end,
+                delete_note: false,
+                levels,
+            });
         }
 
         Ok(Self {
             period_ticks,
-            starts: starts
-                .into_iter()
-                .map(|(tick, delete_note)| QuantizeGrooveAnchor { tick, delete_note })
-                .collect(),
-            ends: ends
-                .into_keys()
-                .map(|tick| QuantizeGrooveAnchor {
-                    tick,
-                    delete_note: false,
-                })
-                .collect(),
+            starts: starts.into_values().collect(),
+            ends: ends.into_values().collect(),
         })
     }
 
@@ -1793,7 +1821,7 @@ impl QuantizeGroove {
         tick: u64,
         anchors: &[QuantizeGrooveAnchor],
         sensitivity: f64,
-    ) -> (u64, bool) {
+    ) -> (u64, bool, Option<QuantizeGrooveLevels>) {
         let cycle = tick / self.period_ticks;
         let local_tick = tick % self.period_ticks;
         let insertion_index = anchors.partition_point(|anchor| anchor.tick <= local_tick);
@@ -1825,7 +1853,7 @@ impl QuantizeGroove {
             nearest = Some((next_distance, next_candidate, next_index));
         }
         let Some((distance, candidate, index)) = nearest else {
-            return (tick, false);
+            return (tick, false, None);
         };
 
         let anchor = anchors[index];
@@ -1843,11 +1871,17 @@ impl QuantizeGroove {
         };
         let sensitivity_limit = previous_gap.min(next_gap) as f64 * 0.5 * sensitivity;
         if distance as f64 > sensitivity_limit {
-            (tick, false)
+            (tick, false, None)
         } else {
-            (candidate, anchor.delete_note)
+            (candidate, anchor.delete_note, Some(anchor.levels))
         }
     }
+}
+
+fn mix_note_level(original: u8, template: u8, strength: f64) -> u8 {
+    (f64::from(original) + (f64::from(template) - f64::from(original)) * strength)
+        .round()
+        .clamp(0.0, f64::from(u8::MAX)) as u8
 }
 
 fn mix_arpeggio_score_level(original: u8, pattern: u8, levels_percent: u8) -> u8 {
@@ -2391,6 +2425,28 @@ pub enum QuantizeNoteMode {
     QuantizeEnd,
 }
 
+/// Per-note groove levels mixed from an `.fsc` template; each value is a 0–1 amount.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct QuantizeNoteLevels {
+    pub velocity: f64,
+    pub pan: f64,
+    pub release: f64,
+    pub mod_x: f64,
+    pub mod_y: f64,
+}
+
+impl Default for QuantizeNoteLevels {
+    fn default() -> Self {
+        Self {
+            velocity: 0.0,
+            pan: 0.0,
+            release: 0.0,
+            mod_x: 0.0,
+            mod_y: 0.0,
+        }
+    }
+}
+
 /// Settings for Piano roll quantization of note starts and durations.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct QuantizeNoteOptions {
@@ -2401,6 +2457,8 @@ pub struct QuantizeNoteOptions {
     pub duration_strength: f64,
     pub swing: f64,
     pub mode: QuantizeNoteMode,
+    /// Per-property mixing strengths used when a score groove is supplied.
+    pub levels: QuantizeNoteLevels,
 }
 
 impl Default for QuantizeNoteOptions {
@@ -2412,6 +2470,7 @@ impl Default for QuantizeNoteOptions {
             duration_strength: 0.0,
             swing: 0.0,
             mode: QuantizeNoteMode::LeaveDuration,
+            levels: QuantizeNoteLevels::default(),
         }
     }
 }
@@ -13007,6 +13066,25 @@ impl FlpDocument {
                 "quantize swing must be between 0 and 1",
             ));
         }
+        if groove_score.is_some() {
+            for (name, strength) in [
+                ("velocity", options.levels.velocity),
+                ("pan", options.levels.pan),
+                ("release", options.levels.release),
+                ("Mod X", options.levels.mod_x),
+                ("Mod Y", options.levels.mod_y),
+            ] {
+                if !strength.is_finite() || !(0.0..=1.0).contains(&strength) {
+                    return Err(FlpError::UnsupportedEdit(match name {
+                        "velocity" => "quantize velocity level must be between 0 and 1",
+                        "pan" => "quantize pan level must be between 0 and 1",
+                        "release" => "quantize release level must be between 0 and 1",
+                        "Mod X" => "quantize Mod X level must be between 0 and 1",
+                        _ => "quantize Mod Y level must be between 0 and 1",
+                    }));
+                }
+            }
+        }
         let groove = groove_score
             .map(|score| QuantizeGroove::from_score(score, self.header.ppq))
             .transpose()?;
@@ -13045,14 +13123,14 @@ impl FlpDocument {
                     let straight_target = grid_index.saturating_mul(grid);
                     let sensitivity_limit = grid as f64 * 0.5 * options.sensitivity;
                     if tick.abs_diff(straight_target) as f64 > sensitivity_limit {
-                        return (tick, false);
+                        return (tick, false, None);
                     }
                     let swing_offset = if grid_index % 2 == 1 {
                         (grid as f64 * 0.5 * options.swing).round() as u64
                     } else {
                         0
                     };
-                    (straight_target.saturating_add(swing_offset), false)
+                    (straight_target.saturating_add(swing_offset), false, None)
                 }
             };
             let mix = |original: u64, target: u64, strength: f64| {
@@ -13061,13 +13139,13 @@ impl FlpDocument {
                     .clamp(0.0, f64::from(u32::MAX)) as u64
             };
 
-            let (target_start, delete_note) = target_for(original_start, false);
-            if delete_note && options.start_strength > 0.0 {
+            let (target_start, delete_note, template_levels) = target_for(original_start, false);
+            if delete_note {
                 deletions.push(note_index);
                 continue;
             }
             let mut next_start = mix(original_start, target_start, options.start_strength);
-            let (target_end, _) = target_for(original_end, true);
+            let (target_end, _, _) = target_for(original_end, true);
             let next_length = if original_length == 0 {
                 original_length
             } else {
@@ -13090,8 +13168,35 @@ impl FlpDocument {
             };
             let next_start = next_start.min(u64::from(u32::MAX)) as u32;
             let next_length = next_length.min(u64::from(u32::MAX)) as u32;
-            if next_start != note.position || next_length != note.length {
-                edits.push((note_index, next_start, next_length));
+            let mut edit = PatternNoteEdit {
+                position: (next_start != note.position).then_some(next_start),
+                length: (next_length != note.length).then_some(next_length),
+                ..PatternNoteEdit::default()
+            };
+            if let Some(template_levels) = template_levels {
+                let next_velocity = mix_note_level(
+                    note.velocity,
+                    template_levels.velocity,
+                    options.levels.velocity,
+                );
+                let next_pan = mix_note_level(note.pan, template_levels.pan, options.levels.pan);
+                let next_release = mix_note_level(
+                    note.release,
+                    template_levels.release,
+                    options.levels.release,
+                );
+                let next_mod_x =
+                    mix_note_level(note.mod_x, template_levels.mod_x, options.levels.mod_x);
+                let next_mod_y =
+                    mix_note_level(note.mod_y, template_levels.mod_y, options.levels.mod_y);
+                edit.velocity = (next_velocity != note.velocity).then_some(next_velocity);
+                edit.pan = (next_pan != note.pan).then_some(next_pan);
+                edit.release = (next_release != note.release).then_some(next_release);
+                edit.mod_x = (next_mod_x != note.mod_x).then_some(next_mod_x);
+                edit.mod_y = (next_mod_y != note.mod_y).then_some(next_mod_y);
+            }
+            if edit != PatternNoteEdit::default() {
+                edits.push((note_index, edit));
             }
         }
         if edits.is_empty() && deletions.is_empty() {
@@ -13099,17 +13204,8 @@ impl FlpDocument {
         }
 
         let mut updated = self.clone();
-        for (note_index, position, length) in &edits {
-            updated.edit_pattern_note(
-                pattern_id,
-                channel_id,
-                *note_index,
-                PatternNoteEdit {
-                    position: Some(*position),
-                    length: Some(*length),
-                    ..PatternNoteEdit::default()
-                },
-            )?;
+        for (note_index, edit) in &edits {
+            updated.edit_pattern_note(pattern_id, channel_id, *note_index, edit.clone())?;
         }
         let deleted = if deletions.is_empty() {
             0

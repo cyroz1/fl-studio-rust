@@ -23,10 +23,10 @@ use flp_rebuild::{
     HumanizerOptions, LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerParameterKind,
     PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation, PlaylistClipEdit,
     PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit,
-    ProjectSettingsEdit, QuantizeNoteMode, QuantizeNoteOptions, RandomNoteChordMap,
-    RandomNoteGeneratorOptions, RandomizerOptions, RiffMachineOptions, RiffMachineQuantizeMode,
-    SamplerEnvelopeLfoEdit, SamplerEnvelopeLfoTarget, SamplerVolumeEnvelopeEdit,
-    ScaleLevelsOptions, StrumOptions, TimeMarkerEdit,
+    ProjectSettingsEdit, QuantizeNoteLevels, QuantizeNoteMode, QuantizeNoteOptions,
+    RandomNoteChordMap, RandomNoteGeneratorOptions, RandomizerOptions, RiffMachineOptions,
+    RiffMachineQuantizeMode, SamplerEnvelopeLfoEdit, SamplerEnvelopeLfoTarget,
+    SamplerVolumeEnvelopeEdit, ScaleLevelsOptions, StrumOptions, TimeMarkerEdit,
 };
 
 struct MidiControlChangeImport<'a> {
@@ -1193,6 +1193,34 @@ fn run(args: Vec<String>) -> Result<(), String> {
             )
         }
         [command, input, output, pattern_id, channel_id, groove_path, strength, sensitivity,
+            duration_strength, mode, velocity_level, pan_level, release_level, mod_x_level,
+            mod_y_level]
+            if command == "quantize-notes-groove" =>
+        {
+            quantize_notes_with_score_scope(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                None,
+                Path::new(groove_path),
+                QuantizeNoteOptions {
+                    start_strength: parse_f64(strength, "quantize start strength")?,
+                    sensitivity: parse_f64(sensitivity, "quantize sensitivity")?,
+                    duration_strength: parse_f64(duration_strength, "quantize duration strength")?,
+                    mode: parse_quantize_note_mode(mode)?,
+                    levels: QuantizeNoteLevels {
+                        velocity: parse_f64(velocity_level, "quantize velocity level")?,
+                        pan: parse_f64(pan_level, "quantize pan level")?,
+                        release: parse_f64(release_level, "quantize release level")?,
+                        mod_x: parse_f64(mod_x_level, "quantize Mod X level")?,
+                        mod_y: parse_f64(mod_y_level, "quantize Mod Y level")?,
+                    },
+                    ..QuantizeNoteOptions::default()
+                },
+            )
+        }
+        [command, input, output, pattern_id, channel_id, groove_path, strength, sensitivity,
             duration_strength, mode]
             if command == "quantize-notes-groove" =>
         {
@@ -1208,6 +1236,35 @@ fn run(args: Vec<String>) -> Result<(), String> {
                     sensitivity: parse_f64(sensitivity, "quantize sensitivity")?,
                     duration_strength: parse_f64(duration_strength, "quantize duration strength")?,
                     mode: parse_quantize_note_mode(mode)?,
+                    ..QuantizeNoteOptions::default()
+                },
+            )
+        }
+        [command, input, output, pattern_id, channel_id, note_indices, groove_path, strength,
+            sensitivity, duration_strength, mode, velocity_level, pan_level, release_level,
+            mod_x_level, mod_y_level]
+            if command == "quantize-notes-groove-selected" =>
+        {
+            let note_indices = parse_note_indices(note_indices)?;
+            quantize_notes_with_score_scope(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                Some(&note_indices),
+                Path::new(groove_path),
+                QuantizeNoteOptions {
+                    start_strength: parse_f64(strength, "quantize start strength")?,
+                    sensitivity: parse_f64(sensitivity, "quantize sensitivity")?,
+                    duration_strength: parse_f64(duration_strength, "quantize duration strength")?,
+                    mode: parse_quantize_note_mode(mode)?,
+                    levels: QuantizeNoteLevels {
+                        velocity: parse_f64(velocity_level, "quantize velocity level")?,
+                        pan: parse_f64(pan_level, "quantize pan level")?,
+                        release: parse_f64(release_level, "quantize release level")?,
+                        mod_x: parse_f64(mod_x_level, "quantize Mod X level")?,
+                        mod_y: parse_f64(mod_y_level, "quantize Mod Y level")?,
+                    },
                     ..QuantizeNoteOptions::default()
                 },
             )
@@ -1249,6 +1306,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                     sensitivity: parse_f64(sensitivity, "quantize sensitivity")?,
                     duration_strength: parse_f64(duration_strength, "quantize duration strength")?,
                     mode: parse_quantize_note_mode(mode)?,
+                    levels: QuantizeNoteLevels::default(),
                 },
             )
         }
@@ -1270,6 +1328,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                     sensitivity: parse_f64(sensitivity, "quantize sensitivity")?,
                     duration_strength: parse_f64(duration_strength, "quantize duration strength")?,
                     mode: parse_quantize_note_mode(mode)?,
+                    levels: QuantizeNoteLevels::default(),
                 },
             )
         }
@@ -3993,8 +4052,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild edit-note-properties <input.flp> <output.flp> <pattern-id> <channel-id> <note-index> <flags-raw|-> <group-raw|-> <fine-pitch|-> <release|-> <midi-channel-raw|-> <pan|-> <mod-x|-> <mod-y|->\n",
             "  flp-rebuild quantize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <grid-ticks> <start-strength-0..1> <swing-0..1> [sensitivity-0..1 duration-strength-0..1 leave-duration|leave-end|quantize-duration|quantize-end]\n",
             "  flp-rebuild quantize-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <grid-ticks> <start-strength-0..1> <swing-0..1> [sensitivity-0..1 duration-strength-0..1 leave-duration|leave-end|quantize-duration|quantize-end]\n",
-            "  flp-rebuild quantize-notes-groove <input.flp> <output.flp> <pattern-id> <channel-id> <groove.fsc> <start-strength-0..1> <sensitivity-0..1> <duration-strength-0..1> <leave-duration|leave-end|quantize-duration|quantize-end>\n",
-            "  flp-rebuild quantize-notes-groove-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <groove.fsc> <start-strength-0..1> <sensitivity-0..1> <duration-strength-0..1> <leave-duration|leave-end|quantize-duration|quantize-end>\n",
+            "  flp-rebuild quantize-notes-groove <input.flp> <output.flp> <pattern-id> <channel-id> <groove.fsc> <start-strength-0..1> <sensitivity-0..1> <duration-strength-0..1> <leave-duration|leave-end|quantize-duration|quantize-end> [velocity-level-0..1 pan-level-0..1 release-level-0..1 modx-level-0..1 mody-level-0..1]\n",
+            "  flp-rebuild quantize-notes-groove-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <groove.fsc> <start-strength-0..1> <sensitivity-0..1> <duration-strength-0..1> <leave-duration|leave-end|quantize-duration|quantize-end> [velocity-level-0..1 pan-level-0..1 release-level-0..1 modx-level-0..1 mody-level-0..1]\n",
             "  flp-rebuild rotate-notes <input.flp> <output.flp> <pattern-id> <channel-id> <snap-ticks> <left|right>\n",
             "  flp-rebuild rotate-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <snap-ticks> <left|right>\n",
             "  flp-rebuild legato-notes <input.flp> <output.flp> <pattern-id> <channel-id>\n",

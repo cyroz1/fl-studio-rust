@@ -83,10 +83,10 @@ use flp_rebuild::{
     PatternNoteEdit, PatternNoteRotation, PayloadEncoding, PlaylistClip, PlaylistClipEdit,
     PlaylistClipSelectionClipboard, PlaylistClipTarget, PlaylistTrack, PlaylistTrackEdit,
     PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit,
-    ProjectSettingsEdit, QuantizeNoteMode, QuantizeNoteOptions, RandomNoteChordMap,
-    RandomNoteGeneratorOptions, RandomizerOptions, RiffMachineOptions, RiffMachineQuantizeMode,
-    SamplerEnvelopeLfo, SamplerEnvelopeLfoEdit, SamplerEnvelopeLfoTarget, ScaleLevelsOptions,
-    StrumOptions, TimeMarker, TimeMarkerEdit, VstPluginStateMetadata,
+    ProjectSettingsEdit, QuantizeNoteLevels, QuantizeNoteMode, QuantizeNoteOptions,
+    RandomNoteChordMap, RandomNoteGeneratorOptions, RandomizerOptions, RiffMachineOptions,
+    RiffMachineQuantizeMode, SamplerEnvelopeLfo, SamplerEnvelopeLfoEdit, SamplerEnvelopeLfoTarget,
+    ScaleLevelsOptions, StrumOptions, TimeMarker, TimeMarkerEdit, VstPluginStateMetadata,
 };
 use md5::{Digest, Md5};
 use vst3_host::midi::{MidiChannel as Vst3MidiChannel, MidiEvent as Vst3MidiEvent};
@@ -4692,6 +4692,11 @@ struct DawUi {
     quantize_sensitivity_percent: u8,
     quantize_duration_strength_percent: u8,
     quantize_mode: QuantizeNoteMode,
+    quantize_velocity_level_percent: u8,
+    quantize_pan_level_percent: u8,
+    quantize_release_level_percent: u8,
+    quantize_mod_x_level_percent: u8,
+    quantize_mod_y_level_percent: u8,
     quantize_score: Option<FscScore>,
     quantize_score_path: Option<PathBuf>,
     quantize_score_grid_cache: Option<(u16, u64, Vec<u64>)>,
@@ -6280,6 +6285,11 @@ impl DawUi {
             quantize_sensitivity_percent: 100,
             quantize_duration_strength_percent: 100,
             quantize_mode: QuantizeNoteMode::LeaveDuration,
+            quantize_velocity_level_percent: 0,
+            quantize_pan_level_percent: 0,
+            quantize_release_level_percent: 0,
+            quantize_mod_x_level_percent: 0,
+            quantize_mod_y_level_percent: 0,
             quantize_score: None,
             quantize_score_path: None,
             quantize_score_grid_cache: None,
@@ -34108,6 +34118,31 @@ impl DawUi {
                     egui::Slider::new(&mut self.quantize_duration_strength_percent, 0..=100)
                         .text("Duration (%)"),
                 );
+                ui.add_enabled(
+                    self.quantize_score.is_some(),
+                    egui::Slider::new(&mut self.quantize_velocity_level_percent, 0..=100)
+                        .text("VEL level (%)"),
+                );
+                ui.add_enabled(
+                    self.quantize_score.is_some(),
+                    egui::Slider::new(&mut self.quantize_pan_level_percent, 0..=100)
+                        .text("PAN level (%)"),
+                );
+                ui.add_enabled(
+                    self.quantize_score.is_some(),
+                    egui::Slider::new(&mut self.quantize_release_level_percent, 0..=100)
+                        .text("REL level (%)"),
+                );
+                ui.add_enabled(
+                    self.quantize_score.is_some(),
+                    egui::Slider::new(&mut self.quantize_mod_x_level_percent, 0..=100)
+                        .text("MODX level (%)"),
+                );
+                ui.add_enabled(
+                    self.quantize_score.is_some(),
+                    egui::Slider::new(&mut self.quantize_mod_y_level_percent, 0..=100)
+                        .text("MODY level (%)"),
+                );
                 egui::ComboBox::from_id_salt("piano-roll-quantize-mode")
                     .selected_text(match self.quantize_mode {
                         QuantizeNoteMode::LeaveDuration => "Quantize: Leave duration",
@@ -34754,7 +34789,7 @@ impl DawUi {
             let groove_score = (!quick_quantize_start_requested)
                 .then(|| self.quantize_score.clone())
                 .flatten();
-            let options = if quick_quantize_start_requested {
+            let mut options = if quick_quantize_start_requested {
                 QuantizeNoteOptions {
                     grid_ticks,
                     start_strength: 1.0,
@@ -34762,6 +34797,7 @@ impl DawUi {
                     duration_strength: 0.0,
                     swing: 0.0,
                     mode: QuantizeNoteMode::LeaveDuration,
+                    levels: QuantizeNoteLevels::default(),
                 }
             } else {
                 QuantizeNoteOptions {
@@ -34771,8 +34807,18 @@ impl DawUi {
                     duration_strength: f64::from(self.quantize_duration_strength_percent) / 100.0,
                     swing: f64::from(self.quantize_swing_percent) / 100.0,
                     mode: self.quantize_mode,
+                    levels: QuantizeNoteLevels::default(),
                 }
             };
+            if groove_score.is_some() {
+                options.levels = QuantizeNoteLevels {
+                    velocity: f64::from(self.quantize_velocity_level_percent) / 100.0,
+                    pan: f64::from(self.quantize_pan_level_percent) / 100.0,
+                    release: f64::from(self.quantize_release_level_percent) / 100.0,
+                    mod_x: f64::from(self.quantize_mod_x_level_percent) / 100.0,
+                    mod_y: f64::from(self.quantize_mod_y_level_percent) / 100.0,
+                };
+            }
             let result = self
                 .document
                 .as_mut()
