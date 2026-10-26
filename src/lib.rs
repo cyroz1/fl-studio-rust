@@ -16104,6 +16104,98 @@ impl FlpDocument {
         Ok(imported.len())
     }
 
+    /// Encodes one channel's Pattern notes as a standalone FL Studio score file.
+    ///
+    /// The score keeps the source project's header and note-event encoding, but contains only
+    /// the selected Pattern's note records. Native `.fsc` compatibility still needs comparison
+    /// with a score saved by FL Studio.
+    pub fn export_score_notes(
+        &self,
+        pattern_id: u16,
+        channel_id: u16,
+    ) -> Result<Vec<u8>, FlpError> {
+        if self.header.format != 0 {
+            return Err(FlpError::UnsupportedEdit(
+                "score export requires a standard FL Studio project",
+            ));
+        }
+        self.require_unique_channel(channel_id)?;
+        let pattern = self
+            .patterns()?
+            .into_iter()
+            .find(|pattern| pattern.id == pattern_id)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested pattern does not exist",
+            ))?;
+        let notes = pattern
+            .notes
+            .into_iter()
+            .filter(|note| note.channel_id == channel_id)
+            .collect::<Vec<_>>();
+        if notes.is_empty() {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected pattern channel has no notes to save",
+            ));
+        }
+        if notes.len() > MAX_MERGED_PATTERN_NOTES {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected pattern channel contains more than two million notes",
+            ));
+        }
+
+        let mut note_event_opcode = None;
+        for (event_index, event) in self.events.iter().enumerate() {
+            if event.opcode != 0x41
+                || event.payload.len() != 2
+                || u16::from_le_bytes([event.payload[0], event.payload[1]]) != pattern_id
+            {
+                continue;
+            }
+            let Some(note_event) = self
+                .events
+                .get(event_index + 1)
+                .filter(|event| Self::is_pattern_note_event(event))
+            else {
+                continue;
+            };
+            match note_event_opcode {
+                None => note_event_opcode = Some(note_event.opcode),
+                Some(opcode) if opcode != note_event.opcode => {
+                    return Err(FlpError::UnsupportedEdit(
+                        "the selected pattern uses conflicting note-event encodings",
+                    ));
+                }
+                _ => {}
+            }
+        }
+        let note_event_opcode = note_event_opcode.ok_or(FlpError::UnsupportedEdit(
+            "the selected pattern has no recognized note-event encoding",
+        ))?;
+
+        let records_length = notes
+            .len()
+            .checked_mul(FLP_NOTE_RECORD_SIZE)
+            .ok_or(FlpError::LengthOverflow)?;
+        let mut records = Vec::with_capacity(records_length);
+        for note in &notes {
+            let mut record = [0u8; FLP_NOTE_RECORD_SIZE];
+            note.encode_into(&mut record);
+            records.extend_from_slice(&record);
+        }
+
+        let mut score_document = self.clone();
+        score_document.header.legacy_channel_count = 0;
+        score_document.events = vec![
+            FlpEvent::new_word(0x41, pattern_id),
+            FlpEvent::new_data(note_event_opcode, records)?,
+        ];
+        score_document.project_version = None;
+        score_document.metadata = ProjectMetadata::default();
+        score_document.trailing_bytes.clear();
+        score_document.refresh_event_offsets()?;
+        score_document.encode_lossless()
+    }
+
     /// Appends one note to a pattern while retaining every unrelated event byte.
     pub fn add_pattern_note(&mut self, pattern_id: u16, note: PatternNote) -> Result<(), FlpError> {
         self.add_pattern_notes(pattern_id, &[note])

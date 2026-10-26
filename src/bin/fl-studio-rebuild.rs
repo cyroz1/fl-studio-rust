@@ -31702,6 +31702,7 @@ impl DawUi {
         let mut open_midi_requested = !ui.ctx().egui_wants_keyboard_input()
             && ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::M));
         let mut import_score_requested = false;
+        let mut export_score_requested = false;
         let mut replace_channel_from_score = false;
         let mut export_midi_requested = false;
         let mut render_requested = false;
@@ -33448,6 +33449,27 @@ impl DawUi {
             ui.menu_button("Score", |ui| {
                 let can_import_score =
                     self.selected_pattern.is_some() && self.selected_note_channel.is_some();
+                let can_export_score = self
+                    .selected_pattern
+                    .zip(self.selected_note_channel)
+                    .is_some_and(|(pattern_id, channel_id)| {
+                        patterns
+                            .iter()
+                            .find(|pattern| pattern.id == pattern_id)
+                            .is_some_and(|pattern| {
+                                pattern
+                                    .notes
+                                    .iter()
+                                    .any(|note| note.channel_id == channel_id)
+                            })
+                    });
+                if ui
+                    .add_enabled(can_export_score, egui::Button::new("Save score as…"))
+                    .clicked()
+                {
+                    export_score_requested = true;
+                    ui.close();
+                }
                 if ui
                     .add_enabled(can_import_score, egui::Button::new("Append score notes…"))
                     .clicked()
@@ -35433,6 +35455,45 @@ impl DawUi {
                     );
                 }
                 Err(error) => self.status = format!("Could not slice notes: {error}"),
+            }
+        }
+
+        if export_score_requested
+            && let (Some(pattern_id), Some(channel_id)) =
+                (self.selected_pattern, self.selected_note_channel)
+            && let Some(mut path) = rfd::FileDialog::new()
+                .set_title("Save FL Studio score")
+                .set_file_name("Score.fsc")
+                .add_filter("FL Studio score files", &["fsc"])
+                .save_file()
+        {
+            if !path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("fsc"))
+            {
+                path.set_extension("fsc");
+            }
+            let result = self
+                .document
+                .as_ref()
+                .ok_or_else(|| "no project is open".to_owned())
+                .and_then(|document| {
+                    document
+                        .export_score_notes(pattern_id, channel_id)
+                        .map_err(|error| error.to_string())
+                })
+                .and_then(|bytes| {
+                    fs::write(&path, bytes)
+                        .map_err(|error| format!("could not write {}: {error}", path.display()))
+                });
+            match result {
+                Ok(()) => {
+                    self.status = format!(
+                        "Saved pattern {pattern_id}, channel {channel_id} as {}",
+                        path.display()
+                    );
+                }
+                Err(error) => self.status = format!("Could not save score: {error}"),
             }
         }
 

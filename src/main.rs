@@ -3238,6 +3238,14 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_bool(replace, "replace channel notes")?,
             )
         }
+        [command, input, output, pattern_id, channel_id] if command == "export-score" => {
+            export_score_notes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+            )
+        }
         [command, input, midi_path, output, track, pattern_id, channel_id]
             if command == "import-midi" =>
         {
@@ -3919,6 +3927,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild create-playlist-automation-clip <input.flp> <output.flp> <arrangement-id> <channel-id> <position-ticks> <length-ticks> <track-index:zero-based>\n",
             "  flp-rebuild import-midi <input.flp> <input.mid> <output.flp> <track> <pattern-id|new> <channel-id> [zero-velocity-note-ons:0|1] [realign-events:0|1] [midi-channels:all|none|1,2,...,16]\n",
             "  flp-rebuild import-score <input.flp> <input.fsc> <output.flp> <pattern-id> <channel-id> [replace-channel-notes:0|1]\n",
+            "  flp-rebuild export-score <input.flp> <output.fsc> <pattern-id> <channel-id>\n",
             "  flp-rebuild import-midi-cc <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <raw-channel> <raw-flags> <cc-0..127> <midi-channel-1..16|all>\n",
             "  flp-rebuild import-midi-cc-new-stream <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <raw-channel> <raw-flags> <cc-0..127> <midi-channel-1..16|all>\n",
             "  flp-rebuild import-midi-all <input.flp> <input.mid> <output.flp> <pattern-id|new> <channel-ids-comma-separated> [zero-velocity-note-ons:0|1] [realign-events:0|1] [midi-channels:all|none|1,2,...,16]\n",
@@ -9392,6 +9401,25 @@ fn import_score_notes(
         } else {
             "appended notes"
         },
+        output.display()
+    );
+    Ok(())
+}
+
+fn export_score_notes(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+) -> Result<(), String> {
+    let (_, document) = load_document(input)?;
+    let bytes = document
+        .export_score_notes(pattern_id, channel_id)
+        .map_err(|error| error.to_string())?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "exported pattern {pattern_id}, channel {channel_id} as score to {}",
         output.display()
     );
     Ok(())
