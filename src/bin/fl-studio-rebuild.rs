@@ -4863,8 +4863,10 @@ struct DawUi {
     riff_use_custom_arpeggio_score: bool,
     riff_progression_score: Option<FscScore>,
     riff_progression_score_path: Option<PathBuf>,
+    riff_progression_time_multiplier: ArpeggioScoreTimeMultiplier,
     riff_chord_score: Option<FscScore>,
     riff_chord_score_path: Option<PathBuf>,
+    riff_chord_time_multiplier: ArpeggioScoreTimeMultiplier,
     riff_chord_progression_enabled: bool,
     riff_arpeggiation_enabled: bool,
     riff_mirroring_enabled: bool,
@@ -6483,8 +6485,10 @@ impl DawUi {
             riff_use_custom_arpeggio_score: false,
             riff_progression_score: None,
             riff_progression_score_path: None,
+            riff_progression_time_multiplier: ArpeggioScoreTimeMultiplier::Normal,
             riff_chord_score: None,
             riff_chord_score_path: None,
+            riff_chord_time_multiplier: ArpeggioScoreTimeMultiplier::Normal,
             riff_chord_progression_enabled: true,
             riff_arpeggiation_enabled: true,
             riff_mirroring_enabled: true,
@@ -33153,6 +33157,38 @@ impl DawUi {
                                         "Load a score to replace the target progression with its note pattern.",
                                     );
                                 }
+                                ui.small(
+                                    "Time mul scales progression note lengths while keeping their starts.",
+                                );
+                                egui::ComboBox::from_id_salt(
+                                    "piano-roll-riff-progression-time",
+                                )
+                                .selected_text(match self.riff_progression_time_multiplier {
+                                    ArpeggioScoreTimeMultiplier::Faster8 => "Time mul ×1/8",
+                                    ArpeggioScoreTimeMultiplier::Faster4 => "Time mul ×1/4",
+                                    ArpeggioScoreTimeMultiplier::Faster2 => "Time mul ×1/2",
+                                    ArpeggioScoreTimeMultiplier::Normal => "Time mul ×1",
+                                    ArpeggioScoreTimeMultiplier::Slower2 => "Time mul ×2",
+                                    ArpeggioScoreTimeMultiplier::Slower3 => "Time mul ×3",
+                                    ArpeggioScoreTimeMultiplier::Slower4 => "Time mul ×4",
+                                })
+                                .show_ui(ui, |ui| {
+                                    for (multiplier, label) in [
+                                        (ArpeggioScoreTimeMultiplier::Faster8, "×1/8"),
+                                        (ArpeggioScoreTimeMultiplier::Faster4, "×1/4"),
+                                        (ArpeggioScoreTimeMultiplier::Faster2, "×1/2"),
+                                        (ArpeggioScoreTimeMultiplier::Normal, "×1"),
+                                        (ArpeggioScoreTimeMultiplier::Slower2, "×2"),
+                                        (ArpeggioScoreTimeMultiplier::Slower3, "×3"),
+                                        (ArpeggioScoreTimeMultiplier::Slower4, "×4"),
+                                    ] {
+                                        ui.selectable_value(
+                                            &mut self.riff_progression_time_multiplier,
+                                            multiplier,
+                                            label,
+                                        );
+                                    }
+                                });
                             });
                         egui::CollapsingHeader::new("Chord Progression")
                             .default_open(false)
@@ -33173,6 +33209,33 @@ impl DawUi {
                                 ui.small(
                                     "Notes at each score onset define a voicing. Its lowest pitch maps to each progression root; voicings cycle in order.",
                                 );
+                                egui::ComboBox::from_id_salt("piano-roll-riff-chord-time")
+                                    .selected_text(match self.riff_chord_time_multiplier {
+                                        ArpeggioScoreTimeMultiplier::Faster8 => "Time mul ×1/8",
+                                        ArpeggioScoreTimeMultiplier::Faster4 => "Time mul ×1/4",
+                                        ArpeggioScoreTimeMultiplier::Faster2 => "Time mul ×1/2",
+                                        ArpeggioScoreTimeMultiplier::Normal => "Time mul ×1",
+                                        ArpeggioScoreTimeMultiplier::Slower2 => "Time mul ×2",
+                                        ArpeggioScoreTimeMultiplier::Slower3 => "Time mul ×3",
+                                        ArpeggioScoreTimeMultiplier::Slower4 => "Time mul ×4",
+                                    })
+                                    .show_ui(ui, |ui| {
+                                        for (multiplier, label) in [
+                                            (ArpeggioScoreTimeMultiplier::Faster8, "×1/8"),
+                                            (ArpeggioScoreTimeMultiplier::Faster4, "×1/4"),
+                                            (ArpeggioScoreTimeMultiplier::Faster2, "×1/2"),
+                                            (ArpeggioScoreTimeMultiplier::Normal, "×1"),
+                                            (ArpeggioScoreTimeMultiplier::Slower2, "×2"),
+                                            (ArpeggioScoreTimeMultiplier::Slower3, "×3"),
+                                            (ArpeggioScoreTimeMultiplier::Slower4, "×4"),
+                                        ] {
+                                            ui.selectable_value(
+                                                &mut self.riff_chord_time_multiplier,
+                                                multiplier,
+                                                label,
+                                            );
+                                        }
+                                    });
                             });
                         ui.add(
                             egui::Slider::new(&mut self.arpeggiator_step_ticks, 1..=384)
@@ -33629,6 +33692,9 @@ impl DawUi {
                                 self.riff_arpeggio_score_mode = defaults.arpeggio_score_mode;
                                 self.riff_arpeggio_score_time_multiplier =
                                     defaults.arpeggio_score_time_multiplier;
+                                self.riff_progression_time_multiplier =
+                                    defaults.progression_time_multiplier;
+                                self.riff_chord_time_multiplier = defaults.chord_time_multiplier;
                                 self.riff_arpeggio_score_levels_percent =
                                     defaults.arpeggio_score_levels_percent;
                                 self.arpeggiator_range_pattern = ArpeggioRangePattern::Up;
@@ -36201,7 +36267,9 @@ impl DawUi {
                 groove_enabled: self.riff_groove_enabled,
                 fit_enabled: self.riff_fit_enabled,
                 progression_score: riff_progression_score.as_ref(),
+                progression_time_multiplier: self.riff_progression_time_multiplier,
                 chord_score: riff_chord_score.as_ref(),
+                chord_time_multiplier: self.riff_chord_time_multiplier,
                 arpeggio_score: riff_arpeggio_score.as_ref(),
                 arpeggio_score_mode: self.riff_arpeggio_score_mode,
                 arpeggio_score_time_multiplier: self.riff_arpeggio_score_time_multiplier,

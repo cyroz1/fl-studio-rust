@@ -2279,7 +2279,7 @@ pub enum ArpeggioScorePatternMode {
     Alternate,
 }
 
-/// Time scaling for a custom Piano roll arpeggiator score.
+/// Time scaling ratios for custom Piano roll score patterns.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ArpeggioScoreTimeMultiplier {
     Faster2,
@@ -2578,9 +2578,13 @@ pub struct RiffMachineOptions<'a> {
     pub group_notes: bool,
     /// Optional `.fsc` pattern for the Riff Machine's Note Progression stage.
     pub progression_score: Option<&'a FscScore>,
+    /// Scale Note Progression durations without moving their onsets.
+    pub progression_time_multiplier: ArpeggioScoreTimeMultiplier,
     /// Optional `.fsc` voicing pattern for the Chord Progression stage. Notes are grouped
     /// by onset, each group's lowest pitch maps to a progression root, and groups cycle.
     pub chord_score: Option<&'a FscScore>,
+    /// Scale generated chord durations without moving their onsets.
+    pub chord_time_multiplier: ArpeggioScoreTimeMultiplier,
     /// Optional `.fsc` pattern for the Riff Machine's Arpeggiation stage.
     pub arpeggio_score: Option<&'a FscScore>,
     pub arpeggio_score_mode: ArpeggioScorePatternMode,
@@ -2654,7 +2658,9 @@ impl<'a> Default for RiffMachineOptions<'a> {
             mirror_vertical: false,
             group_notes: false,
             progression_score: None,
+            progression_time_multiplier: ArpeggioScoreTimeMultiplier::Normal,
             chord_score: None,
+            chord_time_multiplier: ArpeggioScoreTimeMultiplier::Normal,
             arpeggio_score: None,
             arpeggio_score_mode: ArpeggioScorePatternMode::Normal,
             arpeggio_score_time_multiplier: ArpeggioScoreTimeMultiplier::Normal,
@@ -15247,26 +15253,19 @@ impl FlpDocument {
                     self.header.ppq,
                     ArpeggioScoreTimeMultiplier::Normal,
                 )?;
-                let raw_end = u64::from(score_note.position)
-                    .checked_add(u64::from(score_note.length))
-                    .ok_or(FlpError::LengthOverflow)?;
-                let relative_end = raw_end - progression_origin;
-                let mut end = scale_score_tick(
-                    relative_end,
+                let length = scale_score_tick(
+                    u64::from(score_note.length),
                     score.ppq(),
                     self.header.ppq,
-                    ArpeggioScoreTimeMultiplier::Normal,
+                    options.progression_time_multiplier,
                 )?;
-                if end <= start {
-                    end = start.checked_add(1).ok_or(FlpError::LengthOverflow)?;
-                }
                 let position = anchor.checked_add(start).ok_or(FlpError::LengthOverflow)?;
                 let mut progression_note = score_note.clone();
                 progression_note.channel_id = channel_id;
                 progression_note.position =
                     u32::try_from(position).map_err(|_| FlpError::LengthOverflow)?;
                 progression_note.length =
-                    u32::try_from(end - start).map_err(|_| FlpError::LengthOverflow)?;
+                    u32::try_from(length).map_err(|_| FlpError::LengthOverflow)?;
                 progression_note.group = 0;
                 progression_notes.push(progression_note);
                 if progression_notes.len() > MAX_MERGED_PATTERN_NOTES {
@@ -15282,7 +15281,20 @@ impl FlpDocument {
             }
             progression_notes
         } else {
-            target_notes.iter().map(|(_, note)| note.clone()).collect()
+            target_notes
+                .iter()
+                .map(|(_, note)| {
+                    let mut progression_note = note.clone();
+                    progression_note.length = u32::try_from(scale_score_tick(
+                        u64::from(note.length),
+                        self.header.ppq,
+                        self.header.ppq,
+                        options.progression_time_multiplier,
+                    )?)
+                    .map_err(|_| FlpError::LengthOverflow)?;
+                    Ok(progression_note)
+                })
+                .collect::<Result<Vec<_>, FlpError>>()?
         };
         let stage_will_run = options.chord_progression_enabled
             || options.arpeggiation_enabled
@@ -15296,7 +15308,8 @@ impl FlpDocument {
             || groove_enabled
             || options.fit_enabled
             || options.group_notes
-            || options.progression_score.is_some();
+            || options.progression_score.is_some()
+            || options.progression_time_multiplier != ArpeggioScoreTimeMultiplier::Normal;
         if !stage_will_run {
             return Ok(0);
         }
@@ -15399,6 +15412,13 @@ impl FlpDocument {
                 for key in pitches {
                     let mut chord_note = note.clone();
                     chord_note.key = key;
+                    chord_note.length = u32::try_from(scale_score_tick(
+                        u64::from(note.length),
+                        self.header.ppq,
+                        self.header.ppq,
+                        options.chord_time_multiplier,
+                    )?)
+                    .map_err(|_| FlpError::LengthOverflow)?;
                     chord_notes.push(chord_note);
                 }
             }
@@ -15415,6 +15435,7 @@ impl FlpDocument {
         let mut updated = self.clone();
         let riff_indices = if options.chord_progression_enabled
             || options.progression_score.is_some()
+            || options.progression_time_multiplier != ArpeggioScoreTimeMultiplier::Normal
         {
             let mut remove_indices = target_notes
                 .iter()

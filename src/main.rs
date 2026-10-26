@@ -5112,7 +5112,13 @@ fn parse_riff_machine_options(values: &[String]) -> Result<ParsedRiffMachineOpti
             "gate-percent" => options.gate_percent = parse_u8(value, "Riff Machine gate")?,
             "sync" => options.arpeggiation_sync = parse_arpeggio_sync_mode(value)?,
             "progression-score" => progression_score_path = Some(PathBuf::from(value)),
+            "progression-time-multiplier" => {
+                options.progression_time_multiplier = parse_arpeggio_score_time_multiplier(value)?
+            }
             "chord-score" => chord_score_path = Some(PathBuf::from(value)),
+            "chord-time-multiplier" => {
+                options.chord_time_multiplier = parse_arpeggio_score_time_multiplier(value)?
+            }
             "chord-progression" => {
                 options.chord_progression_enabled = parse_bool(value, "chord progression stage")?
             }
