@@ -4790,6 +4790,11 @@ struct DawUi {
     riff_groove_start_percent: u8,
     riff_groove_sensitivity_percent: u8,
     riff_groove_duration_percent: u8,
+    riff_groove_velocity_level_percent: u8,
+    riff_groove_pan_level_percent: u8,
+    riff_groove_mod_x_level_percent: u8,
+    riff_groove_mod_y_level_percent: u8,
+    riff_groove_pitch_level_percent: u8,
     riff_groove_quantize_mode: RiffMachineQuantizeMode,
     riff_groove_score: Option<FscScore>,
     riff_groove_score_path: Option<PathBuf>,
@@ -6385,6 +6390,11 @@ impl DawUi {
             riff_groove_start_percent: 0,
             riff_groove_sensitivity_percent: 50,
             riff_groove_duration_percent: 0,
+            riff_groove_velocity_level_percent: 0,
+            riff_groove_pan_level_percent: 0,
+            riff_groove_mod_x_level_percent: 0,
+            riff_groove_mod_y_level_percent: 0,
+            riff_groove_pitch_level_percent: 0,
             riff_groove_quantize_mode: RiffMachineQuantizeMode::LeaveDuration,
             riff_groove_score: None,
             riff_groove_score_path: None,
@@ -33110,6 +33120,43 @@ impl DawUi {
                                         )
                                         .text("Duration (%)"),
                                     );
+                                    ui.add_enabled_ui(self.riff_groove_score.is_some(), |ui| {
+                                        ui.add(
+                                            egui::Slider::new(
+                                                &mut self.riff_groove_velocity_level_percent,
+                                                0..=100,
+                                            )
+                                            .text("Velocity level (%)"),
+                                        );
+                                        ui.add(
+                                            egui::Slider::new(
+                                                &mut self.riff_groove_pan_level_percent,
+                                                0..=100,
+                                            )
+                                            .text("Pan level (%)"),
+                                        );
+                                        ui.add(
+                                            egui::Slider::new(
+                                                &mut self.riff_groove_mod_x_level_percent,
+                                                0..=100,
+                                            )
+                                            .text("Mod X level (%)"),
+                                        );
+                                        ui.add(
+                                            egui::Slider::new(
+                                                &mut self.riff_groove_mod_y_level_percent,
+                                                0..=100,
+                                            )
+                                            .text("Mod Y level (%)"),
+                                        );
+                                        ui.add(
+                                            egui::Slider::new(
+                                                &mut self.riff_groove_pitch_level_percent,
+                                                0..=100,
+                                            )
+                                            .text("Pitch level (%)"),
+                                        );
+                                    });
                                     egui::ComboBox::from_id_salt("piano-roll-riff-groove-mode")
                                         .selected_text(match self.riff_groove_quantize_mode {
                                             RiffMachineQuantizeMode::LeaveDuration => {
@@ -33237,6 +33284,15 @@ impl DawUi {
                                     defaults.groove_sensitivity_percent;
                                 self.riff_groove_duration_percent =
                                     defaults.groove_duration_percent;
+                                self.riff_groove_velocity_level_percent =
+                                    defaults.groove_velocity_level_percent;
+                                self.riff_groove_pan_level_percent = defaults.groove_pan_level_percent;
+                                self.riff_groove_mod_x_level_percent =
+                                    defaults.groove_mod_x_level_percent;
+                                self.riff_groove_mod_y_level_percent =
+                                    defaults.groove_mod_y_level_percent;
+                                self.riff_groove_pitch_level_percent =
+                                    defaults.groove_pitch_level_percent;
                                 self.riff_groove_quantize_mode = defaults.groove_quantize_mode;
                                 self.riff_groove_score = None;
                                 self.riff_groove_score_path = None;
@@ -33248,10 +33304,21 @@ impl DawUi {
                                 .add_enabled(
                                     edit_scope_available
                                         && self.piano_roll_scale != PianoRollScale::None
+                                        && (self.riff_groove_score.is_some()
+                                            || (self.riff_groove_velocity_level_percent == 0
+                                                && self.riff_groove_pan_level_percent == 0
+                                                && self.riff_groove_mod_x_level_percent == 0
+                                                && self.riff_groove_mod_y_level_percent == 0
+                                                && self.riff_groove_pitch_level_percent == 0))
                                         && (groove_grid_available
                                             || self.riff_groove_score.is_some()
                                             || (self.riff_groove_start_percent == 0
-                                                && self.riff_groove_duration_percent == 0)),
+                                                && self.riff_groove_duration_percent == 0
+                                                && self.riff_groove_velocity_level_percent == 0
+                                                && self.riff_groove_pan_level_percent == 0
+                                                && self.riff_groove_mod_x_level_percent == 0
+                                                && self.riff_groove_mod_y_level_percent == 0
+                                                && self.riff_groove_pitch_level_percent == 0)),
                                     egui::Button::new(format!("Generate for {edit_target}")),
                                 )
                                 .clicked()
@@ -35664,6 +35731,11 @@ impl DawUi {
                 groove_start_percent: self.riff_groove_start_percent,
                 groove_sensitivity_percent: self.riff_groove_sensitivity_percent,
                 groove_duration_percent: self.riff_groove_duration_percent,
+                groove_velocity_level_percent: self.riff_groove_velocity_level_percent,
+                groove_pan_level_percent: self.riff_groove_pan_level_percent,
+                groove_mod_x_level_percent: self.riff_groove_mod_x_level_percent,
+                groove_mod_y_level_percent: self.riff_groove_mod_y_level_percent,
+                groove_pitch_level_percent: self.riff_groove_pitch_level_percent,
                 groove_quantize_mode: self.riff_groove_quantize_mode,
                 length_multiplier_percent: self.riff_length_multiplier_percent,
                 velocity_variation_percent: self.riff_velocity_variation_percent,

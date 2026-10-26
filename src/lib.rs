@@ -1717,6 +1717,7 @@ fn scale_score_tick(
 
 #[derive(Clone, Copy, Debug, Default)]
 struct QuantizeGrooveLevels {
+    key: u16,
     velocity: u8,
     pan: u8,
     release: u8,
@@ -1727,6 +1728,7 @@ struct QuantizeGrooveLevels {
 impl From<&PatternNote> for QuantizeGrooveLevels {
     fn from(note: &PatternNote) -> Self {
         Self {
+            key: note.key,
             velocity: note.velocity,
             pan: note.pan,
             release: note.release,
@@ -1882,6 +1884,17 @@ fn mix_note_level(original: u8, template: u8, strength: f64) -> u8 {
     (f64::from(original) + (f64::from(template) - f64::from(original)) * strength)
         .round()
         .clamp(0.0, f64::from(u8::MAX)) as u8
+}
+
+fn mix_note_pitch(original: u16, template: u16, strength_percent: u8) -> u16 {
+    if strength_percent == 0 {
+        return original;
+    }
+    (f64::from(original)
+        + (f64::from(template) - f64::from(original)) * f64::from(strength_percent.min(100))
+            / 100.0)
+        .round()
+        .clamp(0.0, 127.0) as u16
 }
 
 fn mix_arpeggio_score_level(original: u8, pattern: u8, levels_percent: u8) -> u8 {
@@ -2504,6 +2517,12 @@ pub struct RiffMachineOptions<'a> {
     pub groove_sensitivity_percent: u8,
     /// Mix note durations or end positions toward their quantized values.
     pub groove_duration_percent: u8,
+    /// Mix velocity, pan, Mod X, Mod Y, and pitch toward a score-template note.
+    pub groove_velocity_level_percent: u8,
+    pub groove_pan_level_percent: u8,
+    pub groove_mod_x_level_percent: u8,
+    pub groove_mod_y_level_percent: u8,
+    pub groove_pitch_level_percent: u8,
     pub groove_quantize_mode: RiffMachineQuantizeMode,
     /// Mix seeded offsets into note panning, from 0 through 100 percent.
     pub pan_variation_percent: u8,
@@ -2543,6 +2562,11 @@ impl<'a> Default for RiffMachineOptions<'a> {
             groove_start_percent: 0,
             groove_sensitivity_percent: 50,
             groove_duration_percent: 0,
+            groove_velocity_level_percent: 0,
+            groove_pan_level_percent: 0,
+            groove_mod_x_level_percent: 0,
+            groove_mod_y_level_percent: 0,
+            groove_pitch_level_percent: 0,
             groove_quantize_mode: RiffMachineQuantizeMode::LeaveDuration,
             pan_variation_percent: 0,
             length_multiplier_percent: 100,
@@ -2629,14 +2653,15 @@ fn riff_machine_score_groove_note_timing(
     note: &PatternNote,
     groove: &QuantizeGroove,
     options: RiffMachineOptions<'_>,
-) -> Result<(u32, u32), FlpError> {
+) -> Result<(u32, u32, Option<QuantizeGrooveLevels>), FlpError> {
     let original_start = u64::from(note.position);
     let original_length = u64::from(note.length);
     let original_end = original_start
         .checked_add(original_length)
         .ok_or(FlpError::LengthOverflow)?;
     let sensitivity = f64::from(options.groove_sensitivity_percent.min(100)) / 100.0;
-    let (target_start, _, _) = groove.nearest_anchor(original_start, &groove.starts, sensitivity);
+    let (target_start, _, levels) =
+        groove.nearest_anchor(original_start, &groove.starts, sensitivity);
     let (target_end, _, _) = groove.nearest_anchor(original_end, &groove.ends, sensitivity);
     let mix = |original: u64, target: u64, amount: u8| {
         let delta = target as i64 - original as i64;
@@ -2668,7 +2693,7 @@ fn riff_machine_score_groove_note_timing(
     let start = u32::try_from(start).map_err(|_| FlpError::LengthOverflow)?;
     let length =
         u32::try_from(length.min(u64::from(u32::MAX))).map_err(|_| FlpError::LengthOverflow)?;
-    Ok((start, length.max(1)))
+    Ok((start, length.max(1), levels))
 }
 
 /// Parameters for seeded note-level and pitch randomization.
@@ -14959,6 +14984,11 @@ impl FlpDocument {
         if options.groove_start_percent > 100
             || options.groove_sensitivity_percent > 100
             || options.groove_duration_percent > 100
+            || options.groove_velocity_level_percent > 100
+            || options.groove_pan_level_percent > 100
+            || options.groove_mod_x_level_percent > 100
+            || options.groove_mod_y_level_percent > 100
+            || options.groove_pitch_level_percent > 100
         {
             return Err(FlpError::UnsupportedEdit(
                 "Riff Machine Groove percentages must be between 0 and 100",
@@ -14966,7 +14996,23 @@ impl FlpDocument {
         }
         let groove_enabled = options.groove_score.is_some()
             || options.groove_start_percent > 0
-            || options.groove_duration_percent > 0;
+            || options.groove_duration_percent > 0
+            || options.groove_velocity_level_percent > 0
+            || options.groove_pan_level_percent > 0
+            || options.groove_mod_x_level_percent > 0
+            || options.groove_mod_y_level_percent > 0
+            || options.groove_pitch_level_percent > 0;
+        if options.groove_score.is_none()
+            && (options.groove_velocity_level_percent > 0
+                || options.groove_pan_level_percent > 0
+                || options.groove_mod_x_level_percent > 0
+                || options.groove_mod_y_level_percent > 0
+                || options.groove_pitch_level_percent > 0)
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "Riff Machine Groove level mixing needs a score template",
+            ));
+        }
         let levels_enabled = options.reset_levels
             || options.velocity_variation_percent > 0
             || options.pan_variation_percent > 0
@@ -15371,23 +15417,62 @@ impl FlpDocument {
             .enumerate()
             .filter(|(note_index, _)| selected_indices.contains(note_index))
         {
-            let (position, length) = if let Some(score_groove) = &score_groove {
+            let (position, length, template_levels) = if let Some(score_groove) = &score_groove {
                 riff_machine_score_groove_note_timing(note, score_groove, options)?
             } else {
                 let snap_ticks = snap_ticks.ok_or(FlpError::UnsupportedEdit(
                     "Riff Machine Groove needs an enabled Piano roll snap grid or score template",
                 ))?;
-                riff_machine_groove_note_timing(note, snap_ticks, options)?
+                let (position, length) =
+                    riff_machine_groove_note_timing(note, snap_ticks, options)?;
+                (position, length, None)
             };
-            if position != note.position || length != note.length {
-                edits.insert(
-                    note_index,
-                    PatternNoteEdit {
-                        position: Some(position),
-                        length: Some(length),
-                        ..PatternNoteEdit::default()
-                    },
-                );
+            let mut edit = PatternNoteEdit::default();
+            if position != note.position {
+                edit.position = Some(position);
+            }
+            if length != note.length {
+                edit.length = Some(length);
+            }
+            if let Some(levels) = template_levels {
+                if options.groove_velocity_level_percent > 0 {
+                    edit.velocity = Some(mix_note_level(
+                        note.velocity,
+                        levels.velocity,
+                        f64::from(options.groove_velocity_level_percent) / 100.0,
+                    ));
+                }
+                if options.groove_pan_level_percent > 0 {
+                    edit.pan = Some(mix_note_level(
+                        note.pan,
+                        levels.pan,
+                        f64::from(options.groove_pan_level_percent) / 100.0,
+                    ));
+                }
+                if options.groove_mod_x_level_percent > 0 {
+                    edit.mod_x = Some(mix_note_level(
+                        note.mod_x,
+                        levels.mod_x,
+                        f64::from(options.groove_mod_x_level_percent) / 100.0,
+                    ));
+                }
+                if options.groove_mod_y_level_percent > 0 {
+                    edit.mod_y = Some(mix_note_level(
+                        note.mod_y,
+                        levels.mod_y,
+                        f64::from(options.groove_mod_y_level_percent) / 100.0,
+                    ));
+                }
+                if options.groove_pitch_level_percent > 0 {
+                    edit.key = Some(mix_note_pitch(
+                        note.key,
+                        levels.key,
+                        options.groove_pitch_level_percent,
+                    ));
+                }
+            }
+            if edit != PatternNoteEdit::default() {
+                edits.insert(note_index, edit);
             }
         }
         self.edit_pattern_notes_batch(pattern_id, channel_id, &edits)

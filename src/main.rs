@@ -5079,6 +5079,25 @@ fn parse_riff_machine_options(
             "groove-duration-percent" => {
                 options.groove_duration_percent = parse_u8(value, "Groove duration percentage")?
             }
+            "groove-velocity-level-percent" => {
+                options.groove_velocity_level_percent =
+                    parse_u8(value, "Groove velocity level percentage")?
+            }
+            "groove-pan-level-percent" => {
+                options.groove_pan_level_percent = parse_u8(value, "Groove pan level percentage")?
+            }
+            "groove-mod-x-level-percent" => {
+                options.groove_mod_x_level_percent =
+                    parse_u8(value, "Groove Mod X level percentage")?
+            }
+            "groove-mod-y-level-percent" => {
+                options.groove_mod_y_level_percent =
+                    parse_u8(value, "Groove Mod Y level percentage")?
+            }
+            "groove-pitch-level-percent" => {
+                options.groove_pitch_level_percent =
+                    parse_u8(value, "Groove pitch level percentage")?
+            }
             "groove-mode" => {
                 options.groove_quantize_mode = parse_riff_machine_quantize_mode(value)?
             }
