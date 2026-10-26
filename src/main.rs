@@ -1192,6 +1192,47 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 },
             )
         }
+        [command, input, output, pattern_id, channel_id, groove_path, strength, sensitivity,
+            duration_strength, mode]
+            if command == "quantize-notes-groove" =>
+        {
+            quantize_notes_with_score_scope(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                None,
+                Path::new(groove_path),
+                QuantizeNoteOptions {
+                    start_strength: parse_f64(strength, "quantize start strength")?,
+                    sensitivity: parse_f64(sensitivity, "quantize sensitivity")?,
+                    duration_strength: parse_f64(duration_strength, "quantize duration strength")?,
+                    mode: parse_quantize_note_mode(mode)?,
+                    ..QuantizeNoteOptions::default()
+                },
+            )
+        }
+        [command, input, output, pattern_id, channel_id, note_indices, groove_path, strength,
+            sensitivity, duration_strength, mode]
+            if command == "quantize-notes-groove-selected" =>
+        {
+            let note_indices = parse_note_indices(note_indices)?;
+            quantize_notes_with_score_scope(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                Some(&note_indices),
+                Path::new(groove_path),
+                QuantizeNoteOptions {
+                    start_strength: parse_f64(strength, "quantize start strength")?,
+                    sensitivity: parse_f64(sensitivity, "quantize sensitivity")?,
+                    duration_strength: parse_f64(duration_strength, "quantize duration strength")?,
+                    mode: parse_quantize_note_mode(mode)?,
+                    ..QuantizeNoteOptions::default()
+                },
+            )
+        }
         [command, input, output, pattern_id, channel_id, grid_ticks, strength, swing,
             sensitivity, duration_strength, mode]
             if command == "quantize-notes" =>
@@ -3952,6 +3993,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild edit-note-properties <input.flp> <output.flp> <pattern-id> <channel-id> <note-index> <flags-raw|-> <group-raw|-> <fine-pitch|-> <release|-> <midi-channel-raw|-> <pan|-> <mod-x|-> <mod-y|->\n",
             "  flp-rebuild quantize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <grid-ticks> <start-strength-0..1> <swing-0..1> [sensitivity-0..1 duration-strength-0..1 leave-duration|leave-end|quantize-duration|quantize-end]\n",
             "  flp-rebuild quantize-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <grid-ticks> <start-strength-0..1> <swing-0..1> [sensitivity-0..1 duration-strength-0..1 leave-duration|leave-end|quantize-duration|quantize-end]\n",
+            "  flp-rebuild quantize-notes-groove <input.flp> <output.flp> <pattern-id> <channel-id> <groove.fsc> <start-strength-0..1> <sensitivity-0..1> <duration-strength-0..1> <leave-duration|leave-end|quantize-duration|quantize-end>\n",
+            "  flp-rebuild quantize-notes-groove-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <groove.fsc> <start-strength-0..1> <sensitivity-0..1> <duration-strength-0..1> <leave-duration|leave-end|quantize-duration|quantize-end>\n",
             "  flp-rebuild rotate-notes <input.flp> <output.flp> <pattern-id> <channel-id> <snap-ticks> <left|right>\n",
             "  flp-rebuild rotate-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <snap-ticks> <left|right>\n",
             "  flp-rebuild legato-notes <input.flp> <output.flp> <pattern-id> <channel-id>\n",
@@ -8229,6 +8272,49 @@ fn quantize_notes_with_scope(
         } else {
             "all channel notes"
         },
+        output.display()
+    );
+    Ok(())
+}
+
+fn quantize_notes_with_score_scope(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    note_indices: Option<&[usize]>,
+    groove_path: &Path,
+    options: QuantizeNoteOptions,
+) -> Result<(), String> {
+    let score_bytes = fs::read(groove_path)
+        .map_err(|error| format!("could not read {}: {error}", groove_path.display()))?;
+    let score = FscScore::parse(&score_bytes)
+        .map_err(|error| format!("could not parse {}: {error}", groove_path.display()))?;
+    let (_, mut document) = load_document(input)?;
+    let changed = match note_indices {
+        Some(note_indices) => document.quantize_pattern_note_selection_with_score(
+            pattern_id,
+            channel_id,
+            note_indices,
+            options,
+            &score,
+        ),
+        None => document.quantize_pattern_notes_with_score(pattern_id, channel_id, options, &score),
+    }
+    .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "quantized {changed} notes in pattern {pattern_id}, channel {channel_id} ({}) with groove {} to {}",
+        if note_indices.is_some() {
+            "selected notes"
+        } else {
+            "all channel notes"
+        },
+        groove_path.display(),
         output.display()
     );
     Ok(())

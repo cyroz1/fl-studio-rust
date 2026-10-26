@@ -4692,6 +4692,8 @@ struct DawUi {
     quantize_sensitivity_percent: u8,
     quantize_duration_strength_percent: u8,
     quantize_mode: QuantizeNoteMode,
+    quantize_score: Option<FscScore>,
+    quantize_score_path: Option<PathBuf>,
     chop_divisions: u8,
     strum_spread_ticks: u32,
     strum_descending: bool,
@@ -6277,6 +6279,8 @@ impl DawUi {
             quantize_sensitivity_percent: 100,
             quantize_duration_strength_percent: 100,
             quantize_mode: QuantizeNoteMode::LeaveDuration,
+            quantize_score: None,
+            quantize_score_path: None,
             chop_divisions: 4,
             strum_spread_ticks: 120,
             strum_descending: false,
@@ -31725,6 +31729,7 @@ impl DawUi {
         let mut chord_preview_requested = false;
         let mut sampler_preview_requested = false;
         let mut quantize_requested = false;
+        let mut load_quantize_score_requested = false;
         let mut legato_requested = false;
         let mut quick_chop_requested = false;
         let mut chop_requested = false;
@@ -34087,9 +34092,12 @@ impl DawUi {
                     egui::Slider::new(&mut self.quantize_strength_percent, 0..=100)
                         .text("Strength (%)"),
                 );
-                ui.add(
-                    egui::Slider::new(&mut self.quantize_swing_percent, 0..=100).text("Swing (%)"),
-                );
+                ui.add_enabled(
+                    self.quantize_score.is_none(),
+                    egui::Slider::new(&mut self.quantize_swing_percent, 0..=100)
+                        .text("Swing (%)"),
+                )
+                .on_hover_text("The loaded groove score supplies its own timing offsets.");
                 ui.add(
                     egui::Slider::new(&mut self.quantize_sensitivity_percent, 0..=100)
                         .text("Sensitivity (%)"),
@@ -34129,6 +34137,16 @@ impl DawUi {
                             "Quantize end time",
                         );
                     });
+                if ui.button("Load groove score…").clicked() {
+                    load_quantize_score_requested = true;
+                }
+                if let Some(path) = &self.quantize_score_path {
+                    ui.label(format!("Groove: {}", path.display()));
+                    if ui.small_button("Clear groove").clicked() {
+                        self.quantize_score = None;
+                        self.quantize_score_path = None;
+                    }
+                }
                 ui.add(egui::Slider::new(&mut self.chop_divisions, 2..=16).text("Chop divisions"));
                 ui.add(
                     egui::Slider::new(&mut self.strum_spread_ticks, 0..=1536)
@@ -34663,7 +34681,11 @@ impl DawUi {
                         .speed(1.0),
                 );
             });
-            ui.small("Quantize uses the selected snap grid and moves note starts only.");
+            ui.small(if self.quantize_score.is_some() {
+                "Quantize uses the loaded score as a repeating groove for note starts and ends."
+            } else {
+                "Quantize uses the selected snap grid for note starts and the chosen duration mode."
+            });
             ui.small(
                 "Edit: Auto uses the current selection when present; otherwise it affects the channel.",
             );
@@ -34700,11 +34722,34 @@ impl DawUi {
         if export_midi_requested {
             self.export_selected_pattern_midi_dialog();
         }
+        if load_quantize_score_requested
+            && let Some(path) = rfd::FileDialog::new()
+                .set_title("Load Quantizer groove score")
+                .add_filter("FL Studio score files", &["fsc"])
+                .pick_file()
+        {
+            let result = fs::read(&path)
+                .map_err(|error| format!("could not read {}: {error}", path.display()))
+                .and_then(|bytes| FscScore::parse(&bytes).map_err(|error| error.to_string()));
+            match result {
+                Ok(score) => {
+                    self.quantize_score = Some(score);
+                    self.quantize_score_path = Some(path.clone());
+                    self.status = format!("Loaded Quantizer groove score {}", path.display());
+                }
+                Err(error) => {
+                    self.status = format!("Could not load Quantizer groove score: {error}");
+                }
+            }
+        }
         if (quantize_requested || quantize_selected_requested)
             && let (Some(pattern_id), Some(channel_id)) =
                 (self.selected_pattern, self.selected_note_channel)
         {
             let grid_ticks = self.piano_roll_snap.ticks(ppq, time_signature);
+            let groove_score = (!quick_quantize_start_requested)
+                .then(|| self.quantize_score.clone())
+                .flatten();
             let options = if quick_quantize_start_requested {
                 QuantizeNoteOptions {
                     grid_ticks,
@@ -34730,15 +34775,32 @@ impl DawUi {
                 .ok_or_else(|| "no project is open".to_owned())
                 .and_then(|document| {
                     let result = if quantize_selected_requested {
-                        document.quantize_pattern_note_selection_with_options(
-                            pattern_id,
-                            channel_id,
-                            &selected_quantize_indices,
-                            options,
-                        )
+                        if let Some(score) = &groove_score {
+                            document.quantize_pattern_note_selection_with_score(
+                                pattern_id,
+                                channel_id,
+                                &selected_quantize_indices,
+                                options,
+                                score,
+                            )
+                        } else {
+                            document.quantize_pattern_note_selection_with_options(
+                                pattern_id,
+                                channel_id,
+                                &selected_quantize_indices,
+                                options,
+                            )
+                        }
                     } else {
-                        document
-                            .quantize_pattern_notes_with_options(pattern_id, channel_id, options)
+                        if let Some(score) = &groove_score {
+                            document.quantize_pattern_notes_with_score(
+                                pattern_id, channel_id, options, score,
+                            )
+                        } else {
+                            document.quantize_pattern_notes_with_options(
+                                pattern_id, channel_id, options,
+                            )
+                        }
                     };
                     result.map_err(|error| error.to_string())
                 });

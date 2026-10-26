@@ -115,6 +115,8 @@ flp-rebuild edit-note <input.flp> <output.flp> <pattern-id> <channel-id> <note-i
 flp-rebuild edit-note-properties <input.flp> <output.flp> <pattern-id> <channel-id> <note-index> <flags-raw|-> <group-raw|-> <fine-pitch|-> <release|-> <midi-channel-raw|-> <pan|-> <mod-x|-> <mod-y|->
 flp-rebuild quantize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <grid-ticks> <strength-0..1> <swing-0..1>
 flp-rebuild quantize-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <grid-ticks> <strength-0..1> <swing-0..1> [sensitivity-0..1 duration-strength-0..1 leave-duration|leave-end|quantize-duration|quantize-end]
+flp-rebuild quantize-notes-groove <input.flp> <output.flp> <pattern-id> <channel-id> <groove.fsc> <start-strength-0..1> <sensitivity-0..1> <duration-strength-0..1> <leave-duration|leave-end|quantize-duration|quantize-end>
+flp-rebuild quantize-notes-groove-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <groove.fsc> <start-strength-0..1> <sensitivity-0..1> <duration-strength-0..1> <leave-duration|leave-end|quantize-duration|quantize-end>
 flp-rebuild legato-notes <input.flp> <output.flp> <pattern-id> <channel-id>
 flp-rebuild legato-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based>
 flp-rebuild chop-notes <input.flp> <output.flp> <pattern-id> <channel-id> <divisions-2..64>
@@ -245,7 +247,7 @@ The same menu can delete the selected Pattern after confirmation. `delete-patter
 
 `edit-note-properties` updates a note's raw flags/group, fine-pitch, release, raw MIDI-channel, pan, and modulation X/Y fields. Pass `-` for any property to leave it unchanged. The reserved byte remains untouched.
 
-`quantize-notes` moves note starts toward the nearest grid points for one pattern channel. Strength and swing are fractions from `0` to `1`; lengths and other note properties are retained. Its advanced form also accepts sensitivity, duration strength, and a duration/end mode. `quantize-notes-selected` applies the same controls to comma-separated zero-based channel-local note indexes.
+`quantize-notes` moves note starts toward the nearest grid points for one pattern channel. Strength and swing are fractions from `0` to `1`; lengths and other note properties are retained. Its advanced form also accepts sensitivity, duration strength, and a duration/end mode. `quantize-notes-selected` applies the same controls to comma-separated zero-based channel-local note indexes. The `quantize-notes-groove` commands use an `.fsc` score as a repeating groove: template note starts and ends provide snap points, and zero-velocity template notes delete target notes snapped to those starts. The score supplies its own timing offsets, so score mode has no separate swing control. The repeat period currently uses the latest template note end; verify this against an FL Studio-saved quantization because Image-Line's manual does not specify the period.
 
 `rotate-notes` moves channel note starts left or right by one snap step, wrapping each note inside its meter-aware measure. `rotate-notes-selected` applies the same operation to comma-separated zero-based channel-local note indexes; selecting a grouped note also rotates the other members of its group.
 

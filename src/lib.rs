@@ -1715,6 +1715,141 @@ fn scale_score_tick(
     Ok(if tick > 0 { scaled.max(1) } else { scaled })
 }
 
+#[derive(Clone, Copy, Debug)]
+struct QuantizeGrooveAnchor {
+    tick: u64,
+    delete_note: bool,
+}
+
+#[derive(Clone, Debug)]
+struct QuantizeGroove {
+    period_ticks: u64,
+    starts: Vec<QuantizeGrooveAnchor>,
+    ends: Vec<QuantizeGrooveAnchor>,
+}
+
+impl QuantizeGroove {
+    fn from_score(score: &FscScore, project_ppq: u16) -> Result<Self, FlpError> {
+        if score.notes().is_empty() {
+            return Err(FlpError::UnsupportedEdit(
+                "the quantize groove score does not contain note data",
+            ));
+        }
+
+        let mut scaled = Vec::with_capacity(score.notes().len());
+        let mut period_ticks = 0_u64;
+        for note in score.notes() {
+            let start = scale_score_tick(
+                u64::from(note.position),
+                score.ppq(),
+                project_ppq,
+                ArpeggioScoreTimeMultiplier::Normal,
+            )?;
+            let end = scale_score_tick(
+                u64::from(note.position).saturating_add(u64::from(note.length)),
+                score.ppq(),
+                project_ppq,
+                ArpeggioScoreTimeMultiplier::Normal,
+            )?;
+            period_ticks = period_ticks.max(end);
+            scaled.push((start, end, note.velocity == 0));
+        }
+        if period_ticks == 0 {
+            return Err(FlpError::UnsupportedEdit(
+                "the quantize groove score must have a note with a positive end time",
+            ));
+        }
+
+        let mut starts = BTreeMap::<u64, bool>::new();
+        let mut ends = BTreeMap::<u64, bool>::new();
+        for (start, end, delete_note) in scaled {
+            let start = start % period_ticks;
+            let end = end % period_ticks;
+            starts
+                .entry(start)
+                .and_modify(|existing| *existing |= delete_note)
+                .or_insert(delete_note);
+            ends.entry(end).or_insert(false);
+        }
+
+        Ok(Self {
+            period_ticks,
+            starts: starts
+                .into_iter()
+                .map(|(tick, delete_note)| QuantizeGrooveAnchor { tick, delete_note })
+                .collect(),
+            ends: ends
+                .into_keys()
+                .map(|tick| QuantizeGrooveAnchor {
+                    tick,
+                    delete_note: false,
+                })
+                .collect(),
+        })
+    }
+
+    fn nearest_anchor(
+        &self,
+        tick: u64,
+        anchors: &[QuantizeGrooveAnchor],
+        sensitivity: f64,
+    ) -> (u64, bool) {
+        let cycle = tick / self.period_ticks;
+        let local_tick = tick % self.period_ticks;
+        let insertion_index = anchors.partition_point(|anchor| anchor.tick <= local_tick);
+        let mut nearest: Option<(u64, u64, usize)> = None;
+        if insertion_index > 0 {
+            let index = insertion_index - 1;
+            let candidate = cycle
+                .saturating_mul(self.period_ticks)
+                .saturating_add(anchors[index].tick);
+            nearest = Some((tick.abs_diff(candidate), candidate, index));
+        } else if cycle > 0 {
+            let index = anchors.len() - 1;
+            let candidate = (cycle - 1)
+                .saturating_mul(self.period_ticks)
+                .saturating_add(anchors[index].tick);
+            nearest = Some((tick.abs_diff(candidate), candidate, index));
+        }
+        let next_index = insertion_index % anchors.len();
+        let next_cycle = if insertion_index == anchors.len() {
+            cycle.saturating_add(1)
+        } else {
+            cycle
+        };
+        let next_candidate = next_cycle
+            .saturating_mul(self.period_ticks)
+            .saturating_add(anchors[next_index].tick);
+        let next_distance = tick.abs_diff(next_candidate);
+        if nearest.is_none_or(|current| (next_distance, next_candidate) < (current.0, current.1)) {
+            nearest = Some((next_distance, next_candidate, next_index));
+        }
+        let Some((distance, candidate, index)) = nearest else {
+            return (tick, false);
+        };
+
+        let anchor = anchors[index];
+        let previous_tick = anchors[(index + anchors.len() - 1) % anchors.len()].tick;
+        let next_tick = anchors[(index + 1) % anchors.len()].tick;
+        let previous_gap = if index == 0 {
+            anchor.tick + self.period_ticks - previous_tick
+        } else {
+            anchor.tick - previous_tick
+        };
+        let next_gap = if index + 1 == anchors.len() {
+            next_tick + self.period_ticks - anchor.tick
+        } else {
+            next_tick - anchor.tick
+        };
+        let sensitivity_limit = previous_gap.min(next_gap) as f64 * 0.5 * sensitivity;
+        if distance as f64 > sensitivity_limit {
+            (tick, false)
+        } else {
+            (candidate, anchor.delete_note)
+        }
+    }
+}
+
 fn mix_arpeggio_score_level(original: u8, pattern: u8, levels_percent: u8) -> u8 {
     let percent = u16::from(levels_percent.min(100));
     let original_weight = 100 - percent;
@@ -12738,6 +12873,7 @@ impl FlpDocument {
                 swing,
                 ..QuantizeNoteOptions::default()
             },
+            None,
         )
     }
 
@@ -12748,7 +12884,18 @@ impl FlpDocument {
         channel_id: u16,
         options: QuantizeNoteOptions,
     ) -> Result<usize, FlpError> {
-        self.quantize_pattern_notes_in_scope(pattern_id, channel_id, None, options)
+        self.quantize_pattern_notes_in_scope(pattern_id, channel_id, None, options, None)
+    }
+
+    /// Quantizes a channel's note starts and optional durations against a repeating score groove.
+    pub fn quantize_pattern_notes_with_score(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        options: QuantizeNoteOptions,
+        score: &FscScore,
+    ) -> Result<usize, FlpError> {
+        self.quantize_pattern_notes_in_scope(pattern_id, channel_id, None, options, Some(score))
     }
 
     /// Moves only the supplied channel-note indices toward the closest grid points.
@@ -12772,6 +12919,7 @@ impl FlpDocument {
                 swing,
                 ..QuantizeNoteOptions::default()
             },
+            None,
         )
     }
 
@@ -12783,7 +12931,31 @@ impl FlpDocument {
         note_indices: &[usize],
         options: QuantizeNoteOptions,
     ) -> Result<usize, FlpError> {
-        self.quantize_pattern_notes_in_scope(pattern_id, channel_id, Some(note_indices), options)
+        self.quantize_pattern_notes_in_scope(
+            pattern_id,
+            channel_id,
+            Some(note_indices),
+            options,
+            None,
+        )
+    }
+
+    /// Quantizes selected channel notes against a repeating score groove.
+    pub fn quantize_pattern_note_selection_with_score(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: &[usize],
+        options: QuantizeNoteOptions,
+        score: &FscScore,
+    ) -> Result<usize, FlpError> {
+        self.quantize_pattern_notes_in_scope(
+            pattern_id,
+            channel_id,
+            Some(note_indices),
+            options,
+            Some(score),
+        )
     }
 
     fn quantize_pattern_notes_in_scope(
@@ -12792,8 +12964,9 @@ impl FlpDocument {
         channel_id: u16,
         note_indices: Option<&[usize]>,
         options: QuantizeNoteOptions,
+        groove_score: Option<&FscScore>,
     ) -> Result<usize, FlpError> {
-        if options.grid_ticks == 0 {
+        if groove_score.is_none() && options.grid_ticks == 0 {
             return Err(FlpError::UnsupportedEdit(
                 "quantize grid must be greater than zero ticks",
             ));
@@ -12820,6 +12993,9 @@ impl FlpDocument {
                 "quantize swing must be between 0 and 1",
             ));
         }
+        let groove = groove_score
+            .map(|score| QuantizeGroove::from_score(score, self.header.ppq))
+            .transpose()?;
         let patterns = self.patterns()?;
         let pattern = patterns
             .iter()
@@ -12827,10 +13003,12 @@ impl FlpDocument {
             .ok_or(FlpError::UnsupportedEdit(
                 "the requested pattern does not exist",
             ))?;
-        let grid = u64::from(options.grid_ticks);
+        let grid = u64::from(options.grid_ticks.max(1));
         let selected_indices =
             note_indices.map(|indices| indices.iter().copied().collect::<HashSet<_>>());
-        let edits = pattern
+        let mut edits = Vec::new();
+        let mut deletions = Vec::new();
+        for (note_index, note) in pattern
             .notes
             .iter()
             .filter(|note| note.channel_id == channel_id)
@@ -12840,63 +13018,69 @@ impl FlpDocument {
                     .as_ref()
                     .is_none_or(|indices| indices.contains(note_index))
             })
-            .filter_map(|(note_index, note)| {
-                let original_start = u64::from(note.position);
-                let original_length = u64::from(note.length);
-                let original_end = original_start.saturating_add(original_length);
-                let target_for = |tick: u64| {
+        {
+            let original_start = u64::from(note.position);
+            let original_length = u64::from(note.length);
+            let original_end = original_start.saturating_add(original_length);
+            let target_for = |tick: u64, is_end: bool| {
+                if let Some(groove) = &groove {
+                    let anchors = if is_end { &groove.ends } else { &groove.starts };
+                    groove.nearest_anchor(tick, anchors, options.sensitivity)
+                } else {
                     let grid_index = tick.saturating_add(grid / 2) / grid;
                     let straight_target = grid_index.saturating_mul(grid);
                     let sensitivity_limit = grid as f64 * 0.5 * options.sensitivity;
                     if tick.abs_diff(straight_target) as f64 > sensitivity_limit {
-                        return tick;
+                        return (tick, false);
                     }
                     let swing_offset = if grid_index % 2 == 1 {
                         (grid as f64 * 0.5 * options.swing).round() as u64
                     } else {
                         0
                     };
-                    straight_target.saturating_add(swing_offset)
-                };
-                let mix = |original: u64, target: u64, strength: f64| {
-                    (original as f64 + (target as f64 - original as f64) * strength)
-                        .round()
-                        .clamp(0.0, f64::from(u32::MAX)) as u64
-                };
+                    (straight_target.saturating_add(swing_offset), false)
+                }
+            };
+            let mix = |original: u64, target: u64, strength: f64| {
+                (original as f64 + (target as f64 - original as f64) * strength)
+                    .round()
+                    .clamp(0.0, f64::from(u32::MAX)) as u64
+            };
 
-                let target_start = target_for(original_start);
-                let mut next_start = mix(original_start, target_start, options.start_strength);
-                let target_end = target_for(original_end);
-                let next_length = if original_length == 0 {
-                    original_length
-                } else {
-                    match options.mode {
-                        QuantizeNoteMode::LeaveDuration => original_length,
-                        QuantizeNoteMode::LeaveEnd => {
-                            next_start = next_start.min(original_end.saturating_sub(1));
-                            original_end.saturating_sub(next_start)
-                        }
-                        QuantizeNoteMode::QuantizeDuration => {
-                            let target_length = target_end.saturating_sub(target_start).max(1);
-                            mix(original_length, target_length, options.duration_strength).max(1)
-                        }
-                        QuantizeNoteMode::QuantizeEnd => {
-                            let next_end = mix(original_end, target_end, options.duration_strength);
-                            next_start = next_start.min(next_end.saturating_sub(1));
-                            next_end.saturating_sub(next_start).max(1)
-                        }
+            let (target_start, delete_note) = target_for(original_start, false);
+            if delete_note && options.start_strength > 0.0 {
+                deletions.push(note_index);
+                continue;
+            }
+            let mut next_start = mix(original_start, target_start, options.start_strength);
+            let (target_end, _) = target_for(original_end, true);
+            let next_length = if original_length == 0 {
+                original_length
+            } else {
+                match options.mode {
+                    QuantizeNoteMode::LeaveDuration => original_length,
+                    QuantizeNoteMode::LeaveEnd => {
+                        next_start = next_start.min(original_end.saturating_sub(1));
+                        original_end.saturating_sub(next_start)
                     }
-                };
-                let next_start = next_start.min(u64::from(u32::MAX)) as u32;
-                let next_length = next_length.min(u64::from(u32::MAX)) as u32;
-                (next_start != note.position || next_length != note.length).then_some((
-                    note_index,
-                    next_start,
-                    next_length,
-                ))
-            })
-            .collect::<Vec<_>>();
-        if edits.is_empty() {
+                    QuantizeNoteMode::QuantizeDuration => {
+                        let target_length = target_end.saturating_sub(target_start).max(1);
+                        mix(original_length, target_length, options.duration_strength).max(1)
+                    }
+                    QuantizeNoteMode::QuantizeEnd => {
+                        let next_end = mix(original_end, target_end, options.duration_strength);
+                        next_start = next_start.min(next_end.saturating_sub(1));
+                        next_end.saturating_sub(next_start).max(1)
+                    }
+                }
+            };
+            let next_start = next_start.min(u64::from(u32::MAX)) as u32;
+            let next_length = next_length.min(u64::from(u32::MAX)) as u32;
+            if next_start != note.position || next_length != note.length {
+                edits.push((note_index, next_start, next_length));
+            }
+        }
+        if edits.is_empty() && deletions.is_empty() {
             return Ok(0);
         }
 
@@ -12913,8 +13097,13 @@ impl FlpDocument {
                 },
             )?;
         }
+        let deleted = if deletions.is_empty() {
+            0
+        } else {
+            updated.delete_pattern_note_selection(pattern_id, channel_id, &deletions)?
+        };
         *self = updated;
-        Ok(edits.len())
+        Ok(edits.len() + deleted)
     }
 
     /// Extends each onset group to the next distinct onset on the selected channel.
