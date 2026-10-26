@@ -3082,7 +3082,7 @@ pub struct ArticulateOptions {
     pub chop_chords: bool,
 }
 
-/// Parameters for the Piano roll Claw Machine's periodic note gate and timing slew.
+/// Parameters for the Piano roll Claw Machine's periodic slicing and timing slew.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ClawMachineOptions {
     pub period_ticks: u32,
@@ -3334,6 +3334,66 @@ fn claw_warp_position(
         .clamp(0.0, (period - 1) as f64) as u64;
     let warped_position = cycle_start + warped_phase;
     u32::try_from(warped_position).map_err(|_| FlpError::LengthOverflow)
+}
+
+fn claw_note_slices(
+    start: u64,
+    end: u64,
+    origin: u64,
+    period_ticks: u32,
+    trash_every: u8,
+) -> Result<Vec<(u64, u64, bool)>, FlpError> {
+    const SLICES_PER_PERIOD: u64 = 16;
+    let period = u64::from(period_ticks);
+    let mut segments: Vec<(u64, u64, bool)> = Vec::new();
+    let mut cursor = start;
+    let mut processed_slices = 0usize;
+    while cursor < end {
+        let relative = cursor.saturating_sub(origin);
+        let cycle_start = origin + relative / period * period;
+        let phase = cursor - cycle_start;
+        let slice = phase * SLICES_PER_PERIOD / period;
+        let slice_end = cycle_start + (slice + 1) * period / SLICES_PER_PERIOD;
+        if slice_end <= cursor {
+            return Err(FlpError::UnsupportedEdit(
+                "Claw Machine could not advance to the next period slice",
+            ));
+        }
+        let segment_end = end.min(slice_end);
+        let trashed = (slice + 1).is_multiple_of(u64::from(trash_every));
+        if let Some(previous) = segments.last_mut() {
+            if previous.1 == cursor && previous.2 == trashed {
+                previous.1 = segment_end;
+            } else {
+                segments.push((cursor, segment_end, trashed));
+            }
+        } else {
+            segments.push((cursor, segment_end, trashed));
+        }
+        processed_slices += 1;
+        if processed_slices > MAX_MERGED_PATTERN_NOTES {
+            return Err(FlpError::UnsupportedEdit(
+                "Claw Machine would process more than two million period slices",
+            ));
+        }
+        if segments.len() > MAX_MERGED_PATTERN_NOTES {
+            return Err(FlpError::UnsupportedEdit(
+                "Claw Machine would create more than two million note slices",
+            ));
+        }
+        cursor = segment_end;
+    }
+    if start == end {
+        let relative = start.saturating_sub(origin);
+        let phase = relative % period;
+        let slice = phase * SLICES_PER_PERIOD / period;
+        segments.push((
+            start,
+            end,
+            (slice + 1).is_multiple_of(u64::from(trash_every)),
+        ));
+    }
+    Ok(segments)
 }
 
 fn fold_note_pitch_to_limit(key: i32, minimum: i32, maximum: i32, wrap_to_bottom: bool) -> i32 {
@@ -16910,8 +16970,8 @@ impl FlpDocument {
         Ok(edits.len())
     }
 
-    /// Applies a periodic gate and timing slew to notes in one channel.
-    /// Each period is divided into 16 slices; every Nth slice is removed.
+    /// Applies periodic slicing and timing slew to notes in one channel.
+    /// Retained fragments of notes crossing removed slices are emitted as separate notes.
     pub fn claw_pattern_notes(
         &mut self,
         pattern_id: u16,
@@ -16955,7 +17015,6 @@ impl FlpDocument {
             ));
         }
 
-        const SLICES_PER_PERIOD: u64 = 16;
         let patterns = self.patterns()?;
         let pattern = patterns
             .iter()
@@ -16987,35 +17046,70 @@ impl FlpDocument {
             .map(|(_, note)| u64::from(note.position) + u64::from(note.length))
             .max()
             .expect("targeted notes are not empty");
-        let period = u64::from(options.period_ticks);
         let short_note_threshold = options.period_ticks.div_ceil(16);
         let mut kept_notes = Vec::new();
         let mut removed_indices = Vec::new();
         let mut removed_positions = Vec::new();
 
         for (note_index, note) in targeted_notes {
-            let relative = u64::from(note.position) - origin;
-            let phase = relative % period;
-            let slice = phase * SLICES_PER_PERIOD / period;
-            let trashed = (slice + 1).is_multiple_of(u64::from(options.trash_every));
-            let too_short = options.remove_short_notes && note.length < short_note_threshold;
-            if trashed || too_short {
-                removed_indices.push(note_index);
-                removed_positions.push(note.position);
-                continue;
-            }
-
-            let position = claw_warp_position(
-                u64::from(note.position),
+            let original_length = note.length;
+            let note_start = u64::from(note.position);
+            let note_end = note_start + u64::from(note.length);
+            let segments = claw_note_slices(
+                note_start,
+                note_end,
                 origin,
                 options.period_ticks,
-                options.time_distortion_percent,
+                options.trash_every,
             )?;
-            let original_length = note.length;
-            kept_notes.push((note_index, note, position, original_length));
+            let mut kept_source_note = false;
+            for (segment_start, segment_end, trashed) in segments {
+                let segment_length = u32::try_from(segment_end - segment_start)
+                    .map_err(|_| FlpError::LengthOverflow)?;
+                let too_short = options.remove_short_notes && segment_length < short_note_threshold;
+                if trashed || too_short {
+                    removed_positions.push(segment_start);
+                    if kept_notes.len().saturating_add(removed_positions.len())
+                        > MAX_MERGED_PATTERN_NOTES
+                    {
+                        return Err(FlpError::UnsupportedEdit(
+                            "Claw Machine would create more than two million note slices",
+                        ));
+                    }
+                    continue;
+                }
+
+                let position = claw_warp_position(
+                    segment_start,
+                    origin,
+                    options.period_ticks,
+                    options.time_distortion_percent,
+                )?;
+                let mut segment_note = note.clone();
+                segment_note.position =
+                    u32::try_from(segment_start).map_err(|_| FlpError::LengthOverflow)?;
+                segment_note.length = segment_length;
+                let source_index = if kept_source_note {
+                    None
+                } else {
+                    kept_source_note = true;
+                    Some(note_index)
+                };
+                kept_notes.push((source_index, segment_note, position, original_length));
+                if kept_notes.len() + removed_positions.len() > MAX_MERGED_PATTERN_NOTES {
+                    return Err(FlpError::UnsupportedEdit(
+                        "Claw Machine would create more than two million note slices",
+                    ));
+                }
+            }
+            if !kept_source_note {
+                removed_indices.push(note_index);
+            }
         }
 
-        kept_notes.sort_unstable_by_key(|(note_index, note, _, _)| (note.position, *note_index));
+        kept_notes.sort_unstable_by_key(|(note_index, note, _, _)| {
+            (note.position, note_index.unwrap_or(usize::MAX))
+        });
         if options.stretch_to_compensate && !removed_positions.is_empty() {
             let mut kept_onsets = kept_notes
                 .iter()
@@ -17059,18 +17153,39 @@ impl FlpDocument {
         }
 
         let edits = kept_notes
-            .into_iter()
+            .iter()
             .filter_map(|(note_index, note, position, original_length)| {
-                (position != note.position || note.length != original_length).then_some((
+                let note_index = (*note_index)?;
+                (*position != note.position || note.length != *original_length).then_some((
                     note_index,
-                    position,
+                    *position,
                     note.length,
                 ))
             })
             .collect::<Vec<_>>();
-        let changed_count = edits.len() + removed_indices.len();
+        let additions = kept_notes
+            .into_iter()
+            .filter_map(|(note_index, mut note, position, _)| {
+                note_index.is_none().then(|| {
+                    note.position = position;
+                    note
+                })
+            })
+            .collect::<Vec<_>>();
+        let changed_count = edits.len() + removed_indices.len() + additions.len();
         if changed_count == 0 {
             return Ok(0);
+        }
+        let resulting_note_count = pattern
+            .notes
+            .len()
+            .saturating_sub(removed_indices.len())
+            .checked_add(additions.len())
+            .ok_or(FlpError::LengthOverflow)?;
+        if resulting_note_count > MAX_MERGED_PATTERN_NOTES {
+            return Err(FlpError::UnsupportedEdit(
+                "Claw Machine would create more than two million notes",
+            ));
         }
 
         let mut updated = self.clone();
@@ -17090,6 +17205,7 @@ impl FlpDocument {
         for note_index in removed_indices {
             updated.delete_pattern_note(pattern_id, channel_id, note_index)?;
         }
+        updated.add_pattern_notes(pattern_id, &additions)?;
         *self = updated;
         Ok(changed_count)
     }
