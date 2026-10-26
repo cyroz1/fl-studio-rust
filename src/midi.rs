@@ -116,6 +116,7 @@ struct MidiChannelNoteState {
     pitch_bend_sensitivity_cents: u8,
     rpn_msb: u8,
     rpn_lsb: u8,
+    rpn_selected: bool,
     sustain_pedal_down: bool,
     sostenuto_pedal_down: bool,
 }
@@ -131,6 +132,7 @@ impl Default for MidiChannelNoteState {
             pitch_bend_sensitivity_cents: 0,
             rpn_msb: 127,
             rpn_lsb: 127,
+            rpn_selected: false,
             sustain_pedal_down: false,
             sostenuto_pedal_down: false,
         }
@@ -1860,12 +1862,19 @@ impl MidiTrack {
                                 }
                             }
                         }
-                        101 => state.rpn_msb = data[1],
-                        100 => state.rpn_lsb = data[1],
-                        6 if (state.rpn_msb, state.rpn_lsb) == (0, 0) => {
+                        99 | 98 => state.rpn_selected = false,
+                        101 => {
+                            state.rpn_msb = data[1];
+                            state.rpn_selected = true;
+                        }
+                        100 => {
+                            state.rpn_lsb = data[1];
+                            state.rpn_selected = true;
+                        }
+                        6 if state.rpn_selected && (state.rpn_msb, state.rpn_lsb) == (0, 0) => {
                             state.pitch_bend_sensitivity_semitones = data[1];
                         }
-                        38 if (state.rpn_msb, state.rpn_lsb) == (0, 0) => {
+                        38 if state.rpn_selected && (state.rpn_msb, state.rpn_lsb) == (0, 0) => {
                             state.pitch_bend_sensitivity_cents = data[1];
                         }
                         _ => {}
@@ -2819,6 +2828,23 @@ mod tests {
         assert_eq!(notes[1].mod_x(), 64);
         assert_eq!(notes[1].mod_y(), 64);
         assert_eq!(notes[1].pitch_bend_offset_cents(), 0);
+    }
+
+    #[test]
+    fn midi_import_nrpn_data_entry_does_not_change_pitch_bend_range() {
+        let midi = MidiFile::parse(&midi_fixture(&[
+            0, 0xB0, 101, 0, 0, 0xB0, 100, 0, // Select pitch-bend sensitivity.
+            0, 0xB0, 6, 12, // Set twelve semitones.
+            0, 0xB0, 99, 1, 0, 0xB0, 98, 2, // Select an NRPN.
+            0, 0xB0, 6, 3, 0, 0xB0, 38, 50, // Data belongs to the NRPN.
+            0, 0xE0, 0x7F, 0x7F, 0, 0x90, 60, 100, 10, 0x80, 60, 64, 0, 0xB0, 101, 0, 0, 0xB0, 100,
+            0, // Reselect the RPN.
+            0, 0xB0, 6, 2, 0, 0x90, 62, 100, 10, 0x80, 62, 64, 0, 0xFF, 0x2F, 0,
+        ]))
+        .expect("fixture should parse");
+        let notes = midi.tracks()[0].notes();
+        assert_eq!(notes[0].pitch_bend_offset_cents(), 1200);
+        assert_eq!(notes[1].pitch_bend_offset_cents(), 200);
     }
 
     #[test]
