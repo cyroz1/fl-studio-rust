@@ -19680,18 +19680,17 @@ impl FlpDocument {
                 absolute_end_position.saturating_sub(offset)
             });
             let length = end_position.saturating_sub(position).max(1);
+            let (key, fine_pitch) = midi_note.tuned_fl_pitch();
             imported.push(PatternNote {
                 position,
                 channel_id,
                 length,
-                key: u16::from(midi_note.key()),
+                key,
                 midi_channel: midi_note.channel(),
                 pan: midi::midi_pan_to_fl_note_pan(midi_note.pan()),
                 mod_x: midi::midi_modulation_to_fl_note_value(midi_note.mod_x()),
                 mod_y: midi::midi_modulation_to_fl_note_value(midi_note.mod_y()),
-                fine_pitch: midi::midi_pitch_bend_cents_to_fl_note_fine_pitch(
-                    midi_note.pitch_bend_offset_cents(),
-                ),
+                fine_pitch,
                 velocity: midi_note.velocity(),
                 release: midi_note.release_velocity().map_or(
                     PATTERN_NOTE_DEFAULT_RELEASE,
@@ -35801,6 +35800,24 @@ mod tests {
 
         let reparsed = FlpDocument::parse(&document.encode_lossless().unwrap()).unwrap();
         assert_eq!(reparsed.patterns().unwrap()[0].notes.len(), 3);
+    }
+
+    #[test]
+    fn midi_channel_tuning_is_written_to_imported_pattern_notes() {
+        let project_bytes = pattern_fixture(&[], &[]);
+        let midi_bytes = midi_fixture(
+            &[
+                0, 0xB0, 101, 0, 0, 0xB0, 100, 2, 0, 0xB0, 6, 66, 0, 0xB0, 100, 1, 0, 0xB0, 6, 80,
+                0, 0xB0, 38, 0, 0, 0x90, 60, 100, 10, 0x80, 60, 64, 0, 0xFF, 0x2F, 0,
+            ],
+            480,
+        );
+        let midi = MidiFile::parse(&midi_bytes).unwrap();
+        let mut document = FlpDocument::parse(&project_bytes).unwrap();
+        document.import_midi_track(&midi, 0, 7, 0).unwrap();
+        let reparsed = FlpDocument::parse(&document.encode_lossless().unwrap()).unwrap();
+        let note = &reparsed.patterns().unwrap()[0].notes[0];
+        assert_eq!((note.key, note.fine_pitch), (60, 143));
     }
 
     #[test]

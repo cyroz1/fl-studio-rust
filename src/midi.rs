@@ -42,6 +42,8 @@ pub struct MidiNote {
     mod_x: u8,
     mod_y: u8,
     pitch_bend_offset_cents: i16,
+    channel_coarse_tuning: i8,
+    channel_fine_tuning_cents: i16,
     start_tick: u64,
     end_tick: Option<u64>,
     release_velocity: Option<u8>,
@@ -117,6 +119,8 @@ struct MidiChannelNoteState {
     rpn_msb: u8,
     rpn_lsb: u8,
     rpn_selected: bool,
+    channel_coarse_tuning: u8,
+    channel_fine_tuning: u16,
     sustain_pedal_down: bool,
     sostenuto_pedal_down: bool,
 }
@@ -133,6 +137,8 @@ impl Default for MidiChannelNoteState {
             rpn_msb: 127,
             rpn_lsb: 127,
             rpn_selected: false,
+            channel_coarse_tuning: 64,
+            channel_fine_tuning: 8192,
             sustain_pedal_down: false,
             sostenuto_pedal_down: false,
         }
@@ -1877,6 +1883,17 @@ impl MidiTrack {
                         38 if state.rpn_selected && (state.rpn_msb, state.rpn_lsb) == (0, 0) => {
                             state.pitch_bend_sensitivity_cents = data[1];
                         }
+                        6 if state.rpn_selected && (state.rpn_msb, state.rpn_lsb) == (0, 1) => {
+                            state.channel_fine_tuning =
+                                (u16::from(data[1]) << 7) | (state.channel_fine_tuning & 0x7f);
+                        }
+                        38 if state.rpn_selected && (state.rpn_msb, state.rpn_lsb) == (0, 1) => {
+                            state.channel_fine_tuning =
+                                (state.channel_fine_tuning & 0x3f80) | u16::from(data[1]);
+                        }
+                        6 if state.rpn_selected && (state.rpn_msb, state.rpn_lsb) == (0, 2) => {
+                            state.channel_coarse_tuning = data[1];
+                        }
                         _ => {}
                     }
                 }
@@ -1899,6 +1916,11 @@ impl MidiTrack {
                             state.pitch_bend_sensitivity_semitones,
                             state.pitch_bend_sensitivity_cents,
                         ),
+                        channel_coarse_tuning: state.channel_coarse_tuning as i8 - 64,
+                        channel_fine_tuning_cents: (((i32::from(state.channel_fine_tuning) - 8192)
+                            * 100) as f64
+                            / 8192.0)
+                            .round() as i16,
                         start_tick: event.absolute_tick,
                         end_tick: None,
                         release_velocity: None,
@@ -1948,6 +1970,28 @@ impl MidiNote {
 
     pub fn key(&self) -> u8 {
         self.key
+    }
+
+    /// FL note key and fine pitch approximating the channel tuning at note-on.
+    pub fn tuned_fl_pitch(&self) -> (u16, u8) {
+        let total_cents = i32::from(self.channel_coarse_tuning) * 100
+            + i32::from(self.channel_fine_tuning_cents)
+            + i32::from(self.pitch_bend_offset_cents);
+        // Preserve the original key where possible, since key-mapped instruments
+        // can select a different sound when the key itself is transposed.
+        let key_shift = if total_cents > 1200 {
+            (total_cents - 1200 + 99) / 100
+        } else if total_cents < -1200 {
+            -((-1200 - total_cents + 99) / 100)
+        } else {
+            0
+        };
+        let key = (i32::from(self.key) + key_shift).clamp(0, 127);
+        let cents = total_cents - (key - i32::from(self.key)) * 100;
+        (
+            key as u16,
+            midi_pitch_bend_cents_to_fl_note_fine_pitch(cents.clamp(-1200, 1200) as i16),
+        )
     }
 
     pub fn velocity(&self) -> u8 {
@@ -2828,6 +2872,30 @@ mod tests {
         assert_eq!(notes[1].mod_x(), 64);
         assert_eq!(notes[1].mod_y(), 64);
         assert_eq!(notes[1].pitch_bend_offset_cents(), 0);
+    }
+
+    #[test]
+    fn midi_import_snapshots_channel_tuning_and_bend_per_note() {
+        let midi = MidiFile::parse(&midi_fixture(&[
+            0, 0xB0, 101, 0, 0, 0xB0, 100, 2, 0, 0xB0, 6, 66, // +2 semitones.
+            0, 0xB0, 100, 1, 0, 0xB0, 6, 80, 0, 0xB0, 38, 0, // +25 cents.
+            0, 0xE0, 0, 96, // +100 cents with default bend range.
+            0, 0x90, 60, 100, 0, 0x91, 60, 100, 10, 0x80, 60, 64, 0, 0x81, 60, 64, 0, 0xB0, 121, 0,
+            0, 0x90, 60, 100, 10, 0x80, 60, 64, 0, 0xFF, 0x2F, 0,
+        ]))
+        .expect("fixture should parse");
+        let notes = midi.tracks()[0].notes();
+        assert_eq!(notes[0].tuned_fl_pitch(), (60, 153));
+        assert_eq!(notes[1].tuned_fl_pitch(), (60, 120));
+        assert_eq!(notes[2].tuned_fl_pitch(), (60, 120));
+        let mut extreme = notes[1].clone();
+        extreme.channel_coarse_tuning = 20;
+        assert_eq!(extreme.tuned_fl_pitch(), (68, 240));
+        extreme.key = 127;
+        assert_eq!(extreme.tuned_fl_pitch(), (127, 240));
+        extreme.key = 0;
+        extreme.channel_coarse_tuning = -20;
+        assert_eq!(extreme.tuned_fl_pitch(), (0, 0));
     }
 
     #[test]
