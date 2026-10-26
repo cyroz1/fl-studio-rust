@@ -160,6 +160,23 @@ def _mixer_get_track_color(index):
     return 0
 
 
+def _mixer_get_track_info(mode):
+    try:
+        mode = int(mode)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("Mixer track info mode must be a midi.TN_* constant") from error
+    if mode == 0:  # midi.TN_Master
+        return 0
+    if mode == 1:  # midi.TN_FirstIns
+        return 1
+    if mode == 2:  # midi.TN_LastIns
+        track_names = _active_transport_state.get("mixer_track_names", [])
+        return max(1, len(track_names) - 1)
+    if mode == 3:  # midi.TN_Sel
+        return int(_active_transport_state.get("mixer_selected_track", 0))
+    raise ValueError("Mixer track info mode must be a midi.TN_* constant")
+
+
 def _mixer_set_track_color(index, color):
     index = _mixer_track_index(index)
     try:
@@ -984,6 +1001,10 @@ def _install_modules(script_name, device_name):
     midi = _module("midi")
     constants = {
         "FromMIDI_Max": 127,
+        "TN_Master": 0,
+        "TN_FirstIns": 1,
+        "TN_LastIns": 2,
+        "TN_Sel": 3,
         "PL_Start": 0,
         "PL_LoadOk": 100,
         "PL_LoadError": 101,
@@ -1145,6 +1166,7 @@ def _install_modules(script_name, device_name):
     mixer.setTrackName = _mixer_set_track_name
     mixer.getTrackColor = _mixer_get_track_color
     mixer.setTrackColor = _mixer_set_track_color
+    mixer.getTrackInfo = _mixer_get_track_info
     mixer.isTrackEnabled = _mixer_track_enabled
     mixer.enableTrack = _mixer_enable_track
     mixer.isTrackMuted = _mixer_is_track_muted

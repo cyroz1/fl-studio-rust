@@ -14400,6 +14400,10 @@ impl DawUi {
         if let Ok(mut names) = self.midi_script_transport_state.mixer_track_names.lock() {
             *names = mixer_track_names;
         }
+        self.midi_script_transport_state.mixer_selected_track.store(
+            u64::try_from(self.selected_mixer_insert.unwrap_or(0)).unwrap_or(0),
+            Ordering::Relaxed,
+        );
         let mixer_track_colors = self
             .document
             .as_ref()
