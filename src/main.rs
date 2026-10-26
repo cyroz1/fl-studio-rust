@@ -5061,6 +5061,7 @@ fn parse_riff_machine_options(
                 options.preserve_start_times = parse_bool(value, "preserve start times")?
             }
             "mirror-vertical" => options.mirror_vertical = parse_bool(value, "vertical mirror")?,
+            "group-notes" => options.group_notes = parse_bool(value, "group notes")?,
             "groove-score" => groove_score_path = Some(PathBuf::from(value)),
             "groove-snap-ticks" => {
                 options.groove_snap_ticks = if value == "none" {

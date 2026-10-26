@@ -4787,6 +4787,7 @@ struct DawUi {
     riff_mirror_horizontal: bool,
     riff_preserve_start_times: bool,
     riff_mirror_vertical: bool,
+    riff_group_notes: bool,
     riff_groove_start_percent: u8,
     riff_groove_sensitivity_percent: u8,
     riff_groove_duration_percent: u8,
@@ -6387,6 +6388,7 @@ impl DawUi {
             riff_mirror_horizontal: false,
             riff_preserve_start_times: false,
             riff_mirror_vertical: false,
+            riff_group_notes: false,
             riff_groove_start_percent: 0,
             riff_groove_sensitivity_percent: 50,
             riff_groove_duration_percent: 0,
@@ -33010,6 +33012,9 @@ impl DawUi {
                             );
                         });
                         ui.checkbox(&mut self.riff_mirror_vertical, "Flip vertically");
+                        ui.checkbox(&mut self.riff_group_notes, "Group notes").on_hover_text(
+                            "Assign the generated riff one fresh note group ID.",
+                        );
                         let groove_grid_available = self.piano_roll_snap != PianoRollSnap::None;
                         egui::CollapsingHeader::new("Levels & Panning")
                             .default_open(false)
@@ -33279,6 +33284,7 @@ impl DawUi {
                                 self.riff_mirror_horizontal = defaults.mirror_horizontal;
                                 self.riff_preserve_start_times = defaults.preserve_start_times;
                                 self.riff_mirror_vertical = defaults.mirror_vertical;
+                                self.riff_group_notes = defaults.group_notes;
                                 self.riff_groove_start_percent = defaults.groove_start_percent;
                                 self.riff_groove_sensitivity_percent =
                                     defaults.groove_sensitivity_percent;
@@ -35725,6 +35731,7 @@ impl DawUi {
                 mirror_horizontal: self.riff_mirror_horizontal,
                 preserve_start_times: self.riff_preserve_start_times,
                 mirror_vertical: self.riff_mirror_vertical,
+                group_notes: self.riff_group_notes,
                 groove_score: riff_groove_score.as_ref(),
                 groove_snap_ticks: (self.piano_roll_snap != PianoRollSnap::None)
                     .then(|| self.piano_roll_snap.ticks(ppq, time_signature)),

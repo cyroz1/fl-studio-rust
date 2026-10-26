@@ -2507,6 +2507,8 @@ pub struct RiffMachineOptions<'a> {
     pub preserve_start_times: bool,
     /// Reflect generated pitches around the midpoint of their current pitch range.
     pub mirror_vertical: bool,
+    /// Assign all generated notes one fresh channel-local note group.
+    pub group_notes: bool,
     /// Optional `.fsc` timing template for the Groove stage.
     pub groove_score: Option<&'a FscScore>,
     /// Optional Piano roll snap grid for the Groove stage; `None` means snap is disabled.
@@ -2557,6 +2559,7 @@ impl<'a> Default for RiffMachineOptions<'a> {
             mirror_horizontal: false,
             preserve_start_times: false,
             mirror_vertical: false,
+            group_notes: false,
             groove_score: None,
             groove_snap_ticks: Some(24),
             groove_start_percent: 0,
@@ -15235,6 +15238,39 @@ impl FlpDocument {
                 }
             }
             updated.edit_pattern_notes_batch(pattern_id, channel_id, &mirror_edits)?;
+        }
+        if options.group_notes {
+            let patterns = updated.patterns()?;
+            let pattern = patterns
+                .iter()
+                .find(|pattern| pattern.id == pattern_id)
+                .ok_or(FlpError::UnsupportedEdit(
+                    "the requested pattern does not exist",
+                ))?;
+            let used_groups = pattern
+                .notes
+                .iter()
+                .filter(|note| note.channel_id == channel_id && note.group != 0)
+                .map(|note| note.group)
+                .collect::<BTreeSet<_>>();
+            let group_id = (1..=u16::MAX)
+                .find(|group| !used_groups.contains(group))
+                .ok_or(FlpError::UnsupportedEdit(
+                    "no free note group ID remains for this channel",
+                ))?;
+            let edits = generated_indices
+                .iter()
+                .map(|note_index| {
+                    (
+                        *note_index,
+                        PatternNoteEdit {
+                            group: Some(group_id),
+                            ..PatternNoteEdit::default()
+                        },
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            updated.edit_pattern_notes_batch(pattern_id, channel_id, &edits)?;
         }
         if levels_enabled {
             updated.apply_riff_machine_levels(
