@@ -2552,6 +2552,8 @@ pub struct RiffMachineOptions<'a> {
     pub range_octaves: u8,
     pub gate_percent: u8,
     pub direction: ArpeggioDirection,
+    /// Synchronization behavior for the Arpeggiation stage.
+    pub arpeggiation_sync: ArpeggioSyncMode,
     /// Build scale triads from the input progression before arpeggiation.
     pub chord_progression_enabled: bool,
     /// Chop chords into an arpeggio.
@@ -2639,6 +2641,7 @@ impl<'a> Default for RiffMachineOptions<'a> {
             range_octaves: 1,
             gate_percent: 80,
             direction: ArpeggioDirection::Up,
+            arpeggiation_sync: ArpeggioSyncMode::Block,
             chord_progression_enabled: true,
             arpeggiation_enabled: true,
             mirroring_enabled: true,
@@ -15438,7 +15441,7 @@ impl FlpDocument {
                 ArpeggioDirection::Down => ArpeggioRangePattern::Down,
                 ArpeggioDirection::UpDown => ArpeggioRangePattern::UpDown,
             },
-            sync: ArpeggioSyncMode::Block,
+            sync: options.arpeggiation_sync,
             group_notes: false,
         };
         let output_note_count = if options.arpeggiation_enabled {

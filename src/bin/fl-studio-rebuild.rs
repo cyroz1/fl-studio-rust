@@ -33209,6 +33209,29 @@ impl DawUi {
                                     "Up / Down",
                                 );
                             });
+                        egui::ComboBox::from_id_salt("piano-roll-riff-sync")
+                            .selected_text(match self.arpeggiator_sync_mode {
+                                ArpeggioSyncMode::Time => "Sync: Time",
+                                ArpeggioSyncMode::Block => "Sync: Block",
+                                ArpeggioSyncMode::Chord => "Sync: Chord",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.arpeggiator_sync_mode,
+                                    ArpeggioSyncMode::Time,
+                                    "Time",
+                                );
+                                ui.selectable_value(
+                                    &mut self.arpeggiator_sync_mode,
+                                    ArpeggioSyncMode::Block,
+                                    "Block",
+                                );
+                                ui.selectable_value(
+                                    &mut self.arpeggiator_sync_mode,
+                                    ArpeggioSyncMode::Chord,
+                                    "Chord",
+                                );
+                            });
                         egui::CollapsingHeader::new("Custom arpeggiation")
                             .default_open(false)
                             .show(ui, |ui| {
@@ -36169,6 +36192,7 @@ impl DawUi {
                 range_octaves: self.arpeggiator_range_octaves,
                 gate_percent: self.arpeggiator_gate_percent,
                 direction: self.riff_machine_direction,
+                arpeggiation_sync: self.arpeggiator_sync_mode,
                 chord_progression_enabled: self.riff_chord_progression_enabled,
                 arpeggiation_enabled: self.riff_arpeggiation_enabled,
                 mirroring_enabled: self.riff_mirroring_enabled,

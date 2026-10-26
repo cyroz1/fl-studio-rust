@@ -5110,6 +5110,7 @@ fn parse_riff_machine_options(values: &[String]) -> Result<ParsedRiffMachineOpti
                 options.range_octaves = parse_u8(value, "Riff Machine octave range")?
             }
             "gate-percent" => options.gate_percent = parse_u8(value, "Riff Machine gate")?,
+            "sync" => options.arpeggiation_sync = parse_arpeggio_sync_mode(value)?,
             "progression-score" => progression_score_path = Some(PathBuf::from(value)),
             "chord-score" => chord_score_path = Some(PathBuf::from(value)),
             "chord-progression" => {
