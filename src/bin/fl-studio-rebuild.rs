@@ -4497,6 +4497,7 @@ struct SampleEditorState {
 struct PendingBackupWrite {
     source_path: PathBuf,
     purpose: BackupPurpose,
+    project_edit_revision: u64,
     plugin_state_warnings: Vec<String>,
     receiver: Receiver<Result<PathBuf, String>>,
     worker: thread::JoinHandle<()>,
@@ -4638,6 +4639,8 @@ struct DawUi {
     toolbar_scale: f32,
     status: String,
     dirty: bool,
+    project_edit_revision: u64,
+    autosaved_project_revision: Option<u64>,
     undo_history: Vec<Vec<u8>>,
     redo_history: Vec<Vec<u8>>,
     pending_history_snapshot: Option<Vec<u8>>,
@@ -6260,6 +6263,8 @@ impl DawUi {
             toolbar_scale,
             status: "Ready".to_owned(),
             dirty: false,
+            project_edit_revision: 0,
+            autosaved_project_revision: None,
             undo_history: Vec::new(),
             redo_history: Vec::new(),
             pending_history_snapshot: None,
@@ -7367,6 +7372,7 @@ impl DawUi {
                 if changed {
                     self.stop_project_playback();
                     self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     self.status = match &dialog.action {
                         ChannelGroupDialogAction::AssignSelected(channel_ids) => format!(
                             "Grouped {} channel(s) in {}",
@@ -7423,6 +7429,7 @@ impl DawUi {
             Some(Ok(())) => {
                 self.stop_project_playback();
                 self.dirty = true;
+                self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                 self.status = format!(
                     "Deleted display group {}; its channels are now unsorted",
                     group_name
@@ -7548,6 +7555,7 @@ impl DawUi {
                     .is_some_and(|(after, before)| after != before);
                 if changed {
                     self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     self.status = if dialog.color_enabled {
                         format!("Updated Pattern {} name and color", dialog.pattern_id)
                     } else {
@@ -7651,6 +7659,7 @@ impl DawUi {
             Ok(()) => {
                 self.stop_project_playback();
                 self.dirty = true;
+                self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                 self.selected_pattern = self
                     .document
                     .as_ref()
@@ -8230,6 +8239,7 @@ impl DawUi {
         self.playlist_clip_context_split = None;
         self.active_playlist_clip_drag = None;
         self.dirty = true;
+        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
         self.status = format!(
             "Made Audio Clip {} unique as sample in channel {channel_id}",
             clip_index + 1
@@ -8802,6 +8812,7 @@ impl DawUi {
         self.selected_playlist_clips.insert(clip_index);
         self.playlist_selection_anchor = Some(clip_index);
         self.dirty = true;
+        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
         self.view = MainView::Playlist;
         self.refresh_audio_waveform_paths();
         self.status = format!(
@@ -9075,6 +9086,7 @@ impl DawUi {
             Ok(event_count) => {
                 self.document = Some(document);
                 self.dirty = true;
+                self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                 let plugin_summary = self
                     .load_project_vst3_plugins()
                     .map_or_else(String::new, |summary| format!(" · {summary}"));
@@ -9198,6 +9210,7 @@ impl DawUi {
         let template_path = is_untitled
             .then(|| self.new_project_template_path.clone())
             .flatten();
+        let project_edit_revision = self.project_edit_revision;
         let mut document = document.clone();
         let plugin_state_warnings = self.capture_loaded_vst3_state(&mut document);
         let result = document
@@ -9217,6 +9230,7 @@ impl DawUi {
         match result {
             Ok(path) => {
                 self.last_autosave_path = Some(path.clone());
+                self.autosaved_project_revision = Some(project_edit_revision);
                 self.status = format!(
                     "Autosaved before {operation}{}",
                     plugin_state_warning_suffix(&plugin_state_warnings)
@@ -9248,6 +9262,7 @@ impl DawUi {
         let template_path = is_untitled
             .then(|| self.new_project_template_path.clone())
             .flatten();
+        let project_edit_revision = self.project_edit_revision;
         let mut document = document.clone();
         let plugin_state_warnings = self.capture_loaded_vst3_state(&mut document);
         let bytes = match document.encode_lossless() {
@@ -9284,6 +9299,7 @@ impl DawUi {
         self.pending_backup_write = Some(PendingBackupWrite {
             source_path,
             purpose,
+            project_edit_revision,
             plugin_state_warnings,
             receiver,
             worker,
@@ -9299,19 +9315,23 @@ impl DawUi {
                 Ok(result) => Some((
                     pending.source_path.clone(),
                     pending.purpose,
+                    pending.project_edit_revision,
                     pending.plugin_state_warnings.clone(),
                     result,
                 )),
                 Err(TryRecvError::Disconnected) => Some((
                     pending.source_path.clone(),
                     pending.purpose,
+                    pending.project_edit_revision,
                     pending.plugin_state_warnings.clone(),
                     Err("backup writer stopped unexpectedly".to_owned()),
                 )),
                 Err(TryRecvError::Empty) => None,
             }
         });
-        let Some((source_path, purpose, plugin_state_warnings, result)) = result else {
+        let Some((source_path, purpose, project_edit_revision, plugin_state_warnings, result)) =
+            result
+        else {
             return;
         };
         if let Some(pending) = self.pending_backup_write.take() {
@@ -9329,6 +9349,7 @@ impl DawUi {
                             .is_some_and(|key| project_paths_equal(key, &source_path)));
                 if is_current_project {
                     self.last_autosave_path = Some(path.clone());
+                    self.autosaved_project_revision = Some(project_edit_revision);
                     self.status = format!(
                         "Autosaved to {}{}",
                         path.display(),
@@ -9712,6 +9733,7 @@ impl DawUi {
         self.untitled_autosave_key = new_untitled_project_autosave_key();
         self.saved_project_hash = None;
         self.dirty = true;
+        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
         self.autosave_deadline = None;
         self.last_autosave_path = None;
         self.selected_pattern = destinations.first().map(|(pattern_id, _)| *pattern_id);
@@ -9761,6 +9783,7 @@ impl DawUi {
             }
             self.saved_project_hash = original_hash;
             self.dirty = true;
+            self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
             self.last_autosave_path = Some(prompt.backup_path.clone());
             self.status = if prompt.is_untitled {
                 "Recovered untitled project from autosave".to_owned()
@@ -9804,6 +9827,7 @@ impl DawUi {
         match document.set_project_info(edit) {
             Ok(()) => {
                 self.dirty = true;
+                self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                 self.project_info_open = false;
                 self.status = "Project Info updated".to_owned();
             }
@@ -9931,6 +9955,7 @@ impl DawUi {
         }) {
             Ok(()) => {
                 self.dirty = true;
+                self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                 self.project_settings_open = false;
                 self.status = "Project settings updated".to_owned();
             }
@@ -9947,6 +9972,7 @@ impl DawUi {
             Ok(pattern_id) => {
                 self.selected_pattern = Some(pattern_id);
                 self.dirty = true;
+                self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                 self.status = format!("Created empty pattern {pattern_id}");
                 Some(pattern_id)
             }
@@ -9987,6 +10013,7 @@ impl DawUi {
             Ok(new_pattern_id) => {
                 self.selected_pattern = Some(new_pattern_id);
                 self.dirty = true;
+                self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                 self.status = format!("Duplicated pattern {pattern_id} as {new_pattern_id}");
             }
             Err(error) => self.status = format!("Could not duplicate pattern: {error}"),
@@ -11087,6 +11114,7 @@ impl DawUi {
         if changed {
             self.stop_project_playback();
             self.dirty = true;
+            self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
             self.status = format!("Tempo set to {:.3} BPM", f64::from(milli_bpm) / 1000.0);
         }
         changed
@@ -14293,9 +14321,16 @@ impl DawUi {
                 u64::from(self.live_sampler_tempo_bpm_milli()),
                 Ordering::Relaxed,
             );
+        let project_changed_flag = if !self.dirty {
+            0
+        } else if self.autosaved_project_revision == Some(self.project_edit_revision) {
+            2
+        } else {
+            1
+        };
         self.midi_script_transport_state
             .project_changed_flag
-            .store(if self.dirty { 1 } else { 0 }, Ordering::Relaxed);
+            .store(project_changed_flag, Ordering::Relaxed);
         self.midi_script_transport_state
             .time_signature_numerator
             .store(time_signature_numerator, Ordering::Relaxed);
@@ -15128,6 +15163,7 @@ impl DawUi {
         }) {
             Ok(()) => {
                 self.dirty = true;
+                self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                 self.project_settings_time_signature_enabled = true;
                 self.project_settings_time_signature_numerator = signature.0;
                 self.project_settings_time_signature_denominator = signature.1;
@@ -15180,6 +15216,7 @@ impl DawUi {
                 self.selected_arrangement = Some(arrangement_id);
                 self.selected_time_marker = Some(marker_index);
                 self.dirty = true;
+                self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                 self.status = format!("MIDI script added Playlist marker at tick {tick}");
             }
             Err(error) => {
@@ -16110,6 +16147,7 @@ impl DawUi {
 
         self.document = Some(document);
         self.dirty = true;
+        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
         self.status = format!("Applied {preset_name} to VST3 Channel {target_channel_id}");
         self.last_plugin_action = Some(self.status.clone());
         true
@@ -16150,6 +16188,7 @@ impl DawUi {
             Ok(()) => {
                 self.stop_project_playback();
                 self.dirty = true;
+                self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                 let channel_name = self
                     .document
                     .as_ref()
@@ -16192,6 +16231,7 @@ impl DawUi {
             Ok(channel_id) => {
                 self.stop_project_playback();
                 self.dirty = true;
+                self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                 self.selected_graph_channel = Some(channel_id);
                 self.selected_note_channel = Some(channel_id);
                 self.status = format!("Created Sampler channel {name} from {}", path.display());
@@ -23618,6 +23658,7 @@ impl DawUi {
                                             self.document = updated;
                                             self.stop_project_playback();
                                             self.dirty = true;
+                                            self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                                                     let edit_status = match drag.kind {
                                                 PlaylistClipDragKind::Move => {
                                                     if group_targets.len() > 1 {
@@ -24344,6 +24385,7 @@ impl DawUi {
                         self.stop_project_playback();
                     }
                     self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     ui.ctx().request_repaint();
                     self.status = if let Some(enabled) = edit.enabled {
                         if enabled {
@@ -24435,6 +24477,7 @@ impl DawUi {
                     Some(Ok(updated)) => {
                         self.document = Some(updated);
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                         ui.ctx().request_repaint();
                         self.status = if grouped {
                             format!(
@@ -24526,6 +24569,7 @@ impl DawUi {
                         self.document = Some(updated);
                         self.stop_project_playback();
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                         ui.ctx().request_repaint();
                         self.status = format!(
                             "Moved {moved_count}{} Playlist {} {} one track",
@@ -24599,6 +24643,7 @@ impl DawUi {
                         self.document = Some(updated);
                         self.stop_project_playback();
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                         ui.ctx().request_repaint();
                         self.status = format!(
                             "Shifted {} selected Playlist {} {} by one sixteenth note",
@@ -24716,6 +24761,7 @@ impl DawUi {
                     self.document = Some(updated);
                     self.stop_project_playback();
                     self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     ui.ctx().request_repaint();
                     self.status = if let Some((track_id, muted)) = playlist_track_clips_mute_action
                     {
@@ -24766,6 +24812,7 @@ impl DawUi {
                             self.selected_playlist_clips =
                                 clip_edits.iter().map(|(index, _)| *index).collect();
                             self.dirty = true;
+                            self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                             ui.ctx().request_repaint();
                             if clip_edits.len() == 1 {
                                 let (clip_index, reversed) = clip_edits[0];
@@ -24821,6 +24868,7 @@ impl DawUi {
                     self.document = Some(updated);
                     self.stop_project_playback();
                     self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     ui.ctx().request_repaint();
                     self.status = if group == 0 {
                         format!(
@@ -24879,6 +24927,7 @@ impl DawUi {
                     self.playlist_clip_context_split = None;
                     self.active_playlist_clip_drag = None;
                     self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     self.status = format!(
                         "Made Audio Clip {} unique as channel {channel_id}",
                         clip_index + 1
@@ -24938,6 +24987,7 @@ impl DawUi {
                         self.playlist_clip_context_split = None;
                         self.active_playlist_clip_drag = None;
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                         self.status = format!(
                             "Split Pattern Clip {} at tick {split_position_ticks}",
                             clip_index + 1
@@ -24984,6 +25034,8 @@ impl DawUi {
                                 self.playlist_clip_context_split = None;
                                 self.active_playlist_clip_drag = None;
                                 self.dirty = true;
+                                self.project_edit_revision =
+                                    self.project_edit_revision.wrapping_add(1);
                                 self.status = if snapped {
                                     format!(
                                         "Split Audio Clip {} at zero crossing (tick {effective_split_ticks})",
@@ -25033,6 +25085,7 @@ impl DawUi {
                         self.playlist_clip_context_split = None;
                         self.active_playlist_clip_drag = None;
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                         self.status = format!(
                             "Joined Audio Clips {} and {}",
                             left_clip_index + 1,
@@ -25068,6 +25121,7 @@ impl DawUi {
                         self.playlist_clip_context_split = None;
                         self.active_playlist_clip_drag = None;
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                         self.status = format!(
                             "Joined Pattern Clips {} and {}",
                             left_clip_index + 1,
@@ -25131,6 +25185,7 @@ impl DawUi {
                     self.selected_playlist_clips.insert(clip_index);
                     self.playlist_selection_anchor = Some(clip_index);
                     self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     self.status = if create_pattern_clip_at_requested.is_some() {
                         format!("Placed Pattern {pattern_id} at tick {position_ticks}")
                     } else {
@@ -25202,6 +25257,7 @@ impl DawUi {
                     self.selected_playlist_clips.insert(clip_index);
                     self.playlist_selection_anchor = Some(clip_index);
                     self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     self.status = if create_automation_clip_at_requested.is_some() {
                         format!("Placed Automation Channel {channel_id} at tick {position_ticks}")
                     } else {
@@ -25244,6 +25300,7 @@ impl DawUi {
                     self.selected_playlist_clips.insert(clip_index);
                     self.playlist_selection_anchor = Some(clip_index);
                     self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     self.status =
                         format!("Placed Audio Channel {channel_id} at tick {position_ticks}");
                     playlist_clip_list_changed = true;
@@ -25303,6 +25360,7 @@ impl DawUi {
             {
                 Some(Ok(())) => {
                     self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     ui.ctx().request_repaint();
                     self.status = format!("Auto-named Playlist track {track_id}");
                 }
@@ -25348,6 +25406,7 @@ impl DawUi {
             {
                 Some(Ok(())) => {
                     self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     context.request_repaint();
                     self.status = if name.is_empty() {
                         format!("Reset Playlist track {track_id} name")
@@ -25684,6 +25743,7 @@ impl DawUi {
                 self.playlist_clip_context_split = None;
                 self.active_playlist_clip_drag = None;
                 self.dirty = true;
+                self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                 true
             }
             Some(Err(error)) => {
@@ -25790,6 +25850,7 @@ impl DawUi {
                 self.playlist_clip_context_split = None;
                 self.active_playlist_clip_drag = None;
                 self.dirty = true;
+                self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                 self.status = format!("Joined {} adjacent Audio Clips", clip_indices.len());
                 true
             }
@@ -26164,6 +26225,7 @@ impl DawUi {
                 self.playlist_clip_context_split = None;
                 self.active_playlist_clip_drag = None;
                 self.dirty = true;
+                self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                 self.status = if snapped_count > 0 {
                     format!(
                         "Split {} selected Audio Clips; {snapped_count} split(s) used a zero crossing",
@@ -26288,6 +26350,7 @@ impl DawUi {
                 self.playlist_clip_context_split = None;
                 self.active_playlist_clip_drag = None;
                 self.dirty = true;
+                self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                 self.status = format!(
                     "Split {} selected Pattern Clips at tick {split_position_ticks}",
                     clip_indices.len()
@@ -26397,6 +26460,7 @@ impl DawUi {
                 self.playlist_clip_context_split = None;
                 self.active_playlist_clip_drag = None;
                 self.dirty = true;
+                self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                 self.status = format!("Joined {} adjacent Pattern Clips", clip_indices.len());
                 true
             }
@@ -26469,6 +26533,7 @@ impl DawUi {
                 self.active_playlist_clip_drag = None;
                 self.active_playlist_clip_drag_targets.clear();
                 self.dirty = true;
+                self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                 self.status = if clip_indices.len() == 1 {
                     format!("Deleted Playlist clip {}", clip_indices[0] + 1)
                 } else {
@@ -26601,6 +26666,7 @@ impl DawUi {
                 self.playlist_selection_anchor = None;
                 self.active_playlist_clip_drag = None;
                 self.dirty = true;
+                self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                 self.status = if count == 1 {
                     format!("Cut Playlist clip {}", descending_indices[0] + 1)
                 } else {
@@ -26696,6 +26762,7 @@ impl DawUi {
                 self.playlist_selection_anchor = self.selected_clip;
                 self.active_playlist_clip_drag = None;
                 self.dirty = true;
+                self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                 self.status = if clip_indices.len() == 1 {
                     format!("Pasted Playlist clip {}", clip_indices[0] + 1)
                 } else {
@@ -26824,6 +26891,7 @@ impl DawUi {
                 self.playlist_selection_anchor = self.selected_clip;
                 self.active_playlist_clip_drag = None;
                 self.dirty = true;
+                self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                 self.status = if duplicate_all {
                     format!(
                         "Duplicated all {} Playlist clips to the right",
@@ -27040,6 +27108,7 @@ impl DawUi {
                     Ok(()) => {
                         self.stop_project_playback();
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                         self.status = "Playlist clip updated".to_owned();
                     }
                     Err(error) => {
@@ -27065,6 +27134,7 @@ impl DawUi {
                         self.selected_playlist_clips.insert(duplicate_index);
                         self.playlist_selection_anchor = Some(duplicate_index);
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                         self.status = format!("Duplicated Playlist clip {}", index + 1);
                     }
                     Err(error) => {
@@ -27209,6 +27279,7 @@ impl DawUi {
                     self.stop_project_playback();
                     self.selected_pattern_time_signature = None;
                     self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     self.status =
                         format!("Deleted Pattern {pattern_id} time signature at tick {position}");
                 }
@@ -27250,6 +27321,7 @@ impl DawUi {
                 self.selected_pattern_time_signature = Some(marker_index);
                 self.selected_pattern_time_signature_pattern = Some(pattern_id);
                 self.dirty = true;
+                self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                 self.status = format!(
                     "Set Pattern {pattern_id} time signature to {numerator}/{denominator} at tick {position_ticks}"
                 );
@@ -27382,6 +27454,7 @@ impl DawUi {
                     self.stop_project_playback();
                     self.selected_time_marker = None;
                     self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     self.status = format!("Deleted time marker {}", marker_index + 1);
                 } else {
                     self.status = "Could not delete the selected time marker".to_owned();
@@ -27415,6 +27488,7 @@ impl DawUi {
                     self.selected_time_marker = Some(marker_index);
                     self.new_time_marker_name.clear();
                     self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     self.status = format!("Created time marker {}", marker_index + 1);
                 }
                 Err(error) => self.status = format!("Could not create time marker: {error}"),
@@ -27433,6 +27507,7 @@ impl DawUi {
                 Ok(()) => {
                     self.stop_project_playback();
                     self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     self.status = format!("Updated time marker {}", marker_index + 1);
                 }
                 Err(error) => self.status = format!("Could not update time marker: {error}"),
@@ -28925,6 +29000,7 @@ impl DawUi {
                     self.selected_note = None;
                     self.selected_piano_notes.clear();
                     self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     self.status = format!(
                         "Duplicated channel {source_channel_id} as channel {new_channel_id} ({display_name})"
                     );
@@ -28944,6 +29020,7 @@ impl DawUi {
                 Some(Ok(())) => {
                     self.stop_project_playback();
                     self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     self.status = format!(
                         "Channel {channel_id} {}",
                         if enabled { "unmuted" } else { "muted" }
@@ -28964,6 +29041,7 @@ impl DawUi {
                 Some(Ok(())) => {
                     self.stop_project_playback();
                     self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     self.status = format!(
                         "Sample source on channel {channel_id} {}",
                         if reversed { "reversed" } else { "restored" }
@@ -28984,6 +29062,7 @@ impl DawUi {
                 Some(Ok(())) => {
                     self.stop_project_playback();
                     self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     let track_name = match mixer_track {
                         -1 => "Current".to_owned(),
                         0 => "Master".to_owned(),
@@ -29007,6 +29086,7 @@ impl DawUi {
                 Some(Ok(())) => {
                     self.stop_project_playback();
                     self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     self.status = format!(
                         "Channel {channel_id} main pitch {}",
                         if enabled { "enabled" } else { "disabled" }
@@ -29027,6 +29107,7 @@ impl DawUi {
                 Some(Ok(())) => {
                     self.stop_project_playback();
                     self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     self.status = format!(
                         "Channel {channel_id} Add to Key {}",
                         if enabled { "enabled" } else { "disabled" }
@@ -29046,6 +29127,7 @@ impl DawUi {
             match result {
                 Some(Ok(())) => {
                     self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     self.status = format!(
                         "Channel {channel_id} {}",
                         if zipped { "zipped" } else { "unzipped" }
@@ -29066,6 +29148,7 @@ impl DawUi {
             match result {
                 Some(Ok(())) => {
                     self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     self.status = format!("Global swing mix set to {percent}%");
                 }
                 Some(Err(error)) => {
@@ -29082,6 +29165,7 @@ impl DawUi {
             match result {
                 Some(Ok(())) => {
                     self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     let percent = (u32::from(swing_mix) * 100 + 64) / 128;
                     self.status = format!("Channel {channel_id} swing mix set to {percent}%");
                 }
@@ -29098,6 +29182,7 @@ impl DawUi {
             match result {
                 Some(Ok(())) => {
                     self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     self.status = format!(
                         "Channel {channel_id} saved precomputed fades: Out {fade_out_raw}, In {fade_in_raw}"
                     );
@@ -29116,6 +29201,7 @@ impl DawUi {
             match result {
                 Some(Ok(())) => {
                     self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     self.status = format!(
                         "Channel {channel_id} {} envelope/LFO updated",
                         target.label()
@@ -29138,6 +29224,7 @@ impl DawUi {
             match result {
                 Some(Ok(())) => {
                     self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     self.status = format!("Channel {channel_id} Fine Tune set to {cents} cents");
                 }
                 Some(Err(error)) => {
@@ -29154,6 +29241,7 @@ impl DawUi {
             match result {
                 Some(Ok(())) => {
                     self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     self.status = format!("Updated color for {} channel(s)", channel_ids.len());
                 }
                 Some(Err(error)) => {
@@ -29169,6 +29257,7 @@ impl DawUi {
             match result {
                 Some(Ok(())) => {
                     self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     self.status =
                         format!("Applied RGB gradient to {} channel(s)", channel_ids.len());
                 }
@@ -29187,6 +29276,7 @@ impl DawUi {
                 Some(Ok(())) => {
                     self.stop_project_playback();
                     self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     self.status = format!(
                         "Moved channel {channel_id} to position {}",
                         target_index + 1
@@ -29231,6 +29321,7 @@ impl DawUi {
                     if changed {
                         self.stop_project_playback();
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                         self.status = format!("Sorted Channel Rack by {sort_name}");
                     } else {
                         self.status = format!("Channel Rack is already sorted by {sort_name}");
@@ -29300,6 +29391,7 @@ impl DawUi {
                     Ok(()) => {
                         self.stop_project_playback();
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                         self.status = match operation {
                             StepToggleOperation::Add => {
                                 format!("Added step to pattern {pattern_id}, channel {channel_id}")
@@ -29347,6 +29439,7 @@ impl DawUi {
                     Ok(()) => {
                         self.stop_project_playback();
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                         self.status = format!(
                             "Added key {key} note to step in pattern {pattern_id}, channel {channel_id}"
                         );
@@ -29364,6 +29457,7 @@ impl DawUi {
                 match document.set_channel_levels(channel_id, volume, pan) {
                     Ok(()) => {
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                         self.status = format!("Channel {channel_id} volume and pan updated");
                     }
                     Err(error) => self.status = format!("Could not update channel levels: {error}"),
@@ -29377,6 +29471,7 @@ impl DawUi {
                 match document.set_layer_child_ids(channel_id, &child_ids) {
                     Ok(()) => {
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                         self.status = format!("Layer channel {channel_id} children updated");
                     }
                     Err(error) => {
@@ -29392,6 +29487,7 @@ impl DawUi {
                 match document.edit_channel_stretch_settings(channel_id, edit) {
                     Ok(()) => {
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                         self.status = format!("Channel {channel_id} stretch settings updated");
                     }
                     Err(error) => {
@@ -29409,6 +29505,7 @@ impl DawUi {
                 match document.set_layer_flags(channel_id, random, crossfade) {
                     Ok(()) => {
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                         self.status = format!("Layer channel {channel_id} flags updated");
                     }
                     Err(error) => {
@@ -29424,6 +29521,7 @@ impl DawUi {
                 match document.set_layer_fade(channel_id, fade_raw) {
                     Ok(()) => {
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                         self.status = format!("Layer channel {channel_id} Fade updated");
                     }
                     Err(error) => {
@@ -29936,6 +30034,7 @@ impl DawUi {
                     self.document = updated;
                     self.stop_project_playback();
                     self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     let first_step = graph_actions
                         .first()
                         .map(|action| action.0 + 1)
@@ -30646,6 +30745,7 @@ impl DawUi {
                 Ok(()) => {
                     if let Some(source_channel_id) = copied_state_from {
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                         self.status = format!(
                             "Copied Automation curve state from channel {source_channel_id}"
                         );
@@ -30663,6 +30763,7 @@ impl DawUi {
                             };
                         } else {
                             self.dirty = true;
+                            self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                             self.status = if flipped_points {
                                 format!("Vertically flipped {count} automation point values")
                             } else if normalized_points {
@@ -30684,6 +30785,7 @@ impl DawUi {
                         }
                     } else {
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                         self.status = if initialized_template {
                             "Initialized an empty automation curve from the selected template"
                                 .to_owned()
@@ -30909,6 +31011,7 @@ impl DawUi {
                 let count = note_ids.len();
                 self.document = Some(updated);
                 self.dirty = true;
+                self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                 self.status = format!(
                     "{} {count} Piano roll note{}",
                     if muted { "Muted" } else { "Unmuted" },
@@ -31046,6 +31149,7 @@ impl DawUi {
                 self.document = updated;
                 self.stop_project_playback();
                 self.dirty = true;
+                self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                 let direction = if tick_delta < 0 {
                     "left"
                 } else if tick_delta > 0 {
@@ -31125,6 +31229,7 @@ impl DawUi {
                     self.stop_project_playback();
                 }
                 self.dirty = true;
+                self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                 let noun = if targets.len() == 1 { "note" } else { "notes" };
                 match wheel_edit.action {
                     PianoRollMouseWheelAction::AdjustProperty => {
@@ -31198,6 +31303,7 @@ impl DawUi {
                 self.document = updated;
                 self.stop_project_playback();
                 self.dirty = true;
+                self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                 self.status = format!(
                     "Set {} selected note{} to {length} ticks",
                     targets.len(),
@@ -31276,6 +31382,7 @@ impl DawUi {
             Ok(note_count) => {
                 self.stop_project_playback();
                 self.dirty = true;
+                self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                 self.status = format!(
                     "Changed color of {note_count} note{} to color {}",
                     if note_count == 1 { "" } else { "s" },
@@ -31355,6 +31462,7 @@ impl DawUi {
         }
         self.document = Some(updated);
         self.dirty = true;
+        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
         self.status = if grouped {
             format!("Grouped {selected_count} selected notes")
         } else {
@@ -34419,6 +34527,7 @@ impl DawUi {
                         if changed > 0 {
                             self.stop_project_playback();
                             self.dirty = true;
+                            self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                         }
                         let direction_label = match direction {
                             PatternNoteRotation::Left => "left",
@@ -34469,6 +34578,7 @@ impl DawUi {
                 Ok(changed) => {
                     if changed > 0 {
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     }
                     self.status = format!(
                         "Scaled velocity for {changed} {edit_scope_description} in pattern {pattern_id}"
@@ -34526,6 +34636,7 @@ impl DawUi {
                 Ok(changed) => {
                     if changed > 0 {
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     }
                     if variation_percent > 0 {
                         self.articulate_seed = seed.saturating_add(1);
@@ -34606,6 +34717,7 @@ impl DawUi {
                             self.selected_note =
                                 self.selected_piano_notes.iter().next_back().copied();
                             self.dirty = true;
+                            self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                             self.status = format!(
                                 "Duplicated {duplicated_count} notes to the right in pattern {pattern_id}"
                             );
@@ -34663,6 +34775,7 @@ impl DawUi {
                         self.active_note_drag = None;
                         self.stop_project_playback();
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     }
                     self.status = if deleted == 0 {
                         "No notes to delete in the target channel".to_owned()
@@ -35516,6 +35629,7 @@ impl DawUi {
                     if changed > 0 {
                         self.stop_project_playback();
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     }
                     self.status = if quantize_selected_requested {
                         format!("Quantized {changed} selected notes in pattern {pattern_id}")
@@ -35553,6 +35667,7 @@ impl DawUi {
                     if changed > 0 {
                         self.stop_project_playback();
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     }
                     self.status = format!(
                         "Extended {changed} note lengths in pattern {pattern_id}, {edit_scope_description}"
@@ -35588,6 +35703,7 @@ impl DawUi {
                     if created > 0 {
                         self.stop_project_playback();
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     }
                     self.status = format!(
                         "Created {created} chopped notes in pattern {pattern_id}, {edit_scope_description}"
@@ -35629,6 +35745,7 @@ impl DawUi {
                         if created > 0 {
                             self.stop_project_playback();
                             self.dirty = true;
+                            self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                         }
                         self.status = format!(
                             "Quick Chop created {created} notes in pattern {pattern_id}, {edit_scope_description}"
@@ -35663,6 +35780,7 @@ impl DawUi {
                     if removed > 0 {
                         self.stop_project_playback();
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                         self.selected_piano_notes.clear();
                         self.selected_note = None;
                         self.active_note_drag = None;
@@ -35699,6 +35817,7 @@ impl DawUi {
                     if changed > 0 {
                         self.stop_project_playback();
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     }
                     self.status = format!(
                         "Flipped {changed} note positions in pattern {pattern_id}, {edit_scope_description}"
@@ -35746,6 +35865,7 @@ impl DawUi {
                     if changed > 0 {
                         self.stop_project_playback();
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     }
                     self.status = format!(
                         "Strummed {changed} notes in pattern {pattern_id}, {edit_scope_description}"
@@ -35813,6 +35933,7 @@ impl DawUi {
                     if created > 0 {
                         self.stop_project_playback();
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     }
                     self.status = format!(
                         "Added {created} flam strokes to pattern {pattern_id}, {edit_scope_description}"
@@ -35886,6 +36007,7 @@ impl DawUi {
                         if created > 0 {
                             self.stop_project_playback();
                             self.dirty = true;
+                            self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                         }
                         self.status = format!(
                             "Generated {created} notes in pattern {pattern_id} from tick {start_tick} to {end_tick} using seed {seed}, octave {base_octave}, range {range_octaves}, and {length_variation_percent}% length variation{}{}",
@@ -35992,6 +36114,7 @@ impl DawUi {
                     if changed > 0 {
                         self.stop_project_playback();
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     }
                     self.status = format!(
                         "Randomized {changed} notes in pattern {pattern_id}, {edit_scope_description} using seed {seed}{}",
@@ -36061,6 +36184,7 @@ impl DawUi {
                     if changed > 0 {
                         self.stop_project_playback();
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     }
                     self.status = format!(
                         "Humanized {changed} notes in pattern {pattern_id}, {edit_scope_description} using seed {seed}"
@@ -36112,6 +36236,7 @@ impl DawUi {
                     if changed > 0 {
                         self.stop_project_playback();
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     }
                     self.status = format!(
                         "Limited {changed} note pitches in pattern {pattern_id}, {edit_scope_description}"
@@ -36224,6 +36349,7 @@ impl DawUi {
                     if created > 0 {
                         self.stop_project_playback();
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                         self.selected_piano_notes.clear();
                         self.selected_note = None;
                         self.active_note_drag = None;
@@ -36410,6 +36536,7 @@ impl DawUi {
                         if created > 0 {
                             self.stop_project_playback();
                             self.dirty = true;
+                            self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                             self.selected_piano_notes.clear();
                             self.selected_note = None;
                             self.active_note_drag = None;
@@ -36456,6 +36583,7 @@ impl DawUi {
                     if changed > 0 {
                         self.stop_project_playback();
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                         self.selected_piano_notes.clear();
                         self.selected_note = None;
                         self.active_note_drag = None;
@@ -36494,6 +36622,7 @@ impl DawUi {
                     if created > 0 {
                         self.stop_project_playback();
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     }
                     self.status = format!(
                         "Sliced {created} notes at tick {position_ticks} in pattern {pattern_id}, {edit_scope_description}"
@@ -36578,6 +36707,7 @@ impl DawUi {
                     if imported > 0 {
                         self.stop_project_playback();
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                         self.selected_piano_notes.clear();
                         self.selected_piano_notes
                             .extend((0..imported).map(|offset| {
@@ -37127,6 +37257,7 @@ impl DawUi {
                         }
                         if imported > 0 || target_pattern_id.is_none() {
                             self.dirty = true;
+                            self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                         }
                         self.status = if target_pattern_id.is_none() {
                             format!("Imported {imported} MIDI notes into new pattern {pattern_id}")
@@ -37206,6 +37337,7 @@ impl DawUi {
                             ));
                         }
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                         self.status = if target_pattern_id.is_none() {
                             format!(
                                 "Imported {imported} MIDI notes from {} selected tracks into new pattern {pattern_id}",
@@ -37318,6 +37450,7 @@ impl DawUi {
                             }
                         }
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                         self.status = if target_pattern_id.is_none() {
                             format!(
                                 "Created {} MIDI template channels from selected MIDI tracks and imported {imported} notes into new pattern {pattern_id}",
@@ -37369,6 +37502,7 @@ impl DawUi {
                             }
                         }
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                         self.status = format!(
                             "Imported {imported} notes from {} selected Format-2 tracks into separate Patterns with cloned instrument channels",
                             destinations.len()
@@ -37420,6 +37554,7 @@ impl DawUi {
                         self.selected_piano_notes
                             .insert((pattern_id, channel_id, note_index));
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                         self.status = format!("Added note to pattern {pattern_id}");
                     }
                     Err(error) => self.status = error.to_string(),
@@ -39538,6 +39673,7 @@ impl DawUi {
         self.playlist_clip_context_split = None;
         self.active_playlist_clip_drag = None;
         self.dirty = true;
+        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
         self.view = MainView::Playlist;
         self.refresh_audio_waveform_paths();
         self.status = if mute_source {
@@ -40097,6 +40233,7 @@ impl DawUi {
         self.playlist_clip_context_split = None;
         self.active_playlist_clip_drag = None;
         self.dirty = true;
+        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
         self.view = MainView::Playlist;
         self.refresh_audio_waveform_paths();
         self.status = format!(
@@ -40325,6 +40462,7 @@ impl DawUi {
         self.playlist_clip_context_split = None;
         self.active_playlist_clip_drag = None;
         self.dirty = true;
+        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
         self.view = MainView::Playlist;
         self.refresh_audio_waveform_paths();
         self.status = format!(
@@ -42523,6 +42661,7 @@ impl DawUi {
                     if result.is_ok() {
                         self.document = updated;
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                         self.status = if drag.targets.len() > 1 {
                             let action = match drag.kind {
                                 NoteDragKind::Move => "Moved",
@@ -42748,6 +42887,7 @@ impl DawUi {
                         if result.is_ok() {
                             self.document = updated;
                             self.dirty = true;
+                            self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                             self.status = format!(
                                 "Stretched {} selected notes",
                                 drag.targets.len()
@@ -43079,6 +43219,7 @@ impl DawUi {
                                     self.document = Some(updated);
                                     self.stop_project_playback();
                                     self.dirty = true;
+                                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                                 }
                                 self.status = format!("Sliced {created} notes in pattern {}", pattern.id);
                             }
@@ -43930,6 +44071,7 @@ impl DawUi {
                         self.selected_note = self.selected_piano_notes.iter().next_back().copied();
                         self.selected_note_channel = Some(channel_id);
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                         if stamped_chord && only_one {
                             self.piano_roll_stamp_mode = false;
                         }
@@ -43994,6 +44136,7 @@ impl DawUi {
                         self.active_note_drag = None;
                         self.stop_project_playback();
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     }
                     self.status = if deleted == 0 {
                         "No Piano roll notes to delete".to_owned()
@@ -44147,6 +44290,7 @@ impl DawUi {
                     ) {
                         Ok(()) => {
                             self.dirty = true;
+                            self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                             self.status = format!("Updated note {}", target.label());
                         }
                         Err(error) => {
@@ -44320,6 +44464,7 @@ impl DawUi {
                     Ok(_) => {
                         self.piano_roll_controller_stream = Some((channel, flags));
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                         self.status = format!(
                             "Created raw Pattern controller stream · channel {channel} · flags 0x{flags:02X}"
                         );
@@ -44381,6 +44526,7 @@ impl DawUi {
                     if imported > 0 {
                         self.stop_project_playback();
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     }
                     self.status = format!(
                         "Imported {imported} automation points into Pattern {} stream {} / 0x{:02X}",
@@ -44683,6 +44829,7 @@ impl DawUi {
                     match document.delete_pattern_controller(pattern.id, controller_index) {
                         Ok(()) => {
                             self.dirty = true;
+                            self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                             self.status = "Deleted raw Pattern controller point".to_owned();
                         }
                         Err(error) => {
@@ -44721,6 +44868,7 @@ impl DawUi {
                     ) {
                         Ok(()) => {
                             self.dirty = true;
+                            self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                             self.status = "Updated raw Pattern controller point".to_owned();
                         }
                         Err(error) => {
@@ -44782,6 +44930,7 @@ impl DawUi {
                     ) {
                         Ok(_) => {
                             self.dirty = true;
+                            self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                             self.status = "Drawing raw Pattern controller points".to_owned();
                             self.piano_roll_controller_stroke = Some(PianoRollControllerStroke {
                                 pattern_id: pattern.id,
@@ -44842,6 +44991,8 @@ impl DawUi {
                         ) {
                             Ok(_) => {
                                 self.dirty = true;
+                                self.project_edit_revision =
+                                    self.project_edit_revision.wrapping_add(1);
                                 self.status = "Drawing raw Pattern controller points".to_owned();
                                 self.piano_roll_controller_stroke =
                                     Some(PianoRollControllerStroke {
@@ -44973,6 +45124,7 @@ impl DawUi {
                 match range_result {
                     Ok(changed) if changed > 0 => {
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                         self.status = match selection.operation {
                             PianoRollControllerRangeOperation::Linear => {
                                 format!("Linearized {changed} raw Pattern controller points")
@@ -45055,6 +45207,7 @@ impl DawUi {
                     Ok(_) => {
                         self.piano_roll_controller_stream = Some(stream);
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                         self.status = "Added raw Pattern controller point".to_owned();
                     }
                     Err(error) => {
@@ -45685,6 +45838,7 @@ impl DawUi {
                     .is_ok()
             {
                 self.dirty = true;
+                self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                 self.status = "Piano roll note updated".to_owned();
             }
         }
@@ -45711,6 +45865,7 @@ impl DawUi {
                     self.selected_note = None;
                     self.selected_piano_notes.clear();
                     self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     self.status = if deleted_count == 1 {
                         format!("Deleted note from pattern {pattern_id}")
                     } else {
@@ -47539,6 +47694,7 @@ impl DawUi {
                 match document.set_mixer_insert_name(insert_ordinal, &name) {
                     Ok(()) => {
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                         self.status = if insert_ordinal == 0 {
                             "Renamed Mixer Master".to_owned()
                         } else {
@@ -47595,6 +47751,7 @@ impl DawUi {
                         self.mixer_track_peak_meters
                             .set_live_mixer_soloed_tracks(&soloed_tracks);
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                         let track_name = if insert_ordinal == 0 {
                             "Master".to_owned()
                         } else {
@@ -47697,6 +47854,7 @@ impl DawUi {
                                 Some((track, separation_raw));
                         }
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                         self.status = format!(
                             "Edited Mixer parameter event {event_index}, record {record_index}"
                         );
@@ -47769,6 +47927,7 @@ impl DawUi {
                             ));
                         }
                         self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                         self.status =
                             format!("Updated Mixer routing event {event_index}, flag {flag_index}");
                     }
@@ -47809,6 +47968,7 @@ impl DawUi {
                         })
                         .and_then(Result::err);
                     self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     let moved_status = format!(
                         "Moved Mixer insert {insert_ordinal} effect slot {} to {}",
                         from_slot + 1,
@@ -47872,6 +48032,7 @@ impl DawUi {
                         self.stop_project_playback();
                     }
                     self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     self.status = if staged_song_handoff || staged_pattern_handoff {
                         format!(
                             "Automatic PDC set to {}; preparing a live {} handoff…",
@@ -49233,6 +49394,7 @@ impl DawUi {
             self.view = MainView::PianoRoll;
         }
         self.dirty = true;
+        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
         let mut status_parts = Vec::new();
         if !notes.is_empty() {
             if result.overflowed {
@@ -49635,6 +49797,7 @@ impl DawUi {
             }
         }
         self.dirty = true;
+        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
         self.status = format!(
             "MIDI Mixer {} · {} · raw {raw_value}",
             target.name(),
@@ -49896,6 +50059,7 @@ impl DawUi {
             _ => unreachable!("toggle target was checked above"),
         }
         self.dirty = true;
+        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
         self.status = format!(
             "MIDI Mixer {} · {} · {}",
             target.name(),
@@ -50387,6 +50551,7 @@ impl DawUi {
         }
         host.set_parameter(instance_id, parameter_id, f64::from(value) / 127.0)?;
         self.dirty = true;
+        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
         Ok(true)
     }
 
@@ -53422,6 +53587,7 @@ impl DawUi {
         self.selected_playlist_clips.insert(clip_index);
         self.playlist_selection_anchor = Some(clip_index);
         self.dirty = true;
+        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
         self.view = MainView::Playlist;
         self.refresh_audio_waveform_paths();
         let seconds = summary.frames as f64 / f64::from(summary.sample_rate.max(1));
