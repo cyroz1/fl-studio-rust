@@ -48130,7 +48130,26 @@ impl DawUi {
                             let mut swap_left_right =
                                 insert.swap_left_right().unwrap_or(false);
                             let mut effects_enabled = insert.effects_enabled().unwrap_or(false);
-                            ui.horizontal(|ui| {
+                            let mut mute_locked = insert.mute_locked().unwrap_or(false);
+                            ui.horizontal_wrapped(|ui| {
+                                if ui
+                                    .add_enabled(
+                                        flags_editable,
+                                        egui::Checkbox::new(&mut mute_locked, "Mute lock"),
+                                    )
+                                    .on_hover_text(
+                                        "Keep this track's current mute state when other tracks are soloed or unsoloed",
+                                    )
+                                    .changed()
+                                {
+                                    flag_edits.push((
+                                        insert.ordinal(),
+                                        MixerInsertEdit {
+                                            mute_locked: Some(mute_locked),
+                                            ..MixerInsertEdit::default()
+                                        },
+                                    ));
+                                }
                                 if ui
                                     .add_enabled(
                                         flags_editable,
@@ -48734,6 +48753,7 @@ impl DawUi {
             }
         }
         let mut mixer_solo_mode_resets = Vec::new();
+        let mut mixer_solo_audibility_refresh_needed = false;
         if !flag_edits.is_empty()
             && let Some(document) = self.document.as_mut()
         {
@@ -48772,6 +48792,7 @@ impl DawUi {
                         if edit.soloed.is_some() {
                             mixer_solo_mode_resets.push(insert_ordinal);
                         }
+                        mixer_solo_audibility_refresh_needed |= edit.mute_locked.is_some();
                         self.dirty = true;
                         self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                         let track_name = if insert_ordinal == 0 {
@@ -48787,7 +48808,7 @@ impl DawUi {
                 }
             }
         }
-        if !mixer_solo_mode_resets.is_empty() {
+        if !mixer_solo_mode_resets.is_empty() || mixer_solo_audibility_refresh_needed {
             for insert_ordinal in mixer_solo_mode_resets {
                 self.set_midi_mixer_solo_mode(insert_ordinal, None);
             }
