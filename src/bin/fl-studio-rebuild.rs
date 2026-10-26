@@ -14508,10 +14508,17 @@ impl DawUi {
                 for insert in inserts {
                     let ordinal = insert.ordinal();
                     if let Some(value) = pan.get_mut(ordinal) {
-                        *value = candidate_mixer_pan(&parameters, ordinal);
+                        *value = unique_candidate_mixer_parameter(
+                            &parameters,
+                            ordinal,
+                            MixerParameterKind::Pan,
+                        )
+                        .map(MixerParameterRecord::value)
+                        .filter(|pan_raw| (-6_400..=6_400).contains(pan_raw));
                     }
                     if let Some(value) = separation.get_mut(ordinal) {
-                        *value = candidate_mixer_stereo_separation(&parameters, ordinal);
+                        *value = candidate_mixer_stereo_separation(&parameters, ordinal)
+                            .map(MixerParameterRecord::value);
                     }
                 }
                 (pan, separation)
