@@ -15587,9 +15587,18 @@ impl DawUi {
         destination_index: u16,
         enabled: bool,
     ) {
-        let source = usize::from(source_index);
-        let destination = usize::from(destination_index);
-        let route_parameter_id = u8::try_from(destination + 64).ok();
+        self.set_mixer_route(
+            usize::from(source_index),
+            usize::from(destination_index),
+            enabled,
+            "MIDI script",
+        );
+    }
+
+    fn set_mixer_route(&mut self, source: usize, destination: usize, enabled: bool, editor: &str) {
+        let route_parameter_id = destination
+            .checked_add(64)
+            .and_then(|id| u8::try_from(id).ok());
         let route_existed = self.document.as_ref().is_some_and(|document| {
             let Some(parameter_id) = route_parameter_id else {
                 return false;
@@ -15613,7 +15622,7 @@ impl DawUi {
         let changed = match result {
             Ok(changed) => changed,
             Err(error) => {
-                self.status = format!("MIDI script could not update Mixer route: {error}");
+                self.status = format!("{editor} could not update Mixer route: {error}");
                 return;
             }
         };
@@ -15663,20 +15672,20 @@ impl DawUi {
         if route_created && self.playing && self.performance_mode_active {
             self.status = if performance_route_updated {
                 format!(
-                    "MIDI script created Mixer route {source} to {destination}; applying it during Performance Mode"
+                    "{editor} created Mixer route {source} to {destination}; applying it during Performance Mode"
                 )
             } else {
                 format!(
-                    "MIDI script created Mixer route {source} to {destination}; stop and restart Performance Mode to apply its routing"
+                    "{editor} created Mixer route {source} to {destination}; stop and restart Performance Mode to apply its routing"
                 )
             };
         } else if route_created && self.playing && !stream_rebuilt {
             self.status = format!(
-                "MIDI script created Mixer route {source} to {destination}; stop and restart playback to apply its routing"
+                "{editor} created Mixer route {source} to {destination}; stop and restart playback to apply its routing"
             );
         } else if !stream_rebuilt {
             self.status = format!(
-                "MIDI script set Mixer route {source} to {destination} {}",
+                "{editor} set Mixer route {source} to {destination} {}",
                 if enabled { "enabled" } else { "disabled" },
             );
         }
@@ -46686,6 +46695,7 @@ impl DawUi {
         let mut live_master_pan_edit = None;
         let mut live_master_stereo_separation_edit = None;
         let mut send_flag_edits = Vec::new();
+        let mut send_route_creation = None;
         let mut load_insert_state = None;
         let mut save_insert_state = None;
         let mut effect_slot_move = None;
@@ -48112,6 +48122,61 @@ impl DawUi {
                                 )
                                 .color(MUTED),
                             );
+                            ui.menu_button("Add send to…", |ui| {
+                                ui.small(
+                                    egui::RichText::new(
+                                        "Creates an enabled route at the candidate default level. Track-number mapping needs native comparison.",
+                                    )
+                                    .color(MUTED),
+                                );
+                                ui.separator();
+                                egui::ScrollArea::vertical()
+                                    .max_height(220.0)
+                                    .show(ui, |ui| {
+                                        let mut destination_count = 0;
+                                        for destination in &inserts {
+                                            if destination.ordinal() == insert.ordinal()
+                                                || destination.ordinal() > 127
+                                                || send_summaries.iter().any(|send| {
+                                                    send.insert_ordinal() == insert.ordinal()
+                                                        && usize::from(send.route_parameter_id())
+                                                            == destination.ordinal() + 64
+                                                })
+                                            {
+                                                continue;
+                                            }
+                                            destination_count += 1;
+                                            let destination_name = destination
+                                                .name()
+                                                .filter(|name| !name.is_empty())
+                                                .map(str::to_owned)
+                                                .unwrap_or_else(|| {
+                                                    if destination.ordinal() == 0 {
+                                                        "Master".to_owned()
+                                                    } else {
+                                                        format!("Insert {}", destination.ordinal())
+                                                    }
+                                                });
+                                            if ui
+                                                .button(format!(
+                                                    "{} · {}",
+                                                    destination.ordinal(),
+                                                    destination_name
+                                                ))
+                                                .clicked()
+                                            {
+                                                send_route_creation = Some((
+                                                    insert.ordinal(),
+                                                    destination.ordinal(),
+                                                ));
+                                                ui.close();
+                                            }
+                                        }
+                                        if destination_count == 0 {
+                                            ui.small("No unused candidate destinations");
+                                        }
+                                    });
+                            });
                             if insert_sends.is_empty() {
                                 ui.small("No recognized route-level records");
                             } else {
@@ -48666,6 +48731,9 @@ impl DawUi {
                     Some(enabled),
                 );
             }
+        }
+        if let Some((source, destination)) = send_route_creation {
+            self.set_mixer_route(source, destination, true, "Mixer");
         }
         if let Some((insert_ordinal, from_slot, to_slot)) = effect_slot_move
             && let Some(document) = self.document.as_mut()
