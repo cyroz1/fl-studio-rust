@@ -4042,7 +4042,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild set-mixer-effect-slot-mix-raw <input.flp> <output.flp> <insert-ordinal> <slot-index> <-6400..6400>\n",
             "  flp-rebuild move-mixer-effect-slot <input.flp> <output.flp> <insert-ordinal> <from-slot-0..9> <to-slot-0..9>\n",
             "  flp-rebuild rename-mixer-insert <input.flp> <output.flp> <insert-ordinal> <name>\n",
-            "  flp-rebuild set-mixer-insert-flag <input.flp> <output.flp> <insert-ordinal> <enabled|soloed|polarity-reversed|swap-left-right|effects-enabled> <0|1>\n",
+            "  flp-rebuild set-mixer-insert-flag <input.flp> <output.flp> <insert-ordinal> <enabled|soloed|polarity-reversed|swap-left-right|effects-enabled|mute-locked> <0|1>\n",
             "  flp-rebuild set-mixer-routing-flag <input.flp> <output.flp> <event-index> <flag-byte-index> <0|1>\n",
             "  flp-rebuild automation <file.flp>\n",
             "  flp-rebuild time-markers <file.flp>\n",
@@ -7602,9 +7602,13 @@ fn set_mixer_insert_flag(
             effects_enabled: Some(enabled),
             ..MixerInsertEdit::default()
         },
+        "mute-locked" => MixerInsertEdit {
+            mute_locked: Some(enabled),
+            ..MixerInsertEdit::default()
+        },
         _ => {
             return Err(format!(
-                "unknown Mixer insert flag {field:?}; expected enabled, soloed, polarity-reversed, swap-left-right, or effects-enabled"
+                "unknown Mixer insert flag {field:?}; expected enabled, soloed, polarity-reversed, swap-left-right, effects-enabled, or mute-locked"
             ));
         }
     };

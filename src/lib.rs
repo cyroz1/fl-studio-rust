@@ -5351,6 +5351,7 @@ pub struct MixerInsertEdit {
     pub polarity_reversed: Option<bool>,
     pub swap_left_right: Option<bool>,
     pub effects_enabled: Option<bool>,
+    pub mute_locked: Option<bool>,
 }
 
 impl MixerParameterRecord {
@@ -9695,6 +9696,7 @@ impl FlpDocument {
             (0, edit.polarity_reversed),
             (1, edit.swap_left_right),
             (2, edit.effects_enabled),
+            (11, edit.mute_locked),
         ] {
             if let Some(value) = value {
                 let mask = 1_u32 << bit;
