@@ -2501,6 +2501,20 @@ pub struct RiffMachineOptions<'a> {
     pub range_octaves: u8,
     pub gate_percent: u8,
     pub direction: ArpeggioDirection,
+    /// Build scale triads from the input progression before arpeggiation.
+    pub chord_progression_enabled: bool,
+    /// Chop chords into an arpeggio.
+    pub arpeggiation_enabled: bool,
+    /// Apply horizontal and vertical mirroring.
+    pub mirroring_enabled: bool,
+    /// Apply seeded note-level variation.
+    pub levels_enabled: bool,
+    /// Apply note-length multiplier and variation.
+    pub articulation_enabled: bool,
+    /// Apply score-based groove timing and level mixing.
+    pub groove_enabled: bool,
+    /// Fit generated notes to the configured key range and scale.
+    pub fit_enabled: bool,
     /// Reverse the generated riff's note time order, or pitch order when preserving onsets.
     pub mirror_horizontal: bool,
     /// Keep generated onsets fixed and reverse the pitch sequence during horizontal mirroring.
@@ -2567,6 +2581,13 @@ impl<'a> Default for RiffMachineOptions<'a> {
             range_octaves: 1,
             gate_percent: 80,
             direction: ArpeggioDirection::Up,
+            chord_progression_enabled: true,
+            arpeggiation_enabled: true,
+            mirroring_enabled: true,
+            levels_enabled: true,
+            articulation_enabled: true,
+            groove_enabled: true,
+            fit_enabled: true,
             mirror_horizontal: false,
             preserve_start_times: false,
             mirror_vertical: false,
@@ -14946,48 +14967,52 @@ impl FlpDocument {
         note_indices: Option<&[usize]>,
         options: RiffMachineOptions<'_>,
     ) -> Result<usize, FlpError> {
-        if options.scale_root > 11
-            || options.scale_intervals.is_empty()
-            || options.scale_intervals.first() != Some(&0)
-            || options
-                .scale_intervals
-                .iter()
-                .any(|interval| *interval > 11)
-            || !options
-                .scale_intervals
-                .windows(2)
-                .all(|intervals| intervals[0] < intervals[1])
+        if (options.chord_progression_enabled || options.fit_enabled)
+            && (options.scale_root > 11
+                || options.scale_intervals.is_empty()
+                || options.scale_intervals.first() != Some(&0)
+                || options
+                    .scale_intervals
+                    .iter()
+                    .any(|interval| *interval > 11)
+                || !options
+                    .scale_intervals
+                    .windows(2)
+                    .all(|intervals| intervals[0] < intervals[1]))
         {
             return Err(FlpError::UnsupportedEdit(
                 "Riff Machine scale intervals must be unique, ordered pitch classes starting at zero",
             ));
         }
-        if options.minimum_key > options.maximum_key || options.maximum_key > 127 {
+        if (options.chord_progression_enabled || options.fit_enabled)
+            && (options.minimum_key > options.maximum_key || options.maximum_key > 127)
+        {
             return Err(FlpError::UnsupportedEdit(
                 "Riff Machine key range must be ordered and remain within keys 0 through 127",
             ));
         }
-        if options.step_ticks == 0 {
+        if options.arpeggiation_enabled && options.step_ticks == 0 {
             return Err(FlpError::UnsupportedEdit(
                 "Riff Machine step must be greater than zero ticks",
             ));
         }
-        if !(1..=4).contains(&options.range_octaves) {
+        if options.arpeggiation_enabled && !(1..=4).contains(&options.range_octaves) {
             return Err(FlpError::UnsupportedEdit(
                 "Riff Machine octave range must be between 1 and 4",
             ));
         }
-        if !(1..=100).contains(&options.gate_percent) {
+        if options.arpeggiation_enabled && !(1..=100).contains(&options.gate_percent) {
             return Err(FlpError::UnsupportedEdit(
                 "Riff Machine gate must be between 1 and 100 percent",
             ));
         }
-        if !(10..=100).contains(&options.length_multiplier_percent) {
+        if options.articulation_enabled && !(10..=100).contains(&options.length_multiplier_percent)
+        {
             return Err(FlpError::UnsupportedEdit(
                 "Riff Machine length multiplier must be between 10 and 100 percent",
             ));
         }
-        if options.length_variation_percent > 100 {
+        if options.articulation_enabled && options.length_variation_percent > 100 {
             return Err(FlpError::UnsupportedEdit(
                 "Riff Machine length variation must be between 0 and 100 percent",
             ));
@@ -15020,15 +15045,17 @@ impl FlpDocument {
                 "Riff Machine Groove percentages must be between 0 and 100",
             ));
         }
-        let groove_enabled = options.groove_score.is_some()
-            || options.groove_start_percent > 0
-            || options.groove_duration_percent > 0
-            || options.groove_velocity_level_percent > 0
-            || options.groove_pan_level_percent > 0
-            || options.groove_mod_x_level_percent > 0
-            || options.groove_mod_y_level_percent > 0
-            || options.groove_pitch_level_percent > 0;
-        if options.groove_score.is_none()
+        let groove_enabled = options.groove_enabled
+            && (options.groove_score.is_some()
+                || options.groove_start_percent > 0
+                || options.groove_duration_percent > 0
+                || options.groove_velocity_level_percent > 0
+                || options.groove_pan_level_percent > 0
+                || options.groove_mod_x_level_percent > 0
+                || options.groove_mod_y_level_percent > 0
+                || options.groove_pitch_level_percent > 0);
+        if options.groove_enabled
+            && options.groove_score.is_none()
             && (options.groove_velocity_level_percent > 0
                 || options.groove_pan_level_percent > 0
                 || options.groove_mod_x_level_percent > 0
@@ -15039,13 +15066,14 @@ impl FlpDocument {
                 "Riff Machine Groove level mixing needs a score template",
             ));
         }
-        let levels_enabled = options.reset_levels
-            || options.velocity_variation_percent > 0
-            || options.pan_variation_percent > 0
-            || options.release_variation_percent > 0
-            || options.mod_x_variation_percent > 0
-            || options.mod_y_variation_percent > 0
-            || options.pitch_variation_semitones > 0;
+        let levels_enabled = options.levels_enabled
+            && (options.reset_levels
+                || options.velocity_variation_percent > 0
+                || options.pan_variation_percent > 0
+                || options.release_variation_percent > 0
+                || options.mod_x_variation_percent > 0
+                || options.mod_y_variation_percent > 0
+                || options.pitch_variation_semitones > 0);
         if groove_enabled
             && options.groove_score.is_none()
             && options.groove_snap_ticks.is_none_or(|ticks| ticks == 0)
@@ -15057,8 +15085,9 @@ impl FlpDocument {
 
         let minimum = i32::from(options.minimum_key);
         let maximum = i32::from(options.maximum_key);
-        if !(minimum..=maximum)
-            .any(|key| note_pitch_in_scale(key, options.scale_root, options.scale_intervals))
+        if (options.chord_progression_enabled || options.fit_enabled)
+            && !(minimum..=maximum)
+                .any(|key| note_pitch_in_scale(key, options.scale_root, options.scale_intervals))
         {
             return Err(FlpError::UnsupportedEdit(
                 "Riff Machine key range contains no notes from the selected scale",
@@ -15086,6 +15115,21 @@ impl FlpDocument {
                 "Riff Machine needs a note progression in the target scope",
             ));
         }
+        let stage_will_run = options.chord_progression_enabled
+            || options.arpeggiation_enabled
+            || (options.mirroring_enabled
+                && (options.mirror_horizontal || options.mirror_vertical))
+            || levels_enabled
+            || (options.articulation_enabled
+                && (options.length_multiplier_percent != 100
+                    || options.length_variation_percent > 0
+                    || !options.use_original_lengths))
+            || groove_enabled
+            || options.fit_enabled
+            || options.group_notes;
+        if !stage_will_run {
+            return Ok(0);
+        }
 
         let channel_note_count = pattern
             .notes
@@ -15093,64 +15137,75 @@ impl FlpDocument {
             .filter(|note| note.channel_id == channel_id)
             .count();
         let unaffected_note_count = channel_note_count.saturating_sub(target_notes.len());
-        let mut progression = std::collections::BTreeMap::<u32, PatternNote>::new();
-        for (_, note) in &target_notes {
-            progression
-                .entry(note.position)
-                .and_modify(|root| {
-                    if note.key < root.key {
-                        *root = note.clone();
-                    }
-                })
-                .or_insert_with(|| note.clone());
-        }
+        let riff_notes = if options.chord_progression_enabled {
+            let mut progression = std::collections::BTreeMap::<u32, PatternNote>::new();
+            for (_, note) in &target_notes {
+                progression
+                    .entry(note.position)
+                    .and_modify(|root| {
+                        if note.key < root.key {
+                            *root = note.clone();
+                        }
+                    })
+                    .or_insert_with(|| note.clone());
+            }
 
-        let snap_up = options.snap_direction != LimitSnapDirection::Down;
-        let mut chord_notes = Vec::new();
-        for note in progression.into_values().filter(|note| note.length > 0) {
-            let pitches = riff_triad_keys(
-                note.key,
-                options.minimum_key,
-                options.maximum_key,
-                options.scale_root,
-                options.scale_intervals,
-                options.wrap_to_bottom,
-                snap_up,
-            )?;
-            if pitches.len() < 2 {
-                return Err(FlpError::UnsupportedEdit(
-                    "Riff Machine needs at least two distinct chord pitches inside the key range",
-                ));
+            let snap_up = options.snap_direction != LimitSnapDirection::Down;
+            let mut chord_notes = Vec::new();
+            for note in progression.into_values().filter(|note| note.length > 0) {
+                let pitches = riff_triad_keys(
+                    note.key,
+                    options.minimum_key,
+                    options.maximum_key,
+                    options.scale_root,
+                    options.scale_intervals,
+                    options.wrap_to_bottom,
+                    snap_up,
+                )?;
+                if pitches.len() < 2 {
+                    return Err(FlpError::UnsupportedEdit(
+                        "Riff Machine needs at least two distinct chord pitches inside the key range",
+                    ));
+                }
+                for key in pitches {
+                    let mut chord_note = note.clone();
+                    chord_note.key = key;
+                    chord_notes.push(chord_note);
+                }
+                if chord_notes.len() > MAX_MERGED_PATTERN_NOTES {
+                    return Err(FlpError::UnsupportedEdit(
+                        "Riff Machine would create more than two million chord notes",
+                    ));
+                }
             }
-            for key in pitches {
-                let mut chord_note = note.clone();
-                chord_note.key = key;
-                chord_notes.push(chord_note);
-            }
-            if chord_notes.len() > MAX_MERGED_PATTERN_NOTES {
-                return Err(FlpError::UnsupportedEdit(
-                    "Riff Machine would create more than two million chord notes",
-                ));
-            }
-        }
-        if chord_notes.is_empty() {
+            chord_notes
+        } else {
+            target_notes.iter().map(|(_, note)| note.clone()).collect()
+        };
+        if riff_notes.is_empty() {
             return Err(FlpError::UnsupportedEdit(
                 "Riff Machine progression notes must have a positive length",
             ));
         }
 
         let mut updated = self.clone();
-        let mut remove_indices = target_notes
-            .iter()
-            .map(|(note_index, _)| *note_index)
-            .collect::<Vec<_>>();
-        remove_indices.sort_unstable_by(|left, right| right.cmp(left));
-        for note_index in remove_indices {
-            updated.delete_pattern_note(pattern_id, channel_id, note_index)?;
-        }
-        updated.add_pattern_notes(pattern_id, &chord_notes)?;
-        let chord_indices =
-            (unaffected_note_count..unaffected_note_count + chord_notes.len()).collect::<Vec<_>>();
+        let riff_indices = if options.chord_progression_enabled {
+            let mut remove_indices = target_notes
+                .iter()
+                .map(|(note_index, _)| *note_index)
+                .collect::<Vec<_>>();
+            remove_indices.sort_unstable_by(|left, right| right.cmp(left));
+            for note_index in remove_indices {
+                updated.delete_pattern_note(pattern_id, channel_id, note_index)?;
+            }
+            updated.add_pattern_notes(pattern_id, &riff_notes)?;
+            (unaffected_note_count..unaffected_note_count + riff_notes.len()).collect::<Vec<_>>()
+        } else {
+            target_notes
+                .iter()
+                .map(|(note_index, _)| *note_index)
+                .collect::<Vec<_>>()
+        };
         let arpeggio_options = ArpeggioOptions {
             step_ticks: options.step_ticks,
             range_octaves: options.range_octaves,
@@ -15163,35 +15218,43 @@ impl FlpDocument {
             sync: ArpeggioSyncMode::Block,
             group_notes: false,
         };
-        let arpeggiated = if let Some(score) = options.arpeggio_score {
-            updated.arpeggiate_pattern_note_selection_with_score(
-                pattern_id,
-                channel_id,
-                &chord_indices,
-                score,
-                ArpeggioScoreOptions {
-                    arpeggio: arpeggio_options,
-                    pattern_mode: options.arpeggio_score_mode,
-                    time_multiplier: options.arpeggio_score_time_multiplier,
-                    levels_percent: options.arpeggio_score_levels_percent,
-                },
-            )?
+        let output_note_count = if options.arpeggiation_enabled {
+            if let Some(score) = options.arpeggio_score {
+                updated.arpeggiate_pattern_note_selection_with_score(
+                    pattern_id,
+                    channel_id,
+                    &riff_indices,
+                    score,
+                    ArpeggioScoreOptions {
+                        arpeggio: arpeggio_options,
+                        pattern_mode: options.arpeggio_score_mode,
+                        time_multiplier: options.arpeggio_score_time_multiplier,
+                        levels_percent: options.arpeggio_score_levels_percent,
+                    },
+                )?
+            } else {
+                updated.arpeggiate_pattern_note_selection(
+                    pattern_id,
+                    channel_id,
+                    &riff_indices,
+                    arpeggio_options,
+                )?
+            }
         } else {
-            updated.arpeggiate_pattern_note_selection(
-                pattern_id,
-                channel_id,
-                &chord_indices,
-                arpeggio_options,
-            )?
+            riff_notes.len()
         };
-        if arpeggiated == 0 {
+        if options.arpeggiation_enabled && output_note_count == 0 {
             return Err(FlpError::UnsupportedEdit(
                 "Riff Machine could not arpeggiate the selected progression",
             ));
         }
-        let generated_indices =
-            (unaffected_note_count..unaffected_note_count + arpeggiated).collect::<Vec<_>>();
-        if options.mirror_horizontal || options.mirror_vertical {
+        let generated_indices = if options.arpeggiation_enabled || options.chord_progression_enabled
+        {
+            (unaffected_note_count..unaffected_note_count + output_note_count).collect::<Vec<_>>()
+        } else {
+            riff_indices
+        };
+        if options.mirroring_enabled && (options.mirror_horizontal || options.mirror_vertical) {
             let generated_index_set = generated_indices.iter().copied().collect::<HashSet<_>>();
             let patterns = updated.patterns()?;
             let pattern = patterns
@@ -15319,19 +15382,21 @@ impl FlpDocument {
                 options,
             )?;
         }
-        updated.articulate_pattern_note_selection(
-            pattern_id,
-            channel_id,
-            &generated_indices,
-            ArticulateOptions {
-                multiplier_percent: options.length_multiplier_percent,
-                variation_percent: options.length_variation_percent,
-                seed: options.articulation_seed,
-                use_original_lengths: options.use_original_lengths,
-                chop_chords: false,
-            },
-            false,
-        )?;
+        if options.articulation_enabled {
+            updated.articulate_pattern_note_selection(
+                pattern_id,
+                channel_id,
+                &generated_indices,
+                ArticulateOptions {
+                    multiplier_percent: options.length_multiplier_percent,
+                    variation_percent: options.length_variation_percent,
+                    seed: options.articulation_seed,
+                    use_original_lengths: options.use_original_lengths,
+                    chop_chords: false,
+                },
+                false,
+            )?;
+        }
         if groove_enabled {
             updated.apply_riff_machine_groove(
                 pattern_id,
@@ -15340,21 +15405,23 @@ impl FlpDocument {
                 options,
             )?;
         }
-        updated.limit_pattern_note_selection_range_with_options(
-            pattern_id,
-            channel_id,
-            &generated_indices,
-            LimitNoteOptions {
-                minimum_key: options.minimum_key,
-                maximum_key: options.maximum_key,
-                wrap_to_bottom: options.wrap_to_bottom,
-                scale_root: Some(options.scale_root),
-                scale_intervals: Some(options.scale_intervals),
-                snap_direction: options.snap_direction,
-            },
-        )?;
+        if options.fit_enabled {
+            updated.limit_pattern_note_selection_range_with_options(
+                pattern_id,
+                channel_id,
+                &generated_indices,
+                LimitNoteOptions {
+                    minimum_key: options.minimum_key,
+                    maximum_key: options.maximum_key,
+                    wrap_to_bottom: options.wrap_to_bottom,
+                    scale_root: Some(options.scale_root),
+                    scale_intervals: Some(options.scale_intervals),
+                    snap_direction: options.snap_direction,
+                },
+            )?;
+        }
         *self = updated;
-        Ok(arpeggiated)
+        Ok(output_note_count)
     }
 
     fn apply_riff_machine_levels(

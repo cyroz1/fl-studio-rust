@@ -5079,6 +5079,19 @@ fn parse_riff_machine_options(
                 options.range_octaves = parse_u8(value, "Riff Machine octave range")?
             }
             "gate-percent" => options.gate_percent = parse_u8(value, "Riff Machine gate")?,
+            "chord-progression" => {
+                options.chord_progression_enabled = parse_bool(value, "chord progression stage")?
+            }
+            "arpeggiation" => {
+                options.arpeggiation_enabled = parse_bool(value, "arpeggiation stage")?
+            }
+            "mirroring" => options.mirroring_enabled = parse_bool(value, "mirroring stage")?,
+            "levels" => options.levels_enabled = parse_bool(value, "levels stage")?,
+            "articulation" => {
+                options.articulation_enabled = parse_bool(value, "articulation stage")?
+            }
+            "groove" => options.groove_enabled = parse_bool(value, "groove stage")?,
+            "fit" => options.fit_enabled = parse_bool(value, "fit stage")?,
             "arpeggio-score" => arpeggio_score_path = Some(PathBuf::from(value)),
             "arpeggio-mode" => options.arpeggio_score_mode = parse_arpeggio_score_mode(value)?,
             "arpeggio-time-multiplier" => {
@@ -9269,7 +9282,7 @@ fn riff_machine_notes_with_scope(
     fs::write(output, bytes)
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
-        "created {created} Riff Machine notes in pattern {pattern_id}, channel {channel_id} ({}) with seed {} in {}",
+        "Riff Machine produced {created} notes in pattern {pattern_id}, channel {channel_id} ({}) with seed {} in {}",
         if note_indices.is_some() {
             "selected notes"
         } else {

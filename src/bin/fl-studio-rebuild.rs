@@ -4792,6 +4792,13 @@ struct DawUi {
     arpeggiator_score_time_multiplier: ArpeggioScoreTimeMultiplier,
     arpeggiator_score_levels_percent: u8,
     riff_use_custom_arpeggio_score: bool,
+    riff_chord_progression_enabled: bool,
+    riff_arpeggiation_enabled: bool,
+    riff_mirroring_enabled: bool,
+    riff_levels_enabled: bool,
+    riff_articulation_enabled: bool,
+    riff_groove_enabled: bool,
+    riff_fit_enabled: bool,
     riff_arpeggio_score_mode: ArpeggioScorePatternMode,
     riff_arpeggio_score_time_multiplier: ArpeggioScoreTimeMultiplier,
     riff_arpeggio_score_levels_percent: u8,
@@ -6400,6 +6407,13 @@ impl DawUi {
             arpeggiator_score_time_multiplier: ArpeggioScoreTimeMultiplier::Normal,
             arpeggiator_score_levels_percent: 0,
             riff_use_custom_arpeggio_score: false,
+            riff_chord_progression_enabled: true,
+            riff_arpeggiation_enabled: true,
+            riff_mirroring_enabled: true,
+            riff_levels_enabled: true,
+            riff_articulation_enabled: true,
+            riff_groove_enabled: true,
+            riff_fit_enabled: true,
             riff_arpeggio_score_mode: ArpeggioScorePatternMode::Normal,
             riff_arpeggio_score_time_multiplier: ArpeggioScoreTimeMultiplier::Normal,
             riff_arpeggio_score_levels_percent: 0,
@@ -33000,6 +33014,29 @@ impl DawUi {
                         ui.small(
                             "Use the targeted notes as chord roots, then create a fitted arpeggio.",
                         );
+                        ui.small("Stages run in order; turn off any pass to keep its input unchanged.");
+                        ui.horizontal_wrapped(|ui| {
+                            ui.checkbox(
+                                &mut self.riff_chord_progression_enabled,
+                                "Chords",
+                            )
+                            .on_hover_text("Build scale triads from the input progression.");
+                            ui.checkbox(
+                                &mut self.riff_arpeggiation_enabled,
+                                "Arpeggiation",
+                            )
+                            .on_hover_text("Chop progression chords into a note pattern.");
+                            ui.checkbox(&mut self.riff_mirroring_enabled, "Mirror")
+                                .on_hover_text("Apply the configured horizontal and vertical flips.");
+                            ui.checkbox(&mut self.riff_levels_enabled, "Levels")
+                                .on_hover_text("Apply seeded note-level variation.");
+                            ui.checkbox(&mut self.riff_articulation_enabled, "Articulation")
+                                .on_hover_text("Apply note length scaling and variation.");
+                            ui.checkbox(&mut self.riff_groove_enabled, "Groove")
+                                .on_hover_text("Apply score-based timing and level mixing.");
+                            ui.checkbox(&mut self.riff_fit_enabled, "Fit")
+                                .on_hover_text("Fit notes to the configured scale and key range.");
+                        });
                         ui.add(
                             egui::Slider::new(&mut self.arpeggiator_step_ticks, 1..=384)
                                 .text("Arpeggio step (ticks)"),
@@ -33126,14 +33163,17 @@ impl DawUi {
                         );
                         let groove_grid_available = self.piano_roll_snap != PianoRollSnap::None;
                         let riff_can_generate = edit_scope_available
-                            && self.piano_roll_scale != PianoRollScale::None
-                            && (self.riff_groove_score.is_some()
+                            && (!(self.riff_chord_progression_enabled || self.riff_fit_enabled)
+                                || self.piano_roll_scale != PianoRollScale::None)
+                            && (!self.riff_groove_enabled
+                                || self.riff_groove_score.is_some()
                                 || (self.riff_groove_velocity_level_percent == 0
                                     && self.riff_groove_pan_level_percent == 0
                                     && self.riff_groove_mod_x_level_percent == 0
                                     && self.riff_groove_mod_y_level_percent == 0
                                     && self.riff_groove_pitch_level_percent == 0))
-                            && (groove_grid_available
+                            && (!self.riff_groove_enabled
+                                || groove_grid_available
                                 || self.riff_groove_score.is_some()
                                 || (self.riff_groove_start_percent == 0
                                     && self.riff_groove_duration_percent == 0
@@ -33190,12 +33230,13 @@ impl DawUi {
                                 ui.checkbox(&mut self.riff_bipolar_levels, "Bipolar");
                                 ui.checkbox(&mut self.riff_reset_levels, "Reset before processing");
                             });
-                        let level_seed_active = self.riff_velocity_variation_percent > 0
-                            || self.riff_pan_variation_percent > 0
-                            || self.riff_release_variation_percent > 0
-                            || self.riff_mod_x_variation_percent > 0
-                            || self.riff_mod_y_variation_percent > 0
-                            || self.riff_pitch_variation_semitones > 0;
+                        let level_seed_active = self.riff_levels_enabled
+                            && (self.riff_velocity_variation_percent > 0
+                                || self.riff_pan_variation_percent > 0
+                                || self.riff_release_variation_percent > 0
+                                || self.riff_mod_x_variation_percent > 0
+                                || self.riff_mod_y_variation_percent > 0
+                                || self.riff_pitch_variation_semitones > 0);
                         egui::CollapsingHeader::new("Articulation")
                             .default_open(false)
                             .show(ui, |ui| {
@@ -33214,7 +33255,9 @@ impl DawUi {
                                     .text("Variation (%)"),
                                 );
                                 ui.checkbox(&mut self.riff_use_original_lengths, "Use lengths");
-                                if self.riff_length_variation_percent > 0 {
+                                if self.riff_articulation_enabled
+                                    && self.riff_length_variation_percent > 0
+                                {
                                     ui.horizontal(|ui| {
                                         ui.add(
                                             egui::DragValue::new(&mut self.riff_articulation_seed)
@@ -33408,6 +33451,14 @@ impl DawUi {
                                 self.arpeggiator_gate_percent = defaults.gate_percent;
                                 self.riff_machine_direction = defaults.direction;
                                 self.riff_use_custom_arpeggio_score = false;
+                                self.riff_chord_progression_enabled =
+                                    defaults.chord_progression_enabled;
+                                self.riff_arpeggiation_enabled = defaults.arpeggiation_enabled;
+                                self.riff_mirroring_enabled = defaults.mirroring_enabled;
+                                self.riff_levels_enabled = defaults.levels_enabled;
+                                self.riff_articulation_enabled = defaults.articulation_enabled;
+                                self.riff_groove_enabled = defaults.groove_enabled;
+                                self.riff_fit_enabled = defaults.fit_enabled;
                                 self.riff_arpeggio_score_mode = defaults.arpeggio_score_mode;
                                 self.riff_arpeggio_score_time_multiplier =
                                     defaults.arpeggio_score_time_multiplier;
@@ -35899,6 +35950,13 @@ impl DawUi {
                 range_octaves: self.arpeggiator_range_octaves,
                 gate_percent: self.arpeggiator_gate_percent,
                 direction: self.riff_machine_direction,
+                chord_progression_enabled: self.riff_chord_progression_enabled,
+                arpeggiation_enabled: self.riff_arpeggiation_enabled,
+                mirroring_enabled: self.riff_mirroring_enabled,
+                levels_enabled: self.riff_levels_enabled,
+                articulation_enabled: self.riff_articulation_enabled,
+                groove_enabled: self.riff_groove_enabled,
+                fit_enabled: self.riff_fit_enabled,
                 arpeggio_score: riff_arpeggio_score.as_ref(),
                 arpeggio_score_mode: self.riff_arpeggio_score_mode,
                 arpeggio_score_time_multiplier: self.riff_arpeggio_score_time_multiplier,
@@ -35961,7 +36019,7 @@ impl DawUi {
                         self.riff_seed = self.riff_seed.saturating_add(1);
                     }
                     self.status = format!(
-                        "Generated {created} Riff Machine notes in pattern {pattern_id}, {edit_scope_description}"
+                        "Riff Machine produced {created} notes in pattern {pattern_id}, {edit_scope_description}"
                     );
                 }
                 Err(error) => self.status = format!("Could not generate a riff: {error}"),
