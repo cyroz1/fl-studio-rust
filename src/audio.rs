@@ -153,7 +153,7 @@ impl MixerTrackPeakMeters {
     }
 
     /// Consume left and right insert peaks published since the previous script-state update.
-    pub(crate) fn take_peak_channels(&self, track: usize) -> (f32, f32) {
+    pub fn take_peak_channels(&self, track: usize) -> (f32, f32) {
         let take = |peaks: &[AtomicU32; MIXER_TRACK_METER_COUNT]| {
             peaks
                 .get(track)
@@ -533,6 +533,7 @@ impl MixerTrackPeakMeters {
         Arc::clone(&self.live_master_signal_flags)
     }
 
+    #[cfg(test)]
     pub(crate) fn publish_peak(&self, track: usize, peak: f32) {
         self.publish_stereo_peak(track, peak, peak);
     }
