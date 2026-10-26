@@ -546,6 +546,57 @@ fn candidate_live_mixer_send_key(
     (matching_routes == 1).then_some((selected_send.insert_ordinal(), destination_track))
 }
 
+fn mixer_send_level_knob(ui: &mut egui::Ui, value: &mut i32) -> egui::Response {
+    const MIN_RAW: i32 = 0;
+    const MAX_RAW: i32 = 16_000;
+    const DEFAULT_RAW: i32 = 10_240;
+    const DIAMETER: f32 = 36.0;
+
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(DIAMETER), Sense::click_and_drag());
+    if response.dragged() {
+        let vertical_delta = ui.input(|input| input.pointer.delta().y);
+        if vertical_delta != 0.0 {
+            *value =
+                ((*value as f32 - vertical_delta * 96.0).round() as i32).clamp(MIN_RAW, MAX_RAW);
+        }
+    }
+    if response.double_clicked() {
+        *value = DEFAULT_RAW;
+    }
+
+    let fraction = ((*value - MIN_RAW) as f32 / (MAX_RAW - MIN_RAW) as f32).clamp(0.0, 1.0);
+    let center = rect.center();
+    let radius = DIAMETER * 0.34;
+    let start_angle = -3.0 * std::f32::consts::FRAC_PI_4;
+    let sweep = 3.0 * std::f32::consts::FRAC_PI_2;
+    let value_angle = start_angle + sweep * fraction;
+    let arc_point = |angle: f32| center + Vec2::new(angle.cos(), angle.sin()) * radius;
+    let background_arc = (0..=32)
+        .map(|step| arc_point(start_angle + sweep * step as f32 / 32.0))
+        .collect::<Vec<_>>();
+    ui.painter()
+        .add(egui::Shape::line(background_arc, Stroke::new(2.0, GRID)));
+    if fraction > 0.0 {
+        let value_arc = (0..=32)
+            .map(|step| arc_point(start_angle + sweep * fraction * step as f32 / 32.0))
+            .collect::<Vec<_>>();
+        ui.painter()
+            .add(egui::Shape::line(value_arc, Stroke::new(2.5, GREEN)));
+    }
+
+    ui.painter()
+        .circle_filled(center, radius * 0.63, PANEL_DARK);
+    ui.painter()
+        .circle_stroke(center, radius * 0.63, Stroke::new(1.0, GRID));
+    ui.painter()
+        .line_segment([center, arc_point(value_angle)], Stroke::new(2.0, TEXT));
+    ui.painter().circle_filled(center, 1.8, TEXT);
+
+    response.on_hover_text(
+        "Drag vertically to adjust the raw send level. Double-click resets to the candidate default of 10,240; native scaling is unverified.",
+    )
+}
+
 fn candidate_mixer_master_signal_flags(document: &FlpDocument) -> Option<(bool, bool)> {
     candidate_mixer_insert_signal_flags(&document.mixer_inserts(), 0)
 }
@@ -48211,20 +48262,41 @@ impl DawUi {
                                             let (event_index, record_index) =
                                                 send.parameter_location();
                                             let mut value = send.value();
-                                            if ui
-                                                .add(
-                                                    egui::DragValue::new(&mut value)
-                                                        .prefix("Raw level ")
-                                                        .speed(1.0),
-                                                )
-                                                .changed()
-                                            {
-                                                parameter_edits.push((
-                                                    event_index,
-                                                    record_index,
-                                                    value,
-                                                ));
-                                            }
+                                            let old_value = value;
+                                            ui.horizontal(|ui| {
+                                                if (0..=16_000).contains(&value) {
+                                                    mixer_send_level_knob(ui, &mut value);
+                                                } else {
+                                                    ui.small(
+                                                        egui::RichText::new("Knob unavailable")
+                                                            .color(MUTED),
+                                                    );
+                                                }
+                                                let level_changed = if (0..=16_000).contains(&value)
+                                                {
+                                                    ui.add(
+                                                        egui::DragValue::new(&mut value)
+                                                            .range(0..=16_000)
+                                                            .prefix("Raw ")
+                                                            .speed(1.0),
+                                                    )
+                                                    .changed()
+                                                } else {
+                                                    ui.add(
+                                                        egui::DragValue::new(&mut value)
+                                                            .prefix("Raw level ")
+                                                            .speed(1.0),
+                                                    )
+                                                    .changed()
+                                                };
+                                                if level_changed || value != old_value {
+                                                    parameter_edits.push((
+                                                        event_index,
+                                                        record_index,
+                                                        value,
+                                                    ));
+                                                }
+                                            });
                                         }
                                     });
                             }
