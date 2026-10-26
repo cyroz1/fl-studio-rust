@@ -127,6 +127,7 @@ use midi_script::{
 use midi_thru::{MidiThruSettings, MidiThruWorker};
 
 const APP_BACKGROUND: Color32 = Color32::from_rgb(27, 27, 27);
+const FL_STUDIO_HELP_URL: &str = "https://www.image-line.com/fl-studio-learning-content/fl-studio-online-manual/html/basics_shortcuts.htm";
 const PANEL: Color32 = Color32::from_rgb(44, 44, 44);
 const PANEL_DARK: Color32 = Color32::from_rgb(34, 34, 34);
 const PANEL_LIGHT: Color32 = Color32::from_rgb(57, 57, 57);
@@ -5016,6 +5017,7 @@ struct DawUi {
     selected_mixer_insert: Option<usize>,
     mixer_scroll_to_track: Option<usize>,
     mixer_track_name_editor_requested: bool,
+    open_help_manual_requested: bool,
     mixer_master_peak_hold: f32,
     mixer_insert_peak_holds: [f32; MIXER_TRACK_METER_COUNT],
     mixer_track_peak_meters: Arc<MixerTrackPeakMeters>,
@@ -6646,6 +6648,7 @@ impl DawUi {
             selected_mixer_insert: None,
             mixer_scroll_to_track: None,
             mixer_track_name_editor_requested: false,
+            open_help_manual_requested: false,
             mixer_master_peak_hold: 0.0,
             mixer_insert_peak_holds: [0.0; MIXER_TRACK_METER_COUNT],
             mixer_track_peak_meters: Arc::new(MixerTrackPeakMeters::default()),
@@ -14228,6 +14231,12 @@ impl DawUi {
                 }
             });
             ui.menu_button("Help", |ui| {
+                if ui.button("Open FL Studio help manual  F1").clicked() {
+                    ui.ctx()
+                        .open_url(egui::OpenUrl::new_tab(FL_STUDIO_HELP_URL));
+                    ui.close();
+                }
+                ui.separator();
                 ui.strong("Keyboard shortcuts");
                 ui.separator();
                 for (shortcut, action) in [
@@ -50765,6 +50774,9 @@ impl DawUi {
                         .to_owned();
                 }
             }
+            MidiTransportCommand::OpenHelpManual => {
+                self.open_help_manual_requested = true;
+            }
             MidiTransportCommand::PatternJog(increment) => {
                 self.jog_midi_script_pattern(increment);
             }
@@ -58608,7 +58620,14 @@ impl eframe::App for DawUi {
         };
         self.history_snapshot_available_this_frame =
             frame_snapshot.is_some() || self.pending_history_snapshot.is_some();
+        if ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F1)) {
+            self.open_help_manual_requested = true;
+        }
         self.poll_midi_input(self.history_snapshot_available_this_frame);
+        if std::mem::take(&mut self.open_help_manual_requested) {
+            ui.ctx()
+                .open_url(egui::OpenUrl::new_tab(FL_STUDIO_HELP_URL));
+        }
         self.advance_midi_script_transport_move();
         if self.midi_script_transport_move.is_some() {
             ui.ctx().request_repaint_after(Duration::from_millis(16));

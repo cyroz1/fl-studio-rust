@@ -689,6 +689,7 @@ fn midi_input_thru_message(event: MidiInputEvent) -> Option<([u8; 3], usize)> {
             | MidiTransportCommand::ShowMainView(_)
             | MidiTransportCommand::ToggleAudioSettingsWindow
             | MidiTransportCommand::ToggleProjectInfo
+            | MidiTransportCommand::OpenHelpManual
             | MidiTransportCommand::CloseAllWindows,
         ) => return None,
     };

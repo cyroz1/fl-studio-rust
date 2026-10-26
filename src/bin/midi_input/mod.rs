@@ -767,6 +767,7 @@ fn queue_script_transport_actions(
             ScriptTransportAction::FocusSelectedMixerTrackName => {
                 MidiTransportCommand::FocusSelectedMixerTrackName
             }
+            ScriptTransportAction::OpenHelpManual => MidiTransportCommand::OpenHelpManual,
             ScriptTransportAction::PatternJog(increment) => {
                 MidiTransportCommand::PatternJog(increment)
             }
@@ -882,6 +883,7 @@ pub enum MidiTransportCommand {
     },
     SelectNextEmptyPatternWithNameDialog,
     FocusSelectedMixerTrackName,
+    OpenHelpManual,
     PatternJog(i32),
     TempoJog(i32),
     MarkerJumpJog(i32),
@@ -1556,6 +1558,7 @@ pub fn describe_event(event: MidiInputEvent) -> String {
             MidiTransportCommand::FocusSelectedMixerTrackName => {
                 "MIDI script Rename Mixer Track".to_owned()
             }
+            MidiTransportCommand::OpenHelpManual => "MIDI script Help Manual".to_owned(),
             MidiTransportCommand::PatternJog(_) => "MIDI script Pattern Selection".to_owned(),
             MidiTransportCommand::TempoJog(_) => "MIDI script Tempo".to_owned(),
             MidiTransportCommand::MarkerJumpJog(_) => "MIDI script Marker Jump".to_owned(),
@@ -2371,6 +2374,7 @@ mod tests {
                 },
                 ScriptTransportAction::SelectNextEmptyPatternWithNameDialog,
                 ScriptTransportAction::FocusSelectedMixerTrackName,
+                ScriptTransportAction::OpenHelpManual,
                 ScriptTransportAction::Start,
                 ScriptTransportAction::ShowMainView(4),
                 ScriptTransportAction::ToggleAudioSettingsWindow,
@@ -2416,6 +2420,10 @@ mod tests {
         assert_eq!(
             transport_receiver.try_recv().unwrap().event,
             MidiInputEvent::Transport(MidiTransportCommand::FocusSelectedMixerTrackName)
+        );
+        assert_eq!(
+            transport_receiver.try_recv().unwrap().event,
+            MidiInputEvent::Transport(MidiTransportCommand::OpenHelpManual)
         );
         assert_eq!(
             transport_receiver.try_recv().unwrap().event,
