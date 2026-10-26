@@ -2274,6 +2274,31 @@ mod tests {
     }
 
     #[test]
+    fn python_mixer_track_name_honors_optional_max_length() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport mixer\ndef OnMidiIn(event):\n    name = mixer.getTrackName(1, 3)\n    assert name == 'Pia'\n    assert mixer.getTrackName(1, 0) == ''\n    assert mixer.getTrackName(1) == 'Piano'\n    assert mixer.getTrackName(8, 2) == 'In'\n    assert mixer.getTrackName(1, -2) == 'Piano'\n    event.data1 = len(name)\n    event.data2 = ord(mixer.getTrackName(8, 2)[0])\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let transport_state = Arc::new(MidiScriptTransportState::default());
+        *transport_state.mixer_track_names.lock().unwrap() =
+            vec!["Master".to_owned(), "Piano".to_owned()];
+        let mut runtime = MidiScriptRuntime::start_for_device_with_transport_state(
+            &script,
+            "Test Input",
+            transport_state,
+        )
+        .unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
+
+        assert_eq!(result.bytes, [0xB0, 3, b'I']);
+    }
+
+    #[test]
     fn python_mixer_current_tempo_returns_fractional_or_integer_bpm() {
         let temporary = TestDirectory::new();
         let script_path = temporary.path().join("device_test.py");

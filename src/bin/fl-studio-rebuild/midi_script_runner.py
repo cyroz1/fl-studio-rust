@@ -137,14 +137,22 @@ def _mixer_track_index(index):
     return index
 
 
-def _mixer_get_track_name(index):
+def _mixer_get_track_name(index, maxLen=-1):
     index = _mixer_track_index(index)
+    try:
+        maxLen = int(maxLen)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("Mixer track name maxLen must be an integer") from error
     track_names = _active_transport_state.get("mixer_track_names", [])
     if index < len(track_names):
-        return str(track_names[index])
-    if index == 0:
-        return "Master"
-    return "Insert {}".format(index)
+        name = str(track_names[index])
+    elif index == 0:
+        name = "Master"
+    else:
+        name = "Insert {}".format(index)
+    if maxLen >= 0:
+        return name[:maxLen]
+    return name
 
 
 def _mixer_set_track_name(index, name):
