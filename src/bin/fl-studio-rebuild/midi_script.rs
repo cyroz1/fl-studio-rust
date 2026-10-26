@@ -52,6 +52,10 @@ pub enum ScriptTransportAction {
         tick: u32,
         stop: bool,
     },
+    SetMixerTrackName {
+        index: u16,
+        name: String,
+    },
     JumpToMarker {
         delta: i32,
         select: bool,
@@ -142,6 +146,7 @@ pub struct MidiScriptTransportState {
     pub arrangement_selection_end: AtomicU64,
     pub arrangement_live_selection_start: AtomicU64,
     pub arrangement_live_selection_end: AtomicU64,
+    pub mixer_track_names: Mutex<Vec<String>>,
     pub project_title: Mutex<String>,
     pub project_author: Mutex<String>,
     pub project_genre: Mutex<String>,
@@ -174,6 +179,7 @@ impl Default for MidiScriptTransportState {
             arrangement_selection_end: AtomicU64::new(0),
             arrangement_live_selection_start: AtomicU64::new(0),
             arrangement_live_selection_end: AtomicU64::new(0),
+            mixer_track_names: Mutex::new(vec!["Master".to_owned()]),
             project_title: Mutex::new(String::new()),
             project_author: Mutex::new(String::new()),
             project_genre: Mutex::new(String::new()),
@@ -603,6 +609,12 @@ impl MidiScriptRuntime {
             .lock()
             .map(|names| names.clone())
             .unwrap_or_default();
+        let mixer_track_names = self
+            .transport_state
+            .mixer_track_names
+            .lock()
+            .map(|names| names.clone())
+            .unwrap_or_else(|_| vec!["Master".to_owned()]);
         let pattern_time_signature_changes = self
             .transport_state
             .pattern_time_signature_changes
@@ -711,6 +723,7 @@ impl MidiScriptRuntime {
                     "song_position_hint": song_position_hint,
                     "song_length_hint": song_length_hint,
                     "arrangement_marker_names": arrangement_marker_names,
+                    "mixer_track_names": mixer_track_names,
                     "pattern_time_signature_changes": pattern_time_signature_changes,
                     "arrangement_time_signature_changes": arrangement_time_signature_changes,
                     "arrangement_current_time": arrangement_current_time,
@@ -900,6 +913,21 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
             .as_bool()
             .ok_or_else(|| "MIDI script returned an invalid live-selection endpoint".to_owned())?;
         return Ok(ScriptTransportAction::SetArrangementLiveSelection { tick, stop });
+    }
+    if name == Some("set_mixer_track_name") {
+        let index = action["index"]
+            .as_u64()
+            .and_then(|index| u16::try_from(index).ok())
+            .filter(|index| *index > 0)
+            .ok_or_else(|| "MIDI script returned an invalid Mixer track index".to_owned())?;
+        let track_name = action["name"]
+            .as_str()
+            .filter(|track_name| !track_name.contains('\0'))
+            .ok_or_else(|| "MIDI script returned an invalid Mixer track name".to_owned())?;
+        return Ok(ScriptTransportAction::SetMixerTrackName {
+            index,
+            name: track_name.to_owned(),
+        });
     }
     if name == Some("jump_to_marker") {
         let delta = action["delta"]

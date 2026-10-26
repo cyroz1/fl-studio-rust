@@ -14367,6 +14367,32 @@ impl DawUi {
         if let Ok(mut value) = self.midi_script_transport_state.project_genre.lock() {
             *value = project_genre;
         }
+        let mixer_track_names = self
+            .document
+            .as_ref()
+            .map(|document| {
+                let inserts = document.mixer_inserts();
+                let max_ordinal = inserts
+                    .iter()
+                    .map(|insert| insert.ordinal())
+                    .max()
+                    .unwrap_or(0);
+                let mut names = Vec::with_capacity(max_ordinal.saturating_add(2));
+                names.push("Master".to_owned());
+                names.extend((0..=max_ordinal).map(|ordinal| format!("Insert {}", ordinal + 1)));
+                for insert in inserts {
+                    if let Some(name) = insert.name().filter(|name| !name.is_empty())
+                        && let Some(track_name) = names.get_mut(insert.ordinal() + 1)
+                    {
+                        *track_name = name.to_owned();
+                    }
+                }
+                names
+            })
+            .unwrap_or_else(|| vec!["Master".to_owned()]);
+        if let Ok(mut names) = self.midi_script_transport_state.mixer_track_names.lock() {
+            *names = mixer_track_names;
+        }
         let arrangement_marker_names = self
             .document
             .as_ref()
@@ -15136,6 +15162,42 @@ impl DawUi {
             self.tempo_bpm = bpm;
         } else {
             self.status = "MIDI script tempo could not be applied to this project".to_owned();
+        }
+    }
+
+    fn set_midi_script_mixer_track_name(&mut self, index: u16, name: String) {
+        let result = if index == 0 {
+            Err("the Master Mixer track cannot be renamed".to_owned())
+        } else if let Some(document) = self.document.as_mut() {
+            let insert_ordinal = usize::from(index - 1);
+            let insert = document
+                .mixer_inserts()
+                .into_iter()
+                .find(|insert| insert.ordinal() == insert_ordinal);
+            match insert {
+                Some(insert) if insert.name().unwrap_or_default() == name.as_str() => Ok(false),
+                Some(_) => document
+                    .set_mixer_insert_name(insert_ordinal, &name)
+                    .map(|()| true)
+                    .map_err(|error| error.to_string()),
+                None => Err(format!(
+                    "Mixer insert {} does not have a recognized project record",
+                    insert_ordinal + 1
+                )),
+            }
+        } else {
+            Err("MIDI script Mixer track edits require an open project".to_owned())
+        };
+        match result {
+            Ok(true) => {
+                self.dirty = true;
+                self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+                self.status = format!("MIDI script renamed Mixer insert {index}");
+            }
+            Ok(false) => {}
+            Err(error) => {
+                self.status = format!("MIDI script could not rename Mixer track: {error}");
+            }
         }
     }
 
@@ -49615,6 +49677,9 @@ impl DawUi {
                         .arrangement_live_selection_start
                 };
                 selection_point.store(u64::from(tick), Ordering::Relaxed);
+            }
+            MidiTransportCommand::SetMixerTrackName { index, name } => {
+                self.set_midi_script_mixer_track_name(index, name);
             }
             MidiTransportCommand::JumpToMarker { delta, select } => {
                 self.jump_midi_script_marker_with_selection(delta, select);

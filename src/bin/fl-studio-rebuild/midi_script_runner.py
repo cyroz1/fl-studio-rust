@@ -121,6 +121,39 @@ def _request_transport_action(action):
         _active_transport_actions.append(action)
 
 
+def _mixer_track_index(index):
+    try:
+        index = int(index)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("mixer track index must be an integer") from error
+    if not 0 <= index <= 65535:
+        raise IndexError("mixer track index is outside the supported range")
+    return index
+
+
+def _mixer_get_track_name(index):
+    index = _mixer_track_index(index)
+    if index == 0:
+        return "Master"
+    track_names = _active_transport_state.get("mixer_track_names", [])
+    if index < len(track_names):
+        return str(track_names[index])
+    return "Insert {}".format(index)
+
+
+def _mixer_set_track_name(index, name):
+    index = _mixer_track_index(index)
+    if index == 0:
+        raise ValueError("the Master Mixer track cannot be renamed")
+    if not isinstance(name, str):
+        raise TypeError("Mixer track name must be a string")
+    if "\0" in name:
+        raise ValueError("Mixer track names cannot contain NUL")
+    _request_transport_action(
+        {"action": "set_mixer_track_name", "index": index, "name": name}
+    )
+
+
 def _short_message_length(status):
     if 0x80 <= status <= 0xEF:
         return 2 if (status & 0xF0) in (0xC0, 0xD0) else 3
@@ -833,6 +866,8 @@ def _install_modules(script_name, device_name):
     mixer = _module("mixer")
     mixer.getCurrentTempo = _get_current_tempo
     mixer.setCurrentTempo = _set_current_tempo
+    mixer.getTrackName = _mixer_get_track_name
+    mixer.setTrackName = _mixer_set_track_name
     mixer.getSongStepPos = _get_song_step_pos
     mixer.getSongTickPos = _get_song_tick_pos
 
