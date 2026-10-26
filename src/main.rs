@@ -5053,6 +5053,15 @@ fn parse_riff_machine_options(
                 options.range_octaves = parse_u8(value, "Riff Machine octave range")?
             }
             "gate-percent" => options.gate_percent = parse_u8(value, "Riff Machine gate")?,
+            "length-variation-percent" => {
+                options.length_variation_percent = parse_u8(value, "Riff Machine length variation")?
+            }
+            "articulation-seed" => {
+                options.articulation_seed = parse_u64(value, "Riff Machine Articulation seed")?
+            }
+            "use-original-lengths" => {
+                options.use_original_lengths = parse_bool(value, "use original lengths")?
+            }
             "direction" => options.direction = parse_arpeggio_direction(value)?,
             "mirror-horizontal" => {
                 options.mirror_horizontal = parse_bool(value, "horizontal mirror")?

@@ -4775,6 +4775,7 @@ struct DawUi {
     arpeggiator_score_time_multiplier: ArpeggioScoreTimeMultiplier,
     arpeggiator_score_levels_percent: u8,
     riff_seed: u64,
+    riff_articulation_seed: u64,
     riff_velocity_variation_percent: u8,
     riff_pan_variation_percent: u8,
     riff_release_variation_percent: u8,
@@ -4784,6 +4785,8 @@ struct DawUi {
     riff_reset_levels: bool,
     riff_bipolar_levels: bool,
     riff_length_multiplier_percent: u8,
+    riff_length_variation_percent: u8,
+    riff_use_original_lengths: bool,
     riff_mirror_horizontal: bool,
     riff_preserve_start_times: bool,
     riff_mirror_vertical: bool,
@@ -6376,6 +6379,7 @@ impl DawUi {
             arpeggiator_score_time_multiplier: ArpeggioScoreTimeMultiplier::Normal,
             arpeggiator_score_levels_percent: 0,
             riff_seed: 1,
+            riff_articulation_seed: 1,
             riff_velocity_variation_percent: 10,
             riff_pan_variation_percent: 0,
             riff_release_variation_percent: 0,
@@ -6385,6 +6389,8 @@ impl DawUi {
             riff_reset_levels: false,
             riff_bipolar_levels: true,
             riff_length_multiplier_percent: 100,
+            riff_length_variation_percent: 0,
+            riff_use_original_lengths: true,
             riff_mirror_horizontal: false,
             riff_preserve_start_times: false,
             riff_mirror_vertical: false,
@@ -33078,8 +33084,30 @@ impl DawUi {
                                         &mut self.riff_length_multiplier_percent,
                                         10..=100,
                                     )
-                                    .text("Note length (%)"),
+                                    .text("Multiply (%)"),
                                 );
+                                ui.add(
+                                    egui::Slider::new(
+                                        &mut self.riff_length_variation_percent,
+                                        0..=100,
+                                    )
+                                    .text("Variation (%)"),
+                                );
+                                ui.checkbox(&mut self.riff_use_original_lengths, "Use lengths");
+                                if self.riff_length_variation_percent > 0 {
+                                    ui.horizontal(|ui| {
+                                        ui.add(
+                                            egui::DragValue::new(&mut self.riff_articulation_seed)
+                                                .speed(1)
+                                                .prefix("Seed "),
+                                        );
+                                        if ui.button("New seed").clicked() {
+                                            self.riff_articulation_seed = self
+                                                .riff_articulation_seed
+                                                .saturating_add(1);
+                                        }
+                                    });
+                                }
                             });
                         egui::CollapsingHeader::new("Groove")
                             .default_open(false)
@@ -33266,6 +33294,7 @@ impl DawUi {
                                 self.note_limit_wrap_to_bottom = defaults.wrap_to_bottom;
                                 self.note_limit_snap_direction = defaults.snap_direction;
                                 self.riff_seed = defaults.seed;
+                                self.riff_articulation_seed = defaults.articulation_seed;
                                 self.riff_velocity_variation_percent =
                                     defaults.velocity_variation_percent;
                                 self.riff_pan_variation_percent = defaults.pan_variation_percent;
@@ -33281,6 +33310,9 @@ impl DawUi {
                                 self.riff_bipolar_levels = defaults.bipolar_levels;
                                 self.riff_length_multiplier_percent =
                                     defaults.length_multiplier_percent;
+                                self.riff_length_variation_percent =
+                                    defaults.length_variation_percent;
+                                self.riff_use_original_lengths = defaults.use_original_lengths;
                                 self.riff_mirror_horizontal = defaults.mirror_horizontal;
                                 self.riff_preserve_start_times = defaults.preserve_start_times;
                                 self.riff_mirror_vertical = defaults.mirror_vertical;
@@ -35745,6 +35777,9 @@ impl DawUi {
                 groove_pitch_level_percent: self.riff_groove_pitch_level_percent,
                 groove_quantize_mode: self.riff_groove_quantize_mode,
                 length_multiplier_percent: self.riff_length_multiplier_percent,
+                length_variation_percent: self.riff_length_variation_percent,
+                use_original_lengths: self.riff_use_original_lengths,
+                articulation_seed: self.riff_articulation_seed,
                 velocity_variation_percent: self.riff_velocity_variation_percent,
                 pan_variation_percent: self.riff_pan_variation_percent,
                 release_variation_percent: self.riff_release_variation_percent,

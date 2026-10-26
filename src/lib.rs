@@ -2529,6 +2529,12 @@ pub struct RiffMachineOptions<'a> {
     /// Mix seeded offsets into note panning, from 0 through 100 percent.
     pub pan_variation_percent: u8,
     pub length_multiplier_percent: u8,
+    /// Add seeded bipolar note-length variation after applying the multiplier.
+    pub length_variation_percent: u8,
+    /// Use generated note lengths instead of legato distance to the next onset.
+    pub use_original_lengths: bool,
+    /// Seed used by Articulation note-length variation.
+    pub articulation_seed: u64,
     pub velocity_variation_percent: u8,
     /// Mix seeded offsets into release and modulation levels, from 0 through 100 percent.
     pub release_variation_percent: u8,
@@ -2573,6 +2579,9 @@ impl<'a> Default for RiffMachineOptions<'a> {
             groove_quantize_mode: RiffMachineQuantizeMode::LeaveDuration,
             pan_variation_percent: 0,
             length_multiplier_percent: 100,
+            length_variation_percent: 0,
+            use_original_lengths: true,
+            articulation_seed: 1,
             velocity_variation_percent: 10,
             release_variation_percent: 0,
             mod_x_variation_percent: 0,
@@ -14969,6 +14978,11 @@ impl FlpDocument {
                 "Riff Machine length multiplier must be between 10 and 100 percent",
             ));
         }
+        if options.length_variation_percent > 100 {
+            return Err(FlpError::UnsupportedEdit(
+                "Riff Machine length variation must be between 0 and 100 percent",
+            ));
+        }
         if options.velocity_variation_percent > 100
             || options.pan_variation_percent > 100
             || options.release_variation_percent > 100
@@ -15286,9 +15300,9 @@ impl FlpDocument {
             &generated_indices,
             ArticulateOptions {
                 multiplier_percent: options.length_multiplier_percent,
-                variation_percent: 0,
-                seed: options.seed,
-                use_original_lengths: true,
+                variation_percent: options.length_variation_percent,
+                seed: options.articulation_seed,
+                use_original_lengths: options.use_original_lengths,
                 chop_chords: false,
             },
             false,
