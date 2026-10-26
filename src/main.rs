@@ -15,7 +15,8 @@ use flp_rebuild::sample_render::{
 };
 use flp_rebuild::vst3::{Vst3AudioEffectRenderOptions, Vst3HostRuntime, Vst3PatternRenderOptions};
 use flp_rebuild::{
-    ArpeggioDirection, ArpeggioOptions, ArpeggioRangePattern, ArpeggioSyncMode, ArticulateOptions,
+    ArpeggioDirection, ArpeggioOptions, ArpeggioRangePattern, ArpeggioScoreOptions,
+    ArpeggioScorePatternMode, ArpeggioScoreTimeMultiplier, ArpeggioSyncMode, ArticulateOptions,
     AutomationInterpolationMode, AutomationPointEdit, AutomationScaleLevelsOptions,
     ChannelLevelAdjustmentsEdit, ChannelSortOrder, ChannelStretchSettingsEdit, ClawMachineOptions,
     FlamOptions, FlpDocument, FscScore, FstPreset, HumanizerOptions, LimitNoteOptions,
@@ -2414,6 +2415,51 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 )?,
             )
         }
+        [command, input, score_path, output, pattern_id, channel_id, range_octaves, gate, range_pattern, sync, group_notes, mode, multiplier, levels]
+            if command == "arp-score" =>
+        {
+            arpeggiate_score_notes(
+                Path::new(input),
+                Path::new(score_path),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                None,
+                parse_arpeggio_score_options(
+                    range_octaves,
+                    gate,
+                    range_pattern,
+                    sync,
+                    group_notes,
+                    mode,
+                    multiplier,
+                    levels,
+                )?,
+            )
+        }
+        [command, input, score_path, output, pattern_id, channel_id, note_indices, range_octaves, gate, range_pattern, sync, group_notes, mode, multiplier, levels]
+            if command == "arp-score-selected" =>
+        {
+            let note_indices = parse_note_indices(note_indices)?;
+            arpeggiate_score_notes(
+                Path::new(input),
+                Path::new(score_path),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                Some(&note_indices),
+                parse_arpeggio_score_options(
+                    range_octaves,
+                    gate,
+                    range_pattern,
+                    sync,
+                    group_notes,
+                    mode,
+                    multiplier,
+                    levels,
+                )?,
+            )
+        }
         [command, input, output, pattern_id, channel_id, step_ticks, range_octaves, gate, pattern, sync, group_notes]
             if command == "arp-notes" =>
         {
@@ -3896,6 +3942,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild limit-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <minimum-key-0..127> <maximum-key-0..127> [wrap-to-bottom:0|1 scale-name|none scale-root:0..11|-> snap-direction:up|down|alternate]\n",
             "  flp-rebuild arp-notes <input.flp> <output.flp> <pattern-id> <channel-id> <step-ticks|1/n> <range-octaves-1..4> <gate-1..100> <up|down|up-down|alternate> [time|block|chord [group-notes:0|1]]\n",
             "  flp-rebuild arp-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <step-ticks|1/n> <range-octaves-1..4> <gate-1..100> <up|down|up-down|alternate> [time|block|chord [group-notes:0|1]]\n",
+            "  flp-rebuild arp-score <input.flp> <input.fsc> <output.flp> <pattern-id> <channel-id> <range-octaves-1..4> <gate-1..100> <up|down|up-down|alternate> <time|block|chord> <group-notes:0|1> <normal|flip-vertical|alternate> <time-multiplier:1/8|1/4|1/2|1|2|3|4> <levels:0..100>\n",
+            "  flp-rebuild arp-score-selected <input.flp> <input.fsc> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <range-octaves-1..4> <gate-1..100> <up|down|up-down|alternate> <time|block|chord> <group-notes:0|1> <normal|flip-vertical|alternate> <time-multiplier:1/8|1/4|1/2|1|2|3|4> <levels:0..100>\n",
             "    Arpeggiator step accepts ticks or 1/1, 1/2, 1/4, 1/8, 1/16, 1/32, 1/64, or 1/128, rounded to project ticks using PPQ.\n",
             "  flp-rebuild riff-machine-notes <input.flp> <output.flp> <pattern-id> <channel-id> [--option=value ...]\n",
             "  flp-rebuild riff-machine-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> [--option=value ...]\n",
@@ -4733,6 +4781,57 @@ fn parse_arpeggio_sync_mode(value: &str) -> Result<ArpeggioSyncMode, String> {
         "chord" => Ok(ArpeggioSyncMode::Chord),
         _ => Err("arpeggiator sync mode must be 'time', 'block', or 'chord'".to_owned()),
     }
+}
+
+fn parse_arpeggio_score_mode(value: &str) -> Result<ArpeggioScorePatternMode, String> {
+    match value {
+        "normal" => Ok(ArpeggioScorePatternMode::Normal),
+        "flip-vertical" => Ok(ArpeggioScorePatternMode::FlipVertical),
+        "alternate" => Ok(ArpeggioScorePatternMode::Alternate),
+        _ => Err(
+            "arpeggiator score mode must be 'normal', 'flip-vertical', or 'alternate'".to_owned(),
+        ),
+    }
+}
+
+fn parse_arpeggio_score_time_multiplier(
+    value: &str,
+) -> Result<ArpeggioScoreTimeMultiplier, String> {
+    match value {
+        "1/2" => Ok(ArpeggioScoreTimeMultiplier::Faster2),
+        "1/4" => Ok(ArpeggioScoreTimeMultiplier::Faster4),
+        "1/8" => Ok(ArpeggioScoreTimeMultiplier::Faster8),
+        "1" => Ok(ArpeggioScoreTimeMultiplier::Normal),
+        "2" => Ok(ArpeggioScoreTimeMultiplier::Slower2),
+        "3" => Ok(ArpeggioScoreTimeMultiplier::Slower3),
+        "4" => Ok(ArpeggioScoreTimeMultiplier::Slower4),
+        _ => Err("score time multiplier must be 1/8, 1/4, 1/2, 1, 2, 3, or 4".to_owned()),
+    }
+}
+
+fn parse_arpeggio_score_options(
+    range_octaves: &str,
+    gate: &str,
+    range_pattern: &str,
+    sync: &str,
+    group_notes: &str,
+    pattern_mode: &str,
+    time_multiplier: &str,
+    levels: &str,
+) -> Result<ArpeggioScoreOptions, String> {
+    Ok(ArpeggioScoreOptions {
+        arpeggio: ArpeggioOptions {
+            range_octaves: parse_u8(range_octaves, "arpeggiator range")?,
+            gate_percent: parse_u8(gate, "arpeggiator gate")?,
+            range_pattern: parse_arpeggio_range_pattern(range_pattern)?,
+            sync: parse_arpeggio_sync_mode(sync)?,
+            group_notes: parse_bool(group_notes, "group notes")?,
+            ..ArpeggioOptions::default()
+        },
+        pattern_mode: parse_arpeggio_score_mode(pattern_mode)?,
+        time_multiplier: parse_arpeggio_score_time_multiplier(time_multiplier)?,
+        levels_percent: parse_u8(levels, "arpeggiator score levels")?,
+    })
 }
 
 fn parse_riff_machine_quantize_mode(value: &str) -> Result<RiffMachineQuantizeMode, String> {
@@ -8816,6 +8915,51 @@ fn arpeggiate_notes_with_scope(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "generated {created} arpeggiated notes in pattern {pattern_id}, channel {channel_id} ({}) to {}",
+        if note_indices.is_some() {
+            "selected notes"
+        } else {
+            "all channel notes"
+        },
+        output.display()
+    );
+    Ok(())
+}
+
+fn arpeggiate_score_notes(
+    input: &Path,
+    score_path: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    note_indices: Option<&[usize]>,
+    options: ArpeggioScoreOptions,
+) -> Result<(), String> {
+    let score_bytes = fs::read(score_path)
+        .map_err(|error| format!("could not read {}: {error}", score_path.display()))?;
+    let score = FscScore::parse(&score_bytes)
+        .map_err(|error| format!("could not parse {}: {error}", score_path.display()))?;
+    let (_, mut document) = load_document(input)?;
+    let created = match note_indices {
+        Some(note_indices) => document.arpeggiate_pattern_note_selection_with_score(
+            pattern_id,
+            channel_id,
+            note_indices,
+            &score,
+            options,
+        ),
+        None => {
+            document.arpeggiate_pattern_notes_with_score(pattern_id, channel_id, &score, options)
+        }
+    }
+    .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "generated {created} notes from score {} in pattern {pattern_id}, channel {channel_id} ({}) to {}",
+        score_path.display(),
         if note_indices.is_some() {
             "selected notes"
         } else {

@@ -70,7 +70,8 @@ use flp_rebuild::vst3::{
     Vst3PlaylistStreamProcessor,
 };
 use flp_rebuild::{
-    ArpeggioDirection, ArpeggioOptions, ArpeggioRangePattern, ArpeggioSyncMode, Arrangement,
+    ArpeggioDirection, ArpeggioOptions, ArpeggioRangePattern, ArpeggioScoreOptions,
+    ArpeggioScorePatternMode, ArpeggioScoreTimeMultiplier, ArpeggioSyncMode, Arrangement,
     ArticulateOptions, AutomationChannel, AutomationInterpolationMode, AutomationPoint,
     AutomationPointEdit, AutomationScaleLevelsOptions, ChannelGroupSummary, ChannelNoteRouter,
     ChannelSortOrder, ChannelStretchMode, ChannelStretchSettingsEdit, ChannelSummary, ChannelType,
@@ -4759,6 +4760,11 @@ struct DawUi {
     arpeggiator_group_notes: bool,
     riff_machine_direction: ArpeggioDirection,
     arpeggiator_sync_mode: ArpeggioSyncMode,
+    arpeggiator_score: Option<FscScore>,
+    arpeggiator_score_path: Option<PathBuf>,
+    arpeggiator_score_mode: ArpeggioScorePatternMode,
+    arpeggiator_score_time_multiplier: ArpeggioScoreTimeMultiplier,
+    arpeggiator_score_levels_percent: u8,
     riff_seed: u64,
     riff_velocity_variation_percent: u8,
     riff_pan_variation_percent: u8,
@@ -6339,6 +6345,11 @@ impl DawUi {
             arpeggiator_group_notes: false,
             riff_machine_direction: ArpeggioDirection::Up,
             arpeggiator_sync_mode: ArpeggioSyncMode::Block,
+            arpeggiator_score: None,
+            arpeggiator_score_path: None,
+            arpeggiator_score_mode: ArpeggioScorePatternMode::Normal,
+            arpeggiator_score_time_multiplier: ArpeggioScoreTimeMultiplier::Normal,
+            arpeggiator_score_levels_percent: 0,
             riff_seed: 1,
             riff_velocity_variation_percent: 10,
             riff_pan_variation_percent: 0,
@@ -31727,6 +31738,7 @@ impl DawUi {
         let mut humanize_requested = false;
         let mut limit_requested = false;
         let mut arpeggiate_requested = false;
+        let mut load_arpeggiator_score_requested = false;
         let mut riff_machine_requested = false;
         let mut claw_requested = false;
         let mut slice_requested = false;
@@ -34435,36 +34447,133 @@ impl DawUi {
                             });
                     },
                 );
-                let step_unit = self.arpeggiator_step_note_division.map_or_else(
-                    || "Ticks".to_owned(),
-                    |denominator| format!("1/{denominator} note"),
-                );
-                egui::ComboBox::from_id_salt("piano-roll-arpeggiator-step-unit")
-                    .selected_text(step_unit)
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.arpeggiator_step_note_division,
-                            None,
-                            "Ticks",
-                        );
-                        for denominator in [1, 2, 4, 8, 16, 32, 64, 128] {
+                ui.horizontal(|ui| {
+                    if ui.button("Browse score…").clicked() {
+                        load_arpeggiator_score_requested = true;
+                    }
+                    if let Some(path) = &self.arpeggiator_score_path {
+                        let name = path
+                            .file_name()
+                            .map_or_else(|| "Loaded score".to_owned(), |name| {
+                                name.to_string_lossy().into_owned()
+                            });
+                        ui.label(name);
+                        if ui.button("Clear").clicked() {
+                            self.arpeggiator_score = None;
+                            self.arpeggiator_score_path = None;
+                        }
+                    } else {
+                        ui.label("Built-in pattern");
+                    }
+                });
+                ui.add_enabled_ui(self.arpeggiator_score.is_none(), |ui| {
+                    let step_unit = self.arpeggiator_step_note_division.map_or_else(
+                        || "Ticks".to_owned(),
+                        |denominator| format!("1/{denominator} note"),
+                    );
+                    egui::ComboBox::from_id_salt("piano-roll-arpeggiator-step-unit")
+                        .selected_text(step_unit)
+                        .show_ui(ui, |ui| {
                             ui.selectable_value(
                                 &mut self.arpeggiator_step_note_division,
-                                Some(denominator),
-                                format!("1/{denominator} note"),
+                                None,
+                                "Ticks",
                             );
-                        }
-                    })
-                    .response
-                    .on_hover_text(
-                        "Note divisions are converted using project PPQ, so their playback duration follows tempo changes.",
-                    );
-                if let Some(denominator) = self.arpeggiator_step_note_division {
-                    ui.label(format!("Step: 1/{denominator} note"));
-                } else {
+                            for denominator in [1, 2, 4, 8, 16, 32, 64, 128] {
+                                ui.selectable_value(
+                                    &mut self.arpeggiator_step_note_division,
+                                    Some(denominator),
+                                    format!("1/{denominator} note"),
+                                );
+                            }
+                        })
+                        .response
+                        .on_hover_text(
+                            "Note divisions are converted using project PPQ, so their playback duration follows tempo changes.",
+                        );
+                    if let Some(denominator) = self.arpeggiator_step_note_division {
+                        ui.label(format!("Step: 1/{denominator} note"));
+                    } else {
+                        ui.add(
+                            egui::Slider::new(&mut self.arpeggiator_step_ticks, 1..=384)
+                                .text("Arpeggiator step (ticks)"),
+                        );
+                    }
+                });
+                if self.arpeggiator_score.is_some() {
+                    egui::ComboBox::from_id_salt("piano-roll-arpeggiator-score-mode")
+                        .selected_text(match self.arpeggiator_score_mode {
+                            ArpeggioScorePatternMode::Normal => "Pattern: Normal",
+                            ArpeggioScorePatternMode::FlipVertical => "Pattern: Flip vertical",
+                            ArpeggioScorePatternMode::Alternate => "Pattern: Alternate",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.arpeggiator_score_mode,
+                                ArpeggioScorePatternMode::Normal,
+                                "Normal",
+                            );
+                            ui.selectable_value(
+                                &mut self.arpeggiator_score_mode,
+                                ArpeggioScorePatternMode::FlipVertical,
+                                "Flip vertical",
+                            );
+                            ui.selectable_value(
+                                &mut self.arpeggiator_score_mode,
+                                ArpeggioScorePatternMode::Alternate,
+                                "Alternate",
+                            );
+                        });
+                    egui::ComboBox::from_id_salt("piano-roll-arpeggiator-time-multiplier")
+                        .selected_text(match self.arpeggiator_score_time_multiplier {
+                            ArpeggioScoreTimeMultiplier::Faster2 => "Time: 1/2×",
+                            ArpeggioScoreTimeMultiplier::Faster4 => "Time: 1/4×",
+                            ArpeggioScoreTimeMultiplier::Faster8 => "Time: 1/8×",
+                            ArpeggioScoreTimeMultiplier::Normal => "Time: 1×",
+                            ArpeggioScoreTimeMultiplier::Slower2 => "Time: 2×",
+                            ArpeggioScoreTimeMultiplier::Slower3 => "Time: 3×",
+                            ArpeggioScoreTimeMultiplier::Slower4 => "Time: 4×",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.arpeggiator_score_time_multiplier,
+                                ArpeggioScoreTimeMultiplier::Faster2,
+                                "1/2× faster",
+                            );
+                            ui.selectable_value(
+                                &mut self.arpeggiator_score_time_multiplier,
+                                ArpeggioScoreTimeMultiplier::Faster4,
+                                "1/4× faster",
+                            );
+                            ui.selectable_value(
+                                &mut self.arpeggiator_score_time_multiplier,
+                                ArpeggioScoreTimeMultiplier::Faster8,
+                                "1/8× faster",
+                            );
+                            ui.selectable_value(
+                                &mut self.arpeggiator_score_time_multiplier,
+                                ArpeggioScoreTimeMultiplier::Normal,
+                                "Normal speed",
+                            );
+                            ui.selectable_value(
+                                &mut self.arpeggiator_score_time_multiplier,
+                                ArpeggioScoreTimeMultiplier::Slower2,
+                                "2× slower",
+                            );
+                            ui.selectable_value(
+                                &mut self.arpeggiator_score_time_multiplier,
+                                ArpeggioScoreTimeMultiplier::Slower3,
+                                "3× slower",
+                            );
+                            ui.selectable_value(
+                                &mut self.arpeggiator_score_time_multiplier,
+                                ArpeggioScoreTimeMultiplier::Slower4,
+                                "4× slower",
+                            );
+                        });
                     ui.add(
-                        egui::Slider::new(&mut self.arpeggiator_step_ticks, 1..=384)
-                            .text("Arpeggiator step (ticks)"),
+                        egui::Slider::new(&mut self.arpeggiator_score_levels_percent, 0..=100)
+                            .text("Score levels (%)"),
                     );
                 }
                 ui.add(
@@ -34539,6 +34648,12 @@ impl DawUi {
                         self.arpeggiator_range_pattern = defaults.range_pattern;
                         self.arpeggiator_sync_mode = defaults.sync;
                         self.arpeggiator_group_notes = defaults.group_notes;
+                        self.arpeggiator_score = None;
+                        self.arpeggiator_score_path = None;
+                        self.arpeggiator_score_mode = ArpeggioScorePatternMode::Normal;
+                        self.arpeggiator_score_time_multiplier =
+                            ArpeggioScoreTimeMultiplier::Normal;
+                        self.arpeggiator_score_levels_percent = 0;
                     }
                 });
                 ui.add(
@@ -35235,6 +35350,27 @@ impl DawUi {
                 Err(error) => self.status = format!("Could not limit note pitches: {error}"),
             }
         }
+        if load_arpeggiator_score_requested
+            && let Some(path) = rfd::FileDialog::new()
+                .set_title("Load Arpeggiator score")
+                .add_filter("FL Studio score files", &["fsc"])
+                .pick_file()
+        {
+            let result = fs::read(&path)
+                .map_err(|error| format!("could not read {}: {error}", path.display()))
+                .and_then(|bytes| FscScore::parse(&bytes).map_err(|error| error.to_string()));
+            match result {
+                Ok(score) => {
+                    self.arpeggiator_score = Some(score);
+                    self.arpeggiator_score_path = Some(path.clone());
+                    self.status = format!("Loaded Arpeggiator score {}", path.display());
+                }
+                Err(error) => {
+                    self.status = format!("Could not load Arpeggiator score: {error}");
+                }
+            }
+        }
+
         if arpeggiate_requested
             && let (Some(pattern_id), Some(channel_id)) =
                 (self.selected_pattern, self.selected_note_channel)
@@ -35246,6 +35382,20 @@ impl DawUi {
             let range_pattern = self.arpeggiator_range_pattern;
             let group_notes = self.arpeggiator_group_notes;
             let sync = self.arpeggiator_sync_mode;
+            let score = self.arpeggiator_score.clone();
+            let score_options = ArpeggioScoreOptions {
+                arpeggio: ArpeggioOptions {
+                    step_ticks: self.arpeggiator_step_ticks,
+                    range_octaves,
+                    gate_percent,
+                    range_pattern,
+                    sync,
+                    group_notes,
+                },
+                pattern_mode: self.arpeggiator_score_mode,
+                time_multiplier: self.arpeggiator_score_time_multiplier,
+                levels_percent: self.arpeggiator_score_levels_percent,
+            };
             let result = self
                 .document
                 .as_mut()
@@ -35262,33 +35412,40 @@ impl DawUi {
                         })?,
                         None => step_ticks,
                     };
-                    let result = if edit_selection_only {
-                        document.arpeggiate_pattern_note_selection(
+                    let arpeggio_options = ArpeggioOptions {
+                        step_ticks,
+                        range_octaves,
+                        gate_percent,
+                        range_pattern,
+                        sync,
+                        group_notes,
+                    };
+                    let result = match (score.as_ref(), edit_selection_only) {
+                        (Some(score), true) => document
+                            .arpeggiate_pattern_note_selection_with_score(
+                                pattern_id,
+                                channel_id,
+                                &selected_quantize_indices,
+                                score,
+                                score_options,
+                            ),
+                        (Some(score), false) => document.arpeggiate_pattern_notes_with_score(
+                            pattern_id,
+                            channel_id,
+                            score,
+                            score_options,
+                        ),
+                        (None, true) => document.arpeggiate_pattern_note_selection(
                             pattern_id,
                             channel_id,
                             &selected_quantize_indices,
-                            ArpeggioOptions {
-                                step_ticks,
-                                range_octaves,
-                                gate_percent,
-                                range_pattern,
-                                sync,
-                                group_notes,
-                            },
-                        )
-                    } else {
-                        document.arpeggiate_pattern_notes(
+                            arpeggio_options,
+                        ),
+                        (None, false) => document.arpeggiate_pattern_notes(
                             pattern_id,
                             channel_id,
-                            ArpeggioOptions {
-                                step_ticks,
-                                range_octaves,
-                                gate_percent,
-                                range_pattern,
-                                sync,
-                                group_notes,
-                            },
-                        )
+                            arpeggio_options,
+                        ),
                     };
                     result.map_err(|error| error.to_string())
                 });

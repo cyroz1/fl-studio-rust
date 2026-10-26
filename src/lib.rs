@@ -1693,6 +1693,56 @@ fn channel_accepts_key(channel: &ChannelSummary, key: u16) -> bool {
         .is_none_or(|(low, high)| (low..=high).contains(&key))
 }
 
+fn scale_arpeggio_score_tick(
+    tick: u64,
+    score_ppq: u16,
+    project_ppq: u16,
+    multiplier: ArpeggioScoreTimeMultiplier,
+) -> Result<u64, FlpError> {
+    let (multiplier_numerator, multiplier_denominator) = multiplier.ratio();
+    let denominator = u128::from(score_ppq.max(1))
+        .checked_mul(u128::from(multiplier_denominator))
+        .ok_or(FlpError::LengthOverflow)?;
+    let numerator = u128::from(tick)
+        .checked_mul(u128::from(project_ppq.max(1)))
+        .and_then(|value| value.checked_mul(u128::from(multiplier_numerator)))
+        .ok_or(FlpError::LengthOverflow)?;
+    let rounded = numerator
+        .checked_add(denominator / 2)
+        .ok_or(FlpError::LengthOverflow)?
+        / denominator;
+    let scaled = u64::try_from(rounded).map_err(|_| FlpError::LengthOverflow)?;
+    Ok(if tick > 0 { scaled.max(1) } else { scaled })
+}
+
+fn mix_arpeggio_score_level(original: u8, pattern: u8, levels_percent: u8) -> u8 {
+    let percent = u16::from(levels_percent.min(100));
+    let original_weight = 100 - percent;
+    ((u16::from(original) * original_weight + u16::from(pattern) * percent + 50) / 100) as u8
+}
+
+fn arpeggio_score_octave_order(range_octaves: u8, range_pattern: ArpeggioRangePattern) -> Vec<u8> {
+    let mut order = (0..range_octaves).collect::<Vec<_>>();
+    if range_pattern == ArpeggioRangePattern::Down {
+        order.reverse();
+    }
+    match range_pattern {
+        ArpeggioRangePattern::UpDown if order.len() > 2 => {
+            let trailing = (1..order.len() - 1)
+                .rev()
+                .map(|index| index as u8)
+                .collect::<Vec<_>>();
+            order.extend(trailing);
+        }
+        ArpeggioRangePattern::Alternate => {
+            let trailing = order.iter().rev().copied().collect::<Vec<_>>();
+            order.extend(trailing);
+        }
+        _ => {}
+    }
+    order
+}
+
 /// One point from the `0xEA` payload of a kind-5 automation channel.
 ///
 /// Positions are cumulative beats from the start of the automation clip. The
@@ -1924,12 +1974,14 @@ pub struct PatternNoteEdit {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FscScore {
     notes: Vec<PatternNote>,
+    ppq: u16,
 }
 
 impl FscScore {
     /// Parses score note records while retaining all saved note properties.
     pub fn parse(bytes: &[u8]) -> Result<Self, FlpError> {
         let document = FlpDocument::parse(bytes)?;
+        let ppq = document.header.ppq;
         let mut notes = document
             .patterns()?
             .into_iter()
@@ -1946,11 +1998,15 @@ impl FscScore {
             ));
         }
         notes.sort_by_key(|note| (note.position, note.key));
-        Ok(Self { notes })
+        Ok(Self { notes, ppq })
     }
 
     pub fn notes(&self) -> &[PatternNote] {
         &self.notes
+    }
+
+    pub fn ppq(&self) -> u16 {
+        self.ppq
     }
 }
 
@@ -1984,6 +2040,45 @@ pub enum ArpeggioSyncMode {
     Block,
     /// Repeat until the first note in the source chord ends.
     Chord,
+}
+
+/// How a custom score pattern is transposed vertically across repetitions.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ArpeggioScorePatternMode {
+    /// Use the custom score's pitches as saved.
+    #[default]
+    Normal,
+    /// Invert each custom score pitch around C5.
+    FlipVertical,
+    /// Alternate between the saved and vertically inverted pitch pattern.
+    Alternate,
+}
+
+/// Time scaling for a custom Piano roll arpeggiator score.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ArpeggioScoreTimeMultiplier {
+    Faster2,
+    Faster4,
+    Faster8,
+    #[default]
+    Normal,
+    Slower2,
+    Slower3,
+    Slower4,
+}
+
+impl ArpeggioScoreTimeMultiplier {
+    fn ratio(self) -> (u8, u8) {
+        match self {
+            Self::Faster2 => (1, 2),
+            Self::Faster4 => (1, 4),
+            Self::Faster8 => (1, 8),
+            Self::Normal => (1, 1),
+            Self::Slower2 => (2, 1),
+            Self::Slower3 => (3, 1),
+            Self::Slower4 => (4, 1),
+        }
+    }
 }
 
 /// Direction used when a limited pitch needs to move onto a selected scale.
@@ -2065,6 +2160,26 @@ pub struct ArpeggioOptions {
     pub sync: ArpeggioSyncMode,
     /// Assign generated notes to a new group so they move and edit together.
     pub group_notes: bool,
+}
+
+/// Custom-score settings layered over the normal Piano roll Arpeggiator controls.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ArpeggioScoreOptions {
+    pub arpeggio: ArpeggioOptions,
+    pub pattern_mode: ArpeggioScorePatternMode,
+    pub time_multiplier: ArpeggioScoreTimeMultiplier,
+    pub levels_percent: u8,
+}
+
+impl Default for ArpeggioScoreOptions {
+    fn default() -> Self {
+        Self {
+            arpeggio: ArpeggioOptions::default(),
+            pattern_mode: ArpeggioScorePatternMode::Normal,
+            time_multiplier: ArpeggioScoreTimeMultiplier::Normal,
+            levels_percent: 0,
+        }
+    }
 }
 
 impl Default for ArpeggioOptions {
@@ -13944,6 +14059,388 @@ impl FlpDocument {
                 ))?;
             for note in &mut additions {
                 note.group = group;
+            }
+        }
+
+        let mut updated = self.clone();
+        remove_indices.sort_unstable_by(|left, right| right.cmp(left));
+        for note_index in remove_indices {
+            updated.delete_pattern_note(pattern_id, channel_id, note_index)?;
+        }
+        updated.add_pattern_notes(pattern_id, &additions)?;
+        *self = updated;
+        Ok(additions.len())
+    }
+
+    /// Applies a loaded FL Studio score as a time-and-transposition pattern to channel notes.
+    ///
+    /// Score colors 1–4 (stored in the low MIDI-channel nibble) map to green, blue, pink, and
+    /// yellow. Green notes define transposed slices, blue notes keep overlapping source notes
+    /// intact, pink notes ignore the octave range, and yellow notes can set the loop length.
+    /// The option mappings follow the public tool controls; native output comparison remains
+    /// necessary for exact timing and level behavior.
+    pub fn arpeggiate_pattern_notes_with_score(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        score: &FscScore,
+        options: ArpeggioScoreOptions,
+    ) -> Result<usize, FlpError> {
+        self.arpeggiate_pattern_notes_with_score_in_scope(
+            pattern_id, channel_id, None, score, options,
+        )
+    }
+
+    /// Applies a loaded FL Studio score only to selected channel-local notes.
+    pub fn arpeggiate_pattern_note_selection_with_score(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: &[usize],
+        score: &FscScore,
+        options: ArpeggioScoreOptions,
+    ) -> Result<usize, FlpError> {
+        self.arpeggiate_pattern_notes_with_score_in_scope(
+            pattern_id,
+            channel_id,
+            Some(note_indices),
+            score,
+            options,
+        )
+    }
+
+    fn arpeggiate_pattern_notes_with_score_in_scope(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: Option<&[usize]>,
+        score: &FscScore,
+        options: ArpeggioScoreOptions,
+    ) -> Result<usize, FlpError> {
+        let ArpeggioOptions {
+            range_octaves,
+            gate_percent,
+            range_pattern,
+            sync,
+            group_notes,
+            ..
+        } = options.arpeggio;
+        if !(1..=4).contains(&range_octaves) {
+            return Err(FlpError::UnsupportedEdit(
+                "arpeggiator range must be between 1 and 4 octaves",
+            ));
+        }
+        if !(1..=100).contains(&gate_percent) {
+            return Err(FlpError::UnsupportedEdit(
+                "arpeggiator gate must be between 1 and 100 percent",
+            ));
+        }
+        if options.levels_percent > 100 {
+            return Err(FlpError::UnsupportedEdit(
+                "arpeggiator score levels must be between 0 and 100 percent",
+            ));
+        }
+        self.require_unique_channel(channel_id)?;
+        let patterns = self.patterns()?;
+        let pattern = patterns
+            .iter()
+            .find(|pattern| pattern.id == pattern_id)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested pattern does not exist",
+            ))?;
+
+        let score_notes = score.notes();
+        let yellow_pattern_end = score_notes
+            .iter()
+            .filter(|note| note.midi_channel & 0x0f == 3)
+            .map(|note| u64::from(note.position) + u64::from(note.length))
+            .max();
+        let raw_pattern_length = yellow_pattern_end.unwrap_or_else(|| {
+            score_notes
+                .iter()
+                .map(|note| u64::from(note.position) + u64::from(note.length))
+                .max()
+                .unwrap_or(0)
+        });
+        if raw_pattern_length == 0 {
+            return Err(FlpError::UnsupportedEdit(
+                "the arpeggiator score has no positive pattern length",
+            ));
+        }
+        let project_ppq = self.header.ppq.max(1);
+        let score_ppq = score.ppq().max(1);
+        let pattern_length = scale_arpeggio_score_tick(
+            raw_pattern_length,
+            score_ppq,
+            project_ppq,
+            options.time_multiplier,
+        )?;
+        if pattern_length == 0 {
+            return Err(FlpError::UnsupportedEdit(
+                "the arpeggiator score pattern is shorter than one project tick",
+            ));
+        }
+
+        let mut score_events = Vec::<(PatternNote, u8, u64, u64, Option<usize>)>::new();
+        let mut green_event_count = 0usize;
+        for note in score_notes {
+            let color = note.midi_channel & 0x0f;
+            if !(0..=2).contains(&color) || note.length == 0 {
+                continue;
+            }
+            let start = scale_arpeggio_score_tick(
+                u64::from(note.position),
+                score_ppq,
+                project_ppq,
+                options.time_multiplier,
+            )?;
+            if start >= pattern_length {
+                continue;
+            }
+            let raw_end = u64::from(note.position) + u64::from(note.length);
+            let mut end = scale_arpeggio_score_tick(
+                raw_end,
+                score_ppq,
+                project_ppq,
+                options.time_multiplier,
+            )?
+            .min(pattern_length);
+            if end <= start {
+                end = (start + 1).min(pattern_length);
+            }
+            let green_index = if color == 0 {
+                let index = green_event_count;
+                green_event_count += 1;
+                Some(index)
+            } else {
+                None
+            };
+            score_events.push((note.clone(), color, start, end, green_index));
+        }
+        if green_event_count == 0 {
+            return Err(FlpError::UnsupportedEdit(
+                "the arpeggiator score has no green transposition notes",
+            ));
+        }
+        if score_events.len() > 1_000_000 {
+            return Err(FlpError::UnsupportedEdit(
+                "the arpeggiator score contains more than one million usable notes",
+            ));
+        }
+
+        let selected_indices =
+            note_indices.map(|indices| indices.iter().copied().collect::<HashSet<_>>());
+        let mut onset_groups = std::collections::BTreeMap::<u32, Vec<(usize, PatternNote)>>::new();
+        for (note_index, note) in pattern
+            .notes
+            .iter()
+            .filter(|note| note.channel_id == channel_id)
+            .enumerate()
+        {
+            if !note_index_in_scope(note_index, selected_indices.as_ref()) {
+                continue;
+            }
+            onset_groups
+                .entry(note.position)
+                .or_default()
+                .push((note_index, note.clone()));
+        }
+
+        let octave_order = arpeggio_score_octave_order(range_octaves, range_pattern);
+        let mut remove_indices = Vec::new();
+        let mut additions = Vec::new();
+        for (onset, group) in onset_groups {
+            let block_end = group
+                .iter()
+                .map(|(_, note)| u64::from(note.position) + u64::from(note.length))
+                .max()
+                .unwrap_or(u64::from(onset));
+            let chord_end = group
+                .iter()
+                .map(|(_, note)| u64::from(note.position) + u64::from(note.length))
+                .min()
+                .unwrap_or(u64::from(onset));
+            let loop_end = match sync {
+                ArpeggioSyncMode::Time => u64::from(onset)
+                    .checked_add(pattern_length)
+                    .ok_or(FlpError::LengthOverflow)?,
+                ArpeggioSyncMode::Block => block_end,
+                ArpeggioSyncMode::Chord => chord_end,
+            };
+            if loop_end <= u64::from(onset) {
+                continue;
+            }
+            let loop_duration = loop_end - u64::from(onset);
+            let cycle_count = if sync == ArpeggioSyncMode::Time {
+                1
+            } else {
+                loop_duration.div_ceil(pattern_length)
+            };
+            let estimated_overlaps = cycle_count
+                .saturating_mul(score_events.len() as u64)
+                .saturating_mul(group.len() as u64);
+            if cycle_count > 1_000_000 || estimated_overlaps > 5_000_000 {
+                return Err(FlpError::UnsupportedEdit(
+                    "arpeggiator score would require more than five million note comparisons",
+                ));
+            }
+
+            for (note_index, source) in &group {
+                let source_start = u64::from(source.position);
+                let source_end = (source_start + u64::from(source.length)).min(loop_end);
+                if source_end <= source_start || u64::from(source.length) >= pattern_length {
+                    continue;
+                }
+                let overlaps_blue = (0..cycle_count).any(|cycle| {
+                    let cycle_start = u64::from(onset) + cycle * pattern_length;
+                    score_events.iter().any(|(_, color, start, end, _)| {
+                        if *color != 1 {
+                            return false;
+                        }
+                        let event_start = cycle_start + *start;
+                        let event_end = cycle_start + *end;
+                        event_start < source_end
+                            && event_end > source_start
+                            && event_start < loop_end
+                    })
+                });
+                if overlaps_blue {
+                    continue;
+                }
+
+                let first_addition = additions.len();
+                for cycle in 0..cycle_count {
+                    let cycle_start = u64::from(onset)
+                        .checked_add(
+                            cycle
+                                .checked_mul(pattern_length)
+                                .ok_or(FlpError::LengthOverflow)?,
+                        )
+                        .ok_or(FlpError::LengthOverflow)?;
+                    if cycle_start >= loop_end {
+                        break;
+                    }
+                    for (score_note, color, relative_start, relative_end, green_index) in
+                        &score_events
+                    {
+                        if *color == 1 {
+                            continue;
+                        }
+                        let event_start = cycle_start
+                            .checked_add(*relative_start)
+                            .ok_or(FlpError::LengthOverflow)?;
+                        let event_end = cycle_start
+                            .checked_add(*relative_end)
+                            .ok_or(FlpError::LengthOverflow)?;
+                        let slice_start = source_start.max(event_start);
+                        let slice_end = source_end.min(event_end).min(loop_end);
+                        if slice_end <= slice_start {
+                            continue;
+                        }
+
+                        let cycle_flip = match options.pattern_mode {
+                            ArpeggioScorePatternMode::Normal => false,
+                            ArpeggioScorePatternMode::FlipVertical => true,
+                            ArpeggioScorePatternMode::Alternate => cycle % 2 == 1,
+                        };
+                        let mut transpose = i32::from(score_note.key) - 60;
+                        if cycle_flip {
+                            transpose = -transpose;
+                        }
+                        let octave = if *color == 2 {
+                            0
+                        } else {
+                            let score_step = usize::try_from(cycle)
+                                .map_err(|_| FlpError::LengthOverflow)?
+                                .checked_mul(green_event_count)
+                                .and_then(|index| index.checked_add(green_index.unwrap_or(0)))
+                                .ok_or(FlpError::LengthOverflow)?;
+                            octave_order[score_step % octave_order.len()]
+                        };
+                        let key = i32::from(source.key)
+                            .checked_add(transpose)
+                            .and_then(|value| value.checked_add(i32::from(octave) * 12))
+                            .ok_or(FlpError::LengthOverflow)?;
+                        if !(0..=127).contains(&key) {
+                            return Err(FlpError::UnsupportedEdit(
+                                "the arpeggiator score transposes a note outside the MIDI key range",
+                            ));
+                        }
+                        let raw_length = slice_end - slice_start;
+                        let gated_length = raw_length
+                            .checked_mul(u64::from(gate_percent))
+                            .ok_or(FlpError::LengthOverflow)?
+                            / 100;
+                        let position =
+                            u32::try_from(slice_start).map_err(|_| FlpError::LengthOverflow)?;
+                        let length = u32::try_from(gated_length.max(1))
+                            .map_err(|_| FlpError::LengthOverflow)?;
+                        let mut output = source.clone();
+                        output.position = position;
+                        output.length = length;
+                        output.key = key as u16;
+                        output.velocity = mix_arpeggio_score_level(
+                            source.velocity,
+                            score_note.velocity,
+                            options.levels_percent,
+                        );
+                        output.pan = mix_arpeggio_score_level(
+                            source.pan,
+                            score_note.pan,
+                            options.levels_percent,
+                        );
+                        output.fine_pitch = mix_arpeggio_score_level(
+                            source.fine_pitch,
+                            score_note.fine_pitch,
+                            options.levels_percent,
+                        );
+                        output.release = mix_arpeggio_score_level(
+                            source.release,
+                            score_note.release,
+                            options.levels_percent,
+                        );
+                        output.mod_x = mix_arpeggio_score_level(
+                            source.mod_x,
+                            score_note.mod_x,
+                            options.levels_percent,
+                        );
+                        output.mod_y = mix_arpeggio_score_level(
+                            source.mod_y,
+                            score_note.mod_y,
+                            options.levels_percent,
+                        );
+                        additions.push(output);
+                        if additions.len() > 1_000_000 {
+                            return Err(FlpError::UnsupportedEdit(
+                                "arpeggiator would create more than one million notes",
+                            ));
+                        }
+                    }
+                }
+                if additions.len() == first_addition {
+                    continue;
+                }
+                remove_indices.push(*note_index);
+            }
+        }
+        if additions.is_empty() {
+            return Ok(0);
+        }
+
+        if group_notes {
+            let used_groups = pattern
+                .notes
+                .iter()
+                .filter(|note| note.channel_id == channel_id && note.group != 0)
+                .map(|note| note.group)
+                .collect::<BTreeSet<_>>();
+            let group_id = (1..=u16::MAX)
+                .find(|group| !used_groups.contains(group))
+                .ok_or(FlpError::UnsupportedEdit(
+                    "no free note group ID remains for this channel",
+                ))?;
+            for note in &mut additions {
+                note.group = group_id;
             }
         }
 
