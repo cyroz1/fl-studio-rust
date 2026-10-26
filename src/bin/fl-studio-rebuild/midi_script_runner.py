@@ -155,6 +155,14 @@ def _mixer_get_track_name(index, maxLen=-1):
     return name
 
 
+def _mixer_get_track_recording_file_name(index):
+    index = _mixer_track_index(index)
+    file_names = _active_transport_state.get("mixer_track_recording_file_names", [])
+    if index < len(file_names):
+        return str(file_names[index])
+    return ""
+
+
 def _mixer_set_track_name(index, name):
     index = _mixer_track_index(index)
     if not isinstance(name, str):
@@ -1369,6 +1377,7 @@ def _install_modules(script_name, device_name):
     mixer.getTrackName = _mixer_get_track_name
     mixer.setTrackName = _mixer_set_track_name
     mixer.getTrackColor = _mixer_get_track_color
+    mixer.getTrackRecordingFileName = _mixer_get_track_recording_file_name
     mixer.getTrackPeaks = _mixer_get_track_peaks
     mixer.getLastPeakVol = _mixer_get_last_peak_vol
     mixer.trackCount = _mixer_track_count

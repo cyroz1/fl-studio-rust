@@ -210,6 +210,7 @@ pub struct MidiScriptTransportState {
     pub arrangement_live_selection_start: AtomicU64,
     pub arrangement_live_selection_end: AtomicU64,
     pub mixer_track_names: Mutex<Vec<String>>,
+    pub mixer_track_recording_file_names: Mutex<Vec<String>>,
     pub mixer_selected_track: AtomicU64,
     pub mixer_track_colors: Mutex<Vec<u32>>,
     pub mixer_track_peaks: Mutex<Vec<(f32, f32)>>,
@@ -256,6 +257,7 @@ impl Default for MidiScriptTransportState {
             arrangement_live_selection_start: AtomicU64::new(0),
             arrangement_live_selection_end: AtomicU64::new(0),
             mixer_track_names: Mutex::new(vec!["Master".to_owned()]),
+            mixer_track_recording_file_names: Mutex::new(vec![String::new()]),
             mixer_selected_track: AtomicU64::new(0),
             mixer_track_colors: Mutex::new(vec![0]),
             mixer_track_peaks: Mutex::new(vec![(0.0, 0.0)]),
@@ -704,6 +706,12 @@ impl MidiScriptRuntime {
             .lock()
             .map(|names| names.clone())
             .unwrap_or_else(|_| vec!["Master".to_owned()]);
+        let mixer_track_recording_file_names = self
+            .transport_state
+            .mixer_track_recording_file_names
+            .lock()
+            .map(|names| names.clone())
+            .unwrap_or_else(|_| vec![String::new()]);
         let mixer_track_colors = self
             .transport_state
             .mixer_track_colors
@@ -921,6 +929,10 @@ impl MidiScriptRuntime {
             });
             if let Some(transport_object) = transport.as_object_mut() {
                 transport_object.insert("mixer_track_peaks".to_owned(), json!(mixer_track_peaks));
+                transport_object.insert(
+                    "mixer_track_recording_file_names".to_owned(),
+                    json!(mixer_track_recording_file_names),
+                );
             }
             object.insert("transport".to_owned(), transport);
         }
@@ -2296,6 +2308,35 @@ mod tests {
         let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
 
         assert_eq!(result.bytes, [0xB0, 3, b'I']);
+    }
+
+    #[test]
+    fn python_mixer_get_track_recording_file_name_reads_live_snapshot() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport mixer\ndef OnMidiIn(event):\n    event.data1 = int(mixer.getTrackRecordingFileName(1) == '/tmp/audio-take.wav')\n    event.data2 = int(mixer.getTrackRecordingFileName(0) == '')\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let transport_state = Arc::new(MidiScriptTransportState::default());
+        let mut runtime = MidiScriptRuntime::start_for_device_with_transport_state(
+            &script,
+            "Test Input",
+            Arc::clone(&transport_state),
+        )
+        .unwrap();
+
+        let idle = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
+        *transport_state
+            .mixer_track_recording_file_names
+            .lock()
+            .unwrap() = vec![String::new(), "/tmp/audio-take.wav".to_owned()];
+        let recording = runtime.process_event(20, &[0xB0, 7, 1]).unwrap();
+
+        assert_eq!(idle.bytes, [0xB0, 0, 1]);
+        assert_eq!(recording.bytes, [0xB0, 1, 1]);
     }
 
     #[test]
