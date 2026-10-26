@@ -317,6 +317,23 @@ fn random_pattern_color(current: Option<[u8; 3]>) -> [u8; 3] {
     pattern_color_from_random_index(current, hasher.finish() as usize)
 }
 
+fn fresh_riff_machine_seed(current: u64, other: u64, salt: u64) -> u64 {
+    let entropy = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let mut hasher = RandomState::new().build_hasher();
+    current.hash(&mut hasher);
+    other.hash(&mut hasher);
+    salt.hash(&mut hasher);
+    entropy.hash(&mut hasher);
+    let mut candidate = hasher.finish().max(1);
+    while candidate == current || candidate == other {
+        candidate = candidate.wrapping_add(1).max(1);
+    }
+    candidate
+}
+
 fn show_pattern_color_swatch(ui: &mut egui::Ui, color: Option<[u8; 4]>) {
     if let Some([red, green, blue, _]) = color {
         let (rect, _) = ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
@@ -33108,6 +33125,23 @@ impl DawUi {
                             "Assign the generated riff one fresh note group ID.",
                         );
                         let groove_grid_available = self.piano_roll_snap != PianoRollSnap::None;
+                        let riff_can_generate = edit_scope_available
+                            && self.piano_roll_scale != PianoRollScale::None
+                            && (self.riff_groove_score.is_some()
+                                || (self.riff_groove_velocity_level_percent == 0
+                                    && self.riff_groove_pan_level_percent == 0
+                                    && self.riff_groove_mod_x_level_percent == 0
+                                    && self.riff_groove_mod_y_level_percent == 0
+                                    && self.riff_groove_pitch_level_percent == 0))
+                            && (groove_grid_available
+                                || self.riff_groove_score.is_some()
+                                || (self.riff_groove_start_percent == 0
+                                    && self.riff_groove_duration_percent == 0
+                                    && self.riff_groove_velocity_level_percent == 0
+                                    && self.riff_groove_pan_level_percent == 0
+                                    && self.riff_groove_mod_x_level_percent == 0
+                                    && self.riff_groove_mod_y_level_percent == 0
+                                    && self.riff_groove_pitch_level_percent == 0));
                         egui::CollapsingHeader::new("Levels & Panning")
                             .default_open(false)
                             .show(ui, |ui| {
@@ -33432,23 +33466,32 @@ impl DawUi {
                             }
                             if ui
                                 .add_enabled(
-                                    edit_scope_available
-                                        && self.piano_roll_scale != PianoRollScale::None
-                                        && (self.riff_groove_score.is_some()
-                                            || (self.riff_groove_velocity_level_percent == 0
-                                                && self.riff_groove_pan_level_percent == 0
-                                                && self.riff_groove_mod_x_level_percent == 0
-                                                && self.riff_groove_mod_y_level_percent == 0
-                                                && self.riff_groove_pitch_level_percent == 0))
-                                        && (groove_grid_available
-                                            || self.riff_groove_score.is_some()
-                                            || (self.riff_groove_start_percent == 0
-                                                && self.riff_groove_duration_percent == 0
-                                                && self.riff_groove_velocity_level_percent == 0
-                                                && self.riff_groove_pan_level_percent == 0
-                                                && self.riff_groove_mod_x_level_percent == 0
-                                                && self.riff_groove_mod_y_level_percent == 0
-                                                && self.riff_groove_pitch_level_percent == 0)),
+                                    riff_can_generate,
+                                    egui::Button::new("Throw dice"),
+                                )
+                                .on_hover_text(
+                                    "Choose fresh level and articulation seeds, then generate now.",
+                                )
+                                .clicked()
+                            {
+                                let level_seed = fresh_riff_machine_seed(
+                                    self.riff_seed,
+                                    self.riff_articulation_seed,
+                                    1,
+                                );
+                                let articulation_seed = fresh_riff_machine_seed(
+                                    self.riff_articulation_seed,
+                                    level_seed,
+                                    2,
+                                );
+                                self.riff_seed = level_seed;
+                                self.riff_articulation_seed = articulation_seed;
+                                riff_machine_requested = true;
+                                ui.close();
+                            }
+                            if ui
+                                .add_enabled(
+                                    riff_can_generate,
                                     egui::Button::new(format!("Generate for {edit_target}")),
                                 )
                                 .clicked()
