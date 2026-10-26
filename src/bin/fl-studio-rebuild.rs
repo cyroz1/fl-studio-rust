@@ -85,8 +85,9 @@ use flp_rebuild::{
     PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit,
     ProjectSettingsEdit, QuantizeNoteLevels, QuantizeNoteMode, QuantizeNoteOptions,
     RandomNoteChordMap, RandomNoteGeneratorOptions, RandomizerOptions, RiffMachineOptions,
-    RiffMachineQuantizeMode, SamplerEnvelopeLfo, SamplerEnvelopeLfoEdit, SamplerEnvelopeLfoTarget,
-    ScaleLevelsOptions, StrumOptions, TimeMarker, TimeMarkerEdit, VstPluginStateMetadata,
+    RiffMachineQuantizeMode, RiffMachineStage, SamplerEnvelopeLfo, SamplerEnvelopeLfoEdit,
+    SamplerEnvelopeLfoTarget, ScaleLevelsOptions, StrumOptions, TimeMarker, TimeMarkerEdit,
+    VstPluginStateMetadata,
 };
 use md5::{Digest, Md5};
 use vst3_host::midi::{MidiChannel as Vst3MidiChannel, MidiEvent as Vst3MidiEvent};
@@ -4823,6 +4824,7 @@ struct DawUi {
     riff_preserve_start_times: bool,
     riff_mirror_vertical: bool,
     riff_group_notes: bool,
+    riff_preview_stage: RiffMachineStage,
     riff_groove_start_percent: u8,
     riff_groove_sensitivity_percent: u8,
     riff_groove_duration_percent: u8,
@@ -6442,6 +6444,7 @@ impl DawUi {
             riff_preserve_start_times: false,
             riff_mirror_vertical: false,
             riff_group_notes: false,
+            riff_preview_stage: RiffMachineStage::Fit,
             riff_groove_start_percent: 0,
             riff_groove_sensitivity_percent: 50,
             riff_groove_duration_percent: 0,
@@ -31827,6 +31830,7 @@ impl DawUi {
         let mut arpeggiate_requested = false;
         let mut load_arpeggiator_score_requested = false;
         let mut riff_machine_requested = false;
+        let mut riff_machine_preview_requested = false;
         let mut load_riff_progression_score_requested = false;
         let mut load_riff_chord_score_requested = false;
         let mut load_riff_groove_score_requested = false;
@@ -33580,7 +33584,35 @@ impl DawUi {
                                 self.riff_groove_quantize_mode = defaults.groove_quantize_mode;
                                 self.riff_groove_score = None;
                                 self.riff_groove_score_path = None;
+                                self.riff_preview_stage = RiffMachineStage::Fit;
                             }
+                            ui.horizontal(|ui| {
+                                egui::ComboBox::from_id_salt("piano-roll-riff-preview-stage")
+                                    .selected_text(self.riff_preview_stage.label())
+                                    .show_ui(ui, |ui| {
+                                        for stage in RiffMachineStage::ALL {
+                                            ui.selectable_value(
+                                                &mut self.riff_preview_stage,
+                                                stage,
+                                                stage.label(),
+                                            );
+                                        }
+                                    });
+                                if ui
+                                    .add_enabled(
+                                        riff_can_generate,
+                                        egui::Button::new("Preview up to current step"),
+                                    )
+                                    .on_hover_text(
+                                        "Audition the generated notes through this step without changing the project.",
+                                    )
+                                    .clicked()
+                                {
+                                    riff_machine_requested = true;
+                                    riff_machine_preview_requested = true;
+                                    ui.close();
+                                }
+                            });
                             if level_seed_active && ui.button("New seed").clicked() {
                                 self.riff_seed = self.riff_seed.saturating_add(1);
                             }
@@ -36105,38 +36137,113 @@ impl DawUi {
                 bipolar_levels: self.riff_bipolar_levels,
                 seed: self.riff_seed,
             };
-            let result = self
-                .document
-                .as_mut()
-                .ok_or_else(|| "no project is open".to_owned())
-                .and_then(|document| {
-                    let result = if edit_selection_only {
-                        document.riff_machine_pattern_note_selection(
-                            pattern_id,
-                            channel_id,
-                            &selected_quantize_indices,
-                            options,
-                        )
-                    } else {
-                        document.riff_machine_pattern_notes(pattern_id, channel_id, options)
-                    };
-                    result.map_err(|error| error.to_string())
-                });
-            match result {
-                Ok(created) => {
-                    if created > 0 {
-                        self.stop_project_playback();
-                        self.dirty = true;
-                        self.selected_piano_notes.clear();
-                        self.selected_note = None;
-                        self.active_note_drag = None;
-                        self.riff_seed = self.riff_seed.saturating_add(1);
+            if riff_machine_preview_requested {
+                let stage = self.riff_preview_stage;
+                let preview_result = self
+                    .document
+                    .as_ref()
+                    .cloned()
+                    .ok_or_else(|| "no project is open".to_owned())
+                    .and_then(|mut preview_document| {
+                        let pattern = preview_document
+                            .patterns()
+                            .map_err(|error| error.to_string())?
+                            .into_iter()
+                            .find(|pattern| pattern.id == pattern_id)
+                            .ok_or_else(|| format!("Pattern {pattern_id} was not found"))?;
+                        let selected_indices = selected_quantize_indices
+                            .iter()
+                            .copied()
+                            .collect::<HashSet<_>>();
+                        let mut channel_note_indices = BTreeMap::<u16, usize>::new();
+                        let mut removals = BTreeMap::<u16, Vec<usize>>::new();
+                        let mut target_note_count = 0;
+                        for note in &pattern.notes {
+                            let local_index =
+                                channel_note_indices.entry(note.channel_id).or_default();
+                            let note_index = *local_index;
+                            *local_index += 1;
+                            let in_scope = note.channel_id == channel_id
+                                && (!edit_selection_only || selected_indices.contains(&note_index));
+                            if in_scope {
+                                target_note_count += 1;
+                            } else {
+                                removals
+                                    .entry(note.channel_id)
+                                    .or_default()
+                                    .push(note_index);
+                            }
+                        }
+                        for (remove_channel, mut indices) in removals {
+                            indices.sort_unstable_by(|left, right| right.cmp(left));
+                            for remove_index in indices {
+                                preview_document
+                                    .delete_pattern_note(pattern_id, remove_channel, remove_index)
+                                    .map_err(|error| error.to_string())?;
+                            }
+                        }
+                        let preview_indices = (0..target_note_count).collect::<Vec<_>>();
+                        let result = if edit_selection_only {
+                            preview_document.riff_machine_pattern_note_selection_through_stage(
+                                pattern_id,
+                                channel_id,
+                                &preview_indices,
+                                stage,
+                                options,
+                            )
+                        } else {
+                            preview_document.riff_machine_pattern_notes_through_stage(
+                                pattern_id, channel_id, stage, options,
+                            )
+                        };
+                        result.map_err(|error| error.to_string())?;
+                        Ok(preview_document)
+                    });
+                match preview_result {
+                    Ok(preview_document) => self.preview_riff_machine_stage(
+                        preview_document,
+                        pattern_id,
+                        channel_id,
+                        stage,
+                    ),
+                    Err(error) => {
+                        self.status = format!("Could not prepare the Riff Machine preview: {error}")
                     }
-                    self.status = format!(
-                        "Riff Machine produced {created} notes in pattern {pattern_id}, {edit_scope_description}"
-                    );
                 }
-                Err(error) => self.status = format!("Could not generate a riff: {error}"),
+            } else {
+                let result = self
+                    .document
+                    .as_mut()
+                    .ok_or_else(|| "no project is open".to_owned())
+                    .and_then(|document| {
+                        let result = if edit_selection_only {
+                            document.riff_machine_pattern_note_selection(
+                                pattern_id,
+                                channel_id,
+                                &selected_quantize_indices,
+                                options,
+                            )
+                        } else {
+                            document.riff_machine_pattern_notes(pattern_id, channel_id, options)
+                        };
+                        result.map_err(|error| error.to_string())
+                    });
+                match result {
+                    Ok(created) => {
+                        if created > 0 {
+                            self.stop_project_playback();
+                            self.dirty = true;
+                            self.selected_piano_notes.clear();
+                            self.selected_note = None;
+                            self.active_note_drag = None;
+                            self.riff_seed = self.riff_seed.saturating_add(1);
+                        }
+                        self.status = format!(
+                            "Riff Machine produced {created} notes in pattern {pattern_id}, {edit_scope_description}"
+                        );
+                    }
+                    Err(error) => self.status = format!("Could not generate a riff: {error}"),
+                }
             }
         }
         if claw_requested
@@ -37515,6 +37622,44 @@ impl DawUi {
                 }
             }
             Err(error) => self.status = format!("Could not render VST3 Pattern mix: {error}"),
+        }
+    }
+
+    fn preview_riff_machine_stage(
+        &mut self,
+        preview_document: FlpDocument,
+        pattern_id: u16,
+        channel_id: u16,
+        stage: RiffMachineStage,
+    ) {
+        if self.selected_pattern != Some(pattern_id)
+            || self.selected_note_channel != Some(channel_id)
+        {
+            self.status = "Select the previewed pattern and channel before auditioning".to_owned();
+            return;
+        }
+        let is_sampler = preview_document
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id() == channel_id)
+            .is_some_and(|channel| channel.kind() == Some(0));
+        if !is_sampler && !self.channel_vst3_instances.contains_key(&channel_id) {
+            self.status =
+                "Select a Sampler channel or load a VST3 instrument to preview the riff".to_owned();
+            return;
+        }
+
+        let previous_document = self.document.replace(preview_document);
+        let previous_dirty = self.dirty;
+        if is_sampler {
+            self.stream_selected_sampler_pattern(None);
+        } else {
+            self.play_selected_pattern_channel();
+        }
+        self.document = previous_document;
+        self.dirty = previous_dirty;
+        if self.pending_sampler_stream.is_some() || self.pending_vst3_stream.is_some() {
+            self.status = format!("Previewing Riff Machine through {}", stage.label());
         }
     }
 

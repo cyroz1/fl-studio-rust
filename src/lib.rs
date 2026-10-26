@@ -2488,6 +2488,57 @@ impl Default for QuantizeNoteOptions {
     }
 }
 
+/// Riff Machine processing stages, in the order used by the Piano roll.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[repr(u8)]
+pub enum RiffMachineStage {
+    NoteProgression,
+    ChordProgression,
+    Arpeggiation,
+    Mirroring,
+    Levels,
+    Articulation,
+    Groove,
+    Fit,
+}
+
+impl RiffMachineStage {
+    pub const ALL: [Self; 8] = [
+        Self::NoteProgression,
+        Self::ChordProgression,
+        Self::Arpeggiation,
+        Self::Mirroring,
+        Self::Levels,
+        Self::Articulation,
+        Self::Groove,
+        Self::Fit,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::NoteProgression => "Note Progression",
+            Self::ChordProgression => "Chord Progression",
+            Self::Arpeggiation => "Arpeggiation",
+            Self::Mirroring => "Mirroring",
+            Self::Levels => "Levels",
+            Self::Articulation => "Articulation",
+            Self::Groove => "Groove",
+            Self::Fit => "Fit",
+        }
+    }
+
+    fn limit_options<'a>(self, mut options: RiffMachineOptions<'a>) -> RiffMachineOptions<'a> {
+        options.chord_progression_enabled &= self >= Self::ChordProgression;
+        options.arpeggiation_enabled &= self >= Self::Arpeggiation;
+        options.mirroring_enabled &= self >= Self::Mirroring;
+        options.levels_enabled &= self >= Self::Levels;
+        options.articulation_enabled &= self >= Self::Articulation;
+        options.groove_enabled &= self >= Self::Groove;
+        options.fit_enabled &= self >= Self::Fit;
+        options
+    }
+}
+
 /// Settings for a seeded, scale-based Riff Machine pass over an existing note progression.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RiffMachineOptions<'a> {
@@ -14951,6 +15002,17 @@ impl FlpDocument {
         self.riff_machine_pattern_notes_in_scope(pattern_id, channel_id, None, options)
     }
 
+    /// Runs the Riff Machine through the selected stage, leaving later stages disabled.
+    pub fn riff_machine_pattern_notes_through_stage(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        stage: RiffMachineStage,
+        options: RiffMachineOptions<'_>,
+    ) -> Result<usize, FlpError> {
+        self.riff_machine_pattern_notes(pattern_id, channel_id, stage.limit_options(options))
+    }
+
     /// Runs the Riff Machine only on selected channel-local progression notes.
     pub fn riff_machine_pattern_note_selection(
         &mut self,
@@ -14964,6 +15026,23 @@ impl FlpDocument {
             channel_id,
             Some(note_indices),
             options,
+        )
+    }
+
+    /// Runs the Riff Machine through the selected stage on selected channel-local notes.
+    pub fn riff_machine_pattern_note_selection_through_stage(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        note_indices: &[usize],
+        stage: RiffMachineStage,
+        options: RiffMachineOptions<'_>,
+    ) -> Result<usize, FlpError> {
+        self.riff_machine_pattern_note_selection(
+            pattern_id,
+            channel_id,
+            note_indices,
+            stage.limit_options(options),
         )
     }
 
