@@ -46849,6 +46849,7 @@ impl DawUi {
         let mut rename_edits = Vec::new();
         let mut flag_edits = Vec::new();
         let mut parameter_edits = Vec::new();
+        let mut effect_slot_color_edits = Vec::new();
         let mixer_effect_mix_locations = effect_slots
             .iter()
             .filter_map(|slot| {
@@ -48500,6 +48501,21 @@ impl DawUi {
                                                 });
                                             });
                                             ui.horizontal(|ui| {
+                                                ui.small("Color");
+                                                let mut slot_color = slot_color_stroke;
+                                                if ui
+                                                    .color_edit_button_srgba(&mut slot_color)
+                                                    .changed()
+                                                {
+                                                    let color_raw = u32::from(slot_color.r())
+                                                        | (u32::from(slot_color.g()) << 8)
+                                                        | (u32::from(slot_color.b()) << 16);
+                                                    effect_slot_color_edits.push((
+                                                        insert.ordinal(),
+                                                        slot.slot_index(),
+                                                        color_raw,
+                                                    ));
+                                                }
                                                 if let Some(instance_id) = loaded_effect_instance
                                                     && ui.small_button("Open editor").clicked()
                                                 {
@@ -48695,6 +48711,24 @@ impl DawUi {
                     }
                     Err(error) => {
                         self.status = format!("Could not rename Mixer insert: {error}");
+                    }
+                }
+            }
+        }
+        if !effect_slot_color_edits.is_empty()
+            && let Some(document) = self.document.as_mut()
+        {
+            for (insert_ordinal, slot_index, color_raw) in effect_slot_color_edits {
+                match document.set_mixer_effect_slot_color(insert_ordinal, slot_index, color_raw) {
+                    Ok(()) => {
+                        self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+                        self.status = format!(
+                            "Changed Mixer insert {insert_ordinal} effect slot {slot_index} color"
+                        );
+                    }
+                    Err(error) => {
+                        self.status = format!("Could not change Mixer effect-slot color: {error}");
                     }
                 }
             }
