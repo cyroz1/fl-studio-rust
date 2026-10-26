@@ -33382,7 +33382,7 @@ impl DawUi {
                         });
                         ui.checkbox(&mut self.riff_mirror_vertical, "Flip vertically");
                         ui.checkbox(&mut self.riff_group_notes, "Group notes").on_hover_text(
-                            "Assign the generated riff one fresh note group ID.",
+                            "Group generated notes by their progression onset.",
                         );
                         let groove_grid_available = self.piano_roll_snap != PianoRollSnap::None;
                         let riff_can_generate = edit_scope_available

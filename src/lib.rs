@@ -2574,7 +2574,7 @@ pub struct RiffMachineOptions<'a> {
     pub preserve_start_times: bool,
     /// Reflect generated pitches around the midpoint of their current pitch range.
     pub mirror_vertical: bool,
-    /// Assign all generated notes one fresh channel-local note group.
+    /// Assign generated notes fresh channel-local note groups by progression onset.
     pub group_notes: bool,
     /// Optional `.fsc` pattern for the Riff Machine's Note Progression stage.
     pub progression_score: Option<&'a FscScore>,
@@ -15453,6 +15453,63 @@ impl FlpDocument {
                 .map(|(note_index, _)| *note_index)
                 .collect::<Vec<_>>()
         };
+        if options.group_notes {
+            let riff_onsets = riff_notes
+                .iter()
+                .map(|note| note.position)
+                .collect::<BTreeSet<_>>();
+            let patterns = updated.patterns()?;
+            let pattern = patterns
+                .iter()
+                .find(|pattern| pattern.id == pattern_id)
+                .ok_or(FlpError::UnsupportedEdit(
+                    "the requested pattern does not exist",
+                ))?;
+            let mut used_groups = pattern
+                .notes
+                .iter()
+                .filter(|note| note.channel_id == channel_id && note.group != 0)
+                .map(|note| note.group)
+                .collect::<BTreeSet<_>>();
+            let mut next_group = 1u32;
+            let mut groups_by_onset = std::collections::BTreeMap::new();
+            for onset in &riff_onsets {
+                while next_group <= u32::from(u16::MAX)
+                    && used_groups.contains(&(next_group as u16))
+                {
+                    next_group += 1;
+                }
+                let group_id = u16::try_from(next_group).map_err(|_| {
+                    FlpError::UnsupportedEdit("no free note group ID remains for this channel")
+                })?;
+                used_groups.insert(group_id);
+                groups_by_onset.insert(*onset, group_id);
+                next_group += 1;
+            }
+            let riff_index_set = riff_indices.iter().copied().collect::<HashSet<_>>();
+            let edits = pattern
+                .notes
+                .iter()
+                .filter(|note| note.channel_id == channel_id)
+                .enumerate()
+                .filter(|(note_index, _)| riff_index_set.contains(note_index))
+                .map(|(note_index, note)| {
+                    let group_id = groups_by_onset.get(&note.position).copied().ok_or(
+                        FlpError::UnsupportedEdit(
+                            "Riff Machine could not assign a note group to a progression onset",
+                        ),
+                    )?;
+                    Ok((
+                        note_index,
+                        PatternNoteEdit {
+                            group: Some(group_id),
+                            ..PatternNoteEdit::default()
+                        },
+                    ))
+                })
+                .collect::<Result<HashMap<_, _>, FlpError>>()?;
+            updated.edit_pattern_notes_batch(pattern_id, channel_id, &edits)?;
+        }
         let arpeggio_options = ArpeggioOptions {
             step_ticks: options.step_ticks,
             range_octaves: options.range_octaves,
@@ -15602,39 +15659,6 @@ impl FlpDocument {
                 }
             }
             updated.edit_pattern_notes_batch(pattern_id, channel_id, &mirror_edits)?;
-        }
-        if options.group_notes {
-            let patterns = updated.patterns()?;
-            let pattern = patterns
-                .iter()
-                .find(|pattern| pattern.id == pattern_id)
-                .ok_or(FlpError::UnsupportedEdit(
-                    "the requested pattern does not exist",
-                ))?;
-            let used_groups = pattern
-                .notes
-                .iter()
-                .filter(|note| note.channel_id == channel_id && note.group != 0)
-                .map(|note| note.group)
-                .collect::<BTreeSet<_>>();
-            let group_id = (1..=u16::MAX)
-                .find(|group| !used_groups.contains(group))
-                .ok_or(FlpError::UnsupportedEdit(
-                    "no free note group ID remains for this channel",
-                ))?;
-            let edits = generated_indices
-                .iter()
-                .map(|note_index| {
-                    (
-                        *note_index,
-                        PatternNoteEdit {
-                            group: Some(group_id),
-                            ..PatternNoteEdit::default()
-                        },
-                    )
-                })
-                .collect::<HashMap<_, _>>();
-            updated.edit_pattern_notes_batch(pattern_id, channel_id, &edits)?;
         }
         if levels_enabled {
             updated.apply_riff_machine_levels(
