@@ -1634,6 +1634,74 @@ enum PianoRollSnap {
     Bar,
 }
 
+fn riff_machine_preset_score_directory(step_folder: &str) -> Option<PathBuf> {
+    let mut install_directories = Vec::new();
+    let mut image_line_directories = Vec::new();
+    for variable in ["ProgramFiles", "ProgramFiles(x86)"] {
+        if let Some(program_files) = std::env::var_os(variable) {
+            image_line_directories.push(PathBuf::from(program_files).join("Image-Line"));
+        }
+    }
+    if let Some(wine_prefix) = std::env::var_os("WINEPREFIX") {
+        let drive_c = PathBuf::from(wine_prefix).join("drive_c");
+        for program_files in ["Program Files", "Program Files (x86)"] {
+            image_line_directories.push(drive_c.join(program_files).join("Image-Line"));
+        }
+    } else if let Some(home) = std::env::var_os("HOME") {
+        let drive_c = PathBuf::from(home).join(".wine/drive_c");
+        for program_files in ["Program Files", "Program Files (x86)"] {
+            image_line_directories.push(drive_c.join(program_files).join("Image-Line"));
+        }
+    }
+    for image_line_directory in image_line_directories {
+        install_directories.push(image_line_directory.join("FL Studio"));
+        if let Ok(entries) = fs::read_dir(image_line_directory) {
+            install_directories.extend(entries.flatten().filter_map(|entry| {
+                let is_directory = entry.file_type().ok()?.is_dir();
+                let name = entry.file_name();
+                (is_directory
+                    && name
+                        .to_string_lossy()
+                        .to_ascii_lowercase()
+                        .starts_with("fl studio"))
+                .then_some(entry.path())
+            }));
+        }
+    }
+    let mac_resources = PathBuf::from("/Applications/FL Studio.app/Contents/Resources");
+    install_directories.push(mac_resources.join("FL Studio"));
+    install_directories.push(mac_resources.join("FL"));
+
+    for install_directory in install_directories {
+        let preset_directory = install_directory
+            .join("Data/Patches/Scores/Chopping")
+            .join(step_folder);
+        if preset_directory.is_dir() {
+            return Some(preset_directory);
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let preset_directory = PathBuf::from(home)
+            .join("Documents/Image-Line/FL Studio/Presets/Scores/Chopping")
+            .join(step_folder);
+        if preset_directory.is_dir() {
+            return Some(preset_directory);
+        }
+    }
+    None
+}
+
+fn riff_machine_score_picker(title: &str, step_folder: &str) -> rfd::FileDialog {
+    let dialog = rfd::FileDialog::new()
+        .set_title(title)
+        .add_filter("FL Studio score files", &["fsc"]);
+    if let Some(directory) = riff_machine_preset_score_directory(step_folder) {
+        dialog.set_directory(directory)
+    } else {
+        dialog
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PerformanceGlobalSnap {
     None,
@@ -35214,10 +35282,11 @@ impl DawUi {
             }
         }
         if load_riff_progression_score_requested
-            && let Some(path) = rfd::FileDialog::new()
-                .set_title("Load Riff Machine progression score")
-                .add_filter("FL Studio score files", &["fsc"])
-                .pick_file()
+            && let Some(path) = riff_machine_score_picker(
+                "Load Riff Machine progression score",
+                "Riff machine step 1",
+            )
+            .pick_file()
         {
             let result = fs::read(&path)
                 .map_err(|error| format!("could not read {}: {error}", path.display()))
@@ -35235,10 +35304,9 @@ impl DawUi {
             }
         }
         if load_riff_chord_score_requested
-            && let Some(path) = rfd::FileDialog::new()
-                .set_title("Load Riff Machine chord score")
-                .add_filter("FL Studio score files", &["fsc"])
-                .pick_file()
+            && let Some(path) =
+                riff_machine_score_picker("Load Riff Machine chord score", "Riff machine step 2")
+                    .pick_file()
         {
             let result = fs::read(&path)
                 .map_err(|error| format!("could not read {}: {error}", path.display()))
