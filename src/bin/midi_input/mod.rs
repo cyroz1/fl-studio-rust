@@ -706,9 +706,17 @@ fn queue_script_transport_actions(
             ScriptTransportAction::SetMixerTrackEnabled { index, enabled } => {
                 MidiTransportCommand::SetMixerTrackEnabled { index, enabled }
             }
-            ScriptTransportAction::SetMixerTrackFlag { index, flag, value } => {
-                MidiTransportCommand::SetMixerTrackFlag { index, flag, value }
-            }
+            ScriptTransportAction::SetMixerTrackFlag {
+                index,
+                flag,
+                value,
+                solo_mode,
+            } => MidiTransportCommand::SetMixerTrackFlag {
+                index,
+                flag,
+                value,
+                solo_mode,
+            },
             ScriptTransportAction::SetMixerTrackParameter {
                 index,
                 parameter,
@@ -837,6 +845,7 @@ pub enum MidiTransportCommand {
         index: u16,
         flag: MixerTrackFlag,
         value: bool,
+        solo_mode: Option<u8>,
     },
     SetMixerTrackParameter {
         index: u16,

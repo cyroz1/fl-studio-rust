@@ -4139,6 +4139,77 @@ impl MixerRouteAudibility {
         routing
     }
 
+    /// Returns the set of Mixer tracks that remain audible for the current solo flags and
+    /// per-track MIDI-script solo modes. Modes 1 and 3 include upstream source tracks; modes 2
+    /// and 3 include downstream send tracks. Unrecognized, disabled, and silent routes are not
+    /// used to expand the set.
+    pub(crate) fn live_solo_included_tracks(&self, solo_modes: &[Option<u8>]) -> Vec<usize> {
+        let mut included_tracks = BTreeSet::new();
+        for &soloed_track in &self.soloed_insert_tracks {
+            if soloed_track <= 0 {
+                continue;
+            }
+            included_tracks.insert(soloed_track as usize);
+            let mode = solo_modes
+                .get(soloed_track as usize)
+                .copied()
+                .flatten()
+                .filter(|mode| (1..=4).contains(mode))
+                .unwrap_or(4);
+
+            if matches!(mode, 1 | 3) && !self.disabled_tracks.contains(&soloed_track) {
+                let mut pending = vec![soloed_track];
+                let mut visited = HashSet::from([soloed_track]);
+                while let Some(destination) = pending.pop() {
+                    for (&source, routes) in &self.send_routes_by_source {
+                        if source <= 0
+                            || !self.known_tracks.contains(&source)
+                            || self.disabled_tracks.contains(&source)
+                            || !routes.iter().any(|route| {
+                                route.destination_track == destination
+                                    && route.enabled
+                                    && mixer_send_gain_raw(route.level_raw)
+                                        .is_some_and(|gain| gain > 0.0)
+                            })
+                            || !visited.insert(source)
+                        {
+                            continue;
+                        }
+                        included_tracks.insert(source as usize);
+                        pending.push(source);
+                    }
+                }
+            }
+
+            if matches!(mode, 2 | 3) && !self.disabled_tracks.contains(&soloed_track) {
+                let mut pending = vec![soloed_track];
+                let mut visited = HashSet::from([soloed_track]);
+                while let Some(source) = pending.pop() {
+                    for route in self
+                        .send_routes_by_source
+                        .get(&source)
+                        .into_iter()
+                        .flatten()
+                    {
+                        let destination = route.destination_track;
+                        if destination <= 0
+                            || !self.known_tracks.contains(&destination)
+                            || self.disabled_tracks.contains(&destination)
+                            || !route.enabled
+                            || !mixer_send_gain_raw(route.level_raw).is_some_and(|gain| gain > 0.0)
+                            || !visited.insert(destination)
+                        {
+                            continue;
+                        }
+                        included_tracks.insert(destination as usize);
+                        pending.push(destination);
+                    }
+                }
+            }
+        }
+        included_tracks.into_iter().collect()
+    }
+
     fn add_send_summaries(&mut self, sends: impl IntoIterator<Item = MixerSendSummary>) {
         let sends = sends.into_iter().collect::<Vec<_>>();
         let mut live_control_counts = HashMap::<(i8, i8), usize>::new();
@@ -9802,6 +9873,13 @@ impl FlpDocument {
             summary.parameter_location().1,
             value,
         )
+    }
+
+    /// Returns the Mixer tracks that remain audible for the saved solo flags and supplied
+    /// per-track MIDI-script solo modes. Modes 1 and 3 include upstream source tracks; modes 2
+    /// and 3 include downstream send tracks. Missing modes use track-only mode 4.
+    pub fn mixer_live_solo_included_tracks(&self, solo_modes: &[Option<u8>]) -> Vec<usize> {
+        MixerRouteAudibility::from_document(self).live_solo_included_tracks(solo_modes)
     }
 
     /// Returns saved Mixer send-level records with a paired routing flag when available.
@@ -28665,6 +28743,60 @@ mod tests {
             routing.mixer_insert_processing_order(),
             Err("Mixer send graph contains a cycle".to_owned())
         );
+    }
+
+    #[test]
+    fn mixer_solo_modes_include_upstream_sources_or_downstream_sends() {
+        let insert = |ordinal| MixerInsertSummary {
+            ordinal,
+            input_raw: -1,
+            output_raw: -1,
+            color_raw: 0,
+            icon_raw: None,
+            name: None,
+            flags: Some((1 << 3) | if ordinal == 3 { 1 << 12 } else { 0 }),
+            flags_event_index: None,
+            first_event_index: 0,
+            end_event_index: 0,
+        };
+        let send = |source_track: usize, destination_track: u8| MixerSendSummary {
+            insert_ordinal: source_track,
+            route_parameter_id: 64 + destination_track,
+            value: 12_800,
+            enabled: Some(true),
+            routing_flag_location: None,
+            event_index: 0,
+            record_index: 0,
+        };
+        let mut routing =
+            MixerRouteAudibility::from_inserts_with_parameters((0..=6).map(insert), &[], None);
+        routing.add_send_summaries([
+            send(1, 2),
+            send(2, 3),
+            send(3, 4),
+            send(4, 5),
+            send(6, 4),
+            send(5, 0),
+        ]);
+
+        assert_eq!(routing.live_solo_included_tracks(&[]), vec![3]);
+        assert_eq!(
+            routing.live_solo_included_tracks(&[None, None, None, Some(1)]),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            routing.live_solo_included_tracks(&[None, None, None, Some(2)]),
+            vec![3, 4, 5]
+        );
+        assert_eq!(
+            routing.live_solo_included_tracks(&[None, None, None, Some(3)]),
+            vec![1, 2, 3, 4, 5]
+        );
+        assert_eq!(
+            routing.live_solo_included_tracks(&[None, None, None, Some(4)]),
+            vec![3]
+        );
+        assert_eq!(routing.soloed_insert_tracks, HashSet::from([3]));
     }
 
     #[test]

@@ -382,7 +382,7 @@ def _mixer_set_track_enabled(index, enabled):
     )
 
 
-def _mixer_set_track_flag(index, flag, value):
+def _mixer_set_track_flag(index, flag, value, solo_mode=None):
     index = _mixer_track_index(index)
     state_name = {
         "soloed": "mixer_track_soloed",
@@ -391,14 +391,15 @@ def _mixer_set_track_flag(index, flag, value):
         "effects_enabled": "mixer_track_effects_enabled",
     }[flag]
     _mixer_store_track_flag(index, state_name, value)
-    _request_transport_action(
-        {
-            "action": "set_mixer_track_flag",
-            "index": index,
-            "flag": flag,
-            "value": bool(value),
-        }
-    )
+    action = {
+        "action": "set_mixer_track_flag",
+        "index": index,
+        "flag": flag,
+        "value": bool(value),
+    }
+    if flag == "soloed":
+        action["solo_mode"] = -1 if solo_mode is None else int(solo_mode)
+    _request_transport_action(action)
 
 
 def _mixer_track_parameter(index, state_name, scale):
@@ -547,10 +548,10 @@ def _mixer_solo_track(index, value=-1, mode=-1):
         raise ValueError("Mixer solo value and mode must be integers") from error
     if value not in (-1, 0, 1):
         raise ValueError("Mixer solo value must be -1, 0, or 1")
-    if mode not in (-1, 4):
-        raise NotImplementedError("Mixer solo source and send modes are unsupported")
+    if mode not in (-1, 1, 2, 3, 4):
+        raise ValueError("Mixer solo mode must be -1, 1, 2, 3, or 4")
     active = not _mixer_is_track_solo(index) if value == -1 else value == 1
-    _mixer_set_track_flag(index, "soloed", active)
+    _mixer_set_track_flag(index, "soloed", active, mode if active and mode != -1 else None)
 
 
 def _mixer_is_track_polarity_reversed(index):

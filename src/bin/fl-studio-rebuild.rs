@@ -7931,6 +7931,7 @@ impl DawUi {
                 self.new_project_template_path = None;
                 self.package_workspace = package_workspace;
                 self.document = Some(document);
+                self.reset_midi_mixer_solo_modes();
                 self.refresh_audio_waveform_paths();
                 let recent_path =
                     fs::canonicalize(target_path).unwrap_or_else(|_| target_path.to_path_buf());
@@ -12425,11 +12426,7 @@ impl DawUi {
 
         let parameters = document.mixer_parameter_records().unwrap_or_default();
         let inserts = document.mixer_inserts();
-        let soloed_tracks = inserts
-            .iter()
-            .filter(|insert| insert.ordinal() > 0 && insert.soloed() == Some(true))
-            .map(MixerInsertSummary::ordinal)
-            .collect::<Vec<_>>();
+        let soloed_tracks = self.live_mixer_solo_tracks_for_document(document);
         self.mixer_track_peak_meters
             .set_live_mixer_soloed_tracks(&soloed_tracks);
         for track in 1..=i8::MAX as usize {
@@ -48359,6 +48356,7 @@ impl DawUi {
                 }
             }
         }
+        let mut mixer_solo_mode_resets = Vec::new();
         if !flag_edits.is_empty()
             && let Some(document) = self.document.as_mut()
         {
@@ -48394,14 +48392,9 @@ impl DawUi {
                                     candidate_mixer_insert_signal_flags(&inserts, insert_ordinal),
                                 );
                         }
-                        let soloed_tracks = document
-                            .mixer_inserts()
-                            .into_iter()
-                            .filter(|insert| insert.ordinal() > 0 && insert.soloed() == Some(true))
-                            .map(|insert| insert.ordinal())
-                            .collect::<Vec<_>>();
-                        self.mixer_track_peak_meters
-                            .set_live_mixer_soloed_tracks(&soloed_tracks);
+                        if edit.soloed.is_some() {
+                            mixer_solo_mode_resets.push(insert_ordinal);
+                        }
                         self.dirty = true;
                         self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                         let track_name = if insert_ordinal == 0 {
@@ -48416,6 +48409,12 @@ impl DawUi {
                     }
                 }
             }
+        }
+        if !mixer_solo_mode_resets.is_empty() {
+            for insert_ordinal in mixer_solo_mode_resets {
+                self.set_midi_mixer_solo_mode(insert_ordinal, None);
+            }
+            self.update_live_mixer_solo_mask();
         }
         if !parameter_edits.is_empty()
             && let Some(document) = self.document.as_mut()
@@ -50282,12 +50281,18 @@ impl DawUi {
                     usize::from(index),
                     MidiMixerControlTarget::Mute,
                     enabled,
+                    None,
                     history_snapshot_available,
                 ) {
                     self.status = format!("MIDI script could not update Mixer track mute: {error}");
                 }
             }
-            MidiTransportCommand::SetMixerTrackFlag { index, flag, value } => {
+            MidiTransportCommand::SetMixerTrackFlag {
+                index,
+                flag,
+                value,
+                solo_mode,
+            } => {
                 let target = match flag {
                     MixerTrackFlag::Soloed => MidiMixerControlTarget::Solo,
                     MixerTrackFlag::PolarityReversed => MidiMixerControlTarget::PhaseInvert,
@@ -50298,6 +50303,7 @@ impl DawUi {
                     usize::from(index),
                     target,
                     value,
+                    solo_mode,
                     history_snapshot_available,
                 ) {
                     self.status = format!(
@@ -50400,6 +50406,7 @@ impl DawUi {
                 insert_ordinal,
                 target,
                 raw_value != 0,
+                None,
                 history_snapshot_available,
             );
         }
@@ -50598,8 +50605,64 @@ impl DawUi {
             insert_ordinal,
             target,
             !active,
+            None,
             history_snapshot_available,
         )
+    }
+
+    fn set_midi_mixer_solo_mode(&self, insert_ordinal: usize, mode: Option<u8>) {
+        if let Ok(mut modes) = self
+            .midi_script_transport_state
+            .mixer_track_solo_modes
+            .lock()
+        {
+            if modes.len() <= insert_ordinal {
+                modes.resize(insert_ordinal + 1, None);
+            }
+            modes[insert_ordinal] = mode.filter(|mode| (1..=4).contains(mode));
+        }
+    }
+
+    fn reset_midi_mixer_solo_modes(&self) {
+        let track_count = self
+            .document
+            .as_ref()
+            .and_then(|document| {
+                document
+                    .mixer_inserts()
+                    .iter()
+                    .map(MixerInsertSummary::ordinal)
+                    .max()
+                    .map(|last_track| last_track.saturating_add(1))
+            })
+            .unwrap_or(1);
+        if let Ok(mut modes) = self
+            .midi_script_transport_state
+            .mixer_track_solo_modes
+            .lock()
+        {
+            *modes = vec![None; track_count];
+        }
+    }
+
+    fn live_mixer_solo_tracks_for_document(&self, document: &FlpDocument) -> Vec<usize> {
+        let modes = self
+            .midi_script_transport_state
+            .mixer_track_solo_modes
+            .lock()
+            .map(|modes| modes.clone())
+            .unwrap_or_default();
+        document.mixer_live_solo_included_tracks(&modes)
+    }
+
+    fn update_live_mixer_solo_mask(&self) {
+        let tracks = self
+            .document
+            .as_ref()
+            .map(|document| self.live_mixer_solo_tracks_for_document(document))
+            .unwrap_or_default();
+        self.mixer_track_peak_meters
+            .set_live_mixer_soloed_tracks(&tracks);
     }
 
     fn apply_midi_mixer_toggle_state(
@@ -50607,6 +50670,7 @@ impl DawUi {
         insert_ordinal: usize,
         target: MidiMixerControlTarget,
         active: bool,
+        solo_mode: Option<u8>,
         history_snapshot_available: bool,
     ) -> Result<bool, String> {
         if !target.is_toggle() {
@@ -50666,6 +50730,13 @@ impl DawUi {
             })?
         };
         if old_active == active {
+            if target == MidiMixerControlTarget::Solo {
+                self.set_midi_mixer_solo_mode(
+                    insert_ordinal,
+                    if active { solo_mode } else { None },
+                );
+                self.update_live_mixer_solo_mask();
+            }
             return Ok(false);
         }
         let undo_snapshot =
@@ -50718,6 +50789,10 @@ impl DawUi {
             self.midi_mixer_control_undo_snapshot = Some(snapshot);
         }
         self.midi_mixer_control_undo_last_update = Some(Instant::now());
+        if target == MidiMixerControlTarget::Solo {
+            self.set_midi_mixer_solo_mode(insert_ordinal, if active { solo_mode } else { None });
+            self.update_live_mixer_solo_mask();
+        }
         match target {
             MidiMixerControlTarget::Mute if insert_ordinal == 0 => self
                 .mixer_track_peak_meters
@@ -50730,22 +50805,7 @@ impl DawUi {
                 self.mixer_track_peak_meters
                     .set_live_mixer_insert_enabled(insert_ordinal, live_enabled);
             }
-            MidiMixerControlTarget::Solo => {
-                let soloed_tracks = self
-                    .document
-                    .as_ref()
-                    .map(|document| {
-                        document
-                            .mixer_inserts()
-                            .into_iter()
-                            .filter(|insert| insert.ordinal() > 0 && insert.soloed() == Some(true))
-                            .map(|insert| insert.ordinal())
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                self.mixer_track_peak_meters
-                    .set_live_mixer_soloed_tracks(&soloed_tracks);
-            }
+            MidiMixerControlTarget::Solo => {}
             MidiMixerControlTarget::PhaseInvert | MidiMixerControlTarget::SwapLeftRight
                 if insert_ordinal == 0 =>
             {

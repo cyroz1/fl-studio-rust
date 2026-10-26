@@ -80,6 +80,7 @@ pub enum ScriptTransportAction {
         index: u16,
         flag: MixerTrackFlag,
         value: bool,
+        solo_mode: Option<u8>,
     },
     SetMixerTrackParameter {
         index: u16,
@@ -215,6 +216,7 @@ pub struct MidiScriptTransportState {
     pub mixer_send_routes: Mutex<Vec<MixerSendRouteSnapshot>>,
     pub mixer_track_enabled: Mutex<Vec<Option<bool>>>,
     pub mixer_track_soloed: Mutex<Vec<Option<bool>>>,
+    pub mixer_track_solo_modes: Mutex<Vec<Option<u8>>>,
     pub mixer_track_polarity_reversed: Mutex<Vec<Option<bool>>>,
     pub mixer_track_swap_left_right: Mutex<Vec<Option<bool>>>,
     pub mixer_track_effects_enabled: Mutex<Vec<Option<bool>>>,
@@ -260,6 +262,7 @@ impl Default for MidiScriptTransportState {
             mixer_send_routes: Mutex::new(Vec::new()),
             mixer_track_enabled: Mutex::new(vec![None]),
             mixer_track_soloed: Mutex::new(vec![None]),
+            mixer_track_solo_modes: Mutex::new(vec![None]),
             mixer_track_polarity_reversed: Mutex::new(vec![None]),
             mixer_track_swap_left_right: Mutex::new(vec![None]),
             mixer_track_effects_enabled: Mutex::new(vec![None]),
@@ -1152,7 +1155,24 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
         let value = action["value"]
             .as_bool()
             .ok_or_else(|| "MIDI script returned an invalid Mixer track flag value".to_owned())?;
-        return Ok(ScriptTransportAction::SetMixerTrackFlag { index, flag, value });
+        let solo_mode = if flag == MixerTrackFlag::Soloed {
+            match action.get("solo_mode") {
+                None => None,
+                Some(mode) => match mode.as_i64() {
+                    Some(-1) => None,
+                    Some(1..=4) => Some(mode.as_u64().expect("positive solo mode") as u8),
+                    _ => return Err("MIDI script returned an invalid Mixer solo mode".to_owned()),
+                },
+            }
+        } else {
+            None
+        };
+        return Ok(ScriptTransportAction::SetMixerTrackFlag {
+            index,
+            flag,
+            value,
+            solo_mode,
+        });
     }
     if name == Some("set_mixer_track_parameter") {
         let index = action["index"]
@@ -1456,7 +1476,7 @@ fn byte_value(response: &Value, key: &str, default: u8) -> Result<u8, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MidiControllerScript, MidiScriptRuntime, MidiScriptTransportState,
+        MidiControllerScript, MidiScriptRuntime, MidiScriptTransportState, MixerTrackFlag,
         SCRIPT_BEAT_INDICATOR_BAR, SCRIPT_BEAT_INDICATOR_BEAT, SCRIPT_BEAT_INDICATOR_OFF,
         SCRIPT_TRANSPORT_PATTERN_MODE, SCRIPT_TRANSPORT_PLAYING, SCRIPT_TRANSPORT_RECORDING,
         ScriptTransportAction, absolute_song_position_ticks, discover_midi_scripts,
@@ -2117,6 +2137,62 @@ mod tests {
         let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
 
         assert_eq!(result.bytes, [0xB0, 50, 1]);
+    }
+
+    #[test]
+    fn python_mixer_solo_modes_are_forwarded_to_the_live_mixer() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport mixer\ndef OnMidiIn(event):\n    mixer.soloTrack(2, 1, 3)\n    event.data1 = int(mixer.isTrackSolo(2))\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let mut runtime = MidiScriptRuntime::start_for_device_with_transport_state(
+            &script,
+            "Test Input",
+            Arc::new(MidiScriptTransportState::default()),
+        )
+        .unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
+
+        assert_eq!(result.bytes, [0xB0, 1, 1]);
+        assert_eq!(
+            result.actions,
+            vec![ScriptTransportAction::SetMixerTrackFlag {
+                index: 2,
+                flag: MixerTrackFlag::Soloed,
+                value: true,
+                solo_mode: Some(3),
+            }]
+        );
+    }
+
+    #[test]
+    fn python_mixer_solo_rejects_unknown_modes() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport mixer\ndef OnMidiIn(event):\n    mixer.soloTrack(2, 1, 0)\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let mut runtime = MidiScriptRuntime::start_for_device_with_transport_state(
+            &script,
+            "Test Input",
+            Arc::new(MidiScriptTransportState::default()),
+        )
+        .unwrap();
+
+        assert!(
+            runtime
+                .process_event(12, &[0xB0, 7, 1])
+                .unwrap_err()
+                .contains("Mixer solo mode must be -1, 1, 2, 3, or 4")
+        );
     }
 
     #[test]
