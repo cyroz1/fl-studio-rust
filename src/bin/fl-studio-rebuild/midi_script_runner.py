@@ -160,6 +160,11 @@ def _mixer_get_track_color(index):
     return 0
 
 
+def _mixer_track_count():
+    track_names = _active_transport_state.get("mixer_track_names", [])
+    return max(2, len(track_names))
+
+
 def _mixer_get_track_peaks(index, mode):
     index = _mixer_track_index(index)
     try:
@@ -1326,6 +1331,7 @@ def _install_modules(script_name, device_name):
     mixer.getTrackColor = _mixer_get_track_color
     mixer.getTrackPeaks = _mixer_get_track_peaks
     mixer.getLastPeakVol = _mixer_get_last_peak_vol
+    mixer.trackCount = _mixer_track_count
     mixer.setTrackColor = _mixer_set_track_color
     mixer.getTrackInfo = _mixer_get_track_info
     mixer.getRouteSendActive = _mixer_get_route_send_active
