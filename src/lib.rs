@@ -2509,6 +2509,11 @@ pub struct RiffMachineOptions<'a> {
     pub mirror_vertical: bool,
     /// Assign all generated notes one fresh channel-local note group.
     pub group_notes: bool,
+    /// Optional `.fsc` pattern for the Riff Machine's Arpeggiation stage.
+    pub arpeggio_score: Option<&'a FscScore>,
+    pub arpeggio_score_mode: ArpeggioScorePatternMode,
+    pub arpeggio_score_time_multiplier: ArpeggioScoreTimeMultiplier,
+    pub arpeggio_score_levels_percent: u8,
     /// Optional `.fsc` timing template for the Groove stage.
     pub groove_score: Option<&'a FscScore>,
     /// Optional Piano roll snap grid for the Groove stage; `None` means snap is disabled.
@@ -2566,6 +2571,10 @@ impl<'a> Default for RiffMachineOptions<'a> {
             preserve_start_times: false,
             mirror_vertical: false,
             group_notes: false,
+            arpeggio_score: None,
+            arpeggio_score_mode: ArpeggioScorePatternMode::Normal,
+            arpeggio_score_time_multiplier: ArpeggioScoreTimeMultiplier::Normal,
+            arpeggio_score_levels_percent: 0,
             groove_score: None,
             groove_snap_ticks: Some(24),
             groove_start_percent: 0,
@@ -15142,23 +15151,39 @@ impl FlpDocument {
         updated.add_pattern_notes(pattern_id, &chord_notes)?;
         let chord_indices =
             (unaffected_note_count..unaffected_note_count + chord_notes.len()).collect::<Vec<_>>();
-        let arpeggiated = updated.arpeggiate_pattern_note_selection(
-            pattern_id,
-            channel_id,
-            &chord_indices,
-            ArpeggioOptions {
-                step_ticks: options.step_ticks,
-                range_octaves: options.range_octaves,
-                gate_percent: options.gate_percent,
-                range_pattern: match options.direction {
-                    ArpeggioDirection::Up => ArpeggioRangePattern::Up,
-                    ArpeggioDirection::Down => ArpeggioRangePattern::Down,
-                    ArpeggioDirection::UpDown => ArpeggioRangePattern::UpDown,
-                },
-                sync: ArpeggioSyncMode::Block,
-                group_notes: false,
+        let arpeggio_options = ArpeggioOptions {
+            step_ticks: options.step_ticks,
+            range_octaves: options.range_octaves,
+            gate_percent: options.gate_percent,
+            range_pattern: match options.direction {
+                ArpeggioDirection::Up => ArpeggioRangePattern::Up,
+                ArpeggioDirection::Down => ArpeggioRangePattern::Down,
+                ArpeggioDirection::UpDown => ArpeggioRangePattern::UpDown,
             },
-        )?;
+            sync: ArpeggioSyncMode::Block,
+            group_notes: false,
+        };
+        let arpeggiated = if let Some(score) = options.arpeggio_score {
+            updated.arpeggiate_pattern_note_selection_with_score(
+                pattern_id,
+                channel_id,
+                &chord_indices,
+                score,
+                ArpeggioScoreOptions {
+                    arpeggio: arpeggio_options,
+                    pattern_mode: options.arpeggio_score_mode,
+                    time_multiplier: options.arpeggio_score_time_multiplier,
+                    levels_percent: options.arpeggio_score_levels_percent,
+                },
+            )?
+        } else {
+            updated.arpeggiate_pattern_note_selection(
+                pattern_id,
+                channel_id,
+                &chord_indices,
+                arpeggio_options,
+            )?
+        };
         if arpeggiated == 0 {
             return Err(FlpError::UnsupportedEdit(
                 "Riff Machine could not arpeggiate the selected progression",

@@ -2685,10 +2685,15 @@ fn run(args: Vec<String>) -> Result<(), String> {
         [command, input, output, pattern_id, channel_id, options @ ..]
             if command == "riff-machine-notes" =>
         {
-            let (options, groove_score_path) = parse_riff_machine_options(options)?;
+            let (options, groove_score_path, arpeggio_score_path) =
+                parse_riff_machine_options(options)?;
             let groove_score = groove_score_path
                 .as_deref()
-                .map(load_riff_machine_groove_score)
+                .map(load_riff_machine_score)
+                .transpose()?;
+            let arpeggio_score = arpeggio_score_path
+                .as_deref()
+                .map(load_riff_machine_score)
                 .transpose()?;
             riff_machine_notes_with_scope(
                 Path::new(input),
@@ -2698,16 +2703,22 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 None,
                 options,
                 groove_score.as_ref(),
+                arpeggio_score.as_ref(),
             )
         }
         [command, input, output, pattern_id, channel_id, note_indices, options @ ..]
             if command == "riff-machine-notes-selected" =>
         {
             let note_indices = parse_note_indices(note_indices)?;
-            let (options, groove_score_path) = parse_riff_machine_options(options)?;
+            let (options, groove_score_path, arpeggio_score_path) =
+                parse_riff_machine_options(options)?;
             let groove_score = groove_score_path
                 .as_deref()
-                .map(load_riff_machine_groove_score)
+                .map(load_riff_machine_score)
+                .transpose()?;
+            let arpeggio_score = arpeggio_score_path
+                .as_deref()
+                .map(load_riff_machine_score)
                 .transpose()?;
             riff_machine_notes_with_scope(
                 Path::new(input),
@@ -2717,6 +2728,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 Some(&note_indices),
                 options,
                 groove_score.as_ref(),
+                arpeggio_score.as_ref(),
             )
         }
         [command, input, output, pattern_id, channel_id, position_ticks]
@@ -5002,9 +5014,17 @@ fn parse_riff_machine_quantize_mode(value: &str) -> Result<RiffMachineQuantizeMo
 
 fn parse_riff_machine_options(
     values: &[String],
-) -> Result<(RiffMachineOptions<'static>, Option<PathBuf>), String> {
+) -> Result<
+    (
+        RiffMachineOptions<'static>,
+        Option<PathBuf>,
+        Option<PathBuf>,
+    ),
+    String,
+> {
     let mut options = RiffMachineOptions::default();
     let mut groove_score_path = None;
+    let mut arpeggio_score_path = None;
     let mut seen = std::collections::HashSet::new();
     for argument in values {
         let option = argument.strip_prefix("--").ok_or_else(|| {
@@ -5053,6 +5073,16 @@ fn parse_riff_machine_options(
                 options.range_octaves = parse_u8(value, "Riff Machine octave range")?
             }
             "gate-percent" => options.gate_percent = parse_u8(value, "Riff Machine gate")?,
+            "arpeggio-score" => arpeggio_score_path = Some(PathBuf::from(value)),
+            "arpeggio-mode" => options.arpeggio_score_mode = parse_arpeggio_score_mode(value)?,
+            "arpeggio-time-multiplier" => {
+                options.arpeggio_score_time_multiplier =
+                    parse_arpeggio_score_time_multiplier(value)?
+            }
+            "arpeggio-levels-percent" => {
+                options.arpeggio_score_levels_percent =
+                    parse_u8(value, "Riff Machine Arpeggiation score levels")?
+            }
             "length-variation-percent" => {
                 options.length_variation_percent = parse_u8(value, "Riff Machine length variation")?
             }
@@ -5138,13 +5168,13 @@ fn parse_riff_machine_options(
             _ => return Err(format!("unknown Riff Machine option: --{name}")),
         }
     }
-    Ok((options, groove_score_path))
+    Ok((options, groove_score_path, arpeggio_score_path))
 }
 
-fn load_riff_machine_groove_score(path: &Path) -> Result<FscScore, String> {
-    let bytes = fs::read(path)
-        .map_err(|error| format!("could not read Riff Machine groove score: {error}"))?;
-    FscScore::parse(&bytes).map_err(|error| format!("invalid Riff Machine groove score: {error}"))
+fn load_riff_machine_score(path: &Path) -> Result<FscScore, String> {
+    let bytes =
+        fs::read(path).map_err(|error| format!("could not read Riff Machine score: {error}"))?;
+    FscScore::parse(&bytes).map_err(|error| format!("invalid Riff Machine score: {error}"))
 }
 
 fn parse_note_rotation(value: &str) -> Result<PatternNoteRotation, String> {
@@ -9216,10 +9246,12 @@ fn riff_machine_notes_with_scope(
     note_indices: Option<&[usize]>,
     options: RiffMachineOptions<'_>,
     groove_score: Option<&FscScore>,
+    arpeggio_score: Option<&FscScore>,
 ) -> Result<(), String> {
     let (_, mut document) = load_document(input)?;
     let options = RiffMachineOptions {
         groove_score,
+        arpeggio_score,
         ..options
     };
     let created = match note_indices {

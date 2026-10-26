@@ -4774,6 +4774,10 @@ struct DawUi {
     arpeggiator_score_mode: ArpeggioScorePatternMode,
     arpeggiator_score_time_multiplier: ArpeggioScoreTimeMultiplier,
     arpeggiator_score_levels_percent: u8,
+    riff_use_custom_arpeggio_score: bool,
+    riff_arpeggio_score_mode: ArpeggioScorePatternMode,
+    riff_arpeggio_score_time_multiplier: ArpeggioScoreTimeMultiplier,
+    riff_arpeggio_score_levels_percent: u8,
     riff_seed: u64,
     riff_articulation_seed: u64,
     riff_velocity_variation_percent: u8,
@@ -6378,6 +6382,10 @@ impl DawUi {
             arpeggiator_score_mode: ArpeggioScorePatternMode::Normal,
             arpeggiator_score_time_multiplier: ArpeggioScoreTimeMultiplier::Normal,
             arpeggiator_score_levels_percent: 0,
+            riff_use_custom_arpeggio_score: false,
+            riff_arpeggio_score_mode: ArpeggioScorePatternMode::Normal,
+            riff_arpeggio_score_time_multiplier: ArpeggioScoreTimeMultiplier::Normal,
+            riff_arpeggio_score_levels_percent: 0,
             riff_seed: 1,
             riff_articulation_seed: 1,
             riff_velocity_variation_percent: 10,
@@ -33010,6 +33018,84 @@ impl DawUi {
                                     "Up / Down",
                                 );
                             });
+                        egui::CollapsingHeader::new("Custom arpeggiation")
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    if ui.button("Load .fsc score…").clicked() {
+                                        load_arpeggiator_score_requested = true;
+                                        ui.close();
+                                    }
+                                    if let Some(path) = &self.arpeggiator_score_path {
+                                        ui.label(path.display().to_string());
+                                    }
+                                });
+                                ui.add_enabled_ui(self.arpeggiator_score.is_some(), |ui| {
+                                    ui.checkbox(
+                                        &mut self.riff_use_custom_arpeggio_score,
+                                        "Use score pattern",
+                                    );
+                                    egui::ComboBox::from_id_salt("piano-roll-riff-score-mode")
+                                        .selected_text(match self.riff_arpeggio_score_mode {
+                                            ArpeggioScorePatternMode::Normal => "Normal",
+                                            ArpeggioScorePatternMode::FlipVertical => {
+                                                "Flip vertically"
+                                            }
+                                            ArpeggioScorePatternMode::Alternate => "Alternate",
+                                        })
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(
+                                                &mut self.riff_arpeggio_score_mode,
+                                                ArpeggioScorePatternMode::Normal,
+                                                "Normal",
+                                            );
+                                            ui.selectable_value(
+                                                &mut self.riff_arpeggio_score_mode,
+                                                ArpeggioScorePatternMode::FlipVertical,
+                                                "Flip vertically",
+                                            );
+                                            ui.selectable_value(
+                                                &mut self.riff_arpeggio_score_mode,
+                                                ArpeggioScorePatternMode::Alternate,
+                                                "Alternate",
+                                            );
+                                        });
+                                    egui::ComboBox::from_id_salt("piano-roll-riff-score-time")
+                                        .selected_text(match self.riff_arpeggio_score_time_multiplier {
+                                            ArpeggioScoreTimeMultiplier::Faster8 => "Time ×1/8",
+                                            ArpeggioScoreTimeMultiplier::Faster4 => "Time ×1/4",
+                                            ArpeggioScoreTimeMultiplier::Faster2 => "Time ×1/2",
+                                            ArpeggioScoreTimeMultiplier::Normal => "Time ×1",
+                                            ArpeggioScoreTimeMultiplier::Slower2 => "Time ×2",
+                                            ArpeggioScoreTimeMultiplier::Slower3 => "Time ×3",
+                                            ArpeggioScoreTimeMultiplier::Slower4 => "Time ×4",
+                                        })
+                                        .show_ui(ui, |ui| {
+                                            for (multiplier, label) in [
+                                                (ArpeggioScoreTimeMultiplier::Faster8, "×1/8"),
+                                                (ArpeggioScoreTimeMultiplier::Faster4, "×1/4"),
+                                                (ArpeggioScoreTimeMultiplier::Faster2, "×1/2"),
+                                                (ArpeggioScoreTimeMultiplier::Normal, "×1"),
+                                                (ArpeggioScoreTimeMultiplier::Slower2, "×2"),
+                                                (ArpeggioScoreTimeMultiplier::Slower3, "×3"),
+                                                (ArpeggioScoreTimeMultiplier::Slower4, "×4"),
+                                            ] {
+                                                ui.selectable_value(
+                                                    &mut self.riff_arpeggio_score_time_multiplier,
+                                                    multiplier,
+                                                    label,
+                                                );
+                                            }
+                                        });
+                                    ui.add(
+                                        egui::Slider::new(
+                                            &mut self.riff_arpeggio_score_levels_percent,
+                                            0..=100,
+                                        )
+                                        .text("Score levels (%)"),
+                                    );
+                                });
+                            });
                         ui.checkbox(&mut self.riff_mirror_horizontal, "Flip horizontally");
                         ui.add_enabled_ui(self.riff_mirror_horizontal, |ui| {
                             ui.checkbox(
@@ -33287,6 +33373,12 @@ impl DawUi {
                                 self.arpeggiator_range_octaves = defaults.range_octaves;
                                 self.arpeggiator_gate_percent = defaults.gate_percent;
                                 self.riff_machine_direction = defaults.direction;
+                                self.riff_use_custom_arpeggio_score = false;
+                                self.riff_arpeggio_score_mode = defaults.arpeggio_score_mode;
+                                self.riff_arpeggio_score_time_multiplier =
+                                    defaults.arpeggio_score_time_multiplier;
+                                self.riff_arpeggio_score_levels_percent =
+                                    defaults.arpeggio_score_levels_percent;
                                 self.arpeggiator_range_pattern = ArpeggioRangePattern::Up;
                                 self.arpeggiator_sync_mode = ArpeggioSyncMode::Block;
                                 self.note_limit_minimum_key = defaults.minimum_key as u8;
@@ -35749,6 +35841,10 @@ impl DawUi {
         {
             let scale_intervals = self.piano_roll_scale.intervals();
             let riff_groove_score = self.riff_groove_score.clone();
+            let riff_arpeggio_score = self
+                .riff_use_custom_arpeggio_score
+                .then(|| self.arpeggiator_score.clone())
+                .flatten();
             let options = RiffMachineOptions {
                 scale_root: self.piano_roll_scale_root,
                 scale_intervals,
@@ -35760,6 +35856,10 @@ impl DawUi {
                 range_octaves: self.arpeggiator_range_octaves,
                 gate_percent: self.arpeggiator_gate_percent,
                 direction: self.riff_machine_direction,
+                arpeggio_score: riff_arpeggio_score.as_ref(),
+                arpeggio_score_mode: self.riff_arpeggio_score_mode,
+                arpeggio_score_time_multiplier: self.riff_arpeggio_score_time_multiplier,
+                arpeggio_score_levels_percent: self.riff_arpeggio_score_levels_percent,
                 mirror_horizontal: self.riff_mirror_horizontal,
                 preserve_start_times: self.riff_preserve_start_times,
                 mirror_vertical: self.riff_mirror_vertical,
