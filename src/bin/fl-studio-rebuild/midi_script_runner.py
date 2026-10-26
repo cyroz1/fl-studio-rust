@@ -10,6 +10,7 @@ sys.stdout = sys.stderr
 _active_transport_actions = None
 _active_transport_state = {}
 _midi_out_new_messages = {}
+_has_meters = False
 
 
 def _emit(value):
@@ -114,6 +115,11 @@ def _module(name):
     value = types.ModuleType(name)
     sys.modules[name] = value
     return value
+
+
+def _set_has_meters():
+    global _has_meters
+    _has_meters = True
 
 
 def _request_transport_action(action):
@@ -1343,6 +1349,7 @@ def _install_modules(script_name, device_name):
     device.directFeedback = _direct_feedback
     device.repeatMidiEvent = _repeat_midi_event
     device.stopRepeatMidiEvent = _stop_repeat_midi_event
+    device.setHasMeters = _set_has_meters
 
     mixer = _module("mixer")
     mixer.getCurrentTempo = _get_current_tempo
@@ -1544,6 +1551,10 @@ def _dispatch(namespace, value):
         callback = namespace.get("OnIdle")
         if callback is not None:
             callback()
+        if _has_meters:
+            callback = namespace.get("OnUpdateMeters")
+            if callback is not None:
+                callback()
         return {"handled": False, "actions": _active_transport_actions}
 
     event = EventData(value)
