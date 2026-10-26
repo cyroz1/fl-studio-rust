@@ -173,21 +173,56 @@ def _mixer_set_track_color(index, color):
     )
 
 
-def _mixer_track_enabled(index):
+def _mixer_track_flag_state(index, state_name, default):
     index = _mixer_track_index(index)
-    states = _active_transport_state.get("mixer_track_enabled", [])
+    states = _active_transport_state.get(state_name, [])
     if index < len(states) and states[index] is not None:
         return bool(states[index])
-    return True
+    return default
+
+
+def _mixer_track_enabled(index):
+    return _mixer_track_flag_state(index, "mixer_track_enabled", True)
+
+
+def _mixer_track_flag(index, state_name):
+    return _mixer_track_flag_state(index, state_name, False)
+
+
+def _mixer_store_track_flag(index, state_name, value):
+    states = _active_transport_state.setdefault(state_name, [])
+    if len(states) <= index:
+        states.extend([None] * (index + 1 - len(states)))
+    states[index] = bool(value)
 
 
 def _mixer_set_track_enabled(index, enabled):
     index = _mixer_track_index(index)
+    _mixer_store_track_flag(index, "mixer_track_enabled", enabled)
     _request_transport_action(
         {
             "action": "set_mixer_track_enabled",
             "index": index,
             "enabled": bool(enabled),
+        }
+    )
+
+
+def _mixer_set_track_flag(index, flag, value):
+    index = _mixer_track_index(index)
+    state_name = {
+        "soloed": "mixer_track_soloed",
+        "polarity_reversed": "mixer_track_polarity_reversed",
+        "swap_left_right": "mixer_track_swap_left_right",
+        "effects_enabled": "mixer_track_effects_enabled",
+    }[flag]
+    _mixer_store_track_flag(index, state_name, value)
+    _request_transport_action(
+        {
+            "action": "set_mixer_track_flag",
+            "index": index,
+            "flag": flag,
+            "value": bool(value),
         }
     )
 
@@ -211,6 +246,49 @@ def _mixer_mute_track(index, value=-1):
         raise ValueError("Mixer mute value must be -1, 0, or 1")
     muted = not _mixer_track_enabled(index) if value == -1 else value == 1
     _mixer_set_track_enabled(index, not muted)
+
+
+def _mixer_is_track_solo(index):
+    return _mixer_track_flag(index, "mixer_track_soloed")
+
+
+def _mixer_solo_track(index, value=-1, mode=-1):
+    index = _mixer_track_index(index)
+    try:
+        value = int(value)
+        mode = int(mode)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("Mixer solo value and mode must be integers") from error
+    if value not in (-1, 0, 1):
+        raise ValueError("Mixer solo value must be -1, 0, or 1")
+    if mode not in (-1, 4):
+        raise NotImplementedError("Mixer solo source and send modes are unsupported")
+    active = not _mixer_is_track_solo(index) if value == -1 else value == 1
+    _mixer_set_track_flag(index, "soloed", active)
+
+
+def _mixer_is_track_polarity_reversed(index):
+    return _mixer_track_flag(index, "mixer_track_polarity_reversed")
+
+
+def _mixer_reverse_track_polarity(index, value=False):
+    _mixer_set_track_flag(index, "polarity_reversed", bool(value))
+
+
+def _mixer_is_track_swap_channels(index):
+    return _mixer_track_flag(index, "mixer_track_swap_left_right")
+
+
+def _mixer_swap_track_channels(index, value=False):
+    _mixer_set_track_flag(index, "swap_left_right", bool(value))
+
+
+def _mixer_is_track_slots_enabled(index):
+    return _mixer_track_flag(index, "mixer_track_effects_enabled")
+
+
+def _mixer_enable_track_slots(index, value=False):
+    _mixer_set_track_flag(index, "effects_enabled", bool(value))
 
 
 def _color_to_rgb(color):
@@ -956,6 +1034,14 @@ def _install_modules(script_name, device_name):
     mixer.enableTrack = _mixer_enable_track
     mixer.isTrackMuted = _mixer_is_track_muted
     mixer.muteTrack = _mixer_mute_track
+    mixer.isTrackSolo = _mixer_is_track_solo
+    mixer.soloTrack = _mixer_solo_track
+    mixer.isTrackRevPolarity = _mixer_is_track_polarity_reversed
+    mixer.revTrackPolarity = _mixer_reverse_track_polarity
+    mixer.isTrackSwapChannels = _mixer_is_track_swap_channels
+    mixer.swapTrackChannels = _mixer_swap_track_channels
+    mixer.isTrackSlotsEnabled = _mixer_is_track_slots_enabled
+    mixer.enableTrackSlots = _mixer_enable_track_slots
     mixer.getSongStepPos = _get_song_step_pos
     mixer.getSongTickPos = _get_song_tick_pos
 

@@ -117,7 +117,7 @@ use midi_output::{
     playlist_playback_messages,
 };
 use midi_script::{
-    MidiControllerScript, MidiScriptTransportState, SCRIPT_BEAT_INDICATOR_BAR,
+    MidiControllerScript, MidiScriptTransportState, MixerTrackFlag, SCRIPT_BEAT_INDICATOR_BAR,
     SCRIPT_BEAT_INDICATOR_BEAT, SCRIPT_BEAT_INDICATOR_OFF, SCRIPT_PROJECT_LOAD_ERROR,
     SCRIPT_PROJECT_LOAD_OK, SCRIPT_PROJECT_LOAD_START, SCRIPT_TRANSPORT_PATTERN_MODE,
     SCRIPT_TRANSPORT_PLAYING, SCRIPT_TRANSPORT_RECORDING, absolute_song_position_ticks,
@@ -14442,6 +14442,54 @@ impl DawUi {
             .unwrap_or_else(|| vec![None]);
         if let Ok(mut enabled) = self.midi_script_transport_state.mixer_track_enabled.lock() {
             *enabled = mixer_track_enabled;
+        }
+        let mixer_track_flags = self
+            .document
+            .as_ref()
+            .map(|document| {
+                let inserts = document.mixer_inserts();
+                let max_ordinal = inserts
+                    .iter()
+                    .map(|insert| insert.ordinal())
+                    .max()
+                    .unwrap_or(0);
+                let mut flags = vec![(None, None, None, None); max_ordinal.saturating_add(1)];
+                for insert in inserts {
+                    if let Some(track_flags) = flags.get_mut(insert.ordinal()) {
+                        *track_flags = (
+                            insert.soloed(),
+                            insert.polarity_reversed(),
+                            insert.swap_left_right(),
+                            insert.effects_enabled(),
+                        );
+                    }
+                }
+                flags
+            })
+            .unwrap_or_else(|| vec![(None, None, None, None)]);
+        if let Ok(mut soloed) = self.midi_script_transport_state.mixer_track_soloed.lock() {
+            *soloed = mixer_track_flags.iter().map(|flags| flags.0).collect();
+        }
+        if let Ok(mut polarity) = self
+            .midi_script_transport_state
+            .mixer_track_polarity_reversed
+            .lock()
+        {
+            *polarity = mixer_track_flags.iter().map(|flags| flags.1).collect();
+        }
+        if let Ok(mut swapped) = self
+            .midi_script_transport_state
+            .mixer_track_swap_left_right
+            .lock()
+        {
+            *swapped = mixer_track_flags.iter().map(|flags| flags.2).collect();
+        }
+        if let Ok(mut effects) = self
+            .midi_script_transport_state
+            .mixer_track_effects_enabled
+            .lock()
+        {
+            *effects = mixer_track_flags.iter().map(|flags| flags.3).collect();
         }
         let arrangement_marker_names = self
             .document
@@ -49774,6 +49822,25 @@ impl DawUi {
                     history_snapshot_available,
                 ) {
                     self.status = format!("MIDI script could not update Mixer track mute: {error}");
+                }
+            }
+            MidiTransportCommand::SetMixerTrackFlag { index, flag, value } => {
+                let target = match flag {
+                    MixerTrackFlag::Soloed => MidiMixerControlTarget::Solo,
+                    MixerTrackFlag::PolarityReversed => MidiMixerControlTarget::PhaseInvert,
+                    MixerTrackFlag::SwapLeftRight => MidiMixerControlTarget::SwapLeftRight,
+                    MixerTrackFlag::EffectsEnabled => MidiMixerControlTarget::EffectsEnabled,
+                };
+                if let Err(error) = self.apply_midi_mixer_toggle_state(
+                    usize::from(index),
+                    target,
+                    value,
+                    history_snapshot_available,
+                ) {
+                    self.status = format!(
+                        "MIDI script could not update Mixer track {}: {error}",
+                        target.name()
+                    );
                 }
             }
             MidiTransportCommand::JumpToMarker { delta, select } => {

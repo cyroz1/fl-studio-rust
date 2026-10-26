@@ -64,6 +64,11 @@ pub enum ScriptTransportAction {
         index: u16,
         enabled: bool,
     },
+    SetMixerTrackFlag {
+        index: u16,
+        flag: MixerTrackFlag,
+        value: bool,
+    },
     JumpToMarker {
         delta: i32,
         select: bool,
@@ -85,6 +90,14 @@ pub enum ScriptTransportAction {
         rate_ms: u32,
     },
     StopRepeatMidiOutput,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MixerTrackFlag {
+    Soloed,
+    PolarityReversed,
+    SwapLeftRight,
+    EffectsEnabled,
 }
 
 const SCRIPT_SONG_POSITION_SCALE: f64 = 1_000_000.0;
@@ -157,6 +170,10 @@ pub struct MidiScriptTransportState {
     pub mixer_track_names: Mutex<Vec<String>>,
     pub mixer_track_colors: Mutex<Vec<u32>>,
     pub mixer_track_enabled: Mutex<Vec<Option<bool>>>,
+    pub mixer_track_soloed: Mutex<Vec<Option<bool>>>,
+    pub mixer_track_polarity_reversed: Mutex<Vec<Option<bool>>>,
+    pub mixer_track_swap_left_right: Mutex<Vec<Option<bool>>>,
+    pub mixer_track_effects_enabled: Mutex<Vec<Option<bool>>>,
     pub project_title: Mutex<String>,
     pub project_author: Mutex<String>,
     pub project_genre: Mutex<String>,
@@ -192,6 +209,10 @@ impl Default for MidiScriptTransportState {
             mixer_track_names: Mutex::new(vec!["Master".to_owned()]),
             mixer_track_colors: Mutex::new(vec![0]),
             mixer_track_enabled: Mutex::new(vec![None]),
+            mixer_track_soloed: Mutex::new(vec![None]),
+            mixer_track_polarity_reversed: Mutex::new(vec![None]),
+            mixer_track_swap_left_right: Mutex::new(vec![None]),
+            mixer_track_effects_enabled: Mutex::new(vec![None]),
             project_title: Mutex::new(String::new()),
             project_author: Mutex::new(String::new()),
             project_genre: Mutex::new(String::new()),
@@ -639,6 +660,30 @@ impl MidiScriptRuntime {
             .lock()
             .map(|enabled| enabled.clone())
             .unwrap_or_else(|_| vec![None]);
+        let mixer_track_soloed = self
+            .transport_state
+            .mixer_track_soloed
+            .lock()
+            .map(|soloed| soloed.clone())
+            .unwrap_or_else(|_| vec![None]);
+        let mixer_track_polarity_reversed = self
+            .transport_state
+            .mixer_track_polarity_reversed
+            .lock()
+            .map(|flags| flags.clone())
+            .unwrap_or_else(|_| vec![None]);
+        let mixer_track_swap_left_right = self
+            .transport_state
+            .mixer_track_swap_left_right
+            .lock()
+            .map(|flags| flags.clone())
+            .unwrap_or_else(|_| vec![None]);
+        let mixer_track_effects_enabled = self
+            .transport_state
+            .mixer_track_effects_enabled
+            .lock()
+            .map(|flags| flags.clone())
+            .unwrap_or_else(|_| vec![None]);
         let pattern_time_signature_changes = self
             .transport_state
             .pattern_time_signature_changes
@@ -750,6 +795,10 @@ impl MidiScriptRuntime {
                     "mixer_track_names": mixer_track_names,
                     "mixer_track_colors": mixer_track_colors,
                     "mixer_track_enabled": mixer_track_enabled,
+                    "mixer_track_soloed": mixer_track_soloed,
+                    "mixer_track_polarity_reversed": mixer_track_polarity_reversed,
+                    "mixer_track_swap_left_right": mixer_track_swap_left_right,
+                    "mixer_track_effects_enabled": mixer_track_effects_enabled,
                     "pattern_time_signature_changes": pattern_time_signature_changes,
                     "arrangement_time_signature_changes": arrangement_time_signature_changes,
                     "arrangement_current_time": arrangement_current_time,
@@ -974,6 +1023,23 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
             "MIDI script returned an invalid Mixer track enabled state".to_owned()
         })?;
         return Ok(ScriptTransportAction::SetMixerTrackEnabled { index, enabled });
+    }
+    if name == Some("set_mixer_track_flag") {
+        let index = action["index"]
+            .as_u64()
+            .and_then(|index| u16::try_from(index).ok())
+            .ok_or_else(|| "MIDI script returned an invalid Mixer track index".to_owned())?;
+        let flag = match action["flag"].as_str() {
+            Some("soloed") => MixerTrackFlag::Soloed,
+            Some("polarity_reversed") => MixerTrackFlag::PolarityReversed,
+            Some("swap_left_right") => MixerTrackFlag::SwapLeftRight,
+            Some("effects_enabled") => MixerTrackFlag::EffectsEnabled,
+            _ => return Err("MIDI script returned an invalid Mixer track flag".to_owned()),
+        };
+        let value = action["value"]
+            .as_bool()
+            .ok_or_else(|| "MIDI script returned an invalid Mixer track flag value".to_owned())?;
+        return Ok(ScriptTransportAction::SetMixerTrackFlag { index, flag, value });
     }
     if name == Some("jump_to_marker") {
         let delta = action["delta"]

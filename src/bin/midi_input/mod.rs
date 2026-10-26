@@ -16,7 +16,7 @@ use midir::{Ignore, MidiInput, MidiInputConnection as MidirInputConnection};
 
 use super::midi_script::{
     MidiControllerScript, MidiScriptRuntime, MidiScriptStopHandle, MidiScriptTransportState,
-    ScriptTransportAction,
+    MixerTrackFlag, ScriptTransportAction,
 };
 use flp_rebuild::sample_render::PlaylistTempoMap;
 
@@ -703,6 +703,9 @@ fn queue_script_transport_actions(
             ScriptTransportAction::SetMixerTrackEnabled { index, enabled } => {
                 MidiTransportCommand::SetMixerTrackEnabled { index, enabled }
             }
+            ScriptTransportAction::SetMixerTrackFlag { index, flag, value } => {
+                MidiTransportCommand::SetMixerTrackFlag { index, flag, value }
+            }
             ScriptTransportAction::JumpToMarker { delta, select } => {
                 MidiTransportCommand::JumpToMarker { delta, select }
             }
@@ -757,17 +760,43 @@ pub enum MidiTransportCommand {
     SetSongPosition(u32),
     SetSongPositionTicks(u64),
     SetSongPositionTimeUs(u64),
-    MoveSongPosition { speed_millionths: i32, start: bool },
+    MoveSongPosition {
+        speed_millionths: i32,
+        start: bool,
+    },
     SetPlaybackSpeed(u32),
     SetCurrentTempo(u32),
     SetProjectTimeSignatureNumerator(u8),
     SetProjectTimeSignatureDenominator(u8),
-    AddArrangementTimeMarker { tick: u32, name: String },
-    SetArrangementLiveSelection { tick: u32, stop: bool },
-    SetMixerTrackName { index: u16, name: String },
-    SetMixerTrackColor { index: u16, color: u32 },
-    SetMixerTrackEnabled { index: u16, enabled: bool },
-    JumpToMarker { delta: i32, select: bool },
+    AddArrangementTimeMarker {
+        tick: u32,
+        name: String,
+    },
+    SetArrangementLiveSelection {
+        tick: u32,
+        stop: bool,
+    },
+    SetMixerTrackName {
+        index: u16,
+        name: String,
+    },
+    SetMixerTrackColor {
+        index: u16,
+        color: u32,
+    },
+    SetMixerTrackEnabled {
+        index: u16,
+        enabled: bool,
+    },
+    SetMixerTrackFlag {
+        index: u16,
+        flag: MixerTrackFlag,
+        value: bool,
+    },
+    JumpToMarker {
+        delta: i32,
+        select: bool,
+    },
     SelectNextEmptyPatternWithNameDialog,
     FocusSelectedMixerTrackName,
     PatternJog(i32),
@@ -1409,6 +1438,14 @@ pub fn describe_event(event: MidiInputEvent) -> String {
             MidiTransportCommand::SetMixerTrackEnabled { .. } => {
                 "MIDI script Set Mixer Track Mute".to_owned()
             }
+            MidiTransportCommand::SetMixerTrackFlag { flag, .. } => match flag {
+                MixerTrackFlag::Soloed => "MIDI script Set Mixer Track Solo".to_owned(),
+                MixerTrackFlag::PolarityReversed => "MIDI script Set Mixer Track Phase".to_owned(),
+                MixerTrackFlag::SwapLeftRight => {
+                    "MIDI script Set Mixer Track Channel Swap".to_owned()
+                }
+                MixerTrackFlag::EffectsEnabled => "MIDI script Set Mixer Track Effects".to_owned(),
+            },
             MidiTransportCommand::JumpToMarker { .. } => "MIDI script Jump to Marker".to_owned(),
             MidiTransportCommand::SelectNextEmptyPatternWithNameDialog => {
                 "MIDI script Next Empty Pattern".to_owned()
