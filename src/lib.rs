@@ -1920,6 +1920,40 @@ pub struct PatternNoteEdit {
     pub mod_y: Option<u8>,
 }
 
+/// Note data loaded from a FL Studio score file.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FscScore {
+    notes: Vec<PatternNote>,
+}
+
+impl FscScore {
+    /// Parses score note records while retaining all saved note properties.
+    pub fn parse(bytes: &[u8]) -> Result<Self, FlpError> {
+        let document = FlpDocument::parse(bytes)?;
+        let mut notes = document
+            .patterns()?
+            .into_iter()
+            .flat_map(|pattern| pattern.notes)
+            .collect::<Vec<_>>();
+        if notes.is_empty() {
+            return Err(FlpError::UnsupportedEdit(
+                "the score file does not contain Pattern notes",
+            ));
+        }
+        if notes.len() > MAX_MERGED_PATTERN_NOTES {
+            return Err(FlpError::UnsupportedEdit(
+                "the score file contains more than two million notes",
+            ));
+        }
+        notes.sort_by_key(|note| (note.position, note.key));
+        Ok(Self { notes })
+    }
+
+    pub fn notes(&self) -> &[PatternNote] {
+        &self.notes
+    }
+}
+
 /// Direction used by the Riff Machine's built-in arpeggiation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArpeggioDirection {
@@ -16040,6 +16074,34 @@ impl FlpDocument {
         }
         self.refresh_event_offsets()?;
         Ok(())
+    }
+
+    /// Imports FL Studio score notes into one Pattern channel, appending by default or replacing
+    /// that channel's existing notes when `replace_channel_notes` is enabled.
+    pub fn import_score_notes(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        score: &FscScore,
+        replace_channel_notes: bool,
+    ) -> Result<usize, FlpError> {
+        if score.notes.len() > MAX_MERGED_PATTERN_NOTES {
+            return Err(FlpError::UnsupportedEdit(
+                "the score file contains more than two million notes",
+            ));
+        }
+        let mut imported = score.notes.clone();
+        for note in &mut imported {
+            note.channel_id = channel_id;
+        }
+
+        let mut candidate = self.clone();
+        if replace_channel_notes {
+            candidate.delete_pattern_notes(pattern_id, channel_id)?;
+        }
+        candidate.add_pattern_notes(pattern_id, &imported)?;
+        *self = candidate;
+        Ok(imported.len())
     }
 
     /// Appends one note to a pattern while retaining every unrelated event byte.

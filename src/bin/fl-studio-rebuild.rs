@@ -74,7 +74,7 @@ use flp_rebuild::{
     ArticulateOptions, AutomationChannel, AutomationInterpolationMode, AutomationPoint,
     AutomationPointEdit, AutomationScaleLevelsOptions, ChannelGroupSummary, ChannelNoteRouter,
     ChannelSortOrder, ChannelStretchMode, ChannelStretchSettingsEdit, ChannelSummary, ChannelType,
-    ClawMachineOptions, FlamOptions, FlpDocument, FlpError, FstPreset, FstPresetKind,
+    ClawMachineOptions, FlamOptions, FlpDocument, FlpError, FscScore, FstPreset, FstPresetKind,
     HumanizerOptions, LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerInsertSummary,
     MixerParameterKind, MixerParameterRecord, MixerSendSummary, PATTERN_NOTE_DEFAULT_FLAGS,
     PATTERN_NOTE_DEFAULT_RELEASE, PATTERN_NOTE_SLIDE_FLAG, Pattern, PatternController,
@@ -31701,6 +31701,8 @@ impl DawUi {
         let mut add_note_requested = false;
         let mut open_midi_requested = !ui.ctx().egui_wants_keyboard_input()
             && ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::M));
+        let mut import_score_requested = false;
+        let mut replace_channel_from_score = false;
         let mut export_midi_requested = false;
         let mut render_requested = false;
         let mut render_insert_requested = false;
@@ -33442,6 +33444,28 @@ impl DawUi {
                     &mut self.piano_roll_color_by_midi_channel,
                     "Color by MIDI channel",
                 );
+            });
+            ui.menu_button("Score", |ui| {
+                let can_import_score =
+                    self.selected_pattern.is_some() && self.selected_note_channel.is_some();
+                if ui
+                    .add_enabled(can_import_score, egui::Button::new("Append score notes…"))
+                    .clicked()
+                {
+                    import_score_requested = true;
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        can_import_score,
+                        egui::Button::new("Replace target channel from score…"),
+                    )
+                    .clicked()
+                {
+                    import_score_requested = true;
+                    replace_channel_from_score = true;
+                    ui.close();
+                }
             });
             ui.menu_button("MIDI", |ui| {
                 egui::ComboBox::from_id_salt("midi-channel-mapping")
@@ -35409,6 +35433,71 @@ impl DawUi {
                     );
                 }
                 Err(error) => self.status = format!("Could not slice notes: {error}"),
+            }
+        }
+
+        if import_score_requested
+            && let (Some(pattern_id), Some(channel_id)) =
+                (self.selected_pattern, self.selected_note_channel)
+            && let Some(path) = rfd::FileDialog::new()
+                .set_title("Import FL Studio score")
+                .add_filter("FL Studio score files", &["fsc"])
+                .pick_file()
+        {
+            let result = (|| {
+                let bytes = fs::read(&path)
+                    .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+                let score = FscScore::parse(&bytes).map_err(|error| error.to_string())?;
+                let first_note_index = patterns
+                    .iter()
+                    .find(|pattern| pattern.id == pattern_id)
+                    .map(|pattern| {
+                        pattern
+                            .notes
+                            .iter()
+                            .filter(|note| note.channel_id == channel_id)
+                            .count()
+                    })
+                    .ok_or_else(|| format!("pattern {pattern_id} no longer exists"))?;
+                let imported = self
+                    .document
+                    .as_mut()
+                    .ok_or_else(|| "no project is open".to_owned())?
+                    .import_score_notes(pattern_id, channel_id, &score, replace_channel_from_score)
+                    .map_err(|error| error.to_string())?;
+                Ok::<_, String>((first_note_index, imported))
+            })();
+            match result {
+                Ok((first_note_index, imported)) => {
+                    if imported > 0 {
+                        self.stop_project_playback();
+                        self.dirty = true;
+                        self.selected_piano_notes.clear();
+                        self.selected_piano_notes
+                            .extend((0..imported).map(|offset| {
+                                (
+                                    pattern_id,
+                                    channel_id,
+                                    if replace_channel_from_score {
+                                        offset
+                                    } else {
+                                        first_note_index + offset
+                                    },
+                                )
+                            }));
+                        self.selected_note = self.selected_piano_notes.iter().next_back().copied();
+                        self.active_note_drag = None;
+                    }
+                    self.status = format!(
+                        "Imported {imported} score notes into pattern {pattern_id}, channel {channel_id} ({})",
+                        if replace_channel_from_score {
+                            "replaced channel notes"
+                        } else {
+                            "appended notes"
+                        }
+                    );
+                }
+                Err(error) => self.status = format!("Could not import score notes: {error}"),
             }
         }
 

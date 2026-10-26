@@ -18,9 +18,9 @@ use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, ArpeggioRangePattern, ArpeggioSyncMode, ArticulateOptions,
     AutomationInterpolationMode, AutomationPointEdit, AutomationScaleLevelsOptions,
     ChannelLevelAdjustmentsEdit, ChannelSortOrder, ChannelStretchSettingsEdit, ClawMachineOptions,
-    FlamOptions, FlpDocument, FstPreset, HumanizerOptions, LimitNoteOptions, LimitSnapDirection,
-    MixerInsertEdit, MixerParameterKind, PatternControllerEdit, PatternNote, PatternNoteEdit,
-    PatternNoteRotation, PlaylistClipEdit, PlaylistTrackEdit, PlaylistTrackMotion,
+    FlamOptions, FlpDocument, FscScore, FstPreset, HumanizerOptions, LimitNoteOptions,
+    LimitSnapDirection, MixerInsertEdit, MixerParameterKind, PatternControllerEdit, PatternNote,
+    PatternNoteEdit, PatternNoteRotation, PlaylistClipEdit, PlaylistTrackEdit, PlaylistTrackMotion,
     PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit, QuantizeNoteMode,
     QuantizeNoteOptions, RandomNoteChordMap, RandomNoteGeneratorOptions, RandomizerOptions,
     RiffMachineOptions, RiffMachineQuantizeMode, SamplerEnvelopeLfoEdit, SamplerEnvelopeLfoTarget,
@@ -3214,6 +3214,30 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 },
             )
         }
+        [command, input, score_path, output, pattern_id, channel_id]
+            if command == "import-score" =>
+        {
+            import_score_notes(
+                Path::new(input),
+                Path::new(score_path),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                false,
+            )
+        }
+        [command, input, score_path, output, pattern_id, channel_id, replace]
+            if command == "import-score" =>
+        {
+            import_score_notes(
+                Path::new(input),
+                Path::new(score_path),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                parse_bool(replace, "replace channel notes")?,
+            )
+        }
         [command, input, midi_path, output, track, pattern_id, channel_id]
             if command == "import-midi" =>
         {
@@ -3894,6 +3918,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild create-playlist-audio-clip <input.flp> <output.flp> <arrangement-id> <channel-id> <position-ticks> <length-ticks> <track-index:zero-based>\n",
             "  flp-rebuild create-playlist-automation-clip <input.flp> <output.flp> <arrangement-id> <channel-id> <position-ticks> <length-ticks> <track-index:zero-based>\n",
             "  flp-rebuild import-midi <input.flp> <input.mid> <output.flp> <track> <pattern-id|new> <channel-id> [zero-velocity-note-ons:0|1] [realign-events:0|1] [midi-channels:all|none|1,2,...,16]\n",
+            "  flp-rebuild import-score <input.flp> <input.fsc> <output.flp> <pattern-id> <channel-id> [replace-channel-notes:0|1]\n",
             "  flp-rebuild import-midi-cc <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <raw-channel> <raw-flags> <cc-0..127> <midi-channel-1..16|all>\n",
             "  flp-rebuild import-midi-cc-new-stream <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <raw-channel> <raw-flags> <cc-0..127> <midi-channel-1..16|all>\n",
             "  flp-rebuild import-midi-all <input.flp> <input.mid> <output.flp> <pattern-id|new> <channel-ids-comma-separated> [zero-velocity-note-ons:0|1] [realign-events:0|1] [midi-channels:all|none|1,2,...,16]\n",
@@ -9333,6 +9358,39 @@ fn delete_notes_with_scope(
             "selected notes"
         } else {
             "all channel notes"
+        },
+        output.display()
+    );
+    Ok(())
+}
+
+fn import_score_notes(
+    input: &Path,
+    score_path: &Path,
+    output: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    replace_channel_notes: bool,
+) -> Result<(), String> {
+    let score_bytes = fs::read(score_path)
+        .map_err(|error| format!("could not read {}: {error}", score_path.display()))?;
+    let score = FscScore::parse(&score_bytes)
+        .map_err(|error| format!("could not parse {}: {error}", score_path.display()))?;
+    let (_, mut document) = load_document(input)?;
+    let imported = document
+        .import_score_notes(pattern_id, channel_id, &score, replace_channel_notes)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "imported {imported} score notes into pattern {pattern_id}, channel {channel_id} ({}) to {}",
+        if replace_channel_notes {
+            "replaced notes"
+        } else {
+            "appended notes"
         },
         output.display()
     );
