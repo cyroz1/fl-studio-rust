@@ -14426,6 +14426,29 @@ impl DawUi {
         if let Ok(mut colors) = self.midi_script_transport_state.mixer_track_colors.lock() {
             *colors = mixer_track_colors;
         }
+        let mixer_send_routes = self
+            .document
+            .as_ref()
+            .map(|document| {
+                document
+                    .mixer_send_summaries()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|route| {
+                        let destination = route.route_parameter_id().checked_sub(64)?;
+                        Some((
+                            u16::try_from(route.insert_ordinal()).ok()?,
+                            u16::from(destination),
+                            route.enabled(),
+                            route.value(),
+                        ))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if let Ok(mut routes) = self.midi_script_transport_state.mixer_send_routes.lock() {
+            *routes = mixer_send_routes;
+        }
         let mixer_track_enabled = self
             .document
             .as_ref()

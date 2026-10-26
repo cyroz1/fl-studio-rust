@@ -208,6 +208,30 @@ def _mixer_is_track_selected(index):
     return index == _mixer_track_number()
 
 
+def _mixer_route_summary(index, destIndex):
+    index = _mixer_track_index(index)
+    destIndex = _mixer_track_index(destIndex)
+    routes = _active_transport_state.get("mixer_send_routes", [])
+    matches = [
+        route
+        for route in routes
+        if len(route) == 4 and int(route[0]) == index and int(route[1]) == destIndex
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _mixer_get_route_send_active(index, destIndex):
+    route = _mixer_route_summary(index, destIndex)
+    return bool(route[2]) if route is not None and route[2] is not None else False
+
+
+def _mixer_get_route_level(index, destIndex):
+    route = _mixer_route_summary(index, destIndex)
+    if route is None:
+        raise ValueError("Mixer route is missing or ambiguous")
+    return max(0.0, min(1.0, float(route[3]) / 12_800.0))
+
+
 def _mixer_set_track_color(index, color):
     index = _mixer_track_index(index)
     try:
@@ -1202,6 +1226,8 @@ def _install_modules(script_name, device_name):
     mixer.getTrackColor = _mixer_get_track_color
     mixer.setTrackColor = _mixer_set_track_color
     mixer.getTrackInfo = _mixer_get_track_info
+    mixer.getRouteSendActive = _mixer_get_route_send_active
+    mixer.getRouteToLevel = _mixer_get_route_level
     mixer.trackNumber = _mixer_track_number
     mixer.setTrackNumber = _mixer_set_track_number
     mixer.isTrackSelected = _mixer_is_track_selected

@@ -186,6 +186,7 @@ pub struct MidiScriptTransportState {
     pub mixer_track_names: Mutex<Vec<String>>,
     pub mixer_selected_track: AtomicU64,
     pub mixer_track_colors: Mutex<Vec<u32>>,
+    pub mixer_send_routes: Mutex<Vec<(u16, u16, Option<bool>, i32)>>,
     pub mixer_track_enabled: Mutex<Vec<Option<bool>>>,
     pub mixer_track_soloed: Mutex<Vec<Option<bool>>>,
     pub mixer_track_polarity_reversed: Mutex<Vec<Option<bool>>>,
@@ -229,6 +230,7 @@ impl Default for MidiScriptTransportState {
             mixer_track_names: Mutex::new(vec!["Master".to_owned()]),
             mixer_selected_track: AtomicU64::new(0),
             mixer_track_colors: Mutex::new(vec![0]),
+            mixer_send_routes: Mutex::new(Vec::new()),
             mixer_track_enabled: Mutex::new(vec![None]),
             mixer_track_soloed: Mutex::new(vec![None]),
             mixer_track_polarity_reversed: Mutex::new(vec![None]),
@@ -678,6 +680,12 @@ impl MidiScriptRuntime {
             .lock()
             .map(|colors| colors.clone())
             .unwrap_or_else(|_| vec![0]);
+        let mixer_send_routes = self
+            .transport_state
+            .mixer_send_routes
+            .lock()
+            .map(|routes| routes.clone())
+            .unwrap_or_default();
         let mixer_track_enabled = self
             .transport_state
             .mixer_track_enabled
@@ -840,6 +848,7 @@ impl MidiScriptRuntime {
                         .mixer_selected_track
                         .load(Ordering::Relaxed),
                     "mixer_track_colors": mixer_track_colors,
+                    "mixer_send_routes": mixer_send_routes,
                     "mixer_track_enabled": mixer_track_enabled,
                     "mixer_track_soloed": mixer_track_soloed,
                     "mixer_track_polarity_reversed": mixer_track_polarity_reversed,
