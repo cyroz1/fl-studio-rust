@@ -176,6 +176,7 @@ pub const SCRIPT_PROJECT_LOAD_ERROR: i32 = 101;
 pub const SCRIPT_BEAT_INDICATOR_OFF: i32 = 0;
 pub const SCRIPT_BEAT_INDICATOR_BAR: i32 = 1;
 pub const SCRIPT_BEAT_INDICATOR_BEAT: i32 = 2;
+pub const SCRIPT_MIXER_SCROLL_TO_MAKE_VISIBLE: u32 = 1 << 0;
 
 pub struct MidiScriptTransportState {
     pub state: AtomicU8,

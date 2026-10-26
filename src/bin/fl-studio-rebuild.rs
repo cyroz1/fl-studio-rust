@@ -119,10 +119,10 @@ use midi_output::{
 use midi_script::{
     MidiControllerScript, MidiScriptTransportState, MixerSendRouteSnapshot, MixerTrackFlag,
     MixerTrackParameter, SCRIPT_BEAT_INDICATOR_BAR, SCRIPT_BEAT_INDICATOR_BEAT,
-    SCRIPT_BEAT_INDICATOR_OFF, SCRIPT_PROJECT_LOAD_ERROR, SCRIPT_PROJECT_LOAD_OK,
-    SCRIPT_PROJECT_LOAD_START, SCRIPT_TRANSPORT_PATTERN_MODE, SCRIPT_TRANSPORT_PLAYING,
-    SCRIPT_TRANSPORT_RECORDING, absolute_song_position_ticks, discover_midi_scripts,
-    find_script_for_device, normalized_song_position, song_position_ticks,
+    SCRIPT_BEAT_INDICATOR_OFF, SCRIPT_MIXER_SCROLL_TO_MAKE_VISIBLE, SCRIPT_PROJECT_LOAD_ERROR,
+    SCRIPT_PROJECT_LOAD_OK, SCRIPT_PROJECT_LOAD_START, SCRIPT_TRANSPORT_PATTERN_MODE,
+    SCRIPT_TRANSPORT_PLAYING, SCRIPT_TRANSPORT_RECORDING, absolute_song_position_ticks,
+    discover_midi_scripts, find_script_for_device, normalized_song_position, song_position_ticks,
 };
 use midi_thru::{MidiThruSettings, MidiThruWorker};
 
@@ -4949,6 +4949,7 @@ struct DawUi {
     selected_pattern_time_signature_pattern: Option<u16>,
     pattern_time_signature_dialog_open: bool,
     selected_mixer_insert: Option<usize>,
+    mixer_scroll_to_track: Option<usize>,
     mixer_track_name_editor_requested: bool,
     mixer_master_peak_hold: f32,
     mixer_insert_peak_holds: [f32; MIXER_TRACK_METER_COUNT],
@@ -6572,6 +6573,7 @@ impl DawUi {
             selected_pattern_time_signature_pattern: None,
             pattern_time_signature_dialog_open: false,
             selected_mixer_insert: None,
+            mixer_scroll_to_track: None,
             mixer_track_name_editor_requested: false,
             mixer_master_peak_hold: 0.0,
             mixer_insert_peak_holds: [0.0; MIXER_TRACK_METER_COUNT],
@@ -15350,7 +15352,7 @@ impl DawUi {
         }
     }
 
-    fn set_midi_script_mixer_track_selection(&mut self, index: u16) {
+    fn set_midi_script_mixer_track_selection(&mut self, index: u16, flags: u32) {
         let track_ordinal = usize::from(index);
         let track_exists = track_ordinal < MIXER_TRACK_METER_COUNT
             && match self.document.as_ref() {
@@ -15367,6 +15369,8 @@ impl DawUi {
             return;
         }
         self.selected_mixer_insert = Some(track_ordinal);
+        self.mixer_scroll_to_track =
+            (flags & SCRIPT_MIXER_SCROLL_TO_MAKE_VISIBLE != 0).then_some(track_ordinal);
         self.midi_script_transport_state
             .mixer_selected_track
             .store(u64::from(index), Ordering::Relaxed);
@@ -46467,6 +46471,7 @@ impl DawUi {
             .filter(|ordinal| inserts.iter().any(|insert| insert.ordinal() == *ordinal))
             .or_else(|| inserts.first().map(|insert| insert.ordinal()));
         self.selected_mixer_insert = active_insert;
+        let mixer_scroll_to_track = self.mixer_scroll_to_track.take();
 
         let mut rename_edits = Vec::new();
         let mut flag_edits = Vec::new();
@@ -46552,7 +46557,7 @@ impl DawUi {
                                     } else {
                                         Stroke::new(1.0, GRID)
                                     };
-                                    egui::Frame::new()
+                                    let frame_response = egui::Frame::new()
                                         .fill(fill)
                                         .stroke(stroke)
                                         .inner_margin(7.0)
@@ -47193,6 +47198,12 @@ impl DawUi {
                                                 }
                                             });
                                         });
+                                    if mixer_scroll_to_track == Some(insert.ordinal()) {
+                                        ui.scroll_to_rect(
+                                            frame_response.response.rect,
+                                            Some(egui::Align::Center),
+                                        );
+                                    }
                                 }
                                 if inserts.len() == 1 && inserts[0].ordinal() == 0 {
                                     let empty_width = (bank_width - 132.0).max(180.0);
@@ -50137,8 +50148,8 @@ impl DawUi {
                 };
                 selection_point.store(u64::from(tick), Ordering::Relaxed);
             }
-            MidiTransportCommand::SetMixerTrackSelection { index, flags: _ } => {
-                self.set_midi_script_mixer_track_selection(index);
+            MidiTransportCommand::SetMixerTrackSelection { index, flags } => {
+                self.set_midi_script_mixer_track_selection(index, flags);
             }
             MidiTransportCommand::SetMixerTrackName { index, name } => {
                 self.set_midi_script_mixer_track_name(index, name);
