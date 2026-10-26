@@ -1235,6 +1235,13 @@ def _global_transport(command, value, pmeflags=2, flags=15):
     if command in (35, 36):
         _jog_marker("marker_jump_jog" if command == 35 else "marker_sel_jog", value)
         return 8
+    if command == 101:  # FPT_TrackJog: select a Mixer track
+        track_names = _active_transport_state.get("mixer_track_names", ["Master"])
+        last_track = max(0, len(track_names) - 1)
+        if value != 0:
+            track = _mixer_track_number() + value
+            _mixer_set_track_number(min(last_track, max(0, track)), 1)
+        return 8
     if command == 60:  # FPT_F1: Open the Help manual
         if value != 0:
             _request_transport_action("open_help_manual")
