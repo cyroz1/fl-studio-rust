@@ -2525,6 +2525,9 @@ pub struct RiffMachineOptions<'a> {
     pub group_notes: bool,
     /// Optional `.fsc` pattern for the Riff Machine's Note Progression stage.
     pub progression_score: Option<&'a FscScore>,
+    /// Optional `.fsc` voicing pattern for the Chord Progression stage. Notes are grouped
+    /// by onset, each group's lowest pitch maps to a progression root, and groups cycle.
+    pub chord_score: Option<&'a FscScore>,
     /// Optional `.fsc` pattern for the Riff Machine's Arpeggiation stage.
     pub arpeggio_score: Option<&'a FscScore>,
     pub arpeggio_score_mode: ArpeggioScorePatternMode,
@@ -2595,6 +2598,7 @@ impl<'a> Default for RiffMachineOptions<'a> {
             mirror_vertical: false,
             group_notes: false,
             progression_score: None,
+            chord_score: None,
             arpeggio_score: None,
             arpeggio_score_mode: ArpeggioScorePatternMode::Normal,
             arpeggio_score_time_multiplier: ArpeggioScoreTimeMultiplier::Normal,
@@ -15226,32 +15230,86 @@ impl FlpDocument {
                     .or_insert_with(|| note.clone());
             }
 
+            let chord_patterns = if let Some(score) = options.chord_score {
+                let mut by_onset = std::collections::BTreeMap::<u32, Vec<u16>>::new();
+                for note in score.notes().iter().filter(|note| note.length > 0) {
+                    if note.key > 127 {
+                        return Err(FlpError::UnsupportedEdit(
+                            "Riff Machine chord score contains a pitch outside the MIDI key range",
+                        ));
+                    }
+                    by_onset.entry(note.position).or_default().push(note.key);
+                }
+                let patterns = by_onset.into_values().collect::<Vec<_>>();
+                if patterns.is_empty() {
+                    return Err(FlpError::UnsupportedEdit(
+                        "Riff Machine chord score contains no positive-length notes",
+                    ));
+                }
+                Some(patterns)
+            } else {
+                None
+            };
+
             let snap_up = options.snap_direction != LimitSnapDirection::Down;
             let mut chord_notes = Vec::new();
-            for note in progression.into_values().filter(|note| note.length > 0) {
-                let pitches = riff_triad_keys(
-                    note.key,
-                    options.minimum_key,
-                    options.maximum_key,
-                    options.scale_root,
-                    options.scale_intervals,
-                    options.wrap_to_bottom,
-                    snap_up,
-                )?;
-                if pitches.len() < 2 {
+            for (progression_index, note) in progression
+                .into_values()
+                .filter(|note| note.length > 0)
+                .enumerate()
+            {
+                let pitches = if let Some(patterns) = &chord_patterns {
+                    let pattern = &patterns[progression_index % patterns.len()];
+                    let pattern_root =
+                        pattern
+                            .iter()
+                            .copied()
+                            .min()
+                            .ok_or(FlpError::UnsupportedEdit(
+                                "Riff Machine chord score contains an empty chord",
+                            ))?;
+                    pattern
+                        .iter()
+                        .map(|key| {
+                            let pitch = i32::from(note.key) + i32::from(*key)
+                                - i32::from(pattern_root);
+                            if !(0..=127).contains(&pitch) {
+                                return Err(FlpError::UnsupportedEdit(
+                                    "Riff Machine chord score transposes a pitch outside the MIDI key range",
+                                ));
+                            }
+                            Ok(pitch as u16)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?
+                } else {
+                    riff_triad_keys(
+                        note.key,
+                        options.minimum_key,
+                        options.maximum_key,
+                        options.scale_root,
+                        options.scale_intervals,
+                        options.wrap_to_bottom,
+                        snap_up,
+                    )?
+                };
+                if pitches.iter().copied().collect::<HashSet<_>>().len() < 2 {
                     return Err(FlpError::UnsupportedEdit(
-                        "Riff Machine needs at least two distinct chord pitches inside the key range",
+                        "Riff Machine needs at least two distinct pitches in each chord",
+                    ));
+                }
+                if chord_notes
+                    .len()
+                    .checked_add(pitches.len())
+                    .is_none_or(|count| count > MAX_MERGED_PATTERN_NOTES)
+                {
+                    return Err(FlpError::UnsupportedEdit(
+                        "Riff Machine would create more than two million chord notes",
                     ));
                 }
                 for key in pitches {
                     let mut chord_note = note.clone();
                     chord_note.key = key;
                     chord_notes.push(chord_note);
-                }
-                if chord_notes.len() > MAX_MERGED_PATTERN_NOTES {
-                    return Err(FlpError::UnsupportedEdit(
-                        "Riff Machine would create more than two million chord notes",
-                    ));
                 }
             }
             chord_notes

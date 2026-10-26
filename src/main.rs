@@ -2690,6 +2690,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 groove_score_path,
                 arpeggio_score_path,
                 progression_score_path,
+                chord_score_path,
             } = parse_riff_machine_options(options)?;
             let groove_score = groove_score_path
                 .as_deref()
@@ -2703,10 +2704,15 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 .as_deref()
                 .map(load_riff_machine_score)
                 .transpose()?;
+            let chord_score = chord_score_path
+                .as_deref()
+                .map(load_riff_machine_score)
+                .transpose()?;
             let options = RiffMachineOptions {
                 groove_score: groove_score.as_ref(),
                 arpeggio_score: arpeggio_score.as_ref(),
                 progression_score: progression_score.as_ref(),
+                chord_score: chord_score.as_ref(),
                 ..options
             };
             riff_machine_notes_with_scope(
@@ -2727,6 +2733,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 groove_score_path,
                 arpeggio_score_path,
                 progression_score_path,
+                chord_score_path,
             } = parse_riff_machine_options(options)?;
             let groove_score = groove_score_path
                 .as_deref()
@@ -2740,10 +2747,15 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 .as_deref()
                 .map(load_riff_machine_score)
                 .transpose()?;
+            let chord_score = chord_score_path
+                .as_deref()
+                .map(load_riff_machine_score)
+                .transpose()?;
             let options = RiffMachineOptions {
                 groove_score: groove_score.as_ref(),
                 arpeggio_score: arpeggio_score.as_ref(),
                 progression_score: progression_score.as_ref(),
+                chord_score: chord_score.as_ref(),
                 ..options
             };
             riff_machine_notes_with_scope(
@@ -5041,6 +5053,7 @@ struct ParsedRiffMachineOptions {
     groove_score_path: Option<PathBuf>,
     arpeggio_score_path: Option<PathBuf>,
     progression_score_path: Option<PathBuf>,
+    chord_score_path: Option<PathBuf>,
 }
 
 fn parse_riff_machine_options(values: &[String]) -> Result<ParsedRiffMachineOptions, String> {
@@ -5048,6 +5061,7 @@ fn parse_riff_machine_options(values: &[String]) -> Result<ParsedRiffMachineOpti
     let mut groove_score_path = None;
     let mut arpeggio_score_path = None;
     let mut progression_score_path = None;
+    let mut chord_score_path = None;
     let mut seen = std::collections::HashSet::new();
     for argument in values {
         let option = argument.strip_prefix("--").ok_or_else(|| {
@@ -5097,6 +5111,7 @@ fn parse_riff_machine_options(values: &[String]) -> Result<ParsedRiffMachineOpti
             }
             "gate-percent" => options.gate_percent = parse_u8(value, "Riff Machine gate")?,
             "progression-score" => progression_score_path = Some(PathBuf::from(value)),
+            "chord-score" => chord_score_path = Some(PathBuf::from(value)),
             "chord-progression" => {
                 options.chord_progression_enabled = parse_bool(value, "chord progression stage")?
             }
@@ -5210,6 +5225,7 @@ fn parse_riff_machine_options(values: &[String]) -> Result<ParsedRiffMachineOpti
         groove_score_path,
         arpeggio_score_path,
         progression_score_path,
+        chord_score_path,
     })
 }
 
