@@ -885,7 +885,6 @@ impl MidiScriptRuntime {
                 "song_length_hint": song_length_hint,
                 "arrangement_marker_names": arrangement_marker_names,
                 "mixer_track_names": mixer_track_names,
-                "mixer_track_recording_file_names": mixer_track_recording_file_names,
                 "mixer_selected_track": self
                     .transport_state
                     .mixer_selected_track
@@ -930,6 +929,10 @@ impl MidiScriptRuntime {
             });
             if let Some(transport_object) = transport.as_object_mut() {
                 transport_object.insert("mixer_track_peaks".to_owned(), json!(mixer_track_peaks));
+                transport_object.insert(
+                    "mixer_track_recording_file_names".to_owned(),
+                    json!(mixer_track_recording_file_names),
+                );
             }
             object.insert("transport".to_owned(), transport);
         }
