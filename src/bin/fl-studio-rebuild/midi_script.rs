@@ -815,111 +815,111 @@ impl MidiScriptRuntime {
             .unwrap_or_default();
         let mut request = value.clone();
         if let Some(object) = request.as_object_mut() {
-            object.insert(
-                "transport".to_owned(),
-                json!({
-                    "is_playing": transport & SCRIPT_TRANSPORT_PLAYING != 0,
-                    "is_recording": transport & SCRIPT_TRANSPORT_RECORDING != 0,
-                    "pattern_mode": transport & SCRIPT_TRANSPORT_PATTERN_MODE != 0,
-                    "midi_output_port_number": self
-                        .transport_state
-                        .midi_output_port_number
+            let mut transport = json!({
+                "is_playing": transport & SCRIPT_TRANSPORT_PLAYING != 0,
+                "is_recording": transport & SCRIPT_TRANSPORT_RECORDING != 0,
+                "pattern_mode": transport & SCRIPT_TRANSPORT_PATTERN_MODE != 0,
+                "midi_output_port_number": self
+                    .transport_state
+                    .midi_output_port_number
+                    .load(Ordering::Relaxed),
+                "song_position": song_position,
+                "song_position_ticks": self
+                    .transport_state
+                    .song_position_ticks
+                    .load(Ordering::Relaxed),
+                "ticks_per_quarter": self
+                    .transport_state
+                    .ticks_per_quarter
+                    .load(Ordering::Relaxed)
+                    .max(1),
+                "current_tempo_milli_bpm": self
+                    .transport_state
+                    .current_tempo_milli_bpm
+                    .load(Ordering::Relaxed)
+                    .max(1),
+                "project_changed_flag": self
+                    .transport_state
+                    .project_changed_flag
+                    .load(Ordering::Relaxed),
+                "time_signature_numerator": self
+                    .transport_state
+                    .time_signature_numerator
+                    .load(Ordering::Relaxed)
+                    .max(1),
+                "time_signature_denominator": self
+                    .transport_state
+                    .time_signature_denominator
+                    .load(Ordering::Relaxed)
+                    .max(1),
+                "song_length_ticks": self
+                    .transport_state
+                    .song_length_ticks
+                    .load(Ordering::Relaxed),
+                "song_position_seconds": f64::from_bits(
+                    self.transport_state
+                        .song_position_seconds
                         .load(Ordering::Relaxed),
-                    "song_position": song_position,
-                    "song_position_ticks": self
-                        .transport_state
-                        .song_position_ticks
+                ),
+                "song_length_seconds": f64::from_bits(
+                    self.transport_state
+                        .song_length_seconds
                         .load(Ordering::Relaxed),
-                    "ticks_per_quarter": self
-                        .transport_state
-                        .ticks_per_quarter
-                        .load(Ordering::Relaxed)
-                        .max(1),
-                    "current_tempo_milli_bpm": self
-                        .transport_state
-                        .current_tempo_milli_bpm
-                        .load(Ordering::Relaxed)
-                        .max(1),
-                    "project_changed_flag": self
-                        .transport_state
-                        .project_changed_flag
-                        .load(Ordering::Relaxed),
-                    "time_signature_numerator": self
-                        .transport_state
-                        .time_signature_numerator
-                        .load(Ordering::Relaxed)
-                        .max(1),
-                    "time_signature_denominator": self
-                        .transport_state
-                        .time_signature_denominator
-                        .load(Ordering::Relaxed)
-                        .max(1),
-                    "song_length_ticks": self
-                        .transport_state
-                        .song_length_ticks
-                        .load(Ordering::Relaxed),
-                    "song_position_seconds": f64::from_bits(
-                        self.transport_state
-                            .song_position_seconds
-                            .load(Ordering::Relaxed),
-                    ),
-                    "song_length_seconds": f64::from_bits(
-                        self.transport_state
-                            .song_length_seconds
-                            .load(Ordering::Relaxed),
-                    ),
-                    "hardware_beat_led_state": self
-                        .transport_state
-                        .hardware_beat_led_state
-                        .load(Ordering::Relaxed),
-                    "song_position_hint": song_position_hint,
-                    "song_length_hint": song_length_hint,
-                    "arrangement_marker_names": arrangement_marker_names,
-                    "mixer_track_names": mixer_track_names,
-                    "mixer_selected_track": self
-                        .transport_state
-                        .mixer_selected_track
-                        .load(Ordering::Relaxed),
-                    "mixer_track_colors": mixer_track_colors,
-                    "mixer_track_peaks": mixer_track_peaks,
-                    "mixer_send_routes": mixer_send_routes
-                        .iter()
-                        .map(|route| {
-                            json!([
-                                route.source_index,
-                                route.destination_index,
-                                route.enabled,
-                                route.value_raw
-                            ])
-                        })
-                        .collect::<Vec<_>>(),
-                    "mixer_track_enabled": mixer_track_enabled,
-                    "mixer_track_soloed": mixer_track_soloed,
-                    "mixer_track_polarity_reversed": mixer_track_polarity_reversed,
-                    "mixer_track_swap_left_right": mixer_track_swap_left_right,
-                    "mixer_track_effects_enabled": mixer_track_effects_enabled,
-                    "mixer_track_pan_raw": mixer_track_pan_raw,
-                    "mixer_track_volume_raw": mixer_track_volume_raw,
-                    "mixer_track_stereo_separation_raw": mixer_track_stereo_separation_raw,
-                    "pattern_time_signature_changes": pattern_time_signature_changes,
-                    "arrangement_time_signature_changes": arrangement_time_signature_changes,
-                    "arrangement_current_time": arrangement_current_time,
-                    "arrangement_current_time_snapped": arrangement_current_time_snapped,
-                    "arrangement_selection_start": arrangement_selection_start,
-                    "arrangement_selection_end": arrangement_selection_end,
-                    "arrangement_live_selection_start": self
-                        .transport_state
-                        .arrangement_live_selection_start
-                        .load(Ordering::Relaxed),
-                    "arrangement_live_selection_end": self
-                        .transport_state
-                        .arrangement_live_selection_end
-                        .load(Ordering::Relaxed),
-                    "project_title": project_title,
-                    "project_author": project_author,
-                    "project_genre": project_genre,
-                }),
-            );
+                ),
+                "hardware_beat_led_state": self
+                    .transport_state
+                    .hardware_beat_led_state
+                    .load(Ordering::Relaxed),
+                "song_position_hint": song_position_hint,
+                "song_length_hint": song_length_hint,
+                "arrangement_marker_names": arrangement_marker_names,
+                "mixer_track_names": mixer_track_names,
+                "mixer_selected_track": self
+                    .transport_state
+                    .mixer_selected_track
+                    .load(Ordering::Relaxed),
+                "mixer_track_colors": mixer_track_colors,
+                "mixer_send_routes": mixer_send_routes
+                    .iter()
+                    .map(|route| {
+                        json!([
+                            route.source_index,
+                            route.destination_index,
+                            route.enabled,
+                            route.value_raw
+                        ])
+                    })
+                    .collect::<Vec<_>>(),
+                "mixer_track_enabled": mixer_track_enabled,
+                "mixer_track_soloed": mixer_track_soloed,
+                "mixer_track_polarity_reversed": mixer_track_polarity_reversed,
+                "mixer_track_swap_left_right": mixer_track_swap_left_right,
+                "mixer_track_effects_enabled": mixer_track_effects_enabled,
+                "mixer_track_pan_raw": mixer_track_pan_raw,
+                "mixer_track_volume_raw": mixer_track_volume_raw,
+                "mixer_track_stereo_separation_raw": mixer_track_stereo_separation_raw,
+                "pattern_time_signature_changes": pattern_time_signature_changes,
+                "arrangement_time_signature_changes": arrangement_time_signature_changes,
+                "arrangement_current_time": arrangement_current_time,
+                "arrangement_current_time_snapped": arrangement_current_time_snapped,
+                "arrangement_selection_start": arrangement_selection_start,
+                "arrangement_selection_end": arrangement_selection_end,
+                "arrangement_live_selection_start": self
+                    .transport_state
+                    .arrangement_live_selection_start
+                    .load(Ordering::Relaxed),
+                "arrangement_live_selection_end": self
+                    .transport_state
+                    .arrangement_live_selection_end
+                    .load(Ordering::Relaxed),
+                "project_title": project_title,
+                "project_author": project_author,
+                "project_genre": project_genre,
+            });
+            if let Some(transport_object) = transport.as_object_mut() {
+                transport_object.insert("mixer_track_peaks".to_owned(), json!(mixer_track_peaks));
+            }
+            object.insert("transport".to_owned(), transport);
         }
         serde_json::to_writer(&mut self.stdin, &request)
             .map_err(|error| format!("could not send MIDI to Python script: {error}"))?;
