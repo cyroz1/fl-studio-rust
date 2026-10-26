@@ -216,6 +216,7 @@ pub struct MidiScriptTransportState {
     pub mixer_track_peaks: Mutex<Vec<(f32, f32)>>,
     pub mixer_send_routes: Mutex<Vec<MixerSendRouteSnapshot>>,
     pub mixer_track_enabled: Mutex<Vec<Option<bool>>>,
+    pub mixer_track_mute_locked: Mutex<Vec<Option<bool>>>,
     pub mixer_track_soloed: Mutex<Vec<Option<bool>>>,
     pub mixer_track_solo_modes: Mutex<Vec<Option<u8>>>,
     pub mixer_track_polarity_reversed: Mutex<Vec<Option<bool>>>,
@@ -263,6 +264,7 @@ impl Default for MidiScriptTransportState {
             mixer_track_peaks: Mutex::new(vec![(0.0, 0.0)]),
             mixer_send_routes: Mutex::new(Vec::new()),
             mixer_track_enabled: Mutex::new(vec![None]),
+            mixer_track_mute_locked: Mutex::new(vec![None]),
             mixer_track_soloed: Mutex::new(vec![None]),
             mixer_track_solo_modes: Mutex::new(vec![None]),
             mixer_track_polarity_reversed: Mutex::new(vec![None]),
@@ -742,6 +744,12 @@ impl MidiScriptRuntime {
             .lock()
             .map(|soloed| soloed.clone())
             .unwrap_or_else(|_| vec![None]);
+        let mixer_track_mute_locked = self
+            .transport_state
+            .mixer_track_mute_locked
+            .lock()
+            .map(|locked| locked.clone())
+            .unwrap_or_else(|_| vec![None]);
         let mixer_track_polarity_reversed = self
             .transport_state
             .mixer_track_polarity_reversed
@@ -929,6 +937,10 @@ impl MidiScriptRuntime {
             });
             if let Some(transport_object) = transport.as_object_mut() {
                 transport_object.insert("mixer_track_peaks".to_owned(), json!(mixer_track_peaks));
+                transport_object.insert(
+                    "mixer_track_mute_locked".to_owned(),
+                    json!(mixer_track_mute_locked),
+                );
                 transport_object.insert(
                     "mixer_track_recording_file_names".to_owned(),
                     json!(mixer_track_recording_file_names),
@@ -2354,6 +2366,31 @@ mod tests {
         let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
 
         assert_eq!(result.bytes, [0xB0, 1, 1]);
+    }
+
+    #[test]
+    fn python_mixer_track_mute_lock_reads_saved_insert_flags() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport mixer\ndef OnMidiIn(event):\n    event.data1 = int(mixer.isTrackMuteLock(1))\n    event.data2 = int(mixer.isTrackMuteLock(2))\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let transport_state = Arc::new(MidiScriptTransportState::default());
+        *transport_state.mixer_track_mute_locked.lock().unwrap() =
+            vec![None, Some(true), Some(false)];
+        let mut runtime = MidiScriptRuntime::start_for_device_with_transport_state(
+            &script,
+            "Test Input",
+            transport_state,
+        )
+        .unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
+
+        assert_eq!(result.bytes, [0xB0, 1, 0]);
     }
 
     #[test]

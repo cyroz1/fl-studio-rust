@@ -3866,6 +3866,11 @@ impl MixerInsertSummary {
         self.flags.map(|flags| flags & (1 << 2) != 0)
     }
 
+    /// Whether solo and mute actions preserve this insert's current mute state.
+    pub fn mute_locked(&self) -> Option<bool> {
+        self.flags.map(|flags| flags & (1 << 11) != 0)
+    }
+
     /// Event range associated with this insert record, ending before the next recognized record.
     pub fn event_range(&self) -> std::ops::Range<usize> {
         self.first_event_index..self.end_event_index
@@ -3878,6 +3883,7 @@ impl MixerInsertSummary {
 pub(crate) struct MixerRouteAudibility {
     known_tracks: HashSet<i8>,
     disabled_tracks: HashSet<i8>,
+    mute_locked_insert_tracks: HashSet<i8>,
     soloed_insert_tracks: HashSet<i8>,
     source_transforms: HashMap<i8, MixerInsertSignalTransform>,
     source_fader_volume_raw: HashMap<i8, i32>,
@@ -4139,7 +4145,7 @@ impl MixerRouteAudibility {
         routing
     }
 
-    /// Returns the set of Mixer tracks that remain audible for the current solo flags and
+    /// Returns Mixer tracks that remain audible for current solo and mute-lock flags and
     /// per-track MIDI-script solo modes. Modes 1 and 3 include upstream source tracks; modes 2
     /// and 3 include downstream send tracks. Unrecognized, disabled, and silent routes are not
     /// used to expand the set.
@@ -4204,6 +4210,13 @@ impl MixerRouteAudibility {
                         included_tracks.insert(destination as usize);
                         pending.push(destination);
                     }
+                }
+            }
+        }
+        if !self.soloed_insert_tracks.is_empty() {
+            for &track in &self.mute_locked_insert_tracks {
+                if self.source_enabled.get(&track).copied().unwrap_or(true) {
+                    included_tracks.insert(track as usize);
                 }
             }
         }
@@ -4341,6 +4354,9 @@ impl MixerRouteAudibility {
             routing.source_enabled.insert(track, enabled);
             if !enabled {
                 routing.disabled_tracks.insert(track);
+            }
+            if insert.mute_locked() == Some(true) {
+                routing.mute_locked_insert_tracks.insert(track);
             }
             if insert.soloed() == Some(true) {
                 routing.soloed_insert_tracks.insert(track);
@@ -28816,7 +28832,7 @@ mod tests {
         event_stream.extend_from_slice(&(-1_i32).to_le_bytes());
         event_stream.push(0x95);
         event_stream.extend_from_slice(&0_u32.to_le_bytes());
-        let flags = 0x8000_0005_u32;
+        let flags = 0x8000_0805_u32;
         let mut flags_payload = vec![0xAA, 0xBB, 0xCC, 0xDD];
         flags_payload.extend_from_slice(&flags.to_le_bytes());
         flags_payload.extend_from_slice(&[0x11, 0x22, 0x33, 0x44]);
@@ -28831,6 +28847,7 @@ mod tests {
         assert_eq!(insert.polarity_reversed(), Some(true));
         assert_eq!(insert.swap_left_right(), Some(false));
         assert_eq!(insert.effects_enabled(), Some(true));
+        assert_eq!(insert.mute_locked(), Some(true));
 
         let flags_event_index = insert.flags_event_index.expect("flags event is recognized");
         let original_events = document
@@ -28852,15 +28869,16 @@ mod tests {
             .expect("known Mixer flags should be editable");
 
         let insert = &document.mixer_inserts()[0];
-        assert_eq!(insert.flags(), Some(0x8000_100E));
+        assert_eq!(insert.flags(), Some(0x8000_180E));
         assert_eq!(insert.enabled(), Some(true));
         assert_eq!(insert.soloed(), Some(true));
         assert_eq!(insert.polarity_reversed(), Some(false));
         assert_eq!(insert.swap_left_right(), Some(true));
         assert_eq!(insert.effects_enabled(), Some(true));
+        assert_eq!(insert.mute_locked(), Some(true));
         let edited_payload = document.events()[flags_event_index].payload();
         assert_eq!(&edited_payload[..4], &[0xAA, 0xBB, 0xCC, 0xDD]);
-        assert_eq!(&edited_payload[4..8], &0x8000_100E_u32.to_le_bytes());
+        assert_eq!(&edited_payload[4..8], &0x8000_180E_u32.to_le_bytes());
         assert_eq!(&edited_payload[8..], &[0x11, 0x22, 0x33, 0x44]);
         for (index, event) in document.events().iter().enumerate() {
             if index != flags_event_index {
@@ -28872,7 +28890,8 @@ mod tests {
             .encode_lossless()
             .expect("edited flags should encode losslessly");
         let reparsed = FlpDocument::parse(&encoded).expect("edited project should parse");
-        assert_eq!(reparsed.mixer_inserts()[0].flags(), Some(0x8000_100E));
+        assert_eq!(reparsed.mixer_inserts()[0].flags(), Some(0x8000_180E));
+        assert_eq!(reparsed.mixer_inserts()[0].mute_locked(), Some(true));
 
         let mut legacy_stream = vec![0x9A];
         legacy_stream.extend_from_slice(&(-1_i32).to_le_bytes());
@@ -28881,13 +28900,14 @@ mod tests {
         legacy_stream.push(0x95);
         legacy_stream.extend_from_slice(&0_u32.to_le_bytes());
         let mut legacy_flags = vec![0; 4];
-        legacy_flags.extend_from_slice(&(1_u32 << 3).to_le_bytes());
+        legacy_flags.extend_from_slice(&((1_u32 << 3) | (1 << 11)).to_le_bytes());
         legacy_flags.extend_from_slice(&[0; 4]);
         append_data_event(&mut legacy_stream, 0xDC, &legacy_flags);
         let mut legacy = FlpDocument::parse(&flp_fixture(&legacy_stream, &[], &[]))
             .expect("the legacy fixture should parse");
         legacy.project_version = Some("24.2.0".to_owned());
         assert_eq!(legacy.mixer_inserts()[0].enabled(), Some(true));
+        assert_eq!(legacy.mixer_inserts()[0].mute_locked(), Some(true));
     }
 
     #[test]
@@ -29035,6 +29055,35 @@ mod tests {
             vec![3]
         );
         assert_eq!(routing.soloed_insert_tracks, HashSet::from([3]));
+    }
+
+    #[test]
+    fn mixer_mute_locked_enabled_tracks_remain_audible_during_solo() {
+        let insert = |ordinal| {
+            let flags = match ordinal {
+                0 => 1 << 3,
+                1 => (1 << 3) | (1 << 12),
+                2 => (1 << 3) | (1 << 11),
+                3 => 1 << 11,
+                _ => 1 << 3,
+            };
+            MixerInsertSummary {
+                ordinal,
+                input_raw: -1,
+                output_raw: -1,
+                color_raw: 0,
+                icon_raw: None,
+                name: None,
+                flags: Some(flags),
+                flags_event_index: None,
+                first_event_index: 0,
+                end_event_index: 0,
+            }
+        };
+        let routing =
+            MixerRouteAudibility::from_inserts_with_parameters((0..=3).map(insert), &[], None);
+
+        assert_eq!(routing.live_solo_included_tracks(&[]), vec![1, 2]);
     }
 
     #[test]
