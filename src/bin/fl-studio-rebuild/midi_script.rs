@@ -946,16 +946,20 @@ impl MidiScriptRuntime {
                     .transport_state
                     .arrangement_live_selection_end
                     .load(Ordering::Relaxed),
-                "midi_pickup_enabled": self
-                    .transport_state
-                    .midi_pickup_enabled
-                    .load(Ordering::Relaxed)
-                    != 0,
                 "project_title": project_title,
                 "project_author": project_author,
                 "project_genre": project_genre,
             });
             if let Some(transport_object) = transport.as_object_mut() {
+                transport_object.insert(
+                    "midi_pickup_enabled".to_owned(),
+                    json!(
+                        self.transport_state
+                            .midi_pickup_enabled
+                            .load(Ordering::Relaxed)
+                            != 0
+                    ),
+                );
                 transport_object.insert("mixer_track_peaks".to_owned(), json!(mixer_track_peaks));
                 transport_object.insert(
                     "mixer_track_slot_colors".to_owned(),
