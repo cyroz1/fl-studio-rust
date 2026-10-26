@@ -10,6 +10,8 @@ sys.stdout = sys.stderr
 _active_transport_actions = None
 _active_transport_state = {}
 _midi_out_new_messages = {}
+_mixer_pickup_previous_values = {}
+_active_midi_input_callback = False
 _has_meters = False
 
 
@@ -507,6 +509,34 @@ def _mixer_store_track_parameter(index, state_name, value_raw):
     values[index] = value_raw
 
 
+def _mixer_parameter_pickup_passes(index, parameter, value_raw, pickup_mode, state_name):
+    if pickup_mode == 0 or not _active_midi_input_callback:
+        return True
+    if pickup_mode == 2 and not bool(_active_transport_state.get("midi_pickup_enabled", True)):
+        _mixer_pickup_previous_values.pop((index, parameter), None)
+        return True
+
+    values = _active_transport_state.get(state_name, [])
+    current_raw = values[index] if index < len(values) else None
+    if current_raw is None:
+        current_raw = 8_000 if parameter == "volume" else 0
+    current_raw = int(current_raw)
+    minimum_raw, maximum_raw = {
+        "volume": (0, 10_000),
+        "pan": (-6_400, 6_400),
+        "stereo_separation": (-64, 64),
+    }[parameter]
+    current_raw = max(minimum_raw, min(maximum_raw, current_raw))
+    key = (index, parameter)
+    previous_raw = _mixer_pickup_previous_values.get(key)
+    _mixer_pickup_previous_values[key] = value_raw
+    if previous_raw is None:
+        return value_raw == current_raw
+    return (previous_raw <= current_raw <= value_raw) or (
+        value_raw <= current_raw <= previous_raw
+    )
+
+
 def _mixer_set_track_parameter(index, parameter, value, pickupMode, scale, state_name):
     index = _mixer_track_index(index)
     try:
@@ -520,9 +550,11 @@ def _mixer_set_track_parameter(index, parameter, value, pickupMode, scale, state
         raise ValueError(
             "Mixer pickup mode must be midi.PIM_None, PIM_AlwaysPickup, or PIM_FollowGlobal"
         )
-    if pickupMode != 0:
-        raise NotImplementedError("Mixer track pickup behavior is unsupported")
     value_raw = int(round(max(-1.0, min(1.0, value)) * scale))
+    if not _mixer_parameter_pickup_passes(
+        index, parameter, value_raw, pickupMode, state_name
+    ):
+        return
     _mixer_store_track_parameter(index, state_name, value_raw)
     _request_transport_action(
         {
@@ -563,9 +595,11 @@ def _mixer_set_track_volume(index, volume, pickupMode=0):
         raise ValueError(
             "Mixer pickup mode must be midi.PIM_None, PIM_AlwaysPickup, or PIM_FollowGlobal"
         )
-    if pickupMode != 0:
-        raise NotImplementedError("Mixer track pickup behavior is unsupported")
     value_raw = int(round(max(0.0, min(1.0, volume)) * 10_000))
+    if not _mixer_parameter_pickup_passes(
+        index, "volume", value_raw, pickupMode, "mixer_track_volume_raw"
+    ):
+        return
     _mixer_store_track_parameter(index, "mixer_track_volume_raw", value_raw)
     _request_transport_action(
         {
@@ -1572,10 +1606,12 @@ def _specific_callback(event):
 
 
 def _dispatch(namespace, value):
-    global _active_transport_actions, _active_transport_state
+    global _active_transport_actions, _active_transport_state, _active_midi_input_callback
     _active_transport_actions = []
     _active_transport_state = value.get("transport", {})
+    _active_midi_input_callback = False
     if value.get("initialize"):
+        _mixer_pickup_previous_values.clear()
         callback = namespace.get("OnInit")
         if callback is not None:
             callback()
@@ -1628,6 +1664,7 @@ def _dispatch(namespace, value):
         return {"handled": False, "actions": _active_transport_actions}
 
     event = EventData(value)
+    _active_midi_input_callback = True
     for callback_name in ("OnMidiIn", "OnMidiMsg"):
         callback = namespace.get(callback_name)
         if callback is not None:

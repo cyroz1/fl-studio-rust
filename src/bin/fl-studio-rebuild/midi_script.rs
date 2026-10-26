@@ -214,6 +214,7 @@ pub struct MidiScriptTransportState {
     pub arrangement_selection_end: AtomicU64,
     pub arrangement_live_selection_start: AtomicU64,
     pub arrangement_live_selection_end: AtomicU64,
+    pub midi_pickup_enabled: AtomicU8,
     pub mixer_track_names: Mutex<Vec<String>>,
     pub mixer_track_recording_file_names: Mutex<Vec<String>>,
     pub mixer_selected_track: AtomicU64,
@@ -263,6 +264,7 @@ impl Default for MidiScriptTransportState {
             arrangement_selection_end: AtomicU64::new(0),
             arrangement_live_selection_start: AtomicU64::new(0),
             arrangement_live_selection_end: AtomicU64::new(0),
+            midi_pickup_enabled: AtomicU8::new(1),
             mixer_track_names: Mutex::new(vec!["Master".to_owned()]),
             mixer_track_recording_file_names: Mutex::new(vec![String::new()]),
             mixer_selected_track: AtomicU64::new(0),
@@ -944,6 +946,11 @@ impl MidiScriptRuntime {
                     .transport_state
                     .arrangement_live_selection_end
                     .load(Ordering::Relaxed),
+                "midi_pickup_enabled": self
+                    .transport_state
+                    .midi_pickup_enabled
+                    .load(Ordering::Relaxed)
+                    != 0,
                 "project_title": project_title,
                 "project_author": project_author,
                 "project_genre": project_genre,

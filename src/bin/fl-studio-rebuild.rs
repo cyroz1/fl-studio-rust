@@ -5091,6 +5091,7 @@ struct DawUi {
     midi_auto_detect_controller_script: bool,
     midi_script_discovery_error: Option<String>,
     midi_connect_input_on_startup: bool,
+    midi_pickup_enabled: bool,
     midi_input_error: Option<String>,
     midi_input_connection: Option<ConnectedMidiInput>,
     midi_script_transport_state: Arc<MidiScriptTransportState>,
@@ -6247,6 +6248,7 @@ impl DawUi {
             input_script: midi_selected_controller_script,
             input_script_auto_detect: midi_auto_detect_controller_script,
             connect_input_on_startup: midi_connect_input_on_startup,
+            midi_pickup_enabled,
             first_connect_device_ids: midi_first_connect_device_ids,
             output_id: midi_selected_output_id,
             connect_output_on_startup: midi_connect_output_on_startup,
@@ -6720,6 +6722,7 @@ impl DawUi {
             midi_auto_detect_controller_script,
             midi_script_discovery_error,
             midi_connect_input_on_startup,
+            midi_pickup_enabled,
             midi_input_error,
             midi_input_connection: None,
             midi_script_transport_state: Arc::new(MidiScriptTransportState::default()),
@@ -14354,6 +14357,9 @@ impl DawUi {
         self.midi_script_transport_state
             .state
             .store(state, Ordering::Relaxed);
+        self.midi_script_transport_state
+            .midi_pickup_enabled
+            .store(u8::from(self.midi_pickup_enabled), Ordering::Relaxed);
         let has_script = self
             .midi_input_connection
             .as_ref()
@@ -49171,6 +49177,7 @@ impl DawUi {
             input_script: self.midi_selected_controller_script.clone(),
             input_script_auto_detect: self.midi_auto_detect_controller_script,
             connect_input_on_startup: self.midi_connect_input_on_startup,
+            midi_pickup_enabled: self.midi_pickup_enabled,
             first_connect_device_ids: self.midi_first_connect_device_ids.clone(),
             output_id: self.midi_selected_output_id.clone(),
             connect_output_on_startup: self.midi_connect_output_on_startup,
@@ -55009,6 +55016,18 @@ impl DawUi {
                 "Connect this MIDI input when the app starts",
             )
             .on_hover_text("Reconnects the saved input device when it is available at startup.")
+            .changed()
+        {
+            self.persist_midi_device_selections();
+        }
+        if ui
+            .checkbox(
+                &mut self.midi_pickup_enabled,
+                "Enable global MIDI control pickup",
+            )
+            .on_hover_text(
+                "For scripts using PIM_FollowGlobal, wait until the controller crosses the current Mixer value before changing volume, pan, or stereo separation.",
+            )
             .changed()
         {
             self.persist_midi_device_selections();
@@ -63358,6 +63377,7 @@ struct MidiDeviceSelections {
     input_script: Option<PathBuf>,
     input_script_auto_detect: bool,
     connect_input_on_startup: bool,
+    midi_pickup_enabled: bool,
     first_connect_device_ids: BTreeSet<String>,
     output_id: Option<String>,
     connect_output_on_startup: bool,
@@ -63385,6 +63405,7 @@ impl Default for MidiDeviceSelections {
             input_script: None,
             input_script_auto_detect: false,
             connect_input_on_startup: false,
+            midi_pickup_enabled: true,
             first_connect_device_ids: BTreeSet::new(),
             output_id: None,
             connect_output_on_startup: false,
@@ -63480,7 +63501,7 @@ fn parse_midi_thru_preferences(contents: &str) -> (bool, Option<u8>) {
 
 fn encode_midi_device_selections(selections: &MidiDeviceSelections) -> String {
     format!(
-        "input={}\ninput_script={}\ninput_script_auto_detect={}\nconnect_input_on_startup={}\nfirst_connect_device_ids={}\noutput={}\nconnect_output_on_startup={}\noutput_routes={}\nbank_msb={}\nbank_lsb={}\nprograms={}\nclock={}\nplaylist_notes={}\npattern_notes={}\nfixed_velocity={}\nperformance_channel={}\nrecord_audio={}\nrecord_notes={}\nrecord_automation={}\nrecord_automation_controller={}\nrecord_automation_channel={}\nrecord_automation_flags={}\n",
+        "input={}\ninput_script={}\ninput_script_auto_detect={}\nconnect_input_on_startup={}\nmidi_pickup_enabled={}\nfirst_connect_device_ids={}\noutput={}\nconnect_output_on_startup={}\noutput_routes={}\nbank_msb={}\nbank_lsb={}\nprograms={}\nclock={}\nplaylist_notes={}\npattern_notes={}\nfixed_velocity={}\nperformance_channel={}\nrecord_audio={}\nrecord_notes={}\nrecord_automation={}\nrecord_automation_controller={}\nrecord_automation_channel={}\nrecord_automation_flags={}\n",
         encode_midi_device_id(selections.input_id.as_deref().unwrap_or_default()),
         selections.input_script.as_ref().map_or_else(
             || "-".to_owned(),
@@ -63488,6 +63509,7 @@ fn encode_midi_device_selections(selections: &MidiDeviceSelections) -> String {
         ),
         u8::from(selections.input_script_auto_detect),
         u8::from(selections.connect_input_on_startup),
+        u8::from(selections.midi_pickup_enabled),
         encode_midi_device_ids(&selections.first_connect_device_ids),
         encode_midi_device_id(selections.output_id.as_deref().unwrap_or_default()),
         u8::from(selections.connect_output_on_startup),
@@ -63523,6 +63545,8 @@ fn parse_midi_device_selections(contents: &str) -> MidiDeviceSelections {
             selections.input_script_auto_detect = enabled == "1";
         } else if let Some(enabled) = line.strip_prefix("connect_input_on_startup=") {
             selections.connect_input_on_startup = enabled == "1";
+        } else if let Some(enabled) = line.strip_prefix("midi_pickup_enabled=") {
+            selections.midi_pickup_enabled = enabled == "1";
         } else if let Some(encoded_ids) = line.strip_prefix("first_connect_device_ids=") {
             selections.first_connect_device_ids = parse_midi_device_ids(encoded_ids);
         } else if let Some(encoded_id) = line.strip_prefix("output=") {
@@ -70595,6 +70619,7 @@ mod tests {
             input_script: Some(PathBuf::from("Scripts/Controller/device_test.py")),
             input_script_auto_detect: false,
             connect_input_on_startup: true,
+            midi_pickup_enabled: false,
             first_connect_device_ids: std::collections::BTreeSet::from([
                 "alsa:first,device\n雪".to_owned(),
                 "CoreMIDI:port-2".to_owned(),
