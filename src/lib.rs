@@ -17125,8 +17125,8 @@ impl FlpDocument {
                     .map(u64::from)
                     .unwrap_or(scope_end);
                 let has_removed_note_in_gap = removed_positions.iter().any(|removed_position| {
-                    u64::from(*removed_position) > u64::from(note.position)
-                        && u64::from(*removed_position) < next_original_onset
+                    *removed_position > u64::from(note.position)
+                        && *removed_position < next_original_onset
                 });
                 if !has_removed_note_in_gap {
                     continue;
