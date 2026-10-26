@@ -34174,6 +34174,24 @@ impl DawUi {
                             "Quantize end time",
                         );
                     });
+                ui.menu_button("Quantize options", |ui| {
+                    if ui.button("Reset").clicked() {
+                        self.quantize_strength_percent = 100;
+                        self.quantize_swing_percent = 0;
+                        self.quantize_sensitivity_percent = 100;
+                        self.quantize_duration_strength_percent = 100;
+                        self.quantize_mode = QuantizeNoteMode::LeaveDuration;
+                        self.quantize_velocity_level_percent = 0;
+                        self.quantize_pan_level_percent = 0;
+                        self.quantize_release_level_percent = 0;
+                        self.quantize_mod_x_level_percent = 0;
+                        self.quantize_mod_y_level_percent = 0;
+                        self.quantize_score = None;
+                        self.quantize_score_path = None;
+                        self.quantize_score_grid_cache = None;
+                        ui.close();
+                    }
+                });
                 if ui.button("Load groove score…").clicked() {
                     load_quantize_score_requested = true;
                 }
