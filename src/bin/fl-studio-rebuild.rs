@@ -48459,12 +48459,22 @@ impl DawUi {
                                 } else {
                                     saved_state
                                 };
+                                let slot_color_stroke = slot.color_raw().map_or(GRID, |raw| {
+                                    Color32::from_rgb(
+                                        (raw & 0xFF) as u8,
+                                        ((raw >> 8) & 0xFF) as u8,
+                                        ((raw >> 16) & 0xFF) as u8,
+                                    )
+                                });
                                 let width = ui.available_width();
                                 let slot_index_raw = slot_index as u16;
                                 let (response, dropped_slot) = ui.dnd_drop_zone::<(usize, u16), _>(
                                     egui::Frame::new()
                                     .fill(PANEL_DARK)
-                                    .stroke(Stroke::new(1.0, GRID))
+                                    .stroke(Stroke::new(
+                                        if slot.color_raw().is_some() { 1.5 } else { 1.0 },
+                                        slot_color_stroke,
+                                    ))
                                         .inner_margin(6.0),
                                     |ui| {
                                         ui.set_min_width(width - 14.0);
