@@ -910,7 +910,6 @@ impl MidiScriptRuntime {
                     })
                     .collect::<Vec<_>>(),
                 "mixer_track_enabled": mixer_track_enabled,
-                "mixer_track_mute_locked": mixer_track_mute_locked,
                 "mixer_track_soloed": mixer_track_soloed,
                 "mixer_track_polarity_reversed": mixer_track_polarity_reversed,
                 "mixer_track_swap_left_right": mixer_track_swap_left_right,
@@ -938,6 +937,10 @@ impl MidiScriptRuntime {
             });
             if let Some(transport_object) = transport.as_object_mut() {
                 transport_object.insert("mixer_track_peaks".to_owned(), json!(mixer_track_peaks));
+                transport_object.insert(
+                    "mixer_track_mute_locked".to_owned(),
+                    json!(mixer_track_mute_locked),
+                );
                 transport_object.insert(
                     "mixer_track_recording_file_names".to_owned(),
                     json!(mixer_track_recording_file_names),
