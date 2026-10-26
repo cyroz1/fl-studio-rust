@@ -2695,6 +2695,11 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 .as_deref()
                 .map(load_riff_machine_score)
                 .transpose()?;
+            let options = RiffMachineOptions {
+                groove_score: groove_score.as_ref(),
+                arpeggio_score: arpeggio_score.as_ref(),
+                ..options
+            };
             riff_machine_notes_with_scope(
                 Path::new(input),
                 Path::new(output),
@@ -2702,8 +2707,6 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u16(channel_id, "channel id")?,
                 None,
                 options,
-                groove_score.as_ref(),
-                arpeggio_score.as_ref(),
             )
         }
         [command, input, output, pattern_id, channel_id, note_indices, options @ ..]
@@ -2720,6 +2723,11 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 .as_deref()
                 .map(load_riff_machine_score)
                 .transpose()?;
+            let options = RiffMachineOptions {
+                groove_score: groove_score.as_ref(),
+                arpeggio_score: arpeggio_score.as_ref(),
+                ..options
+            };
             riff_machine_notes_with_scope(
                 Path::new(input),
                 Path::new(output),
@@ -2727,8 +2735,6 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u16(channel_id, "channel id")?,
                 Some(&note_indices),
                 options,
-                groove_score.as_ref(),
-                arpeggio_score.as_ref(),
             )
         }
         [command, input, output, pattern_id, channel_id, position_ticks]
@@ -9245,15 +9251,8 @@ fn riff_machine_notes_with_scope(
     channel_id: u16,
     note_indices: Option<&[usize]>,
     options: RiffMachineOptions<'_>,
-    groove_score: Option<&FscScore>,
-    arpeggio_score: Option<&FscScore>,
 ) -> Result<(), String> {
     let (_, mut document) = load_document(input)?;
-    let options = RiffMachineOptions {
-        groove_score,
-        arpeggio_score,
-        ..options
-    };
     let created = match note_indices {
         Some(note_indices) => document.riff_machine_pattern_note_selection(
             pattern_id,
