@@ -55,6 +55,7 @@ pub enum ScriptTransportAction {
     AddArrangementTimeMarker {
         tick: u32,
         name: String,
+        stop_playback: bool,
     },
     SetArrangementLiveSelection {
         tick: u32,
@@ -114,6 +115,7 @@ pub enum ScriptTransportAction {
     },
     SelectNextEmptyPatternWithNameDialog,
     FocusSelectedMixerTrackName,
+    OpenHelpManual,
     PatternJog(i32),
     TempoJog(i32),
     MarkerJumpJog(i32),
@@ -163,6 +165,7 @@ impl ScriptTransportAction {
                 Some(Self::SelectNextEmptyPatternWithNameDialog)
             }
             "focus_selected_mixer_track_name" => Some(Self::FocusSelectedMixerTrackName),
+            "open_help_manual" => Some(Self::OpenHelpManual),
             _ => None,
         }
     }
@@ -214,6 +217,7 @@ pub struct MidiScriptTransportState {
     pub arrangement_selection_end: AtomicU64,
     pub arrangement_live_selection_start: AtomicU64,
     pub arrangement_live_selection_end: AtomicU64,
+    pub midi_pickup_enabled: AtomicU8,
     pub mixer_track_names: Mutex<Vec<String>>,
     pub mixer_track_recording_file_names: Mutex<Vec<String>>,
     pub mixer_selected_track: AtomicU64,
@@ -263,6 +267,7 @@ impl Default for MidiScriptTransportState {
             arrangement_selection_end: AtomicU64::new(0),
             arrangement_live_selection_start: AtomicU64::new(0),
             arrangement_live_selection_end: AtomicU64::new(0),
+            midi_pickup_enabled: AtomicU8::new(1),
             mixer_track_names: Mutex::new(vec!["Master".to_owned()]),
             mixer_track_recording_file_names: Mutex::new(vec![String::new()]),
             mixer_selected_track: AtomicU64::new(0),
@@ -949,6 +954,15 @@ impl MidiScriptRuntime {
                 "project_genre": project_genre,
             });
             if let Some(transport_object) = transport.as_object_mut() {
+                transport_object.insert(
+                    "midi_pickup_enabled".to_owned(),
+                    json!(
+                        self.transport_state
+                            .midi_pickup_enabled
+                            .load(Ordering::Relaxed)
+                            != 0
+                    ),
+                );
                 transport_object.insert("mixer_track_peaks".to_owned(), json!(mixer_track_peaks));
                 transport_object.insert(
                     "mixer_track_slot_colors".to_owned(),
@@ -1120,9 +1134,14 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
             .ok_or_else(|| {
                 "MIDI script returned an invalid Playlist time-marker name".to_owned()
             })?;
+        let stop_playback = action
+            .get("stop_playback")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
         return Ok(ScriptTransportAction::AddArrangementTimeMarker {
             tick,
             name: marker_name.to_owned(),
+            stop_playback,
         });
     }
     if name == Some("set_arrangement_live_selection") {
@@ -2659,6 +2678,24 @@ mod tests {
     }
 
     #[test]
+    fn python_global_transport_f1_opens_help_for_global_midi_events() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport midi\nimport transport\ndef OnMidiIn(event):\n    result = transport.globalTransport(midi.FPT_F1, 1, event.pmeflags)\n    event.data1 = int(result == midi.GT_Global)\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let mut runtime = MidiScriptRuntime::start_for_device(&script, "Test Input").unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
+
+        assert_eq!(result.bytes, [0xB0, 1, 1]);
+        assert_eq!(result.actions, [ScriptTransportAction::OpenHelpManual]);
+    }
+
+    #[test]
     fn python_global_transport_f4_selects_and_names_next_empty_pattern() {
         let temporary = TestDirectory::new();
         let script_path = temporary.path().join("device_test.py");
@@ -2719,6 +2756,7 @@ mod tests {
             [ScriptTransportAction::AddArrangementTimeMarker {
                 tick: 960,
                 name: "Verse".to_owned(),
+                stop_playback: true,
             }]
         );
     }

@@ -127,6 +127,7 @@ use midi_script::{
 use midi_thru::{MidiThruSettings, MidiThruWorker};
 
 const APP_BACKGROUND: Color32 = Color32::from_rgb(27, 27, 27);
+const FL_STUDIO_HELP_URL: &str = "https://www.image-line.com/fl-studio-learning-content/fl-studio-online-manual/html/basics_shortcuts.htm";
 const PANEL: Color32 = Color32::from_rgb(44, 44, 44);
 const PANEL_DARK: Color32 = Color32::from_rgb(34, 34, 34);
 const PANEL_LIGHT: Color32 = Color32::from_rgb(57, 57, 57);
@@ -5016,6 +5017,7 @@ struct DawUi {
     selected_mixer_insert: Option<usize>,
     mixer_scroll_to_track: Option<usize>,
     mixer_track_name_editor_requested: bool,
+    open_help_manual_requested: bool,
     mixer_master_peak_hold: f32,
     mixer_insert_peak_holds: [f32; MIXER_TRACK_METER_COUNT],
     mixer_track_peak_meters: Arc<MixerTrackPeakMeters>,
@@ -5091,6 +5093,7 @@ struct DawUi {
     midi_auto_detect_controller_script: bool,
     midi_script_discovery_error: Option<String>,
     midi_connect_input_on_startup: bool,
+    midi_pickup_enabled: bool,
     midi_input_error: Option<String>,
     midi_input_connection: Option<ConnectedMidiInput>,
     midi_script_transport_state: Arc<MidiScriptTransportState>,
@@ -6247,6 +6250,7 @@ impl DawUi {
             input_script: midi_selected_controller_script,
             input_script_auto_detect: midi_auto_detect_controller_script,
             connect_input_on_startup: midi_connect_input_on_startup,
+            midi_pickup_enabled,
             first_connect_device_ids: midi_first_connect_device_ids,
             output_id: midi_selected_output_id,
             connect_output_on_startup: midi_connect_output_on_startup,
@@ -6644,6 +6648,7 @@ impl DawUi {
             selected_mixer_insert: None,
             mixer_scroll_to_track: None,
             mixer_track_name_editor_requested: false,
+            open_help_manual_requested: false,
             mixer_master_peak_hold: 0.0,
             mixer_insert_peak_holds: [0.0; MIXER_TRACK_METER_COUNT],
             mixer_track_peak_meters: Arc::new(MixerTrackPeakMeters::default()),
@@ -6720,6 +6725,7 @@ impl DawUi {
             midi_auto_detect_controller_script,
             midi_script_discovery_error,
             midi_connect_input_on_startup,
+            midi_pickup_enabled,
             midi_input_error,
             midi_input_connection: None,
             midi_script_transport_state: Arc::new(MidiScriptTransportState::default()),
@@ -14225,6 +14231,12 @@ impl DawUi {
                 }
             });
             ui.menu_button("Help", |ui| {
+                if ui.button("Open FL Studio help manual  F1").clicked() {
+                    ui.ctx()
+                        .open_url(egui::OpenUrl::new_tab(FL_STUDIO_HELP_URL));
+                    ui.close();
+                }
+                ui.separator();
                 ui.strong("Keyboard shortcuts");
                 ui.separator();
                 for (shortcut, action) in [
@@ -14354,6 +14366,9 @@ impl DawUi {
         self.midi_script_transport_state
             .state
             .store(state, Ordering::Relaxed);
+        self.midi_script_transport_state
+            .midi_pickup_enabled
+            .store(u8::from(self.midi_pickup_enabled), Ordering::Relaxed);
         let has_script = self
             .midi_input_connection
             .as_ref()
@@ -16069,7 +16084,12 @@ impl DawUi {
         }
     }
 
-    fn add_midi_script_arrangement_time_marker(&mut self, tick: u32, name: String) {
+    fn add_midi_script_arrangement_time_marker(
+        &mut self,
+        tick: u32,
+        name: String,
+        stop_playback: bool,
+    ) {
         let arrangements = self
             .document
             .as_ref()
@@ -16103,7 +16123,9 @@ impl DawUi {
             });
         match result {
             Ok(marker_index) => {
-                self.stop_project_playback();
+                if stop_playback {
+                    self.stop_project_playback();
+                }
                 self.selected_arrangement = Some(arrangement_id);
                 self.selected_time_marker = Some(marker_index);
                 self.dirty = true;
@@ -49171,6 +49193,7 @@ impl DawUi {
             input_script: self.midi_selected_controller_script.clone(),
             input_script_auto_detect: self.midi_auto_detect_controller_script,
             connect_input_on_startup: self.midi_connect_input_on_startup,
+            midi_pickup_enabled: self.midi_pickup_enabled,
             first_connect_device_ids: self.midi_first_connect_device_ids.clone(),
             output_id: self.midi_selected_output_id.clone(),
             connect_output_on_startup: self.midi_connect_output_on_startup,
@@ -50653,8 +50676,12 @@ impl DawUi {
             MidiTransportCommand::SetProjectTimeSignatureDenominator(denominator) => {
                 self.set_midi_script_project_time_signature(None, Some(denominator));
             }
-            MidiTransportCommand::AddArrangementTimeMarker { tick, name } => {
-                self.add_midi_script_arrangement_time_marker(tick, name);
+            MidiTransportCommand::AddArrangementTimeMarker {
+                tick,
+                name,
+                stop_playback,
+            } => {
+                self.add_midi_script_arrangement_time_marker(tick, name, stop_playback);
             }
             MidiTransportCommand::SetArrangementLiveSelection { tick, stop } => {
                 let selection_point = if stop {
@@ -50757,6 +50784,9 @@ impl DawUi {
                     self.status = "Open a project with a recognized Mixer track before renaming it"
                         .to_owned();
                 }
+            }
+            MidiTransportCommand::OpenHelpManual => {
+                self.open_help_manual_requested = true;
             }
             MidiTransportCommand::PatternJog(increment) => {
                 self.jog_midi_script_pattern(increment);
@@ -55013,6 +55043,18 @@ impl DawUi {
         {
             self.persist_midi_device_selections();
         }
+        if ui
+            .checkbox(
+                &mut self.midi_pickup_enabled,
+                "Enable global MIDI control pickup",
+            )
+            .on_hover_text(
+                "For scripts using PIM_FollowGlobal, wait until the controller crosses the current Mixer value before changing volume, pan, or stereo separation.",
+            )
+            .changed()
+        {
+            self.persist_midi_device_selections();
+        }
         ui.horizontal(|ui| {
             ui.add_enabled_ui(self.midi_recording.is_none(), |ui| {
                 ui.label("Input quantize");
@@ -58589,7 +58631,14 @@ impl eframe::App for DawUi {
         };
         self.history_snapshot_available_this_frame =
             frame_snapshot.is_some() || self.pending_history_snapshot.is_some();
+        if ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F1)) {
+            self.open_help_manual_requested = true;
+        }
         self.poll_midi_input(self.history_snapshot_available_this_frame);
+        if std::mem::take(&mut self.open_help_manual_requested) {
+            ui.ctx()
+                .open_url(egui::OpenUrl::new_tab(FL_STUDIO_HELP_URL));
+        }
         self.advance_midi_script_transport_move();
         if self.midi_script_transport_move.is_some() {
             ui.ctx().request_repaint_after(Duration::from_millis(16));
@@ -63358,6 +63407,7 @@ struct MidiDeviceSelections {
     input_script: Option<PathBuf>,
     input_script_auto_detect: bool,
     connect_input_on_startup: bool,
+    midi_pickup_enabled: bool,
     first_connect_device_ids: BTreeSet<String>,
     output_id: Option<String>,
     connect_output_on_startup: bool,
@@ -63385,6 +63435,7 @@ impl Default for MidiDeviceSelections {
             input_script: None,
             input_script_auto_detect: false,
             connect_input_on_startup: false,
+            midi_pickup_enabled: true,
             first_connect_device_ids: BTreeSet::new(),
             output_id: None,
             connect_output_on_startup: false,
@@ -63480,7 +63531,7 @@ fn parse_midi_thru_preferences(contents: &str) -> (bool, Option<u8>) {
 
 fn encode_midi_device_selections(selections: &MidiDeviceSelections) -> String {
     format!(
-        "input={}\ninput_script={}\ninput_script_auto_detect={}\nconnect_input_on_startup={}\nfirst_connect_device_ids={}\noutput={}\nconnect_output_on_startup={}\noutput_routes={}\nbank_msb={}\nbank_lsb={}\nprograms={}\nclock={}\nplaylist_notes={}\npattern_notes={}\nfixed_velocity={}\nperformance_channel={}\nrecord_audio={}\nrecord_notes={}\nrecord_automation={}\nrecord_automation_controller={}\nrecord_automation_channel={}\nrecord_automation_flags={}\n",
+        "input={}\ninput_script={}\ninput_script_auto_detect={}\nconnect_input_on_startup={}\nmidi_pickup_enabled={}\nfirst_connect_device_ids={}\noutput={}\nconnect_output_on_startup={}\noutput_routes={}\nbank_msb={}\nbank_lsb={}\nprograms={}\nclock={}\nplaylist_notes={}\npattern_notes={}\nfixed_velocity={}\nperformance_channel={}\nrecord_audio={}\nrecord_notes={}\nrecord_automation={}\nrecord_automation_controller={}\nrecord_automation_channel={}\nrecord_automation_flags={}\n",
         encode_midi_device_id(selections.input_id.as_deref().unwrap_or_default()),
         selections.input_script.as_ref().map_or_else(
             || "-".to_owned(),
@@ -63488,6 +63539,7 @@ fn encode_midi_device_selections(selections: &MidiDeviceSelections) -> String {
         ),
         u8::from(selections.input_script_auto_detect),
         u8::from(selections.connect_input_on_startup),
+        u8::from(selections.midi_pickup_enabled),
         encode_midi_device_ids(&selections.first_connect_device_ids),
         encode_midi_device_id(selections.output_id.as_deref().unwrap_or_default()),
         u8::from(selections.connect_output_on_startup),
@@ -63523,6 +63575,8 @@ fn parse_midi_device_selections(contents: &str) -> MidiDeviceSelections {
             selections.input_script_auto_detect = enabled == "1";
         } else if let Some(enabled) = line.strip_prefix("connect_input_on_startup=") {
             selections.connect_input_on_startup = enabled == "1";
+        } else if let Some(enabled) = line.strip_prefix("midi_pickup_enabled=") {
+            selections.midi_pickup_enabled = enabled == "1";
         } else if let Some(encoded_ids) = line.strip_prefix("first_connect_device_ids=") {
             selections.first_connect_device_ids = parse_midi_device_ids(encoded_ids);
         } else if let Some(encoded_id) = line.strip_prefix("output=") {
@@ -70595,6 +70649,7 @@ mod tests {
             input_script: Some(PathBuf::from("Scripts/Controller/device_test.py")),
             input_script_auto_detect: false,
             connect_input_on_startup: true,
+            midi_pickup_enabled: false,
             first_connect_device_ids: std::collections::BTreeSet::from([
                 "alsa:first,device\n雪".to_owned(),
                 "CoreMIDI:port-2".to_owned(),

@@ -689,6 +689,7 @@ fn midi_input_thru_message(event: MidiInputEvent) -> Option<([u8; 3], usize)> {
             | MidiTransportCommand::ShowMainView(_)
             | MidiTransportCommand::ToggleAudioSettingsWindow
             | MidiTransportCommand::ToggleProjectInfo
+            | MidiTransportCommand::OpenHelpManual
             | MidiTransportCommand::CloseAllWindows,
         ) => return None,
     };
@@ -841,6 +842,7 @@ mod tests {
             MidiTransportCommand::AddArrangementTimeMarker {
                 tick: 960,
                 name: "Verse".to_owned(),
+                stop_playback: true,
             },
             MidiTransportCommand::JumpToMarker {
                 delta: -1,
