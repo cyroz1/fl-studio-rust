@@ -33377,14 +33377,20 @@ impl DawUi {
                         egui::CollapsingHeader::new("Articulation")
                             .default_open(false)
                             .show(ui, |ui| {
-                                ui.add(
+                                let snap_available = self.piano_roll_snap != PianoRollSnap::None;
+                                if !snap_available {
+                                    ui.small("Length and Variation need an active Piano roll snap.");
+                                }
+                                ui.add_enabled(
+                                    snap_available,
                                     egui::Slider::new(
                                         &mut self.riff_length_multiplier_percent,
                                         10..=100,
                                     )
                                     .text("Multiply (%)"),
                                 );
-                                ui.add(
+                                ui.add_enabled(
+                                    snap_available,
                                     egui::Slider::new(
                                         &mut self.riff_length_variation_percent,
                                         0..=100,
@@ -33393,6 +33399,7 @@ impl DawUi {
                                 );
                                 ui.checkbox(&mut self.riff_use_original_lengths, "Use lengths");
                                 if self.riff_articulation_enabled
+                                    && snap_available
                                     && self.riff_length_variation_percent > 0
                                 {
                                     ui.horizontal(|ui| {
@@ -36191,8 +36198,18 @@ impl DawUi {
                 groove_mod_y_level_percent: self.riff_groove_mod_y_level_percent,
                 groove_pitch_level_percent: self.riff_groove_pitch_level_percent,
                 groove_quantize_mode: self.riff_groove_quantize_mode,
-                length_multiplier_percent: self.riff_length_multiplier_percent,
-                length_variation_percent: self.riff_length_variation_percent,
+                generated_note_length_ticks: (self.piano_roll_snap != PianoRollSnap::None)
+                    .then(|| self.piano_roll_snap.ticks(ppq, time_signature)),
+                length_multiplier_percent: if self.piano_roll_snap == PianoRollSnap::None {
+                    100
+                } else {
+                    self.riff_length_multiplier_percent
+                },
+                length_variation_percent: if self.piano_roll_snap == PianoRollSnap::None {
+                    0
+                } else {
+                    self.riff_length_variation_percent
+                },
                 use_original_lengths: self.riff_use_original_lengths,
                 articulation_seed: self.riff_articulation_seed,
                 velocity_variation_percent: self.riff_velocity_variation_percent,

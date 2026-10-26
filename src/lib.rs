@@ -2603,6 +2603,8 @@ pub struct RiffMachineOptions<'a> {
     pub groove_quantize_mode: RiffMachineQuantizeMode,
     /// Mix seeded offsets into note panning, from 0 through 100 percent.
     pub pan_variation_percent: u8,
+    /// Set generated note lengths to this Piano roll snap value before Articulation runs.
+    pub generated_note_length_ticks: Option<u32>,
     pub length_multiplier_percent: u8,
     /// Add seeded bipolar note-length variation after applying the multiplier.
     pub length_variation_percent: u8,
@@ -2666,6 +2668,7 @@ impl<'a> Default for RiffMachineOptions<'a> {
             groove_pitch_level_percent: 0,
             groove_quantize_mode: RiffMachineQuantizeMode::LeaveDuration,
             pan_variation_percent: 0,
+            generated_note_length_ticks: None,
             length_multiplier_percent: 100,
             length_variation_percent: 0,
             use_original_lengths: true,
@@ -15082,6 +15085,11 @@ impl FlpDocument {
                 "Riff Machine step must be greater than zero ticks",
             ));
         }
+        if options.generated_note_length_ticks == Some(0) {
+            return Err(FlpError::UnsupportedEdit(
+                "Riff Machine generated note length must be greater than zero ticks",
+            ));
+        }
         if options.arpeggiation_enabled && !(1..=4).contains(&options.range_octaves) {
             return Err(FlpError::UnsupportedEdit(
                 "Riff Machine octave range must be between 1 and 4",
@@ -15469,6 +15477,21 @@ impl FlpDocument {
         } else {
             riff_indices
         };
+        if let Some(length_ticks) = options.generated_note_length_ticks {
+            let note_edits = generated_indices
+                .iter()
+                .map(|note_index| {
+                    (
+                        *note_index,
+                        PatternNoteEdit {
+                            length: Some(length_ticks),
+                            ..PatternNoteEdit::default()
+                        },
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            updated.edit_pattern_notes_batch(pattern_id, channel_id, &note_edits)?;
+        }
         if options.mirroring_enabled && (options.mirror_horizontal || options.mirror_vertical) {
             let generated_index_set = generated_indices.iter().copied().collect::<HashSet<_>>();
             let patterns = updated.patterns()?;
