@@ -177,6 +177,37 @@ def _mixer_get_track_info(mode):
     raise ValueError("Mixer track info mode must be a midi.TN_* constant")
 
 
+def _mixer_track_number():
+    return int(_active_transport_state.get("mixer_selected_track", 0))
+
+
+def _mixer_set_track_number(index, flags=0):
+    index = _mixer_track_index(index)
+    try:
+        flags = int(flags)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("Mixer selection flags must be an integer") from error
+    if not 0 <= flags <= 0xFFFFFFFF:
+        raise ValueError("Mixer selection flags are outside the supported range")
+    _active_transport_state["mixer_selected_track"] = index
+    _request_transport_action(
+        {
+            "action": "set_mixer_track_selection",
+            "index": index,
+            "flags": flags,
+        }
+    )
+
+
+def _mixer_set_active_track(index):
+    _mixer_set_track_number(index)
+
+
+def _mixer_is_track_selected(index):
+    index = _mixer_track_index(index)
+    return index == _mixer_track_number()
+
+
 def _mixer_set_track_color(index, color):
     index = _mixer_track_index(index)
     try:
@@ -1005,6 +1036,10 @@ def _install_modules(script_name, device_name):
         "TN_FirstIns": 1,
         "TN_LastIns": 2,
         "TN_Sel": 3,
+        "curfxScrollToMakeVisible": 1,
+        "StartcurfxCancelSmoothing": 2,
+        "curfxNoDeselectAll": 4,
+        "curfxMinimalLatencyUpdate": 8,
         "PL_Start": 0,
         "PL_LoadOk": 100,
         "PL_LoadError": 101,
@@ -1167,6 +1202,10 @@ def _install_modules(script_name, device_name):
     mixer.getTrackColor = _mixer_get_track_color
     mixer.setTrackColor = _mixer_set_track_color
     mixer.getTrackInfo = _mixer_get_track_info
+    mixer.trackNumber = _mixer_track_number
+    mixer.setTrackNumber = _mixer_set_track_number
+    mixer.isTrackSelected = _mixer_is_track_selected
+    mixer.setActiveTrack = _mixer_set_active_track
     mixer.isTrackEnabled = _mixer_track_enabled
     mixer.enableTrack = _mixer_enable_track
     mixer.isTrackMuted = _mixer_is_track_muted

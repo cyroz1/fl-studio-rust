@@ -52,6 +52,10 @@ pub enum ScriptTransportAction {
         tick: u32,
         stop: bool,
     },
+    SetMixerTrackSelection {
+        index: u16,
+        flags: u32,
+    },
     SetMixerTrackName {
         index: u16,
         name: String,
@@ -1047,6 +1051,17 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
             index,
             name: track_name.to_owned(),
         });
+    }
+    if name == Some("set_mixer_track_selection") {
+        let index = action["index"]
+            .as_u64()
+            .and_then(|index| u16::try_from(index).ok())
+            .ok_or_else(|| "MIDI script returned an invalid Mixer track index".to_owned())?;
+        let flags = action["flags"]
+            .as_u64()
+            .and_then(|flags| u32::try_from(flags).ok())
+            .ok_or_else(|| "MIDI script returned invalid Mixer track selection flags".to_owned())?;
+        return Ok(ScriptTransportAction::SetMixerTrackSelection { index, flags });
     }
     if name == Some("set_mixer_track_color") {
         let index = action["index"]

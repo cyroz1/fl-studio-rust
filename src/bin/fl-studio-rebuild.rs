@@ -15327,6 +15327,28 @@ impl DawUi {
         }
     }
 
+    fn set_midi_script_mixer_track_selection(&mut self, index: u16) {
+        let track_ordinal = usize::from(index);
+        let track_exists = track_ordinal < MIXER_TRACK_METER_COUNT
+            && match self.document.as_ref() {
+                Some(document) => document
+                    .mixer_inserts()
+                    .iter()
+                    .any(|insert| insert.ordinal() == track_ordinal),
+                None => track_ordinal == 0,
+            };
+        if !track_exists {
+            self.status = format!(
+                "MIDI script cannot select Mixer track {track_ordinal} without a recognized project record"
+            );
+            return;
+        }
+        self.selected_mixer_insert = Some(track_ordinal);
+        self.midi_script_transport_state
+            .mixer_selected_track
+            .store(u64::from(index), Ordering::Relaxed);
+    }
+
     fn set_midi_script_mixer_track_name(&mut self, index: u16, name: String) {
         let result = if let Some(document) = self.document.as_mut() {
             let insert_ordinal = usize::from(index);
@@ -49974,6 +49996,9 @@ impl DawUi {
                         .arrangement_live_selection_start
                 };
                 selection_point.store(u64::from(tick), Ordering::Relaxed);
+            }
+            MidiTransportCommand::SetMixerTrackSelection { index, flags: _ } => {
+                self.set_midi_script_mixer_track_selection(index);
             }
             MidiTransportCommand::SetMixerTrackName { index, name } => {
                 self.set_midi_script_mixer_track_name(index, name);
