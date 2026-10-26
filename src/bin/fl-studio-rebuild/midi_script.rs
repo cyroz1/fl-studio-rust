@@ -2220,7 +2220,7 @@ mod tests {
     }
 
     #[test]
-    fn python_mixer_track_count_includes_master_and_first_insert() {
+    fn python_mixer_track_count_includes_master_current_and_insert_range() {
         let temporary = TestDirectory::new();
         let script_path = temporary.path().join("device_test.py");
         fs::write(
@@ -2243,7 +2243,34 @@ mod tests {
         let populated_mixer = runtime.process_event(20, &[0xB0, 7, 1]).unwrap();
 
         assert_eq!(empty_mixer.bytes, [0xB0, 2, 1]);
-        assert_eq!(populated_mixer.bytes, [0xB0, 3, 2]);
+        assert_eq!(populated_mixer.bytes, [0xB0, 4, 2]);
+    }
+
+    #[test]
+    fn python_mixer_get_track_count_excludes_master_and_current() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport mixer\ndef OnMidiIn(event):\n    event.data1 = mixer.getTrackCount()\n    event.data2 = mixer.trackCount()\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let transport_state = Arc::new(MidiScriptTransportState::default());
+        let mut runtime = MidiScriptRuntime::start_for_device_with_transport_state(
+            &script,
+            "Test Input",
+            Arc::clone(&transport_state),
+        )
+        .unwrap();
+
+        let empty_mixer = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
+        *transport_state.mixer_track_names.lock().unwrap() =
+            vec!["Master".to_owned(), "Drums".to_owned(), "Bass".to_owned()];
+        let populated_mixer = runtime.process_event(20, &[0xB0, 7, 1]).unwrap();
+
+        assert_eq!(empty_mixer.bytes, [0xB0, 0, 2]);
+        assert_eq!(populated_mixer.bytes, [0xB0, 2, 4]);
     }
 
     #[test]
