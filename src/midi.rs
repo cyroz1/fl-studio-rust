@@ -1911,7 +1911,7 @@ impl MidiTrack {
                         pan: state.pan,
                         mod_x: state.mod_x,
                         mod_y: state.mod_y,
-                        pitch_bend_offset_cents: midi_pitch_bend_offset_cents(
+                        pitch_bend_offset_cents: midi_pitch_bend_unclamped_cents(
                             state.pitch_bend_value,
                             state.pitch_bend_sensitivity_semitones,
                             state.pitch_bend_sensitivity_cents,
@@ -2015,7 +2015,7 @@ impl MidiNote {
 
     /// Pitch bend offset in cents active when the note started.
     pub fn pitch_bend_offset_cents(&self) -> i16 {
-        self.pitch_bend_offset_cents
+        self.pitch_bend_offset_cents.clamp(-1200, 1200)
     }
 
     pub fn start_tick(&self) -> u64 {
@@ -2064,6 +2064,10 @@ pub fn midi_pan_to_fl_note_pan(pan: u8) -> u8 {
 
 /// Converts a 14-bit MIDI pitch-bend value to cents using its RPN 0 sensitivity.
 pub fn midi_pitch_bend_offset_cents(value: u16, semitones: u8, cents: u8) -> i16 {
+    midi_pitch_bend_unclamped_cents(value, semitones, cents).clamp(-1200, 1200)
+}
+
+fn midi_pitch_bend_unclamped_cents(value: u16, semitones: u8, cents: u8) -> i16 {
     let bend = i32::from(value.min(0x3FFF)) - 8192;
     if bend == 0 {
         return 0;
@@ -2072,7 +2076,7 @@ pub fn midi_pitch_bend_offset_cents(value: u16, semitones: u8, cents: u8) -> i16
     let scale = if bend < 0 { 8192 } else { 8191 };
     let magnitude = (i64::from(bend.abs()) * range_cents + i64::from(scale) / 2) / i64::from(scale);
     let offset = if bend < 0 { -magnitude } else { magnitude };
-    offset.clamp(-1200, 1200) as i16
+    offset as i16
 }
 
 /// Maps a MIDI pitch-bend offset in cents to FL Studio's 10-cent note-fine-pitch steps.
@@ -2872,6 +2876,19 @@ mod tests {
         assert_eq!(notes[1].mod_x(), 64);
         assert_eq!(notes[1].mod_y(), 64);
         assert_eq!(notes[1].pitch_bend_offset_cents(), 0);
+    }
+
+    #[test]
+    fn midi_import_combines_wide_bend_and_tuning_before_clamping() {
+        let midi = MidiFile::parse(&midi_fixture(&[
+            0, 0xB0, 101, 0, 0, 0xB0, 100, 0, 0, 0xB0, 6, 24, // Bend range +/−24 semitones.
+            0, 0xB0, 100, 2, 0, 0xB0, 6, 52, // Coarse tuning −12 semitones.
+            0, 0xE0, 127, 127, 0, 0x90, 60, 100, 10, 0x80, 60, 64, 0, 0xFF, 0x2F, 0,
+        ]))
+        .unwrap();
+        let note = &midi.tracks()[0].notes()[0];
+        assert_eq!(note.pitch_bend_offset_cents(), 1200); // Existing API remains bounded.
+        assert_eq!(note.tuned_fl_pitch(), (60, 240));
     }
 
     #[test]
