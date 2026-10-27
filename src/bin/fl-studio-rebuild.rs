@@ -5149,6 +5149,7 @@ struct DawUi {
     midi_record_fixed_velocity: bool,
     record_notes_enabled: bool,
     record_automation_enabled: bool,
+    record_automation_to_playlist: bool,
     midi_record_automation_controller: u8,
     midi_record_automation_channel: u8,
     midi_record_automation_flags: u8,
@@ -5599,6 +5600,7 @@ struct ActiveMidiRecording {
     record_notes: bool,
     automation: Option<MidiAutomationRecording>,
     playlist_recording_target: Option<MidiPlaylistRecordingTarget>,
+    playlist_automation_target: Option<MidiPlaylistAutomationRecordingTarget>,
     scale_snap: Option<DetectedPianoRollScale>,
 }
 
@@ -5685,6 +5687,83 @@ fn record_pattern_controller_points(
         .draw_pattern_controller_points(pattern_id, stream, points)
         .map_err(|error| error.to_string())?;
     Ok(points.len())
+}
+
+fn record_playlist_automation_clip(
+    document: &mut FlpDocument,
+    links: &mut Vec<PlaylistVst3ParameterLink>,
+    project_path: Option<&Path>,
+    target: MidiPlaylistAutomationRecordingTarget,
+    controller: u8,
+    elapsed_ticks: u32,
+    ppq: u16,
+    points: &[(u32, f32)],
+) -> Result<(u16, usize, u32, bool), String> {
+    if points.is_empty() {
+        return Err("the take contains no selected CC changes".to_owned());
+    }
+    if ppq == 0 {
+        return Err("Playlist Automation recording requires a non-zero PPQ value".to_owned());
+    }
+
+    let mut candidate = document.clone();
+    let mut candidate_links = links.clone();
+    let channel_id = candidate
+        .duplicate_automation_channel(
+            target.template_channel_id,
+            &format!("MIDI CC {controller} Take"),
+        )
+        .map_err(|error| error.to_string())?;
+    let automation_points = points
+        .iter()
+        .map(|(position_ticks, value)| {
+            (
+                f64::from(*position_ticks) / f64::from(ppq),
+                f64::from(*value),
+                0.0,
+            )
+        })
+        .collect::<Vec<_>>();
+    candidate
+        .replace_automation_points(channel_id, &automation_points)
+        .map_err(|error| error.to_string())?;
+
+    let mut copied_parameter_links = false;
+    if let Some(project_path) = project_path {
+        let source_links = links
+            .iter()
+            .filter(|link| {
+                link.automation_channel_id == target.template_channel_id
+                    && project_paths_equal(Path::new(&link.project_path), project_path)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for mut link in source_links {
+            link.automation_channel_id = channel_id;
+            upsert_playlist_vst3_parameter_link(&mut candidate_links, link);
+            copied_parameter_links = true;
+        }
+    }
+
+    let last_point_tick = points.last().map_or(0, |(position, _)| *position);
+    let point_end_tick = last_point_tick.saturating_add(1);
+    let length_ticks = elapsed_ticks
+        .max(point_end_tick)
+        .max(target.minimum_length_ticks)
+        .max(1);
+    let clip_index = candidate
+        .create_playlist_automation_clip(
+            target.arrangement_id,
+            channel_id,
+            target.position_ticks,
+            length_ticks,
+            target.track_index,
+        )
+        .map_err(|error| error.to_string())?;
+
+    *document = candidate;
+    *links = candidate_links;
+    Ok((channel_id, clip_index, length_ticks, copied_parameter_links))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -5994,7 +6073,11 @@ fn midi_cc_to_mixer_stereo_separation_raw(value: u8) -> i32 {
 impl ActiveMidiRecording {
     fn record(&mut self, message: ReceivedMidiMessage) {
         if let Some(automation) = &mut self.automation {
-            let position = self.recorder.position_for_message(&message);
+            let position = if self.playlist_automation_target.is_some() {
+                self.recorder.elapsed_position_for_message(&message)
+            } else {
+                self.recorder.position_for_message(&message)
+            };
             if let (
                 Some(position),
                 MidiInputEvent::ControlChange {
@@ -6039,6 +6122,15 @@ struct MidiPlaylistClipExtension {
 enum MidiPlaylistRecordingTarget {
     AddClip(MidiPlaylistClipPlacement),
     ExtendClip(MidiPlaylistClipExtension),
+}
+
+#[derive(Clone, Copy)]
+struct MidiPlaylistAutomationRecordingTarget {
+    template_channel_id: u16,
+    arrangement_id: u16,
+    position_ticks: u32,
+    track_index: u16,
+    minimum_length_ticks: u32,
 }
 
 enum MidiPlaylistRecordingOutcome {
@@ -6270,6 +6362,7 @@ impl DawUi {
             record_audio: record_audio_enabled,
             record_notes: record_notes_enabled,
             record_automation: record_automation_enabled,
+            record_automation_to_playlist,
             record_automation_controller: midi_record_automation_controller,
             record_automation_channel: midi_record_automation_channel,
             record_automation_flags: midi_record_automation_flags,
@@ -6785,6 +6878,7 @@ impl DawUi {
             midi_record_fixed_velocity,
             record_notes_enabled,
             record_automation_enabled,
+            record_automation_to_playlist,
             midi_record_automation_controller,
             midi_record_automation_channel,
             midi_record_automation_flags,
@@ -16468,10 +16562,19 @@ impl DawUi {
                     record_filters_changed |= ui
                         .checkbox(&mut self.record_automation_enabled, "CC automation")
                         .on_hover_text(
-                            "Record the selected CC into this Pattern stream; use the Plug-ins panel to link the stream to a loaded VST3 parameter.",
+                            "Record the selected CC into a Pattern Event stream by default. You can also record a new Playlist Automation Clip while the Playlist is playing.",
                         )
                         .changed();
                     ui.add_enabled_ui(self.record_automation_enabled, |ui| {
+                        record_filters_changed |= ui
+                            .checkbox(
+                                &mut self.record_automation_to_playlist,
+                                "Playlist Automation Clip",
+                            )
+                            .on_hover_text(
+                                "During Playlist playback, record into a new Automation Clip copied from the selected Automation channel. Its existing parameter link is copied when available.",
+                            )
+                            .changed();
                         ui.horizontal(|ui| {
                             ui.label("CC");
                             record_filters_changed |= ui
@@ -49541,6 +49644,7 @@ impl DawUi {
             record_audio: self.record_audio_enabled,
             record_notes: self.record_notes_enabled,
             record_automation: self.record_automation_enabled,
+            record_automation_to_playlist: self.record_automation_to_playlist,
             record_automation_controller: self.midi_record_automation_controller,
             record_automation_channel: self.midi_record_automation_channel,
             record_automation_flags: self.midi_record_automation_flags,
@@ -50445,12 +50549,14 @@ impl DawUi {
                 return;
             }
         };
-        let Some(pattern_id) = self
+        let playlist_automation_requested = record_automation && self.record_automation_to_playlist;
+        let pattern_id = self
             .selected_pattern
             .filter(|pattern_id| patterns.iter().any(|pattern| pattern.id == *pattern_id))
             .or_else(|| patterns.first().map(|pattern| pattern.id))
-        else {
-            self.status = "Create or select a pattern before recording MIDI notes".to_owned();
+            .or_else(|| (playlist_automation_requested && !record_notes).then_some(0));
+        let Some(pattern_id) = pattern_id else {
+            self.status = "Create or select a Pattern before recording MIDI notes".to_owned();
             return;
         };
         let channels = document.channels();
@@ -50486,6 +50592,102 @@ impl DawUi {
             .iter()
             .find(|arrangement| arrangement.id == playback_arrangement_id)
             .or_else(|| arrangements.first());
+        let playlist_automation_target = if record_automation && self.record_automation_to_playlist
+        {
+            let Some(position_ticks) = playhead_tick else {
+                self.status =
+                    "Playlist Automation recording requires a valid Playlist playhead".to_owned();
+                return;
+            };
+            if song_timeline_start.is_none() {
+                self.status = "Start Playlist playback before recording a Playlist Automation Clip"
+                    .to_owned();
+                return;
+            }
+            let Some(template_channel_id) = self.selected_automation_channel else {
+                self.status =
+                    "Select an Automation channel before recording a Playlist Automation Clip"
+                        .to_owned();
+                return;
+            };
+            let automation_channels = match document.automation_channels() {
+                Ok(channels) => channels,
+                Err(error) => {
+                    self.status = format!("Could not read Automation channels: {error}");
+                    return;
+                }
+            };
+            if !automation_channels.iter().any(|channel| {
+                channel.channel_id() == template_channel_id && channel.data_event_index().is_some()
+            }) {
+                self.status = format!(
+                    "Automation channel {template_channel_id} needs a recognized point curve before it can be used for recording"
+                );
+                return;
+            }
+            let automation_channel_ids = automation_channels
+                .iter()
+                .filter(|channel| channel.data_event_index().is_some())
+                .map(|channel| channel.channel_id())
+                .collect::<BTreeSet<_>>();
+            if !arrangements.iter().any(|arrangement| {
+                arrangement.clips.iter().any(|clip| {
+                    matches!(clip.target(), PlaylistClipTarget::Channel { id } if automation_channel_ids.contains(&id))
+                })
+            }) {
+                self.status = "Playlist Automation recording needs an existing Automation Clip as a record template".to_owned();
+                return;
+            }
+            let Some(arrangement) = playback_arrangement else {
+                self.status = "Open a Playlist arrangement before recording Automation".to_owned();
+                return;
+            };
+            let signature_changes = arrangement
+                .time_markers
+                .iter()
+                .filter(|marker| marker.is_signature())
+                .filter_map(|marker| {
+                    Some((
+                        marker.position_ticks(),
+                        marker.numerator()?.max(1),
+                        marker.denominator()?.max(1),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            let minimum_length_ticks = playlist_bar_ticks(
+                document.header().ppq(),
+                playlist_signature_at_tick(
+                    document.metadata().time_signature(),
+                    &signature_changes,
+                    position_ticks,
+                ),
+            )
+            .min(u64::from(u32::MAX)) as u32;
+            let track_index = self
+                .selected_playlist_track
+                .filter(|track_index| *track_index <= 499)
+                .and_then(|track_index| u16::try_from(track_index).ok())
+                .or_else(|| {
+                    arrangements
+                        .iter()
+                        .flat_map(|candidate| candidate.clips.iter())
+                        .find(|clip| {
+                            matches!(clip.target(), PlaylistClipTarget::Channel { id } if id == template_channel_id)
+                        })
+                        .and_then(|clip| clip.track_index)
+                        .and_then(|track_index| u16::try_from(track_index).ok())
+                })
+                .unwrap_or(0);
+            Some(MidiPlaylistAutomationRecordingTarget {
+                template_channel_id,
+                arrangement_id: arrangement.id,
+                position_ticks,
+                track_index,
+                minimum_length_ticks,
+            })
+        } else {
+            None
+        };
         let pattern_loop_length_ticks = patterns
             .iter()
             .find(|pattern| pattern.id == pattern_id)
@@ -50630,6 +50832,7 @@ impl DawUi {
                         )
                     }),
                     playlist_recording_target,
+                    playlist_automation_target,
                     scale_snap,
                 });
                 let mut recording_targets = Vec::new();
@@ -50642,22 +50845,47 @@ impl DawUi {
                     recording_targets.push(format!("notes on {channel_name}"));
                 }
                 if record_automation {
-                    recording_targets.push(format!(
-                        "CC{} to raw stream ({}, {})",
-                        self.midi_record_automation_controller,
-                        self.midi_record_automation_channel,
-                        self.midi_record_automation_flags
-                    ));
+                    if let Some(target) = playlist_automation_target {
+                        recording_targets.push(format!(
+                            "CC{} to a new Playlist Automation Clip on track {} at tick {}",
+                            self.midi_record_automation_controller,
+                            target.track_index + 1,
+                            target.position_ticks
+                        ));
+                    } else {
+                        recording_targets.push(format!(
+                            "CC{} to raw stream ({}, {})",
+                            self.midi_record_automation_controller,
+                            self.midi_record_automation_channel,
+                            self.midi_record_automation_flags
+                        ));
+                    }
                 }
+                let recording_context = playlist_automation_target.map_or_else(
+                    || format!("to Pattern {pattern_id} from tick {recording_start_tick}"),
+                    |target| {
+                        if record_notes {
+                            format!(
+                                "to Pattern {pattern_id} and Playlist from song tick {}",
+                                target.position_ticks
+                            )
+                        } else {
+                            format!(
+                                "during Playlist playback from song tick {}",
+                                target.position_ticks
+                            )
+                        }
+                    },
+                );
                 self.status = format!(
-                    "Recording {} to Pattern {pattern_id} from tick {recording_start_tick}{}; press Record to finish",
+                    "Recording {} {recording_context}{}; press Record to finish",
                     recording_targets.join(" and "),
                     match playlist_recording_target {
                         Some(MidiPlaylistRecordingTarget::AddClip(_)) => {
-                            " · Playlist clip will be added at the start position"
+                            " · Playlist Pattern Clip will be added at the start position"
                         }
                         Some(MidiPlaylistRecordingTarget::ExtendClip(_)) => {
-                            " · active Playlist clip will extend to contain the take"
+                            " · active Playlist Pattern Clip will extend to contain the take"
                         }
                         None => "",
                     }
@@ -50680,6 +50908,7 @@ impl DawUi {
             recorder,
             automation,
             playlist_recording_target,
+            playlist_automation_target,
             scale_snap,
             ..
         } = recording;
@@ -50744,7 +50973,8 @@ impl DawUi {
             self.status = format!("Could not add recorded MIDI notes: {error}");
             return;
         }
-        if let Some((_, stream, _, _)) = automation_info.as_ref()
+        if playlist_automation_target.is_none()
+            && let Some((_, stream, _, _)) = automation_info.as_ref()
             && let Err(error) = record_pattern_controller_points(
                 &mut updated,
                 result.pattern_id,
@@ -50753,6 +50983,32 @@ impl DawUi {
             )
         {
             self.status = format!("Could not save recorded MIDI CC automation: {error}");
+            return;
+        }
+        let mut updated_playlist_vst3_parameter_links = self.playlist_vst3_parameter_links.clone();
+        let playlist_automation_result =
+            match (playlist_automation_target, automation_info.as_ref()) {
+                (Some(target), Some((controller, _, _, _))) if !automation_points.is_empty() => {
+                    Some(record_playlist_automation_clip(
+                        &mut updated,
+                        &mut updated_playlist_vst3_parameter_links,
+                        result.project_path.as_deref(),
+                        target,
+                        *controller,
+                        recorded_elapsed_ticks,
+                        document.header().ppq(),
+                        &automation_points,
+                    ))
+                }
+                _ => None,
+            };
+        if playlist_automation_target.is_some()
+            && notes.is_empty()
+            && let Some(Err(error)) = playlist_automation_result.as_ref()
+        {
+            self.status = format!(
+                "Could not save the Playlist Automation take; captured CC points were discarded: {error}"
+            );
             return;
         }
         let playlist_recording_result = if notes.is_empty() {
@@ -50790,14 +51046,24 @@ impl DawUi {
                 }
             })
         };
+        let mut playlist_automation_links_save_error = None;
+        if let Some(Ok((_, _, _, copied_links))) = playlist_automation_result.as_ref() {
+            self.playlist_vst3_parameter_links = updated_playlist_vst3_parameter_links;
+            if *copied_links {
+                playlist_automation_links_save_error =
+                    save_playlist_vst3_parameter_links(&self.playlist_vst3_parameter_links).err();
+            }
+        }
         self.document = Some(updated);
         if let Some(snapshot) = undo_snapshot {
             self.remember_undo_snapshot(snapshot);
         }
-        self.selected_pattern = Some(result.pattern_id);
+        if !notes.is_empty() || playlist_automation_target.is_none() {
+            self.selected_pattern = Some(result.pattern_id);
+        }
         if !notes.is_empty() {
             self.selected_note_channel = Some(result.channel_id);
-        } else if !automation_points.is_empty() {
+        } else if !automation_points.is_empty() && playlist_automation_target.is_none() {
             self.view = MainView::PianoRoll;
         }
         self.dirty = true;
@@ -50817,18 +51083,29 @@ impl DawUi {
                 ));
             }
         }
-        if let Some((controller, (channel, flags), overflowed, _)) = automation_info
+        if let Some((controller, (channel, flags), overflowed, _)) = automation_info.as_ref()
             && !automation_points.is_empty()
         {
-            let suffix = if overflowed {
+            let suffix = if *overflowed {
                 "; later CC changes were ignored after the point limit"
             } else {
                 ""
             };
-            status_parts.push(format!(
-                "Recorded {} CC{controller} point(s) into raw Pattern stream ({channel}, {flags}){suffix}; no parameter link was created",
-                automation_points.len()
-            ));
+            if playlist_automation_target.is_some()
+                && playlist_automation_result
+                    .as_ref()
+                    .is_some_and(|recording_result| recording_result.is_ok())
+            {
+                status_parts.push(format!(
+                    "Recorded {} CC{controller} point(s) into a new Playlist Automation Clip{suffix}",
+                    automation_points.len()
+                ));
+            } else if playlist_automation_target.is_none() {
+                status_parts.push(format!(
+                    "Recorded {} CC{controller} point(s) into raw Pattern stream ({channel}, {flags}){suffix}; no parameter link was created",
+                    automation_points.len()
+                ));
+            }
         }
         let mut status = status_parts.join(" · ");
         if snapped_to_scale && let Some(scale) = scale_snap {
@@ -50887,6 +51164,34 @@ impl DawUi {
                     };
                     status.push_str(&format!(" · notes saved; {action}: {error}"));
                 }
+            }
+        }
+        if let (Some(target), Some(recording_result)) =
+            (playlist_automation_target, playlist_automation_result)
+        {
+            match recording_result {
+                Ok((channel_id, clip_index, length_ticks, _)) => {
+                    self.selected_automation_channel = Some(channel_id);
+                    self.selected_arrangement = Some(target.arrangement_id);
+                    self.selected_clip = Some(clip_index);
+                    self.selected_playlist_clips.clear();
+                    self.selected_playlist_clips.insert(clip_index);
+                    self.playlist_selection_anchor = Some(clip_index);
+                    self.view = MainView::Playlist;
+                    status.push_str(&format!(
+                        " · Automation Clip added on track {} at tick {} for {length_ticks} ticks",
+                        target.track_index + 1,
+                        target.position_ticks
+                    ));
+                    if playlist_automation_links_save_error.is_some() {
+                        status.push_str(
+                            " · its copied VST3 parameter link works for this session but could not be saved",
+                        );
+                    }
+                }
+                Err(error) => status.push_str(&format!(
+                    " · Playlist Automation Clip not added; captured CC points were discarded: {error}"
+                )),
             }
         }
         self.status = status;
@@ -63801,6 +64106,7 @@ struct MidiDeviceSelections {
     record_audio: bool,
     record_notes: bool,
     record_automation: bool,
+    record_automation_to_playlist: bool,
     record_automation_controller: u8,
     record_automation_channel: u8,
     record_automation_flags: u8,
@@ -63829,6 +64135,7 @@ impl Default for MidiDeviceSelections {
             record_audio: true,
             record_notes: true,
             record_automation: false,
+            record_automation_to_playlist: false,
             record_automation_controller: 1,
             record_automation_channel: 0,
             record_automation_flags: 0,
@@ -63909,7 +64216,7 @@ fn parse_midi_thru_preferences(contents: &str) -> (bool, Option<u8>) {
 
 fn encode_midi_device_selections(selections: &MidiDeviceSelections) -> String {
     format!(
-        "input={}\ninput_script={}\ninput_script_auto_detect={}\nconnect_input_on_startup={}\nmidi_pickup_enabled={}\nfirst_connect_device_ids={}\noutput={}\nconnect_output_on_startup={}\noutput_routes={}\nbank_msb={}\nbank_lsb={}\nprograms={}\nclock={}\nplaylist_notes={}\npattern_notes={}\nfixed_velocity={}\nperformance_channel={}\nrecord_audio={}\nrecord_notes={}\nrecord_automation={}\nrecord_automation_controller={}\nrecord_automation_channel={}\nrecord_automation_flags={}\n",
+        "input={}\ninput_script={}\ninput_script_auto_detect={}\nconnect_input_on_startup={}\nmidi_pickup_enabled={}\nfirst_connect_device_ids={}\noutput={}\nconnect_output_on_startup={}\noutput_routes={}\nbank_msb={}\nbank_lsb={}\nprograms={}\nclock={}\nplaylist_notes={}\npattern_notes={}\nfixed_velocity={}\nperformance_channel={}\nrecord_audio={}\nrecord_notes={}\nrecord_automation={}\nrecord_automation_to_playlist={}\nrecord_automation_controller={}\nrecord_automation_channel={}\nrecord_automation_flags={}\n",
         encode_midi_device_id(selections.input_id.as_deref().unwrap_or_default()),
         selections.input_script.as_ref().map_or_else(
             || "-".to_owned(),
@@ -63933,6 +64240,7 @@ fn encode_midi_device_selections(selections: &MidiDeviceSelections) -> String {
         u8::from(selections.record_audio),
         u8::from(selections.record_notes),
         u8::from(selections.record_automation),
+        u8::from(selections.record_automation_to_playlist),
         selections.record_automation_controller.min(127),
         selections.record_automation_channel,
         selections.record_automation_flags
@@ -63997,6 +64305,8 @@ fn parse_midi_device_selections(contents: &str) -> MidiDeviceSelections {
             selections.record_notes = enabled == "1";
         } else if let Some(enabled) = line.strip_prefix("record_automation=") {
             selections.record_automation = enabled == "1";
+        } else if let Some(enabled) = line.strip_prefix("record_automation_to_playlist=") {
+            selections.record_automation_to_playlist = enabled == "1";
         } else if let Some(controller) = line.strip_prefix("record_automation_controller=") {
             if let Ok(controller) = controller.parse::<u8>()
                 && controller <= 127
@@ -71051,6 +71361,7 @@ mod tests {
             record_audio: false,
             record_notes: true,
             record_automation: true,
+            record_automation_to_playlist: true,
             record_automation_controller: 74,
             record_automation_channel: 240,
             record_automation_flags: 129,

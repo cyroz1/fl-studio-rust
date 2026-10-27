@@ -22102,6 +22102,102 @@ impl FlpDocument {
         Ok(())
     }
 
+    /// Replaces every point in one type-5 automation channel while retaining its opaque header
+    /// and era-specific trailer. New points receive zeroed opaque tail bytes, as with insertion.
+    pub fn replace_automation_points(
+        &mut self,
+        channel_id: u16,
+        points: &[(f64, f64, f32)],
+    ) -> Result<(), FlpError> {
+        let channels = self.channels();
+        let mut matching = channels.iter().filter(|channel| channel.id == channel_id);
+        let Some(channel) = matching.next() else {
+            return Err(FlpError::ChannelNotFound(channel_id));
+        };
+        if matching.next().is_some() {
+            return Err(FlpError::AmbiguousChannelId(channel_id));
+        }
+        if channel.kind != Some(5) {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel is not a type-5 automation channel",
+            ));
+        }
+        let mut automation_events = channel
+            .event_range()
+            .filter(|index| self.events[*index].opcode == 0xEA);
+        let Some(event_index) = automation_events.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected automation channel has no existing 0xEA point blob",
+            ));
+        };
+        if automation_events.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected automation channel has multiple 0xEA point blobs",
+            ));
+        }
+        let event = &self.events[event_index];
+        if !matches!(event.encoding, PayloadEncoding::Data { .. }) {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected 0xEA automation blob is not a length-prefixed data event",
+            ));
+        }
+        decode_automation_points(event)?;
+
+        let new_count = u32::try_from(points.len()).map_err(|_| FlpError::LengthOverflow)?;
+        let old_count = usize::try_from(u32::from_le_bytes(
+            event.payload[FLP_AUTOMATION_COUNT_OFFSET..FLP_AUTOMATION_POINTS_OFFSET]
+                .try_into()
+                .expect("a decoded automation blob has a four-byte point count"),
+        ))
+        .map_err(|_| FlpError::LengthOverflow)?;
+        let old_points_end = FLP_AUTOMATION_POINTS_OFFSET
+            .checked_add(
+                old_count
+                    .checked_mul(FLP_AUTOMATION_POINT_SIZE)
+                    .ok_or(FlpError::LengthOverflow)?,
+            )
+            .ok_or(FlpError::LengthOverflow)?;
+
+        let mut previous_position = 0.0;
+        for (position, value, tension) in points {
+            if !position.is_finite() || *position < previous_position {
+                return Err(FlpError::UnsupportedEdit(
+                    "automation point positions must remain finite, non-negative, and ordered",
+                ));
+            }
+            validate_automation_point_value(*value)?;
+            validate_automation_point_tension(*tension)?;
+            previous_position = *position;
+        }
+
+        let point_bytes_length = points
+            .len()
+            .checked_mul(FLP_AUTOMATION_POINT_SIZE)
+            .ok_or(FlpError::LengthOverflow)?;
+        let payload_capacity = FLP_AUTOMATION_POINTS_OFFSET
+            .checked_add(point_bytes_length)
+            .and_then(|length| length.checked_add(event.payload.len() - old_points_end))
+            .ok_or(FlpError::LengthOverflow)?;
+        let mut payload = Vec::with_capacity(payload_capacity);
+        payload.extend_from_slice(&event.payload[..FLP_AUTOMATION_COUNT_OFFSET]);
+        payload.extend_from_slice(&new_count.to_le_bytes());
+        let mut previous_position = 0.0;
+        for (position, value, tension) in points {
+            payload.extend_from_slice(&(*position - previous_position).to_le_bytes());
+            payload.extend_from_slice(&value.to_le_bytes());
+            payload.extend_from_slice(&tension.to_le_bytes());
+            payload.extend_from_slice(&[0; 4]);
+            previous_position = *position;
+        }
+        payload.extend_from_slice(&event.payload[old_points_end..]);
+
+        let mut candidate = self.clone();
+        candidate.events[event_index].replace_data_payload(payload)?;
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
     /// Replaces the source path in an existing sample-bearing channel's `0xC4` event.
     /// The channel's string encoding and bytes after the terminator are preserved.
     /// This does not create a missing sample-path event.

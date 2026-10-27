@@ -1917,6 +1917,13 @@ impl MidiPatternRecorder {
             .map(|position| position.pattern_tick)
     }
 
+    /// Returns the tick offset from the take start using the same timestamp origin,
+    /// tempo map, and input offset as recorded notes.
+    pub fn elapsed_position_for_message(&mut self, message: &ReceivedMidiMessage) -> Option<u32> {
+        self.position_for_message_with_timeline(message)
+            .map(|position| position.timeline_tick.saturating_sub(self.start_tick))
+    }
+
     fn position_for_message_with_timeline(
         &mut self,
         message: &ReceivedMidiMessage,
