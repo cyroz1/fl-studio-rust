@@ -14441,7 +14441,9 @@ impl DawUi {
             .map_or((0.0, 0.0), AudioEngine::output_peak_channels);
         self.midi_script_mixer_peak_holds[0] = master_peaks;
         for track in 1..MIXER_TRACK_METER_COUNT {
-            let (left, right) = self.mixer_track_peak_meters.take_peak_channels(track);
+            let (left, right) = self
+                .mixer_track_peak_meters
+                .take_post_effect_peak_channels(track);
             let held = &mut self.midi_script_mixer_peak_holds[track];
             held.0 = left.max(held.0 * decay);
             held.1 = right.max(held.1 * decay);

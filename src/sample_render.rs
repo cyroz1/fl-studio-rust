@@ -2135,6 +2135,8 @@ pub fn stream_input_monitor_through_mixer(
     let mut output_block = vec![0.0_f32; BLOCK_FRAMES * 2];
     let mut mixer_buses = mixer_buses_required
         .then(|| vec![0.0_f32; MIXER_TRACK_METER_COUNT * BLOCK_FRAMES * 2 * mixer_bus_planes]);
+    let mut post_effect_buses = mixer_effect_buses_required
+        .then(|| vec![0.0_f32; MIXER_TRACK_METER_COUNT * BLOCK_FRAMES * 2]);
     if let Some(processor) = vst3_processor.as_mut() {
         processor.set_live_mixer_source_targets(mixer_meters);
         processor.start_processing()?;
@@ -2161,6 +2163,9 @@ pub fn stream_input_monitor_through_mixer(
                 .map(|buses| &mut buses[..active_bus_samples]);
             if let Some(buses) = buses.as_deref_mut() {
                 buses.fill(0.0);
+            }
+            if let Some(buses) = post_effect_buses.as_deref_mut() {
+                buses[..MIXER_TRACK_METER_COUNT * sample_count].fill(0.0);
             }
             for (frame_index, input_frame) in input_frames[..frame_count].iter().enumerate() {
                 if !route_is_audible {
@@ -2250,7 +2255,15 @@ pub fn stream_input_monitor_through_mixer(
             }
             if let Some(processor) = vst3_processor.as_mut() {
                 if let Some(buses) = buses.as_deref_mut() {
-                    processor.mix_next_block_with_meter_buses(block, buses)?;
+                    if let Some(post_effect_buses) = post_effect_buses.as_deref_mut() {
+                        processor.mix_next_block_with_post_effect_buses(
+                            block,
+                            buses,
+                            &mut post_effect_buses[..MIXER_TRACK_METER_COUNT * sample_count],
+                        )?;
+                    } else {
+                        processor.mix_next_block_with_meter_buses(block, buses)?;
+                    }
                 } else {
                     processor.mix_next_block(block)?;
                 }
@@ -2272,6 +2285,27 @@ pub fn stream_input_monitor_through_mixer(
                                 )
                             });
                     mixer_meters.publish_stereo_peak(track, left_peak, right_peak);
+                    let post_effect_track_samples =
+                        post_effect_buses
+                            .as_deref()
+                            .map_or(track_samples, |post_effect_buses| {
+                                let start = track * sample_count;
+                                &post_effect_buses[start..start + sample_count]
+                            });
+                    let (post_effect_frames, _) = post_effect_track_samples.as_chunks::<2>();
+                    let (post_effect_left_peak, post_effect_right_peak) = post_effect_frames
+                        .iter()
+                        .fold((0.0_f32, 0.0_f32), |(left_peak, right_peak), frame| {
+                            (
+                                left_peak.max(frame[0].abs()),
+                                right_peak.max(frame[1].abs()),
+                            )
+                        });
+                    mixer_meters.publish_post_effect_stereo_peak(
+                        track,
+                        post_effect_left_peak,
+                        post_effect_right_peak,
+                    );
                 }
             }
             master_output.apply(block);
@@ -5292,6 +5326,8 @@ fn stream_prepared_playlist_render_with_performance(
         .vst3_processor
         .as_deref()
         .is_some_and(Vst3PlaylistStreamProcessor::needs_mixer_insert_buses);
+    let mixer_post_effect_buses_required =
+        mixer_effect_buses_required && (capture_post_effect_buses || meters.is_some());
     let mixer_post_effect_stems_required = capture_post_effect_buses && mixer_effect_buses_required;
     let mixer_bus_planes = 1 + usize::from(mixer_effect_buses_required);
     let meter_plane_samples = MIXER_TRACK_METER_COUNT * STREAM_BLOCK_FRAMES * 2;
@@ -5301,7 +5337,7 @@ fn stream_prepared_playlist_render_with_performance(
         Vec::new()
     };
     let mut post_effect_buses =
-        mixer_post_effect_stems_required.then(|| vec![0.0f32; meter_plane_samples]);
+        mixer_post_effect_buses_required.then(|| vec![0.0f32; meter_plane_samples]);
     let direct_source_delay_frames = render.vst3_processor.as_deref().map_or(
         0,
         Vst3PlaylistStreamProcessor::pdc_direct_source_delay_frames,
@@ -5374,6 +5410,9 @@ fn stream_prepared_playlist_render_with_performance(
                 } else {
                     None
                 };
+                if let Some(post_effect_buses) = post_effect_buses.as_deref_mut() {
+                    post_effect_buses[..meter_bus_samples].fill(0.0);
+                }
                 mix_prepared_audio_clip_block(
                     &audio_mix_context,
                     block_start,
@@ -5448,6 +5487,27 @@ fn stream_prepared_playlist_render_with_performance(
                             },
                         );
                         meters.publish_stereo_peak(track, left_peak, right_peak);
+                        let post_effect_track_samples = post_effect_buses.as_deref().map_or(
+                            track_samples,
+                            |post_effect_buses| {
+                                let start = track * sample_count;
+                                &post_effect_buses[start..start + sample_count]
+                            },
+                        );
+                        let (post_effect_frames, _) = post_effect_track_samples.as_chunks::<2>();
+                        let (post_effect_left_peak, post_effect_right_peak) = post_effect_frames
+                            .iter()
+                            .fold((0.0_f32, 0.0_f32), |(left_peak, right_peak), frame| {
+                                (
+                                    left_peak.max(frame[0].abs()),
+                                    right_peak.max(frame[1].abs()),
+                                )
+                            });
+                        meters.publish_post_effect_stereo_peak(
+                            track,
+                            post_effect_left_peak,
+                            post_effect_right_peak,
+                        );
                     }
                 }
                 render.master_output.apply(block);
@@ -5463,8 +5523,9 @@ fn stream_prepared_playlist_render_with_performance(
                         pre_effect: meter_buses
                             .as_deref()
                             .map(|buses| &buses[..MIXER_TRACK_METER_COUNT * samples_to_write]),
-                        post_effect: post_effect_buses
-                            .as_deref()
+                        post_effect: mixer_post_effect_stems_required
+                            .then(|| post_effect_buses.as_deref())
+                            .flatten()
                             .map(|buses| &buses[..MIXER_TRACK_METER_COUNT * samples_to_write]),
                     },
                 )?;

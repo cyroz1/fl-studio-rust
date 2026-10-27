@@ -88,13 +88,15 @@ pub(crate) struct LiveMixerSendTargetAtomics {
 /// Block-peak snapshots for the supported live Playlist Mixer routes.
 ///
 /// The render worker publishes the maximum sample for each insert between UI reads. The UI
-/// consumes the combined values with [`take_peak`](Self::take_peak); MIDI scripts can consume
-/// channel-specific values independently with [`take_peak_channels`](Self::take_peak_channels).
-/// Both paths keep the audio thread lock-free.
+/// consumes the combined pre-effect values with [`take_peak`](Self::take_peak); MIDI scripts
+/// consume channel-specific pre-effect or post-effect values independently. Both paths keep the
+/// audio thread lock-free.
 pub struct MixerTrackPeakMeters {
     peaks: [AtomicU32; MIXER_TRACK_METER_COUNT],
     script_peaks_left: [AtomicU32; MIXER_TRACK_METER_COUNT],
     script_peaks_right: [AtomicU32; MIXER_TRACK_METER_COUNT],
+    script_post_effect_peaks_left: [AtomicU32; MIXER_TRACK_METER_COUNT],
+    script_post_effect_peaks_right: [AtomicU32; MIXER_TRACK_METER_COUNT],
     live_mixer_insert_fader_raw: [Arc<AtomicI32>; MIXER_TRACK_METER_COUNT],
     live_mixer_insert_pan_raw: [Arc<AtomicI32>; MIXER_TRACK_METER_COUNT],
     live_mixer_insert_stereo_separation_raw: [Arc<AtomicI32>; MIXER_TRACK_METER_COUNT],
@@ -118,6 +120,12 @@ impl Default for MixerTrackPeakMeters {
             peaks: std::array::from_fn(|_| AtomicU32::new(0.0_f32.to_bits())),
             script_peaks_left: std::array::from_fn(|_| AtomicU32::new(0.0_f32.to_bits())),
             script_peaks_right: std::array::from_fn(|_| AtomicU32::new(0.0_f32.to_bits())),
+            script_post_effect_peaks_left: std::array::from_fn(|_| {
+                AtomicU32::new(0.0_f32.to_bits())
+            }),
+            script_post_effect_peaks_right: std::array::from_fn(|_| {
+                AtomicU32::new(0.0_f32.to_bits())
+            }),
             live_mixer_insert_fader_raw: std::array::from_fn(|_| {
                 Arc::new(AtomicI32::new(i32::MIN))
             }),
@@ -166,6 +174,20 @@ impl MixerTrackPeakMeters {
         )
     }
 
+    /// Consume left and right post-effect insert peaks published since the previous script read.
+    pub fn take_post_effect_peak_channels(&self, track: usize) -> (f32, f32) {
+        let take = |peaks: &[AtomicU32; MIXER_TRACK_METER_COUNT]| {
+            peaks
+                .get(track)
+                .map(|peak| f32::from_bits(peak.swap(0.0_f32.to_bits(), Ordering::AcqRel)))
+                .unwrap_or(0.0)
+        };
+        (
+            take(&self.script_post_effect_peaks_left),
+            take(&self.script_post_effect_peaks_right),
+        )
+    }
+
     /// Clear all pending meter peaks before starting a new live stream.
     pub fn clear(&self) {
         for peak in &self.peaks {
@@ -175,6 +197,8 @@ impl MixerTrackPeakMeters {
             .script_peaks_left
             .iter()
             .chain(self.script_peaks_right.iter())
+            .chain(self.script_post_effect_peaks_left.iter())
+            .chain(self.script_post_effect_peaks_right.iter())
         {
             peak.store(0.0_f32.to_bits(), Ordering::Release);
         }
@@ -547,6 +571,15 @@ impl MixerTrackPeakMeters {
             publish_positive_peak(slot, left);
         }
         if let Some(slot) = self.script_peaks_right.get(track) {
+            publish_positive_peak(slot, right);
+        }
+    }
+
+    pub(crate) fn publish_post_effect_stereo_peak(&self, track: usize, left: f32, right: f32) {
+        if let Some(slot) = self.script_post_effect_peaks_left.get(track) {
+            publish_positive_peak(slot, left);
+        }
+        if let Some(slot) = self.script_post_effect_peaks_right.get(track) {
             publish_positive_peak(slot, right);
         }
     }
