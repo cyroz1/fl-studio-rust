@@ -50594,11 +50594,14 @@ impl DawUi {
             .or_else(|| arrangements.first());
         let playlist_automation_target = if record_automation && self.record_automation_to_playlist
         {
-            let Some(position_ticks) = playhead_tick else {
+            let Some(position_tick) = playhead_tick
+                .filter(|tick| tick.is_finite() && (0.0..=f64::from(u32::MAX)).contains(tick))
+            else {
                 self.status =
                     "Playlist Automation recording requires a valid Playlist playhead".to_owned();
                 return;
             };
+            let position_ticks = position_tick.round() as u32;
             if song_timeline_start.is_none() {
                 self.status = "Start Playlist playback before recording a Playlist Automation Clip"
                     .to_owned();
