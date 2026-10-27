@@ -1836,7 +1836,15 @@ impl MidiTrack {
                             }
                         }
                         121 => {
+                            let sensitivity_semitones = state.pitch_bend_sensitivity_semitones;
+                            let sensitivity_cents = state.pitch_bend_sensitivity_cents;
+                            let coarse_tuning = state.channel_coarse_tuning;
+                            let fine_tuning = state.channel_fine_tuning;
                             *state = MidiChannelNoteState::default();
+                            state.pitch_bend_sensitivity_semitones = sensitivity_semitones;
+                            state.pitch_bend_sensitivity_cents = sensitivity_cents;
+                            state.channel_coarse_tuning = coarse_tuning;
+                            state.channel_fine_tuning = fine_tuning;
                             sostenuto_captured_notes.remove(&channel);
                             if let Some(note_indices) = deferred_note_offs.remove(&channel) {
                                 for note_index in note_indices {
@@ -2883,6 +2891,20 @@ mod tests {
     }
 
     #[test]
+    fn midi_import_reset_retains_rpn_values_and_clears_selection() {
+        let midi = MidiFile::parse(&midi_fixture(&[
+            0, 0xB0, 101, 0, 0, 0xB0, 100, 0, 0, 0xB0, 6, 12, 0, 0xB0, 100, 2, 0, 0xB0, 6,
+            66, // +2 semitones channel tuning.
+            0, 0xB0, 121, 0, 0, 0xB0, 6, 80, // Reset clears selection, not tuning.
+            0, 0xE0, 127, 127, 0, 0x90, 60, 100, 10, 0x80, 60, 64, 0, 0xFF, 0x2F, 0,
+        ]))
+        .unwrap();
+        let notes = midi.tracks()[0].notes();
+        assert_eq!(notes[0].pitch_bend_offset_cents(), 1200);
+        assert_eq!(notes[0].tuned_fl_pitch(), (62, 240));
+    }
+
+    #[test]
     fn midi_import_combines_wide_bend_and_tuning_before_clamping() {
         let midi = MidiFile::parse(&midi_fixture(&[
             0, 0xB0, 101, 0, 0, 0xB0, 100, 0, 0, 0xB0, 6, 24, // Bend range +/−24 semitones.
@@ -2908,7 +2930,7 @@ mod tests {
         let notes = midi.tracks()[0].notes();
         assert_eq!(notes[0].tuned_fl_pitch(), (60, 153));
         assert_eq!(notes[1].tuned_fl_pitch(), (60, 120));
-        assert_eq!(notes[2].tuned_fl_pitch(), (60, 120));
+        assert_eq!(notes[2].tuned_fl_pitch(), (60, 143));
         let mut extreme = notes[1].clone();
         extreme.channel_coarse_tuning = 20;
         assert_eq!(extreme.tuned_fl_pitch(), (68, 240));

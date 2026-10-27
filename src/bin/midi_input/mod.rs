@@ -1063,16 +1063,12 @@ impl MidiInputChannelState {
                 self.mod_x = 64;
                 self.mod_y = 64;
                 self.pitch_bend_value = 8192;
-                self.pitch_bend_sensitivity_semitones = 2;
-                self.pitch_bend_sensitivity_cents = 0;
                 self.rpn_msb = 127;
                 self.rpn_lsb = 127;
                 self.rpn_selected = false;
                 self.nrpn_selected = false;
                 self.nrpn_msb = 127;
                 self.nrpn_lsb = 127;
-                self.channel_coarse_tuning = 64;
-                self.channel_fine_tuning = 8192;
             }
             MidiInputEvent::ControlChange {
                 controller: 98,
@@ -3326,7 +3322,8 @@ mod tests {
             controller: 121,
             value: 0,
         });
-        assert_eq!(state.sampler_pitch_offset_cents(), 0);
+        assert_eq!(state.sampler_pitch_offset_cents(), -1175);
+        assert_eq!(state.raw_pitch_bend_sensitivity_semitones(), 24);
     }
 
     #[test]
@@ -3360,7 +3357,7 @@ mod tests {
     }
 
     #[test]
-    fn reset_all_controllers_centers_pitch_bend_and_restores_its_default_range() {
+    fn reset_all_controllers_centers_bend_but_preserves_registered_values() {
         let mut state = MidiInputChannelState::default();
         for (controller, value) in [(7, 63), (10, 100), (11, 48), (71, 0), (74, 127)] {
             state.update(MidiInputEvent::ControlChange {
@@ -3409,8 +3406,8 @@ mod tests {
         assert_eq!(state.raw_pitch_bend_value(), 8192);
         assert_eq!(state.sampler_pitch_offset_cents(), 0);
         assert_eq!(state.tuned_note_pitch(60).1, 120);
-        assert_eq!(state.raw_pitch_bend_sensitivity_semitones(), 2);
-        assert_eq!(state.raw_pitch_bend_sensitivity_cents(), 0);
+        assert_eq!(state.raw_pitch_bend_sensitivity_semitones(), 12);
+        assert_eq!(state.raw_pitch_bend_sensitivity_cents(), 50);
 
         // Reset also nulls the selected RPN, so later Data Entry cannot change bend range.
         state.update(MidiInputEvent::ControlChange {
@@ -3418,7 +3415,7 @@ mod tests {
             controller: 6,
             value: 7,
         });
-        assert_eq!(state.raw_pitch_bend_sensitivity_semitones(), 2);
+        assert_eq!(state.raw_pitch_bend_sensitivity_semitones(), 12);
     }
 
     #[test]
