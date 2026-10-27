@@ -52,6 +52,7 @@ pub enum ScriptTransportAction {
     SetCurrentTempoMilliBpm(u32),
     SetProjectTimeSignatureNumerator(u8),
     SetProjectTimeSignatureDenominator(u8),
+    SetGlobalSwingMixRaw(u8),
     AddArrangementTimeMarker {
         tick: u32,
         name: String,
@@ -61,6 +62,7 @@ pub enum ScriptTransportAction {
         tick: u32,
         stop: bool,
     },
+    SelectChannel(u16),
     SetMixerTrackSelection {
         index: u16,
         flags: u32,
@@ -116,6 +118,11 @@ pub enum ScriptTransportAction {
     SelectNextEmptyPatternWithNameDialog,
     FocusSelectedMixerTrackName,
     OpenHelpManual,
+    Undo,
+    Redo,
+    UndoHistoryJog(i32),
+    TogglePianoRollSnap,
+    PianoRollSnapJog(i32),
     PatternJog(i32),
     TempoJog(i32),
     MarkerJumpJog(i32),
@@ -166,6 +173,9 @@ impl ScriptTransportAction {
             }
             "focus_selected_mixer_track_name" => Some(Self::FocusSelectedMixerTrackName),
             "open_help_manual" => Some(Self::OpenHelpManual),
+            "undo" => Some(Self::Undo),
+            "redo" => Some(Self::Redo),
+            "toggle_piano_roll_snap" => Some(Self::TogglePianoRollSnap),
             _ => None,
         }
     }
@@ -202,6 +212,7 @@ pub struct MidiScriptTransportState {
     pub project_changed_flag: AtomicI32,
     pub time_signature_numerator: AtomicU64,
     pub time_signature_denominator: AtomicU64,
+    pub global_swing_mix_raw: AtomicU64,
     pub song_length_ticks: AtomicU64,
     pub song_position_seconds: AtomicU64,
     pub song_length_seconds: AtomicU64,
@@ -218,6 +229,8 @@ pub struct MidiScriptTransportState {
     pub arrangement_live_selection_start: AtomicU64,
     pub arrangement_live_selection_end: AtomicU64,
     pub midi_pickup_enabled: AtomicU8,
+    pub channel_ids: Mutex<Vec<u16>>,
+    pub selected_channel_id: AtomicU64,
     pub mixer_track_names: Mutex<Vec<String>>,
     pub mixer_track_recording_file_names: Mutex<Vec<String>>,
     pub mixer_selected_track: AtomicU64,
@@ -252,6 +265,7 @@ impl Default for MidiScriptTransportState {
             project_changed_flag: AtomicI32::new(0),
             time_signature_numerator: AtomicU64::new(4),
             time_signature_denominator: AtomicU64::new(4),
+            global_swing_mix_raw: AtomicU64::new(0),
             song_length_ticks: AtomicU64::new(0),
             song_position_seconds: AtomicU64::new(0.0_f64.to_bits()),
             song_length_seconds: AtomicU64::new(0.0_f64.to_bits()),
@@ -268,6 +282,8 @@ impl Default for MidiScriptTransportState {
             arrangement_live_selection_start: AtomicU64::new(0),
             arrangement_live_selection_end: AtomicU64::new(0),
             midi_pickup_enabled: AtomicU8::new(1),
+            channel_ids: Mutex::new(Vec::new()),
+            selected_channel_id: AtomicU64::new(u64::MAX),
             mixer_track_names: Mutex::new(vec!["Master".to_owned()]),
             mixer_track_recording_file_names: Mutex::new(vec![String::new()]),
             mixer_selected_track: AtomicU64::new(0),
@@ -714,6 +730,16 @@ impl MidiScriptRuntime {
             .lock()
             .map(|names| names.clone())
             .unwrap_or_default();
+        let channel_ids = self
+            .transport_state
+            .channel_ids
+            .lock()
+            .map(|ids| ids.clone())
+            .unwrap_or_default();
+        let selected_channel_id = self
+            .transport_state
+            .selected_channel_id
+            .load(Ordering::Relaxed);
         let mixer_track_names = self
             .transport_state
             .mixer_track_names
@@ -954,6 +980,17 @@ impl MidiScriptRuntime {
                 "project_genre": project_genre,
             });
             if let Some(transport_object) = transport.as_object_mut() {
+                transport_object.insert("channel_ids".to_owned(), json!(channel_ids));
+                transport_object
+                    .insert("selected_channel_id".to_owned(), json!(selected_channel_id));
+                transport_object.insert(
+                    "global_swing_mix_raw".to_owned(),
+                    json!(
+                        self.transport_state
+                            .global_swing_mix_raw
+                            .load(Ordering::Relaxed)
+                    ),
+                );
                 transport_object.insert(
                     "midi_pickup_enabled".to_owned(),
                     json!(
@@ -1057,6 +1094,28 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
         return Ok(ScriptTransportAction::SetSongPosition(
             position.min(SCRIPT_SONG_POSITION_SCALE_U32),
         ));
+    }
+    if name == Some("undo_history_jog") {
+        let increment = action["increment"]
+            .as_i64()
+            .and_then(|increment| i32::try_from(increment).ok())
+            .ok_or_else(|| "MIDI script returned an invalid undo-history increment".to_owned())?;
+        return Ok(ScriptTransportAction::UndoHistoryJog(increment));
+    }
+    if name == Some("piano_roll_snap_jog") {
+        let increment = action["increment"]
+            .as_i64()
+            .and_then(|increment| i32::try_from(increment).ok())
+            .ok_or_else(|| "MIDI script returned an invalid snap-mode increment".to_owned())?;
+        return Ok(ScriptTransportAction::PianoRollSnapJog(increment));
+    }
+    if name == Some("set_global_swing_mix") {
+        let value_raw = action["value_raw"]
+            .as_u64()
+            .and_then(|value| u8::try_from(value).ok())
+            .filter(|value| *value <= 128)
+            .ok_or_else(|| "MIDI script returned an invalid global swing value".to_owned())?;
+        return Ok(ScriptTransportAction::SetGlobalSwingMixRaw(value_raw));
     }
     if name == Some("set_song_position_ticks") {
         let position = action["position"]
@@ -1178,6 +1237,13 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
             .and_then(|flags| u32::try_from(flags).ok())
             .ok_or_else(|| "MIDI script returned invalid Mixer track selection flags".to_owned())?;
         return Ok(ScriptTransportAction::SetMixerTrackSelection { index, flags });
+    }
+    if name == Some("select_channel") {
+        let channel_id = action["channel_id"]
+            .as_u64()
+            .and_then(|channel_id| u16::try_from(channel_id).ok())
+            .ok_or_else(|| "MIDI script returned an invalid Channel Rack channel ID".to_owned())?;
+        return Ok(ScriptTransportAction::SelectChannel(channel_id));
     }
     if name == Some("set_mixer_track_color") {
         let index = action["index"]

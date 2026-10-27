@@ -4814,6 +4814,7 @@ struct DawUi {
     step_graph_reset: Option<StepGraphReset>,
     active_note_drag: Option<ActiveNoteDrag>,
     piano_roll_snap: PianoRollSnap,
+    piano_roll_snap_before_none: PianoRollSnap,
     piano_roll_mouse_wheel_remainder: f32,
     piano_roll_mouse_wheel_action: Option<PianoRollMouseWheelAction>,
     piano_roll_mouse_wheel_fine: bool,
@@ -6446,6 +6447,7 @@ impl DawUi {
             step_graph_reset: None,
             active_note_drag: None,
             piano_roll_snap: PianoRollSnap::QuarterBeat,
+            piano_roll_snap_before_none: PianoRollSnap::QuarterBeat,
             piano_roll_mouse_wheel_remainder: 0.0,
             piano_roll_mouse_wheel_action: None,
             piano_roll_mouse_wheel_fine: false,
@@ -14428,6 +14430,11 @@ impl DawUi {
             .as_ref()
             .map(|document| u64::from(document.metadata().time_signature().unwrap_or((4, 4)).1))
             .unwrap_or(4);
+        let global_swing_mix_raw = self
+            .document
+            .as_ref()
+            .map(|document| u64::from(document.metadata().global_swing_mix()))
+            .unwrap_or(0);
         self.midi_script_transport_state
             .ticks_per_quarter
             .store(ticks_per_quarter, Ordering::Relaxed);
@@ -14466,6 +14473,9 @@ impl DawUi {
             .time_signature_denominator
             .store(time_signature_denominator, Ordering::Relaxed);
         self.midi_script_transport_state
+            .global_swing_mix_raw
+            .store(global_swing_mix_raw, Ordering::Relaxed);
+        self.midi_script_transport_state
             .song_length_ticks
             .store(song_length_ticks, Ordering::Relaxed);
         self.midi_script_transport_state
@@ -14495,6 +14505,30 @@ impl DawUi {
         if let Ok(mut value) = self.midi_script_transport_state.project_genre.lock() {
             *value = project_genre;
         }
+        let channel_ids = self
+            .document
+            .as_ref()
+            .map(|document| {
+                document
+                    .channels()
+                    .into_iter()
+                    .map(|channel| channel.id())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let selected_channel_id = self
+            .selected_graph_channel
+            .or_else(|| self.selected_rack_channels.iter().next().copied())
+            .or(self.selected_note_channel)
+            .filter(|channel_id| channel_ids.contains(channel_id))
+            .or_else(|| channel_ids.first().copied());
+        if let Ok(mut ids) = self.midi_script_transport_state.channel_ids.lock() {
+            *ids = channel_ids;
+        }
+        self.midi_script_transport_state.selected_channel_id.store(
+            selected_channel_id.map_or(u64::MAX, u64::from),
+            Ordering::Relaxed,
+        );
         let mixer_track_names = self
             .document
             .as_ref()
@@ -15547,6 +15581,94 @@ impl DawUi {
         } else {
             self.status = "MIDI script tempo could not be applied to this project".to_owned();
         }
+    }
+
+    fn set_midi_script_global_swing_mix(&mut self, value_raw: u8) {
+        if value_raw > 128 {
+            self.status = "MIDI script global shuffle must be between 0 and 128".to_owned();
+            return;
+        }
+        let Some(document) = self.document.as_mut() else {
+            self.status = "MIDI script shuffle changes require an open project".to_owned();
+            return;
+        };
+        if document.metadata().global_swing_mix() == value_raw {
+            return;
+        }
+        match document.set_global_swing_mix(value_raw) {
+            Ok(()) => {
+                self.midi_script_transport_state
+                    .global_swing_mix_raw
+                    .store(u64::from(value_raw), Ordering::Relaxed);
+                self.dirty = true;
+                self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+                self.status = format!(
+                    "MIDI script global shuffle set to {:.1}%",
+                    f64::from(value_raw) * (100.0 / 128.0)
+                );
+            }
+            Err(error) => {
+                self.status = format!("MIDI script could not set global shuffle: {error}");
+            }
+        }
+    }
+
+    fn toggle_midi_script_piano_roll_snap(&mut self) {
+        if self.view != MainView::PianoRoll {
+            return;
+        }
+        if self.piano_roll_snap == PianoRollSnap::None {
+            self.piano_roll_snap = self.piano_roll_snap_before_none;
+        } else {
+            self.piano_roll_snap_before_none = self.piano_roll_snap;
+            self.piano_roll_snap = PianoRollSnap::None;
+        }
+        self.status = format!(
+            "MIDI script Piano roll snap: {}",
+            self.piano_roll_snap.label()
+        );
+    }
+
+    fn jog_midi_script_piano_roll_snap(&mut self, increment: i32) {
+        if self.view != MainView::PianoRoll || increment == 0 {
+            return;
+        }
+        let current_index = PianoRollSnap::ALL
+            .iter()
+            .position(|snap| *snap == self.piano_roll_snap)
+            .unwrap_or(1);
+        let next_index = (current_index as i64 + i64::from(increment))
+            .clamp(0, PianoRollSnap::ALL.len().saturating_sub(1) as i64)
+            as usize;
+        self.piano_roll_snap = PianoRollSnap::ALL[next_index];
+        if self.piano_roll_snap != PianoRollSnap::None {
+            self.piano_roll_snap_before_none = self.piano_roll_snap;
+        }
+        self.status = format!(
+            "MIDI script Piano roll snap: {}",
+            self.piano_roll_snap.label()
+        );
+    }
+
+    fn set_midi_script_channel_selection(&mut self, channel_id: u16) {
+        let channel_exists = self.document.as_ref().is_some_and(|document| {
+            document
+                .channels()
+                .iter()
+                .any(|channel| channel.id() == channel_id)
+        });
+        if !channel_exists {
+            self.status = format!(
+                "MIDI script cannot select Channel Rack channel {channel_id} without a recognized project record"
+            );
+            return;
+        }
+        self.selected_graph_channel = Some(channel_id);
+        self.selected_note_channel = Some(channel_id);
+        self.selected_rack_channels.clear();
+        self.selected_rack_channels.insert(channel_id);
+        self.rack_selection_anchor = Some(channel_id);
+        self.status = format!("MIDI script selected Channel Rack channel {channel_id}");
     }
 
     fn set_midi_script_mixer_track_selection(&mut self, index: u16, flags: u32) {
@@ -50676,6 +50798,9 @@ impl DawUi {
             MidiTransportCommand::SetProjectTimeSignatureDenominator(denominator) => {
                 self.set_midi_script_project_time_signature(None, Some(denominator));
             }
+            MidiTransportCommand::SetGlobalSwingMixRaw(value_raw) => {
+                self.set_midi_script_global_swing_mix(value_raw);
+            }
             MidiTransportCommand::AddArrangementTimeMarker {
                 tick,
                 name,
@@ -50694,6 +50819,9 @@ impl DawUi {
                         .arrangement_live_selection_start
                 };
                 selection_point.store(u64::from(tick), Ordering::Relaxed);
+            }
+            MidiTransportCommand::SelectChannel(channel_id) => {
+                self.set_midi_script_channel_selection(channel_id);
             }
             MidiTransportCommand::SetMixerTrackSelection { index, flags } => {
                 self.set_midi_script_mixer_track_selection(index, flags);
@@ -50787,6 +50915,29 @@ impl DawUi {
             }
             MidiTransportCommand::OpenHelpManual => {
                 self.open_help_manual_requested = true;
+            }
+            MidiTransportCommand::Undo => self.undo_document(),
+            MidiTransportCommand::Redo => self.redo_document(),
+            MidiTransportCommand::UndoHistoryJog(increment) => {
+                let history_len = if increment > 0 {
+                    self.undo_history.len()
+                } else {
+                    self.redo_history.len()
+                };
+                let steps = (increment.unsigned_abs() as usize).min(history_len);
+                for _ in 0..steps {
+                    if increment > 0 {
+                        self.undo_document();
+                    } else {
+                        self.redo_document();
+                    }
+                }
+            }
+            MidiTransportCommand::TogglePianoRollSnap => {
+                self.toggle_midi_script_piano_roll_snap();
+            }
+            MidiTransportCommand::PianoRollSnapJog(increment) => {
+                self.jog_midi_script_piano_roll_snap(increment);
             }
             MidiTransportCommand::PatternJog(increment) => {
                 self.jog_midi_script_pattern(increment);

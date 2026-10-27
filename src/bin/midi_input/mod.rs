@@ -687,6 +687,9 @@ fn queue_script_transport_actions(
             ScriptTransportAction::SetProjectTimeSignatureDenominator(denominator) => {
                 MidiTransportCommand::SetProjectTimeSignatureDenominator(denominator)
             }
+            ScriptTransportAction::SetGlobalSwingMixRaw(value_raw) => {
+                MidiTransportCommand::SetGlobalSwingMixRaw(value_raw)
+            }
             ScriptTransportAction::AddArrangementTimeMarker {
                 tick,
                 name,
@@ -698,6 +701,9 @@ fn queue_script_transport_actions(
             },
             ScriptTransportAction::SetArrangementLiveSelection { tick, stop } => {
                 MidiTransportCommand::SetArrangementLiveSelection { tick, stop }
+            }
+            ScriptTransportAction::SelectChannel(channel_id) => {
+                MidiTransportCommand::SelectChannel(channel_id)
             }
             ScriptTransportAction::SetMixerTrackSelection { index, flags } => {
                 MidiTransportCommand::SetMixerTrackSelection { index, flags }
@@ -773,6 +779,15 @@ fn queue_script_transport_actions(
                 MidiTransportCommand::FocusSelectedMixerTrackName
             }
             ScriptTransportAction::OpenHelpManual => MidiTransportCommand::OpenHelpManual,
+            ScriptTransportAction::Undo => MidiTransportCommand::Undo,
+            ScriptTransportAction::Redo => MidiTransportCommand::Redo,
+            ScriptTransportAction::UndoHistoryJog(increment) => {
+                MidiTransportCommand::UndoHistoryJog(increment)
+            }
+            ScriptTransportAction::TogglePianoRollSnap => MidiTransportCommand::TogglePianoRollSnap,
+            ScriptTransportAction::PianoRollSnapJog(increment) => {
+                MidiTransportCommand::PianoRollSnapJog(increment)
+            }
             ScriptTransportAction::PatternJog(increment) => {
                 MidiTransportCommand::PatternJog(increment)
             }
@@ -826,6 +841,7 @@ pub enum MidiTransportCommand {
     SetCurrentTempo(u32),
     SetProjectTimeSignatureNumerator(u8),
     SetProjectTimeSignatureDenominator(u8),
+    SetGlobalSwingMixRaw(u8),
     AddArrangementTimeMarker {
         tick: u32,
         name: String,
@@ -835,6 +851,7 @@ pub enum MidiTransportCommand {
         tick: u32,
         stop: bool,
     },
+    SelectChannel(u16),
     SetMixerTrackSelection {
         index: u16,
         flags: u32,
@@ -890,6 +907,11 @@ pub enum MidiTransportCommand {
     SelectNextEmptyPatternWithNameDialog,
     FocusSelectedMixerTrackName,
     OpenHelpManual,
+    Undo,
+    Redo,
+    UndoHistoryJog(i32),
+    TogglePianoRollSnap,
+    PianoRollSnapJog(i32),
     PatternJog(i32),
     TempoJog(i32),
     MarkerJumpJog(i32),
@@ -1598,12 +1620,16 @@ pub fn describe_event(event: MidiInputEvent) -> String {
             | MidiTransportCommand::SetProjectTimeSignatureDenominator(_) => {
                 "MIDI script Project Time Signature".to_owned()
             }
+            MidiTransportCommand::SetGlobalSwingMixRaw(_) => {
+                "MIDI script Global Shuffle".to_owned()
+            }
             MidiTransportCommand::AddArrangementTimeMarker { .. } => {
                 "MIDI script Add Time Marker".to_owned()
             }
             MidiTransportCommand::SetArrangementLiveSelection { .. } => {
                 "MIDI script Live Selection".to_owned()
             }
+            MidiTransportCommand::SelectChannel(_) => "MIDI script Select Channel".to_owned(),
             MidiTransportCommand::SetMixerTrackSelection { .. } => {
                 "MIDI script Select Mixer Track".to_owned()
             }
@@ -1649,6 +1675,13 @@ pub fn describe_event(event: MidiInputEvent) -> String {
                 "MIDI script Rename Mixer Track".to_owned()
             }
             MidiTransportCommand::OpenHelpManual => "MIDI script Help Manual".to_owned(),
+            MidiTransportCommand::Undo => "MIDI script Undo".to_owned(),
+            MidiTransportCommand::Redo => "MIDI script Redo".to_owned(),
+            MidiTransportCommand::UndoHistoryJog(_) => "MIDI script Undo History".to_owned(),
+            MidiTransportCommand::TogglePianoRollSnap => "MIDI script Piano roll Snap".to_owned(),
+            MidiTransportCommand::PianoRollSnapJog(_) => {
+                "MIDI script Piano roll Snap Mode".to_owned()
+            }
             MidiTransportCommand::PatternJog(_) => "MIDI script Pattern Selection".to_owned(),
             MidiTransportCommand::TempoJog(_) => "MIDI script Tempo".to_owned(),
             MidiTransportCommand::MarkerJumpJog(_) => "MIDI script Marker Jump".to_owned(),

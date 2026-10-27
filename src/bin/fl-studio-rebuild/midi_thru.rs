@@ -667,8 +667,10 @@ fn midi_input_thru_message(event: MidiInputEvent) -> Option<([u8; 3], usize)> {
             | MidiTransportCommand::SetCurrentTempo(_)
             | MidiTransportCommand::SetProjectTimeSignatureNumerator(_)
             | MidiTransportCommand::SetProjectTimeSignatureDenominator(_)
+            | MidiTransportCommand::SetGlobalSwingMixRaw(_)
             | MidiTransportCommand::AddArrangementTimeMarker { .. }
             | MidiTransportCommand::SetArrangementLiveSelection { .. }
+            | MidiTransportCommand::SelectChannel(_)
             | MidiTransportCommand::SetMixerTrackSelection { .. }
             | MidiTransportCommand::SetMixerTrackName { .. }
             | MidiTransportCommand::SetMixerTrackColor { .. }
@@ -682,6 +684,11 @@ fn midi_input_thru_message(event: MidiInputEvent) -> Option<([u8; 3], usize)> {
             | MidiTransportCommand::JumpToMarker { .. }
             | MidiTransportCommand::SelectNextEmptyPatternWithNameDialog
             | MidiTransportCommand::FocusSelectedMixerTrackName
+            | MidiTransportCommand::Undo
+            | MidiTransportCommand::Redo
+            | MidiTransportCommand::UndoHistoryJog(_)
+            | MidiTransportCommand::TogglePianoRollSnap
+            | MidiTransportCommand::PianoRollSnapJog(_)
             | MidiTransportCommand::PatternJog(_)
             | MidiTransportCommand::TempoJog(_)
             | MidiTransportCommand::MarkerJumpJog(_)

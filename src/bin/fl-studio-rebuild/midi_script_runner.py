@@ -1139,6 +1139,23 @@ def _get_current_tempo(asInt=0):
     return int(tempo) if asInt else tempo
 
 
+def _get_shuffle():
+    raw = int(_active_transport_state.get("global_swing_mix_raw", 0))
+    return min(128, max(0, raw)) / 128.0
+
+
+def _set_shuffle(value):
+    try:
+        value = float(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("channels.setShuffle() value must be numeric") from error
+    if not math.isfinite(value):
+        raise ValueError("channels.setShuffle() value must be finite")
+    raw = int(math.floor(min(1.0, max(0.0, value)) * 128.0 + 0.5))
+    _active_transport_state["global_swing_mix_raw"] = raw
+    _request_transport_action({"action": "set_global_swing_mix", "value_raw": raw})
+
+
 def _set_current_tempo(tempo, asInt=0):
     try:
         tempo = float(tempo)
@@ -1228,6 +1245,42 @@ def _global_transport(command, value, pmeflags=2, flags=15):
         if value != 0:
             _request_transport_action(action)
         return 8
+    if command == 20:  # FPT_Undo
+        if value != 0:
+            _request_transport_action("undo")
+        return 8
+    if command == 21:  # FPT_UndoUp
+        if value != 0:
+            _request_transport_action("redo")
+        return 8
+    if command == 22:  # FPT_UndoJog
+        if value != 0:
+            _request_transport_action(
+                {"action": "undo_history_jog", "increment": value}
+            )
+        return 8
+    if command == 48:  # FPT_Snap
+        if value != 0:
+            _request_transport_action("toggle_piano_roll_snap")
+        return 8
+    if command == 49:  # FPT_SnapMode
+        if value != 0:
+            _request_transport_action(
+                {"action": "piano_roll_snap_jog", "increment": value}
+            )
+        return 8
+    if command == 122:  # FPT_ShuffleJog
+        current = min(
+            128,
+            max(0, int(_active_transport_state.get("global_swing_mix_raw", 0))),
+        )
+        raw = min(128, max(0, current + value))
+        if raw != current:
+            _active_transport_state["global_swing_mix_raw"] = raw
+            _request_transport_action(
+                {"action": "set_global_swing_mix", "value_raw": raw}
+            )
+        return 8
     if command in (13, 14):
         if value not in (0, 2):
             return -1
@@ -1257,6 +1310,22 @@ def _global_transport(command, value, pmeflags=2, flags=15):
         if value != 0:
             track = _mixer_track_number() + value
             _mixer_set_track_number(min(last_track, max(0, track)), 1)
+        return 8
+    if command == 102:  # FPT_ChannelJog: select a Channel Rack channel
+        channel_ids = [int(channel_id) for channel_id in _active_transport_state.get("channel_ids", [])]
+        if value != 0 and channel_ids:
+            selected_channel_id = int(_active_transport_state.get("selected_channel_id", -1))
+            try:
+                selected_index = channel_ids.index(selected_channel_id)
+            except ValueError:
+                selected_index = -1 if value > 0 else len(channel_ids)
+            selected_index = min(len(channel_ids) - 1, max(0, selected_index + value))
+            channel_id = channel_ids[selected_index]
+            if channel_id != selected_channel_id:
+                _active_transport_state["selected_channel_id"] = channel_id
+                _request_transport_action(
+                    {"action": "select_channel", "channel_id": channel_id}
+                )
         return 8
     if command == 60:  # FPT_F1: Open the Help manual
         if value != 0:
@@ -1503,6 +1572,10 @@ def _install_modules(script_name, device_name):
     mixer = _module("mixer")
     mixer.getCurrentTempo = _get_current_tempo
     mixer.setCurrentTempo = _set_current_tempo
+
+    channels = _module("channels")
+    channels.getShuffle = _get_shuffle
+    channels.setShuffle = _set_shuffle
     mixer.getTrackName = _mixer_get_track_name
     mixer.setTrackName = _mixer_set_track_name
     mixer.getTrackColor = _mixer_get_track_color
