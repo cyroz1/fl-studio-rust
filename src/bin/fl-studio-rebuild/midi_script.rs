@@ -52,6 +52,7 @@ pub enum ScriptTransportAction {
     SetCurrentTempoMilliBpm(u32),
     SetProjectTimeSignatureNumerator(u8),
     SetProjectTimeSignatureDenominator(u8),
+    SetGlobalSwingMixRaw(u8),
     AddArrangementTimeMarker {
         tick: u32,
         name: String,
@@ -208,6 +209,7 @@ pub struct MidiScriptTransportState {
     pub project_changed_flag: AtomicI32,
     pub time_signature_numerator: AtomicU64,
     pub time_signature_denominator: AtomicU64,
+    pub global_swing_mix_raw: AtomicU64,
     pub song_length_ticks: AtomicU64,
     pub song_position_seconds: AtomicU64,
     pub song_length_seconds: AtomicU64,
@@ -260,6 +262,7 @@ impl Default for MidiScriptTransportState {
             project_changed_flag: AtomicI32::new(0),
             time_signature_numerator: AtomicU64::new(4),
             time_signature_denominator: AtomicU64::new(4),
+            global_swing_mix_raw: AtomicU64::new(0),
             song_length_ticks: AtomicU64::new(0),
             song_position_seconds: AtomicU64::new(0.0_f64.to_bits()),
             song_length_seconds: AtomicU64::new(0.0_f64.to_bits()),
@@ -978,6 +981,14 @@ impl MidiScriptRuntime {
                 transport_object
                     .insert("selected_channel_id".to_owned(), json!(selected_channel_id));
                 transport_object.insert(
+                    "global_swing_mix_raw".to_owned(),
+                    json!(
+                        self.transport_state
+                            .global_swing_mix_raw
+                            .load(Ordering::Relaxed)
+                    ),
+                );
+                transport_object.insert(
                     "midi_pickup_enabled".to_owned(),
                     json!(
                         self.transport_state
@@ -1087,6 +1098,14 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
             .and_then(|increment| i32::try_from(increment).ok())
             .ok_or_else(|| "MIDI script returned an invalid undo-history increment".to_owned())?;
         return Ok(ScriptTransportAction::UndoHistoryJog(increment));
+    }
+    if name == Some("set_global_swing_mix") {
+        let value_raw = action["value_raw"]
+            .as_u64()
+            .and_then(|value| u8::try_from(value).ok())
+            .filter(|value| *value <= 128)
+            .ok_or_else(|| "MIDI script returned an invalid global swing value".to_owned())?;
+        return Ok(ScriptTransportAction::SetGlobalSwingMixRaw(value_raw));
     }
     if name == Some("set_song_position_ticks") {
         let position = action["position"]

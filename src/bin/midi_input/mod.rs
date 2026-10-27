@@ -688,6 +688,9 @@ fn queue_script_transport_actions(
             ScriptTransportAction::SetProjectTimeSignatureDenominator(denominator) => {
                 MidiTransportCommand::SetProjectTimeSignatureDenominator(denominator)
             }
+            ScriptTransportAction::SetGlobalSwingMixRaw(value_raw) => {
+                MidiTransportCommand::SetGlobalSwingMixRaw(value_raw)
+            }
             ScriptTransportAction::AddArrangementTimeMarker {
                 tick,
                 name,
@@ -835,6 +838,7 @@ pub enum MidiTransportCommand {
     SetCurrentTempo(u32),
     SetProjectTimeSignatureNumerator(u8),
     SetProjectTimeSignatureDenominator(u8),
+    SetGlobalSwingMixRaw(u8),
     AddArrangementTimeMarker {
         tick: u32,
         name: String,
@@ -1541,6 +1545,9 @@ pub fn describe_event(event: MidiInputEvent) -> String {
             MidiTransportCommand::SetProjectTimeSignatureNumerator(_)
             | MidiTransportCommand::SetProjectTimeSignatureDenominator(_) => {
                 "MIDI script Project Time Signature".to_owned()
+            }
+            MidiTransportCommand::SetGlobalSwingMixRaw(_) => {
+                "MIDI script Global Shuffle".to_owned()
             }
             MidiTransportCommand::AddArrangementTimeMarker { .. } => {
                 "MIDI script Add Time Marker".to_owned()

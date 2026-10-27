@@ -1139,6 +1139,23 @@ def _get_current_tempo(asInt=0):
     return int(tempo) if asInt else tempo
 
 
+def _get_shuffle():
+    raw = int(_active_transport_state.get("global_swing_mix_raw", 0))
+    return min(128, max(0, raw)) / 128.0
+
+
+def _set_shuffle(value):
+    try:
+        value = float(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("channels.setShuffle() value must be numeric") from error
+    if not math.isfinite(value):
+        raise ValueError("channels.setShuffle() value must be finite")
+    raw = int(math.floor(min(1.0, max(0.0, value)) * 128.0 + 0.5))
+    _active_transport_state["global_swing_mix_raw"] = raw
+    _request_transport_action({"action": "set_global_swing_mix", "value_raw": raw})
+
+
 def _set_current_tempo(tempo, asInt=0):
     try:
         tempo = float(tempo)
@@ -1240,6 +1257,18 @@ def _global_transport(command, value, pmeflags=2, flags=15):
         if value != 0:
             _request_transport_action(
                 {"action": "undo_history_jog", "increment": value}
+            )
+        return 8
+    if command == 122:  # FPT_ShuffleJog
+        current = min(
+            128,
+            max(0, int(_active_transport_state.get("global_swing_mix_raw", 0))),
+        )
+        raw = min(128, max(0, current + value))
+        if raw != current:
+            _active_transport_state["global_swing_mix_raw"] = raw
+            _request_transport_action(
+                {"action": "set_global_swing_mix", "value_raw": raw}
             )
         return 8
     if command in (13, 14):
@@ -1533,6 +1562,10 @@ def _install_modules(script_name, device_name):
     mixer = _module("mixer")
     mixer.getCurrentTempo = _get_current_tempo
     mixer.setCurrentTempo = _set_current_tempo
+
+    channels = _module("channels")
+    channels.getShuffle = _get_shuffle
+    channels.setShuffle = _set_shuffle
     mixer.getTrackName = _mixer_get_track_name
     mixer.setTrackName = _mixer_set_track_name
     mixer.getTrackColor = _mixer_get_track_color

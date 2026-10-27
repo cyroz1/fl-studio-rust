@@ -14428,6 +14428,11 @@ impl DawUi {
             .as_ref()
             .map(|document| u64::from(document.metadata().time_signature().unwrap_or((4, 4)).1))
             .unwrap_or(4);
+        let global_swing_mix_raw = self
+            .document
+            .as_ref()
+            .map(|document| u64::from(document.metadata().global_swing_mix()))
+            .unwrap_or(0);
         self.midi_script_transport_state
             .ticks_per_quarter
             .store(ticks_per_quarter, Ordering::Relaxed);
@@ -14465,6 +14470,9 @@ impl DawUi {
         self.midi_script_transport_state
             .time_signature_denominator
             .store(time_signature_denominator, Ordering::Relaxed);
+        self.midi_script_transport_state
+            .global_swing_mix_raw
+            .store(global_swing_mix_raw, Ordering::Relaxed);
         self.midi_script_transport_state
             .song_length_ticks
             .store(song_length_ticks, Ordering::Relaxed);
@@ -15570,6 +15578,36 @@ impl DawUi {
             self.tempo_bpm = bpm;
         } else {
             self.status = "MIDI script tempo could not be applied to this project".to_owned();
+        }
+    }
+
+    fn set_midi_script_global_swing_mix(&mut self, value_raw: u8) {
+        if value_raw > 128 {
+            self.status = "MIDI script global shuffle must be between 0 and 128".to_owned();
+            return;
+        }
+        let Some(document) = self.document.as_mut() else {
+            self.status = "MIDI script shuffle changes require an open project".to_owned();
+            return;
+        };
+        if document.metadata().global_swing_mix() == value_raw {
+            return;
+        }
+        match document.set_global_swing_mix(value_raw) {
+            Ok(()) => {
+                self.midi_script_transport_state
+                    .global_swing_mix_raw
+                    .store(u64::from(value_raw), Ordering::Relaxed);
+                self.dirty = true;
+                self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+                self.status = format!(
+                    "MIDI script global shuffle set to {:.1}%",
+                    f64::from(value_raw) * (100.0 / 128.0)
+                );
+            }
+            Err(error) => {
+                self.status = format!("MIDI script could not set global shuffle: {error}");
+            }
         }
     }
 
@@ -50720,6 +50758,9 @@ impl DawUi {
             }
             MidiTransportCommand::SetProjectTimeSignatureDenominator(denominator) => {
                 self.set_midi_script_project_time_signature(None, Some(denominator));
+            }
+            MidiTransportCommand::SetGlobalSwingMixRaw(value_raw) => {
+                self.set_midi_script_global_swing_mix(value_raw);
             }
             MidiTransportCommand::AddArrangementTimeMarker {
                 tick,
