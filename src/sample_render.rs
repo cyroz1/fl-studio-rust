@@ -6164,11 +6164,15 @@ fn stream_pattern_from_tick_with_vst3_to_device(
         .vst3_processor
         .as_ref()
         .is_some_and(Vst3PlaylistStreamProcessor::needs_mixer_insert_buses);
+    let mixer_meter_buses_required = live_master_meters.is_some();
+    let mixer_buses_required = mixer_meter_buses_required || mixer_effect_buses_required;
     let mixer_bus_planes = 1 + usize::from(mixer_effect_buses_required);
-    let mut mixer_buses = mixer_effect_buses_required.then(|| {
+    let mut mixer_buses = mixer_buses_required.then(|| {
         vec![0.0f32; MIXER_TRACK_METER_COUNT * SAMPLER_BLOCK_FRAMES * 2 * mixer_bus_planes]
     });
-    let mut mixer_bus_delays = if mixer_effect_buses_required {
+    let mut post_effect_buses = mixer_effect_buses_required
+        .then(|| vec![0.0f32; MIXER_TRACK_METER_COUNT * SAMPLER_BLOCK_FRAMES * 2]);
+    let mut mixer_bus_delays = if mixer_buses_required {
         (0..MIXER_TRACK_METER_COUNT * mixer_bus_planes)
             .map(|_| StereoFrameDelay::new(sampler_delay_frames))
             .collect::<Result<Vec<_>, _>>()?
@@ -6208,11 +6212,23 @@ fn stream_pattern_from_tick_with_vst3_to_device(
             sampler_delay.process_interleaved(&mut block[..sample_count])?;
             if let Some(processor) = playback.vst3_processor.as_mut() {
                 if let Some(mixer_buses) = mixer_buses.as_mut() {
-                    processor.mix_next_block_with_meter_buses(
-                        &mut block[..sample_count],
-                        &mut mixer_buses
-                            [..MIXER_TRACK_METER_COUNT * sample_count * mixer_bus_planes],
-                    )?;
+                    let active_buses = &mut mixer_buses
+                        [..MIXER_TRACK_METER_COUNT * sample_count * mixer_bus_planes];
+                    if let Some(post_effect_buses) = post_effect_buses.as_mut() {
+                        let post_effect_buses =
+                            &mut post_effect_buses[..MIXER_TRACK_METER_COUNT * sample_count];
+                        post_effect_buses.fill(0.0);
+                        processor.mix_next_block_with_post_effect_buses(
+                            &mut block[..sample_count],
+                            active_buses,
+                            post_effect_buses,
+                        )?;
+                    } else {
+                        processor.mix_next_block_with_meter_buses(
+                            &mut block[..sample_count],
+                            active_buses,
+                        )?;
+                    }
                 } else {
                     processor.mix_next_block(&mut block[..sample_count])?;
                 }
@@ -6288,13 +6304,67 @@ fn stream_pattern_from_tick_with_vst3_to_device(
             sampler_delay.process_interleaved(&mut block[..sample_count])?;
             if let Some(processor) = playback.vst3_processor.as_mut() {
                 if let Some(mixer_buses) = mixer_buses.as_mut() {
-                    processor.mix_next_block_with_meter_buses(
-                        &mut block[..sample_count],
-                        &mut mixer_buses
-                            [..MIXER_TRACK_METER_COUNT * sample_count * mixer_bus_planes],
-                    )?;
+                    let active_buses = &mut mixer_buses
+                        [..MIXER_TRACK_METER_COUNT * sample_count * mixer_bus_planes];
+                    if let Some(post_effect_buses) = post_effect_buses.as_mut() {
+                        let post_effect_buses =
+                            &mut post_effect_buses[..MIXER_TRACK_METER_COUNT * sample_count];
+                        post_effect_buses.fill(0.0);
+                        processor.mix_next_block_with_post_effect_buses(
+                            &mut block[..sample_count],
+                            active_buses,
+                            post_effect_buses,
+                        )?;
+                    } else {
+                        processor.mix_next_block_with_meter_buses(
+                            &mut block[..sample_count],
+                            active_buses,
+                        )?;
+                    }
                 } else {
                     processor.mix_next_block(&mut block[..sample_count])?;
+                }
+            }
+            if let (Some(meters), Some(mixer_buses)) = (live_master_meters, mixer_buses.as_deref())
+            {
+                let pre_effect_buses = &mixer_buses[..MIXER_TRACK_METER_COUNT * sample_count];
+                for (track, track_samples) in pre_effect_buses
+                    .chunks_exact(sample_count)
+                    .enumerate()
+                    .skip(1)
+                {
+                    let (frames, _) = track_samples.as_chunks::<2>();
+                    let (left_peak, right_peak) =
+                        frames
+                            .iter()
+                            .fold((0.0_f32, 0.0_f32), |(left_peak, right_peak), frame| {
+                                (
+                                    left_peak.max(frame[0].abs()),
+                                    right_peak.max(frame[1].abs()),
+                                )
+                            });
+                    meters.publish_stereo_peak(track, left_peak, right_peak);
+                    let post_effect_track_samples =
+                        post_effect_buses
+                            .as_deref()
+                            .map_or(track_samples, |post_effect_buses| {
+                                let start = track * sample_count;
+                                &post_effect_buses[start..start + sample_count]
+                            });
+                    let (post_effect_frames, _) = post_effect_track_samples.as_chunks::<2>();
+                    let (post_effect_left_peak, post_effect_right_peak) = post_effect_frames
+                        .iter()
+                        .fold((0.0_f32, 0.0_f32), |(left_peak, right_peak), frame| {
+                            (
+                                left_peak.max(frame[0].abs()),
+                                right_peak.max(frame[1].abs()),
+                            )
+                        });
+                    meters.publish_post_effect_stereo_peak(
+                        track,
+                        post_effect_left_peak,
+                        post_effect_right_peak,
+                    );
                 }
             }
             master_output.apply(&mut block[..sample_count]);

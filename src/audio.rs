@@ -85,7 +85,7 @@ pub(crate) struct LiveMixerSendTargetAtomics {
     pub(crate) enabled: Arc<AtomicI32>,
 }
 
-/// Block-peak snapshots for the supported live Playlist Mixer routes.
+/// Block-peak snapshots for the supported live Mixer routes.
 ///
 /// The render worker publishes the maximum sample for each insert between UI reads. The UI
 /// consumes the combined pre-effect values with [`take_peak`](Self::take_peak); MIDI scripts

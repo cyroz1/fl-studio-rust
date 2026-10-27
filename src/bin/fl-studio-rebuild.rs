@@ -40324,6 +40324,12 @@ impl DawUi {
         let read_sample_root_note = self.read_sample_root_note;
         let resampling_quality = self.live_resampling_quality;
         let worker_mixer_meters = Arc::clone(&self.mixer_track_peak_meters);
+        if staged_handoff.is_none() {
+            worker_mixer_meters.clear();
+            self.mixer_insert_peak_holds.fill(0.0);
+            self.midi_script_mixer_peak_holds.fill((0.0, 0.0));
+            self.midi_script_mixer_peak_updated_at = Instant::now();
+        }
         let (sender, receiver) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
             .name(if loop_length_ticks.is_some() {
