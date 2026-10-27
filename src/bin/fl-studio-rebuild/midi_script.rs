@@ -121,6 +121,8 @@ pub enum ScriptTransportAction {
     Undo,
     Redo,
     UndoHistoryJog(i32),
+    TogglePianoRollSnap,
+    PianoRollSnapJog(i32),
     PatternJog(i32),
     TempoJog(i32),
     MarkerJumpJog(i32),
@@ -173,6 +175,7 @@ impl ScriptTransportAction {
             "open_help_manual" => Some(Self::OpenHelpManual),
             "undo" => Some(Self::Undo),
             "redo" => Some(Self::Redo),
+            "toggle_piano_roll_snap" => Some(Self::TogglePianoRollSnap),
             _ => None,
         }
     }
@@ -1098,6 +1101,13 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
             .and_then(|increment| i32::try_from(increment).ok())
             .ok_or_else(|| "MIDI script returned an invalid undo-history increment".to_owned())?;
         return Ok(ScriptTransportAction::UndoHistoryJog(increment));
+    }
+    if name == Some("piano_roll_snap_jog") {
+        let increment = action["increment"]
+            .as_i64()
+            .and_then(|increment| i32::try_from(increment).ok())
+            .ok_or_else(|| "MIDI script returned an invalid snap-mode increment".to_owned())?;
+        return Ok(ScriptTransportAction::PianoRollSnapJog(increment));
     }
     if name == Some("set_global_swing_mix") {
         let value_raw = action["value_raw"]

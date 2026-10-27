@@ -1259,6 +1259,16 @@ def _global_transport(command, value, pmeflags=2, flags=15):
                 {"action": "undo_history_jog", "increment": value}
             )
         return 8
+    if command == 48:  # FPT_Snap
+        if value != 0:
+            _request_transport_action("toggle_piano_roll_snap")
+        return 8
+    if command == 49:  # FPT_SnapMode
+        if value != 0:
+            _request_transport_action(
+                {"action": "piano_roll_snap_jog", "increment": value}
+            )
+        return 8
     if command == 122:  # FPT_ShuffleJog
         current = min(
             128,

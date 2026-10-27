@@ -4814,6 +4814,7 @@ struct DawUi {
     step_graph_reset: Option<StepGraphReset>,
     active_note_drag: Option<ActiveNoteDrag>,
     piano_roll_snap: PianoRollSnap,
+    piano_roll_snap_before_none: PianoRollSnap,
     piano_roll_mouse_wheel_remainder: f32,
     piano_roll_mouse_wheel_action: Option<PianoRollMouseWheelAction>,
     piano_roll_mouse_wheel_fine: bool,
@@ -6446,6 +6447,7 @@ impl DawUi {
             step_graph_reset: None,
             active_note_drag: None,
             piano_roll_snap: PianoRollSnap::QuarterBeat,
+            piano_roll_snap_before_none: PianoRollSnap::QuarterBeat,
             piano_roll_mouse_wheel_remainder: 0.0,
             piano_roll_mouse_wheel_action: None,
             piano_roll_mouse_wheel_fine: false,
@@ -15609,6 +15611,43 @@ impl DawUi {
                 self.status = format!("MIDI script could not set global shuffle: {error}");
             }
         }
+    }
+
+    fn toggle_midi_script_piano_roll_snap(&mut self) {
+        if self.view != MainView::PianoRoll {
+            return;
+        }
+        if self.piano_roll_snap == PianoRollSnap::None {
+            self.piano_roll_snap = self.piano_roll_snap_before_none;
+        } else {
+            self.piano_roll_snap_before_none = self.piano_roll_snap;
+            self.piano_roll_snap = PianoRollSnap::None;
+        }
+        self.status = format!(
+            "MIDI script Piano roll snap: {}",
+            self.piano_roll_snap.label()
+        );
+    }
+
+    fn jog_midi_script_piano_roll_snap(&mut self, increment: i32) {
+        if self.view != MainView::PianoRoll || increment == 0 {
+            return;
+        }
+        let current_index = PianoRollSnap::ALL
+            .iter()
+            .position(|snap| *snap == self.piano_roll_snap)
+            .unwrap_or(1);
+        let next_index = (current_index as i64 + i64::from(increment))
+            .clamp(0, PianoRollSnap::ALL.len().saturating_sub(1) as i64)
+            as usize;
+        self.piano_roll_snap = PianoRollSnap::ALL[next_index];
+        if self.piano_roll_snap != PianoRollSnap::None {
+            self.piano_roll_snap_before_none = self.piano_roll_snap;
+        }
+        self.status = format!(
+            "MIDI script Piano roll snap: {}",
+            self.piano_roll_snap.label()
+        );
     }
 
     fn set_midi_script_channel_selection(&mut self, channel_id: u16) {
@@ -50893,6 +50932,12 @@ impl DawUi {
                         self.redo_document();
                     }
                 }
+            }
+            MidiTransportCommand::TogglePianoRollSnap => {
+                self.toggle_midi_script_piano_roll_snap();
+            }
+            MidiTransportCommand::PianoRollSnapJog(increment) => {
+                self.jog_midi_script_piano_roll_snap(increment);
             }
             MidiTransportCommand::PatternJog(increment) => {
                 self.jog_midi_script_pattern(increment);
