@@ -562,6 +562,21 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 },
             )
         }
+        [command, input, output, pattern_id, position, name]
+            if command == "create-pattern-time-marker" =>
+        {
+            edit_pattern_time_marker_file(Path::new(input), Path::new(output), parse_u16(pattern_id, "pattern id")?, None, Some(parse_u32(position, "marker position")?), Some(name))
+        }
+        [command, input, output, pattern_id, marker_index, position, name]
+            if command == "edit-pattern-time-marker" =>
+        {
+            edit_pattern_time_marker_file(Path::new(input), Path::new(output), parse_u16(pattern_id, "pattern id")?, Some(parse_usize(marker_index, "marker index")?), Some(parse_u32(position, "marker position")?), Some(name))
+        }
+        [command, input, output, pattern_id, marker_index]
+            if command == "delete-pattern-time-marker" =>
+        {
+            edit_pattern_time_marker_file(Path::new(input), Path::new(output), parse_u16(pattern_id, "pattern id")?, Some(parse_usize(marker_index, "marker index")?), None, None)
+        }
         [command, input, output, pattern_id, position, numerator, denominator]
             if command == "set-pattern-time-signature" =>
         {
@@ -4079,6 +4094,9 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild set-project-master-pitch <input.flp> <output.flp> <cents:-1200..1200>\n",
             "  flp-rebuild set-project-time-signature <input.flp> <output.flp> <numerator> <denominator>\n",
             "  flp-rebuild set-pattern-time-signature <input.flp> <output.flp> <pattern-id> <position-ticks> <numerator> <denominator>\n",
+            "  flp-rebuild create-pattern-time-marker <input.flp> <output.flp> <pattern-id> <position-ticks> <name>\n",
+            "  flp-rebuild edit-pattern-time-marker <input.flp> <output.flp> <pattern-id> <marker-index> <position-ticks> <name>\n",
+            "  flp-rebuild delete-pattern-time-marker <input.flp> <output.flp> <pattern-id> <marker-index>\n",
             "  flp-rebuild delete-pattern-time-signature <input.flp> <output.flp> <pattern-id> <position-ticks>\n",
             "  flp-rebuild set-global-swing <input.flp> <output.flp> <percent-0..100>\n",
             "  flp-rebuild rename-channel <input.flp> <output.flp> <channel-id> <name>\n",
@@ -11384,6 +11402,45 @@ fn edit_time_marker(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "edited time marker {marker_index} in arrangement {arrangement_id} to {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn edit_pattern_time_marker_file(
+    input: &Path,
+    output: &Path,
+    pattern_id: u16,
+    marker_index: Option<usize>,
+    position: Option<u32>,
+    name: Option<&str>,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    match (marker_index, position, name) {
+        (None, Some(position), Some(name)) => {
+            document
+                .create_pattern_time_marker(pattern_id, position, name)
+                .map_err(|error| error.to_string())?;
+        }
+        (Some(index), Some(position), Some(name)) => {
+            document
+                .edit_pattern_time_marker(pattern_id, index, position, name)
+                .map_err(|error| error.to_string())?;
+        }
+        (Some(index), None, None) => {
+            document
+                .delete_pattern_time_marker(pattern_id, index)
+                .map_err(|error| error.to_string())?;
+        }
+        _ => return Err("invalid Pattern time marker operation".to_owned()),
+    }
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "updated Pattern {pattern_id} time markers in {}",
         output.display()
     );
     Ok(())

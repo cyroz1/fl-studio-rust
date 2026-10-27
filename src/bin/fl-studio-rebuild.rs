@@ -5014,6 +5014,9 @@ struct DawUi {
     selected_time_marker: Option<usize>,
     selected_pattern_time_signature: Option<usize>,
     selected_pattern_time_signature_pattern: Option<u16>,
+    selected_pattern_time_marker: Option<usize>,
+    pattern_time_marker_position: u32,
+    pattern_time_marker_name: String,
     pattern_time_signature_dialog_open: bool,
     selected_mixer_insert: Option<usize>,
     mixer_scroll_to_track: Option<usize>,
@@ -6646,6 +6649,9 @@ impl DawUi {
             selected_time_marker: None,
             selected_pattern_time_signature: None,
             selected_pattern_time_signature_pattern: None,
+            selected_pattern_time_marker: None,
+            pattern_time_marker_position: 0,
+            pattern_time_marker_name: String::new(),
             pattern_time_signature_dialog_open: false,
             selected_mixer_insert: None,
             mixer_scroll_to_track: None,
@@ -28189,6 +28195,22 @@ impl DawUi {
         if self.selected_pattern_time_signature_pattern != Some(pattern_id) {
             self.selected_pattern_time_signature_pattern = Some(pattern_id);
             self.selected_pattern_time_signature = None;
+            self.selected_pattern_time_marker = None;
+        }
+        let ordinary_markers = markers
+            .iter()
+            .enumerate()
+            .filter(|(_, marker)| {
+                marker.raw_position() & !MAX_TIME_MARKER_TICK == 0
+                    && marker.numerator().is_none()
+                    && marker.denominator().is_none()
+            })
+            .collect::<Vec<_>>();
+        if self
+            .selected_pattern_time_marker
+            .is_some_and(|selected| !ordinary_markers.iter().any(|(index, _)| *index == selected))
+        {
+            self.selected_pattern_time_marker = None;
         }
         let signatures = markers
             .iter()
@@ -28224,8 +28246,11 @@ impl DawUi {
         let mut update_request = None;
         let mut delete_request = None;
         let mut create_request = false;
+        let mut marker_create = false;
+        let mut marker_save = false;
+        let mut marker_delete = false;
         let mut dialog_open = self.pattern_time_signature_dialog_open;
-        egui::Window::new(format!("Pattern {pattern_id} time signatures"))
+        egui::Window::new(format!("Pattern {pattern_id} time markers"))
             .id(egui::Id::new("pattern-time-signature-dialog"))
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .open(&mut dialog_open)
@@ -28296,8 +28321,121 @@ impl DawUi {
                     );
                     create_request = ui.button("Set signature").clicked();
                 });
+                ui.separator();
+                ui.label("Named time markers");
+                let previous_selection = self.selected_pattern_time_marker;
+                ui.horizontal_wrapped(|ui| {
+                    let label = ordinary_markers
+                        .iter()
+                        .find(|(index, _)| Some(*index) == self.selected_pattern_time_marker)
+                        .map_or_else(
+                            || "Select marker".to_owned(),
+                            |(_, marker)| {
+                                format!(
+                                    "{} · tick {}",
+                                    marker.name().unwrap_or("(unnamed)"),
+                                    marker.position_ticks()
+                                )
+                            },
+                        );
+                    egui::ComboBox::from_id_salt("pattern-time-marker-select")
+                        .selected_text(label)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.selected_pattern_time_marker,
+                                None,
+                                "New marker",
+                            );
+                            for (index, marker) in &ordinary_markers {
+                                ui.selectable_value(
+                                    &mut self.selected_pattern_time_marker,
+                                    Some(*index),
+                                    format!(
+                                        "{} · tick {}",
+                                        marker.name().unwrap_or("(unnamed)"),
+                                        marker.position_ticks()
+                                    ),
+                                );
+                            }
+                        });
+                    if self.selected_pattern_time_marker != previous_selection
+                        && let Some((_, marker)) = ordinary_markers
+                            .iter()
+                            .find(|(index, _)| Some(*index) == self.selected_pattern_time_marker)
+                    {
+                        self.pattern_time_marker_position = marker.position_ticks();
+                        self.pattern_time_marker_name = marker.name().unwrap_or("").to_owned();
+                    }
+                    ui.add(
+                        egui::DragValue::new(&mut self.pattern_time_marker_position)
+                            .range(0..=MAX_TIME_MARKER_TICK)
+                            .prefix("Tick "),
+                    );
+                    ui.text_edit_singleline(&mut self.pattern_time_marker_name);
+                    marker_create = ui.button("Add marker").clicked();
+                    marker_save = ui
+                        .add_enabled(
+                            self.selected_pattern_time_marker.is_some(),
+                            egui::Button::new("Save marker"),
+                        )
+                        .clicked();
+                    marker_delete = ui
+                        .add_enabled(
+                            self.selected_pattern_time_marker.is_some(),
+                            egui::Button::new("Delete marker"),
+                        )
+                        .clicked();
+                });
             });
         self.pattern_time_signature_dialog_open = dialog_open;
+
+        if marker_create || marker_save || marker_delete {
+            let selected = self.selected_pattern_time_marker;
+            let result = self
+                .document
+                .as_mut()
+                .ok_or_else(|| "no project is open".to_owned())
+                .and_then(|document| {
+                    if marker_create {
+                        document
+                            .create_pattern_time_marker(
+                                pattern_id,
+                                self.pattern_time_marker_position,
+                                &self.pattern_time_marker_name,
+                            )
+                            .map(Some)
+                    } else if let Some(index) = selected {
+                        if marker_save {
+                            document
+                                .edit_pattern_time_marker(
+                                    pattern_id,
+                                    index,
+                                    self.pattern_time_marker_position,
+                                    &self.pattern_time_marker_name,
+                                )
+                                .map(|()| Some(index))
+                        } else {
+                            document
+                                .delete_pattern_time_marker(pattern_id, index)
+                                .map(|()| None)
+                        }
+                    } else {
+                        return Err("no Pattern time marker selected".to_owned());
+                    }
+                    .map_err(|error| error.to_string())
+                });
+            match result {
+                Ok(selection) => {
+                    self.stop_project_playback();
+                    self.selected_pattern_time_marker = selection;
+                    self.selected_pattern_time_signature = None;
+                    self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+                    self.status = format!("Updated Pattern {pattern_id} time markers");
+                }
+                Err(error) => self.status = format!("Could not edit Pattern time marker: {error}"),
+            }
+        }
 
         if let Some(position) = delete_request {
             let result = self
@@ -28313,6 +28451,7 @@ impl DawUi {
                 Ok(()) => {
                     self.stop_project_playback();
                     self.selected_pattern_time_signature = None;
+                    self.selected_pattern_time_marker = None;
                     self.dirty = true;
                     self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     self.status =
@@ -28355,6 +28494,7 @@ impl DawUi {
                 self.stop_project_playback();
                 self.selected_pattern_time_signature = Some(marker_index);
                 self.selected_pattern_time_signature_pattern = Some(pattern_id);
+                self.selected_pattern_time_marker = None;
                 self.dirty = true;
                 self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                 self.status = format!(
@@ -33060,6 +33200,8 @@ impl DawUi {
         let mut quick_quantize_start_requested = false;
         let mut discard_note_lengths_requested = false;
         let mut open_pattern_time_signature_dialog = false;
+        let mut add_auto_pattern_marker = false;
+        let mut open_new_pattern_marker = false;
         let mut note_mute_requested = None;
         let mut note_nudge_requested = None;
         let mut note_rotation_requested = None;
@@ -33070,6 +33212,10 @@ impl DawUi {
             self.status = "Magic Lasso canceled".to_owned();
         }
         if ui.memory(|memory| memory.focused().is_none()) {
+            add_auto_pattern_marker =
+                ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::T));
+            open_new_pattern_marker =
+                ui.input_mut(|input| input.consume_key(egui::Modifiers::ALT, egui::Key::T));
             delete_selection_requested = ui.input_mut(|input| {
                 input.consume_key(egui::Modifiers::NONE, egui::Key::Delete)
                     || input.consume_key(egui::Modifiers::NONE, egui::Key::Backspace)
@@ -33321,6 +33467,56 @@ impl DawUi {
         if open_pattern_time_signature_dialog {
             self.pattern_time_signature_dialog_open = true;
         }
+        if (add_auto_pattern_marker || open_new_pattern_marker)
+            && self.pattern_playback_mode
+            && let Some(pattern_id) = self.selected_pattern
+        {
+            let position = self
+                .current_pattern_mode_playhead_tick()
+                .filter(|(active_pattern, _)| *active_pattern == pattern_id)
+                .map_or(
+                    self.pattern_seek_tick.min(u64::from(MAX_TIME_MARKER_TICK)) as u32,
+                    |(_, tick)| tick.round().clamp(0.0, f64::from(MAX_TIME_MARKER_TICK)) as u32,
+                )
+                .min(MAX_TIME_MARKER_TICK);
+            if add_auto_pattern_marker {
+                let result = self
+                    .document
+                    .as_mut()
+                    .ok_or_else(|| "no project is open".to_owned())
+                    .and_then(|document| {
+                        document
+                            .create_pattern_time_marker(pattern_id, position, "Auto")
+                            .map_err(|error| error.to_string())
+                    });
+                match result {
+                    Ok(index) => {
+                        self.stop_project_playback();
+                        self.selected_pattern_time_signature_pattern = Some(pattern_id);
+                        self.selected_pattern_time_marker = Some(index);
+                        self.pattern_time_marker_position = position;
+                        self.pattern_time_marker_name = "Auto".to_owned();
+                        self.selected_pattern_time_signature = None;
+                        self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+                        self.status =
+                            format!("Added Pattern {pattern_id} marker at tick {position}");
+                        if let Some(document) = self.document.as_ref() {
+                            patterns = document.patterns().unwrap_or_default();
+                        }
+                    }
+                    Err(error) => self.status = format!("Could not add Pattern marker: {error}"),
+                }
+            } else {
+                self.selected_pattern_time_signature_pattern = Some(pattern_id);
+                self.selected_pattern_time_marker = None;
+                self.pattern_time_marker_position = position;
+                self.pattern_time_marker_name.clear();
+                self.pattern_time_signature_dialog_open = true;
+            }
+        } else if add_auto_pattern_marker || open_new_pattern_marker {
+            self.status = "Select a Pattern and switch to PAT mode to add a time marker".to_owned();
+        }
         let selection_pattern_before_toolbar = self.selected_pattern;
         let selection_channel_before_toolbar = self.selected_note_channel;
         let selected_quantize_indices = match (self.selected_pattern, self.selected_note_channel) {
@@ -33423,8 +33619,8 @@ impl DawUi {
                     }
                 });
             if ui
-                .button("Meter")
-                .on_hover_text("Pattern time signatures (Shift+Ctrl/Cmd+P)")
+                .button("Markers")
+                .on_hover_text("Pattern time markers and signatures (Shift+Ctrl/Cmd+P)")
                 .clicked()
             {
                 self.pattern_time_signature_dialog_open = true;
@@ -42638,13 +42834,7 @@ impl DawUi {
             .notes
             .iter()
             .map(|note| note.position.saturating_add(note.length))
-            .chain(
-                pattern
-                    .time_markers
-                    .iter()
-                    .filter(|marker| marker.is_signature())
-                    .map(TimeMarker::position_ticks),
-            )
+            .chain(pattern.time_markers.iter().map(TimeMarker::position_ticks))
             .chain(
                 pattern
                     .controllers
@@ -42680,6 +42870,7 @@ impl DawUi {
             .map_or_else(|| ui.available_width(), |rect| rect.width());
         let min_grid_width = (visible_width - keyboard_width).max(240.0);
         let grid_width = (max_tick as f32 * tick_scale + 160.0).clamp(min_grid_width, 30000.0);
+        let grid_last_tick = max_tick.min((grid_width / tick_scale).ceil() as u32);
         let grid_height = f32::from(key_high - key_low + 1) * key_height;
         let mut notes_to_add = Vec::new();
         let mut notes_to_delete = BTreeSet::new();
@@ -42870,7 +43061,7 @@ impl DawUi {
             let mut signatures = pattern
                 .time_markers
                 .iter()
-                .filter(|marker| marker.is_signature())
+                .filter(|marker| marker.is_signature() && marker.position_ticks() <= grid_last_tick)
                 .filter_map(|marker| {
                     Some((
                         marker.position_ticks(),
@@ -42914,7 +43105,7 @@ impl DawUi {
             let mut segment_start = 0u32;
             loop {
                 let next_change = signatures.get(signature_index).copied();
-                let segment_end = next_change.map_or(max_tick, |(position, _, _)| position);
+                let segment_end = next_change.map_or(grid_last_tick, |(position, _, _)| position);
                 let bar_ticks = (u32::from(ppq.max(1))
                     .saturating_mul(u32::from(numerator.max(1)))
                     .saturating_mul(4)
@@ -42929,10 +43120,10 @@ impl DawUi {
                     }
                 }
                 let Some((position, _, _)) = next_change else {
-                    if segment_start < max_tick
-                        && (max_tick - segment_start).is_multiple_of(bar_ticks)
+                    if segment_start < grid_last_tick
+                        && (grid_last_tick - segment_start).is_multiple_of(bar_ticks)
                     {
-                        draw_bar_line(max_tick, GRID);
+                        draw_bar_line(grid_last_tick, GRID);
                     }
                     break;
                 };
@@ -42958,6 +43149,25 @@ impl DawUi {
                 );
                 segment_start = position;
             }
+            for marker in pattern.time_markers.iter().filter(|marker| {
+                marker.raw_position() & !MAX_TIME_MARKER_TICK == 0
+                    && marker.position_ticks() <= grid_last_tick
+                    && marker.numerator().is_none()
+                    && marker.denominator().is_none()
+            }) {
+                let x = rect.left() + keyboard_width + marker.position_ticks() as f32 * tick_scale;
+                painter.line_segment(
+                    [egui::pos2(x, ruler_rect.top()), egui::pos2(x, ruler_rect.bottom())],
+                    Stroke::new(1.0, ORANGE),
+                );
+                painter.text(
+                    egui::pos2(x + 3.0, ruler_rect.center().y),
+                    Align2::LEFT_CENTER,
+                    marker.name().unwrap_or("Marker"),
+                    FontId::proportional(9.0),
+                    ORANGE,
+                );
+            }
             let rebuild_groove_grid = self.quantize_score.is_some()
                 && self
                     .quantize_score_grid_cache
@@ -42974,7 +43184,7 @@ impl DawUi {
                 );
             }
             if let Some((_, period_ticks, ticks)) = &self.quantize_score_grid_cache {
-                let max_tick_u64 = u64::from(max_tick);
+                let max_tick_u64 = u64::from(grid_last_tick);
                 for anchor_tick in ticks {
                     let mut tick = *anchor_tick;
                     while tick <= max_tick_u64 {

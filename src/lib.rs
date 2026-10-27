@@ -7467,6 +7467,199 @@ impl FlpDocument {
         ))
     }
 
+    /// Creates an ordinary named time marker in a Pattern, preserving unrelated events.
+    pub fn create_pattern_time_marker(
+        &mut self,
+        pattern_id: u16,
+        position_ticks: u32,
+        name: &str,
+    ) -> Result<usize, FlpError> {
+        if position_ticks > TIME_MARKER_TICK_MASK || name.contains('\0') {
+            return Err(FlpError::UnsupportedEdit(
+                "invalid Pattern time marker position or name",
+            ));
+        }
+        let pattern = self.unique_pattern_for_time_markers(pattern_id)?;
+        let mut starts = self.events.iter().enumerate().filter(|(_, event)| {
+            event.opcode == 0x41 && event.payload.as_slice() == pattern_id.to_le_bytes()
+        });
+        let (start, _) = starts.next().ok_or(FlpError::UnsupportedEdit(
+            "the Pattern has no source marker",
+        ))?;
+        if starts.next().is_some() {
+            return Err(FlpError::UnsupportedEdit("the Pattern id is ambiguous"));
+        }
+        let region_start = start + 1;
+        let region_end = self.events[region_start..]
+            .iter()
+            .position(|event| matches!(event.opcode, 0x40 | 0x41 | 0x62 | 0x63))
+            .map_or(self.events.len(), |offset| region_start + offset);
+        let later = pattern
+            .time_markers
+            .iter()
+            .find(|marker| marker.position_ticks() > position_ticks)
+            .and_then(|marker| marker.source_events.position)
+            .filter(|index| (region_start..region_end).contains(index));
+        let last = pattern
+            .time_markers
+            .iter()
+            .flat_map(|marker| {
+                [
+                    marker.source_events.position,
+                    marker.source_events.numerator,
+                    marker.source_events.denominator,
+                    marker.source_events.name,
+                ]
+            })
+            .flatten()
+            .filter(|index| (region_start..region_end).contains(index))
+            .max()
+            .map(|index| index + 1);
+        let insertion = later.or(last).unwrap_or(region_end);
+        let payload = encode_project_string(name, self.project_strings_use_utf16())?;
+        let mut candidate = self.clone();
+        candidate.events.splice(
+            insertion..insertion,
+            [
+                FlpEvent::new_dword(0x94, position_ticks),
+                FlpEvent::new_data(0xCD, payload)?,
+            ],
+        );
+        candidate.refresh_event_offsets()?;
+        let index = candidate
+            .unique_pattern_for_time_markers(pattern_id)?
+            .time_markers
+            .iter()
+            .position(|marker| marker.source_events.position == Some(insertion))
+            .ok_or(FlpError::UnsupportedEdit(
+                "the new Pattern time marker could not be decoded",
+            ))?;
+        *self = candidate;
+        Ok(index)
+    }
+
+    /// Edits an ordinary Pattern time marker selected by its zero-based marker index.
+    pub fn edit_pattern_time_marker(
+        &mut self,
+        pattern_id: u16,
+        marker_index: usize,
+        position_ticks: u32,
+        name: &str,
+    ) -> Result<(), FlpError> {
+        if position_ticks > TIME_MARKER_TICK_MASK || name.contains('\0') {
+            return Err(FlpError::UnsupportedEdit(
+                "invalid Pattern time marker position or name",
+            ));
+        }
+        let pattern = self.unique_pattern_for_time_markers(pattern_id)?;
+        let marker = pattern
+            .time_markers
+            .get(marker_index)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the Pattern time marker does not exist",
+            ))?;
+        if marker.raw_position & !TIME_MARKER_TICK_MASK != 0
+            || marker.numerator.is_some()
+            || marker.denominator.is_some()
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "only ordinary Pattern time markers can be edited",
+            ));
+        }
+        let position_index = marker
+            .source_events
+            .position
+            .ok_or(FlpError::UnsupportedEdit(
+                "the marker has no position event",
+            ))?;
+        let mut candidate = self.clone();
+        candidate.events[position_index].replace_dword_payload(position_ticks)?;
+        if let Some(index) = marker.source_events.name {
+            let event = &candidate.events[index];
+            let utf16 =
+                project_string_is_utf16(&event.payload, candidate.project_version.as_deref());
+            let payload = replace_project_string_payload(&event.payload, name, utf16)?;
+            candidate.events[index].replace_data_payload(payload)?;
+        } else {
+            let payload = encode_project_string(name, candidate.project_strings_use_utf16())?;
+            candidate
+                .events
+                .insert(position_index + 1, FlpEvent::new_data(0xCD, payload)?);
+        }
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    /// Deletes an ordinary Pattern time marker without removing neighboring events.
+    pub fn delete_pattern_time_marker(
+        &mut self,
+        pattern_id: u16,
+        marker_index: usize,
+    ) -> Result<(), FlpError> {
+        let pattern = self.unique_pattern_for_time_markers(pattern_id)?;
+        let marker = pattern
+            .time_markers
+            .get(marker_index)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the Pattern time marker does not exist",
+            ))?;
+        if marker.raw_position & !TIME_MARKER_TICK_MASK != 0
+            || marker.numerator.is_some()
+            || marker.denominator.is_some()
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "only ordinary Pattern time markers can be deleted",
+            ));
+        }
+        let position_index = marker
+            .source_events
+            .position
+            .ok_or(FlpError::UnsupportedEdit(
+                "the marker has no position event",
+            ))?;
+        let mut indices = [Some(position_index), marker.source_events.name]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        indices.sort_unstable();
+        indices.dedup();
+        let mut candidate = self.clone();
+        for index in indices.into_iter().rev() {
+            candidate.events.remove(index);
+        }
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    fn unique_pattern_for_time_markers(&self, pattern_id: u16) -> Result<Pattern, FlpError> {
+        if self
+            .events
+            .iter()
+            .filter(|event| {
+                event.opcode == 0x41 && event.payload.as_slice() == pattern_id.to_le_bytes()
+            })
+            .count()
+            != 1
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "the Pattern id is missing or ambiguous",
+            ));
+        }
+        let mut matching = self
+            .patterns()?
+            .into_iter()
+            .filter(|pattern| pattern.id == pattern_id);
+        let pattern = matching.next().ok_or(FlpError::UnsupportedEdit(
+            "the requested Pattern does not exist",
+        ))?;
+        if matching.next().is_some() {
+            return Err(FlpError::UnsupportedEdit("the Pattern id is ambiguous"));
+        }
+        Ok(pattern)
+    }
+
     /// Sets or creates a time-signature marker within one Pattern.
     /// Pattern markers are scoped by the `0x41` Pattern ID events and remain separate from
     /// project defaults and Playlist arrangement markers.
@@ -33513,6 +33706,104 @@ mod tests {
         let reparsed = FlpDocument::parse(&encoded).expect("edited file should parse");
         assert_eq!(reparsed.patterns().unwrap()[0].notes.len(), 2);
         assert_eq!(reparsed.trailing_bytes(), &[0xB2]);
+    }
+
+    #[test]
+    fn ordinary_pattern_markers_are_created_edited_and_deleted_losslessly() {
+        let mut event_stream = vec![0x41, 7, 0];
+        append_data_event(&mut event_stream, 0xD0, &[]);
+        append_time_marker(
+            &mut event_stream,
+            super::TIME_MARKER_SIGNATURE_BIT | 384,
+            3,
+            4,
+            "Meter",
+        );
+        event_stream.extend_from_slice(&[0xFF, 2, 0xAA, 0xBB, 0x41, 8, 0]);
+        append_data_event(&mut event_stream, 0xD0, &[]);
+        event_stream.extend_from_slice(&[0x63, 1, 0]);
+        append_time_marker(
+            &mut event_stream,
+            super::TIME_MARKER_SIGNATURE_BIT | 192,
+            5,
+            8,
+            "Playlist",
+        );
+        let input = flp_fixture(&event_stream, &[0xA1], &[0xB2]);
+        let mut document = FlpDocument::parse(&input).unwrap();
+        let marker_index = document.create_pattern_time_marker(7, 96, "Verse").unwrap();
+        assert_eq!(marker_index, 0);
+        let pattern = document.patterns().unwrap().remove(0);
+        assert_eq!(
+            (
+                pattern.time_markers[0].position_ticks(),
+                pattern.time_markers[0].name()
+            ),
+            (96, Some("Verse"))
+        );
+        assert!(pattern.time_markers[1].is_signature());
+        document
+            .edit_pattern_time_marker(7, 0, 144, "Chorus")
+            .unwrap();
+        let encoded = document.encode_lossless().unwrap();
+        let mut document = FlpDocument::parse(&encoded).unwrap();
+        let marker = &document.patterns().unwrap()[0].time_markers[0];
+        assert_eq!(
+            (marker.position_ticks(), marker.name()),
+            (144, Some("Chorus"))
+        );
+        let before = document.encode_lossless().unwrap();
+        assert!(
+            document
+                .edit_pattern_time_marker(7, 1, 0, "invalid")
+                .is_err()
+        );
+        assert!(document.delete_pattern_time_marker(7, 1).is_err());
+        assert!(
+            document
+                .create_pattern_time_marker(7, 0, "bad\0name")
+                .is_err()
+        );
+        assert_eq!(document.encode_lossless().unwrap(), before);
+        document.delete_pattern_time_marker(7, 0).unwrap();
+        assert_eq!(document.encode_lossless().unwrap(), input);
+    }
+
+    #[test]
+    fn pattern_marker_edits_retain_name_suffix_and_reject_ambiguous_or_special_markers() {
+        let mut events = vec![0x41, 7, 0];
+        append_data_event(&mut events, 0xD0, &[]);
+        events.push(0x94);
+        events.extend_from_slice(&12u32.to_le_bytes());
+        append_data_event(&mut events, 0xCD, b"Old\0\xAA\xBB");
+        events.push(0x94);
+        events.extend_from_slice(&(0x1000_0000u32 | 24).to_le_bytes());
+        let input = flp_fixture(&events, &[], &[]);
+        let mut document = FlpDocument::parse(&input).unwrap();
+        document.edit_pattern_time_marker(7, 0, 20, "New").unwrap();
+        let name_event = document
+            .events()
+            .iter()
+            .find(|event| event.opcode() == 0xCD)
+            .unwrap();
+        assert_eq!(name_event.payload(), b"New\0\xAA\xBB");
+        let before = document.encode_lossless().unwrap();
+        assert!(
+            document
+                .edit_pattern_time_marker(7, 1, 25, "special")
+                .is_err()
+        );
+        assert!(document.delete_pattern_time_marker(7, 1).is_err());
+        assert_eq!(document.encode_lossless().unwrap(), before);
+
+        events.extend_from_slice(&[0x41, 7, 0]);
+        append_data_event(&mut events, 0xD0, &[]);
+        let input = flp_fixture(&events, &[], &[]);
+        let mut duplicate = FlpDocument::parse(&input).unwrap();
+        assert!(duplicate.create_pattern_time_marker(7, 1, "new").is_err());
+        assert!(duplicate.edit_pattern_time_marker(7, 0, 1, "new").is_err());
+        assert!(duplicate.delete_pattern_time_marker(7, 0).is_err());
+        assert_eq!(duplicate.encode_lossless().unwrap(), input);
     }
 
     #[test]
