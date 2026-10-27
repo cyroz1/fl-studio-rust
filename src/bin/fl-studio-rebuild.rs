@@ -5689,16 +5689,26 @@ fn record_pattern_controller_points(
     Ok(points.len())
 }
 
+struct MidiPlaylistAutomationTake<'a> {
+    controller: u8,
+    elapsed_ticks: u32,
+    ppq: u16,
+    points: &'a [(u32, f32)],
+}
+
 fn record_playlist_automation_clip(
     document: &mut FlpDocument,
     links: &mut Vec<PlaylistVst3ParameterLink>,
     project_path: Option<&Path>,
     target: MidiPlaylistAutomationRecordingTarget,
-    controller: u8,
-    elapsed_ticks: u32,
-    ppq: u16,
-    points: &[(u32, f32)],
+    take: MidiPlaylistAutomationTake<'_>,
 ) -> Result<(u16, usize, u32, bool), String> {
+    let MidiPlaylistAutomationTake {
+        controller,
+        elapsed_ticks,
+        ppq,
+        points,
+    } = take;
     if points.is_empty() {
         return Err("the take contains no selected CC changes".to_owned());
     }
@@ -50678,7 +50688,7 @@ impl DawUi {
                             matches!(clip.target(), PlaylistClipTarget::Channel { id } if id == template_channel_id)
                         })
                         .and_then(|clip| clip.track_index)
-                        .and_then(|track_index| u16::try_from(track_index).ok())
+                        .filter(|track_index| *track_index <= 499)
                 })
                 .unwrap_or(0);
             Some(MidiPlaylistAutomationRecordingTarget {
@@ -50997,10 +51007,12 @@ impl DawUi {
                         &mut updated_playlist_vst3_parameter_links,
                         result.project_path.as_deref(),
                         target,
-                        *controller,
-                        recorded_elapsed_ticks,
-                        document.header().ppq(),
-                        &automation_points,
+                        MidiPlaylistAutomationTake {
+                            controller: *controller,
+                            elapsed_ticks: recorded_elapsed_ticks,
+                            ppq: document.header().ppq(),
+                            points: &automation_points,
+                        },
                     ))
                 }
                 _ => None,
