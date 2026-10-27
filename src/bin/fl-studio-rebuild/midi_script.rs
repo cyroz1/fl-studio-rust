@@ -2744,6 +2744,55 @@ mod tests {
     }
 
     #[test]
+    fn python_global_transport_jogs_channels_shuffle_and_editing_commands() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            r#"# name=Test Script
+import midi
+import transport
+def OnMidiIn(event):
+    flags = event.pmeflags
+    transport.globalTransport(midi.FPT_ChannelJog, 5, flags)
+    transport.globalTransport(midi.FPT_ChannelJog, -5, flags)
+    transport.globalTransport(midi.FPT_ChannelJog, 0, flags)
+    transport.globalTransport(midi.FPT_ShuffleJog, 50, flags)
+    transport.globalTransport(midi.FPT_ShuffleJog, -30, flags)
+    transport.globalTransport(midi.FPT_Undo, 1, flags)
+    transport.globalTransport(midi.FPT_UndoUp, 1, flags)
+    transport.globalTransport(midi.FPT_UndoJog, -2, flags)
+    transport.globalTransport(midi.FPT_Snap, 1, flags)
+    transport.globalTransport(midi.FPT_SnapMode, 3, flags)
+"#,
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let state = Arc::new(MidiScriptTransportState::default());
+        *state.channel_ids.lock().unwrap() = vec![3, 8, 20];
+        state.selected_channel_id.store(8, Ordering::Relaxed);
+        state.global_swing_mix_raw.store(100, Ordering::Relaxed);
+        let mut runtime =
+            MidiScriptRuntime::start_for_device_with_transport_state(&script, "Test Input", state)
+                .unwrap();
+        let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
+        assert_eq!(
+            result.actions,
+            [
+                ScriptTransportAction::SelectChannel(20),
+                ScriptTransportAction::SelectChannel(3),
+                ScriptTransportAction::SetGlobalSwingMixRaw(128),
+                ScriptTransportAction::SetGlobalSwingMixRaw(98),
+                ScriptTransportAction::Undo,
+                ScriptTransportAction::Redo,
+                ScriptTransportAction::UndoHistoryJog(-2),
+                ScriptTransportAction::TogglePianoRollSnap,
+                ScriptTransportAction::PianoRollSnapJog(3),
+            ]
+        );
+    }
+
+    #[test]
     fn python_global_transport_f1_opens_help_for_global_midi_events() {
         let temporary = TestDirectory::new();
         let script_path = temporary.path().join("device_test.py");
