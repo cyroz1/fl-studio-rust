@@ -52053,8 +52053,13 @@ impl DawUi {
                     (100, 0),
                     (6, state.raw_pitch_bend_sensitivity_semitones()),
                     (38, state.raw_pitch_bend_sensitivity_cents()),
-                    (101, 127),
-                    (100, 127),
+                    (100, 1),
+                    (6, (state.raw_channel_fine_tuning() >> 7) as u8),
+                    (38, (state.raw_channel_fine_tuning() & 127) as u8),
+                    (100, 2),
+                    (6, state.raw_channel_coarse_tuning()),
+                    state.parameter_selection_messages()[0],
+                    state.parameter_selection_messages()[1],
                     (
                         64,
                         if self.midi_live_sampler_sustain_channels.contains(&channel) {
@@ -52484,8 +52489,14 @@ impl DawUi {
             send_control_change(100, 0);
             send_control_change(6, state.raw_pitch_bend_sensitivity_semitones());
             send_control_change(38, state.raw_pitch_bend_sensitivity_cents());
-            send_control_change(101, 127);
-            send_control_change(100, 127);
+            send_control_change(100, 1);
+            send_control_change(6, (state.raw_channel_fine_tuning() >> 7) as u8);
+            send_control_change(38, (state.raw_channel_fine_tuning() & 127) as u8);
+            send_control_change(100, 2);
+            send_control_change(6, state.raw_channel_coarse_tuning());
+            for (controller, value) in state.parameter_selection_messages() {
+                send_control_change(controller, value);
+            }
             send_control_change(
                 64,
                 if self.midi_live_sampler_sustain_channels.contains(&channel) {
@@ -52551,8 +52562,14 @@ impl DawUi {
             send_control_change(100, 0);
             send_control_change(6, state.raw_pitch_bend_sensitivity_semitones());
             send_control_change(38, state.raw_pitch_bend_sensitivity_cents());
-            send_control_change(101, 127);
-            send_control_change(100, 127);
+            send_control_change(100, 1);
+            send_control_change(6, (state.raw_channel_fine_tuning() >> 7) as u8);
+            send_control_change(38, (state.raw_channel_fine_tuning() & 127) as u8);
+            send_control_change(100, 2);
+            send_control_change(6, state.raw_channel_coarse_tuning());
+            for (controller, value) in state.parameter_selection_messages() {
+                send_control_change(controller, value);
+            }
             send_control_change(
                 64,
                 if self.midi_live_sampler_sustain_channels.contains(&channel) {
@@ -52575,7 +52592,7 @@ impl DawUi {
             }));
             let _ = sender.send(LayerLiveInputEvent::SamplerPitchBend {
                 channel,
-                cents: state.pitch_bend_offset_cents(),
+                cents: state.sampler_pitch_offset_cents(),
             });
         }
     }
@@ -52687,7 +52704,7 @@ impl DawUi {
         let resampling_quality = self.live_resampling_quality;
         let initial_pitch_bend_cents = self
             .midi_input_channel_state
-            .map(MidiInputChannelState::pitch_bend_offset_cents);
+            .map(MidiInputChannelState::sampler_pitch_offset_cents);
         let initial_pan = self
             .midi_input_channel_state
             .map(MidiInputChannelState::raw_pan);
@@ -52964,11 +52981,11 @@ impl DawUi {
                         value: channel_state.raw_expression_14bit(),
                     });
                 }
-                if matches!(controller, 6 | 38 | 100 | 101) {
+                if matches!(controller, 6 | 38 | 98..=101) {
                     queued_events.push(LayerLiveInputEvent::SamplerPitchBend {
                         channel,
                         cents: self.midi_input_channel_state[usize::from(channel & 0x0F)]
-                            .pitch_bend_offset_cents(),
+                            .sampler_pitch_offset_cents(),
                     });
                 }
                 if controller == 121 {
@@ -52977,7 +52994,7 @@ impl DawUi {
                         pan: self.midi_input_channel_state[usize::from(channel & 0x0F)].raw_pan(),
                         pitch_bend_cents: self.midi_input_channel_state
                             [usize::from(channel & 0x0F)]
-                        .pitch_bend_offset_cents(),
+                        .sampler_pitch_offset_cents(),
                     });
                 }
                 if matches!(controller, 120 | 123..=127) {
@@ -52998,7 +53015,7 @@ impl DawUi {
                 queued_events.push(LayerLiveInputEvent::SamplerPitchBend {
                     channel,
                     cents: self.midi_input_channel_state[usize::from(channel & 0x0F)]
-                        .pitch_bend_offset_cents(),
+                        .sampler_pitch_offset_cents(),
                 });
             }
             MidiInputEvent::ChannelPressure { channel, pressure } => {
@@ -53152,13 +53169,13 @@ impl DawUi {
             MidiInputEvent::PitchBend { channel, .. }
             | MidiInputEvent::ControlChange {
                 channel,
-                controller: 6 | 38 | 100 | 101,
+                controller: 6 | 38 | 98..=101,
                 ..
             } => (
                 SamplerLiveNoteEvent::PitchBend {
                     channel,
                     cents: self.midi_input_channel_state[usize::from(channel & 0x0F)]
-                        .pitch_bend_offset_cents(),
+                        .sampler_pitch_offset_cents(),
                 },
                 None,
             ),
@@ -53260,7 +53277,7 @@ impl DawUi {
                     channel,
                     pan: self.midi_input_channel_state[usize::from(channel & 0x0F)].raw_pan(),
                     pitch_bend_cents: self.midi_input_channel_state[usize::from(channel & 0x0F)]
-                        .pitch_bend_offset_cents(),
+                        .sampler_pitch_offset_cents(),
                 },
                 None,
             ),

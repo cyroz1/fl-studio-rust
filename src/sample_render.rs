@@ -12042,8 +12042,15 @@ fn update_sampler_voice_slide(
 
 fn set_sampler_voice_source_step(voice: &mut SamplerVoice, pitch_bend_cents: i16) {
     let slide_ratio = 2.0_f64.powf(voice.pitch_offset_cents / 1_200.0);
-    voice.source_step =
-        voice.base_source_step * audio_clip_master_pitch_ratio(pitch_bend_cents) * slide_ratio;
+    let direction = if voice.source_step == 0.0 {
+        voice.base_source_step.signum()
+    } else {
+        voice.source_step.signum()
+    };
+    voice.source_step = direction
+        * voice.base_source_step.abs()
+        * audio_clip_master_pitch_ratio(pitch_bend_cents)
+        * slide_ratio;
 }
 
 impl<'a> SamplerVoiceEngine<'a> {
@@ -12712,7 +12719,6 @@ impl<'a> SamplerVoiceEngine<'a> {
 
     fn apply_live_pitch_bend(&mut self, channel: u8, cents: i16) {
         let channel = channel & 0x0F;
-        let cents = cents.clamp(-1200, 1200);
         self.pitch_bend_cents[usize::from(channel)] = cents;
         for voice in self.voices.iter_mut().filter_map(Option::as_mut) {
             if voice.input_midi_channel == Some(channel) {
@@ -19792,6 +19798,25 @@ mod tests {
 
         let voice = engine.voices[0].as_ref().expect("note should start");
         assert!((voice.source_step - 2.0f64.powf(50.0 / 1_200.0)).abs() < 1e-12);
+
+        engine.set_voice_input_midi_channel(0, 2);
+        engine.apply_live_pitch_bend(3, 2400);
+        assert!(
+            (engine.voices[0].as_ref().unwrap().source_step - 2.0f64.powf(50.0 / 1200.0)).abs()
+                < 1e-12
+        );
+        engine.apply_live_pitch_bend(2, 2400);
+        assert!(
+            (engine.voices[0].as_ref().unwrap().source_step - 4.0 * 2.0f64.powf(50.0 / 1200.0))
+                .abs()
+                < 1e-12
+        );
+        engine.voices[0].as_mut().unwrap().source_step *= -1.0;
+        engine.apply_live_pitch_bend(2, 0);
+        assert!(
+            (engine.voices[0].as_ref().unwrap().source_step + 2.0f64.powf(50.0 / 1200.0)).abs()
+                < 1e-12
+        );
     }
 
     #[test]

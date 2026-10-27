@@ -9,8 +9,7 @@ use std::time::{Duration, Instant};
 use flp_rebuild::PatternNote;
 use flp_rebuild::midi::{
     midi_modulation_to_fl_note_value, midi_offset_to_fl_pitch, midi_pan_to_fl_note_pan,
-    midi_pitch_bend_offset_cents, midi_pitch_bend_unclamped_cents,
-    midi_release_velocity_to_fl_note_release,
+    midi_pitch_bend_unclamped_cents, midi_release_velocity_to_fl_note_release,
 };
 use midir::{Ignore, MidiInput, MidiInputConnection as MidirInputConnection};
 
@@ -961,6 +960,9 @@ pub struct MidiInputChannelState {
     rpn_msb: u8,
     rpn_lsb: u8,
     rpn_selected: bool,
+    nrpn_selected: bool,
+    nrpn_msb: u8,
+    nrpn_lsb: u8,
     channel_coarse_tuning: u8,
     channel_fine_tuning: u16,
 }
@@ -985,6 +987,9 @@ impl Default for MidiInputChannelState {
             rpn_msb: 127,
             rpn_lsb: 127,
             rpn_selected: false,
+            nrpn_selected: false,
+            nrpn_msb: 127,
+            nrpn_lsb: 127,
             channel_coarse_tuning: 64,
             channel_fine_tuning: 8192,
         }
@@ -1063,13 +1068,28 @@ impl MidiInputChannelState {
                 self.rpn_msb = 127;
                 self.rpn_lsb = 127;
                 self.rpn_selected = false;
+                self.nrpn_selected = false;
+                self.nrpn_msb = 127;
+                self.nrpn_lsb = 127;
                 self.channel_coarse_tuning = 64;
                 self.channel_fine_tuning = 8192;
             }
             MidiInputEvent::ControlChange {
-                controller: 98 | 99,
+                controller: 98,
+                value,
                 ..
             } => {
+                self.nrpn_lsb = value.min(127);
+                self.nrpn_selected = true;
+                self.rpn_selected = false;
+            }
+            MidiInputEvent::ControlChange {
+                controller: 99,
+                value,
+                ..
+            } => {
+                self.nrpn_msb = value.min(127);
+                self.nrpn_selected = true;
                 self.rpn_selected = false;
             }
             MidiInputEvent::ControlChange {
@@ -1079,6 +1099,7 @@ impl MidiInputChannelState {
             } => {
                 self.rpn_msb = value.min(127);
                 self.rpn_selected = true;
+                self.nrpn_selected = false;
             }
             MidiInputEvent::ControlChange {
                 controller: 100,
@@ -1087,6 +1108,7 @@ impl MidiInputChannelState {
             } => {
                 self.rpn_lsb = value.min(127);
                 self.rpn_selected = true;
+                self.nrpn_selected = false;
             }
             MidiInputEvent::ControlChange {
                 controller: 6,
@@ -1164,6 +1186,24 @@ impl MidiInputChannelState {
         self.pitch_bend_sensitivity_cents
     }
 
+    pub fn raw_channel_coarse_tuning(self) -> u8 {
+        self.channel_coarse_tuning
+    }
+
+    pub fn raw_channel_fine_tuning(self) -> u16 {
+        self.channel_fine_tuning
+    }
+
+    pub fn parameter_selection_messages(self) -> [(u8, u8); 2] {
+        if self.rpn_selected {
+            [(101, self.rpn_msb), (100, self.rpn_lsb)]
+        } else if self.nrpn_selected {
+            [(99, self.nrpn_msb), (98, self.nrpn_lsb)]
+        } else {
+            [(101, 127), (100, 127)]
+        }
+    }
+
     pub fn raw_expression(self) -> u8 {
         self.expression
     }
@@ -1196,15 +1236,7 @@ impl MidiInputChannelState {
         midi_modulation_to_fl_note_value(self.mod_y)
     }
 
-    pub fn pitch_bend_offset_cents(self) -> i16 {
-        midi_pitch_bend_offset_cents(
-            self.pitch_bend_value,
-            self.pitch_bend_sensitivity_semitones,
-            self.pitch_bend_sensitivity_cents,
-        )
-    }
-
-    fn tuned_note_pitch(self, key: u8) -> (u16, u8) {
+    pub fn sampler_pitch_offset_cents(self) -> i16 {
         let fine =
             (((i32::from(self.channel_fine_tuning) - 8192) * 100) as f64 / 8192.0).round() as i32;
         let bend = midi_pitch_bend_unclamped_cents(
@@ -1212,10 +1244,11 @@ impl MidiInputChannelState {
             self.pitch_bend_sensitivity_semitones,
             self.pitch_bend_sensitivity_cents,
         );
-        midi_offset_to_fl_pitch(
-            key,
-            (i32::from(self.channel_coarse_tuning) - 64) * 100 + fine + i32::from(bend),
-        )
+        ((i32::from(self.channel_coarse_tuning) - 64) * 100 + fine + i32::from(bend)) as i16
+    }
+
+    fn tuned_note_pitch(self, key: u8) -> (u16, u8) {
+        midi_offset_to_fl_pitch(key, i32::from(self.sampler_pitch_offset_cents()))
     }
 }
 
@@ -3263,6 +3296,40 @@ mod tests {
     }
 
     #[test]
+    fn sampler_live_pitch_combines_channel_tuning_with_wide_bend() {
+        let mut state = MidiInputChannelState::default();
+        for (controller, value) in [
+            (101, 0),
+            (100, 0),
+            (6, 24),
+            (100, 2),
+            (6, 52),
+            (100, 1),
+            (6, 80),
+            (38, 0),
+        ] {
+            state.update(MidiInputEvent::ControlChange {
+                channel: 0,
+                controller,
+                value,
+            });
+        }
+        state.update(MidiInputEvent::PitchBend {
+            channel: 0,
+            value: 8191,
+        });
+        assert_eq!(state.sampler_pitch_offset_cents(), 1225);
+        assert_eq!(state.raw_channel_coarse_tuning(), 52);
+        assert_eq!(state.raw_channel_fine_tuning(), 10240);
+        state.update(MidiInputEvent::ControlChange {
+            channel: 0,
+            controller: 121,
+            value: 0,
+        });
+        assert_eq!(state.sampler_pitch_offset_cents(), 0);
+    }
+
+    #[test]
     fn nrpn_data_entry_does_not_change_live_pitch_bend_range() {
         let mut state = MidiInputChannelState::default();
         for (controller, value) in [
@@ -3340,7 +3407,7 @@ mod tests {
         assert_eq!(state.raw_mod_x(), 64);
         assert_eq!(state.raw_mod_y(), 64);
         assert_eq!(state.raw_pitch_bend_value(), 8192);
-        assert_eq!(state.pitch_bend_offset_cents(), 0);
+        assert_eq!(state.sampler_pitch_offset_cents(), 0);
         assert_eq!(state.tuned_note_pitch(60).1, 120);
         assert_eq!(state.raw_pitch_bend_sensitivity_semitones(), 2);
         assert_eq!(state.raw_pitch_bend_sensitivity_cents(), 0);

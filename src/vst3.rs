@@ -41,6 +41,8 @@ static NEXT_VST3_NOTE_EXPRESSION_ID: AtomicU64 = AtomicU64::new(0);
 const VST3_NOTE_EXPRESSION_ID_START: u64 = 1 << 30;
 const VST3_NOTE_EXPRESSION_ID_COUNT: u64 = 1 << 30;
 const LIVE_VST3_INPUT_TRACK_ID: u32 = u32::MAX;
+// A newly attached live session restores controller state on all 16 channels.
+const PLAYLIST_LIVE_MIDI_QUEUE_CAPACITY: usize = 1024;
 const MAX_STEREO_BUFFER_BYTES: usize = 512 * 1024 * 1024;
 const VST3_EFFECT_RENDER_BLOCK_FRAMES: usize = 512;
 const MIXER_EFFECT_MIX_SMOOTHING_SECONDS: f32 = 0.02;
@@ -4867,7 +4869,8 @@ impl Vst3HostRuntime {
             let resampler = StereoStreamResampler::new(render.sample_rate_u32, output_sample_rate)?;
             notes_scheduled = notes_scheduled.saturating_add(render.note_count);
             let template_events = render.events.clone();
-            let (live_midi_sender, live_midi_receiver) = mpsc::sync_channel(256);
+            let (live_midi_sender, live_midi_receiver) =
+                mpsc::sync_channel(PLAYLIST_LIVE_MIDI_QUEUE_CAPACITY);
             let live_midi_stopped_generation = Arc::new(AtomicU64::new(0));
             live_input_senders.insert(
                 channel_id,
@@ -5514,7 +5517,8 @@ impl Vst3HostRuntime {
                 channel_pan_gains(pan, render.output_channels == 1, pan_law);
             let resampler = StereoStreamResampler::new(render.sample_rate_u32, output_sample_rate)?;
             notes_scheduled += render.note_count;
-            let (live_midi_sender, live_midi_receiver) = mpsc::sync_channel(256);
+            let (live_midi_sender, live_midi_receiver) =
+                mpsc::sync_channel(PLAYLIST_LIVE_MIDI_QUEUE_CAPACITY);
             let live_midi_stopped_generation = Arc::new(AtomicU64::new(0));
             live_input_senders.insert(
                 channel_id,
