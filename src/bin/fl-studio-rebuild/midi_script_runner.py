@@ -1258,6 +1258,22 @@ def _global_transport(command, value, pmeflags=2, flags=15):
             track = _mixer_track_number() + value
             _mixer_set_track_number(min(last_track, max(0, track)), 1)
         return 8
+    if command == 102:  # FPT_ChannelJog: select a Channel Rack channel
+        channel_ids = [int(channel_id) for channel_id in _active_transport_state.get("channel_ids", [])]
+        if value != 0 and channel_ids:
+            selected_channel_id = int(_active_transport_state.get("selected_channel_id", -1))
+            try:
+                selected_index = channel_ids.index(selected_channel_id)
+            except ValueError:
+                selected_index = -1 if value > 0 else len(channel_ids)
+            selected_index = min(len(channel_ids) - 1, max(0, selected_index + value))
+            channel_id = channel_ids[selected_index]
+            if channel_id != selected_channel_id:
+                _active_transport_state["selected_channel_id"] = channel_id
+                _request_transport_action(
+                    {"action": "select_channel", "channel_id": channel_id}
+                )
+        return 8
     if command == 60:  # FPT_F1: Open the Help manual
         if value != 0:
             _request_transport_action("open_help_manual")

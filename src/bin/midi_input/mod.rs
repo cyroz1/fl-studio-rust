@@ -700,6 +700,9 @@ fn queue_script_transport_actions(
             ScriptTransportAction::SetArrangementLiveSelection { tick, stop } => {
                 MidiTransportCommand::SetArrangementLiveSelection { tick, stop }
             }
+            ScriptTransportAction::SelectChannel(channel_id) => {
+                MidiTransportCommand::SelectChannel(channel_id)
+            }
             ScriptTransportAction::SetMixerTrackSelection { index, flags } => {
                 MidiTransportCommand::SetMixerTrackSelection { index, flags }
             }
@@ -836,6 +839,7 @@ pub enum MidiTransportCommand {
         tick: u32,
         stop: bool,
     },
+    SelectChannel(u16),
     SetMixerTrackSelection {
         index: u16,
         flags: u32,
@@ -1536,6 +1540,7 @@ pub fn describe_event(event: MidiInputEvent) -> String {
             MidiTransportCommand::SetArrangementLiveSelection { .. } => {
                 "MIDI script Live Selection".to_owned()
             }
+            MidiTransportCommand::SelectChannel(_) => "MIDI script Select Channel".to_owned(),
             MidiTransportCommand::SetMixerTrackSelection { .. } => {
                 "MIDI script Select Mixer Track".to_owned()
             }

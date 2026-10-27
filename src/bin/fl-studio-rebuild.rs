@@ -14495,6 +14495,30 @@ impl DawUi {
         if let Ok(mut value) = self.midi_script_transport_state.project_genre.lock() {
             *value = project_genre;
         }
+        let channel_ids = self
+            .document
+            .as_ref()
+            .map(|document| {
+                document
+                    .channels()
+                    .into_iter()
+                    .map(|channel| channel.id())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let selected_channel_id = self
+            .selected_graph_channel
+            .or_else(|| self.selected_rack_channels.iter().next().copied())
+            .or(self.selected_note_channel)
+            .filter(|channel_id| channel_ids.contains(channel_id))
+            .or_else(|| channel_ids.first().copied());
+        if let Ok(mut ids) = self.midi_script_transport_state.channel_ids.lock() {
+            *ids = channel_ids;
+        }
+        self.midi_script_transport_state.selected_channel_id.store(
+            selected_channel_id.map_or(u64::MAX, u64::from),
+            Ordering::Relaxed,
+        );
         let mixer_track_names = self
             .document
             .as_ref()
@@ -15547,6 +15571,27 @@ impl DawUi {
         } else {
             self.status = "MIDI script tempo could not be applied to this project".to_owned();
         }
+    }
+
+    fn set_midi_script_channel_selection(&mut self, channel_id: u16) {
+        let channel_exists = self.document.as_ref().is_some_and(|document| {
+            document
+                .channels()
+                .iter()
+                .any(|channel| channel.id() == channel_id)
+        });
+        if !channel_exists {
+            self.status = format!(
+                "MIDI script cannot select Channel Rack channel {channel_id} without a recognized project record"
+            );
+            return;
+        }
+        self.selected_graph_channel = Some(channel_id);
+        self.selected_note_channel = Some(channel_id);
+        self.selected_rack_channels.clear();
+        self.selected_rack_channels.insert(channel_id);
+        self.rack_selection_anchor = Some(channel_id);
+        self.status = format!("MIDI script selected Channel Rack channel {channel_id}");
     }
 
     fn set_midi_script_mixer_track_selection(&mut self, index: u16, flags: u32) {
@@ -50694,6 +50739,9 @@ impl DawUi {
                         .arrangement_live_selection_start
                 };
                 selection_point.store(u64::from(tick), Ordering::Relaxed);
+            }
+            MidiTransportCommand::SelectChannel(channel_id) => {
+                self.set_midi_script_channel_selection(channel_id);
             }
             MidiTransportCommand::SetMixerTrackSelection { index, flags } => {
                 self.set_midi_script_mixer_track_selection(index, flags);

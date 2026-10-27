@@ -669,6 +669,7 @@ fn midi_input_thru_message(event: MidiInputEvent) -> Option<([u8; 3], usize)> {
             | MidiTransportCommand::SetProjectTimeSignatureDenominator(_)
             | MidiTransportCommand::AddArrangementTimeMarker { .. }
             | MidiTransportCommand::SetArrangementLiveSelection { .. }
+            | MidiTransportCommand::SelectChannel(_)
             | MidiTransportCommand::SetMixerTrackSelection { .. }
             | MidiTransportCommand::SetMixerTrackName { .. }
             | MidiTransportCommand::SetMixerTrackColor { .. }
