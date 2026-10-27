@@ -1228,6 +1228,20 @@ def _global_transport(command, value, pmeflags=2, flags=15):
         if value != 0:
             _request_transport_action(action)
         return 8
+    if command == 20:  # FPT_Undo
+        if value != 0:
+            _request_transport_action("undo")
+        return 8
+    if command == 21:  # FPT_UndoUp
+        if value != 0:
+            _request_transport_action("redo")
+        return 8
+    if command == 22:  # FPT_UndoJog
+        if value != 0:
+            _request_transport_action(
+                {"action": "undo_history_jog", "increment": value}
+            )
+        return 8
     if command in (13, 14):
         if value not in (0, 2):
             return -1

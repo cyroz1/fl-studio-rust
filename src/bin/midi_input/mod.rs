@@ -777,6 +777,11 @@ fn queue_script_transport_actions(
                 MidiTransportCommand::FocusSelectedMixerTrackName
             }
             ScriptTransportAction::OpenHelpManual => MidiTransportCommand::OpenHelpManual,
+            ScriptTransportAction::Undo => MidiTransportCommand::Undo,
+            ScriptTransportAction::Redo => MidiTransportCommand::Redo,
+            ScriptTransportAction::UndoHistoryJog(increment) => {
+                MidiTransportCommand::UndoHistoryJog(increment)
+            }
             ScriptTransportAction::PatternJog(increment) => {
                 MidiTransportCommand::PatternJog(increment)
             }
@@ -895,6 +900,9 @@ pub enum MidiTransportCommand {
     SelectNextEmptyPatternWithNameDialog,
     FocusSelectedMixerTrackName,
     OpenHelpManual,
+    Undo,
+    Redo,
+    UndoHistoryJog(i32),
     PatternJog(i32),
     TempoJog(i32),
     MarkerJumpJog(i32),
@@ -1586,6 +1594,9 @@ pub fn describe_event(event: MidiInputEvent) -> String {
                 "MIDI script Rename Mixer Track".to_owned()
             }
             MidiTransportCommand::OpenHelpManual => "MIDI script Help Manual".to_owned(),
+            MidiTransportCommand::Undo => "MIDI script Undo".to_owned(),
+            MidiTransportCommand::Redo => "MIDI script Redo".to_owned(),
+            MidiTransportCommand::UndoHistoryJog(_) => "MIDI script Undo History".to_owned(),
             MidiTransportCommand::PatternJog(_) => "MIDI script Pattern Selection".to_owned(),
             MidiTransportCommand::TempoJog(_) => "MIDI script Tempo".to_owned(),
             MidiTransportCommand::MarkerJumpJog(_) => "MIDI script Marker Jump".to_owned(),

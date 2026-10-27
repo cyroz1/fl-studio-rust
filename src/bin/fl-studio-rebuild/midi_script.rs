@@ -117,6 +117,9 @@ pub enum ScriptTransportAction {
     SelectNextEmptyPatternWithNameDialog,
     FocusSelectedMixerTrackName,
     OpenHelpManual,
+    Undo,
+    Redo,
+    UndoHistoryJog(i32),
     PatternJog(i32),
     TempoJog(i32),
     MarkerJumpJog(i32),
@@ -167,6 +170,8 @@ impl ScriptTransportAction {
             }
             "focus_selected_mixer_track_name" => Some(Self::FocusSelectedMixerTrackName),
             "open_help_manual" => Some(Self::OpenHelpManual),
+            "undo" => Some(Self::Undo),
+            "redo" => Some(Self::Redo),
             _ => None,
         }
     }
@@ -1075,6 +1080,13 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
         return Ok(ScriptTransportAction::SetSongPosition(
             position.min(SCRIPT_SONG_POSITION_SCALE_U32),
         ));
+    }
+    if name == Some("undo_history_jog") {
+        let increment = action["increment"]
+            .as_i64()
+            .and_then(|increment| i32::try_from(increment).ok())
+            .ok_or_else(|| "MIDI script returned an invalid undo-history increment".to_owned())?;
+        return Ok(ScriptTransportAction::UndoHistoryJog(increment));
     }
     if name == Some("set_song_position_ticks") {
         let position = action["position"]

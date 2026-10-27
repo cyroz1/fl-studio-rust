@@ -50836,6 +50836,23 @@ impl DawUi {
             MidiTransportCommand::OpenHelpManual => {
                 self.open_help_manual_requested = true;
             }
+            MidiTransportCommand::Undo => self.undo_document(),
+            MidiTransportCommand::Redo => self.redo_document(),
+            MidiTransportCommand::UndoHistoryJog(increment) => {
+                let history_len = if increment > 0 {
+                    self.undo_history.len()
+                } else {
+                    self.redo_history.len()
+                };
+                let steps = (increment.unsigned_abs() as usize).min(history_len);
+                for _ in 0..steps {
+                    if increment > 0 {
+                        self.undo_document();
+                    } else {
+                        self.redo_document();
+                    }
+                }
+            }
             MidiTransportCommand::PatternJog(increment) => {
                 self.jog_midi_script_pattern(increment);
             }

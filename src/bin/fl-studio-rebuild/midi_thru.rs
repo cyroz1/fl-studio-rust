@@ -683,6 +683,9 @@ fn midi_input_thru_message(event: MidiInputEvent) -> Option<([u8; 3], usize)> {
             | MidiTransportCommand::JumpToMarker { .. }
             | MidiTransportCommand::SelectNextEmptyPatternWithNameDialog
             | MidiTransportCommand::FocusSelectedMixerTrackName
+            | MidiTransportCommand::Undo
+            | MidiTransportCommand::Redo
+            | MidiTransportCommand::UndoHistoryJog(_)
             | MidiTransportCommand::PatternJog(_)
             | MidiTransportCommand::TempoJog(_)
             | MidiTransportCommand::MarkerJumpJog(_)
