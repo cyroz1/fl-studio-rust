@@ -34,7 +34,7 @@ use crate::media::{
     sample_sampler_metadata,
 };
 use crate::vst3::{
-    PlaylistMidiNote, Vst3ParameterAutomation, Vst3PlaylistAutomationPoint,
+    MAX_PDC_DELAY_BYTES, PlaylistMidiNote, Vst3ParameterAutomation, Vst3PlaylistAutomationPoint,
     Vst3PlaylistParameterAutomation, Vst3PlaylistStreamProcessor,
     expand_pattern_parameter_automation_for_clip,
 };
@@ -5285,6 +5285,47 @@ struct PlaylistRenderMixerBuses<'a> {
     post_effect: Option<&'a [f32]>,
 }
 
+fn update_performance_source_pdc_delays(
+    delay_frames: u64,
+    direct_source_delay: &mut crate::audio::StereoFrameDelay,
+    mixer_bus_delays: &mut Vec<crate::audio::StereoFrameDelay>,
+    mixer_bus_delay_count: usize,
+) -> Result<(), String> {
+    let delay_line_count = u64::try_from(mixer_bus_delay_count)
+        .ok()
+        .and_then(|count| count.checked_add(1))
+        .ok_or_else(|| "Performance PDC delay count overflow".to_owned())?;
+    let delay_bytes = delay_frames
+        .checked_mul(delay_line_count)
+        .and_then(|frames| frames.checked_mul(std::mem::size_of::<[f32; 2]>() as u64))
+        .ok_or_else(|| "Performance PDC delay storage size overflow".to_owned())?;
+    if delay_bytes > MAX_PDC_DELAY_BYTES {
+        return Err(format!(
+            "Performance PDC needs {delay_bytes} bytes of source delay storage, exceeding the 128 MiB limit"
+        ));
+    }
+    direct_source_delay.set_delay_frames(delay_frames)?;
+    if mixer_bus_delays.len() == mixer_bus_delay_count {
+        for delay in mixer_bus_delays {
+            delay.set_delay_frames(delay_frames)?;
+        }
+        return Ok(());
+    }
+    let previous = std::mem::take(mixer_bus_delays);
+    let mut previous = previous.into_iter();
+    let mut updated = Vec::new();
+    updated
+        .try_reserve_exact(mixer_bus_delay_count)
+        .map_err(|error| format!("could not allocate Performance Mixer PDC delays: {error}"))?;
+    for _ in 0..mixer_bus_delay_count {
+        let mut delay = previous.next().unwrap_or_default();
+        delay.set_delay_frames(delay_frames)?;
+        updated.push(delay);
+    }
+    *mixer_bus_delays = updated;
+    Ok(())
+}
+
 fn stream_prepared_playlist_render_with_performance(
     mut render: PreparedPlaylistBlockMix<'_>,
     mut performance: Option<PlaylistPerformanceRuntime>,
@@ -5342,15 +5383,21 @@ fn stream_prepared_playlist_render_with_performance(
         0,
         Vst3PlaylistStreamProcessor::pdc_direct_source_delay_frames,
     );
-    let mut direct_source_delay = crate::audio::StereoFrameDelay::new(direct_source_delay_frames)?;
-    let mut mixer_bus_delays =
-        if direct_source_delay_frames > 0 && (meters.is_some() || mixer_effect_buses_required) {
-            (0..MIXER_TRACK_METER_COUNT * mixer_bus_planes)
-                .map(|_| crate::audio::StereoFrameDelay::new(direct_source_delay_frames))
-                .collect::<Result<Vec<_>, _>>()?
-        } else {
-            Vec::new()
-        };
+    let mixer_bus_delay_count = if (meters.is_some() || mixer_effect_buses_required)
+        && (performance.is_some() || direct_source_delay_frames > 0)
+    {
+        MIXER_TRACK_METER_COUNT * mixer_bus_planes
+    } else {
+        0
+    };
+    let mut direct_source_delay = crate::audio::StereoFrameDelay::default();
+    let mut mixer_bus_delays = Vec::new();
+    update_performance_source_pdc_delays(
+        direct_source_delay_frames,
+        &mut direct_source_delay,
+        &mut mixer_bus_delays,
+        mixer_bus_delay_count,
+    )?;
     if let Some(processor) = render.vst3_processor.as_deref_mut() {
         if let Some(meters) = meters {
             processor.set_live_mixer_source_targets(meters);
@@ -5428,6 +5475,16 @@ fn stream_prepared_playlist_render_with_performance(
                         block,
                         meter_buses.as_deref_mut(),
                         render.vst3_processor.as_deref_mut(),
+                    )?;
+                    let delay_frames = render.vst3_processor.as_deref().map_or(
+                        0,
+                        Vst3PlaylistStreamProcessor::pdc_direct_source_delay_frames,
+                    );
+                    update_performance_source_pdc_delays(
+                        delay_frames,
+                        &mut direct_source_delay,
+                        &mut mixer_bus_delays,
+                        mixer_bus_delay_count,
                     )?;
                 }
                 let sampler_samples = &mut sampler_block[..sample_count];
@@ -16858,6 +16915,27 @@ mod tests {
             &[4.0, 4.0]
         );
         assert_eq!(frames_to_skip, 0);
+    }
+
+    #[test]
+    fn performance_pdc_updates_retarget_direct_and_mixer_bus_delays() {
+        let mut direct = crate::audio::StereoFrameDelay::new(2).unwrap();
+        let mut mixer_buses = (0..3)
+            .map(|_| crate::audio::StereoFrameDelay::new(2).unwrap())
+            .collect::<Vec<_>>();
+
+        update_performance_source_pdc_delays(5, &mut direct, &mut mixer_buses, 3).unwrap();
+        assert_eq!(direct.delay_frames(), 5);
+        assert!(mixer_buses.iter().all(|delay| delay.delay_frames() == 5));
+
+        update_performance_source_pdc_delays(0, &mut direct, &mut mixer_buses, 3).unwrap();
+        assert_eq!(direct.delay_frames(), 0);
+        assert!(mixer_buses.iter().all(|delay| delay.delay_frames() == 0));
+
+        update_performance_source_pdc_delays(1, &mut direct, &mut mixer_buses, 1).unwrap();
+        assert_eq!(direct.delay_frames(), 1);
+        assert_eq!(mixer_buses.len(), 1);
+        assert_eq!(mixer_buses[0].delay_frames(), 1);
     }
 
     #[test]

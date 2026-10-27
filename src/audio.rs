@@ -1424,18 +1424,44 @@ pub(crate) struct StereoFrameDelay {
 
 impl StereoFrameDelay {
     pub(crate) fn new(delay_frames: u64) -> Result<Self, String> {
+        let mut delay = Self::default();
+        delay.set_delay_frames(delay_frames)?;
+        Ok(delay)
+    }
+
+    pub(crate) fn delay_frames(&self) -> u64 {
+        self.frames.len() as u64
+    }
+
+    /// Resize the delay while preserving the most recent queued frames.
+    ///
+    /// Growing a delay prepends silence for history that was not retained; shrinking it drops
+    /// the oldest queued frames so the newest signal history continues without a stream reset.
+    pub(crate) fn set_delay_frames(&mut self, delay_frames: u64) -> Result<(), String> {
         let capacity = usize::try_from(delay_frames)
             .map_err(|_| "PDC delay is too large for this platform".to_owned())?;
+        if capacity == self.frames.len() {
+            return Ok(());
+        }
+
+        let retained_frames = capacity.min(self.frames.len());
         let mut frames = Vec::new();
         frames
             .try_reserve_exact(capacity)
             .map_err(|error| format!("could not allocate PDC delay line: {error}"))?;
         frames.resize(capacity, [0.0; 2]);
-        Ok(Self { frames, cursor: 0 })
-    }
-
-    pub(crate) fn delay_frames(&self) -> u64 {
-        self.frames.len() as u64
+        if retained_frames > 0 {
+            let source_start =
+                (self.cursor + self.frames.len() - retained_frames) % self.frames.len();
+            let destination_start = capacity - retained_frames;
+            for offset in 0..retained_frames {
+                frames[destination_start + offset] =
+                    self.frames[(source_start + offset) % self.frames.len()];
+            }
+        }
+        self.frames = frames;
+        self.cursor = 0;
+        Ok(())
     }
 
     pub(crate) fn process_interleaved(&mut self, samples: &mut [f32]) -> Result<(), String> {
@@ -6031,6 +6057,34 @@ mod tests {
             .process_interleaved(&mut second)
             .expect("stereo frames should process");
         assert_eq!(second, [1.0, -1.0, 2.0, -2.0, 3.0, -3.0]);
+    }
+
+    #[test]
+    fn stereo_frame_delay_can_change_latency_without_dropping_recent_audio() {
+        let mut delay = StereoFrameDelay::new(4).expect("small delay line should allocate");
+        let mut first = [1.0, -1.0, 2.0, -2.0, 3.0, -3.0, 4.0, -4.0, 5.0, -5.0];
+        delay
+            .process_interleaved(&mut first)
+            .expect("stereo frames should process");
+        assert_eq!(first, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, -1.0]);
+
+        delay
+            .set_delay_frames(2)
+            .expect("a shorter delay should be applied");
+        let mut shorter = [6.0, -6.0, 7.0, -7.0];
+        delay
+            .process_interleaved(&mut shorter)
+            .expect("stereo frames should process");
+        assert_eq!(shorter, [4.0, -4.0, 5.0, -5.0]);
+
+        delay
+            .set_delay_frames(4)
+            .expect("a longer delay should be applied");
+        let mut longer = [8.0, -8.0, 9.0, -9.0, 10.0, -10.0, 11.0, -11.0];
+        delay
+            .process_interleaved(&mut longer)
+            .expect("stereo frames should process");
+        assert_eq!(longer, [0.0, 0.0, 0.0, 0.0, 6.0, -6.0, 7.0, -7.0]);
     }
 
     #[test]

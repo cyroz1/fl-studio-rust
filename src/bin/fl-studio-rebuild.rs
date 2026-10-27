@@ -47304,7 +47304,7 @@ impl DawUi {
                 if ui
                     .checkbox(&mut enabled, "Automatic PDC")
                     .on_hover_text(
-                        "Align supported direct and Mixer send paths using reported VST3 latency. Song and selected Pattern playback apply this change through a staged stream handoff; other active playback modes stop and require a new start.",
+                        "Align supported direct and Mixer send paths using reported VST3 latency. Song and selected Pattern playback apply this through a staged stream handoff; Performance playback applies it at an audio block boundary.",
                     )
                     .changed()
                 {
@@ -49555,7 +49555,20 @@ impl DawUi {
                         && self.stage_pattern_stream_rebuild(
                             PdcStreamHandoffReason::AutomaticPdc { enabled },
                         );
-                    if playback_was_active && !staged_song_handoff && !staged_pattern_handoff {
+                    let performance_live_update = playback_was_active
+                        && self.performance_mode_active
+                        && self
+                            .document
+                            .as_ref()
+                            .zip(self.performance_mixer_routing_sender.as_ref())
+                            .is_some_and(|(document, sender)| {
+                                sender.send(document.clone()).is_ok()
+                            });
+                    if playback_was_active
+                        && !staged_song_handoff
+                        && !staged_pattern_handoff
+                        && !performance_live_update
+                    {
                         self.stop_project_playback();
                     }
                     self.dirty = true;
@@ -49569,6 +49582,11 @@ impl DawUi {
                             } else {
                                 "Song"
                             }
+                        )
+                    } else if performance_live_update {
+                        format!(
+                            "Automatic PDC set to {}; applying at the next Performance audio block",
+                            u8::from(enabled)
                         )
                     } else if playback_was_active {
                         format!(

@@ -48,7 +48,7 @@ const VST3_EFFECT_RENDER_BLOCK_FRAMES: usize = 512;
 const MIXER_EFFECT_MIX_SMOOTHING_SECONDS: f32 = 0.02;
 const MAX_VST3_EFFECT_LATENCY_SECONDS: f64 = 60.0;
 const MAX_VST3_AUTOMATION_POINTS: usize = 1_000_000;
-const MAX_PDC_DELAY_BYTES: u64 = 128 * 1024 * 1024;
+pub(crate) const MAX_PDC_DELAY_BYTES: u64 = 128 * 1024 * 1024;
 // Leave headroom below vst3-host's 4096-change processing queue for concurrent editor edits.
 const MAX_VST3_AUTOMATION_CHANGES_PER_BLOCK: usize = 2_048;
 const FLP_VST3_STATE_MARKER: u32 = 1;
@@ -847,6 +847,7 @@ impl Vst3PlaylistStreamProcessor {
         document: &FlpDocument,
         meters: Option<&MixerTrackPeakMeters>,
     ) -> Result<(), String> {
+        self.automatic_pdc_enabled = document.mixer_automatic_pdc_enabled().unwrap_or(true);
         let routing = MixerRouteAudibility::from_document(document);
         let channels_by_id = document
             .channels()
@@ -910,6 +911,7 @@ impl Vst3PlaylistStreamProcessor {
             0
         };
         configure_mixer_effect_pdc(self, &routing, instrument_delay_frames)?;
+        self.extend_to_output_frames(self.content_frames)?;
         if let Some(meters) = meters {
             self.set_live_mixer_source_targets(meters);
         }
@@ -1383,9 +1385,7 @@ impl Vst3PlaylistStreamProcessor {
             } else {
                 0
             };
-            if stream.delay_line.delay_frames() != compensation_frames {
-                stream.delay_line = StereoFrameDelay::new(compensation_frames)?;
-            }
+            stream.delay_line.set_delay_frames(compensation_frames)?;
             let stream_frames = self
                 .content_frames
                 .checked_add(stream.latency_frames)
@@ -2110,6 +2110,27 @@ fn plan_pdc_delays(latencies: &[u64]) -> (u64, Vec<u64>) {
     (maximum, delays)
 }
 
+fn update_stereo_delay_lines(
+    lines: &mut Vec<StereoFrameDelay>,
+    delay_frames: impl IntoIterator<Item = u64>,
+) -> Result<(), String> {
+    let previous = std::mem::take(lines);
+    let mut previous = previous.into_iter();
+    let delays = delay_frames.into_iter();
+    let (minimum_count, _) = delays.size_hint();
+    let mut updated = Vec::new();
+    updated
+        .try_reserve_exact(minimum_count)
+        .map_err(|error| format!("could not allocate Mixer PDC delays: {error}"))?;
+    for frames in delays {
+        let mut line = previous.next().unwrap_or_default();
+        line.set_delay_frames(frames)?;
+        updated.push(line);
+    }
+    *lines = updated;
+    Ok(())
+}
+
 fn configure_mixer_effect_pdc(
     processor: &mut Vst3PlaylistStreamProcessor,
     routing: &MixerRouteAudibility,
@@ -2216,24 +2237,15 @@ fn configure_mixer_effect_pdc(
         ));
     }
 
-    processor.mixer_effect_output_delay =
-        StereoFrameDelay::new(if processor.automatic_pdc_enabled {
+    processor
+        .mixer_effect_output_delay
+        .set_delay_frames(if processor.automatic_pdc_enabled {
             master_input_latency_frames
         } else {
             0
         })?;
-    processor.mixer_effect_meter_input_delays = Vec::new();
-    processor.mixer_effect_input_delays = Vec::new();
-    processor
-        .mixer_effect_meter_input_delays
-        .try_reserve_exact(crate::audio::MIXER_TRACK_METER_COUNT)
-        .map_err(|error| format!("could not allocate Mixer meter PDC delays: {error}"))?;
-    processor
-        .mixer_effect_input_delays
-        .try_reserve_exact(crate::audio::MIXER_TRACK_METER_COUNT)
-        .map_err(|error| format!("could not allocate Mixer input PDC delays: {error}"))?;
-    for track in 0..crate::audio::MIXER_TRACK_METER_COUNT {
-        let delay_frames = if processor.automatic_pdc_enabled {
+    let meter_input_delays = (0..crate::audio::MIXER_TRACK_METER_COUNT).map(|track| {
+        if processor.automatic_pdc_enabled {
             pdc_plan
                 .input_latency_frames
                 .get(&track)
@@ -2241,38 +2253,47 @@ fn configure_mixer_effect_pdc(
                 .unwrap_or_default()
         } else {
             0
-        };
-        processor
-            .mixer_effect_meter_input_delays
-            .push(StereoFrameDelay::new(delay_frames)?);
-        processor
-            .mixer_effect_input_delays
-            .push(StereoFrameDelay::new(delay_frames)?);
-    }
-    processor.mixer_post_effect_stem_delays.clear();
-    processor
-        .mixer_post_effect_stem_delays
-        .try_reserve_exact(crate::audio::MIXER_TRACK_METER_COUNT)
-        .map_err(|error| format!("could not allocate post-effect Mixer PDC delays: {error}"))?;
-    for track in 0..crate::audio::MIXER_TRACK_METER_COUNT {
-        let output_latency_frames = pdc_plan
-            .output_latency_frames
-            .get(&track)
-            .copied()
-            .unwrap_or_default();
-        let delay_frames = if processor.automatic_pdc_enabled
-            && pdc_plan.tracks_reaching_master.contains(&track)
-        {
-            master_input_latency_frames
-                .checked_sub(output_latency_frames)
-                .ok_or_else(|| "post-effect Mixer output exceeds planned PDC".to_owned())?
+        }
+    });
+    update_stereo_delay_lines(
+        &mut processor.mixer_effect_meter_input_delays,
+        meter_input_delays,
+    )?;
+    let effect_input_delays = (0..crate::audio::MIXER_TRACK_METER_COUNT).map(|track| {
+        if processor.automatic_pdc_enabled {
+            pdc_plan
+                .input_latency_frames
+                .get(&track)
+                .copied()
+                .unwrap_or_default()
         } else {
             0
-        };
-        processor
-            .mixer_post_effect_stem_delays
-            .push(StereoFrameDelay::new(delay_frames)?);
-    }
+        }
+    });
+    update_stereo_delay_lines(
+        &mut processor.mixer_effect_input_delays,
+        effect_input_delays,
+    )?;
+    let post_effect_stem_delays = (0..crate::audio::MIXER_TRACK_METER_COUNT)
+        .map(|track| {
+            let output_latency_frames = pdc_plan
+                .output_latency_frames
+                .get(&track)
+                .copied()
+                .unwrap_or_default();
+            if processor.automatic_pdc_enabled && pdc_plan.tracks_reaching_master.contains(&track) {
+                master_input_latency_frames
+                    .checked_sub(output_latency_frames)
+                    .ok_or_else(|| "post-effect Mixer output exceeds planned PDC".to_owned())
+            } else {
+                Ok(0)
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    update_stereo_delay_lines(
+        &mut processor.mixer_post_effect_stem_delays,
+        post_effect_stem_delays,
+    )?;
 
     for chain in &mut processor.mixer_effect_chains {
         if chain.insert_ordinal == 0 {
@@ -2300,11 +2321,19 @@ fn configure_mixer_effect_pdc(
         } else {
             0
         };
-        chain.output_alignment_delay = StereoFrameDelay::new(output_alignment_frames)?;
-        chain.dry_reference_delay = StereoFrameDelay::new(chain.latency_frames)?;
-        chain.downstream_delays = Vec::new();
         chain
-            .downstream_delays
+            .output_alignment_delay
+            .set_delay_frames(output_alignment_frames)?;
+        chain
+            .dry_reference_delay
+            .set_delay_frames(chain.latency_frames)?;
+        let previous_downstream_delays = std::mem::take(&mut chain.downstream_delays);
+        let mut previous_downstream_delays = previous_downstream_delays
+            .into_iter()
+            .map(|delay| (delay.track, delay))
+            .collect::<HashMap<_, _>>();
+        let mut downstream_delays = Vec::new();
+        downstream_delays
             .try_reserve_exact(chain.route_plan.insert_effect_input_transforms.len())
             .map_err(|error| format!("could not allocate Mixer send PDC routes: {error}"))?;
         for (track, transform) in &chain.route_plan.insert_effect_input_transforms {
@@ -2328,16 +2357,24 @@ fn configure_mixer_effect_pdc(
             let meter_transform = meter_transforms.get(track).copied().ok_or_else(|| {
                 format!("Mixer insert {track} has no meter transform for its send route")
             })?;
-            chain
-                .downstream_delays
-                .push(PlaylistMixerEffectBranchDelay {
+            let mut delays = previous_downstream_delays.remove(track).unwrap_or_else(|| {
+                PlaylistMixerEffectBranchDelay {
                     track: *track,
                     meter_transform,
                     effect_input_transform: *transform,
-                    meter_delay: StereoFrameDelay::new(branch_delay_frames)?,
-                    effect_input_delay: StereoFrameDelay::new(branch_delay_frames)?,
-                });
+                    meter_delay: StereoFrameDelay::default(),
+                    effect_input_delay: StereoFrameDelay::default(),
+                }
+            });
+            delays.meter_transform = meter_transform;
+            delays.effect_input_transform = *transform;
+            delays.meter_delay.set_delay_frames(branch_delay_frames)?;
+            delays
+                .effect_input_delay
+                .set_delay_frames(branch_delay_frames)?;
+            downstream_delays.push(delays);
         }
+        chain.downstream_delays = downstream_delays;
     }
     processor.mixer_effect_route_delay_frames = route_delay_frames;
     processor.mixer_effect_pdc_latency_frames = total_effect_latency_frames;
@@ -7987,6 +8024,31 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEST_BINARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn live_pdc_delay_updates_resize_existing_track_lines_in_place() {
+        let mut delays = (0..2)
+            .map(|_| StereoFrameDelay::new(2).unwrap())
+            .collect::<Vec<_>>();
+
+        update_stereo_delay_lines(&mut delays, [4, 6]).unwrap();
+        assert_eq!(
+            delays
+                .iter()
+                .map(StereoFrameDelay::delay_frames)
+                .collect::<Vec<_>>(),
+            [4, 6]
+        );
+
+        update_stereo_delay_lines(&mut delays, [0, 1, 3]).unwrap();
+        assert_eq!(
+            delays
+                .iter()
+                .map(StereoFrameDelay::delay_frames)
+                .collect::<Vec<_>>(),
+            [0, 1, 3]
+        );
+    }
 
     fn temporary_test_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
