@@ -5523,10 +5523,13 @@ fn stream_prepared_playlist_render_with_performance(
                         pre_effect: meter_buses
                             .as_deref()
                             .map(|buses| &buses[..MIXER_TRACK_METER_COUNT * samples_to_write]),
-                        post_effect: mixer_post_effect_stems_required
-                            .then(|| post_effect_buses.as_deref())
-                            .flatten()
-                            .map(|buses| &buses[..MIXER_TRACK_METER_COUNT * samples_to_write]),
+                        post_effect: if mixer_post_effect_stems_required {
+                            post_effect_buses
+                                .as_deref()
+                                .map(|buses| &buses[..MIXER_TRACK_METER_COUNT * samples_to_write])
+                        } else {
+                            None
+                        },
                     },
                 )?;
                 frames_rendered = block_start.saturating_add(frames_to_write as u64);
