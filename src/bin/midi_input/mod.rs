@@ -960,6 +960,7 @@ pub struct MidiInputChannelState {
     pitch_bend_sensitivity_cents: u8,
     rpn_msb: u8,
     rpn_lsb: u8,
+    rpn_selected: bool,
 }
 
 impl Default for MidiInputChannelState {
@@ -981,6 +982,7 @@ impl Default for MidiInputChannelState {
             pitch_bend_sensitivity_cents: 0,
             rpn_msb: 127,
             rpn_lsb: 127,
+            rpn_selected: false,
         }
     }
 }
@@ -1056,29 +1058,42 @@ impl MidiInputChannelState {
                 self.pitch_bend_sensitivity_cents = 0;
                 self.rpn_msb = 127;
                 self.rpn_lsb = 127;
+                self.rpn_selected = false;
+            }
+            MidiInputEvent::ControlChange {
+                controller: 98 | 99,
+                ..
+            } => {
+                self.rpn_selected = false;
             }
             MidiInputEvent::ControlChange {
                 controller: 101,
                 value,
                 ..
-            } => self.rpn_msb = value.min(127),
+            } => {
+                self.rpn_msb = value.min(127);
+                self.rpn_selected = true;
+            }
             MidiInputEvent::ControlChange {
                 controller: 100,
                 value,
                 ..
-            } => self.rpn_lsb = value.min(127),
+            } => {
+                self.rpn_lsb = value.min(127);
+                self.rpn_selected = true;
+            }
             MidiInputEvent::ControlChange {
                 controller: 6,
                 value,
                 ..
-            } if (self.rpn_msb, self.rpn_lsb) == (0, 0) => {
+            } if self.rpn_selected && (self.rpn_msb, self.rpn_lsb) == (0, 0) => {
                 self.pitch_bend_sensitivity_semitones = value.min(127);
             }
             MidiInputEvent::ControlChange {
                 controller: 38,
                 value,
                 ..
-            } if (self.rpn_msb, self.rpn_lsb) == (0, 0) => {
+            } if self.rpn_selected && (self.rpn_msb, self.rpn_lsb) == (0, 0) => {
                 self.pitch_bend_sensitivity_cents = value.min(99);
             }
             MidiInputEvent::PitchBend { value, .. } => {
@@ -3145,6 +3160,36 @@ mod tests {
             value: -8192,
         });
         assert_eq!(state.note_fine_pitch(), 100);
+    }
+
+    #[test]
+    fn nrpn_data_entry_does_not_change_live_pitch_bend_range() {
+        let mut state = MidiInputChannelState::default();
+        for (controller, value) in [
+            (101, 0),
+            (100, 0),
+            (6, 12),
+            (99, 1),
+            (98, 2),
+            (6, 3),
+            (38, 50),
+        ] {
+            state.update(MidiInputEvent::ControlChange {
+                channel: 0,
+                controller,
+                value,
+            });
+        }
+        assert_eq!(state.raw_pitch_bend_sensitivity_semitones(), 12);
+        assert_eq!(state.raw_pitch_bend_sensitivity_cents(), 0);
+        for (controller, value) in [(101, 0), (100, 0), (6, 2)] {
+            state.update(MidiInputEvent::ControlChange {
+                channel: 0,
+                controller,
+                value,
+            });
+        }
+        assert_eq!(state.raw_pitch_bend_sensitivity_semitones(), 2);
     }
 
     #[test]
