@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use flp_rebuild::PatternNote;
 use flp_rebuild::midi::{
-    midi_modulation_to_fl_note_value, midi_pan_to_fl_note_pan,
-    midi_pitch_bend_cents_to_fl_note_fine_pitch, midi_pitch_bend_offset_cents,
+    midi_modulation_to_fl_note_value, midi_offset_to_fl_pitch, midi_pan_to_fl_note_pan,
+    midi_pitch_bend_offset_cents, midi_pitch_bend_unclamped_cents,
     midi_release_velocity_to_fl_note_release,
 };
 use midir::{Ignore, MidiInput, MidiInputConnection as MidirInputConnection};
@@ -961,6 +961,8 @@ pub struct MidiInputChannelState {
     rpn_msb: u8,
     rpn_lsb: u8,
     rpn_selected: bool,
+    channel_coarse_tuning: u8,
+    channel_fine_tuning: u16,
 }
 
 impl Default for MidiInputChannelState {
@@ -983,6 +985,8 @@ impl Default for MidiInputChannelState {
             rpn_msb: 127,
             rpn_lsb: 127,
             rpn_selected: false,
+            channel_coarse_tuning: 64,
+            channel_fine_tuning: 8192,
         }
     }
 }
@@ -1059,6 +1063,8 @@ impl MidiInputChannelState {
                 self.rpn_msb = 127;
                 self.rpn_lsb = 127;
                 self.rpn_selected = false;
+                self.channel_coarse_tuning = 64;
+                self.channel_fine_tuning = 8192;
             }
             MidiInputEvent::ControlChange {
                 controller: 98 | 99,
@@ -1095,6 +1101,29 @@ impl MidiInputChannelState {
                 ..
             } if self.rpn_selected && (self.rpn_msb, self.rpn_lsb) == (0, 0) => {
                 self.pitch_bend_sensitivity_cents = value.min(99);
+            }
+            MidiInputEvent::ControlChange {
+                controller: 6,
+                value,
+                ..
+            } if self.rpn_selected && (self.rpn_msb, self.rpn_lsb) == (0, 1) => {
+                self.channel_fine_tuning =
+                    (u16::from(value.min(127)) << 7) | (self.channel_fine_tuning & 0x7f);
+            }
+            MidiInputEvent::ControlChange {
+                controller: 38,
+                value,
+                ..
+            } if self.rpn_selected && (self.rpn_msb, self.rpn_lsb) == (0, 1) => {
+                self.channel_fine_tuning =
+                    (self.channel_fine_tuning & 0x3f80) | u16::from(value.min(127));
+            }
+            MidiInputEvent::ControlChange {
+                controller: 6,
+                value,
+                ..
+            } if self.rpn_selected && (self.rpn_msb, self.rpn_lsb) == (0, 2) => {
+                self.channel_coarse_tuning = value.min(127);
             }
             MidiInputEvent::PitchBend { value, .. } => {
                 self.pitch_bend_value = (i32::from(value) + 8192).clamp(0, 0x3FFF) as u16;
@@ -1175,8 +1204,18 @@ impl MidiInputChannelState {
         )
     }
 
-    fn note_fine_pitch(self) -> u8 {
-        midi_pitch_bend_cents_to_fl_note_fine_pitch(self.pitch_bend_offset_cents())
+    fn tuned_note_pitch(self, key: u8) -> (u16, u8) {
+        let fine =
+            (((i32::from(self.channel_fine_tuning) - 8192) * 100) as f64 / 8192.0).round() as i32;
+        let bend = midi_pitch_bend_unclamped_cents(
+            self.pitch_bend_value,
+            self.pitch_bend_sensitivity_semitones,
+            self.pitch_bend_sensitivity_cents,
+        );
+        midi_offset_to_fl_pitch(
+            key,
+            (i32::from(self.channel_coarse_tuning) - 64) * 100 + fine + i32::from(bend),
+        )
     }
 }
 
@@ -1626,6 +1665,7 @@ pub struct MidiPatternRecorderSettings {
 }
 
 struct ActiveMidiNote {
+    tuned_key: u16,
     start_tick: u32,
     timeline_start_tick: u32,
     velocity: u8,
@@ -1886,17 +1926,19 @@ impl MidiPatternRecorder {
                     .get(usize::from(channel))
                     .copied()
                     .unwrap_or_default();
+                let (tuned_key, fine_pitch) = channel_state.tuned_note_pitch(key);
                 self.active_notes
                     .entry((channel, key))
                     .or_default()
                     .push_back(ActiveMidiNote {
+                        tuned_key,
                         start_tick: tick,
                         timeline_start_tick: position.timeline_tick,
                         velocity: fixed_velocity.unwrap_or(velocity).min(127),
                         pan: channel_state.raw_pan(),
                         mod_x: channel_state.note_mod_x(),
                         mod_y: channel_state.note_mod_y(),
-                        fine_pitch: channel_state.note_fine_pitch(),
+                        fine_pitch,
                         sostenuto_held: false,
                     });
             }
@@ -2223,7 +2265,7 @@ impl MidiPatternRecorder {
         active_note: ActiveMidiNote,
         end_tick: u32,
         midi_channel: u8,
-        key: u8,
+        _key: u8,
         release_velocity: Option<u8>,
     ) -> PatternNote {
         let position = quantize_recording_tick(active_note.start_tick, self.snap_ticks);
@@ -2234,7 +2276,7 @@ impl MidiPatternRecorder {
             position,
             channel_id: self.channel_id,
             length: end_tick.saturating_sub(position).max(1),
-            key: u16::from(key),
+            key: active_note.tuned_key,
             midi_channel,
             pan: midi_pan_to_fl_note_pan(active_note.pan),
             mod_x: active_note.mod_x,
@@ -3059,6 +3101,64 @@ mod tests {
     }
 
     #[test]
+    fn recording_snapshots_channel_tuning_without_losing_note_off_pairing() {
+        let started_at = Instant::now();
+        let mut recorder = MidiPatternRecorder::new(
+            MidiPatternRecorderSettings {
+                pattern_id: 1,
+                channel_id: 2,
+                project_path: None,
+                ppq: 96,
+                tempo_bpm: 120.0,
+                start_tick: 0,
+                snap_ticks: None,
+                timing_offset_ms: 0,
+                song_timeline_start: None,
+            },
+            started_at,
+        )
+        .unwrap();
+        let message = |elapsed_ms, event| ReceivedMidiMessage {
+            timestamp_micros: 1_000_000 + elapsed_ms * 1_000,
+            received_at: started_at + Duration::from_millis(elapsed_ms),
+            event,
+        };
+        for (controller, value) in [(101, 0), (100, 2), (6, 84), (100, 1), (6, 80), (38, 0)] {
+            recorder.record(message(
+                0,
+                MidiInputEvent::ControlChange {
+                    channel: 0,
+                    controller,
+                    value,
+                },
+            ));
+        }
+        recorder.record(message(
+            100,
+            MidiInputEvent::NoteOn {
+                channel: 0,
+                key: 60,
+                velocity: 100,
+            },
+        ));
+        recorder.record(message(
+            200,
+            MidiInputEvent::NoteOff {
+                channel: 0,
+                key: 60,
+                velocity: 40,
+            },
+        ));
+        let result = recorder.finish(Some(1_300_000), started_at + Duration::from_millis(300));
+        assert_eq!(result.notes.len(), 1);
+        assert_eq!((result.notes[0].key, result.notes[0].fine_pitch), (69, 233));
+        assert_eq!(
+            result.notes[0].release,
+            midi_release_velocity_to_fl_note_release(40)
+        );
+    }
+
+    #[test]
     fn records_pitch_bend_at_each_note_on_using_rpn_sensitivity() {
         let started_at = Instant::now();
         let mut recorder = MidiPatternRecorder::new(
@@ -3153,13 +3253,13 @@ mod tests {
             channel: 0,
             value: 8191,
         });
-        assert_eq!(state.note_fine_pitch(), 140);
+        assert_eq!(state.tuned_note_pitch(60).1, 140);
 
         state.update(MidiInputEvent::PitchBend {
             channel: 0,
             value: -8192,
         });
-        assert_eq!(state.note_fine_pitch(), 100);
+        assert_eq!(state.tuned_note_pitch(60).1, 100);
     }
 
     #[test]
@@ -3241,7 +3341,7 @@ mod tests {
         assert_eq!(state.raw_mod_y(), 64);
         assert_eq!(state.raw_pitch_bend_value(), 8192);
         assert_eq!(state.pitch_bend_offset_cents(), 0);
-        assert_eq!(state.note_fine_pitch(), 120);
+        assert_eq!(state.tuned_note_pitch(60).1, 120);
         assert_eq!(state.raw_pitch_bend_sensitivity_semitones(), 2);
         assert_eq!(state.raw_pitch_bend_sensitivity_cents(), 0);
 

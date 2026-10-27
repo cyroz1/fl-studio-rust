@@ -1963,6 +1963,24 @@ impl MidiTrack {
     }
 }
 
+/// Approximate a MIDI pitch offset using an FL key and 10-cent fine-pitch field.
+pub fn midi_offset_to_fl_pitch(source_key: u8, total_cents: i32) -> (u16, u8) {
+    let total_cents = total_cents.clamp(-25600, 25600);
+    let key_shift = if total_cents > 1200 {
+        (total_cents - 1200 + 99) / 100
+    } else if total_cents < -1200 {
+        -((-1200 - total_cents + 99) / 100)
+    } else {
+        0
+    };
+    let key = (i32::from(source_key) + key_shift).clamp(0, 127);
+    let cents = total_cents - (key - i32::from(source_key)) * 100;
+    (
+        key as u16,
+        midi_pitch_bend_cents_to_fl_note_fine_pitch(cents.clamp(-1200, 1200) as i16),
+    )
+}
+
 impl MidiNote {
     pub fn channel(&self) -> u8 {
         self.channel
@@ -1977,21 +1995,7 @@ impl MidiNote {
         let total_cents = i32::from(self.channel_coarse_tuning) * 100
             + i32::from(self.channel_fine_tuning_cents)
             + i32::from(self.pitch_bend_offset_cents);
-        // Preserve the original key where possible, since key-mapped instruments
-        // can select a different sound when the key itself is transposed.
-        let key_shift = if total_cents > 1200 {
-            (total_cents - 1200 + 99) / 100
-        } else if total_cents < -1200 {
-            -((-1200 - total_cents + 99) / 100)
-        } else {
-            0
-        };
-        let key = (i32::from(self.key) + key_shift).clamp(0, 127);
-        let cents = total_cents - (key - i32::from(self.key)) * 100;
-        (
-            key as u16,
-            midi_pitch_bend_cents_to_fl_note_fine_pitch(cents.clamp(-1200, 1200) as i16),
-        )
+        midi_offset_to_fl_pitch(self.key, total_cents)
     }
 
     pub fn velocity(&self) -> u8 {
@@ -2002,7 +2006,6 @@ impl MidiNote {
     pub fn pan(&self) -> u8 {
         self.pan
     }
-
     /// MIDI CC 74 value active when the note started.
     pub fn mod_x(&self) -> u8 {
         self.mod_x
@@ -2067,7 +2070,8 @@ pub fn midi_pitch_bend_offset_cents(value: u16, semitones: u8, cents: u8) -> i16
     midi_pitch_bend_unclamped_cents(value, semitones, cents).clamp(-1200, 1200)
 }
 
-fn midi_pitch_bend_unclamped_cents(value: u16, semitones: u8, cents: u8) -> i16 {
+/// Calculate bend cents before limiting them to the FL fine-pitch range.
+pub fn midi_pitch_bend_unclamped_cents(value: u16, semitones: u8, cents: u8) -> i16 {
     let bend = i32::from(value.min(0x3FFF)) - 8192;
     if bend == 0 {
         return 0;
