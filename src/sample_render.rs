@@ -2559,10 +2559,12 @@ pub fn stream_playlist_performance_with_vst3_to_device(
         options.clone(),
         performance.performance_zone_end_tick,
         performance.start_frame,
-        performance.launches,
-        performance.mixer_routing_updates,
-        performance.latency_updates,
-        performance.latency_reports,
+        PlaylistPerformanceControls {
+            launches: performance.launches,
+            mixer_routing_updates: performance.mixer_routing_updates,
+            latency_updates: performance.latency_updates,
+            latency_reports: performance.latency_reports,
+        },
         PlaylistPerformanceSources {
             sampler_clip_indices: &performance_sampler_clip_indices,
             audio_clip_indices: &performance_audio_clip_indices,
@@ -9626,16 +9628,20 @@ struct PlaylistPerformanceRuntime {
     active_audio_playbacks: Vec<PreparedClip>,
 }
 
+struct PlaylistPerformanceControls {
+    launches: Receiver<PlaylistPerformanceCommand>,
+    mixer_routing_updates: Receiver<FlpDocument>,
+    latency_updates: Receiver<BTreeSet<u64>>,
+    latency_reports: Sender<Vst3LatencyReport>,
+}
+
 impl PlaylistPerformanceRuntime {
     fn new(
         document: &FlpDocument,
         options: PlaylistRenderOptions,
         performance_zone_end_tick: u32,
         start_frame: u64,
-        launches: Receiver<PlaylistPerformanceCommand>,
-        mixer_routing_updates: Receiver<FlpDocument>,
-        latency_updates: Receiver<BTreeSet<u64>>,
-        latency_reports: Sender<Vst3LatencyReport>,
+        controls: PlaylistPerformanceControls,
         sources: PlaylistPerformanceSources<'_>,
     ) -> Result<Self, String> {
         let arrangement = document
@@ -9988,10 +9994,10 @@ impl PlaylistPerformanceRuntime {
             start_frame,
             sample_rate: options.sample_rate,
             tempo_map: PlaylistTempoMap::for_arrangement(document, options.arrangement_id)?,
-            launches,
-            mixer_routing_updates,
-            latency_updates,
-            latency_reports,
+            launches: controls.launches,
+            mixer_routing_updates: controls.mixer_routing_updates,
+            latency_updates: controls.latency_updates,
+            latency_reports: controls.latency_reports,
             current_document: document.clone(),
             pending_commands: Vec::new(),
             queued_by_track: BTreeMap::new(),
