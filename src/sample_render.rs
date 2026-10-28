@@ -52,6 +52,7 @@ const MAX_SOURCE_CACHE_BYTES: usize = 512 * 1024 * 1024;
 const DEFAULT_SAMPLER_VOICE_LIMIT: usize = 64;
 const MAX_SAMPLER_VOICE_LIMIT: usize = 256;
 const SAMPLER_LIVE_NOTE_QUEUE_CAPACITY: usize = 1_024;
+const VST3_LIVE_INPUT_QUEUE_CAPACITY: usize = 1_024;
 const SAMPLER_RELEASE_SECONDS: f64 = 0.005;
 const SAMPLER_ROOT_KEY: u16 = 60;
 const SAMPLER_BLOCK_FRAMES: usize = 1_024;
@@ -971,6 +972,63 @@ pub enum Vst3LiveInputEvent {
         key: u8,
         pressure: u8,
     },
+}
+
+/// Lock-free producer for stopped-transport VST3 live-MIDI events.
+pub struct Vst3LiveInputSender {
+    events: Arc<ArrayQueue<Vst3LiveInputEvent>>,
+    closed: Arc<AtomicBool>,
+}
+
+/// Lock-free consumer for stopped-transport VST3 live-MIDI events.
+pub struct Vst3LiveInputReceiver {
+    events: Arc<ArrayQueue<Vst3LiveInputEvent>>,
+    closed: Arc<AtomicBool>,
+}
+
+/// Creates a bounded, allocation-free queue for live MIDI input to a VST3 worker.
+pub fn vst3_live_input_queue() -> (Vst3LiveInputSender, Vst3LiveInputReceiver) {
+    let events = Arc::new(ArrayQueue::new(VST3_LIVE_INPUT_QUEUE_CAPACITY));
+    let closed = Arc::new(AtomicBool::new(false));
+    (
+        Vst3LiveInputSender {
+            events: Arc::clone(&events),
+            closed: Arc::clone(&closed),
+        },
+        Vst3LiveInputReceiver { events, closed },
+    )
+}
+
+impl Vst3LiveInputSender {
+    /// Enqueues an event without blocking, returning it when the queue is full or closed.
+    pub fn send(&self, event: Vst3LiveInputEvent) -> Result<(), Vst3LiveInputEvent> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(event);
+        }
+        self.events.push(event)
+    }
+}
+
+impl Drop for Vst3LiveInputSender {
+    fn drop(&mut self) {
+        self.closed.store(true, Ordering::Release);
+    }
+}
+
+impl Vst3LiveInputReceiver {
+    fn try_recv(&self) -> Result<Vst3LiveInputEvent, TryRecvError> {
+        match self.events.pop() {
+            Some(event) => Ok(event),
+            None if self.closed.load(Ordering::Acquire) => Err(TryRecvError::Disconnected),
+            None => Err(TryRecvError::Empty),
+        }
+    }
+}
+
+impl Drop for Vst3LiveInputReceiver {
+    fn drop(&mut self) {
+        self.closed.store(true, Ordering::Release);
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -7806,7 +7864,7 @@ pub fn stream_vst3_midi_input_to_device(
     document: FlpDocument,
     source_channel_id: u16,
     target_channel_ids: BTreeSet<u16>,
-    events: Receiver<Vst3LiveInputEvent>,
+    events: Vst3LiveInputReceiver,
     writer: &StreamingAudioWriter,
     cancelled: &AtomicBool,
 ) -> Result<(), String> {

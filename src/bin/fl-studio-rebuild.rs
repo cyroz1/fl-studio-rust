@@ -47,8 +47,8 @@ use flp_rebuild::sample_render::{
     SamplerLiveNoteEvent, SamplerLiveNoteSender, SamplerPatternLoopPlayback,
     SamplerPatternLoopStreamControls, SamplerPatternRenderOptions, SamplerPatternRenderSummary,
     SamplerPatternStreamControls, Vst3LatencyUpdateControls, Vst3LiveInputEvent,
-    Vst3PatternLoopPlayback, Vst3PatternLoopStreamControls, Vst3PatternPlayback,
-    Vst3PatternStreamControls, WavChannelMode, WavDitherMode, WavSampleFormat,
+    Vst3LiveInputSender, Vst3PatternLoopPlayback, Vst3PatternLoopStreamControls,
+    Vst3PatternPlayback, Vst3PatternStreamControls, WavChannelMode, WavDitherMode, WavSampleFormat,
     nearest_playlist_audio_clip_zero_crossing_tick, playlist_audio_clip_fade_gain,
     playlist_performance_clip_indices_with_vst3, playlist_performance_static_document_with_vst3,
     playlist_performance_vst3_channel_ids, playlist_performance_vst3_clip_indices,
@@ -65,7 +65,7 @@ use flp_rebuild::sample_render::{
     stream_sampler_midi_input_to_device,
     stream_sampler_pattern_loop_from_tick_to_device_with_live_controls,
     stream_sampler_pattern_to_device, stream_sampler_pattern_to_device_with_live_controls,
-    stream_vst3_midi_input_to_device, write_input_recording_to_wav,
+    stream_vst3_midi_input_to_device, vst3_live_input_queue, write_input_recording_to_wav,
 };
 use flp_rebuild::vst3::{
     MAX_REPORTED_TAIL_SECONDS, Vst3AutomationPoint, Vst3HostRuntime, Vst3LatencyReport,
@@ -5434,7 +5434,7 @@ struct LiveVst3InputSession {
     pattern_id: u16,
     channel_id: u16,
     target_channel_ids: BTreeSet<u16>,
-    sender: Sender<Vst3LiveInputEvent>,
+    sender: Vst3LiveInputSender,
     receiver: Receiver<Result<(), String>>,
     cancelled: Arc<AtomicBool>,
     worker: thread::JoinHandle<()>,
@@ -53210,7 +53210,7 @@ impl DawUi {
                 return false;
             }
         };
-        let (event_sender, event_receiver) = mpsc::channel();
+        let (event_sender, event_receiver) = vst3_live_input_queue();
         let (result_sender, result_receiver) = mpsc::sync_channel(1);
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
@@ -53425,7 +53425,7 @@ impl DawUi {
         }
     }
 
-    fn send_live_vst3_controller_state(&self, sender: &Sender<Vst3LiveInputEvent>) {
+    fn send_live_vst3_controller_state(&self, sender: &Vst3LiveInputSender) {
         for (channel_index, state) in self.midi_input_channel_state.iter().copied().enumerate() {
             let channel = channel_index as u8;
             let send_control_change = |controller, value| {
@@ -54854,6 +54854,9 @@ impl DawUi {
         } else if self.live_vst3_input.is_some() || self.live_playlist_vst3_input.is_some() {
             self.stop_live_vst3_input();
             self.stop_live_audition_playback_if_stopped();
+            self.status =
+                "Could not queue VST3 live MIDI; audition stopped to release active notes"
+                    .to_owned();
         }
     }
 
