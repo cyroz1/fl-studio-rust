@@ -713,6 +713,13 @@ pub struct SamplerPatternLoopPlayback {
     pub start_tick: u64,
 }
 
+/// Live Sampler Pattern loop inputs, meters, and block-boundary Mixer updates.
+pub struct SamplerPatternLoopStreamControls<'a> {
+    pub playback: SamplerPatternLoopPlayback,
+    pub meters: &'a crate::audio::MixerTrackPeakMeters,
+    pub latency_updates: Option<Vst3LatencyUpdateControls>,
+}
+
 /// Timing and prepared plug-in stream for live Pattern-mode playback.
 pub struct Vst3PatternLoopPlayback {
     pub loop_length_ticks: u64,
@@ -6244,20 +6251,43 @@ pub fn stream_sampler_pattern_loop_from_tick_to_device_with_live_master_controls
     writer: &StreamingAudioWriter,
     cancelled: &AtomicBool,
 ) -> Result<SamplerPatternRenderSummary, String> {
+    stream_sampler_pattern_loop_from_tick_to_device_with_live_controls(
+        document,
+        project_path,
+        options,
+        SamplerPatternLoopStreamControls {
+            playback,
+            meters,
+            latency_updates: None,
+        },
+        writer,
+        cancelled,
+    )
+}
+
+/// Stream a Sampler Pattern loop with live Mixer routing and latency updates at block boundaries.
+pub fn stream_sampler_pattern_loop_from_tick_to_device_with_live_controls(
+    document: &FlpDocument,
+    project_path: impl AsRef<Path>,
+    options: SamplerPatternRenderOptions,
+    controls: SamplerPatternLoopStreamControls<'_>,
+    writer: &StreamingAudioWriter,
+    cancelled: &AtomicBool,
+) -> Result<SamplerPatternRenderSummary, String> {
     stream_pattern_from_tick_with_vst3_to_device(
         document,
         project_path,
         options,
         PatternStreamConfig {
-            loop_length_ticks: playback.loop_length_ticks,
-            start_tick: playback.start_tick,
+            loop_length_ticks: controls.playback.loop_length_ticks,
+            start_tick: controls.playback.start_tick,
             vst3_processor: None,
             allow_empty_sampler: false,
             repeat_pattern: true,
         },
         PatternLiveStreamControls {
-            meters: Some(meters),
-            latency_updates: None,
+            meters: Some(controls.meters),
+            latency_updates: controls.latency_updates,
         },
         writer,
         cancelled,

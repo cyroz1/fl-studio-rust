@@ -43,14 +43,14 @@ use flp_rebuild::sample_render::{
     PlaylistPerformanceCommand, PlaylistPerformanceLaunch, PlaylistPerformanceStream,
     PlaylistRenderOptions, PlaylistRenderRange, PlaylistRenderSummary, PlaylistStreamMonitor,
     PlaylistTailMode, PlaylistTempoMap, ResamplingQuality, SamplerLiveInputRouting,
-    SamplerLiveNoteEvent, SamplerPatternLoopPlayback, SamplerPatternRenderOptions,
-    SamplerPatternRenderSummary, Vst3LatencyUpdateControls, Vst3LiveInputEvent,
-    Vst3PatternLoopPlayback, Vst3PatternLoopStreamControls, Vst3PatternPlayback, WavChannelMode,
-    WavDitherMode, WavSampleFormat, nearest_playlist_audio_clip_zero_crossing_tick,
-    playlist_audio_clip_fade_gain, playlist_performance_clip_indices_with_vst3,
-    playlist_performance_static_document_with_vst3, playlist_performance_vst3_channel_ids,
-    playlist_performance_vst3_clip_indices, render_audio_clips_to_file,
-    render_playlist_mixer_stems_with_vst3_cancellable,
+    SamplerLiveNoteEvent, SamplerPatternLoopPlayback, SamplerPatternLoopStreamControls,
+    SamplerPatternRenderOptions, SamplerPatternRenderSummary, Vst3LatencyUpdateControls,
+    Vst3LiveInputEvent, Vst3PatternLoopPlayback, Vst3PatternLoopStreamControls,
+    Vst3PatternPlayback, WavChannelMode, WavDitherMode, WavSampleFormat,
+    nearest_playlist_audio_clip_zero_crossing_tick, playlist_audio_clip_fade_gain,
+    playlist_performance_clip_indices_with_vst3, playlist_performance_static_document_with_vst3,
+    playlist_performance_vst3_channel_ids, playlist_performance_vst3_clip_indices,
+    render_audio_clips_to_file, render_playlist_mixer_stems_with_vst3_cancellable,
     render_playlist_with_vst3_to_file_from_frame_cancellable,
     render_playlist_with_vst3_to_flac_cancellable, render_playlist_with_vst3_to_mp3_cancellable,
     render_playlist_with_vst3_to_ogg_cancellable, render_playlist_with_vst3_to_wav_cancellable,
@@ -61,7 +61,7 @@ use flp_rebuild::sample_render::{
     stream_playlist_performance_with_vst3_to_device,
     stream_playlist_with_vst3_to_device_with_monitor_and_latency_updates,
     stream_sampler_midi_input_to_device,
-    stream_sampler_pattern_loop_from_tick_to_device_with_live_master_controls,
+    stream_sampler_pattern_loop_from_tick_to_device_with_live_controls,
     stream_sampler_pattern_to_device, stream_vst3_midi_input_to_device,
     write_input_recording_to_wav,
 };
@@ -12341,13 +12341,9 @@ impl DawUi {
         self.midi_script_mixer_peak_updated_at = Instant::now();
         let (latency_update_sender, latency_update_receiver) = mpsc::channel();
         let (latency_report_sender, latency_report_receiver) = mpsc::channel();
-        let (playlist_pdc_update_sender, playlist_pdc_update_receiver) = if vst3_processor.is_some()
-        {
-            let (update_sender, update_receiver) = mpsc::channel();
-            (Some(update_sender), Some(update_receiver))
-        } else {
-            (None, None)
-        };
+        let (playlist_pdc_update_sender, playlist_pdc_update_receiver) = mpsc::channel();
+        let playlist_pdc_update_sender = Some(playlist_pdc_update_sender);
+        let playlist_pdc_update_receiver = Some(playlist_pdc_update_receiver);
         let playlist_pdc_update_sender_for_ui = playlist_pdc_update_sender.clone();
         let (sender, receiver) = mpsc::sync_channel(1);
         let worker_options = options.clone();
@@ -40368,8 +40364,9 @@ impl DawUi {
                 return;
             }
         };
+        let has_vst3_processor = vst3_processor.is_some();
         let (pattern_latency_update_sender, pattern_latency_update_receiver) =
-            if loop_length_ticks.is_some() && vst3_processor.is_some() {
+            if loop_length_ticks.is_some() {
                 let (update_sender, update_receiver) = mpsc::channel();
                 let (report_sender, report_receiver) = mpsc::channel();
                 (
@@ -40380,13 +40377,17 @@ impl DawUi {
                 (None, None)
             };
         let (pattern_pdc_update_sender, pattern_pdc_update_receiver) =
-            if loop_length_ticks.is_some() && vst3_processor.is_some() {
+            if loop_length_ticks.is_some() {
                 let (update_sender, update_receiver) = mpsc::channel();
                 (Some(update_sender), Some(update_receiver))
             } else {
                 (None, None)
             };
-        let pattern_latency_update_sender_for_ui = pattern_latency_update_sender.clone();
+        let pattern_latency_update_sender_for_ui = if has_vst3_processor {
+            pattern_latency_update_sender.clone()
+        } else {
+            None
+        };
         let pattern_pdc_update_sender_for_ui = pattern_pdc_update_sender.clone();
         let (
             pattern_latency_update_receiver,
@@ -40513,15 +40514,24 @@ impl DawUi {
                                 )
                             }
                         } else if let Some(loop_length_ticks) = loop_length_ticks {
-                            stream_sampler_pattern_loop_from_tick_to_device_with_live_master_controls(
+                            stream_sampler_pattern_loop_from_tick_to_device_with_live_controls(
                                 &document,
                                 &project_path,
                                 options,
-                                SamplerPatternLoopPlayback {
-                                    loop_length_ticks,
-                                    start_tick: loop_start_tick,
+                                SamplerPatternLoopStreamControls {
+                                    playback: SamplerPatternLoopPlayback {
+                                        loop_length_ticks,
+                                        start_tick: loop_start_tick,
+                                    },
+                                    meters: &worker_mixer_meters,
+                                    latency_updates: pattern_latency_update_receiver
+                                        .zip(pattern_latency_report_sender)
+                                        .map(|(updates, reports)| Vst3LatencyUpdateControls {
+                                            updates,
+                                            reports,
+                                            pdc_updates: pattern_pdc_update_receiver,
+                                        }),
                                 },
-                                &worker_mixer_meters,
                                 &writer,
                                 &worker_cancelled,
                             )
@@ -40562,7 +40572,11 @@ impl DawUi {
                 self.playing = true;
                 self.project_playback_loaded = true;
                 self.pattern_latency_update_sender = pattern_latency_update_sender_for_ui;
-                self.pattern_latency_report_receiver = pattern_latency_report_receiver;
+                self.pattern_latency_report_receiver = if has_vst3_processor {
+                    pattern_latency_report_receiver
+                } else {
+                    None
+                };
                 self.pattern_pdc_update_sender = pattern_pdc_update_sender_for_ui;
                 self.status = if handoff_in_progress {
                     match staged_handoff {
