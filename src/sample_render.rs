@@ -11,6 +11,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwapOption;
+use crossbeam_queue::ArrayQueue;
 use flacenc::bitsink::ByteSink;
 use flacenc::component::{BitRepr, Frame, FrameOffset, Stream};
 use flacenc::error::Verify;
@@ -50,6 +51,7 @@ const MAX_MIX_BYTES: usize = 512 * 1024 * 1024;
 const MAX_SOURCE_CACHE_BYTES: usize = 512 * 1024 * 1024;
 const DEFAULT_SAMPLER_VOICE_LIMIT: usize = 64;
 const MAX_SAMPLER_VOICE_LIMIT: usize = 256;
+const SAMPLER_LIVE_NOTE_QUEUE_CAPACITY: usize = 1_024;
 const SAMPLER_RELEASE_SECONDS: f64 = 0.005;
 const SAMPLER_ROOT_KEY: u16 = 60;
 const SAMPLER_BLOCK_FRAMES: usize = 1_024;
@@ -830,6 +832,63 @@ pub enum SamplerLiveNoteEvent {
         pan: u8,
         pitch_bend_cents: i16,
     },
+}
+
+/// Lock-free producer for Sampler live-MIDI events.
+#[derive(Clone)]
+pub struct SamplerLiveNoteSender {
+    events: Arc<ArrayQueue<SamplerLiveNoteEvent>>,
+    overflowed: Arc<AtomicBool>,
+}
+
+/// Lock-free consumer for Sampler live-MIDI events.
+pub struct SamplerLiveNoteReceiver {
+    events: Arc<ArrayQueue<SamplerLiveNoteEvent>>,
+    overflowed: Arc<AtomicBool>,
+}
+
+/// Creates a bounded, allocation-free queue for MIDI callback to Sampler worker events.
+pub fn sampler_live_note_queue() -> (SamplerLiveNoteSender, SamplerLiveNoteReceiver) {
+    let events = Arc::new(ArrayQueue::new(SAMPLER_LIVE_NOTE_QUEUE_CAPACITY));
+    let overflowed = Arc::new(AtomicBool::new(false));
+    (
+        SamplerLiveNoteSender {
+            events: Arc::clone(&events),
+            overflowed: Arc::clone(&overflowed),
+        },
+        SamplerLiveNoteReceiver { events, overflowed },
+    )
+}
+
+impl SamplerLiveNoteSender {
+    /// Enqueues an event without blocking; a full queue marks the stream for panic recovery.
+    pub fn send(&self, event: SamplerLiveNoteEvent) -> Result<(), SamplerLiveNoteEvent> {
+        self.events.push(event).inspect_err(|_| {
+            self.overflowed.store(true, Ordering::Release);
+        })
+    }
+}
+
+impl SamplerLiveNoteReceiver {
+    fn take_overflowed(&self) -> bool {
+        self.overflowed.swap(false, Ordering::AcqRel)
+    }
+
+    fn pop(&self) -> Option<SamplerLiveNoteEvent> {
+        self.events.pop()
+    }
+
+    fn try_recv(&self) -> Result<SamplerLiveNoteEvent, TryRecvError> {
+        self.pop().ok_or(TryRecvError::Empty)
+    }
+
+    fn discard_pending(&self) {
+        for _ in 0..SAMPLER_LIVE_NOTE_QUEUE_CAPACITY {
+            if self.events.pop().is_none() {
+                break;
+            }
+        }
+    }
 }
 
 /// Source channel and resolved Sampler destinations for live MIDI audition.
@@ -7087,7 +7146,7 @@ pub fn stream_sampler_midi_input_to_device(
     project_path: impl AsRef<Path>,
     options: SamplerPatternRenderOptions,
     routing: SamplerLiveInputRouting,
-    events: Receiver<SamplerLiveNoteEvent>,
+    events: SamplerLiveNoteReceiver,
     writer: &StreamingAudioWriter,
     cancelled: &AtomicBool,
 ) -> Result<(), String> {
@@ -7172,6 +7231,19 @@ pub fn stream_sampler_midi_input_to_device(
         check_cancelled(Some(cancelled))?;
         if writer.is_cancelled() {
             return Err("Sampler input audition was stopped".to_owned());
+        }
+        if events.take_overflowed() {
+            events.discard_pending();
+            note_targets.clear();
+            for channel in 0_u8..16 {
+                engine.stop_live_voices(channel);
+                engine.set_live_sustain(channel, false);
+                engine.set_live_sostenuto(channel, false);
+                engine.apply_live_pitch_bend(channel, 0);
+                engine.apply_live_pan(channel, 64);
+                engine.apply_live_channel_volume(channel, 127);
+                engine.apply_live_expression(channel, 127);
+            }
         }
         loop {
             match events.try_recv() {

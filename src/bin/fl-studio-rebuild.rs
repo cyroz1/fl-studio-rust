@@ -44,19 +44,19 @@ use flp_rebuild::sample_render::{
     PlaylistPerformanceCommand, PlaylistPerformanceLaunch, PlaylistPerformanceStream,
     PlaylistRenderOptions, PlaylistRenderRange, PlaylistRenderSummary, PlaylistStreamMonitor,
     PlaylistTailMode, PlaylistTempoMap, ResamplingQuality, SamplerLiveInputRouting,
-    SamplerLiveNoteEvent, SamplerPatternLoopPlayback, SamplerPatternLoopStreamControls,
-    SamplerPatternRenderOptions, SamplerPatternRenderSummary, SamplerPatternStreamControls,
-    Vst3LatencyUpdateControls, Vst3LiveInputEvent, Vst3PatternLoopPlayback,
-    Vst3PatternLoopStreamControls, Vst3PatternPlayback, Vst3PatternStreamControls, WavChannelMode,
-    WavDitherMode, WavSampleFormat, nearest_playlist_audio_clip_zero_crossing_tick,
-    playlist_audio_clip_fade_gain, playlist_performance_clip_indices_with_vst3,
-    playlist_performance_static_document_with_vst3, playlist_performance_vst3_channel_ids,
-    playlist_performance_vst3_clip_indices, render_audio_clips_to_file,
-    render_playlist_mixer_stems_with_vst3_cancellable,
+    SamplerLiveNoteEvent, SamplerLiveNoteSender, SamplerPatternLoopPlayback,
+    SamplerPatternLoopStreamControls, SamplerPatternRenderOptions, SamplerPatternRenderSummary,
+    SamplerPatternStreamControls, Vst3LatencyUpdateControls, Vst3LiveInputEvent,
+    Vst3PatternLoopPlayback, Vst3PatternLoopStreamControls, Vst3PatternPlayback,
+    Vst3PatternStreamControls, WavChannelMode, WavDitherMode, WavSampleFormat,
+    nearest_playlist_audio_clip_zero_crossing_tick, playlist_audio_clip_fade_gain,
+    playlist_performance_clip_indices_with_vst3, playlist_performance_static_document_with_vst3,
+    playlist_performance_vst3_channel_ids, playlist_performance_vst3_clip_indices,
+    render_audio_clips_to_file, render_playlist_mixer_stems_with_vst3_cancellable,
     render_playlist_with_vst3_to_file_from_frame_cancellable,
     render_playlist_with_vst3_to_flac_cancellable, render_playlist_with_vst3_to_mp3_cancellable,
     render_playlist_with_vst3_to_ogg_cancellable, render_playlist_with_vst3_to_wav_cancellable,
-    render_sampler_pattern_to_file, stream_input_monitor_through_mixer,
+    render_sampler_pattern_to_file, sampler_live_note_queue, stream_input_monitor_through_mixer,
     stream_mixed_layer_midi_input_to_device,
     stream_pattern_loop_with_vst3_from_tick_to_device_with_live_controls,
     stream_pattern_with_vst3_to_device_with_live_controls,
@@ -5408,7 +5408,7 @@ struct LiveSamplerInputSession {
     pattern_id: u16,
     channel_id: u16,
     target_channel_ids: BTreeSet<u16>,
-    sender: Sender<SamplerLiveNoteEvent>,
+    sender: SamplerLiveNoteSender,
     receiver: Receiver<Result<(), String>>,
     cancelled: Arc<AtomicBool>,
     worker: thread::JoinHandle<()>,
@@ -53659,7 +53659,7 @@ impl DawUi {
             }
         };
 
-        let (event_sender, event_receiver) = mpsc::channel();
+        let (event_sender, event_receiver) = sampler_live_note_queue();
         let (result_sender, result_receiver) = mpsc::sync_channel(1);
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
@@ -54275,16 +54275,11 @@ impl DawUi {
         } else {
             false
         };
-        if event_sent {
-            if let Some((source_note, audition_key)) = mapped_note_on {
-                self.midi_live_sampler_note_mapping
-                    .entry(source_note)
-                    .or_default()
-                    .push_back(audition_key);
-            }
-        } else if self.live_sampler_input.is_some() {
-            self.stop_live_sampler_input();
-            self.stop_live_audition_playback_if_stopped();
+        if event_sent && let Some((source_note, audition_key)) = mapped_note_on {
+            self.midi_live_sampler_note_mapping
+                .entry(source_note)
+                .or_default()
+                .push_back(audition_key);
         }
     }
 
