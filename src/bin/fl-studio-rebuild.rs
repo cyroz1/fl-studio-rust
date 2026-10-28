@@ -27412,8 +27412,7 @@ impl DawUi {
             .unwrap_or_default();
         let current = midi_script_playlist_track_performance_modes(&[track_id], &tracks)
             .first()
-            .map(|modes| modes[parameter.mode_index()])
-            .flatten();
+            .and_then(|modes| modes[parameter.mode_index()]);
         let Some(next_value) =
             midi_script_increment_playlist_performance_mode(current, parameter, increment)
         else {
