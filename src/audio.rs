@@ -42,7 +42,8 @@ const RETIRED_STREAM_QUEUE_CAPACITY: usize = 4;
 const STREAM_PREFILL_FRAMES: usize = 512;
 const STREAM_HANDOFF_IDLE: u8 = 0;
 const STREAM_HANDOFF_COMMITTING: u8 = 1;
-const STREAM_HANDOFF_STOPPING: u8 = 2;
+const STREAM_HANDOFF_CONTROL: u8 = 2;
+const STREAM_HANDOFF_REAPING: u8 = 3;
 const OUTPUT_GAIN_MAX: f32 = 2.0;
 const OUTPUT_GAIN_SMOOTHING_SECONDS: f32 = 0.02;
 const BROWSER_PREVIEW_ACTIVE_BIT: u64 = 1 << 63;
@@ -1903,6 +1904,8 @@ struct PlaybackState {
     streaming: ArcSwapOption<StreamingPlayback>,
     pending_streaming: ArcSwapOption<StreamingPlayback>,
     retired_streaming: ArrayQueue<Arc<StreamingPlayback>>,
+    retired_streaming_overflow: Mutex<Vec<Arc<StreamingPlayback>>>,
+    streaming_readers: AtomicU32,
     stream_handoff_gate: AtomicU8,
     cursor_frames: AtomicU64,
     playback_speed: AtomicU32,
@@ -2592,6 +2595,8 @@ impl PlaybackState {
             streaming: ArcSwapOption::empty(),
             pending_streaming: ArcSwapOption::empty(),
             retired_streaming: ArrayQueue::new(RETIRED_STREAM_QUEUE_CAPACITY),
+            retired_streaming_overflow: Mutex::new(Vec::new()),
+            streaming_readers: AtomicU32::new(0),
             stream_handoff_gate: AtomicU8::new(STREAM_HANDOFF_IDLE),
             cursor_frames: AtomicU64::new(0),
             playback_speed: AtomicU32::new(1.0_f32.to_bits()),
@@ -2641,6 +2646,30 @@ impl PlaybackState {
             };
             self.browser_preview_gain
                 .store(gain_bits, Ordering::Release);
+        }
+    }
+
+    fn acquire_stream_handoff_control(&self) {
+        while self
+            .stream_handoff_gate
+            .compare_exchange(
+                STREAM_HANDOFF_IDLE,
+                STREAM_HANDOFF_CONTROL,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            std::thread::yield_now();
+        }
+    }
+
+    fn retire_streaming_from_control(&self, streaming: Arc<StreamingPlayback>) {
+        if let Err(streaming) = self.retired_streaming.push(streaming) {
+            self.retired_streaming_overflow
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(streaming);
         }
     }
 
@@ -2711,7 +2740,7 @@ impl PlaybackState {
         };
         let previous = self.streaming.swap(Some(next_owned));
         if let Some(previous) = previous {
-            // Only the audio callback publishes retired streams; UI calls drain the queue.
+            // The control thread drains retired streams after output readers leave.
             if let Err(previous) = self.retired_streaming.push(previous) {
                 // This is unreachable while the queue-empty guard above holds, but retaining the
                 // stream in the pending slot is safer than dropping it on the realtime thread.
@@ -3001,25 +3030,16 @@ impl PlaybackState {
     }
 
     fn cancel_stream(&self) {
-        while self
-            .stream_handoff_gate
-            .compare_exchange(
-                STREAM_HANDOFF_IDLE,
-                STREAM_HANDOFF_STOPPING,
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            )
-            .is_err()
-        {
-            std::thread::yield_now();
-        }
+        self.acquire_stream_handoff_control();
         if let Some(streaming) = self.streaming.swap(None) {
             streaming.cancelled.store(true, Ordering::Release);
             streaming.active.store(false, Ordering::Release);
+            self.retire_streaming_from_control(streaming);
         }
         if let Some(streaming) = self.pending_streaming.swap(None) {
             streaming.cancelled.store(true, Ordering::Release);
             streaming.active.store(false, Ordering::Release);
+            self.retire_streaming_from_control(streaming);
         }
         self.stream_handoff_gate
             .store(STREAM_HANDOFF_IDLE, Ordering::Release);
@@ -3648,23 +3668,32 @@ impl AudioEngine {
         if !Arc::ptr_eq(&self.playback, &staged.playback) {
             return Err("The staged stream belongs to a different audio engine".to_owned());
         }
-        if staged.stream.cancelled.load(Ordering::Acquire) {
-            return Err("The staged stream was cancelled".to_owned());
-        }
-        if staged.stream.handoff_committed.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        if self.playback.pending_streaming.load().is_some() {
-            return Err("Another staged stream handoff is already pending".to_owned());
-        }
-        staged.stream.handoff_target_frame.store(
-            staged.stream.consumed_frames.load(Ordering::Acquire),
-            Ordering::Release,
-        );
+        self.playback.acquire_stream_handoff_control();
+        let should_request_output = (|| {
+            if staged.stream.cancelled.load(Ordering::Acquire) {
+                return Err("The staged stream was cancelled".to_owned());
+            }
+            if staged.stream.handoff_committed.load(Ordering::Acquire) {
+                return Ok(false);
+            }
+            if self.playback.pending_streaming.load().is_some() {
+                return Err("Another staged stream handoff is already pending".to_owned());
+            }
+            staged.stream.handoff_target_frame.store(
+                staged.stream.consumed_frames.load(Ordering::Acquire),
+                Ordering::Release,
+            );
+            self.playback
+                .pending_streaming
+                .store(Some(Arc::clone(&staged.stream)));
+            Ok(true)
+        })();
         self.playback
-            .pending_streaming
-            .store(Some(Arc::clone(&staged.stream)));
-        self.request_output_source(AUDIO_SOURCE_STREAM);
+            .stream_handoff_gate
+            .store(STREAM_HANDOFF_IDLE, Ordering::Release);
+        if should_request_output? {
+            self.request_output_source(AUDIO_SOURCE_STREAM);
+        }
         Ok(())
     }
 
@@ -3676,22 +3705,59 @@ impl AudioEngine {
         if !Arc::ptr_eq(&self.playback, &staged.playback) {
             return Err("The staged stream belongs to a different audio engine".to_owned());
         }
-        if staged.is_committed() {
-            return Err("The staged stream has already been committed".to_owned());
-        }
-        if let Some(pending) = self.playback.pending_streaming.load_full()
-            && Arc::ptr_eq(&pending, &staged.stream)
-        {
-            self.playback.pending_streaming.store(None);
-        }
-        staged.stream.cancelled.store(true, Ordering::Release);
-        staged.stream.active.store(false, Ordering::Release);
-        Ok(())
+        self.playback.acquire_stream_handoff_control();
+        let result = (|| {
+            if staged.is_committed() {
+                return Err("The staged stream has already been committed".to_owned());
+            }
+            if let Some(pending) = self.playback.pending_streaming.load_full()
+                && Arc::ptr_eq(&pending, &staged.stream)
+                && let Some(pending) = self.playback.pending_streaming.swap(None)
+            {
+                pending.cancelled.store(true, Ordering::Release);
+                pending.active.store(false, Ordering::Release);
+                self.playback.retire_streaming_from_control(pending);
+            }
+            staged.stream.cancelled.store(true, Ordering::Release);
+            staged.stream.active.store(false, Ordering::Release);
+            Ok(())
+        })();
+        self.playback
+            .stream_handoff_gate
+            .store(STREAM_HANDOFF_IDLE, Ordering::Release);
+        result
     }
 
     /// Release retired streams, samples, and recording buffers after callback readers have left.
     pub fn reap_retired_streaming_playbacks(&self) {
-        while self.playback.retired_streaming.pop().is_some() {}
+        // Exclude stream handoffs and control replacements while reclaiming old streams.
+        if self
+            .playback
+            .stream_handoff_gate
+            .compare_exchange(
+                STREAM_HANDOFF_IDLE,
+                STREAM_HANDOFF_REAPING,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            if self.playback.streaming_readers.load(Ordering::SeqCst) == 0 {
+                while self.playback.retired_streaming.pop().is_some() {}
+                let overflow = {
+                    let mut retired = self
+                        .playback
+                        .retired_streaming_overflow
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    std::mem::take(&mut *retired)
+                };
+                drop(overflow);
+            }
+            self.playback
+                .stream_handoff_gate
+                .store(STREAM_HANDOFF_IDLE, Ordering::Release);
+        }
         self.playback.reap_retired_sample_buffers();
         self.input_recording.reap();
         self.input_monitor_recording.reap();
@@ -4560,6 +4626,8 @@ where
             config,
             move |output, info| {
                 enable_denormal_protection();
+                let _streaming_reader =
+                    RealtimeReadGuard::new(&playback_for_callback.streaming_readers);
                 playback_for_callback
                     .output_latency_estimate
                     .observe_cpal_output_callback(info);
@@ -5744,6 +5812,7 @@ fn render_wasapi_buffer(
     render_state: &mut WasapiRenderState,
     output: &mut Vec<u8>,
 ) -> Result<(), String> {
+    let _streaming_reader = RealtimeReadGuard::new(&playback.streaming_readers);
     playback
         .output_callback_frames
         .store(u32::try_from(frames).unwrap_or(u32::MAX), Ordering::Release);
