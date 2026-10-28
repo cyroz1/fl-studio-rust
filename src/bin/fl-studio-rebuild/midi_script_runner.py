@@ -131,6 +131,71 @@ def _request_transport_action(action):
         _active_transport_actions.append(action)
 
 
+def _playlist_track_count():
+    try:
+        return max(0, int(_active_transport_state.get("playlist_track_count", 0)))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _playlist_selected_track_ids():
+    try:
+        return {
+            int(track_id)
+            for track_id in _active_transport_state.get("selected_playlist_track_ids", [])
+        }
+    except (TypeError, ValueError, OverflowError):
+        return set()
+
+
+def _playlist_set_track_selection(track_ids):
+    track_count = _playlist_track_count()
+    selected_track_ids = sorted(
+        {
+            int(track_id)
+            for track_id in track_ids
+            if 1 <= int(track_id) <= track_count
+        }
+    )
+    _active_transport_state["selected_playlist_track_ids"] = selected_track_ids
+    _request_transport_action(
+        {"action": "set_playlist_track_selection", "track_ids": selected_track_ids}
+    )
+
+
+def _playlist_is_track_selected(index):
+    try:
+        index = int(index)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    if not 1 <= index <= _playlist_track_count():
+        return 0
+    return int(index in _playlist_selected_track_ids())
+
+
+def _playlist_select_track(index):
+    try:
+        index = int(index)
+    except (TypeError, ValueError, OverflowError):
+        return
+    if not 1 <= index <= _playlist_track_count():
+        return
+    selected_track_ids = _playlist_selected_track_ids()
+    if index in selected_track_ids:
+        selected_track_ids.remove(index)
+    else:
+        selected_track_ids.add(index)
+    _playlist_set_track_selection(selected_track_ids)
+
+
+def _playlist_select_all():
+    _playlist_set_track_selection(range(1, _playlist_track_count() + 1))
+
+
+def _playlist_deselect_all():
+    _playlist_set_track_selection(())
+
+
 def _mixer_track_index(index):
     try:
         index = int(index)
@@ -1570,8 +1635,11 @@ def _install_modules(script_name, device_name):
     device.setHasMeters = _set_has_meters
 
     playlist = _module("playlist")
-    playlist.selectAll = lambda: _request_transport_action("select_all_playlist_tracks")
-    playlist.deselectAll = lambda: _request_transport_action("deselect_all_playlist_tracks")
+    playlist.trackCount = _playlist_track_count
+    playlist.isTrackSelected = _playlist_is_track_selected
+    playlist.selectTrack = _playlist_select_track
+    playlist.selectAll = _playlist_select_all
+    playlist.deselectAll = _playlist_deselect_all
 
     mixer = _module("mixer")
     mixer.getCurrentTempo = _get_current_tempo

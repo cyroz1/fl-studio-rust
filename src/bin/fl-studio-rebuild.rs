@@ -14778,6 +14778,24 @@ impl DawUi {
         if let Ok(mut value) = self.midi_script_transport_state.project_genre.lock() {
             *value = project_genre;
         }
+        let playlist_track_ids = self.midi_script_playlist_track_ids();
+        let supported_playlist_track_ids =
+            playlist_track_ids.iter().copied().collect::<BTreeSet<_>>();
+        self.midi_script_transport_state
+            .playlist_track_count
+            .store(playlist_track_ids.len() as u64, Ordering::Relaxed);
+        if let Ok(mut selected_track_ids) = self
+            .midi_script_transport_state
+            .selected_playlist_track_ids
+            .lock()
+        {
+            *selected_track_ids = self
+                .selected_playlist_tracks
+                .iter()
+                .filter(|track_id| supported_playlist_track_ids.contains(track_id))
+                .copied()
+                .collect();
+        }
         let channel_ids = self
             .document
             .as_ref()
@@ -27081,12 +27099,15 @@ impl DawUi {
         midi_script_playlist_track_ids(arrangement, &tracks)
     }
 
-    fn set_midi_script_playlist_track_selection(&mut self, select_all: bool) {
-        self.selected_playlist_tracks = if select_all {
-            self.midi_script_playlist_track_ids().into_iter().collect()
-        } else {
-            BTreeSet::new()
-        };
+    fn set_midi_script_playlist_track_selection(&mut self, track_ids: Vec<u32>) {
+        let supported_track_ids = self
+            .midi_script_playlist_track_ids()
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        self.selected_playlist_tracks = track_ids
+            .into_iter()
+            .filter(|track_id| supported_track_ids.contains(track_id))
+            .collect();
         self.selected_playlist_track = self.selected_playlist_tracks.iter().next_back().copied();
         self.playlist_track_selection_anchor = self.selected_playlist_tracks.iter().next().copied();
         self.status = match self.selected_playlist_tracks.len() {
@@ -51881,11 +51902,8 @@ impl DawUi {
                 };
                 selection_point.store(u64::from(tick), Ordering::Relaxed);
             }
-            MidiTransportCommand::SelectAllPlaylistTracks => {
-                self.set_midi_script_playlist_track_selection(true);
-            }
-            MidiTransportCommand::DeselectAllPlaylistTracks => {
-                self.set_midi_script_playlist_track_selection(false);
+            MidiTransportCommand::SetPlaylistTrackSelection(track_ids) => {
+                self.set_midi_script_playlist_track_selection(track_ids);
             }
             MidiTransportCommand::SelectChannel(channel_id) => {
                 self.set_midi_script_channel_selection(channel_id);

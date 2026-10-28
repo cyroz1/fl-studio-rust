@@ -702,11 +702,8 @@ fn queue_script_transport_actions(
             ScriptTransportAction::SetArrangementLiveSelection { tick, stop } => {
                 MidiTransportCommand::SetArrangementLiveSelection { tick, stop }
             }
-            ScriptTransportAction::SelectAllPlaylistTracks => {
-                MidiTransportCommand::SelectAllPlaylistTracks
-            }
-            ScriptTransportAction::DeselectAllPlaylistTracks => {
-                MidiTransportCommand::DeselectAllPlaylistTracks
+            ScriptTransportAction::SetPlaylistTrackSelection(track_ids) => {
+                MidiTransportCommand::SetPlaylistTrackSelection(track_ids)
             }
             ScriptTransportAction::SelectChannel(channel_id) => {
                 MidiTransportCommand::SelectChannel(channel_id)
@@ -857,8 +854,7 @@ pub enum MidiTransportCommand {
         tick: u32,
         stop: bool,
     },
-    SelectAllPlaylistTracks,
-    DeselectAllPlaylistTracks,
+    SetPlaylistTrackSelection(Vec<u32>),
     SelectChannel(u16),
     SetMixerTrackSelection {
         index: u16,
@@ -1637,11 +1633,8 @@ pub fn describe_event(event: MidiInputEvent) -> String {
             MidiTransportCommand::SetArrangementLiveSelection { .. } => {
                 "MIDI script Live Selection".to_owned()
             }
-            MidiTransportCommand::SelectAllPlaylistTracks => {
-                "MIDI script Select All Playlist Tracks".to_owned()
-            }
-            MidiTransportCommand::DeselectAllPlaylistTracks => {
-                "MIDI script Deselect Playlist Tracks".to_owned()
+            MidiTransportCommand::SetPlaylistTrackSelection(_) => {
+                "MIDI script Set Playlist Track Selection".to_owned()
             }
             MidiTransportCommand::SelectChannel(_) => "MIDI script Select Channel".to_owned(),
             MidiTransportCommand::SetMixerTrackSelection { .. } => {
@@ -2511,8 +2504,8 @@ mod tests {
                 ScriptTransportAction::SetCurrentTempoMilliBpm(123_456),
                 ScriptTransportAction::SetProjectTimeSignatureNumerator(7),
                 ScriptTransportAction::SetProjectTimeSignatureDenominator(8),
-                ScriptTransportAction::SelectAllPlaylistTracks,
-                ScriptTransportAction::DeselectAllPlaylistTracks,
+                ScriptTransportAction::SetPlaylistTrackSelection(vec![1, 3]),
+                ScriptTransportAction::SetPlaylistTrackSelection(Vec::new()),
                 ScriptTransportAction::AddArrangementTimeMarker {
                     tick: 960,
                     name: "Verse".to_owned(),
@@ -2551,11 +2544,11 @@ mod tests {
         );
         assert_eq!(
             transport_receiver.try_recv().unwrap().event,
-            MidiInputEvent::Transport(MidiTransportCommand::SelectAllPlaylistTracks)
+            MidiInputEvent::Transport(MidiTransportCommand::SetPlaylistTrackSelection(vec![1, 3]))
         );
         assert_eq!(
             transport_receiver.try_recv().unwrap().event,
-            MidiInputEvent::Transport(MidiTransportCommand::DeselectAllPlaylistTracks)
+            MidiInputEvent::Transport(MidiTransportCommand::SetPlaylistTrackSelection(Vec::new()))
         );
         assert_eq!(
             transport_receiver.try_recv().unwrap().event,

@@ -62,8 +62,7 @@ pub enum ScriptTransportAction {
         tick: u32,
         stop: bool,
     },
-    SelectAllPlaylistTracks,
-    DeselectAllPlaylistTracks,
+    SetPlaylistTrackSelection(Vec<u32>),
     SelectChannel(u16),
     SetMixerTrackSelection {
         index: u16,
@@ -162,6 +161,7 @@ const SCRIPT_SONG_POSITION_SCALE_U32: u32 = 1_000_000;
 const SCRIPT_MIN_TEMPO_MILLI_BPM: u32 = 10_000;
 const SCRIPT_MAX_TEMPO_MILLI_BPM: u32 = 522_000;
 const SCRIPT_MAX_ARRANGEMENT_MARKER_TICK: u32 = 0x07FF_FFFF;
+const SCRIPT_MAX_PLAYLIST_TRACK_COUNT: usize = 65_536;
 impl ScriptTransportAction {
     fn parse(value: &str) -> Option<Self> {
         match value {
@@ -170,8 +170,6 @@ impl ScriptTransportAction {
             "record" => Some(Self::RecordToggle),
             "toggle_playback" => Some(Self::TogglePlayback),
             "loop_mode" => Some(Self::ToggleLoopMode),
-            "select_all_playlist_tracks" => Some(Self::SelectAllPlaylistTracks),
-            "deselect_all_playlist_tracks" => Some(Self::DeselectAllPlaylistTracks),
             "select_next_empty_pattern_with_name_dialog" => {
                 Some(Self::SelectNextEmptyPatternWithNameDialog)
             }
@@ -232,6 +230,8 @@ pub struct MidiScriptTransportState {
     pub arrangement_selection_end: AtomicU64,
     pub arrangement_live_selection_start: AtomicU64,
     pub arrangement_live_selection_end: AtomicU64,
+    pub playlist_track_count: AtomicU64,
+    pub selected_playlist_track_ids: Mutex<Vec<u32>>,
     pub midi_pickup_enabled: AtomicU8,
     pub channel_ids: Mutex<Vec<u16>>,
     pub selected_channel_id: AtomicU64,
@@ -285,6 +285,8 @@ impl Default for MidiScriptTransportState {
             arrangement_selection_end: AtomicU64::new(0),
             arrangement_live_selection_start: AtomicU64::new(0),
             arrangement_live_selection_end: AtomicU64::new(0),
+            playlist_track_count: AtomicU64::new(0),
+            selected_playlist_track_ids: Mutex::new(Vec::new()),
             midi_pickup_enabled: AtomicU8::new(1),
             channel_ids: Mutex::new(Vec::new()),
             selected_channel_id: AtomicU64::new(u64::MAX),
@@ -734,6 +736,16 @@ impl MidiScriptRuntime {
             .lock()
             .map(|names| names.clone())
             .unwrap_or_default();
+        let playlist_track_count = self
+            .transport_state
+            .playlist_track_count
+            .load(Ordering::Relaxed);
+        let selected_playlist_track_ids = self
+            .transport_state
+            .selected_playlist_track_ids
+            .lock()
+            .map(|track_ids| track_ids.clone())
+            .unwrap_or_default();
         let channel_ids = self
             .transport_state
             .channel_ids
@@ -940,6 +952,8 @@ impl MidiScriptRuntime {
                 "song_position_hint": song_position_hint,
                 "song_length_hint": song_length_hint,
                 "arrangement_marker_names": arrangement_marker_names,
+                "playlist_track_count": playlist_track_count,
+                "selected_playlist_track_ids": selected_playlist_track_ids,
                 "mixer_track_names": mixer_track_names,
                 "mixer_selected_track": self
                     .transport_state
@@ -1088,6 +1102,31 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
             .ok_or_else(|| "MIDI script returned an unknown transport action".to_owned());
     }
     let name = action["action"].as_str();
+    if name == Some("set_playlist_track_selection") {
+        let track_ids = action["track_ids"]
+            .as_array()
+            .filter(|track_ids| track_ids.len() <= SCRIPT_MAX_PLAYLIST_TRACK_COUNT)
+            .ok_or_else(|| "MIDI script returned an invalid Playlist track selection".to_owned())?;
+        let track_ids = track_ids
+            .iter()
+            .map(|track_id| {
+                track_id
+                    .as_u64()
+                    .and_then(|track_id| u32::try_from(track_id).ok())
+                    .filter(|track_id| {
+                        (1..=SCRIPT_MAX_PLAYLIST_TRACK_COUNT as u32).contains(track_id)
+                    })
+                    .ok_or_else(|| "MIDI script returned an invalid Playlist track ID".to_owned())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut unique_track_ids = track_ids.clone();
+        unique_track_ids.sort_unstable();
+        unique_track_ids.dedup();
+        if unique_track_ids.len() != track_ids.len() {
+            return Err("MIDI script returned duplicate Playlist track IDs".to_owned());
+        }
+        return Ok(ScriptTransportAction::SetPlaylistTrackSelection(track_ids));
+    }
     if name == Some("set_song_position") {
         let position = action["position"]
             .as_f64()
@@ -1839,24 +1878,36 @@ mod tests {
     }
 
     #[test]
-    fn python_playlist_select_all_commands_are_returned() {
+    fn python_playlist_selection_uses_one_based_track_indices_and_toggle_state() {
         let temporary = TestDirectory::new();
         let script_path = temporary.path().join("device_test.py");
         fs::write(
             &script_path,
-            "# name=Test Script\nimport playlist\ndef OnMidiIn(event):\n    playlist.selectAll()\n    playlist.deselectAll()\n",
+            "# name=Test Script\nimport playlist\ndef OnMidiIn(event):\n    if playlist.trackCount() != 3:\n        raise RuntimeError('wrong Playlist track count')\n    if not playlist.isTrackSelected(2):\n        raise RuntimeError('track 2 should start selected')\n    playlist.selectTrack(2)\n    if playlist.isTrackSelected(2) or not playlist.isTrackSelected(3):\n        raise RuntimeError('selectTrack should toggle one-based track 2')\n    playlist.selectTrack(1)\n    if not playlist.isTrackSelected(1) or not playlist.isTrackSelected(3):\n        raise RuntimeError('track selection should preserve other selected rows')\n    playlist.selectAll()\n    if not all(playlist.isTrackSelected(index) for index in range(1, 4)):\n        raise RuntimeError('selectAll should select every Playlist row')\n    playlist.deselectAll()\n    if any(playlist.isTrackSelected(index) for index in range(1, 4)):\n        raise RuntimeError('deselectAll should clear Playlist row selection')\n",
         )
         .unwrap();
         let script = MidiControllerScript::parse(script_path).unwrap();
-        let mut runtime = MidiScriptRuntime::start_for_device(&script, "Test Input").unwrap();
+        let transport_state = Arc::new(MidiScriptTransportState::default());
+        transport_state
+            .playlist_track_count
+            .store(3, Ordering::Relaxed);
+        *transport_state.selected_playlist_track_ids.lock().unwrap() = vec![2, 3];
+        let mut runtime = MidiScriptRuntime::start_for_device_with_transport_state(
+            &script,
+            "Test Input",
+            transport_state,
+        )
+        .unwrap();
 
         let result = runtime.process_event(12, &[0xB0, 7, 127]).unwrap();
 
         assert_eq!(
             result.actions,
             [
-                ScriptTransportAction::SelectAllPlaylistTracks,
-                ScriptTransportAction::DeselectAllPlaylistTracks,
+                ScriptTransportAction::SetPlaylistTrackSelection(vec![3]),
+                ScriptTransportAction::SetPlaylistTrackSelection(vec![1, 3]),
+                ScriptTransportAction::SetPlaylistTrackSelection(vec![1, 2, 3]),
+                ScriptTransportAction::SetPlaylistTrackSelection(Vec::new()),
             ]
         );
     }

@@ -694,8 +694,7 @@ fn midi_input_thru_message(event: MidiInputEvent) -> Option<([u8; 3], usize)> {
             | MidiTransportCommand::SetGlobalSwingMixRaw(_)
             | MidiTransportCommand::AddArrangementTimeMarker { .. }
             | MidiTransportCommand::SetArrangementLiveSelection { .. }
-            | MidiTransportCommand::SelectAllPlaylistTracks
-            | MidiTransportCommand::DeselectAllPlaylistTracks
+            | MidiTransportCommand::SetPlaylistTrackSelection(_)
             | MidiTransportCommand::SelectChannel(_)
             | MidiTransportCommand::SetMixerTrackSelection { .. }
             | MidiTransportCommand::SetMixerTrackName { .. }
