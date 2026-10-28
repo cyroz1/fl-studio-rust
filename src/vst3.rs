@@ -355,6 +355,7 @@ pub(crate) struct PlaylistMidiNote {
 
 struct PlaylistPluginStream {
     channel_id: u16,
+    plugin_instance_id: u64,
     plugin: Arc<Mutex<Plugin>>,
     live_midi_receiver: Receiver<PlaylistLiveMidiEvent>,
     live_midi_stopped_generation: Arc<AtomicU64>,
@@ -367,6 +368,7 @@ struct PlaylistPluginStream {
     next_event: usize,
     resampler_finished: bool,
     latency_frames: u64,
+    manual_latency_offset_samples: i32,
     delay_line: StereoFrameDelay,
     gain: f32,
     left_pan_gain: f32,
@@ -627,6 +629,7 @@ struct PlaylistMixerEffectStream {
     live_insert_effects_enabled_target: Option<Arc<AtomicI32>>,
     wet_mix_ramp: LiveWetMixRamp,
     latency_frames: u64,
+    manual_latency_offset_samples: i32,
     dry_delay_line: StereoFrameDelay,
     dry_delay_scratch: Vec<f32>,
 }
@@ -916,6 +919,87 @@ impl Vst3PlaylistStreamProcessor {
             self.set_live_mixer_source_targets(meters);
         }
         Ok(())
+    }
+
+    /// Refresh plug-in latency reports at a Performance Mode block boundary and rebuild PDC
+    /// while preserving the active streams and queued delay-line history.
+    pub(crate) fn refresh_live_latency_reports(
+        &mut self,
+        plugin_ids: &BTreeSet<u64>,
+        document: &FlpDocument,
+        meters: Option<&MixerTrackPeakMeters>,
+    ) -> Result<Vec<Vst3LatencyReport>, String> {
+        let mut reports = Vec::with_capacity(self.streams.len() + self.mixer_effects.len());
+        for stream in &mut self.streams {
+            if !plugin_ids.contains(&stream.plugin_instance_id) {
+                continue;
+            }
+            let report = refresh_plugin_latency_report(stream.plugin_instance_id, &stream.plugin)?;
+            let pdc_latency_samples = apply_manual_latency_offset(
+                report.latency_samples,
+                stream.manual_latency_offset_samples,
+            );
+            stream.latency_frames = plugin_latency_in_output_frames(
+                stream.channel_id,
+                pdc_latency_samples,
+                report.sample_rate_hz,
+                self.output_sample_rate,
+            )?;
+            let stream_frames = self
+                .content_frames
+                .checked_add(stream.latency_frames)
+                .ok_or_else(|| "VST3 PDC stream length overflow".to_owned())?;
+            let source_frames = (stream_frames as f64 * stream.render.sample_rate
+                / f64::from(self.output_sample_rate))
+            .ceil();
+            if !source_frames.is_finite() || source_frames > u64::MAX as f64 {
+                return Err(
+                    "VST3 Playlist stream length is outside the renderable range".to_owned(),
+                );
+            }
+            stream.render.total_frames = source_frames as u64;
+            reports.push(report);
+        }
+        for effect in &mut self.mixer_effects {
+            if !plugin_ids.contains(&effect.id) {
+                continue;
+            }
+            let report = refresh_plugin_latency_report(effect.id, &effect.plugin)?;
+            if !report.sample_rate_hz.is_finite() || report.sample_rate_hz <= 0.0 {
+                return Err(format!(
+                    "VST3 Mixer insert {} effect slot {} reports an invalid sample rate",
+                    effect.insert_ordinal,
+                    effect.slot_index + 1
+                ));
+            }
+            let pdc_latency_samples = apply_manual_latency_offset(
+                report.latency_samples,
+                effect.manual_latency_offset_samples,
+            );
+            let maximum_latency_frames =
+                (report.sample_rate_hz * MAX_VST3_EFFECT_LATENCY_SECONDS).ceil() as u64;
+            if u64::from(pdc_latency_samples) > maximum_latency_frames {
+                return Err(format!(
+                    "VST3 Mixer insert {} effect slot {} reports {} frames of latency, exceeding the {MAX_VST3_EFFECT_LATENCY_SECONDS}-second processing limit",
+                    effect.insert_ordinal,
+                    effect.slot_index + 1,
+                    pdc_latency_samples
+                ));
+            }
+            effect.latency_frames = u64::from(pdc_latency_samples);
+            reports.push(report);
+        }
+        if reports.is_empty() {
+            return Ok(reports);
+        }
+        let stream_latencies = self
+            .streams
+            .iter()
+            .map(|stream| stream.latency_frames)
+            .collect::<Vec<_>>();
+        self.maximum_latency_frames = plan_pdc_delays(&stream_latencies).0;
+        self.apply_live_mixer_routing(document, meters)?;
+        Ok(reports)
     }
 
     pub(crate) fn performance_channel_ids(&self) -> BTreeSet<u16> {
@@ -2065,6 +2149,32 @@ fn plugin_latency_in_output_frames(
     Ok(output_frames as u64)
 }
 
+fn refresh_plugin_latency_report(
+    plugin_id: u64,
+    plugin: &Arc<Mutex<Plugin>>,
+) -> Result<Vst3LatencyReport, String> {
+    let mut plugin = plugin
+        .lock()
+        .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
+    let was_processing = plugin.is_processing();
+    if was_processing {
+        plugin.stop_processing().map_err(|error| {
+            format!("could not stop VST3 instance {plugin_id} for a latency refresh: {error}")
+        })?;
+    }
+    let report = Vst3LatencyReport {
+        plugin_id,
+        latency_samples: plugin.latency_samples(),
+        sample_rate_hz: plugin.sample_rate(),
+    };
+    if was_processing {
+        plugin.start_processing().map_err(|error| {
+            format!("could not resume VST3 instance {plugin_id} after a latency refresh: {error}")
+        })?;
+    }
+    Ok(report)
+}
+
 fn pdc_aligned_output_frames(
     content_frames: u64,
     maximum_latency_frames: u64,
@@ -2823,11 +2933,20 @@ pub struct HostedPluginInfo {
     pub sample_rate_hz: f64,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Vst3HostServiceChanges {
     pub io_changed: bool,
     pub latency_changed: bool,
     pub latency_changed_while_processing: bool,
+    pub latency_changed_plugin_ids: BTreeSet<u64>,
+}
+
+/// A latency report refreshed by an active Playlist processor at a safe processing boundary.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Vst3LatencyReport {
+    pub plugin_id: u64,
+    pub latency_samples: u32,
+    pub sample_rate_hz: f64,
 }
 
 impl HostedPluginInfo {
@@ -4919,6 +5038,7 @@ impl Vst3HostRuntime {
             );
             streams.push(PlaylistPluginStream {
                 channel_id,
+                plugin_instance_id: instance_id,
                 plugin,
                 live_midi_receiver,
                 live_midi_stopped_generation,
@@ -4931,6 +5051,7 @@ impl Vst3HostRuntime {
                 next_event: 0,
                 resampler_finished: false,
                 latency_frames,
+                manual_latency_offset_samples: self.manual_latency_offset_for_plugin(instance_id),
                 delay_line: StereoFrameDelay::default(),
                 gain,
                 left_pan_gain,
@@ -5227,6 +5348,7 @@ impl Vst3HostRuntime {
                             .clamp(1.0, f64::from(u32::MAX)) as u32,
                     ),
                     latency_frames,
+                    manual_latency_offset_samples: self.manual_latency_offset_for_plugin(id),
                     dry_delay_line,
                     dry_delay_scratch: vec![0.0; block_size * 2],
                 });
@@ -5567,6 +5689,7 @@ impl Vst3HostRuntime {
             );
             streams.push(PlaylistPluginStream {
                 channel_id,
+                plugin_instance_id: instance_id,
                 plugin,
                 live_midi_receiver,
                 live_midi_stopped_generation,
@@ -5579,6 +5702,7 @@ impl Vst3HostRuntime {
                 next_event: 0,
                 resampler_finished: false,
                 latency_frames,
+                manual_latency_offset_samples: self.manual_latency_offset_for_plugin(instance_id),
                 delay_line: StereoFrameDelay::default(),
                 gain,
                 left_pan_gain,
@@ -5643,10 +5767,10 @@ impl Vst3HostRuntime {
 
     /// Service editor/UI requests and VST3 restart requests on the control thread.
     ///
-    /// Latency reports are refreshed only after processing has stopped, as required before
-    /// rebuilding delay compensation. Callers must rebuild active streams when either
-    /// `io_changed` or `latency_changed` is returned; subsequent calls refresh reports once the
-    /// corresponding plug-in instances are no longer processing.
+    /// This method refreshes reported latency in `HostedPluginInfo` after an instance has stopped
+    /// processing. Active Performance streams can instead refresh the requested instances at a
+    /// block boundary; other active streams must rebuild when `latency_changed` is returned.
+    /// Output routing and buffers must be rebuilt when `io_changed` is returned.
     pub fn service_editors(&mut self) -> Result<Vst3HostServiceChanges, String> {
         let mut changes = Vst3HostServiceChanges::default();
         for loaded in &mut self.loaded {
@@ -5667,6 +5791,7 @@ impl Vst3HostRuntime {
                 self.pending_latency_refresh.insert(loaded.info.id);
                 changes.latency_changed = true;
                 changes.latency_changed_while_processing |= plugin.is_processing();
+                changes.latency_changed_plugin_ids.insert(loaded.info.id);
             }
             if self.pending_latency_refresh.contains(&loaded.info.id) && !plugin.is_processing() {
                 loaded.info.latency_samples = plugin.latency_samples();
@@ -5683,6 +5808,19 @@ impl Vst3HostRuntime {
             .iter()
             .map(|loaded| loaded.info.clone())
             .collect()
+    }
+
+    /// Apply a latency report received from an active Playlist processor.
+    pub fn apply_latency_report(&mut self, report: Vst3LatencyReport) {
+        if let Some(loaded) = self
+            .loaded
+            .iter_mut()
+            .find(|loaded| loaded.info.id == report.plugin_id)
+        {
+            loaded.info.latency_samples = report.latency_samples;
+            loaded.info.sample_rate_hz = report.sample_rate_hz;
+            self.pending_latency_refresh.remove(&report.plugin_id);
+        }
     }
 
     fn plugin(&self, id: u64) -> Result<&Arc<Mutex<Plugin>>, String> {
@@ -5719,6 +5857,13 @@ impl Vst3HostRuntime {
                     loaded.info.manual_latency_offset_samples,
                 )
             })
+    }
+
+    fn manual_latency_offset_for_plugin(&self, id: u64) -> i32 {
+        self.loaded
+            .iter()
+            .find(|loaded| loaded.info.id == id)
+            .map_or(0, |loaded| loaded.info.manual_latency_offset_samples)
     }
 }
 

@@ -6,7 +6,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -34,8 +34,8 @@ use crate::media::{
     sample_sampler_metadata,
 };
 use crate::vst3::{
-    MAX_PDC_DELAY_BYTES, PlaylistMidiNote, Vst3ParameterAutomation, Vst3PlaylistAutomationPoint,
-    Vst3PlaylistParameterAutomation, Vst3PlaylistStreamProcessor,
+    MAX_PDC_DELAY_BYTES, PlaylistMidiNote, Vst3LatencyReport, Vst3ParameterAutomation,
+    Vst3PlaylistAutomationPoint, Vst3PlaylistParameterAutomation, Vst3PlaylistStreamProcessor,
     expand_pattern_parameter_automation_for_clip,
 };
 use crate::{
@@ -1188,6 +1188,8 @@ pub struct PlaylistPerformanceStream {
     pub start_frame: u64,
     pub launches: Receiver<PlaylistPerformanceCommand>,
     pub mixer_routing_updates: Receiver<FlpDocument>,
+    pub latency_updates: Receiver<BTreeSet<u64>>,
+    pub latency_reports: Sender<Vst3LatencyReport>,
     pub meters: Option<Arc<MixerTrackPeakMeters>>,
 }
 
@@ -2559,6 +2561,8 @@ pub fn stream_playlist_performance_with_vst3_to_device(
         performance.start_frame,
         performance.launches,
         performance.mixer_routing_updates,
+        performance.latency_updates,
+        performance.latency_reports,
         PlaylistPerformanceSources {
             sampler_clip_indices: &performance_sampler_clip_indices,
             audio_clip_indices: &performance_audio_clip_indices,
@@ -9600,6 +9604,9 @@ struct PlaylistPerformanceRuntime {
     tempo_map: PlaylistTempoMap,
     launches: Receiver<PlaylistPerformanceCommand>,
     mixer_routing_updates: Receiver<FlpDocument>,
+    latency_updates: Receiver<BTreeSet<u64>>,
+    latency_reports: Sender<Vst3LatencyReport>,
+    current_document: FlpDocument,
     pending_commands: Vec<PlaylistPerformanceCommand>,
     queued_by_track: BTreeMap<u32, VecDeque<PlaylistPerformanceLaunch>>,
     motion_by_track: HashMap<u32, Option<PlaylistTrackMotion>>,
@@ -9627,6 +9634,8 @@ impl PlaylistPerformanceRuntime {
         start_frame: u64,
         launches: Receiver<PlaylistPerformanceCommand>,
         mixer_routing_updates: Receiver<FlpDocument>,
+        latency_updates: Receiver<BTreeSet<u64>>,
+        latency_reports: Sender<Vst3LatencyReport>,
         sources: PlaylistPerformanceSources<'_>,
     ) -> Result<Self, String> {
         let arrangement = document
@@ -9981,6 +9990,9 @@ impl PlaylistPerformanceRuntime {
             tempo_map: PlaylistTempoMap::for_arrangement(document, options.arrangement_id)?,
             launches,
             mixer_routing_updates,
+            latency_updates,
+            latency_reports,
+            current_document: document.clone(),
             pending_commands: Vec::new(),
             queued_by_track: BTreeMap::new(),
             motion_by_track,
@@ -10068,6 +10080,7 @@ impl PlaylistPerformanceRuntime {
         let Some(document) = latest_document else {
             return Ok(());
         };
+        self.current_document = document.clone();
         let routing = MixerRouteAudibility::from_document(&document);
         sampler_engine
             .update_performance_mixer_routing(&document, audio_context.live_mixer_source_targets);
@@ -10106,6 +10119,22 @@ impl PlaylistPerformanceRuntime {
             audio_context,
             vst3_processor.as_deref_mut(),
         )?;
+        let mut latency_update_plugin_ids = BTreeSet::new();
+        while let Ok(plugin_ids) = self.latency_updates.try_recv() {
+            latency_update_plugin_ids.extend(plugin_ids);
+        }
+        if !latency_update_plugin_ids.is_empty()
+            && let Some(processor) = vst3_processor.as_deref_mut()
+        {
+            let reports = processor.refresh_live_latency_reports(
+                &latency_update_plugin_ids,
+                &self.current_document,
+                audio_context.live_mixer_source_targets,
+            )?;
+            for report in reports {
+                let _ = self.latency_reports.send(report);
+            }
+        }
         let block_start = block.start;
         let frame_count = usize::try_from(block.end.saturating_sub(block_start))
             .map_err(|_| "Performance Mode audio block is too large".to_owned())?;
@@ -16366,6 +16395,8 @@ mod tests {
         };
         let (launches, receiver) = std::sync::mpsc::channel();
         let (_routing_updates, routing_update_receiver) = std::sync::mpsc::channel();
+        let (_latency_updates, latency_update_receiver) = std::sync::mpsc::channel();
+        let (latency_report_sender, _latency_reports) = std::sync::mpsc::channel();
         let mut runtime = PlaylistPerformanceRuntime {
             performance_zone_end_tick: 0,
             start_frame: 0,
@@ -16374,6 +16405,9 @@ mod tests {
                 .expect("constant tempo map should build"),
             launches: receiver,
             mixer_routing_updates: routing_update_receiver,
+            latency_updates: latency_update_receiver,
+            latency_reports: latency_report_sender,
+            current_document: performance_audio_clip_fixture(80, None),
             pending_commands: Vec::new(),
             queued_by_track: BTreeMap::new(),
             motion_by_track: HashMap::new(),

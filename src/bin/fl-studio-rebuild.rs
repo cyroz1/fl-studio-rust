@@ -64,10 +64,10 @@ use flp_rebuild::sample_render::{
     write_input_recording_to_wav,
 };
 use flp_rebuild::vst3::{
-    MAX_REPORTED_TAIL_SECONDS, Vst3AutomationPoint, Vst3HostRuntime, Vst3ParameterAutomation,
-    Vst3PatternChannelRenderRequest, Vst3PatternRenderOptions, Vst3PatternStreamHandle,
-    Vst3PlaylistAutomationSources, Vst3PlaylistLiveInputSender, Vst3PlaylistLiveInputSession,
-    Vst3PlaylistStreamProcessor,
+    MAX_REPORTED_TAIL_SECONDS, Vst3AutomationPoint, Vst3HostRuntime, Vst3LatencyReport,
+    Vst3ParameterAutomation, Vst3PatternChannelRenderRequest, Vst3PatternRenderOptions,
+    Vst3PatternStreamHandle, Vst3PlaylistAutomationSources, Vst3PlaylistLiveInputSender,
+    Vst3PlaylistLiveInputSession, Vst3PlaylistStreamProcessor,
 };
 use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, ArpeggioRangePattern, ArpeggioScoreOptions,
@@ -4740,6 +4740,8 @@ struct DawUi {
     performance_scene_round_robin: BTreeMap<(u16, PlaylistPerformanceSceneKey, u32), usize>,
     performance_launch_sender: Option<Sender<PlaylistPerformanceCommand>>,
     performance_mixer_routing_sender: Option<Sender<FlpDocument>>,
+    performance_latency_update_sender: Option<Sender<BTreeSet<u64>>>,
+    performance_latency_report_receiver: Option<Receiver<Vst3LatencyReport>>,
     project_playback_loaded: bool,
     playlist_playback_loaded: bool,
     playlist_seek_tick: u32,
@@ -6479,6 +6481,8 @@ impl DawUi {
             performance_scene_round_robin: BTreeMap::new(),
             performance_launch_sender: None,
             performance_mixer_routing_sender: None,
+            performance_latency_update_sender: None,
+            performance_latency_report_receiver: None,
             project_playback_loaded: false,
             playlist_playback_loaded: false,
             playlist_seek_tick: 0,
@@ -12884,6 +12888,8 @@ impl DawUi {
         self.midi_script_mixer_peak_updated_at = Instant::now();
         let (launch_sender, launch_receiver) = mpsc::channel();
         let (routing_update_sender, routing_update_receiver) = mpsc::channel();
+        let (latency_update_sender, latency_update_receiver) = mpsc::channel();
+        let (latency_report_sender, latency_report_receiver) = mpsc::channel();
         let (sender, receiver) = mpsc::sync_channel(1);
         let worker_options = options.clone();
         let worker = thread::Builder::new()
@@ -12904,6 +12910,8 @@ impl DawUi {
                                 start_frame,
                                 launches: launch_receiver,
                                 mixer_routing_updates: routing_update_receiver,
+                                latency_updates: latency_update_receiver,
+                                latency_reports: latency_report_sender,
                                 meters: Some(worker_mixer_meters),
                             },
                         )
@@ -12920,6 +12928,8 @@ impl DawUi {
                 self.playlist_tempo_map = Some(playlist_tempo_map);
                 self.performance_launch_sender = Some(launch_sender);
                 self.performance_mixer_routing_sender = Some(routing_update_sender);
+                self.performance_latency_update_sender = Some(latency_update_sender);
+                self.performance_latency_report_receiver = Some(latency_report_receiver);
                 self.pending_audio_render = Some(PendingAudioRender {
                     receiver,
                     cancelled,
@@ -13219,6 +13229,8 @@ impl DawUi {
         self.performance_scene_round_robin.clear();
         self.performance_launch_sender = None;
         self.performance_mixer_routing_sender = None;
+        self.performance_latency_update_sender = None;
+        self.performance_latency_report_receiver = None;
         self.stop_midi_playlist_playback();
         self.stop_midi_pattern_transport();
         self.pattern_mode_playback_source = None;
@@ -59477,6 +59489,18 @@ impl eframe::App for DawUi {
         {
             self.step_graph_editor_open = !self.step_graph_editor_open;
         }
+        loop {
+            let report = self
+                .performance_latency_report_receiver
+                .as_ref()
+                .and_then(|receiver| receiver.try_recv().ok());
+            let Some(report) = report else {
+                break;
+            };
+            if let Some(host) = self.vst3_host.as_mut() {
+                host.apply_latency_report(report);
+            }
+        }
         let vst3_runtime_update = self
             .vst3_host
             .as_mut()
@@ -59510,6 +59534,20 @@ impl eframe::App for DawUi {
                     || self.pending_song_render.is_some()
                     || self.pending_vst3_stream.is_some()
                     || changes.latency_changed_while_processing;
+                let performance_latency_refresh_queued = changes.latency_changed
+                    && !changes.io_changed
+                    && changes.latency_changed_while_processing
+                    && !changes.latency_changed_plugin_ids.is_empty()
+                    && self.playing
+                    && self.performance_launch_sender.is_some()
+                    && self
+                        .performance_latency_update_sender
+                        .as_ref()
+                        .is_some_and(|sender| {
+                            sender
+                                .send(changes.latency_changed_plugin_ids.clone())
+                                .is_ok()
+                        });
                 let staged_pattern_handoff = changes.latency_changed
                     && !changes.io_changed
                     && resume_pattern_playback
@@ -59518,7 +59556,9 @@ impl eframe::App for DawUi {
                     && !changes.io_changed
                     && resume_playlist_playback
                     && self.stage_playlist_stream_rebuild(PdcStreamHandoffReason::Vst3Latency);
-                if staged_pattern_handoff {
+                if performance_latency_refresh_queued {
+                    self.status = "VST3 latency changed; refreshing PDC at a Performance Mode block boundary while active clips continue".to_owned();
+                } else if staged_pattern_handoff {
                     self.status = format!(
                         "VST3 latency changed; staging a PDC handoff while Pattern audio continues from tick {}",
                         self.pattern_seek_tick
