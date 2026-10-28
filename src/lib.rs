@@ -2139,6 +2139,11 @@ pub const PATTERN_NOTE_DEFAULT_RELEASE: u8 = 64;
 /// FL Studio score-note flag for slide notes.
 pub const PATTERN_NOTE_SLIDE_FLAG: u16 = 1 << 3;
 
+/// FL Studio score-note byte-19 flag for per-note portamento.
+///
+/// When set, this inverts the owning channel's Portamento setting for the note.
+pub const PATTERN_NOTE_PORTA_FLAG: u8 = 1 << 4;
+
 /// Candidate FL Studio score-note flag for muted notes.
 ///
 /// Image-Line documents the note mute behavior but not its FLP bit assignment;
@@ -2156,6 +2161,7 @@ pub struct PatternNoteEdit {
     pub position: Option<u32>,
     pub flags: Option<u16>,
     pub slide: Option<bool>,
+    pub porta: Option<bool>,
     pub muted: Option<bool>,
     pub length: Option<u32>,
     pub key: Option<u16>,
@@ -5606,6 +5612,16 @@ impl PatternNote {
         self.flags & PATTERN_NOTE_SLIDE_FLAG != 0
     }
 
+    /// Whether this note inverts its channel's Portamento setting.
+    pub fn is_porta_note(&self) -> bool {
+        self.midi_channel & PATTERN_NOTE_PORTA_FLAG != 0
+    }
+
+    /// The note's low-nibble color/MIDI channel, excluding byte-19 flags.
+    pub fn midi_channel_index(&self) -> u8 {
+        self.midi_channel & 0x0f
+    }
+
     /// Whether this note carries the candidate FL Studio mute flag.
     pub fn is_muted(&self) -> bool {
         self.flags & PATTERN_NOTE_MUTED_FLAG != 0
@@ -5699,6 +5715,13 @@ impl PatternNote {
         }
         if let Some(value) = edit.midi_channel {
             self.midi_channel = value;
+        }
+        if let Some(value) = edit.porta {
+            if value {
+                self.midi_channel |= PATTERN_NOTE_PORTA_FLAG;
+            } else {
+                self.midi_channel &= !PATTERN_NOTE_PORTA_FLAG;
+            }
         }
         if let Some(value) = edit.pan {
             self.pan = value;

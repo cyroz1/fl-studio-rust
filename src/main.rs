@@ -1242,6 +1242,21 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 },
             )
         }
+        [command, input, output, pattern_id, channel_id, note_index, enabled]
+            if command == "set-note-porta" =>
+        {
+            edit_note(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                parse_usize(note_index, "channel note index")?,
+                PatternNoteEdit {
+                    porta: Some(parse_bool(enabled, "note Porta setting")?),
+                    ..PatternNoteEdit::default()
+                },
+            )
+        }
         [command, input, output, pattern_id, channel_id, groove_path, strength, sensitivity,
             duration_strength, mode, velocity_level, pan_level, release_level, mod_x_level,
             mod_y_level]
@@ -4166,6 +4181,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild interpolate-automation-points <input.flp> <output.flp> <channel-id> <first-point-index> <last-point-index> [linear|smooth]\n",
             "  flp-rebuild edit-note <input.flp> <output.flp> <pattern-id> <channel-id> <note-index> <position> <length> <key> <velocity>\n",
             "  flp-rebuild edit-note-properties <input.flp> <output.flp> <pattern-id> <channel-id> <note-index> <flags-raw|-> <group-raw|-> <fine-pitch|-> <release|-> <midi-channel-raw|-> <pan|-> <mod-x|-> <mod-y|->\n",
+            "  flp-rebuild set-note-porta <input.flp> <output.flp> <pattern-id> <channel-id> <note-index> <enabled:0|1>\n",
             "  flp-rebuild quantize-notes <input.flp> <output.flp> <pattern-id> <channel-id> <grid-ticks> <start-strength-0..1> <swing-0..1> [sensitivity-0..1 duration-strength-0..1 leave-duration|leave-end|quantize-duration|quantize-end]\n",
             "  flp-rebuild quantize-notes-selected <input.flp> <output.flp> <pattern-id> <channel-id> <note-indices:comma-separated-zero-based> <grid-ticks> <start-strength-0..1> <swing-0..1> [sensitivity-0..1 duration-strength-0..1 leave-duration|leave-end|quantize-duration|quantize-end]\n",
             "  flp-rebuild quantize-notes-groove <input.flp> <output.flp> <pattern-id> <channel-id> <groove.fsc> <start-strength-0..1> <sensitivity-0..1> <duration-strength-0..1> <leave-duration|leave-end|quantize-duration|quantize-end> [velocity-level-0..1 pan-level-0..1 release-level-0..1 modx-level-0..1 mody-level-0..1]\n",
@@ -7119,7 +7135,7 @@ fn list_notes(path: &Path, pattern_id: u16, start: usize, count: usize) -> Resul
         let channel_note_index = channel_note_indices.entry(note.channel_id).or_default();
         if index >= start {
             println!(
-                "{:06} channel={} channel_note_index={} position={} length={} key={} velocity={} pan={} release={} flags=0x{:04X} group={} fine_pitch={} midi_channel={} mod_x={} mod_y={}",
+                "{:06} channel={} channel_note_index={} position={} length={} key={} velocity={} pan={} release={} flags=0x{:04X} group={} fine_pitch={} midi_channel={} porta={} midi_channel_raw=0x{:02X} mod_x={} mod_y={}",
                 index,
                 note.channel_id,
                 channel_note_index,
@@ -7132,6 +7148,8 @@ fn list_notes(path: &Path, pattern_id: u16, start: usize, count: usize) -> Resul
                 note.flags,
                 note.group,
                 note.fine_pitch,
+                note.midi_channel_index(),
+                note.is_porta_note(),
                 note.midi_channel,
                 note.mod_x,
                 note.mod_y,

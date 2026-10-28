@@ -44002,6 +44002,16 @@ impl DawUi {
                         Stroke::NONE,
                     ));
                 }
+                let porta_marker_x = note_rect.left() + if note.is_slide_note() { 10.0 } else { 4.0 };
+                if note.is_porta_note()
+                    && note_rect.right() - porta_marker_x >= 3.0
+                {
+                    painter.circle_stroke(
+                        egui::pos2(porta_marker_x, note_rect.center().y),
+                        2.5,
+                        Stroke::new(1.0, if selected { Color32::WHITE } else { TEXT }),
+                    );
+                }
                 let resize_handle = egui::Rect::from_min_max(
                     egui::pos2(
                         (note_rect.right() - 5.0).max(note_rect.left()),
@@ -44039,9 +44049,15 @@ impl DawUi {
                         Sense::click_and_drag()
                     },
                 )
-                .on_hover_text(
-                    "Drag the selection stretch handle or use Right-Shift+drag on a selected note edge; Alt on the handle bypasses snap, while Alt+Right-Shift uses 25% steps. Edit > Allow resizing from left enables left-edge resizing. After clicking to move a note, Shift locks pitch and Ctrl/Cmd locks timing · Alt/Option+wheel edits the active property · Shift+Alt/Option+wheel nudges timing",
-                );
+                .on_hover_text(format!(
+                    "{} · Porta flag: {}. Drag the selection stretch handle or use Right-Shift+drag on a selected note edge; Alt on the handle bypasses snap, while Alt+Right-Shift uses 25% steps. Edit > Allow resizing from left enables left-edge resizing. After clicking to move a note, Shift locks pitch and Ctrl/Cmd locks timing · Alt/Option+wheel edits the active property · Shift+Alt/Option+wheel nudges timing",
+                    if note.is_slide_note() {
+                        "Slide note"
+                    } else {
+                        "Piano roll note"
+                    },
+                    if note.is_porta_note() { "on" } else { "off" }
+                ));
                 let note_id = (pattern.id, note.channel_id, *channel_index);
                 let modifiers = scroll_modifiers;
                 let wheel_target_hovered = response.hovered()
@@ -47469,6 +47485,7 @@ impl DawUi {
         let mut velocity = note.velocity;
         let mut flags = note.flags;
         let mut slide_note = note.is_slide_note();
+        let mut porta_note = note.is_porta_note();
         let mut muted_note = note.is_muted();
         let mut group = note.group;
         let mut fine_pitch = note.fine_pitch;
@@ -47484,6 +47501,7 @@ impl DawUi {
         let mut velocity_changed = false;
         let mut flags_changed = false;
         let mut slide_changed = false;
+        let mut porta_changed = false;
         let mut muted_changed = false;
         let mut group_changed = false;
         ui.separator();
@@ -47540,6 +47558,12 @@ impl DawUi {
                         "Stores FL Studio's slide-note flag. Glide rendering for native instruments is not implemented yet.",
                     )
                     .changed();
+                porta_changed = ui
+                    .checkbox(&mut porta_note, "Porta")
+                    .on_hover_text(
+                        "Inverts the channel's Porta setting for this note. The transition applies to native instruments; Sampler playback is supported here.",
+                    )
+                    .changed();
                 muted_changed = ui
                     .checkbox(&mut muted_note, "Muted")
                     .on_hover_text("Muted Piano roll notes are excluded from supported playback and export")
@@ -47590,6 +47614,7 @@ impl DawUi {
                 || velocity_changed
                 || flags_changed
                 || slide_changed
+                || porta_changed
                 || muted_changed
                 || group_changed
                 || fine_pitch_changed
@@ -47606,6 +47631,7 @@ impl DawUi {
                 velocity: velocity_changed.then_some(velocity),
                 flags: flags_changed.then_some(flags),
                 slide: slide_changed.then_some(slide_note),
+                porta: porta_changed.then_some(porta_note),
                 muted: muted_changed.then_some(muted_note),
                 group: group_changed.then_some(group),
                 fine_pitch: fine_pitch_changed.then_some(fine_pitch),

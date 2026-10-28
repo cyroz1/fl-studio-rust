@@ -2437,7 +2437,7 @@ fn tracks_for_grouped_notes(
 
 fn export_note(note: &PatternNote, start_tick: u64, end_tick: u64) -> MidiExportNote {
     MidiExportNote {
-        channel: note.midi_channel,
+        channel: note.midi_channel_index(),
         key: u8::try_from(note.key).unwrap_or(u8::MAX),
         velocity: note.velocity,
         release_velocity: fl_note_release_to_midi_velocity(note.release),

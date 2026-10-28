@@ -42,8 +42,8 @@ use crate::vst3::{
 use crate::{
     Arrangement, ChannelNoteRouter, ChannelStretchMode, ChannelSummary, FlpDocument,
     MixerInsertSignalTransform, MixerLiveSourceRoutePlan, MixerRouteAudibility,
-    MixerSourceRoutePlan, MixerSourceRouteTransform, Pattern, PatternNote, PlaylistClip,
-    PlaylistClipTarget, PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync,
+    MixerSourceRoutePlan, MixerSourceRouteTransform, PATTERN_NOTE_PORTA_FLAG, Pattern, PatternNote,
+    PlaylistClip, PlaylistClipTarget, PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync,
 };
 
 const DEFAULT_SAMPLE_RATE: u32 = 44_100;
@@ -10523,7 +10523,7 @@ impl PlaylistPerformanceRuntime {
                         channel_id: placed.target_channel_id,
                         key: placed.note.key,
                         velocity: placed.note.velocity,
-                        midi_channel: placed.note.midi_channel,
+                        midi_channel: placed.note.midi_channel_index(),
                         fine_pitch_offset_cents: placed.note.fine_pitch_offset_cents(),
                         pan: placed.note.pan,
                         mod_x: placed.note.mod_x,
@@ -13340,7 +13340,10 @@ impl<'a> SamplerVoiceEngine<'a> {
                 }
             }
         }
-        let portamento_start = if source.portamento_enabled || source.mono_enabled {
+        let note_midi_channel = note.midi_channel & 0x0f;
+        let note_portamento_enabled =
+            source.portamento_enabled != (note.midi_channel & PATTERN_NOTE_PORTA_FLAG != 0);
+        let portamento_start = if note_portamento_enabled || source.mono_enabled {
             let pitch_bend_cents = self.pitch_bend_cents;
             let pan_law = self.pan_law;
             self.voices
@@ -13348,6 +13351,7 @@ impl<'a> SamplerVoiceEngine<'a> {
                 .filter_map(Option::as_mut)
                 .filter(|voice| {
                     voice.channel_id == note.channel_id
+                        && voice.midi_channel == note_midi_channel
                         && !voice.key_released
                         && !voice.release_started
                         && voice
@@ -13369,12 +13373,11 @@ impl<'a> SamplerVoiceEngine<'a> {
             None
         };
         if source.mono_enabled {
-            for voice in self
-                .voices
-                .iter_mut()
-                .flatten()
-                .filter(|voice| voice.channel_id == note.channel_id && !voice.release_started)
-            {
+            for voice in self.voices.iter_mut().flatten().filter(|voice| {
+                voice.channel_id == note.channel_id
+                    && voice.midi_channel == note_midi_channel
+                    && !voice.release_started
+            }) {
                 begin_sampler_voice_release(voice, note.start_frame, self.release_frames);
             }
         } else if let Some(max_polyphony) = source
@@ -13488,7 +13491,7 @@ impl<'a> SamplerVoiceEngine<'a> {
             channel_id: note.channel_id,
             playlist_track_id: note.playlist_track_id,
             key: note.key,
-            midi_channel: note.midi_channel,
+            midi_channel: note_midi_channel,
             note_fine_pitch_offset_cents: note.fine_pitch_offset_cents,
             input_midi_channel: None,
             source_position: if source.reverse {
@@ -13566,7 +13569,7 @@ impl<'a> SamplerVoiceEngine<'a> {
             .flatten()
             .filter(|voice| {
                 voice.channel_id == note.channel_id
-                    && voice.midi_channel == note.midi_channel
+                    && voice.midi_channel == (note.midi_channel & 0x0f)
                     && !voice.key_released
                     && voice
                         .stop_frame
@@ -13588,7 +13591,7 @@ impl<'a> SamplerVoiceEngine<'a> {
         let target_velocity_gain = f32::from(note.velocity.min(127)) / 127.0;
         for voice in self.voices.iter_mut().flatten().filter(|voice| {
             voice.channel_id == note.channel_id
-                && voice.midi_channel == note.midi_channel
+                && voice.midi_channel == (note.midi_channel & 0x0f)
                 && !voice.key_released
                 && voice
                     .stop_frame
