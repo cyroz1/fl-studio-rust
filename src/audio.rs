@@ -6,13 +6,14 @@
 //! visible to the application.
 
 use std::collections::{HashMap, VecDeque};
+use std::ops::Deref;
 use std::sync::atomic::{
     AtomicBool, AtomicI32, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering,
 };
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use arc_swap::ArcSwapOption;
+use arc_swap::{ArcSwapOption, Guard as ArcSwapGuard};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{
     FromSample, Sample, SampleFormat, Stream, StreamConfig, SupportedBufferSize,
@@ -1898,10 +1899,7 @@ impl Default for AudioSettings {
 
 struct PlaybackState {
     commands: AudioCommandQueue,
-    samples: ArcSwapOption<Vec<f32>>,
-    // Keep replaced buffers alive until every output callback has released its ArcSwap guard.
-    output_sample_readers: AtomicU32,
-    retired_sample_buffers: Mutex<Vec<Arc<Vec<f32>>>>,
+    samples: RetiredArcSwapOption<Vec<f32>>,
     streaming: ArcSwapOption<StreamingPlayback>,
     pending_streaming: ArcSwapOption<StreamingPlayback>,
     retired_streaming: ArrayQueue<Arc<StreamingPlayback>>,
@@ -1910,7 +1908,7 @@ struct PlaybackState {
     playback_speed: AtomicU32,
     playback_speed_phase: AtomicU32,
     active: AtomicBool,
-    browser_preview_samples: ArcSwapOption<Vec<f32>>,
+    browser_preview_samples: RetiredArcSwapOption<Vec<f32>>,
     browser_preview_state: AtomicU64,
     browser_preview_looping: AtomicBool,
     browser_preview_gain: AtomicU32,
@@ -1924,20 +1922,81 @@ struct PlaybackState {
     input_monitor_active: Arc<AtomicBool>,
 }
 
-struct OutputSampleReadGuard<'a> {
+struct RealtimeReadGuard<'a> {
     readers: &'a AtomicU32,
 }
 
-impl<'a> OutputSampleReadGuard<'a> {
+impl<'a> RealtimeReadGuard<'a> {
     fn new(readers: &'a AtomicU32) -> Self {
         readers.fetch_add(1, Ordering::SeqCst);
         Self { readers }
     }
 }
 
-impl Drop for OutputSampleReadGuard<'_> {
+impl Drop for RealtimeReadGuard<'_> {
     fn drop(&mut self) {
         self.readers.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+// Retain replaced Arcs while realtime readers may still hold a promoted ArcSwap guard.
+struct RetiredArcSwapOption<T: Send + Sync + 'static> {
+    value: ArcSwapOption<T>,
+    readers: AtomicU32,
+    retired: Mutex<Vec<Arc<T>>>,
+}
+
+impl<T: Send + Sync + 'static> RetiredArcSwapOption<T> {
+    fn new() -> Self {
+        Self {
+            value: ArcSwapOption::empty(),
+            readers: AtomicU32::new(0),
+            retired: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn load(&self) -> RetiredArcSwapGuard<'_, T> {
+        let reader = RealtimeReadGuard::new(&self.readers);
+        let value = self.value.load();
+        RetiredArcSwapGuard {
+            value,
+            _reader: reader,
+        }
+    }
+
+    fn store(&self, value: Option<Arc<T>>) {
+        // Slot replacement and reclamation run off the device callback thread.
+        if let Some(previous) = self.value.swap(value) {
+            self.retired
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(previous);
+        }
+        self.reap();
+    }
+
+    fn reap(&self) {
+        if self.readers.load(Ordering::SeqCst) != 0 {
+            return;
+        }
+        self.retired
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+}
+
+struct RetiredArcSwapGuard<'a, T: Send + Sync + 'static> {
+    // ArcSwap guards drop before the reader counter is decremented.
+    value: ArcSwapGuard<Option<Arc<T>>>,
+    _reader: RealtimeReadGuard<'a>,
+}
+
+impl<T: Send + Sync + 'static> Deref for RetiredArcSwapGuard<'_, T> {
+    type Target = Option<Arc<T>>;
+
+    fn deref(&self) -> &Self::Target {
+        self.value.deref()
     }
 }
 
@@ -2401,7 +2460,7 @@ pub struct AudioInputMonitorOutput {
 #[derive(Clone)]
 pub struct AudioInputMonitorRecorder {
     sample_rate: u32,
-    recording: Arc<ArcSwapOption<InputRecordingState>>,
+    recording: Arc<RetiredArcSwapOption<InputRecordingState>>,
 }
 
 impl AudioInputMonitorRecorder {
@@ -2529,9 +2588,7 @@ impl PlaybackState {
                 transport: ArrayQueue::new(AUDIO_COMMAND_QUEUE_CAPACITY),
                 parameters: ArrayQueue::new(AUDIO_COMMAND_QUEUE_CAPACITY),
             },
-            samples: ArcSwapOption::empty(),
-            output_sample_readers: AtomicU32::new(0),
-            retired_sample_buffers: Mutex::new(Vec::new()),
+            samples: RetiredArcSwapOption::new(),
             streaming: ArcSwapOption::empty(),
             pending_streaming: ArcSwapOption::empty(),
             retired_streaming: ArrayQueue::new(RETIRED_STREAM_QUEUE_CAPACITY),
@@ -2540,7 +2597,7 @@ impl PlaybackState {
             playback_speed: AtomicU32::new(1.0_f32.to_bits()),
             playback_speed_phase: AtomicU32::new(0.0_f32.to_bits()),
             active: AtomicBool::new(false),
-            browser_preview_samples: ArcSwapOption::empty(),
+            browser_preview_samples: RetiredArcSwapOption::new(),
             browser_preview_state: AtomicU64::new(0),
             browser_preview_looping: AtomicBool::new(false),
             browser_preview_gain: AtomicU32::new(1.0_f32.to_bits()),
@@ -2670,7 +2727,7 @@ impl PlaybackState {
 
     fn start(&self, samples: Vec<f32>) {
         self.cancel_stream();
-        self.replace_samples(Some(Arc::new(samples)));
+        self.samples.store(Some(Arc::new(samples)));
         self.cursor_frames.store(0, Ordering::Release);
         self.playback_speed_phase
             .store(0.0_f32.to_bits(), Ordering::Release);
@@ -2679,42 +2736,19 @@ impl PlaybackState {
 
     fn start_browser_preview(&self, samples: Vec<f32>) {
         self.stop_browser_preview();
-        self.replace_browser_preview_samples(Some(Arc::new(samples)));
+        self.browser_preview_samples.store(Some(Arc::new(samples)));
         self.browser_preview_state
             .store(BROWSER_PREVIEW_ACTIVE_BIT, Ordering::Release);
     }
 
     fn stop_browser_preview(&self) {
         self.browser_preview_state.store(0, Ordering::Release);
-        self.replace_browser_preview_samples(None);
-    }
-
-    fn replace_samples(&self, samples: Option<Arc<Vec<f32>>>) {
-        self.retire_sample_buffer(self.samples.swap(samples));
-    }
-
-    fn replace_browser_preview_samples(&self, samples: Option<Arc<Vec<f32>>>) {
-        self.retire_sample_buffer(self.browser_preview_samples.swap(samples));
-    }
-
-    fn retire_sample_buffer(&self, previous: Option<Arc<Vec<f32>>>) {
-        if let Some(previous) = previous {
-            self.retired_sample_buffers
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(previous);
-        }
-        self.reap_retired_sample_buffers();
+        self.browser_preview_samples.store(None);
     }
 
     fn reap_retired_sample_buffers(&self) {
-        if self.output_sample_readers.load(Ordering::SeqCst) != 0 {
-            return;
-        }
-        self.retired_sample_buffers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
+        self.samples.reap();
+        self.browser_preview_samples.reap();
     }
 
     fn browser_preview_active(&self) -> bool {
@@ -2962,7 +2996,7 @@ impl PlaybackState {
         self.cursor_frames.store(0, Ordering::Release);
         self.playback_speed_phase
             .store(0.0_f32.to_bits(), Ordering::Release);
-        self.replace_samples(None);
+        self.samples.store(None);
         self.cancel_stream();
     }
 
@@ -3372,8 +3406,8 @@ pub struct AudioEngine {
     sample_rate: u32,
     input_peak: Arc<AtomicU32>,
     input_callback_frames: Arc<AtomicU32>,
-    input_recording: Arc<ArcSwapOption<InputRecordingState>>,
-    input_monitor_recording: Arc<ArcSwapOption<InputRecordingState>>,
+    input_recording: Arc<RetiredArcSwapOption<InputRecordingState>>,
+    input_monitor_recording: Arc<RetiredArcSwapOption<InputRecordingState>>,
     input_monitor_ring: Arc<AudioRingBuffer>,
     input_channel_pair: Arc<AtomicU16>,
     input_channel_count: u16,
@@ -3655,10 +3689,12 @@ impl AudioEngine {
         Ok(())
     }
 
-    /// Release retired audio buffers on the control thread after callback readers have left.
+    /// Release retired streams, samples, and recording buffers after callback readers have left.
     pub fn reap_retired_streaming_playbacks(&self) {
         while self.playback.retired_streaming.pop().is_some() {}
         self.playback.reap_retired_sample_buffers();
+        self.input_recording.reap();
+        self.input_monitor_recording.reap();
     }
 
     /// Begin a low-latency stream for interactive instrument audition.
@@ -3904,7 +3940,7 @@ impl AudioEngine {
                 recording,
                 processed_recording: AudioInputMonitorRecorder {
                     sample_rate: self.sample_rate,
-                    recording: Arc::new(ArcSwapOption::empty()),
+                    recording: Arc::new(RetiredArcSwapOption::new()),
                 },
             },
         ))
@@ -3992,8 +4028,8 @@ impl AudioEngine {
             .store(settings.output_gain.to_bits(), Ordering::Release);
         let input_peak = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
         let input_callback_frames = Arc::new(AtomicU32::new(0));
-        let input_recording = Arc::new(ArcSwapOption::empty());
-        let input_monitor_recording = Arc::new(ArcSwapOption::empty());
+        let input_recording = Arc::new(RetiredArcSwapOption::new());
+        let input_monitor_recording = Arc::new(RetiredArcSwapOption::new());
         let input_latency_estimate = Arc::new(AudioLatencyEstimate::default());
         let input_channel_pair = Arc::new(AtomicU16::new(settings.input_channel_pair));
         let error = Arc::new(AudioErrorState::default());
@@ -4093,8 +4129,8 @@ impl AudioEngine {
             .store(settings.output_gain.to_bits(), Ordering::Release);
         let input_peak = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
         let input_callback_frames = Arc::new(AtomicU32::new(0));
-        let input_recording = Arc::new(ArcSwapOption::empty());
-        let input_monitor_recording = Arc::new(ArcSwapOption::empty());
+        let input_recording = Arc::new(RetiredArcSwapOption::new());
+        let input_monitor_recording = Arc::new(RetiredArcSwapOption::new());
         let input_latency_estimate = Arc::new(AudioLatencyEstimate::default());
         let input_channel_pair = Arc::new(AtomicU16::new(settings.input_channel_pair));
         let input_channel_count = Arc::new(AtomicU16::new(0));
@@ -4523,8 +4559,6 @@ where
         .build_output_stream::<T, _, _>(
             config,
             move |output, info| {
-                let _sample_read =
-                    OutputSampleReadGuard::new(&playback_for_callback.output_sample_readers);
                 enable_denormal_protection();
                 playback_for_callback
                     .output_latency_estimate
@@ -4607,8 +4641,8 @@ struct InputStreamState {
     peak: Arc<AtomicU32>,
     callback_frames: Arc<AtomicU32>,
     source: Arc<AtomicU8>,
-    recording: Arc<ArcSwapOption<InputRecordingState>>,
-    monitor_recording: Arc<ArcSwapOption<InputRecordingState>>,
+    recording: Arc<RetiredArcSwapOption<InputRecordingState>>,
+    monitor_recording: Arc<RetiredArcSwapOption<InputRecordingState>>,
     monitor_active: Arc<AtomicBool>,
     input_latency_estimate: Arc<AudioLatencyEstimate>,
     error: Arc<AudioErrorState>,
@@ -5188,8 +5222,8 @@ struct WasapiWorkerState {
     ring: Arc<AudioRingBuffer>,
     input_peak: Arc<AtomicU32>,
     input_callback_frames: Arc<AtomicU32>,
-    input_recording: Arc<ArcSwapOption<InputRecordingState>>,
-    input_monitor_recording: Arc<ArcSwapOption<InputRecordingState>>,
+    input_recording: Arc<RetiredArcSwapOption<InputRecordingState>>,
+    input_monitor_recording: Arc<RetiredArcSwapOption<InputRecordingState>>,
     input_latency_estimate: Arc<AudioLatencyEstimate>,
     input_channel_pair: Arc<AtomicU16>,
     input_channel_count: Arc<AtomicU16>,
@@ -5691,7 +5725,6 @@ fn render_wasapi_buffer(
     render_state: &mut WasapiRenderState,
     output: &mut Vec<u8>,
 ) -> Result<(), String> {
-    let _sample_read = OutputSampleReadGuard::new(&playback.output_sample_readers);
     playback
         .output_callback_frames
         .store(u32::try_from(frames).unwrap_or(u32::MAX), Ordering::Release);
