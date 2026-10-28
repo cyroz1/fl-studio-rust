@@ -39,22 +39,24 @@ use flp_rebuild::sample_render::{
     AudioClipRenderOptions, AudioClipRenderSummary, AudioFileRenderOptions, AudioRecordingSummary,
     AudioRenderEncodingOptions, AudioRenderOutput, LayerLiveInputConfig, LayerLiveInputEvent,
     MP3_BITRATES_KBPS, MixerStemRenderOptions, PLAYLIST_AUDIO_CLIP_GAIN_MINUS_INFINITY,
-    PlaylistAudioClipEnvelope, PlaylistAudioClipFadeCurve, PlaylistLatencyUpdateControls,
-    PlaylistLiveStreamControls, PlaylistPerformanceCommand, PlaylistPerformanceLaunch,
-    PlaylistPerformanceStream, PlaylistRenderOptions, PlaylistRenderRange, PlaylistRenderSummary,
-    PlaylistStreamMonitor, PlaylistTailMode, PlaylistTempoMap, ResamplingQuality,
-    SamplerLiveInputRouting, SamplerLiveNoteEvent, SamplerPatternLoopPlayback,
-    SamplerPatternRenderOptions, SamplerPatternRenderSummary, Vst3LiveInputEvent,
-    Vst3PatternLoopPlayback, Vst3PatternPlayback, WavChannelMode, WavDitherMode, WavSampleFormat,
-    nearest_playlist_audio_clip_zero_crossing_tick, playlist_audio_clip_fade_gain,
-    playlist_performance_clip_indices_with_vst3, playlist_performance_static_document_with_vst3,
-    playlist_performance_vst3_channel_ids, playlist_performance_vst3_clip_indices,
-    render_audio_clips_to_file, render_playlist_mixer_stems_with_vst3_cancellable,
+    PlaylistAudioClipEnvelope, PlaylistAudioClipFadeCurve, PlaylistLiveStreamControls,
+    PlaylistPerformanceCommand, PlaylistPerformanceLaunch, PlaylistPerformanceStream,
+    PlaylistRenderOptions, PlaylistRenderRange, PlaylistRenderSummary, PlaylistStreamMonitor,
+    PlaylistTailMode, PlaylistTempoMap, ResamplingQuality, SamplerLiveInputRouting,
+    SamplerLiveNoteEvent, SamplerPatternLoopPlayback, SamplerPatternRenderOptions,
+    SamplerPatternRenderSummary, Vst3LatencyUpdateControls, Vst3LiveInputEvent,
+    Vst3PatternLoopPlayback, Vst3PatternLoopStreamControls, Vst3PatternPlayback, WavChannelMode,
+    WavDitherMode, WavSampleFormat, nearest_playlist_audio_clip_zero_crossing_tick,
+    playlist_audio_clip_fade_gain, playlist_performance_clip_indices_with_vst3,
+    playlist_performance_static_document_with_vst3, playlist_performance_vst3_channel_ids,
+    playlist_performance_vst3_clip_indices, render_audio_clips_to_file,
+    render_playlist_mixer_stems_with_vst3_cancellable,
     render_playlist_with_vst3_to_file_from_frame_cancellable,
     render_playlist_with_vst3_to_flac_cancellable, render_playlist_with_vst3_to_mp3_cancellable,
     render_playlist_with_vst3_to_ogg_cancellable, render_playlist_with_vst3_to_wav_cancellable,
     render_sampler_pattern_to_file, stream_input_monitor_through_mixer,
     stream_mixed_layer_midi_input_to_device,
+    stream_pattern_loop_with_vst3_from_tick_to_device_with_live_controls,
     stream_pattern_loop_with_vst3_from_tick_to_device_with_live_master_controls,
     stream_pattern_with_vst3_to_device_with_live_master_controls,
     stream_playlist_performance_with_vst3_to_device,
@@ -4743,6 +4745,8 @@ struct DawUi {
     performance_mixer_routing_sender: Option<Sender<FlpDocument>>,
     performance_latency_update_sender: Option<Sender<BTreeSet<u64>>>,
     performance_latency_report_receiver: Option<Receiver<Vst3LatencyReport>>,
+    pattern_latency_update_sender: Option<Sender<BTreeSet<u64>>>,
+    pattern_latency_report_receiver: Option<Receiver<Vst3LatencyReport>>,
     playlist_latency_update_sender: Option<Sender<BTreeSet<u64>>>,
     playlist_latency_report_receiver: Option<Receiver<Vst3LatencyReport>>,
     project_playback_loaded: bool,
@@ -6486,6 +6490,8 @@ impl DawUi {
             performance_mixer_routing_sender: None,
             performance_latency_update_sender: None,
             performance_latency_report_receiver: None,
+            pattern_latency_update_sender: None,
+            pattern_latency_report_receiver: None,
             playlist_latency_update_sender: None,
             playlist_latency_report_receiver: None,
             project_playback_loaded: false,
@@ -12352,7 +12358,7 @@ impl DawUi {
                                     start_frame,
                                     &worker_mixer_meters,
                                 ),
-                                latency_updates: Some(PlaylistLatencyUpdateControls {
+                                latency_updates: Some(Vst3LatencyUpdateControls {
                                     updates: latency_update_receiver,
                                     reports: latency_report_sender,
                                 }),
@@ -13249,6 +13255,8 @@ impl DawUi {
         self.performance_mixer_routing_sender = None;
         self.performance_latency_update_sender = None;
         self.performance_latency_report_receiver = None;
+        self.pattern_latency_update_sender = None;
+        self.pattern_latency_report_receiver = None;
         self.playlist_latency_update_sender = None;
         self.playlist_latency_report_receiver = None;
         self.stop_midi_playlist_playback();
@@ -40305,6 +40313,27 @@ impl DawUi {
                 return;
             }
         };
+        let (pattern_latency_update_sender, pattern_latency_update_receiver) =
+            if loop_length_ticks.is_some() && vst3_processor.is_some() {
+                let (update_sender, update_receiver) = mpsc::channel();
+                let (report_sender, report_receiver) = mpsc::channel();
+                (
+                    Some(update_sender),
+                    Some((update_receiver, report_sender, report_receiver)),
+                )
+            } else {
+                (None, None)
+            };
+        let pattern_latency_update_sender_for_ui = pattern_latency_update_sender.clone();
+        let (
+            pattern_latency_update_receiver,
+            pattern_latency_report_sender,
+            pattern_latency_report_receiver,
+        ) = pattern_latency_update_receiver
+            .map(|(updates, reports, report_receiver)| {
+                (Some(updates), Some(reports), Some(report_receiver))
+            })
+            .unwrap_or((None, None, None));
         let live_midi_senders = vst3_processor
             .as_ref()
             .map(Vst3PlaylistStreamProcessor::live_midi_input_senders)
@@ -40382,16 +40411,23 @@ impl DawUi {
                         };
                         if let Some(vst3_processor) = vst3_processor {
                             if let Some(loop_length_ticks) = loop_length_ticks {
-                                stream_pattern_loop_with_vst3_from_tick_to_device_with_live_master_controls(
+                                stream_pattern_loop_with_vst3_from_tick_to_device_with_live_controls(
                                     &document,
                                     &project_path,
                                     options,
-                                    Vst3PatternLoopPlayback {
-                                        loop_length_ticks,
-                                        start_tick: loop_start_tick,
-                                        processor: vst3_processor,
+                                    Vst3PatternLoopStreamControls {
+                                        playback: Vst3PatternLoopPlayback {
+                                            loop_length_ticks,
+                                            start_tick: loop_start_tick,
+                                            processor: vst3_processor,
+                                        },
+                                        meters: &worker_mixer_meters,
+                                        latency_updates: pattern_latency_update_receiver
+                                            .zip(pattern_latency_report_sender)
+                                            .map(|(updates, reports)| {
+                                                Vst3LatencyUpdateControls { updates, reports }
+                                            }),
                                     },
-                                    &worker_mixer_meters,
                                     &writer,
                                     &worker_cancelled,
                                 )
@@ -40458,6 +40494,8 @@ impl DawUi {
                 });
                 self.playing = true;
                 self.project_playback_loaded = true;
+                self.pattern_latency_update_sender = pattern_latency_update_sender_for_ui;
+                self.pattern_latency_report_receiver = pattern_latency_report_receiver;
                 self.status = if handoff_in_progress {
                     match staged_handoff {
                         Some((_, PdcStreamHandoffReason::MixerRouting)) => {
@@ -59533,6 +59571,18 @@ impl eframe::App for DawUi {
                 host.apply_latency_report(report);
             }
         }
+        loop {
+            let report = self
+                .pattern_latency_report_receiver
+                .as_ref()
+                .and_then(|receiver| receiver.try_recv().ok());
+            let Some(report) = report else {
+                break;
+            };
+            if let Some(host) = self.vst3_host.as_mut() {
+                host.apply_latency_report(report);
+            }
+        }
         let vst3_runtime_update = self
             .vst3_host
             .as_mut()
@@ -59580,6 +59630,20 @@ impl eframe::App for DawUi {
                                 .send(changes.latency_changed_plugin_ids.clone())
                                 .is_ok()
                         });
+                let pattern_latency_refresh_queued = changes.latency_changed
+                    && !changes.io_changed
+                    && changes.latency_changed_while_processing
+                    && !changes.latency_changed_plugin_ids.is_empty()
+                    && resume_pattern_playback
+                    && !self.performance_mode_active
+                    && self
+                        .pattern_latency_update_sender
+                        .as_ref()
+                        .is_some_and(|sender| {
+                            sender
+                                .send(changes.latency_changed_plugin_ids.clone())
+                                .is_ok()
+                        });
                 let playlist_latency_refresh_queued = changes.latency_changed
                     && !changes.io_changed
                     && changes.latency_changed_while_processing
@@ -59597,6 +59661,7 @@ impl eframe::App for DawUi {
                 let staged_pattern_handoff = changes.latency_changed
                     && !changes.io_changed
                     && resume_pattern_playback
+                    && !pattern_latency_refresh_queued
                     && self.stage_pattern_stream_rebuild(PdcStreamHandoffReason::Vst3Latency);
                 let staged_playlist_handoff = changes.latency_changed
                     && !changes.io_changed
@@ -59605,6 +59670,8 @@ impl eframe::App for DawUi {
                     && self.stage_playlist_stream_rebuild(PdcStreamHandoffReason::Vst3Latency);
                 if performance_latency_refresh_queued {
                     self.status = "VST3 latency changed; refreshing PDC at a Performance Mode block boundary while active clips continue".to_owned();
+                } else if pattern_latency_refresh_queued {
+                    self.status = "VST3 latency changed; refreshing PDC at the next Pattern audio-block boundary while playback continues".to_owned();
                 } else if playlist_latency_refresh_queued {
                     self.status = "VST3 latency changed; refreshing PDC at the next Song audio-block boundary while playback continues".to_owned();
                 } else if staged_pattern_handoff {
