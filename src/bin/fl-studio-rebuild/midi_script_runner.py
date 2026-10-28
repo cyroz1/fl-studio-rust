@@ -227,6 +227,42 @@ def _playlist_get_track_activity_level(index):
     return float(levels[index - 1]) if index <= len(levels) else 0.0
 
 
+def _playlist_track_performance_value(index, value_index):
+    index = _playlist_track_index(index)
+    modes = _active_transport_state.get("playlist_track_performance_modes", [])
+    if index > len(modes):
+        return -1
+    values = modes[index - 1]
+    if not isinstance(values, (list, tuple)) or value_index >= len(values):
+        return -1
+    value = values[value_index]
+    return -1 if value is None else int(value)
+
+
+def _playlist_get_live_loop_mode(index):
+    return _playlist_track_performance_value(index, 0)
+
+
+def _playlist_get_live_trigger_mode(index):
+    return _playlist_track_performance_value(index, 1)
+
+
+def _playlist_get_live_pos_snap(index):
+    return _playlist_track_performance_value(index, 2)
+
+
+def _playlist_get_live_trig_snap(index):
+    return _playlist_track_performance_value(index, 3)
+
+
+def _playlist_get_performance_mode_state():
+    return bool(_active_transport_state.get("playlist_performance_mode_active", False))
+
+
+def _playlist_get_song_start_tick_pos():
+    return int(_active_transport_state.get("playlist_song_start_tick", 0))
+
+
 def _playlist_selected_track_ids():
     try:
         return {
@@ -1732,6 +1768,12 @@ def _install_modules(script_name, device_name):
     playlist.isTrackSolo = _playlist_is_track_solo
     playlist.soloTrack = _playlist_solo_track
     playlist.getTrackActivityLevel = _playlist_get_track_activity_level
+    playlist.getLiveLoopMode = _playlist_get_live_loop_mode
+    playlist.getLiveTriggerMode = _playlist_get_live_trigger_mode
+    playlist.getLivePosSnap = _playlist_get_live_pos_snap
+    playlist.getLiveTrigSnap = _playlist_get_live_trig_snap
+    playlist.getPerformanceModeState = _playlist_get_performance_mode_state
+    playlist.getSongStartTickPos = _playlist_get_song_start_tick_pos
     playlist.isTrackSelected = _playlist_is_track_selected
     playlist.selectTrack = _playlist_select_track
     playlist.selectAll = _playlist_select_all

@@ -14804,28 +14804,39 @@ impl DawUi {
                 })
                 .collect();
         }
-        let playlist_track_activity_levels = self
-            .document
-            .as_ref()
-            .and_then(|document| {
-                let arrangements = document.arrangements().ok()?;
-                let arrangement = arrangements
-                    .iter()
-                    .find(|arrangement| Some(arrangement.id) == self.selected_arrangement)
-                    .or_else(|| arrangements.first())?;
-                let tracks = document.playlist_tracks_in_arrangement(arrangement.id);
-                Some(midi_script_playlist_track_activity_levels(
-                    arrangement,
-                    &playlist_track_ids,
-                    &tracks,
-                    Some(
-                        self.current_playhead_tick()
-                            .unwrap_or(f64::from(self.playlist_seek_tick)),
-                    ),
-                    self.soloed_playlist_track_range,
-                ))
-            })
-            .unwrap_or_else(|| vec![0.0; playlist_track_ids.len()]);
+        let (playlist_track_activity_levels, playlist_track_performance_modes, song_start_tick) =
+            self.document
+                .as_ref()
+                .and_then(|document| {
+                    let arrangements = document.arrangements().ok()?;
+                    let arrangement = arrangements
+                        .iter()
+                        .find(|arrangement| Some(arrangement.id) == self.selected_arrangement)
+                        .or_else(|| arrangements.first())?;
+                    let tracks = document.playlist_tracks_in_arrangement(arrangement.id);
+                    Some((
+                        midi_script_playlist_track_activity_levels(
+                            arrangement,
+                            &playlist_track_ids,
+                            &tracks,
+                            Some(
+                                self.current_playhead_tick()
+                                    .unwrap_or(f64::from(self.playlist_seek_tick)),
+                            ),
+                            self.soloed_playlist_track_range,
+                        ),
+                        midi_script_playlist_track_performance_modes(&playlist_track_ids, &tracks),
+                        playlist_performance_zone_start_tick(&arrangement.time_markers)
+                            .unwrap_or(0),
+                    ))
+                })
+                .unwrap_or_else(|| {
+                    (
+                        vec![0.0; playlist_track_ids.len()],
+                        vec![[None; 4]; playlist_track_ids.len()],
+                        0,
+                    )
+                });
         if let Ok(mut levels) = self
             .midi_script_transport_state
             .playlist_track_activity_levels
@@ -14833,6 +14844,19 @@ impl DawUi {
         {
             *levels = playlist_track_activity_levels;
         }
+        if let Ok(mut modes) = self
+            .midi_script_transport_state
+            .playlist_track_performance_modes
+            .lock()
+        {
+            *modes = playlist_track_performance_modes;
+        }
+        self.midi_script_transport_state
+            .playlist_performance_mode_active
+            .store(u8::from(self.performance_mode_active), Ordering::Relaxed);
+        self.midi_script_transport_state
+            .playlist_song_start_tick
+            .store(u64::from(song_start_tick), Ordering::Relaxed);
         if let Ok(mut selected_track_ids) = self
             .midi_script_transport_state
             .selected_playlist_track_ids
@@ -69699,6 +69723,50 @@ fn midi_script_playlist_track_activity_levels(
         .collect()
 }
 
+fn midi_script_playlist_track_performance_modes(
+    track_ids: &[u32],
+    tracks: &[PlaylistTrack],
+) -> Vec<[Option<u8>; 4]> {
+    track_ids
+        .iter()
+        .map(|track_id| {
+            let Some(track) = tracks.iter().find(|track| track.id == *track_id) else {
+                return [None; 4];
+            };
+            let motion = track.motion.map(|mode| match mode {
+                PlaylistTrackMotion::Stay => 0,
+                PlaylistTrackMotion::OneShot => 1,
+                PlaylistTrackMotion::MarchWrap => 2,
+                PlaylistTrackMotion::MarchStay => 3,
+                PlaylistTrackMotion::MarchStop => 4,
+                PlaylistTrackMotion::Random => 5,
+                PlaylistTrackMotion::ExclusiveRandom => 6,
+            });
+            let press = track.press.map(|mode| match mode {
+                PlaylistTrackPress::Retrigger => 0,
+                PlaylistTrackPress::HoldStop => 1,
+                PlaylistTrackPress::HoldMotion => 2,
+                PlaylistTrackPress::Latch => 3,
+            });
+            let sync_value = |mode| match mode {
+                PlaylistTrackSync::Off => 0,
+                PlaylistTrackSync::QuarterBeat => 1,
+                PlaylistTrackSync::HalfBeat => 2,
+                PlaylistTrackSync::Beat => 3,
+                PlaylistTrackSync::TwoBeats => 4,
+                PlaylistTrackSync::FourBeats => 5,
+                PlaylistTrackSync::Auto => 6,
+            };
+            [
+                motion,
+                press,
+                track.position_sync.map(sync_value),
+                track.trigger_sync.map(sync_value),
+            ]
+        })
+        .collect()
+}
+
 fn midi_script_marker_selection_target(
     markers: &[(usize, u32)],
     selected_marker: Option<usize>,
@@ -71098,9 +71166,10 @@ mod tests {
         PianoRollChordStamp, PianoRollGrid, PianoRollScale, PianoRollSnap,
         PlaylistAudioClipEnvelope, PlaylistAudioClipFadeCurve, PlaylistClip, PlaylistClipDragKind,
         PlaylistClipEdit, PlaylistClipResizeEdge, PlaylistTempoMap, PlaylistTrack,
-        PlaylistVst3ParameterLink, PluginCandidate, PluginFormat, ProjectPlaylistAudioClipEnvelope,
-        TimeSelectionShift, TouchGesture, TouchTapTracker, TouchZoomConfig,
-        WINDOW_LAYOUT_PRESETS_HEADER, WindowLayoutPreset, audio_recording_start_tick_with_offset,
+        PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync, PlaylistVst3ParameterLink,
+        PluginCandidate, PluginFormat, ProjectPlaylistAudioClipEnvelope, TimeSelectionShift,
+        TouchGesture, TouchTapTracker, TouchZoomConfig, WINDOW_LAYOUT_PRESETS_HEADER,
+        WindowLayoutPreset, audio_recording_start_tick_with_offset,
         built_in_midi_controller_templates, candidate_live_mixer_send_key,
         candidate_matches_vst_identity, candidate_mixer_controls,
         candidate_mixer_stereo_separation, detect_chord_name, detect_piano_roll_channel_scale,
@@ -71117,16 +71186,17 @@ mod tests {
         midi_script_moved_song_position_tick, midi_script_pattern_jog_target,
         midi_script_playlist_track_activity_levels, midi_script_playlist_track_ids,
         midi_script_playlist_track_mute_states, midi_script_playlist_track_names,
-        midi_script_tempo_jog_target, midi_script_time_position_seconds_to_ticks,
-        midi_vst3_parameter_mapping_for_target, midi_vst3_parameter_mappings_for_cc,
-        next_empty_pattern_id, next_piano_roll_note_group, note_from_grid_position,
-        parse_internal_lfo_parameter_links, parse_midi_control_change_mapping,
-        parse_midi_controller_templates, parse_midi_device_selections,
-        parse_midi_mixer_control_mappings, parse_midi_output_programs, parse_midi_output_routes,
-        parse_midi_output_values, parse_midi_vst3_parameter_mappings,
-        parse_pattern_vst3_parameter_links, parse_playlist_audio_clip_envelopes,
-        parse_playlist_vst3_parameter_links, parse_window_layout_presets,
-        pattern_color_from_random_index, pattern_lfo_loop_length_ticks, pattern_loop_frame_at_tick,
+        midi_script_playlist_track_performance_modes, midi_script_tempo_jog_target,
+        midi_script_time_position_seconds_to_ticks, midi_vst3_parameter_mapping_for_target,
+        midi_vst3_parameter_mappings_for_cc, next_empty_pattern_id, next_piano_roll_note_group,
+        note_from_grid_position, parse_internal_lfo_parameter_links,
+        parse_midi_control_change_mapping, parse_midi_controller_templates,
+        parse_midi_device_selections, parse_midi_mixer_control_mappings,
+        parse_midi_output_programs, parse_midi_output_routes, parse_midi_output_values,
+        parse_midi_vst3_parameter_mappings, parse_pattern_vst3_parameter_links,
+        parse_playlist_audio_clip_envelopes, parse_playlist_vst3_parameter_links,
+        parse_window_layout_presets, pattern_color_from_random_index,
+        pattern_lfo_loop_length_ticks, pattern_loop_frame_at_tick,
         pattern_loop_handoff_tick_at_frame, pattern_loop_tick_at_frame,
         pattern_vst3_parameter_automation_for_channel, pattern_vst3_parameter_link_for_target,
         piano_roll_color_group_note_ids, piano_roll_controller_stroke_points,
@@ -71632,6 +71702,31 @@ mod tests {
                 None,
             ),
             [0.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn midi_script_playlist_performance_modes_match_documented_values() {
+        let track = PlaylistTrack {
+            id: 1,
+            state_byte: None,
+            name: None,
+            enabled: None,
+            grouped: None,
+            press: Some(PlaylistTrackPress::Latch),
+            motion: Some(PlaylistTrackMotion::ExclusiveRandom),
+            trigger_sync: Some(PlaylistTrackSync::FourBeats),
+            queued: None,
+            position_sync: Some(PlaylistTrackSync::TwoBeats),
+            tolerant: None,
+            state_bytes: Vec::new(),
+        };
+        assert_eq!(
+            midi_script_playlist_track_performance_modes(&[1, 2], &[track]),
+            vec![
+                [Some(6), Some(3), Some(4), Some(5)],
+                [None, None, None, None],
+            ]
         );
     }
 

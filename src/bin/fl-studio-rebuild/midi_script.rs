@@ -248,7 +248,10 @@ pub struct MidiScriptTransportState {
     pub playlist_track_muted: Mutex<Vec<bool>>,
     pub playlist_track_soloed: Mutex<Vec<bool>>,
     pub playlist_track_activity_levels: Mutex<Vec<f32>>,
+    pub playlist_track_performance_modes: Mutex<Vec<[Option<u8>; 4]>>,
     pub selected_playlist_track_ids: Mutex<Vec<u32>>,
+    pub playlist_performance_mode_active: AtomicU8,
+    pub playlist_song_start_tick: AtomicU64,
     pub midi_pickup_enabled: AtomicU8,
     pub channel_ids: Mutex<Vec<u16>>,
     pub selected_channel_id: AtomicU64,
@@ -307,7 +310,10 @@ impl Default for MidiScriptTransportState {
             playlist_track_muted: Mutex::new(Vec::new()),
             playlist_track_soloed: Mutex::new(Vec::new()),
             playlist_track_activity_levels: Mutex::new(Vec::new()),
+            playlist_track_performance_modes: Mutex::new(Vec::new()),
             selected_playlist_track_ids: Mutex::new(Vec::new()),
+            playlist_performance_mode_active: AtomicU8::new(0),
+            playlist_song_start_tick: AtomicU64::new(0),
             midi_pickup_enabled: AtomicU8::new(1),
             channel_ids: Mutex::new(Vec::new()),
             selected_channel_id: AtomicU64::new(u64::MAX),
@@ -785,6 +791,21 @@ impl MidiScriptRuntime {
             .lock()
             .map(|levels| levels.clone())
             .unwrap_or_default();
+        let playlist_track_performance_modes = self
+            .transport_state
+            .playlist_track_performance_modes
+            .lock()
+            .map(|modes| modes.clone())
+            .unwrap_or_default();
+        let playlist_performance_mode_active = self
+            .transport_state
+            .playlist_performance_mode_active
+            .load(Ordering::Relaxed)
+            != 0;
+        let playlist_song_start_tick = self
+            .transport_state
+            .playlist_song_start_tick
+            .load(Ordering::Relaxed);
         let selected_playlist_track_ids = self
             .transport_state
             .selected_playlist_track_ids
@@ -1060,6 +1081,18 @@ impl MidiScriptRuntime {
                 transport_object.insert(
                     "playlist_track_activity_levels".to_owned(),
                     json!(playlist_track_activity_levels),
+                );
+                transport_object.insert(
+                    "playlist_track_performance_modes".to_owned(),
+                    json!(playlist_track_performance_modes),
+                );
+                transport_object.insert(
+                    "playlist_performance_mode_active".to_owned(),
+                    json!(playlist_performance_mode_active),
+                );
+                transport_object.insert(
+                    "playlist_song_start_tick".to_owned(),
+                    json!(playlist_song_start_tick),
                 );
                 transport_object.insert(
                     "selected_playlist_track_ids".to_owned(),
@@ -2172,6 +2205,45 @@ mod tests {
             .playlist_track_activity_levels
             .lock()
             .unwrap() = vec![0.5, 0.0];
+        let mut runtime = MidiScriptRuntime::start_for_device_with_transport_state(
+            &script,
+            "Test Input",
+            transport_state,
+        )
+        .unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 127]).unwrap();
+
+        assert!(result.actions.is_empty());
+    }
+
+    #[test]
+    fn python_playlist_performance_getters_read_published_track_modes() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport playlist\ndef OnMidiIn(event):\n    if playlist.getLiveLoopMode(1) != 6:\n        raise RuntimeError('wrong Playlist Motion mode')\n    if playlist.getLiveTriggerMode(1) != 3:\n        raise RuntimeError('wrong Playlist Press mode')\n    if playlist.getLivePosSnap(1) != 4:\n        raise RuntimeError('wrong Playlist Position Sync mode')\n    if playlist.getLiveTrigSnap(1) != 5:\n        raise RuntimeError('wrong Playlist Trigger Sync mode')\n    if playlist.getLiveLoopMode(2) != -1:\n        raise RuntimeError('unknown Playlist track mode should be -1')\n    if not playlist.getPerformanceModeState():\n        raise RuntimeError('Performance Mode should be enabled')\n    if playlist.getSongStartTickPos() != 3840:\n        raise RuntimeError('wrong Performance Mode Start marker tick')\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let transport_state = Arc::new(MidiScriptTransportState::default());
+        transport_state
+            .playlist_track_count
+            .store(2, Ordering::Relaxed);
+        *transport_state
+            .playlist_track_performance_modes
+            .lock()
+            .unwrap() = vec![
+            [Some(6), Some(3), Some(4), Some(5)],
+            [None, None, None, None],
+        ];
+        transport_state
+            .playlist_performance_mode_active
+            .store(1, Ordering::Relaxed);
+        transport_state
+            .playlist_song_start_tick
+            .store(3840, Ordering::Relaxed);
         let mut runtime = MidiScriptRuntime::start_for_device_with_transport_state(
             &script,
             "Test Input",
