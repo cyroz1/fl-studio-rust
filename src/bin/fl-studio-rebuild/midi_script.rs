@@ -952,8 +952,6 @@ impl MidiScriptRuntime {
                 "song_position_hint": song_position_hint,
                 "song_length_hint": song_length_hint,
                 "arrangement_marker_names": arrangement_marker_names,
-                "playlist_track_count": playlist_track_count,
-                "selected_playlist_track_ids": selected_playlist_track_ids,
                 "mixer_track_names": mixer_track_names,
                 "mixer_selected_track": self
                     .transport_state
@@ -998,6 +996,14 @@ impl MidiScriptRuntime {
                 "project_genre": project_genre,
             });
             if let Some(transport_object) = transport.as_object_mut() {
+                transport_object.insert(
+                    "playlist_track_count".to_owned(),
+                    json!(playlist_track_count),
+                );
+                transport_object.insert(
+                    "selected_playlist_track_ids".to_owned(),
+                    json!(selected_playlist_track_ids),
+                );
                 transport_object.insert("channel_ids".to_owned(), json!(channel_ids));
                 transport_object
                     .insert("selected_channel_id".to_owned(), json!(selected_channel_id));
