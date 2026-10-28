@@ -927,6 +927,17 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u16(fade_in, "Sampler Fade In raw value")?,
             )
         }
+        [command, input, output, channel_id, enabled, slide_raw]
+            if command == "set-sampler-portamento" =>
+        {
+            set_sampler_portamento(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(channel_id, "Sampler channel id")?,
+                parse_optional_bool(enabled, "Sampler Porta enabled")?,
+                parse_optional_u32(slide_raw, "Sampler Polyphony Slide raw value")?,
+            )
+        }
         [command, input, output, channel_id, enabled, tempo_sync, predelay, attack, hold, decay, sustain, release, amount, attack_tension, decay_tension, release_tension]
             if command == "edit-sampler-volume-envelope" =>
         {
@@ -4125,6 +4136,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild set-channel-color-gradient <input.flp> <output.flp> <channel-ids:comma-separated-in-order> <start-RRGGBB> <end-RRGGBB>\n",
             "  flp-rebuild set-channel-levels <input.flp> <output.flp> <channel-id> <volume-0..12800> <pan-0..12800>\n",
             "  flp-rebuild set-sampler-quick-fades <input.flp> <output.flp> <sampler-channel-id> <fade-out-0..1024> <fade-in-0..1024>\n",
+            "  flp-rebuild set-sampler-portamento <input.flp> <output.flp> <sampler-channel-id> <porta:0|1|-> <slide-raw-0..1660|->\n",
             "  flp-rebuild edit-sampler-volume-envelope <input.flp> <output.flp> <sampler-channel-id> <enabled:0|1|-> <tempo-sync:0|1|-> <predelay-raw|-> <attack-raw|-> <hold-raw|-> <decay-raw|-> <sustain-raw|-> <release-raw|-> <amount-raw|-> <attack-tension-raw|-> <decay-tension-raw|-> <release-tension-raw|->\n",
             "  flp-rebuild edit-sampler-envelope-lfo <input.flp> <output.flp> <sampler-channel-id> <target:panning|volume|mod-x|mod-y|pitch> <enabled:0|1|-> <envelope-tempo-sync:0|1|-> <lfo-tempo-sync:0|1|-> <lfo-phase-retrigger:0|1|-> <predelay-raw|-> <attack-raw|-> <hold-raw|-> <decay-raw|-> <sustain-raw|-> <release-raw|-> <amount-raw|-> <attack-tension-raw|-> <decay-tension-raw|-> <release-tension-raw|-> <lfo-predelay-raw|-> <lfo-attack-raw|-> <lfo-amount-raw|-> <lfo-speed-raw|-> <lfo-shape:0|1|2|->\n",
             "  flp-rebuild set-channel-fine-tune <input.flp> <output.flp> <channel-id> <-100..100-cents>\n",
@@ -6319,7 +6331,7 @@ fn list_channels(path: &Path) -> Result<(), String> {
     println!("channels: {}", channels.len());
     for channel in channels {
         println!(
-            "id={} kind={} type={:?} enabled={} zipped={} main_pitch={} add_to_key={} fine_tune_raw={:?} key_region={:?} stretch_settings={:?} sampler_fade_out_raw={:?} sampler_fade_in_raw={:?} sampler_volume_envelope={:?} sampler_envelopes={:?} color={:?} volume={:?} pan={:?} level_adjusts_raw={:?} swing_mix_raw={:?} layer_children={:?} layer_flags={:?} plugin={} name={} sample_path={:?} events={:?}",
+            "id={} kind={} type={:?} enabled={} zipped={} main_pitch={} add_to_key={} fine_tune_raw={:?} key_region={:?} stretch_settings={:?} sampler_fade_out_raw={:?} sampler_fade_in_raw={:?} sampler_portamento={:?} sampler_polyphony_slide_raw={:?} sampler_volume_envelope={:?} sampler_envelopes={:?} color={:?} volume={:?} pan={:?} level_adjusts_raw={:?} swing_mix_raw={:?} layer_children={:?} layer_flags={:?} plugin={} name={} sample_path={:?} events={:?}",
             channel.id(),
             channel
                 .kind()
@@ -6336,6 +6348,8 @@ fn list_channels(path: &Path) -> Result<(), String> {
             channel.stretch_settings(),
             channel.sampler_fade_out_raw(),
             channel.sampler_fade_in_raw(),
+            channel.sampler_portamento_enabled(),
+            channel.sampler_polyphony_slide_raw(),
             channel.sampler_volume_envelope(),
             channel.sampler_envelope_lfos(),
             channel.color(),
@@ -7975,6 +7989,29 @@ fn set_sampler_quick_fades(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "set Sampler channel {channel_id} precomputed Fade Out to {fade_out_raw} and Fade In to {fade_in_raw} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn set_sampler_portamento(
+    input: &Path,
+    output: &Path,
+    channel_id: u16,
+    enabled: Option<bool>,
+    slide_raw: Option<u32>,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .set_sampler_portamento(channel_id, enabled, slide_raw)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "updated Sampler channel {channel_id} Porta={enabled:?} Slide={slide_raw:?} in {}",
         output.display()
     );
     Ok(())

@@ -718,6 +718,8 @@ pub struct ChannelSummary {
     sampler_fade_in_raw: Option<u16>,
     sampler_envelope_lfos: [Option<SamplerEnvelopeLfo>; 5],
     sampler_max_polyphony_raw: Option<u32>,
+    sampler_polyphony_slide_raw: Option<u32>,
+    sampler_polyphony_flags_raw: Option<u8>,
     sampler_mono_enabled: Option<bool>,
     channel_cut_groups: Option<(u16, u16)>,
     envelope_lfo_events_seen: u8,
@@ -1164,6 +1166,21 @@ impl ChannelSummary {
         (self.kind == Some(0))
             .then_some(self.sampler_mono_enabled)
             .flatten()
+    }
+
+    /// Saved raw Sampler Polyphony Slide value from the channel's `0xDD` event.
+    /// The stored value follows FL Studio's nonlinear 0..=1660 control range.
+    pub fn sampler_polyphony_slide_raw(&self) -> Option<u32> {
+        (self.kind == Some(0))
+            .then_some(self.sampler_polyphony_slide_raw)
+            .flatten()
+    }
+
+    /// Whether the Sampler's Porta flag is set in the channel's `0xDD` event.
+    pub fn sampler_portamento_enabled(&self) -> Option<bool> {
+        self.sampler_polyphony_flags_raw
+            .filter(|_| self.kind == Some(0))
+            .map(|flags| flags & 2 != 0)
     }
 
     /// Saved `(Cut, Cut by)` channel group numbers from event `0x84`, when present.
@@ -5958,7 +5975,7 @@ impl FlpDocument {
                 }
                 0xDD if matches!(event.encoding, PayloadEncoding::Data { .. }) => {
                     // PyFLP maps 0xDD to Max Polyphony (u32), Slide (u32), and
-                    // flags (u8), with Mono stored in bit 0 of flags.
+                    // flags (u8), with Mono in bit 0 and Porta in bit 1.
                     if event.payload.len() >= 4 && channel.sampler_max_polyphony_raw.is_none() {
                         channel.sampler_max_polyphony_raw = Some(u32::from_le_bytes(
                             event.payload[..4]
@@ -5966,8 +5983,20 @@ impl FlpDocument {
                                 .expect("the polyphony maximum has four bytes"),
                         ));
                     }
-                    if event.payload.len() >= 9 && channel.sampler_mono_enabled.is_none() {
-                        channel.sampler_mono_enabled = Some(event.payload[8] & 1 != 0);
+                    if event.payload.len() >= 8 && channel.sampler_polyphony_slide_raw.is_none() {
+                        channel.sampler_polyphony_slide_raw = Some(u32::from_le_bytes(
+                            event.payload[4..8]
+                                .try_into()
+                                .expect("the polyphony slide value has four bytes"),
+                        ));
+                    }
+                    if event.payload.len() >= 9 {
+                        if channel.sampler_polyphony_flags_raw.is_none() {
+                            channel.sampler_polyphony_flags_raw = Some(event.payload[8]);
+                        }
+                        if channel.sampler_mono_enabled.is_none() {
+                            channel.sampler_mono_enabled = Some(event.payload[8] & 1 != 0);
+                        }
                     }
                 }
                 0x84 if event.encoding == PayloadEncoding::Dword
@@ -20712,6 +20741,69 @@ impl FlpDocument {
                 .events
                 .insert(insertion_index, FlpEvent::new_word(opcode, value));
         }
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    /// Edits the saved Sampler Porta switch and Polyphony Slide control in one existing `0xDD`
+    /// event. Other flag bits, Max Polyphony, trailing payload bytes, and unrelated events are
+    /// preserved. Slide uses FL Studio's documented nonlinear raw range of 0..=1660.
+    pub fn set_sampler_portamento(
+        &mut self,
+        channel_id: u16,
+        enabled: Option<bool>,
+        slide_raw: Option<u32>,
+    ) -> Result<(), FlpError> {
+        if enabled.is_none() && slide_raw.is_none() {
+            return Err(FlpError::UnsupportedEdit(
+                "at least one Sampler Porta or Slide value must be provided",
+            ));
+        }
+        if slide_raw.is_some_and(|value| value > 1660) {
+            return Err(FlpError::UnsupportedEdit(
+                "Sampler Polyphony Slide must be in the 0..=1660 range",
+            ));
+        }
+
+        self.require_unique_channel(channel_id)?;
+        let channel = self
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id() == channel_id)
+            .expect("the unique channel was checked above");
+        if channel.kind != Some(ChannelType::Sampler.raw()) {
+            return Err(FlpError::UnsupportedEdit(
+                "Porta and Polyphony Slide apply only to Sampler channels",
+            ));
+        }
+
+        let polyphony_events = channel
+            .event_range()
+            .filter(|index| self.events[*index].opcode == 0xDD)
+            .collect::<Vec<_>>();
+        if polyphony_events.len() != 1 {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected Sampler must have exactly one existing Polyphony (`0xDD`) event",
+            ));
+        }
+        let event_index = polyphony_events[0];
+        let event = &self.events[event_index];
+        if !matches!(event.encoding, PayloadEncoding::Data { .. }) || event.payload.len() < 9 {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected Sampler's Polyphony event is truncated or unrecognized",
+            ));
+        }
+
+        let mut candidate = self.clone();
+        let mut payload = candidate.events[event_index].payload.clone();
+        if let Some(value) = slide_raw {
+            payload[4..8].copy_from_slice(&value.to_le_bytes());
+        }
+        if let Some(value) = enabled {
+            payload[8] = (payload[8] & !2) | (u8::from(value) << 1);
+        }
+        candidate.events[event_index].replace_data_payload(payload)?;
         candidate.refresh_event_offsets()?;
         *self = candidate;
         Ok(())

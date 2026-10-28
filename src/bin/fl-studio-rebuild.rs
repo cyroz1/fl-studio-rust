@@ -29153,6 +29153,7 @@ impl DawUi {
         let mut global_swing_edit = None;
         let mut channel_swing_edits = Vec::new();
         let mut sampler_fade_edits = Vec::new();
+        let mut sampler_portamento_edits = Vec::new();
         let mut sampler_envelope_lfo_edits = Vec::new();
         let mut channel_fine_tune_edits = Vec::new();
         let mut layer_edits = Vec::new();
@@ -29411,6 +29412,7 @@ impl DawUi {
                 let mut layer_flags_apply = None;
                 let mut layer_fade_apply = None;
                 let mut sampler_fade_apply = None;
+                let mut sampler_portamento_apply = None;
                 let mut sampler_envelope_lfo_applies = Vec::new();
                 let mut channel_fine_tune_apply = None;
                 let mut channel_key_region_apply = None;
@@ -29423,6 +29425,10 @@ impl DawUi {
                 let sampler_fade_in_raw = channel.sampler_fade_in_raw();
                 let mut sampler_fade_out = sampler_fade_out_raw.unwrap_or(0);
                 let mut sampler_fade_in = sampler_fade_in_raw.unwrap_or(0);
+                let sampler_portamento_enabled = channel.sampler_portamento_enabled();
+                let sampler_polyphony_slide_raw = channel.sampler_polyphony_slide_raw();
+                let mut sampler_portamento = sampler_portamento_enabled.unwrap_or(false);
+                let mut sampler_polyphony_slide = sampler_polyphony_slide_raw.unwrap_or(0);
                 let channel_fine_tune_raw = channel.keyboard_fine_tune_raw();
                 let mut channel_fine_tune = channel
                     .keyboard_fine_tune_cents()
@@ -30224,6 +30230,43 @@ impl DawUi {
                             });
                         }
                         if channel.kind() == Some(0) {
+                            ui.collapsing("Polyphony portamento", |ui| {
+                                ui.small(
+                                    "Porta enables pitch slides between notes. Slide sets the saved transition time used by Porta and overlapping Mono notes.",
+                                );
+                                let valid_values = sampler_portamento_enabled.is_some()
+                                    && sampler_polyphony_slide_raw
+                                        .is_some_and(|value| value <= 1660);
+                                if valid_values {
+                                    let porta_changed = ui
+                                        .checkbox(&mut sampler_portamento, "Porta")
+                                        .changed();
+                                    let slide_changed = ui
+                                        .add(
+                                            egui::Slider::new(
+                                                &mut sampler_polyphony_slide,
+                                                0..=1660,
+                                            )
+                                            .text("Slide"),
+                                        )
+                                        .changed();
+                                    if porta_changed || slide_changed {
+                                        sampler_portamento_apply = Some((
+                                            sampler_portamento,
+                                            sampler_polyphony_slide,
+                                        ));
+                                    }
+                                } else {
+                                    ui.colored_label(
+                                        ORANGE,
+                                        format!(
+                                            "No recognized Polyphony event or Slide value: Porta {:?}, Slide {:?}",
+                                            sampler_portamento_enabled,
+                                            sampler_polyphony_slide_raw
+                                        ),
+                                    );
+                                }
+                            });
                             ui.collapsing("Precomputed sample fades", |ui| {
                                 ui.small(
                                     "Precomputed Fade In and Fade Out are applied during Sampler playback and rendering.",
@@ -30401,6 +30444,9 @@ impl DawUi {
                 }
                 if let Some((fade_out_raw, fade_in_raw)) = sampler_fade_apply {
                     sampler_fade_edits.push((channel.id(), fade_out_raw, fade_in_raw));
+                }
+                if let Some((enabled, slide_raw)) = sampler_portamento_apply {
+                    sampler_portamento_edits.push((channel.id(), enabled, slide_raw));
                 }
                 if let Some((low_key, high_key)) = channel_key_region_apply {
                     channel_key_region_edits.push((channel.id(), low_key, high_key));
@@ -30730,6 +30776,24 @@ impl DawUi {
                 }
                 Some(Err(error)) => {
                     self.status = format!("Could not change Sampler precomputed fades: {error}");
+                }
+                None => {}
+            }
+        }
+        for (channel_id, enabled, slide_raw) in sampler_portamento_edits {
+            let result = self.document.as_mut().map(|document| {
+                document.set_sampler_portamento(channel_id, Some(enabled), Some(slide_raw))
+            });
+            match result {
+                Some(Ok(())) => {
+                    self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+                    self.status = format!(
+                        "Channel {channel_id} Porta set to {enabled}, Slide to {slide_raw}"
+                    );
+                }
+                Some(Err(error)) => {
+                    self.status = format!("Could not change Sampler portamento settings: {error}");
                 }
                 None => {}
             }
