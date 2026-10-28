@@ -35,6 +35,7 @@ const INPUT_RECORDING_BUFFER_FRAMES: usize = 65_536;
 const LATENCY_ESTIMATE_MIN_SAMPLES: u32 = 8;
 const LATENCY_ESTIMATE_MAX_MICROSECONDS: u128 = 1_000_000;
 const AUDIO_ERROR_HISTORY_LIMIT: usize = 16;
+const AUDIO_EVENT_QUEUE_CAPACITY: usize = 64;
 const AUDIO_COMMAND_QUEUE_CAPACITY: usize = 128;
 const RETIRED_STREAM_QUEUE_CAPACITY: usize = 4;
 const STREAM_PREFILL_FRAMES: usize = 512;
@@ -2054,32 +2055,62 @@ fn create_streaming_playback(
     (playback, writers)
 }
 
-#[derive(Default)]
 struct AudioErrorState {
     latest: Mutex<Option<String>>,
     recent: Mutex<VecDeque<String>>,
     count: AtomicU64,
+    events: ArrayQueue<AudioEngineEvent>,
+}
+
+enum AudioEngineEvent {
+    DeviceStreamError(String),
+}
+
+impl Default for AudioErrorState {
+    fn default() -> Self {
+        Self {
+            latest: Mutex::new(None),
+            recent: Mutex::new(VecDeque::with_capacity(AUDIO_ERROR_HISTORY_LIMIT)),
+            count: AtomicU64::new(0),
+            events: ArrayQueue::new(AUDIO_EVENT_QUEUE_CAPACITY),
+        }
+    }
 }
 
 impl AudioErrorState {
     fn report(&self, message: String) {
         self.count.fetch_add(1, Ordering::Relaxed);
-        *self
+        let event = AudioEngineEvent::DeviceStreamError(message);
+        if let Err(event) = self.events.push(event) {
+            self.events.pop();
+            let _ = self.events.push(event);
+        }
+    }
+
+    fn drain_events(&self) {
+        if self.events.is_empty() {
+            return;
+        }
+        let mut latest = self
             .latest
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(message.clone());
-
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut recent = self
             .recent
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if recent.len() == AUDIO_ERROR_HISTORY_LIMIT {
-            recent.pop_front();
+        while let Some(event) = self.events.pop() {
+            let AudioEngineEvent::DeviceStreamError(message) = event;
+            *latest = Some(message.clone());
+            if recent.len() == AUDIO_ERROR_HISTORY_LIMIT {
+                recent.pop_front();
+            }
+            recent.push_back(message);
         }
-        recent.push_back(message);
     }
 
     fn take_latest(&self) -> Option<String> {
+        self.drain_events();
         self.latest
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2087,6 +2118,7 @@ impl AudioErrorState {
     }
 
     fn recent(&self) -> Vec<String> {
+        self.drain_events();
         self.recent
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -3832,6 +3864,7 @@ impl AudioEngine {
 
     /// Number of device stream errors reported since this engine started.
     pub fn stream_error_count(&self) -> u64 {
+        self.error.drain_events();
         self.error.count.load(Ordering::Relaxed)
     }
 
