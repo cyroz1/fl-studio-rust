@@ -5291,13 +5291,27 @@ fn wasapi_exclusive_output_worker(
             phase: 0.0,
             output_gain: settings.output_gain,
         };
+        let buffer_frames = client
+            .get_buffer_size()
+            .map_err(|error| error.to_string())? as usize;
         let initial_frames = client
             .get_available_space_in_frames()
             .map_err(|error| error.to_string())? as usize;
+        if initial_frames > buffer_frames {
+            return Err(format!(
+                "WASAPI requested {initial_frames} output frames for a {buffer_frames}-frame buffer"
+            ));
+        }
         let mut submitted_frames = u64::try_from(initial_frames).unwrap_or(u64::MAX);
-        // Reuse this storage for each later event instead of allocating a
-        // fresh byte buffer on every wake-up.
-        let mut output = Vec::with_capacity(initial_frames.saturating_mul(format_spec.frame_bytes));
+        // Allocate the initialized device buffer size before playback so later
+        // event callbacks can reuse this storage without growing it.
+        let output_bytes = buffer_frames
+            .checked_mul(format_spec.frame_bytes)
+            .ok_or_else(|| "WASAPI output buffer size overflowed".to_owned())?;
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(output_bytes)
+            .map_err(|error| format!("Could not allocate WASAPI output buffer: {error}"))?;
         render_wasapi_buffer(
             initial_frames,
             &format_spec,
@@ -5324,6 +5338,11 @@ fn wasapi_exclusive_output_worker(
                         .get_available_space_in_frames()
                         .map_err(|error| error.to_string())?
                         as usize;
+                    if frames > buffer_frames {
+                        return Err(format!(
+                            "WASAPI requested {frames} output frames for a {buffer_frames}-frame buffer"
+                        ));
+                    }
                     render_wasapi_buffer(
                         frames,
                         &format_spec,
