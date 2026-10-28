@@ -621,6 +621,7 @@ struct PlaylistMixerEffectStream {
     block_size: usize,
     input_channels: usize,
     output_channels: usize,
+    sidechain_inputs: Vec<PlaylistMixerEffectSidechainInput>,
     wet_mix: f32,
     saved_enabled: bool,
     saved_insert_effects_enabled: bool,
@@ -632,6 +633,17 @@ struct PlaylistMixerEffectStream {
     manual_latency_offset_samples: i32,
     dry_delay_line: StereoFrameDelay,
     dry_delay_scratch: Vec<f32>,
+}
+
+struct PlaylistMixerEffectSidechainInput {
+    bus_index: usize,
+    source_track: usize,
+    channel_count: usize,
+    saved_enabled: bool,
+    live_control: bool,
+    live_enabled_target: Option<Arc<AtomicI32>>,
+    enabled_ramp: LiveWetMixRamp,
+    delay: StereoFrameDelay,
 }
 
 impl PlaylistMixerEffectStream {
@@ -783,6 +795,7 @@ pub struct Vst3PlaylistStreamProcessor {
     mixer_effect_chains: Vec<PlaylistMixerEffectChain>,
     mixer_effect_scratch: Vec<f32>,
     mixer_effect_dry_scratch: Vec<f32>,
+    mixer_effect_post_effect_bus_scratch: Vec<f32>,
     mixer_effect_tail_frames: u64,
     mixer_effect_dry_delay_frames: u64,
     mixer_effect_route_delay_frames: u64,
@@ -842,6 +855,16 @@ impl Vst3PlaylistStreamProcessor {
                     effect.insert_ordinal,
                     effect.saved_insert_effects_enabled,
                 );
+            for sidechain in &mut effect.sidechain_inputs {
+                sidechain.live_enabled_target = sidechain
+                    .live_control
+                    .then(|| {
+                        meters
+                            .live_mixer_send_targets(sidechain.source_track, effect.insert_ordinal)
+                            .map(|targets| Arc::clone(&targets.enabled))
+                    })
+                    .flatten();
+            }
         }
     }
 
@@ -871,6 +894,14 @@ impl Vst3PlaylistStreamProcessor {
                     control: LiveMixerSourceControl::new(route_plan, self.output_sample_rate),
                     targets: None,
                 });
+        }
+        for effect in &mut self.mixer_effects {
+            let sources = routing.mixer_sidechain_sources_for_insert(effect.insert_ordinal);
+            update_playlist_mixer_effect_sidechain_inputs(
+                effect,
+                &sources,
+                f64::from(self.output_sample_rate),
+            )?;
         }
         for chain in &mut self.mixer_effect_chains {
             if chain.insert_ordinal == 0 {
@@ -1763,12 +1794,12 @@ impl Vst3PlaylistStreamProcessor {
         Ok(())
     }
 
-    fn process_mixer_effects(
-        &mut self,
+    fn process_mixer_effects<'a>(
+        &'a mut self,
         output: &mut [f32],
         mut meter_buses: Option<&mut [f32]>,
         mut effect_input_buses: Option<&mut [f32]>,
-        mut post_effect_buses: Option<&mut [f32]>,
+        mut post_effect_buses: Option<&'a mut [f32]>,
     ) -> Result<(), String> {
         if !output.len().is_multiple_of(2) {
             return Err("VST3 Mixer effect buffer must contain stereo frames".to_owned());
@@ -1776,6 +1807,23 @@ impl Vst3PlaylistStreamProcessor {
 
         self.mixer_effect_output_delay.process_interleaved(output)?;
         let samples_per_track = output.len();
+        if post_effect_buses.is_none()
+            && self
+                .mixer_effects
+                .iter()
+                .any(|effect| !effect.sidechain_inputs.is_empty())
+        {
+            if meter_buses.is_none() {
+                return Err("VST3 Mixer sidechain inputs require Mixer source buses".to_owned());
+            }
+            let bus_samples = crate::audio::MIXER_TRACK_METER_COUNT
+                .checked_mul(samples_per_track)
+                .ok_or_else(|| "post-effect Mixer bus size overflow".to_owned())?;
+            self.mixer_effect_post_effect_bus_scratch
+                .resize(bus_samples, 0.0);
+            self.mixer_effect_post_effect_bus_scratch.fill(0.0);
+            post_effect_buses = Some(&mut self.mixer_effect_post_effect_bus_scratch);
+        }
         if let Some(meter_buses) = meter_buses.as_deref_mut() {
             for (track, delay) in self.mixer_effect_meter_input_delays.iter_mut().enumerate() {
                 let start = track
@@ -1820,6 +1868,8 @@ impl Vst3PlaylistStreamProcessor {
                 process_playlist_mixer_effect_chain(
                     &mut self.mixer_effects[first_effect_index..end_effect_index],
                     output,
+                    post_effect_buses.as_deref(),
+                    samples_per_track,
                 )?;
                 continue;
             }
@@ -1858,6 +1908,8 @@ impl Vst3PlaylistStreamProcessor {
             process_playlist_mixer_effect_chain(
                 &mut self.mixer_effects[first_effect_index..end_effect_index],
                 &mut self.mixer_effect_scratch,
+                post_effect_buses.as_deref(),
+                samples_per_track,
             )?;
             chain
                 .dry_reference_delay
@@ -2041,6 +2093,8 @@ impl Vst3PlaylistStreamProcessor {
 fn process_playlist_mixer_effect_chain(
     effects: &mut [PlaylistMixerEffectStream],
     samples: &mut [f32],
+    post_effect_buses: Option<&[f32]>,
+    samples_per_track: usize,
 ) -> Result<(), String> {
     if effects.is_empty() {
         return Ok(());
@@ -2049,9 +2103,11 @@ fn process_playlist_mixer_effect_chain(
         return Err("VST3 Mixer effect buffer must contain stereo frames".to_owned());
     }
     let chain_block_frames = effects[0].block_size.max(1);
-    for chain_block in samples.chunks_mut(chain_block_frames * 2) {
+    for (chain_block_index, chain_block) in samples.chunks_mut(chain_block_frames * 2).enumerate() {
+        let chain_block_start_frame = chain_block_index * chain_block_frames;
         for effect in effects.iter_mut() {
             let max_frames = effect.block_size.max(1);
+            let mut effect_block_start_frame = chain_block_start_frame;
             for block in chain_block.chunks_mut(max_frames * 2) {
                 effect.begin_wet_mix_block();
                 let frame_count = block.len() / 2;
@@ -2071,6 +2127,14 @@ fn process_playlist_mixer_effect_chain(
                         input.channels[1][frame_index] = right;
                     }
                 }
+                fill_playlist_mixer_sidechain_inputs(
+                    &mut effect.sidechain_inputs,
+                    &mut effect.buffers.inputs,
+                    post_effect_buses,
+                    samples_per_track,
+                    effect_block_start_frame,
+                    frame_count,
+                )?;
                 {
                     let mut plugin = effect
                         .plugin
@@ -2112,9 +2176,157 @@ fn process_playlist_mixer_effect_chain(
                     frame[0] = dry_left * dry_gain + wet_left * wet_mix;
                     frame[1] = dry_right * dry_gain + wet_right * wet_mix;
                 }
+                effect_block_start_frame += frame_count;
             }
         }
     }
+    Ok(())
+}
+
+fn fill_playlist_mixer_sidechain_inputs(
+    sidechain_inputs: &mut [PlaylistMixerEffectSidechainInput],
+    input_buses: &mut [vst3_host::audio::AudioBusBuffer],
+    post_effect_buses: Option<&[f32]>,
+    samples_per_track: usize,
+    frame_offset: usize,
+    frame_count: usize,
+) -> Result<(), String> {
+    if sidechain_inputs.is_empty() {
+        return Ok(());
+    }
+    let post_effect_buses = post_effect_buses
+        .ok_or_else(|| "VST3 Mixer sidechain inputs require post-effect Mixer buses".to_owned())?;
+    if !samples_per_track.is_multiple_of(2) {
+        return Err("post-effect Mixer bus stride must contain stereo frames".to_owned());
+    }
+    let expected_samples = crate::audio::MIXER_TRACK_METER_COUNT
+        .checked_mul(samples_per_track)
+        .ok_or_else(|| "post-effect Mixer bus size overflow".to_owned())?;
+    if post_effect_buses.len() != expected_samples {
+        return Err("post-effect Mixer buses do not match the render block".to_owned());
+    }
+
+    for sidechain in sidechain_inputs {
+        if sidechain.source_track >= crate::audio::MIXER_TRACK_METER_COUNT {
+            return Err("VST3 Mixer sidechain source exceeds the supported track range".to_owned());
+        }
+        let source_start = sidechain
+            .source_track
+            .checked_mul(samples_per_track)
+            .and_then(|start| start.checked_add(frame_offset.checked_mul(2)?))
+            .ok_or_else(|| "VST3 Mixer sidechain source offset overflow".to_owned())?;
+        let source_end = source_start
+            .checked_add(
+                frame_count
+                    .checked_mul(2)
+                    .ok_or_else(|| "VST3 Mixer sidechain block size overflow".to_owned())?,
+            )
+            .filter(|end| *end <= post_effect_buses.len())
+            .ok_or_else(|| "post-effect Mixer bus is too small for a sidechain".to_owned())?;
+        let source = &post_effect_buses[source_start..source_end];
+        let input_bus = input_buses
+            .get_mut(sidechain.bus_index)
+            .ok_or_else(|| "VST3 Mixer sidechain input bus is unavailable".to_owned())?;
+        if !input_bus.active
+            || input_bus.channels.len() != sidechain.channel_count
+            || !matches!(sidechain.channel_count, 1 | 2)
+        {
+            return Err("VST3 Mixer sidechain input bus has an unsupported layout".to_owned());
+        }
+        if input_bus
+            .channels
+            .iter()
+            .any(|channel| channel.len() != frame_count)
+        {
+            return Err("VST3 Mixer sidechain input bus has an unexpected block size".to_owned());
+        }
+        if let Some(target) = &sidechain.live_enabled_target {
+            let enabled = match target.load(Ordering::Acquire) {
+                0 => false,
+                1 => true,
+                _ => sidechain.saved_enabled,
+            };
+            sidechain
+                .enabled_ramp
+                .set_target(if enabled { 1.0 } else { 0.0 });
+        }
+        for frame_index in 0..frame_count {
+            let source_offset = frame_index * 2;
+            let mut frame = [
+                finite_sample(source[source_offset]),
+                finite_sample(source[source_offset + 1]),
+            ];
+            sidechain.delay.process_frame(&mut frame);
+            let enabled_gain = sidechain.enabled_ramp.next();
+            frame[0] *= enabled_gain;
+            frame[1] *= enabled_gain;
+            if sidechain.channel_count == 1 {
+                input_bus.channels[0][frame_index] = (frame[0] + frame[1]) * 0.5;
+            } else {
+                input_bus.channels[0][frame_index] = frame[0];
+                input_bus.channels[1][frame_index] = frame[1];
+            }
+        }
+    }
+    Ok(())
+}
+
+fn update_playlist_mixer_effect_sidechain_inputs(
+    effect: &mut PlaylistMixerEffectStream,
+    sources: &[(usize, bool, bool)],
+    sample_rate: f64,
+) -> Result<(), String> {
+    let smoothing_frames = (sample_rate * f64::from(MIXER_EFFECT_MIX_SMOOTHING_SECONDS))
+        .round()
+        .clamp(1.0, f64::from(u32::MAX)) as u32;
+    let previous_inputs = std::mem::take(&mut effect.sidechain_inputs);
+    let mut previous_inputs = previous_inputs
+        .into_iter()
+        .map(|input| ((input.bus_index, input.source_track), input))
+        .collect::<BTreeMap<_, _>>();
+    let active_auxiliary_buses = effect
+        .buffers
+        .inputs
+        .iter()
+        .enumerate()
+        .skip(1)
+        .filter(|(_, bus)| bus.active && matches!(bus.channels.len(), 1 | 2));
+    let mut sidechain_inputs = Vec::new();
+    sidechain_inputs
+        .try_reserve_exact(sources.len())
+        .map_err(|error| format!("could not allocate VST3 Mixer sidechain inputs: {error}"))?;
+    // VST3 bus layouts expose index, activation, and channel count here. Pair active
+    // auxiliary buses with sources by ascending bus index and source-track order.
+    for ((bus_index, bus), (source_track, saved_enabled, live_control)) in
+        active_auxiliary_buses.zip(sources.iter().copied())
+    {
+        let mut input = previous_inputs
+            .remove(&(bus_index, source_track))
+            .unwrap_or_else(|| PlaylistMixerEffectSidechainInput {
+                bus_index,
+                source_track,
+                channel_count: bus.channels.len(),
+                saved_enabled,
+                live_control,
+                live_enabled_target: None,
+                enabled_ramp: LiveWetMixRamp::new(
+                    if saved_enabled { 1.0 } else { 0.0 },
+                    smoothing_frames,
+                ),
+                delay: StereoFrameDelay::default(),
+            });
+        input.channel_count = bus.channels.len();
+        input.saved_enabled = saved_enabled;
+        input.live_control = live_control;
+        input.live_enabled_target = None;
+        if !live_control {
+            input
+                .enabled_ramp
+                .set_target(if saved_enabled { 1.0 } else { 0.0 });
+        }
+        sidechain_inputs.push(input);
+    }
+    effect.sidechain_inputs = sidechain_inputs;
     Ok(())
 }
 
@@ -2271,7 +2483,17 @@ fn configure_mixer_effect_pdc(
             effect_latency_by_track.insert(chain.insert_ordinal, chain.latency_frames);
         }
     }
-    let pdc_plan = routing.mixer_insert_pdc_plan(&effect_latency_by_track)?;
+    let sidechain_routes = processor
+        .mixer_effects
+        .iter()
+        .flat_map(|effect| {
+            effect
+                .sidechain_inputs
+                .iter()
+                .map(move |sidechain| (sidechain.source_track, effect.insert_ordinal))
+        })
+        .collect::<BTreeSet<_>>();
+    let pdc_plan = routing.mixer_insert_pdc_plan(&effect_latency_by_track, &sidechain_routes)?;
     let master_input_latency_frames = pdc_plan.master_input_latency_frames;
     let total_effect_latency_frames = master_input_latency_frames
         .checked_add(master_effect_latency_frames)
@@ -2333,6 +2555,42 @@ fn configure_mixer_effect_pdc(
             add_delay_frames(&mut route_delay_frames, branch_delay_frames, 2)?;
         }
     }
+    if processor.automatic_pdc_enabled {
+        for effect in &processor.mixer_effects {
+            let destination_input_latency = if effect.insert_ordinal == 0 {
+                master_input_latency_frames
+            } else {
+                pdc_plan
+                    .input_latency_frames
+                    .get(&effect.insert_ordinal)
+                    .copied()
+                    .ok_or_else(|| {
+                        format!(
+                            "Mixer insert {} has no latency entry for its sidechain inputs",
+                            effect.insert_ordinal
+                        )
+                    })?
+            };
+            for sidechain in &effect.sidechain_inputs {
+                let source_output_latency = pdc_plan
+                    .output_latency_frames
+                    .get(&sidechain.source_track)
+                    .copied()
+                    .ok_or_else(|| {
+                        format!(
+                            "Mixer insert {} has no latency entry for sidechain source {}",
+                            effect.insert_ordinal, sidechain.source_track
+                        )
+                    })?;
+                let branch_delay = destination_input_latency
+                    .checked_sub(source_output_latency)
+                    .ok_or_else(|| {
+                        "Mixer sidechain path exceeds its planned PDC latency".to_owned()
+                    })?;
+                add_delay_frames(&mut route_delay_frames, branch_delay, 1)?;
+            }
+        }
+    }
 
     let total_delay_frames = instrument_delay_frames
         .checked_add(processor.mixer_effect_dry_delay_frames)
@@ -2384,6 +2642,44 @@ fn configure_mixer_effect_pdc(
         &mut processor.mixer_effect_input_delays,
         effect_input_delays,
     )?;
+    for effect in &mut processor.mixer_effects {
+        let destination_input_latency = if effect.insert_ordinal == 0 {
+            master_input_latency_frames
+        } else {
+            pdc_plan
+                .input_latency_frames
+                .get(&effect.insert_ordinal)
+                .copied()
+                .ok_or_else(|| {
+                    format!(
+                        "Mixer insert {} has no latency entry for its sidechain inputs",
+                        effect.insert_ordinal
+                    )
+                })?
+        };
+        for sidechain in &mut effect.sidechain_inputs {
+            let source_output_latency = pdc_plan
+                .output_latency_frames
+                .get(&sidechain.source_track)
+                .copied()
+                .ok_or_else(|| {
+                    format!(
+                        "Mixer insert {} has no latency entry for sidechain source {}",
+                        effect.insert_ordinal, sidechain.source_track
+                    )
+                })?;
+            let branch_delay = if processor.automatic_pdc_enabled {
+                destination_input_latency
+                    .checked_sub(source_output_latency)
+                    .ok_or_else(|| {
+                        "Mixer sidechain path exceeds its planned PDC latency".to_owned()
+                    })?
+            } else {
+                0
+            };
+            sidechain.delay.set_delay_frames(branch_delay)?;
+        }
+    }
     let post_effect_stem_delays = (0..crate::audio::MIXER_TRACK_METER_COUNT)
         .map(|track| {
             let output_latency_frames = pdc_plan
@@ -5106,6 +5402,7 @@ impl Vst3HostRuntime {
             mixer_effect_chains: Vec::new(),
             mixer_effect_scratch: Vec::new(),
             mixer_effect_dry_scratch: Vec::new(),
+            mixer_effect_post_effect_bus_scratch: Vec::new(),
             mixer_effect_tail_frames: 0,
             mixer_effect_dry_delay_frames: 0,
             mixer_effect_route_delay_frames: 0,
@@ -5220,6 +5517,7 @@ impl Vst3HostRuntime {
             if !saved_insert_effects_enabled && !live_mix_changes {
                 continue;
             }
+            let sidechain_sources = routing.mixer_sidechain_sources_for_insert(insert_ordinal);
             let first_effect_index = processor.mixer_effects.len();
             for slot in effect_slots
                 .iter()
@@ -5355,6 +5653,7 @@ impl Vst3HostRuntime {
                     block_size,
                     input_channels,
                     output_channels,
+                    sidechain_inputs: Vec::new(),
                     wet_mix,
                     saved_enabled,
                     saved_insert_effects_enabled,
@@ -5376,6 +5675,14 @@ impl Vst3HostRuntime {
                     dry_delay_line,
                     dry_delay_scratch: vec![0.0; block_size * 2],
                 });
+                update_playlist_mixer_effect_sidechain_inputs(
+                    processor
+                        .mixer_effects
+                        .last_mut()
+                        .expect("Mixer effect was just pushed"),
+                    &sidechain_sources,
+                    sample_rate,
+                )?;
             }
             let end_effect_index = processor.mixer_effects.len();
             if first_effect_index == end_effect_index {
@@ -5763,6 +6070,7 @@ impl Vst3HostRuntime {
             mixer_effect_chains: Vec::new(),
             mixer_effect_scratch: Vec::new(),
             mixer_effect_dry_scratch: Vec::new(),
+            mixer_effect_post_effect_bus_scratch: Vec::new(),
             mixer_effect_tail_frames: 0,
             mixer_effect_dry_delay_frames: 0,
             mixer_effect_route_delay_frames: 0,
@@ -9352,6 +9660,106 @@ mod tests {
         assert_eq!(buffers.inputs[0].channels[1], vec![0.0; 17]);
         assert_eq!(buffers.outputs[0].channels[0], vec![0.0; 17]);
         assert!(validate_vst3_audio_block(&buffers, 48_000.0, 512).is_ok());
+    }
+
+    #[test]
+    fn mixer_effect_sidechain_inputs_receive_post_effect_source_buses() {
+        let layout = AudioBusLayout {
+            inputs: vec![
+                vst3_host::audio::AudioBusConfig {
+                    channel_count: 2,
+                    active: true,
+                },
+                vst3_host::audio::AudioBusConfig {
+                    channel_count: 2,
+                    active: true,
+                },
+                vst3_host::audio::AudioBusConfig {
+                    channel_count: 1,
+                    active: true,
+                },
+            ],
+            outputs: vec![vst3_host::audio::AudioBusConfig {
+                channel_count: 2,
+                active: true,
+            }],
+        };
+        let mut buffers = BusAudioBuffers::new(&layout, 2, 48_000.0);
+        let mut sidechain_inputs = vec![
+            PlaylistMixerEffectSidechainInput {
+                bus_index: 1,
+                source_track: 1,
+                channel_count: 2,
+                saved_enabled: false,
+                live_control: true,
+                live_enabled_target: Some(Arc::new(AtomicI32::new(1))),
+                enabled_ramp: LiveWetMixRamp::new(0.0, 1),
+                delay: StereoFrameDelay::default(),
+            },
+            PlaylistMixerEffectSidechainInput {
+                bus_index: 2,
+                source_track: 0,
+                channel_count: 1,
+                saved_enabled: true,
+                live_control: false,
+                live_enabled_target: None,
+                enabled_ramp: LiveWetMixRamp::new(1.0, 1),
+                delay: StereoFrameDelay::default(),
+            },
+        ];
+        let mut post_effect_buses = vec![0.0; crate::audio::MIXER_TRACK_METER_COUNT * 4];
+        post_effect_buses[..4].copy_from_slice(&[1.0, 3.0, 5.0, 7.0]);
+        post_effect_buses[4..8].copy_from_slice(&[0.1, 0.2, 0.3, 0.4]);
+
+        fill_playlist_mixer_sidechain_inputs(
+            &mut sidechain_inputs,
+            &mut buffers.inputs,
+            Some(&post_effect_buses),
+            4,
+            0,
+            2,
+        )
+        .expect("sidechain buses should receive their source signals");
+        assert_eq!(buffers.inputs[1].channels[0], vec![0.1, 0.3]);
+        assert_eq!(buffers.inputs[1].channels[1], vec![0.2, 0.4]);
+        assert_eq!(buffers.inputs[2].channels[0], vec![2.0, 6.0]);
+
+        resize_vst3_bus_audio_buffers(&mut buffers, 1);
+        sidechain_inputs[0]
+            .live_enabled_target
+            .as_ref()
+            .expect("live sidechain route should have an enabled target")
+            .store(0, Ordering::Release);
+        fill_playlist_mixer_sidechain_inputs(
+            &mut sidechain_inputs,
+            &mut buffers.inputs,
+            Some(&post_effect_buses),
+            4,
+            1,
+            1,
+        )
+        .expect("sidechain offsets should follow variable-size processing blocks");
+        assert_eq!(buffers.inputs[1].channels[0], vec![0.0]);
+        assert_eq!(buffers.inputs[1].channels[1], vec![0.0]);
+        assert_eq!(buffers.inputs[2].channels[0], vec![6.0]);
+
+        resize_vst3_bus_audio_buffers(&mut buffers, 1);
+        sidechain_inputs[0]
+            .live_enabled_target
+            .as_ref()
+            .expect("live sidechain route should have an enabled target")
+            .store(1, Ordering::Release);
+        fill_playlist_mixer_sidechain_inputs(
+            &mut sidechain_inputs,
+            &mut buffers.inputs,
+            Some(&post_effect_buses),
+            4,
+            1,
+            1,
+        )
+        .expect("live sidechain enable changes should reach the auxiliary bus");
+        assert_eq!(buffers.inputs[1].channels[0], vec![0.3]);
+        assert_eq!(buffers.inputs[1].channels[1], vec![0.4]);
     }
 
     #[test]

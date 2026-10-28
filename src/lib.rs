@@ -4178,8 +4178,8 @@ impl MixerRouteAudibility {
 
     /// Returns Mixer tracks that remain audible for current solo and mute-lock flags and
     /// per-track MIDI-script solo modes. Modes 1 and 3 include upstream source tracks; modes 2
-    /// and 3 include downstream send tracks. Unrecognized, disabled, and silent routes are not
-    /// used to expand the set.
+    /// and 3 include downstream send tracks. Enabled zero-level routes also keep a source
+    /// available when it feeds a sidechain.
     pub(crate) fn live_solo_included_tracks(&self, solo_modes: &[Option<u8>]) -> Vec<usize> {
         let mut included_tracks = BTreeSet::new();
         for &soloed_track in &self.soloed_insert_tracks {
@@ -4203,10 +4203,7 @@ impl MixerRouteAudibility {
                             || !self.known_tracks.contains(&source)
                             || self.disabled_tracks.contains(&source)
                             || !routes.iter().any(|route| {
-                                route.destination_track == destination
-                                    && route.enabled
-                                    && mixer_send_gain_raw(route.level_raw)
-                                        .is_some_and(|gain| gain > 0.0)
+                                route.destination_track == destination && route.enabled
                             })
                             || !visited.insert(source)
                         {
@@ -4233,7 +4230,6 @@ impl MixerRouteAudibility {
                             || !self.known_tracks.contains(&destination)
                             || self.disabled_tracks.contains(&destination)
                             || !route.enabled
-                            || !mixer_send_gain_raw(route.level_raw).is_some_and(|gain| gain > 0.0)
                             || !visited.insert(destination)
                         {
                             continue;
@@ -4463,11 +4459,11 @@ impl MixerRouteAudibility {
         track: i8,
         visited: &mut HashSet<i8>,
         source_mute_override: Option<i8>,
-        include_live_zero_sends: bool,
+        include_live_routes: bool,
     ) -> bool {
         if (self.disabled_tracks.contains(&track)
             && source_mute_override != Some(track)
-            && !include_live_zero_sends)
+            && !include_live_routes)
             || !visited.insert(track)
         {
             return false;
@@ -4482,13 +4478,12 @@ impl MixerRouteAudibility {
             .into_iter()
             .flatten()
             .any(|route| {
-                ((route.enabled && mixer_send_gain_raw(route.level_raw).unwrap_or_default() > 0.0)
-                    || (include_live_zero_sends && route.live_control))
+                (route.enabled || (include_live_routes && route.live_control))
                     && self.route_can_reach_soloed_insert_with_source_mute_override(
                         route.destination_track,
                         visited,
                         source_mute_override,
-                        include_live_zero_sends,
+                        include_live_routes,
                     )
             });
         visited.remove(&track);
@@ -4940,7 +4935,7 @@ impl MixerRouteAudibility {
         }
     }
 
-    /// Returns Mixer inserts in source-before-destination order for post-effect sends.
+    /// Returns Mixer inserts in source-before-destination order for sends and sidechains.
     ///
     /// The supported FLP route graph is acyclic. Rejecting a cycle here prevents the
     /// effect pass from processing a destination before its incoming effect signal.
@@ -4971,8 +4966,7 @@ impl MixerRouteAudibility {
                 .into_iter()
                 .flatten()
             {
-                let gain = mixer_send_gain_raw(route.level_raw).unwrap_or_default();
-                if !route.enabled || gain <= 0.0 || route.destination_track <= 0 {
+                if !(route.enabled || route.live_control) || route.destination_track <= 0 {
                     continue;
                 }
                 let destination = route.destination_track as usize;
@@ -5010,9 +5004,39 @@ impl MixerRouteAudibility {
         Ok(order)
     }
 
+    /// Returns source inserts connected to an effect sidechain, in stable track order.
+    /// A saved zero-level route still carries signal to a sidechain bus; its level only
+    /// controls the audible send path.
+    pub(crate) fn mixer_sidechain_sources_for_insert(
+        &self,
+        destination: usize,
+    ) -> Vec<(usize, bool, bool)> {
+        let Ok(destination) = i8::try_from(destination) else {
+            return Vec::new();
+        };
+        let mut sources = BTreeMap::<usize, (bool, bool)>::new();
+        for (&source, routes) in &self.send_routes_by_source {
+            if source <= 0 || !self.complete_send_sources.contains(&source) {
+                continue;
+            }
+            for route in routes.iter().filter(|route| {
+                route.destination_track == destination && (route.enabled || route.live_control)
+            }) {
+                let entry = sources.entry(source as usize).or_default();
+                entry.0 |= route.enabled;
+                entry.1 |= route.live_control;
+            }
+        }
+        sources
+            .into_iter()
+            .map(|(source, (enabled, live_control))| (source, enabled, live_control))
+            .collect()
+    }
+
     pub(crate) fn mixer_insert_pdc_plan(
         &self,
         effect_latency_frames: &HashMap<usize, u64>,
+        sidechain_routes: &BTreeSet<(usize, usize)>,
     ) -> Result<MixerInsertPdcPlan, String> {
         let order = self.mixer_insert_processing_order()?;
         let mut plan = MixerInsertPdcPlan::default();
@@ -5025,9 +5049,12 @@ impl MixerRouteAudibility {
                     continue;
                 }
                 if routes.iter().any(|route| {
-                    route.enabled
-                        && mixer_send_gain_raw(route.level_raw).unwrap_or_default() > 0.0
-                        && route.destination_track == track_id
+                    let audible_send = route.enabled
+                        && mixer_send_gain_raw(route.level_raw).unwrap_or_default() > 0.0;
+                    let connected_sidechain = sidechain_routes
+                        .contains(&(*source_track as usize, track))
+                        && (route.enabled || route.live_control);
+                    (audible_send || connected_sidechain) && route.destination_track == track_id
                 }) {
                     input_latency_frames = input_latency_frames.max(
                         plan.output_latency_frames
@@ -5057,6 +5084,18 @@ impl MixerRouteAudibility {
                 plan.master_input_latency_frames = plan.master_input_latency_frames.max(
                     plan.output_latency_frames
                         .get(&(track as usize))
+                        .copied()
+                        .unwrap_or_default(),
+                );
+            }
+        }
+        // Master sidechain inputs participate in latency alignment without turning a
+        // sidechain-only source into an audible path to Master.
+        for &(source_track, destination_track) in sidechain_routes {
+            if destination_track == 0 {
+                plan.master_input_latency_frames = plan.master_input_latency_frames.max(
+                    plan.output_latency_frames
+                        .get(&source_track)
                         .copied()
                         .unwrap_or_default(),
                 );
@@ -25095,7 +25134,7 @@ fn decode_vst_text(bytes: &[u8]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeSet, HashSet};
+    use std::collections::{BTreeSet, HashMap, HashSet};
 
     use super::{
         ArpeggioOptions, ArpeggioRangePattern, ArpeggioSyncMode, ArticulateOptions,
@@ -29618,6 +29657,63 @@ mod tests {
             routing.mixer_insert_processing_order(),
             Err("Mixer send graph contains a cycle".to_owned())
         );
+    }
+
+    #[test]
+    fn mixer_zero_level_routes_supply_sidechain_ordering_and_pdc() {
+        let insert = |ordinal| MixerInsertSummary {
+            ordinal,
+            input_raw: -1,
+            output_raw: -1,
+            color_raw: 0,
+            icon_raw: None,
+            name: None,
+            flags: Some(1 << 3),
+            flags_event_index: None,
+            first_event_index: 0,
+            end_event_index: 0,
+        };
+        let send = |source_track: usize, destination_track: u8, value: i32| MixerSendSummary {
+            insert_ordinal: source_track,
+            route_parameter_id: 64_u8 + destination_track,
+            value,
+            enabled: Some(true),
+            routing_flag_location: None,
+            event_index: 0,
+            record_index: 0,
+        };
+        let mut routing = MixerRouteAudibility::from_inserts_with_parameters(
+            [insert(0), insert(1), insert(2)],
+            &[],
+            None,
+        );
+        routing.add_send_summaries([send(1, 2, 0), send(2, 0, 12_800)]);
+
+        assert_eq!(
+            routing.mixer_sidechain_sources_for_insert(2),
+            vec![(1, true, true)]
+        );
+        assert_eq!(
+            routing
+                .mixer_insert_processing_order()
+                .expect("zero-level sidechain route should order source before destination"),
+            vec![1, 2]
+        );
+
+        let effect_latencies = HashMap::from([(1, 5), (2, 7)]);
+        let without_sidechain = routing
+            .mixer_insert_pdc_plan(&effect_latencies, &BTreeSet::new())
+            .expect("PDC should plan without an active sidechain bus");
+        assert_eq!(without_sidechain.input_latency_frames[&2], 0);
+        assert!(!without_sidechain.tracks_reaching_master.contains(&1));
+
+        let with_sidechain = routing
+            .mixer_insert_pdc_plan(&effect_latencies, &BTreeSet::from([(1, 2)]))
+            .expect("PDC should align a connected sidechain bus");
+        assert_eq!(with_sidechain.input_latency_frames[&2], 5);
+        assert_eq!(with_sidechain.output_latency_frames[&2], 12);
+        assert_eq!(with_sidechain.master_input_latency_frames, 12);
+        assert!(!with_sidechain.tracks_reaching_master.contains(&1));
     }
 
     #[test]
