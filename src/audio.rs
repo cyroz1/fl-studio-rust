@@ -1899,6 +1899,9 @@ impl Default for AudioSettings {
 struct PlaybackState {
     commands: AudioCommandQueue,
     samples: ArcSwapOption<Vec<f32>>,
+    // Keep replaced buffers alive until every output callback has released its ArcSwap guard.
+    output_sample_readers: AtomicU32,
+    retired_sample_buffers: Mutex<Vec<Arc<Vec<f32>>>>,
     streaming: ArcSwapOption<StreamingPlayback>,
     pending_streaming: ArcSwapOption<StreamingPlayback>,
     retired_streaming: ArrayQueue<Arc<StreamingPlayback>>,
@@ -1919,6 +1922,23 @@ struct PlaybackState {
     output_latency_estimate: AudioLatencyEstimate,
     input_monitor_ring_flush_requested: AtomicBool,
     input_monitor_active: Arc<AtomicBool>,
+}
+
+struct OutputSampleReadGuard<'a> {
+    readers: &'a AtomicU32,
+}
+
+impl<'a> OutputSampleReadGuard<'a> {
+    fn new(readers: &'a AtomicU32) -> Self {
+        readers.fetch_add(1, Ordering::SeqCst);
+        Self { readers }
+    }
+}
+
+impl Drop for OutputSampleReadGuard<'_> {
+    fn drop(&mut self) {
+        self.readers.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 struct AudioCommandQueue {
@@ -2510,6 +2530,8 @@ impl PlaybackState {
                 parameters: ArrayQueue::new(AUDIO_COMMAND_QUEUE_CAPACITY),
             },
             samples: ArcSwapOption::empty(),
+            output_sample_readers: AtomicU32::new(0),
+            retired_sample_buffers: Mutex::new(Vec::new()),
             streaming: ArcSwapOption::empty(),
             pending_streaming: ArcSwapOption::empty(),
             retired_streaming: ArrayQueue::new(RETIRED_STREAM_QUEUE_CAPACITY),
@@ -2648,7 +2670,7 @@ impl PlaybackState {
 
     fn start(&self, samples: Vec<f32>) {
         self.cancel_stream();
-        self.samples.store(Some(Arc::new(samples)));
+        self.replace_samples(Some(Arc::new(samples)));
         self.cursor_frames.store(0, Ordering::Release);
         self.playback_speed_phase
             .store(0.0_f32.to_bits(), Ordering::Release);
@@ -2657,14 +2679,42 @@ impl PlaybackState {
 
     fn start_browser_preview(&self, samples: Vec<f32>) {
         self.stop_browser_preview();
-        self.browser_preview_samples.store(Some(Arc::new(samples)));
+        self.replace_browser_preview_samples(Some(Arc::new(samples)));
         self.browser_preview_state
             .store(BROWSER_PREVIEW_ACTIVE_BIT, Ordering::Release);
     }
 
     fn stop_browser_preview(&self) {
         self.browser_preview_state.store(0, Ordering::Release);
-        self.browser_preview_samples.store(None);
+        self.replace_browser_preview_samples(None);
+    }
+
+    fn replace_samples(&self, samples: Option<Arc<Vec<f32>>>) {
+        self.retire_sample_buffer(self.samples.swap(samples));
+    }
+
+    fn replace_browser_preview_samples(&self, samples: Option<Arc<Vec<f32>>>) {
+        self.retire_sample_buffer(self.browser_preview_samples.swap(samples));
+    }
+
+    fn retire_sample_buffer(&self, previous: Option<Arc<Vec<f32>>>) {
+        if let Some(previous) = previous {
+            self.retired_sample_buffers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(previous);
+        }
+        self.reap_retired_sample_buffers();
+    }
+
+    fn reap_retired_sample_buffers(&self) {
+        if self.output_sample_readers.load(Ordering::SeqCst) != 0 {
+            return;
+        }
+        self.retired_sample_buffers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
     }
 
     fn browser_preview_active(&self) -> bool {
@@ -2912,7 +2962,7 @@ impl PlaybackState {
         self.cursor_frames.store(0, Ordering::Release);
         self.playback_speed_phase
             .store(0.0_f32.to_bits(), Ordering::Release);
-        self.samples.store(None);
+        self.replace_samples(None);
         self.cancel_stream();
     }
 
@@ -3605,9 +3655,10 @@ impl AudioEngine {
         Ok(())
     }
 
-    /// Release retired stream buffers on the control thread after the audio callback hands off.
+    /// Release retired audio buffers on the control thread after callback readers have left.
     pub fn reap_retired_streaming_playbacks(&self) {
         while self.playback.retired_streaming.pop().is_some() {}
+        self.playback.reap_retired_sample_buffers();
     }
 
     /// Begin a low-latency stream for interactive instrument audition.
@@ -4472,6 +4523,8 @@ where
         .build_output_stream::<T, _, _>(
             config,
             move |output, info| {
+                let _sample_read =
+                    OutputSampleReadGuard::new(&playback_for_callback.output_sample_readers);
                 enable_denormal_protection();
                 playback_for_callback
                     .output_latency_estimate
@@ -5638,6 +5691,7 @@ fn render_wasapi_buffer(
     render_state: &mut WasapiRenderState,
     output: &mut Vec<u8>,
 ) -> Result<(), String> {
+    let _sample_read = OutputSampleReadGuard::new(&playback.output_sample_readers);
     playback
         .output_callback_frames
         .store(u32::try_from(frames).unwrap_or(u32::MAX), Ordering::Release);
