@@ -5923,6 +5923,20 @@ impl MidiVst3ParameterMappingTarget {
             Self::MixerEffect(target) => &target.parameter_name,
         }
     }
+
+    fn plugin_uid(&self) -> &str {
+        match self {
+            Self::Channel(target) => &target.plugin_uid,
+            Self::MixerEffect(target) => &target.plugin_uid,
+        }
+    }
+
+    const fn parameter_id(&self) -> u32 {
+        match self {
+            Self::Channel(target) => target.parameter_id,
+            Self::MixerEffect(target) => target.parameter_id,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -6005,12 +6019,129 @@ impl InternalLfoWaveform {
 struct InternalLfoParameterLink {
     project_path: String,
     pattern_id: u16,
-    target: MidiVst3ParameterTarget,
+    target: MidiVst3ParameterMappingTarget,
     waveform: InternalLfoWaveform,
     period_millibeats: u32,
     minimum_raw: u16,
     maximum_raw: u16,
     phase_degrees: u16,
+}
+
+fn show_internal_lfo_parameter_link_controls(
+    ui: &mut egui::Ui,
+    link: Option<&InternalLfoParameterLink>,
+    target: &MidiVst3ParameterMappingTarget,
+    scope: Option<(&Path, u16)>,
+    parameter_is_read_only: bool,
+    instance_id: u64,
+    parameter_id: u32,
+) -> (Option<InternalLfoParameterLink>, bool) {
+    let mut upsert = None;
+    let mut unlink = false;
+    ui.horizontal(|ui| {
+        if let Some(link) = link {
+            let mut updated = link.clone();
+            let label = format!(
+                "LFO · {} · {:.2} beats",
+                updated.waveform.label(),
+                updated.period_millibeats as f32 / 1_000.0
+            );
+            ui.menu_button(label, |ui| {
+                egui::ComboBox::from_id_salt((
+                    "vst3_internal_lfo_waveform",
+                    instance_id,
+                    parameter_id,
+                ))
+                .selected_text(updated.waveform.label())
+                .show_ui(ui, |ui| {
+                    for waveform in InternalLfoWaveform::ALL {
+                        ui.selectable_value(&mut updated.waveform, waveform, waveform.label());
+                    }
+                });
+
+                let mut period_beats = updated.period_millibeats as f32 / 1_000.0;
+                if ui
+                    .add(
+                        egui::Slider::new(&mut period_beats, 0.25..=64.0)
+                            .step_by(0.25)
+                            .text("Period (beats)"),
+                    )
+                    .changed()
+                {
+                    updated.period_millibeats = (period_beats * 1_000.0).round() as u32;
+                }
+
+                let mut minimum = updated.minimum_raw as f32 / 10_000.0;
+                if ui
+                    .add(
+                        egui::Slider::new(&mut minimum, 0.0..=1.0)
+                            .step_by(0.01)
+                            .text("Min"),
+                    )
+                    .changed()
+                {
+                    updated.minimum_raw = (minimum.min(f32::from(updated.maximum_raw) / 10_000.0)
+                        * 10_000.0)
+                        .round() as u16;
+                }
+
+                let mut maximum = updated.maximum_raw as f32 / 10_000.0;
+                if ui
+                    .add(
+                        egui::Slider::new(&mut maximum, 0.0..=1.0)
+                            .step_by(0.01)
+                            .text("Max"),
+                    )
+                    .changed()
+                {
+                    updated.maximum_raw = (maximum.max(f32::from(updated.minimum_raw) / 10_000.0)
+                        * 10_000.0)
+                        .round() as u16;
+                }
+
+                let mut phase = f32::from(updated.phase_degrees);
+                if ui
+                    .add(
+                        egui::Slider::new(&mut phase, 0.0..=359.0)
+                            .step_by(1.0)
+                            .text("Phase°"),
+                    )
+                    .changed()
+                {
+                    updated.phase_degrees = phase.round() as u16;
+                }
+                unlink = ui.small_button("Clear LFO").clicked();
+            });
+            if updated != *link && !unlink {
+                upsert = Some(updated);
+            }
+        } else if ui
+            .add_enabled(
+                !parameter_is_read_only && scope.is_some(),
+                egui::Button::new("Add LFO"),
+            )
+            .clicked()
+            && let Some((project_path, pattern_id)) = scope
+        {
+            upsert = Some(InternalLfoParameterLink {
+                project_path: project_path.to_string_lossy().into_owned(),
+                pattern_id,
+                target: target.clone(),
+                waveform: InternalLfoWaveform::Sine,
+                period_millibeats: 4_000,
+                minimum_raw: 0,
+                maximum_raw: 10_000,
+                phase_degrees: 0,
+            });
+        }
+    });
+    if link.is_none() && scope.is_none() {
+        ui.small(
+            egui::RichText::new("Save the project and select a Pattern to add an LFO link.")
+                .color(MUTED),
+        );
+    }
+    (upsert, unlink)
 }
 
 #[derive(Clone, Copy)]
@@ -8408,14 +8539,14 @@ impl DawUi {
         &self,
         pattern: &Pattern,
         ppq: u16,
+        loop_length_ticks: u64,
     ) -> BTreeMap<(usize, u16), Vec<Vst3PlaylistParameterAutomation>> {
         let (Some(project_path), Some(host)) =
             (self.current_path.as_deref(), self.vst3_host.as_ref())
         else {
             return BTreeMap::new();
         };
-        let loaded_plugins = host.loaded_plugins();
-        let mut automations = BTreeMap::new();
+        let mut targets = BTreeMap::new();
         for link in self
             .pattern_vst3_mixer_effect_parameter_links
             .iter()
@@ -8424,22 +8555,52 @@ impl DawUi {
                     && link.pattern_id == pattern.id
             })
         {
-            let key = (link.target.insert_ordinal, link.target.slot_index);
+            targets
+                .entry((
+                    link.target.insert_ordinal,
+                    link.target.slot_index,
+                    link.target.parameter_id,
+                    link.target.plugin_uid.clone(),
+                ))
+                .or_insert_with(|| link.target.clone());
+        }
+        for link in self.internal_lfo_parameter_links.iter().filter(|link| {
+            project_paths_equal(Path::new(&link.project_path), project_path)
+                && link.pattern_id == pattern.id
+        }) {
+            let MidiVst3ParameterMappingTarget::MixerEffect(target) = &link.target else {
+                continue;
+            };
+            targets
+                .entry((
+                    target.insert_ordinal,
+                    target.slot_index,
+                    target.parameter_id,
+                    target.plugin_uid.clone(),
+                ))
+                .or_insert_with(|| target.clone());
+        }
+        let loaded_plugins = host.loaded_plugins();
+        let mut automations = BTreeMap::new();
+        for ((insert_ordinal, slot_index, _, _), target) in targets {
+            let key = (insert_ordinal, slot_index);
             let Some(instance_id) = self.mixer_effect_vst3_instances.get(&key) else {
                 continue;
             };
             if !loaded_plugins
                 .iter()
-                .any(|plugin| plugin.id == *instance_id && plugin.uid == link.target.plugin_uid)
+                .any(|plugin| plugin.id == *instance_id && plugin.uid == target.plugin_uid)
             {
                 continue;
             }
-            let lanes = pattern_vst3_mixer_effect_parameter_automation_for_target(
+            let lanes = pattern_vst3_mixer_effect_parameter_automation_for_target_with_lfo(
                 &self.pattern_vst3_mixer_effect_parameter_links,
+                &self.internal_lfo_parameter_links,
                 project_path,
                 pattern,
                 ppq,
-                &link.target,
+                loop_length_ticks,
+                &target,
             );
             if !lanes.is_empty() {
                 automations
@@ -8490,10 +8651,15 @@ impl DawUi {
         if ppq == 0 {
             return BTreeMap::new();
         }
+        let default_time_signature = document.metadata().time_signature().unwrap_or((4, 4));
         let mut playlist_automation = BTreeMap::new();
         for pattern in patterns {
-            let pattern_automation =
-                self.pattern_vst3_mixer_effect_parameter_automations_for_pattern(&pattern, ppq);
+            let pattern_automation = self
+                .pattern_vst3_mixer_effect_parameter_automations_for_pattern(
+                    &pattern,
+                    ppq,
+                    pattern_lfo_loop_length_ticks(&pattern, ppq, default_time_signature),
+                );
             for ((insert_ordinal, slot_index), lanes) in pattern_automation {
                 if !lanes.is_empty() {
                     playlist_automation.insert((pattern.id, insert_ordinal, slot_index), lanes);
@@ -41560,6 +41726,13 @@ impl DawUi {
                     self.pattern_vst3_mixer_effect_parameter_automations_for_pattern(
                         pattern,
                         document.header().ppq(),
+                        vst3_stream_duration_ticks.unwrap_or_else(|| {
+                            pattern_lfo_loop_length_ticks(
+                                pattern,
+                                document.header().ppq(),
+                                document.metadata().time_signature().unwrap_or((4, 4)),
+                            )
+                        }),
                     )
                 });
         let vst3_processor = if let Some(duration_ticks) = vst3_stream_duration_ticks {
@@ -43832,7 +44005,7 @@ impl DawUi {
                 }
                 self.status = match pending.kind {
                     PendingSongRenderKind::Mix => format!(
-                        "Rendered {} audio clips, {} Sampler clips ({} notes), and {} VST3 channels ({} notes) to {} at {} Hz; {} plug-in channels unloaded, {} scaled audio and {} scaled pattern clips skipped. Measured pre-effect peaks for {} Mixer inserts; supported VST3 Mixer effects and linked Pattern Event/Automation Clip parameters were included",
+                        "Rendered {} audio clips, {} Sampler clips ({} notes), and {} VST3 channels ({} notes) to {} at {} Hz; {} plug-in channels unloaded, {} scaled audio and {} scaled pattern clips skipped. Measured pre-effect peaks for {} Mixer inserts; supported VST3 Mixer effects and linked Pattern Event, LFO, and Automation Clip parameters were included",
                         summary.audio_clips_rendered,
                         summary.sampler_pattern_clips_rendered,
                         summary.sampler_notes_rendered,
@@ -43846,7 +44019,7 @@ impl DawUi {
                         insert_peaks.len(),
                     ),
                     PendingSongRenderKind::MixerStems => format!(
-                        "Rendered supported Mixer stems into {} at {} Hz; {}, {}. Loaded VST3 insert and Master effects with route PDC and linked Pattern Event/Automation Clip parameters were included; native effect formats, other effect automation links, and PDC silence trimming remain unsupported",
+                        "Rendered supported Mixer stems into {} at {} Hz; {}, {}. Loaded VST3 insert and Master effects with route PDC and linked Pattern Event, LFO, and Automation Clip parameters were included; native effect formats, other effect automation links, and PDC silence trimming remain unsupported",
                         pending.output_path.display(),
                         summary.sample_rate,
                         if summary.mixer_master_stem_rendered {
@@ -58888,7 +59061,11 @@ impl DawUi {
         let mut playlist_vst3_mixer_effect_unlink_request =
             None::<(PathBuf, u16, MidiVst3MixerEffectParameterTarget)>;
         let mut internal_lfo_upserts = Vec::new();
-        let mut internal_lfo_unlink_request: Option<(PathBuf, u16, MidiVst3ParameterTarget)> = None;
+        let mut internal_lfo_unlink_request: Option<(
+            PathBuf,
+            u16,
+            MidiVst3ParameterMappingTarget,
+        )> = None;
         let pattern_vst3_source = self.selected_pattern_vst3_parameter_source();
         let pattern_vst3_link_hint = pattern_vst3_source.is_none().then(|| {
             if self.selected_pattern.is_some()
@@ -59947,7 +60124,7 @@ impl DawUi {
                             .as_deref()
                             .zip(self.selected_pattern)
                             .and_then(|(project_path, pattern_id)| {
-                                channel_target.as_ref().and_then(|target| {
+                                mapping_target.as_ref().and_then(|target| {
                                     internal_lfo_parameter_link_for_target(
                                         &self.internal_lfo_parameter_links,
                                         project_path,
@@ -60176,176 +60353,70 @@ impl DawUi {
                                 }
                             }
                         });
-                        if let Some(target) = channel_target.as_ref() {
-                            if let Some((
+                        if let Some(target) = mapping_target.as_ref() {
+                            let lfo_scope = self.current_path.as_deref().zip(self.selected_pattern);
+                            let (lfo_upsert, clear_lfo) =
+                                show_internal_lfo_parameter_link_controls(
+                                    ui,
+                                    internal_lfo_link.as_ref(),
+                                    target,
+                                    lfo_scope,
+                                    parameter.is_read_only,
+                                    info.id,
+                                    parameter.id,
+                                );
+                            if let Some(link) = lfo_upsert {
+                                internal_lfo_upserts.push(link);
+                            }
+                            if clear_lfo
+                                && let Some((project_path, pattern_id)) = lfo_scope
+                            {
+                                internal_lfo_unlink_request = Some((
+                                    project_path.to_path_buf(),
+                                    pattern_id,
+                                    target.clone(),
+                                ));
+                            }
+                        }
+                        if let Some(target) = channel_target.as_ref()
+                            && let Some((
                                 project_path,
                                 automation_channel_id,
                                 channel_name,
                                 has_points,
                             )) = playlist_vst3_source.as_ref()
-                            {
-                                let playlist_link = playlist_vst3_parameter_link_for_target(
-                                    &self.playlist_vst3_parameter_links,
-                                    Path::new(project_path),
-                                    *automation_channel_id,
-                                    target,
-                                );
-                                ui.horizontal(|ui| {
-                                    ui.small(format!("Playlist Automation · {channel_name}"));
-                                    if playlist_link.is_some() {
-                                        ui.small("Linked");
-                                        if ui.small_button("Clear automation").clicked() {
-                                            playlist_vst3_unlink_request = Some((
-                                                PathBuf::from(project_path),
-                                                *automation_channel_id,
-                                                target.clone(),
-                                            ));
-                                        }
-                                    } else if ui
-                                        .add_enabled(
-                                            !parameter.is_read_only && *has_points,
-                                            egui::Button::new("Link Automation"),
-                                        )
-                                        .clicked()
-                                    {
-                                        playlist_vst3_link_request = Some((
-                                            project_path.clone(),
+                        {
+                            let playlist_link = playlist_vst3_parameter_link_for_target(
+                                &self.playlist_vst3_parameter_links,
+                                Path::new(project_path),
+                                *automation_channel_id,
+                                target,
+                            );
+                            ui.horizontal(|ui| {
+                                ui.small(format!("Playlist Automation · {channel_name}"));
+                                if playlist_link.is_some() {
+                                    ui.small("Linked");
+                                    if ui.small_button("Clear automation").clicked() {
+                                        playlist_vst3_unlink_request = Some((
+                                            PathBuf::from(project_path),
                                             *automation_channel_id,
                                             target.clone(),
                                         ));
                                     }
-                                });
-                            }
-                            let lfo_scope = self.current_path.as_ref().zip(self.selected_pattern);
-                            ui.horizontal(|ui| {
-                                if let Some(link) = internal_lfo_link.as_ref() {
-                                    let mut updated = link.clone();
-                                    let label = format!(
-                                        "LFO · {} · {:.2} beats",
-                                        updated.waveform.label(),
-                                        updated.period_millibeats as f32 / 1_000.0
-                                    );
-                                    let mut clear_lfo = false;
-                                    ui.menu_button(label, |ui| {
-                                        egui::ComboBox::from_id_salt((
-                                            "vst3_internal_lfo_waveform",
-                                            info.id,
-                                            parameter.id,
-                                        ))
-                                        .selected_text(updated.waveform.label())
-                                        .show_ui(
-                                            ui,
-                                            |ui| {
-                                                for waveform in InternalLfoWaveform::ALL {
-                                                    ui.selectable_value(
-                                                        &mut updated.waveform,
-                                                        waveform,
-                                                        waveform.label(),
-                                                    );
-                                                }
-                                            },
-                                        );
-
-                                        let mut period_beats =
-                                            updated.period_millibeats as f32 / 1_000.0;
-                                        if ui
-                                            .add(
-                                                egui::Slider::new(&mut period_beats, 0.25..=64.0)
-                                                    .step_by(0.25)
-                                                    .text("Period (beats)"),
-                                            )
-                                            .changed()
-                                        {
-                                            updated.period_millibeats =
-                                                (period_beats * 1_000.0).round() as u32;
-                                        }
-
-                                        let mut minimum = updated.minimum_raw as f32 / 10_000.0;
-                                        if ui
-                                            .add(
-                                                egui::Slider::new(&mut minimum, 0.0..=1.0)
-                                                    .step_by(0.01)
-                                                    .text("Min"),
-                                            )
-                                            .changed()
-                                        {
-                                            updated.minimum_raw = (minimum
-                                                .min(f32::from(updated.maximum_raw) / 10_000.0)
-                                                * 10_000.0)
-                                                .round()
-                                                as u16;
-                                        }
-
-                                        let mut maximum = updated.maximum_raw as f32 / 10_000.0;
-                                        if ui
-                                            .add(
-                                                egui::Slider::new(&mut maximum, 0.0..=1.0)
-                                                    .step_by(0.01)
-                                                    .text("Max"),
-                                            )
-                                            .changed()
-                                        {
-                                            updated.maximum_raw = (maximum
-                                                .max(f32::from(updated.minimum_raw) / 10_000.0)
-                                                * 10_000.0)
-                                                .round()
-                                                as u16;
-                                        }
-
-                                        let mut phase = f32::from(updated.phase_degrees);
-                                        if ui
-                                            .add(
-                                                egui::Slider::new(&mut phase, 0.0..=359.0)
-                                                    .step_by(1.0)
-                                                    .text("Phase°"),
-                                            )
-                                            .changed()
-                                        {
-                                            updated.phase_degrees = phase.round() as u16;
-                                        }
-                                        clear_lfo = ui.small_button("Clear LFO").clicked();
-                                    });
-                                    if clear_lfo && let Some((project_path, pattern_id)) = lfo_scope
-                                    {
-                                        internal_lfo_unlink_request = Some((
-                                            project_path.clone(),
-                                            pattern_id,
-                                            target.clone(),
-                                        ));
-                                    }
-                                    if updated != *link && !clear_lfo {
-                                        internal_lfo_upserts.push(updated);
-                                    }
                                 } else if ui
                                     .add_enabled(
-                                        !parameter.is_read_only && lfo_scope.is_some(),
-                                        egui::Button::new("Add LFO"),
+                                        !parameter.is_read_only && *has_points,
+                                        egui::Button::new("Link Automation"),
                                     )
                                     .clicked()
-                                    && let Some((project_path, pattern_id)) = lfo_scope
                                 {
-                                    internal_lfo_upserts.push(InternalLfoParameterLink {
-                                        project_path: project_path.to_string_lossy().into_owned(),
-                                        pattern_id,
-                                        target: target.clone(),
-                                        waveform: InternalLfoWaveform::Sine,
-                                        period_millibeats: 4_000,
-                                        minimum_raw: 0,
-                                        maximum_raw: 10_000,
-                                        phase_degrees: 0,
-                                    });
+                                    playlist_vst3_link_request = Some((
+                                        project_path.clone(),
+                                        *automation_channel_id,
+                                        target.clone(),
+                                    ));
                                 }
                             });
-                            if internal_lfo_link.is_none()
-                                && (self.current_path.is_none() || self.selected_pattern.is_none())
-                            {
-                                ui.small(
-                                    egui::RichText::new(
-                                        "Save the project and select a Pattern to add an LFO link.",
-                                    )
-                                    .color(MUTED),
-                                );
-                            }
                         }
                         if let Some(target) = effect_target.as_ref()
                             && let Some((
@@ -60435,18 +60506,19 @@ impl DawUi {
         if let Some((project_path, pattern_id, stream_channel, stream_flags, target)) =
             pattern_vst3_link_request
         {
+            let lfo_target = MidiVst3ParameterMappingTarget::Channel(target.clone());
             let lfo_link_existed = internal_lfo_parameter_link_for_target(
                 &self.internal_lfo_parameter_links,
                 Path::new(&project_path),
                 pattern_id,
-                &target,
+                &lfo_target,
             )
             .is_some();
             remove_internal_lfo_parameter_link(
                 &mut self.internal_lfo_parameter_links,
                 Path::new(&project_path),
                 pattern_id,
-                &target,
+                &lfo_target,
             );
             upsert_pattern_vst3_parameter_link(
                 &mut self.pattern_vst3_parameter_links,
@@ -60508,6 +60580,20 @@ impl DawUi {
         if let Some((project_path, pattern_id, stream_channel, stream_flags, target)) =
             pattern_vst3_mixer_effect_link_request
         {
+            let lfo_target = MidiVst3ParameterMappingTarget::MixerEffect(target.clone());
+            let lfo_link_existed = internal_lfo_parameter_link_for_target(
+                &self.internal_lfo_parameter_links,
+                Path::new(&project_path),
+                pattern_id,
+                &lfo_target,
+            )
+            .is_some();
+            remove_internal_lfo_parameter_link(
+                &mut self.internal_lfo_parameter_links,
+                Path::new(&project_path),
+                pattern_id,
+                &lfo_target,
+            );
             upsert_pattern_vst3_mixer_effect_parameter_link(
                 &mut self.pattern_vst3_mixer_effect_parameter_links,
                 PatternVst3MixerEffectParameterLink {
@@ -60518,16 +60604,29 @@ impl DawUi {
                     target: target.clone(),
                 },
             );
-            self.status = save_pattern_vst3_mixer_effect_parameter_links(
+            let save_result = save_pattern_vst3_mixer_effect_parameter_links(
                 &self.pattern_vst3_mixer_effect_parameter_links,
             )
-            .err()
-            .map_or_else(
+            .and_then(|()| {
+                if lfo_link_existed {
+                    save_internal_lfo_parameter_links(&self.internal_lfo_parameter_links)
+                } else {
+                    Ok(())
+                }
+            });
+            self.status = save_result.err().map_or_else(
                 || {
-                    format!(
-                        "Linked Pattern {pattern_id} event stream to {} on this machine",
-                        target.parameter_name
-                    )
+                    if lfo_link_existed {
+                        format!(
+                            "Linked Pattern {pattern_id} event stream to {}; cleared its LFO link",
+                            target.parameter_name
+                        )
+                    } else {
+                        format!(
+                            "Linked Pattern {pattern_id} event stream to {} on this machine",
+                            target.parameter_name
+                        )
+                    }
                 },
                 |error| {
                     format!(
@@ -60658,12 +60757,24 @@ impl DawUi {
         }
         for link in internal_lfo_upserts {
             let project_path = PathBuf::from(&link.project_path);
-            remove_pattern_vst3_parameter_link(
-                &mut self.pattern_vst3_parameter_links,
-                &project_path,
-                link.pattern_id,
-                &link.target,
-            );
+            match &link.target {
+                MidiVst3ParameterMappingTarget::Channel(target) => {
+                    remove_pattern_vst3_parameter_link(
+                        &mut self.pattern_vst3_parameter_links,
+                        &project_path,
+                        link.pattern_id,
+                        target,
+                    );
+                }
+                MidiVst3ParameterMappingTarget::MixerEffect(target) => {
+                    remove_pattern_vst3_mixer_effect_parameter_link(
+                        &mut self.pattern_vst3_mixer_effect_parameter_links,
+                        &project_path,
+                        link.pattern_id,
+                        target,
+                    );
+                }
+            }
             upsert_internal_lfo_parameter_link(
                 &mut self.internal_lfo_parameter_links,
                 link.clone(),
@@ -60671,12 +60782,17 @@ impl DawUi {
             let save_result = save_internal_lfo_parameter_links(&self.internal_lfo_parameter_links)
                 .and_then(|()| {
                     save_pattern_vst3_parameter_links(&self.pattern_vst3_parameter_links)
+                })
+                .and_then(|()| {
+                    save_pattern_vst3_mixer_effect_parameter_links(
+                        &self.pattern_vst3_mixer_effect_parameter_links,
+                    )
                 });
             self.status = save_result.err().map_or_else(
                 || {
                     format!(
                         "Linked {} to a Pattern LFO on this machine",
-                        link.target.parameter_name
+                        link.target.parameter_name()
                     )
                 },
                 |error| {
@@ -60694,7 +60810,7 @@ impl DawUi {
             self.status = save_internal_lfo_parameter_links(&self.internal_lfo_parameter_links)
                 .err()
                 .map_or_else(
-                    || format!("Cleared Pattern LFO link for {}", target.parameter_name),
+                    || format!("Cleared Pattern LFO link for {}", target.parameter_name()),
                     |error| {
                         format!(
                             "Cleared Pattern LFO link for this session; could not save it: {error}"
@@ -65123,8 +65239,8 @@ fn playlist_vst3_mixer_effect_parameter_link_for_target<'a>(
 
 fn valid_internal_lfo_parameter_link(link: &InternalLfoParameterLink) -> bool {
     !link.project_path.is_empty()
-        && !link.target.plugin_uid.is_empty()
-        && !link.target.parameter_name.is_empty()
+        && !link.target.plugin_uid().is_empty()
+        && !link.target.parameter_name().is_empty()
         && (250..=64_000).contains(&link.period_millibeats)
         && link.minimum_raw <= link.maximum_raw
         && link.maximum_raw <= 10_000
@@ -65135,11 +65251,11 @@ fn same_internal_lfo_parameter_link_target(
     link: &InternalLfoParameterLink,
     project_path: &Path,
     pattern_id: u16,
-    target: &MidiVst3ParameterTarget,
+    target: &MidiVst3ParameterMappingTarget,
 ) -> bool {
     project_paths_equal(Path::new(&link.project_path), project_path)
         && link.pattern_id == pattern_id
-        && same_midi_vst3_parameter_target(&link.target, target)
+        && &link.target == target
 }
 
 fn upsert_internal_lfo_parameter_link(
@@ -65164,7 +65280,7 @@ fn remove_internal_lfo_parameter_link(
     links: &mut Vec<InternalLfoParameterLink>,
     project_path: &Path,
     pattern_id: u16,
-    target: &MidiVst3ParameterTarget,
+    target: &MidiVst3ParameterMappingTarget,
 ) {
     links.retain(|link| {
         !same_internal_lfo_parameter_link_target(link, project_path, pattern_id, target)
@@ -65175,7 +65291,7 @@ fn internal_lfo_parameter_link_for_target<'a>(
     links: &'a [InternalLfoParameterLink],
     project_path: &Path,
     pattern_id: u16,
-    target: &MidiVst3ParameterTarget,
+    target: &MidiVst3ParameterMappingTarget,
 ) -> Option<&'a InternalLfoParameterLink> {
     links.iter().find(|link| {
         same_internal_lfo_parameter_link_target(link, project_path, pattern_id, target)
@@ -65255,8 +65371,32 @@ fn internal_lfo_parameter_automation(
         })
         .collect();
     Vst3ParameterAutomation {
-        parameter_id: link.target.parameter_id,
+        parameter_id: link.target.parameter_id(),
         points,
+    }
+}
+
+fn internal_lfo_mixer_effect_parameter_automation(
+    link: &InternalLfoParameterLink,
+    ppq: u16,
+    loop_length_ticks: u64,
+) -> Vst3PlaylistParameterAutomation {
+    let automation = internal_lfo_parameter_automation(link, ppq, loop_length_ticks);
+    Vst3PlaylistParameterAutomation {
+        parameter_id: automation.parameter_id,
+        points: automation
+            .points
+            .into_iter()
+            .filter_map(|point| {
+                let tick = point.position_beats * f64::from(ppq);
+                (tick.is_finite() && tick >= 0.0 && tick < u64::MAX as f64).then_some(
+                    Vst3PlaylistAutomationPoint {
+                        tick: tick.round() as u64,
+                        value: point.value,
+                    },
+                )
+            })
+            .collect(),
     }
 }
 
@@ -65316,11 +65456,14 @@ fn pattern_vst3_parameter_automation_for_channel(
             .lfo_links
             .iter()
             .filter(|link| {
+                let MidiVst3ParameterMappingTarget::Channel(target) = &link.target else {
+                    return false;
+                };
                 project_paths_equal(Path::new(&link.project_path), project_path)
                     && link.pattern_id == pattern.id
-                    && link.target.project_channel_id == target_channel_id
-                    && link.target.plugin_uid == plugin_uid
-                    && !event_linked_parameters.contains(&link.target.parameter_id)
+                    && target.project_channel_id == target_channel_id
+                    && target.plugin_uid == plugin_uid
+                    && !event_linked_parameters.contains(&target.parameter_id)
             })
             .map(|link| internal_lfo_parameter_automation(link, ppq, loop_length_ticks)),
     );
@@ -65366,6 +65509,40 @@ fn pattern_vst3_mixer_effect_parameter_automation_for_target(
                 points,
             })
         })
+        .collect()
+}
+
+fn pattern_vst3_mixer_effect_parameter_automation_for_target_with_lfo(
+    event_links: &[PatternVst3MixerEffectParameterLink],
+    lfo_links: &[InternalLfoParameterLink],
+    project_path: &Path,
+    pattern: &Pattern,
+    ppq: u16,
+    loop_length_ticks: u64,
+    target: &MidiVst3MixerEffectParameterTarget,
+) -> Vec<Vst3PlaylistParameterAutomation> {
+    let event_automation = pattern_vst3_mixer_effect_parameter_automation_for_target(
+        event_links,
+        project_path,
+        pattern,
+        ppq,
+        target,
+    );
+    if !event_automation.is_empty() || ppq == 0 || loop_length_ticks == 0 {
+        return event_automation;
+    }
+    lfo_links
+        .iter()
+        .filter(|link| {
+            project_paths_equal(Path::new(&link.project_path), project_path)
+                && link.pattern_id == pattern.id
+                && matches!(
+                    &link.target,
+                    MidiVst3ParameterMappingTarget::MixerEffect(link_target)
+                        if same_mixer_effect_parameter_target(link_target, target)
+                )
+        })
+        .map(|link| internal_lfo_mixer_effect_parameter_automation(link, ppq, loop_length_ticks))
         .collect()
 }
 
@@ -66175,60 +66352,144 @@ fn parse_internal_lfo_parameter_links(contents: &str) -> Vec<InternalLfoParamete
         let Some(encoded) = line.strip_prefix("link=") else {
             continue;
         };
-        let mut fields = encoded.split('\t');
-        let Some(project_path) = fields.next().and_then(decode_midi_device_id) else {
-            continue;
-        };
-        let Some(pattern_id) = fields.next().and_then(|field| field.parse::<u16>().ok()) else {
-            continue;
-        };
-        let Some(project_channel_id) = fields.next().and_then(|field| field.parse::<u16>().ok())
+        let fields = encoded.split('\t').collect::<Vec<_>>();
+        let Some(project_path) = fields
+            .first()
+            .and_then(|field| decode_midi_device_id(field))
         else {
             continue;
         };
-        let Some(plugin_uid) = fields.next().and_then(decode_midi_device_id) else {
+        let Some(pattern_id) = fields.get(1).and_then(|field| field.parse::<u16>().ok()) else {
             continue;
         };
-        let Some(parameter_id) = fields.next().and_then(|field| field.parse::<u32>().ok()) else {
+        let (mut target, values_start) = match fields.len() {
+            11 => {
+                let Some(project_channel_id) =
+                    fields.get(2).and_then(|field| field.parse::<u16>().ok())
+                else {
+                    continue;
+                };
+                (
+                    MidiVst3ParameterMappingTarget::Channel(MidiVst3ParameterTarget {
+                        project_channel_id,
+                        plugin_uid: String::new(),
+                        parameter_id: 0,
+                        parameter_name: String::new(),
+                    }),
+                    3,
+                )
+            }
+            12 if fields.get(2) == Some(&"channel") => {
+                let Some(project_channel_id) =
+                    fields.get(3).and_then(|field| field.parse::<u16>().ok())
+                else {
+                    continue;
+                };
+                (
+                    MidiVst3ParameterMappingTarget::Channel(MidiVst3ParameterTarget {
+                        project_channel_id,
+                        plugin_uid: String::new(),
+                        parameter_id: 0,
+                        parameter_name: String::new(),
+                    }),
+                    4,
+                )
+            }
+            13 if fields.get(2) == Some(&"mixer_effect") => {
+                let Some(insert_ordinal) =
+                    fields.get(3).and_then(|field| field.parse::<usize>().ok())
+                else {
+                    continue;
+                };
+                let Some(slot_index) = fields.get(4).and_then(|field| field.parse::<u16>().ok())
+                else {
+                    continue;
+                };
+                (
+                    MidiVst3ParameterMappingTarget::MixerEffect(
+                        MidiVst3MixerEffectParameterTarget {
+                            insert_ordinal,
+                            slot_index,
+                            plugin_uid: String::new(),
+                            parameter_id: 0,
+                            parameter_name: String::new(),
+                        },
+                    ),
+                    5,
+                )
+            }
+            _ => continue,
+        };
+        if fields.len() != values_start + 8 {
+            continue;
+        }
+        let Some(plugin_uid) = fields
+            .get(values_start)
+            .and_then(|field| decode_midi_device_id(field))
+        else {
             continue;
         };
-        let Some(parameter_name) = fields.next().and_then(decode_midi_device_id) else {
+        let Some(parameter_id) = fields
+            .get(values_start + 1)
+            .and_then(|field| field.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Some(parameter_name) = fields
+            .get(values_start + 2)
+            .and_then(|field| decode_midi_device_id(field))
+        else {
             continue;
         };
         let Some(waveform) = fields
-            .next()
+            .get(values_start + 3)
             .and_then(|field| field.parse::<u8>().ok())
             .and_then(InternalLfoWaveform::from_code)
         else {
             continue;
         };
-        let Some(period_millibeats) = fields.next().and_then(|field| field.parse::<u32>().ok())
+        let Some(period_millibeats) = fields
+            .get(values_start + 4)
+            .and_then(|field| field.parse::<u32>().ok())
         else {
             continue;
         };
-        let Some(minimum_raw) = fields.next().and_then(|field| field.parse::<u16>().ok()) else {
+        let Some(minimum_raw) = fields
+            .get(values_start + 5)
+            .and_then(|field| field.parse::<u16>().ok())
+        else {
             continue;
         };
-        let Some(maximum_raw) = fields.next().and_then(|field| field.parse::<u16>().ok()) else {
+        let Some(maximum_raw) = fields
+            .get(values_start + 6)
+            .and_then(|field| field.parse::<u16>().ok())
+        else {
             continue;
         };
-        let Some(phase_degrees) = fields.next().and_then(|field| field.parse::<u16>().ok()) else {
+        let Some(phase_degrees) = fields
+            .get(values_start + 7)
+            .and_then(|field| field.parse::<u16>().ok())
+        else {
             continue;
         };
-        if fields.next().is_some() {
-            continue;
+        match &mut target {
+            MidiVst3ParameterMappingTarget::Channel(target) => {
+                target.plugin_uid = plugin_uid;
+                target.parameter_id = parameter_id;
+                target.parameter_name = parameter_name;
+            }
+            MidiVst3ParameterMappingTarget::MixerEffect(target) => {
+                target.plugin_uid = plugin_uid;
+                target.parameter_id = parameter_id;
+                target.parameter_name = parameter_name;
+            }
         }
         upsert_internal_lfo_parameter_link(
             &mut links,
             InternalLfoParameterLink {
                 project_path,
                 pattern_id,
-                target: MidiVst3ParameterTarget {
-                    project_channel_id,
-                    plugin_uid,
-                    parameter_id,
-                    parameter_name,
-                },
+                target,
                 waveform,
                 period_millibeats,
                 minimum_raw,
@@ -66241,7 +66502,7 @@ fn parse_internal_lfo_parameter_links(contents: &str) -> Vec<InternalLfoParamete
 }
 
 fn serialize_internal_lfo_parameter_links(links: &[InternalLfoParameterLink]) -> String {
-    let mut contents = String::from("version=1\n");
+    let mut contents = String::from("version=2\n");
     let mut normalized = Vec::new();
     for link in links {
         upsert_internal_lfo_parameter_link(&mut normalized, link.clone());
@@ -66251,14 +66512,24 @@ fn serialize_internal_lfo_parameter_links(links: &[InternalLfoParameterLink]) ->
         contents.push_str(&encode_midi_device_id(&link.project_path));
         contents.push('\t');
         contents.push_str(&link.pattern_id.to_string());
+        match &link.target {
+            MidiVst3ParameterMappingTarget::Channel(target) => {
+                contents.push_str("\tchannel\t");
+                contents.push_str(&target.project_channel_id.to_string());
+            }
+            MidiVst3ParameterMappingTarget::MixerEffect(target) => {
+                contents.push_str("\tmixer_effect\t");
+                contents.push_str(&target.insert_ordinal.to_string());
+                contents.push('\t');
+                contents.push_str(&target.slot_index.to_string());
+            }
+        }
         contents.push('\t');
-        contents.push_str(&link.target.project_channel_id.to_string());
+        contents.push_str(&encode_midi_device_id(link.target.plugin_uid()));
         contents.push('\t');
-        contents.push_str(&encode_midi_device_id(&link.target.plugin_uid));
+        contents.push_str(&link.target.parameter_id().to_string());
         contents.push('\t');
-        contents.push_str(&link.target.parameter_id.to_string());
-        contents.push('\t');
-        contents.push_str(&encode_midi_device_id(&link.target.parameter_name));
+        contents.push_str(&encode_midi_device_id(link.target.parameter_name()));
         contents.push('\t');
         contents.push_str(&link.waveform.code().to_string());
         contents.push('\t');
@@ -72786,6 +73057,7 @@ mod tests {
         pattern_color_from_random_index, pattern_lfo_loop_length_ticks, pattern_loop_frame_at_tick,
         pattern_loop_handoff_tick_at_frame, pattern_loop_tick_at_frame,
         pattern_vst3_mixer_effect_parameter_automation_for_target,
+        pattern_vst3_mixer_effect_parameter_automation_for_target_with_lfo,
         pattern_vst3_mixer_effect_parameter_link_for_target,
         pattern_vst3_parameter_automation_for_channel, pattern_vst3_parameter_link_for_target,
         piano_roll_color_group_note_ids, piano_roll_controller_stroke_points,
@@ -75190,7 +75462,7 @@ mod tests {
         let lfo_link = InternalLfoParameterLink {
             project_path: project_path.to_string_lossy().into_owned(),
             pattern_id: 6,
-            target: link.target.clone(),
+            target: MidiVst3ParameterMappingTarget::Channel(link.target.clone()),
             waveform: InternalLfoWaveform::Sine,
             period_millibeats: 4_000,
             minimum_raw: 2_500,
@@ -75307,6 +75579,91 @@ mod tests {
     }
 
     #[test]
+    fn pattern_vst3_mixer_effect_lfo_generates_ticks_and_yields_to_event_points() {
+        let project_path = std::env::temp_dir().join("pattern effect lfo.flp");
+        let target = MidiVst3MixerEffectParameterTarget {
+            insert_ordinal: 3,
+            slot_index: 2,
+            plugin_uid: "com.example.effect".to_owned(),
+            parameter_id: 47,
+            parameter_name: "Feedback".to_owned(),
+        };
+        let target_mapping = MidiVst3ParameterMappingTarget::MixerEffect(target.clone());
+        let lfo_link = InternalLfoParameterLink {
+            project_path: project_path.to_string_lossy().into_owned(),
+            pattern_id: 8,
+            target: target_mapping,
+            waveform: InternalLfoWaveform::Triangle,
+            period_millibeats: 4_000,
+            minimum_raw: 2_000,
+            maximum_raw: 8_000,
+            phase_degrees: 0,
+        };
+        let pattern = Pattern {
+            id: 8,
+            length_ticks: Some(384),
+            ..Pattern::default()
+        };
+        let lfo_automation = pattern_vst3_mixer_effect_parameter_automation_for_target_with_lfo(
+            &[],
+            std::slice::from_ref(&lfo_link),
+            &project_path,
+            &pattern,
+            96,
+            384,
+            &target,
+        );
+        assert_eq!(lfo_automation.len(), 1);
+        assert_eq!(lfo_automation[0].parameter_id, target.parameter_id);
+        assert_eq!(lfo_automation[0].points.len(), 33);
+        assert_eq!(lfo_automation[0].points.first().unwrap().tick, 0);
+        assert_eq!(lfo_automation[0].points.last().unwrap().tick, 384);
+        assert!(
+            lfo_automation[0]
+                .points
+                .windows(2)
+                .all(|pair| pair[0].tick < pair[1].tick)
+        );
+
+        let event_link = PatternVst3MixerEffectParameterLink {
+            project_path: project_path.to_string_lossy().into_owned(),
+            pattern_id: 8,
+            stream_channel: 2,
+            stream_flags: 0x31,
+            target: target.clone(),
+        };
+        let event_pattern = Pattern {
+            id: 8,
+            controllers: vec![PatternController {
+                position: 96,
+                channel: 2,
+                flags: 0x31,
+                value_bits: 0.75f32.to_bits(),
+                ..PatternController::default()
+            }],
+            ..Pattern::default()
+        };
+        assert_eq!(
+            pattern_vst3_mixer_effect_parameter_automation_for_target_with_lfo(
+                &[event_link],
+                std::slice::from_ref(&lfo_link),
+                &project_path,
+                &event_pattern,
+                96,
+                384,
+                &target,
+            ),
+            vec![Vst3PlaylistParameterAutomation {
+                parameter_id: target.parameter_id,
+                points: vec![Vst3PlaylistAutomationPoint {
+                    tick: 96,
+                    value: 0.75,
+                }],
+            }]
+        );
+    }
+
+    #[test]
     fn internal_lfo_links_round_trip_and_replace_per_project_pattern_target() {
         let project_path = std::env::temp_dir().join("internal lfo project 雪.flp");
         let target = MidiVst3ParameterTarget {
@@ -75315,10 +75672,11 @@ mod tests {
             parameter_id: 7,
             parameter_name: "Cutoff 雪".to_owned(),
         };
+        let mapping_target = MidiVst3ParameterMappingTarget::Channel(target.clone());
         let link = InternalLfoParameterLink {
             project_path: project_path.to_string_lossy().into_owned(),
             pattern_id: 4,
-            target: target.clone(),
+            target: mapping_target.clone(),
             waveform: InternalLfoWaveform::Triangle,
             period_millibeats: 1_500,
             minimum_raw: 1_250,
@@ -75326,17 +75684,45 @@ mod tests {
             phase_degrees: 90,
         };
         let other_target = InternalLfoParameterLink {
-            target: MidiVst3ParameterTarget {
+            target: MidiVst3ParameterMappingTarget::Channel(MidiVst3ParameterTarget {
                 parameter_id: 8,
                 parameter_name: "Resonance".to_owned(),
                 ..target.clone()
-            },
+            }),
             ..link.clone()
         };
-        let encoded = serialize_internal_lfo_parameter_links(&[link.clone(), other_target.clone()]);
+        let effect_target =
+            MidiVst3ParameterMappingTarget::MixerEffect(MidiVst3MixerEffectParameterTarget {
+                insert_ordinal: 9,
+                slot_index: 4,
+                plugin_uid: "com.example.effect".to_owned(),
+                parameter_id: 22,
+                parameter_name: "Rate".to_owned(),
+            });
+        let effect_link = InternalLfoParameterLink {
+            project_path: project_path.to_string_lossy().into_owned(),
+            pattern_id: 4,
+            target: effect_target.clone(),
+            ..link.clone()
+        };
+        let encoded = serialize_internal_lfo_parameter_links(&[
+            link.clone(),
+            other_target.clone(),
+            effect_link.clone(),
+        ]);
         assert_eq!(
             parse_internal_lfo_parameter_links(&encoded),
-            vec![link.clone(), other_target.clone()]
+            vec![link.clone(), other_target.clone(), effect_link]
+        );
+        let legacy = format!(
+            "version=1\nlink={}\t4\t23\t{}\t7\t{}\t1\t1500\t1250\t8750\t90\n",
+            encode_midi_device_id(&project_path.to_string_lossy()),
+            encode_midi_device_id("com.example.synth\tuid"),
+            encode_midi_device_id("Cutoff 雪")
+        );
+        assert_eq!(
+            parse_internal_lfo_parameter_links(&legacy),
+            vec![link.clone()]
         );
 
         let replacement = InternalLfoParameterLink {
@@ -75348,11 +75734,12 @@ mod tests {
         upsert_internal_lfo_parameter_link(&mut links, replacement.clone());
         assert_eq!(links, vec![other_target, replacement]);
         assert_eq!(
-            internal_lfo_parameter_link_for_target(&links, &project_path, 4, &target),
+            internal_lfo_parameter_link_for_target(&links, &project_path, 4, &mapping_target),
             Some(&links[1])
         );
         assert!(
-            internal_lfo_parameter_link_for_target(&links, &project_path, 5, &target).is_none()
+            internal_lfo_parameter_link_for_target(&links, &project_path, 5, &mapping_target)
+                .is_none()
         );
     }
 
@@ -75362,12 +75749,12 @@ mod tests {
             let link = InternalLfoParameterLink {
                 project_path: "/tmp/internal-lfo.flp".to_owned(),
                 pattern_id: 2,
-                target: MidiVst3ParameterTarget {
+                target: MidiVst3ParameterMappingTarget::Channel(MidiVst3ParameterTarget {
                     project_channel_id: 7,
                     plugin_uid: "com.example.synth".to_owned(),
                     parameter_id: 19,
                     parameter_name: "Cutoff".to_owned(),
-                },
+                }),
                 waveform,
                 period_millibeats: 4_000,
                 minimum_raw: 2_000,
@@ -75437,12 +75824,12 @@ mod tests {
                 ..InternalLfoParameterLink {
                     project_path: "/tmp/internal-lfo.flp".to_owned(),
                     pattern_id: 2,
-                    target: MidiVst3ParameterTarget {
+                    target: MidiVst3ParameterMappingTarget::Channel(MidiVst3ParameterTarget {
                         project_channel_id: 7,
                         plugin_uid: "com.example.synth".to_owned(),
                         parameter_id: 19,
                         parameter_name: "Cutoff".to_owned(),
-                    },
+                    }),
                     waveform: InternalLfoWaveform::Sine,
                     period_millibeats: 4_000,
                     minimum_raw: 2_000,
