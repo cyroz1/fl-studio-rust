@@ -1873,6 +1873,12 @@ pub struct PlaylistLatencyUpdateControls {
     pub reports: Sender<Vst3LatencyReport>,
 }
 
+/// Live device-stream controls for a Playlist render worker.
+pub struct PlaylistLiveStreamControls<'a> {
+    pub monitor: PlaylistStreamMonitor<'a>,
+    pub latency_updates: Option<PlaylistLatencyUpdateControls>,
+}
+
 struct PlaylistLiveLatencyUpdateState<'a> {
     document: &'a FlpDocument,
     updates: Receiver<BTreeSet<u64>>,
@@ -2448,8 +2454,10 @@ pub fn stream_playlist_with_vst3_to_device_from_frame(
         writer,
         cancelled,
         vst3_processor,
-        PlaylistStreamMonitor::from_frame(start_frame),
-        None,
+        PlaylistLiveStreamControls {
+            monitor: PlaylistStreamMonitor::from_frame(start_frame),
+            latency_updates: None,
+        },
     )
 }
 
@@ -2470,8 +2478,10 @@ pub fn stream_playlist_with_vst3_to_device_with_monitor(
         writer,
         cancelled,
         vst3_processor,
-        monitor,
-        None,
+        PlaylistLiveStreamControls {
+            monitor,
+            latency_updates: None,
+        },
     )
 }
 
@@ -2483,8 +2493,7 @@ pub fn stream_playlist_with_vst3_to_device_with_monitor_and_latency_updates(
     writer: &StreamingAudioWriter,
     cancelled: &AtomicBool,
     vst3_processor: Option<Vst3PlaylistStreamProcessor>,
-    monitor: PlaylistStreamMonitor<'_>,
-    latency_controls: PlaylistLatencyUpdateControls,
+    controls: PlaylistLiveStreamControls<'_>,
 ) -> Result<PlaylistRenderSummary, String> {
     stream_playlist_with_vst3_to_device_from_frame_inner(
         document,
@@ -2493,8 +2502,7 @@ pub fn stream_playlist_with_vst3_to_device_with_monitor_and_latency_updates(
         writer,
         cancelled,
         vst3_processor,
-        monitor,
-        Some(latency_controls),
+        controls,
     )
 }
 
@@ -2682,10 +2690,13 @@ pub fn stream_playlist_performance_with_vst3_to_device(
             vst3_processor: vst3_processor.as_mut(),
             remainder_stop: None,
         },
-        Some(runtime),
-        None,
-        performance.meters.as_deref(),
-        cancelled,
+        PlaylistPreparedRenderControls {
+            performance: Some(runtime),
+            latency_updates: None,
+            meters: performance.meters.as_deref(),
+            cancelled,
+            capture_post_effect_buses: false,
+        },
         || writer.is_cancelled(),
         false,
         |block, _mixer_buses| {
@@ -2705,9 +2716,12 @@ fn stream_playlist_with_vst3_to_device_from_frame_inner(
     writer: &StreamingAudioWriter,
     cancelled: &AtomicBool,
     mut vst3_processor: Option<Vst3PlaylistStreamProcessor>,
-    monitor: PlaylistStreamMonitor<'_>,
-    latency_controls: Option<PlaylistLatencyUpdateControls>,
+    controls: PlaylistLiveStreamControls<'_>,
 ) -> Result<PlaylistRenderSummary, String> {
+    let PlaylistLiveStreamControls {
+        monitor,
+        latency_updates: latency_controls,
+    } = controls;
     let start_frame = monitor.start_frame;
     let meters = monitor.meters;
     let live_master_fader_gain = monitor.live_master_fader_gain;
@@ -5322,12 +5336,14 @@ fn stream_prepared_playlist_render(
 ) -> Result<PlaylistBlockRenderSummary, String> {
     stream_prepared_playlist_render_with_performance(
         render,
-        None,
-        None,
-        meters,
-        cancelled,
+        PlaylistPreparedRenderControls {
+            performance: None,
+            latency_updates: None,
+            meters,
+            cancelled,
+            capture_post_effect_buses: false,
+        },
         stream_cancelled,
-        false,
         write_block,
     )
 }
@@ -5342,12 +5358,14 @@ fn stream_prepared_playlist_render_with_live_latency_updates(
 ) -> Result<PlaylistBlockRenderSummary, String> {
     stream_prepared_playlist_render_with_performance(
         render,
-        None,
-        Some(latency_updates),
-        meters,
-        cancelled,
+        PlaylistPreparedRenderControls {
+            performance: None,
+            latency_updates: Some(latency_updates),
+            meters,
+            cancelled,
+            capture_post_effect_buses: false,
+        },
         stream_cancelled,
-        false,
         write_block,
     )
 }
@@ -5361,12 +5379,14 @@ fn stream_prepared_playlist_render_with_post_effect_stems(
 ) -> Result<PlaylistBlockRenderSummary, String> {
     stream_prepared_playlist_render_with_performance(
         render,
-        None,
-        None,
-        meters,
-        cancelled,
+        PlaylistPreparedRenderControls {
+            performance: None,
+            latency_updates: None,
+            meters,
+            cancelled,
+            capture_post_effect_buses: true,
+        },
         stream_cancelled,
-        true,
         write_block,
     )
 }
@@ -5375,6 +5395,14 @@ fn stream_prepared_playlist_render_with_post_effect_stems(
 struct PlaylistRenderMixerBuses<'a> {
     pre_effect: Option<&'a [f32]>,
     post_effect: Option<&'a [f32]>,
+}
+
+struct PlaylistPreparedRenderControls<'document, 'runtime> {
+    performance: Option<PlaylistPerformanceRuntime>,
+    latency_updates: Option<PlaylistLiveLatencyUpdateState<'document>>,
+    meters: Option<&'runtime MixerTrackPeakMeters>,
+    cancelled: &'runtime AtomicBool,
+    capture_post_effect_buses: bool,
 }
 
 fn update_live_playlist_source_pdc_delays(
@@ -5454,14 +5482,17 @@ fn refresh_playlist_latency_updates(
 
 fn stream_prepared_playlist_render_with_performance(
     mut render: PreparedPlaylistBlockMix<'_>,
-    mut performance: Option<PlaylistPerformanceRuntime>,
-    mut latency_updates: Option<PlaylistLiveLatencyUpdateState<'_>>,
-    meters: Option<&MixerTrackPeakMeters>,
-    cancelled: &AtomicBool,
+    controls: PlaylistPreparedRenderControls<'_, '_>,
     mut stream_cancelled: impl FnMut() -> bool,
-    capture_post_effect_buses: bool,
     mut write_block: impl FnMut(&[f32], PlaylistRenderMixerBuses<'_>) -> Result<(), String>,
 ) -> Result<PlaylistBlockRenderSummary, String> {
+    let PlaylistPreparedRenderControls {
+        mut performance,
+        mut latency_updates,
+        meters,
+        cancelled,
+        capture_post_effect_buses,
+    } = controls;
     crate::audio::enable_denormal_protection();
     let mut frames = render.frames;
     let options = render.options;
