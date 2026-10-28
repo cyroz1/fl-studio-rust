@@ -61774,7 +61774,13 @@ fn piano_roll_cross_pattern_ghost_notes_for_anchor(
             else {
                 continue;
             };
-            if source_pattern_id == current_pattern_id {
+            if source_clip_index == current_anchor_clip_index {
+                continue;
+            }
+            let same_lane_pattern_stack = anchor_clip_index.is_some()
+                && source_pattern_id == current_pattern_id
+                && source_clip.playlist_track_id() == anchor.playlist_track_id();
+            if source_pattern_id == current_pattern_id && !same_lane_pattern_stack {
                 continue;
             }
             let source_clip_key = PianoRollGhostClipKey {
@@ -70738,9 +70744,10 @@ mod tests {
         pattern_vst3_parameter_automation_for_channel, pattern_vst3_parameter_link_for_target,
         piano_roll_color_group_note_ids, piano_roll_controller_stroke_points,
         piano_roll_controller_value_at, piano_roll_controller_value_range,
-        piano_roll_cross_pattern_ghost_notes, piano_roll_discard_length_edit,
-        piano_roll_duplicate_offset, piano_roll_ghost_note_is_visible, piano_roll_key_at_y,
-        piano_roll_note_group_members, piano_roll_note_nudge_edit, piano_roll_odd_note_selection,
+        piano_roll_cross_pattern_ghost_notes, piano_roll_cross_pattern_ghost_notes_for_anchor,
+        piano_roll_discard_length_edit, piano_roll_duplicate_offset,
+        piano_roll_ghost_note_is_visible, piano_roll_key_at_y, piano_roll_note_group_members,
+        piano_roll_note_nudge_edit, piano_roll_odd_note_selection,
         piano_roll_overlap_note_selection, piano_roll_pitch_range_note_selection,
         piano_roll_random_note_selection, piano_roll_selection_time_range,
         piano_roll_shift_time_range, piano_roll_time_range_from_drag,
@@ -73863,6 +73870,39 @@ mod tests {
                 })
                 .collect::<Vec<_>>(),
             vec![(5, 67, 60, 24), (6, 55, 78, 18)]
+        );
+    }
+
+    #[test]
+    fn piano_roll_ghosts_include_other_same_lane_stacked_instances_of_the_anchored_pattern() {
+        let arrangement = playlist_pattern_ghost_arrangement_fixture(&[
+            (100, 96, 1, 0),
+            (148, 96, 1, 0),
+            (148, 96, 1, 1),
+        ]);
+        let patterns = vec![piano_roll_ghost_test_pattern(
+            1,
+            96,
+            vec![piano_roll_ghost_test_note(5, 67, 12, 24)],
+        )];
+
+        let anchored = piano_roll_cross_pattern_ghost_notes_for_anchor(
+            1,
+            &patterns,
+            &arrangement,
+            &BTreeSet::new(),
+            Some(0),
+        );
+        assert_eq!(anchored.len(), 1);
+        assert_eq!(anchored[0].source_clip.clip_index, 1);
+        assert_eq!(anchored[0].position_ticks, 60);
+        assert_eq!(anchored[0].length_ticks, 24);
+
+        // Without a selected Playlist clip, same-Pattern instances do not provide
+        // an unambiguous source-to-editor time origin.
+        assert!(
+            piano_roll_cross_pattern_ghost_notes(1, &patterns, &arrangement, &BTreeSet::new(),)
+                .is_empty()
         );
     }
 
