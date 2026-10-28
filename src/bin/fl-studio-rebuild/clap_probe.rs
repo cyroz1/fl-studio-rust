@@ -28,7 +28,6 @@ const MAX_NOTE_PREVIEW_TOTAL_CHANNELS: u32 = 64;
 const NOTE_PREVIEW_BLOCK_FRAMES: u32 = 512;
 const NOTE_PREVIEW_DURATION_MILLISECONDS: u32 = 1500;
 const NOTE_PREVIEW_NOTE_MILLISECONDS: u32 = 500;
-const MIDI2_PREVIEW_NOTE_VELOCITY: u16 = 52_428;
 const PROBE_HEADER: &str = "FL_STUDIO_REBUILD_CLAP_PROBE_V1";
 const INSTANCE_PROBE_HEADER: &str = "FL_STUDIO_REBUILD_CLAP_INSTANCE_V1";
 
@@ -109,8 +108,16 @@ pub enum ClapNotePreviewState {
 
 pub type ClapInspectionResponse = (PathBuf, Result<Vec<ClapPluginDescriptor>, String>);
 pub type ClapInstanceInspectionResponse = (PathBuf, String, Result<ClapInstanceInfo, String>);
-pub type ClapNotePreviewRequest = (PathBuf, String, String, u32);
-pub type ClapNotePreviewResponse = (PathBuf, String, String, Result<Vec<f32>, String>);
+pub type ClapNotePreviewRequest = (PathBuf, String, String, u32, u8, u8, u64);
+pub type ClapNotePreviewResponse = (
+    PathBuf,
+    String,
+    String,
+    u8,
+    u8,
+    u64,
+    Result<Vec<f32>, String>,
+);
 
 pub fn start_worker(
     egui_context: eframe::egui::Context,
@@ -175,12 +182,24 @@ pub fn start_note_preview_worker(
     thread::Builder::new()
         .name("clap-note-preview".to_owned())
         .spawn(move || {
-            while let Ok((path, plugin_id, plugin_name, sample_rate)) = request_receiver.recv() {
+            while let Ok((
+                path,
+                plugin_id,
+                plugin_name,
+                sample_rate,
+                note_key,
+                velocity,
+                request_id,
+            )) = request_receiver.recv()
+            {
                 let response = (
                     path.clone(),
                     plugin_id.clone(),
                     plugin_name,
-                    note_preview_in_subprocess(&path, &plugin_id, sample_rate),
+                    note_key,
+                    velocity,
+                    request_id,
+                    note_preview_in_subprocess(&path, &plugin_id, sample_rate, note_key, velocity),
                 );
                 if response_sender.send(response).is_err() {
                     break;
@@ -217,12 +236,16 @@ pub fn note_preview_in_subprocess(
     path: &Path,
     plugin_id: &str,
     sample_rate: u32,
+    note_key: u8,
+    velocity: u8,
 ) -> Result<Vec<f32>, String> {
     let arguments = [
         OsString::from(NOTE_PREVIEW_FLAG),
         path.as_os_str().to_owned(),
         OsString::from(plugin_id),
         OsString::from(sample_rate.to_string()),
+        OsString::from(note_key.to_string()),
+        OsString::from(velocity.to_string()),
     ];
     let output = run_limited_subprocess(&arguments, "note preview", MAX_NOTE_PREVIEW_OUTPUT_BYTES)?;
     if output.is_empty() || !output.len().is_multiple_of(8) {
@@ -378,8 +401,14 @@ pub fn run_instance_child(path: &Path, plugin_id: &str) -> i32 {
 }
 
 /// Entry point used only by the short-lived note-preview child process.
-pub fn run_note_preview_child(path: &Path, plugin_id: &str, sample_rate: u32) -> i32 {
-    match render_note_preview(path, plugin_id, sample_rate) {
+pub fn run_note_preview_child(
+    path: &Path,
+    plugin_id: &str,
+    sample_rate: u32,
+    note_key: u8,
+    velocity: u8,
+) -> i32 {
+    match render_note_preview(path, plugin_id, sample_rate, note_key, velocity) {
         Ok(samples) => {
             let mut bytes = Vec::with_capacity(samples.len() * std::mem::size_of::<f32>());
             for sample in samples {
@@ -405,11 +434,23 @@ enum PreviewNoteDialect {
     Midi2,
 }
 
-fn render_note_preview(path: &Path, plugin_id: &str, sample_rate: u32) -> Result<Vec<f32>, String> {
+fn render_note_preview(
+    path: &Path,
+    plugin_id: &str,
+    sample_rate: u32,
+    note_key: u8,
+    velocity: u8,
+) -> Result<Vec<f32>, String> {
     if !(8_000..=192_000).contains(&sample_rate) {
         return Err(format!(
             "unsupported CLAP preview sample rate: {sample_rate}"
         ));
+    }
+    if note_key > 127 {
+        return Err("CLAP preview MIDI note must be between 0 and 127".to_owned());
+    }
+    if !(1..=127).contains(&velocity) {
+        return Err("CLAP preview MIDI velocity must be between 1 and 127".to_owned());
     }
 
     let entry = unsafe { PluginEntry::load(path) }
@@ -489,21 +530,29 @@ fn render_note_preview(path: &Path, plugin_id: &str, sample_rate: u32) -> Result
         let frame_count = (total_frames - frame_offset).min(NOTE_PREVIEW_BLOCK_FRAMES);
         let frame_end = frame_offset + frame_count;
         let mut input_event_buffer = EventBuffer::with_capacity(2);
-        let pckn = clack_host::prelude::Pckn::new(note_port_index, 0u16, 60u16, 0u32);
+        let pckn = clack_host::prelude::Pckn::new(note_port_index, 0u16, u16::from(note_key), 0u32);
         if frame_offset == 0 {
             match dialect {
                 PreviewNoteDialect::Clap => {
-                    input_event_buffer.push(&NoteOnEvent::new(0, pckn, 0.8));
+                    input_event_buffer.push(&NoteOnEvent::new(
+                        0,
+                        pckn,
+                        f64::from(velocity) / 127.0,
+                    ));
                 }
                 PreviewNoteDialect::Midi => {
-                    input_event_buffer.push(&MidiEvent::new(0, note_port_index, [0x90, 60, 100]));
+                    input_event_buffer.push(&MidiEvent::new(
+                        0,
+                        note_port_index,
+                        [0x90, note_key, velocity],
+                    ));
                 }
                 PreviewNoteDialect::Midi2 => {
                     input_event_buffer.push(&midi2_preview_note_event(
                         0,
                         note_port_index,
-                        60,
-                        MIDI2_PREVIEW_NOTE_VELOCITY,
+                        note_key,
+                        midi2_preview_velocity(velocity),
                         true,
                     ));
                 }
@@ -519,14 +568,14 @@ fn render_note_preview(path: &Path, plugin_id: &str, sample_rate: u32) -> Result
                     input_event_buffer.push(&MidiEvent::new(
                         event_time,
                         note_port_index,
-                        [0x80, 60, 0],
+                        [0x80, note_key, 0],
                     ));
                 }
                 PreviewNoteDialect::Midi2 => {
                     input_event_buffer.push(&midi2_preview_note_event(
                         event_time,
                         note_port_index,
-                        60,
+                        note_key,
                         0,
                         false,
                     ));
@@ -737,6 +786,10 @@ fn midi2_preview_note_event(
     let status = if note_on { 0x9_u32 } else { 0x8_u32 };
     let header = 0x4000_0000 | (status << 20) | (u32::from(key) << 8);
     Midi2Event::new(time, port_index, [header, u32::from(velocity) << 16, 0, 0])
+}
+
+fn midi2_preview_velocity(velocity: u8) -> u16 {
+    ((u32::from(velocity) * u32::from(u16::MAX)) / 127) as u16
 }
 
 fn inspect_plugin_instance(path: &Path, plugin_id: &str) -> Result<ClapInstanceInfo, String> {
