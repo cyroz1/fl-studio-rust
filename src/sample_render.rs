@@ -740,6 +740,13 @@ pub struct Vst3PatternPlayback {
     pub processor: Vst3PlaylistStreamProcessor,
 }
 
+/// Live Sampler/VST3 Pattern preview inputs, meters, and block-boundary updates.
+pub struct Vst3PatternStreamControls<'a> {
+    pub playback: Vst3PatternPlayback,
+    pub meters: &'a crate::audio::MixerTrackPeakMeters,
+    pub latency_updates: Option<Vst3LatencyUpdateControls>,
+}
+
 impl Default for SamplerPatternRenderOptions {
     fn default() -> Self {
         Self {
@@ -6392,20 +6399,43 @@ pub fn stream_pattern_with_vst3_to_device_with_live_master_controls(
     writer: &StreamingAudioWriter,
     cancelled: &AtomicBool,
 ) -> Result<SamplerPatternRenderSummary, String> {
+    stream_pattern_with_vst3_to_device_with_live_controls(
+        document,
+        project_path,
+        options,
+        Vst3PatternStreamControls {
+            playback,
+            meters,
+            latency_updates: None,
+        },
+        writer,
+        cancelled,
+    )
+}
+
+/// Stream one Pattern with live VST3 latency and Mixer updates at block boundaries.
+pub fn stream_pattern_with_vst3_to_device_with_live_controls(
+    document: &FlpDocument,
+    project_path: impl AsRef<Path>,
+    options: SamplerPatternRenderOptions,
+    controls: Vst3PatternStreamControls<'_>,
+    writer: &StreamingAudioWriter,
+    cancelled: &AtomicBool,
+) -> Result<SamplerPatternRenderSummary, String> {
     stream_pattern_from_tick_with_vst3_to_device(
         document,
         project_path,
         options,
         PatternStreamConfig {
-            loop_length_ticks: playback.duration_ticks,
+            loop_length_ticks: controls.playback.duration_ticks,
             start_tick: 0,
-            vst3_processor: Some(playback.processor),
+            vst3_processor: Some(controls.playback.processor),
             allow_empty_sampler: true,
             repeat_pattern: false,
         },
         PatternLiveStreamControls {
-            meters: Some(meters),
-            latency_updates: None,
+            meters: Some(controls.meters),
+            latency_updates: controls.latency_updates,
         },
         writer,
         cancelled,
@@ -6504,7 +6534,7 @@ fn stream_pattern_from_tick_with_vst3_to_device(
             options.pattern_id
         ));
     }
-    let finite_output_frames = if playback.repeat_pattern {
+    let mut finite_output_frames = if playback.repeat_pattern {
         None
     } else {
         let base_frames = render.summary.frames.max(
@@ -6620,6 +6650,11 @@ fn stream_pattern_from_tick_with_vst3_to_device(
                     mixer_bus_delay_count,
                 )?;
             }
+            if let Some(output_frames) = finite_output_frames.as_mut()
+                && let Some(processor) = playback.vst3_processor.as_ref()
+            {
+                *output_frames = (*output_frames).max(processor.summary().frames);
+            }
             let frame_count = (start_frame - block_start).min(SAMPLER_BLOCK_FRAMES as u64) as usize;
             let sample_count = frame_count * 2;
             if let Some(mixer_buses) = mixer_buses.as_mut() {
@@ -6701,6 +6736,11 @@ fn stream_pattern_from_tick_with_vst3_to_device(
                     &mut mixer_bus_delays,
                     mixer_bus_delay_count,
                 )?;
+            }
+            if let Some(output_frames) = finite_output_frames.as_mut()
+                && let Some(processor) = playback.vst3_processor.as_ref()
+            {
+                *output_frames = (*output_frames).max(processor.summary().frames);
             }
             let block_end = block_start.saturating_add(SAMPLER_BLOCK_FRAMES as u64);
             if playback.repeat_pattern {
