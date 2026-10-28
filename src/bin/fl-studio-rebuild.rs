@@ -4726,6 +4726,23 @@ struct PerformanceLaunchContext<'a> {
     signature_changes: &'a [(u32, u8, u8)],
 }
 
+#[derive(Clone, Copy)]
+enum PerformanceTriggerSnapOverride {
+    Current,
+    Track,
+    Global,
+    Bypass,
+}
+
+const MIDI_SCRIPT_TLC_MUTE_OTHERS: u32 = 1;
+const MIDI_SCRIPT_TLC_FILL: u32 = 1 << 1;
+const MIDI_SCRIPT_TLC_QUEUE: u32 = 1 << 2;
+const MIDI_SCRIPT_TLC_GLOBAL_SNAP: u32 = 1 << 3;
+const MIDI_SCRIPT_TLC_NO_SNAP: u32 = 2 << 3;
+const MIDI_SCRIPT_TLC_SNAP_MASK: u32 = 3 << 3;
+const MIDI_SCRIPT_TLC_COLUMN_MODE: u32 = 1 << 7;
+const MIDI_SCRIPT_TLC_WEAK_COLUMN_MODE: u32 = 1 << 8;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct MidiHeldPerformanceClip {
     arrangement_id: u16,
@@ -11522,6 +11539,7 @@ impl DawUi {
         context: PerformanceLaunchContext<'_>,
         clip_index: usize,
         explicit_queue: bool,
+        snap_override: PerformanceTriggerSnapOverride,
     ) -> Option<(PlaylistPerformanceCommand, u32, bool, &'static str)> {
         let PerformanceLaunchContext {
             arrangement,
@@ -11550,9 +11568,14 @@ impl DawUi {
         let safe_device_frame = current_device_frame.saturating_add(u64::from(sample_rate) / 8);
         let current_tick = tempo_map.tick_at_frame(current_device_frame, sample_rate)?;
         let safe_tick = tempo_map.tick_at_frame(safe_device_frame, sample_rate)?;
-        let global_snap_override = self
-            .midi_performance_global_snap_mode
-            .then_some(self.performance_global_snap);
+        let global_snap_override = match snap_override {
+            PerformanceTriggerSnapOverride::Current => self
+                .midi_performance_global_snap_mode
+                .then_some(self.performance_global_snap),
+            PerformanceTriggerSnapOverride::Track => None,
+            PerformanceTriggerSnapOverride::Global => Some(self.performance_global_snap),
+            PerformanceTriggerSnapOverride::Bypass => Some(PerformanceGlobalSnap::None),
+        };
         let trigger_snap_active = global_snap_override.map_or(
             clip_trigger_sync != Some(PlaylistTrackSync::Off),
             PerformanceGlobalSnap::uses_timing_grid,
@@ -11632,6 +11655,272 @@ impl DawUi {
             performance_zone_end_tick,
             &loaded_vst3_channels,
         )
+    }
+
+    fn trigger_midi_script_playlist_live_clip(
+        &mut self,
+        track_id: u32,
+        block_num: i32,
+        flags: u32,
+        velocity: i32,
+    ) {
+        if !self.performance_mode_active
+            || !self.playing
+            || self.performance_launch_sender.is_none()
+        {
+            self.status =
+                "Playlist live clips can only be triggered during Performance Mode playback".into();
+            return;
+        }
+        if block_num < -1 {
+            self.status = "Playlist live block number must be -1 or nonnegative".into();
+            return;
+        }
+        if (block_num == -1) != (flags & MIDI_SCRIPT_TLC_FILL != 0) {
+            self.status = if block_num == -1 {
+                "TLC_Fill is required to stop a Playlist live clip with block number -1".into()
+            } else {
+                "TLC_Fill is only supported with block number -1".into()
+            };
+            return;
+        }
+        if velocity < -1 {
+            self.status = "Playlist live clip layer must be -1 or nonnegative".into();
+            return;
+        }
+        let column_mode =
+            flags & (MIDI_SCRIPT_TLC_COLUMN_MODE | MIDI_SCRIPT_TLC_WEAK_COLUMN_MODE) != 0;
+        if block_num == -1 && column_mode {
+            self.status = "TLC_Fill cannot be combined with Playlist scene mode".into();
+            return;
+        }
+
+        let track_ids = self.midi_script_playlist_track_ids();
+        if !track_ids.contains(&track_id) {
+            self.status = format!(
+                "Could not trigger Playlist track {track_id}: track is outside the supported rows"
+            );
+            return;
+        }
+        let Some(document) = self.document.as_ref() else {
+            self.status = "Open a project to trigger Playlist live clips".into();
+            return;
+        };
+        let Ok(arrangements) = document.arrangements() else {
+            self.status = "Could not read Playlist arrangements for live clip triggering".into();
+            return;
+        };
+        let Some(arrangement) = arrangements
+            .iter()
+            .find(|arrangement| Some(arrangement.id) == self.selected_arrangement)
+            .or_else(|| arrangements.first())
+            .cloned()
+        else {
+            self.status = "Open a project to trigger Playlist live clips".into();
+            return;
+        };
+        let Some(performance_zone_end_tick) =
+            playlist_performance_zone_start_tick(&arrangement.time_markers)
+        else {
+            self.status = "Add a Playlist Start marker before triggering live clips".into();
+            return;
+        };
+        let mut tracks = document.playlist_tracks_in_arrangement(arrangement.id);
+        tracks.sort_by_key(|track| track.id);
+
+        if block_num == -1 {
+            self.queue_performance_track_stop(track_id);
+            if flags & MIDI_SCRIPT_TLC_MUTE_OTHERS != 0 {
+                for other_track_id in track_ids.into_iter().filter(|id| *id != track_id) {
+                    self.queue_performance_track_stop(other_track_id);
+                }
+            }
+            self.status = if flags & MIDI_SCRIPT_TLC_MUTE_OTHERS != 0 {
+                "MIDI script stopped live clips on all Playlist tracks".into()
+            } else {
+                format!("MIDI script stopped the live clip on Playlist track {track_id}")
+            };
+            return;
+        }
+
+        let Ok(supported_clip_indices) = self.performance_supported_clip_indices(
+            document,
+            arrangement.id,
+            performance_zone_end_tick,
+        ) else {
+            self.status =
+                "Could not determine which Playlist clips support Performance Mode".into();
+            return;
+        };
+        let signature_changes = arrangement
+            .time_markers
+            .iter()
+            .filter(|marker| marker.is_signature())
+            .filter_map(|marker| {
+                Some((
+                    marker.position_ticks(),
+                    marker.numerator()?.max(1),
+                    marker.denominator()?.max(1),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let ppq = document.header().ppq().max(1);
+        let initial_time_signature = document.metadata().time_signature().unwrap_or((4, 4));
+        let marker_positions = midi_script_playlist_performance_marker_positions(
+            &arrangement,
+            performance_zone_end_tick,
+        );
+        let Some(block_index) = u32::try_from(block_num).ok() else {
+            self.status = "Playlist live block number is outside the supported range".into();
+            return;
+        };
+        let block_context = PlaylistPerformanceBlockContext {
+            performance_zone_end_tick,
+            marker_positions: &marker_positions,
+            ppq,
+            initial_time_signature: Some(initial_time_signature),
+            signature_changes: &signature_changes,
+        };
+        let block_clip_indices = midi_script_playlist_performance_block_clip_indices(
+            &arrangement,
+            &supported_clip_indices,
+            &track_ids,
+            block_index,
+            block_context,
+        );
+        let selected_track_ids = if column_mode {
+            block_clip_indices.keys().copied().collect::<Vec<_>>()
+        } else {
+            vec![track_id]
+        };
+        let snap_override = match flags & MIDI_SCRIPT_TLC_SNAP_MASK {
+            0 => PerformanceTriggerSnapOverride::Track,
+            MIDI_SCRIPT_TLC_GLOBAL_SNAP => PerformanceTriggerSnapOverride::Global,
+            MIDI_SCRIPT_TLC_NO_SNAP => PerformanceTriggerSnapOverride::Bypass,
+            _ => {
+                self.status = "Playlist live clip snap flags are not supported".into();
+                return;
+            }
+        };
+        let explicit_queue = flags & MIDI_SCRIPT_TLC_QUEUE != 0;
+        let mut launch_actions = Vec::new();
+        for selected_track_id in selected_track_ids {
+            let Some(clip_indices) = block_clip_indices.get(&selected_track_id) else {
+                continue;
+            };
+            let round_robin_key = midi_script_playlist_live_block_scene_key(
+                &arrangement,
+                block_index,
+                clip_indices,
+                block_context,
+            )
+            .map(|scene_key| (arrangement.id, scene_key, selected_track_id));
+            let next_layer = round_robin_key
+                .as_ref()
+                .and_then(|key| self.performance_scene_round_robin.get(key).copied())
+                .unwrap_or(0);
+            let Some(layer_index) = midi_script_playlist_live_clip_layer_index(
+                velocity,
+                next_layer,
+                clip_indices.len(),
+            ) else {
+                if !column_mode {
+                    self.status = format!(
+                        "Playlist live block {block_num} on track {track_id} has no layer {velocity}"
+                    );
+                    return;
+                }
+                continue;
+            };
+            let clip_index = clip_indices[layer_index];
+            let Some((command, start_tick, queued, _)) = self.performance_clip_launch_request(
+                PerformanceLaunchContext {
+                    arrangement: &arrangement,
+                    tracks: &tracks,
+                    ppq,
+                    initial_time_signature: Some(initial_time_signature),
+                    signature_changes: &signature_changes,
+                },
+                clip_index,
+                explicit_queue,
+                snap_override,
+            ) else {
+                self.status = "Could not map Playlist live clip launch timing".into();
+                return;
+            };
+            if let Some(round_robin_key) = round_robin_key {
+                self.performance_scene_round_robin
+                    .insert(round_robin_key, (layer_index + 1) % clip_indices.len());
+            }
+            launch_actions.push((selected_track_id, clip_index, command, start_tick, queued));
+        }
+        if launch_actions.is_empty() {
+            self.status = format!(
+                "No supported clips in Playlist live block {block_num}{}",
+                if column_mode {
+                    ""
+                } else {
+                    " on the requested track"
+                }
+            );
+            return;
+        }
+
+        let scene_start_tick = launch_actions
+            .iter()
+            .map(|(_, _, _, start_tick, _)| *start_tick)
+            .min()
+            .unwrap_or_default();
+        let launched_track_ids = launch_actions
+            .iter()
+            .map(|(selected_track_id, ..)| *selected_track_id)
+            .collect::<BTreeSet<_>>();
+        if flags & MIDI_SCRIPT_TLC_MUTE_OTHERS != 0 {
+            for other_track_id in track_ids
+                .into_iter()
+                .filter(|id| !launched_track_ids.contains(id))
+            {
+                self.queue_performance_track_stop_at_tick(other_track_id, scene_start_tick);
+            }
+        }
+        let Some(sender) = self.performance_launch_sender.clone() else {
+            self.status = "Performance Mode audio worker is no longer available".into();
+            return;
+        };
+        let mut launched_tracks = 0usize;
+        let mut queued_any = false;
+        for (selected_track_id, clip_index, command, start_tick, queued) in launch_actions {
+            if sender.send(command).is_err() {
+                self.status = "Performance Mode audio worker is no longer available".into();
+                return;
+            }
+            launched_tracks += 1;
+            queued_any |= queued;
+            if !column_mode {
+                self.status = if queued {
+                    format!(
+                        "MIDI script queued Playlist Clip {} for track {selected_track_id}",
+                        clip_index + 1
+                    )
+                } else {
+                    format!(
+                        "MIDI script scheduled Playlist Clip {} for tick {start_tick}",
+                        clip_index + 1
+                    )
+                };
+            }
+        }
+        if column_mode {
+            self.status = if queued_any {
+                format!(
+                    "MIDI script queued Playlist live block {block_num} across {launched_tracks} tracks"
+                )
+            } else {
+                format!(
+                    "MIDI script triggered Playlist live block {block_num} across {launched_tracks} tracks"
+                )
+            };
+        }
     }
 
     fn queue_performance_hold_release(
@@ -12028,6 +12317,7 @@ impl DawUi {
                     },
                     clip_index,
                     false,
+                    PerformanceTriggerSnapOverride::Current,
                 )
             else {
                 continue;
@@ -12221,6 +12511,7 @@ impl DawUi {
                 },
                 clip_index,
                 false,
+                PerformanceTriggerSnapOverride::Current,
             )
         else {
             self.status = "Could not map MIDI Performance Mode launch timing or position".into();
@@ -25757,6 +26048,7 @@ impl DawUi {
                 },
                 clip_index,
                 explicit_queue,
+                PerformanceTriggerSnapOverride::Current,
             );
             let Some((command, start_tick, queue_launch, clip_position_sync_label)) =
                 launch_request
@@ -52354,6 +52646,12 @@ impl DawUi {
                 parameter,
                 increment,
             } => self.increment_midi_script_playlist_track_mode(track_id, parameter, increment),
+            MidiTransportCommand::TriggerPlaylistLiveClip {
+                track_id,
+                block_num,
+                flags,
+                velocity,
+            } => self.trigger_midi_script_playlist_live_clip(track_id, block_num, flags, velocity),
             MidiTransportCommand::SelectChannel(channel_id) => {
                 self.set_midi_script_channel_selection(channel_id);
             }
@@ -69978,19 +70276,10 @@ fn midi_script_playlist_performance_block_index(
     u32::try_from(marker_index.checked_sub(1)?).ok()
 }
 
-fn midi_script_playlist_live_block_statuses(
+fn midi_script_playlist_performance_marker_positions(
     arrangement: &Arrangement,
-    track_ids: &[u32],
     performance_zone_end_tick: u32,
-    ppq: u16,
-    initial_time_signature: Option<(u8, u8)>,
-    signature_changes: &[(u32, u8, u8)],
-    live_status: &PlaylistPerformanceLiveStatus,
-) -> Vec<BTreeMap<u32, u8>> {
-    let mut statuses = vec![BTreeMap::new(); track_ids.len()];
-    if performance_zone_end_tick == 0 {
-        return statuses;
-    }
+) -> Vec<u32> {
     let mut marker_positions = arrangement
         .time_markers
         .iter()
@@ -70007,6 +70296,135 @@ fn midi_script_playlist_live_block_statuses(
     {
         marker_positions.insert(0, 0);
     }
+    marker_positions
+}
+
+#[derive(Clone, Copy)]
+struct PlaylistPerformanceBlockContext<'a> {
+    performance_zone_end_tick: u32,
+    marker_positions: &'a [u32],
+    ppq: u16,
+    initial_time_signature: Option<(u8, u8)>,
+    signature_changes: &'a [(u32, u8, u8)],
+}
+
+fn midi_script_playlist_performance_block_clip_indices(
+    arrangement: &Arrangement,
+    supported_clip_indices: &BTreeSet<usize>,
+    track_ids: &[u32],
+    block_index: u32,
+    context: PlaylistPerformanceBlockContext<'_>,
+) -> BTreeMap<u32, Vec<usize>> {
+    let PlaylistPerformanceBlockContext {
+        performance_zone_end_tick,
+        marker_positions,
+        ppq,
+        initial_time_signature,
+        signature_changes,
+    } = context;
+    let track_ids = track_ids.iter().copied().collect::<BTreeSet<_>>();
+    let mut clips_by_track = BTreeMap::<u32, Vec<(u32, usize)>>::new();
+    for &clip_index in supported_clip_indices {
+        let Some(clip) = arrangement.clips.get(clip_index) else {
+            continue;
+        };
+        let Some(track_id) = clip.playlist_track_id() else {
+            continue;
+        };
+        if !track_ids.contains(&track_id)
+            || midi_script_playlist_performance_block_index(
+                clip.position_ticks,
+                performance_zone_end_tick,
+                marker_positions,
+                ppq,
+                initial_time_signature,
+                signature_changes,
+            ) != Some(block_index)
+        {
+            continue;
+        }
+        clips_by_track
+            .entry(track_id)
+            .or_default()
+            .push((clip.position_ticks, clip_index));
+    }
+    clips_by_track
+        .into_iter()
+        .map(|(track_id, mut clips)| {
+            clips.sort_unstable();
+            (
+                track_id,
+                clips
+                    .into_iter()
+                    .map(|(_, clip_index)| clip_index)
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+fn midi_script_playlist_live_block_scene_key(
+    arrangement: &Arrangement,
+    block_index: u32,
+    clip_indices: &[usize],
+    context: PlaylistPerformanceBlockContext<'_>,
+) -> Option<PlaylistPerformanceSceneKey> {
+    let PlaylistPerformanceBlockContext {
+        marker_positions,
+        ppq,
+        initial_time_signature,
+        signature_changes,
+        ..
+    } = context;
+    let clip = clip_indices
+        .first()
+        .and_then(|clip_index| arrangement.clips.get(*clip_index))?;
+    let block_start_tick = if marker_positions.is_empty() {
+        playlist_measure_at_tick(
+            ppq,
+            initial_time_signature,
+            signature_changes,
+            clip.position_ticks,
+        )
+        .0
+    } else {
+        *marker_positions.get(usize::try_from(block_index).ok()?)?
+    };
+    Some(PlaylistPerformanceSceneKey::Marker(block_start_tick))
+}
+
+fn midi_script_playlist_live_clip_layer_index(
+    requested_layer: i32,
+    next_layer: usize,
+    layer_count: usize,
+) -> Option<usize> {
+    if layer_count == 0 {
+        return None;
+    }
+    if requested_layer < 0 {
+        (requested_layer == -1).then_some(next_layer % layer_count)
+    } else {
+        usize::try_from(requested_layer)
+            .ok()
+            .filter(|layer| *layer < layer_count)
+    }
+}
+
+fn midi_script_playlist_live_block_statuses(
+    arrangement: &Arrangement,
+    track_ids: &[u32],
+    performance_zone_end_tick: u32,
+    ppq: u16,
+    initial_time_signature: Option<(u8, u8)>,
+    signature_changes: &[(u32, u8, u8)],
+    live_status: &PlaylistPerformanceLiveStatus,
+) -> Vec<BTreeMap<u32, u8>> {
+    let mut statuses = vec![BTreeMap::new(); track_ids.len()];
+    if performance_zone_end_tick == 0 {
+        return statuses;
+    }
+    let marker_positions =
+        midi_script_playlist_performance_marker_positions(arrangement, performance_zone_end_tick);
     let track_rows = track_ids
         .iter()
         .enumerate()
@@ -71469,7 +71887,9 @@ mod tests {
         midi_script_clip_selection_bounds, midi_script_increment_playlist_performance_mode,
         midi_script_marker_jump_target, midi_script_marker_selection_target,
         midi_script_mixer_recording_file_names, midi_script_moved_song_position_tick,
-        midi_script_pattern_jog_target, midi_script_playlist_live_block_statuses,
+        midi_script_pattern_jog_target, midi_script_playlist_live_block_scene_key,
+        midi_script_playlist_live_block_statuses, midi_script_playlist_live_clip_layer_index,
+        midi_script_playlist_performance_block_clip_indices,
         midi_script_playlist_performance_block_index, midi_script_playlist_track_activity_levels,
         midi_script_playlist_track_ids, midi_script_playlist_track_mute_states,
         midi_script_playlist_track_names, midi_script_playlist_track_performance_modes,
@@ -72052,6 +72472,53 @@ mod tests {
             midi_script_playlist_performance_block_index(1000, 1000, &[], 96, None, &[]),
             None
         );
+    }
+
+    #[test]
+    fn midi_script_live_block_clip_layers_resolve_by_track_and_round_robin() {
+        let arrangement = playlist_track_arrangement_fixture(&[
+            (0, 48, 499),
+            (0, 48, 499),
+            (0, 48, 498),
+            (384, 48, 499),
+        ]);
+        let supported_clip_indices = BTreeSet::from([0, 1, 2, 3]);
+        let marker_positions = [0, 384];
+        let block_context = super::PlaylistPerformanceBlockContext {
+            performance_zone_end_tick: 768,
+            marker_positions: &marker_positions,
+            ppq: 96,
+            initial_time_signature: Some((4, 4)),
+            signature_changes: &[],
+        };
+        let block_zero = midi_script_playlist_performance_block_clip_indices(
+            &arrangement,
+            &supported_clip_indices,
+            &[1, 2],
+            0,
+            block_context,
+        );
+        assert_eq!(block_zero, BTreeMap::from([(1, vec![0, 1]), (2, vec![2])]));
+        assert_eq!(
+            midi_script_playlist_live_block_scene_key(
+                &arrangement,
+                0,
+                &block_zero[&1],
+                block_context,
+            ),
+            Some(super::PlaylistPerformanceSceneKey::Marker(0))
+        );
+        assert_eq!(
+            midi_script_playlist_live_clip_layer_index(-1, 1, 2),
+            Some(1)
+        );
+        assert_eq!(
+            midi_script_playlist_live_clip_layer_index(-1, 2, 2),
+            Some(0)
+        );
+        assert_eq!(midi_script_playlist_live_clip_layer_index(1, 0, 2), Some(1));
+        assert_eq!(midi_script_playlist_live_clip_layer_index(2, 0, 2), None);
+        assert_eq!(midi_script_playlist_live_clip_layer_index(-2, 0, 2), None);
     }
 
     #[test]

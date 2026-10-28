@@ -108,6 +108,12 @@ pub enum ScriptTransportAction {
         parameter: PlaylistTrackPerformanceParameter,
         increment: i32,
     },
+    TriggerPlaylistLiveClip {
+        track_id: u32,
+        block_num: i32,
+        flags: u32,
+        velocity: i32,
+    },
     SelectChannel(u16),
     SetMixerTrackSelection {
         index: u16,
@@ -1344,6 +1350,37 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
             increment,
         });
     }
+    if name == Some("trigger_playlist_live_clip") {
+        let track_id = action["track_id"]
+            .as_u64()
+            .and_then(|track_id| u32::try_from(track_id).ok())
+            .filter(|track_id| (1..=SCRIPT_MAX_PLAYLIST_TRACK_COUNT as u32).contains(track_id))
+            .ok_or_else(|| "MIDI script returned an invalid Playlist track ID".to_owned())?;
+        let block_num = action["block_num"]
+            .as_i64()
+            .and_then(|value| i32::try_from(value).ok())
+            .filter(|value| *value >= -1)
+            .ok_or_else(|| "MIDI script returned an invalid live block number".to_owned())?;
+        let flags = action["flags"]
+            .as_u64()
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| "MIDI script returned invalid live clip flags".to_owned())?;
+        let velocity = action["velocity"]
+            .as_i64()
+            .and_then(|value| i32::try_from(value).ok())
+            .filter(|value| *value >= -1)
+            .ok_or_else(|| "MIDI script returned an invalid live clip layer".to_owned())?;
+        let supported_flags = 1 | 2 | 4 | (3 << 3) | (1 << 7) | (1 << 8) | (1 << 30);
+        if flags & !supported_flags != 0 || (flags & (3 << 3)) == (3 << 3) {
+            return Err("MIDI script returned unsupported live clip flags".to_owned());
+        }
+        return Ok(ScriptTransportAction::TriggerPlaylistLiveClip {
+            track_id,
+            block_num,
+            flags,
+            velocity,
+        });
+    }
     if name == Some("set_song_position") {
         let position = action["position"]
             .as_f64()
@@ -2358,6 +2395,48 @@ mod tests {
         let result = runtime.process_event(12, &[0xB0, 7, 127]).unwrap();
 
         assert!(result.actions.is_empty());
+    }
+
+    #[test]
+    fn python_playlist_trigger_live_clip_queues_supported_flags_and_layers() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport midi, playlist\ndef OnMidiIn(event):\n    if (midi.TLC_MuteOthers, midi.TLC_Fill, midi.TLC_Queue, midi.TLC_GlobalSnap, midi.TLC_NoSnap, midi.TLC_ColumnMode, midi.TLC_WeakColumnMode) != (1, 2, 4, 8, 16, 128, 256):\n        raise RuntimeError('wrong live clip flag constants')\n    playlist.triggerLiveClip(2, 4, midi.TLC_MuteOthers | midi.TLC_Queue | midi.TLC_GlobalSnap | midi.TLC_WeakColumnMode, 3)\n    playlist.triggerLiveClip(1, -1, midi.TLC_Fill)\n    try:\n        playlist.triggerLiveClip(1, 0, midi.TLC_Release)\n    except ValueError:\n        pass\n    else:\n        raise RuntimeError('unsupported live clip flags must be rejected')\n    try:\n        playlist.triggerLiveClip(1, -1, 0)\n    except ValueError:\n        pass\n    else:\n        raise RuntimeError('TLC_Fill is required for block -1')\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let transport_state = Arc::new(MidiScriptTransportState::default());
+        transport_state
+            .playlist_track_count
+            .store(2, Ordering::Relaxed);
+        let mut runtime = MidiScriptRuntime::start_for_device_with_transport_state(
+            &script,
+            "Test Input",
+            transport_state,
+        )
+        .unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 127]).unwrap();
+
+        assert_eq!(
+            result.actions,
+            [
+                ScriptTransportAction::TriggerPlaylistLiveClip {
+                    track_id: 2,
+                    block_num: 4,
+                    flags: 1 | 4 | 8 | 256,
+                    velocity: 3,
+                },
+                ScriptTransportAction::TriggerPlaylistLiveClip {
+                    track_id: 1,
+                    block_num: -1,
+                    flags: 2,
+                    velocity: -1,
+                },
+            ]
+        );
     }
 
     #[test]

@@ -339,6 +339,42 @@ def _playlist_get_live_block_status(index, block_num, mode=0):
     return 2 if playing or scheduled else 1
 
 
+def _playlist_trigger_live_clip(index, subNum, flags, velocity=-1):
+    index = _playlist_track_index(index)
+    try:
+        subNum = int(subNum)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("Playlist live block number must be an integer") from error
+    if not -1 <= subNum <= 0x7FFFFFFF:
+        raise ValueError("Playlist live block number must be -1 or nonnegative")
+    try:
+        flags = int(flags)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("Playlist live clip flags must be an integer") from error
+    if not 0 <= flags <= 0xFFFFFFFF:
+        raise ValueError("Playlist live clip flags are outside the supported range")
+    supported_flags = 1 | 2 | 4 | (3 << 3) | (1 << 7) | (1 << 8) | (1 << 30)
+    if flags & ~supported_flags or (flags & (3 << 3)) == (3 << 3):
+        raise ValueError("Playlist live clip flags are not supported")
+    if (subNum == -1) != bool(flags & (1 << 1)):
+        raise ValueError("TLC_Fill is required only when stopping a Playlist live clip")
+    try:
+        velocity = int(velocity)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("Playlist live clip layer must be an integer") from error
+    if not -1 <= velocity <= 0x7FFFFFFF:
+        raise ValueError("Playlist live clip layer must be -1 or nonnegative")
+    _request_transport_action(
+        {
+            "action": "trigger_playlist_live_clip",
+            "track_id": index,
+            "block_num": subNum,
+            "flags": flags,
+            "velocity": velocity,
+        }
+    )
+
+
 def _playlist_inc_live_mode(index, value, mode_index, parameter, max_value):
     index = _playlist_track_index(index)
     try:
@@ -1748,6 +1784,24 @@ def _install_modules(script_name, device_name):
         "LB_Status_Default": 0,
         "LB_Status_Simple": 1,
         "LB_Status_Simplest": 2,
+        "TLC_MuteOthers": 1,
+        "TLC_Fill": 1 << 1,
+        "TLC_Queue": 1 << 2,
+        "TLC_TrackSnap": 0 << 3,
+        "TLC_GlobalSnap": 1 << 3,
+        "TLC_NoSnap": 2 << 3,
+        "TLC_Release": 1 << 5,
+        "TLC_NoPlayCheck": 1 << 6,
+        "TLC_ColumnMode": 1 << 7,
+        "TLC_WeakColumnMode": 1 << 8,
+        "TLC_TriggerCheckColumnMode": 1 << 9,
+        "TLC_NoHardwareUpdate": 1 << 30,
+        "TLC_SecondPass": 1 << 31,
+        "TLC_SubNum_Normal": 0 << 16,
+        "TLC_SubNum_ClipPos": 1 << 16,
+        "TLC_SubNum_GroupNum": 2 << 16,
+        "TLC_SubNum_Read": 3 << 16,
+        "TLC_SubNum_Leave": 4 << 16,
         "PME_System": 2,
         "PME_System_Safe": 4,
         "PME_PreviewNote": 8,
@@ -1915,6 +1969,7 @@ def _install_modules(script_name, device_name):
     playlist.getLiveTrigSnap = _playlist_get_live_trig_snap
     playlist.getLiveStatus = _playlist_get_live_status
     playlist.getLiveBlockStatus = _playlist_get_live_block_status
+    playlist.triggerLiveClip = _playlist_trigger_live_clip
     playlist.incLivePosSnap = _playlist_inc_live_pos_snap
     playlist.incLiveTrigSnap = _playlist_inc_live_trig_snap
     playlist.incLiveLoopMode = _playlist_inc_live_loop_mode

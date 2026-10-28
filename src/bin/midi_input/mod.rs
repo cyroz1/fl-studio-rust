@@ -729,6 +729,17 @@ fn queue_script_transport_actions(
                 parameter,
                 increment,
             },
+            ScriptTransportAction::TriggerPlaylistLiveClip {
+                track_id,
+                block_num,
+                flags,
+                velocity,
+            } => MidiTransportCommand::TriggerPlaylistLiveClip {
+                track_id,
+                block_num,
+                flags,
+                velocity,
+            },
             ScriptTransportAction::SelectChannel(channel_id) => {
                 MidiTransportCommand::SelectChannel(channel_id)
             }
@@ -896,6 +907,12 @@ pub enum MidiTransportCommand {
         track_id: u32,
         parameter: PlaylistTrackPerformanceParameter,
         increment: i32,
+    },
+    TriggerPlaylistLiveClip {
+        track_id: u32,
+        block_num: i32,
+        flags: u32,
+        velocity: i32,
     },
     SelectChannel(u16),
     SetMixerTrackSelection {
@@ -1689,6 +1706,9 @@ pub fn describe_event(event: MidiInputEvent) -> String {
             }
             MidiTransportCommand::IncrementPlaylistTrackMode { .. } => {
                 "MIDI script Playlist Performance Mode".to_owned()
+            }
+            MidiTransportCommand::TriggerPlaylistLiveClip { .. } => {
+                "MIDI script Trigger Playlist Clip".to_owned()
             }
             MidiTransportCommand::SelectChannel(_) => "MIDI script Select Channel".to_owned(),
             MidiTransportCommand::SetMixerTrackSelection { .. } => {
@@ -2577,6 +2597,12 @@ mod tests {
                     parameter: PlaylistTrackPerformanceParameter::Motion,
                     increment: -1,
                 },
+                ScriptTransportAction::TriggerPlaylistLiveClip {
+                    track_id: 2,
+                    block_num: 4,
+                    flags: 1 | 4 | 8,
+                    velocity: 3,
+                },
                 ScriptTransportAction::SetPlaylistTrackSelection(Vec::new()),
                 ScriptTransportAction::AddArrangementTimeMarker {
                     tick: 960,
@@ -2646,6 +2672,15 @@ mod tests {
                 track_id: 2,
                 parameter: PlaylistTrackPerformanceParameter::Motion,
                 increment: -1,
+            })
+        );
+        assert_eq!(
+            transport_receiver.try_recv().unwrap().event,
+            MidiInputEvent::Transport(MidiTransportCommand::TriggerPlaylistLiveClip {
+                track_id: 2,
+                block_num: 4,
+                flags: 1 | 4 | 8,
+                velocity: 3,
             })
         );
         assert_eq!(
