@@ -40606,12 +40606,12 @@ impl DawUi {
             self.status = "Open a project before rendering VST3 channels".to_owned();
             return;
         };
-        let (notes, pattern) = match document.patterns() {
+        let pattern = match document.patterns() {
             Ok(patterns) => match patterns
                 .into_iter()
                 .find(|pattern| pattern.id == pattern_id)
             {
-                Some(pattern) => (pattern.notes.clone(), pattern),
+                Some(pattern) => pattern,
                 None => {
                     self.status = format!("Pattern {pattern_id} was not found");
                     return;
@@ -40623,16 +40623,24 @@ impl DawUi {
             }
         };
         let ppq = document.header().ppq();
+        let pattern_loop_length_ticks = pattern_lfo_loop_length_ticks(
+            &pattern,
+            ppq,
+            document.metadata().time_signature().unwrap_or((4, 4)),
+        );
         let pattern_automations = self.pattern_vst3_parameter_automations_for_pattern(
             &pattern,
             ppq,
-            pattern_lfo_loop_length_ticks(
+            pattern_loop_length_ticks,
+        );
+        let mixer_effect_parameter_automation = self
+            .pattern_vst3_mixer_effect_parameter_automations_for_pattern(
                 &pattern,
                 ppq,
-                document.metadata().time_signature().unwrap_or((4, 4)),
-            ),
-        );
+                pattern_loop_length_ticks,
+            );
         let instances = self.channel_vst3_instances.clone();
+        let mixer_effect_instances = self.mixer_effect_vst3_instances.clone();
         let project_channels = document.channels();
 
         let insert_placement = if insert_into_playlist {
@@ -40652,7 +40660,6 @@ impl DawUi {
             None
         };
 
-        let ppq = document.header().ppq();
         let tempo_bpm = document.metadata().tempo_bpm().unwrap_or(self.tempo_bpm);
         let channels = project_channels
             .iter()
@@ -40719,10 +40726,13 @@ impl DawUi {
             .as_ref()
             .ok_or_else(|| "VST3 host is not initialized".to_owned())
             .and_then(|host| {
-                host.render_pattern_channels_to_file(
+                host.render_pattern_channels_with_mixer_effects_to_file(
                     &document,
-                    &notes,
+                    pattern_id,
+                    pattern_loop_length_ticks,
                     &channels,
+                    &mixer_effect_instances,
+                    &mixer_effect_parameter_automation,
                     &path,
                     AudioFileRenderOptions {
                         output_format,

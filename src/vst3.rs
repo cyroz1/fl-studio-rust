@@ -4814,6 +4814,155 @@ impl Vst3HostRuntime {
         )
     }
 
+    /// Render one Pattern through its loaded VST3 instruments and the project's loaded Mixer FX.
+    ///
+    /// The prepared Pattern stream applies the same channel routing, effect automation, and PDC
+    /// used by Pattern playback. Pattern repetition is stopped after its first pass; the render
+    /// then includes the standard two-second instrument tail plus any reported effect tails.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_pattern_channels_with_mixer_effects_to_file(
+        &self,
+        document: &FlpDocument,
+        pattern_id: u16,
+        loop_length_ticks: u64,
+        channels: &[Vst3PatternChannelRenderRequest],
+        mixer_effect_instances: &BTreeMap<(usize, u16), u64>,
+        mixer_effect_parameter_automation: &BTreeMap<
+            (usize, u16),
+            Vec<Vst3PlaylistParameterAutomation>,
+        >,
+        path: impl AsRef<Path>,
+        file_options: AudioFileRenderOptions,
+    ) -> Result<Vst3PatternMixRenderSummary, String> {
+        if channels.is_empty() {
+            return Err("no loaded VST3 Pattern channels have notes to render".to_owned());
+        }
+
+        let mut channel_instances = BTreeMap::new();
+        let mut parameter_automation = BTreeMap::new();
+        for channel in channels {
+            let channel_id = channel.options.channel_id;
+            if channel_instances
+                .insert(channel_id, channel.instance_id)
+                .is_some()
+            {
+                return Err(format!(
+                    "VST3 Pattern channel {channel_id} was requested more than once"
+                ));
+            }
+            if !channel.parameter_automation.is_empty() {
+                parameter_automation.insert(channel_id, channel.parameter_automation.clone());
+            }
+        }
+
+        let sample_rate = {
+            let first_channel = channels
+                .first()
+                .expect("nonempty VST3 Pattern channels were checked above");
+            let plugin = self.plugin(first_channel.instance_id)?;
+            let plugin = plugin
+                .lock()
+                .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
+            let sample_rate = plugin.sample_rate();
+            if !sample_rate.is_finite() || !(8_000.0..=384_000.0).contains(&sample_rate) {
+                return Err("VST3 Pattern render rate is invalid".to_owned());
+            }
+            sample_rate.round() as u32
+        };
+
+        let mut processor = self.prepare_pattern_loop_stream_with_automation(
+            document,
+            pattern_id,
+            loop_length_ticks,
+            sample_rate,
+            &channel_instances,
+            &parameter_automation,
+        )?;
+        processor.stop_pattern_repetition_after_first_pass();
+        self.attach_mixer_effects(
+            document,
+            mixer_effect_instances,
+            &mut processor,
+            true,
+            false,
+            mixer_effect_parameter_automation,
+            None,
+        )?;
+
+        let pattern_frames = processor.content_frames();
+        let instrument_tail_frames = u64::from(sample_rate)
+            .checked_mul(2)
+            .ok_or_else(|| "VST3 Pattern tail length overflow".to_owned())?;
+        let content_with_instrument_tail = pattern_frames
+            .checked_add(instrument_tail_frames)
+            .ok_or_else(|| "VST3 Pattern render length overflow".to_owned())?;
+        processor.extend_to_output_frames(content_with_instrument_tail)?;
+
+        let processor_summary = processor.summary();
+        if processor_summary.plugin_channels_rendered == 0 || processor_summary.notes_scheduled == 0
+        {
+            return Err("no loaded VST3 Pattern channels have audible notes to render".to_owned());
+        }
+        let trim_frames = processor
+            .pdc_render_start_trim_frames()
+            .min(processor_summary.frames);
+        let summary = Vst3PatternMixRenderSummary {
+            frames: processor_summary.frames.saturating_sub(trim_frames),
+            sample_rate: processor_summary.sample_rate,
+            channels_rendered: processor_summary.plugin_channels_rendered,
+            notes_rendered: processor_summary.notes_scheduled,
+        };
+
+        processor.start_processing()?;
+        let render_result = render_stereo_audio_to_file(
+            path.as_ref(),
+            summary.frames,
+            summary.sample_rate,
+            file_options.encoding,
+            file_options.output_format,
+            |write_block| {
+                let mut rendered_frame = 0_u64;
+                let mut block = Vec::new();
+                let mut mixer_buses = Vec::new();
+                while rendered_frame < processor_summary.frames {
+                    let frame_count = (processor_summary.frames - rendered_frame).min(4_096);
+                    let sample_count = usize::try_from(frame_count)
+                        .ok()
+                        .and_then(|frames| frames.checked_mul(2))
+                        .ok_or_else(|| "VST3 Pattern block size overflow".to_owned())?;
+                    let bus_sample_count = sample_count
+                        .checked_mul(crate::audio::MIXER_TRACK_METER_COUNT)
+                        .and_then(|count| count.checked_mul(2))
+                        .ok_or_else(|| "VST3 Pattern Mixer bus size overflow".to_owned())?;
+                    block.resize(sample_count, 0.0);
+                    block.fill(0.0);
+                    mixer_buses.resize(bus_sample_count, 0.0);
+                    mixer_buses.fill(0.0);
+                    processor.mix_next_block_with_meter_buses(&mut block, &mut mixer_buses)?;
+                    apply_mixer_master_output_to_stereo(document, &mut block)?;
+
+                    let skipped_frames =
+                        trim_frames.saturating_sub(rendered_frame).min(frame_count);
+                    if skipped_frames < frame_count {
+                        let skip_samples = usize::try_from(skipped_frames)
+                            .ok()
+                            .and_then(|frames| frames.checked_mul(2))
+                            .ok_or_else(|| "VST3 Pattern PDC trim overflow".to_owned())?;
+                        write_block(&block[skip_samples..])?;
+                    }
+                    rendered_frame = rendered_frame
+                        .checked_add(frame_count)
+                        .ok_or_else(|| "VST3 Pattern render frame overflow".to_owned())?;
+                }
+                Ok(summary)
+            },
+        );
+        let stop_result = processor.stop_processing();
+        let summary = render_result?;
+        stop_result?;
+        Ok(summary)
+    }
+
     /// Start a low-latency stream for live MIDI audition through an already loaded instrument.
     pub fn start_live_midi_input_stream(
         &self,
