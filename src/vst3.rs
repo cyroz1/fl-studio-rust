@@ -921,8 +921,8 @@ impl Vst3PlaylistStreamProcessor {
         Ok(())
     }
 
-    /// Refresh plug-in latency reports at a Performance Mode block boundary and rebuild PDC
-    /// while preserving the active streams and queued delay-line history.
+    /// Refresh plug-in latency reports at a stream block boundary and rebuild PDC while
+    /// preserving the active streams and queued delay-line history.
     pub(crate) fn refresh_live_latency_reports(
         &mut self,
         plugin_ids: &BTreeSet<u64>,

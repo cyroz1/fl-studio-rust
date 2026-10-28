@@ -1878,6 +1878,7 @@ pub struct PlaylistStreamMonitor<'a> {
 pub struct Vst3LatencyUpdateControls {
     pub updates: Receiver<BTreeSet<u64>>,
     pub reports: Sender<Vst3LatencyReport>,
+    pub pdc_updates: Option<Receiver<FlpDocument>>,
 }
 
 /// Live device-stream controls for a Playlist render worker.
@@ -1886,8 +1887,9 @@ pub struct PlaylistLiveStreamControls<'a> {
     pub latency_updates: Option<Vst3LatencyUpdateControls>,
 }
 
-struct LiveLatencyUpdateState<'a> {
-    document: &'a FlpDocument,
+struct LiveLatencyUpdateState {
+    document: FlpDocument,
+    pdc_updates: Option<Receiver<FlpDocument>>,
     updates: Receiver<BTreeSet<u64>>,
     reports: Sender<Vst3LatencyReport>,
 }
@@ -2845,7 +2847,8 @@ fn stream_playlist_with_vst3_to_device_from_frame_inner(
     };
 
     let latency_updates = latency_controls.map(|controls| LiveLatencyUpdateState {
-        document,
+        document: document.clone(),
+        pdc_updates: controls.pdc_updates,
         updates: controls.updates,
         reports: controls.reports,
     });
@@ -5356,7 +5359,7 @@ fn stream_prepared_playlist_render(
 
 fn stream_prepared_playlist_render_with_live_latency_updates(
     render: PreparedPlaylistBlockMix<'_>,
-    latency_updates: LiveLatencyUpdateState<'_>,
+    latency_updates: LiveLatencyUpdateState,
     meters: Option<&MixerTrackPeakMeters>,
     cancelled: &AtomicBool,
     stream_cancelled: impl FnMut() -> bool,
@@ -5403,9 +5406,9 @@ struct PlaylistRenderMixerBuses<'a> {
     post_effect: Option<&'a [f32]>,
 }
 
-struct PlaylistPreparedRenderControls<'document, 'runtime> {
+struct PlaylistPreparedRenderControls<'runtime> {
     performance: Option<PlaylistPerformanceRuntime>,
-    latency_updates: Option<LiveLatencyUpdateState<'document>>,
+    latency_updates: Option<LiveLatencyUpdateState>,
     meters: Option<&'runtime MixerTrackPeakMeters>,
     cancelled: &'runtime AtomicBool,
     capture_post_effect_buses: bool,
@@ -5453,7 +5456,7 @@ fn update_live_source_pdc_delays(
 }
 
 fn refresh_vst3_latency_updates(
-    updates: &mut LiveLatencyUpdateState<'_>,
+    updates: &mut LiveLatencyUpdateState,
     vst3_processor: Option<&mut Vst3PlaylistStreamProcessor>,
     meters: Option<&MixerTrackPeakMeters>,
     direct_source_delay: &mut crate::audio::StereoFrameDelay,
@@ -5470,7 +5473,7 @@ fn refresh_vst3_latency_updates(
     let Some(processor) = vst3_processor else {
         return Ok(false);
     };
-    let reports = processor.refresh_live_latency_reports(&plugin_ids, updates.document, meters)?;
+    let reports = processor.refresh_live_latency_reports(&plugin_ids, &updates.document, meters)?;
     if reports.is_empty() {
         return Ok(false);
     }
@@ -5486,9 +5489,41 @@ fn refresh_vst3_latency_updates(
     Ok(true)
 }
 
+fn apply_live_pdc_updates(
+    updates: &mut LiveLatencyUpdateState,
+    vst3_processor: Option<&mut Vst3PlaylistStreamProcessor>,
+    meters: Option<&MixerTrackPeakMeters>,
+    direct_source_delay: &mut crate::audio::StereoFrameDelay,
+    mixer_bus_delays: &mut Vec<crate::audio::StereoFrameDelay>,
+    mixer_bus_delay_count: usize,
+) -> Result<bool, String> {
+    let mut latest_document = None;
+    if let Some(receiver) = updates.pdc_updates.as_ref() {
+        while let Ok(document) = receiver.try_recv() {
+            latest_document = Some(document);
+        }
+    }
+    let Some(document) = latest_document else {
+        return Ok(false);
+    };
+    let Some(processor) = vst3_processor else {
+        updates.document = document;
+        return Ok(false);
+    };
+    processor.apply_live_mixer_routing(&document, meters)?;
+    update_live_source_pdc_delays(
+        processor.pdc_direct_source_delay_frames(),
+        direct_source_delay,
+        mixer_bus_delays,
+        mixer_bus_delay_count,
+    )?;
+    updates.document = document;
+    Ok(true)
+}
+
 fn stream_prepared_playlist_render_with_performance(
     mut render: PreparedPlaylistBlockMix<'_>,
-    controls: PlaylistPreparedRenderControls<'_, '_>,
+    controls: PlaylistPreparedRenderControls<'_>,
     mut stream_cancelled: impl FnMut() -> bool,
     mut write_block: impl FnMut(&[f32], PlaylistRenderMixerBuses<'_>) -> Result<(), String>,
 ) -> Result<PlaylistBlockRenderSummary, String> {
@@ -5607,6 +5642,19 @@ fn stream_prepared_playlist_render_with_performance(
                 check_cancelled(Some(cancelled))?;
                 if stream_cancelled() {
                     return Err("Playlist playback was stopped".to_owned());
+                }
+                if let Some(latency_updates) = latency_updates.as_mut()
+                    && apply_live_pdc_updates(
+                        latency_updates,
+                        render.vst3_processor.as_deref_mut(),
+                        meters,
+                        &mut direct_source_delay,
+                        &mut mixer_bus_delays,
+                        mixer_bus_delay_count,
+                    )?
+                    && let Some(processor) = render.vst3_processor.as_deref()
+                {
+                    frames = frames.max(processor.summary().frames);
                 }
                 if let Some(latency_updates) = latency_updates.as_mut()
                     && refresh_vst3_latency_updates(
@@ -6336,7 +6384,8 @@ fn stream_pattern_from_tick_with_vst3_to_device(
         latency_updates,
     } = controls;
     let mut latency_updates = latency_updates.map(|controls| LiveLatencyUpdateState {
-        document,
+        document: document.clone(),
+        pdc_updates: controls.pdc_updates,
         updates: controls.updates,
         reports: controls.reports,
     });
@@ -6485,6 +6534,16 @@ fn stream_pattern_from_tick_with_vst3_to_device(
                 return Err("Sampler Pattern playback was stopped".to_owned());
             }
             if let Some(latency_updates) = latency_updates.as_mut() {
+                apply_live_pdc_updates(
+                    latency_updates,
+                    playback.vst3_processor.as_mut(),
+                    live_master_meters,
+                    &mut sampler_delay,
+                    &mut mixer_bus_delays,
+                    mixer_bus_delay_count,
+                )?;
+            }
+            if let Some(latency_updates) = latency_updates.as_mut() {
                 refresh_vst3_latency_updates(
                     latency_updates,
                     playback.vst3_processor.as_mut(),
@@ -6550,6 +6609,16 @@ fn stream_pattern_from_tick_with_vst3_to_device(
             check_cancelled(Some(cancelled))?;
             if writer.is_cancelled() {
                 return Err("Sampler pattern playback was stopped".to_owned());
+            }
+            if let Some(latency_updates) = latency_updates.as_mut() {
+                apply_live_pdc_updates(
+                    latency_updates,
+                    playback.vst3_processor.as_mut(),
+                    live_master_meters,
+                    &mut sampler_delay,
+                    &mut mixer_bus_delays,
+                    mixer_bus_delay_count,
+                )?;
             }
             if let Some(latency_updates) = latency_updates.as_mut() {
                 refresh_vst3_latency_updates(

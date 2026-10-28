@@ -4746,6 +4746,8 @@ struct DawUi {
     performance_latency_report_receiver: Option<Receiver<Vst3LatencyReport>>,
     pattern_latency_update_sender: Option<Sender<BTreeSet<u64>>>,
     pattern_latency_report_receiver: Option<Receiver<Vst3LatencyReport>>,
+    pattern_pdc_update_sender: Option<Sender<FlpDocument>>,
+    playlist_pdc_update_sender: Option<Sender<FlpDocument>>,
     playlist_latency_update_sender: Option<Sender<BTreeSet<u64>>>,
     playlist_latency_report_receiver: Option<Receiver<Vst3LatencyReport>>,
     project_playback_loaded: bool,
@@ -6491,6 +6493,8 @@ impl DawUi {
             performance_latency_report_receiver: None,
             pattern_latency_update_sender: None,
             pattern_latency_report_receiver: None,
+            pattern_pdc_update_sender: None,
+            playlist_pdc_update_sender: None,
             playlist_latency_update_sender: None,
             playlist_latency_report_receiver: None,
             project_playback_loaded: false,
@@ -12337,6 +12341,14 @@ impl DawUi {
         self.midi_script_mixer_peak_updated_at = Instant::now();
         let (latency_update_sender, latency_update_receiver) = mpsc::channel();
         let (latency_report_sender, latency_report_receiver) = mpsc::channel();
+        let (playlist_pdc_update_sender, playlist_pdc_update_receiver) = if vst3_processor.is_some()
+        {
+            let (update_sender, update_receiver) = mpsc::channel();
+            (Some(update_sender), Some(update_receiver))
+        } else {
+            (None, None)
+        };
+        let playlist_pdc_update_sender_for_ui = playlist_pdc_update_sender.clone();
         let (sender, receiver) = mpsc::sync_channel(1);
         let worker_options = options.clone();
         let worker = thread::Builder::new()
@@ -12360,6 +12372,7 @@ impl DawUi {
                                 latency_updates: Some(Vst3LatencyUpdateControls {
                                     updates: latency_update_receiver,
                                     reports: latency_report_sender,
+                                    pdc_updates: playlist_pdc_update_receiver,
                                 }),
                             },
                         )
@@ -12383,6 +12396,7 @@ impl DawUi {
                 self.project_playback_loaded = true;
                 self.playlist_playback_loaded = true;
                 self.playlist_tempo_map = Some(playlist_tempo_map);
+                self.playlist_pdc_update_sender = playlist_pdc_update_sender_for_ui;
                 self.playlist_latency_update_sender = Some(latency_update_sender);
                 self.playlist_latency_report_receiver = Some(latency_report_receiver);
                 self.pending_audio_render = Some(PendingAudioRender {
@@ -13256,6 +13270,8 @@ impl DawUi {
         self.performance_latency_report_receiver = None;
         self.pattern_latency_update_sender = None;
         self.pattern_latency_report_receiver = None;
+        self.pattern_pdc_update_sender = None;
+        self.playlist_pdc_update_sender = None;
         self.playlist_latency_update_sender = None;
         self.playlist_latency_report_receiver = None;
         self.stop_midi_playlist_playback();
@@ -40323,7 +40339,15 @@ impl DawUi {
             } else {
                 (None, None)
             };
+        let (pattern_pdc_update_sender, pattern_pdc_update_receiver) =
+            if loop_length_ticks.is_some() && vst3_processor.is_some() {
+                let (update_sender, update_receiver) = mpsc::channel();
+                (Some(update_sender), Some(update_receiver))
+            } else {
+                (None, None)
+            };
         let pattern_latency_update_sender_for_ui = pattern_latency_update_sender.clone();
+        let pattern_pdc_update_sender_for_ui = pattern_pdc_update_sender.clone();
         let (
             pattern_latency_update_receiver,
             pattern_latency_report_sender,
@@ -40424,7 +40448,11 @@ impl DawUi {
                                         latency_updates: pattern_latency_update_receiver
                                             .zip(pattern_latency_report_sender)
                                             .map(|(updates, reports)| {
-                                                Vst3LatencyUpdateControls { updates, reports }
+                                                Vst3LatencyUpdateControls {
+                                                    updates,
+                                                    reports,
+                                                    pdc_updates: pattern_pdc_update_receiver,
+                                                }
                                             }),
                                     },
                                     &writer,
@@ -40495,6 +40523,7 @@ impl DawUi {
                 self.project_playback_loaded = true;
                 self.pattern_latency_update_sender = pattern_latency_update_sender_for_ui;
                 self.pattern_latency_report_receiver = pattern_latency_report_receiver;
+                self.pattern_pdc_update_sender = pattern_pdc_update_sender_for_ui;
                 self.status = if handoff_in_progress {
                     match staged_handoff {
                         Some((_, PdcStreamHandoffReason::MixerRouting)) => {
@@ -49609,10 +49638,33 @@ impl DawUi {
             {
                 Ok(Some(())) => {
                     let playback_was_active = self.playing;
+                    let song_live_pdc_update = playback_was_active
+                        && self.playlist_playback_loaded
+                        && !self.pattern_playback_mode
+                        && !self.performance_mode_active
+                        && self
+                            .document
+                            .as_ref()
+                            .zip(self.playlist_pdc_update_sender.as_ref())
+                            .is_some_and(|(document, sender)| {
+                                sender.send(document.clone()).is_ok()
+                            });
+                    let pattern_live_pdc_update = playback_was_active
+                        && self.pattern_playback_mode
+                        && self.pattern_mode_playback_source.is_some()
+                        && !self.performance_mode_active
+                        && self
+                            .document
+                            .as_ref()
+                            .zip(self.pattern_pdc_update_sender.as_ref())
+                            .is_some_and(|(document, sender)| {
+                                sender.send(document.clone()).is_ok()
+                            });
                     let staged_song_handoff = playback_was_active
                         && self.playlist_playback_loaded
                         && !self.pattern_playback_mode
                         && !self.performance_mode_active
+                        && !song_live_pdc_update
                         && self.stage_playlist_stream_rebuild(
                             PdcStreamHandoffReason::AutomaticPdc { enabled },
                         );
@@ -49621,6 +49673,7 @@ impl DawUi {
                         && self.pattern_playback_mode
                         && self.pattern_mode_playback_source.is_some()
                         && !self.performance_mode_active
+                        && !pattern_live_pdc_update
                         && self.stage_pattern_stream_rebuild(
                             PdcStreamHandoffReason::AutomaticPdc { enabled },
                         );
@@ -49636,13 +49689,25 @@ impl DawUi {
                     if playback_was_active
                         && !staged_song_handoff
                         && !staged_pattern_handoff
+                        && !song_live_pdc_update
+                        && !pattern_live_pdc_update
                         && !performance_live_update
                     {
                         self.stop_project_playback();
                     }
                     self.dirty = true;
                     self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
-                    self.status = if staged_song_handoff || staged_pattern_handoff {
+                    self.status = if song_live_pdc_update || pattern_live_pdc_update {
+                        format!(
+                            "Automatic PDC set to {}; applying at the next {} audio-block boundary",
+                            u8::from(enabled),
+                            if pattern_live_pdc_update {
+                                "Pattern"
+                            } else {
+                                "Song"
+                            }
+                        )
+                    } else if staged_song_handoff || staged_pattern_handoff {
                         format!(
                             "Automatic PDC set to {}; preparing a live {} handoff…",
                             u8::from(enabled),
