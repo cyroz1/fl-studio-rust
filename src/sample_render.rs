@@ -56,6 +56,8 @@ const VST3_LIVE_INPUT_QUEUE_CAPACITY: usize = 1_024;
 const LAYER_LIVE_INPUT_QUEUE_CAPACITY: usize = 1_024;
 const SAMPLER_RELEASE_SECONDS: f64 = 0.005;
 const SAMPLER_ROOT_KEY: u16 = 60;
+const SAMPLER_POLYPHONY_SLIDE_DEFAULT_RAW: u32 = 820;
+const SAMPLER_POLYPHONY_SLIDE_MAX_RAW: u32 = 1_660;
 const SAMPLER_BLOCK_FRAMES: usize = 1_024;
 const FLAC_BLOCK_FRAMES: usize = 4_096;
 const FLAC_MAX_SAMPLE_FRAMES: u64 = (1_u64 << 36) - 1;
@@ -7244,6 +7246,7 @@ pub fn stream_sampler_midi_input_to_device(
         .collect::<HashMap<_, _>>();
     let ppq = document.header().ppq();
     let project_tempo_bpm = document.metadata().tempo_bpm().unwrap_or(140.0);
+    let mut current_tempo_bpm = project_tempo_bpm;
     let mut base_resample_pitch_adjustment_by_channel = HashMap::<u16, f64>::new();
     let duration_stretch_channels = target_channel_ids
         .iter()
@@ -7331,6 +7334,7 @@ pub fn stream_sampler_midi_input_to_device(
                             "Sampler channel {target_channel_id} uses duration-preserving time stretching; live tempo changes require rebuilding the stretched sample"
                         ));
                     }
+                    current_tempo_bpm = tempo_bpm;
                     live_resample_fine_pitch_by_channel.clear();
                     for (target_channel_id, base_adjustment_cents) in
                         &base_resample_pitch_adjustment_by_channel
@@ -7405,6 +7409,17 @@ pub fn stream_sampler_midi_input_to_device(
                             key: note_key,
                             midi_channel: 0,
                             slide_note: false,
+                            slide_duration_frames: engine
+                                .sources_by_channel
+                                .get(&target_channel_id)
+                                .map_or(0, |source| {
+                                    sampler_polyphony_slide_frames(
+                                        source.polyphony_slide_raw,
+                                        ppq,
+                                        current_tempo_bpm,
+                                        options.sample_rate,
+                                    )
+                                }),
                             velocity,
                             pan: engine.live_midi_pan(midi_channel),
                             fine_pitch_offset_cents: live_resample_fine_pitch_by_channel
@@ -7551,6 +7566,8 @@ pub fn stream_mixed_layer_midi_input_to_device(
         Some(cancelled),
     )?;
     let channels = document.channels();
+    let ppq = document.header().ppq();
+    let tempo_bpm = document.metadata().tempo_bpm().unwrap_or(140.0);
     let channel_router = ChannelNoteRouter::new(channels);
     let master_output = MixerMasterOutput::from_document(&document);
     let empty_notes = [];
@@ -7644,6 +7661,17 @@ pub fn stream_mixed_layer_midi_input_to_device(
                                         key: rendered_key,
                                         midi_channel: 0,
                                         slide_note: false,
+                                        slide_duration_frames: sampler_engine
+                                            .sources_by_channel
+                                            .get(&target_channel_id)
+                                            .map_or(0, |source| {
+                                                sampler_polyphony_slide_frames(
+                                                    source.polyphony_slide_raw,
+                                                    ppq,
+                                                    tempo_bpm,
+                                                    sampler_render.summary.sample_rate,
+                                                )
+                                            }),
                                         velocity,
                                         pan: sampler_engine.live_midi_pan(channel),
                                         fine_pitch_offset_cents: 0,
@@ -9765,6 +9793,8 @@ fn prepare_sampler_arrangement(
                 volume_envelope,
                 max_polyphony_raw: channel.sampler_max_polyphony_raw(),
                 mono_enabled: channel.sampler_mono_enabled().unwrap_or(false),
+                portamento_enabled: channel.sampler_portamento_enabled().unwrap_or(false),
+                polyphony_slide_raw: channel.sampler_polyphony_slide_raw(),
                 channel_cut_groups: channel.channel_cut_groups(),
                 fast_declick_for_cut_groups,
                 key_range: sample_metadata.key_range,
@@ -9852,6 +9882,12 @@ fn prepare_sampler_arrangement(
                     .map(|frame| frame.max(start_frame.saturating_add(1)))
             })
             .transpose()?;
+        let slide_duration_frames = sampler_polyphony_slide_frames(
+            channel.sampler_polyphony_slide_raw(),
+            ppq,
+            tempo_map.tempo_bpm_at_tick(placed.start_tick),
+            options.sample_rate,
+        );
         let mut fine_pitch_offset_cents = note.fine_pitch_offset_cents();
         if !note.is_slide_note()
             && let Some(base_pitch_adjustment_cents) =
@@ -9905,6 +9941,7 @@ fn prepare_sampler_arrangement(
                 key: note_key,
                 midi_channel: note.midi_channel,
                 slide_note: true,
+                slide_duration_frames,
                 velocity: note.velocity,
                 pan: note.pan,
                 fine_pitch_offset_cents,
@@ -9961,6 +9998,7 @@ fn prepare_sampler_arrangement(
             key: note_key,
             midi_channel: note.midi_channel,
             slide_note: false,
+            slide_duration_frames,
             velocity: note.velocity,
             pan: note.pan,
             fine_pitch_offset_cents,
@@ -10027,6 +10065,8 @@ struct SamplerVoiceSource {
     volume_envelope: Option<SamplerVolumeEnvelope>,
     max_polyphony_raw: Option<u32>,
     mono_enabled: bool,
+    portamento_enabled: bool,
+    polyphony_slide_raw: Option<u32>,
     channel_cut_groups: Option<(u16, u16)>,
     fast_declick_for_cut_groups: bool,
     key_range: Option<(u8, u8)>,
@@ -10120,6 +10160,7 @@ struct ScheduledSamplerNote {
     key: u16,
     midi_channel: u8,
     slide_note: bool,
+    slide_duration_frames: u64,
     velocity: u8,
     pan: u8,
     fine_pitch_offset_cents: i16,
@@ -12529,6 +12570,8 @@ fn prepare_sampler_pattern_for_channel_internal(
                 volume_envelope,
                 max_polyphony_raw: channel.sampler_max_polyphony_raw(),
                 mono_enabled: channel.sampler_mono_enabled().unwrap_or(false),
+                portamento_enabled: channel.sampler_portamento_enabled().unwrap_or(false),
+                polyphony_slide_raw: channel.sampler_polyphony_slide_raw(),
                 channel_cut_groups: channel.channel_cut_groups(),
                 fast_declick_for_cut_groups,
                 key_range: sample_metadata.key_range,
@@ -12616,6 +12659,12 @@ fn prepare_sampler_pattern_for_channel_internal(
                     .max(start_frame.saturating_add(1)),
             )
         };
+        let slide_duration_frames = sampler_polyphony_slide_frames(
+            channel.sampler_polyphony_slide_raw(),
+            ppq,
+            tempo_bpm,
+            options.sample_rate,
+        );
         if note.is_slide_note() {
             notes.push(ScheduledSamplerNote {
                 clip_index: 0,
@@ -12628,6 +12677,7 @@ fn prepare_sampler_pattern_for_channel_internal(
                 key: note_key,
                 midi_channel: note.midi_channel,
                 slide_note: true,
+                slide_duration_frames,
                 velocity: note.velocity,
                 pan: note.pan,
                 fine_pitch_offset_cents: note.fine_pitch_offset_cents(),
@@ -12683,6 +12733,7 @@ fn prepare_sampler_pattern_for_channel_internal(
             key: note_key,
             midi_channel: note.midi_channel,
             slide_note: false,
+            slide_duration_frames,
             velocity: note.velocity,
             pan: note.pan,
             fine_pitch_offset_cents: note.fine_pitch_offset_cents(),
@@ -13289,6 +13340,34 @@ impl<'a> SamplerVoiceEngine<'a> {
                 }
             }
         }
+        let portamento_start = if source.portamento_enabled || source.mono_enabled {
+            let pitch_bend_cents = self.pitch_bend_cents;
+            let pan_law = self.pan_law;
+            self.voices
+                .iter_mut()
+                .filter_map(Option::as_mut)
+                .filter(|voice| {
+                    voice.channel_id == note.channel_id
+                        && !voice.key_released
+                        && !voice.release_started
+                        && voice
+                            .stop_frame
+                            .is_none_or(|stop_frame| stop_frame > note.start_frame)
+                })
+                .max_by_key(|voice| voice.started_frame)
+                .map(|voice| {
+                    update_sampler_voice_slide(voice, note.start_frame, pitch_bend_cents, pan_law);
+                    (
+                        f64::from(voice.key) * 100.0
+                            + f64::from(voice.note_fine_pitch_offset_cents)
+                            + voice.pitch_offset_cents,
+                        voice.velocity_gain,
+                        voice.note_pan_value,
+                    )
+                })
+        } else {
+            None
+        };
         if source.mono_enabled {
             for voice in self
                 .voices
@@ -13450,6 +13529,30 @@ impl<'a> SamplerVoiceEngine<'a> {
             release_total_frames: None,
             release_cosine: false,
         });
+        if let Some((start_pitch_cents, start_velocity_gain, start_pan_value)) = portamento_start
+            && note.slide_duration_frames > 0
+        {
+            let target_pitch_cents =
+                f64::from(note.key) * 100.0 + f64::from(note.fine_pitch_offset_cents);
+            if let Some(voice) = self.voices[slot_index].as_mut() {
+                voice.note_slide = Some(SamplerNoteSlide {
+                    start_frame: note.start_frame,
+                    end_frame: note.start_frame.saturating_add(note.slide_duration_frames),
+                    start_pitch_cents: start_pitch_cents - target_pitch_cents,
+                    target_pitch_cents: 0.0,
+                    start_velocity_gain,
+                    target_velocity_gain: velocity_gain,
+                    start_pan_value,
+                    target_pan_value: note_pan_value,
+                });
+                update_sampler_voice_slide(
+                    voice,
+                    note.start_frame,
+                    self.pitch_bend_cents,
+                    self.pan_law,
+                );
+            }
+        }
         Some(slot_index)
     }
 
@@ -14951,6 +15054,33 @@ fn ticks_to_frames(ticks: u64, ppq: u16, tempo_bpm: f64, sample_rate: u32) -> Re
         return Err("Playlist position is outside the renderable timeline".to_owned());
     }
     Ok(frames.round() as u64)
+}
+
+fn sampler_polyphony_slide_frames(
+    slide_raw: Option<u32>,
+    ppq: u16,
+    tempo_bpm: f64,
+    sample_rate: u32,
+) -> u64 {
+    if ppq == 0 || !tempo_bpm.is_finite() || tempo_bpm <= 0.0 {
+        return 0;
+    }
+    let raw = f64::from(
+        slide_raw
+            .unwrap_or(SAMPLER_POLYPHONY_SLIDE_DEFAULT_RAW)
+            .min(SAMPLER_POLYPHONY_SLIDE_MAX_RAW),
+    );
+    let normalized = raw / f64::from(SAMPLER_POLYPHONY_SLIDE_MAX_RAW);
+    // The raw control is documented as nonlinear. This fourth-power curve is
+    // an inferred fit to the published default (820 ~= half a step) and max
+    // (1660 = eight steps), pending a controlled native render comparison.
+    let ticks = f64::from(ppq) * 2.0 * normalized.powi(4);
+    let frames = ticks * 60.0 * f64::from(sample_rate) / (f64::from(ppq) * tempo_bpm);
+    if frames.is_finite() && frames > 0.0 {
+        frames.round().min(u64::MAX as f64) as u64
+    } else {
+        0
+    }
 }
 
 fn source_duration_to_frames(
@@ -18053,6 +18183,7 @@ mod tests {
                 key: SAMPLER_ROOT_KEY,
                 midi_channel: 0,
                 slide_note: false,
+                slide_duration_frames: 0,
                 velocity: 127,
                 pan: 64,
                 fine_pitch_offset_cents: 0,
@@ -18073,6 +18204,8 @@ mod tests {
                     volume_envelope: None,
                     max_polyphony_raw: None,
                     mono_enabled: false,
+                    portamento_enabled: false,
+                    polyphony_slide_raw: None,
                     channel_cut_groups: None,
                     fast_declick_for_cut_groups: false,
                     key_range: None,
@@ -19267,6 +19400,8 @@ mod tests {
             }),
             max_polyphony_raw: None,
             mono_enabled: false,
+            portamento_enabled: false,
+            polyphony_slide_raw: None,
             channel_cut_groups: None,
             fast_declick_for_cut_groups: false,
             key_range: None,
@@ -19291,6 +19426,7 @@ mod tests {
             key: SAMPLER_ROOT_KEY,
             midi_channel: 0,
             slide_note: false,
+            slide_duration_frames: 0,
             velocity: 127,
             pan: 64,
             fine_pitch_offset_cents: 0,
@@ -19417,6 +19553,8 @@ mod tests {
                 volume_envelope: None,
                 max_polyphony_raw: None,
                 mono_enabled: false,
+                portamento_enabled: false,
+                polyphony_slide_raw: None,
                 channel_cut_groups: None,
                 fast_declick_for_cut_groups: false,
                 key_range: None,
@@ -19441,6 +19579,7 @@ mod tests {
             key: SAMPLER_ROOT_KEY,
             midi_channel: 0,
             slide_note: false,
+            slide_duration_frames: 0,
             velocity: 127,
             pan: 64,
             fine_pitch_offset_cents: 0,
@@ -19480,6 +19619,8 @@ mod tests {
                 volume_envelope: None,
                 max_polyphony_raw: None,
                 mono_enabled: false,
+                portamento_enabled: false,
+                polyphony_slide_raw: None,
                 channel_cut_groups: None,
                 fast_declick_for_cut_groups: false,
                 key_range: None,
@@ -19504,6 +19645,7 @@ mod tests {
             key: SAMPLER_ROOT_KEY,
             midi_channel: 0,
             slide_note: false,
+            slide_duration_frames: 0,
             velocity: 127,
             pan: 64,
             fine_pitch_offset_cents: 0,
@@ -19539,6 +19681,8 @@ mod tests {
                 volume_envelope: None,
                 max_polyphony_raw: None,
                 mono_enabled: false,
+                portamento_enabled: false,
+                polyphony_slide_raw: None,
                 channel_cut_groups: None,
                 fast_declick_for_cut_groups: false,
                 key_range: None,
@@ -19563,6 +19707,7 @@ mod tests {
             key: SAMPLER_ROOT_KEY,
             midi_channel: 0,
             slide_note: false,
+            slide_duration_frames: 0,
             velocity: 127,
             pan: 64,
             fine_pitch_offset_cents: 0,
@@ -19613,6 +19758,8 @@ mod tests {
                 volume_envelope: None,
                 max_polyphony_raw: None,
                 mono_enabled: false,
+                portamento_enabled: false,
+                polyphony_slide_raw: None,
                 channel_cut_groups: None,
                 fast_declick_for_cut_groups: false,
                 key_range: None,
@@ -19637,6 +19784,7 @@ mod tests {
             key: SAMPLER_ROOT_KEY,
             midi_channel: 0,
             slide_note: false,
+            slide_duration_frames: 0,
             velocity: 127,
             pan: 64,
             fine_pitch_offset_cents: 0,
@@ -19673,6 +19821,8 @@ mod tests {
                 volume_envelope: None,
                 max_polyphony_raw: None,
                 mono_enabled: false,
+                portamento_enabled: false,
+                polyphony_slide_raw: None,
                 channel_cut_groups: None,
                 fast_declick_for_cut_groups: false,
                 key_range: None,
@@ -19698,6 +19848,7 @@ mod tests {
                 key: SAMPLER_ROOT_KEY,
                 midi_channel: 0,
                 slide_note: false,
+                slide_duration_frames: 0,
                 velocity: 127,
                 pan: 96,
                 fine_pitch_offset_cents: 0,
@@ -19715,6 +19866,7 @@ mod tests {
                 key: SAMPLER_ROOT_KEY,
                 midi_channel: 0,
                 slide_note: false,
+                slide_duration_frames: 0,
                 velocity: 127,
                 pan: 32,
                 fine_pitch_offset_cents: 0,
@@ -19755,6 +19907,8 @@ mod tests {
                 volume_envelope: None,
                 max_polyphony_raw: None,
                 mono_enabled: false,
+                portamento_enabled: false,
+                polyphony_slide_raw: None,
                 channel_cut_groups: None,
                 fast_declick_for_cut_groups: false,
                 key_range: None,
@@ -19781,6 +19935,7 @@ mod tests {
                 key: SAMPLER_ROOT_KEY,
                 midi_channel: 0,
                 slide_note: false,
+                slide_duration_frames: 0,
                 velocity: 127,
                 pan: 64,
                 fine_pitch_offset_cents: 0,
@@ -19851,6 +20006,7 @@ mod tests {
                 key: SAMPLER_ROOT_KEY,
                 midi_channel: 0,
                 slide_note: false,
+                slide_duration_frames: 0,
                 velocity: 127,
                 pan: engine.live_midi_pan(2),
                 fine_pitch_offset_cents: 0,
@@ -19888,6 +20044,8 @@ mod tests {
                 volume_envelope: None,
                 max_polyphony_raw: None,
                 mono_enabled: false,
+                portamento_enabled: false,
+                polyphony_slide_raw: None,
                 channel_cut_groups: None,
                 fast_declick_for_cut_groups: false,
                 key_range: None,
@@ -19913,6 +20071,7 @@ mod tests {
             key,
             midi_channel: 0,
             slide_note: false,
+            slide_duration_frames: 0,
             velocity: 127,
             pan: 64,
             fine_pitch_offset_cents: 0,
@@ -19970,6 +20129,8 @@ mod tests {
                 volume_envelope: None,
                 max_polyphony_raw: None,
                 mono_enabled: false,
+                portamento_enabled: false,
+                polyphony_slide_raw: None,
                 channel_cut_groups: None,
                 fast_declick_for_cut_groups: false,
                 key_range: None,
@@ -20000,6 +20161,7 @@ mod tests {
             key: SAMPLER_ROOT_KEY,
             midi_channel: 0,
             slide_note: false,
+            slide_duration_frames: 0,
             velocity: 127,
             pan: 64,
             fine_pitch_offset_cents: 0,
@@ -20031,6 +20193,8 @@ mod tests {
                 volume_envelope: None,
                 max_polyphony_raw: None,
                 mono_enabled: false,
+                portamento_enabled: false,
+                polyphony_slide_raw: None,
                 channel_cut_groups: None,
                 fast_declick_for_cut_groups: false,
                 key_range: None,
@@ -20055,6 +20219,7 @@ mod tests {
             key: SAMPLER_ROOT_KEY,
             midi_channel: 0,
             slide_note: false,
+            slide_duration_frames: 0,
             velocity: 127,
             pan: 64,
             fine_pitch_offset_cents: 0,
@@ -20085,6 +20250,8 @@ mod tests {
                 volume_envelope: None,
                 max_polyphony_raw: None,
                 mono_enabled: false,
+                portamento_enabled: false,
+                polyphony_slide_raw: None,
                 channel_cut_groups: None,
                 fast_declick_for_cut_groups: false,
                 key_range: None,
@@ -20109,6 +20276,7 @@ mod tests {
             key: SAMPLER_ROOT_KEY,
             midi_channel: 0,
             slide_note: false,
+            slide_duration_frames: 0,
             velocity: 127,
             pan: 64,
             fine_pitch_offset_cents: 0,
@@ -20142,6 +20310,8 @@ mod tests {
                 volume_envelope: None,
                 max_polyphony_raw: None,
                 mono_enabled: false,
+                portamento_enabled: false,
+                polyphony_slide_raw: None,
                 channel_cut_groups: None,
                 fast_declick_for_cut_groups: false,
                 key_range: None,
@@ -20166,6 +20336,7 @@ mod tests {
             key: SAMPLER_ROOT_KEY,
             midi_channel: 0,
             slide_note: false,
+            slide_duration_frames: 0,
             velocity: 127,
             pan: 64,
             fine_pitch_offset_cents: 0,
@@ -20195,6 +20366,8 @@ mod tests {
                 volume_envelope: None,
                 max_polyphony_raw: None,
                 mono_enabled: false,
+                portamento_enabled: false,
+                polyphony_slide_raw: None,
                 channel_cut_groups: None,
                 fast_declick_for_cut_groups: false,
                 key_range: None,
@@ -20219,6 +20392,7 @@ mod tests {
             key: SAMPLER_ROOT_KEY,
             midi_channel: 0,
             slide_note: false,
+            slide_duration_frames: 0,
             velocity: 127,
             pan: 64,
             fine_pitch_offset_cents: 0,
@@ -20254,6 +20428,8 @@ mod tests {
                 volume_envelope: None,
                 max_polyphony_raw: None,
                 mono_enabled: false,
+                portamento_enabled: false,
+                polyphony_slide_raw: None,
                 channel_cut_groups: None,
                 fast_declick_for_cut_groups: false,
                 key_range: None,
@@ -20278,6 +20454,7 @@ mod tests {
             key: SAMPLER_ROOT_KEY,
             midi_channel: 0,
             slide_note: false,
+            slide_duration_frames: 0,
             velocity: 127,
             pan: 64,
             fine_pitch_offset_cents: 0,
@@ -20313,6 +20490,8 @@ mod tests {
                 volume_envelope: None,
                 max_polyphony_raw: None,
                 mono_enabled: false,
+                portamento_enabled: false,
+                polyphony_slide_raw: None,
                 channel_cut_groups: None,
                 fast_declick_for_cut_groups: false,
                 key_range: None,
@@ -20337,6 +20516,7 @@ mod tests {
             key: SAMPLER_ROOT_KEY,
             midi_channel: 0,
             slide_note: false,
+            slide_duration_frames: 0,
             velocity: 127,
             pan: 64,
             fine_pitch_offset_cents: 0,
@@ -20372,6 +20552,8 @@ mod tests {
                 volume_envelope: None,
                 max_polyphony_raw: None,
                 mono_enabled: false,
+                portamento_enabled: false,
+                polyphony_slide_raw: None,
                 channel_cut_groups: None,
                 fast_declick_for_cut_groups: false,
                 key_range: None,
@@ -20396,6 +20578,7 @@ mod tests {
             key: SAMPLER_ROOT_KEY,
             midi_channel: 0,
             slide_note: false,
+            slide_duration_frames: 0,
             velocity: 127,
             pan: 64,
             fine_pitch_offset_cents: 0,
@@ -20446,6 +20629,8 @@ mod tests {
                 volume_envelope: None,
                 max_polyphony_raw: None,
                 mono_enabled: false,
+                portamento_enabled: false,
+                polyphony_slide_raw: None,
                 channel_cut_groups: None,
                 fast_declick_for_cut_groups: false,
                 key_range: None,
@@ -20470,6 +20655,7 @@ mod tests {
             key: SAMPLER_ROOT_KEY + 12,
             midi_channel: 0,
             slide_note: false,
+            slide_duration_frames: 0,
             velocity: 127,
             pan: 64,
             fine_pitch_offset_cents: 0,
@@ -20501,6 +20687,8 @@ mod tests {
                 volume_envelope: None,
                 max_polyphony_raw: None,
                 mono_enabled: false,
+                portamento_enabled: false,
+                polyphony_slide_raw: None,
                 channel_cut_groups: None,
                 fast_declick_for_cut_groups: false,
                 key_range: None,
@@ -20525,6 +20713,7 @@ mod tests {
             key: SAMPLER_ROOT_KEY,
             midi_channel: 0,
             slide_note: false,
+            slide_duration_frames: 0,
             velocity: 127,
             pan: 64,
             fine_pitch_offset_cents: 0,
@@ -20563,6 +20752,8 @@ mod tests {
             volume_envelope: None,
             max_polyphony_raw: None,
             mono_enabled: false,
+            portamento_enabled: false,
+            polyphony_slide_raw: None,
             channel_cut_groups: None,
             fast_declick_for_cut_groups: false,
             key_range: Some((48, 72)),
@@ -20638,6 +20829,8 @@ mod tests {
                 volume_envelope: None,
                 max_polyphony_raw: None,
                 mono_enabled: false,
+                portamento_enabled: false,
+                polyphony_slide_raw: None,
                 channel_cut_groups: None,
                 fast_declick_for_cut_groups: false,
                 key_range: None,
@@ -20662,6 +20855,7 @@ mod tests {
             key: SAMPLER_ROOT_KEY,
             midi_channel: 0,
             slide_note: false,
+            slide_duration_frames: 0,
             velocity: 127,
             pan: 64,
             fine_pitch_offset_cents: 50,
@@ -20712,6 +20906,8 @@ mod tests {
                 volume_envelope: None,
                 max_polyphony_raw: None,
                 mono_enabled: false,
+                portamento_enabled: false,
+                polyphony_slide_raw: None,
                 channel_cut_groups: None,
                 fast_declick_for_cut_groups: false,
                 key_range: None,
@@ -20736,6 +20932,7 @@ mod tests {
             key: SAMPLER_ROOT_KEY,
             midi_channel: 0,
             slide_note: false,
+            slide_duration_frames: 0,
             velocity: 127,
             pan: 64,
             fine_pitch_offset_cents: 0,
@@ -20775,6 +20972,8 @@ mod tests {
                     volume_envelope: None,
                     max_polyphony_raw: None,
                     mono_enabled: false,
+                    portamento_enabled: false,
+                    polyphony_slide_raw: None,
                     channel_cut_groups: None,
                     fast_declick_for_cut_groups: false,
                     key_range: None,
@@ -20799,6 +20998,8 @@ mod tests {
                     volume_envelope: None,
                     max_polyphony_raw: None,
                     mono_enabled: false,
+                    portamento_enabled: false,
+                    polyphony_slide_raw: None,
                     channel_cut_groups: None,
                     fast_declick_for_cut_groups: false,
                     key_range: None,
@@ -20825,6 +21026,7 @@ mod tests {
                 key: SAMPLER_ROOT_KEY,
                 midi_channel: 0,
                 slide_note: false,
+                slide_duration_frames: 0,
                 velocity: 127,
                 pan: 64,
                 fine_pitch_offset_cents: 0,
@@ -20842,6 +21044,7 @@ mod tests {
                 key: SAMPLER_ROOT_KEY,
                 midi_channel: 0,
                 slide_note: false,
+                slide_duration_frames: 0,
                 velocity: 127,
                 pan: 64,
                 fine_pitch_offset_cents: 0,
@@ -20876,6 +21079,8 @@ mod tests {
                     volume_envelope: None,
                     max_polyphony_raw: Some(1),
                     mono_enabled: false,
+                    portamento_enabled: false,
+                    polyphony_slide_raw: None,
                     channel_cut_groups: None,
                     fast_declick_for_cut_groups: false,
                     key_range: None,
@@ -20903,6 +21108,8 @@ mod tests {
                     volume_envelope: None,
                     max_polyphony_raw: None,
                     mono_enabled: false,
+                    portamento_enabled: false,
+                    polyphony_slide_raw: None,
                     channel_cut_groups: None,
                     fast_declick_for_cut_groups: false,
                     key_range: None,
@@ -20929,6 +21136,7 @@ mod tests {
                 key: SAMPLER_ROOT_KEY,
                 midi_channel: 0,
                 slide_note: false,
+                slide_duration_frames: 0,
                 velocity: 127,
                 pan: 64,
                 fine_pitch_offset_cents: 0,
@@ -20946,6 +21154,7 @@ mod tests {
                 key: SAMPLER_ROOT_KEY,
                 midi_channel: 0,
                 slide_note: false,
+                slide_duration_frames: 0,
                 velocity: 127,
                 pan: 64,
                 fine_pitch_offset_cents: 0,
@@ -20963,6 +21172,7 @@ mod tests {
                 key: SAMPLER_ROOT_KEY,
                 midi_channel: 0,
                 slide_note: false,
+                slide_duration_frames: 0,
                 velocity: 127,
                 pan: 64,
                 fine_pitch_offset_cents: 0,
@@ -21013,6 +21223,8 @@ mod tests {
                 volume_envelope: None,
                 max_polyphony_raw: Some(1),
                 mono_enabled: true,
+                portamento_enabled: false,
+                polyphony_slide_raw: None,
                 channel_cut_groups: None,
                 fast_declick_for_cut_groups: false,
                 key_range: None,
@@ -21038,6 +21250,7 @@ mod tests {
                 key: SAMPLER_ROOT_KEY,
                 midi_channel: 0,
                 slide_note: false,
+                slide_duration_frames: 0,
                 velocity: 127,
                 pan: 64,
                 fine_pitch_offset_cents: 0,
@@ -21055,6 +21268,7 @@ mod tests {
                 key: SAMPLER_ROOT_KEY + 1,
                 midi_channel: 0,
                 slide_note: false,
+                slide_duration_frames: 0,
                 velocity: 127,
                 pan: 64,
                 fine_pitch_offset_cents: 0,
@@ -21100,6 +21314,8 @@ mod tests {
             volume_envelope: None,
             max_polyphony_raw: None,
             mono_enabled: false,
+            portamento_enabled: false,
+            polyphony_slide_raw: None,
             channel_cut_groups: groups,
             fast_declick_for_cut_groups: false,
             key_range: None,
@@ -21128,6 +21344,7 @@ mod tests {
             key: SAMPLER_ROOT_KEY,
             midi_channel: 0,
             slide_note: false,
+            slide_duration_frames: 0,
             velocity: 127,
             pan: 64,
             fine_pitch_offset_cents: 0,
@@ -21177,6 +21394,8 @@ mod tests {
             volume_envelope: None,
             max_polyphony_raw: None,
             mono_enabled: false,
+            portamento_enabled: false,
+            polyphony_slide_raw: None,
             channel_cut_groups: groups,
             fast_declick_for_cut_groups,
             key_range: None,
@@ -21204,6 +21423,7 @@ mod tests {
             key: SAMPLER_ROOT_KEY,
             midi_channel: 0,
             slide_note: false,
+            slide_duration_frames: 0,
             velocity: 127,
             pan: 64,
             fine_pitch_offset_cents: 0,
@@ -21253,6 +21473,8 @@ mod tests {
             volume_envelope: None,
             max_polyphony_raw: None,
             mono_enabled: false,
+            portamento_enabled: false,
+            polyphony_slide_raw: None,
             channel_cut_groups: None,
             fast_declick_for_cut_groups: false,
             key_range: None,
@@ -21279,6 +21501,7 @@ mod tests {
                     key,
                     midi_channel,
                     slide_note,
+                    slide_duration_frames: 0,
                     velocity: 127,
                     pan: 64,
                     fine_pitch_offset_cents,
@@ -21344,6 +21567,8 @@ mod tests {
             volume_envelope: None,
             max_polyphony_raw: None,
             mono_enabled: false,
+            portamento_enabled: false,
+            polyphony_slide_raw: None,
             channel_cut_groups: None,
             fast_declick_for_cut_groups: false,
             key_range: None,
@@ -21368,6 +21593,7 @@ mod tests {
             key,
             midi_channel: 0,
             slide_note,
+            slide_duration_frames: 0,
             velocity: 127,
             pan: 64,
             fine_pitch_offset_cents: 0,
@@ -21406,6 +21632,8 @@ mod tests {
             volume_envelope: None,
             max_polyphony_raw: None,
             mono_enabled: false,
+            portamento_enabled: false,
+            polyphony_slide_raw: None,
             channel_cut_groups: None,
             fast_declick_for_cut_groups: false,
             key_range: None,
@@ -21430,6 +21658,7 @@ mod tests {
             key: SAMPLER_ROOT_KEY,
             midi_channel: 0,
             slide_note,
+            slide_duration_frames: 0,
             velocity,
             pan,
             fine_pitch_offset_cents: 0,
@@ -21478,6 +21707,8 @@ mod tests {
             volume_envelope: None,
             max_polyphony_raw: None,
             mono_enabled: false,
+            portamento_enabled: false,
+            polyphony_slide_raw: None,
             channel_cut_groups: None,
             fast_declick_for_cut_groups: false,
             key_range: None,
@@ -21503,6 +21734,7 @@ mod tests {
                 key: SAMPLER_ROOT_KEY,
                 midi_channel: 0,
                 slide_note: false,
+                slide_duration_frames: 0,
                 velocity: 127,
                 pan: 64,
                 fine_pitch_offset_cents: 0,
@@ -21520,6 +21752,7 @@ mod tests {
                 key: SAMPLER_ROOT_KEY - 12,
                 midi_channel: 0,
                 slide_note: true,
+                slide_duration_frames: 0,
                 velocity: 127,
                 pan: 64,
                 fine_pitch_offset_cents: 0,
@@ -21561,6 +21794,8 @@ mod tests {
             volume_envelope: None,
             max_polyphony_raw: None,
             mono_enabled: false,
+            portamento_enabled: false,
+            polyphony_slide_raw: None,
             channel_cut_groups: None,
             fast_declick_for_cut_groups: false,
             key_range: None,
@@ -21585,6 +21820,7 @@ mod tests {
             key: SAMPLER_ROOT_KEY + 7,
             midi_channel: 0,
             slide_note: true,
+            slide_duration_frames: 0,
             velocity: 127,
             pan: 64,
             fine_pitch_offset_cents: 0,
