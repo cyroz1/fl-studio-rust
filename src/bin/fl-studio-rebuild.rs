@@ -41680,25 +41680,28 @@ impl DawUi {
         } else {
             0
         };
-        let pattern_for_vst3 =
-            if loop_length_ticks.is_some() || !self.channel_vst3_instances.is_empty() {
-                let pattern = match document.patterns() {
-                    Ok(patterns) => patterns
-                        .into_iter()
-                        .find(|pattern| pattern.id == pattern_id),
-                    Err(error) => {
-                        self.status = format!("Could not decode Pattern automation: {error}");
-                        return;
-                    }
-                };
-                let Some(pattern) = pattern else {
-                    self.status = format!("Pattern {pattern_id} was not found");
+        let pattern_for_vst3 = if should_prepare_pattern_vst3_stream(
+            loop_length_ticks,
+            !self.channel_vst3_instances.is_empty(),
+            !self.mixer_effect_vst3_instances.is_empty(),
+        ) {
+            let pattern = match document.patterns() {
+                Ok(patterns) => patterns
+                    .into_iter()
+                    .find(|pattern| pattern.id == pattern_id),
+                Err(error) => {
+                    self.status = format!("Could not decode Pattern automation: {error}");
                     return;
-                };
-                Some(pattern)
-            } else {
-                None
+                }
             };
+            let Some(pattern) = pattern else {
+                self.status = format!("Pattern {pattern_id} was not found");
+                return;
+            };
+            Some(pattern)
+        } else {
+            None
+        };
         let vst3_stream_duration_ticks = loop_length_ticks.or_else(|| {
             pattern_for_vst3.as_ref().map(|pattern| {
                 pattern_lfo_loop_length_ticks(
@@ -65332,6 +65335,14 @@ fn pattern_lfo_loop_length_ticks(
     }
 }
 
+fn should_prepare_pattern_vst3_stream(
+    loop_length_ticks: Option<u64>,
+    has_vst3_instruments: bool,
+    has_mixer_effects: bool,
+) -> bool {
+    loop_length_ticks.is_some() || has_vst3_instruments || has_mixer_effects
+}
+
 fn internal_lfo_value_at_phase(waveform: InternalLfoWaveform, phase: f64) -> f64 {
     let phase = phase.rem_euclid(1.0);
     match waveform {
@@ -73093,15 +73104,16 @@ mod tests {
         serialize_pattern_vst3_parameter_links, serialize_playlist_audio_clip_envelopes,
         serialize_playlist_vst3_mixer_effect_parameter_links,
         serialize_playlist_vst3_parameter_links, serialize_window_layout_presets,
-        should_auto_connect_midi_input, should_auto_connect_midi_output, snap_note_tick,
-        snap_piano_roll_key_to_scale, snap_recorded_midi_notes_to_scale,
-        toggle_piano_roll_note_group_selection, touch_pan_zoom_scroll_offset, track_two_finger_tap,
-        update_channel_rack_selection, update_layer_child_selection,
-        update_piano_roll_box_selection, upsert_internal_lfo_parameter_link,
-        upsert_midi_mixer_control_mapping, upsert_midi_vst3_parameter_mapping,
-        upsert_pattern_vst3_mixer_effect_parameter_link, upsert_pattern_vst3_parameter_link,
-        upsert_playlist_audio_clip_envelope, upsert_playlist_vst3_mixer_effect_parameter_link,
-        upsert_playlist_vst3_parameter_link, zoom_to_fit,
+        should_auto_connect_midi_input, should_auto_connect_midi_output,
+        should_prepare_pattern_vst3_stream, snap_note_tick, snap_piano_roll_key_to_scale,
+        snap_recorded_midi_notes_to_scale, toggle_piano_roll_note_group_selection,
+        touch_pan_zoom_scroll_offset, track_two_finger_tap, update_channel_rack_selection,
+        update_layer_child_selection, update_piano_roll_box_selection,
+        upsert_internal_lfo_parameter_link, upsert_midi_mixer_control_mapping,
+        upsert_midi_vst3_parameter_mapping, upsert_pattern_vst3_mixer_effect_parameter_link,
+        upsert_pattern_vst3_parameter_link, upsert_playlist_audio_clip_envelope,
+        upsert_playlist_vst3_mixer_effect_parameter_link, upsert_playlist_vst3_parameter_link,
+        zoom_to_fit,
     };
 
     #[test]
@@ -75741,6 +75753,14 @@ mod tests {
             internal_lfo_parameter_link_for_target(&links, &project_path, 5, &mapping_target)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn selected_pattern_preview_prepares_mixer_effects_without_vst3_instruments() {
+        assert!(should_prepare_pattern_vst3_stream(None, false, true));
+        assert!(should_prepare_pattern_vst3_stream(None, true, false));
+        assert!(should_prepare_pattern_vst3_stream(Some(384), false, false));
+        assert!(!should_prepare_pattern_vst3_stream(None, false, false));
     }
 
     #[test]
