@@ -15120,6 +15120,7 @@ impl DawUi {
             playlist_track_performance_modes,
             playlist_live_block_statuses,
             song_start_tick,
+            playlist_live_block_marker_positions,
         ) = self
             .document
             .as_ref()
@@ -15166,6 +15167,7 @@ impl DawUi {
                         &live_performance_status,
                     ),
                     song_start_tick,
+                    midi_script_playlist_performance_marker_positions(arrangement, song_start_tick),
                 ))
             })
             .unwrap_or_else(|| {
@@ -15174,6 +15176,7 @@ impl DawUi {
                     vec![[None; 4]; playlist_track_ids.len()],
                     vec![BTreeMap::new(); playlist_track_ids.len()],
                     0,
+                    Vec::new(),
                 )
             });
         if let Ok(mut levels) = self
@@ -15196,6 +15199,13 @@ impl DawUi {
             .lock()
         {
             *statuses = playlist_live_block_statuses;
+        }
+        if let Ok(mut positions) = self
+            .midi_script_transport_state
+            .playlist_live_block_marker_positions
+            .lock()
+        {
+            *positions = playlist_live_block_marker_positions;
         }
         self.midi_script_transport_state
             .playlist_performance_mode_active

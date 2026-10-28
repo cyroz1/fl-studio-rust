@@ -437,6 +437,159 @@ def _playlist_get_song_start_tick_pos():
     return int(_active_transport_state.get("playlist_song_start_tick", 0))
 
 
+def _playlist_get_vis_time_component(component):
+    defaults = (1, 1, 0)
+    parts = str(_active_transport_state.get("song_position_hint", "1:01:000")).split(":")
+    if len(parts) != 3:
+        return defaults[component]
+    try:
+        values = tuple(int(part) for part in parts)
+    except (TypeError, ValueError, OverflowError):
+        return defaults[component]
+    if any(value < 0 for value in values):
+        return defaults[component]
+    return values[component]
+
+
+def _playlist_get_vis_time_bar():
+    return _playlist_get_vis_time_component(0)
+
+
+def _playlist_get_vis_time_step():
+    return _playlist_get_vis_time_component(1)
+
+
+def _playlist_get_vis_time_tick():
+    return _playlist_get_vis_time_component(2)
+
+
+def _playlist_live_block_marker_positions():
+    positions = _active_transport_state.get("playlist_live_block_marker_positions", [])
+    if not isinstance(positions, (list, tuple)):
+        return []
+    try:
+        return sorted({int(position) for position in positions if int(position) >= 0})
+    except (TypeError, ValueError, OverflowError):
+        return []
+
+
+def _playlist_time_signature_state():
+    ppq = max(1, int(_active_transport_state.get("ticks_per_quarter", 96)))
+    initial_signature = (
+        max(1, int(_active_transport_state.get("time_signature_numerator", 4))),
+        max(1, int(_active_transport_state.get("time_signature_denominator", 4))),
+    )
+    changes = _active_transport_state.get("arrangement_time_signature_changes", [])
+    return ppq, initial_signature, changes
+
+
+def _playlist_bar_ticks(ppq, signature):
+    numerator = max(1, int(signature[0]))
+    denominator = max(1, int(signature[1]))
+    return max(1, max(1, int(ppq)) * numerator * 4 // denominator)
+
+
+def _playlist_measure_at_tick(tick, ppq, initial_signature, signature_changes):
+    changes = sorted(
+        (int(position), max(1, int(numerator)), max(1, int(denominator)))
+        for position, numerator, denominator in signature_changes
+    )
+    signature = (max(1, int(initial_signature[0])), max(1, int(initial_signature[1])))
+    segment_start = 0
+    measure_number = 1
+    index = 0
+    while index < len(changes):
+        position = changes[index][0]
+        if position > tick:
+            break
+        if position > segment_start:
+            bar_ticks = _playlist_bar_ticks(ppq, signature)
+            elapsed_ticks = position - segment_start
+            completed_bars = elapsed_ticks // bar_ticks
+            measure_number += completed_bars
+            last_boundary = segment_start + completed_bars * bar_ticks
+            if last_boundary < position:
+                measure_number += 1
+            segment_start = position
+        while index < len(changes) and changes[index][0] == position:
+            _, numerator, denominator = changes[index]
+            signature = (numerator, denominator)
+            index += 1
+
+    bar_ticks = _playlist_bar_ticks(ppq, signature)
+    elapsed_ticks = tick - segment_start
+    completed_bars = elapsed_ticks // bar_ticks
+    bar_start = segment_start + completed_bars * bar_ticks
+    return bar_start, measure_number + completed_bars
+
+
+def _playlist_measure_start_tick(block_num, ppq, initial_signature, signature_changes):
+    changes = sorted(
+        (int(position), max(1, int(numerator)), max(1, int(denominator)))
+        for position, numerator, denominator in signature_changes
+    )
+    signature = (max(1, int(initial_signature[0])), max(1, int(initial_signature[1])))
+    segment_start = 0
+    first_measure = 0
+    index = 0
+    while index < len(changes):
+        position = changes[index][0]
+        if position > segment_start:
+            bar_ticks = _playlist_bar_ticks(ppq, signature)
+            elapsed_ticks = position - segment_start
+            segment_measures = (elapsed_ticks + bar_ticks - 1) // bar_ticks
+            if block_num < first_measure + segment_measures:
+                return segment_start + (block_num - first_measure) * bar_ticks
+            first_measure += segment_measures
+            segment_start = position
+        while index < len(changes) and changes[index][0] == position:
+            _, numerator, denominator = changes[index]
+            signature = (numerator, denominator)
+            index += 1
+
+    bar_ticks = _playlist_bar_ticks(ppq, signature)
+    return segment_start + (block_num - first_measure) * bar_ticks
+
+
+def _playlist_live_block_num_to_time(block_num):
+    try:
+        block_num = int(block_num)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("Playlist block number must be a nonnegative integer") from error
+    if block_num < 0:
+        raise ValueError("Playlist block number must be a nonnegative integer")
+    marker_positions = _playlist_live_block_marker_positions()
+    if marker_positions:
+        if block_num >= len(marker_positions):
+            raise IndexError("Playlist block number is outside the live marker range")
+        return marker_positions[block_num]
+    ppq, initial_signature, changes = _playlist_time_signature_state()
+    time_ticks = _playlist_measure_start_tick(block_num, ppq, initial_signature, changes)
+    if time_ticks > 0xFFFFFFFF:
+        raise OverflowError("Playlist block time is outside the supported tick range")
+    return time_ticks
+
+
+def _playlist_live_time_to_block_num(time_ticks):
+    try:
+        time_ticks = int(time_ticks)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("Playlist time must be a nonnegative integer tick") from error
+    if not 0 <= time_ticks <= 0xFFFFFFFF:
+        raise ValueError("Playlist time is outside the supported tick range")
+    marker_positions = _playlist_live_block_marker_positions()
+    if marker_positions:
+        return max(0, sum(position < time_ticks for position in marker_positions) - 1)
+    ppq, initial_signature, changes = _playlist_time_signature_state()
+    bar_start, measure_number = _playlist_measure_at_tick(
+        time_ticks, ppq, initial_signature, changes
+    )
+    block_num = measure_number - 1
+    if time_ticks == bar_start:
+        block_num -= 1
+    return max(0, block_num)
+
+
 def _playlist_selected_track_ids():
     try:
         return {
@@ -1976,6 +2129,11 @@ def _install_modules(script_name, device_name):
     playlist.incLiveTrigMode = _playlist_inc_live_trig_mode
     playlist.getPerformanceModeState = _playlist_get_performance_mode_state
     playlist.getSongStartTickPos = _playlist_get_song_start_tick_pos
+    playlist.getVisTimeBar = _playlist_get_vis_time_bar
+    playlist.getVisTimeStep = _playlist_get_vis_time_step
+    playlist.getVisTimeTick = _playlist_get_vis_time_tick
+    playlist.liveBlockNumToTime = _playlist_live_block_num_to_time
+    playlist.liveTimeToBlockNum = _playlist_live_time_to_block_num
     playlist.isTrackSelected = _playlist_is_track_selected
     playlist.selectTrack = _playlist_select_track
     playlist.selectAll = _playlist_select_all

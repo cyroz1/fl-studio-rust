@@ -288,6 +288,7 @@ pub struct MidiScriptTransportState {
     pub playlist_track_activity_levels: Mutex<Vec<f32>>,
     pub playlist_track_performance_modes: Mutex<Vec<[Option<u8>; 4]>>,
     pub playlist_live_block_statuses: Mutex<Vec<BTreeMap<u32, u8>>>,
+    pub playlist_live_block_marker_positions: Mutex<Vec<u32>>,
     pub selected_playlist_track_ids: Mutex<Vec<u32>>,
     pub playlist_performance_mode_active: AtomicU8,
     pub playlist_song_start_tick: AtomicU64,
@@ -351,6 +352,7 @@ impl Default for MidiScriptTransportState {
             playlist_track_activity_levels: Mutex::new(Vec::new()),
             playlist_track_performance_modes: Mutex::new(Vec::new()),
             playlist_live_block_statuses: Mutex::new(Vec::new()),
+            playlist_live_block_marker_positions: Mutex::new(Vec::new()),
             selected_playlist_track_ids: Mutex::new(Vec::new()),
             playlist_performance_mode_active: AtomicU8::new(0),
             playlist_song_start_tick: AtomicU64::new(0),
@@ -843,6 +845,12 @@ impl MidiScriptRuntime {
             .lock()
             .map(|statuses| statuses.clone())
             .unwrap_or_default();
+        let playlist_live_block_marker_positions = self
+            .transport_state
+            .playlist_live_block_marker_positions
+            .lock()
+            .map(|positions| positions.clone())
+            .unwrap_or_default();
         let playlist_performance_mode_active = self
             .transport_state
             .playlist_performance_mode_active
@@ -1135,6 +1143,10 @@ impl MidiScriptRuntime {
                 transport_object.insert(
                     "playlist_live_block_statuses".to_owned(),
                     json!(playlist_live_block_statuses),
+                );
+                transport_object.insert(
+                    "playlist_live_block_marker_positions".to_owned(),
+                    json!(playlist_live_block_marker_positions),
                 );
                 transport_object.insert(
                     "playlist_performance_mode_active".to_owned(),
@@ -3711,6 +3723,84 @@ def OnMidiIn(event):
         let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
 
         assert_eq!(result.bytes, [0xB0, 2, 48]);
+    }
+
+    #[test]
+    fn python_playlist_performance_api_reports_visual_time_and_bar_boundaries() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport playlist\ndef OnMidiIn(event):\n    event.data1 = int((playlist.getVisTimeBar(), playlist.getVisTimeStep(), playlist.getVisTimeTick()) == (5, 3, 17) and playlist.liveBlockNumToTime(1) == 384)\n    event.data2 = int(playlist.liveTimeToBlockNum(384) == 0 and playlist.liveTimeToBlockNum(385) == 1)\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let transport_state = Arc::new(MidiScriptTransportState::default());
+        *transport_state.song_position_hint.lock().unwrap() = "5:03:017".to_owned();
+        let mut runtime = MidiScriptRuntime::start_for_device_with_transport_state(
+            &script,
+            "Test Input",
+            transport_state,
+        )
+        .unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
+
+        assert_eq!(result.bytes, [0xB0, 1, 1]);
+    }
+
+    #[test]
+    fn python_playlist_performance_api_uses_live_markers_and_signature_changes() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport playlist\ndef OnMidiIn(event):\n    event.data1 = int(playlist.liveBlockNumToTime(2) == 768 and playlist.liveTimeToBlockNum(384) == 0 and playlist.liveTimeToBlockNum(385) == 1)\n    event.data2 = int(playlist.liveBlockNumToTime(3) == 1152 and playlist.liveTimeToBlockNum(1152) == 2 and playlist.liveTimeToBlockNum(1153) == 3)\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let transport_state = Arc::new(MidiScriptTransportState::default());
+        *transport_state
+            .playlist_live_block_marker_positions
+            .lock()
+            .unwrap() = vec![0, 384, 768, 1152];
+        let mut runtime = MidiScriptRuntime::start_for_device_with_transport_state(
+            &script,
+            "Test Input",
+            transport_state,
+        )
+        .unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
+
+        assert_eq!(result.bytes, [0xB0, 1, 1]);
+    }
+
+    #[test]
+    fn python_playlist_performance_api_maps_bar_blocks_across_signature_changes() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport playlist\ndef OnMidiIn(event):\n    event.data1 = int(playlist.liveBlockNumToTime(2) == 576)\n    event.data2 = int(playlist.liveTimeToBlockNum(576) == 1 and playlist.liveTimeToBlockNum(577) == 2)\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let transport_state = Arc::new(MidiScriptTransportState::default());
+        *transport_state
+            .arrangement_time_signature_changes
+            .lock()
+            .unwrap() = vec![(576, 3, 4)];
+        let mut runtime = MidiScriptRuntime::start_for_device_with_transport_state(
+            &script,
+            "Test Input",
+            transport_state,
+        )
+        .unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
+
+        assert_eq!(result.bytes, [0xB0, 1, 1]);
     }
 
     #[test]
