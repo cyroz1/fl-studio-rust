@@ -5209,6 +5209,7 @@ struct DawUi {
     midi_vst3_parameter_mappings: Vec<MidiVst3ParameterMapping>,
     pattern_vst3_parameter_links: Vec<PatternVst3ParameterLink>,
     playlist_vst3_parameter_links: Vec<PlaylistVst3ParameterLink>,
+    playlist_vst3_mixer_effect_parameter_links: Vec<PlaylistVst3MixerEffectParameterLink>,
     internal_lfo_parameter_links: Vec<InternalLfoParameterLink>,
     playlist_audio_clip_envelopes: Vec<ProjectPlaylistAudioClipEnvelope>,
     playlist_automatic_crossfades: Vec<ProjectPlaylistAutomaticCrossfades>,
@@ -5780,10 +5781,11 @@ struct MidiPlaylistAutomationTake<'a> {
 fn record_playlist_automation_clip(
     document: &mut FlpDocument,
     links: &mut Vec<PlaylistVst3ParameterLink>,
+    mixer_effect_links: &mut Vec<PlaylistVst3MixerEffectParameterLink>,
     project_path: Option<&Path>,
     target: MidiPlaylistAutomationRecordingTarget,
     take: MidiPlaylistAutomationTake<'_>,
-) -> Result<(u16, usize, u32, bool), String> {
+) -> Result<(u16, usize, u32, bool, bool), String> {
     let MidiPlaylistAutomationTake {
         controller,
         elapsed_ticks,
@@ -5799,6 +5801,7 @@ fn record_playlist_automation_clip(
 
     let mut candidate = document.clone();
     let mut candidate_links = links.clone();
+    let mut candidate_mixer_effect_links = mixer_effect_links.clone();
     let channel_id = candidate
         .duplicate_automation_channel(
             target.template_channel_id,
@@ -5820,6 +5823,7 @@ fn record_playlist_automation_clip(
         .map_err(|error| error.to_string())?;
 
     let mut copied_parameter_links = false;
+    let mut copied_mixer_effect_links = false;
     if let Some(project_path) = project_path {
         let source_links = links
             .iter()
@@ -5833,6 +5837,22 @@ fn record_playlist_automation_clip(
             link.automation_channel_id = channel_id;
             upsert_playlist_vst3_parameter_link(&mut candidate_links, link);
             copied_parameter_links = true;
+        }
+        let source_effect_links = mixer_effect_links
+            .iter()
+            .filter(|link| {
+                link.automation_channel_id == target.template_channel_id
+                    && project_paths_equal(Path::new(&link.project_path), project_path)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for mut link in source_effect_links {
+            link.automation_channel_id = channel_id;
+            upsert_playlist_vst3_mixer_effect_parameter_link(
+                &mut candidate_mixer_effect_links,
+                link,
+            );
+            copied_mixer_effect_links = true;
         }
     }
 
@@ -5854,7 +5874,14 @@ fn record_playlist_automation_clip(
 
     *document = candidate;
     *links = candidate_links;
-    Ok((channel_id, clip_index, length_ticks, copied_parameter_links))
+    *mixer_effect_links = candidate_mixer_effect_links;
+    Ok((
+        channel_id,
+        clip_index,
+        length_ticks,
+        copied_parameter_links,
+        copied_mixer_effect_links,
+    ))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -5918,6 +5945,13 @@ struct PlaylistVst3ParameterLink {
     project_path: String,
     automation_channel_id: u16,
     target: MidiVst3ParameterTarget,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PlaylistVst3MixerEffectParameterLink {
+    project_path: String,
+    automation_channel_id: u16,
+    target: MidiVst3MixerEffectParameterTarget,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6484,6 +6518,8 @@ impl DawUi {
         let vst3_manual_latency_offsets = load_vst3_manual_latency_offsets();
         let pattern_vst3_parameter_links = load_pattern_vst3_parameter_links();
         let playlist_vst3_parameter_links = load_playlist_vst3_parameter_links();
+        let playlist_vst3_mixer_effect_parameter_links =
+            load_playlist_vst3_mixer_effect_parameter_links();
         let internal_lfo_parameter_links = load_internal_lfo_parameter_links();
         let playlist_audio_clip_envelopes = load_playlist_audio_clip_envelopes();
         let playlist_automatic_crossfades = load_playlist_automatic_crossfades();
@@ -6965,6 +7001,7 @@ impl DawUi {
             midi_vst3_parameter_mappings,
             pattern_vst3_parameter_links,
             playlist_vst3_parameter_links,
+            playlist_vst3_mixer_effect_parameter_links,
             internal_lfo_parameter_links,
             playlist_audio_clip_envelopes,
             playlist_automatic_crossfades,
@@ -8445,6 +8482,59 @@ impl DawUi {
             sources
                 .automation_clips
                 .entry((link.automation_channel_id, link.target.project_channel_id))
+                .or_default()
+                .push(Vst3ParameterAutomation {
+                    parameter_id: link.target.parameter_id,
+                    points,
+                });
+        }
+        for link in self
+            .playlist_vst3_mixer_effect_parameter_links
+            .iter()
+            .filter(|link| project_paths_equal(Path::new(&link.project_path), project_path))
+        {
+            let Some(automation_channel) = automation_channels
+                .get(&link.automation_channel_id)
+                .copied()
+            else {
+                continue;
+            };
+            let Some(instance_id) = self
+                .mixer_effect_vst3_instances
+                .get(&(link.target.insert_ordinal, link.target.slot_index))
+            else {
+                continue;
+            };
+            if !loaded_plugins
+                .iter()
+                .any(|plugin| plugin.id == *instance_id && plugin.uid == link.target.plugin_uid)
+            {
+                continue;
+            }
+            let points = automation_channel
+                .points()
+                .iter()
+                .filter(|point| {
+                    point.position_beats().is_finite()
+                        && point.position_beats() >= 0.0
+                        && point.value().is_finite()
+                        && (0.0..=1.0).contains(&point.value())
+                })
+                .map(|point| Vst3AutomationPoint {
+                    position_beats: point.position_beats(),
+                    value: point.value(),
+                })
+                .collect::<Vec<_>>();
+            if points.is_empty() {
+                continue;
+            }
+            sources
+                .mixer_effect_automation_clips
+                .entry((
+                    link.automation_channel_id,
+                    link.target.insert_ordinal,
+                    link.target.slot_index,
+                ))
                 .or_default()
                 .push(Vst3ParameterAutomation {
                     parameter_id: link.target.parameter_id,
@@ -43645,7 +43735,7 @@ impl DawUi {
                 }
                 self.status = match pending.kind {
                     PendingSongRenderKind::Mix => format!(
-                        "Rendered {} audio clips, {} Sampler clips ({} notes), and {} VST3 channels ({} notes) to {} at {} Hz; {} plug-in channels unloaded, {} scaled audio and {} scaled pattern clips skipped. Measured pre-effect peaks for {} Mixer inserts; effects and automation were not rendered",
+                        "Rendered {} audio clips, {} Sampler clips ({} notes), and {} VST3 channels ({} notes) to {} at {} Hz; {} plug-in channels unloaded, {} scaled audio and {} scaled pattern clips skipped. Measured pre-effect peaks for {} Mixer inserts; supported VST3 Mixer effects and linked Automation Clips were included",
                         summary.audio_clips_rendered,
                         summary.sampler_pattern_clips_rendered,
                         summary.sampler_notes_rendered,
@@ -43659,7 +43749,7 @@ impl DawUi {
                         insert_peaks.len(),
                     ),
                     PendingSongRenderKind::MixerStems => format!(
-                        "Rendered supported Mixer stems into {} at {} Hz; {}, {}. Loaded VST3 insert and Master effects with route PDC were included; native effect formats, effect automation, and PDC silence trimming were not rendered",
+                        "Rendered supported Mixer stems into {} at {} Hz; {}, {}. Loaded VST3 insert and Master effects with route PDC and linked Automation Clip parameters were included; native effect formats, other effect automation links, and PDC silence trimming remain unsupported",
                         pending.output_path.display(),
                         summary.sample_rate,
                         if summary.mixer_master_stem_rendered {
@@ -52286,12 +52376,15 @@ impl DawUi {
             return;
         }
         let mut updated_playlist_vst3_parameter_links = self.playlist_vst3_parameter_links.clone();
+        let mut updated_playlist_vst3_mixer_effect_parameter_links =
+            self.playlist_vst3_mixer_effect_parameter_links.clone();
         let playlist_automation_result =
             match (playlist_automation_target, automation_info.as_ref()) {
                 (Some(target), Some((controller, _, _, _))) if !automation_points.is_empty() => {
                     Some(record_playlist_automation_clip(
                         &mut updated,
                         &mut updated_playlist_vst3_parameter_links,
+                        &mut updated_playlist_vst3_mixer_effect_parameter_links,
                         result.project_path.as_deref(),
                         target,
                         MidiPlaylistAutomationTake {
@@ -52349,11 +52442,30 @@ impl DawUi {
             })
         };
         let mut playlist_automation_links_save_error = None;
-        if let Some(Ok((_, _, _, copied_links))) = playlist_automation_result.as_ref() {
+        if let Some(Ok((_, _, _, copied_links, copied_effect_links))) =
+            playlist_automation_result.as_ref()
+        {
             self.playlist_vst3_parameter_links = updated_playlist_vst3_parameter_links;
-            if *copied_links {
-                playlist_automation_links_save_error =
-                    save_playlist_vst3_parameter_links(&self.playlist_vst3_parameter_links).err();
+            self.playlist_vst3_mixer_effect_parameter_links =
+                updated_playlist_vst3_mixer_effect_parameter_links;
+            if *copied_links || *copied_effect_links {
+                let mut save_errors = Vec::new();
+                if *copied_links
+                    && let Err(error) =
+                        save_playlist_vst3_parameter_links(&self.playlist_vst3_parameter_links)
+                {
+                    save_errors.push(error);
+                }
+                if *copied_effect_links
+                    && let Err(error) = save_playlist_vst3_mixer_effect_parameter_links(
+                        &self.playlist_vst3_mixer_effect_parameter_links,
+                    )
+                {
+                    save_errors.push(error);
+                }
+                if !save_errors.is_empty() {
+                    playlist_automation_links_save_error = Some(save_errors.join("; "));
+                }
             }
         }
         self.document = Some(updated);
@@ -52472,7 +52584,7 @@ impl DawUi {
             (playlist_automation_target, playlist_automation_result)
         {
             match recording_result {
-                Ok((channel_id, clip_index, length_ticks, _)) => {
+                Ok((channel_id, clip_index, length_ticks, _, _)) => {
                     self.selected_automation_channel = Some(channel_id);
                     self.selected_arrangement = Some(target.arrangement_id);
                     self.selected_clip = Some(clip_index);
@@ -52487,7 +52599,7 @@ impl DawUi {
                     ));
                     if playlist_automation_links_save_error.is_some() {
                         status.push_str(
-                            " · its copied VST3 parameter link works for this session but could not be saved",
+                            " · its copied VST3 parameter links work for this session but could not be saved",
                         );
                     }
                 }
@@ -58670,6 +58782,10 @@ impl DawUi {
         let mut playlist_vst3_link_request: Option<(String, u16, MidiVst3ParameterTarget)> = None;
         let mut playlist_vst3_unlink_request: Option<(PathBuf, u16, MidiVst3ParameterTarget)> =
             None;
+        let mut playlist_vst3_mixer_effect_link_request =
+            None::<(String, u16, MidiVst3MixerEffectParameterTarget)>;
+        let mut playlist_vst3_mixer_effect_unlink_request =
+            None::<(PathBuf, u16, MidiVst3MixerEffectParameterTarget)>;
         let mut internal_lfo_upserts = Vec::new();
         let mut internal_lfo_unlink_request: Option<(PathBuf, u16, MidiVst3ParameterTarget)> = None;
         let pattern_vst3_source = self.selected_pattern_vst3_parameter_source();
@@ -60049,6 +60165,47 @@ impl DawUi {
                                 );
                             }
                         }
+                        if let Some(target) = effect_target.as_ref()
+                            && let Some((
+                                project_path,
+                                automation_channel_id,
+                                channel_name,
+                                has_points,
+                            )) = playlist_vst3_source.as_ref()
+                        {
+                            let playlist_link =
+                                playlist_vst3_mixer_effect_parameter_link_for_target(
+                                    &self.playlist_vst3_mixer_effect_parameter_links,
+                                    Path::new(project_path),
+                                    *automation_channel_id,
+                                    target,
+                                );
+                            ui.horizontal(|ui| {
+                                ui.small(format!("Playlist Automation · {channel_name}"));
+                                if playlist_link.is_some() {
+                                    ui.small("Linked");
+                                    if ui.small_button("Clear automation").clicked() {
+                                        playlist_vst3_mixer_effect_unlink_request = Some((
+                                            PathBuf::from(project_path),
+                                            *automation_channel_id,
+                                            target.clone(),
+                                        ));
+                                    }
+                                } else if ui
+                                    .add_enabled(
+                                        !parameter.is_read_only && *has_points,
+                                        egui::Button::new("Link Automation"),
+                                    )
+                                    .clicked()
+                                {
+                                    playlist_vst3_mixer_effect_link_request = Some((
+                                        project_path.clone(),
+                                        *automation_channel_id,
+                                        target.clone(),
+                                    ));
+                                }
+                            });
+                        }
                         if mapping_target.is_none() {
                             ui.small(
                                 egui::RichText::new(
@@ -60202,6 +60359,63 @@ impl DawUi {
                 .err()
                 .map_or_else(
                     || format!("Cleared Playlist Automation link for {}", target.parameter_name),
+                    |error| {
+                        format!(
+                            "Cleared Playlist Automation link for this session; could not save it: {error}"
+                        )
+                    },
+                );
+        }
+        if let Some((project_path, automation_channel_id, target)) =
+            playlist_vst3_mixer_effect_link_request
+        {
+            upsert_playlist_vst3_mixer_effect_parameter_link(
+                &mut self.playlist_vst3_mixer_effect_parameter_links,
+                PlaylistVst3MixerEffectParameterLink {
+                    project_path,
+                    automation_channel_id,
+                    target: target.clone(),
+                },
+            );
+            self.status = save_playlist_vst3_mixer_effect_parameter_links(
+                &self.playlist_vst3_mixer_effect_parameter_links,
+            )
+            .err()
+            .map_or_else(
+                || {
+                    format!(
+                        "Linked Playlist Automation to {} on this machine",
+                        target.parameter_name
+                    )
+                },
+                |error| {
+                    format!(
+                        "Linked Playlist Automation for this session; could not save it: {error}"
+                    )
+                },
+            );
+        }
+        if let Some((project_path, automation_channel_id, target)) =
+            playlist_vst3_mixer_effect_unlink_request
+        {
+            remove_playlist_vst3_mixer_effect_parameter_link(
+                &mut self.playlist_vst3_mixer_effect_parameter_links,
+                &project_path,
+                automation_channel_id,
+                &target,
+            );
+            self.status =
+                save_playlist_vst3_mixer_effect_parameter_links(
+                    &self.playlist_vst3_mixer_effect_parameter_links,
+                )
+                .err()
+                .map_or_else(
+                    || {
+                        format!(
+                            "Cleared Playlist Automation link for {}",
+                            target.parameter_name
+                        )
+                    },
                     |error| {
                         format!(
                             "Cleared Playlist Automation link for this session; could not save it: {error}"
@@ -63699,6 +63913,10 @@ fn playlist_vst3_parameter_links_file() -> Option<PathBuf> {
     midi_control_change_mapping_file("playlist-vst3-parameter-links.txt")
 }
 
+fn playlist_vst3_mixer_effect_parameter_links_file() -> Option<PathBuf> {
+    midi_control_change_mapping_file("playlist-vst3-mixer-effect-parameter-links.txt")
+}
+
 fn internal_lfo_parameter_links_file() -> Option<PathBuf> {
     midi_control_change_mapping_file("internal-lfo-parameter-links.txt")
 }
@@ -63762,6 +63980,13 @@ fn load_playlist_vst3_parameter_links() -> Vec<PlaylistVst3ParameterLink> {
     playlist_vst3_parameter_links_file()
         .and_then(|path| fs::read_to_string(path).ok())
         .map(|contents| parse_playlist_vst3_parameter_links(&contents))
+        .unwrap_or_default()
+}
+
+fn load_playlist_vst3_mixer_effect_parameter_links() -> Vec<PlaylistVst3MixerEffectParameterLink> {
+    playlist_vst3_mixer_effect_parameter_links_file()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .map(|contents| parse_playlist_vst3_mixer_effect_parameter_links(&contents))
         .unwrap_or_default()
 }
 
@@ -64022,6 +64247,23 @@ fn save_playlist_vst3_parameter_links(links: &[PlaylistVst3ParameterLink]) -> Re
         .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
     fs::write(&path, serialize_playlist_vst3_parameter_links(links))
         .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
+fn save_playlist_vst3_mixer_effect_parameter_links(
+    links: &[PlaylistVst3MixerEffectParameterLink],
+) -> Result<(), String> {
+    let path = playlist_vst3_mixer_effect_parameter_links_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path.parent().ok_or_else(|| {
+        "the Playlist VST3 Mixer effect link path has no parent folder".to_owned()
+    })?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    fs::write(
+        &path,
+        serialize_playlist_vst3_mixer_effect_parameter_links(links),
+    )
+    .map_err(|error| format!("could not write {}: {error}", path.display()))
 }
 
 fn save_internal_lfo_parameter_links(links: &[InternalLfoParameterLink]) -> Result<(), String> {
@@ -64465,6 +64707,80 @@ fn playlist_vst3_parameter_link_for_target<'a>(
 ) -> Option<&'a PlaylistVst3ParameterLink> {
     links.iter().find(|link| {
         same_playlist_vst3_parameter_link_target(link, project_path, automation_channel_id, target)
+    })
+}
+
+fn same_playlist_vst3_mixer_effect_parameter_link_target(
+    link: &PlaylistVst3MixerEffectParameterLink,
+    project_path: &Path,
+    automation_channel_id: u16,
+    target: &MidiVst3MixerEffectParameterTarget,
+) -> bool {
+    project_paths_equal(Path::new(&link.project_path), project_path)
+        && link.automation_channel_id == automation_channel_id
+        && link.target.insert_ordinal == target.insert_ordinal
+        && link.target.slot_index == target.slot_index
+        && link.target.plugin_uid == target.plugin_uid
+        && link.target.parameter_id == target.parameter_id
+}
+
+fn valid_playlist_vst3_mixer_effect_parameter_link(
+    link: &PlaylistVst3MixerEffectParameterLink,
+) -> bool {
+    !link.project_path.is_empty()
+        && link.target.insert_ordinal <= 127
+        && link.target.slot_index < 10
+        && !link.target.plugin_uid.is_empty()
+        && !link.target.parameter_name.is_empty()
+}
+
+fn upsert_playlist_vst3_mixer_effect_parameter_link(
+    links: &mut Vec<PlaylistVst3MixerEffectParameterLink>,
+    link: PlaylistVst3MixerEffectParameterLink,
+) {
+    if !valid_playlist_vst3_mixer_effect_parameter_link(&link) {
+        return;
+    }
+    links.retain(|existing| {
+        !same_playlist_vst3_mixer_effect_parameter_link_target(
+            existing,
+            Path::new(&link.project_path),
+            link.automation_channel_id,
+            &link.target,
+        )
+    });
+    links.push(link);
+}
+
+fn remove_playlist_vst3_mixer_effect_parameter_link(
+    links: &mut Vec<PlaylistVst3MixerEffectParameterLink>,
+    project_path: &Path,
+    automation_channel_id: u16,
+    target: &MidiVst3MixerEffectParameterTarget,
+) {
+    links.retain(|link| {
+        !same_playlist_vst3_mixer_effect_parameter_link_target(
+            link,
+            project_path,
+            automation_channel_id,
+            target,
+        )
+    });
+}
+
+fn playlist_vst3_mixer_effect_parameter_link_for_target<'a>(
+    links: &'a [PlaylistVst3MixerEffectParameterLink],
+    project_path: &Path,
+    automation_channel_id: u16,
+    target: &MidiVst3MixerEffectParameterTarget,
+) -> Option<&'a PlaylistVst3MixerEffectParameterLink> {
+    links.iter().find(|link| {
+        same_playlist_vst3_mixer_effect_parameter_link_target(
+            link,
+            project_path,
+            automation_channel_id,
+            target,
+        )
     })
 }
 
@@ -65290,6 +65606,87 @@ fn serialize_playlist_vst3_parameter_links(links: &[PlaylistVst3ParameterLink]) 
         contents.push_str(&link.automation_channel_id.to_string());
         contents.push('\t');
         contents.push_str(&link.target.project_channel_id.to_string());
+        contents.push('\t');
+        contents.push_str(&encode_midi_device_id(&link.target.plugin_uid));
+        contents.push('\t');
+        contents.push_str(&link.target.parameter_id.to_string());
+        contents.push('\t');
+        contents.push_str(&encode_midi_device_id(&link.target.parameter_name));
+        contents.push('\n');
+    }
+    contents
+}
+
+fn parse_playlist_vst3_mixer_effect_parameter_links(
+    contents: &str,
+) -> Vec<PlaylistVst3MixerEffectParameterLink> {
+    let mut links = Vec::new();
+    for line in contents.lines() {
+        let Some(encoded) = line.strip_prefix("link=") else {
+            continue;
+        };
+        let mut fields = encoded.split('\t');
+        let Some(project_path) = fields.next().and_then(decode_midi_device_id) else {
+            continue;
+        };
+        let Some(automation_channel_id) = fields.next().and_then(|field| field.parse::<u16>().ok())
+        else {
+            continue;
+        };
+        let Some(insert_ordinal) = fields.next().and_then(|field| field.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        let Some(slot_index) = fields.next().and_then(|field| field.parse::<u16>().ok()) else {
+            continue;
+        };
+        let Some(plugin_uid) = fields.next().and_then(decode_midi_device_id) else {
+            continue;
+        };
+        let Some(parameter_id) = fields.next().and_then(|field| field.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(parameter_name) = fields.next().and_then(decode_midi_device_id) else {
+            continue;
+        };
+        if fields.next().is_some() {
+            continue;
+        }
+        upsert_playlist_vst3_mixer_effect_parameter_link(
+            &mut links,
+            PlaylistVst3MixerEffectParameterLink {
+                project_path,
+                automation_channel_id,
+                target: MidiVst3MixerEffectParameterTarget {
+                    insert_ordinal,
+                    slot_index,
+                    plugin_uid,
+                    parameter_id,
+                    parameter_name,
+                },
+            },
+        );
+    }
+    links
+}
+
+fn serialize_playlist_vst3_mixer_effect_parameter_links(
+    links: &[PlaylistVst3MixerEffectParameterLink],
+) -> String {
+    let mut contents = String::from("version=1\n");
+    let mut normalized = Vec::new();
+    for link in links {
+        upsert_playlist_vst3_mixer_effect_parameter_link(&mut normalized, link.clone());
+    }
+    for link in normalized {
+        contents.push_str("link=");
+        contents.push_str(&encode_midi_device_id(&link.project_path));
+        contents.push('\t');
+        contents.push_str(&link.automation_channel_id.to_string());
+        contents.push('\t');
+        contents.push_str(&link.target.insert_ordinal.to_string());
+        contents.push('\t');
+        contents.push_str(&link.target.slot_index.to_string());
         contents.push('\t');
         contents.push_str(&encode_midi_device_id(&link.target.plugin_uid));
         contents.push('\t');
@@ -71880,11 +72277,12 @@ mod tests {
         PlaylistAudioClipEnvelope, PlaylistAudioClipFadeCurve, PlaylistClip, PlaylistClipDragKind,
         PlaylistClipEdit, PlaylistClipResizeEdge, PlaylistPerformanceLiveStatus, PlaylistTempoMap,
         PlaylistTrack, PlaylistTrackMotion, PlaylistTrackPerformanceParameter, PlaylistTrackPress,
-        PlaylistTrackSync, PlaylistVst3ParameterLink, PluginCandidate, PluginFormat,
-        ProjectPlaylistAudioClipEnvelope, TimeSelectionShift, TouchGesture, TouchTapTracker,
-        TouchZoomConfig, WINDOW_LAYOUT_PRESETS_HEADER, WindowLayoutPreset,
-        audio_recording_start_tick_with_offset, built_in_midi_controller_templates,
-        candidate_live_mixer_send_key, candidate_matches_vst_identity, candidate_mixer_controls,
+        PlaylistTrackSync, PlaylistVst3MixerEffectParameterLink, PlaylistVst3ParameterLink,
+        PluginCandidate, PluginFormat, ProjectPlaylistAudioClipEnvelope, TimeSelectionShift,
+        TouchGesture, TouchTapTracker, TouchZoomConfig, WINDOW_LAYOUT_PRESETS_HEADER,
+        WindowLayoutPreset, audio_recording_start_tick_with_offset,
+        built_in_midi_controller_templates, candidate_live_mixer_send_key,
+        candidate_matches_vst_identity, candidate_mixer_controls,
         candidate_mixer_stereo_separation, detect_chord_name, detect_piano_roll_channel_scale,
         detect_piano_roll_scale, encode_midi_device_id, encode_midi_device_selections,
         encode_midi_output_routes, first_available_playlist_track,
@@ -71911,8 +72309,9 @@ mod tests {
         parse_midi_mixer_control_mappings, parse_midi_output_programs, parse_midi_output_routes,
         parse_midi_output_values, parse_midi_vst3_parameter_mappings,
         parse_pattern_vst3_parameter_links, parse_playlist_audio_clip_envelopes,
-        parse_playlist_vst3_parameter_links, parse_window_layout_presets,
-        pattern_color_from_random_index, pattern_lfo_loop_length_ticks, pattern_loop_frame_at_tick,
+        parse_playlist_vst3_mixer_effect_parameter_links, parse_playlist_vst3_parameter_links,
+        parse_window_layout_presets, pattern_color_from_random_index,
+        pattern_lfo_loop_length_ticks, pattern_loop_frame_at_tick,
         pattern_loop_handoff_tick_at_frame, pattern_loop_tick_at_frame,
         pattern_vst3_parameter_automation_for_channel, pattern_vst3_parameter_link_for_target,
         piano_roll_color_group_note_ids, piano_roll_controller_stroke_points,
@@ -71935,22 +72334,26 @@ mod tests {
         playlist_signature_at_tick, playlist_song_length_bst_components,
         playlist_song_position_bst_components, playlist_song_position_label,
         playlist_track_group_range, playlist_track_is_hidden,
+        playlist_vst3_mixer_effect_parameter_link_for_target,
         playlist_vst3_parameter_link_for_target, random_pattern_color, recolor_piano_roll_notes,
         record_pattern_controller_points, recorded_pattern_clip_required_length,
         recording_input_targets, remove_midi_vst3_parameter_mapping,
-        remove_pattern_vst3_parameter_link, remove_playlist_vst3_parameter_link,
-        sample_editor_selection_for_drag, serialize_internal_lfo_parameter_links,
-        serialize_midi_controller_templates, serialize_midi_mixer_control_mappings,
-        serialize_midi_vst3_parameter_mappings, serialize_pattern_vst3_parameter_links,
-        serialize_playlist_audio_clip_envelopes, serialize_playlist_vst3_parameter_links,
-        serialize_window_layout_presets, should_auto_connect_midi_input,
-        should_auto_connect_midi_output, snap_note_tick, snap_piano_roll_key_to_scale,
-        snap_recorded_midi_notes_to_scale, toggle_piano_roll_note_group_selection,
-        touch_pan_zoom_scroll_offset, track_two_finger_tap, update_channel_rack_selection,
-        update_layer_child_selection, update_piano_roll_box_selection,
-        upsert_internal_lfo_parameter_link, upsert_midi_mixer_control_mapping,
-        upsert_midi_vst3_parameter_mapping, upsert_pattern_vst3_parameter_link,
-        upsert_playlist_audio_clip_envelope, upsert_playlist_vst3_parameter_link, zoom_to_fit,
+        remove_pattern_vst3_parameter_link, remove_playlist_vst3_mixer_effect_parameter_link,
+        remove_playlist_vst3_parameter_link, sample_editor_selection_for_drag,
+        serialize_internal_lfo_parameter_links, serialize_midi_controller_templates,
+        serialize_midi_mixer_control_mappings, serialize_midi_vst3_parameter_mappings,
+        serialize_pattern_vst3_parameter_links, serialize_playlist_audio_clip_envelopes,
+        serialize_playlist_vst3_mixer_effect_parameter_links,
+        serialize_playlist_vst3_parameter_links, serialize_window_layout_presets,
+        should_auto_connect_midi_input, should_auto_connect_midi_output, snap_note_tick,
+        snap_piano_roll_key_to_scale, snap_recorded_midi_notes_to_scale,
+        toggle_piano_roll_note_group_selection, touch_pan_zoom_scroll_offset, track_two_finger_tap,
+        update_channel_rack_selection, update_layer_child_selection,
+        update_piano_roll_box_selection, upsert_internal_lfo_parameter_link,
+        upsert_midi_mixer_control_mapping, upsert_midi_vst3_parameter_mapping,
+        upsert_pattern_vst3_parameter_link, upsert_playlist_audio_clip_envelope,
+        upsert_playlist_vst3_mixer_effect_parameter_link, upsert_playlist_vst3_parameter_link,
+        zoom_to_fit,
     };
 
     #[test]
@@ -73907,7 +74310,7 @@ mod tests {
         };
         let mut links = vec![link, other_source.clone()];
         upsert_playlist_vst3_parameter_link(&mut links, replacement.clone());
-        assert_eq!(links, vec![other_source.clone(), replacement]);
+        assert_eq!(links, vec![other_source.clone(), replacement.clone()]);
         assert_eq!(
             playlist_vst3_parameter_link_for_target(&links, &project_path, 5, &target),
             Some(&links[1])
@@ -73919,6 +74322,67 @@ mod tests {
 
         remove_playlist_vst3_parameter_link(&mut links, &project_path, 5, &target);
         assert_eq!(links, vec![other_source]);
+    }
+
+    #[test]
+    fn playlist_vst3_mixer_effect_parameter_links_round_trip_by_slot_and_source() {
+        let project_path = std::env::temp_dir().join("effect automation project 雪.flp");
+        let target = MidiVst3MixerEffectParameterTarget {
+            insert_ordinal: 12,
+            slot_index: 4,
+            plugin_uid: "com.example.effect\tuid".to_owned(),
+            parameter_id: 91,
+            parameter_name: "Room size 雪".to_owned(),
+        };
+        let link = PlaylistVst3MixerEffectParameterLink {
+            project_path: project_path.to_string_lossy().into_owned(),
+            automation_channel_id: 7,
+            target: target.clone(),
+        };
+        let other_source = PlaylistVst3MixerEffectParameterLink {
+            automation_channel_id: 8,
+            ..link.clone()
+        };
+        let encoded = serialize_playlist_vst3_mixer_effect_parameter_links(&[
+            link.clone(),
+            other_source.clone(),
+        ]);
+        assert_eq!(
+            parse_playlist_vst3_mixer_effect_parameter_links(&encoded),
+            vec![link.clone(), other_source.clone()]
+        );
+
+        let replacement = PlaylistVst3MixerEffectParameterLink {
+            target: MidiVst3MixerEffectParameterTarget {
+                parameter_name: "Room Size".to_owned(),
+                ..target.clone()
+            },
+            ..link.clone()
+        };
+        let mut links = vec![link, other_source.clone()];
+        upsert_playlist_vst3_mixer_effect_parameter_link(&mut links, replacement.clone());
+        assert_eq!(links, vec![other_source.clone(), replacement.clone()]);
+        assert_eq!(
+            playlist_vst3_mixer_effect_parameter_link_for_target(&links, &project_path, 7, &target),
+            Some(&links[1])
+        );
+        assert_eq!(
+            playlist_vst3_mixer_effect_parameter_link_for_target(&links, &project_path, 8, &target),
+            Some(&links[0])
+        );
+
+        remove_playlist_vst3_mixer_effect_parameter_link(&mut links, &project_path, 7, &target);
+        assert_eq!(links, vec![other_source]);
+
+        let invalid_slot = PlaylistVst3MixerEffectParameterLink {
+            target: MidiVst3MixerEffectParameterTarget {
+                slot_index: 10,
+                ..target
+            },
+            ..replacement
+        };
+        upsert_playlist_vst3_mixer_effect_parameter_link(&mut links, invalid_slot);
+        assert_eq!(links.len(), 1);
     }
 
     #[test]

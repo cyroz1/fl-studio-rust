@@ -3069,8 +3069,9 @@ fn stream_playlist_with_vst3_to_device_from_frame_inner(
 /// Sampler, and VST3 event timing. Automatic PDC aligns supported direct-to-Master sources using
 /// loaded VST3 instrument latency. Supported direct and paired send routes apply recognized
 /// insert mute/solo and signal transforms; the summary includes their pre-effect insert peaks.
-/// Effect processing, parameter automation, manual PDC, sidechain routing, and PDC through effect
-/// or send chains remain unsupported.
+/// The attached VST3 processor applies supported instrument and Mixer effect chains, route PDC,
+/// and linked type-5 Automation Clip parameters. Native effect formats, other effect automation
+/// links, and FL Studio output comparison remain incomplete.
 pub fn render_playlist_with_vst3_to_wav_cancellable(
     document: &FlpDocument,
     project_path: impl AsRef<Path>,
@@ -3728,9 +3729,9 @@ fn render_playlist_with_vst3_cancellable(
 /// sends, insert level/pan transforms, mute/solo state, and route PDC. Only recognized, enabled
 /// inserts routed from a project channel are written. The optional Master stem uses the final
 /// supported mix after Master controls and loaded VST3 Master effects. The optional Current stem
-/// uses its selected insert's pre-effect bus. Native effect formats, effect parameter automation,
-/// PDC silence trimming uses each supported route's known startup delay, and unsupported route types
-/// are not included.
+/// uses its selected insert's pre-effect bus. Linked type-5 Automation Clips drive loaded VST3
+/// effect parameters. Native effect formats, other effect automation links, unsupported route
+/// types, and PDC silence trimming remain incomplete.
 pub fn render_playlist_mixer_stems_with_vst3_cancellable(
     document: &FlpDocument,
     project_path: impl AsRef<Path>,

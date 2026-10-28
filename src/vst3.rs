@@ -326,6 +326,8 @@ pub struct Vst3PlaylistAutomationSources {
     pub pattern_clips: BTreeMap<(u16, u16), Vec<Vst3ParameterAutomation>>,
     /// Automation Clip curves keyed by `(automation_channel_id, VST3 channel_id)`.
     pub automation_clips: BTreeMap<(u16, u16), Vec<Vst3ParameterAutomation>>,
+    /// Automation Clip curves keyed by `(automation_channel_id, Mixer insert, effect slot)`.
+    pub mixer_effect_automation_clips: BTreeMap<(u16, usize, u16), Vec<Vst3ParameterAutomation>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -622,6 +624,7 @@ struct PlaylistMixerEffectStream {
     input_channels: usize,
     output_channels: usize,
     sidechain_inputs: Vec<PlaylistMixerEffectSidechainInput>,
+    parameter_automation: Vec<PreparedParameterAutomation>,
     wet_mix: f32,
     saved_enabled: bool,
     saved_insert_effects_enabled: bool,
@@ -801,6 +804,7 @@ pub struct Vst3PlaylistStreamProcessor {
     mixer_effect_route_delay_frames: u64,
     mixer_effect_pdc_latency_frames: u64,
     mixer_effect_output_delay: StereoFrameDelay,
+    mixer_effect_frame: u64,
     mixer_effect_meter_input_delays: Vec<StereoFrameDelay>,
     mixer_effect_input_delays: Vec<StereoFrameDelay>,
     mixer_post_effect_stem_delays: Vec<StereoFrameDelay>,
@@ -1790,7 +1794,21 @@ impl Vst3PlaylistStreamProcessor {
                 }
             }
         }
-        self.process_mixer_effects(output, meter_buses, effect_input_buses, post_effect_buses)?;
+        let block_start_frame = self.mixer_effect_frame;
+        self.process_mixer_effects(
+            output,
+            meter_buses,
+            effect_input_buses,
+            post_effect_buses,
+            block_start_frame,
+        )?;
+        self.mixer_effect_frame = self
+            .mixer_effect_frame
+            .checked_add(
+                u64::try_from(frame_count)
+                    .map_err(|_| "Mixer effect automation frame count overflow".to_owned())?,
+            )
+            .ok_or_else(|| "Mixer effect automation frame position overflow".to_owned())?;
         Ok(())
     }
 
@@ -1800,6 +1818,7 @@ impl Vst3PlaylistStreamProcessor {
         mut meter_buses: Option<&mut [f32]>,
         mut effect_input_buses: Option<&mut [f32]>,
         mut post_effect_buses: Option<&'a mut [f32]>,
+        block_start_frame: u64,
     ) -> Result<(), String> {
         if !output.len().is_multiple_of(2) {
             return Err("VST3 Mixer effect buffer must contain stereo frames".to_owned());
@@ -1870,6 +1889,7 @@ impl Vst3PlaylistStreamProcessor {
                     output,
                     post_effect_buses.as_deref(),
                     samples_per_track,
+                    block_start_frame,
                 )?;
                 continue;
             }
@@ -1910,6 +1930,7 @@ impl Vst3PlaylistStreamProcessor {
                 &mut self.mixer_effect_scratch,
                 post_effect_buses.as_deref(),
                 samples_per_track,
+                block_start_frame,
             )?;
             chain
                 .dry_reference_delay
@@ -2095,6 +2116,7 @@ fn process_playlist_mixer_effect_chain(
     samples: &mut [f32],
     post_effect_buses: Option<&[f32]>,
     samples_per_track: usize,
+    block_start_frame: u64,
 ) -> Result<(), String> {
     if effects.is_empty() {
         return Ok(());
@@ -2104,10 +2126,17 @@ fn process_playlist_mixer_effect_chain(
     }
     let chain_block_frames = effects[0].block_size.max(1);
     for (chain_block_index, chain_block) in samples.chunks_mut(chain_block_frames * 2).enumerate() {
-        let chain_block_start_frame = chain_block_index * chain_block_frames;
+        let chain_block_offset = chain_block_index * chain_block_frames;
+        let chain_block_start_frame = block_start_frame
+            .checked_add(
+                u64::try_from(chain_block_offset)
+                    .map_err(|_| "Mixer effect automation frame offset overflow".to_owned())?,
+            )
+            .ok_or_else(|| "Mixer effect automation frame position overflow".to_owned())?;
         for effect in effects.iter_mut() {
             let max_frames = effect.block_size.max(1);
             let mut effect_block_start_frame = chain_block_start_frame;
+            let mut effect_block_offset = chain_block_offset;
             for block in chain_block.chunks_mut(max_frames * 2) {
                 effect.begin_wet_mix_block();
                 let frame_count = block.len() / 2;
@@ -2132,7 +2161,7 @@ fn process_playlist_mixer_effect_chain(
                     &mut effect.buffers.inputs,
                     post_effect_buses,
                     samples_per_track,
-                    effect_block_start_frame,
+                    effect_block_offset,
                     frame_count,
                 )?;
                 {
@@ -2144,6 +2173,12 @@ fn process_playlist_mixer_effect_chain(
                         &effect.buffers,
                         plugin.sample_rate(),
                         plugin.block_size(),
+                    )?;
+                    set_parameter_automation_for_block(
+                        &mut plugin,
+                        &effect.parameter_automation,
+                        effect_block_start_frame,
+                        frame_count,
                     )?;
                     plugin
                         .process_bus_audio(&mut effect.buffers)
@@ -2176,7 +2211,14 @@ fn process_playlist_mixer_effect_chain(
                     frame[0] = dry_left * dry_gain + wet_left * wet_mix;
                     frame[1] = dry_right * dry_gain + wet_right * wet_mix;
                 }
-                effect_block_start_frame += frame_count;
+                effect_block_start_frame = effect_block_start_frame
+                    .checked_add(
+                        u64::try_from(frame_count).map_err(|_| {
+                            "Mixer effect automation frame count overflow".to_owned()
+                        })?,
+                    )
+                    .ok_or_else(|| "Mixer effect automation frame position overflow".to_owned())?;
+                effect_block_offset += frame_count;
             }
         }
     }
@@ -4995,6 +5037,11 @@ impl Vst3HostRuntime {
         automation_sources: &Vst3PlaylistAutomationSources,
         live_mix_changes: bool,
     ) -> Result<Vst3PlaylistStreamProcessor, String> {
+        let effect_automation = expand_playlist_mixer_effect_parameter_automation(
+            document,
+            options.clone(),
+            &automation_sources.mixer_effect_automation_clips,
+        )?;
         let mut processor = self.prepare_playlist_stream_with_automation_sources(
             document,
             options,
@@ -5008,6 +5055,7 @@ impl Vst3HostRuntime {
             &mut processor,
             true,
             live_mix_changes,
+            &effect_automation,
         )?;
         Ok(processor)
     }
@@ -5100,6 +5148,11 @@ impl Vst3HostRuntime {
         include_plugin_reported_tails: bool,
         automation_sources: &Vst3PlaylistAutomationSources,
     ) -> Result<Vst3PlaylistStreamProcessor, String> {
+        let effect_automation = expand_playlist_mixer_effect_parameter_automation(
+            document,
+            options.clone(),
+            &automation_sources.mixer_effect_automation_clips,
+        )?;
         let mut processor = self.prepare_playlist_performance_stream_with_automation_sources(
             document,
             options,
@@ -5114,6 +5167,7 @@ impl Vst3HostRuntime {
             &mut processor,
             false,
             true,
+            &effect_automation,
         )?;
         Ok(processor)
     }
@@ -5408,6 +5462,7 @@ impl Vst3HostRuntime {
             mixer_effect_route_delay_frames: 0,
             mixer_effect_pdc_latency_frames: 0,
             mixer_effect_output_delay: StereoFrameDelay::default(),
+            mixer_effect_frame: 0,
             mixer_effect_meter_input_delays: Vec::new(),
             mixer_effect_input_delays: Vec::new(),
             mixer_post_effect_stem_delays: Vec::new(),
@@ -5455,6 +5510,7 @@ impl Vst3HostRuntime {
             &mut processor,
             false,
             true,
+            &BTreeMap::new(),
         )?;
         Ok(processor)
     }
@@ -5466,6 +5522,7 @@ impl Vst3HostRuntime {
         processor: &mut Vst3PlaylistStreamProcessor,
         include_effect_tails: bool,
         live_mix_changes: bool,
+        effect_parameter_automation: &BTreeMap<(usize, u16), Vec<Vst3PlaylistParameterAutomation>>,
     ) -> Result<(), String> {
         let inserts = document.mixer_inserts();
         let effect_slots = document.mixer_effect_slots();
@@ -5635,6 +5692,24 @@ impl Vst3HostRuntime {
                 }
                 let dry_delay_line = StereoFrameDelay::new(dry_delay_frames)?;
                 mixer_effect_dry_delay_frames = next_dry_delay_frames;
+                let parameter_automation = effect_parameter_automation
+                    .get(&key)
+                    .map(|lanes| {
+                        let prepared = prepare_playlist_parameter_automation(
+                            lanes,
+                            &processor.tempo_map,
+                            output_sample_rate,
+                            processor.content_frames,
+                        )?;
+                        validate_parameter_automation_block_density(
+                            &prepared,
+                            block_size,
+                            processor.content_frames,
+                        )?;
+                        Ok::<_, String>(prepared)
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
                 let reported_tail = reported_tail_seconds(tail_samples, sample_rate)
                     .map(|seconds| (seconds * f64::from(output_sample_rate)).ceil() as u64)
                     .unwrap_or(0);
@@ -5654,6 +5729,7 @@ impl Vst3HostRuntime {
                     input_channels,
                     output_channels,
                     sidechain_inputs: Vec::new(),
+                    parameter_automation,
                     wet_mix,
                     saved_enabled,
                     saved_insert_effects_enabled,
@@ -6076,6 +6152,7 @@ impl Vst3HostRuntime {
             mixer_effect_route_delay_frames: 0,
             mixer_effect_pdc_latency_frames: 0,
             mixer_effect_output_delay: StereoFrameDelay::default(),
+            mixer_effect_frame: 0,
             mixer_effect_meter_input_delays: Vec::new(),
             mixer_effect_input_delays: Vec::new(),
             mixer_post_effect_stem_delays: Vec::new(),
@@ -6531,6 +6608,139 @@ fn expand_automation_clip_parameter_automation_for_clip(
         }
     }
     Ok(automation_by_channel)
+}
+
+fn expand_playlist_mixer_effect_parameter_automation(
+    document: &FlpDocument,
+    options: PlaylistRenderOptions,
+    automation_clip_automation: &BTreeMap<(u16, usize, u16), Vec<Vst3ParameterAutomation>>,
+) -> Result<BTreeMap<(usize, u16), Vec<Vst3PlaylistParameterAutomation>>, String> {
+    if automation_clip_automation.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let ppq = document.header().ppq();
+    if ppq == 0 {
+        return Err("project PPQ must be greater than zero".to_owned());
+    }
+    let arrangement = document
+        .arrangements()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|arrangement| arrangement.id == options.arrangement_id)
+        .ok_or_else(|| format!("arrangement {} was not found", options.arrangement_id))?;
+    let disabled_track_ids = document
+        .playlist_tracks()
+        .into_iter()
+        .filter(|track| track.enabled == Some(false))
+        .map(|track| track.id)
+        .collect::<BTreeSet<_>>();
+    let clip_is_muted = |clip: &crate::PlaylistClip| {
+        if clip.is_muted() {
+            return true;
+        }
+        let track_id = clip.playlist_track_id();
+        if let Some((first_track, last_track)) = options.soloed_playlist_track_range {
+            !track_id.is_some_and(|track_id| (first_track..=last_track).contains(&track_id))
+        } else {
+            track_id.is_some_and(|track_id| disabled_track_ids.contains(&track_id))
+        }
+    };
+    let mut points_by_lane =
+        BTreeMap::<(usize, u16, u32), Vec<(u64, usize, usize, usize, f64)>>::new();
+    let mut expanded_point_count = 0usize;
+
+    for (clip_index, clip) in arrangement.clips.iter().enumerate() {
+        if clip_is_muted(clip)
+            || clip.length_ticks == 0
+            || clip
+                .scale
+                .is_some_and(|scale| !scale.is_finite() || (scale - 1.0).abs() > 1e-9)
+        {
+            continue;
+        }
+        let PlaylistClipTarget::Channel {
+            id: automation_channel_id,
+        } = clip.target()
+        else {
+            continue;
+        };
+        let clip_length = u64::from(clip.length_ticks);
+        for ((linked_automation_channel_id, insert_ordinal, slot_index), lanes) in
+            automation_clip_automation
+        {
+            if *linked_automation_channel_id != automation_channel_id {
+                continue;
+            }
+            for (lane_index, lane) in lanes.iter().enumerate() {
+                for (point_index, point) in lane.points.iter().enumerate() {
+                    if !point.position_beats.is_finite()
+                        || point.position_beats < 0.0
+                        || !point.value.is_finite()
+                        || !(0.0..=1.0).contains(&point.value)
+                    {
+                        continue;
+                    }
+                    let point_tick = point.position_beats * f64::from(ppq);
+                    if !point_tick.is_finite() || point_tick >= u64::MAX as f64 {
+                        continue;
+                    }
+                    let relative_tick = point_tick.round() as u64;
+                    if relative_tick >= clip_length {
+                        continue;
+                    }
+                    let absolute_tick = u64::from(clip.position_ticks)
+                        .checked_add(relative_tick)
+                        .ok_or_else(|| {
+                        "Playlist automation point position overflow".to_owned()
+                    })?;
+                    expanded_point_count = expanded_point_count
+                        .checked_add(1)
+                        .filter(|count| *count <= MAX_VST3_AUTOMATION_POINTS)
+                        .ok_or_else(|| {
+                            format!(
+                                "Playlist VST3 automation exceeds {MAX_VST3_AUTOMATION_POINTS} points"
+                            )
+                        })?;
+                    points_by_lane
+                        .entry((*insert_ordinal, *slot_index, lane.parameter_id))
+                        .or_default()
+                        .push((
+                            absolute_tick,
+                            clip_index,
+                            lane_index,
+                            point_index,
+                            point.value,
+                        ));
+                }
+            }
+        }
+    }
+
+    let mut automation_by_effect =
+        BTreeMap::<(usize, u16), Vec<Vst3PlaylistParameterAutomation>>::new();
+    for ((insert_ordinal, slot_index, parameter_id), mut points) in points_by_lane {
+        points.sort_by_key(|point| (point.0, point.1, point.2, point.3));
+        let mut unique_points = Vec::<Vst3PlaylistAutomationPoint>::with_capacity(points.len());
+        for (tick, _, _, _, value) in points {
+            if let Some(previous) = unique_points.last_mut()
+                && previous.tick == tick
+            {
+                previous.value = value;
+            } else {
+                unique_points.push(Vst3PlaylistAutomationPoint { tick, value });
+            }
+        }
+        if !unique_points.is_empty() {
+            automation_by_effect
+                .entry((insert_ordinal, slot_index))
+                .or_default()
+                .push(Vst3PlaylistParameterAutomation {
+                    parameter_id,
+                    points: unique_points,
+                });
+        }
+    }
+    Ok(automation_by_effect)
 }
 
 fn prepare_playlist_parameter_automation(
@@ -9220,6 +9430,56 @@ mod tests {
         assert_eq!(expanded[&4].len(), 1);
         assert_eq!(
             expanded[&4][0].points,
+            vec![
+                Vst3PlaylistAutomationPoint {
+                    tick: 408,
+                    value: 0.2,
+                },
+                Vst3PlaylistAutomationPoint {
+                    tick: 480,
+                    value: 0.8,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn playlist_automation_clip_parameter_automation_targets_mixer_effects() {
+        let document = playlist_parameter_automation_fixture();
+        let automation = BTreeMap::from([(
+            (11, 1, 2),
+            vec![Vst3ParameterAutomation {
+                parameter_id: 81,
+                points: vec![
+                    Vst3AutomationPoint {
+                        position_beats: 0.25,
+                        value: 0.2,
+                    },
+                    Vst3AutomationPoint {
+                        position_beats: 1.0,
+                        value: 0.8,
+                    },
+                    Vst3AutomationPoint {
+                        position_beats: 3.0,
+                        value: 0.3,
+                    },
+                ],
+            }],
+        )]);
+        let expanded = expand_playlist_mixer_effect_parameter_automation(
+            &document,
+            PlaylistRenderOptions {
+                arrangement_id: 3,
+                ..PlaylistRenderOptions::default()
+            },
+            &automation,
+        )
+        .expect("Automation Clip parameter automation should target the Mixer effect");
+
+        assert_eq!(expanded.len(), 1);
+        assert_eq!(expanded[&(1, 2)].len(), 1);
+        assert_eq!(
+            expanded[&(1, 2)][0].points,
             vec![
                 Vst3PlaylistAutomationPoint {
                     tick: 408,
