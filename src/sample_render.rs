@@ -12844,6 +12844,7 @@ struct SamplerVoiceEngine<'a> {
     next_note: usize,
     next_live_note: usize,
     voices: Vec<Option<SamplerVoice>>,
+    last_portamento_values_by_group: HashMap<(u16, u8), SamplerPortamentoValues>,
     release_frames: usize,
     output_sample_rate: u32,
     resampling_quality: ResamplingQuality,
@@ -12909,6 +12910,13 @@ struct SamplerNoteSlide {
     target_velocity_gain: f32,
     start_pan_value: f32,
     target_pan_value: f32,
+}
+
+#[derive(Clone, Copy)]
+struct SamplerPortamentoValues {
+    pitch_cents: f64,
+    velocity_gain: f32,
+    pan_value: f32,
 }
 
 fn update_sampler_voice_slide(
@@ -13003,6 +13011,7 @@ impl<'a> SamplerVoiceEngine<'a> {
             next_note: 0,
             next_live_note: 0,
             voices: std::iter::repeat_with(|| None).take(voice_limit).collect(),
+            last_portamento_values_by_group: HashMap::new(),
             release_frames,
             output_sample_rate,
             resampling_quality,
@@ -13344,31 +13353,10 @@ impl<'a> SamplerVoiceEngine<'a> {
         let note_portamento_enabled =
             source.portamento_enabled != (note.midi_channel & PATTERN_NOTE_PORTA_FLAG != 0);
         let portamento_start = if note_portamento_enabled || source.mono_enabled {
-            let pitch_bend_cents = self.pitch_bend_cents;
-            let pan_law = self.pan_law;
-            self.voices
-                .iter_mut()
-                .filter_map(Option::as_mut)
-                .filter(|voice| {
-                    voice.channel_id == note.channel_id
-                        && voice.midi_channel == note_midi_channel
-                        && !voice.key_released
-                        && !voice.release_started
-                        && voice
-                            .stop_frame
-                            .is_none_or(|stop_frame| stop_frame > note.start_frame)
-                })
-                .max_by_key(|voice| voice.started_frame)
-                .map(|voice| {
-                    update_sampler_voice_slide(voice, note.start_frame, pitch_bend_cents, pan_law);
-                    (
-                        f64::from(voice.key) * 100.0
-                            + f64::from(voice.note_fine_pitch_offset_cents)
-                            + voice.pitch_offset_cents,
-                        voice.velocity_gain,
-                        voice.note_pan_value,
-                    )
-                })
+            self.last_portamento_values_by_group
+                .get(&(note.channel_id, note_midi_channel))
+                .copied()
+                .map(|values| (values.pitch_cents, values.velocity_gain, values.pan_value))
         } else {
             None
         };
@@ -13532,6 +13520,14 @@ impl<'a> SamplerVoiceEngine<'a> {
             release_total_frames: None,
             release_cosine: false,
         });
+        self.last_portamento_values_by_group.insert(
+            (note.channel_id, note_midi_channel),
+            SamplerPortamentoValues {
+                pitch_cents: f64::from(note.key) * 100.0 + f64::from(note.fine_pitch_offset_cents),
+                velocity_gain,
+                pan_value: note_pan_value,
+            },
+        );
         if let Some((start_pitch_cents, start_velocity_gain, start_pan_value)) = portamento_start
             && note.slide_duration_frames > 0
         {
