@@ -123,11 +123,12 @@ use midi_output::{
 };
 use midi_script::{
     MidiControllerScript, MidiScriptTransportState, MixerSendRouteSnapshot, MixerTrackFlag,
-    MixerTrackParameter, SCRIPT_BEAT_INDICATOR_BAR, SCRIPT_BEAT_INDICATOR_BEAT,
-    SCRIPT_BEAT_INDICATOR_OFF, SCRIPT_MIXER_SCROLL_TO_MAKE_VISIBLE, SCRIPT_PROJECT_LOAD_ERROR,
-    SCRIPT_PROJECT_LOAD_OK, SCRIPT_PROJECT_LOAD_START, SCRIPT_TRANSPORT_PATTERN_MODE,
-    SCRIPT_TRANSPORT_PLAYING, SCRIPT_TRANSPORT_RECORDING, absolute_song_position_ticks,
-    discover_midi_scripts, find_script_for_device, normalized_song_position, song_position_ticks,
+    MixerTrackParameter, PlaylistTrackPerformanceParameter, SCRIPT_BEAT_INDICATOR_BAR,
+    SCRIPT_BEAT_INDICATOR_BEAT, SCRIPT_BEAT_INDICATOR_OFF, SCRIPT_MIXER_SCROLL_TO_MAKE_VISIBLE,
+    SCRIPT_PROJECT_LOAD_ERROR, SCRIPT_PROJECT_LOAD_OK, SCRIPT_PROJECT_LOAD_START,
+    SCRIPT_TRANSPORT_PATTERN_MODE, SCRIPT_TRANSPORT_PLAYING, SCRIPT_TRANSPORT_RECORDING,
+    absolute_song_position_ticks, discover_midi_scripts, find_script_for_device,
+    normalized_song_position, song_position_ticks,
 };
 use midi_thru::{MidiThruSettings, MidiThruWorker};
 
@@ -27371,6 +27372,134 @@ impl DawUi {
         }
     }
 
+    fn increment_midi_script_playlist_track_mode(
+        &mut self,
+        track_id: u32,
+        parameter: PlaylistTrackPerformanceParameter,
+        increment: i32,
+    ) {
+        if increment == 0 {
+            return;
+        }
+        if self.document.is_none() {
+            self.status = "Open a project to edit Playlist Performance Mode".to_owned();
+            return;
+        }
+        if !self.midi_script_playlist_track_ids().contains(&track_id) {
+            self.status = format!(
+                "Could not change Playlist track {track_id} Performance Mode: track is outside the supported rows"
+            );
+            return;
+        }
+        let arrangements = self
+            .document
+            .as_ref()
+            .and_then(|document| document.arrangements().ok())
+            .unwrap_or_default();
+        let Some(arrangement_id) = arrangements
+            .iter()
+            .find(|arrangement| Some(arrangement.id) == self.selected_arrangement)
+            .or_else(|| arrangements.first())
+            .map(|arrangement| arrangement.id)
+        else {
+            self.status = "Open a project to edit Playlist Performance Mode".to_owned();
+            return;
+        };
+        let tracks = self
+            .document
+            .as_ref()
+            .map(|document| document.playlist_tracks_in_arrangement(arrangement_id))
+            .unwrap_or_default();
+        let current = midi_script_playlist_track_performance_modes(&[track_id], &tracks)
+            .first()
+            .map(|modes| modes[parameter.mode_index()])
+            .flatten();
+        let Some(next_value) =
+            midi_script_increment_playlist_performance_mode(current, parameter, increment)
+        else {
+            self.status = format!(
+                "Could not change Playlist track {track_id} Performance Mode: saved mode is unavailable"
+            );
+            return;
+        };
+        if Some(next_value) == current {
+            return;
+        }
+        let edit = match parameter {
+            PlaylistTrackPerformanceParameter::Motion => PlaylistTrackEdit {
+                motion: Some(match next_value {
+                    0 => PlaylistTrackMotion::Stay,
+                    1 => PlaylistTrackMotion::OneShot,
+                    2 => PlaylistTrackMotion::MarchWrap,
+                    3 => PlaylistTrackMotion::MarchStay,
+                    4 => PlaylistTrackMotion::MarchStop,
+                    5 => PlaylistTrackMotion::Random,
+                    _ => PlaylistTrackMotion::ExclusiveRandom,
+                }),
+                ..PlaylistTrackEdit::default()
+            },
+            PlaylistTrackPerformanceParameter::Press => PlaylistTrackEdit {
+                press: Some(match next_value {
+                    0 => PlaylistTrackPress::Retrigger,
+                    1 => PlaylistTrackPress::HoldStop,
+                    2 => PlaylistTrackPress::HoldMotion,
+                    _ => PlaylistTrackPress::Latch,
+                }),
+                ..PlaylistTrackEdit::default()
+            },
+            PlaylistTrackPerformanceParameter::PositionSync => PlaylistTrackEdit {
+                position_sync: Some(match next_value {
+                    0 => PlaylistTrackSync::Off,
+                    1 => PlaylistTrackSync::QuarterBeat,
+                    2 => PlaylistTrackSync::HalfBeat,
+                    3 => PlaylistTrackSync::Beat,
+                    4 => PlaylistTrackSync::TwoBeats,
+                    5 => PlaylistTrackSync::FourBeats,
+                    _ => PlaylistTrackSync::Auto,
+                }),
+                ..PlaylistTrackEdit::default()
+            },
+            PlaylistTrackPerformanceParameter::TriggerSync => PlaylistTrackEdit {
+                trigger_sync: Some(match next_value {
+                    0 => PlaylistTrackSync::Off,
+                    1 => PlaylistTrackSync::QuarterBeat,
+                    2 => PlaylistTrackSync::HalfBeat,
+                    3 => PlaylistTrackSync::Beat,
+                    4 => PlaylistTrackSync::TwoBeats,
+                    5 => PlaylistTrackSync::FourBeats,
+                    _ => PlaylistTrackSync::Auto,
+                }),
+                ..PlaylistTrackEdit::default()
+            },
+        };
+        let result = self.document.as_mut().map(|document| {
+            document.edit_playlist_track_in_arrangement(arrangement_id, track_id, edit)
+        });
+        match result {
+            Some(Ok(())) => {
+                self.stop_project_playback();
+                self.dirty = true;
+                self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+                let parameter_name = match parameter {
+                    PlaylistTrackPerformanceParameter::Motion => "Motion",
+                    PlaylistTrackPerformanceParameter::Press => "Press",
+                    PlaylistTrackPerformanceParameter::PositionSync => "Position Sync",
+                    PlaylistTrackPerformanceParameter::TriggerSync => "Trigger Sync",
+                };
+                self.status = format!(
+                    "Changed Playlist track {track_id} {parameter_name} mode to {next_value}"
+                );
+            }
+            Some(Err(error)) => {
+                self.status =
+                    format!("Could not change Playlist track {track_id} Performance Mode: {error}");
+            }
+            None => {
+                self.status = "Open a project to edit Playlist Performance Mode".to_owned();
+            }
+        }
+    }
+
     fn merge_selected_playlist_pattern_clips(&mut self) -> bool {
         let Some(arrangement_id) = self.selected_arrangement else {
             self.status = "Select Pattern Clips in the Playlist before merging".to_owned();
@@ -52167,6 +52296,11 @@ impl DawUi {
                 value,
                 in_group,
             } => self.set_midi_script_playlist_track_solo(track_id, value, in_group),
+            MidiTransportCommand::IncrementPlaylistTrackMode {
+                track_id,
+                parameter,
+                increment,
+            } => self.increment_midi_script_playlist_track_mode(track_id, parameter, increment),
             MidiTransportCommand::SelectChannel(channel_id) => {
                 self.set_midi_script_channel_selection(channel_id);
             }
@@ -69767,6 +69901,17 @@ fn midi_script_playlist_track_performance_modes(
         .collect()
 }
 
+fn midi_script_increment_playlist_performance_mode(
+    current: Option<u8>,
+    parameter: PlaylistTrackPerformanceParameter,
+    increment: i32,
+) -> Option<u8> {
+    let current = current.filter(|value| *value <= parameter.max_value())?;
+    let next =
+        (i64::from(current) + i64::from(increment)).clamp(0, i64::from(parameter.max_value()));
+    u8::try_from(next).ok()
+}
+
 fn midi_script_marker_selection_target(
     markers: &[(usize, u32)],
     selected_marker: Option<usize>,
@@ -71166,12 +71311,12 @@ mod tests {
         PianoRollChordStamp, PianoRollGrid, PianoRollScale, PianoRollSnap,
         PlaylistAudioClipEnvelope, PlaylistAudioClipFadeCurve, PlaylistClip, PlaylistClipDragKind,
         PlaylistClipEdit, PlaylistClipResizeEdge, PlaylistTempoMap, PlaylistTrack,
-        PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync, PlaylistVst3ParameterLink,
-        PluginCandidate, PluginFormat, ProjectPlaylistAudioClipEnvelope, TimeSelectionShift,
-        TouchGesture, TouchTapTracker, TouchZoomConfig, WINDOW_LAYOUT_PRESETS_HEADER,
-        WindowLayoutPreset, audio_recording_start_tick_with_offset,
-        built_in_midi_controller_templates, candidate_live_mixer_send_key,
-        candidate_matches_vst_identity, candidate_mixer_controls,
+        PlaylistTrackMotion, PlaylistTrackPerformanceParameter, PlaylistTrackPress,
+        PlaylistTrackSync, PlaylistVst3ParameterLink, PluginCandidate, PluginFormat,
+        ProjectPlaylistAudioClipEnvelope, TimeSelectionShift, TouchGesture, TouchTapTracker,
+        TouchZoomConfig, WINDOW_LAYOUT_PRESETS_HEADER, WindowLayoutPreset,
+        audio_recording_start_tick_with_offset, built_in_midi_controller_templates,
+        candidate_live_mixer_send_key, candidate_matches_vst_identity, candidate_mixer_controls,
         candidate_mixer_stereo_separation, detect_chord_name, detect_piano_roll_channel_scale,
         detect_piano_roll_scale, encode_midi_device_id, encode_midi_device_selections,
         encode_midi_output_routes, first_available_playlist_track,
@@ -71181,22 +71326,22 @@ mod tests {
         midi_cc_to_mixer_pan_raw, midi_cc_to_mixer_stereo_separation_raw,
         midi_controller_binding_for_device, midi_mixer_button_press_edge,
         midi_mixer_control_for_cc, midi_script_arrangement_time_ticks, midi_script_bar_beat,
-        midi_script_clip_selection_bounds, midi_script_marker_jump_target,
-        midi_script_marker_selection_target, midi_script_mixer_recording_file_names,
-        midi_script_moved_song_position_tick, midi_script_pattern_jog_target,
-        midi_script_playlist_track_activity_levels, midi_script_playlist_track_ids,
-        midi_script_playlist_track_mute_states, midi_script_playlist_track_names,
-        midi_script_playlist_track_performance_modes, midi_script_tempo_jog_target,
-        midi_script_time_position_seconds_to_ticks, midi_vst3_parameter_mapping_for_target,
-        midi_vst3_parameter_mappings_for_cc, next_empty_pattern_id, next_piano_roll_note_group,
-        note_from_grid_position, parse_internal_lfo_parameter_links,
-        parse_midi_control_change_mapping, parse_midi_controller_templates,
-        parse_midi_device_selections, parse_midi_mixer_control_mappings,
-        parse_midi_output_programs, parse_midi_output_routes, parse_midi_output_values,
-        parse_midi_vst3_parameter_mappings, parse_pattern_vst3_parameter_links,
-        parse_playlist_audio_clip_envelopes, parse_playlist_vst3_parameter_links,
-        parse_window_layout_presets, pattern_color_from_random_index,
-        pattern_lfo_loop_length_ticks, pattern_loop_frame_at_tick,
+        midi_script_clip_selection_bounds, midi_script_increment_playlist_performance_mode,
+        midi_script_marker_jump_target, midi_script_marker_selection_target,
+        midi_script_mixer_recording_file_names, midi_script_moved_song_position_tick,
+        midi_script_pattern_jog_target, midi_script_playlist_track_activity_levels,
+        midi_script_playlist_track_ids, midi_script_playlist_track_mute_states,
+        midi_script_playlist_track_names, midi_script_playlist_track_performance_modes,
+        midi_script_tempo_jog_target, midi_script_time_position_seconds_to_ticks,
+        midi_vst3_parameter_mapping_for_target, midi_vst3_parameter_mappings_for_cc,
+        next_empty_pattern_id, next_piano_roll_note_group, note_from_grid_position,
+        parse_internal_lfo_parameter_links, parse_midi_control_change_mapping,
+        parse_midi_controller_templates, parse_midi_device_selections,
+        parse_midi_mixer_control_mappings, parse_midi_output_programs, parse_midi_output_routes,
+        parse_midi_output_values, parse_midi_vst3_parameter_mappings,
+        parse_pattern_vst3_parameter_links, parse_playlist_audio_clip_envelopes,
+        parse_playlist_vst3_parameter_links, parse_window_layout_presets,
+        pattern_color_from_random_index, pattern_lfo_loop_length_ticks, pattern_loop_frame_at_tick,
         pattern_loop_handoff_tick_at_frame, pattern_loop_tick_at_frame,
         pattern_vst3_parameter_automation_for_channel, pattern_vst3_parameter_link_for_target,
         piano_roll_color_group_note_ids, piano_roll_controller_stroke_points,
@@ -71727,6 +71872,50 @@ mod tests {
                 [Some(6), Some(3), Some(4), Some(5)],
                 [None, None, None, None],
             ]
+        );
+    }
+
+    #[test]
+    fn midi_script_playlist_performance_mode_increments_clamp_to_valid_ranges() {
+        assert_eq!(
+            midi_script_increment_playlist_performance_mode(
+                Some(0),
+                PlaylistTrackPerformanceParameter::Motion,
+                -2,
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            midi_script_increment_playlist_performance_mode(
+                Some(5),
+                PlaylistTrackPerformanceParameter::Motion,
+                4,
+            ),
+            Some(6)
+        );
+        assert_eq!(
+            midi_script_increment_playlist_performance_mode(
+                Some(2),
+                PlaylistTrackPerformanceParameter::Press,
+                9,
+            ),
+            Some(3)
+        );
+        assert_eq!(
+            midi_script_increment_playlist_performance_mode(
+                Some(3),
+                PlaylistTrackPerformanceParameter::TriggerSync,
+                -7,
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            midi_script_increment_playlist_performance_mode(
+                None,
+                PlaylistTrackPerformanceParameter::PositionSync,
+                1,
+            ),
+            None
         );
     }
 

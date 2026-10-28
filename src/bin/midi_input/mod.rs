@@ -15,7 +15,7 @@ use midir::{Ignore, MidiInput, MidiInputConnection as MidirInputConnection};
 
 use super::midi_script::{
     MidiControllerScript, MidiScriptRuntime, MidiScriptStopHandle, MidiScriptTransportState,
-    MixerTrackFlag, MixerTrackParameter, ScriptTransportAction,
+    MixerTrackFlag, MixerTrackParameter, PlaylistTrackPerformanceParameter, ScriptTransportAction,
 };
 use flp_rebuild::sample_render::PlaylistTempoMap;
 
@@ -720,6 +720,15 @@ fn queue_script_transport_actions(
                 value,
                 in_group,
             },
+            ScriptTransportAction::IncrementPlaylistTrackMode {
+                track_id,
+                parameter,
+                increment,
+            } => MidiTransportCommand::IncrementPlaylistTrackMode {
+                track_id,
+                parameter,
+                increment,
+            },
             ScriptTransportAction::SelectChannel(channel_id) => {
                 MidiTransportCommand::SelectChannel(channel_id)
             }
@@ -882,6 +891,11 @@ pub enum MidiTransportCommand {
         track_id: u32,
         value: i8,
         in_group: bool,
+    },
+    IncrementPlaylistTrackMode {
+        track_id: u32,
+        parameter: PlaylistTrackPerformanceParameter,
+        increment: i32,
     },
     SelectChannel(u16),
     SetMixerTrackSelection {
@@ -1672,6 +1686,9 @@ pub fn describe_event(event: MidiInputEvent) -> String {
             }
             MidiTransportCommand::SetPlaylistTrackSolo { .. } => {
                 "MIDI script Set Playlist Track Solo".to_owned()
+            }
+            MidiTransportCommand::IncrementPlaylistTrackMode { .. } => {
+                "MIDI script Playlist Performance Mode".to_owned()
             }
             MidiTransportCommand::SelectChannel(_) => "MIDI script Select Channel".to_owned(),
             MidiTransportCommand::SetMixerTrackSelection { .. } => {
@@ -2555,6 +2572,11 @@ mod tests {
                     value: -1,
                     in_group: true,
                 },
+                ScriptTransportAction::IncrementPlaylistTrackMode {
+                    track_id: 2,
+                    parameter: PlaylistTrackPerformanceParameter::Motion,
+                    increment: -1,
+                },
                 ScriptTransportAction::SetPlaylistTrackSelection(Vec::new()),
                 ScriptTransportAction::AddArrangementTimeMarker {
                     tick: 960,
@@ -2616,6 +2638,14 @@ mod tests {
                 track_id: 1,
                 value: -1,
                 in_group: true,
+            })
+        );
+        assert_eq!(
+            transport_receiver.try_recv().unwrap().event,
+            MidiInputEvent::Transport(MidiTransportCommand::IncrementPlaylistTrackMode {
+                track_id: 2,
+                parameter: PlaylistTrackPerformanceParameter::Motion,
+                increment: -1,
             })
         );
         assert_eq!(

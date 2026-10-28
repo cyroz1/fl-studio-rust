@@ -698,6 +698,7 @@ fn midi_input_thru_message(event: MidiInputEvent) -> Option<([u8; 3], usize)> {
             | MidiTransportCommand::SetPlaylistTrackName { .. }
             | MidiTransportCommand::SetPlaylistTrackMute { .. }
             | MidiTransportCommand::SetPlaylistTrackSolo { .. }
+            | MidiTransportCommand::IncrementPlaylistTrackMode { .. }
             | MidiTransportCommand::SelectChannel(_)
             | MidiTransportCommand::SetMixerTrackSelection { .. }
             | MidiTransportCommand::SetMixerTrackName { .. }

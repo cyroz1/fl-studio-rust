@@ -255,6 +255,60 @@ def _playlist_get_live_trig_snap(index):
     return _playlist_track_performance_value(index, 3)
 
 
+def _playlist_inc_live_mode(index, value, mode_index, parameter, max_value):
+    index = _playlist_track_index(index)
+    try:
+        increment = int(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("Playlist performance mode increment must be an integer") from error
+    if not -(1 << 31) <= increment < (1 << 31):
+        raise ValueError("Playlist performance mode increment is outside the supported range")
+    modes = _active_transport_state.get("playlist_track_performance_modes", [])
+    if index > len(modes):
+        return
+    track_modes = modes[index - 1]
+    if not isinstance(track_modes, (list, tuple)) or mode_index >= len(track_modes):
+        return
+    try:
+        current = int(track_modes[mode_index])
+    except (TypeError, ValueError, OverflowError):
+        return
+    if not 0 <= current <= max_value or increment == 0:
+        return
+    next_value = min(max_value, max(0, current + increment))
+    if next_value == current:
+        return
+    updated_track_modes = list(track_modes)
+    updated_track_modes[mode_index] = next_value
+    updated_modes = list(modes)
+    updated_modes[index - 1] = updated_track_modes
+    _active_transport_state["playlist_track_performance_modes"] = updated_modes
+    _request_transport_action(
+        {
+            "action": "increment_playlist_track_mode",
+            "track_id": index,
+            "parameter": parameter,
+            "increment": increment,
+        }
+    )
+
+
+def _playlist_inc_live_pos_snap(index, value):
+    _playlist_inc_live_mode(index, value, 2, "position_sync", 6)
+
+
+def _playlist_inc_live_trig_snap(index, value):
+    _playlist_inc_live_mode(index, value, 3, "trigger_sync", 6)
+
+
+def _playlist_inc_live_loop_mode(index, value):
+    _playlist_inc_live_mode(index, value, 0, "motion", 6)
+
+
+def _playlist_inc_live_trig_mode(index, value):
+    _playlist_inc_live_mode(index, value, 1, "press", 3)
+
+
 def _playlist_get_performance_mode_state():
     return bool(_active_transport_state.get("playlist_performance_mode_active", False))
 
@@ -1772,6 +1826,10 @@ def _install_modules(script_name, device_name):
     playlist.getLiveTriggerMode = _playlist_get_live_trigger_mode
     playlist.getLivePosSnap = _playlist_get_live_pos_snap
     playlist.getLiveTrigSnap = _playlist_get_live_trig_snap
+    playlist.incLivePosSnap = _playlist_inc_live_pos_snap
+    playlist.incLiveTrigSnap = _playlist_inc_live_trig_snap
+    playlist.incLiveLoopMode = _playlist_inc_live_loop_mode
+    playlist.incLiveTrigMode = _playlist_inc_live_trig_mode
     playlist.getPerformanceModeState = _playlist_get_performance_mode_state
     playlist.getSongStartTickPos = _playlist_get_song_start_tick_pos
     playlist.isTrackSelected = _playlist_is_track_selected

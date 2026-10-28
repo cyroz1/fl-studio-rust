@@ -26,6 +26,32 @@ pub struct ScriptMidiResult {
     pub actions: Vec<ScriptTransportAction>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlaylistTrackPerformanceParameter {
+    Motion,
+    Press,
+    PositionSync,
+    TriggerSync,
+}
+
+impl PlaylistTrackPerformanceParameter {
+    pub fn mode_index(self) -> usize {
+        match self {
+            Self::Motion => 0,
+            Self::Press => 1,
+            Self::PositionSync => 2,
+            Self::TriggerSync => 3,
+        }
+    }
+
+    pub fn max_value(self) -> u8 {
+        match self {
+            Self::Motion | Self::PositionSync | Self::TriggerSync => 6,
+            Self::Press => 3,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MixerSendRouteSnapshot {
     pub source_index: u16,
@@ -75,6 +101,11 @@ pub enum ScriptTransportAction {
         track_id: u32,
         value: i8,
         in_group: bool,
+    },
+    IncrementPlaylistTrackMode {
+        track_id: u32,
+        parameter: PlaylistTrackPerformanceParameter,
+        increment: i32,
     },
     SelectChannel(u16),
     SetMixerTrackSelection {
@@ -1273,6 +1304,33 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
             in_group,
         });
     }
+    if name == Some("increment_playlist_track_mode") {
+        let track_id = action["track_id"]
+            .as_u64()
+            .and_then(|track_id| u32::try_from(track_id).ok())
+            .filter(|track_id| (1..=SCRIPT_MAX_PLAYLIST_TRACK_COUNT as u32).contains(track_id))
+            .ok_or_else(|| "MIDI script returned an invalid Playlist track ID".to_owned())?;
+        let parameter = match action["parameter"].as_str() {
+            Some("motion") => PlaylistTrackPerformanceParameter::Motion,
+            Some("press") => PlaylistTrackPerformanceParameter::Press,
+            Some("position_sync") => PlaylistTrackPerformanceParameter::PositionSync,
+            Some("trigger_sync") => PlaylistTrackPerformanceParameter::TriggerSync,
+            _ => {
+                return Err(
+                    "MIDI script returned an invalid Playlist performance parameter".to_owned(),
+                );
+            }
+        };
+        let increment = action["increment"]
+            .as_i64()
+            .and_then(|increment| i32::try_from(increment).ok())
+            .ok_or_else(|| "MIDI script returned an invalid Playlist mode increment".to_owned())?;
+        return Ok(ScriptTransportAction::IncrementPlaylistTrackMode {
+            track_id,
+            parameter,
+            increment,
+        });
+    }
     if name == Some("set_song_position") {
         let position = action["position"]
             .as_f64()
@@ -1808,10 +1866,11 @@ fn byte_value(response: &Value, key: &str, default: u8) -> Result<u8, String> {
 mod tests {
     use super::{
         MidiControllerScript, MidiScriptRuntime, MidiScriptTransportState, MixerTrackFlag,
-        SCRIPT_BEAT_INDICATOR_BAR, SCRIPT_BEAT_INDICATOR_BEAT, SCRIPT_BEAT_INDICATOR_OFF,
-        SCRIPT_TRANSPORT_PATTERN_MODE, SCRIPT_TRANSPORT_PLAYING, SCRIPT_TRANSPORT_RECORDING,
-        ScriptTransportAction, absolute_song_position_ticks, discover_midi_scripts,
-        find_script_for_device, normalized_song_position, song_position_ticks, transform_message,
+        PlaylistTrackPerformanceParameter, SCRIPT_BEAT_INDICATOR_BAR, SCRIPT_BEAT_INDICATOR_BEAT,
+        SCRIPT_BEAT_INDICATOR_OFF, SCRIPT_TRANSPORT_PATTERN_MODE, SCRIPT_TRANSPORT_PLAYING,
+        SCRIPT_TRANSPORT_RECORDING, ScriptTransportAction, absolute_song_position_ticks,
+        discover_midi_scripts, find_script_for_device, normalized_song_position,
+        song_position_ticks, transform_message,
     };
     use serde_json::json;
     use std::fs;
@@ -2254,6 +2313,73 @@ mod tests {
         let result = runtime.process_event(12, &[0xB0, 7, 127]).unwrap();
 
         assert!(result.actions.is_empty());
+    }
+
+    #[test]
+    fn python_playlist_performance_mode_increments_queue_edits_and_update_cached_modes() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport playlist\ndef OnMidiIn(event):\n    playlist.incLiveLoopMode(1, 2)\n    playlist.incLiveTrigMode(1, 2)\n    playlist.incLivePosSnap(1, 1)\n    playlist.incLiveTrigSnap(1, -3)\n    playlist.incLiveLoopMode(1, 99)\n    playlist.incLiveTrigMode(1, 99)\n    playlist.incLivePosSnap(1, -99)\n    playlist.incLiveTrigSnap(1, 0)\n    playlist.incLiveLoopMode(2, 1)\n    if (playlist.getLiveLoopMode(1), playlist.getLiveTriggerMode(1), playlist.getLivePosSnap(1), playlist.getLiveTrigSnap(1)) != (6, 3, 0, 2):\n        raise RuntimeError('Playlist mode increments did not update callback state')\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let transport_state = Arc::new(MidiScriptTransportState::default());
+        transport_state
+            .playlist_track_count
+            .store(2, Ordering::Relaxed);
+        *transport_state
+            .playlist_track_performance_modes
+            .lock()
+            .unwrap() = vec![
+            [Some(0), Some(1), Some(4), Some(5)],
+            [None, None, None, None],
+        ];
+        let mut runtime = MidiScriptRuntime::start_for_device_with_transport_state(
+            &script,
+            "Test Input",
+            transport_state,
+        )
+        .unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 127]).unwrap();
+
+        assert_eq!(
+            result.actions,
+            [
+                ScriptTransportAction::IncrementPlaylistTrackMode {
+                    track_id: 1,
+                    parameter: PlaylistTrackPerformanceParameter::Motion,
+                    increment: 2,
+                },
+                ScriptTransportAction::IncrementPlaylistTrackMode {
+                    track_id: 1,
+                    parameter: PlaylistTrackPerformanceParameter::Press,
+                    increment: 2,
+                },
+                ScriptTransportAction::IncrementPlaylistTrackMode {
+                    track_id: 1,
+                    parameter: PlaylistTrackPerformanceParameter::PositionSync,
+                    increment: 1,
+                },
+                ScriptTransportAction::IncrementPlaylistTrackMode {
+                    track_id: 1,
+                    parameter: PlaylistTrackPerformanceParameter::TriggerSync,
+                    increment: -3,
+                },
+                ScriptTransportAction::IncrementPlaylistTrackMode {
+                    track_id: 1,
+                    parameter: PlaylistTrackPerformanceParameter::Motion,
+                    increment: 99,
+                },
+                ScriptTransportAction::IncrementPlaylistTrackMode {
+                    track_id: 1,
+                    parameter: PlaylistTrackPerformanceParameter::PositionSync,
+                    increment: -99,
+                },
+            ]
+        );
     }
 
     #[test]
