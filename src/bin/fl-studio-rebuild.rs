@@ -71,8 +71,9 @@ use flp_rebuild::sample_render::{
 use flp_rebuild::vst3::{
     MAX_REPORTED_TAIL_SECONDS, Vst3AutomationPoint, Vst3HostRuntime, Vst3LatencyReport,
     Vst3ParameterAutomation, Vst3PatternChannelRenderRequest, Vst3PatternRenderOptions,
-    Vst3PatternStreamHandle, Vst3PlaylistAutomationSources, Vst3PlaylistLiveInputSender,
-    Vst3PlaylistLiveInputSession, Vst3PlaylistStreamProcessor,
+    Vst3PatternStreamHandle, Vst3PlaylistAutomationPoint, Vst3PlaylistAutomationSources,
+    Vst3PlaylistLiveInputSender, Vst3PlaylistLiveInputSession, Vst3PlaylistParameterAutomation,
+    Vst3PlaylistStreamProcessor,
 };
 use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, ArpeggioRangePattern, ArpeggioScoreOptions,
@@ -5208,6 +5209,7 @@ struct DawUi {
     midi_mixer_control_mappings: Vec<MidiMixerControlMapping>,
     midi_vst3_parameter_mappings: Vec<MidiVst3ParameterMapping>,
     pattern_vst3_parameter_links: Vec<PatternVst3ParameterLink>,
+    pattern_vst3_mixer_effect_parameter_links: Vec<PatternVst3MixerEffectParameterLink>,
     playlist_vst3_parameter_links: Vec<PlaylistVst3ParameterLink>,
     playlist_vst3_mixer_effect_parameter_links: Vec<PlaylistVst3MixerEffectParameterLink>,
     internal_lfo_parameter_links: Vec<InternalLfoParameterLink>,
@@ -5941,6 +5943,15 @@ struct PatternVst3ParameterLink {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct PatternVst3MixerEffectParameterLink {
+    project_path: String,
+    pattern_id: u16,
+    stream_channel: u8,
+    stream_flags: u8,
+    target: MidiVst3MixerEffectParameterTarget,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct PlaylistVst3ParameterLink {
     project_path: String,
     automation_channel_id: u16,
@@ -6517,6 +6528,8 @@ impl DawUi {
         let midi_vst3_parameter_mappings = load_midi_vst3_parameter_mappings();
         let vst3_manual_latency_offsets = load_vst3_manual_latency_offsets();
         let pattern_vst3_parameter_links = load_pattern_vst3_parameter_links();
+        let pattern_vst3_mixer_effect_parameter_links =
+            load_pattern_vst3_mixer_effect_parameter_links();
         let playlist_vst3_parameter_links = load_playlist_vst3_parameter_links();
         let playlist_vst3_mixer_effect_parameter_links =
             load_playlist_vst3_mixer_effect_parameter_links();
@@ -7000,6 +7013,7 @@ impl DawUi {
             midi_mixer_control_mappings,
             midi_vst3_parameter_mappings,
             pattern_vst3_parameter_links,
+            pattern_vst3_mixer_effect_parameter_links,
             playlist_vst3_parameter_links,
             playlist_vst3_mixer_effect_parameter_links,
             internal_lfo_parameter_links,
@@ -8390,6 +8404,53 @@ impl DawUi {
         automations
     }
 
+    fn pattern_vst3_mixer_effect_parameter_automations_for_pattern(
+        &self,
+        pattern: &Pattern,
+        ppq: u16,
+    ) -> BTreeMap<(usize, u16), Vec<Vst3PlaylistParameterAutomation>> {
+        let (Some(project_path), Some(host)) =
+            (self.current_path.as_deref(), self.vst3_host.as_ref())
+        else {
+            return BTreeMap::new();
+        };
+        let loaded_plugins = host.loaded_plugins();
+        let mut automations = BTreeMap::new();
+        for link in self
+            .pattern_vst3_mixer_effect_parameter_links
+            .iter()
+            .filter(|link| {
+                project_paths_equal(Path::new(&link.project_path), project_path)
+                    && link.pattern_id == pattern.id
+            })
+        {
+            let key = (link.target.insert_ordinal, link.target.slot_index);
+            let Some(instance_id) = self.mixer_effect_vst3_instances.get(&key) else {
+                continue;
+            };
+            if !loaded_plugins
+                .iter()
+                .any(|plugin| plugin.id == *instance_id && plugin.uid == link.target.plugin_uid)
+            {
+                continue;
+            }
+            let lanes = pattern_vst3_mixer_effect_parameter_automation_for_target(
+                &self.pattern_vst3_mixer_effect_parameter_links,
+                project_path,
+                pattern,
+                ppq,
+                &link.target,
+            );
+            if !lanes.is_empty() {
+                automations
+                    .entry(key)
+                    .or_insert_with(Vec::new)
+                    .extend(lanes);
+            }
+        }
+        automations
+    }
+
     fn pattern_vst3_parameter_automations_for_playlist(
         &self,
         document: &FlpDocument,
@@ -8418,12 +8479,38 @@ impl DawUi {
         playlist_automation
     }
 
+    fn pattern_vst3_mixer_effect_parameter_automations_for_playlist(
+        &self,
+        document: &FlpDocument,
+    ) -> BTreeMap<(u16, usize, u16), Vec<Vst3PlaylistParameterAutomation>> {
+        let Ok(patterns) = document.patterns() else {
+            return BTreeMap::new();
+        };
+        let ppq = document.header().ppq();
+        if ppq == 0 {
+            return BTreeMap::new();
+        }
+        let mut playlist_automation = BTreeMap::new();
+        for pattern in patterns {
+            let pattern_automation =
+                self.pattern_vst3_mixer_effect_parameter_automations_for_pattern(&pattern, ppq);
+            for ((insert_ordinal, slot_index), lanes) in pattern_automation {
+                if !lanes.is_empty() {
+                    playlist_automation.insert((pattern.id, insert_ordinal, slot_index), lanes);
+                }
+            }
+        }
+        playlist_automation
+    }
+
     fn vst3_playlist_automation_sources(
         &self,
         document: &FlpDocument,
     ) -> Vst3PlaylistAutomationSources {
         let mut sources = Vst3PlaylistAutomationSources {
             pattern_clips: self.pattern_vst3_parameter_automations_for_playlist(document),
+            mixer_effect_pattern_clips: self
+                .pattern_vst3_mixer_effect_parameter_automations_for_playlist(document),
             ..Vst3PlaylistAutomationSources::default()
         };
         let (Some(project_path), Some(host)) =
@@ -41466,6 +41553,15 @@ impl DawUi {
         } else {
             BTreeMap::new()
         };
+        let pattern_mixer_effect_automations =
+            pattern_for_vst3
+                .as_ref()
+                .map_or_else(BTreeMap::new, |pattern| {
+                    self.pattern_vst3_mixer_effect_parameter_automations_for_pattern(
+                        pattern,
+                        document.header().ppq(),
+                    )
+                });
         let vst3_processor = if let Some(duration_ticks) = vst3_stream_duration_ticks {
             self.vst3_host
                 .as_ref()
@@ -41478,6 +41574,7 @@ impl DawUi {
                         &self.channel_vst3_instances,
                         &self.mixer_effect_vst3_instances,
                         &pattern_automations,
+                        &pattern_mixer_effect_automations,
                     )
                 })
                 .transpose()
@@ -43735,7 +43832,7 @@ impl DawUi {
                 }
                 self.status = match pending.kind {
                     PendingSongRenderKind::Mix => format!(
-                        "Rendered {} audio clips, {} Sampler clips ({} notes), and {} VST3 channels ({} notes) to {} at {} Hz; {} plug-in channels unloaded, {} scaled audio and {} scaled pattern clips skipped. Measured pre-effect peaks for {} Mixer inserts; supported VST3 Mixer effects and linked Automation Clips were included",
+                        "Rendered {} audio clips, {} Sampler clips ({} notes), and {} VST3 channels ({} notes) to {} at {} Hz; {} plug-in channels unloaded, {} scaled audio and {} scaled pattern clips skipped. Measured pre-effect peaks for {} Mixer inserts; supported VST3 Mixer effects and linked Pattern Event/Automation Clip parameters were included",
                         summary.audio_clips_rendered,
                         summary.sampler_pattern_clips_rendered,
                         summary.sampler_notes_rendered,
@@ -43749,7 +43846,7 @@ impl DawUi {
                         insert_peaks.len(),
                     ),
                     PendingSongRenderKind::MixerStems => format!(
-                        "Rendered supported Mixer stems into {} at {} Hz; {}, {}. Loaded VST3 insert and Master effects with route PDC and linked Automation Clip parameters were included; native effect formats, other effect automation links, and PDC silence trimming remain unsupported",
+                        "Rendered supported Mixer stems into {} at {} Hz; {}, {}. Loaded VST3 insert and Master effects with route PDC and linked Pattern Event/Automation Clip parameters were included; native effect formats, other effect automation links, and PDC silence trimming remain unsupported",
                         pending.output_path.display(),
                         summary.sample_rate,
                         if summary.mixer_master_stem_rendered {
@@ -58779,6 +58876,10 @@ impl DawUi {
         let mut pattern_vst3_link_request: Option<(String, u16, u8, u8, MidiVst3ParameterTarget)> =
             None;
         let mut pattern_vst3_unlink_request: Option<(PathBuf, u16, MidiVst3ParameterTarget)> = None;
+        let mut pattern_vst3_mixer_effect_link_request =
+            None::<(String, u16, u8, u8, MidiVst3MixerEffectParameterTarget)>;
+        let mut pattern_vst3_mixer_effect_unlink_request =
+            None::<(PathBuf, u16, MidiVst3MixerEffectParameterTarget)>;
         let mut playlist_vst3_link_request: Option<(String, u16, MidiVst3ParameterTarget)> = None;
         let mut playlist_vst3_unlink_request: Option<(PathBuf, u16, MidiVst3ParameterTarget)> =
             None;
@@ -59827,6 +59928,20 @@ impl DawUi {
                                     )
                                 })
                             });
+                        let pattern_mixer_effect_link = self
+                            .current_path
+                            .as_deref()
+                            .zip(self.selected_pattern)
+                            .and_then(|(project_path, pattern_id)| {
+                                effect_target.as_ref().and_then(|target| {
+                                    pattern_vst3_mixer_effect_parameter_link_for_target(
+                                        &self.pattern_vst3_mixer_effect_parameter_links,
+                                        project_path,
+                                        pattern_id,
+                                        target,
+                                    )
+                                })
+                            });
                         let internal_lfo_link = self
                             .current_path
                             .as_deref()
@@ -59991,6 +60106,73 @@ impl DawUi {
                                     if ui.small_button("Clear").clicked() {
                                         midi_vst3_remove_mapping = Some(mapping_target);
                                     }
+                                }
+                                if let Some(link) = pattern_mixer_effect_link {
+                                    ui.small(format!(
+                                        "Pattern {} · event channel {} · flags 0x{:02X}",
+                                        link.pattern_id, link.stream_channel, link.stream_flags
+                                    ));
+                                }
+                                let selected_stream_is_linked =
+                                    pattern_vst3_source.as_ref().is_some_and(
+                                        |(
+                                            project_path,
+                                            pattern_id,
+                                            stream_channel,
+                                            stream_flags,
+                                        )| {
+                                            pattern_mixer_effect_link.is_some_and(|link| {
+                                                project_paths_equal(
+                                                    Path::new(&link.project_path),
+                                                    Path::new(project_path),
+                                                ) && link.pattern_id == *pattern_id
+                                                    && link.stream_channel == *stream_channel
+                                                    && link.stream_flags == *stream_flags
+                                            })
+                                        },
+                                    );
+                                if let Some((
+                                    project_path,
+                                    pattern_id,
+                                    stream_channel,
+                                    stream_flags,
+                                )) = pattern_vst3_source.as_ref()
+                                {
+                                    if selected_stream_is_linked {
+                                        ui.small("Event linked");
+                                    } else if ui
+                                        .add_enabled(
+                                            !parameter.is_read_only,
+                                            egui::Button::new(if pattern_mixer_effect_link.is_some()
+                                            {
+                                                "Relink Event"
+                                            } else {
+                                                "Link Event"
+                                            }),
+                                        )
+                                        .clicked()
+                                    {
+                                        pattern_vst3_mixer_effect_link_request = Some((
+                                            project_path.clone(),
+                                            *pattern_id,
+                                            *stream_channel,
+                                            *stream_flags,
+                                            target.clone(),
+                                        ));
+                                    }
+                                } else if !parameter.is_read_only {
+                                    ui.add_enabled(false, egui::Button::new("Link Event"));
+                                }
+                                if pattern_mixer_effect_link.is_some()
+                                    && ui.small_button("Clear event").clicked()
+                                    && let (Some(project_path), Some(pattern_id)) =
+                                        (self.current_path.as_ref(), self.selected_pattern)
+                                {
+                                    pattern_vst3_mixer_effect_unlink_request = Some((
+                                        project_path.clone(),
+                                        pattern_id,
+                                        target.clone(),
+                                    ));
                                 }
                             }
                         });
@@ -60322,6 +60504,57 @@ impl DawUi {
                         )
                     },
                 );
+        }
+        if let Some((project_path, pattern_id, stream_channel, stream_flags, target)) =
+            pattern_vst3_mixer_effect_link_request
+        {
+            upsert_pattern_vst3_mixer_effect_parameter_link(
+                &mut self.pattern_vst3_mixer_effect_parameter_links,
+                PatternVst3MixerEffectParameterLink {
+                    project_path,
+                    pattern_id,
+                    stream_channel,
+                    stream_flags,
+                    target: target.clone(),
+                },
+            );
+            self.status = save_pattern_vst3_mixer_effect_parameter_links(
+                &self.pattern_vst3_mixer_effect_parameter_links,
+            )
+            .err()
+            .map_or_else(
+                || {
+                    format!(
+                        "Linked Pattern {pattern_id} event stream to {} on this machine",
+                        target.parameter_name
+                    )
+                },
+                |error| {
+                    format!(
+                        "Linked Pattern event stream for this session; could not save it: {error}"
+                    )
+                },
+            );
+        }
+        if let Some((project_path, pattern_id, target)) = pattern_vst3_mixer_effect_unlink_request {
+            remove_pattern_vst3_mixer_effect_parameter_link(
+                &mut self.pattern_vst3_mixer_effect_parameter_links,
+                &project_path,
+                pattern_id,
+                &target,
+            );
+            self.status = save_pattern_vst3_mixer_effect_parameter_links(
+                &self.pattern_vst3_mixer_effect_parameter_links,
+            )
+            .err()
+            .map_or_else(
+                || format!("Cleared Pattern event link for {}", target.parameter_name),
+                |error| {
+                    format!(
+                        "Cleared Pattern event link for this session; could not save it: {error}"
+                    )
+                },
+            );
         }
         if let Some((project_path, automation_channel_id, target)) = playlist_vst3_link_request {
             upsert_playlist_vst3_parameter_link(
@@ -63909,6 +64142,10 @@ fn pattern_vst3_parameter_links_file() -> Option<PathBuf> {
     midi_control_change_mapping_file("pattern-vst3-parameter-links.txt")
 }
 
+fn pattern_vst3_mixer_effect_parameter_links_file() -> Option<PathBuf> {
+    midi_control_change_mapping_file("pattern-vst3-mixer-effect-parameter-links.txt")
+}
+
 fn playlist_vst3_parameter_links_file() -> Option<PathBuf> {
     midi_control_change_mapping_file("playlist-vst3-parameter-links.txt")
 }
@@ -63973,6 +64210,13 @@ fn load_pattern_vst3_parameter_links() -> Vec<PatternVst3ParameterLink> {
     pattern_vst3_parameter_links_file()
         .and_then(|path| fs::read_to_string(path).ok())
         .map(|contents| parse_pattern_vst3_parameter_links(&contents))
+        .unwrap_or_default()
+}
+
+fn load_pattern_vst3_mixer_effect_parameter_links() -> Vec<PatternVst3MixerEffectParameterLink> {
+    pattern_vst3_mixer_effect_parameter_links_file()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .map(|contents| parse_pattern_vst3_mixer_effect_parameter_links(&contents))
         .unwrap_or_default()
 }
 
@@ -64237,6 +64481,23 @@ fn save_pattern_vst3_parameter_links(links: &[PatternVst3ParameterLink]) -> Resu
         .map_err(|error| format!("could not write {}: {error}", path.display()))
 }
 
+fn save_pattern_vst3_mixer_effect_parameter_links(
+    links: &[PatternVst3MixerEffectParameterLink],
+) -> Result<(), String> {
+    let path = pattern_vst3_mixer_effect_parameter_links_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the Pattern VST3 Mixer effect link path has no parent folder".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    fs::write(
+        &path,
+        serialize_pattern_vst3_mixer_effect_parameter_links(links),
+    )
+    .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
 fn save_playlist_vst3_parameter_links(links: &[PlaylistVst3ParameterLink]) -> Result<(), String> {
     let path = playlist_vst3_parameter_links_file()
         .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
@@ -64373,6 +64634,16 @@ fn same_midi_vst3_parameter_target(
     right: &MidiVst3ParameterTarget,
 ) -> bool {
     left.project_channel_id == right.project_channel_id
+        && left.plugin_uid == right.plugin_uid
+        && left.parameter_id == right.parameter_id
+}
+
+fn same_mixer_effect_parameter_target(
+    left: &MidiVst3MixerEffectParameterTarget,
+    right: &MidiVst3MixerEffectParameterTarget,
+) -> bool {
+    left.insert_ordinal == right.insert_ordinal
+        && left.slot_index == right.slot_index
         && left.plugin_uid == right.plugin_uid
         && left.parameter_id == right.parameter_id
 }
@@ -64650,6 +64921,72 @@ fn pattern_vst3_parameter_link_for_target<'a>(
 ) -> Option<&'a PatternVst3ParameterLink> {
     links.iter().find(|link| {
         same_pattern_vst3_parameter_link_target(link, project_path, pattern_id, target)
+    })
+}
+
+fn valid_pattern_vst3_mixer_effect_parameter_link(
+    link: &PatternVst3MixerEffectParameterLink,
+) -> bool {
+    !link.project_path.is_empty()
+        && link.target.insert_ordinal <= 127
+        && link.target.slot_index < 10
+        && !link.target.plugin_uid.is_empty()
+        && !link.target.parameter_name.is_empty()
+}
+
+fn same_pattern_vst3_mixer_effect_parameter_link_target(
+    link: &PatternVst3MixerEffectParameterLink,
+    project_path: &Path,
+    pattern_id: u16,
+    target: &MidiVst3MixerEffectParameterTarget,
+) -> bool {
+    project_paths_equal(Path::new(&link.project_path), project_path)
+        && link.pattern_id == pattern_id
+        && same_mixer_effect_parameter_target(&link.target, target)
+}
+
+fn upsert_pattern_vst3_mixer_effect_parameter_link(
+    links: &mut Vec<PatternVst3MixerEffectParameterLink>,
+    link: PatternVst3MixerEffectParameterLink,
+) {
+    if !valid_pattern_vst3_mixer_effect_parameter_link(&link) {
+        return;
+    }
+    links.retain(|existing| {
+        !same_pattern_vst3_mixer_effect_parameter_link_target(
+            existing,
+            Path::new(&link.project_path),
+            link.pattern_id,
+            &link.target,
+        )
+    });
+    links.push(link);
+}
+
+fn remove_pattern_vst3_mixer_effect_parameter_link(
+    links: &mut Vec<PatternVst3MixerEffectParameterLink>,
+    project_path: &Path,
+    pattern_id: u16,
+    target: &MidiVst3MixerEffectParameterTarget,
+) {
+    links.retain(|link| {
+        !same_pattern_vst3_mixer_effect_parameter_link_target(
+            link,
+            project_path,
+            pattern_id,
+            target,
+        )
+    });
+}
+
+fn pattern_vst3_mixer_effect_parameter_link_for_target<'a>(
+    links: &'a [PatternVst3MixerEffectParameterLink],
+    project_path: &Path,
+    pattern_id: u16,
+    target: &MidiVst3MixerEffectParameterTarget,
+) -> Option<&'a PatternVst3MixerEffectParameterLink> {
+    links.iter().find(|link| {
+        same_pattern_vst3_mixer_effect_parameter_link_target(link, project_path, pattern_id, target)
     })
 }
 
@@ -64988,6 +65325,48 @@ fn pattern_vst3_parameter_automation_for_channel(
             .map(|link| internal_lfo_parameter_automation(link, ppq, loop_length_ticks)),
     );
     lanes
+}
+
+fn pattern_vst3_mixer_effect_parameter_automation_for_target(
+    links: &[PatternVst3MixerEffectParameterLink],
+    project_path: &Path,
+    pattern: &Pattern,
+    ppq: u16,
+    target: &MidiVst3MixerEffectParameterTarget,
+) -> Vec<Vst3PlaylistParameterAutomation> {
+    if ppq == 0 || target.plugin_uid.is_empty() {
+        return Vec::new();
+    }
+    links
+        .iter()
+        .filter(|link| {
+            project_paths_equal(Path::new(&link.project_path), project_path)
+                && link.pattern_id == pattern.id
+                && same_mixer_effect_parameter_target(&link.target, target)
+        })
+        .filter_map(|link| {
+            let points = pattern
+                .controllers
+                .iter()
+                .filter(|point| {
+                    point.channel == link.stream_channel && point.flags == link.stream_flags
+                })
+                .filter_map(|point| {
+                    let value = point.value();
+                    (value.is_finite() && (0.0..=1.0).contains(&value)).then_some(
+                        Vst3PlaylistAutomationPoint {
+                            tick: u64::from(point.position),
+                            value: f64::from(value),
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            (!points.is_empty()).then_some(Vst3PlaylistParameterAutomation {
+                parameter_id: target.parameter_id,
+                points,
+            })
+        })
+        .collect()
 }
 
 fn playlist_audio_clip_effective_reverse(
@@ -65535,6 +65914,98 @@ fn serialize_pattern_vst3_parameter_links(links: &[PatternVst3ParameterLink]) ->
         contents.push_str(&link.stream_flags.to_string());
         contents.push('\t');
         contents.push_str(&link.target.project_channel_id.to_string());
+        contents.push('\t');
+        contents.push_str(&encode_midi_device_id(&link.target.plugin_uid));
+        contents.push('\t');
+        contents.push_str(&link.target.parameter_id.to_string());
+        contents.push('\t');
+        contents.push_str(&encode_midi_device_id(&link.target.parameter_name));
+        contents.push('\n');
+    }
+    contents
+}
+
+fn parse_pattern_vst3_mixer_effect_parameter_links(
+    contents: &str,
+) -> Vec<PatternVst3MixerEffectParameterLink> {
+    let mut links = Vec::new();
+    for line in contents.lines() {
+        let Some(encoded) = line.strip_prefix("link=") else {
+            continue;
+        };
+        let mut fields = encoded.split('\t');
+        let Some(project_path) = fields.next().and_then(decode_midi_device_id) else {
+            continue;
+        };
+        let Some(pattern_id) = fields.next().and_then(|field| field.parse::<u16>().ok()) else {
+            continue;
+        };
+        let Some(stream_channel) = fields.next().and_then(|field| field.parse::<u8>().ok()) else {
+            continue;
+        };
+        let Some(stream_flags) = fields.next().and_then(|field| field.parse::<u8>().ok()) else {
+            continue;
+        };
+        let Some(insert_ordinal) = fields.next().and_then(|field| field.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        let Some(slot_index) = fields.next().and_then(|field| field.parse::<u16>().ok()) else {
+            continue;
+        };
+        let Some(plugin_uid) = fields.next().and_then(decode_midi_device_id) else {
+            continue;
+        };
+        let Some(parameter_id) = fields.next().and_then(|field| field.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(parameter_name) = fields.next().and_then(decode_midi_device_id) else {
+            continue;
+        };
+        if fields.next().is_some() {
+            continue;
+        }
+        upsert_pattern_vst3_mixer_effect_parameter_link(
+            &mut links,
+            PatternVst3MixerEffectParameterLink {
+                project_path,
+                pattern_id,
+                stream_channel,
+                stream_flags,
+                target: MidiVst3MixerEffectParameterTarget {
+                    insert_ordinal,
+                    slot_index,
+                    plugin_uid,
+                    parameter_id,
+                    parameter_name,
+                },
+            },
+        );
+    }
+    links
+}
+
+fn serialize_pattern_vst3_mixer_effect_parameter_links(
+    links: &[PatternVst3MixerEffectParameterLink],
+) -> String {
+    let mut contents = String::from("version=1\n");
+    let mut normalized = Vec::new();
+    for link in links {
+        upsert_pattern_vst3_mixer_effect_parameter_link(&mut normalized, link.clone());
+    }
+    for link in normalized {
+        contents.push_str("link=");
+        contents.push_str(&encode_midi_device_id(&link.project_path));
+        contents.push('\t');
+        contents.push_str(&link.pattern_id.to_string());
+        contents.push('\t');
+        contents.push_str(&link.stream_channel.to_string());
+        contents.push('\t');
+        contents.push_str(&link.stream_flags.to_string());
+        contents.push('\t');
+        contents.push_str(&link.target.insert_ordinal.to_string());
+        contents.push('\t');
+        contents.push_str(&link.target.slot_index.to_string());
         contents.push('\t');
         contents.push_str(&encode_midi_device_id(&link.target.plugin_uid));
         contents.push('\t');
@@ -72272,17 +72743,18 @@ mod tests {
         MidiMixerControlTarget, MidiOutputDevice, MidiVst3MixerEffectParameterTarget,
         MidiVst3ParameterMapping, MidiVst3ParameterMappingTarget, MidiVst3ParameterTarget,
         PIANO_ROLL_RULER_HEIGHT, PLAYLIST_AUDIO_CLIP_GAIN_MINUS_INFINITY, Pattern,
-        PatternController, PatternNote, PatternVst3AutomationSources, PatternVst3ParameterLink,
-        PianoRollChordStamp, PianoRollGrid, PianoRollScale, PianoRollSnap,
-        PlaylistAudioClipEnvelope, PlaylistAudioClipFadeCurve, PlaylistClip, PlaylistClipDragKind,
-        PlaylistClipEdit, PlaylistClipResizeEdge, PlaylistPerformanceLiveStatus, PlaylistTempoMap,
-        PlaylistTrack, PlaylistTrackMotion, PlaylistTrackPerformanceParameter, PlaylistTrackPress,
+        PatternController, PatternNote, PatternVst3AutomationSources,
+        PatternVst3MixerEffectParameterLink, PatternVst3ParameterLink, PianoRollChordStamp,
+        PianoRollGrid, PianoRollScale, PianoRollSnap, PlaylistAudioClipEnvelope,
+        PlaylistAudioClipFadeCurve, PlaylistClip, PlaylistClipDragKind, PlaylistClipEdit,
+        PlaylistClipResizeEdge, PlaylistPerformanceLiveStatus, PlaylistTempoMap, PlaylistTrack,
+        PlaylistTrackMotion, PlaylistTrackPerformanceParameter, PlaylistTrackPress,
         PlaylistTrackSync, PlaylistVst3MixerEffectParameterLink, PlaylistVst3ParameterLink,
         PluginCandidate, PluginFormat, ProjectPlaylistAudioClipEnvelope, TimeSelectionShift,
-        TouchGesture, TouchTapTracker, TouchZoomConfig, WINDOW_LAYOUT_PRESETS_HEADER,
-        WindowLayoutPreset, audio_recording_start_tick_with_offset,
-        built_in_midi_controller_templates, candidate_live_mixer_send_key,
-        candidate_matches_vst_identity, candidate_mixer_controls,
+        TouchGesture, TouchTapTracker, TouchZoomConfig, Vst3PlaylistAutomationPoint,
+        Vst3PlaylistParameterAutomation, WINDOW_LAYOUT_PRESETS_HEADER, WindowLayoutPreset,
+        audio_recording_start_tick_with_offset, built_in_midi_controller_templates,
+        candidate_live_mixer_send_key, candidate_matches_vst_identity, candidate_mixer_controls,
         candidate_mixer_stereo_separation, detect_chord_name, detect_piano_roll_channel_scale,
         detect_piano_roll_scale, encode_midi_device_id, encode_midi_device_selections,
         encode_midi_output_routes, first_available_playlist_track,
@@ -72308,11 +72780,13 @@ mod tests {
         parse_midi_controller_templates, parse_midi_device_selections,
         parse_midi_mixer_control_mappings, parse_midi_output_programs, parse_midi_output_routes,
         parse_midi_output_values, parse_midi_vst3_parameter_mappings,
-        parse_pattern_vst3_parameter_links, parse_playlist_audio_clip_envelopes,
-        parse_playlist_vst3_mixer_effect_parameter_links, parse_playlist_vst3_parameter_links,
-        parse_window_layout_presets, pattern_color_from_random_index,
-        pattern_lfo_loop_length_ticks, pattern_loop_frame_at_tick,
+        parse_pattern_vst3_mixer_effect_parameter_links, parse_pattern_vst3_parameter_links,
+        parse_playlist_audio_clip_envelopes, parse_playlist_vst3_mixer_effect_parameter_links,
+        parse_playlist_vst3_parameter_links, parse_window_layout_presets,
+        pattern_color_from_random_index, pattern_lfo_loop_length_ticks, pattern_loop_frame_at_tick,
         pattern_loop_handoff_tick_at_frame, pattern_loop_tick_at_frame,
+        pattern_vst3_mixer_effect_parameter_automation_for_target,
+        pattern_vst3_mixer_effect_parameter_link_for_target,
         pattern_vst3_parameter_automation_for_channel, pattern_vst3_parameter_link_for_target,
         piano_roll_color_group_note_ids, piano_roll_controller_stroke_points,
         piano_roll_controller_value_at, piano_roll_controller_value_range,
@@ -72338,10 +72812,12 @@ mod tests {
         playlist_vst3_parameter_link_for_target, random_pattern_color, recolor_piano_roll_notes,
         record_pattern_controller_points, recorded_pattern_clip_required_length,
         recording_input_targets, remove_midi_vst3_parameter_mapping,
-        remove_pattern_vst3_parameter_link, remove_playlist_vst3_mixer_effect_parameter_link,
-        remove_playlist_vst3_parameter_link, sample_editor_selection_for_drag,
-        serialize_internal_lfo_parameter_links, serialize_midi_controller_templates,
-        serialize_midi_mixer_control_mappings, serialize_midi_vst3_parameter_mappings,
+        remove_pattern_vst3_mixer_effect_parameter_link, remove_pattern_vst3_parameter_link,
+        remove_playlist_vst3_mixer_effect_parameter_link, remove_playlist_vst3_parameter_link,
+        sample_editor_selection_for_drag, serialize_internal_lfo_parameter_links,
+        serialize_midi_controller_templates, serialize_midi_mixer_control_mappings,
+        serialize_midi_vst3_parameter_mappings,
+        serialize_pattern_vst3_mixer_effect_parameter_links,
         serialize_pattern_vst3_parameter_links, serialize_playlist_audio_clip_envelopes,
         serialize_playlist_vst3_mixer_effect_parameter_links,
         serialize_playlist_vst3_parameter_links, serialize_window_layout_presets,
@@ -72351,9 +72827,9 @@ mod tests {
         update_channel_rack_selection, update_layer_child_selection,
         update_piano_roll_box_selection, upsert_internal_lfo_parameter_link,
         upsert_midi_mixer_control_mapping, upsert_midi_vst3_parameter_mapping,
-        upsert_pattern_vst3_parameter_link, upsert_playlist_audio_clip_envelope,
-        upsert_playlist_vst3_mixer_effect_parameter_link, upsert_playlist_vst3_parameter_link,
-        zoom_to_fit,
+        upsert_pattern_vst3_mixer_effect_parameter_link, upsert_pattern_vst3_parameter_link,
+        upsert_playlist_audio_clip_envelope, upsert_playlist_vst3_mixer_effect_parameter_link,
+        upsert_playlist_vst3_parameter_link, zoom_to_fit,
     };
 
     #[test]
@@ -74276,6 +74752,75 @@ mod tests {
     }
 
     #[test]
+    fn pattern_vst3_mixer_effect_parameter_links_round_trip_and_replace_per_pattern_target() {
+        let project_path = std::env::temp_dir().join("effect event project 雪.flp");
+        let target = MidiVst3MixerEffectParameterTarget {
+            insert_ordinal: 12,
+            slot_index: 4,
+            plugin_uid: "com.example.effect\tuid".to_owned(),
+            parameter_id: 91,
+            parameter_name: "Room size 雪".to_owned(),
+        };
+        let link = PatternVst3MixerEffectParameterLink {
+            project_path: project_path.to_string_lossy().into_owned(),
+            pattern_id: 7,
+            stream_channel: 3,
+            stream_flags: 0x24,
+            target: target.clone(),
+        };
+        let other_target = PatternVst3MixerEffectParameterLink {
+            target: MidiVst3MixerEffectParameterTarget {
+                parameter_id: 92,
+                parameter_name: "Damping".to_owned(),
+                ..target.clone()
+            },
+            ..link.clone()
+        };
+        let encoded = serialize_pattern_vst3_mixer_effect_parameter_links(&[
+            link.clone(),
+            other_target.clone(),
+        ]);
+        assert_eq!(
+            parse_pattern_vst3_mixer_effect_parameter_links(&encoded),
+            vec![link.clone(), other_target.clone()]
+        );
+
+        let replacement = PatternVst3MixerEffectParameterLink {
+            stream_channel: 9,
+            stream_flags: 0x44,
+            target: MidiVst3MixerEffectParameterTarget {
+                parameter_name: "Room Size".to_owned(),
+                ..target.clone()
+            },
+            ..link.clone()
+        };
+        let mut links = vec![link, other_target.clone()];
+        upsert_pattern_vst3_mixer_effect_parameter_link(&mut links, replacement.clone());
+        assert_eq!(links, vec![other_target.clone(), replacement.clone()]);
+        assert_eq!(
+            pattern_vst3_mixer_effect_parameter_link_for_target(&links, &project_path, 7, &target,),
+            Some(&links[1])
+        );
+        assert!(
+            pattern_vst3_mixer_effect_parameter_link_for_target(&links, &project_path, 8, &target,)
+                .is_none()
+        );
+
+        remove_pattern_vst3_mixer_effect_parameter_link(&mut links, &project_path, 7, &target);
+        assert_eq!(links, vec![other_target]);
+
+        let invalid_slot = PatternVst3MixerEffectParameterLink {
+            target: MidiVst3MixerEffectParameterTarget {
+                slot_index: 10,
+                ..target
+            },
+            ..replacement
+        };
+        upsert_pattern_vst3_mixer_effect_parameter_link(&mut links, invalid_slot);
+        assert_eq!(links.len(), 1);
+    }
+
+    #[test]
     fn playlist_vst3_parameter_links_round_trip_per_project_automation_source_and_target() {
         let project_path = std::env::temp_dir().join("automation clip project 雪.flp");
         let target = MidiVst3ParameterTarget {
@@ -74696,6 +75241,68 @@ mod tests {
                 384,
             )
             .is_empty()
+        );
+    }
+
+    #[test]
+    fn pattern_vst3_mixer_effect_automation_uses_the_linked_event_stream() {
+        let project_path = std::env::temp_dir().join("pattern effect automation.flp");
+        let target = MidiVst3MixerEffectParameterTarget {
+            insert_ordinal: 3,
+            slot_index: 2,
+            plugin_uid: "com.example.effect".to_owned(),
+            parameter_id: 47,
+            parameter_name: "Feedback".to_owned(),
+        };
+        let link = PatternVst3MixerEffectParameterLink {
+            project_path: project_path.to_string_lossy().into_owned(),
+            pattern_id: 8,
+            stream_channel: 2,
+            stream_flags: 0x31,
+            target: target.clone(),
+        };
+        let point = |position, channel, flags, value: f32| PatternController {
+            position,
+            channel,
+            flags,
+            value_bits: value.to_bits(),
+            ..PatternController::default()
+        };
+        let pattern = Pattern {
+            id: 8,
+            controllers: vec![
+                point(0, 2, 0x31, 0.25),
+                point(96, 2, 0x31, 0.75),
+                point(48, 3, 0x31, 0.9),
+                point(64, 2, 0x30, 0.5),
+                point(120, 2, 0x31, 1.5),
+                point(144, 2, 0x31, f32::NAN),
+            ],
+            ..Pattern::default()
+        };
+
+        let automation = pattern_vst3_mixer_effect_parameter_automation_for_target(
+            &[link],
+            &project_path,
+            &pattern,
+            96,
+            &target,
+        );
+        assert_eq!(
+            automation,
+            vec![Vst3PlaylistParameterAutomation {
+                parameter_id: 47,
+                points: vec![
+                    Vst3PlaylistAutomationPoint {
+                        tick: 0,
+                        value: 0.25,
+                    },
+                    Vst3PlaylistAutomationPoint {
+                        tick: 96,
+                        value: 0.75,
+                    },
+                ],
+            }]
         );
     }
 
