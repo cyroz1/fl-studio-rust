@@ -353,6 +353,30 @@ impl MidiThruProcessor {
         };
         let output_channel =
             input_channel.map(|channel| settings.output_channel.unwrap_or(channel) & 0x0F);
+        if let PolyphonicPressure {
+            channel,
+            key,
+            pressure,
+        } = &event
+        {
+            let source_note = (*channel & 0x0F, (*key).min(127));
+            if let Some(mapped_notes) = self.note_mapping.get(&source_note) {
+                let output_notes = mapped_notes.iter().copied().collect::<BTreeSet<_>>();
+                if !output_notes.is_empty() {
+                    for (mapped_channel, mapped_key) in output_notes {
+                        let mapped_event = PolyphonicPressure {
+                            channel: mapped_channel,
+                            key: mapped_key,
+                            pressure: *pressure,
+                        };
+                        if let Some((bytes, length)) = midi_input_thru_message(mapped_event) {
+                            output.send(&bytes[..length])?;
+                        }
+                    }
+                    return Ok(());
+                }
+            }
+        }
         let output_event = match event.clone() {
             NoteOn {
                 channel,
