@@ -4814,6 +4814,44 @@ impl Vst3HostRuntime {
         )
     }
 
+    /// Prepare one Pattern's loaded Mixer VST3 effects for a bounded offline render.
+    ///
+    /// This processor has no instrument streams. Callers can render Sampler or audio sources into
+    /// its Mixer buses, then pass those buses through the Pattern's loaded insert and Master FX.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_pattern_mixer_effects_processor(
+        &self,
+        document: &FlpDocument,
+        pattern_id: u16,
+        loop_length_ticks: u64,
+        output_sample_rate: u32,
+        mixer_effect_instances: &BTreeMap<(usize, u16), u64>,
+        mixer_effect_parameter_automation: &BTreeMap<
+            (usize, u16),
+            Vec<Vst3PlaylistParameterAutomation>,
+        >,
+    ) -> Result<Vst3PlaylistStreamProcessor, String> {
+        let mut processor = self.prepare_pattern_loop_stream_with_automation(
+            document,
+            pattern_id,
+            loop_length_ticks,
+            output_sample_rate,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )?;
+        processor.stop_pattern_repetition_after_first_pass();
+        self.attach_mixer_effects(
+            document,
+            mixer_effect_instances,
+            &mut processor,
+            true,
+            false,
+            mixer_effect_parameter_automation,
+            None,
+        )?;
+        Ok(processor)
+    }
+
     /// Render one Pattern through its loaded VST3 instruments and the project's loaded Mixer FX.
     ///
     /// The prepared Pattern stream applies the same channel routing, effect automation, and PDC

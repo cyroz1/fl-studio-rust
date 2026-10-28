@@ -57,7 +57,8 @@ use flp_rebuild::sample_render::{
     render_playlist_with_vst3_to_file_from_frame_cancellable,
     render_playlist_with_vst3_to_flac_cancellable, render_playlist_with_vst3_to_mp3_cancellable,
     render_playlist_with_vst3_to_ogg_cancellable, render_playlist_with_vst3_to_wav_cancellable,
-    render_sampler_pattern_to_file, sampler_live_note_queue, stream_input_monitor_through_mixer,
+    render_sampler_pattern_to_file, render_sampler_pattern_to_file_with_mixer_effects,
+    sampler_live_note_queue, stream_input_monitor_through_mixer,
     stream_mixed_layer_midi_input_to_device,
     stream_pattern_loop_with_vst3_from_tick_to_device_with_live_controls,
     stream_pattern_with_vst3_to_device_with_live_controls,
@@ -44159,6 +44160,59 @@ impl DawUi {
             wav_channel_mode: self.playlist_render_channel_mode,
             ..SamplerPatternRenderOptions::default()
         };
+        let mixer_effect_instances = self.mixer_effect_vst3_instances.clone();
+        let mixer_effect_processor = if mixer_effect_instances.is_empty() {
+            None
+        } else {
+            let Some(host) = self.vst3_host.as_ref() else {
+                self.status = "VST3 host is not initialized".to_owned();
+                return;
+            };
+            let pattern = match document.patterns() {
+                Ok(patterns) => match patterns
+                    .into_iter()
+                    .find(|pattern| pattern.id == pattern_id)
+                {
+                    Some(pattern) => pattern,
+                    None => {
+                        self.status = format!("Pattern {pattern_id} was not found");
+                        return;
+                    }
+                },
+                Err(error) => {
+                    self.status = format!("Could not decode Pattern notes: {error}");
+                    return;
+                }
+            };
+            let ppq = document.header().ppq();
+            let loop_length_ticks = pattern_lfo_loop_length_ticks(
+                &pattern,
+                ppq,
+                document.metadata().time_signature().unwrap_or((4, 4)),
+            );
+            let effect_automation = self
+                .pattern_vst3_mixer_effect_parameter_automations_for_pattern(
+                    &pattern,
+                    ppq,
+                    loop_length_ticks,
+                );
+            match host.prepare_pattern_mixer_effects_processor(
+                document,
+                pattern_id,
+                loop_length_ticks,
+                options.sample_rate,
+                &mixer_effect_instances,
+                &effect_automation,
+            ) {
+                Ok(processor) => Some(processor),
+                Err(error) => {
+                    self.status = format!(
+                        "Could not prepare Mixer effects for Sampler Pattern render: {error}"
+                    );
+                    return;
+                }
+            }
+        };
         let document = document.clone();
         let package_workspace = self.package_workspace.clone();
         let output_path_for_worker = output_path.clone();
@@ -44167,13 +44221,23 @@ impl DawUi {
             .name("sampler-pattern-render".to_owned())
             .spawn(move || {
                 let _package_workspace = package_workspace;
-                let result = render_sampler_pattern_to_file(
-                    &document,
-                    &project_path,
-                    options,
-                    &output_path_for_worker,
-                    output_format,
-                );
+                let result = match mixer_effect_processor {
+                    Some(processor) => render_sampler_pattern_to_file_with_mixer_effects(
+                        &document,
+                        &project_path,
+                        options,
+                        &output_path_for_worker,
+                        output_format,
+                        processor,
+                    ),
+                    None => render_sampler_pattern_to_file(
+                        &document,
+                        &project_path,
+                        options,
+                        &output_path_for_worker,
+                        output_format,
+                    ),
+                };
                 let _ = sender.send(result);
             });
         match worker {

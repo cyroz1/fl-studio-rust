@@ -6239,11 +6239,10 @@ fn encode_float_spool(
 
 /// Render the sample voices in one FLP pattern to a WAV using the selected bit depth and channel mode.
 ///
-/// This initial Sampler path schedules kind-0 channel notes on the project timeline, reads the
-/// channel's `0xC4` sample path, resamples by note key, applies velocity and the channel's
-/// provisional gain/pan mapping, and caps simultaneous voices. The default sample root key is
-/// assumed to be MIDI 60; sampler root-key settings, envelopes, loop modes, filters, and effects
-/// are not decoded yet.
+/// This Sampler path schedules kind-0 channel notes on the project timeline, reads the channel's
+/// `0xC4` sample path and supported sample metadata, applies note velocity and channel routing, and
+/// caps simultaneous voices. Channel-native Sampler filters remain unsupported; the effect-aware
+/// file renderer can apply loaded VST3 Mixer insert and Master effects.
 pub fn render_sampler_pattern_to_wav(
     document: &FlpDocument,
     project_path: impl AsRef<Path>,
@@ -6285,6 +6284,59 @@ pub fn render_sampler_pattern_to_file(
         },
         output_format,
     )?;
+    Ok(summary)
+}
+
+/// Render one Sampler Pattern through prepared loaded Mixer effects to an audio file.
+pub fn render_sampler_pattern_to_file_with_mixer_effects(
+    document: &FlpDocument,
+    project_path: impl AsRef<Path>,
+    options: SamplerPatternRenderOptions,
+    output_path: impl AsRef<Path>,
+    output_format: AudioRenderOutput,
+    mut processor: Vst3PlaylistStreamProcessor,
+) -> Result<SamplerPatternRenderSummary, String> {
+    let project_path = project_path.as_ref();
+    let output_path = output_path.as_ref();
+    validate_output_path_with_extension(project_path, output_path, output_format.extension())?;
+    if processor.summary().sample_rate != options.sample_rate {
+        return Err("Sampler Pattern and Mixer effect sample rates do not match".to_owned());
+    }
+
+    let render = prepare_sampler_pattern(document, project_path, options, false, None)?;
+    let content_frames = render.summary.frames.max(processor.content_frames());
+    processor.extend_to_output_frames(content_frames)?;
+    let processor_summary = processor.summary();
+    let trim_frames = processor
+        .pdc_render_start_trim_frames()
+        .min(processor_summary.frames);
+
+    processor.start_processing()?;
+    let render_result = render_stereo_audio_to_file(
+        output_path,
+        processor_summary.frames.saturating_sub(trim_frames),
+        processor_summary.sample_rate,
+        AudioRenderEncodingOptions {
+            wav_sample_format: options.wav_sample_format,
+            wav_dither_mode: options.wav_dither_mode,
+            wav_channel_mode: options.wav_channel_mode,
+        },
+        output_format,
+        |write_block| {
+            stream_prepared_sampler_pattern_with_mixer_effects(
+                &render,
+                Some(&mut processor),
+                processor_summary.frames,
+                trim_frames,
+                None,
+                || false,
+                write_block,
+            )
+        },
+    );
+    let stop_result = processor.stop_processing();
+    let summary = render_result?;
+    stop_result?;
     Ok(summary)
 }
 
@@ -8108,6 +8160,26 @@ fn live_input_controller_event(event: Vst3LiveInputEvent) -> Result<MidiEvent, S
 fn stream_prepared_sampler_pattern(
     render: &PreparedSamplerPattern,
     cancelled: Option<&AtomicBool>,
+    stream_cancelled: impl FnMut() -> bool,
+    write_block: impl FnMut(&[f32]) -> Result<(), String>,
+) -> Result<SamplerPatternRenderSummary, String> {
+    stream_prepared_sampler_pattern_with_mixer_effects(
+        render,
+        None,
+        render.summary.frames,
+        0,
+        cancelled,
+        stream_cancelled,
+        write_block,
+    )
+}
+
+fn stream_prepared_sampler_pattern_with_mixer_effects(
+    render: &PreparedSamplerPattern,
+    mut processor: Option<&mut Vst3PlaylistStreamProcessor>,
+    render_frames: u64,
+    trim_frames: u64,
+    cancelled: Option<&AtomicBool>,
     mut stream_cancelled: impl FnMut() -> bool,
     mut write_block: impl FnMut(&[f32]) -> Result<(), String>,
 ) -> Result<SamplerPatternRenderSummary, String> {
@@ -8125,23 +8197,56 @@ fn stream_prepared_sampler_pattern(
         render.pan_law,
     );
     engine.mixer_transforms_by_channel = Some(&render.mixer_transforms_by_channel);
+    if processor.is_some() {
+        engine.mixer_meter_transforms_by_channel = Some(&render.mixer_meter_transforms_by_channel);
+        engine.mixer_effect_input_transforms_by_channel =
+            Some(&render.mixer_effect_input_transforms_by_channel);
+    }
     let mut block = vec![0.0f32; SAMPLER_BLOCK_FRAMES * 2];
+    let mut mixer_buses = Vec::new();
     let mut block_start = 0u64;
-    while block_start < render.summary.frames {
+    while block_start < render_frames {
         check_cancelled(cancelled)?;
         if stream_cancelled() {
             return Err("Sampler pattern playback was stopped".to_owned());
         }
-        let frame_count =
-            (render.summary.frames - block_start).min(SAMPLER_BLOCK_FRAMES as u64) as usize;
+        let frame_count = (render_frames - block_start).min(SAMPLER_BLOCK_FRAMES as u64) as usize;
         let block_samples = &mut block[..frame_count * 2];
-        engine.render_block(block_start, frame_count, block_samples);
+        if let Some(processor) = processor.as_deref_mut() {
+            let bus_samples = frame_count
+                .checked_mul(2)
+                .and_then(|samples| samples.checked_mul(MIXER_TRACK_METER_COUNT))
+                .and_then(|samples| samples.checked_mul(2))
+                .ok_or_else(|| "Sampler Mixer effect bus size overflow".to_owned())?;
+            mixer_buses.resize(bus_samples, 0.0);
+            mixer_buses.fill(0.0);
+            engine.render_block_with_meters(
+                block_start,
+                frame_count,
+                block_samples,
+                Some(&mut mixer_buses),
+                frame_count * 2,
+            );
+            processor.mix_next_block_with_meter_buses(block_samples, &mut mixer_buses)?;
+        } else {
+            engine.render_block(block_start, frame_count, block_samples);
+        }
         render.master_output.apply(block_samples);
-        write_block(block_samples)?;
+        let skipped_frames = trim_frames
+            .saturating_sub(block_start)
+            .min(frame_count as u64);
+        if skipped_frames < frame_count as u64 {
+            let skip_samples = usize::try_from(skipped_frames)
+                .ok()
+                .and_then(|frames| frames.checked_mul(2))
+                .ok_or_else(|| "Sampler Pattern PDC trim overflow".to_owned())?;
+            write_block(&block_samples[skip_samples..])?;
+        }
         block_start += frame_count as u64;
     }
     let mut summary = render.summary.clone();
     summary.voices_stolen = engine.voices_stolen;
+    summary.frames = render_frames.saturating_sub(trim_frames);
     Ok(summary)
 }
 
