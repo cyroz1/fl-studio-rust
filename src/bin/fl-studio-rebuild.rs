@@ -57,7 +57,6 @@ use flp_rebuild::sample_render::{
     render_sampler_pattern_to_file, stream_input_monitor_through_mixer,
     stream_mixed_layer_midi_input_to_device,
     stream_pattern_loop_with_vst3_from_tick_to_device_with_live_controls,
-    stream_pattern_loop_with_vst3_from_tick_to_device_with_live_master_controls,
     stream_pattern_with_vst3_to_device_with_live_master_controls,
     stream_playlist_performance_with_vst3_to_device,
     stream_playlist_with_vst3_to_device_with_monitor_and_latency_updates,
