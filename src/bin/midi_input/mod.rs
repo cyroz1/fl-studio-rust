@@ -705,6 +705,9 @@ fn queue_script_transport_actions(
             ScriptTransportAction::SetPlaylistTrackSelection(track_ids) => {
                 MidiTransportCommand::SetPlaylistTrackSelection(track_ids)
             }
+            ScriptTransportAction::SetPlaylistTrackName { track_id, name } => {
+                MidiTransportCommand::SetPlaylistTrackName { track_id, name }
+            }
             ScriptTransportAction::SelectChannel(channel_id) => {
                 MidiTransportCommand::SelectChannel(channel_id)
             }
@@ -855,6 +858,10 @@ pub enum MidiTransportCommand {
         stop: bool,
     },
     SetPlaylistTrackSelection(Vec<u32>),
+    SetPlaylistTrackName {
+        track_id: u32,
+        name: String,
+    },
     SelectChannel(u16),
     SetMixerTrackSelection {
         index: u16,
@@ -1635,6 +1642,9 @@ pub fn describe_event(event: MidiInputEvent) -> String {
             }
             MidiTransportCommand::SetPlaylistTrackSelection(_) => {
                 "MIDI script Set Playlist Track Selection".to_owned()
+            }
+            MidiTransportCommand::SetPlaylistTrackName { .. } => {
+                "MIDI script Set Playlist Track Name".to_owned()
             }
             MidiTransportCommand::SelectChannel(_) => "MIDI script Select Channel".to_owned(),
             MidiTransportCommand::SetMixerTrackSelection { .. } => {
@@ -2505,6 +2515,10 @@ mod tests {
                 ScriptTransportAction::SetProjectTimeSignatureNumerator(7),
                 ScriptTransportAction::SetProjectTimeSignatureDenominator(8),
                 ScriptTransportAction::SetPlaylistTrackSelection(vec![1, 3]),
+                ScriptTransportAction::SetPlaylistTrackName {
+                    track_id: 2,
+                    name: "Bass".to_owned(),
+                },
                 ScriptTransportAction::SetPlaylistTrackSelection(Vec::new()),
                 ScriptTransportAction::AddArrangementTimeMarker {
                     tick: 960,
@@ -2545,6 +2559,13 @@ mod tests {
         assert_eq!(
             transport_receiver.try_recv().unwrap().event,
             MidiInputEvent::Transport(MidiTransportCommand::SetPlaylistTrackSelection(vec![1, 3]))
+        );
+        assert_eq!(
+            transport_receiver.try_recv().unwrap().event,
+            MidiInputEvent::Transport(MidiTransportCommand::SetPlaylistTrackName {
+                track_id: 2,
+                name: "Bass".to_owned(),
+            })
         );
         assert_eq!(
             transport_receiver.try_recv().unwrap().event,

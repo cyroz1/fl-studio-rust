@@ -695,6 +695,7 @@ fn midi_input_thru_message(event: MidiInputEvent) -> Option<([u8; 3], usize)> {
             | MidiTransportCommand::AddArrangementTimeMarker { .. }
             | MidiTransportCommand::SetArrangementLiveSelection { .. }
             | MidiTransportCommand::SetPlaylistTrackSelection(_)
+            | MidiTransportCommand::SetPlaylistTrackName { .. }
             | MidiTransportCommand::SelectChannel(_)
             | MidiTransportCommand::SetMixerTrackSelection { .. }
             | MidiTransportCommand::SetMixerTrackName { .. }

@@ -63,6 +63,10 @@ pub enum ScriptTransportAction {
         stop: bool,
     },
     SetPlaylistTrackSelection(Vec<u32>),
+    SetPlaylistTrackName {
+        track_id: u32,
+        name: String,
+    },
     SelectChannel(u16),
     SetMixerTrackSelection {
         index: u16,
@@ -231,6 +235,7 @@ pub struct MidiScriptTransportState {
     pub arrangement_live_selection_start: AtomicU64,
     pub arrangement_live_selection_end: AtomicU64,
     pub playlist_track_count: AtomicU64,
+    pub playlist_track_names: Mutex<Vec<String>>,
     pub selected_playlist_track_ids: Mutex<Vec<u32>>,
     pub midi_pickup_enabled: AtomicU8,
     pub channel_ids: Mutex<Vec<u16>>,
@@ -286,6 +291,7 @@ impl Default for MidiScriptTransportState {
             arrangement_live_selection_start: AtomicU64::new(0),
             arrangement_live_selection_end: AtomicU64::new(0),
             playlist_track_count: AtomicU64::new(0),
+            playlist_track_names: Mutex::new(Vec::new()),
             selected_playlist_track_ids: Mutex::new(Vec::new()),
             midi_pickup_enabled: AtomicU8::new(1),
             channel_ids: Mutex::new(Vec::new()),
@@ -740,6 +746,12 @@ impl MidiScriptRuntime {
             .transport_state
             .playlist_track_count
             .load(Ordering::Relaxed);
+        let playlist_track_names = self
+            .transport_state
+            .playlist_track_names
+            .lock()
+            .map(|track_names| track_names.clone())
+            .unwrap_or_default();
         let selected_playlist_track_ids = self
             .transport_state
             .selected_playlist_track_ids
@@ -1001,6 +1013,10 @@ impl MidiScriptRuntime {
                     json!(playlist_track_count),
                 );
                 transport_object.insert(
+                    "playlist_track_names".to_owned(),
+                    json!(playlist_track_names),
+                );
+                transport_object.insert(
                     "selected_playlist_track_ids".to_owned(),
                     json!(selected_playlist_track_ids),
                 );
@@ -1132,6 +1148,21 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
             return Err("MIDI script returned duplicate Playlist track IDs".to_owned());
         }
         return Ok(ScriptTransportAction::SetPlaylistTrackSelection(track_ids));
+    }
+    if name == Some("set_playlist_track_name") {
+        let track_id = action["track_id"]
+            .as_u64()
+            .and_then(|track_id| u32::try_from(track_id).ok())
+            .filter(|track_id| (1..=SCRIPT_MAX_PLAYLIST_TRACK_COUNT as u32).contains(track_id))
+            .ok_or_else(|| "MIDI script returned an invalid Playlist track ID".to_owned())?;
+        let track_name = action["name"]
+            .as_str()
+            .filter(|track_name| !track_name.contains('\0'))
+            .ok_or_else(|| "MIDI script returned an invalid Playlist track name".to_owned())?;
+        return Ok(ScriptTransportAction::SetPlaylistTrackName {
+            track_id,
+            name: track_name.to_owned(),
+        });
     }
     if name == Some("set_song_position") {
         let position = action["position"]
@@ -1914,6 +1945,46 @@ mod tests {
                 ScriptTransportAction::SetPlaylistTrackSelection(vec![1, 3]),
                 ScriptTransportAction::SetPlaylistTrackSelection(vec![1, 2, 3]),
                 ScriptTransportAction::SetPlaylistTrackSelection(Vec::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn python_playlist_track_names_use_one_based_indices_and_queue_edits() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport playlist\ndef OnMidiIn(event):\n    if playlist.getTrackName(1) != 'Drums':\n        raise RuntimeError('Playlist track name was not read')\n    if playlist.getTrackName(2) != 'Track 2':\n        raise RuntimeError('unnamed Playlist row should use its default label')\n    playlist.setTrackName(2, 'Bass')\n    playlist.setTrackName(2, '')\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let transport_state = Arc::new(MidiScriptTransportState::default());
+        transport_state
+            .playlist_track_count
+            .store(2, Ordering::Relaxed);
+        *transport_state.playlist_track_names.lock().unwrap() =
+            vec!["Drums".to_owned(), "".to_owned()];
+        let mut runtime = MidiScriptRuntime::start_for_device_with_transport_state(
+            &script,
+            "Test Input",
+            transport_state,
+        )
+        .unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 127]).unwrap();
+
+        assert_eq!(
+            result.actions,
+            [
+                ScriptTransportAction::SetPlaylistTrackName {
+                    track_id: 2,
+                    name: "Bass".to_owned(),
+                },
+                ScriptTransportAction::SetPlaylistTrackName {
+                    track_id: 2,
+                    name: String::new(),
+                },
             ]
         );
     }

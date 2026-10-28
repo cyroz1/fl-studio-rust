@@ -138,6 +138,37 @@ def _playlist_track_count():
         return 0
 
 
+def _playlist_track_index(index):
+    try:
+        index = int(index)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("Playlist track index must be an integer") from error
+    if not 1 <= index <= _playlist_track_count():
+        raise IndexError("Playlist track index is outside the supported range")
+    return index
+
+
+def _playlist_get_track_name(index):
+    index = _playlist_track_index(index)
+    track_names = _active_transport_state.get("playlist_track_names", [])
+    if index <= len(track_names):
+        name = str(track_names[index - 1])
+        if name:
+            return name
+    return "Track {}".format(index)
+
+
+def _playlist_set_track_name(index, name):
+    index = _playlist_track_index(index)
+    if not isinstance(name, str):
+        raise TypeError("Playlist track name must be a string")
+    if "\0" in name:
+        raise ValueError("Playlist track names cannot contain NUL")
+    _request_transport_action(
+        {"action": "set_playlist_track_name", "track_id": index, "name": name}
+    )
+
+
 def _playlist_selected_track_ids():
     try:
         return {
@@ -1636,6 +1667,8 @@ def _install_modules(script_name, device_name):
 
     playlist = _module("playlist")
     playlist.trackCount = _playlist_track_count
+    playlist.getTrackName = _playlist_get_track_name
+    playlist.setTrackName = _playlist_set_track_name
     playlist.isTrackSelected = _playlist_is_track_selected
     playlist.selectTrack = _playlist_select_track
     playlist.selectAll = _playlist_select_all
