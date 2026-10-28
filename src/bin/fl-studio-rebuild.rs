@@ -29160,6 +29160,7 @@ impl DawUi {
         let mut layer_fade_edits = Vec::new();
         let mut channel_mixer_track_edits = Vec::<(Vec<u16>, i8)>::new();
         let mut channel_stretch_edits = Vec::new();
+        let mut channel_key_region_edits = Vec::new();
         let mut step_toggles = Vec::<(u16, Vec<usize>, u32, StepToggleOperation)>::new();
         let mut step_note_additions = Vec::<(u16, u32, u16)>::new();
         let mut mute_removed_steps_changed = false;
@@ -29412,6 +29413,7 @@ impl DawUi {
                 let mut sampler_fade_apply = None;
                 let mut sampler_envelope_lfo_applies = Vec::new();
                 let mut channel_fine_tune_apply = None;
+                let mut channel_key_region_apply = None;
                 let layer_flags = channel.layer_flags();
                 let mut layer_random = channel.layer_random_enabled().unwrap_or(false);
                 let mut layer_crossfade = channel.layer_crossfade_enabled().unwrap_or(false);
@@ -30090,6 +30092,31 @@ impl DawUi {
                             }
                         });
                         if !zipped {
+                        if let Some((key_low, key_high)) = channel.keyboard_key_region() {
+                            let mut low_key = key_low;
+                            let mut high_key = key_high;
+                            let mut changed = false;
+                            ui.collapsing("Playable key range", |ui| {
+                                ui.small("Inclusive MIDI key bounds applied to notes routed through this channel.");
+                                ui.horizontal_wrapped(|ui| {
+                                    changed |= ui
+                                        .add(
+                                            egui::Slider::new(&mut low_key, 0..=high_key)
+                                                .text("Low key"),
+                                        )
+                                        .changed();
+                                    changed |= ui
+                                        .add(
+                                            egui::Slider::new(&mut high_key, low_key..=127)
+                                                .text("High key"),
+                                        )
+                                        .changed();
+                                });
+                            });
+                            if changed {
+                                channel_key_region_apply = Some((low_key, high_key));
+                            }
+                        }
                         if let Some(mut selected_children) =
                             channel.layer_child_ids().map(<[u16]>::to_vec)
                         {
@@ -30374,6 +30401,9 @@ impl DawUi {
                 }
                 if let Some((fade_out_raw, fade_in_raw)) = sampler_fade_apply {
                     sampler_fade_edits.push((channel.id(), fade_out_raw, fade_in_raw));
+                }
+                if let Some((low_key, high_key)) = channel_key_region_apply {
+                    channel_key_region_edits.push((channel.id(), low_key, high_key));
                 }
                 sampler_envelope_lfo_edits.extend(
                     sampler_envelope_lfo_applies
@@ -31005,6 +31035,29 @@ impl DawUi {
                         self.status = format!(
                             "Could not update channel {channel_id} stretch settings: {error}"
                         );
+                    }
+                }
+            }
+        }
+        if !channel_key_region_edits.is_empty()
+            && let Some(document) = self.document.as_mut()
+        {
+            for (channel_id, low_key, high_key) in channel_key_region_edits {
+                match document.set_channel_key_region(
+                    channel_id,
+                    u8::try_from(low_key).expect("the key-range slider stays within 0..=127"),
+                    u8::try_from(high_key).expect("the key-range slider stays within 0..=127"),
+                ) {
+                    Ok(()) => {
+                        self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+                        self.status = format!(
+                            "Channel {channel_id} playable key range set to {low_key}–{high_key}"
+                        );
+                    }
+                    Err(error) => {
+                        self.status =
+                            format!("Could not update channel {channel_id} key range: {error}");
                     }
                 }
             }

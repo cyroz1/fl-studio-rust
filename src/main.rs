@@ -711,6 +711,17 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_bool(enabled, "Enable main pitch setting")?,
             )
         }
+        [command, input, output, channel_id, low_key, high_key]
+            if command == "set-channel-key-region" =>
+        {
+            set_channel_key_region(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(channel_id, "channel id")?,
+                parse_u8(low_key, "low MIDI key")?,
+                parse_u8(high_key, "high MIDI key")?,
+            )
+        }
         [command, input, output, channel_id, enabled] if command == "set-channel-enabled" => {
             set_channel_enabled(
                 Path::new(input),
@@ -4122,6 +4133,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild set-channel-sample-reversed <input.flp> <output.flp> <channel-id> <0|1>\n",
             "  flp-rebuild set-channel-zipped <input.flp> <output.flp> <channel-id> <0|1>\n",
             "  flp-rebuild set-channel-main-pitch <input.flp> <output.flp> <channel-id> <0|1>\n",
+            "  flp-rebuild set-channel-key-region <input.flp> <output.flp> <channel-id> <low-key:0..127> <high-key:0..127>\n",
             "  flp-rebuild set-channel-add-to-key <input.flp> <output.flp> <channel-id> <0|1>\n",
             "  flp-rebuild set-channel-mixer-track <input.flp> <output.flp> <channel-id> <mixer-track:-1=Current|0=Master|1..127=insert>\n",
             "  flp-rebuild edit-channel-stretch-settings <input.flp> <output.flp> <channel-id> <time-raw|-> <pitch-raw|-> <multiplier-raw|-> <mode:-1..9|->\n",
@@ -6307,7 +6319,7 @@ fn list_channels(path: &Path) -> Result<(), String> {
     println!("channels: {}", channels.len());
     for channel in channels {
         println!(
-            "id={} kind={} type={:?} enabled={} zipped={} main_pitch={} add_to_key={} fine_tune_raw={:?} stretch_settings={:?} sampler_fade_out_raw={:?} sampler_fade_in_raw={:?} sampler_volume_envelope={:?} sampler_envelopes={:?} color={:?} volume={:?} pan={:?} level_adjusts_raw={:?} swing_mix_raw={:?} layer_children={:?} layer_flags={:?} plugin={} name={} sample_path={:?} events={:?}",
+            "id={} kind={} type={:?} enabled={} zipped={} main_pitch={} add_to_key={} fine_tune_raw={:?} key_region={:?} stretch_settings={:?} sampler_fade_out_raw={:?} sampler_fade_in_raw={:?} sampler_volume_envelope={:?} sampler_envelopes={:?} color={:?} volume={:?} pan={:?} level_adjusts_raw={:?} swing_mix_raw={:?} layer_children={:?} layer_flags={:?} plugin={} name={} sample_path={:?} events={:?}",
             channel.id(),
             channel
                 .kind()
@@ -6320,6 +6332,7 @@ fn list_channels(path: &Path) -> Result<(), String> {
             channel.keyboard_main_pitch_enabled(),
             channel.keyboard_add_to_key_enabled(),
             channel.keyboard_fine_tune_raw(),
+            channel.keyboard_key_region(),
             channel.stretch_settings(),
             channel.sampler_fade_out_raw(),
             channel.sampler_fade_in_raw(),
@@ -7803,6 +7816,29 @@ fn set_channel_main_pitch(
     println!(
         "{} main pitch on channel {channel_id} in {}",
         if enabled { "enabled" } else { "disabled" },
+        output.display()
+    );
+    Ok(())
+}
+
+fn set_channel_key_region(
+    input: &Path,
+    output: &Path,
+    channel_id: u16,
+    low_key: u8,
+    high_key: u8,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .set_channel_key_region(channel_id, low_key, high_key)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "set channel {channel_id} playable key range to {low_key}–{high_key} in {}",
         output.display()
     );
     Ok(())

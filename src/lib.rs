@@ -22538,6 +22538,72 @@ impl FlpDocument {
         Ok(())
     }
 
+    /// Sets the inclusive playable MIDI key range in a recognized Parameters (`0xC7`) event.
+    /// The existing payload must contain both bounds; all other bytes are retained.
+    pub fn set_channel_key_region(
+        &mut self,
+        channel_id: u16,
+        low_key: u8,
+        high_key: u8,
+    ) -> Result<(), FlpError> {
+        if low_key > 127 || high_key > 127 {
+            return Err(FlpError::UnsupportedEdit(
+                "playable key-range bounds must be between 0 and 127",
+            ));
+        }
+        if low_key > high_key {
+            return Err(FlpError::UnsupportedEdit(
+                "the playable key range low bound must not exceed its high bound",
+            ));
+        }
+
+        self.require_unique_channel(channel_id)?;
+        let channel = self
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id == channel_id)
+            .ok_or(FlpError::ChannelNotFound(channel_id))?;
+        if !matches!(channel.kind, Some(0..=4)) {
+            return Err(FlpError::UnsupportedEdit(
+                "playable key ranges can only be edited on recognized note channel types",
+            ));
+        }
+        let c7_events = channel
+            .event_range()
+            .filter(|index| self.events[*index].opcode == 0xC7)
+            .collect::<Vec<_>>();
+        let mut parameter_events = c7_events.iter().copied().filter(|index| {
+            matches!(self.events[*index].encoding, PayloadEncoding::Data { .. })
+                && ascii_version(&self.events[*index].payload).is_none()
+        });
+        let Some(parameters_index) = parameter_events.next() else {
+            return Err(FlpError::UnsupportedEdit(if c7_events.is_empty() {
+                "the selected channel has no existing Parameters (`0xC7`) event"
+            } else {
+                "the selected channel's `0xC7` event is not a recognized Parameters payload"
+            }));
+        };
+        if parameter_events.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel has multiple Parameters (`0xC7`) events",
+            ));
+        }
+        if self.events[parameters_index].payload.len() < 76 {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel's Parameters event does not contain both key-range bounds",
+            ));
+        }
+
+        let mut candidate = self.clone();
+        let mut payload = candidate.events[parameters_index].payload.clone();
+        payload[68..72].copy_from_slice(&u32::from(low_key).to_le_bytes());
+        payload[72..76].copy_from_slice(&u32::from(high_key).to_le_bytes());
+        candidate.events[parameters_index].replace_data_payload(payload)?;
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
     /// Enables or disables the channel's Add to Key option for project Master pitch.
     /// The flag is stored at byte 64 of the channel Parameters (`0xC7`) payload.
     pub fn set_channel_add_to_key_enabled(
