@@ -40482,12 +40482,12 @@ impl DawUi {
         } else {
             None
         };
-        let (notes, pattern) = match document.patterns() {
+        let pattern = match document.patterns() {
             Ok(patterns) => match patterns
                 .into_iter()
                 .find(|pattern| pattern.id == pattern_id)
             {
-                Some(pattern) => (pattern.notes.clone(), pattern),
+                Some(pattern) => pattern,
                 None => {
                     self.status = format!("Pattern {pattern_id} was not found");
                     return;
@@ -40499,21 +40499,42 @@ impl DawUi {
             }
         };
         let ppq = document.header().ppq();
+        let pattern_loop_length_ticks = pattern_lfo_loop_length_ticks(
+            &pattern,
+            ppq,
+            document.metadata().time_signature().unwrap_or((4, 4)),
+        );
         let pattern_automations = self.pattern_vst3_parameter_automations_for_pattern(
             &pattern,
             ppq,
-            pattern_lfo_loop_length_ticks(
+            pattern_loop_length_ticks,
+        );
+        let mixer_effect_parameter_automation = self
+            .pattern_vst3_mixer_effect_parameter_automations_for_pattern(
                 &pattern,
                 ppq,
-                document.metadata().time_signature().unwrap_or((4, 4)),
-            ),
-        );
-        let tempo_bpm = document.metadata().tempo_bpm().unwrap_or(self.tempo_bpm);
-        let global_swing_mix_raw = document.metadata().global_swing_mix();
-        let channel_swing_mix_raw = project_channel_swing_mix_raw(&document, channel_id);
-        let pitch_offset_cents = project_channel_pitch_offset_cents(&document, channel_id);
-        let note_pitch_offset_semitones =
-            project_channel_master_pitch_note_offset_semitones(&document, channel_id);
+                pattern_loop_length_ticks,
+            );
+        let mixer_effect_instances = self.mixer_effect_vst3_instances.clone();
+        let channel = Vst3PatternChannelRenderRequest {
+            instance_id,
+            parameter_automation: pattern_automations
+                .get(&channel_id)
+                .cloned()
+                .unwrap_or_default(),
+            options: Vst3PatternRenderOptions {
+                channel_id,
+                ppq,
+                tempo_bpm: document.metadata().tempo_bpm().unwrap_or(self.tempo_bpm),
+                tail_seconds: 2.0,
+                global_swing_mix_raw: document.metadata().global_swing_mix(),
+                channel_swing_mix_raw: project_channel_swing_mix_raw(&document, channel_id),
+                pitch_offset_cents: project_channel_pitch_offset_cents(&document, channel_id),
+                note_pitch_offset_semitones: project_channel_master_pitch_note_offset_semitones(
+                    &document, channel_id,
+                ),
+            },
+        };
         let selected_format = self.playlist_song_output_format;
         let output_format = self.audio_render_output();
         let dialog_title = if insert_into_playlist {
@@ -40551,23 +40572,13 @@ impl DawUi {
             .as_ref()
             .ok_or_else(|| "VST3 host is not initialized".to_owned())
             .and_then(|host| {
-                host.render_pattern_channel_to_file_with_automation(
-                    instance_id,
-                    &notes,
-                    Vst3PatternRenderOptions {
-                        channel_id,
-                        ppq,
-                        tempo_bpm,
-                        tail_seconds: 2.0,
-                        global_swing_mix_raw,
-                        channel_swing_mix_raw,
-                        pitch_offset_cents,
-                        note_pitch_offset_semitones,
-                    },
-                    pattern_automations
-                        .get(&channel_id)
-                        .map(Vec::as_slice)
-                        .unwrap_or(&[]),
+                host.render_pattern_channels_with_mixer_effects_to_file(
+                    &document,
+                    pattern_id,
+                    pattern_loop_length_ticks,
+                    std::slice::from_ref(&channel),
+                    &mixer_effect_instances,
+                    &mixer_effect_parameter_automation,
                     &path,
                     AudioFileRenderOptions {
                         output_format,
