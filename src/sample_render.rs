@@ -9882,12 +9882,12 @@ fn prepare_sampler_arrangement(
                     .map(|frame| frame.max(start_frame.saturating_add(1)))
             })
             .transpose()?;
-        let slide_duration_frames = sampler_polyphony_slide_frames(
-            channel.sampler_polyphony_slide_raw(),
-            ppq,
-            tempo_map.tempo_bpm_at_tick(placed.start_tick),
-            options.sample_rate,
-        );
+        let slide_duration_ticks =
+            sampler_polyphony_slide_ticks(channel.sampler_polyphony_slide_raw(), ppq);
+        let slide_end_tick = placed.start_tick as f64 + slide_duration_ticks;
+        let slide_end_frame =
+            tempo_map.frame_at_fractional_tick(slide_end_tick, options.sample_rate)?;
+        let slide_duration_frames = slide_end_frame.saturating_sub(start_frame);
         let mut fine_pitch_offset_cents = note.fine_pitch_offset_cents();
         if !note.is_slide_note()
             && let Some(base_pitch_adjustment_cents) =
@@ -15065,6 +15065,19 @@ fn sampler_polyphony_slide_frames(
     if ppq == 0 || !tempo_bpm.is_finite() || tempo_bpm <= 0.0 {
         return 0;
     }
+    let ticks = sampler_polyphony_slide_ticks(slide_raw, ppq);
+    let frames = ticks * 60.0 * f64::from(sample_rate) / (f64::from(ppq) * tempo_bpm);
+    if frames.is_finite() && frames > 0.0 {
+        frames.round().min(u64::MAX as f64) as u64
+    } else {
+        0
+    }
+}
+
+fn sampler_polyphony_slide_ticks(slide_raw: Option<u32>, ppq: u16) -> f64 {
+    if ppq == 0 {
+        return 0.0;
+    }
     let raw = f64::from(
         slide_raw
             .unwrap_or(SAMPLER_POLYPHONY_SLIDE_DEFAULT_RAW)
@@ -15074,13 +15087,7 @@ fn sampler_polyphony_slide_frames(
     // The raw control is documented as nonlinear. This fourth-power curve is
     // an inferred fit to the published default (820 ~= half a step) and max
     // (1660 = eight steps), pending a controlled native render comparison.
-    let ticks = f64::from(ppq) * 2.0 * normalized.powi(4);
-    let frames = ticks * 60.0 * f64::from(sample_rate) / (f64::from(ppq) * tempo_bpm);
-    if frames.is_finite() && frames > 0.0 {
-        frames.round().min(u64::MAX as f64) as u64
-    } else {
-        0
-    }
+    f64::from(ppq) * 2.0 * normalized.powi(4)
 }
 
 fn source_duration_to_frames(
