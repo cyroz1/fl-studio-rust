@@ -2,9 +2,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::hash::{BuildHasher, Hash, Hasher, RandomState};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -42,12 +42,12 @@ use flp_rebuild::sample_render::{
     LayerLiveInputSender, MP3_BITRATES_KBPS, MixerStemRenderOptions,
     PLAYLIST_AUDIO_CLIP_GAIN_MINUS_INFINITY, PlaylistAudioClipEnvelope, PlaylistAudioClipFadeCurve,
     PlaylistLiveStreamControls, PlaylistPerformanceCommand, PlaylistPerformanceLaunch,
-    PlaylistPerformanceStream, PlaylistRenderOptions, PlaylistRenderRange, PlaylistRenderSummary,
-    PlaylistStreamMonitor, PlaylistTailMode, PlaylistTempoMap, ResamplingQuality,
-    SamplerLiveInputRouting, SamplerLiveNoteEvent, SamplerLiveNoteSender,
-    SamplerPatternLoopPlayback, SamplerPatternLoopStreamControls, SamplerPatternRenderOptions,
-    SamplerPatternRenderSummary, SamplerPatternStreamControls, Vst3LatencyUpdateControls,
-    Vst3LiveInputEvent, Vst3LiveInputSender, Vst3PatternLoopPlayback,
+    PlaylistPerformanceLiveStatus, PlaylistPerformanceStream, PlaylistRenderOptions,
+    PlaylistRenderRange, PlaylistRenderSummary, PlaylistStreamMonitor, PlaylistTailMode,
+    PlaylistTempoMap, ResamplingQuality, SamplerLiveInputRouting, SamplerLiveNoteEvent,
+    SamplerLiveNoteSender, SamplerPatternLoopPlayback, SamplerPatternLoopStreamControls,
+    SamplerPatternRenderOptions, SamplerPatternRenderSummary, SamplerPatternStreamControls,
+    Vst3LatencyUpdateControls, Vst3LiveInputEvent, Vst3LiveInputSender, Vst3PatternLoopPlayback,
     Vst3PatternLoopStreamControls, Vst3PatternPlayback, Vst3PatternStreamControls, WavChannelMode,
     WavDitherMode, WavSampleFormat, layer_live_input_queue,
     nearest_playlist_audio_clip_zero_crossing_tick, playlist_audio_clip_fade_gain,
@@ -4788,6 +4788,7 @@ struct DawUi {
     midi_performance_plus_scene_mode: bool,
     performance_scene_round_robin: BTreeMap<(u16, PlaylistPerformanceSceneKey, u32), usize>,
     performance_launch_sender: Option<Sender<PlaylistPerformanceCommand>>,
+    playlist_performance_live_status: Arc<Mutex<PlaylistPerformanceLiveStatus>>,
     performance_mixer_routing_sender: Option<Sender<FlpDocument>>,
     performance_latency_update_sender: Option<Sender<BTreeSet<u64>>>,
     performance_latency_report_receiver: Option<Receiver<Vst3LatencyReport>>,
@@ -6541,6 +6542,9 @@ impl DawUi {
             midi_performance_plus_scene_mode: false,
             performance_scene_round_robin: BTreeMap::new(),
             performance_launch_sender: None,
+            playlist_performance_live_status: Arc::new(Mutex::new(
+                PlaylistPerformanceLiveStatus::default(),
+            )),
             performance_mixer_routing_sender: None,
             performance_latency_update_sender: None,
             performance_latency_report_receiver: None,
@@ -13035,6 +13039,8 @@ impl DawUi {
         let (latency_update_sender, latency_update_receiver) = mpsc::channel();
         let (latency_report_sender, latency_report_receiver) = mpsc::channel();
         let (sender, receiver) = mpsc::sync_channel(1);
+        let live_status = Arc::new(Mutex::new(PlaylistPerformanceLiveStatus::default()));
+        let worker_live_status = Arc::clone(&live_status);
         let worker_options = options.clone();
         let worker = thread::Builder::new()
             .name("performance-audio-render".to_owned())
@@ -13056,10 +13062,14 @@ impl DawUi {
                                 mixer_routing_updates: routing_update_receiver,
                                 latency_updates: latency_update_receiver,
                                 latency_reports: latency_report_sender,
+                                live_status: Arc::clone(&worker_live_status),
                                 meters: Some(worker_mixer_meters),
                             },
                         )
                     });
+                if let Ok(mut status) = worker_live_status.lock() {
+                    *status = PlaylistPerformanceLiveStatus::default();
+                }
                 writer.finish();
                 let _ = sender.send(result);
             });
@@ -13071,6 +13081,7 @@ impl DawUi {
                 self.playlist_seek_tick = start_tick;
                 self.playlist_tempo_map = Some(playlist_tempo_map);
                 self.performance_launch_sender = Some(launch_sender);
+                self.playlist_performance_live_status = live_status;
                 self.performance_mixer_routing_sender = Some(routing_update_sender);
                 self.performance_latency_update_sender = Some(latency_update_sender);
                 self.performance_latency_report_receiver = Some(latency_report_receiver);
@@ -14805,39 +14816,75 @@ impl DawUi {
                 })
                 .collect();
         }
-        let (playlist_track_activity_levels, playlist_track_performance_modes, song_start_tick) =
-            self.document
-                .as_ref()
-                .and_then(|document| {
-                    let arrangements = document.arrangements().ok()?;
-                    let arrangement = arrangements
-                        .iter()
-                        .find(|arrangement| Some(arrangement.id) == self.selected_arrangement)
-                        .or_else(|| arrangements.first())?;
-                    let tracks = document.playlist_tracks_in_arrangement(arrangement.id);
-                    Some((
-                        midi_script_playlist_track_activity_levels(
-                            arrangement,
-                            &playlist_track_ids,
-                            &tracks,
-                            Some(
-                                self.current_playhead_tick()
-                                    .unwrap_or(f64::from(self.playlist_seek_tick)),
-                            ),
-                            self.soloed_playlist_track_range,
+        let live_performance_status = if self.performance_launch_sender.is_some() {
+            self.playlist_performance_live_status
+                .lock()
+                .map(|status| status.clone())
+                .unwrap_or_default()
+        } else {
+            PlaylistPerformanceLiveStatus::default()
+        };
+        let (
+            playlist_track_activity_levels,
+            playlist_track_performance_modes,
+            playlist_live_block_statuses,
+            song_start_tick,
+        ) = self
+            .document
+            .as_ref()
+            .and_then(|document| {
+                let arrangements = document.arrangements().ok()?;
+                let arrangement = arrangements
+                    .iter()
+                    .find(|arrangement| Some(arrangement.id) == self.selected_arrangement)
+                    .or_else(|| arrangements.first())?;
+                let tracks = document.playlist_tracks_in_arrangement(arrangement.id);
+                let song_start_tick =
+                    playlist_performance_zone_start_tick(&arrangement.time_markers).unwrap_or(0);
+                let signature_changes = arrangement
+                    .time_markers
+                    .iter()
+                    .filter(|marker| marker.is_signature())
+                    .filter_map(|marker| {
+                        Some((
+                            marker.position_ticks(),
+                            marker.numerator()?.max(1),
+                            marker.denominator()?.max(1),
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                Some((
+                    midi_script_playlist_track_activity_levels(
+                        arrangement,
+                        &playlist_track_ids,
+                        &tracks,
+                        Some(
+                            self.current_playhead_tick()
+                                .unwrap_or(f64::from(self.playlist_seek_tick)),
                         ),
-                        midi_script_playlist_track_performance_modes(&playlist_track_ids, &tracks),
-                        playlist_performance_zone_start_tick(&arrangement.time_markers)
-                            .unwrap_or(0),
-                    ))
-                })
-                .unwrap_or_else(|| {
-                    (
-                        vec![0.0; playlist_track_ids.len()],
-                        vec![[None; 4]; playlist_track_ids.len()],
-                        0,
-                    )
-                });
+                        self.soloed_playlist_track_range,
+                    ),
+                    midi_script_playlist_track_performance_modes(&playlist_track_ids, &tracks),
+                    midi_script_playlist_live_block_statuses(
+                        arrangement,
+                        &playlist_track_ids,
+                        song_start_tick,
+                        project_ppq,
+                        document.metadata().time_signature(),
+                        &signature_changes,
+                        &live_performance_status,
+                    ),
+                    song_start_tick,
+                ))
+            })
+            .unwrap_or_else(|| {
+                (
+                    vec![0.0; playlist_track_ids.len()],
+                    vec![[None; 4]; playlist_track_ids.len()],
+                    vec![BTreeMap::new(); playlist_track_ids.len()],
+                    0,
+                )
+            });
         if let Ok(mut levels) = self
             .midi_script_transport_state
             .playlist_track_activity_levels
@@ -14851,6 +14898,13 @@ impl DawUi {
             .lock()
         {
             *modes = playlist_track_performance_modes;
+        }
+        if let Ok(mut statuses) = self
+            .midi_script_transport_state
+            .playlist_live_block_statuses
+            .lock()
+        {
+            *statuses = playlist_live_block_statuses;
         }
         self.midi_script_transport_state
             .playlist_performance_mode_active
@@ -69900,6 +69954,93 @@ fn midi_script_playlist_track_performance_modes(
         .collect()
 }
 
+fn midi_script_playlist_performance_block_index(
+    clip_start_tick: u32,
+    performance_zone_end_tick: u32,
+    marker_positions: &[u32],
+    ppq: u16,
+    initial_time_signature: Option<(u8, u8)>,
+    signature_changes: &[(u32, u8, u8)],
+) -> Option<u32> {
+    if clip_start_tick >= performance_zone_end_tick {
+        return None;
+    }
+    if marker_positions.is_empty() {
+        let (_, measure_number) = playlist_measure_at_tick(
+            ppq,
+            initial_time_signature,
+            signature_changes,
+            clip_start_tick,
+        );
+        return u32::try_from(measure_number.saturating_sub(1)).ok();
+    }
+    let marker_index = marker_positions.partition_point(|position| *position <= clip_start_tick);
+    u32::try_from(marker_index.checked_sub(1)?).ok()
+}
+
+fn midi_script_playlist_live_block_statuses(
+    arrangement: &Arrangement,
+    track_ids: &[u32],
+    performance_zone_end_tick: u32,
+    ppq: u16,
+    initial_time_signature: Option<(u8, u8)>,
+    signature_changes: &[(u32, u8, u8)],
+    live_status: &PlaylistPerformanceLiveStatus,
+) -> Vec<BTreeMap<u32, u8>> {
+    let mut statuses = vec![BTreeMap::new(); track_ids.len()];
+    if performance_zone_end_tick == 0 {
+        return statuses;
+    }
+    let mut marker_positions = arrangement
+        .time_markers
+        .iter()
+        .filter(|marker| {
+            !marker.is_signature() && marker.position_ticks() < performance_zone_end_tick
+        })
+        .map(TimeMarker::position_ticks)
+        .collect::<Vec<_>>();
+    marker_positions.sort_unstable();
+    marker_positions.dedup();
+    if marker_positions
+        .first()
+        .is_some_and(|position| *position > 0)
+    {
+        marker_positions.insert(0, 0);
+    }
+    let track_rows = track_ids
+        .iter()
+        .enumerate()
+        .map(|(row, track_id)| (*track_id, row))
+        .collect::<BTreeMap<_, _>>();
+    for (clip_index, clip) in arrangement.clips.iter().enumerate() {
+        let Some(track_id) = clip.playlist_track_id() else {
+            continue;
+        };
+        let Some(&row) = track_rows.get(&track_id) else {
+            continue;
+        };
+        let Some(block_index) = midi_script_playlist_performance_block_index(
+            clip.position_ticks,
+            performance_zone_end_tick,
+            &marker_positions,
+            ppq,
+            initial_time_signature,
+            signature_changes,
+        ) else {
+            continue;
+        };
+        let block_status = statuses[row].entry(block_index).or_default();
+        *block_status |= 1;
+        if live_status.playing_clip_indices.contains(&clip_index) {
+            *block_status |= 4;
+        }
+        if live_status.scheduled_clip_indices.contains(&clip_index) {
+            *block_status |= 2;
+        }
+    }
+    statuses
+}
+
 fn midi_script_increment_playlist_performance_mode(
     current: Option<u8>,
     parameter: PlaylistTrackPerformanceParameter,
@@ -71309,8 +71450,8 @@ mod tests {
         PatternController, PatternNote, PatternVst3AutomationSources, PatternVst3ParameterLink,
         PianoRollChordStamp, PianoRollGrid, PianoRollScale, PianoRollSnap,
         PlaylistAudioClipEnvelope, PlaylistAudioClipFadeCurve, PlaylistClip, PlaylistClipDragKind,
-        PlaylistClipEdit, PlaylistClipResizeEdge, PlaylistTempoMap, PlaylistTrack,
-        PlaylistTrackMotion, PlaylistTrackPerformanceParameter, PlaylistTrackPress,
+        PlaylistClipEdit, PlaylistClipResizeEdge, PlaylistPerformanceLiveStatus, PlaylistTempoMap,
+        PlaylistTrack, PlaylistTrackMotion, PlaylistTrackPerformanceParameter, PlaylistTrackPress,
         PlaylistTrackSync, PlaylistVst3ParameterLink, PluginCandidate, PluginFormat,
         ProjectPlaylistAudioClipEnvelope, TimeSelectionShift, TouchGesture, TouchTapTracker,
         TouchZoomConfig, WINDOW_LAYOUT_PRESETS_HEADER, WindowLayoutPreset,
@@ -71328,7 +71469,8 @@ mod tests {
         midi_script_clip_selection_bounds, midi_script_increment_playlist_performance_mode,
         midi_script_marker_jump_target, midi_script_marker_selection_target,
         midi_script_mixer_recording_file_names, midi_script_moved_song_position_tick,
-        midi_script_pattern_jog_target, midi_script_playlist_track_activity_levels,
+        midi_script_pattern_jog_target, midi_script_playlist_live_block_statuses,
+        midi_script_playlist_performance_block_index, midi_script_playlist_track_activity_levels,
         midi_script_playlist_track_ids, midi_script_playlist_track_mute_states,
         midi_script_playlist_track_names, midi_script_playlist_track_performance_modes,
         midi_script_tempo_jog_target, midi_script_time_position_seconds_to_ticks,
@@ -71871,6 +72013,67 @@ mod tests {
                 [Some(6), Some(3), Some(4), Some(5)],
                 [None, None, None, None],
             ]
+        );
+    }
+
+    #[test]
+    fn midi_script_performance_blocks_follow_markers_or_meter_bars() {
+        assert_eq!(
+            midi_script_playlist_performance_block_index(0, 768, &[], 96, Some((4, 4)), &[]),
+            Some(0)
+        );
+        assert_eq!(
+            midi_script_playlist_performance_block_index(384, 768, &[], 96, Some((4, 4)), &[]),
+            Some(1)
+        );
+        assert_eq!(
+            midi_script_playlist_performance_block_index(
+                576,
+                1000,
+                &[],
+                96,
+                Some((4, 4)),
+                &[(288, 3, 4)],
+            ),
+            Some(2)
+        );
+        assert_eq!(
+            midi_script_playlist_performance_block_index(
+                384,
+                1000,
+                &[0, 384, 768],
+                96,
+                Some((4, 4)),
+                &[],
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            midi_script_playlist_performance_block_index(1000, 1000, &[], 96, None, &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn midi_script_performance_block_statuses_include_fill_playing_and_scheduled_bits() {
+        let arrangement =
+            playlist_track_arrangement_fixture(&[(0, 48, 499), (384, 48, 499), (500, 48, 498)]);
+        let live_status = PlaylistPerformanceLiveStatus {
+            playing_clip_indices: BTreeSet::from([0]),
+            scheduled_clip_indices: BTreeSet::from([2]),
+        };
+
+        assert_eq!(
+            midi_script_playlist_live_block_statuses(
+                &arrangement,
+                &[1, 2],
+                1536,
+                96,
+                Some((4, 4)),
+                &[],
+                &live_status,
+            ),
+            vec![BTreeMap::from([(0, 5), (1, 1)]), BTreeMap::from([(1, 3)]),]
         );
     }
 

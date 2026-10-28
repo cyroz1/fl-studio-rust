@@ -1335,6 +1335,13 @@ pub enum PlaylistPerformanceCommand {
     },
 }
 
+/// Performance clips that are currently playing or scheduled in the live renderer.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PlaylistPerformanceLiveStatus {
+    pub playing_clip_indices: BTreeSet<usize>,
+    pub scheduled_clip_indices: BTreeSet<usize>,
+}
+
 impl PlaylistPerformanceCommand {
     fn start_frame(self) -> u64 {
         match self {
@@ -1353,6 +1360,7 @@ pub struct PlaylistPerformanceStream {
     pub mixer_routing_updates: Receiver<FlpDocument>,
     pub latency_updates: Receiver<BTreeSet<u64>>,
     pub latency_reports: Sender<Vst3LatencyReport>,
+    pub live_status: Arc<Mutex<PlaylistPerformanceLiveStatus>>,
     pub meters: Option<Arc<MixerTrackPeakMeters>>,
 }
 
@@ -2775,6 +2783,7 @@ pub fn stream_playlist_performance_with_vst3_to_device(
             mixer_routing_updates: performance.mixer_routing_updates,
             latency_updates: performance.latency_updates,
             latency_reports: performance.latency_reports,
+            live_status: performance.live_status,
         },
         PlaylistPerformanceSources {
             sampler_clip_indices: &performance_sampler_clip_indices,
@@ -10189,6 +10198,7 @@ struct PerformanceSamplerNote {
 
 struct ActivePerformanceSamplerClip {
     clip_index: usize,
+    start_frame: u64,
     next_loop_tick: u64,
     initial_offset_ticks: u64,
     first_loop_end_tick: u64,
@@ -10233,6 +10243,7 @@ struct PerformanceVst3Note {
 
 struct ActivePerformanceAudioClip {
     clip_index: usize,
+    start_frame: u64,
     next_loop_tick: u64,
     initial_offset_ticks: u64,
     first_loop_end_tick: u64,
@@ -10242,6 +10253,7 @@ struct ActivePerformanceAudioClip {
 
 struct ActivePerformanceVst3Clip {
     clip_index: usize,
+    start_frame: u64,
     next_loop_tick: u64,
     initial_offset_ticks: u64,
     first_loop_end_tick: u64,
@@ -10282,6 +10294,7 @@ struct PlaylistPerformanceRuntime {
     mixer_routing_updates: Receiver<FlpDocument>,
     latency_updates: Receiver<BTreeSet<u64>>,
     latency_reports: Sender<Vst3LatencyReport>,
+    live_status: Arc<Mutex<PlaylistPerformanceLiveStatus>>,
     current_document: FlpDocument,
     pending_commands: Vec<PlaylistPerformanceCommand>,
     queued_by_track: BTreeMap<u32, VecDeque<PlaylistPerformanceLaunch>>,
@@ -10307,6 +10320,7 @@ struct PlaylistPerformanceControls {
     mixer_routing_updates: Receiver<FlpDocument>,
     latency_updates: Receiver<BTreeSet<u64>>,
     latency_reports: Sender<Vst3LatencyReport>,
+    live_status: Arc<Mutex<PlaylistPerformanceLiveStatus>>,
 }
 
 impl PlaylistPerformanceRuntime {
@@ -10672,6 +10686,7 @@ impl PlaylistPerformanceRuntime {
             mixer_routing_updates: controls.mixer_routing_updates,
             latency_updates: controls.latency_updates,
             latency_reports: controls.latency_reports,
+            live_status: controls.live_status,
             current_document: document.clone(),
             pending_commands: Vec::new(),
             queued_by_track: BTreeMap::new(),
@@ -11459,6 +11474,7 @@ impl PlaylistPerformanceRuntime {
         }
         self.active_audio_playbacks
             .retain(|clip| clip.start_frame.saturating_add(clip.duration_frames) > block_start);
+        self.publish_live_status(block_end);
         sampler_engine.queue_live_notes(queued_notes);
         let dynamic_audio_context = PreparedAudioClipMixContext {
             clips: &self.active_audio_playbacks,
@@ -11476,6 +11492,54 @@ impl PlaylistPerformanceRuntime {
             None,
         )?;
         Ok(())
+    }
+
+    fn publish_live_status(&self, block_end: u64) {
+        let mut status = PlaylistPerformanceLiveStatus::default();
+        for active in self.active_by_track.values() {
+            let target = if active.start_frame <= block_end {
+                &mut status.playing_clip_indices
+            } else {
+                &mut status.scheduled_clip_indices
+            };
+            target.insert(active.clip_index);
+        }
+        for active in self.active_audio_by_track.values() {
+            let target = if active.start_frame <= block_end {
+                &mut status.playing_clip_indices
+            } else {
+                &mut status.scheduled_clip_indices
+            };
+            target.insert(active.clip_index);
+        }
+        for active in self.active_vst3_by_track.values() {
+            let target = if active.start_frame <= block_end {
+                &mut status.playing_clip_indices
+            } else {
+                &mut status.scheduled_clip_indices
+            };
+            target.insert(active.clip_index);
+        }
+        for command in &self.pending_commands {
+            match *command {
+                PlaylistPerformanceCommand::Launch(launch)
+                | PlaylistPerformanceCommand::Enqueue(launch) => {
+                    status.scheduled_clip_indices.insert(launch.clip_index);
+                }
+                PlaylistPerformanceCommand::AdvanceMotion { clip_index, .. } => {
+                    status.scheduled_clip_indices.insert(clip_index);
+                }
+                PlaylistPerformanceCommand::StopTrack { .. } => {}
+            }
+        }
+        for queue in self.queued_by_track.values() {
+            status
+                .scheduled_clip_indices
+                .extend(queue.iter().map(|launch| launch.clip_index));
+        }
+        if let Ok(mut current_status) = self.live_status.lock() {
+            *current_status = status;
+        }
     }
 
     fn validate_launch(&self, launch: PlaylistPerformanceLaunch) -> Result<(), String> {
@@ -11548,6 +11612,7 @@ impl PlaylistPerformanceRuntime {
                 track_id,
                 ActivePerformanceSamplerClip {
                     clip_index: launch.clip_index,
+                    start_frame: launch.start_frame,
                     next_loop_tick: launch.start_tick,
                     initial_offset_ticks: launch.position_offset_ticks,
                     first_loop_end_tick,
@@ -11561,6 +11626,7 @@ impl PlaylistPerformanceRuntime {
                 track_id,
                 ActivePerformanceAudioClip {
                     clip_index: launch.clip_index,
+                    start_frame: launch.start_frame,
                     next_loop_tick: launch.start_tick,
                     initial_offset_ticks: launch.position_offset_ticks,
                     first_loop_end_tick,
@@ -11574,6 +11640,7 @@ impl PlaylistPerformanceRuntime {
                 track_id,
                 ActivePerformanceVst3Clip {
                     clip_index: launch.clip_index,
+                    start_frame: launch.start_frame,
                     next_loop_tick: launch.start_tick,
                     initial_offset_ticks: launch.position_offset_ticks,
                     first_loop_end_tick,
@@ -17241,6 +17308,7 @@ mod tests {
             mixer_routing_updates: routing_update_receiver,
             latency_updates: latency_update_receiver,
             latency_reports: latency_report_sender,
+            live_status: Arc::new(Mutex::new(PlaylistPerformanceLiveStatus::default())),
             current_document: performance_audio_clip_fixture(80, None),
             pending_commands: Vec::new(),
             queued_by_track: BTreeMap::new(),

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -280,6 +281,7 @@ pub struct MidiScriptTransportState {
     pub playlist_track_soloed: Mutex<Vec<bool>>,
     pub playlist_track_activity_levels: Mutex<Vec<f32>>,
     pub playlist_track_performance_modes: Mutex<Vec<[Option<u8>; 4]>>,
+    pub playlist_live_block_statuses: Mutex<Vec<BTreeMap<u32, u8>>>,
     pub selected_playlist_track_ids: Mutex<Vec<u32>>,
     pub playlist_performance_mode_active: AtomicU8,
     pub playlist_song_start_tick: AtomicU64,
@@ -342,6 +344,7 @@ impl Default for MidiScriptTransportState {
             playlist_track_soloed: Mutex::new(Vec::new()),
             playlist_track_activity_levels: Mutex::new(Vec::new()),
             playlist_track_performance_modes: Mutex::new(Vec::new()),
+            playlist_live_block_statuses: Mutex::new(Vec::new()),
             selected_playlist_track_ids: Mutex::new(Vec::new()),
             playlist_performance_mode_active: AtomicU8::new(0),
             playlist_song_start_tick: AtomicU64::new(0),
@@ -828,6 +831,12 @@ impl MidiScriptRuntime {
             .lock()
             .map(|modes| modes.clone())
             .unwrap_or_default();
+        let playlist_live_block_statuses = self
+            .transport_state
+            .playlist_live_block_statuses
+            .lock()
+            .map(|statuses| statuses.clone())
+            .unwrap_or_default();
         let playlist_performance_mode_active = self
             .transport_state
             .playlist_performance_mode_active
@@ -1116,6 +1125,10 @@ impl MidiScriptRuntime {
                 transport_object.insert(
                     "playlist_track_performance_modes".to_owned(),
                     json!(playlist_track_performance_modes),
+                );
+                transport_object.insert(
+                    "playlist_live_block_statuses".to_owned(),
+                    json!(playlist_live_block_statuses),
                 );
                 transport_object.insert(
                     "playlist_performance_mode_active".to_owned(),
@@ -1873,6 +1886,7 @@ mod tests {
         song_position_ticks, transform_message,
     };
     use serde_json::json;
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -2303,6 +2317,37 @@ mod tests {
         transport_state
             .playlist_song_start_tick
             .store(3840, Ordering::Relaxed);
+        let mut runtime = MidiScriptRuntime::start_for_device_with_transport_state(
+            &script,
+            "Test Input",
+            transport_state,
+        )
+        .unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 127]).unwrap();
+
+        assert!(result.actions.is_empty());
+    }
+
+    #[test]
+    fn python_playlist_live_status_queries_support_documented_modes() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport midi, playlist\ndef OnMidiIn(event):\n    if (midi.LB_Status_Default, midi.LB_Status_Simple, midi.LB_Status_Simplest) != (0, 1, 2):\n        raise RuntimeError('wrong live status constants')\n    if playlist.getLiveStatus(1) != 7:\n        raise RuntimeError('default track status should combine its block flags')\n    if playlist.getLiveStatus(1, midi.LB_Status_Simple) != 1:\n        raise RuntimeError('playing track simple status is wrong')\n    if playlist.getLiveStatus(2, midi.LB_Status_Simple) != 3:\n        raise RuntimeError('scheduled track simple status is wrong')\n    if playlist.getLiveStatus(3, midi.LB_Status_Simple) != 7:\n        raise RuntimeError('idle filled track simple status is wrong')\n    if playlist.getLiveBlockStatus(1, 0) != 5:\n        raise RuntimeError('default block status should include filled and playing flags')\n    if playlist.getLiveBlockStatus(1, 1, midi.LB_Status_Simple) != 7:\n        raise RuntimeError('scheduled block simple status is wrong')\n    if playlist.getLiveBlockStatus(1, 0, midi.LB_Status_Simplest) != 2:\n        raise RuntimeError('simplest block status should report playing')\n    if playlist.getLiveBlockStatus(3, 0, midi.LB_Status_Simplest) != 1:\n        raise RuntimeError('simplest block status should report filled')\n    if playlist.getLiveBlockStatus(1, 2) != 0:\n        raise RuntimeError('empty block status should be zero')\n    try:\n        playlist.getLiveStatus(1, midi.LB_Status_Simplest)\n    except ValueError:\n        pass\n    else:\n        raise RuntimeError('simplest mode must be rejected for track status')\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let transport_state = Arc::new(MidiScriptTransportState::default());
+        transport_state
+            .playlist_track_count
+            .store(3, Ordering::Relaxed);
+        *transport_state.playlist_live_block_statuses.lock().unwrap() = vec![
+            BTreeMap::from([(0, 5), (1, 3)]),
+            BTreeMap::from([(0, 3)]),
+            BTreeMap::from([(0, 1)]),
+        ];
         let mut runtime = MidiScriptRuntime::start_for_device_with_transport_state(
             &script,
             "Test Input",

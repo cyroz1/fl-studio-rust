@@ -255,6 +255,90 @@ def _playlist_get_live_trig_snap(index):
     return _playlist_track_performance_value(index, 3)
 
 
+def _playlist_live_block_status_row(index):
+    statuses = _active_transport_state.get("playlist_live_block_statuses", [])
+    if index > len(statuses):
+        return {}
+    row = statuses[index - 1]
+    return row if isinstance(row, dict) else {}
+
+
+def _playlist_live_status_mode(mode, allow_simplest):
+    try:
+        mode = int(mode)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("Playlist live status mode must be a supported integer") from error
+    if mode not in ((0, 1, 2) if allow_simplest else (0, 1)):
+        raise ValueError("Playlist live status mode is not supported")
+    return mode
+
+
+def _playlist_live_block_status_values(row):
+    values = []
+    for value in row.values():
+        try:
+            values.append(int(value))
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return values
+
+
+def _playlist_get_live_status(index, mode=0):
+    index = _playlist_track_index(index)
+    mode = _playlist_live_status_mode(mode, False)
+    values = _playlist_live_block_status_values(_playlist_live_block_status_row(index))
+    filled = any(value & 1 for value in values)
+    scheduled = any(value & 2 for value in values)
+    playing = any(value & 4 for value in values)
+    if mode == 0:
+        result = 0
+        for value in values:
+            result |= value
+        return result
+    if not filled:
+        return 0
+    result = 1
+    if not playing:
+        result |= 2
+    if not scheduled and not playing:
+        result |= 4
+    return result
+
+
+def _playlist_get_live_block_status(index, block_num, mode=0):
+    index = _playlist_track_index(index)
+    try:
+        block_num = int(block_num)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("Playlist block number must be a nonnegative integer") from error
+    if block_num < 0:
+        raise ValueError("Playlist block number must be a nonnegative integer")
+    mode = _playlist_live_status_mode(mode, True)
+    row = _playlist_live_block_status_row(index)
+    value = row.get(str(block_num), row.get(block_num, 0))
+    try:
+        value = int(value)
+    except (TypeError, ValueError, OverflowError):
+        value = 0
+    filled = bool(value & 1)
+    scheduled = bool(value & 2)
+    playing = bool(value & 4)
+    if mode == 0:
+        return value
+    if mode == 1:
+        if not filled:
+            return 0
+        result = 1
+        if playing or scheduled:
+            result |= 2
+        if scheduled and not playing:
+            result |= 4
+        return result
+    if not filled:
+        return 0
+    return 2 if playing or scheduled else 1
+
+
 def _playlist_inc_live_mode(index, value, mode_index, parameter, max_value):
     index = _playlist_track_index(index)
     try:
@@ -1661,6 +1745,9 @@ def _install_modules(script_name, device_name):
         "PL_Start": 0,
         "PL_LoadOk": 100,
         "PL_LoadError": 101,
+        "LB_Status_Default": 0,
+        "LB_Status_Simple": 1,
+        "LB_Status_Simplest": 2,
         "PME_System": 2,
         "PME_System_Safe": 4,
         "PME_PreviewNote": 8,
@@ -1826,6 +1913,8 @@ def _install_modules(script_name, device_name):
     playlist.getLiveTriggerMode = _playlist_get_live_trigger_mode
     playlist.getLivePosSnap = _playlist_get_live_pos_snap
     playlist.getLiveTrigSnap = _playlist_get_live_trig_snap
+    playlist.getLiveStatus = _playlist_get_live_status
+    playlist.getLiveBlockStatus = _playlist_get_live_block_status
     playlist.incLivePosSnap = _playlist_inc_live_pos_snap
     playlist.incLiveTrigSnap = _playlist_inc_live_trig_snap
     playlist.incLiveLoopMode = _playlist_inc_live_loop_mode
