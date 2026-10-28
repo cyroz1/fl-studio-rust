@@ -53,6 +53,7 @@ const DEFAULT_SAMPLER_VOICE_LIMIT: usize = 64;
 const MAX_SAMPLER_VOICE_LIMIT: usize = 256;
 const SAMPLER_LIVE_NOTE_QUEUE_CAPACITY: usize = 1_024;
 const VST3_LIVE_INPUT_QUEUE_CAPACITY: usize = 1_024;
+const LAYER_LIVE_INPUT_QUEUE_CAPACITY: usize = 1_024;
 const SAMPLER_RELEASE_SECONDS: f64 = 0.005;
 const SAMPLER_ROOT_KEY: u16 = 60;
 const SAMPLER_BLOCK_FRAMES: usize = 1_024;
@@ -848,7 +849,7 @@ pub struct SamplerLiveNoteReceiver {
     overflowed: Arc<AtomicBool>,
 }
 
-/// Creates a bounded, allocation-free queue for MIDI callback to Sampler worker events.
+/// Creates a bounded, allocation-free queue for live MIDI input to a Sampler worker.
 pub fn sampler_live_note_queue() -> (SamplerLiveNoteSender, SamplerLiveNoteReceiver) {
     let events = Arc::new(ArrayQueue::new(SAMPLER_LIVE_NOTE_QUEUE_CAPACITY));
     let overflowed = Arc::new(AtomicBool::new(false));
@@ -974,34 +975,50 @@ pub enum Vst3LiveInputEvent {
     },
 }
 
-/// Lock-free producer for stopped-transport VST3 live-MIDI events.
-pub struct Vst3LiveInputSender {
-    events: Arc<ArrayQueue<Vst3LiveInputEvent>>,
+/// Lock-free producer for bounded live-MIDI event queues.
+pub struct BoundedLiveInputSender<T: Send> {
+    events: Arc<ArrayQueue<T>>,
     closed: Arc<AtomicBool>,
 }
 
-/// Lock-free consumer for stopped-transport VST3 live-MIDI events.
-pub struct Vst3LiveInputReceiver {
-    events: Arc<ArrayQueue<Vst3LiveInputEvent>>,
+/// Lock-free consumer for bounded live-MIDI event queues.
+pub struct BoundedLiveInputReceiver<T: Send> {
+    events: Arc<ArrayQueue<T>>,
     closed: Arc<AtomicBool>,
+}
+
+pub type Vst3LiveInputSender = BoundedLiveInputSender<Vst3LiveInputEvent>;
+pub type Vst3LiveInputReceiver = BoundedLiveInputReceiver<Vst3LiveInputEvent>;
+pub type LayerLiveInputSender = BoundedLiveInputSender<LayerLiveInputEvent>;
+pub type LayerLiveInputReceiver = BoundedLiveInputReceiver<LayerLiveInputEvent>;
+
+fn bounded_live_input_queue<T: Send>(
+    capacity: usize,
+) -> (BoundedLiveInputSender<T>, BoundedLiveInputReceiver<T>) {
+    let events = Arc::new(ArrayQueue::new(capacity));
+    let closed = Arc::new(AtomicBool::new(false));
+    (
+        BoundedLiveInputSender {
+            events: Arc::clone(&events),
+            closed: Arc::clone(&closed),
+        },
+        BoundedLiveInputReceiver { events, closed },
+    )
 }
 
 /// Creates a bounded, allocation-free queue for live MIDI input to a VST3 worker.
 pub fn vst3_live_input_queue() -> (Vst3LiveInputSender, Vst3LiveInputReceiver) {
-    let events = Arc::new(ArrayQueue::new(VST3_LIVE_INPUT_QUEUE_CAPACITY));
-    let closed = Arc::new(AtomicBool::new(false));
-    (
-        Vst3LiveInputSender {
-            events: Arc::clone(&events),
-            closed: Arc::clone(&closed),
-        },
-        Vst3LiveInputReceiver { events, closed },
-    )
+    bounded_live_input_queue(VST3_LIVE_INPUT_QUEUE_CAPACITY)
 }
 
-impl Vst3LiveInputSender {
+/// Creates a bounded, allocation-free queue for live MIDI input to a mixed Layer worker.
+pub fn layer_live_input_queue() -> (LayerLiveInputSender, LayerLiveInputReceiver) {
+    bounded_live_input_queue(LAYER_LIVE_INPUT_QUEUE_CAPACITY)
+}
+
+impl<T: Send> BoundedLiveInputSender<T> {
     /// Enqueues an event without blocking, returning it when the queue is full or closed.
-    pub fn send(&self, event: Vst3LiveInputEvent) -> Result<(), Vst3LiveInputEvent> {
+    pub fn send(&self, event: T) -> Result<(), T> {
         if self.closed.load(Ordering::Acquire) {
             return Err(event);
         }
@@ -1009,14 +1026,14 @@ impl Vst3LiveInputSender {
     }
 }
 
-impl Drop for Vst3LiveInputSender {
+impl<T: Send> Drop for BoundedLiveInputSender<T> {
     fn drop(&mut self) {
         self.closed.store(true, Ordering::Release);
     }
 }
 
-impl Vst3LiveInputReceiver {
-    fn try_recv(&self) -> Result<Vst3LiveInputEvent, TryRecvError> {
+impl<T: Send> BoundedLiveInputReceiver<T> {
+    fn try_recv(&self) -> Result<T, TryRecvError> {
         match self.events.pop() {
             Some(event) => Ok(event),
             None if self.closed.load(Ordering::Acquire) => Err(TryRecvError::Disconnected),
@@ -1025,7 +1042,7 @@ impl Vst3LiveInputReceiver {
     }
 }
 
-impl Drop for Vst3LiveInputReceiver {
+impl<T: Send> Drop for BoundedLiveInputReceiver<T> {
     fn drop(&mut self) {
         self.closed.store(true, Ordering::Release);
     }
@@ -7500,7 +7517,7 @@ pub fn stream_mixed_layer_midi_input_to_device(
     mut processor: Vst3PlaylistStreamProcessor,
     document: FlpDocument,
     config: LayerLiveInputConfig,
-    events: Receiver<LayerLiveInputEvent>,
+    events: LayerLiveInputReceiver,
     writer: &StreamingAudioWriter,
     cancelled: &AtomicBool,
 ) -> Result<(), String> {

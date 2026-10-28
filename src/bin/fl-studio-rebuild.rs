@@ -39,16 +39,17 @@ use flp_rebuild::project_package::{ProjectPackageWorkspace, copy_unique_sample_f
 use flp_rebuild::sample_render::{
     AudioClipRenderOptions, AudioClipRenderSummary, AudioFileRenderOptions, AudioRecordingSummary,
     AudioRenderEncodingOptions, AudioRenderOutput, LayerLiveInputConfig, LayerLiveInputEvent,
-    MP3_BITRATES_KBPS, MixerStemRenderOptions, PLAYLIST_AUDIO_CLIP_GAIN_MINUS_INFINITY,
-    PlaylistAudioClipEnvelope, PlaylistAudioClipFadeCurve, PlaylistLiveStreamControls,
-    PlaylistPerformanceCommand, PlaylistPerformanceLaunch, PlaylistPerformanceStream,
-    PlaylistRenderOptions, PlaylistRenderRange, PlaylistRenderSummary, PlaylistStreamMonitor,
-    PlaylistTailMode, PlaylistTempoMap, ResamplingQuality, SamplerLiveInputRouting,
-    SamplerLiveNoteEvent, SamplerLiveNoteSender, SamplerPatternLoopPlayback,
-    SamplerPatternLoopStreamControls, SamplerPatternRenderOptions, SamplerPatternRenderSummary,
-    SamplerPatternStreamControls, Vst3LatencyUpdateControls, Vst3LiveInputEvent,
-    Vst3LiveInputSender, Vst3PatternLoopPlayback, Vst3PatternLoopStreamControls,
-    Vst3PatternPlayback, Vst3PatternStreamControls, WavChannelMode, WavDitherMode, WavSampleFormat,
+    LayerLiveInputSender, MP3_BITRATES_KBPS, MixerStemRenderOptions,
+    PLAYLIST_AUDIO_CLIP_GAIN_MINUS_INFINITY, PlaylistAudioClipEnvelope, PlaylistAudioClipFadeCurve,
+    PlaylistLiveStreamControls, PlaylistPerformanceCommand, PlaylistPerformanceLaunch,
+    PlaylistPerformanceStream, PlaylistRenderOptions, PlaylistRenderRange, PlaylistRenderSummary,
+    PlaylistStreamMonitor, PlaylistTailMode, PlaylistTempoMap, ResamplingQuality,
+    SamplerLiveInputRouting, SamplerLiveNoteEvent, SamplerLiveNoteSender,
+    SamplerPatternLoopPlayback, SamplerPatternLoopStreamControls, SamplerPatternRenderOptions,
+    SamplerPatternRenderSummary, SamplerPatternStreamControls, Vst3LatencyUpdateControls,
+    Vst3LiveInputEvent, Vst3LiveInputSender, Vst3PatternLoopPlayback,
+    Vst3PatternLoopStreamControls, Vst3PatternPlayback, Vst3PatternStreamControls, WavChannelMode,
+    WavDitherMode, WavSampleFormat, layer_live_input_queue,
     nearest_playlist_audio_clip_zero_crossing_tick, playlist_audio_clip_fade_gain,
     playlist_performance_clip_indices_with_vst3, playlist_performance_static_document_with_vst3,
     playlist_performance_vst3_channel_ids, playlist_performance_vst3_clip_indices,
@@ -5424,7 +5425,7 @@ struct LiveLayerInputSession {
     pattern_id: u16,
     channel_id: u16,
     targets: LiveLayerInputTargets,
-    sender: Sender<LayerLiveInputEvent>,
+    sender: LayerLiveInputSender,
     receiver: Receiver<Result<(), String>>,
     cancelled: Arc<AtomicBool>,
     worker: thread::JoinHandle<()>,
@@ -53382,7 +53383,7 @@ impl DawUi {
                 ..SamplerPatternRenderOptions::default()
             },
         };
-        let (event_sender, event_receiver) = mpsc::channel();
+        let (event_sender, event_receiver) = layer_live_input_queue();
         let (result_sender, result_receiver) = mpsc::sync_channel(1);
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
@@ -53484,7 +53485,7 @@ impl DawUi {
         }
     }
 
-    fn send_live_layer_controller_state(&self, sender: &Sender<LayerLiveInputEvent>) {
+    fn send_live_layer_controller_state(&self, sender: &LayerLiveInputSender) {
         for (channel_index, state) in self.midi_input_channel_state.iter().copied().enumerate() {
             let channel = channel_index as u8;
             let send_control_change = |controller, value| {
@@ -54030,6 +54031,9 @@ impl DawUi {
         } else if self.live_layer_input.is_some() {
             self.stop_live_layer_input();
             self.stop_live_audition_playback_if_stopped();
+            self.status =
+                "Could not queue Layer live MIDI; audition stopped to release active notes"
+                    .to_owned();
         }
         true
     }
