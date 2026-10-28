@@ -62,6 +62,8 @@ pub enum ScriptTransportAction {
         tick: u32,
         stop: bool,
     },
+    SelectAllPlaylistTracks,
+    DeselectAllPlaylistTracks,
     SelectChannel(u16),
     SetMixerTrackSelection {
         index: u16,
@@ -168,6 +170,8 @@ impl ScriptTransportAction {
             "record" => Some(Self::RecordToggle),
             "toggle_playback" => Some(Self::TogglePlayback),
             "loop_mode" => Some(Self::ToggleLoopMode),
+            "select_all_playlist_tracks" => Some(Self::SelectAllPlaylistTracks),
+            "deselect_all_playlist_tracks" => Some(Self::DeselectAllPlaylistTracks),
             "select_next_empty_pattern_with_name_dialog" => {
                 Some(Self::SelectNextEmptyPatternWithNameDialog)
             }
@@ -1830,6 +1834,29 @@ mod tests {
                 ScriptTransportAction::ToggleLoopMode,
                 ScriptTransportAction::SetSongPosition(750_000),
                 ScriptTransportAction::SetSongPositionTicks(48),
+            ]
+        );
+    }
+
+    #[test]
+    fn python_playlist_select_all_commands_are_returned() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport playlist\ndef OnMidiIn(event):\n    playlist.selectAll()\n    playlist.deselectAll()\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let mut runtime = MidiScriptRuntime::start_for_device(&script, "Test Input").unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 127]).unwrap();
+
+        assert_eq!(
+            result.actions,
+            [
+                ScriptTransportAction::SelectAllPlaylistTracks,
+                ScriptTransportAction::DeselectAllPlaylistTracks,
             ]
         );
     }

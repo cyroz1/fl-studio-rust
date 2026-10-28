@@ -27065,6 +27065,40 @@ impl DawUi {
         };
     }
 
+    fn midi_script_playlist_track_ids(&self) -> Vec<u32> {
+        let Some(document) = self.document.as_ref() else {
+            return Vec::new();
+        };
+        let arrangements = document.arrangements().unwrap_or_default();
+        let Some(arrangement) = arrangements
+            .iter()
+            .find(|arrangement| Some(arrangement.id) == self.selected_arrangement)
+            .or_else(|| arrangements.first())
+        else {
+            return Vec::new();
+        };
+        let tracks = document.playlist_tracks_in_arrangement(arrangement.id);
+        midi_script_playlist_track_ids(arrangement, &tracks)
+    }
+
+    fn set_midi_script_playlist_track_selection(&mut self, select_all: bool) {
+        self.selected_playlist_tracks = if select_all {
+            self.midi_script_playlist_track_ids().into_iter().collect()
+        } else {
+            BTreeSet::new()
+        };
+        self.selected_playlist_track = self.selected_playlist_tracks.iter().next_back().copied();
+        self.playlist_track_selection_anchor = self.selected_playlist_tracks.iter().next().copied();
+        self.status = match self.selected_playlist_tracks.len() {
+            0 => "No Playlist tracks selected".to_owned(),
+            1 => format!(
+                "Selected Playlist track {}",
+                self.selected_playlist_track.unwrap_or_default()
+            ),
+            count => format!("Selected {count} Playlist tracks"),
+        };
+    }
+
     fn merge_selected_playlist_pattern_clips(&mut self) -> bool {
         let Some(arrangement_id) = self.selected_arrangement else {
             self.status = "Select Pattern Clips in the Playlist before merging".to_owned();
@@ -51847,6 +51881,12 @@ impl DawUi {
                 };
                 selection_point.store(u64::from(tick), Ordering::Relaxed);
             }
+            MidiTransportCommand::SelectAllPlaylistTracks => {
+                self.set_midi_script_playlist_track_selection(true);
+            }
+            MidiTransportCommand::DeselectAllPlaylistTracks => {
+                self.set_midi_script_playlist_track_selection(false);
+            }
             MidiTransportCommand::SelectChannel(channel_id) => {
                 self.set_midi_script_channel_selection(channel_id);
             }
@@ -69314,6 +69354,25 @@ fn midi_script_arrangement_time_ticks(current_time: f64, ppq: u16) -> (u64, u64)
     (current_time, snapped_time)
 }
 
+fn midi_script_playlist_track_ids(arrangement: &Arrangement, tracks: &[PlaylistTrack]) -> Vec<u32> {
+    let last_track = arrangement
+        .clips
+        .iter()
+        .filter_map(|clip| clip.track_index)
+        .max()
+        .into_iter()
+        .chain(tracks.iter().filter_map(|track| {
+            track
+                .id
+                .checked_sub(1)
+                .and_then(|row| u16::try_from(row).ok())
+        }))
+        .max()
+        .unwrap_or(15)
+        .max(15);
+    (1..=u32::from(last_track) + 1).collect()
+}
+
 fn midi_script_marker_selection_target(
     markers: &[(usize, u32)],
     selected_marker: Option<usize>,
@@ -70730,16 +70789,17 @@ mod tests {
         midi_script_clip_selection_bounds, midi_script_marker_jump_target,
         midi_script_marker_selection_target, midi_script_mixer_recording_file_names,
         midi_script_moved_song_position_tick, midi_script_pattern_jog_target,
-        midi_script_tempo_jog_target, midi_script_time_position_seconds_to_ticks,
-        midi_vst3_parameter_mapping_for_target, midi_vst3_parameter_mappings_for_cc,
-        next_empty_pattern_id, next_piano_roll_note_group, note_from_grid_position,
-        parse_internal_lfo_parameter_links, parse_midi_control_change_mapping,
-        parse_midi_controller_templates, parse_midi_device_selections,
-        parse_midi_mixer_control_mappings, parse_midi_output_programs, parse_midi_output_routes,
-        parse_midi_output_values, parse_midi_vst3_parameter_mappings,
-        parse_pattern_vst3_parameter_links, parse_playlist_audio_clip_envelopes,
-        parse_playlist_vst3_parameter_links, parse_window_layout_presets,
-        pattern_color_from_random_index, pattern_lfo_loop_length_ticks, pattern_loop_frame_at_tick,
+        midi_script_playlist_track_ids, midi_script_tempo_jog_target,
+        midi_script_time_position_seconds_to_ticks, midi_vst3_parameter_mapping_for_target,
+        midi_vst3_parameter_mappings_for_cc, next_empty_pattern_id, next_piano_roll_note_group,
+        note_from_grid_position, parse_internal_lfo_parameter_links,
+        parse_midi_control_change_mapping, parse_midi_controller_templates,
+        parse_midi_device_selections, parse_midi_mixer_control_mappings,
+        parse_midi_output_programs, parse_midi_output_routes, parse_midi_output_values,
+        parse_midi_vst3_parameter_mappings, parse_pattern_vst3_parameter_links,
+        parse_playlist_audio_clip_envelopes, parse_playlist_vst3_parameter_links,
+        parse_window_layout_presets, pattern_color_from_random_index,
+        pattern_lfo_loop_length_ticks, pattern_loop_frame_at_tick,
         pattern_loop_handoff_tick_at_frame, pattern_loop_tick_at_frame,
         pattern_vst3_parameter_automation_for_channel, pattern_vst3_parameter_link_for_target,
         piano_roll_color_group_note_ids, piano_roll_controller_stroke_points,
@@ -71114,6 +71174,20 @@ mod tests {
             .arrangements()
             .expect("Playlist fixture should have an arrangement")
             .remove(0)
+    }
+
+    #[test]
+    fn midi_script_playlist_select_all_covers_default_and_used_rows() {
+        let empty_arrangement = playlist_track_arrangement_fixture(&[]);
+        assert_eq!(
+            midi_script_playlist_track_ids(&empty_arrangement, &[]),
+            (1..=16).collect::<Vec<_>>()
+        );
+
+        let extended_arrangement = playlist_track_arrangement_fixture(&[(0, 96, 478)]);
+        let selected_rows = midi_script_playlist_track_ids(&extended_arrangement, &[]);
+        assert_eq!(selected_rows.len(), 22);
+        assert_eq!(selected_rows.last(), Some(&22));
     }
 
     fn playlist_pattern_ghost_arrangement_fixture(clips: &[(u32, u32, u16, u16)]) -> Arrangement {

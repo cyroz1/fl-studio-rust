@@ -1569,6 +1569,10 @@ def _install_modules(script_name, device_name):
     device.stopRepeatMidiEvent = _stop_repeat_midi_event
     device.setHasMeters = _set_has_meters
 
+    playlist = _module("playlist")
+    playlist.selectAll = lambda: _request_transport_action("select_all_playlist_tracks")
+    playlist.deselectAll = lambda: _request_transport_action("deselect_all_playlist_tracks")
+
     mixer = _module("mixer")
     mixer.getCurrentTempo = _get_current_tempo
     mixer.setCurrentTempo = _set_current_tempo

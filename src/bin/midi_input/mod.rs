@@ -702,6 +702,12 @@ fn queue_script_transport_actions(
             ScriptTransportAction::SetArrangementLiveSelection { tick, stop } => {
                 MidiTransportCommand::SetArrangementLiveSelection { tick, stop }
             }
+            ScriptTransportAction::SelectAllPlaylistTracks => {
+                MidiTransportCommand::SelectAllPlaylistTracks
+            }
+            ScriptTransportAction::DeselectAllPlaylistTracks => {
+                MidiTransportCommand::DeselectAllPlaylistTracks
+            }
             ScriptTransportAction::SelectChannel(channel_id) => {
                 MidiTransportCommand::SelectChannel(channel_id)
             }
@@ -851,6 +857,8 @@ pub enum MidiTransportCommand {
         tick: u32,
         stop: bool,
     },
+    SelectAllPlaylistTracks,
+    DeselectAllPlaylistTracks,
     SelectChannel(u16),
     SetMixerTrackSelection {
         index: u16,
@@ -1628,6 +1636,12 @@ pub fn describe_event(event: MidiInputEvent) -> String {
             }
             MidiTransportCommand::SetArrangementLiveSelection { .. } => {
                 "MIDI script Live Selection".to_owned()
+            }
+            MidiTransportCommand::SelectAllPlaylistTracks => {
+                "MIDI script Select All Playlist Tracks".to_owned()
+            }
+            MidiTransportCommand::DeselectAllPlaylistTracks => {
+                "MIDI script Deselect Playlist Tracks".to_owned()
             }
             MidiTransportCommand::SelectChannel(_) => "MIDI script Select Channel".to_owned(),
             MidiTransportCommand::SetMixerTrackSelection { .. } => {
@@ -2497,6 +2511,8 @@ mod tests {
                 ScriptTransportAction::SetCurrentTempoMilliBpm(123_456),
                 ScriptTransportAction::SetProjectTimeSignatureNumerator(7),
                 ScriptTransportAction::SetProjectTimeSignatureDenominator(8),
+                ScriptTransportAction::SelectAllPlaylistTracks,
+                ScriptTransportAction::DeselectAllPlaylistTracks,
                 ScriptTransportAction::AddArrangementTimeMarker {
                     tick: 960,
                     name: "Verse".to_owned(),
@@ -2532,6 +2548,14 @@ mod tests {
         assert_eq!(
             transport_receiver.try_recv().unwrap().event,
             MidiInputEvent::Transport(MidiTransportCommand::SetProjectTimeSignatureDenominator(8))
+        );
+        assert_eq!(
+            transport_receiver.try_recv().unwrap().event,
+            MidiInputEvent::Transport(MidiTransportCommand::SelectAllPlaylistTracks)
+        );
+        assert_eq!(
+            transport_receiver.try_recv().unwrap().event,
+            MidiInputEvent::Transport(MidiTransportCommand::DeselectAllPlaylistTracks)
         );
         assert_eq!(
             transport_receiver.try_recv().unwrap().event,
