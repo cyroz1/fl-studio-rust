@@ -5733,6 +5733,7 @@ fn stream_prepared_playlist_render_with_performance(
         options.resampling_quality,
         render.sampler.pan_law,
     );
+    sampler_engine.tempo_map = Some(&render.sampler.tempo_map);
     sampler_engine.mixer_transforms_by_channel = Some(&render.sampler.mixer_transforms_by_channel);
     if let Some(meters) = meters {
         sampler_engine.live_mixer_source_routes_by_channel =
@@ -9494,6 +9495,7 @@ pub(crate) fn schedule_playlist_pattern_notes_with_adjustments<'a>(
 
 struct PreparedSamplerArrangement {
     summary: SamplerPatternRenderSummary,
+    tempo_map: PlaylistTempoMap,
     pan_law: PanLaw,
     notes: Vec<ScheduledSamplerNote>,
     sources_by_channel: HashMap<u16, SamplerVoiceSource>,
@@ -9612,6 +9614,7 @@ fn prepare_sampler_arrangement(
                 notes_skipped_unresolved_sample: 0,
                 unresolved_sample_channels: Vec::new(),
             },
+            tempo_map: tempo_map.clone(),
             pan_law,
             notes: Vec::new(),
             sources_by_channel: HashMap::new(),
@@ -10027,6 +10030,7 @@ fn prepare_sampler_arrangement(
             notes_skipped_unresolved_sample: skipped_unresolved,
             unresolved_sample_channels: unresolved_sample_channels.into_iter().collect(),
         },
+        tempo_map: tempo_map.clone(),
         pan_law,
         notes,
         sources_by_channel,
@@ -12830,6 +12834,7 @@ fn refresh_prepared_clip_mixer_routes(
 struct SamplerVoiceEngine<'a> {
     sources_by_channel: &'a HashMap<u16, SamplerVoiceSource>,
     notes: &'a [ScheduledSamplerNote],
+    tempo_map: Option<&'a PlaylistTempoMap>,
     live_notes: Vec<ScheduledSamplerNote>,
     mixer_transforms_by_channel: Option<&'a HashMap<u16, MixerSourceRouteTransform>>,
     live_mixer_source_routes_by_channel: Option<&'a HashMap<u16, MixerLiveSourceRoutePlan>>,
@@ -12904,6 +12909,8 @@ struct SamplerVoice {
 struct SamplerNoteSlide {
     start_frame: u64,
     end_frame: u64,
+    start_tick: Option<f64>,
+    end_tick: Option<f64>,
     start_pitch_cents: f64,
     target_pitch_cents: f64,
     start_velocity_gain: f32,
@@ -12922,15 +12929,23 @@ struct SamplerPortamentoValues {
 fn update_sampler_voice_slide(
     voice: &mut SamplerVoice,
     frame: u64,
+    tick: Option<f64>,
     pitch_bend_cents: [i16; 16],
     pan_law: PanLaw,
 ) {
     if let Some(slide) = voice.note_slide {
-        let progress = if frame >= slide.end_frame {
-            1.0
-        } else {
-            frame.saturating_sub(slide.start_frame) as f64
-                / slide.end_frame.saturating_sub(slide.start_frame).max(1) as f64
+        let progress = match (tick, slide.start_tick, slide.end_tick) {
+            (Some(tick), Some(start_tick), Some(end_tick)) if end_tick > start_tick => {
+                (tick - start_tick) / (end_tick - start_tick)
+            }
+            _ => {
+                if frame >= slide.end_frame {
+                    1.0
+                } else {
+                    frame.saturating_sub(slide.start_frame) as f64
+                        / slide.end_frame.saturating_sub(slide.start_frame).max(1) as f64
+                }
+            }
         }
         .clamp(0.0, 1.0);
         voice.pitch_offset_cents = slide.start_pitch_cents
@@ -12999,6 +13014,7 @@ impl<'a> SamplerVoiceEngine<'a> {
         Self {
             sources_by_channel,
             notes,
+            tempo_map: None,
             live_notes: Vec::new(),
             mixer_transforms_by_channel: None,
             live_mixer_source_routes_by_channel: None,
@@ -13022,6 +13038,27 @@ impl<'a> SamplerVoiceEngine<'a> {
             live_midi_expression: [1.0; 16],
             sustain_down: [false; 16],
             sostenuto_down: [false; 16],
+        }
+    }
+
+    fn tick_at_frame(&self, frame: u64) -> Option<f64> {
+        self.tempo_map?
+            .tick_at_frame(frame, self.output_sample_rate)
+    }
+
+    fn slide_tick_bounds(&self, start_frame: u64, end_frame: u64) -> (Option<f64>, Option<f64>) {
+        let Some(tempo_map) = self.tempo_map else {
+            return (None, None);
+        };
+        let start_tick = self.tick_at_frame(start_frame);
+        let end_tick = self.tick_at_frame(end_frame);
+        if start_tick
+            .zip(end_tick)
+            .is_some_and(|(start, end)| tempo_map.has_tempo_change_between(start, end))
+        {
+            (start_tick, end_tick)
+        } else {
+            (None, None)
         }
     }
 
@@ -13117,10 +13154,28 @@ impl<'a> SamplerVoiceEngine<'a> {
         let mut last_active_output_frame = None;
         for offset in 0..frame_count {
             let frame = block_start + offset as u64;
+            let current_tick = self
+                .voices
+                .iter()
+                .any(|voice| {
+                    voice.as_ref().is_some_and(|voice| {
+                        voice
+                            .note_slide
+                            .is_some_and(|slide| slide.start_tick.is_some())
+                    })
+                })
+                .then(|| self.tick_at_frame(frame))
+                .flatten();
             self.current_frame = frame;
             for voice in self.voices.iter_mut().filter_map(Option::as_mut) {
                 if voice.note_slide.is_some() {
-                    update_sampler_voice_slide(voice, frame, self.pitch_bend_cents, self.pan_law);
+                    update_sampler_voice_slide(
+                        voice,
+                        frame,
+                        current_tick,
+                        self.pitch_bend_cents,
+                        self.pan_law,
+                    );
                 }
             }
             while self
@@ -13157,6 +13212,7 @@ impl<'a> SamplerVoiceEngine<'a> {
                         update_sampler_voice_slide(
                             voice,
                             frame,
+                            current_tick,
                             self.pitch_bend_cents,
                             self.pan_law,
                         );
@@ -13533,10 +13589,15 @@ impl<'a> SamplerVoiceEngine<'a> {
         {
             let target_pitch_cents =
                 f64::from(note.key) * 100.0 + f64::from(note.fine_pitch_offset_cents);
+            let end_frame = note.start_frame.saturating_add(note.slide_duration_frames);
+            let (start_tick, end_tick) = self.slide_tick_bounds(note.start_frame, end_frame);
+            let current_tick = self.tick_at_frame(note.start_frame);
             if let Some(voice) = self.voices[slot_index].as_mut() {
                 voice.note_slide = Some(SamplerNoteSlide {
                     start_frame: note.start_frame,
-                    end_frame: note.start_frame.saturating_add(note.slide_duration_frames),
+                    end_frame,
+                    start_tick,
+                    end_tick,
                     start_pitch_cents: start_pitch_cents - target_pitch_cents,
                     target_pitch_cents: 0.0,
                     start_velocity_gain,
@@ -13547,6 +13608,7 @@ impl<'a> SamplerVoiceEngine<'a> {
                 update_sampler_voice_slide(
                     voice,
                     note.start_frame,
+                    current_tick,
                     self.pitch_bend_cents,
                     self.pan_law,
                 );
@@ -13559,6 +13621,8 @@ impl<'a> SamplerVoiceEngine<'a> {
         let Some(end_frame) = note.stop_frame.filter(|end| *end > note.start_frame) else {
             return;
         };
+        let (start_tick, end_tick) = self.slide_tick_bounds(note.start_frame, end_frame);
+        let current_tick = self.tick_at_frame(note.start_frame);
         let reference_pitch_cents = self
             .voices
             .iter()
@@ -13596,6 +13660,7 @@ impl<'a> SamplerVoiceEngine<'a> {
             update_sampler_voice_slide(
                 voice,
                 note.start_frame,
+                current_tick,
                 self.pitch_bend_cents,
                 self.pan_law,
             );
@@ -13603,6 +13668,8 @@ impl<'a> SamplerVoiceEngine<'a> {
             voice.note_slide = Some(SamplerNoteSlide {
                 start_frame: note.start_frame,
                 end_frame,
+                start_tick,
+                end_tick,
                 start_pitch_cents,
                 target_pitch_cents: start_pitch_cents + pitch_delta_cents,
                 start_velocity_gain: voice.velocity_gain,
@@ -13613,6 +13680,7 @@ impl<'a> SamplerVoiceEngine<'a> {
             update_sampler_voice_slide(
                 voice,
                 note.start_frame,
+                current_tick,
                 self.pitch_bend_cents,
                 self.pan_law,
             );
@@ -18177,6 +18245,7 @@ mod tests {
                 notes_skipped_unresolved_sample: 0,
                 unresolved_sample_channels: Vec::new(),
             },
+            tempo_map: PlaylistTempoMap::constant(96, 120.0).unwrap(),
             pan_law: PanLaw::Circular,
             notes: vec![ScheduledSamplerNote {
                 clip_index: 0,
