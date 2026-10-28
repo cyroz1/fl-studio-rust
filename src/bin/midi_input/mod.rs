@@ -708,6 +708,9 @@ fn queue_script_transport_actions(
             ScriptTransportAction::SetPlaylistTrackName { track_id, name } => {
                 MidiTransportCommand::SetPlaylistTrackName { track_id, name }
             }
+            ScriptTransportAction::SetPlaylistTrackMute { track_id, muted } => {
+                MidiTransportCommand::SetPlaylistTrackMute { track_id, muted }
+            }
             ScriptTransportAction::SelectChannel(channel_id) => {
                 MidiTransportCommand::SelectChannel(channel_id)
             }
@@ -861,6 +864,10 @@ pub enum MidiTransportCommand {
     SetPlaylistTrackName {
         track_id: u32,
         name: String,
+    },
+    SetPlaylistTrackMute {
+        track_id: u32,
+        muted: bool,
     },
     SelectChannel(u16),
     SetMixerTrackSelection {
@@ -1645,6 +1652,9 @@ pub fn describe_event(event: MidiInputEvent) -> String {
             }
             MidiTransportCommand::SetPlaylistTrackName { .. } => {
                 "MIDI script Set Playlist Track Name".to_owned()
+            }
+            MidiTransportCommand::SetPlaylistTrackMute { .. } => {
+                "MIDI script Set Playlist Track Mute".to_owned()
             }
             MidiTransportCommand::SelectChannel(_) => "MIDI script Select Channel".to_owned(),
             MidiTransportCommand::SetMixerTrackSelection { .. } => {
@@ -2519,6 +2529,10 @@ mod tests {
                     track_id: 2,
                     name: "Bass".to_owned(),
                 },
+                ScriptTransportAction::SetPlaylistTrackMute {
+                    track_id: 3,
+                    muted: true,
+                },
                 ScriptTransportAction::SetPlaylistTrackSelection(Vec::new()),
                 ScriptTransportAction::AddArrangementTimeMarker {
                     tick: 960,
@@ -2565,6 +2579,13 @@ mod tests {
             MidiInputEvent::Transport(MidiTransportCommand::SetPlaylistTrackName {
                 track_id: 2,
                 name: "Bass".to_owned(),
+            })
+        );
+        assert_eq!(
+            transport_receiver.try_recv().unwrap().event,
+            MidiInputEvent::Transport(MidiTransportCommand::SetPlaylistTrackMute {
+                track_id: 3,
+                muted: true,
             })
         );
         assert_eq!(

@@ -67,6 +67,10 @@ pub enum ScriptTransportAction {
         track_id: u32,
         name: String,
     },
+    SetPlaylistTrackMute {
+        track_id: u32,
+        muted: bool,
+    },
     SelectChannel(u16),
     SetMixerTrackSelection {
         index: u16,
@@ -236,6 +240,7 @@ pub struct MidiScriptTransportState {
     pub arrangement_live_selection_end: AtomicU64,
     pub playlist_track_count: AtomicU64,
     pub playlist_track_names: Mutex<Vec<String>>,
+    pub playlist_track_muted: Mutex<Vec<bool>>,
     pub selected_playlist_track_ids: Mutex<Vec<u32>>,
     pub midi_pickup_enabled: AtomicU8,
     pub channel_ids: Mutex<Vec<u16>>,
@@ -292,6 +297,7 @@ impl Default for MidiScriptTransportState {
             arrangement_live_selection_end: AtomicU64::new(0),
             playlist_track_count: AtomicU64::new(0),
             playlist_track_names: Mutex::new(Vec::new()),
+            playlist_track_muted: Mutex::new(Vec::new()),
             selected_playlist_track_ids: Mutex::new(Vec::new()),
             midi_pickup_enabled: AtomicU8::new(1),
             channel_ids: Mutex::new(Vec::new()),
@@ -752,6 +758,12 @@ impl MidiScriptRuntime {
             .lock()
             .map(|track_names| track_names.clone())
             .unwrap_or_default();
+        let playlist_track_muted = self
+            .transport_state
+            .playlist_track_muted
+            .lock()
+            .map(|muted| muted.clone())
+            .unwrap_or_default();
         let selected_playlist_track_ids = self
             .transport_state
             .selected_playlist_track_ids
@@ -1017,6 +1029,10 @@ impl MidiScriptRuntime {
                     json!(playlist_track_names),
                 );
                 transport_object.insert(
+                    "playlist_track_muted".to_owned(),
+                    json!(playlist_track_muted),
+                );
+                transport_object.insert(
                     "selected_playlist_track_ids".to_owned(),
                     json!(selected_playlist_track_ids),
                 );
@@ -1163,6 +1179,17 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
             track_id,
             name: track_name.to_owned(),
         });
+    }
+    if name == Some("set_playlist_track_mute") {
+        let track_id = action["track_id"]
+            .as_u64()
+            .and_then(|track_id| u32::try_from(track_id).ok())
+            .filter(|track_id| (1..=SCRIPT_MAX_PLAYLIST_TRACK_COUNT as u32).contains(track_id))
+            .ok_or_else(|| "MIDI script returned an invalid Playlist track ID".to_owned())?;
+        let muted = action["muted"]
+            .as_bool()
+            .ok_or_else(|| "MIDI script returned an invalid Playlist mute state".to_owned())?;
+        return Ok(ScriptTransportAction::SetPlaylistTrackMute { track_id, muted });
     }
     if name == Some("set_song_position") {
         let position = action["position"]
@@ -1984,6 +2011,49 @@ mod tests {
                 ScriptTransportAction::SetPlaylistTrackName {
                     track_id: 2,
                     name: String::new(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn python_playlist_mute_queries_and_commands_use_one_based_indices() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport playlist\ndef OnMidiIn(event):\n    if not playlist.isTrackMuted(1) or playlist.isTrackMuted(2):\n        raise RuntimeError('Playlist mute state was read incorrectly')\n    playlist.muteTrack(2)\n    if not playlist.isTrackMuted(2):\n        raise RuntimeError('muteTrack toggle should update state during the callback')\n    playlist.muteTrack(1, 0)\n    if playlist.isTrackMuted(1):\n        raise RuntimeError('muteTrack explicit unmute should update state during the callback')\n    playlist.muteTrack(2, 1)\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let transport_state = Arc::new(MidiScriptTransportState::default());
+        transport_state
+            .playlist_track_count
+            .store(2, Ordering::Relaxed);
+        *transport_state.playlist_track_muted.lock().unwrap() = vec![true, false];
+        let mut runtime = MidiScriptRuntime::start_for_device_with_transport_state(
+            &script,
+            "Test Input",
+            transport_state,
+        )
+        .unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 127]).unwrap();
+
+        assert_eq!(
+            result.actions,
+            [
+                ScriptTransportAction::SetPlaylistTrackMute {
+                    track_id: 2,
+                    muted: true,
+                },
+                ScriptTransportAction::SetPlaylistTrackMute {
+                    track_id: 1,
+                    muted: false,
+                },
+                ScriptTransportAction::SetPlaylistTrackMute {
+                    track_id: 2,
+                    muted: true,
                 },
             ]
         );

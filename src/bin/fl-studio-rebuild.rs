@@ -14778,7 +14778,8 @@ impl DawUi {
         if let Ok(mut value) = self.midi_script_transport_state.project_genre.lock() {
             *value = project_genre;
         }
-        let (playlist_track_ids, playlist_track_names) = self.midi_script_playlist_track_snapshot();
+        let (playlist_track_ids, playlist_track_names, playlist_track_muted) =
+            self.midi_script_playlist_track_snapshot();
         let supported_playlist_track_ids =
             playlist_track_ids.iter().copied().collect::<BTreeSet<_>>();
         self.midi_script_transport_state
@@ -14786,6 +14787,9 @@ impl DawUi {
             .store(playlist_track_ids.len() as u64, Ordering::Relaxed);
         if let Ok(mut track_names) = self.midi_script_transport_state.playlist_track_names.lock() {
             *track_names = playlist_track_names;
+        }
+        if let Ok(mut muted) = self.midi_script_transport_state.playlist_track_muted.lock() {
+            *muted = playlist_track_muted;
         }
         if let Ok(mut selected_track_ids) = self
             .midi_script_transport_state
@@ -27086,9 +27090,9 @@ impl DawUi {
         };
     }
 
-    fn midi_script_playlist_track_snapshot(&self) -> (Vec<u32>, Vec<String>) {
+    fn midi_script_playlist_track_snapshot(&self) -> (Vec<u32>, Vec<String>, Vec<bool>) {
         let Some(document) = self.document.as_ref() else {
-            return (Vec::new(), Vec::new());
+            return (Vec::new(), Vec::new(), Vec::new());
         };
         let arrangements = document.arrangements().unwrap_or_default();
         let Some(arrangement) = arrangements
@@ -27096,12 +27100,13 @@ impl DawUi {
             .find(|arrangement| Some(arrangement.id) == self.selected_arrangement)
             .or_else(|| arrangements.first())
         else {
-            return (Vec::new(), Vec::new());
+            return (Vec::new(), Vec::new(), Vec::new());
         };
         let tracks = document.playlist_tracks_in_arrangement(arrangement.id);
         let track_ids = midi_script_playlist_track_ids(arrangement, &tracks);
         let track_names = midi_script_playlist_track_names(&track_ids, &tracks);
-        (track_ids, track_names)
+        let track_muted = midi_script_playlist_track_mute_states(&track_ids, &tracks);
+        (track_ids, track_names, track_muted)
     }
 
     fn midi_script_playlist_track_ids(&self) -> Vec<u32> {
@@ -27159,6 +27164,69 @@ impl DawUi {
             }
             None => {
                 self.status = "Open a project to rename Playlist tracks".to_owned();
+            }
+        }
+    }
+
+    fn set_midi_script_playlist_track_mute(&mut self, track_id: u32, muted: bool) {
+        if self.document.is_none() {
+            self.status = "Open a project to mute Playlist tracks".to_owned();
+            return;
+        }
+        let (track_ids, _, track_muted) = self.midi_script_playlist_track_snapshot();
+        let Some(track_index) = track_ids
+            .iter()
+            .position(|candidate| *candidate == track_id)
+        else {
+            self.status = format!(
+                "Could not change Playlist track {track_id} mute state: track is outside the supported rows"
+            );
+            return;
+        };
+        if track_muted.get(track_index).copied() == Some(muted) {
+            return;
+        }
+        let arrangements = self
+            .document
+            .as_ref()
+            .and_then(|document| document.arrangements().ok())
+            .unwrap_or_default();
+        let Some(arrangement_id) = arrangements
+            .iter()
+            .find(|arrangement| Some(arrangement.id) == self.selected_arrangement)
+            .or_else(|| arrangements.first())
+            .map(|arrangement| arrangement.id)
+        else {
+            self.status = "Open a project to mute Playlist tracks".to_owned();
+            return;
+        };
+        let result = self.document.as_mut().map(|document| {
+            document.edit_playlist_track_in_arrangement(
+                arrangement_id,
+                track_id,
+                PlaylistTrackEdit {
+                    enabled: Some(!muted),
+                    ..PlaylistTrackEdit::default()
+                },
+            )
+        });
+        match result {
+            Some(Ok(())) => {
+                self.stop_project_playback();
+                self.dirty = true;
+                self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+                self.status = if muted {
+                    format!("Muted Playlist track {track_id}")
+                } else {
+                    format!("Unmuted Playlist track {track_id}")
+                };
+            }
+            Some(Err(error)) => {
+                self.status =
+                    format!("Could not change Playlist track {track_id} mute state: {error}");
+            }
+            None => {
+                self.status = "Open a project to mute Playlist tracks".to_owned();
             }
         }
     }
@@ -51951,6 +52019,9 @@ impl DawUi {
             MidiTransportCommand::SetPlaylistTrackName { track_id, name } => {
                 self.set_midi_script_playlist_track_name(track_id, name);
             }
+            MidiTransportCommand::SetPlaylistTrackMute { track_id, muted } => {
+                self.set_midi_script_playlist_track_mute(track_id, muted);
+            }
             MidiTransportCommand::SelectChannel(channel_id) => {
                 self.set_midi_script_channel_selection(channel_id);
             }
@@ -69459,6 +69530,20 @@ fn midi_script_playlist_track_names(track_ids: &[u32], tracks: &[PlaylistTrack])
         .collect()
 }
 
+fn midi_script_playlist_track_mute_states(
+    track_ids: &[u32],
+    tracks: &[PlaylistTrack],
+) -> Vec<bool> {
+    let muted_by_id = tracks
+        .iter()
+        .map(|track| (track.id, track.enabled == Some(false)))
+        .collect::<BTreeMap<_, _>>();
+    track_ids
+        .iter()
+        .map(|track_id| muted_by_id.get(track_id).copied().unwrap_or(false))
+        .collect()
+}
+
 fn midi_script_marker_selection_target(
     markers: &[(usize, u32)],
     selected_marker: Option<usize>,
@@ -70875,17 +70960,18 @@ mod tests {
         midi_script_clip_selection_bounds, midi_script_marker_jump_target,
         midi_script_marker_selection_target, midi_script_mixer_recording_file_names,
         midi_script_moved_song_position_tick, midi_script_pattern_jog_target,
-        midi_script_playlist_track_ids, midi_script_playlist_track_names,
-        midi_script_tempo_jog_target, midi_script_time_position_seconds_to_ticks,
-        midi_vst3_parameter_mapping_for_target, midi_vst3_parameter_mappings_for_cc,
-        next_empty_pattern_id, next_piano_roll_note_group, note_from_grid_position,
-        parse_internal_lfo_parameter_links, parse_midi_control_change_mapping,
-        parse_midi_controller_templates, parse_midi_device_selections,
-        parse_midi_mixer_control_mappings, parse_midi_output_programs, parse_midi_output_routes,
-        parse_midi_output_values, parse_midi_vst3_parameter_mappings,
-        parse_pattern_vst3_parameter_links, parse_playlist_audio_clip_envelopes,
-        parse_playlist_vst3_parameter_links, parse_window_layout_presets,
-        pattern_color_from_random_index, pattern_lfo_loop_length_ticks, pattern_loop_frame_at_tick,
+        midi_script_playlist_track_ids, midi_script_playlist_track_mute_states,
+        midi_script_playlist_track_names, midi_script_tempo_jog_target,
+        midi_script_time_position_seconds_to_ticks, midi_vst3_parameter_mapping_for_target,
+        midi_vst3_parameter_mappings_for_cc, next_empty_pattern_id, next_piano_roll_note_group,
+        note_from_grid_position, parse_internal_lfo_parameter_links,
+        parse_midi_control_change_mapping, parse_midi_controller_templates,
+        parse_midi_device_selections, parse_midi_mixer_control_mappings,
+        parse_midi_output_programs, parse_midi_output_routes, parse_midi_output_values,
+        parse_midi_vst3_parameter_mappings, parse_pattern_vst3_parameter_links,
+        parse_playlist_audio_clip_envelopes, parse_playlist_vst3_parameter_links,
+        parse_window_layout_presets, pattern_color_from_random_index,
+        pattern_lfo_loop_length_ticks, pattern_loop_frame_at_tick,
         pattern_loop_handoff_tick_at_frame, pattern_loop_tick_at_frame,
         pattern_vst3_parameter_automation_for_channel, pattern_vst3_parameter_link_for_target,
         piano_roll_color_group_note_ids, piano_roll_controller_stroke_points,
@@ -71283,7 +71369,7 @@ mod tests {
             id: 2,
             state_byte: None,
             name: Some("Bass".to_owned()),
-            enabled: None,
+            enabled: Some(false),
             grouped: None,
             press: None,
             motion: None,
@@ -71300,6 +71386,24 @@ mod tests {
                 "Bass".to_owned(),
                 "Track 3".to_owned()
             ]
+        );
+        let muted_track = PlaylistTrack {
+            id: 2,
+            state_byte: None,
+            name: None,
+            enabled: Some(false),
+            grouped: None,
+            press: None,
+            motion: None,
+            trigger_sync: None,
+            queued: None,
+            position_sync: None,
+            tolerant: None,
+            state_bytes: Vec::new(),
+        };
+        assert_eq!(
+            midi_script_playlist_track_mute_states(&selected_rows[..3], &[muted_track]),
+            vec![false, true, false]
         );
     }
 

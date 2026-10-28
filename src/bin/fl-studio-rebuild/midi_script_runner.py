@@ -169,6 +169,34 @@ def _playlist_set_track_name(index, name):
     )
 
 
+def _playlist_is_track_muted(index):
+    index = _playlist_track_index(index)
+    muted = _active_transport_state.get("playlist_track_muted", [])
+    return bool(muted[index - 1]) if index <= len(muted) else False
+
+
+def _playlist_mute_track(index, value=-1):
+    index = _playlist_track_index(index)
+    try:
+        value = int(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("Playlist mute value must be -1, 0, or 1") from error
+    if value not in (-1, 0, 1):
+        raise ValueError("Playlist mute value must be -1, 0, or 1")
+    muted = not _playlist_is_track_muted(index) if value == -1 else bool(value)
+    muted_states = [
+        bool(track_muted)
+        for track_muted in _active_transport_state.get("playlist_track_muted", [])
+    ]
+    while len(muted_states) < _playlist_track_count():
+        muted_states.append(False)
+    muted_states[index - 1] = muted
+    _active_transport_state["playlist_track_muted"] = muted_states
+    _request_transport_action(
+        {"action": "set_playlist_track_mute", "track_id": index, "muted": muted}
+    )
+
+
 def _playlist_selected_track_ids():
     try:
         return {
@@ -1669,6 +1697,8 @@ def _install_modules(script_name, device_name):
     playlist.trackCount = _playlist_track_count
     playlist.getTrackName = _playlist_get_track_name
     playlist.setTrackName = _playlist_set_track_name
+    playlist.isTrackMuted = _playlist_is_track_muted
+    playlist.muteTrack = _playlist_mute_track
     playlist.isTrackSelected = _playlist_is_track_selected
     playlist.selectTrack = _playlist_select_track
     playlist.selectAll = _playlist_select_all
