@@ -2698,7 +2698,6 @@ pub fn stream_playlist_performance_with_vst3_to_device(
             capture_post_effect_buses: false,
         },
         || writer.is_cancelled(),
-        false,
         |block, _mixer_buses| {
             writer.write_stereo_samples(skip_render_block_prefix(block, &mut frames_to_skip))
         },
