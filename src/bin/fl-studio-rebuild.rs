@@ -16139,9 +16139,41 @@ impl DawUi {
             } else {
                 false
             };
-        let stream_rebuilt = if route_created && self.playing && self.pattern_playback_mode {
+        let song_route_updated = route_created
+            && self.playing
+            && self.playlist_playback_loaded
+            && !self.pattern_playback_mode
+            && !self.performance_mode_active
+            && self
+                .document
+                .as_ref()
+                .zip(self.playlist_pdc_update_sender.as_ref())
+                .is_some_and(|(document, sender)| sender.send(document.clone()).is_ok());
+        let pattern_route_updated = route_created
+            && self.playing
+            && self.pattern_playback_mode
+            && self.pattern_mode_playback_source.is_some()
+            && !self.performance_mode_active
+            && self
+                .document
+                .as_ref()
+                .zip(self.pattern_pdc_update_sender.as_ref())
+                .is_some_and(|(document, sender)| sender.send(document.clone()).is_ok());
+        let stream_rebuilt = if route_created
+            && self.playing
+            && !performance_route_updated
+            && !song_route_updated
+            && !pattern_route_updated
+            && self.pattern_playback_mode
+        {
             self.stage_pattern_stream_rebuild(PdcStreamHandoffReason::MixerRouting)
-        } else if route_created && self.playing && !self.performance_mode_active {
+        } else if route_created
+            && self.playing
+            && !performance_route_updated
+            && !song_route_updated
+            && !pattern_route_updated
+            && !self.performance_mode_active
+        {
             self.stage_playlist_stream_rebuild(PdcStreamHandoffReason::MixerRouting)
         } else {
             false
@@ -16158,6 +16190,14 @@ impl DawUi {
                     "{editor} created Mixer route {source} to {destination}; stop and restart Performance Mode to apply its routing"
                 )
             };
+        } else if route_created && song_route_updated {
+            self.status = format!(
+                "{editor} created Mixer route {source} to {destination}; applying it at the next Song audio-block boundary"
+            );
+        } else if route_created && pattern_route_updated {
+            self.status = format!(
+                "{editor} created Mixer route {source} to {destination}; applying it at the next Pattern audio-block boundary"
+            );
         } else if route_created && self.playing && !stream_rebuilt {
             self.status = format!(
                 "{editor} created Mixer route {source} to {destination}; stop and restart playback to apply its routing"

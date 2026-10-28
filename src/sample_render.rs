@@ -1878,6 +1878,7 @@ pub struct PlaylistStreamMonitor<'a> {
 pub struct Vst3LatencyUpdateControls {
     pub updates: Receiver<BTreeSet<u64>>,
     pub reports: Sender<Vst3LatencyReport>,
+    /// Latest Mixer snapshots for block-boundary APDC and saved send-route updates.
     pub pdc_updates: Option<Receiver<FlpDocument>>,
 }
 
@@ -5489,14 +5490,30 @@ fn refresh_vst3_latency_updates(
     Ok(true)
 }
 
+struct LiveMixerPdcUpdateContext<'a, 'engine> {
+    meters: Option<&'a MixerTrackPeakMeters>,
+    sampler_engine: Option<&'a mut SamplerVoiceEngine<'engine>>,
+    audio_clips: Option<&'a [PreparedClip]>,
+    sample_rate: u32,
+    direct_source_delay: &'a mut crate::audio::StereoFrameDelay,
+    mixer_bus_delays: &'a mut Vec<crate::audio::StereoFrameDelay>,
+    mixer_bus_delay_count: usize,
+}
+
 fn apply_live_pdc_updates(
     updates: &mut LiveLatencyUpdateState,
     vst3_processor: Option<&mut Vst3PlaylistStreamProcessor>,
-    meters: Option<&MixerTrackPeakMeters>,
-    direct_source_delay: &mut crate::audio::StereoFrameDelay,
-    mixer_bus_delays: &mut Vec<crate::audio::StereoFrameDelay>,
-    mixer_bus_delay_count: usize,
+    context: LiveMixerPdcUpdateContext<'_, '_>,
 ) -> Result<bool, String> {
+    let LiveMixerPdcUpdateContext {
+        meters,
+        sampler_engine,
+        audio_clips,
+        sample_rate,
+        direct_source_delay,
+        mixer_bus_delays,
+        mixer_bus_delay_count,
+    } = context;
     let mut latest_document = None;
     if let Some(receiver) = updates.pdc_updates.as_ref() {
         while let Ok(document) = receiver.try_recv() {
@@ -5506,6 +5523,16 @@ fn apply_live_pdc_updates(
     let Some(document) = latest_document else {
         return Ok(false);
     };
+    if let Some(sampler_engine) = sampler_engine {
+        sampler_engine.update_live_mixer_routing(&document, meters);
+    }
+    if let Some(audio_clips) = audio_clips {
+        refresh_prepared_clip_mixer_routes(
+            audio_clips,
+            &MixerRouteAudibility::from_document(&document),
+            sample_rate,
+        );
+    }
     let Some(processor) = vst3_processor else {
         updates.document = document;
         return Ok(false);
@@ -5647,10 +5674,15 @@ fn stream_prepared_playlist_render_with_performance(
                     && apply_live_pdc_updates(
                         latency_updates,
                         render.vst3_processor.as_deref_mut(),
-                        meters,
-                        &mut direct_source_delay,
-                        &mut mixer_bus_delays,
-                        mixer_bus_delay_count,
+                        LiveMixerPdcUpdateContext {
+                            meters,
+                            sampler_engine: Some(&mut sampler_engine),
+                            audio_clips: Some(&render.audio.clips),
+                            sample_rate: options.sample_rate,
+                            direct_source_delay: &mut direct_source_delay,
+                            mixer_bus_delays: &mut mixer_bus_delays,
+                            mixer_bus_delay_count,
+                        },
                     )?
                     && let Some(processor) = render.vst3_processor.as_deref()
                 {
@@ -6537,10 +6569,15 @@ fn stream_pattern_from_tick_with_vst3_to_device(
                 apply_live_pdc_updates(
                     latency_updates,
                     playback.vst3_processor.as_mut(),
-                    live_master_meters,
-                    &mut sampler_delay,
-                    &mut mixer_bus_delays,
-                    mixer_bus_delay_count,
+                    LiveMixerPdcUpdateContext {
+                        meters: live_master_meters,
+                        sampler_engine: Some(&mut engine),
+                        audio_clips: None,
+                        sample_rate: options.sample_rate,
+                        direct_source_delay: &mut sampler_delay,
+                        mixer_bus_delays: &mut mixer_bus_delays,
+                        mixer_bus_delay_count,
+                    },
                 )?;
             }
             if let Some(latency_updates) = latency_updates.as_mut() {
@@ -6614,10 +6651,15 @@ fn stream_pattern_from_tick_with_vst3_to_device(
                 apply_live_pdc_updates(
                     latency_updates,
                     playback.vst3_processor.as_mut(),
-                    live_master_meters,
-                    &mut sampler_delay,
-                    &mut mixer_bus_delays,
-                    mixer_bus_delay_count,
+                    LiveMixerPdcUpdateContext {
+                        meters: live_master_meters,
+                        sampler_engine: Some(&mut engine),
+                        audio_clips: None,
+                        sample_rate: options.sample_rate,
+                        direct_source_delay: &mut sampler_delay,
+                        mixer_bus_delays: &mut mixer_bus_delays,
+                        mixer_bus_delay_count,
+                    },
                 )?;
             }
             if let Some(latency_updates) = latency_updates.as_mut() {
@@ -10412,7 +10454,7 @@ impl PlaylistPerformanceRuntime {
         self.current_document = document.clone();
         let routing = MixerRouteAudibility::from_document(&document);
         sampler_engine
-            .update_performance_mixer_routing(&document, audio_context.live_mixer_source_targets);
+            .update_live_mixer_routing(&document, audio_context.live_mixer_source_targets);
         refresh_prepared_clip_mixer_routes(
             audio_context.clips,
             &routing,
@@ -12481,7 +12523,7 @@ struct SamplerVoiceEngine<'a> {
         Option<&'a HashMap<u16, Vec<(usize, MixerSourceRouteTransform)>>>,
     mixer_effect_input_transforms_by_channel:
         Option<&'a HashMap<u16, Vec<(usize, MixerSourceRouteTransform)>>>,
-    performance_mixer_routes_by_channel: HashMap<u16, PerformanceMixerChannelRoute>,
+    live_mixer_routes_by_channel: HashMap<u16, PerformanceMixerChannelRoute>,
     pan_law: PanLaw,
     current_frame: u64,
     next_note: usize,
@@ -12640,7 +12682,7 @@ impl<'a> SamplerVoiceEngine<'a> {
             live_mixer_source_targets: None,
             mixer_meter_transforms_by_channel: None,
             mixer_effect_input_transforms_by_channel: None,
-            performance_mixer_routes_by_channel: HashMap::new(),
+            live_mixer_routes_by_channel: HashMap::new(),
             pan_law,
             current_frame: 0,
             next_note: 0,
@@ -12659,7 +12701,7 @@ impl<'a> SamplerVoiceEngine<'a> {
         }
     }
 
-    fn update_performance_mixer_routing(
+    fn update_live_mixer_routing(
         &mut self,
         document: &FlpDocument,
         meters: Option<&MixerTrackPeakMeters>,
@@ -12670,7 +12712,7 @@ impl<'a> SamplerVoiceEngine<'a> {
             .into_iter()
             .map(|channel| (channel.id(), channel))
             .collect::<HashMap<_, _>>();
-        self.performance_mixer_routes_by_channel = self
+        self.live_mixer_routes_by_channel = self
             .sources_by_channel
             .keys()
             .filter_map(|channel_id| {
@@ -12682,10 +12724,7 @@ impl<'a> SamplerVoiceEngine<'a> {
             })
             .collect();
         for voice in self.voices.iter_mut().flatten() {
-            let Some(route) = self
-                .performance_mixer_routes_by_channel
-                .get(&voice.channel_id)
-            else {
+            let Some(route) = self.live_mixer_routes_by_channel.get(&voice.channel_id) else {
                 continue;
             };
             voice.mixer_transform = route.mixer_transform;
@@ -13068,9 +13107,7 @@ impl<'a> SamplerVoiceEngine<'a> {
         );
         let velocity_gain = f32::from(note.velocity.min(127)) / 127.0;
         let base_gain = source.gain * note.layer_gain;
-        let performance_route = self
-            .performance_mixer_routes_by_channel
-            .get(&note.channel_id);
+        let performance_route = self.live_mixer_routes_by_channel.get(&note.channel_id);
         let live_source_route = performance_route
             .and_then(|route| route.live_source_route.as_ref())
             .or_else(|| {
