@@ -3103,6 +3103,7 @@ pub struct Vst3HostRuntime {
     loaded: Vec<HostedPlugin>,
     pending_latency_refresh: BTreeSet<u64>,
     manual_latency_offsets_by_uid: BTreeMap<String, i32>,
+    manual_latency_offset_overrides: BTreeSet<u64>,
     next_id: u64,
 }
 
@@ -3347,6 +3348,7 @@ impl Vst3HostRuntime {
             loaded: Vec::new(),
             pending_latency_refresh: BTreeSet::new(),
             manual_latency_offsets_by_uid: BTreeMap::new(),
+            manual_latency_offset_overrides: BTreeSet::new(),
             next_id: 1,
         })
     }
@@ -3357,6 +3359,7 @@ impl Vst3HostRuntime {
             .iter()
             .map(|(uid, offset)| (uid.to_ascii_lowercase(), *offset))
             .collect();
+        self.manual_latency_offset_overrides.clear();
         for loaded in &mut self.loaded {
             loaded.info.manual_latency_offset_samples = self
                 .manual_latency_offsets_by_uid
@@ -3383,10 +3386,31 @@ impl Vst3HostRuntime {
             .insert(uid.clone(), offset_samples)
             != Some(offset_samples);
         for loaded in &mut self.loaded {
-            if loaded.info.uid.eq_ignore_ascii_case(&uid) {
+            if loaded.info.uid.eq_ignore_ascii_case(&uid)
+                && !self
+                    .manual_latency_offset_overrides
+                    .contains(&loaded.info.id)
+            {
                 loaded.info.manual_latency_offset_samples = offset_samples;
             }
         }
+        Ok(changed)
+    }
+
+    /// Update one loaded instance without changing the class-wide default or its peers.
+    pub fn set_manual_latency_offset_for_instance(
+        &mut self,
+        id: u64,
+        offset_samples: i32,
+    ) -> Result<bool, String> {
+        let loaded = self
+            .loaded
+            .iter_mut()
+            .find(|loaded| loaded.info.id == id)
+            .ok_or_else(|| format!("no loaded VST3 instance with id {id}"))?;
+        let changed = loaded.info.manual_latency_offset_samples != offset_samples;
+        loaded.info.manual_latency_offset_samples = offset_samples;
+        self.manual_latency_offset_overrides.insert(id);
         Ok(changed)
     }
 

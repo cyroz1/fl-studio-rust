@@ -4,8 +4,9 @@ use std::fs;
 use std::path::PathBuf;
 
 const VST3_MANUAL_LATENCY_OFFSETS_FILE: &str = "vst3-manual-latency-offsets.txt";
+const VST3_PROJECT_MANUAL_LATENCY_OFFSETS_DIRECTORY: &str = "vst3-project-manual-latency-offsets";
 
-fn vst3_manual_latency_offsets_file() -> Option<PathBuf> {
+fn app_settings_directory() -> Option<PathBuf> {
     let root = if cfg!(target_os = "windows") {
         env::var_os("APPDATA").map(PathBuf::from).or_else(|| {
             env::var_os("USERPROFILE")
@@ -25,9 +26,21 @@ fn vst3_manual_latency_offsets_file() -> Option<PathBuf> {
                     .map(|home| home.join(".config"))
             })
     }?;
+    Some(root.join("fl-studio-rebuild"))
+}
+
+fn vst3_manual_latency_offsets_file() -> Option<PathBuf> {
+    Some(app_settings_directory()?.join(VST3_MANUAL_LATENCY_OFFSETS_FILE))
+}
+
+fn vst3_project_manual_latency_offsets_file(project_id: &str) -> Option<PathBuf> {
+    if project_id.len() != 16 || !project_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
     Some(
-        root.join("fl-studio-rebuild")
-            .join(VST3_MANUAL_LATENCY_OFFSETS_FILE),
+        app_settings_directory()?
+            .join(VST3_PROJECT_MANUAL_LATENCY_OFFSETS_DIRECTORY)
+            .join(format!("{}.txt", project_id.to_ascii_lowercase())),
     )
 }
 
@@ -50,6 +63,33 @@ pub fn save_vst3_manual_latency_offsets(offsets: &BTreeMap<String, i32>) -> Resu
         .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
     fs::write(&path, serialize_vst3_manual_latency_offsets(offsets))
         .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
+/// Read project-scoped VST3 latency offsets keyed by a stable project instance identifier.
+pub fn load_vst3_project_manual_latency_offsets(project_id: &str) -> BTreeMap<String, i32> {
+    vst3_project_manual_latency_offsets_file(project_id)
+        .and_then(|path| fs::read_to_string(path).ok())
+        .map(|contents| parse_vst3_project_manual_latency_offsets(&contents))
+        .unwrap_or_default()
+}
+
+/// Save project-scoped VST3 latency offsets outside the FLP, keyed by the project's stable path ID.
+pub fn save_vst3_project_manual_latency_offsets(
+    project_id: &str,
+    offsets: &BTreeMap<String, i32>,
+) -> Result<(), String> {
+    let path = vst3_project_manual_latency_offsets_file(project_id)
+        .ok_or_else(|| "the project latency offset path is not valid".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the project latency offset path has no parent folder".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    fs::write(
+        &path,
+        serialize_vst3_project_manual_latency_offsets(offsets),
+    )
+    .map_err(|error| format!("could not write {}: {error}", path.display()))
 }
 
 pub fn parse_vst3_manual_latency_offsets(contents: &str) -> BTreeMap<String, i32> {
@@ -81,6 +121,42 @@ pub fn serialize_vst3_manual_latency_offsets(offsets: &BTreeMap<String, i32>) ->
         }
         contents.push_str("offset=");
         contents.push_str(&encode_plugin_uid(plugin_uid));
+        contents.push('\t');
+        contents.push_str(&offset_samples.to_string());
+        contents.push('\n');
+    }
+    contents
+}
+
+pub fn parse_vst3_project_manual_latency_offsets(contents: &str) -> BTreeMap<String, i32> {
+    let mut offsets = BTreeMap::new();
+    let mut lines = contents.lines();
+    if lines.next() != Some("vst3-project-manual-latency-offsets-v1") {
+        return offsets;
+    }
+    for line in lines {
+        let mut fields = line.split('\t');
+        let Some(key) = fields.next().and_then(decode_plugin_uid) else {
+            continue;
+        };
+        let Some(offset_samples) = fields.next().and_then(|field| field.parse::<i32>().ok()) else {
+            continue;
+        };
+        if fields.next().is_some() || key.is_empty() {
+            continue;
+        }
+        offsets.insert(key, offset_samples);
+    }
+    offsets
+}
+
+pub fn serialize_vst3_project_manual_latency_offsets(offsets: &BTreeMap<String, i32>) -> String {
+    let mut contents = String::from("vst3-project-manual-latency-offsets-v1\n");
+    for (key, offset_samples) in offsets {
+        if key.is_empty() {
+            continue;
+        }
+        contents.push_str(&encode_plugin_uid(key));
         contents.push('\t');
         contents.push_str(&offset_samples.to_string());
         contents.push('\n');

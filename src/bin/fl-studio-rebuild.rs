@@ -31,7 +31,8 @@ use flp_rebuild::media::{
 };
 use flp_rebuild::midi::{MidiChannelMapping, MidiFile, MidiImportOptions};
 use flp_rebuild::plugin_settings::{
-    load_vst3_manual_latency_offsets, save_vst3_manual_latency_offsets,
+    load_vst3_manual_latency_offsets, load_vst3_project_manual_latency_offsets,
+    save_vst3_manual_latency_offsets, save_vst3_project_manual_latency_offsets,
 };
 use flp_rebuild::plugins::{PluginCandidate, PluginFormat, scan_installed_plugins};
 use flp_rebuild::project_package::{ProjectPackageWorkspace, copy_unique_sample_file};
@@ -5084,6 +5085,9 @@ struct DawUi {
     clap_note_preview_states: BTreeMap<(PathBuf, String), ClapNotePreviewState>,
     vst3_host: Option<Vst3HostRuntime>,
     vst3_manual_latency_offsets: BTreeMap<String, i32>,
+    vst3_project_manual_latency_offsets: BTreeMap<String, i32>,
+    vst3_manual_latency_offset_keys: BTreeMap<u64, String>,
+    vst3_manual_latency_offset_labels: BTreeMap<u64, String>,
     channel_vst3_instances: BTreeMap<u16, u64>,
     mixer_effect_vst3_instances: BTreeMap<(usize, u16), u64>,
     audio_catalog: AudioDeviceCatalog,
@@ -6831,6 +6835,9 @@ impl DawUi {
             clap_note_preview_states: BTreeMap::new(),
             vst3_host: None,
             vst3_manual_latency_offsets,
+            vst3_project_manual_latency_offsets: BTreeMap::new(),
+            vst3_manual_latency_offset_keys: BTreeMap::new(),
+            vst3_manual_latency_offset_labels: BTreeMap::new(),
             channel_vst3_instances: BTreeMap::new(),
             mixer_effect_vst3_instances: BTreeMap::new(),
             audio_catalog,
@@ -8116,6 +8123,8 @@ impl DawUi {
                 self.automation_interpolation_anchor = None;
                 self.last_plugin_action = None;
                 self.vst3_host = None;
+                self.vst3_manual_latency_offset_keys.clear();
+                self.vst3_manual_latency_offset_labels.clear();
                 self.channel_vst3_instances.clear();
                 self.mixer_effect_vst3_instances.clear();
                 self.selected_arrangement = document.arrangements().ok().and_then(|arrangements| {
@@ -8132,6 +8141,8 @@ impl DawUi {
                 let (armed_tracks, input_pairs) = load_audio_recording_track_settings(target_path);
                 self.armed_audio_recording_tracks = armed_tracks;
                 self.audio_recording_track_input_pairs = input_pairs;
+                self.vst3_project_manual_latency_offsets =
+                    load_vst3_project_manual_latency_offsets(&stable_project_id(target_path));
                 self.new_project_template_path = None;
                 self.package_workspace = package_workspace;
                 self.document = Some(document);
@@ -9037,6 +9048,8 @@ impl DawUi {
 
     fn load_project_vst3_plugins(&mut self) -> Option<String> {
         self.vst3_host = None;
+        self.vst3_manual_latency_offset_keys.clear();
+        self.vst3_manual_latency_offset_labels.clear();
         self.channel_vst3_instances.clear();
         self.mixer_effect_vst3_instances.clear();
         let document = self.document.as_ref()?;
@@ -9110,12 +9123,26 @@ impl DawUi {
         host.set_manual_latency_offsets(&self.vst3_manual_latency_offsets);
         let mut channel_instances = BTreeMap::new();
         let mut mixer_effect_instances = BTreeMap::new();
+        let mut manual_latency_offset_keys = BTreeMap::new();
+        let mut manual_latency_offset_labels = BTreeMap::new();
         let mut loaded_effect_count = 0usize;
         let mut restored_count = 0usize;
         for (state, candidate, class_uid) in channel_plans {
             let channel_id = state.channel_id();
             match host.load(&candidate.path, Some(&class_uid)) {
                 Ok(info) => {
+                    let offset_key = channel_vst3_latency_offset_key(channel_id, &info.uid);
+                    if let Some(offset_samples) =
+                        self.vst3_project_manual_latency_offsets.get(&offset_key)
+                        && let Err(error) =
+                            host.set_manual_latency_offset_for_instance(info.id, *offset_samples)
+                    {
+                        unresolved.push(format!(
+                            "channel {channel_id} PDC offset could not be applied: {error}"
+                        ));
+                    }
+                    manual_latency_offset_keys.insert(info.id, offset_key);
+                    manual_latency_offset_labels.insert(info.id, format!("Channel {channel_id}"));
                     channel_instances.insert(channel_id, info.id);
                     match host.restore_flp_channel_state(info.id, &state) {
                         Ok(()) => restored_count += 1,
@@ -9134,6 +9161,21 @@ impl DawUi {
             match host.load_audio_effect(&candidate.path, Some(&class_uid)) {
                 Ok(info) => {
                     loaded_effect_count += 1;
+                    let offset_key = mixer_effect_vst3_latency_offset_key(key.0, key.1, &info.uid);
+                    if let Some(offset_samples) =
+                        self.vst3_project_manual_latency_offsets.get(&offset_key)
+                        && let Err(error) =
+                            host.set_manual_latency_offset_for_instance(info.id, *offset_samples)
+                    {
+                        unresolved.push(format!(
+                            "Mixer insert {} effect slot {} PDC offset could not be applied: {error}",
+                            key.0,
+                            key.1 + 1
+                        ));
+                    }
+                    manual_latency_offset_keys.insert(info.id, offset_key);
+                    manual_latency_offset_labels
+                        .insert(info.id, format!("Insert {} · slot {}", key.0, key.1 + 1));
                     match host.restore_flp_mixer_effect_state(info.id, &slot) {
                         Ok(()) => {
                             mixer_effect_instances.insert(key, info.id);
@@ -9156,6 +9198,8 @@ impl DawUi {
         let loaded_count = channel_instances.len() + loaded_effect_count;
         self.channel_vst3_instances = channel_instances;
         self.mixer_effect_vst3_instances = mixer_effect_instances;
+        self.vst3_manual_latency_offset_keys = manual_latency_offset_keys;
+        self.vst3_manual_latency_offset_labels = manual_latency_offset_labels;
         if !host.loaded_plugins().is_empty() {
             self.vst3_host = Some(host);
         }
@@ -11233,6 +11277,16 @@ impl DawUi {
                         " · audio recording track settings could not be saved: {error}"
                     ));
                 }
+                let project_latency_offset_save_error =
+                    if !self.vst3_project_manual_latency_offsets.is_empty() {
+                        save_vst3_project_manual_latency_offsets(
+                            &stable_project_id(path),
+                            &self.vst3_project_manual_latency_offsets,
+                        )
+                        .err()
+                    } else {
+                        None
+                    };
                 self.new_project_template_path = None;
                 if let Some(workspace) = package_workspace_after_save {
                     self.package_workspace = Some(workspace);
@@ -11257,6 +11311,11 @@ impl DawUi {
                 };
                 self.status
                     .push_str(&plugin_state_warning_suffix(&plugin_state_warnings));
+                if let Some(error) = project_latency_offset_save_error {
+                    self.status.push_str(&format!(
+                        " · project VST3 PDC offsets could not be saved: {error}"
+                    ));
+                }
                 if let Some(summary) = sample_bundle_summary {
                     if summary.bundled_files > 0 {
                         self.status.push_str(&format!(
@@ -57568,7 +57627,7 @@ impl DawUi {
         let mut open_id = None;
         let mut close_id = None;
         let mut parameter_edits = Vec::new();
-        let mut vst3_latency_offset_edits = BTreeMap::new();
+        let mut vst3_latency_offset_edits = Vec::new();
         let mut midi_vst3_learn_request = None;
         let mut midi_vst3_cancel_learning = false;
         let mut midi_vst3_remove_mapping = None;
@@ -57690,6 +57749,7 @@ impl DawUi {
             .map(|info| (info.uid.to_ascii_lowercase(), info.id))
             .collect::<BTreeMap<_, _>>();
         let mut latency_offset_uids_drawn = BTreeSet::new();
+        let mut latency_offset_instance_ids_drawn = BTreeSet::new();
         let plugin_states = self
             .document
             .as_ref()
@@ -58417,15 +58477,32 @@ impl DawUi {
                     ));
                 }
                 let latency_offset_uid = info.uid.to_ascii_lowercase();
-                if latency_offset_uids_drawn.insert(latency_offset_uid.clone()) {
+                let project_offset_key =
+                    self.vst3_manual_latency_offset_keys.get(&info.id).cloned();
+                let draw_instance_offset = project_offset_key.is_some()
+                    && latency_offset_instance_ids_drawn.insert(info.id);
+                let draw_class_offset = project_offset_key.is_none()
+                    && latency_offset_uids_drawn.insert(latency_offset_uid.clone());
+                if draw_instance_offset {
+                    let offset_key = project_offset_key.expect("checked as a project instance");
                     let mut offset_samples = self
-                        .vst3_manual_latency_offsets
-                        .get(&latency_offset_uid)
+                        .vst3_project_manual_latency_offsets
+                        .get(&offset_key)
                         .copied()
+                        .or_else(|| {
+                            self.vst3_manual_latency_offsets
+                                .get(&latency_offset_uid)
+                                .copied()
+                        })
                         .unwrap_or_default();
                     let performance_stream_active = self.playing && self.performance_mode_active;
                     ui.horizontal(|ui| {
-                        ui.label("Manual PDC offset");
+                        let label = self
+                            .vst3_manual_latency_offset_labels
+                            .get(&info.id)
+                            .map(String::as_str)
+                            .unwrap_or("Project instance");
+                        ui.label(format!("Project PDC offset · {label}"));
                         let response = ui
                             .add_enabled(
                                 !performance_stream_active,
@@ -58435,11 +58512,56 @@ impl DawUi {
                                     .suffix(" samples"),
                             )
                             .on_hover_text(
-                                "Added to the plug-in's reported latency for PDC. Positive values add latency; negative values subtract it.",
+                                "Added to this plug-in instance's reported latency for PDC. Saved in app settings for this project; the FLP file is unchanged.",
                             );
                         if response.changed() {
-                            vst3_latency_offset_edits
-                                .insert(latency_offset_uid.clone(), offset_samples);
+                            vst3_latency_offset_edits.push((
+                                info.id,
+                                Some(offset_key.clone()),
+                                latency_offset_uid.clone(),
+                                offset_samples,
+                            ));
+                        }
+                        ui.small(format!(
+                            "PDC latency: {} samples",
+                            info.pdc_latency_samples()
+                        ));
+                    });
+                    if performance_stream_active {
+                        ui.small(
+                            egui::RichText::new(
+                                "Stop Performance playback to edit the PDC offset.",
+                            )
+                            .color(MUTED),
+                        );
+                    }
+                } else if draw_class_offset {
+                    let mut offset_samples = self
+                        .vst3_manual_latency_offsets
+                        .get(&latency_offset_uid)
+                        .copied()
+                        .unwrap_or_default();
+                    let performance_stream_active = self.playing && self.performance_mode_active;
+                    ui.horizontal(|ui| {
+                        ui.label("Manual PDC offset · plug-in class");
+                        let response = ui
+                            .add_enabled(
+                                !performance_stream_active,
+                                egui::DragValue::new(&mut offset_samples)
+                                    .range(-100_000..=100_000)
+                                    .speed(1.0)
+                                    .suffix(" samples"),
+                            )
+                            .on_hover_text(
+                                "Added to the plug-in class's reported latency for PDC. Positive values add latency; negative values subtract it. Used as the default for project instances without an override.",
+                            );
+                        if response.changed() {
+                            vst3_latency_offset_edits.push((
+                                info.id,
+                                None,
+                                latency_offset_uid.clone(),
+                                offset_samples,
+                            ));
                         }
                         ui.small(format!(
                             "PDC latency: {} samples",
@@ -59120,16 +59242,38 @@ impl DawUi {
                 && !self.pattern_playback_mode
                 && !self.performance_mode_active;
             let mut changed = false;
-            for (uid, offset_samples) in vst3_latency_offset_edits {
-                let Some(id) = loaded_vst3_ids_by_uid.get(&uid).copied() else {
-                    continue;
-                };
+            let mut global_offsets_changed = false;
+            let mut project_offset_save_error = None;
+            for (id, project_key, uid, offset_samples) in vst3_latency_offset_edits {
                 let Some(host) = self.vst3_host.as_mut() else {
                     continue;
                 };
-                match host.set_manual_latency_offset(id, offset_samples) {
+                let update_result = if project_key.is_some() {
+                    host.set_manual_latency_offset_for_instance(id, offset_samples)
+                } else {
+                    loaded_vst3_ids_by_uid
+                        .get(&uid)
+                        .copied()
+                        .map(|id| host.set_manual_latency_offset(id, offset_samples))
+                        .unwrap_or_else(|| Err(format!("no loaded VST3 instance for class {uid}")))
+                };
+                match update_result {
                     Ok(true) => {
-                        self.vst3_manual_latency_offsets.insert(uid, offset_samples);
+                        if let Some(project_key) = project_key {
+                            self.vst3_project_manual_latency_offsets
+                                .insert(project_key, offset_samples);
+                            if let Some(project_path) = self.current_path.as_deref()
+                                && let Err(error) = save_vst3_project_manual_latency_offsets(
+                                    &stable_project_id(project_path),
+                                    &self.vst3_project_manual_latency_offsets,
+                                )
+                            {
+                                project_offset_save_error = Some(error);
+                            }
+                        } else {
+                            self.vst3_manual_latency_offsets.insert(uid, offset_samples);
+                            global_offsets_changed = true;
+                        }
                         changed = true;
                     }
                     Ok(false) => {}
@@ -59178,8 +59322,11 @@ impl DawUi {
                     }
                     resumed
                 };
-                let save_result =
-                    save_vst3_manual_latency_offsets(&self.vst3_manual_latency_offsets);
+                let save_result = if global_offsets_changed {
+                    save_vst3_manual_latency_offsets(&self.vst3_manual_latency_offsets)
+                } else {
+                    Ok(())
+                };
                 self.status = match (save_result, resumed_tick) {
                     (Err(error), Some(tick)) if staged_pattern_handoff => format!(
                         "Updated VST3 PDC offset and staged Pattern playback at tick {tick}; could not save it: {error}"
@@ -59206,6 +59353,11 @@ impl DawUi {
                         "Updated VST3 PDC offset; it will apply on the next playback start".to_owned()
                     }
                 };
+                if let Some(error) = project_offset_save_error {
+                    self.status.push_str(&format!(
+                        " · project PDC offset could not be saved: {error}"
+                    ));
+                }
             }
         }
         if let Some(host) = &self.vst3_host {
@@ -59262,7 +59414,23 @@ impl DawUi {
         match host.load(path, class_uid.as_deref()) {
             Ok(info) => {
                 if let Some(channel_id) = restore_channel_id {
-                    loaded_channel_instance = Some((channel_id, info.id));
+                    let offset_key = channel_vst3_latency_offset_key(channel_id, &info.uid);
+                    if let Some(offset_samples) =
+                        self.vst3_project_manual_latency_offsets.get(&offset_key)
+                        && let Err(error) =
+                            host.set_manual_latency_offset_for_instance(info.id, *offset_samples)
+                    {
+                        self.status = format!(
+                            "Loaded {} but could not apply its project PDC offset: {error}",
+                            info.name
+                        );
+                    }
+                    loaded_channel_instance = Some((
+                        channel_id,
+                        info.id,
+                        offset_key,
+                        format!("Channel {channel_id}"),
+                    ));
                 }
                 let state_message = if let (Some(channel_id), Some(project_state)) =
                     (restore_channel_id, project_plugin_state.as_ref())
@@ -59290,8 +59458,12 @@ impl DawUi {
             }
             Err(error) => self.status = format!("Could not load VST3: {error}"),
         }
-        if let Some((channel_id, instance_id)) = loaded_channel_instance {
+        if let Some((channel_id, instance_id, offset_key, offset_label)) = loaded_channel_instance {
             self.channel_vst3_instances.insert(channel_id, instance_id);
+            self.vst3_manual_latency_offset_keys
+                .insert(instance_id, offset_key);
+            self.vst3_manual_latency_offset_labels
+                .insert(instance_id, offset_label);
         }
         self.last_plugin_action = Some(self.status.clone());
     }
@@ -65829,6 +66001,21 @@ fn stable_project_id(project_path: &Path) -> String {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     format!("{hash:016x}")
+}
+
+fn channel_vst3_latency_offset_key(channel_id: u16, plugin_uid: &str) -> String {
+    format!("channel\t{channel_id}\t{}", plugin_uid.to_ascii_lowercase())
+}
+
+fn mixer_effect_vst3_latency_offset_key(
+    insert_ordinal: usize,
+    slot_index: u16,
+    plugin_uid: &str,
+) -> String {
+    format!(
+        "mixer\t{insert_ordinal}\t{slot_index}\t{}",
+        plugin_uid.to_ascii_lowercase()
+    )
 }
 
 fn write_project_backup(
