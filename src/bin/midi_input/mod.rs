@@ -2508,7 +2508,7 @@ mod tests {
 
     #[test]
     fn script_midi_output_actions_reach_the_dedicated_output_queue() {
-        let (transport_sender, transport_receiver) = mpsc::sync_channel(16);
+        let (transport_sender, transport_receiver) = mpsc::sync_channel(32);
         let (midi_output_sender, midi_output_receiver) = mpsc::sync_channel(2);
         let dropped_messages = AtomicU64::new(0);
         let received_at = Instant::now();
