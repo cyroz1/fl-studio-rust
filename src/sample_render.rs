@@ -1867,6 +1867,18 @@ pub struct PlaylistStreamMonitor<'a> {
     live_master_signal_flags: Option<Arc<AtomicI32>>,
 }
 
+/// Channels for refreshing PDC inside an active Song Playlist stream.
+pub struct PlaylistLatencyUpdateControls {
+    pub updates: Receiver<BTreeSet<u64>>,
+    pub reports: Sender<Vst3LatencyReport>,
+}
+
+struct PlaylistLiveLatencyUpdateState<'a> {
+    document: &'a FlpDocument,
+    updates: Receiver<BTreeSet<u64>>,
+    reports: Sender<Vst3LatencyReport>,
+}
+
 impl<'a> PlaylistStreamMonitor<'a> {
     /// Stream from a frame without publishing per-insert meter data.
     pub const fn from_frame(start_frame: u64) -> Self {
@@ -2437,6 +2449,7 @@ pub fn stream_playlist_with_vst3_to_device_from_frame(
         cancelled,
         vst3_processor,
         PlaylistStreamMonitor::from_frame(start_frame),
+        None,
     )
 }
 
@@ -2458,6 +2471,30 @@ pub fn stream_playlist_with_vst3_to_device_with_monitor(
         cancelled,
         vst3_processor,
         monitor,
+        None,
+    )
+}
+
+/// Stream Playlist playback with block-boundary VST3 latency refreshes.
+pub fn stream_playlist_with_vst3_to_device_with_monitor_and_latency_updates(
+    document: &FlpDocument,
+    project_path: impl AsRef<Path>,
+    options: PlaylistRenderOptions,
+    writer: &StreamingAudioWriter,
+    cancelled: &AtomicBool,
+    vst3_processor: Option<Vst3PlaylistStreamProcessor>,
+    monitor: PlaylistStreamMonitor<'_>,
+    latency_controls: PlaylistLatencyUpdateControls,
+) -> Result<PlaylistRenderSummary, String> {
+    stream_playlist_with_vst3_to_device_from_frame_inner(
+        document,
+        project_path,
+        options,
+        writer,
+        cancelled,
+        vst3_processor,
+        monitor,
+        Some(latency_controls),
     )
 }
 
@@ -2646,6 +2683,7 @@ pub fn stream_playlist_performance_with_vst3_to_device(
             remainder_stop: None,
         },
         Some(runtime),
+        None,
         performance.meters.as_deref(),
         cancelled,
         || writer.is_cancelled(),
@@ -2668,6 +2706,7 @@ fn stream_playlist_with_vst3_to_device_from_frame_inner(
     cancelled: &AtomicBool,
     mut vst3_processor: Option<Vst3PlaylistStreamProcessor>,
     monitor: PlaylistStreamMonitor<'_>,
+    latency_controls: Option<PlaylistLatencyUpdateControls>,
 ) -> Result<PlaylistRenderSummary, String> {
     let start_frame = monitor.start_frame;
     let meters = monitor.meters;
@@ -2785,27 +2824,52 @@ fn stream_playlist_with_vst3_to_device_from_frame_inner(
         mixer_insert_peaks: None,
     };
 
+    let latency_updates = latency_controls.map(|controls| PlaylistLiveLatencyUpdateState {
+        document,
+        updates: controls.updates,
+        reports: controls.reports,
+    });
     let mut frames_to_skip = start_frame.min(frames);
-    summary.voices_stolen = stream_prepared_playlist_render(
-        PreparedPlaylistBlockMix {
-            audio: &audio,
-            sampler: &sampler,
-            options,
-            frames,
-            master_output,
-            vst3_processor: vst3_processor.as_mut(),
-            remainder_stop: None,
-        },
-        meters,
-        cancelled,
-        || writer.is_cancelled(),
-        |block, _mixer_buses| {
-            let skipped_frames = frames_to_skip.min((block.len() / 2) as u64) as usize;
-            frames_to_skip -= skipped_frames as u64;
-            writer.write_stereo_samples(&block[skipped_frames * 2..])
-        },
-    )?
-    .voices_stolen;
+    let render = PreparedPlaylistBlockMix {
+        audio: &audio,
+        sampler: &sampler,
+        options,
+        frames,
+        master_output,
+        vst3_processor: vst3_processor.as_mut(),
+        remainder_stop: None,
+    };
+    let block_summary = if let Some(latency_updates) = latency_updates {
+        stream_prepared_playlist_render_with_live_latency_updates(
+            render,
+            latency_updates,
+            meters,
+            cancelled,
+            || writer.is_cancelled(),
+            |block, _mixer_buses| {
+                let skipped_frames = frames_to_skip.min((block.len() / 2) as u64) as usize;
+                frames_to_skip -= skipped_frames as u64;
+                writer.write_stereo_samples(&block[skipped_frames * 2..])
+            },
+        )?
+    } else {
+        stream_prepared_playlist_render(
+            render,
+            meters,
+            cancelled,
+            || writer.is_cancelled(),
+            |block, _mixer_buses| {
+                let skipped_frames = frames_to_skip.min((block.len() / 2) as u64) as usize;
+                frames_to_skip -= skipped_frames as u64;
+                writer.write_stereo_samples(&block[skipped_frames * 2..])
+            },
+        )?
+    };
+    summary.voices_stolen = block_summary.voices_stolen;
+    summary.frames = summary.frames.max(block_summary.frames_rendered);
+    if let Some(processor) = vst3_processor.as_ref() {
+        summary.frames = summary.frames.max(processor.summary().frames);
+    }
     Ok(summary)
 }
 
@@ -5259,6 +5323,27 @@ fn stream_prepared_playlist_render(
     stream_prepared_playlist_render_with_performance(
         render,
         None,
+        None,
+        meters,
+        cancelled,
+        stream_cancelled,
+        false,
+        write_block,
+    )
+}
+
+fn stream_prepared_playlist_render_with_live_latency_updates(
+    render: PreparedPlaylistBlockMix<'_>,
+    latency_updates: PlaylistLiveLatencyUpdateState<'_>,
+    meters: Option<&MixerTrackPeakMeters>,
+    cancelled: &AtomicBool,
+    stream_cancelled: impl FnMut() -> bool,
+    write_block: impl FnMut(&[f32], PlaylistRenderMixerBuses<'_>) -> Result<(), String>,
+) -> Result<PlaylistBlockRenderSummary, String> {
+    stream_prepared_playlist_render_with_performance(
+        render,
+        None,
+        Some(latency_updates),
         meters,
         cancelled,
         stream_cancelled,
@@ -5277,6 +5362,7 @@ fn stream_prepared_playlist_render_with_post_effect_stems(
     stream_prepared_playlist_render_with_performance(
         render,
         None,
+        None,
         meters,
         cancelled,
         stream_cancelled,
@@ -5291,7 +5377,7 @@ struct PlaylistRenderMixerBuses<'a> {
     post_effect: Option<&'a [f32]>,
 }
 
-fn update_performance_source_pdc_delays(
+fn update_live_playlist_source_pdc_delays(
     delay_frames: u64,
     direct_source_delay: &mut crate::audio::StereoFrameDelay,
     mixer_bus_delays: &mut Vec<crate::audio::StereoFrameDelay>,
@@ -5300,14 +5386,14 @@ fn update_performance_source_pdc_delays(
     let delay_line_count = u64::try_from(mixer_bus_delay_count)
         .ok()
         .and_then(|count| count.checked_add(1))
-        .ok_or_else(|| "Performance PDC delay count overflow".to_owned())?;
+        .ok_or_else(|| "Playlist PDC delay count overflow".to_owned())?;
     let delay_bytes = delay_frames
         .checked_mul(delay_line_count)
         .and_then(|frames| frames.checked_mul(std::mem::size_of::<[f32; 2]>() as u64))
-        .ok_or_else(|| "Performance PDC delay storage size overflow".to_owned())?;
+        .ok_or_else(|| "Playlist PDC delay storage size overflow".to_owned())?;
     if delay_bytes > MAX_PDC_DELAY_BYTES {
         return Err(format!(
-            "Performance PDC needs {delay_bytes} bytes of source delay storage, exceeding the 128 MiB limit"
+            "Playlist PDC needs {delay_bytes} bytes of source delay storage, exceeding the 128 MiB limit"
         ));
     }
     direct_source_delay.set_delay_frames(delay_frames)?;
@@ -5322,7 +5408,7 @@ fn update_performance_source_pdc_delays(
     let mut updated = Vec::new();
     updated
         .try_reserve_exact(mixer_bus_delay_count)
-        .map_err(|error| format!("could not allocate Performance Mixer PDC delays: {error}"))?;
+        .map_err(|error| format!("could not allocate Playlist Mixer PDC delays: {error}"))?;
     for _ in 0..mixer_bus_delay_count {
         let mut delay = previous.next().unwrap_or_default();
         delay.set_delay_frames(delay_frames)?;
@@ -5332,9 +5418,44 @@ fn update_performance_source_pdc_delays(
     Ok(())
 }
 
+fn refresh_playlist_latency_updates(
+    updates: &mut PlaylistLiveLatencyUpdateState<'_>,
+    vst3_processor: Option<&mut Vst3PlaylistStreamProcessor>,
+    meters: Option<&MixerTrackPeakMeters>,
+    direct_source_delay: &mut crate::audio::StereoFrameDelay,
+    mixer_bus_delays: &mut Vec<crate::audio::StereoFrameDelay>,
+    mixer_bus_delay_count: usize,
+) -> Result<bool, String> {
+    let mut plugin_ids = BTreeSet::new();
+    while let Ok(changed_plugin_ids) = updates.updates.try_recv() {
+        plugin_ids.extend(changed_plugin_ids);
+    }
+    if plugin_ids.is_empty() {
+        return Ok(false);
+    }
+    let Some(processor) = vst3_processor else {
+        return Ok(false);
+    };
+    let reports = processor.refresh_live_latency_reports(&plugin_ids, updates.document, meters)?;
+    if reports.is_empty() {
+        return Ok(false);
+    }
+    for report in reports {
+        let _ = updates.reports.send(report);
+    }
+    update_live_playlist_source_pdc_delays(
+        processor.pdc_direct_source_delay_frames(),
+        direct_source_delay,
+        mixer_bus_delays,
+        mixer_bus_delay_count,
+    )?;
+    Ok(true)
+}
+
 fn stream_prepared_playlist_render_with_performance(
     mut render: PreparedPlaylistBlockMix<'_>,
     mut performance: Option<PlaylistPerformanceRuntime>,
+    mut latency_updates: Option<PlaylistLiveLatencyUpdateState<'_>>,
     meters: Option<&MixerTrackPeakMeters>,
     cancelled: &AtomicBool,
     mut stream_cancelled: impl FnMut() -> bool,
@@ -5342,7 +5463,7 @@ fn stream_prepared_playlist_render_with_performance(
     mut write_block: impl FnMut(&[f32], PlaylistRenderMixerBuses<'_>) -> Result<(), String>,
 ) -> Result<PlaylistBlockRenderSummary, String> {
     crate::audio::enable_denormal_protection();
-    let frames = render.frames;
+    let mut frames = render.frames;
     let options = render.options;
     let mut remainder_detector = render.remainder_stop.map(PlaylistRemainderDetector::new);
     let release_frames = (f64::from(options.sample_rate) * SAMPLER_RELEASE_SECONDS)
@@ -5390,7 +5511,7 @@ fn stream_prepared_playlist_render_with_performance(
         Vst3PlaylistStreamProcessor::pdc_direct_source_delay_frames,
     );
     let mixer_bus_delay_count = if (meters.is_some() || mixer_effect_buses_required)
-        && (performance.is_some() || direct_source_delay_frames > 0)
+        && (performance.is_some() || latency_updates.is_some() || direct_source_delay_frames > 0)
     {
         MIXER_TRACK_METER_COUNT * mixer_bus_planes
     } else {
@@ -5398,7 +5519,7 @@ fn stream_prepared_playlist_render_with_performance(
     };
     let mut direct_source_delay = crate::audio::StereoFrameDelay::default();
     let mut mixer_bus_delays = Vec::new();
-    update_performance_source_pdc_delays(
+    update_live_playlist_source_pdc_delays(
         direct_source_delay_frames,
         &mut direct_source_delay,
         &mut mixer_bus_delays,
@@ -5450,6 +5571,19 @@ fn stream_prepared_playlist_render_with_performance(
                 if stream_cancelled() {
                     return Err("Playlist playback was stopped".to_owned());
                 }
+                if let Some(latency_updates) = latency_updates.as_mut()
+                    && refresh_playlist_latency_updates(
+                        latency_updates,
+                        render.vst3_processor.as_deref_mut(),
+                        meters,
+                        &mut direct_source_delay,
+                        &mut mixer_bus_delays,
+                        mixer_bus_delay_count,
+                    )?
+                    && let Some(processor) = render.vst3_processor.as_deref()
+                {
+                    frames = frames.max(processor.summary().frames);
+                }
                 let frame_count = (frames - block_start).min(STREAM_BLOCK_FRAMES as u64) as usize;
                 let sample_count = frame_count * 2;
                 let meter_bus_samples = MIXER_TRACK_METER_COUNT * sample_count;
@@ -5486,7 +5620,7 @@ fn stream_prepared_playlist_render_with_performance(
                         0,
                         Vst3PlaylistStreamProcessor::pdc_direct_source_delay_frames,
                     );
-                    update_performance_source_pdc_delays(
+                    update_live_playlist_source_pdc_delays(
                         delay_frames,
                         &mut direct_source_delay,
                         &mut mixer_bus_delays,
@@ -16964,15 +17098,15 @@ mod tests {
             .map(|_| crate::audio::StereoFrameDelay::new(2).unwrap())
             .collect::<Vec<_>>();
 
-        update_performance_source_pdc_delays(5, &mut direct, &mut mixer_buses, 3).unwrap();
+        update_live_playlist_source_pdc_delays(5, &mut direct, &mut mixer_buses, 3).unwrap();
         assert_eq!(direct.delay_frames(), 5);
         assert!(mixer_buses.iter().all(|delay| delay.delay_frames() == 5));
 
-        update_performance_source_pdc_delays(0, &mut direct, &mut mixer_buses, 3).unwrap();
+        update_live_playlist_source_pdc_delays(0, &mut direct, &mut mixer_buses, 3).unwrap();
         assert_eq!(direct.delay_frames(), 0);
         assert!(mixer_buses.iter().all(|delay| delay.delay_frames() == 0));
 
-        update_performance_source_pdc_delays(1, &mut direct, &mut mixer_buses, 1).unwrap();
+        update_live_playlist_source_pdc_delays(1, &mut direct, &mut mixer_buses, 1).unwrap();
         assert_eq!(direct.delay_frames(), 1);
         assert_eq!(mixer_buses.len(), 1);
         assert_eq!(mixer_buses[0].delay_frames(), 1);
