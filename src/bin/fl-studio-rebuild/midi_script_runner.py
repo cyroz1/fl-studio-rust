@@ -221,6 +221,12 @@ def _playlist_solo_track(index, value=-1, inGroup=False):
     )
 
 
+def _playlist_get_track_activity_level(index):
+    index = _playlist_track_index(index)
+    levels = _active_transport_state.get("playlist_track_activity_levels", [])
+    return float(levels[index - 1]) if index <= len(levels) else 0.0
+
+
 def _playlist_selected_track_ids():
     try:
         return {
@@ -1725,6 +1731,7 @@ def _install_modules(script_name, device_name):
     playlist.muteTrack = _playlist_mute_track
     playlist.isTrackSolo = _playlist_is_track_solo
     playlist.soloTrack = _playlist_solo_track
+    playlist.getTrackActivityLevel = _playlist_get_track_activity_level
     playlist.isTrackSelected = _playlist_is_track_selected
     playlist.selectTrack = _playlist_select_track
     playlist.selectAll = _playlist_select_all

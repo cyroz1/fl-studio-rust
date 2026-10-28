@@ -247,6 +247,7 @@ pub struct MidiScriptTransportState {
     pub playlist_track_names: Mutex<Vec<String>>,
     pub playlist_track_muted: Mutex<Vec<bool>>,
     pub playlist_track_soloed: Mutex<Vec<bool>>,
+    pub playlist_track_activity_levels: Mutex<Vec<f32>>,
     pub selected_playlist_track_ids: Mutex<Vec<u32>>,
     pub midi_pickup_enabled: AtomicU8,
     pub channel_ids: Mutex<Vec<u16>>,
@@ -305,6 +306,7 @@ impl Default for MidiScriptTransportState {
             playlist_track_names: Mutex::new(Vec::new()),
             playlist_track_muted: Mutex::new(Vec::new()),
             playlist_track_soloed: Mutex::new(Vec::new()),
+            playlist_track_activity_levels: Mutex::new(Vec::new()),
             selected_playlist_track_ids: Mutex::new(Vec::new()),
             midi_pickup_enabled: AtomicU8::new(1),
             channel_ids: Mutex::new(Vec::new()),
@@ -777,6 +779,12 @@ impl MidiScriptRuntime {
             .lock()
             .map(|soloed| soloed.clone())
             .unwrap_or_default();
+        let playlist_track_activity_levels = self
+            .transport_state
+            .playlist_track_activity_levels
+            .lock()
+            .map(|levels| levels.clone())
+            .unwrap_or_default();
         let selected_playlist_track_ids = self
             .transport_state
             .selected_playlist_track_ids
@@ -1048,6 +1056,10 @@ impl MidiScriptRuntime {
                 transport_object.insert(
                     "playlist_track_soloed".to_owned(),
                     json!(playlist_track_soloed),
+                );
+                transport_object.insert(
+                    "playlist_track_activity_levels".to_owned(),
+                    json!(playlist_track_activity_levels),
                 );
                 transport_object.insert(
                     "selected_playlist_track_ids".to_owned(),
@@ -2140,6 +2152,36 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn python_playlist_activity_level_returns_the_published_clip_state() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport playlist\ndef OnMidiIn(event):\n    if playlist.getTrackActivityLevel(1) != 0.5:\n        raise RuntimeError('active Playlist track level should be 0.5')\n    if playlist.getTrackActivityLevel(2) != 0.0:\n        raise RuntimeError('inactive Playlist track level should be 0.0')\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let transport_state = Arc::new(MidiScriptTransportState::default());
+        transport_state
+            .playlist_track_count
+            .store(2, Ordering::Relaxed);
+        *transport_state
+            .playlist_track_activity_levels
+            .lock()
+            .unwrap() = vec![0.5, 0.0];
+        let mut runtime = MidiScriptRuntime::start_for_device_with_transport_state(
+            &script,
+            "Test Input",
+            transport_state,
+        )
+        .unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 127]).unwrap();
+
+        assert!(result.actions.is_empty());
     }
 
     #[test]

@@ -14804,6 +14804,35 @@ impl DawUi {
                 })
                 .collect();
         }
+        let playlist_track_activity_levels = self
+            .document
+            .as_ref()
+            .and_then(|document| {
+                let arrangements = document.arrangements().ok()?;
+                let arrangement = arrangements
+                    .iter()
+                    .find(|arrangement| Some(arrangement.id) == self.selected_arrangement)
+                    .or_else(|| arrangements.first())?;
+                let tracks = document.playlist_tracks_in_arrangement(arrangement.id);
+                Some(midi_script_playlist_track_activity_levels(
+                    arrangement,
+                    &playlist_track_ids,
+                    &tracks,
+                    Some(
+                        self.current_playhead_tick()
+                            .unwrap_or(f64::from(self.playlist_seek_tick)),
+                    ),
+                    self.soloed_playlist_track_range,
+                ))
+            })
+            .unwrap_or_else(|| vec![0.0; playlist_track_ids.len()]);
+        if let Ok(mut levels) = self
+            .midi_script_transport_state
+            .playlist_track_activity_levels
+            .lock()
+        {
+            *levels = playlist_track_activity_levels;
+        }
         if let Ok(mut selected_track_ids) = self
             .midi_script_transport_state
             .selected_playlist_track_ids
@@ -69636,6 +69665,40 @@ fn midi_script_playlist_track_mute_states(
         .collect()
 }
 
+fn midi_script_playlist_track_activity_levels(
+    arrangement: &Arrangement,
+    track_ids: &[u32],
+    tracks: &[PlaylistTrack],
+    playhead_tick: Option<f64>,
+    soloed_range: Option<(u32, u32)>,
+) -> Vec<f32> {
+    let Some(playhead_tick) = playhead_tick.filter(|tick| tick.is_finite() && *tick >= 0.0) else {
+        return vec![0.0; track_ids.len()];
+    };
+    let playhead_tick = absolute_song_position_ticks(playhead_tick);
+    let muted = midi_script_playlist_track_mute_states(track_ids, tracks);
+    track_ids
+        .iter()
+        .enumerate()
+        .map(|(index, track_id)| {
+            if muted.get(index).copied().unwrap_or(false)
+                || soloed_range.is_some_and(|(first, last)| !(first..=last).contains(track_id))
+            {
+                return 0.0;
+            }
+            let has_active_clip = arrangement.clips.iter().any(|clip| {
+                if clip.playlist_track_id() != Some(*track_id) || clip.is_muted() {
+                    return false;
+                }
+                let start_tick = u64::from(clip.position_ticks);
+                let end_tick = start_tick + u64::from(clip.length_ticks);
+                start_tick <= playhead_tick && playhead_tick < end_tick
+            });
+            if has_active_clip { 0.5 } else { 0.0 }
+        })
+        .collect()
+}
+
 fn midi_script_marker_selection_target(
     markers: &[(usize, u32)],
     selected_marker: Option<usize>,
@@ -71052,18 +71115,18 @@ mod tests {
         midi_script_clip_selection_bounds, midi_script_marker_jump_target,
         midi_script_marker_selection_target, midi_script_mixer_recording_file_names,
         midi_script_moved_song_position_tick, midi_script_pattern_jog_target,
-        midi_script_playlist_track_ids, midi_script_playlist_track_mute_states,
-        midi_script_playlist_track_names, midi_script_tempo_jog_target,
-        midi_script_time_position_seconds_to_ticks, midi_vst3_parameter_mapping_for_target,
-        midi_vst3_parameter_mappings_for_cc, next_empty_pattern_id, next_piano_roll_note_group,
-        note_from_grid_position, parse_internal_lfo_parameter_links,
-        parse_midi_control_change_mapping, parse_midi_controller_templates,
-        parse_midi_device_selections, parse_midi_mixer_control_mappings,
-        parse_midi_output_programs, parse_midi_output_routes, parse_midi_output_values,
-        parse_midi_vst3_parameter_mappings, parse_pattern_vst3_parameter_links,
-        parse_playlist_audio_clip_envelopes, parse_playlist_vst3_parameter_links,
-        parse_window_layout_presets, pattern_color_from_random_index,
-        pattern_lfo_loop_length_ticks, pattern_loop_frame_at_tick,
+        midi_script_playlist_track_activity_levels, midi_script_playlist_track_ids,
+        midi_script_playlist_track_mute_states, midi_script_playlist_track_names,
+        midi_script_tempo_jog_target, midi_script_time_position_seconds_to_ticks,
+        midi_vst3_parameter_mapping_for_target, midi_vst3_parameter_mappings_for_cc,
+        next_empty_pattern_id, next_piano_roll_note_group, note_from_grid_position,
+        parse_internal_lfo_parameter_links, parse_midi_control_change_mapping,
+        parse_midi_controller_templates, parse_midi_device_selections,
+        parse_midi_mixer_control_mappings, parse_midi_output_programs, parse_midi_output_routes,
+        parse_midi_output_values, parse_midi_vst3_parameter_mappings,
+        parse_pattern_vst3_parameter_links, parse_playlist_audio_clip_envelopes,
+        parse_playlist_vst3_parameter_links, parse_window_layout_presets,
+        pattern_color_from_random_index, pattern_lfo_loop_length_ticks, pattern_loop_frame_at_tick,
         pattern_loop_handoff_tick_at_frame, pattern_loop_tick_at_frame,
         pattern_vst3_parameter_automation_for_channel, pattern_vst3_parameter_link_for_target,
         piano_roll_color_group_note_ids, piano_roll_controller_stroke_points,
@@ -71496,6 +71559,79 @@ mod tests {
         assert_eq!(
             midi_script_playlist_track_mute_states(&selected_rows[..3], &[muted_track]),
             vec![false, true, false]
+        );
+    }
+
+    #[test]
+    fn midi_script_playlist_activity_level_tracks_clip_bounds_mute_and_solo() {
+        let arrangement = playlist_track_arrangement_fixture(&[(0, 96, 499), (96, 96, 498)]);
+        let track_ids = [1, 2];
+        assert_eq!(
+            midi_script_playlist_track_activity_levels(
+                &arrangement,
+                &track_ids,
+                &[],
+                Some(0.0),
+                None,
+            ),
+            [0.5, 0.0]
+        );
+        let mut muted_clip_arrangement = arrangement.clone();
+        muted_clip_arrangement.clips[0].muted = true;
+        assert_eq!(
+            midi_script_playlist_track_activity_levels(
+                &muted_clip_arrangement,
+                &track_ids,
+                &[],
+                Some(48.0),
+                None,
+            ),
+            [0.0, 0.0]
+        );
+        assert_eq!(
+            midi_script_playlist_track_activity_levels(
+                &arrangement,
+                &track_ids,
+                &[],
+                Some(96.0),
+                None,
+            ),
+            [0.0, 0.5]
+        );
+        assert_eq!(
+            midi_script_playlist_track_activity_levels(
+                &arrangement,
+                &track_ids,
+                &[],
+                Some(48.0),
+                Some((2, 2)),
+            ),
+            [0.0, 0.0]
+        );
+
+        let muted_track = PlaylistTrack {
+            id: 1,
+            state_byte: None,
+            name: None,
+            enabled: Some(false),
+            grouped: None,
+            press: None,
+            motion: None,
+            trigger_sync: None,
+            queued: None,
+            position_sync: None,
+            tolerant: None,
+            state_bytes: Vec::new(),
+        };
+        assert_eq!(
+            midi_script_playlist_track_activity_levels(
+                &arrangement,
+                &track_ids,
+                &[muted_track],
+                Some(48.0),
+                None,
+            ),
+            [0.0, 0.0]
         );
     }
 
