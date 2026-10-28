@@ -2059,6 +2059,7 @@ struct AudioErrorState {
     latest: Mutex<Option<String>>,
     recent: Mutex<VecDeque<String>>,
     count: AtomicU64,
+    xrun_count: AtomicU64,
     events: ArrayQueue<AudioEngineEvent>,
 }
 
@@ -2072,14 +2073,18 @@ impl Default for AudioErrorState {
             latest: Mutex::new(None),
             recent: Mutex::new(VecDeque::with_capacity(AUDIO_ERROR_HISTORY_LIMIT)),
             count: AtomicU64::new(0),
+            xrun_count: AtomicU64::new(0),
             events: ArrayQueue::new(AUDIO_EVENT_QUEUE_CAPACITY),
         }
     }
 }
 
 impl AudioErrorState {
-    fn report(&self, message: String) {
+    fn report(&self, message: String, is_xrun: bool) {
         self.count.fetch_add(1, Ordering::Relaxed);
+        if is_xrun {
+            self.xrun_count.fetch_add(1, Ordering::Relaxed);
+        }
         let event = AudioEngineEvent::DeviceStreamError(message);
         if let Err(event) = self.events.push(event) {
             self.events.pop();
@@ -3868,6 +3873,11 @@ impl AudioEngine {
         self.error.count.load(Ordering::Relaxed)
     }
 
+    /// Number of device buffer underruns or overruns reported by CPAL.
+    pub fn reported_device_xrun_count(&self) -> u64 {
+        self.error.xrun_count.load(Ordering::Relaxed)
+    }
+
     /// Recent device stream error messages, oldest first.
     pub fn stream_error_history(&self) -> Vec<String> {
         self.error.recent()
@@ -4531,7 +4541,7 @@ where
                     Ordering::Release,
                 );
             },
-            move |stream_error| set_error(&error, stream_error.to_string()),
+            move |stream_error| set_cpal_stream_error(&error, stream_error),
             Some(Duration::from_secs(5)),
         )
         .map_err(|error| format!("Could not build output stream: {error}"))?;
@@ -4693,7 +4703,7 @@ where
                 }
                 peak.store(max_peak.to_bits(), Ordering::Release);
             },
-            move |stream_error| set_error(&error, stream_error.to_string()),
+            move |stream_error| set_cpal_stream_error(&error, stream_error),
             Some(Duration::from_secs(5)),
         )
         .map_err(|error| format!("Could not build input stream: {error}"))?;
@@ -4956,8 +4966,14 @@ fn tone_sample(phase: f32, sample_rate: f32) -> (f32, f32) {
     (value, next_phase)
 }
 
+#[cfg(windows)]
 fn set_error(error: &AudioErrorState, message: String) {
-    error.report(message);
+    error.report(message, false);
+}
+
+fn set_cpal_stream_error(error: &AudioErrorState, stream_error: cpal::Error) {
+    let is_xrun = stream_error.kind() == cpal::ErrorKind::Xrun;
+    error.report(stream_error.to_string(), is_xrun);
 }
 
 struct AudioRingBuffer {

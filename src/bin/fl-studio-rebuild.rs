@@ -57469,9 +57469,12 @@ impl DawUi {
 
         if let Some(engine) = &self.audio_engine {
             let stream_error_count = engine.stream_error_count();
+            let device_xrun_count = engine.reported_device_xrun_count();
             let underrun_frames = engine.streaming_underrun_frames();
             ui.horizontal(|ui| {
                 ui.label(format!("Device stream errors: {stream_error_count}"));
+                ui.separator();
+                ui.label(format!("Reported device xruns: {device_xrun_count}"));
                 if underrun_frames > 0 {
                     ui.separator();
                     ui.label(format!("Stream underruns: {underrun_frames} frames"));
