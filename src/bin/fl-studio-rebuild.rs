@@ -1188,6 +1188,31 @@ fn main() -> eframe::Result {
         };
         std::process::exit(clap_probe::run_instance_child(&path, plugin_id));
     }
+    if args.get(1).is_some_and(|argument| {
+        argument == std::ffi::OsStr::new(clap_probe::NOTE_PREVIEW_SERVER_FLAG)
+    }) {
+        let Some(path) = args.get(2).map(PathBuf::from) else {
+            eprintln!("CLAP note preview server needs a bundle or library path");
+            std::process::exit(2);
+        };
+        let Some(plugin_id) = args.get(3).and_then(|value| value.to_str()) else {
+            eprintln!("CLAP note preview server needs a UTF-8 plug-in ID");
+            std::process::exit(2);
+        };
+        let Some(sample_rate) = args.get(4).and_then(|value| value.to_str()) else {
+            eprintln!("CLAP note preview server needs a sample rate");
+            std::process::exit(2);
+        };
+        let Ok(sample_rate) = sample_rate.parse::<u32>() else {
+            eprintln!("CLAP note preview server sample rate must be an integer");
+            std::process::exit(2);
+        };
+        std::process::exit(clap_probe::run_note_preview_server_child(
+            &path,
+            plugin_id,
+            sample_rate,
+        ));
+    }
     if args
         .get(1)
         .is_some_and(|argument| argument == std::ffi::OsStr::new(clap_probe::NOTE_PREVIEW_FLAG))
@@ -58010,7 +58035,7 @@ impl DawUi {
             ui.heading(format!("Detected CLAP plug-ins ({})", clap_candidates.len()));
             ui.label(
                 egui::RichText::new(
-                "Descriptor scans, inspection, and one-shot instrument previews run in helper processes. Persistent CLAP instances and project playback are not available yet.",
+                "Repeated auditions reuse the loaded CLAP instrument while the plug-in and output rate stay the same. Project playback and native plug-in editors are not available yet.",
                 )
                 .color(MUTED),
             );

@@ -1,9 +1,9 @@
 use std::ffi::{CString, OsString};
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use clack_extensions::audio_ports::{AudioPortFlags, AudioPortInfoBuffer, PluginAudioPorts};
@@ -18,10 +18,12 @@ use clack_host::prelude::{
 pub const PROBE_FLAG: &str = "--clap-probe";
 pub const INSTANCE_PROBE_FLAG: &str = "--clap-instance-probe";
 pub const NOTE_PREVIEW_FLAG: &str = "--clap-note-preview";
+pub const NOTE_PREVIEW_SERVER_FLAG: &str = "--clap-note-preview-server";
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_PROBE_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_NOTE_PREVIEW_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_NOTE_PREVIEW_PROTOCOL_HEADER_BYTES: usize = 4096;
 const MAX_INSTANCE_METADATA_ITEMS: u32 = 512;
 const MAX_NOTE_PREVIEW_AUDIO_PORTS: u32 = 16;
 const MAX_NOTE_PREVIEW_TOTAL_CHANNELS: u32 = 64;
@@ -182,6 +184,7 @@ pub fn start_note_preview_worker(
     thread::Builder::new()
         .name("clap-note-preview".to_owned())
         .spawn(move || {
+            let mut preview_process = None;
             while let Ok((
                 path,
                 plugin_id,
@@ -192,6 +195,30 @@ pub fn start_note_preview_worker(
                 request_id,
             )) = request_receiver.recv()
             {
+                let process_matches =
+                    preview_process
+                        .as_ref()
+                        .is_some_and(|process: &ClapPreviewProcess| {
+                            process.matches(&path, &plugin_id, sample_rate)
+                        });
+                if !process_matches {
+                    preview_process.take();
+                }
+                let result = if let Some(process) = preview_process.as_mut() {
+                    process.render(note_key, velocity)
+                } else {
+                    match ClapPreviewProcess::spawn(&path, &plugin_id, sample_rate) {
+                        Ok(mut process) => {
+                            let result = process.render(note_key, velocity);
+                            preview_process = Some(process);
+                            result
+                        }
+                        Err(error) => Err(error),
+                    }
+                };
+                if result.is_err() {
+                    preview_process.take();
+                }
                 let response = (
                     path.clone(),
                     plugin_id.clone(),
@@ -199,7 +226,7 @@ pub fn start_note_preview_worker(
                     note_key,
                     velocity,
                     request_id,
-                    note_preview_in_subprocess(&path, &plugin_id, sample_rate, note_key, velocity),
+                    result,
                 );
                 if response_sender.send(response).is_err() {
                     break;
@@ -232,35 +259,241 @@ pub fn inspect_instance_in_subprocess(
         .and_then(|output| parse_instance_probe_output(&output))
 }
 
-pub fn note_preview_in_subprocess(
-    path: &Path,
-    plugin_id: &str,
+enum ClapPreviewProcessResponse {
+    Ready,
+    Audio(Vec<f32>),
+    Error(String),
+}
+
+struct ClapPreviewProcess {
+    path: PathBuf,
+    plugin_id: String,
     sample_rate: u32,
-    note_key: u8,
-    velocity: u8,
-) -> Result<Vec<f32>, String> {
-    let arguments = [
-        OsString::from(NOTE_PREVIEW_FLAG),
-        path.as_os_str().to_owned(),
-        OsString::from(plugin_id),
-        OsString::from(sample_rate.to_string()),
-        OsString::from(note_key.to_string()),
-        OsString::from(velocity.to_string()),
-    ];
-    let output = run_limited_subprocess(&arguments, "note preview", MAX_NOTE_PREVIEW_OUTPUT_BYTES)?;
-    if output.is_empty() || !output.len().is_multiple_of(8) {
-        return Err("CLAP note preview returned incomplete stereo audio".to_owned());
+    child: Child,
+    stdin: BufWriter<ChildStdin>,
+    responses: Receiver<ClapPreviewProcessResponse>,
+    reader: Option<JoinHandle<()>>,
+}
+
+impl ClapPreviewProcess {
+    fn spawn(path: &Path, plugin_id: &str, sample_rate: u32) -> Result<Self, String> {
+        let executable = std::env::current_exe()
+            .map_err(|error| format!("could not locate the application executable: {error}"))?;
+        let mut child = Command::new(executable)
+            .arg(NOTE_PREVIEW_SERVER_FLAG)
+            .arg(path)
+            .arg(plugin_id)
+            .arg(sample_rate.to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| format!("could not start the CLAP note preview helper: {error}"))?;
+        let Some(stdin) = child.stdin.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("CLAP note preview helper did not provide input".to_owned());
+        };
+        let Some(stdout) = child.stdout.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("CLAP note preview helper did not provide output".to_owned());
+        };
+        let (response_sender, responses) = mpsc::channel();
+        let reader = match thread::Builder::new()
+            .name("clap-preview-response".to_owned())
+            .spawn(move || read_preview_process_responses(stdout, response_sender))
+        {
+            Ok(reader) => reader,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "could not start the CLAP preview response reader: {error}"
+                ));
+            }
+        };
+        let process = Self {
+            path: path.to_owned(),
+            plugin_id: plugin_id.to_owned(),
+            sample_rate,
+            child,
+            stdin: BufWriter::new(stdin),
+            responses,
+            reader: Some(reader),
+        };
+        match process.receive_response()? {
+            ClapPreviewProcessResponse::Ready => Ok(process),
+            ClapPreviewProcessResponse::Error(error) => Err(error),
+            ClapPreviewProcessResponse::Audio(_) => {
+                Err("CLAP preview helper sent audio before initialization".to_owned())
+            }
+        }
     }
 
-    Ok(output
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|sample| {
-            let sample = f32::from_le_bytes(*sample);
-            if sample.is_finite() { sample } else { 0.0 }
-        })
-        .collect())
+    fn matches(&self, path: &Path, plugin_id: &str, sample_rate: u32) -> bool {
+        self.path == path && self.plugin_id == plugin_id && self.sample_rate == sample_rate
+    }
+
+    fn render(&mut self, note_key: u8, velocity: u8) -> Result<Vec<f32>, String> {
+        writeln!(self.stdin, "PREVIEW {note_key} {velocity}")
+            .and_then(|_| self.stdin.flush())
+            .map_err(|error| format!("could not send a CLAP preview request: {error}"))?;
+        match self.receive_response()? {
+            ClapPreviewProcessResponse::Audio(samples) => Ok(samples),
+            ClapPreviewProcessResponse::Error(error) => Err(error),
+            ClapPreviewProcessResponse::Ready => {
+                Err("CLAP preview helper restarted unexpectedly".to_owned())
+            }
+        }
+    }
+
+    fn receive_response(&self) -> Result<ClapPreviewProcessResponse, String> {
+        match self.responses.recv_timeout(PROBE_TIMEOUT) {
+            Ok(response) => Ok(response),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                Err("CLAP note preview helper timed out after 10 seconds".to_owned())
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err("CLAP note preview helper stopped unexpectedly".to_owned())
+            }
+        }
+    }
+}
+
+impl Drop for ClapPreviewProcess {
+    fn drop(&mut self) {
+        let _ = self.stdin.write_all(b"STOP\n");
+        let _ = self.stdin.flush();
+        let deadline = Instant::now() + Duration::from_millis(250);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) | Err(_) => {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    break;
+                }
+            }
+        }
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
+fn read_preview_process_responses(
+    stdout: ChildStdout,
+    response_sender: Sender<ClapPreviewProcessResponse>,
+) {
+    let mut stdout = BufReader::new(stdout);
+    loop {
+        let header = match read_preview_protocol_header(&mut stdout) {
+            Ok(Some(header)) => header,
+            Ok(None) => {
+                let _ = response_sender.send(ClapPreviewProcessResponse::Error(
+                    "CLAP note preview helper closed its output".to_owned(),
+                ));
+                return;
+            }
+            Err(error) => {
+                let _ = response_sender.send(ClapPreviewProcessResponse::Error(format!(
+                    "could not read from the CLAP preview helper: {error}"
+                )));
+                return;
+            }
+        };
+        if header == "READY" {
+            if response_sender
+                .send(ClapPreviewProcessResponse::Ready)
+                .is_err()
+            {
+                return;
+            }
+            continue;
+        }
+        if let Some(byte_count) = header.strip_prefix("OK ") {
+            let Ok(byte_count) = byte_count.parse::<usize>() else {
+                let _ = response_sender.send(ClapPreviewProcessResponse::Error(
+                    "CLAP preview helper sent an invalid audio length".to_owned(),
+                ));
+                return;
+            };
+            if byte_count == 0
+                || byte_count > MAX_NOTE_PREVIEW_OUTPUT_BYTES
+                || !byte_count.is_multiple_of(8)
+            {
+                let _ = response_sender.send(ClapPreviewProcessResponse::Error(
+                    "CLAP preview helper sent an invalid stereo audio length".to_owned(),
+                ));
+                return;
+            }
+            let mut output = vec![0; byte_count];
+            if let Err(error) = stdout.read_exact(&mut output) {
+                let _ = response_sender.send(ClapPreviewProcessResponse::Error(format!(
+                    "could not read CLAP preview audio: {error}"
+                )));
+                return;
+            }
+            let samples = output
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|sample| {
+                    let sample = f32::from_le_bytes(*sample);
+                    if sample.is_finite() { sample } else { 0.0 }
+                })
+                .collect();
+            if response_sender
+                .send(ClapPreviewProcessResponse::Audio(samples))
+                .is_err()
+            {
+                return;
+            }
+            continue;
+        }
+        let error = header
+            .strip_prefix("ERR ")
+            .unwrap_or("CLAP preview helper sent an invalid response")
+            .to_owned();
+        let _ = response_sender.send(ClapPreviewProcessResponse::Error(error));
+        return;
+    }
+}
+
+fn read_preview_protocol_header(
+    stdout: &mut BufReader<ChildStdout>,
+) -> std::io::Result<Option<String>> {
+    let mut bytes = Vec::with_capacity(64);
+    let mut byte = [0; 1];
+    loop {
+        match stdout.read(&mut byte)? {
+            0 if bytes.is_empty() => return Ok(None),
+            0 => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "CLAP preview helper ended an incomplete response header",
+                ));
+            }
+            _ if byte[0] == b'\n' => break,
+            _ if bytes.len() == MAX_NOTE_PREVIEW_PROTOCOL_HEADER_BYTES => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "CLAP preview helper response header exceeded its size limit",
+                ));
+            }
+            _ => bytes.push(byte[0]),
+        }
+    }
+    if bytes.last() == Some(&b'\r') {
+        bytes.pop();
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
 fn run_probe_subprocess(arguments: &[OsString], description: &str) -> Result<String, String> {
@@ -427,6 +660,103 @@ pub fn run_note_preview_child(
     }
 }
 
+/// Serves note auditions from one initialized CLAP instance until the parent exits.
+pub fn run_note_preview_server_child(path: &Path, plugin_id: &str, sample_rate: u32) -> i32 {
+    let mut output = BufWriter::new(std::io::stdout().lock());
+    let mut instance = match ClapNotePreviewInstance::new(path, plugin_id, sample_rate) {
+        Ok(instance) => instance,
+        Err(error) => {
+            let _ = write_preview_server_error(&mut output, &error);
+            let _ = output.flush();
+            return 1;
+        }
+    };
+    if writeln!(output, "READY")
+        .and_then(|_| output.flush())
+        .is_err()
+    {
+        return 1;
+    }
+
+    for line in std::io::stdin().lock().lines() {
+        let line = match line {
+            Ok(line) => line,
+            Err(error) => {
+                let _ = write_preview_server_error(&mut output, &error.to_string());
+                let _ = output.flush();
+                return 1;
+            }
+        };
+        if line == "STOP" {
+            return 0;
+        }
+
+        let mut fields = line.split_whitespace();
+        let request = match (
+            fields.next(),
+            fields.next().and_then(|field| field.parse::<u8>().ok()),
+            fields.next().and_then(|field| field.parse::<u8>().ok()),
+            fields.next(),
+        ) {
+            (Some("PREVIEW"), Some(note_key), Some(velocity), None) => (note_key, velocity),
+            _ => {
+                let _ = write_preview_server_error(&mut output, "invalid CLAP preview request");
+                let _ = output.flush();
+                return 1;
+            }
+        };
+
+        let samples = match instance.render(request.0, request.1) {
+            Ok(samples) => samples,
+            Err(error) => {
+                let _ = write_preview_server_error(&mut output, &error);
+                let _ = output.flush();
+                return 1;
+            }
+        };
+        let Some(byte_count) = samples.len().checked_mul(std::mem::size_of::<f32>()) else {
+            let _ = write_preview_server_error(&mut output, "CLAP preview audio length overflowed");
+            let _ = output.flush();
+            return 1;
+        };
+        if byte_count == 0
+            || byte_count > MAX_NOTE_PREVIEW_OUTPUT_BYTES
+            || !byte_count.is_multiple_of(8)
+        {
+            let _ = write_preview_server_error(&mut output, "CLAP preview audio length is invalid");
+            let _ = output.flush();
+            return 1;
+        }
+        if writeln!(output, "OK {byte_count}").is_err() {
+            return 1;
+        }
+        for sample in samples {
+            if output.write_all(&sample.to_le_bytes()).is_err() {
+                return 1;
+            }
+        }
+        if output.flush().is_err() {
+            return 1;
+        }
+    }
+    0
+}
+
+fn write_preview_server_error(output: &mut impl Write, error: &str) -> std::io::Result<()> {
+    let message = error
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .take(512)
+        .collect::<String>();
+    writeln!(output, "ERR {message}")
+}
+
 #[derive(Clone, Copy)]
 enum PreviewNoteDialect {
     Clap,
@@ -441,232 +771,286 @@ fn render_note_preview(
     note_key: u8,
     velocity: u8,
 ) -> Result<Vec<f32>, String> {
-    if !(8_000..=192_000).contains(&sample_rate) {
-        return Err(format!(
-            "unsupported CLAP preview sample rate: {sample_rate}"
-        ));
-    }
-    if note_key > 127 {
-        return Err("CLAP preview MIDI note must be between 0 and 127".to_owned());
-    }
-    if !(1..=127).contains(&velocity) {
-        return Err("CLAP preview MIDI velocity must be between 1 and 127".to_owned());
-    }
+    let mut instance = ClapNotePreviewInstance::new(path, plugin_id, sample_rate)?;
+    instance.render(note_key, velocity)
+}
 
-    let entry = unsafe { PluginEntry::load(path) }
-        .map_err(|error| format!("could not load CLAP entry: {error}"))?;
-    let plugin_id = CString::new(plugin_id)
-        .map_err(|_| "CLAP plug-in ID contains an invalid null byte".to_owned())?;
-    let host_info = HostInfo::new(
-        "FL Studio Rebuild",
-        "fl-studio-rust contributors",
-        "https://github.com/cyroz1/fl-studio-rust",
-        env!("CARGO_PKG_VERSION"),
-    )
-    .map_err(|error| format!("could not describe the host to the CLAP plug-in: {error}"))?;
-    let mut instance = PluginInstance::<()>::new(|_| (), |_| (), &entry, &plugin_id, &host_info)
-        .map_err(|error| format!("could not initialize CLAP plug-in instance: {error}"))?;
+struct ClapNotePreviewInstance {
+    instance: PluginInstance<()>,
+    sample_rate: u32,
+    input_port_channels: Vec<u32>,
+    output_port_channels: Vec<u32>,
+    main_output_index: usize,
+    note_port_index: u16,
+    dialect: PreviewNoteDialect,
+    next_steady_time: u64,
+}
 
-    let (input_port_channels, output_port_channels, main_output_index, note_port_index, dialect) = {
-        let plugin = instance.plugin_handle();
-        let audio_ports = plugin
-            .get_extension::<PluginAudioPorts>()
-            .ok_or_else(|| "CLAP instrument does not expose audio ports".to_owned())?;
-        let note_ports = plugin
-            .get_extension::<PluginNotePorts>()
-            .ok_or_else(|| "CLAP instrument does not expose note input ports".to_owned())?;
-        let input_port_channels = read_preview_audio_port_channels(&audio_ports, &plugin, true)?;
-        let (output_port_channels, main_output_index) =
-            read_preview_audio_outputs(&audio_ports, &plugin)?;
-        let (note_port_index, dialect) = find_preview_note_input(&note_ports, &plugin)?;
-        (
+impl ClapNotePreviewInstance {
+    fn new(path: &Path, plugin_id: &str, sample_rate: u32) -> Result<Self, String> {
+        if !(8_000..=192_000).contains(&sample_rate) {
+            return Err(format!(
+                "unsupported CLAP preview sample rate: {sample_rate}"
+            ));
+        }
+
+        let entry = unsafe { PluginEntry::load(path) }
+            .map_err(|error| format!("could not load CLAP entry: {error}"))?;
+        let plugin_id = CString::new(plugin_id)
+            .map_err(|_| "CLAP plug-in ID contains an invalid null byte".to_owned())?;
+        let host_info = HostInfo::new(
+            "FL Studio Rebuild",
+            "fl-studio-rust contributors",
+            "https://github.com/cyroz1/fl-studio-rust",
+            env!("CARGO_PKG_VERSION"),
+        )
+        .map_err(|error| format!("could not describe the host to the CLAP plug-in: {error}"))?;
+        let mut instance =
+            PluginInstance::<()>::new(|_| (), |_| (), &entry, &plugin_id, &host_info)
+                .map_err(|error| format!("could not initialize CLAP plug-in instance: {error}"))?;
+
+        let (
             input_port_channels,
             output_port_channels,
             main_output_index,
             note_port_index,
             dialect,
-        )
-    };
+        ) = {
+            let plugin = instance.plugin_handle();
+            let audio_ports = plugin
+                .get_extension::<PluginAudioPorts>()
+                .ok_or_else(|| "CLAP instrument does not expose audio ports".to_owned())?;
+            let note_ports = plugin
+                .get_extension::<PluginNotePorts>()
+                .ok_or_else(|| "CLAP instrument does not expose note input ports".to_owned())?;
+            let input_port_channels =
+                read_preview_audio_port_channels(&audio_ports, &plugin, true)?;
+            let (output_port_channels, main_output_index) =
+                read_preview_audio_outputs(&audio_ports, &plugin)?;
+            let (note_port_index, dialect) = find_preview_note_input(&note_ports, &plugin)?;
+            (
+                input_port_channels,
+                output_port_channels,
+                main_output_index,
+                note_port_index,
+                dialect,
+            )
+        };
 
-    let main_output_channels = output_port_channels[main_output_index];
-    if !(1..=2).contains(&main_output_channels) {
-        return Err(format!(
-            "CLAP preview needs a mono or stereo main output; plug-in reports {main_output_channels} channels"
-        ));
+        let main_output_channels = output_port_channels[main_output_index];
+        if !(1..=2).contains(&main_output_channels) {
+            return Err(format!(
+                "CLAP preview needs a mono or stereo main output; plug-in reports {main_output_channels} channels"
+            ));
+        }
+
+        Ok(Self {
+            instance,
+            sample_rate,
+            input_port_channels,
+            output_port_channels,
+            main_output_index,
+            note_port_index,
+            dialect,
+            next_steady_time: 0,
+        })
     }
 
-    let audio_configuration = PluginAudioConfiguration {
-        sample_rate: f64::from(sample_rate),
-        min_frames_count: 1,
-        max_frames_count: NOTE_PREVIEW_BLOCK_FRAMES,
-    };
-    let stopped_processor = instance
-        .activate(|_, _| (), audio_configuration)
-        .map_err(|error| format!("could not activate CLAP instrument: {error}"))?;
-    let mut audio_processor = match stopped_processor.start_processing() {
-        Ok(processor) => processor,
-        Err(error) => {
-            let stopped_processor = error.into_stopped_processor();
-            instance.deactivate(stopped_processor);
-            return Err("CLAP instrument could not start audio processing".to_owned());
+    fn render(&mut self, note_key: u8, velocity: u8) -> Result<Vec<f32>, String> {
+        if note_key > 127 {
+            return Err("CLAP preview MIDI note must be between 0 and 127".to_owned());
         }
-    };
+        if !(1..=127).contains(&velocity) {
+            return Err("CLAP preview MIDI velocity must be between 1 and 127".to_owned());
+        }
 
-    let total_frames = sample_rate * NOTE_PREVIEW_DURATION_MILLISECONDS / 1000;
-    let note_off_frame = sample_rate * NOTE_PREVIEW_NOTE_MILLISECONDS / 1000;
-    let mut samples = Vec::with_capacity(total_frames as usize * 2);
-    let mut input_audio_ports = AudioPorts::with_capacity(
-        input_port_channels.iter().sum::<u32>() as usize,
-        input_port_channels.len(),
-    );
-    let mut output_audio_ports = AudioPorts::with_capacity(
-        output_port_channels.iter().sum::<u32>() as usize,
-        output_port_channels.len(),
-    );
-    let mut frame_offset = 0;
-    let mut render_error = None;
+        let audio_configuration = PluginAudioConfiguration {
+            sample_rate: f64::from(self.sample_rate),
+            min_frames_count: 1,
+            max_frames_count: NOTE_PREVIEW_BLOCK_FRAMES,
+        };
+        let stopped_processor = self
+            .instance
+            .activate(|_, _| (), audio_configuration)
+            .map_err(|error| format!("could not activate CLAP instrument: {error}"))?;
+        let mut audio_processor = match stopped_processor.start_processing() {
+            Ok(processor) => processor,
+            Err(error) => {
+                let stopped_processor = error.into_stopped_processor();
+                self.instance.deactivate(stopped_processor);
+                return Err("CLAP instrument could not start audio processing".to_owned());
+            }
+        };
 
-    while frame_offset < total_frames {
-        let frame_count = (total_frames - frame_offset).min(NOTE_PREVIEW_BLOCK_FRAMES);
-        let frame_end = frame_offset + frame_count;
-        let mut input_event_buffer = EventBuffer::with_capacity(2);
-        let pckn = clack_host::prelude::Pckn::new(note_port_index, 0u16, u16::from(note_key), 0u32);
-        if frame_offset == 0 {
-            match dialect {
-                PreviewNoteDialect::Clap => {
-                    input_event_buffer.push(&NoteOnEvent::new(
-                        0,
-                        pckn,
-                        f64::from(velocity) / 127.0,
-                    ));
-                }
-                PreviewNoteDialect::Midi => {
-                    input_event_buffer.push(&MidiEvent::new(
-                        0,
-                        note_port_index,
-                        [0x90, note_key, velocity],
-                    ));
-                }
-                PreviewNoteDialect::Midi2 => {
-                    input_event_buffer.push(&midi2_preview_note_event(
-                        0,
-                        note_port_index,
-                        note_key,
-                        midi2_preview_velocity(velocity),
-                        true,
-                    ));
+        let total_frames = self.sample_rate * NOTE_PREVIEW_DURATION_MILLISECONDS / 1000;
+        let note_off_frame = self.sample_rate * NOTE_PREVIEW_NOTE_MILLISECONDS / 1000;
+        let main_output_channels = self.output_port_channels[self.main_output_index];
+        let mut samples = Vec::with_capacity(total_frames as usize * 2);
+        let mut input_audio_ports = AudioPorts::with_capacity(
+            self.input_port_channels.iter().sum::<u32>() as usize,
+            self.input_port_channels.len(),
+        );
+        let mut output_audio_ports = AudioPorts::with_capacity(
+            self.output_port_channels.iter().sum::<u32>() as usize,
+            self.output_port_channels.len(),
+        );
+        let render_start_time = self.next_steady_time;
+        let mut frame_offset = 0;
+        let mut render_error = None;
+
+        while frame_offset < total_frames {
+            let frame_count = (total_frames - frame_offset).min(NOTE_PREVIEW_BLOCK_FRAMES);
+            let frame_end = frame_offset + frame_count;
+            let mut input_event_buffer = EventBuffer::with_capacity(2);
+            let pckn = clack_host::prelude::Pckn::new(
+                self.note_port_index,
+                0u16,
+                u16::from(note_key),
+                0u32,
+            );
+            if frame_offset == 0 {
+                match self.dialect {
+                    PreviewNoteDialect::Clap => {
+                        input_event_buffer.push(&NoteOnEvent::new(
+                            0,
+                            pckn,
+                            f64::from(velocity) / 127.0,
+                        ));
+                    }
+                    PreviewNoteDialect::Midi => {
+                        input_event_buffer.push(&MidiEvent::new(
+                            0,
+                            self.note_port_index,
+                            [0x90, note_key, velocity],
+                        ));
+                    }
+                    PreviewNoteDialect::Midi2 => {
+                        input_event_buffer.push(&midi2_preview_note_event(
+                            0,
+                            self.note_port_index,
+                            note_key,
+                            midi2_preview_velocity(velocity),
+                            true,
+                        ));
+                    }
                 }
             }
-        }
-        if (frame_offset..frame_end).contains(&note_off_frame) {
-            let event_time = note_off_frame - frame_offset;
-            match dialect {
-                PreviewNoteDialect::Clap => {
-                    input_event_buffer.push(&NoteOffEvent::new(event_time, pckn, 0.0));
-                }
-                PreviewNoteDialect::Midi => {
-                    input_event_buffer.push(&MidiEvent::new(
-                        event_time,
-                        note_port_index,
-                        [0x80, note_key, 0],
-                    ));
-                }
-                PreviewNoteDialect::Midi2 => {
-                    input_event_buffer.push(&midi2_preview_note_event(
-                        event_time,
-                        note_port_index,
-                        note_key,
-                        0,
-                        false,
-                    ));
+            if (frame_offset..frame_end).contains(&note_off_frame) {
+                let event_time = note_off_frame - frame_offset;
+                match self.dialect {
+                    PreviewNoteDialect::Clap => {
+                        input_event_buffer.push(&NoteOffEvent::new(event_time, pckn, 0.0));
+                    }
+                    PreviewNoteDialect::Midi => {
+                        input_event_buffer.push(&MidiEvent::new(
+                            event_time,
+                            self.note_port_index,
+                            [0x80, note_key, 0],
+                        ));
+                    }
+                    PreviewNoteDialect::Midi2 => {
+                        input_event_buffer.push(&midi2_preview_note_event(
+                            event_time,
+                            self.note_port_index,
+                            note_key,
+                            0,
+                            false,
+                        ));
+                    }
                 }
             }
-        }
-        input_event_buffer.sort();
-        let mut output_event_buffer = EventBuffer::with_capacity(16);
-        let mut input_audio_storage = input_port_channels
-            .iter()
-            .map(|channel_count| {
-                (0..*channel_count)
-                    .map(|_| vec![0.0f32; frame_count as usize])
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        let mut output_audio_storage = output_port_channels
-            .iter()
-            .map(|channel_count| {
-                (0..*channel_count)
-                    .map(|_| vec![0.0f32; frame_count as usize])
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
+            input_event_buffer.sort();
+            let mut output_event_buffer = EventBuffer::with_capacity(16);
+            let mut input_audio_storage = self
+                .input_port_channels
+                .iter()
+                .map(|channel_count| {
+                    (0..*channel_count)
+                        .map(|_| vec![0.0f32; frame_count as usize])
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let mut output_audio_storage = self
+                .output_port_channels
+                .iter()
+                .map(|channel_count| {
+                    (0..*channel_count)
+                        .map(|_| vec![0.0f32; frame_count as usize])
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
 
-        let process_result: Result<(), String> = {
-            let input_audio = if input_audio_storage.is_empty() {
-                InputAudioBuffers::empty()
-            } else {
-                input_audio_ports.with_input_buffers(input_audio_storage.iter_mut().map(
-                    |channels| AudioPortBuffer {
-                        latency: 0,
-                        channels: AudioPortBufferType::f32_input_only(
-                            channels.iter_mut().map(InputChannel::constant),
-                        ),
-                    },
-                ))
+            let steady_time = render_start_time.saturating_add(u64::from(frame_offset));
+            let process_result: Result<(), String> = {
+                let input_audio = if input_audio_storage.is_empty() {
+                    InputAudioBuffers::empty()
+                } else {
+                    input_audio_ports.with_input_buffers(input_audio_storage.iter_mut().map(
+                        |channels| AudioPortBuffer {
+                            latency: 0,
+                            channels: AudioPortBufferType::f32_input_only(
+                                channels.iter_mut().map(InputChannel::constant),
+                            ),
+                        },
+                    ))
+                };
+                let mut output_audio =
+                    output_audio_ports.with_output_buffers(output_audio_storage.iter_mut().map(
+                        |channels| AudioPortBuffer {
+                            latency: 0,
+                            channels: AudioPortBufferType::f32_output_only(
+                                channels.iter_mut().map(Vec::as_mut_slice),
+                            ),
+                        },
+                    ));
+                let input_events = input_event_buffer.as_input();
+                let mut output_events = output_event_buffer.as_output();
+                audio_processor
+                    .process(
+                        &input_audio,
+                        &mut output_audio,
+                        &input_events,
+                        &mut output_events,
+                        Some(steady_time),
+                        None,
+                    )
+                    .map(|_: ProcessStatus| ())
+                    .map_err(|error| {
+                        format!("CLAP instrument failed while rendering audio: {error}")
+                    })
             };
-            let mut output_audio =
-                output_audio_ports.with_output_buffers(output_audio_storage.iter_mut().map(
-                    |channels| AudioPortBuffer {
-                        latency: 0,
-                        channels: AudioPortBufferType::f32_output_only(
-                            channels.iter_mut().map(Vec::as_mut_slice),
-                        ),
-                    },
-                ));
-            let input_events = input_event_buffer.as_input();
-            let mut output_events = output_event_buffer.as_output();
-            audio_processor
-                .process(
-                    &input_audio,
-                    &mut output_audio,
-                    &input_events,
-                    &mut output_events,
-                    Some(u64::from(frame_offset)),
-                    None,
-                )
-                .map(|_: ProcessStatus| ())
-                .map_err(|error| format!("CLAP instrument failed while rendering audio: {error}"))
-        };
 
-        if let Err(error) = process_result {
-            render_error = Some(error);
-            break;
+            if let Err(error) = process_result {
+                render_error = Some(error);
+                break;
+            }
+
+            let main_output = &output_audio_storage[self.main_output_index];
+            let left_channel = &main_output[0];
+            let right_channel = if main_output_channels == 1 {
+                left_channel
+            } else {
+                &main_output[1]
+            };
+            for (&left, &right) in left_channel
+                .iter()
+                .zip(right_channel.iter())
+                .take(frame_count as usize)
+            {
+                samples.push(if left.is_finite() { left } else { 0.0 });
+                samples.push(if right.is_finite() { right } else { 0.0 });
+            }
+            frame_offset = frame_end;
         }
 
-        let main_output = &output_audio_storage[main_output_index];
-        let left_channel = &main_output[0];
-        let right_channel = if main_output_channels == 1 {
-            left_channel
-        } else {
-            &main_output[1]
-        };
-        for (&left, &right) in left_channel
-            .iter()
-            .zip(right_channel.iter())
-            .take(frame_count as usize)
-        {
-            samples.push(if left.is_finite() { left } else { 0.0 });
-            samples.push(if right.is_finite() { right } else { 0.0 });
+        let stopped_processor = audio_processor.stop_processing();
+        self.instance.deactivate(stopped_processor);
+        if let Some(error) = render_error {
+            return Err(error);
         }
-        frame_offset = frame_end;
+        self.next_steady_time = render_start_time.saturating_add(u64::from(total_frames));
+        Ok(samples)
     }
-
-    let stopped_processor = audio_processor.stop_processing();
-    instance.deactivate(stopped_processor);
-    if let Some(error) = render_error {
-        return Err(error);
-    }
-    Ok(samples)
 }
 
 fn read_preview_audio_port_channels(
