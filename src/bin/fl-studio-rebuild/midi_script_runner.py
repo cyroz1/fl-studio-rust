@@ -197,6 +197,30 @@ def _playlist_mute_track(index, value=-1):
     )
 
 
+def _playlist_is_track_solo(index):
+    index = _playlist_track_index(index)
+    soloed = _active_transport_state.get("playlist_track_soloed", [])
+    return bool(soloed[index - 1]) if index <= len(soloed) else False
+
+
+def _playlist_solo_track(index, value=-1, inGroup=False):
+    index = _playlist_track_index(index)
+    try:
+        value = int(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("Playlist solo value must be -1, 0, or 1") from error
+    if value not in (-1, 0, 1):
+        raise ValueError("Playlist solo value must be -1, 0, or 1")
+    _request_transport_action(
+        {
+            "action": "set_playlist_track_solo",
+            "track_id": index,
+            "value": value,
+            "in_group": bool(inGroup),
+        }
+    )
+
+
 def _playlist_selected_track_ids():
     try:
         return {
@@ -1699,6 +1723,8 @@ def _install_modules(script_name, device_name):
     playlist.setTrackName = _playlist_set_track_name
     playlist.isTrackMuted = _playlist_is_track_muted
     playlist.muteTrack = _playlist_mute_track
+    playlist.isTrackSolo = _playlist_is_track_solo
+    playlist.soloTrack = _playlist_solo_track
     playlist.isTrackSelected = _playlist_is_track_selected
     playlist.selectTrack = _playlist_select_track
     playlist.selectAll = _playlist_select_all

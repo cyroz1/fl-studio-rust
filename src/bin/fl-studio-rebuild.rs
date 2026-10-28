@@ -14791,6 +14791,19 @@ impl DawUi {
         if let Ok(mut muted) = self.midi_script_transport_state.playlist_track_muted.lock() {
             *muted = playlist_track_muted;
         }
+        if let Ok(mut soloed) = self
+            .midi_script_transport_state
+            .playlist_track_soloed
+            .lock()
+        {
+            *soloed = playlist_track_ids
+                .iter()
+                .map(|track_id| {
+                    self.soloed_playlist_track_range
+                        .is_some_and(|(first, last)| (first..=last).contains(track_id))
+                })
+                .collect();
+        }
         if let Ok(mut selected_track_ids) = self
             .midi_script_transport_state
             .selected_playlist_track_ids
@@ -27227,6 +27240,80 @@ impl DawUi {
             }
             None => {
                 self.status = "Open a project to mute Playlist tracks".to_owned();
+            }
+        }
+    }
+
+    fn set_midi_script_playlist_track_solo(&mut self, track_id: u32, value: i8, in_group: bool) {
+        if self.document.is_none() {
+            self.status = "Open a project to solo Playlist tracks".to_owned();
+            return;
+        }
+        let (track_ids, _, _) = self.midi_script_playlist_track_snapshot();
+        if !track_ids.contains(&track_id) {
+            self.status = format!(
+                "Could not change Playlist track {track_id} solo state: track is outside the supported rows"
+            );
+            return;
+        }
+        let currently_soloed = self
+            .soloed_playlist_track_range
+            .is_some_and(|(first, last)| (first..=last).contains(&track_id));
+        let soloed = match value {
+            -1 => !currently_soloed,
+            0 => false,
+            1 => true,
+            _ => return,
+        };
+        let next_range = if soloed {
+            let group_range = if in_group {
+                self.document.as_ref().and_then(|document| {
+                    let arrangements = document.arrangements().ok()?;
+                    let arrangement = arrangements
+                        .iter()
+                        .find(|arrangement| Some(arrangement.id) == self.selected_arrangement)
+                        .or_else(|| arrangements.first())?;
+                    let tracks = document.playlist_tracks_in_arrangement(arrangement.id);
+                    playlist_track_group_range(track_id, &tracks)
+                })
+            } else {
+                None
+            };
+            Some(group_range.unwrap_or((track_id, track_id)))
+        } else if currently_soloed {
+            None
+        } else {
+            self.soloed_playlist_track_range
+        };
+        if self.soloed_playlist_track_range == next_range {
+            return;
+        }
+
+        let playback_was_loaded = self.playlist_playback_loaded;
+        let playback_was_playing = self.playing;
+        let resume_tick = self
+            .current_playhead_tick()
+            .map(|tick| tick.round().clamp(0.0, f64::from(u32::MAX)) as u32)
+            .unwrap_or(self.playlist_seek_tick);
+        if playback_was_loaded {
+            self.stop_project_playback();
+            self.playlist_seek_tick = resume_tick;
+        }
+        self.soloed_playlist_track_range = next_range;
+        self.status = self.soloed_playlist_track_range.map_or_else(
+            || "Playlist solo cleared".to_owned(),
+            |(first, last)| {
+                if first == last {
+                    format!("Soloed Playlist track {first}")
+                } else {
+                    format!("Soloed Playlist tracks {first}–{last}")
+                }
+            },
+        );
+        if playback_was_loaded {
+            self.start_project_playback();
+            if !playback_was_playing && self.playing {
+                self.toggle_project_playback();
             }
         }
     }
@@ -52022,6 +52109,11 @@ impl DawUi {
             MidiTransportCommand::SetPlaylistTrackMute { track_id, muted } => {
                 self.set_midi_script_playlist_track_mute(track_id, muted);
             }
+            MidiTransportCommand::SetPlaylistTrackSolo {
+                track_id,
+                value,
+                in_group,
+            } => self.set_midi_script_playlist_track_solo(track_id, value, in_group),
             MidiTransportCommand::SelectChannel(channel_id) => {
                 self.set_midi_script_channel_selection(channel_id);
             }

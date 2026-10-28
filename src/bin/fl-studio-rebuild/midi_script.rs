@@ -71,6 +71,11 @@ pub enum ScriptTransportAction {
         track_id: u32,
         muted: bool,
     },
+    SetPlaylistTrackSolo {
+        track_id: u32,
+        value: i8,
+        in_group: bool,
+    },
     SelectChannel(u16),
     SetMixerTrackSelection {
         index: u16,
@@ -241,6 +246,7 @@ pub struct MidiScriptTransportState {
     pub playlist_track_count: AtomicU64,
     pub playlist_track_names: Mutex<Vec<String>>,
     pub playlist_track_muted: Mutex<Vec<bool>>,
+    pub playlist_track_soloed: Mutex<Vec<bool>>,
     pub selected_playlist_track_ids: Mutex<Vec<u32>>,
     pub midi_pickup_enabled: AtomicU8,
     pub channel_ids: Mutex<Vec<u16>>,
@@ -298,6 +304,7 @@ impl Default for MidiScriptTransportState {
             playlist_track_count: AtomicU64::new(0),
             playlist_track_names: Mutex::new(Vec::new()),
             playlist_track_muted: Mutex::new(Vec::new()),
+            playlist_track_soloed: Mutex::new(Vec::new()),
             selected_playlist_track_ids: Mutex::new(Vec::new()),
             midi_pickup_enabled: AtomicU8::new(1),
             channel_ids: Mutex::new(Vec::new()),
@@ -764,6 +771,12 @@ impl MidiScriptRuntime {
             .lock()
             .map(|muted| muted.clone())
             .unwrap_or_default();
+        let playlist_track_soloed = self
+            .transport_state
+            .playlist_track_soloed
+            .lock()
+            .map(|soloed| soloed.clone())
+            .unwrap_or_default();
         let selected_playlist_track_ids = self
             .transport_state
             .selected_playlist_track_ids
@@ -1033,6 +1046,10 @@ impl MidiScriptRuntime {
                     json!(playlist_track_muted),
                 );
                 transport_object.insert(
+                    "playlist_track_soloed".to_owned(),
+                    json!(playlist_track_soloed),
+                );
+                transport_object.insert(
                     "selected_playlist_track_ids".to_owned(),
                     json!(selected_playlist_track_ids),
                 );
@@ -1190,6 +1207,26 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
             .as_bool()
             .ok_or_else(|| "MIDI script returned an invalid Playlist mute state".to_owned())?;
         return Ok(ScriptTransportAction::SetPlaylistTrackMute { track_id, muted });
+    }
+    if name == Some("set_playlist_track_solo") {
+        let track_id = action["track_id"]
+            .as_u64()
+            .and_then(|track_id| u32::try_from(track_id).ok())
+            .filter(|track_id| (1..=SCRIPT_MAX_PLAYLIST_TRACK_COUNT as u32).contains(track_id))
+            .ok_or_else(|| "MIDI script returned an invalid Playlist track ID".to_owned())?;
+        let value = action["value"]
+            .as_i64()
+            .and_then(|value| i8::try_from(value).ok())
+            .filter(|value| (-1..=1).contains(value))
+            .ok_or_else(|| "MIDI script returned an invalid Playlist solo value".to_owned())?;
+        let in_group = action["in_group"]
+            .as_bool()
+            .ok_or_else(|| "MIDI script returned an invalid Playlist solo group flag".to_owned())?;
+        return Ok(ScriptTransportAction::SetPlaylistTrackSolo {
+            track_id,
+            value,
+            in_group,
+        });
     }
     if name == Some("set_song_position") {
         let position = action["position"]
@@ -2054,6 +2091,52 @@ mod tests {
                 ScriptTransportAction::SetPlaylistTrackMute {
                     track_id: 2,
                     muted: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn python_playlist_solo_queries_and_commands_preserve_group_arguments() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport playlist\ndef OnMidiIn(event):\n    if playlist.isTrackSolo(1) or not playlist.isTrackSolo(2):\n        raise RuntimeError('Playlist solo state was read incorrectly')\n    playlist.soloTrack(1)\n    playlist.soloTrack(2, 0, True)\n    playlist.soloTrack(1, 1, inGroup=True)\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let transport_state = Arc::new(MidiScriptTransportState::default());
+        transport_state
+            .playlist_track_count
+            .store(2, Ordering::Relaxed);
+        *transport_state.playlist_track_soloed.lock().unwrap() = vec![false, true];
+        let mut runtime = MidiScriptRuntime::start_for_device_with_transport_state(
+            &script,
+            "Test Input",
+            transport_state,
+        )
+        .unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 127]).unwrap();
+
+        assert_eq!(
+            result.actions,
+            [
+                ScriptTransportAction::SetPlaylistTrackSolo {
+                    track_id: 1,
+                    value: -1,
+                    in_group: false,
+                },
+                ScriptTransportAction::SetPlaylistTrackSolo {
+                    track_id: 2,
+                    value: 0,
+                    in_group: true,
+                },
+                ScriptTransportAction::SetPlaylistTrackSolo {
+                    track_id: 1,
+                    value: 1,
+                    in_group: true,
                 },
             ]
         );
