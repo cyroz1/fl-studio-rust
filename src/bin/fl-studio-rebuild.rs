@@ -44,13 +44,14 @@ use flp_rebuild::sample_render::{
     PlaylistRenderOptions, PlaylistRenderRange, PlaylistRenderSummary, PlaylistStreamMonitor,
     PlaylistTailMode, PlaylistTempoMap, ResamplingQuality, SamplerLiveInputRouting,
     SamplerLiveNoteEvent, SamplerPatternLoopPlayback, SamplerPatternLoopStreamControls,
-    SamplerPatternRenderOptions, SamplerPatternRenderSummary, Vst3LatencyUpdateControls,
-    Vst3LiveInputEvent, Vst3PatternLoopPlayback, Vst3PatternLoopStreamControls,
-    Vst3PatternPlayback, Vst3PatternStreamControls, WavChannelMode, WavDitherMode, WavSampleFormat,
-    nearest_playlist_audio_clip_zero_crossing_tick, playlist_audio_clip_fade_gain,
-    playlist_performance_clip_indices_with_vst3, playlist_performance_static_document_with_vst3,
-    playlist_performance_vst3_channel_ids, playlist_performance_vst3_clip_indices,
-    render_audio_clips_to_file, render_playlist_mixer_stems_with_vst3_cancellable,
+    SamplerPatternRenderOptions, SamplerPatternRenderSummary, SamplerPatternStreamControls,
+    Vst3LatencyUpdateControls, Vst3LiveInputEvent, Vst3PatternLoopPlayback,
+    Vst3PatternLoopStreamControls, Vst3PatternPlayback, Vst3PatternStreamControls, WavChannelMode,
+    WavDitherMode, WavSampleFormat, nearest_playlist_audio_clip_zero_crossing_tick,
+    playlist_audio_clip_fade_gain, playlist_performance_clip_indices_with_vst3,
+    playlist_performance_static_document_with_vst3, playlist_performance_vst3_channel_ids,
+    playlist_performance_vst3_clip_indices, render_audio_clips_to_file,
+    render_playlist_mixer_stems_with_vst3_cancellable,
     render_playlist_with_vst3_to_file_from_frame_cancellable,
     render_playlist_with_vst3_to_flac_cancellable, render_playlist_with_vst3_to_mp3_cancellable,
     render_playlist_with_vst3_to_ogg_cancellable, render_playlist_with_vst3_to_wav_cancellable,
@@ -62,8 +63,8 @@ use flp_rebuild::sample_render::{
     stream_playlist_with_vst3_to_device_with_monitor_and_latency_updates,
     stream_sampler_midi_input_to_device,
     stream_sampler_pattern_loop_from_tick_to_device_with_live_controls,
-    stream_sampler_pattern_to_device, stream_vst3_midi_input_to_device,
-    write_input_recording_to_wav,
+    stream_sampler_pattern_to_device, stream_sampler_pattern_to_device_with_live_controls,
+    stream_vst3_midi_input_to_device, write_input_recording_to_wav,
 };
 use flp_rebuild::vst3::{
     MAX_REPORTED_TAIL_SECONDS, Vst3AutomationPoint, Vst3HostRuntime, Vst3LatencyReport,
@@ -40364,24 +40365,17 @@ impl DawUi {
             }
         };
         let has_vst3_processor = vst3_processor.is_some();
-        let (pattern_latency_update_sender, pattern_latency_update_receiver) =
-            if loop_length_ticks.is_some() || has_vst3_processor {
-                let (update_sender, update_receiver) = mpsc::channel();
-                let (report_sender, report_receiver) = mpsc::channel();
-                (
-                    Some(update_sender),
-                    Some((update_receiver, report_sender, report_receiver)),
-                )
-            } else {
-                (None, None)
-            };
-        let (pattern_pdc_update_sender, pattern_pdc_update_receiver) =
-            if loop_length_ticks.is_some() || has_vst3_processor {
-                let (update_sender, update_receiver) = mpsc::channel();
-                (Some(update_sender), Some(update_receiver))
-            } else {
-                (None, None)
-            };
+        let (pattern_latency_update_sender, pattern_latency_update_receiver) = mpsc::channel();
+        let (pattern_latency_report_sender, pattern_latency_report_receiver) = mpsc::channel();
+        let pattern_latency_update_sender = Some(pattern_latency_update_sender);
+        let pattern_latency_update_receiver = Some((
+            pattern_latency_update_receiver,
+            pattern_latency_report_sender,
+            pattern_latency_report_receiver,
+        ));
+        let (pattern_pdc_update_sender, pattern_pdc_update_receiver) = mpsc::channel();
+        let pattern_pdc_update_sender = Some(pattern_pdc_update_sender);
+        let pattern_pdc_update_receiver = Some(pattern_pdc_update_receiver);
         let pattern_latency_update_sender_for_ui = if has_vst3_processor {
             pattern_latency_update_sender.clone()
         } else {
@@ -40405,9 +40399,7 @@ impl DawUi {
             .as_ref()
             .map(Vst3PlaylistStreamProcessor::summary);
 
-        if vst3_processor.is_some() {
-            self.initialize_live_master_mixer_targets(document);
-        }
+        self.initialize_live_master_mixer_targets(document);
 
         if staged_handoff.is_none() {
             self.stop_project_playback();
@@ -40545,10 +40537,20 @@ impl DawUi {
                                 &worker_cancelled,
                             )
                         } else {
-                            stream_sampler_pattern_to_device(
+                            stream_sampler_pattern_to_device_with_live_controls(
                                 &document,
                                 &project_path,
                                 options,
+                                SamplerPatternStreamControls {
+                                    meters: &worker_mixer_meters,
+                                    latency_updates: pattern_latency_update_receiver
+                                        .zip(pattern_latency_report_sender)
+                                        .map(|(updates, reports)| Vst3LatencyUpdateControls {
+                                            updates,
+                                            reports,
+                                            pdc_updates: pattern_pdc_update_receiver,
+                                        }),
+                                },
                                 &writer,
                                 &worker_cancelled,
                             )

@@ -720,6 +720,12 @@ pub struct SamplerPatternLoopStreamControls<'a> {
     pub latency_updates: Option<Vst3LatencyUpdateControls>,
 }
 
+/// Live Sampler Pattern preview inputs, meters, and block-boundary Mixer updates.
+pub struct SamplerPatternStreamControls<'a> {
+    pub meters: &'a crate::audio::MixerTrackPeakMeters,
+    pub latency_updates: Option<Vst3LatencyUpdateControls>,
+}
+
 /// Timing and prepared plug-in stream for live Pattern-mode playback.
 pub struct Vst3PatternLoopPlayback {
     pub loop_length_ticks: u64,
@@ -6195,6 +6201,36 @@ pub fn stream_sampler_pattern_to_device(
     )
 }
 
+/// Stream one Sampler Pattern with live Mixer updates at audio-block boundaries.
+pub fn stream_sampler_pattern_to_device_with_live_controls(
+    document: &FlpDocument,
+    project_path: impl AsRef<Path>,
+    options: SamplerPatternRenderOptions,
+    controls: SamplerPatternStreamControls<'_>,
+    writer: &StreamingAudioWriter,
+    cancelled: &AtomicBool,
+) -> Result<SamplerPatternRenderSummary, String> {
+    stream_pattern_from_tick_with_vst3_to_device(
+        document,
+        project_path,
+        options,
+        PatternStreamConfig {
+            loop_length_ticks: 1,
+            start_tick: 0,
+            vst3_processor: None,
+            allow_empty_sampler: false,
+            repeat_pattern: false,
+            extend_preview_tail: false,
+        },
+        PatternLiveStreamControls {
+            meters: Some(controls.meters),
+            latency_updates: controls.latency_updates,
+        },
+        writer,
+        cancelled,
+    )
+}
+
 /// Stream one Sampler Pattern repeatedly until the worker or audio writer is cancelled.
 pub fn stream_sampler_pattern_loop_to_device(
     document: &FlpDocument,
@@ -6238,6 +6274,7 @@ pub fn stream_sampler_pattern_loop_from_tick_to_device(
             vst3_processor: None,
             allow_empty_sampler: false,
             repeat_pattern: true,
+            extend_preview_tail: false,
         },
         PatternLiveStreamControls {
             meters: None,
@@ -6291,6 +6328,7 @@ pub fn stream_sampler_pattern_loop_from_tick_to_device_with_live_controls(
             vst3_processor: None,
             allow_empty_sampler: false,
             repeat_pattern: true,
+            extend_preview_tail: false,
         },
         PatternLiveStreamControls {
             meters: Some(controls.meters),
@@ -6320,6 +6358,7 @@ pub fn stream_pattern_loop_with_vst3_from_tick_to_device(
             vst3_processor: Some(playback.processor),
             allow_empty_sampler: true,
             repeat_pattern: true,
+            extend_preview_tail: false,
         },
         PatternLiveStreamControls {
             meters: None,
@@ -6350,6 +6389,7 @@ pub fn stream_pattern_loop_with_vst3_from_tick_to_device_with_live_master_contro
             vst3_processor: Some(playback.processor),
             allow_empty_sampler: true,
             repeat_pattern: true,
+            extend_preview_tail: false,
         },
         PatternLiveStreamControls {
             meters: Some(meters),
@@ -6379,6 +6419,7 @@ pub fn stream_pattern_loop_with_vst3_from_tick_to_device_with_live_controls(
             vst3_processor: Some(controls.playback.processor),
             allow_empty_sampler: true,
             repeat_pattern: true,
+            extend_preview_tail: false,
         },
         PatternLiveStreamControls {
             meters: Some(controls.meters),
@@ -6432,6 +6473,7 @@ pub fn stream_pattern_with_vst3_to_device_with_live_controls(
             vst3_processor: Some(controls.playback.processor),
             allow_empty_sampler: true,
             repeat_pattern: false,
+            extend_preview_tail: true,
         },
         PatternLiveStreamControls {
             meters: Some(controls.meters),
@@ -6448,6 +6490,7 @@ struct PatternStreamConfig {
     vst3_processor: Option<Vst3PlaylistStreamProcessor>,
     allow_empty_sampler: bool,
     repeat_pattern: bool,
+    extend_preview_tail: bool,
 }
 
 struct PatternLiveStreamControls<'a> {
@@ -6543,7 +6586,11 @@ fn stream_pattern_from_tick_with_vst3_to_device(
                 .as_ref()
                 .map_or(0, |processor| processor.summary().frames),
         );
-        let tail_frames = u64::from(options.sample_rate).saturating_mul(2);
+        let tail_frames = if playback.extend_preview_tail {
+            u64::from(options.sample_rate).saturating_mul(2)
+        } else {
+            0
+        };
         let output_frames = base_frames
             .checked_add(tail_frames)
             .ok_or_else(|| "Pattern preview tail length overflow".to_owned())?;
