@@ -15,9 +15,10 @@ use audio_unit_probe::{
 use clap_probe::{
     ClapInspectionResponse, ClapInspectionState, ClapInstanceInspectionResponse,
     ClapInstanceInspectionState, ClapNotePreviewRequest, ClapNotePreviewResponse,
-    ClapNotePreviewSettings, ClapNotePreviewState, ClapPatternNote, ClapPatternPreviewPurpose,
-    ClapPatternPreviewRequest, ClapPatternPreviewResponse, ClapPatternPreviewSettings,
-    MAX_NOTE_PREVIEW_NOTE_MILLISECONDS, MIN_NOTE_PREVIEW_NOTE_MILLISECONDS,
+    ClapNotePreviewSettings, ClapNotePreviewState, ClapPatternNote, ClapPatternPreviewOutput,
+    ClapPatternPreviewPurpose, ClapPatternPreviewRequest, ClapPatternPreviewResponse,
+    ClapPatternPreviewSettings, MAX_NOTE_PREVIEW_NOTE_MILLISECONDS,
+    MIN_NOTE_PREVIEW_NOTE_MILLISECONDS,
 };
 use eframe::egui::{self, Align2, Color32, FontId, Id, PointerButton, Sense, Stroke, Vec2};
 use flp_rebuild::audio::{
@@ -5187,6 +5188,7 @@ struct DawUi {
     clap_pattern_preview_request_id: u64,
     clap_pattern_playback_instruments: BTreeMap<u16, ClapPatternPlaybackInstrument>,
     pending_clap_pattern_playback: Option<PendingClapPatternPlayback>,
+    pending_clap_state_capture: Option<PendingClapStateCapture>,
     active_clap_pattern_audio_layers: Vec<PatternAudioLayer>,
     clap_preview_note_key: u8,
     clap_preview_velocity: u8,
@@ -5545,6 +5547,14 @@ struct PendingClapPatternPlayback {
     loop_start_tick: u64,
     request_channels: BTreeMap<u64, u16>,
     audio_layers: Vec<PatternAudioLayer>,
+}
+
+struct PendingClapStateCapture {
+    request_id: u64,
+    project_generation: u64,
+    channel_id: u16,
+    path: PathBuf,
+    plugin_id: String,
 }
 
 struct LiveSamplerInputSession {
@@ -7167,6 +7177,7 @@ impl DawUi {
             clap_pattern_preview_request_id: 0,
             clap_pattern_playback_instruments: BTreeMap::new(),
             pending_clap_pattern_playback: None,
+            pending_clap_state_capture: None,
             active_clap_pattern_audio_layers: Vec::new(),
             clap_preview_note_key: 60,
             clap_preview_velocity: 100,
@@ -8366,6 +8377,7 @@ impl DawUi {
             Ok((package_workspace, document)) => {
                 self.stop_project_playback();
                 self.project_generation = self.project_generation.wrapping_add(1);
+                self.pending_clap_state_capture = None;
                 self.armed_audio_recording_tracks.clear();
                 self.audio_recording_track_input_pairs.clear();
                 self.piano_roll_hidden_ghost_channels.clear();
@@ -13609,7 +13621,8 @@ impl DawUi {
                     instrument.plugin_id,
                     instrument.plugin_name,
                     sample_rate,
-                    settings,
+                    Some(settings),
+                    instrument.state,
                     ClapPatternPreviewPurpose::Transport,
                     request_id,
                 ))
@@ -19945,6 +19958,7 @@ impl DawUi {
             .clap_pattern_preview_states
             .values()
             .any(|state| matches!(state, ClapNotePreviewState::Rendering))
+            || self.pending_clap_state_capture.is_some()
             || self
                 .clap_note_preview_states
                 .values()
@@ -19988,6 +20002,11 @@ impl DawUi {
         }
 
         let sample_rate = engine.sample_rate();
+        let saved_state = self
+            .clap_pattern_playback_instruments
+            .get(&settings.channel_id)
+            .filter(|instrument| instrument.path == path && instrument.plugin_id == plugin_id)
+            .and_then(|instrument| instrument.state.clone());
         self.browser_preview_queued = None;
         self.browser_preview_cancelled = self.browser_preview_pending.is_some();
         self.browser_preview_path = None;
@@ -20004,7 +20023,8 @@ impl DawUi {
                 plugin_id,
                 plugin_name.clone(),
                 sample_rate,
-                settings.clone(),
+                Some(settings.clone()),
+                saved_state,
                 ClapPatternPreviewPurpose::Audition,
                 request_id,
             ))
@@ -20027,6 +20047,16 @@ impl DawUi {
         while let Ok((path, plugin_id, plugin_name, settings, purpose, request_id, result)) =
             self.clap_pattern_preview_receiver.try_recv()
         {
+            if purpose == ClapPatternPreviewPurpose::SaveState {
+                self.handle_clap_state_capture_response(
+                    path,
+                    plugin_id,
+                    plugin_name,
+                    request_id,
+                    result,
+                );
+                continue;
+            }
             if purpose == ClapPatternPreviewPurpose::Transport {
                 self.handle_clap_pattern_transport_response(
                     settings,
@@ -20039,6 +20069,9 @@ impl DawUi {
             if request_id != self.clap_pattern_preview_request_id {
                 continue;
             }
+            let Some(settings) = settings else {
+                continue;
+            };
             let key = (path, plugin_id, settings.pattern_id, settings.channel_id);
             if !matches!(
                 self.clap_pattern_preview_states.get(&key),
@@ -20047,7 +20080,12 @@ impl DawUi {
                 continue;
             }
 
-            let result = result.and_then(|samples| {
+            let result = result.and_then(|output| {
+                let ClapPatternPreviewOutput::Audio(samples) = output else {
+                    return Err(
+                        "CLAP Pattern preview returned plug-in state instead of audio".to_owned(),
+                    );
+                };
                 let engine = self
                     .audio_engine
                     .as_ref()
@@ -20089,17 +20127,152 @@ impl DawUi {
         }
     }
 
-    fn handle_clap_pattern_transport_response(
+    fn request_clap_state_capture(&mut self, channel_id: u16) {
+        if self.pending_clap_state_capture.is_some() {
+            self.status = "A CLAP state capture is already in progress".to_owned();
+            return;
+        }
+        if self
+            .clap_pattern_preview_states
+            .values()
+            .any(|state| matches!(state, ClapNotePreviewState::Rendering))
+        {
+            self.status = "Wait for the active CLAP Pattern preview before capturing state".into();
+            return;
+        }
+        let Some(instrument) = self
+            .clap_pattern_playback_instruments
+            .get(&channel_id)
+            .cloned()
+        else {
+            self.status = format!("Channel {channel_id} has no assigned CLAP instrument");
+            return;
+        };
+        self.clap_pattern_preview_request_id =
+            self.clap_pattern_preview_request_id.wrapping_add(1).max(1);
+        let request_id = self.clap_pattern_preview_request_id;
+        self.pending_clap_state_capture = Some(PendingClapStateCapture {
+            request_id,
+            project_generation: self.project_generation,
+            channel_id,
+            path: instrument.path.clone(),
+            plugin_id: instrument.plugin_id.clone(),
+        });
+        let sample_rate = self
+            .audio_engine
+            .as_ref()
+            .map(AudioEngine::sample_rate)
+            .unwrap_or(self.audio_settings.sample_rate);
+        if self
+            .clap_pattern_preview_sender
+            .send((
+                instrument.path,
+                instrument.plugin_id,
+                instrument.plugin_name.clone(),
+                sample_rate,
+                None,
+                instrument.state,
+                ClapPatternPreviewPurpose::SaveState,
+                request_id,
+            ))
+            .is_err()
+        {
+            self.pending_clap_state_capture = None;
+            self.status = "CLAP Pattern preview worker is unavailable".to_owned();
+        } else {
+            self.status = format!(
+                "Capturing state for {} on Pattern transport Channel {channel_id}",
+                instrument.plugin_name
+            );
+        }
+    }
+
+    fn handle_clap_state_capture_response(
         &mut self,
-        settings: ClapPatternPreviewSettings,
+        path: PathBuf,
+        plugin_id: String,
         plugin_name: String,
         request_id: u64,
-        result: Result<Vec<f32>, String>,
+        result: Result<ClapPatternPreviewOutput, String>,
+    ) {
+        let Some(pending) = self.pending_clap_state_capture.as_ref() else {
+            return;
+        };
+        if pending.request_id != request_id {
+            return;
+        }
+        let pending = self.pending_clap_state_capture.take().unwrap();
+        if pending.project_generation != self.project_generation {
+            return;
+        }
+        if pending.path != path || pending.plugin_id != plugin_id {
+            self.status = "CLAP state capture returned a mismatched plug-in".to_owned();
+            return;
+        }
+        let assignment = self
+            .clap_pattern_playback_instruments
+            .get_mut(&pending.channel_id);
+        let Some(assignment) = assignment
+            .filter(|assignment| assignment.path == path && assignment.plugin_id == plugin_id)
+        else {
+            self.status = format!(
+                "Discarded state capture for Pattern transport Channel {} because its assignment changed",
+                pending.channel_id
+            );
+            return;
+        };
+        match result {
+            Ok(ClapPatternPreviewOutput::SavedState(state)) => {
+                assignment.state = Some(state);
+                self.status = if let Some(project_path) = self.current_path.as_deref() {
+                    match save_clap_project_instruments(
+                        &stable_project_id(project_path),
+                        &self.clap_pattern_playback_instruments,
+                    ) {
+                        Ok(()) => format!(
+                            "Captured and saved CLAP state for {} on Channel {}",
+                            plugin_name, pending.channel_id
+                        ),
+                        Err(error) => format!(
+                            "Captured CLAP state for {} on Channel {}, but could not save it: {error}",
+                            plugin_name, pending.channel_id
+                        ),
+                    }
+                } else {
+                    format!(
+                        "Captured CLAP state for {} on Channel {}; it will be saved when this project is saved",
+                        plugin_name, pending.channel_id
+                    )
+                };
+            }
+            Ok(ClapPatternPreviewOutput::Audio(_)) => {
+                self.status = "CLAP state capture returned audio instead of state".to_owned();
+            }
+            Err(error) => {
+                self.status = format!(
+                    "Could not capture CLAP state for {} on Channel {}: {error}",
+                    plugin_name, pending.channel_id
+                );
+            }
+        }
+    }
+
+    fn handle_clap_pattern_transport_response(
+        &mut self,
+        settings: Option<ClapPatternPreviewSettings>,
+        plugin_name: String,
+        request_id: u64,
+        result: Result<ClapPatternPreviewOutput, String>,
     ) {
         let Some(pending) = self.pending_clap_pattern_playback.as_mut() else {
             return;
         };
         let Some(channel_id) = pending.request_channels.remove(&request_id) else {
+            return;
+        };
+        let Some(settings) = settings else {
+            self.pending_clap_pattern_playback = None;
+            self.status = "CLAP Pattern playback response was missing its source settings".into();
             return;
         };
         if settings.pattern_id != pending.pattern_id || settings.channel_id != channel_id {
@@ -20108,10 +20281,19 @@ impl DawUi {
             return;
         }
         match result {
-            Ok(samples) => pending.audio_layers.push(PatternAudioLayer {
-                channel_id,
-                samples,
-            }),
+            Ok(ClapPatternPreviewOutput::Audio(samples)) => {
+                pending.audio_layers.push(PatternAudioLayer {
+                    channel_id,
+                    samples,
+                })
+            }
+            Ok(ClapPatternPreviewOutput::SavedState(_)) => {
+                self.pending_clap_pattern_playback = None;
+                self.status = format!(
+                    "CLAP Pattern playback for channel {channel_id} returned plug-in state instead of audio"
+                );
+                return;
+            }
             Err(error) => {
                 self.pending_clap_pattern_playback = None;
                 self.status = format!(
@@ -60974,6 +61156,7 @@ impl DawUi {
         let mut preview_clap_pattern = None;
         let mut assign_clap_pattern_transport = None;
         let mut remove_clap_pattern_transport = None;
+        let mut capture_clap_state = None;
         let mut probe_audio_unit = None;
         let mut preview_audio_unit = None;
         let mut open_id = None;
@@ -61397,7 +61580,7 @@ impl DawUi {
                         ));
                     }
                 });
-                ui.small("Assignments are saved per project on this machine. CLAP loops render at project base tempo and mix directly to Master; Mixer and Layer routing, tempo automation, and plug-in state restoration are not applied.");
+                ui.small("Assignments and captured CLAP plug-in state are saved per project on this machine, outside the FLP. CLAP loops render at project base tempo and mix directly to Master; Mixer and Layer routing and tempo automation are not applied.");
             }
             if !self.clap_pattern_playback_instruments.is_empty() {
                 ui.collapsing("Assigned CLAP Pattern channels", |ui| {
@@ -61409,6 +61592,28 @@ impl DawUi {
                                 instrument.plugin_id,
                                 instrument.path.display()
                             ));
+                            ui.small(if instrument.state.is_some() {
+                                "State snapshot saved"
+                            } else {
+                                "No state snapshot"
+                            });
+                            if ui
+                                .add_enabled(
+                                    self.pending_clap_state_capture.is_none(),
+                                    egui::Button::new(if self
+                                        .pending_clap_state_capture
+                                        .as_ref()
+                                        .is_some_and(|pending| pending.channel_id == *channel_id)
+                                    {
+                                        "Capturing…"
+                                    } else {
+                                        "Capture state"
+                                    }),
+                                )
+                                .clicked()
+                            {
+                                capture_clap_state = Some(*channel_id);
+                            }
                             if ui.button("Remove").clicked() {
                                 remove_clap_pattern_transport = Some(*channel_id);
                             }
@@ -61619,11 +61824,15 @@ impl DawUi {
                                             path: candidate.path.clone(),
                                             plugin_id: descriptor.id.clone(),
                                             plugin_name: descriptor.name.clone(),
+                                            state: None,
                                         };
                                         let assigned = self
                                             .clap_pattern_playback_instruments
                                             .get(&settings.channel_id)
-                                            == Some(&instrument);
+                                            .is_some_and(|current| {
+                                                current.path == instrument.path
+                                                    && current.plugin_id == instrument.plugin_id
+                                            });
                                         ui.horizontal(|ui| {
                                             if ui
                                                 .button(if assigned {
@@ -62007,6 +62216,10 @@ impl DawUi {
 
         if let Some((path, plugin_id, plugin_name, settings)) = preview_clap_pattern {
             self.request_clap_pattern_preview(path, plugin_id, plugin_name, settings, ui.ctx());
+        }
+
+        if let Some(channel_id) = capture_clap_state {
+            self.request_clap_state_capture(channel_id);
         }
 
         if let Some((channel_id, instrument)) = assign_clap_pattern_transport {

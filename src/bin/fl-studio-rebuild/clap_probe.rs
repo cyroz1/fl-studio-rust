@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use clack_extensions::audio_ports::{AudioPortFlags, AudioPortInfoBuffer, PluginAudioPorts};
 use clack_extensions::note_ports::{NoteDialect, NotePortInfoBuffer, PluginNotePorts};
 use clack_extensions::params::{ParamInfoBuffer, PluginParams};
+use clack_extensions::state::PluginState;
 use clack_host::events::event_types::{
     Midi2Event, MidiEvent, NoteExpressionEvent, NoteExpressionType, NoteOffEvent, NoteOnEvent,
 };
@@ -16,6 +17,7 @@ use clack_host::prelude::{
     AudioPortBuffer, AudioPortBufferType, AudioPorts, EventBuffer, HostInfo, InputAudioBuffers,
     InputChannel, PluginAudioConfiguration, PluginEntry, PluginInstance, ProcessStatus,
 };
+use flp_rebuild::plugin_settings::MAX_CLAP_PROJECT_PLUGIN_STATE_BYTES;
 
 pub const PROBE_FLAG: &str = "--clap-probe";
 pub const INSTANCE_PROBE_FLAG: &str = "--clap-instance-probe";
@@ -147,6 +149,13 @@ pub struct ClapPatternPreviewSettings {
 pub enum ClapPatternPreviewPurpose {
     Audition,
     Transport,
+    SaveState,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ClapPatternPreviewOutput {
+    Audio(Vec<f32>),
+    SavedState(Vec<u8>),
 }
 
 pub type ClapInspectionResponse = (PathBuf, Result<Vec<ClapPluginDescriptor>, String>);
@@ -167,7 +176,8 @@ pub type ClapPatternPreviewRequest = (
     String,
     String,
     u32,
-    ClapPatternPreviewSettings,
+    Option<ClapPatternPreviewSettings>,
+    Option<Vec<u8>>,
     ClapPatternPreviewPurpose,
     u64,
 );
@@ -175,10 +185,10 @@ pub type ClapPatternPreviewResponse = (
     PathBuf,
     String,
     String,
-    ClapPatternPreviewSettings,
+    Option<ClapPatternPreviewSettings>,
     ClapPatternPreviewPurpose,
     u64,
-    Result<Vec<f32>, String>,
+    Result<ClapPatternPreviewOutput, String>,
 );
 
 pub fn start_worker(
@@ -315,12 +325,14 @@ pub fn start_pattern_preview_worker(
         .name("clap-pattern-preview".to_owned())
         .spawn(move || {
             let mut preview_process = None;
+            let mut preview_process_has_loaded_state = false;
             while let Ok((
                 path,
                 plugin_id,
                 plugin_name,
                 sample_rate,
                 settings,
+                state,
                 purpose,
                 request_id,
             )) = request_receiver.recv()
@@ -331,12 +343,28 @@ pub fn start_pattern_preview_worker(
                         .is_some_and(|process: &ClapPreviewProcess| {
                             process.matches(&path, &plugin_id, sample_rate)
                         });
-                if !process_matches {
+                if !process_matches || (state.is_none() && preview_process_has_loaded_state) {
                     preview_process.take();
                 }
-                let render = |process: &mut ClapPreviewProcess| match purpose {
-                    ClapPatternPreviewPurpose::Audition => process.render_pattern(&settings),
-                    ClapPatternPreviewPurpose::Transport => process.render_pattern_loop(&settings),
+                let render = |process: &mut ClapPreviewProcess| {
+                    if let Some(state) = &state {
+                        process.load_state(state)?;
+                    }
+                    match purpose {
+                        ClapPatternPreviewPurpose::Audition => process
+                            .render_pattern(settings.as_ref().ok_or_else(|| {
+                                "CLAP Pattern audition is missing its settings".to_owned()
+                            })?)
+                            .map(ClapPatternPreviewOutput::Audio),
+                        ClapPatternPreviewPurpose::Transport => process
+                            .render_pattern_loop(settings.as_ref().ok_or_else(|| {
+                                "CLAP Pattern transport is missing its settings".to_owned()
+                            })?)
+                            .map(ClapPatternPreviewOutput::Audio),
+                        ClapPatternPreviewPurpose::SaveState => process
+                            .save_state()
+                            .map(ClapPatternPreviewOutput::SavedState),
+                    }
                 };
                 let result = if let Some(process) = preview_process.as_mut() {
                     render(process)
@@ -353,6 +381,7 @@ pub fn start_pattern_preview_worker(
                 if result.is_err() {
                     preview_process.take();
                 }
+                preview_process_has_loaded_state = result.is_ok() && state.is_some();
                 if response_sender
                     .send((
                         path,
@@ -398,6 +427,7 @@ pub fn inspect_instance_in_subprocess(
 enum ClapPreviewProcessResponse {
     Ready,
     Audio(Vec<f32>),
+    State(Vec<u8>),
     Error(String),
 }
 
@@ -464,6 +494,9 @@ impl ClapPreviewProcess {
             ClapPreviewProcessResponse::Audio(_) => {
                 Err("CLAP preview helper sent audio before initialization".to_owned())
             }
+            ClapPreviewProcessResponse::State(_) => {
+                Err("CLAP preview helper sent state before initialization".to_owned())
+            }
         }
     }
 
@@ -488,6 +521,9 @@ impl ClapPreviewProcess {
             ClapPreviewProcessResponse::Error(error) => Err(error),
             ClapPreviewProcessResponse::Ready => {
                 Err("CLAP preview helper restarted unexpectedly".to_owned())
+            }
+            ClapPreviewProcessResponse::State(_) => {
+                Err("CLAP preview helper sent state instead of audio".to_owned())
             }
         }
     }
@@ -546,6 +582,41 @@ impl ClapPreviewProcess {
             ClapPreviewProcessResponse::Error(error) => Err(error),
             ClapPreviewProcessResponse::Ready => {
                 Err("CLAP preview helper restarted unexpectedly".to_owned())
+            }
+            ClapPreviewProcessResponse::State(_) => {
+                Err("CLAP preview helper sent state instead of audio".to_owned())
+            }
+        }
+    }
+
+    fn load_state(&mut self, state: &[u8]) -> Result<(), String> {
+        if state.len() > MAX_CLAP_PROJECT_PLUGIN_STATE_BYTES {
+            return Err("CLAP plug-in state exceeds the 32 MiB limit".to_owned());
+        }
+        writeln!(self.stdin, "LOAD_STATE {}", state.len())
+            .and_then(|_| self.stdin.write_all(state))
+            .and_then(|_| self.stdin.write_all(b"\n"))
+            .and_then(|_| self.stdin.flush())
+            .map_err(|error| format!("could not send CLAP plug-in state: {error}"))?;
+        match self.receive_response()? {
+            ClapPreviewProcessResponse::Ready => Ok(()),
+            ClapPreviewProcessResponse::Error(error) => Err(error),
+            ClapPreviewProcessResponse::Audio(_) | ClapPreviewProcessResponse::State(_) => {
+                Err("CLAP preview helper sent an unexpected response to state load".to_owned())
+            }
+        }
+    }
+
+    fn save_state(&mut self) -> Result<Vec<u8>, String> {
+        self.stdin
+            .write_all(b"SAVE_STATE\n")
+            .and_then(|_| self.stdin.flush())
+            .map_err(|error| format!("could not request CLAP plug-in state: {error}"))?;
+        match self.receive_response()? {
+            ClapPreviewProcessResponse::State(state) => Ok(state),
+            ClapPreviewProcessResponse::Error(error) => Err(error),
+            ClapPreviewProcessResponse::Audio(_) | ClapPreviewProcessResponse::Ready => {
+                Err("CLAP preview helper sent an unexpected response to state save".to_owned())
             }
         }
     }
@@ -651,6 +722,47 @@ fn read_preview_process_responses(
                 .collect();
             if response_sender
                 .send(ClapPreviewProcessResponse::Audio(samples))
+                .is_err()
+            {
+                return;
+            }
+            continue;
+        }
+        if let Some(byte_count) = header.strip_prefix("STATE ") {
+            let Ok(byte_count) = byte_count.parse::<usize>() else {
+                let _ = response_sender.send(ClapPreviewProcessResponse::Error(
+                    "CLAP preview helper sent an invalid plug-in state length".to_owned(),
+                ));
+                return;
+            };
+            if byte_count > MAX_CLAP_PROJECT_PLUGIN_STATE_BYTES {
+                let _ = response_sender.send(ClapPreviewProcessResponse::Error(
+                    "CLAP preview helper plug-in state exceeded the 32 MiB limit".to_owned(),
+                ));
+                return;
+            }
+            let mut state = vec![0; byte_count];
+            if let Err(error) = stdout.read_exact(&mut state) {
+                let _ = response_sender.send(ClapPreviewProcessResponse::Error(format!(
+                    "could not read CLAP plug-in state: {error}"
+                )));
+                return;
+            }
+            let mut delimiter = [0; 1];
+            if let Err(error) = stdout.read_exact(&mut delimiter) {
+                let _ = response_sender.send(ClapPreviewProcessResponse::Error(format!(
+                    "could not finish reading CLAP plug-in state: {error}"
+                )));
+                return;
+            }
+            if delimiter[0] != b'\n' {
+                let _ = response_sender.send(ClapPreviewProcessResponse::Error(
+                    "CLAP preview helper sent an invalid plug-in state delimiter".to_owned(),
+                ));
+                return;
+            }
+            if response_sender
+                .send(ClapPreviewProcessResponse::State(state))
                 .is_err()
             {
                 return;
@@ -901,6 +1013,49 @@ pub fn run_note_preview_server_child(path: &Path, plugin_id: &str, sample_rate: 
             return 0;
         }
 
+        if line == "SAVE_STATE" {
+            match instance.save_state() {
+                Ok(state) => {
+                    if write_preview_server_state(&mut output, &state).is_err() {
+                        return 1;
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    let _ = write_preview_server_error(&mut output, &error);
+                    let _ = output.flush();
+                    return 1;
+                }
+            }
+        }
+
+        if let Some(header) = line.strip_prefix("LOAD_STATE ") {
+            let state = match read_preview_server_state(&mut input, header) {
+                Ok(state) => state,
+                Err(error) => {
+                    let _ = write_preview_server_error(&mut output, &error);
+                    let _ = output.flush();
+                    return 1;
+                }
+            };
+            match instance.load_state(&state) {
+                Ok(()) => {
+                    if writeln!(output, "READY")
+                        .and_then(|_| output.flush())
+                        .is_err()
+                    {
+                        return 1;
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    let _ = write_preview_server_error(&mut output, &error);
+                    let _ = output.flush();
+                    return 1;
+                }
+            }
+        }
+
         let samples = if let Some(header) = line.strip_prefix("PREVIEW ") {
             match parse_note_preview_request(header) {
                 Ok((note_key, velocity, note_duration)) => {
@@ -1066,6 +1221,41 @@ fn write_preview_server_audio(output: &mut impl Write, samples: &[f32]) -> std::
     output.flush()
 }
 
+fn read_preview_server_state(input: &mut impl Read, header: &str) -> Result<Vec<u8>, String> {
+    let mut fields = header.split_whitespace();
+    let Some(byte_count) = fields.next().and_then(|field| field.parse::<usize>().ok()) else {
+        return Err("invalid CLAP plug-in state length".to_owned());
+    };
+    if fields.next().is_some() || byte_count > MAX_CLAP_PROJECT_PLUGIN_STATE_BYTES {
+        return Err("CLAP plug-in state exceeds the 32 MiB limit".to_owned());
+    }
+    let mut state = vec![0; byte_count];
+    input
+        .read_exact(&mut state)
+        .map_err(|error| format!("could not read CLAP plug-in state: {error}"))?;
+    let mut delimiter = [0; 1];
+    input
+        .read_exact(&mut delimiter)
+        .map_err(|error| format!("could not finish reading CLAP plug-in state: {error}"))?;
+    if delimiter[0] != b'\n' {
+        return Err("invalid CLAP plug-in state delimiter".to_owned());
+    }
+    Ok(state)
+}
+
+fn write_preview_server_state(output: &mut impl Write, state: &[u8]) -> std::io::Result<()> {
+    if state.len() > MAX_CLAP_PROJECT_PLUGIN_STATE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "CLAP plug-in state exceeds the 32 MiB limit",
+        ));
+    }
+    writeln!(output, "STATE {}", state.len())?;
+    output.write_all(state)?;
+    output.write_all(b"\n")?;
+    output.flush()
+}
+
 fn write_preview_server_error(output: &mut impl Write, error: &str) -> std::io::Result<()> {
     let message = error
         .chars()
@@ -1109,6 +1299,36 @@ struct ClapNotePreviewInstance {
     note_port_index: u16,
     dialect: PreviewNoteDialect,
     next_steady_time: u64,
+}
+
+struct LimitedClapStateWriter {
+    bytes: Vec<u8>,
+    exceeded_limit: bool,
+}
+
+impl Write for LimitedClapStateWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let Some(new_len) = self.bytes.len().checked_add(bytes.len()) else {
+            self.exceeded_limit = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "CLAP plug-in state length overflowed",
+            ));
+        };
+        if new_len > MAX_CLAP_PROJECT_PLUGIN_STATE_BYTES {
+            self.exceeded_limit = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "CLAP plug-in state exceeds the 32 MiB limit",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 impl ClapNotePreviewInstance {
@@ -1179,6 +1399,38 @@ impl ClapNotePreviewInstance {
             dialect,
             next_steady_time: 0,
         })
+    }
+
+    fn load_state(&mut self, bytes: &[u8]) -> Result<(), String> {
+        if bytes.len() > MAX_CLAP_PROJECT_PLUGIN_STATE_BYTES {
+            return Err("CLAP plug-in state exceeds the 32 MiB limit".to_owned());
+        }
+        let plugin = self.instance.plugin_handle();
+        let state = plugin
+            .get_extension::<PluginState>()
+            .ok_or_else(|| "CLAP instrument does not support state restoration".to_owned())?;
+        let mut input = std::io::Cursor::new(bytes);
+        state
+            .load(&plugin, &mut input)
+            .map_err(|error| format!("CLAP instrument could not restore its state: {error}"))
+    }
+
+    fn save_state(&mut self) -> Result<Vec<u8>, String> {
+        let plugin = self.instance.plugin_handle();
+        let state = plugin
+            .get_extension::<PluginState>()
+            .ok_or_else(|| "CLAP instrument does not support state saving".to_owned())?;
+        let mut writer = LimitedClapStateWriter {
+            bytes: Vec::new(),
+            exceeded_limit: false,
+        };
+        let save_result = state.save(&plugin, &mut writer);
+        if writer.exceeded_limit {
+            return Err("CLAP plug-in state exceeds the 32 MiB limit".to_owned());
+        }
+        save_result
+            .map_err(|error| format!("CLAP instrument could not save its state: {error}"))?;
+        Ok(writer.bytes)
     }
 
     fn render(
@@ -2235,8 +2487,9 @@ mod tests {
         ClapPatternNote, ClapPatternPreviewSettings, ClapPluginDescriptor,
         MAX_NOTE_PREVIEW_NOTE_MILLISECONDS, MIN_NOTE_PREVIEW_NOTE_MILLISECONDS,
         encode_instance_probe_output, encode_probe_output, parse_instance_probe_output,
-        parse_pattern_preview_request, parse_probe_output, schedule_pattern_preview_events,
-        second_pattern_loop_audio, validate_note_preview_note_length,
+        parse_pattern_preview_request, parse_probe_output, read_preview_server_state,
+        schedule_pattern_preview_events, second_pattern_loop_audio,
+        validate_note_preview_note_length, write_preview_server_state,
     };
     use std::io::Cursor;
 
@@ -2318,6 +2571,31 @@ mod tests {
         assert!(validate_note_preview_note_length(MAX_NOTE_PREVIEW_NOTE_MILLISECONDS).is_ok());
         assert!(validate_note_preview_note_length(MIN_NOTE_PREVIEW_NOTE_MILLISECONDS - 1).is_err());
         assert!(validate_note_preview_note_length(MAX_NOTE_PREVIEW_NOTE_MILLISECONDS + 1).is_err());
+    }
+
+    #[test]
+    fn clap_state_protocol_preserves_arbitrary_binary_bytes() {
+        let state = [0, b'\n', 0xff, b'\r', 7];
+        let mut response = Vec::new();
+        write_preview_server_state(&mut response, &state).expect("state response should write");
+        let header_end = response
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .expect("state response should include a header");
+        assert_eq!(
+            std::str::from_utf8(&response[..header_end]).expect("header should be UTF-8"),
+            format!("STATE {}", state.len())
+        );
+        assert_eq!(&response[header_end + 1..response.len() - 1], &state);
+        assert_eq!(response.last(), Some(&b'\n'));
+
+        let mut input = Cursor::new(&response[header_end + 1..]);
+        assert_eq!(
+            read_preview_server_state(&mut input, &state.len().to_string())
+                .expect("state request should parse"),
+            state
+        );
+        assert_eq!(input.position() as usize, state.len() + 1);
     }
 
     fn pattern_preview_settings() -> ClapPatternPreviewSettings {

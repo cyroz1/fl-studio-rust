@@ -6,12 +6,14 @@ use std::path::{Path, PathBuf};
 const VST3_MANUAL_LATENCY_OFFSETS_FILE: &str = "vst3-manual-latency-offsets.txt";
 const VST3_PROJECT_MANUAL_LATENCY_OFFSETS_DIRECTORY: &str = "vst3-project-manual-latency-offsets";
 const CLAP_PROJECT_INSTRUMENTS_DIRECTORY: &str = "clap-project-instruments";
+pub const MAX_CLAP_PROJECT_PLUGIN_STATE_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClapProjectInstrumentAssignment {
     pub path: PathBuf,
     pub plugin_id: String,
     pub plugin_name: String,
+    pub state: Option<Vec<u8>>,
 }
 
 fn app_settings_directory() -> Option<PathBuf> {
@@ -126,6 +128,17 @@ pub fn save_clap_project_instruments(
     project_id: &str,
     assignments: &BTreeMap<u16, ClapProjectInstrumentAssignment>,
 ) -> Result<(), String> {
+    if assignments.values().any(|assignment| {
+        assignment
+            .state
+            .as_ref()
+            .is_some_and(|state| state.len() > MAX_CLAP_PROJECT_PLUGIN_STATE_BYTES)
+    }) {
+        return Err(format!(
+            "CLAP plug-in state exceeds the {} MiB project limit",
+            MAX_CLAP_PROJECT_PLUGIN_STATE_BYTES / (1024 * 1024)
+        ));
+    }
     let path = clap_project_instruments_file(project_id)
         .ok_or_else(|| "the project CLAP instrument path is not valid".to_owned())?;
     let parent = path
@@ -142,9 +155,11 @@ pub fn parse_clap_project_instruments(
 ) -> BTreeMap<u16, ClapProjectInstrumentAssignment> {
     let mut assignments = BTreeMap::new();
     let mut lines = contents.lines();
-    if lines.next() != Some("clap-project-instruments-v1") {
-        return assignments;
-    }
+    let version = match lines.next() {
+        Some("clap-project-instruments-v1") => 1,
+        Some("clap-project-instruments-v2") => 2,
+        _ => return assignments,
+    };
     for line in lines {
         let mut fields = line.split('\t');
         let Some(channel_id) = fields.next().and_then(|field| field.parse::<u16>().ok()) else {
@@ -159,6 +174,23 @@ pub fn parse_clap_project_instruments(
         let Some(plugin_name) = fields.next().and_then(decode_plugin_uid) else {
             continue;
         };
+        let state = if version == 2 {
+            let Some(encoded_state) = fields.next() else {
+                continue;
+            };
+            if encoded_state == "-" {
+                None
+            } else if encoded_state.len() <= MAX_CLAP_PROJECT_PLUGIN_STATE_BYTES * 2 {
+                let Some(state) = decode_bytes_hex(encoded_state) else {
+                    continue;
+                };
+                Some(state)
+            } else {
+                continue;
+            }
+        } else {
+            None
+        };
         if fields.next().is_some()
             || path.as_os_str().is_empty()
             || plugin_id.is_empty()
@@ -172,6 +204,7 @@ pub fn parse_clap_project_instruments(
                 path,
                 plugin_id,
                 plugin_name,
+                state,
             },
         );
     }
@@ -181,7 +214,7 @@ pub fn parse_clap_project_instruments(
 pub fn serialize_clap_project_instruments(
     assignments: &BTreeMap<u16, ClapProjectInstrumentAssignment>,
 ) -> String {
-    let mut contents = String::from("clap-project-instruments-v1\n");
+    let mut contents = String::from("clap-project-instruments-v2\n");
     for (channel_id, assignment) in assignments {
         if assignment.path.as_os_str().is_empty()
             || assignment.plugin_id.is_empty()
@@ -196,6 +229,12 @@ pub fn serialize_clap_project_instruments(
         contents.push_str(&encode_plugin_uid(&assignment.plugin_id));
         contents.push('\t');
         contents.push_str(&encode_plugin_uid(&assignment.plugin_name));
+        contents.push('\t');
+        if let Some(state) = &assignment.state {
+            contents.push_str(&encode_bytes_hex(state));
+        } else {
+            contents.push('-');
+        }
         contents.push('\n');
     }
     contents
@@ -421,6 +460,7 @@ mod tests {
                 path: PathBuf::from("/tmp/Écho Synth\tMk II.clap"),
                 plugin_id: "org.example\tvoice".to_owned(),
                 plugin_name: "Écho\nMk II".to_owned(),
+                state: Some(vec![0, 1, 0xff, b'\n']),
             },
         )]);
 
@@ -438,6 +478,22 @@ mod tests {
         assert!(parsed.is_empty());
     }
 
+    #[test]
+    fn clap_project_instrument_assignments_read_v1_without_state() {
+        let parsed = parse_clap_project_instruments(
+            "clap-project-instruments-v1\n8\t2f746d702f78\t6964\t6e616d65\n",
+        );
+        assert_eq!(
+            parsed.get(&8),
+            Some(&ClapProjectInstrumentAssignment {
+                path: PathBuf::from("/tmp/x"),
+                plugin_id: "id".to_owned(),
+                plugin_name: "name".to_owned(),
+                state: None,
+            })
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn clap_project_instrument_assignments_preserve_non_utf8_paths() {
@@ -451,6 +507,7 @@ mod tests {
                 )),
                 plugin_id: "org.example.synth".to_owned(),
                 plugin_name: "Example Synth".to_owned(),
+                state: None,
             },
         )]);
 
