@@ -387,6 +387,23 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 ),
                 parse_u8(controller, "MIDI Control Change number")?,
                 parse_midi_channel_number(midi_channel)?,
+                MidiExportFileFormat::Format1,
+            )
+        }
+        [command, project, output, pattern_id, raw_channel, raw_flags, controller, midi_channel, file_format]
+            if command == "export-midi-cc" =>
+        {
+            export_midi_controller_stream(
+                Path::new(project),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                (
+                    parse_u8(raw_channel, "raw controller stream channel")?,
+                    parse_u8(raw_flags, "raw controller stream flags")?,
+                ),
+                parse_u8(controller, "MIDI Control Change number")?,
+                parse_midi_channel_number(midi_channel)?,
+                parse_midi_export_file_format(file_format)?,
             )
         }
         [command, project, output, arrangement_id] if command == "export-midi-song" => {
@@ -443,6 +460,23 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 ),
                 parse_u8(controller, "MIDI Control Change number")?,
                 parse_midi_channel_number(midi_channel)?,
+                MidiExportFileFormat::Format1,
+            )
+        }
+        [command, project, output, arrangement_id, raw_channel, raw_flags, controller, midi_channel, file_format]
+            if command == "export-midi-song-cc" =>
+        {
+            export_midi_song_controller_stream(
+                Path::new(project),
+                Path::new(output),
+                parse_u16(arrangement_id, "arrangement id")?,
+                (
+                    parse_u8(raw_channel, "raw controller stream channel")?,
+                    parse_u8(raw_flags, "raw controller stream flags")?,
+                ),
+                parse_u8(controller, "MIDI Control Change number")?,
+                parse_midi_channel_number(midi_channel)?,
+                parse_midi_export_file_format(file_format)?,
             )
         }
         [command, path, track] if command == "midi-events" => {
@@ -4156,9 +4190,9 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild global-swing <file.flp>\n",
             "  flp-rebuild midi-info <file.mid>\n",
             "  flp-rebuild export-midi-pattern <project.flp> <output.mid> <pattern-id> [stored|channels] [format0|format1]\n",
-            "  flp-rebuild export-midi-cc <project.flp> <output.mid> <pattern-id> <raw-channel> <raw-flags> <cc-0..127> <midi-channel-1..16>\n",
+            "  flp-rebuild export-midi-cc <project.flp> <output.mid> <pattern-id> <raw-channel> <raw-flags> <cc-0..127> <midi-channel-1..16> [format0|format1]\n",
             "  flp-rebuild export-midi-song <project.flp> <output.mid> <arrangement-id> [stored|channels] [format0|format1]\n",
-            "  flp-rebuild export-midi-song-cc <project.flp> <output.mid> <arrangement-id> <raw-channel> <raw-flags> <cc-0..127> <midi-channel-1..16>\n",
+            "  flp-rebuild export-midi-song-cc <project.flp> <output.mid> <arrangement-id> <raw-channel> <raw-flags> <cc-0..127> <midi-channel-1..16> [format0|format1]\n",
             "  flp-rebuild midi-events <file.mid> <track> [start] [count]\n",
             "  flp-rebuild scan <directory>\n",
             "  flp-rebuild plugin-scan\n",
@@ -6165,14 +6199,16 @@ fn export_midi_controller_stream(
     raw_stream: (u8, u8),
     midi_controller: u8,
     midi_channel: u8,
+    file_format: MidiExportFileFormat,
 ) -> Result<(), String> {
     let (_, document) = load_document(project)?;
-    let bytes = MidiFile::encode_project_pattern_controller_stream(
+    let bytes = MidiFile::encode_project_pattern_controller_stream_with_format(
         &document,
         pattern_id,
         raw_stream,
         midi_controller,
         midi_channel,
+        file_format,
     )
     .map_err(|error| error.to_string())?;
     fs::write(output, &bytes)
@@ -6220,14 +6256,16 @@ fn export_midi_song_controller_stream(
     raw_stream: (u8, u8),
     midi_controller: u8,
     midi_channel: u8,
+    file_format: MidiExportFileFormat,
 ) -> Result<(), String> {
     let (_, document) = load_document(project)?;
-    let bytes = MidiFile::encode_project_song_controller_stream(
+    let bytes = MidiFile::encode_project_song_controller_stream_with_format(
         &document,
         arrangement_id,
         raw_stream,
         midi_controller,
         midi_channel,
+        file_format,
     )
     .map_err(|error| error.to_string())?;
     fs::write(output, &bytes)

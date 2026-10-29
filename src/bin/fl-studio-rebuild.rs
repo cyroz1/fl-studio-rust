@@ -53982,6 +53982,7 @@ impl DawUi {
             });
         }
 
+        let file_format = self.midi_export_file_format;
         let mut export_request = None;
         let mut cancel_requested = false;
         if let Some(pending) = self.pending_midi_cc_export.as_mut() {
@@ -53997,6 +53998,10 @@ impl DawUi {
                 PendingMidiCcExportTarget::Pattern(_) => "Export selected stream",
                 PendingMidiCcExportTarget::Song(_) => "Export stream across song",
             };
+            let file_format_label = match file_format {
+                MidiExportFileFormat::Format0 => "SMF format 0",
+                MidiExportFileFormat::Format1 => "SMF format 1",
+            };
             let help_text = match pending.target {
                 PendingMidiCcExportTarget::Pattern(_) => {
                     "Raw values map to MIDI 0–127; Pattern ticks and project PPQ are preserved."
@@ -54011,7 +54016,7 @@ impl DawUi {
                     ui.weak(pending.path.display().to_string());
                 });
                 ui.label(format!(
-                    "{source_label} · raw stream channel {} · flags 0x{:02X}",
+                    "{source_label} · raw stream channel {} · flags 0x{:02X} · {file_format_label}",
                     pending.target_stream.0, pending.target_stream.1
                 ));
                 ui.horizontal(|ui| {
@@ -54034,6 +54039,7 @@ impl DawUi {
                         pending.target_stream,
                         pending.controller_number,
                         pending.midi_channel - 1,
+                        file_format,
                     ));
                 }
                 cancel_requested = ui.button("Cancel").clicked();
@@ -54042,7 +54048,7 @@ impl DawUi {
         if cancel_requested {
             self.pending_midi_cc_export = None;
         }
-        if let Some((path, target, target_stream, cc, channel)) = export_request {
+        if let Some((path, target, target_stream, cc, channel, file_format)) = export_request {
             let result = self
                 .document
                 .as_ref()
@@ -54050,21 +54056,23 @@ impl DawUi {
                 .and_then(|document| {
                     let encoded = match target {
                         PendingMidiCcExportTarget::Pattern(pattern_id) => {
-                            MidiFile::encode_project_pattern_controller_stream(
+                            MidiFile::encode_project_pattern_controller_stream_with_format(
                                 document,
                                 pattern_id,
                                 target_stream,
                                 cc,
                                 channel,
+                                file_format,
                             )
                         }
                         PendingMidiCcExportTarget::Song(arrangement_id) => {
-                            MidiFile::encode_project_song_controller_stream(
+                            MidiFile::encode_project_song_controller_stream_with_format(
                                 document,
                                 arrangement_id,
                                 target_stream,
                                 cc,
                                 channel,
+                                file_format,
                             )
                         }
                     };

@@ -288,6 +288,18 @@ struct MidiExportOptions<'a> {
     project_channel_order: &'a [u16],
     tempo_events: &'a [(u64, f64)],
     markers: &'a [MidiExportMarker],
+    auxiliary_track: Option<MidiExportAuxiliaryTrack>,
+}
+
+struct MidiExportAuxiliaryTrack {
+    name: String,
+    end_tick: u64,
+    events: Vec<TimedMidiBytes>,
+}
+
+struct MidiExportSongOptions {
+    file_format: MidiExportFileFormat,
+    auxiliary_track: Option<MidiExportAuxiliaryTrack>,
 }
 
 impl MidiExportTrack {
@@ -572,6 +584,25 @@ impl MidiFile {
         midi_controller: u8,
         midi_channel: u8,
     ) -> Result<Vec<u8>, MidiError> {
+        Self::encode_project_pattern_controller_stream_with_format(
+            document,
+            pattern_id,
+            raw_stream,
+            midi_controller,
+            midi_channel,
+            MidiExportFileFormat::Format1,
+        )
+    }
+
+    /// Exports one raw Pattern controller stream using the requested MIDI file layout.
+    pub fn encode_project_pattern_controller_stream_with_format(
+        document: &FlpDocument,
+        pattern_id: u16,
+        raw_stream: (u8, u8),
+        midi_controller: u8,
+        midi_channel: u8,
+        file_format: MidiExportFileFormat,
+    ) -> Result<Vec<u8>, MidiError> {
         if midi_controller > 127 {
             return Err(MidiError::InvalidExport(
                 "MIDI Control Change number must be from 0 through 127",
@@ -635,14 +666,24 @@ impl MidiFile {
         let mut output = Vec::new();
         output.extend_from_slice(MTHD);
         output.extend_from_slice(&6u32.to_be_bytes());
-        output.extend_from_slice(&1u16.to_be_bytes());
-        output.extend_from_slice(&2u16.to_be_bytes());
+        let (smf_format, track_count) = match file_format {
+            MidiExportFileFormat::Format0 => (0u16, 1u16),
+            MidiExportFileFormat::Format1 => (1u16, 2u16),
+        };
+        output.extend_from_slice(&smf_format.to_be_bytes());
+        output.extend_from_slice(&track_count.to_be_bytes());
         output.extend_from_slice(&ppq.to_be_bytes());
 
         let mut conductor_events = vec![TimedMidiBytes {
             tick: 0,
             order: 0,
-            bytes: meta_event_bytes(0x03, b"Tempo and meter")?,
+            bytes: meta_event_bytes(
+                0x03,
+                match file_format {
+                    MidiExportFileFormat::Format0 => b"FL Studio export" as &[u8],
+                    MidiExportFileFormat::Format1 => b"Tempo and meter",
+                },
+            )?,
         }];
         conductor_events.push(TimedMidiBytes {
             tick: 0,
@@ -657,22 +698,14 @@ impl MidiFile {
                 bytes: meta_event_bytes(0x58, &signature)?,
             });
         }
-        conductor_events.sort_by_key(|event| (event.tick, event.order));
-        let mut conductor = Vec::new();
-        let mut previous_tick = 0;
-        for event in conductor_events {
-            write_delta(&mut conductor, event.tick.saturating_sub(previous_tick))?;
-            conductor.extend_from_slice(&event.bytes);
-            previous_tick = event.tick;
-        }
-        write_end_of_track(&mut conductor, 0)?;
-        append_track_chunk(&mut output, conductor)?;
-
         let mut controller_events = vec![TimedMidiBytes {
             tick: 0,
             order: 0,
             bytes: meta_event_bytes(
-                0x03,
+                match file_format {
+                    MidiExportFileFormat::Format0 => 0x01,
+                    MidiExportFileFormat::Format1 => 0x03,
+                },
                 format!(
                     "Pattern {pattern_id} controller {} / 0x{:02X}",
                     raw_stream.0, raw_stream.1
@@ -688,19 +721,48 @@ impl MidiFile {
                 bytes: vec![0xB0 | midi_channel, midi_controller, value],
             });
         }
-        controller_events.sort_by_key(|event| (event.tick, event.order));
-        let mut controller_track = Vec::new();
-        let mut previous_tick = 0;
-        for event in controller_events {
-            write_delta(
-                &mut controller_track,
-                event.tick.saturating_sub(previous_tick),
-            )?;
-            controller_track.extend_from_slice(&event.bytes);
-            previous_tick = event.tick;
+        match file_format {
+            MidiExportFileFormat::Format0 => {
+                let mut events = conductor_events;
+                events.extend(controller_events);
+                events.sort_by_key(|event| (event.tick, event.order));
+                let mut track = Vec::new();
+                let mut previous_tick = 0;
+                for event in events {
+                    write_delta(&mut track, event.tick.saturating_sub(previous_tick))?;
+                    track.extend_from_slice(&event.bytes);
+                    previous_tick = event.tick;
+                }
+                write_end_of_track(&mut track, 0)?;
+                append_track_chunk(&mut output, track)?;
+            }
+            MidiExportFileFormat::Format1 => {
+                conductor_events.sort_by_key(|event| (event.tick, event.order));
+                let mut conductor = Vec::new();
+                let mut previous_tick = 0;
+                for event in conductor_events {
+                    write_delta(&mut conductor, event.tick.saturating_sub(previous_tick))?;
+                    conductor.extend_from_slice(&event.bytes);
+                    previous_tick = event.tick;
+                }
+                write_end_of_track(&mut conductor, 0)?;
+                append_track_chunk(&mut output, conductor)?;
+
+                controller_events.sort_by_key(|event| (event.tick, event.order));
+                let mut controller_track = Vec::new();
+                let mut previous_tick = 0;
+                for event in controller_events {
+                    write_delta(
+                        &mut controller_track,
+                        event.tick.saturating_sub(previous_tick),
+                    )?;
+                    controller_track.extend_from_slice(&event.bytes);
+                    previous_tick = event.tick;
+                }
+                write_end_of_track(&mut controller_track, 0)?;
+                append_track_chunk(&mut output, controller_track)?;
+            }
         }
-        write_end_of_track(&mut controller_track, 0)?;
-        append_track_chunk(&mut output, controller_track)?;
         Ok(output)
     }
 
@@ -715,6 +777,25 @@ impl MidiFile {
         raw_stream: (u8, u8),
         midi_controller: u8,
         midi_channel: u8,
+    ) -> Result<Vec<u8>, MidiError> {
+        Self::encode_project_song_controller_stream_with_format(
+            document,
+            arrangement_id,
+            raw_stream,
+            midi_controller,
+            midi_channel,
+            MidiExportFileFormat::Format1,
+        )
+    }
+
+    /// Exports one arrangement's raw Pattern controller stream using the requested MIDI layout.
+    pub fn encode_project_song_controller_stream_with_format(
+        document: &FlpDocument,
+        arrangement_id: u16,
+        raw_stream: (u8, u8),
+        midi_controller: u8,
+        midi_channel: u8,
+        file_format: MidiExportFileFormat,
     ) -> Result<Vec<u8>, MidiError> {
         if midi_controller > 127 {
             return Err(MidiError::InvalidExport(
@@ -909,49 +990,28 @@ impl MidiFile {
             ));
         }
 
-        // Reuse the regular song exporter for its conductor, tempo automation, markers, and
-        // note tracks, then append a dedicated CC track so those existing mappings stay intact.
-        let mut output = Self::encode_project_song(
+        let auxiliary_track = MidiExportAuxiliaryTrack {
+            name: format!(
+                "Arrangement {arrangement_id} raw controller {} / 0x{:02X} as CC {midi_controller} channel {}",
+                raw_stream.0,
+                raw_stream.1,
+                midi_channel + 1
+            ),
+            end_tick: song_end_tick,
+            events: controller_events,
+        };
+        Self::encode_project_song_with_live_filters_and_format_and_auxiliary_track(
             document,
             arrangement_id,
             MidiChannelMapping::PreserveNoteChannels,
-        )?;
-        let existing_track_count = u16::from_be_bytes([output[10], output[11]]);
-        let new_track_count = existing_track_count
-            .checked_add(1)
-            .ok_or(MidiError::LengthOverflow)?;
-        controller_events.push(TimedMidiBytes {
-            tick: 0,
-            order: 0,
-            bytes: meta_event_bytes(
-                0x03,
-                format!(
-                    "Arrangement {arrangement_id} raw controller {} / 0x{:02X} as CC {midi_controller} channel {}",
-                    raw_stream.0,
-                    raw_stream.1,
-                    midi_channel + 1
-                )
-                .as_bytes(),
-            )?,
-        });
-        controller_events.sort_by_key(|event| (event.tick, event.order));
-        let mut controller_track = Vec::new();
-        let mut previous_tick = 0u64;
-        for event in controller_events {
-            write_delta(
-                &mut controller_track,
-                event.tick.saturating_sub(previous_tick),
-            )?;
-            controller_track.extend_from_slice(&event.bytes);
-            previous_tick = event.tick;
-        }
-        write_end_of_track(
-            &mut controller_track,
-            song_end_tick.saturating_sub(previous_tick),
-        )?;
-        append_track_chunk(&mut output, controller_track)?;
-        output[10..12].copy_from_slice(&new_track_count.to_be_bytes());
-        Ok(output)
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            None,
+            MidiExportSongOptions {
+                file_format,
+                auxiliary_track: Some(auxiliary_track),
+            },
+        )
     }
 
     /// Exports pattern clips in one FL Studio arrangement to a format-1 MIDI file.
@@ -1037,6 +1097,33 @@ impl MidiFile {
         soloed_playlist_track_range: Option<(u32, u32)>,
         file_format: MidiExportFileFormat,
     ) -> Result<Vec<u8>, MidiError> {
+        Self::encode_project_song_with_live_filters_and_format_and_auxiliary_track(
+            document,
+            arrangement_id,
+            channel_mapping,
+            excluded_project_channels,
+            disabled_playlist_track_ids,
+            soloed_playlist_track_range,
+            MidiExportSongOptions {
+                file_format,
+                auxiliary_track: None,
+            },
+        )
+    }
+
+    fn encode_project_song_with_live_filters_and_format_and_auxiliary_track(
+        document: &FlpDocument,
+        arrangement_id: u16,
+        channel_mapping: MidiChannelMapping,
+        excluded_project_channels: &BTreeSet<u16>,
+        disabled_playlist_track_ids: &BTreeSet<u32>,
+        soloed_playlist_track_range: Option<(u32, u32)>,
+        options: MidiExportSongOptions,
+    ) -> Result<Vec<u8>, MidiError> {
+        let MidiExportSongOptions {
+            file_format,
+            auxiliary_track,
+        } = options;
         let arrangements = document
             .arrangements()
             .map_err(|error| MidiError::Project(error.to_string()))?;
@@ -1231,6 +1318,7 @@ impl MidiFile {
             &tempo_events,
             &markers,
             file_format,
+            auxiliary_track,
         )
     }
 
@@ -1285,6 +1373,7 @@ impl MidiFile {
             &[],
             &[],
             file_format,
+            None,
         )
     }
 
@@ -1295,6 +1384,7 @@ impl MidiFile {
         tempo_events: &[(u64, f64)],
         markers: &[MidiExportMarker],
         file_format: MidiExportFileFormat,
+        auxiliary_track: Option<MidiExportAuxiliaryTrack>,
     ) -> Result<Vec<u8>, MidiError> {
         let channel_order = document
             .channels()
@@ -1312,6 +1402,7 @@ impl MidiFile {
                 project_channel_order: &channel_order,
                 tempo_events,
                 markers,
+                auxiliary_track,
             },
         )
     }
@@ -1356,6 +1447,7 @@ impl MidiFile {
                 project_channel_order,
                 tempo_events: &[],
                 markers: &[],
+                auxiliary_track: None,
             },
         )
     }
@@ -1373,6 +1465,7 @@ impl MidiFile {
             project_channel_order,
             tempo_events,
             markers,
+            auxiliary_track,
         } = options;
         if ppq == 0 || ppq & 0x8000 != 0 {
             return Err(MidiError::InvalidExport(
@@ -1395,6 +1488,7 @@ impl MidiFile {
         } else {
             tracks
         };
+        let auxiliary_end_tick = auxiliary_track.as_ref().map_or(0, |track| track.end_tick);
         let (smf_format, track_count) = match file_format {
             MidiExportFileFormat::Format0 => (0_u16, 1_u16),
             MidiExportFileFormat::Format1 => (
@@ -1403,6 +1497,7 @@ impl MidiFile {
                     tracks
                         .len()
                         .checked_add(1)
+                        .and_then(|count| count.checked_add(usize::from(auxiliary_track.is_some())))
                         .ok_or(MidiError::LengthOverflow)?,
                 )
                 .map_err(|_| MidiError::LengthOverflow)?,
@@ -1580,6 +1675,14 @@ impl MidiFile {
                 for track_events in events_by_track {
                     events.extend(track_events);
                 }
+                if let Some(auxiliary_track) = auxiliary_track {
+                    events.push(TimedMidiBytes {
+                        tick: 0,
+                        order: 0,
+                        bytes: meta_event_bytes(0x01, auxiliary_track.name.as_bytes())?,
+                    });
+                    events.extend(auxiliary_track.events);
+                }
                 events.sort_by_key(|event| (event.tick, event.order));
                 let mut track_bytes = Vec::new();
                 let mut previous_tick = 0_u64;
@@ -1588,7 +1691,12 @@ impl MidiFile {
                     track_bytes.extend_from_slice(&event.bytes);
                     previous_tick = event.tick;
                 }
-                let end_tick = tracks.iter().map(|track| track.end_tick).max().unwrap_or(0);
+                let end_tick = tracks
+                    .iter()
+                    .map(|track| track.end_tick)
+                    .max()
+                    .unwrap_or(0)
+                    .max(auxiliary_end_tick);
                 write_end_of_track(
                     &mut track_bytes,
                     end_tick.max(previous_tick).saturating_sub(previous_tick),
@@ -1622,6 +1730,27 @@ impl MidiFile {
                             .end_tick
                             .max(previous_tick)
                             .saturating_sub(previous_tick),
+                    )?;
+                    append_track_chunk(&mut output, track_bytes)?;
+                }
+                if let Some(auxiliary_track) = auxiliary_track {
+                    let mut events = vec![TimedMidiBytes {
+                        tick: 0,
+                        order: 0,
+                        bytes: meta_event_bytes(0x03, auxiliary_track.name.as_bytes())?,
+                    }];
+                    events.extend(auxiliary_track.events);
+                    events.sort_by_key(|event| (event.tick, event.order));
+                    let mut track_bytes = Vec::new();
+                    let mut previous_tick = 0_u64;
+                    for event in events {
+                        write_delta(&mut track_bytes, event.tick.saturating_sub(previous_tick))?;
+                        track_bytes.extend_from_slice(&event.bytes);
+                        previous_tick = event.tick;
+                    }
+                    write_end_of_track(
+                        &mut track_bytes,
+                        auxiliary_end_tick.saturating_sub(previous_tick),
                     )?;
                     append_track_chunk(&mut output, track_bytes)?;
                 }
