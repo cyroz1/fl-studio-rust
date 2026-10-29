@@ -46,7 +46,7 @@ pub const INSTANCE_PROBE_FLAG: &str = "--clap-instance-probe";
 pub const NOTE_PREVIEW_FLAG: &str = "--clap-note-preview";
 pub const NOTE_PREVIEW_SERVER_FLAG: &str = "--clap-note-preview-server";
 pub const MIXER_EFFECT_SERVER_FLAG: &str = "--clap-mixer-effect-server";
-pub const MIXER_EFFECT_EDITOR_FLAG: &str = "--clap-mixer-effect-editor";
+pub const PLUGIN_EDITOR_FLAG: &str = "--clap-plugin-editor";
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_PROBE_OUTPUT_BYTES: usize = 1024 * 1024;
@@ -123,9 +123,9 @@ impl HostHandlers for ClapMixerEffectHost {
     }
 }
 
-struct ClapMixerEffectEditorHost;
+struct ClapPluginEditorHost;
 
-struct ClapMixerEffectEditorHostShared {
+struct ClapPluginEditorHostShared {
     parameter_flush_requested: Arc<AtomicBool>,
     gui_closed: Arc<AtomicBool>,
     gui_was_destroyed: Arc<AtomicBool>,
@@ -134,11 +134,11 @@ struct ClapMixerEffectEditorHostShared {
     resize_requested: Arc<Mutex<Option<GuiSize>>>,
 }
 
-struct ClapMixerEffectEditorHostMainThread;
+struct ClapPluginEditorHostMainThread;
 
-struct ClapMixerEffectEditorHostAudioProcessor;
+struct ClapPluginEditorHostAudioProcessor;
 
-impl SharedHandler<'_> for ClapMixerEffectEditorHostShared {
+impl SharedHandler<'_> for ClapPluginEditorHostShared {
     fn request_restart(&self) {}
 
     fn request_process(&self) {}
@@ -146,11 +146,11 @@ impl SharedHandler<'_> for ClapMixerEffectEditorHostShared {
     fn request_callback(&self) {}
 }
 
-impl MainThreadHandler<'_> for ClapMixerEffectEditorHostMainThread {}
+impl MainThreadHandler<'_> for ClapPluginEditorHostMainThread {}
 
-impl AudioProcessorHandler<'_> for ClapMixerEffectEditorHostAudioProcessor {}
+impl AudioProcessorHandler<'_> for ClapPluginEditorHostAudioProcessor {}
 
-impl HostGuiImpl for ClapMixerEffectEditorHostShared {
+impl HostGuiImpl for ClapPluginEditorHostShared {
     fn resize_hints_changed(&self) {}
 
     fn request_resize(&self, new_size: GuiSize) -> Result<(), HostError> {
@@ -183,23 +183,23 @@ impl HostGuiImpl for ClapMixerEffectEditorHostShared {
     }
 }
 
-impl HostParamsImplShared for ClapMixerEffectEditorHostShared {
+impl HostParamsImplShared for ClapPluginEditorHostShared {
     fn request_flush(&self) {
         self.parameter_flush_requested
             .store(true, Ordering::Release);
     }
 }
 
-impl HostParamsImplMainThread for ClapMixerEffectEditorHostMainThread {
+impl HostParamsImplMainThread for ClapPluginEditorHostMainThread {
     fn rescan(&self, _flags: ParamRescanFlags) {}
 
     fn clear(&self, _param_id: ClapId, _flags: ParamClearFlags) {}
 }
 
-impl HostHandlers for ClapMixerEffectEditorHost {
-    type Shared<'a> = ClapMixerEffectEditorHostShared;
-    type MainThread<'a> = ClapMixerEffectEditorHostMainThread;
-    type AudioProcessor<'a> = ClapMixerEffectEditorHostAudioProcessor;
+impl HostHandlers for ClapPluginEditorHost {
+    type Shared<'a> = ClapPluginEditorHostShared;
+    type MainThread<'a> = ClapPluginEditorHostMainThread;
+    type AudioProcessor<'a> = ClapPluginEditorHostAudioProcessor;
 
     fn declare_extensions(builder: &mut HostExtensions<Self>, _shared: &Self::Shared<'_>) {
         builder.register::<HostGui>().register::<HostParams>();
@@ -1077,25 +1077,25 @@ enum ClapMixerEffectProcessResponse {
     Error(String),
 }
 
-pub struct ClapMixerEffectEditorOutput {
+pub struct ClapPluginEditorOutput {
     pub state: Option<Vec<u8>>,
     pub parameter_overrides: BTreeMap<u32, f64>,
 }
 
-pub enum ClapMixerEffectEditorEvent {
+pub enum ClapPluginEditorEvent {
     LiveParameters(BTreeMap<u32, f64>),
-    Finished(Result<ClapMixerEffectEditorOutput, String>),
+    Finished(Result<ClapPluginEditorOutput, String>),
 }
 
-type ClapMixerEffectEditorInput = (Option<Vec<u8>>, BTreeMap<u32, f64>);
+type ClapPluginEditorInput = (Option<Vec<u8>>, BTreeMap<u32, f64>);
 
-pub struct ClapMixerEffectEditorProcess {
+pub struct ClapPluginEditorProcess {
     child: Arc<Mutex<Child>>,
-    responses: Receiver<ClapMixerEffectEditorEvent>,
+    responses: Receiver<ClapPluginEditorEvent>,
     completed: Arc<AtomicBool>,
 }
 
-impl ClapMixerEffectEditorProcess {
+impl ClapPluginEditorProcess {
     pub fn spawn(
         path: &Path,
         plugin_id: &str,
@@ -1113,7 +1113,7 @@ impl ClapMixerEffectEditorProcess {
         let executable = std::env::current_exe()
             .map_err(|error| format!("could not locate the CLAP editor helper: {error}"))?;
         let mut child = Command::new(executable)
-            .arg(MIXER_EFFECT_EDITOR_FLAG)
+            .arg(PLUGIN_EDITOR_FLAG)
             .arg(path)
             .arg(plugin_id)
             .stdin(Stdio::piped())
@@ -1171,8 +1171,8 @@ impl ClapMixerEffectEditorProcess {
         let (response_sender, responses) = mpsc::channel();
         let live_sender = response_sender.clone();
         thread::Builder::new()
-            .name("clap-mixer-effect-editor-live-parameters".to_owned())
-            .spawn(move || read_mixer_effect_editor_live_parameters(stderr, live_sender))
+            .name("clap-plugin-editor-live-parameters".to_owned())
+            .spawn(move || read_plugin_editor_live_parameters(stderr, live_sender))
             .map_err(|error| {
                 let mut child = child
                     .lock()
@@ -1182,9 +1182,9 @@ impl ClapMixerEffectEditorProcess {
                 format!("could not start the CLAP editor parameter reader: {error}")
             })?;
         thread::Builder::new()
-            .name("clap-mixer-effect-editor-response".to_owned())
+            .name("clap-plugin-editor-response".to_owned())
             .spawn(move || {
-                let result = read_mixer_effect_editor_response(stdout).and_then(|response| {
+                let result = read_plugin_editor_response(stdout).and_then(|response| {
                     let deadline = Instant::now() + CLAP_MIXER_EFFECT_PROCESS_TIMEOUT;
                     loop {
                         let status = worker_child
@@ -1216,7 +1216,7 @@ impl ClapMixerEffectEditorProcess {
                     }
                 });
                 worker_completed.store(true, Ordering::Release);
-                let _ = response_sender.send(ClapMixerEffectEditorEvent::Finished(result));
+                let _ = response_sender.send(ClapPluginEditorEvent::Finished(result));
             })
             .map_err(|error| {
                 let mut child = child
@@ -1234,12 +1234,12 @@ impl ClapMixerEffectEditorProcess {
         })
     }
 
-    pub fn try_recv(&self) -> Result<ClapMixerEffectEditorEvent, mpsc::TryRecvError> {
+    pub fn try_recv(&self) -> Result<ClapPluginEditorEvent, mpsc::TryRecvError> {
         self.responses.try_recv()
     }
 }
 
-impl Drop for ClapMixerEffectEditorProcess {
+impl Drop for ClapPluginEditorProcess {
     fn drop(&mut self) {
         if self.completed.load(Ordering::Acquire) {
             return;
@@ -2932,16 +2932,16 @@ pub fn run_mixer_effect_server_child(path: &Path, plugin_id: &str, sample_rate: 
     }
 }
 
-pub fn run_mixer_effect_editor_child(path: &Path, plugin_id: &str) -> i32 {
+pub fn run_plugin_editor_child(path: &Path, plugin_id: &str) -> i32 {
     let stdin = std::io::stdin();
     let mut input = BufReader::new(stdin.lock());
-    let result = read_mixer_effect_editor_input(&mut input).and_then(|(state, parameters)| {
-        run_mixer_effect_editor_ui(path, plugin_id, state.as_deref(), &parameters)
+    let result = read_plugin_editor_input(&mut input).and_then(|(state, parameters)| {
+        run_plugin_editor_ui(path, plugin_id, state.as_deref(), &parameters)
     });
     let stdout = std::io::stdout();
     let mut output = BufWriter::new(stdout.lock());
     match result {
-        Ok(result) => match write_mixer_effect_editor_response(&mut output, &result) {
+        Ok(result) => match write_plugin_editor_response(&mut output, &result) {
             Ok(()) => 0,
             Err(error) => {
                 eprintln!("could not return CLAP editor state: {error}");
@@ -4268,10 +4268,7 @@ fn write_preview_server_state(output: &mut impl Write, state: &[u8]) -> std::io:
     output.flush()
 }
 
-fn read_mixer_effect_editor_live_parameters(
-    stderr: ChildStderr,
-    sender: Sender<ClapMixerEffectEditorEvent>,
-) {
+fn read_plugin_editor_live_parameters(stderr: ChildStderr, sender: Sender<ClapPluginEditorEvent>) {
     let mut input = BufReader::new(stderr);
     loop {
         let line = match read_bounded_editor_stderr_line(&mut input, 128) {
@@ -4301,9 +4298,10 @@ fn read_mixer_effect_editor_live_parameters(
             continue;
         };
         if sender
-            .send(ClapMixerEffectEditorEvent::LiveParameters(BTreeMap::from(
-                [(parameter_id, value)],
-            )))
+            .send(ClapPluginEditorEvent::LiveParameters(BTreeMap::from([(
+                parameter_id,
+                value,
+            )])))
             .is_err()
         {
             break;
@@ -4352,9 +4350,7 @@ fn read_bounded_editor_stderr_line(
     }
 }
 
-fn read_mixer_effect_editor_input(
-    input: &mut impl Read,
-) -> Result<ClapMixerEffectEditorInput, String> {
+fn read_plugin_editor_input(input: &mut impl Read) -> Result<ClapPluginEditorInput, String> {
     let state_header = read_preview_protocol_header(input)
         .map_err(|error| format!("could not read CLAP editor state header: {error}"))?
         .ok_or_else(|| "CLAP editor request ended before its state header".to_owned())?;
@@ -4439,9 +4435,7 @@ fn read_mixer_effect_editor_input(
     Ok((state, parameter_values))
 }
 
-fn read_mixer_effect_editor_response(
-    output: ChildStdout,
-) -> Result<ClapMixerEffectEditorOutput, String> {
+fn read_plugin_editor_response(output: ChildStdout) -> Result<ClapPluginEditorOutput, String> {
     let mut input = BufReader::new(output);
     let header = read_preview_protocol_header(&mut input)
         .map_err(|error| format!("could not read CLAP editor result: {error}"))?
@@ -4524,15 +4518,15 @@ fn read_mixer_effect_editor_response(
     {
         return Err("CLAP editor helper returned trailing data".to_owned());
     }
-    Ok(ClapMixerEffectEditorOutput {
+    Ok(ClapPluginEditorOutput {
         state,
         parameter_overrides,
     })
 }
 
-fn write_mixer_effect_editor_response(
+fn write_plugin_editor_response(
     output: &mut impl Write,
-    result: &ClapMixerEffectEditorOutput,
+    result: &ClapPluginEditorOutput,
 ) -> std::io::Result<()> {
     if result
         .state
@@ -4649,7 +4643,7 @@ impl Write for LimitedClapStateWriter {
 }
 
 #[derive(Clone)]
-struct ClapMixerEffectEditorSignals {
+struct ClapPluginEditorSignals {
     parameter_flush_requested: Arc<AtomicBool>,
     gui_closed: Arc<AtomicBool>,
     gui_was_destroyed: Arc<AtomicBool>,
@@ -4658,7 +4652,7 @@ struct ClapMixerEffectEditorSignals {
     resize_requested: Arc<Mutex<Option<GuiSize>>>,
 }
 
-impl ClapMixerEffectEditorSignals {
+impl ClapPluginEditorSignals {
     fn new() -> Self {
         Self {
             parameter_flush_requested: Arc::new(AtomicBool::new(false)),
@@ -4670,8 +4664,8 @@ impl ClapMixerEffectEditorSignals {
         }
     }
 
-    fn host_shared(&self) -> ClapMixerEffectEditorHostShared {
-        ClapMixerEffectEditorHostShared {
+    fn host_shared(&self) -> ClapPluginEditorHostShared {
+        ClapPluginEditorHostShared {
             parameter_flush_requested: Arc::clone(&self.parameter_flush_requested),
             gui_closed: Arc::clone(&self.gui_closed),
             gui_was_destroyed: Arc::clone(&self.gui_was_destroyed),
@@ -4682,9 +4676,9 @@ impl ClapMixerEffectEditorSignals {
     }
 }
 
-struct ClapMixerEffectEditorSession {
-    instance: PluginInstance<ClapMixerEffectEditorHost>,
-    signals: ClapMixerEffectEditorSignals,
+struct ClapPluginEditorSession {
+    instance: PluginInstance<ClapPluginEditorHost>,
+    signals: ClapPluginEditorSignals,
     gui: Option<PluginGui>,
     gui_created: bool,
     gui_floating: bool,
@@ -4692,7 +4686,7 @@ struct ClapMixerEffectEditorSession {
     parameter_values_before_editor: BTreeMap<u32, f64>,
 }
 
-impl ClapMixerEffectEditorSession {
+impl ClapPluginEditorSession {
     fn new(
         path: &Path,
         plugin_id: &str,
@@ -4713,11 +4707,11 @@ impl ClapMixerEffectEditorSession {
             env!("CARGO_PKG_VERSION"),
         )
         .map_err(|error| format!("could not describe the host to the CLAP plug-in: {error}"))?;
-        let signals = ClapMixerEffectEditorSignals::new();
+        let signals = ClapPluginEditorSignals::new();
         let shared_signals = signals.clone();
-        let mut instance = PluginInstance::<ClapMixerEffectEditorHost>::new(
+        let mut instance = PluginInstance::<ClapPluginEditorHost>::new(
             move |_| shared_signals.host_shared(),
-            |_| ClapMixerEffectEditorHostMainThread,
+            |_| ClapPluginEditorHostMainThread,
             &entry,
             &plugin_id,
             &host_info,
@@ -4727,11 +4721,11 @@ impl ClapMixerEffectEditorSession {
             let plugin = instance.plugin_handle();
             let state_extension = plugin
                 .get_extension::<PluginState>()
-                .ok_or_else(|| "CLAP effect does not support state restoration".to_owned())?;
+                .ok_or_else(|| "CLAP plug-in does not support state restoration".to_owned())?;
             let mut input = std::io::Cursor::new(state);
             state_extension
                 .load(&plugin, &mut input)
-                .map_err(|error| format!("CLAP effect could not restore its state: {error}"))?;
+                .map_err(|error| format!("CLAP plug-in could not restore its state: {error}"))?;
         }
         if !parameter_overrides.is_empty() {
             apply_clap_editor_parameter_overrides(&mut instance, parameter_overrides)?;
@@ -4758,7 +4752,7 @@ impl ClapMixerEffectEditorSession {
         let plugin = self.instance.plugin_handle();
         let gui = plugin
             .get_extension::<PluginGui>()
-            .ok_or_else(|| "CLAP effect does not expose a native editor".to_owned())?;
+            .ok_or_else(|| "CLAP plug-in does not expose a native editor".to_owned())?;
         let configurations = if api_type.supports_embedding() {
             [
                 Some(GuiConfiguration {
@@ -4785,7 +4779,7 @@ impl ClapMixerEffectEditorSession {
             .find(|configuration| gui.is_api_supported(&plugin, *configuration))
             .ok_or_else(|| {
                 format!(
-                    "CLAP effect does not support a native editor on {}",
+                    "CLAP plug-in does not support a native editor on {}",
                     api_type.0.to_string_lossy()
                 )
             })?;
@@ -4808,7 +4802,7 @@ impl ClapMixerEffectEditorSession {
             height: 600,
         });
         if configuration.is_floating {
-            let title = CString::new("CLAP Mixer editor")
+            let title = CString::new("CLAP plug-in editor")
                 .expect("constant editor title contains no null byte");
             gui.suggest_title(&plugin, &title);
             // SAFETY: `parent` is a live eframe window and remains alive until `gui.destroy`.
@@ -4886,7 +4880,7 @@ impl ClapMixerEffectEditorSession {
         let count = params.count(&plugin);
         if count > MAX_INSTANCE_METADATA_ITEMS {
             return Err(format!(
-                "CLAP effect exposes {count} parameters; the metadata limit is {MAX_INSTANCE_METADATA_ITEMS}"
+                "CLAP plug-in exposes {count} parameters; the metadata limit is {MAX_INSTANCE_METADATA_ITEMS}"
             ));
         }
         let mut buffer = ParamInfoBuffer::new();
@@ -4923,7 +4917,7 @@ impl ClapMixerEffectEditorSession {
         if writer.exceeded_limit {
             return Err("CLAP plug-in state exceeds the 32 MiB limit".to_owned());
         }
-        save_result.map_err(|error| format!("CLAP effect could not save its state: {error}"))?;
+        save_result.map_err(|error| format!("CLAP plug-in could not save its state: {error}"))?;
         Ok(Some(writer.bytes))
     }
 
@@ -4936,7 +4930,7 @@ impl ClapMixerEffectEditorSession {
         }
     }
 
-    fn close_and_capture(&mut self) -> Result<ClapMixerEffectEditorOutput, String> {
+    fn close_and_capture(&mut self) -> Result<ClapPluginEditorOutput, String> {
         if self.gui_created {
             if let Some(gui) = self.gui {
                 gui.destroy(&self.instance.plugin_handle());
@@ -4953,14 +4947,14 @@ impl ClapMixerEffectEditorSession {
             })
             .collect();
         let state = self.save_state()?;
-        Ok(ClapMixerEffectEditorOutput {
+        Ok(ClapPluginEditorOutput {
             state,
             parameter_overrides,
         })
     }
 }
 
-impl Drop for ClapMixerEffectEditorSession {
+impl Drop for ClapPluginEditorSession {
     fn drop(&mut self) {
         if self.gui_created {
             if let Some(gui) = self.gui {
@@ -4972,21 +4966,21 @@ impl Drop for ClapMixerEffectEditorSession {
 }
 
 fn apply_clap_editor_parameter_overrides(
-    instance: &mut PluginInstance<ClapMixerEffectEditorHost>,
+    instance: &mut PluginInstance<ClapPluginEditorHost>,
     parameter_overrides: &BTreeMap<u32, f64>,
 ) -> Result<(), String> {
     let params = {
         let plugin = instance.plugin_handle();
         plugin
             .get_extension::<PluginParams>()
-            .ok_or_else(|| "CLAP effect does not expose parameters".to_owned())?
+            .ok_or_else(|| "CLAP plug-in does not expose parameters".to_owned())?
     };
     let ranges = {
         let plugin = instance.plugin_handle();
         let count = params.count(&plugin);
         if count > MAX_INSTANCE_METADATA_ITEMS {
             return Err(format!(
-                "CLAP effect exposes {count} parameters; the metadata limit is {MAX_INSTANCE_METADATA_ITEMS}"
+                "CLAP plug-in exposes {count} parameters; the metadata limit is {MAX_INSTANCE_METADATA_ITEMS}"
             ));
         }
         let mut ranges = BTreeMap::new();
@@ -5063,9 +5057,9 @@ fn clap_editor_parent_window<'a>(
     }
 }
 
-struct ClapMixerEffectEditorApp {
-    session: Option<ClapMixerEffectEditorSession>,
-    result: Arc<Mutex<Option<Result<ClapMixerEffectEditorOutput, String>>>>,
+struct ClapPluginEditorApp {
+    session: Option<ClapPluginEditorSession>,
+    result: Arc<Mutex<Option<Result<ClapPluginEditorOutput, String>>>>,
     last_reported_parameter_values: BTreeMap<u32, f64>,
     initial_window_size: egui::Vec2,
     initial_window_size_applied: bool,
@@ -5073,7 +5067,7 @@ struct ClapMixerEffectEditorApp {
     last_parameter_poll: Instant,
 }
 
-impl ClapMixerEffectEditorApp {
+impl ClapPluginEditorApp {
     fn finish(&mut self) {
         let Some(mut session) = self.session.take() else {
             return;
@@ -5086,7 +5080,7 @@ impl ClapMixerEffectEditorApp {
     }
 }
 
-impl eframe::App for ClapMixerEffectEditorApp {
+impl eframe::App for ClapPluginEditorApp {
     fn on_exit(&mut self) {
         self.finish();
     }
@@ -5163,19 +5157,19 @@ impl eframe::App for ClapMixerEffectEditorApp {
     }
 }
 
-impl Drop for ClapMixerEffectEditorApp {
+impl Drop for ClapPluginEditorApp {
     fn drop(&mut self) {
         self.finish();
     }
 }
 
-fn run_mixer_effect_editor_ui(
+fn run_plugin_editor_ui(
     path: &Path,
     plugin_id: &str,
     state: Option<&[u8]>,
     parameter_overrides: &BTreeMap<u32, f64>,
-) -> Result<ClapMixerEffectEditorOutput, String> {
-    let session = ClapMixerEffectEditorSession::new(path, plugin_id, state, parameter_overrides)?;
+) -> Result<ClapPluginEditorOutput, String> {
+    let session = ClapPluginEditorSession::new(path, plugin_id, state, parameter_overrides)?;
     let output = Arc::new(Mutex::new(None));
     let app_output = Arc::clone(&output);
     let options = eframe::NativeOptions {
@@ -5187,7 +5181,7 @@ fn run_mixer_effect_editor_ui(
         ..Default::default()
     };
     let run_result = eframe::run_native(
-        "CLAP Mixer editor",
+        "CLAP plug-in editor",
         options,
         Box::new(move |creation| {
             let mut session = session;
@@ -5195,7 +5189,7 @@ fn run_mixer_effect_editor_ui(
                 Box::new(std::io::Error::other(error)) as Box<dyn std::error::Error + Send + Sync>
             })?;
             let last_reported_parameter_values = session.parameter_values_before_editor.clone();
-            Ok(Box::new(ClapMixerEffectEditorApp {
+            Ok(Box::new(ClapPluginEditorApp {
                 session: Some(session),
                 result: app_output,
                 last_reported_parameter_values,

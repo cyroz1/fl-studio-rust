@@ -9,13 +9,15 @@ const CLAP_PROJECT_INSTRUMENTS_DIRECTORY: &str = "clap-project-instruments";
 const CLAP_PROJECT_MIXER_EFFECTS_DIRECTORY: &str = "clap-project-mixer-effects";
 pub const MAX_CLAP_PROJECT_PLUGIN_STATE_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_CLAP_PROJECT_MIXER_AUXILIARY_BUSES: usize = 16;
+const MAX_CLAP_PROJECT_PARAMETER_OVERRIDES: usize = 512;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ClapProjectInstrumentAssignment {
     pub path: PathBuf,
     pub plugin_id: String,
     pub plugin_name: String,
     pub state: Option<Vec<u8>>,
+    pub parameter_overrides: BTreeMap<u32, f64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -159,9 +161,14 @@ pub fn save_clap_project_instruments(
             .state
             .as_ref()
             .is_some_and(|state| state.len() > MAX_CLAP_PROJECT_PLUGIN_STATE_BYTES)
+            || assignment.parameter_overrides.len() > MAX_CLAP_PROJECT_PARAMETER_OVERRIDES
+            || assignment
+                .parameter_overrides
+                .values()
+                .any(|value| !value.is_finite())
     }) {
         return Err(format!(
-            "CLAP plug-in state exceeds the {} MiB project limit",
+            "CLAP plug-in state exceeds the {} MiB limit or parameter overrides are invalid",
             MAX_CLAP_PROJECT_PLUGIN_STATE_BYTES / (1024 * 1024)
         ));
     }
@@ -278,7 +285,7 @@ pub fn parse_clap_project_mixer_effects(
             let Some(encoded_overrides) = fields.next() else {
                 continue;
             };
-            let Some(overrides) = parse_clap_mixer_parameter_overrides(encoded_overrides) else {
+            let Some(overrides) = parse_clap_parameter_overrides(encoded_overrides) else {
                 continue;
             };
             overrides
@@ -411,7 +418,7 @@ fn parse_clap_mixer_auxiliary_input_source_map(
     Some(Some(mapping))
 }
 
-fn parse_clap_mixer_parameter_overrides(encoded: &str) -> Option<BTreeMap<u32, f64>> {
+fn parse_clap_parameter_overrides(encoded: &str) -> Option<BTreeMap<u32, f64>> {
     if encoded == "-" {
         return Some(BTreeMap::new());
     }
@@ -423,11 +430,22 @@ fn parse_clap_mixer_parameter_overrides(encoded: &str) -> Option<BTreeMap<u32, f
         if !value.is_finite() || overrides.insert(parameter_id, value).is_some() {
             return None;
         }
-        if overrides.len() > 512 {
+        if overrides.len() > MAX_CLAP_PROJECT_PARAMETER_OVERRIDES {
             return None;
         }
     }
     Some(overrides)
+}
+
+fn serialize_clap_parameter_overrides(overrides: &BTreeMap<u32, f64>) -> String {
+    if overrides.is_empty() {
+        return "-".to_owned();
+    }
+    overrides
+        .iter()
+        .map(|(parameter_id, value)| format!("{parameter_id}:{:016x}", value.to_bits()))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 pub fn parse_clap_project_instruments(
@@ -438,6 +456,7 @@ pub fn parse_clap_project_instruments(
     let version = match lines.next() {
         Some("clap-project-instruments-v1") => 1,
         Some("clap-project-instruments-v2") => 2,
+        Some("clap-project-instruments-v3") => 3,
         _ => return assignments,
     };
     for line in lines {
@@ -454,7 +473,7 @@ pub fn parse_clap_project_instruments(
         let Some(plugin_name) = fields.next().and_then(decode_plugin_uid) else {
             continue;
         };
-        let state = if version == 2 {
+        let state = if version >= 2 {
             let Some(encoded_state) = fields.next() else {
                 continue;
             };
@@ -471,6 +490,15 @@ pub fn parse_clap_project_instruments(
         } else {
             None
         };
+        let parameter_overrides = if version >= 3 {
+            let Some(parameter_overrides) = fields.next().and_then(parse_clap_parameter_overrides)
+            else {
+                continue;
+            };
+            parameter_overrides
+        } else {
+            BTreeMap::new()
+        };
         if fields.next().is_some()
             || path.as_os_str().is_empty()
             || plugin_id.is_empty()
@@ -485,6 +513,7 @@ pub fn parse_clap_project_instruments(
                 plugin_id,
                 plugin_name,
                 state,
+                parameter_overrides,
             },
         );
     }
@@ -494,7 +523,7 @@ pub fn parse_clap_project_instruments(
 pub fn serialize_clap_project_instruments(
     assignments: &BTreeMap<u16, ClapProjectInstrumentAssignment>,
 ) -> String {
-    let mut contents = String::from("clap-project-instruments-v2\n");
+    let mut contents = String::from("clap-project-instruments-v3\n");
     for (channel_id, assignment) in assignments {
         if assignment.path.as_os_str().is_empty()
             || assignment.plugin_id.is_empty()
@@ -515,6 +544,10 @@ pub fn serialize_clap_project_instruments(
         } else {
             contents.push('-');
         }
+        contents.push('\t');
+        contents.push_str(&serialize_clap_parameter_overrides(
+            &assignment.parameter_overrides,
+        ));
         contents.push('\n');
     }
     contents
@@ -743,6 +776,7 @@ mod tests {
                 plugin_id: "org.example\tvoice".to_owned(),
                 plugin_name: "Écho\nMk II".to_owned(),
                 state: Some(vec![0, 1, 0xff, b'\n']),
+                parameter_overrides: BTreeMap::new(),
             },
         )]);
 
@@ -777,6 +811,7 @@ mod tests {
                 plugin_id: "id".to_owned(),
                 plugin_name: "name".to_owned(),
                 state: None,
+                parameter_overrides: BTreeMap::new(),
             })
         );
     }
@@ -795,6 +830,7 @@ mod tests {
                 plugin_id: "org.example.synth".to_owned(),
                 plugin_name: "Example Synth".to_owned(),
                 state: None,
+                parameter_overrides: BTreeMap::new(),
             },
         )]);
 
