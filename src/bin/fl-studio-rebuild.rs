@@ -58,7 +58,7 @@ use flp_rebuild::sample_render::{
     render_playlist_with_vst3_to_flac_cancellable, render_playlist_with_vst3_to_mp3_cancellable,
     render_playlist_with_vst3_to_ogg_cancellable, render_playlist_with_vst3_to_wav_cancellable,
     render_sampler_pattern_to_file, render_sampler_pattern_to_file_with_mixer_effects,
-    render_selected_audio_clip_to_file_with_mixer_effects, sampler_live_note_queue,
+    render_selected_audio_clips_to_file_with_mixer_effects, sampler_live_note_queue,
     stream_input_monitor_through_mixer, stream_mixed_layer_midi_input_to_device,
     stream_pattern_loop_with_vst3_from_tick_to_device_with_live_controls,
     stream_pattern_with_vst3_to_device_with_live_controls,
@@ -5386,7 +5386,7 @@ struct PendingAudioClipExport {
     receiver: Receiver<Result<AudioClipRenderSummary, String>>,
     worker: Option<thread::JoinHandle<()>>,
     output_path: PathBuf,
-    selected_clip_index: Option<usize>,
+    selected_clip_indices: Option<Vec<usize>>,
     start_from_song_start: bool,
     action: SelectedAudioClipRenderAction,
     source: Option<PendingAudioClipSource>,
@@ -8918,6 +8918,49 @@ impl DawUi {
                 channel.id() == id && channel.kind() == Some(4) && channel.enabled() != Some(false)
             })
             .then_some((arrangement_id, clip_index))
+    }
+
+    fn selected_playlist_audio_clips(&self) -> Option<(u16, Vec<usize>)> {
+        let arrangement_id = self.selected_arrangement.unwrap_or_default();
+        let clip_indices = if self.selected_arrangement == Some(arrangement_id)
+            && self.selected_playlist_clips.len() > 1
+        {
+            let mut clip_indices = self
+                .selected_playlist_clips
+                .iter()
+                .copied()
+                .collect::<Vec<_>>();
+            clip_indices.sort_unstable();
+            clip_indices
+        } else {
+            vec![self.selected_clip?]
+        };
+        let document = self.document.as_ref()?;
+        let arrangement = document
+            .arrangements()
+            .ok()?
+            .into_iter()
+            .find(|arrangement| arrangement.id == arrangement_id)?;
+        let channels = document.channels();
+        clip_indices
+            .iter()
+            .all(|clip_index| {
+                arrangement
+                    .clips
+                    .get(*clip_index)
+                    .and_then(|clip| match clip.target() {
+                        PlaylistClipTarget::Channel { id } => Some(id),
+                        PlaylistClipTarget::Pattern { .. } => None,
+                    })
+                    .is_some_and(|channel_id| {
+                        channels.iter().any(|channel| {
+                            channel.id() == channel_id
+                                && channel.kind() == Some(4)
+                                && channel.enabled() != Some(false)
+                        })
+                    })
+            })
+            .then_some((arrangement_id, clip_indices))
     }
 
     fn selected_playlist_pattern_clip(&self) -> Option<(u16, usize)> {
@@ -14528,12 +14571,29 @@ impl DawUi {
                         self.render_audio_clips_dialog();
                         ui.close();
                     }
-                    ui.menu_button("Render selected Audio Clip…", |ui| {
-                        let can_render = self.selected_playlist_audio_clip().is_some()
+                    let selected_audio_clips = self.selected_playlist_audio_clips();
+                    let render_audio_clips_label = if selected_audio_clips
+                        .as_ref()
+                        .is_some_and(|(_, indices)| indices.len() > 1)
+                    {
+                        "Render selected Audio Clips…"
+                    } else {
+                        "Render selected Audio Clip…"
+                    };
+                    let audio_clip_start_choice = if selected_audio_clips
+                        .as_ref()
+                        .is_some_and(|(_, indices)| indices.len() > 1)
+                    {
+                        "From earliest clip start…"
+                    } else {
+                        "From clip start…"
+                    };
+                    ui.menu_button(render_audio_clips_label, |ui| {
+                        let can_render = selected_audio_clips.is_some()
                             && self.sample_project_path().is_some()
                             && self.pending_audio_clip_export.is_none();
                         if ui
-                            .add_enabled(can_render, egui::Button::new("From clip start…"))
+                            .add_enabled(can_render, egui::Button::new(audio_clip_start_choice))
                             .clicked()
                         {
                             self.render_selected_audio_clip_dialog(
@@ -42286,10 +42346,21 @@ impl DawUi {
         start_from_song_start: bool,
         action: SelectedAudioClipRenderAction,
     ) {
-        let Some((arrangement_id, clip_index)) = self.selected_playlist_audio_clip() else {
+        let selection = if action == SelectedAudioClipRenderAction::Export {
+            self.selected_playlist_audio_clips()
+        } else {
+            self.selected_playlist_audio_clip()
+                .map(|(arrangement_id, clip_index)| (arrangement_id, vec![clip_index]))
+        };
+        let Some((arrangement_id, clip_indices)) = selection else {
             self.status = "Select an enabled audio-channel clip in the Playlist first".to_owned();
             return;
         };
+        let Some(clip_index) = clip_indices.first().copied() else {
+            self.status = "Select an enabled audio-channel clip in the Playlist first".to_owned();
+            return;
+        };
+        let is_group = clip_indices.len() > 1;
         if self.pending_audio_clip_export.is_some() {
             self.status = "An audio clip render is already running".to_owned();
             return;
@@ -42319,29 +42390,39 @@ impl DawUi {
             SelectedAudioClipRenderAction::Insert => "Render and insert",
             SelectedAudioClipRenderAction::Consolidate => "Consolidate",
         };
+        let start_suffix = if start_from_song_start {
+            "song_start"
+        } else if is_group {
+            "earliest_start"
+        } else {
+            "clip_start"
+        };
+        let action_suffix = match action {
+            SelectedAudioClipRenderAction::Export => "",
+            SelectedAudioClipRenderAction::Insert => "_inserted",
+            SelectedAudioClipRenderAction::Consolidate => "_consolidated",
+        };
         let Some(output_path) = add_audio_render_file_filter(
             rfd::FileDialog::new()
                 .set_title(format!(
-                    "{operation} selected Playlist audio clip from {}",
+                    "{operation} selected Playlist audio {} from {}",
+                    if is_group { "clips" } else { "clip" },
                     if start_from_song_start {
                         "song start"
+                    } else if is_group {
+                        "earliest clip start"
                     } else {
                         "clip start"
                     }
                 ))
                 .set_file_name(format!(
-                    "{project_stem}_clip_{}_{}{}.{}",
-                    clip_index + 1,
-                    if start_from_song_start {
-                        "song_start"
+                    "{project_stem}_{}_{start_suffix}{}.{}",
+                    if is_group {
+                        format!("clips_{}", clip_indices.len())
                     } else {
-                        "clip_start"
+                        format!("clip_{}", clip_index + 1)
                     },
-                    match action {
-                        SelectedAudioClipRenderAction::Export => "",
-                        SelectedAudioClipRenderAction::Insert => "_inserted",
-                        SelectedAudioClipRenderAction::Consolidate => "_consolidated",
-                    },
+                    action_suffix,
                     output_format.extension()
                 )),
             output_format,
@@ -42356,7 +42437,8 @@ impl DawUi {
             wav_dither_mode: self.playlist_render_dither_mode,
             wav_channel_mode: self.playlist_render_channel_mode,
             resampling_quality: self.playlist_render_quality,
-            clip_index: Some(clip_index),
+            clip_index: (!is_group).then_some(clip_index),
+            clip_indices: if is_group { clip_indices } else { Vec::new() },
             start_from_song_start,
             soloed_playlist_track_range: self.soloed_playlist_track_range,
             clip_envelopes: self.playlist_audio_clip_envelopes_for_current_project(arrangement_id),
@@ -42400,8 +42482,13 @@ impl DawUi {
             self.status = "An audio clip render is already running".to_owned();
             return;
         }
-        let mixer_effect_processor = match options.clip_index {
-            Some(selected_clip_index) if !self.mixer_effect_vst3_instances.is_empty() => {
+        let selected_clip_indices = if options.clip_indices.is_empty() {
+            options.clip_index.map(|clip_index| vec![clip_index])
+        } else {
+            Some(options.clip_indices.clone())
+        };
+        let mixer_effect_processor = match selected_clip_indices.as_deref() {
+            Some(selected_clip_indices) if !self.mixer_effect_vst3_instances.is_empty() => {
                 let Some(host) = self.vst3_host.as_ref() else {
                     self.status = "VST3 host is not initialized".to_owned();
                     return;
@@ -42411,7 +42498,7 @@ impl DawUi {
                     document,
                     options.arrangement_id,
                     options.sample_rate,
-                    selected_clip_index,
+                    selected_clip_indices,
                     options.soloed_playlist_track_range,
                     &self.mixer_effect_vst3_instances,
                     &automation_sources,
@@ -42440,7 +42527,7 @@ impl DawUi {
                 let _package_workspace = package_workspace;
                 let result = match mixer_effect_processor {
                     Some((processor, render_from_song_start)) => {
-                        render_selected_audio_clip_to_file_with_mixer_effects(
+                        render_selected_audio_clips_to_file_with_mixer_effects(
                             &document,
                             &project_path,
                             worker_options,
@@ -42462,18 +42549,21 @@ impl DawUi {
             });
         match worker {
             Ok(worker) => {
-                let selected_clip_index = options.clip_index;
                 self.pending_audio_clip_export = Some(PendingAudioClipExport {
                     receiver,
                     worker: Some(worker),
                     output_path: output_path.clone(),
-                    selected_clip_index,
+                    selected_clip_indices: selected_clip_indices.clone(),
                     start_from_song_start: options.start_from_song_start,
                     action,
                     source,
                 });
-                self.status = match (action, selected_clip_index) {
-                    (SelectedAudioClipRenderAction::Consolidate, Some(clip_index)) => format!(
+                let selected_clip_index = selected_clip_indices
+                    .as_ref()
+                    .filter(|indices| indices.len() == 1)
+                    .map(|indices| indices[0]);
+                self.status = match (action, selected_clip_index, selected_clip_indices.as_ref()) {
+                    (SelectedAudioClipRenderAction::Consolidate, Some(clip_index), _) => format!(
                         "Consolidating selected Playlist audio clip {} from {} to {}…",
                         clip_index + 1,
                         if options.start_from_song_start {
@@ -42483,7 +42573,7 @@ impl DawUi {
                         },
                         output_path.display()
                     ),
-                    (SelectedAudioClipRenderAction::Insert, Some(clip_index)) => format!(
+                    (SelectedAudioClipRenderAction::Insert, Some(clip_index), _) => format!(
                         "Rendering and inserting selected Playlist audio clip {} from {} to {}…",
                         clip_index + 1,
                         if options.start_from_song_start {
@@ -42493,7 +42583,7 @@ impl DawUi {
                         },
                         output_path.display()
                     ),
-                    (SelectedAudioClipRenderAction::Export, Some(clip_index)) => format!(
+                    (SelectedAudioClipRenderAction::Export, Some(clip_index), _) => format!(
                         "Rendering selected Playlist audio clip {} from {} to {}…",
                         clip_index + 1,
                         if options.start_from_song_start {
@@ -42503,7 +42593,17 @@ impl DawUi {
                         },
                         output_path.display()
                     ),
-                    (_, None) => format!(
+                    (SelectedAudioClipRenderAction::Export, None, Some(indices)) => format!(
+                        "Rendering {} selected Playlist Audio Clips from {} to {}…",
+                        indices.len(),
+                        if options.start_from_song_start {
+                            "song start"
+                        } else {
+                            "earliest clip start"
+                        },
+                        output_path.display()
+                    ),
+                    (_, None, _) => format!(
                         "Rendering Playlist audio clips to {}…",
                         output_path.display()
                     ),
@@ -42550,14 +42650,25 @@ impl DawUi {
                     );
                     return;
                 }
-                self.status = match pending.selected_clip_index {
-                    Some(clip_index) => format!(
+                self.status = match pending.selected_clip_indices.as_deref() {
+                    Some(selected_indices) if selected_indices.len() == 1 => format!(
                         "Rendered selected Playlist audio clip {} from {} to {} at {} Hz",
-                        clip_index + 1,
+                        selected_indices[0] + 1,
                         if pending.start_from_song_start {
                             "song start"
                         } else {
                             "clip start"
+                        },
+                        pending.output_path.display(),
+                        summary.sample_rate,
+                    ),
+                    Some(selected_indices) => format!(
+                        "Rendered {} selected Playlist Audio Clips from {} to {} at {} Hz",
+                        selected_indices.len(),
+                        if pending.start_from_song_start {
+                            "song start"
+                        } else {
+                            "earliest clip start"
                         },
                         pending.output_path.display(),
                         summary.sample_rate,

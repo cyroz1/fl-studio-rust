@@ -4862,7 +4862,7 @@ impl Vst3HostRuntime {
         document: &FlpDocument,
         arrangement_id: u16,
         output_sample_rate: u32,
-        selected_clip_index: usize,
+        selected_clip_indices: &[usize],
         soloed_playlist_track_range: Option<(u32, u32)>,
         mixer_effect_instances: &BTreeMap<(usize, u16), u64>,
         automation_sources: &Vst3PlaylistAutomationSources,
@@ -4873,13 +4873,24 @@ impl Vst3HostRuntime {
             .into_iter()
             .find(|arrangement| arrangement.id == arrangement_id)
             .ok_or_else(|| format!("arrangement {arrangement_id} was not found"))?;
-        let clip = arrangement
-            .clips
-            .get(selected_clip_index)
-            .ok_or_else(|| format!("Playlist clip {selected_clip_index} does not exist"))?;
-        let content_end_tick = u64::from(clip.position_ticks)
-            .checked_add(u64::from(clip.length_ticks))
-            .ok_or_else(|| "selected Audio Clip endpoint overflow".to_owned())?;
+        if selected_clip_indices.is_empty() {
+            return Err("Mixer-effect Audio Clip renders require a selected clip".to_owned());
+        }
+        let content_end_tick = selected_clip_indices
+            .iter()
+            .map(|clip_index| {
+                let clip = arrangement
+                    .clips
+                    .get(*clip_index)
+                    .ok_or_else(|| format!("Playlist clip {clip_index} does not exist"))?;
+                u64::from(clip.position_ticks)
+                    .checked_add(u64::from(clip.length_ticks))
+                    .ok_or_else(|| "selected Audio Clip endpoint overflow".to_owned())
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .max()
+            .ok_or_else(|| "Mixer-effect Audio Clip renders require a selected clip".to_owned())?;
         let options = PlaylistRenderOptions {
             arrangement_id,
             sample_rate: output_sample_rate,

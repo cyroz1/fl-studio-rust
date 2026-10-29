@@ -523,6 +523,8 @@ pub struct AudioClipRenderOptions {
     pub resampling_quality: ResamplingQuality,
     /// Render only this zero-based arrangement clip, rebased to output time zero.
     pub clip_index: Option<usize>,
+    /// Render only these zero-based arrangement clips as one relative-timeline selection.
+    pub clip_indices: Vec<usize>,
     /// Keep the selected clip at its original arrangement position in the output.
     pub start_from_song_start: bool,
     /// Render only this inclusive one-based Playlist track range when soloing.
@@ -693,6 +695,7 @@ impl Default for AudioClipRenderOptions {
             wav_channel_mode: WavChannelMode::Stereo,
             resampling_quality: ResamplingQuality::RENDER_DEFAULT,
             clip_index: None,
+            clip_indices: Vec::new(),
             start_from_song_start: false,
             soloed_playlist_track_range: None,
             clip_envelopes: Arc::new(Vec::new()),
@@ -2209,11 +2212,34 @@ pub fn render_selected_audio_clip_to_file_with_mixer_effects(
     options: AudioClipRenderOptions,
     output_path: impl AsRef<Path>,
     output_format: AudioRenderOutput,
+    processor: Vst3PlaylistStreamProcessor,
+    render_from_song_start: bool,
+) -> Result<AudioClipRenderSummary, String> {
+    render_selected_audio_clips_to_file_with_mixer_effects(
+        document,
+        project_path,
+        options,
+        output_path,
+        output_format,
+        processor,
+        render_from_song_start,
+    )
+}
+
+/// Render a selected Audio Clip or group through prepared loaded Mixer effects to an audio file.
+pub fn render_selected_audio_clips_to_file_with_mixer_effects(
+    document: &FlpDocument,
+    project_path: impl AsRef<Path>,
+    options: AudioClipRenderOptions,
+    output_path: impl AsRef<Path>,
+    output_format: AudioRenderOutput,
     mut processor: Vst3PlaylistStreamProcessor,
     render_from_song_start: bool,
 ) -> Result<AudioClipRenderSummary, String> {
-    if options.clip_index.is_none() {
-        return Err("Mixer-effect Audio Clip renders require one selected clip".to_owned());
+    if selected_audio_clip_indices(&options)?.is_none() {
+        return Err(
+            "Mixer-effect Audio Clip renders require a selected clip or clip group".to_owned(),
+        );
     }
     let project_path = project_path.as_ref();
     let output_path = output_path.as_ref();
@@ -2228,8 +2254,9 @@ pub fn render_selected_audio_clip_to_file_with_mixer_effects(
     require_audio_clips(&render)?;
     let clip_start_frame = render
         .clips
-        .first()
+        .iter()
         .map(|clip| clip.start_frame)
+        .min()
         .ok_or_else(|| "selected Audio Clip produced no render source".to_owned())?;
     let output_start_frame = if options.start_from_song_start {
         0
@@ -2830,6 +2857,7 @@ pub fn stream_playlist_performance_with_vst3_to_device(
             wav_channel_mode: options.wav_channel_mode,
             resampling_quality: options.resampling_quality,
             clip_index: None,
+            clip_indices: Vec::new(),
             start_from_song_start: false,
             soloed_playlist_track_range: options.soloed_playlist_track_range,
             clip_envelopes: Arc::clone(&options.clip_envelopes),
@@ -3010,6 +3038,7 @@ fn stream_playlist_with_vst3_to_device_from_frame_inner(
             wav_channel_mode: options.wav_channel_mode,
             resampling_quality: options.resampling_quality,
             clip_index: None,
+            clip_indices: Vec::new(),
             start_from_song_start: false,
             soloed_playlist_track_range: options.soloed_playlist_track_range,
             clip_envelopes: Arc::clone(&options.clip_envelopes),
@@ -3360,6 +3389,7 @@ fn render_playlist_with_vst3_cancellable(
             wav_channel_mode: options.wav_channel_mode,
             resampling_quality: options.resampling_quality,
             clip_index: None,
+            clip_indices: Vec::new(),
             start_from_song_start: false,
             soloed_playlist_track_range: options.soloed_playlist_track_range,
             clip_envelopes: Arc::clone(&options.clip_envelopes),
@@ -3916,6 +3946,7 @@ pub fn render_playlist_mixer_stems_with_vst3_cancellable(
             wav_channel_mode: options.wav_channel_mode,
             resampling_quality: options.resampling_quality,
             clip_index: None,
+            clip_indices: Vec::new(),
             start_from_song_start: false,
             soloed_playlist_track_range: options.soloed_playlist_track_range,
             clip_envelopes: Arc::clone(&options.clip_envelopes),
@@ -8510,8 +8541,30 @@ fn render_audio_clips_to_stereo_buffer_inner(
     Ok((mix, render.summary))
 }
 
-fn audio_clip_matches_selection(selected_clip_index: Option<usize>, clip_index: usize) -> bool {
-    selected_clip_index.is_none_or(|selected_index| selected_index == clip_index)
+fn selected_audio_clip_indices(
+    options: &AudioClipRenderOptions,
+) -> Result<Option<Vec<usize>>, String> {
+    if options.clip_indices.is_empty() {
+        return Ok(options.clip_index.map(|clip_index| vec![clip_index]));
+    }
+    if options.clip_index.is_some() {
+        return Err("select either one Audio Clip or an Audio Clip group, not both".to_owned());
+    }
+    let mut clip_indices = options.clip_indices.clone();
+    clip_indices.sort_unstable();
+    let original_len = clip_indices.len();
+    clip_indices.dedup();
+    if clip_indices.len() != original_len {
+        return Err("Audio Clip selection contains duplicate clips".to_owned());
+    }
+    Ok(Some(clip_indices))
+}
+
+fn audio_clip_matches_selection(
+    selected_clip_indices: Option<&[usize]>,
+    clip_index: usize,
+) -> bool {
+    selected_clip_indices.is_none_or(|selected_indices| selected_indices.contains(&clip_index))
 }
 
 fn audio_clip_selection_start_tick(
@@ -9109,17 +9162,23 @@ fn prepare_audio_clip_render(
     let mixer_route_audibility = MixerRouteAudibility::from_document(document);
     let resolver = SamplePathResolver::new(project_path);
 
-    let selected_clip = options
-        .clip_index
-        .map(|clip_index| {
-            arrangement
-                .clips
-                .get(clip_index)
-                .ok_or_else(|| format!("Playlist clip {clip_index} does not exist"))
-        })
-        .transpose()?;
+    let selected_clip_indices = selected_audio_clip_indices(&options)?;
+    if let Some(selected_clip_indices) = &selected_clip_indices {
+        for clip_index in selected_clip_indices {
+            if arrangement.clips.get(*clip_index).is_none() {
+                return Err(format!("Playlist clip {clip_index} does not exist"));
+            }
+        }
+    }
+    let selected_clip_position_ticks = selected_clip_indices.as_ref().and_then(|clip_indices| {
+        clip_indices
+            .iter()
+            .filter_map(|clip_index| arrangement.clips.get(*clip_index))
+            .map(|clip| clip.position_ticks)
+            .min()
+    });
     let selection_start_tick = audio_clip_selection_start_tick(
-        selected_clip.map(|clip| clip.position_ticks),
+        selected_clip_position_ticks,
         options.start_from_song_start,
     );
 
@@ -9140,19 +9199,37 @@ fn prepare_audio_clip_render(
     )>::new();
     for (clip_index, clip) in arrangement.clips.iter().enumerate() {
         check_cancelled(cancelled)?;
-        if !audio_clip_matches_selection(options.clip_index, clip_index) {
+        let is_selected = selected_clip_indices
+            .as_ref()
+            .is_some_and(|selected_indices| selected_indices.contains(&clip_index));
+        if !audio_clip_matches_selection(selected_clip_indices.as_deref(), clip_index) {
             continue;
         }
         let relative_position =
             audio_clip_render_start_tick(clip.position_ticks, selection_start_tick)?;
         max_tick = max_tick.max(relative_position + u64::from(clip.length_ticks));
         if track_filter.clip_is_muted(clip) {
+            if is_selected {
+                return Err(format!(
+                    "selected Playlist clip {clip_index} is muted or on a disabled track"
+                ));
+            }
             continue;
         }
         let PlaylistClipTarget::Channel { id } = clip.target() else {
+            if is_selected {
+                return Err(format!(
+                    "selected Playlist clip {clip_index} does not target an audio channel"
+                ));
+            }
             continue;
         };
         let Some(channel) = channels.iter().find(|channel| channel.id() == id) else {
+            if is_selected {
+                return Err(format!(
+                    "selected Playlist clip {clip_index} references missing audio channel {id}"
+                ));
+            }
             continue;
         };
         let mixer_route_allowed = if include_muted_mixer_sources {
@@ -9161,6 +9238,11 @@ fn prepare_audio_clip_render(
             mixer_route_audibility.allows_channel(channel.mixer_track())
         };
         if channel.kind() != Some(4) || channel.enabled() == Some(false) || !mixer_route_allowed {
+            if is_selected {
+                return Err(format!(
+                    "selected Playlist clip {clip_index} does not target an enabled audio channel"
+                ));
+            }
             continue;
         }
         if clip
@@ -9168,7 +9250,7 @@ fn prepare_audio_clip_render(
             .is_some_and(|scale| !scale.is_finite() || (scale - 1.0).abs() > 1e-9)
         {
             clips_skipped_unsupported_scale += 1;
-            if options.clip_index == Some(clip_index) {
+            if is_selected {
                 return Err(format!(
                     "selected Playlist clip {clip_index} uses a stretch scale unsupported by this renderer"
                 ));
@@ -9207,12 +9289,8 @@ fn prepare_audio_clip_render(
             mixer_route_plan,
         ));
     }
-    if let Some(clip_index) = options.clip_index
-        && candidate_clips.is_empty()
-    {
-        return Err(format!(
-            "selected Playlist clip {clip_index} does not target an enabled audio channel"
-        ));
+    if selected_clip_indices.is_some() && candidate_clips.is_empty() {
+        return Err("selected Playlist audio clip group produced no render sources".to_owned());
     }
     let selection_start_tick = u64::from(selection_start_tick);
     let timeline_end_tick = selection_start_tick
@@ -17863,8 +17941,8 @@ mod tests {
     #[test]
     fn selected_audio_clip_is_filtered_and_rebased_to_time_zero() {
         assert!(audio_clip_matches_selection(None, 0));
-        assert!(audio_clip_matches_selection(Some(2), 2));
-        assert!(!audio_clip_matches_selection(Some(2), 1));
+        assert!(audio_clip_matches_selection(Some(&[2]), 2));
+        assert!(!audio_clip_matches_selection(Some(&[2]), 1));
         assert_eq!(audio_clip_selection_start_tick(Some(384), false), 384);
         assert_eq!(audio_clip_selection_start_tick(Some(384), true), 0);
         assert_eq!(audio_clip_selection_start_tick(None, true), 0);
