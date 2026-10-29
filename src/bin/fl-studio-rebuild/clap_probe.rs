@@ -859,12 +859,10 @@ fn read_preview_process_responses(
                     )));
                     return;
                 }
-                for sample_bytes in chunk[..chunk_length].chunks_exact(4) {
-                    let sample = f32::from_le_bytes(
-                        sample_bytes
-                            .try_into()
-                            .expect("sample chunks contain four bytes"),
-                    );
+                let (sample_bytes, remainder) = chunk[..chunk_length].as_chunks::<4>();
+                debug_assert!(remainder.is_empty());
+                for sample_bytes in sample_bytes {
+                    let sample = f32::from_le_bytes(*sample_bytes);
                     samples.push(if sample.is_finite() { sample } else { 0.0 });
                 }
                 remaining_bytes -= chunk_length;
