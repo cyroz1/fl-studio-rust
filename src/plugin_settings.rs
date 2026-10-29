@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 const VST3_MANUAL_LATENCY_OFFSETS_FILE: &str = "vst3-manual-latency-offsets.txt";
 const VST3_PROJECT_MANUAL_LATENCY_OFFSETS_DIRECTORY: &str = "vst3-project-manual-latency-offsets";
 const CLAP_PROJECT_INSTRUMENTS_DIRECTORY: &str = "clap-project-instruments";
+const CLAP_PROJECT_INSTRUMENT_PARAMETER_OVERRIDES_DIRECTORY: &str =
+    "clap-project-instrument-parameter-overrides";
 const CLAP_PROJECT_MIXER_EFFECTS_DIRECTORY: &str = "clap-project-mixer-effects";
 pub const MAX_CLAP_PROJECT_PLUGIN_STATE_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_CLAP_PROJECT_MIXER_AUXILIARY_BUSES: usize = 16;
@@ -82,6 +84,17 @@ fn clap_project_instruments_file(project_id: &str) -> Option<PathBuf> {
     )
 }
 
+fn clap_project_instrument_parameter_overrides_file(project_id: &str) -> Option<PathBuf> {
+    if project_id.len() != 16 || !project_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(
+        app_settings_directory()?
+            .join(CLAP_PROJECT_INSTRUMENT_PARAMETER_OVERRIDES_DIRECTORY)
+            .join(format!("{}.txt", project_id.to_ascii_lowercase())),
+    )
+}
+
 fn clap_project_mixer_effects_file(project_id: &str) -> Option<PathBuf> {
     if project_id.len() != 16 || !project_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
@@ -145,10 +158,25 @@ pub fn save_vst3_project_manual_latency_offsets(
 pub fn load_clap_project_instruments(
     project_id: &str,
 ) -> BTreeMap<u16, ClapProjectInstrumentAssignment> {
-    clap_project_instruments_file(project_id)
+    let mut assignments = clap_project_instruments_file(project_id)
         .and_then(|path| fs::read_to_string(path).ok())
         .map(|contents| parse_clap_project_instruments(&contents))
-        .unwrap_or_default()
+        .unwrap_or_default();
+    if let Some(overrides_path) = clap_project_instrument_parameter_overrides_file(project_id)
+        && let Ok(contents) = fs::read_to_string(overrides_path)
+    {
+        for (channel_id, path, plugin_id, parameter_overrides) in
+            parse_clap_project_instrument_parameter_overrides(&contents)
+        {
+            if let Some(assignment) = assignments
+                .get_mut(&channel_id)
+                .filter(|assignment| assignment.path == path && assignment.plugin_id == plugin_id)
+            {
+                assignment.parameter_overrides = parameter_overrides;
+            }
+        }
+    }
+    assignments
 }
 
 /// Save machine-local CLAP instrument assignments outside the FLP file.
@@ -180,7 +208,36 @@ pub fn save_clap_project_instruments(
     fs::create_dir_all(parent)
         .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
     fs::write(&path, serialize_clap_project_instruments(assignments))
-        .map_err(|error| format!("could not write {}: {error}", path.display()))
+        .map_err(|error| format!("could not write {}: {error}", path.display()))?;
+    save_clap_project_instrument_parameter_overrides(project_id, assignments)
+}
+
+/// Persist assigned CLAP instrument parameter values without rewriting plug-in state blobs.
+pub fn save_clap_project_instrument_parameter_overrides(
+    project_id: &str,
+    assignments: &BTreeMap<u16, ClapProjectInstrumentAssignment>,
+) -> Result<(), String> {
+    if assignments.values().any(|assignment| {
+        assignment.parameter_overrides.len() > MAX_CLAP_PROJECT_PARAMETER_OVERRIDES
+            || assignment
+                .parameter_overrides
+                .values()
+                .any(|value| !value.is_finite())
+    }) {
+        return Err("CLAP instrument parameter overrides are invalid".to_owned());
+    }
+    let path = clap_project_instrument_parameter_overrides_file(project_id)
+        .ok_or_else(|| "the project CLAP instrument parameter path is not valid".to_owned())?;
+    let parent = path.parent().ok_or_else(|| {
+        "the project CLAP instrument parameter path has no parent folder".to_owned()
+    })?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    fs::write(
+        &path,
+        serialize_clap_project_instrument_parameter_overrides(assignments),
+    )
+    .map_err(|error| format!("could not write {}: {error}", path.display()))
 }
 
 /// Read machine-local CLAP effect assignments for project Mixer insert slots.
@@ -446,6 +503,59 @@ fn serialize_clap_parameter_overrides(overrides: &BTreeMap<u32, f64>) -> String 
         .map(|(parameter_id, value)| format!("{parameter_id}:{:016x}", value.to_bits()))
         .collect::<Vec<_>>()
         .join(",")
+}
+
+fn parse_clap_project_instrument_parameter_overrides(
+    contents: &str,
+) -> Vec<(u16, PathBuf, String, BTreeMap<u32, f64>)> {
+    let mut records = Vec::new();
+    let mut lines = contents.lines();
+    if lines.next() != Some("clap-project-instrument-parameter-overrides-v1") {
+        return records;
+    }
+    for line in lines {
+        let mut fields = line.split('\t');
+        let Some(channel_id) = fields.next().and_then(|field| field.parse::<u16>().ok()) else {
+            continue;
+        };
+        let Some(path) = fields.next().and_then(decode_path) else {
+            continue;
+        };
+        let Some(plugin_id) = fields.next().and_then(decode_plugin_uid) else {
+            continue;
+        };
+        let Some(parameter_overrides) = fields.next().and_then(parse_clap_parameter_overrides)
+        else {
+            continue;
+        };
+        if fields.next().is_some() || path.as_os_str().is_empty() || plugin_id.is_empty() {
+            continue;
+        }
+        records.push((channel_id, path, plugin_id, parameter_overrides));
+    }
+    records
+}
+
+fn serialize_clap_project_instrument_parameter_overrides(
+    assignments: &BTreeMap<u16, ClapProjectInstrumentAssignment>,
+) -> String {
+    let mut contents = String::from("clap-project-instrument-parameter-overrides-v1\n");
+    for (channel_id, assignment) in assignments {
+        if assignment.path.as_os_str().is_empty() || assignment.plugin_id.is_empty() {
+            continue;
+        }
+        contents.push_str(&channel_id.to_string());
+        contents.push('\t');
+        contents.push_str(&encode_path(&assignment.path));
+        contents.push('\t');
+        contents.push_str(&encode_plugin_uid(&assignment.plugin_id));
+        contents.push('\t');
+        contents.push_str(&serialize_clap_parameter_overrides(
+            &assignment.parameter_overrides,
+        ));
+        contents.push('\n');
+    }
+    contents
 }
 
 pub fn parse_clap_project_instruments(

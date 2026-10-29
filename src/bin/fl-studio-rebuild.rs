@@ -41,9 +41,9 @@ use flp_rebuild::plugin_settings::{
     ClapProjectInstrumentAssignment as ClapPatternPlaybackInstrument,
     ClapProjectMixerEffectAssignment, load_clap_project_instruments,
     load_clap_project_mixer_effects, load_vst3_manual_latency_offsets,
-    load_vst3_project_manual_latency_offsets, save_clap_project_instruments,
-    save_clap_project_mixer_effects, save_vst3_manual_latency_offsets,
-    save_vst3_project_manual_latency_offsets,
+    load_vst3_project_manual_latency_offsets, save_clap_project_instrument_parameter_overrides,
+    save_clap_project_instruments, save_clap_project_mixer_effects,
+    save_vst3_manual_latency_offsets, save_vst3_project_manual_latency_offsets,
 };
 use flp_rebuild::plugins::{PluginCandidate, PluginFormat, scan_installed_plugins};
 use flp_rebuild::project_package::{ProjectPackageWorkspace, copy_unique_sample_file};
@@ -5764,10 +5764,13 @@ struct PendingClapInstrumentEditor {
 
 struct PendingClapParameterEdit {
     request_id: u64,
+    project_generation: u64,
+    project_id: Option<String>,
     channel_id: u16,
     path: PathBuf,
     plugin_id: String,
     parameter_id: u32,
+    value: f64,
     previous_value: Option<f64>,
 }
 
@@ -22052,10 +22055,13 @@ impl DawUi {
         let request_id = self.clap_parameter_request_id;
         self.pending_clap_parameter_edit = Some(PendingClapParameterEdit {
             request_id,
+            project_generation: self.project_generation,
+            project_id: self.current_path.as_deref().map(stable_project_id),
             channel_id,
             path: path.clone(),
             plugin_id: plugin_id.clone(),
             parameter_id,
+            value,
             previous_value,
         });
         let state = self
@@ -22128,7 +22134,63 @@ impl DawUi {
         }
         match result {
             Ok(ClapPatternPreviewOutput::ParametersSet) => {
-                self.status = format!("Applied parameter changes to {plugin_name}");
+                let project_matches = pending.project_generation == self.project_generation
+                    && pending.project_id == self.current_path.as_deref().map(stable_project_id);
+                if !project_matches {
+                    self.status = format!(
+                        "Applied parameter changes to {plugin_name}; the project changed before the update could be saved"
+                    );
+                    return;
+                }
+                let Some(assignment) = self
+                    .clap_pattern_playback_instruments
+                    .get_mut(&pending.channel_id)
+                    .filter(|assignment| {
+                        assignment.path == pending.path && assignment.plugin_id == pending.plugin_id
+                    })
+                else {
+                    self.status = format!("Applied parameter changes to {plugin_name}");
+                    return;
+                };
+                let previous_assignment_value = assignment
+                    .parameter_overrides
+                    .insert(pending.parameter_id, pending.value);
+                let save_result = pending.project_id.as_deref().map(|project_id| {
+                    save_clap_project_instrument_parameter_overrides(
+                        project_id,
+                        &self.clap_pattern_playback_instruments,
+                    )
+                });
+                match save_result {
+                    Some(Ok(())) => {
+                        self.status =
+                            format!("Applied and saved parameter changes to {plugin_name}");
+                    }
+                    Some(Err(error)) => {
+                        if let Some(assignment) = self
+                            .clap_pattern_playback_instruments
+                            .get_mut(&pending.channel_id)
+                            .filter(|assignment| {
+                                assignment.path == pending.path
+                                    && assignment.plugin_id == pending.plugin_id
+                            })
+                        {
+                            if let Some(previous_value) = previous_assignment_value {
+                                assignment
+                                    .parameter_overrides
+                                    .insert(pending.parameter_id, previous_value);
+                            } else {
+                                assignment.parameter_overrides.remove(&pending.parameter_id);
+                            }
+                        }
+                        self.status = format!(
+                            "Applied parameter changes to {plugin_name}, but could not save them: {error}"
+                        );
+                    }
+                    None => {
+                        self.status = format!("Applied parameter changes to {plugin_name}");
+                    }
+                }
             }
             Ok(ClapPatternPreviewOutput::Audio(_) | ClapPatternPreviewOutput::SavedState(_)) => {
                 self.restore_clap_parameter_edit(pending);
@@ -66174,7 +66236,7 @@ impl DawUi {
                                                         });
                                                     }
                                                     }
-                                                    ui.small("Parameter edits apply to Pattern audition and transport. Pattern Event and Pattern LFO links and Playlist Automation links drive assigned CLAP parameters during supported playback and song/stem renders. Pattern Event points take precedence over LFO automation for a shared parameter. Use Capture state on an assigned channel to save plug-in parameter values for this project.");
+                                                    ui.small("Parameter edits apply to Pattern audition and transport. Successful edits to assigned channels save as machine-local parameter overrides. Pattern Event, Pattern LFO, and Playlist Automation links drive assigned CLAP parameters during supported playback and song/stem renders. Pattern Event points take precedence over LFO automation for a shared parameter. Use Capture state to save other plug-in state changes for this project.");
                                                     if info.parameters.len()
                                                         < info.parameter_count as usize
                                                     {
