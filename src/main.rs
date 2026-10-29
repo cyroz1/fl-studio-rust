@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use flp_rebuild::media::{SamplePathResolver, decode_audio_file};
-use flp_rebuild::midi::{MidiChannelMapping, MidiFile, MidiImportOptions};
+use flp_rebuild::midi::{MidiChannelMapping, MidiExportFileFormat, MidiFile, MidiImportOptions};
 use flp_rebuild::plugin_settings::load_vst3_manual_latency_offsets;
 use flp_rebuild::plugins::scan_installed_plugins;
 use flp_rebuild::project_package::copy_unique_sample_file;
@@ -339,6 +339,19 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 Path::new(output),
                 parse_u16(pattern_id, "pattern id")?,
                 MidiChannelMapping::PreserveNoteChannels,
+                MidiExportFileFormat::Format1,
+            )
+        }
+        [command, project, output, pattern_id, file_format]
+            if command == "export-midi-pattern"
+                && matches!(file_format.as_str(), "0" | "1" | "format0" | "format1") =>
+        {
+            export_midi_pattern(
+                Path::new(project),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                MidiChannelMapping::PreserveNoteChannels,
+                parse_midi_export_file_format(file_format)?,
             )
         }
         [command, project, output, pattern_id, mapping] if command == "export-midi-pattern" => {
@@ -347,6 +360,18 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 Path::new(output),
                 parse_u16(pattern_id, "pattern id")?,
                 parse_midi_channel_mapping(mapping)?,
+                MidiExportFileFormat::Format1,
+            )
+        }
+        [command, project, output, pattern_id, mapping, file_format]
+            if command == "export-midi-pattern" =>
+        {
+            export_midi_pattern(
+                Path::new(project),
+                Path::new(output),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_midi_channel_mapping(mapping)?,
+                parse_midi_export_file_format(file_format)?,
             )
         }
         [command, project, output, pattern_id, raw_channel, raw_flags, controller, midi_channel]
@@ -370,6 +395,19 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 Path::new(output),
                 parse_u16(arrangement_id, "arrangement id")?,
                 MidiChannelMapping::PreserveNoteChannels,
+                MidiExportFileFormat::Format1,
+            )
+        }
+        [command, project, output, arrangement_id, file_format]
+            if command == "export-midi-song"
+                && matches!(file_format.as_str(), "0" | "1" | "format0" | "format1") =>
+        {
+            export_midi_song(
+                Path::new(project),
+                Path::new(output),
+                parse_u16(arrangement_id, "arrangement id")?,
+                MidiChannelMapping::PreserveNoteChannels,
+                parse_midi_export_file_format(file_format)?,
             )
         }
         [command, project, output, arrangement_id, mapping] if command == "export-midi-song" => {
@@ -378,6 +416,18 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 Path::new(output),
                 parse_u16(arrangement_id, "arrangement id")?,
                 parse_midi_channel_mapping(mapping)?,
+                MidiExportFileFormat::Format1,
+            )
+        }
+        [command, project, output, arrangement_id, mapping, file_format]
+            if command == "export-midi-song" =>
+        {
+            export_midi_song(
+                Path::new(project),
+                Path::new(output),
+                parse_u16(arrangement_id, "arrangement id")?,
+                parse_midi_channel_mapping(mapping)?,
+                parse_midi_export_file_format(file_format)?,
             )
         }
         [command, project, output, arrangement_id, raw_channel, raw_flags, controller, midi_channel]
@@ -4105,9 +4155,9 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild project-settings <file.flp>\n",
             "  flp-rebuild global-swing <file.flp>\n",
             "  flp-rebuild midi-info <file.mid>\n",
-            "  flp-rebuild export-midi-pattern <project.flp> <output.mid> <pattern-id> [stored|channels]\n",
+            "  flp-rebuild export-midi-pattern <project.flp> <output.mid> <pattern-id> [stored|channels] [format0|format1]\n",
             "  flp-rebuild export-midi-cc <project.flp> <output.mid> <pattern-id> <raw-channel> <raw-flags> <cc-0..127> <midi-channel-1..16>\n",
-            "  flp-rebuild export-midi-song <project.flp> <output.mid> <arrangement-id> [stored|channels]\n",
+            "  flp-rebuild export-midi-song <project.flp> <output.mid> <arrangement-id> [stored|channels] [format0|format1]\n",
             "  flp-rebuild export-midi-song-cc <project.flp> <output.mid> <arrangement-id> <raw-channel> <raw-flags> <cc-0..127> <midi-channel-1..16>\n",
             "  flp-rebuild midi-events <file.mid> <track> [start] [count]\n",
             "  flp-rebuild scan <directory>\n",
@@ -4576,6 +4626,14 @@ fn parse_midi_channel_mapping(value: &str) -> Result<MidiChannelMapping, String>
         "stored" => Ok(MidiChannelMapping::PreserveNoteChannels),
         "channels" => Ok(MidiChannelMapping::AssignProjectChannels),
         _ => Err("MIDI channel mapping must be 'stored' or 'channels'".to_owned()),
+    }
+}
+
+fn parse_midi_export_file_format(value: &str) -> Result<MidiExportFileFormat, String> {
+    match value {
+        "0" | "format0" => Ok(MidiExportFileFormat::Format0),
+        "1" | "format1" => Ok(MidiExportFileFormat::Format1),
+        _ => Err("MIDI file format must be '0'/'format0' or '1'/'format1'".to_owned()),
     }
 }
 
@@ -6080,10 +6138,16 @@ fn export_midi_pattern(
     output: &Path,
     pattern_id: u16,
     channel_mapping: MidiChannelMapping,
+    file_format: MidiExportFileFormat,
 ) -> Result<(), String> {
     let (_, document) = load_document(project)?;
-    let bytes = MidiFile::encode_project_pattern(&document, pattern_id, channel_mapping)
-        .map_err(|error| error.to_string())?;
+    let bytes = MidiFile::encode_project_pattern_with_format(
+        &document,
+        pattern_id,
+        channel_mapping,
+        file_format,
+    )
+    .map_err(|error| error.to_string())?;
     fs::write(output, &bytes)
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
@@ -6129,10 +6193,16 @@ fn export_midi_song(
     output: &Path,
     arrangement_id: u16,
     channel_mapping: MidiChannelMapping,
+    file_format: MidiExportFileFormat,
 ) -> Result<(), String> {
     let (_, document) = load_document(project)?;
-    let bytes = MidiFile::encode_project_song(&document, arrangement_id, channel_mapping)
-        .map_err(|error| error.to_string())?;
+    let bytes = MidiFile::encode_project_song_with_format(
+        &document,
+        arrangement_id,
+        channel_mapping,
+        file_format,
+    )
+    .map_err(|error| error.to_string())?;
     fs::write(output, &bytes)
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(

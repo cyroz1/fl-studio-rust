@@ -36,7 +36,7 @@ use flp_rebuild::media::{
     decode_audio_waveform, find_empty_project_template, process_audio_range_to_stereo_preview,
     summarize_audio_waveform, write_audio_range_to_wav_with_options,
 };
-use flp_rebuild::midi::{MidiChannelMapping, MidiFile, MidiImportOptions};
+use flp_rebuild::midi::{MidiChannelMapping, MidiExportFileFormat, MidiFile, MidiImportOptions};
 use flp_rebuild::plugin_settings::{
     ClapProjectInstrumentAssignment as ClapPatternPlaybackInstrument,
     ClapProjectMixerEffectAssignment, load_clap_project_instruments,
@@ -5146,6 +5146,7 @@ struct DawUi {
     pending_midi_cc_import: Option<PendingMidiCcImport>,
     pending_midi_cc_export: Option<PendingMidiCcExport>,
     midi_channel_mapping: MidiChannelMapping,
+    midi_export_file_format: MidiExportFileFormat,
     selected_arrangement: Option<u16>,
     selected_clip: Option<usize>,
     selected_playlist_clips: BTreeSet<usize>,
@@ -7512,6 +7513,7 @@ impl DawUi {
             pending_midi_cc_import: None,
             pending_midi_cc_export: None,
             midi_channel_mapping: MidiChannelMapping::PreserveNoteChannels,
+            midi_export_file_format: MidiExportFileFormat::Format1,
             selected_arrangement: None,
             selected_clip: None,
             selected_playlist_clips: BTreeSet::new(),
@@ -41903,6 +41905,23 @@ impl DawUi {
                             "One per FL channel",
                         );
                     });
+                egui::ComboBox::from_id_salt("midi-export-file-format")
+                    .selected_text(match self.midi_export_file_format {
+                        MidiExportFileFormat::Format0 => "File: Format 0 (single track)",
+                        MidiExportFileFormat::Format1 => "File: Format 1 (separate tracks)",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.midi_export_file_format,
+                            MidiExportFileFormat::Format0,
+                            "Format 0 · single track",
+                        );
+                        ui.selectable_value(
+                            &mut self.midi_export_file_format,
+                            MidiExportFileFormat::Format1,
+                            "Format 1 · separate tracks",
+                        );
+                    });
                 if ui
                     .add_enabled(
                         self.selected_pattern.is_some(),
@@ -49761,15 +49780,18 @@ impl DawUi {
             self.status = "Open a project before exporting MIDI".to_owned();
             return;
         };
-        let bytes =
-            match MidiFile::encode_project_pattern(document, pattern_id, self.midi_channel_mapping)
-            {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    self.status = format!("Could not export pattern MIDI: {error}");
-                    return;
-                }
-            };
+        let bytes = match MidiFile::encode_project_pattern_with_format(
+            document,
+            pattern_id,
+            self.midi_channel_mapping,
+            self.midi_export_file_format,
+        ) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.status = format!("Could not export pattern MIDI: {error}");
+                return;
+            }
+        };
         let project_stem = self
             .current_path
             .as_deref()
@@ -49814,10 +49836,11 @@ impl DawUi {
             self.status = "This project has no Playlist arrangement to export".to_owned();
             return;
         };
-        let bytes = match MidiFile::encode_project_song(
+        let bytes = match MidiFile::encode_project_song_with_format(
             document,
             arrangement_id,
             self.midi_channel_mapping,
+            self.midi_export_file_format,
         ) {
             Ok(bytes) => bytes,
             Err(error) => {
