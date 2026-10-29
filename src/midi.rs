@@ -751,6 +751,13 @@ impl MidiFile {
             if controller_points.is_empty() {
                 continue;
             }
+            let (source_start_tick, source_end_tick) = clip
+                .recognized_pattern_source_window_ticks()
+                .ok_or(MidiError::InvalidExport(
+                    "Playlist Pattern source windows must be recognized tick windows matching the clip length",
+                ))?;
+            let source_start_tick = u64::from(source_start_tick);
+            let source_end_tick = u64::from(source_end_tick);
             if controller_points
                 .iter()
                 .any(|point| !point.value().is_finite())
@@ -790,17 +797,39 @@ impl MidiFile {
                 continue;
             }
 
-            let repetitions = clip_length.div_ceil(loop_length);
-            for repetition in 0..repetitions {
+            let first_point_tick = controller_points
+                .iter()
+                .map(|point| u64::from(point.position))
+                .max()
+                .unwrap_or(0);
+            let first_repetition = source_start_tick.saturating_sub(first_point_tick) / loop_length;
+            let last_repetition = (source_end_tick - 1) / loop_length;
+            let mut previous_point = None::<(u64, u64, usize, f64)>;
+            for repetition in first_repetition..=last_repetition {
                 let repeat_start = repetition
                     .checked_mul(loop_length)
                     .ok_or(MidiError::LengthOverflow)?;
-                for point in &controller_points {
+                for (point_index, point) in controller_points.iter().enumerate() {
                     let point_position = u64::from(point.position);
-                    let relative_tick = repeat_start
+                    let source_tick = repeat_start
                         .checked_add(point_position)
                         .ok_or(MidiError::LengthOverflow)?;
-                    if relative_tick >= clip_length {
+                    if source_tick < source_start_tick {
+                        let candidate = (
+                            source_tick,
+                            repetition,
+                            point_index,
+                            f64::from(point.value()),
+                        );
+                        if previous_point.is_none_or(|previous| {
+                            (candidate.0, candidate.1, candidate.2)
+                                > (previous.0, previous.1, previous.2)
+                        }) {
+                            previous_point = Some(candidate);
+                        }
+                        continue;
+                    }
+                    if source_tick >= source_end_tick {
                         continue;
                     }
                     exported_point_count = exported_point_count.saturating_add(1);
@@ -811,7 +840,7 @@ impl MidiFile {
                     }
                     controller_events.push(TimedMidiBytes {
                         tick: clip_start
-                            .checked_add(relative_tick)
+                            .checked_add(source_tick - source_start_tick)
                             .ok_or(MidiError::LengthOverflow)?,
                         order: 4,
                         bytes: vec![
@@ -821,6 +850,25 @@ impl MidiFile {
                         ],
                     });
                 }
+            }
+            if source_start_tick > 0
+                && let Some((_, _, _, normalized_value)) = previous_point
+            {
+                exported_point_count = exported_point_count.saturating_add(1);
+                if exported_point_count > MAX_EXPORTED_CONTROLLER_POINTS {
+                    return Err(MidiError::InvalidExport(
+                        "the arrangement expands to more than one million controller points",
+                    ));
+                }
+                controller_events.push(TimedMidiBytes {
+                    tick: clip_start,
+                    order: 3,
+                    bytes: vec![
+                        0xB0 | midi_channel,
+                        midi_controller,
+                        (normalized_value.clamp(0.0, 1.0) * 127.0).round() as u8,
+                    ],
+                });
             }
         }
 
@@ -975,6 +1023,13 @@ impl MidiFile {
                     "scaled Playlist Pattern Clips cannot be exported yet",
                 ));
             }
+            let (source_start_tick, source_end_tick) = clip
+                .recognized_pattern_source_window_ticks()
+                .ok_or(MidiError::InvalidExport(
+                    "Playlist Pattern source windows must be recognized tick windows matching the clip length",
+                ))?;
+            let source_start_tick = u64::from(source_start_tick);
+            let source_end_tick = u64::from(source_end_tick);
             let clip_length = u64::from(clip.length_ticks);
             if clip_length == 0 {
                 continue;
@@ -1002,8 +1057,29 @@ impl MidiFile {
                 continue;
             }
             let clip_start = u64::from(clip.position_ticks);
-            let repetitions = clip_length.div_ceil(loop_length);
-            for repetition in 0..repetitions {
+            let play_truncated_notes = document
+                .project_settings()
+                .is_none_or(|settings| settings.play_truncated_notes_in_clips);
+            let first_repetition = pattern
+                .notes
+                .iter()
+                .filter(|note| {
+                    !note.is_muted()
+                        && !excluded_project_channels.contains(&note.channel_id)
+                        && u64::from(note.position) < source_end_tick
+                })
+                .map(|note| {
+                    first_pattern_note_repetition_for_source_window(
+                        note,
+                        source_start_tick,
+                        loop_length,
+                        play_truncated_notes,
+                    )
+                })
+                .min();
+            let last_repetition = (source_end_tick - 1) / loop_length;
+            let first_repetition = first_repetition.unwrap_or_else(|| last_repetition + 1);
+            for repetition in first_repetition..=last_repetition {
                 let repeat_start = repetition
                     .checked_mul(loop_length)
                     .ok_or(MidiError::LengthOverflow)?;
@@ -1011,12 +1087,23 @@ impl MidiFile {
                     if note.is_muted() || excluded_project_channels.contains(&note.channel_id) {
                         continue;
                     }
-                    let relative_start = repeat_start
+                    let source_note_start = repeat_start
                         .checked_add(u64::from(note.position))
                         .ok_or(MidiError::LengthOverflow)?;
-                    if relative_start >= clip_length {
+                    if source_note_start >= source_end_tick {
                         continue;
                     }
+                    let source_note_end = source_note_start
+                        .checked_add(u64::from(note.length))
+                        .ok_or(MidiError::LengthOverflow)?;
+                    let starts_before_source_window = source_note_start < source_start_tick;
+                    if starts_before_source_window
+                        && (!play_truncated_notes || source_note_end <= source_start_tick)
+                    {
+                        continue;
+                    }
+                    let relative_start =
+                        source_note_start.max(source_start_tick) - source_start_tick;
                     exported_note_count = exported_note_count.saturating_add(1);
                     if exported_note_count > MAX_EXPORTED_NOTES {
                         return Err(MidiError::InvalidExport(
@@ -1026,8 +1113,11 @@ impl MidiFile {
                     let start_tick = clip_start
                         .checked_add(relative_start)
                         .ok_or(MidiError::LengthOverflow)?;
-                    let stop_tick = start_tick
-                        .checked_add(u64::from(note.length))
+                    let relative_end = source_note_end
+                        .checked_sub(source_start_tick)
+                        .ok_or(MidiError::LengthOverflow)?;
+                    let stop_tick = clip_start
+                        .checked_add(relative_end)
                         .ok_or(MidiError::LengthOverflow)?
                         .min(clip_end);
                     notes_by_channel
@@ -2490,6 +2580,29 @@ impl fmt::Display for MidiError {
 }
 
 impl std::error::Error for MidiError {}
+
+fn first_pattern_note_repetition_for_source_window(
+    note: &PatternNote,
+    source_start_tick: u64,
+    loop_length: u64,
+    play_truncated_notes: bool,
+) -> u64 {
+    let note_start = u64::from(note.position);
+    if note.length == 0 || !play_truncated_notes {
+        if source_start_tick <= note_start {
+            0
+        } else {
+            (source_start_tick - note_start).div_ceil(loop_length)
+        }
+    } else {
+        let note_end = note_start + u64::from(note.length);
+        if note_end > source_start_tick {
+            0
+        } else {
+            (source_start_tick - note_end) / loop_length + 1
+        }
+    }
+}
 
 fn tracks_for_notes(
     document: &FlpDocument,

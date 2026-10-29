@@ -10592,10 +10592,11 @@ pub fn schedule_playlist_pattern_notes_with_adjustments<'a>(
         let clip_end = u64::from(clip.position_ticks)
             .checked_add(clip_length)
             .ok_or_else(|| "Playlist pattern clip end position overflow".to_owned())?;
+        let last_repetition = (source_end_tick - 1) / loop_length;
         let first_repetition = pattern
             .notes
             .iter()
-            .filter(|note| !note.is_muted())
+            .filter(|note| !note.is_muted() && u64::from(note.position) < source_end_tick)
             .map(|note| {
                 let note_start = u64::from(note.position);
                 let note_length = u64::from(note.length);
@@ -10621,8 +10622,7 @@ pub fn schedule_playlist_pattern_notes_with_adjustments<'a>(
                 }
             })
             .min()
-            .unwrap_or_else(|| source_start_tick / loop_length);
-        let last_repetition = (source_end_tick - 1) / loop_length;
+            .unwrap_or_else(|| last_repetition.saturating_add(1));
         for repetition in first_repetition..=last_repetition {
             let repeat_start = repetition
                 .checked_mul(loop_length)
