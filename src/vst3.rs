@@ -6932,6 +6932,50 @@ fn expand_automation_clip_parameter_automation_for_clip(
     Ok(automation_by_channel)
 }
 
+/// Expand one type-5 Automation channel curve into a Playlist Automation Clip's visible timeline.
+/// Points are returned relative to the clip start and preserve the decoded tension approximation.
+pub fn expand_automation_channel_curve_for_clip(
+    automation_points: &[crate::AutomationPoint],
+    clip: &crate::PlaylistClip,
+    ppq: u16,
+) -> Result<Vec<Vst3PlaylistAutomationPoint>, String> {
+    if ppq == 0 {
+        return Err("project PPQ must be greater than zero".to_owned());
+    }
+    if clip.length_ticks == 0
+        || clip
+            .scale
+            .is_some_and(|scale| !scale.is_finite() || (scale - 1.0).abs() > 1e-9)
+    {
+        return Ok(Vec::new());
+    }
+    let Some((source_start_tick, source_end_tick, explicit_source_window)) =
+        playlist_automation_source_window(clip)
+    else {
+        return Ok(Vec::new());
+    };
+    let points = automation_points
+        .iter()
+        .map(|point| Vst3AutomationPoint {
+            position_beats: point.position_beats(),
+            value: point.value(),
+            tension: point.tension(),
+        })
+        .collect::<Vec<_>>();
+    if points.len() > MAX_VST3_AUTOMATION_POINTS {
+        return Err(format!(
+            "Playlist automation exceeds {MAX_VST3_AUTOMATION_POINTS} points"
+        ));
+    }
+    Ok(playlist_automation_points_in_source_window(
+        &points,
+        ppq,
+        source_start_tick,
+        source_end_tick,
+        explicit_source_window,
+    ))
+}
+
 fn playlist_automation_source_window(clip: &crate::PlaylistClip) -> Option<(u64, u64, bool)> {
     let clip_length = u64::from(clip.length_ticks);
     match clip.source_window_ticks() {

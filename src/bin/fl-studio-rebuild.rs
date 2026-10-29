@@ -47,20 +47,20 @@ use flp_rebuild::sample_render::{
     AudioRenderEncodingOptions, AudioRenderOutput, LayerLiveInputConfig, LayerLiveInputEvent,
     LayerLiveInputSender, MP3_BITRATES_KBPS, MixerStemRenderOptions,
     PLAYLIST_AUDIO_CLIP_GAIN_MINUS_INFINITY, PatternAudioLayer, PlaylistAudioClipEnvelope,
-    PlaylistAudioClipFadeCurve, PlaylistAudioLayer, PlaylistLiveStreamControls,
-    PlaylistPatternScheduleOptions, PlaylistPerformanceCommand, PlaylistPerformanceLaunch,
-    PlaylistPerformanceLiveStatus, PlaylistPerformanceStream, PlaylistRenderOptions,
-    PlaylistRenderRange, PlaylistRenderSummary, PlaylistStreamMonitor, PlaylistTailMode,
-    PlaylistTempoMap, PlaylistTrackFilter, ResamplingQuality, SamplerLiveInputRouting,
-    SamplerLiveNoteEvent, SamplerLiveNoteSender, SamplerPatternLoopPlayback,
-    SamplerPatternLoopStreamControls, SamplerPatternRenderOptions, SamplerPatternRenderSummary,
-    SamplerPatternStreamControls, Vst3LatencyUpdateControls, Vst3LiveInputEvent,
-    Vst3LiveInputSender, Vst3PatternLoopPlayback, Vst3PatternLoopStreamControls,
-    Vst3PatternPlayback, Vst3PatternStreamControls, WavChannelMode, WavDitherMode, WavSampleFormat,
-    layer_live_input_queue, nearest_playlist_audio_clip_zero_crossing_tick,
-    playlist_audio_clip_fade_gain, playlist_performance_clip_indices_with_vst3,
-    playlist_performance_static_document_with_vst3, playlist_performance_vst3_channel_ids,
-    playlist_performance_vst3_clip_indices,
+    PlaylistAudioClipFadeCurve, PlaylistAudioLayer, PlaylistChannelAutomationPoint,
+    PlaylistLiveStreamControls, PlaylistPatternScheduleOptions, PlaylistPerformanceCommand,
+    PlaylistPerformanceLaunch, PlaylistPerformanceLiveStatus, PlaylistPerformanceStream,
+    PlaylistRenderOptions, PlaylistRenderRange, PlaylistRenderSummary, PlaylistStreamMonitor,
+    PlaylistTailMode, PlaylistTempoMap, PlaylistTrackFilter, ResamplingQuality,
+    SamplerLiveInputRouting, SamplerLiveNoteEvent, SamplerLiveNoteSender,
+    SamplerPatternLoopPlayback, SamplerPatternLoopStreamControls, SamplerPatternRenderOptions,
+    SamplerPatternRenderSummary, SamplerPatternStreamControls, Vst3LatencyUpdateControls,
+    Vst3LiveInputEvent, Vst3LiveInputSender, Vst3PatternLoopPlayback,
+    Vst3PatternLoopStreamControls, Vst3PatternPlayback, Vst3PatternStreamControls, WavChannelMode,
+    WavDitherMode, WavSampleFormat, layer_live_input_queue,
+    nearest_playlist_audio_clip_zero_crossing_tick, playlist_audio_clip_fade_gain,
+    playlist_performance_clip_indices_with_vst3, playlist_performance_static_document_with_vst3,
+    playlist_performance_vst3_channel_ids, playlist_performance_vst3_clip_indices,
     project_channel_stereo_output_gains_with_layer_adjustments, render_audio_clips_to_file,
     render_playlist_mixer_stems_with_vst3_cancellable,
     render_playlist_with_vst3_to_file_from_frame_cancellable,
@@ -84,7 +84,7 @@ use flp_rebuild::vst3::{
     Vst3ParameterAutomation, Vst3PatternChannelRenderRequest, Vst3PatternRenderOptions,
     Vst3PatternStreamHandle, Vst3PlaylistAutomationPoint, Vst3PlaylistAutomationSources,
     Vst3PlaylistLiveInputSender, Vst3PlaylistLiveInputSession, Vst3PlaylistParameterAutomation,
-    Vst3PlaylistStreamProcessor,
+    Vst3PlaylistStreamProcessor, expand_automation_channel_curve_for_clip,
 };
 use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, ArpeggioRangePattern, ArpeggioScoreOptions,
@@ -5265,6 +5265,7 @@ struct DawUi {
     pattern_vst3_mixer_effect_parameter_links: Vec<PatternVst3MixerEffectParameterLink>,
     playlist_vst3_parameter_links: Vec<PlaylistVst3ParameterLink>,
     playlist_vst3_mixer_effect_parameter_links: Vec<PlaylistVst3MixerEffectParameterLink>,
+    playlist_clap_audio_control_links: Vec<PlaylistClapAudioControlLink>,
     internal_lfo_parameter_links: Vec<InternalLfoParameterLink>,
     playlist_audio_clip_envelopes: Vec<ProjectPlaylistAudioClipEnvelope>,
     playlist_automatic_crossfades: Vec<ProjectPlaylistAutomaticCrossfades>,
@@ -5583,17 +5584,25 @@ struct PendingClapPlaylistPlayback {
     staged_handoff_reason: Option<PdcStreamHandoffReason>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct ClapPlaylistAudioRoute {
     channel_id: u16,
     left_gain: f32,
     right_gain: f32,
+    layer_gain: f32,
+    layer_pan_raw: i32,
+    volume_automation: Arc<Vec<PlaylistChannelAutomationPoint>>,
+    pan_automation: Arc<Vec<PlaylistChannelAutomationPoint>>,
 }
 
 struct ClapPlaylistPreviewRequest {
     settings: ClapPatternPreviewSettings,
     left_gain: f32,
     right_gain: f32,
+    layer_gain: f32,
+    layer_pan_raw: i32,
+    volume_automation: Arc<Vec<PlaylistChannelAutomationPoint>>,
+    pan_automation: Arc<Vec<PlaylistChannelAutomationPoint>>,
 }
 
 struct PendingClapStateCapture {
@@ -6118,6 +6127,42 @@ struct PlaylistVst3MixerEffectParameterLink {
     automation_channel_id: u16,
     target: MidiVst3MixerEffectParameterTarget,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlaylistClapAudioControl {
+    Volume,
+    Pan,
+}
+
+impl PlaylistClapAudioControl {
+    const fn code(self) -> &'static str {
+        match self {
+            Self::Volume => "volume",
+            Self::Pan => "pan",
+        }
+    }
+
+    fn from_code(code: &str) -> Option<Self> {
+        match code {
+            "volume" => Some(Self::Volume),
+            "pan" => Some(Self::Pan),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PlaylistClapAudioControlLink {
+    project_path: String,
+    automation_channel_id: u16,
+    target_channel_id: u16,
+    control: PlaylistClapAudioControl,
+}
+
+type PlaylistClapChannelAutomationCurves = (
+    Arc<Vec<PlaylistChannelAutomationPoint>>,
+    Arc<Vec<PlaylistChannelAutomationPoint>>,
+);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InternalLfoWaveform {
@@ -6806,6 +6851,7 @@ impl DawUi {
         let playlist_vst3_parameter_links = load_playlist_vst3_parameter_links();
         let playlist_vst3_mixer_effect_parameter_links =
             load_playlist_vst3_mixer_effect_parameter_links();
+        let playlist_clap_audio_control_links = load_playlist_clap_audio_control_links();
         let internal_lfo_parameter_links = load_internal_lfo_parameter_links();
         let playlist_audio_clip_envelopes = load_playlist_audio_clip_envelopes();
         let playlist_automatic_crossfades = load_playlist_automatic_crossfades();
@@ -7306,6 +7352,7 @@ impl DawUi {
             pattern_vst3_mixer_effect_parameter_links,
             playlist_vst3_parameter_links,
             playlist_vst3_mixer_effect_parameter_links,
+            playlist_clap_audio_control_links,
             internal_lfo_parameter_links,
             playlist_audio_clip_envelopes,
             playlist_automatic_crossfades,
@@ -20376,6 +20423,13 @@ impl DawUi {
                             "CLAP Playlist source Channel {channel_id} disappeared during preparation"
                         )
                     })?;
+                let (volume_automation, pan_automation) = self
+                    .clap_playlist_control_automation_for_channel(
+                        document,
+                        &arrangement,
+                        track_filter,
+                        channel_id,
+                    )?;
                 Ok(ClapPlaylistPreviewRequest {
                     settings: ClapPatternPreviewSettings {
                         pattern_id: arrangement_id,
@@ -20391,9 +20445,114 @@ impl DawUi {
                     },
                     left_gain,
                     right_gain,
+                    layer_gain: f32::from_bits(layer_gain_bits),
+                    layer_pan_raw,
+                    volume_automation,
+                    pan_automation,
                 })
             })
             .collect()
+    }
+
+    fn clap_playlist_control_automation_for_channel(
+        &self,
+        document: &FlpDocument,
+        arrangement: &Arrangement,
+        track_filter: PlaylistTrackFilter<'_>,
+        channel_id: u16,
+    ) -> Result<PlaylistClapChannelAutomationCurves, String> {
+        let (Some(project_path), Ok(automation_channels)) =
+            (self.current_path.as_deref(), document.automation_channels())
+        else {
+            return Ok((Arc::new(Vec::new()), Arc::new(Vec::new())));
+        };
+        let automation_channels = automation_channels
+            .into_iter()
+            .map(|channel| (channel.channel_id(), channel))
+            .collect::<HashMap<_, _>>();
+        let mut volume_points = Vec::<(u64, usize, usize, PlaylistChannelAutomationPoint)>::new();
+        let mut pan_points = Vec::<(u64, usize, usize, PlaylistChannelAutomationPoint)>::new();
+        for link in self
+            .playlist_clap_audio_control_links
+            .iter()
+            .filter(|link| {
+                project_paths_equal(Path::new(&link.project_path), project_path)
+                    && link.target_channel_id == channel_id
+            })
+        {
+            let Some(automation_channel) = automation_channels.get(&link.automation_channel_id)
+            else {
+                continue;
+            };
+            for (clip_index, clip) in arrangement.clips.iter().enumerate() {
+                if track_filter.clip_is_muted(clip)
+                    || !matches!(clip.target(), PlaylistClipTarget::Channel { id } if id == link.automation_channel_id)
+                {
+                    continue;
+                }
+                if clip
+                    .scale
+                    .is_some_and(|scale| !scale.is_finite() || (scale - 1.0).abs() > 1e-9)
+                {
+                    return Err(format!(
+                        "CLAP channel automation cannot yet expand scaled Automation clips (clip at tick {})",
+                        clip.position_ticks,
+                    ));
+                }
+                if clip.source_window_ticks().is_some_and(|(start, end)| {
+                    (start, end) != (0, 0) && end.checked_sub(start) != Some(clip.length_ticks)
+                }) {
+                    return Err(format!(
+                        "CLAP channel automation cannot yet expand this Automation clip source window (clip at tick {})",
+                        clip.position_ticks,
+                    ));
+                }
+                let expanded = expand_automation_channel_curve_for_clip(
+                    automation_channel.points(),
+                    clip,
+                    document.header().ppq(),
+                )?;
+                let destination = match link.control {
+                    PlaylistClapAudioControl::Volume => &mut volume_points,
+                    PlaylistClapAudioControl::Pan => &mut pan_points,
+                };
+                for (point_index, point) in expanded.into_iter().enumerate() {
+                    let tick = u64::from(clip.position_ticks)
+                        .checked_add(point.tick)
+                        .ok_or_else(|| "CLAP channel automation position overflow".to_owned())?;
+                    destination.push((
+                        tick,
+                        clip_index,
+                        point_index,
+                        PlaylistChannelAutomationPoint {
+                            tick,
+                            value: point.value,
+                            tension: point.tension,
+                        },
+                    ));
+                    if destination.len() > 1_000_000 {
+                        return Err("CLAP channel automation exceeds 1,000,000 points".to_owned());
+                    }
+                }
+            }
+        }
+        let finish = |mut points: Vec<(u64, usize, usize, PlaylistChannelAutomationPoint)>| {
+            points.sort_by_key(|(tick, clip_index, point_index, _)| {
+                (*tick, *clip_index, *point_index)
+            });
+            let mut unique = Vec::<PlaylistChannelAutomationPoint>::with_capacity(points.len());
+            for (tick, _, _, point) in points {
+                if let Some(previous) = unique.last_mut()
+                    && previous.tick == tick
+                {
+                    *previous = point;
+                } else {
+                    unique.push(point);
+                }
+            }
+            Arc::new(unique)
+        };
+        Ok((finish(volume_points), finish(pan_points)))
     }
 
     fn prepare_clap_playlist_playback(
@@ -20451,6 +20610,10 @@ impl DawUi {
                     channel_id,
                     left_gain: request.left_gain,
                     right_gain: request.right_gain,
+                    layer_gain: request.layer_gain,
+                    layer_pan_raw: request.layer_pan_raw,
+                    volume_automation: request.volume_automation,
+                    pan_automation: request.pan_automation,
                 },
             );
             let parameter_values = self.clap_parameter_overrides_for(
@@ -21098,6 +21261,10 @@ impl DawUi {
                     channel_id,
                     left_gain: route.left_gain,
                     right_gain: route.right_gain,
+                    layer_gain: route.layer_gain,
+                    layer_pan_raw: route.layer_pan_raw,
+                    volume_automation: route.volume_automation,
+                    pan_automation: route.pan_automation,
                     samples,
                 });
             }
@@ -32406,6 +32573,16 @@ impl DawUi {
         };
         let channels = document.channels();
         let channel_groups = document.channel_groups();
+        let playlist_clap_control_project_path = self.current_path.clone();
+        let selected_automation_channel_id = self.selected_automation_channel.filter(|id| {
+            document
+                .automation_channels()
+                .is_ok_and(|automation_channels| {
+                    automation_channels
+                        .iter()
+                        .any(|channel| channel.channel_id() == *id && !channel.points().is_empty())
+                })
+        });
         let group_indices = channel_groups
             .iter()
             .map(ChannelGroupSummary::index)
@@ -32476,6 +32653,8 @@ impl DawUi {
         let mut channel_main_pitch_edits = Vec::new();
         let mut channel_add_to_key_edits = Vec::new();
         let mut channel_zipped_edits = Vec::new();
+        let mut playlist_clap_control_link_edits = Vec::new();
+        let mut playlist_clap_control_unlink_edits = Vec::new();
         let (zip_selected, unzip_all, group_selected, previous_group, next_group) =
             if ui.memory(|memory| memory.focused().is_none()) {
                 ui.input_mut(|input| {
@@ -33038,6 +33217,87 @@ impl DawUi {
                                     self.selected_graph_channel = Some(channel.id());
                                     self.selected_note_channel = Some(channel.id());
                                     ui.close();
+                                }
+                                if self
+                                    .clap_pattern_playback_instruments
+                                    .contains_key(&channel.id())
+                                {
+                                    ui.separator();
+                                    ui.menu_button("Playlist automation", |ui| {
+                                        if let Some(automation_channel_id) =
+                                            selected_automation_channel_id
+                                        {
+                                            ui.small(format!(
+                                                "Selected source: Automation channel {automation_channel_id}"
+                                            ));
+                                        } else {
+                                            ui.small(
+                                                "Select an Automation channel with points first",
+                                            );
+                                        }
+                                        let Some(project_path) =
+                                            playlist_clap_control_project_path.as_deref()
+                                        else {
+                                            ui.small(
+                                                "Save the project before creating an automation link",
+                                            );
+                                            return;
+                                        };
+                                        for (control, label) in [
+                                            (PlaylistClapAudioControl::Volume, "Volume"),
+                                            (PlaylistClapAudioControl::Pan, "Pan"),
+                                        ] {
+                                            let current_link = self
+                                                .playlist_clap_audio_control_links
+                                                .iter()
+                                                .find(|link| {
+                                                    project_paths_equal(
+                                                        Path::new(&link.project_path),
+                                                        project_path,
+                                                    ) && link.target_channel_id == channel.id()
+                                                        && link.control == control
+                                                });
+                                            if let Some(automation_channel_id) =
+                                                selected_automation_channel_id
+                                            {
+                                                let button = ui.add_enabled(
+                                                    true,
+                                                    egui::Button::new(format!(
+                                                        "Link selected Automation to {label}"
+                                                    )),
+                                                );
+                                                if button.clicked() {
+                                                    playlist_clap_control_link_edits.push((
+                                                        automation_channel_id,
+                                                        channel.id(),
+                                                        control,
+                                                    ));
+                                                    ui.close();
+                                                }
+                                            } else {
+                                                ui.add_enabled(
+                                                    false,
+                                                    egui::Button::new(format!(
+                                                        "Link selected Automation to {label}"
+                                                    )),
+                                                );
+                                            }
+                                            if let Some(link) = current_link {
+                                                ui.small(format!(
+                                                    "{label} source: Automation channel {}",
+                                                    link.automation_channel_id
+                                                ));
+                                                if ui
+                                                    .button(format!("Clear {label} automation link"))
+                                                    .clicked()
+                                                {
+                                                    playlist_clap_control_unlink_edits
+                                                        .push((channel.id(), control));
+                                                    ui.close();
+                                                }
+                                            }
+                                        }
+                                    });
                                 }
                                 if ui
                                     .add_enabled(
@@ -34424,6 +34684,64 @@ impl DawUi {
                     }
                     Err(error) => {
                         self.status = format!("Could not add note to step: {error}");
+                    }
+                }
+            }
+        }
+        if !playlist_clap_control_link_edits.is_empty()
+            && let Some(project_path) = playlist_clap_control_project_path.as_deref()
+        {
+            for (automation_channel_id, target_channel_id, control) in
+                playlist_clap_control_link_edits
+            {
+                let mut links = self.playlist_clap_audio_control_links.clone();
+                upsert_playlist_clap_audio_control_link(
+                    &mut links,
+                    PlaylistClapAudioControlLink {
+                        project_path: project_path.to_string_lossy().into_owned(),
+                        automation_channel_id,
+                        target_channel_id,
+                        control,
+                    },
+                );
+                match save_playlist_clap_audio_control_links(&links) {
+                    Ok(()) => {
+                        self.playlist_clap_audio_control_links = links;
+                        self.active_clap_playlist_cache_key = None;
+                        self.pending_clap_playlist_playback = None;
+                        self.status = format!(
+                            "Linked Automation channel {automation_channel_id} to CLAP Channel {target_channel_id} {}",
+                            control.code()
+                        );
+                    }
+                    Err(error) => {
+                        self.status = format!("Could not save CLAP automation link: {error}");
+                    }
+                }
+            }
+        }
+        if !playlist_clap_control_unlink_edits.is_empty()
+            && let Some(project_path) = playlist_clap_control_project_path.as_deref()
+        {
+            for (target_channel_id, control) in playlist_clap_control_unlink_edits {
+                let mut links = self.playlist_clap_audio_control_links.clone();
+                links.retain(|link| {
+                    !(project_paths_equal(Path::new(&link.project_path), project_path)
+                        && link.target_channel_id == target_channel_id
+                        && link.control == control)
+                });
+                match save_playlist_clap_audio_control_links(&links) {
+                    Ok(()) => {
+                        self.playlist_clap_audio_control_links = links;
+                        self.active_clap_playlist_cache_key = None;
+                        self.pending_clap_playlist_playback = None;
+                        self.status = format!(
+                            "Cleared CLAP Channel {target_channel_id} {} automation link",
+                            control.code()
+                        );
+                    }
+                    Err(error) => {
+                        self.status = format!("Could not save CLAP automation link: {error}");
                     }
                 }
             }
@@ -67611,6 +67929,10 @@ fn playlist_vst3_mixer_effect_parameter_links_file() -> Option<PathBuf> {
     midi_control_change_mapping_file("playlist-vst3-mixer-effect-parameter-links.txt")
 }
 
+fn playlist_clap_audio_control_links_file() -> Option<PathBuf> {
+    midi_control_change_mapping_file("playlist-clap-audio-control-links.txt")
+}
+
 fn internal_lfo_parameter_links_file() -> Option<PathBuf> {
     midi_control_change_mapping_file("internal-lfo-parameter-links.txt")
 }
@@ -67688,6 +68010,13 @@ fn load_playlist_vst3_mixer_effect_parameter_links() -> Vec<PlaylistVst3MixerEff
     playlist_vst3_mixer_effect_parameter_links_file()
         .and_then(|path| fs::read_to_string(path).ok())
         .map(|contents| parse_playlist_vst3_mixer_effect_parameter_links(&contents))
+        .unwrap_or_default()
+}
+
+fn load_playlist_clap_audio_control_links() -> Vec<PlaylistClapAudioControlLink> {
+    playlist_clap_audio_control_links_file()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .map(|contents| parse_playlist_clap_audio_control_links(&contents))
         .unwrap_or_default()
 }
 
@@ -67964,6 +68293,20 @@ fn save_playlist_vst3_parameter_links(links: &[PlaylistVst3ParameterLink]) -> Re
     fs::create_dir_all(parent)
         .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
     fs::write(&path, serialize_playlist_vst3_parameter_links(links))
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
+fn save_playlist_clap_audio_control_links(
+    links: &[PlaylistClapAudioControlLink],
+) -> Result<(), String> {
+    let path = playlist_clap_audio_control_links_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path.parent().ok_or_else(|| {
+        "the Playlist CLAP audio control link path has no parent folder".to_owned()
+    })?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    fs::write(&path, serialize_playlist_clap_audio_control_links(links))
         .map_err(|error| format!("could not write {}: {error}", path.display()))
 }
 
@@ -68502,6 +68845,23 @@ fn playlist_vst3_parameter_link_for_target<'a>(
     links.iter().find(|link| {
         same_playlist_vst3_parameter_link_target(link, project_path, automation_channel_id, target)
     })
+}
+
+fn upsert_playlist_clap_audio_control_link(
+    links: &mut Vec<PlaylistClapAudioControlLink>,
+    link: PlaylistClapAudioControlLink,
+) {
+    if link.project_path.is_empty() {
+        return;
+    }
+    links.retain(|existing| {
+        !(project_paths_equal(
+            Path::new(&existing.project_path),
+            Path::new(&link.project_path),
+        ) && existing.target_channel_id == link.target_channel_id
+            && existing.control == link.control)
+    });
+    links.push(link);
 }
 
 fn same_playlist_vst3_mixer_effect_parameter_link_target(
@@ -69613,6 +69973,63 @@ fn serialize_playlist_vst3_parameter_links(links: &[PlaylistVst3ParameterLink]) 
         contents.push_str(&link.target.parameter_id.to_string());
         contents.push('\t');
         contents.push_str(&encode_midi_device_id(&link.target.parameter_name));
+        contents.push('\n');
+    }
+    contents
+}
+
+fn parse_playlist_clap_audio_control_links(contents: &str) -> Vec<PlaylistClapAudioControlLink> {
+    let mut links = Vec::new();
+    for line in contents.lines() {
+        let Some(encoded) = line.strip_prefix("link=") else {
+            continue;
+        };
+        let mut fields = encoded.split('\t');
+        let Some(project_path) = fields.next().and_then(decode_midi_device_id) else {
+            continue;
+        };
+        let Some(automation_channel_id) = fields.next().and_then(|field| field.parse::<u16>().ok())
+        else {
+            continue;
+        };
+        let Some(target_channel_id) = fields.next().and_then(|field| field.parse::<u16>().ok())
+        else {
+            continue;
+        };
+        let Some(control) = fields.next().and_then(PlaylistClapAudioControl::from_code) else {
+            continue;
+        };
+        if fields.next().is_some() {
+            continue;
+        }
+        upsert_playlist_clap_audio_control_link(
+            &mut links,
+            PlaylistClapAudioControlLink {
+                project_path,
+                automation_channel_id,
+                target_channel_id,
+                control,
+            },
+        );
+    }
+    links
+}
+
+fn serialize_playlist_clap_audio_control_links(links: &[PlaylistClapAudioControlLink]) -> String {
+    let mut contents = String::from("version=1\n");
+    let mut normalized = Vec::new();
+    for link in links {
+        upsert_playlist_clap_audio_control_link(&mut normalized, link.clone());
+    }
+    for link in normalized {
+        contents.push_str("link=");
+        contents.push_str(&encode_midi_device_id(&link.project_path));
+        contents.push('\t');
+        contents.push_str(&link.automation_channel_id.to_string());
+        contents.push('\t');
+        contents.push_str(&link.target_channel_id.to_string());
+        contents.push('\t');
+        contents.push_str(link.control.code());
         contents.push('\n');
     }
     contents

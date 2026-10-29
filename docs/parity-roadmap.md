@@ -458,9 +458,13 @@ Ordered by dependency and by "most compatibility per unit effort":
    Windows WASAPI exclusive access, and one bounded Playlist stream that mixes
     audio clips, Sampler notes, and mapped VST3 instruments placed by Pattern
     Clips are implemented with provisional channel volume/pan. Matching
-    installed VST3 channels now load on project open. Validate Playlist playback
-    on each platform and compare timing, levels, and instrument behavior against
-    native FL Studio output.
+    installed VST3 channels now load on project open. CLAP instruments also play
+    from Playlist Pattern Clips through Layers; app-local links let visible
+    Playlist Automation Clips control a CLAP channel's volume or pan. Scaled or
+    incompatible source-window Automation Clips and Pattern Event automation
+    for CLAP remain unsupported.
+    Validate Playlist playback on each platform and compare timing, levels, and
+    instrument behavior against native FL Studio output.
 3. **Realtime sampler + scheduler (partial)** — selected-pattern and Playlist
    Sampler notes schedule at sample offsets with bounded polyphony, voice
    stealing, basic sample-rate conversion, and channel gain/pan. Pattern-mode

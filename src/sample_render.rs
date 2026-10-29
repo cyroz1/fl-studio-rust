@@ -746,7 +746,19 @@ pub struct PlaylistAudioLayer {
     pub channel_id: u16,
     pub left_gain: f32,
     pub right_gain: f32,
+    pub layer_gain: f32,
+    pub layer_pan_raw: i32,
+    pub volume_automation: Arc<Vec<PlaylistChannelAutomationPoint>>,
+    pub pan_automation: Arc<Vec<PlaylistChannelAutomationPoint>>,
     pub samples: Vec<f32>,
+}
+
+/// One normalized point in a channel volume or pan automation curve.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PlaylistChannelAutomationPoint {
+    pub tick: u64,
+    pub value: f64,
+    pub tension: f32,
 }
 
 impl PartialEq for PlaylistAudioLayer {
@@ -754,6 +766,10 @@ impl PartialEq for PlaylistAudioLayer {
         self.channel_id == other.channel_id
             && self.left_gain.to_bits() == other.left_gain.to_bits()
             && self.right_gain.to_bits() == other.right_gain.to_bits()
+            && self.layer_gain.to_bits() == other.layer_gain.to_bits()
+            && self.layer_pan_raw == other.layer_pan_raw
+            && self.volume_automation == other.volume_automation
+            && self.pan_automation == other.pan_automation
             && self.samples.len() == other.samples.len()
             && self
                 .samples
@@ -5921,6 +5937,11 @@ fn stream_prepared_playlist_render_with_performance(
         meters,
         options.sample_rate,
     );
+    let clap_channel_mix_controls = PreparedClapChannelMixControls {
+        levels_by_channel: &render.sampler.clap_channel_levels_by_channel,
+        automation_by_channel: &render.sampler.clap_channel_automation_by_channel,
+        pan_law: render.sampler.pan_law,
+    };
     let mut output = vec![0.0f32; STREAM_BLOCK_FRAMES * 2];
     let mut sampler_block = vec![0.0f32; STREAM_BLOCK_FRAMES * 2];
     let mixer_effect_buses_required = render
@@ -6099,6 +6120,7 @@ fn stream_prepared_playlist_render_with_performance(
                     frame_count,
                     &options.clap_audio_layers,
                     &clap_mixer_routes,
+                    clap_channel_mix_controls,
                     meter_buses.as_deref_mut(),
                 )?;
                 direct_source_delay.process_interleaved(block)?;
@@ -7007,6 +7029,13 @@ struct PreparedClapMixerRoute {
     mixer_effect_input_transforms: Vec<(usize, MixerSourceRouteTransform)>,
 }
 
+#[derive(Clone, Copy)]
+struct PreparedClapChannelMixControls<'a> {
+    levels_by_channel: &'a HashMap<u16, (Option<u32>, Option<i32>)>,
+    automation_by_channel: &'a HashMap<u16, PreparedClapChannelAutomation>,
+    pan_law: PanLaw,
+}
+
 fn prepare_pattern_clap_mixer_routes(
     layers: &[PatternAudioLayer],
     document: &FlpDocument,
@@ -7115,6 +7144,7 @@ fn mix_playlist_clap_audio_layers(
     frame_count: usize,
     layers: &[PlaylistAudioLayer],
     routes_by_channel: &HashMap<u16, PreparedClapMixerRoute>,
+    channel_controls: PreparedClapChannelMixControls<'_>,
     mixer_buses: Option<&mut [f32]>,
 ) -> Result<(), String> {
     if layers.is_empty() {
@@ -7135,6 +7165,17 @@ fn mix_playlist_clap_audio_layers(
         let layer_frames = (layer.samples.len() / 2) as u64;
         let route = routes_by_channel.get(&layer.channel_id);
         let live_source_control = route.and_then(|route| route.live_source_control.as_ref());
+        let (saved_volume, saved_pan) = channel_controls
+            .levels_by_channel
+            .get(&layer.channel_id)
+            .copied()
+            .unwrap_or((None, None));
+        let automation = channel_controls
+            .automation_by_channel
+            .get(&layer.channel_id);
+        let volume_automation =
+            automation.map_or(&[][..], |automation| automation.volume.as_slice());
+        let pan_automation = automation.map_or(&[][..], |automation| automation.pan.as_slice());
         for frame_index in 0..frame_count {
             let source_frame_index = block_start.saturating_add(frame_index as u64);
             if source_frame_index >= layer_frames {
@@ -7142,10 +7183,44 @@ fn mix_playlist_clap_audio_layers(
             }
             let source_sample = (source_frame_index * 2) as usize;
             let target_sample = frame_index * 2;
-            let source_frame = [
-                layer.samples[source_sample] * layer.left_gain,
-                layer.samples[source_sample + 1] * layer.right_gain,
-            ];
+            let source_frame = if volume_automation.is_empty() && pan_automation.is_empty() {
+                [
+                    layer.samples[source_sample] * layer.left_gain,
+                    layer.samples[source_sample + 1] * layer.right_gain,
+                ]
+            } else {
+                let volume = if volume_automation.is_empty() {
+                    saved_volume
+                } else {
+                    let fallback = f64::from(saved_volume.unwrap_or(10_000).min(12_800)) / 12_800.0;
+                    let normalized = channel_automation_value_at_frame(
+                        volume_automation,
+                        source_frame_index,
+                        fallback,
+                    );
+                    Some((normalized.clamp(0.0, 1.0) * 12_800.0).round() as u32)
+                };
+                let pan = if pan_automation.is_empty() {
+                    saved_pan
+                } else {
+                    let fallback =
+                        f64::from(saved_pan.unwrap_or(6_400).clamp(0, 12_800)) / 12_800.0;
+                    let normalized = channel_automation_value_at_frame(
+                        pan_automation,
+                        source_frame_index,
+                        fallback,
+                    );
+                    Some((normalized.clamp(0.0, 1.0) * 12_800.0).round() as i32)
+                };
+                let (channel_gain, channel_pan) = channel_gain_pan(volume, pan);
+                let pan = (channel_pan + layer.layer_pan_raw as f32 / 6_400.0).clamp(-1.0, 1.0);
+                let (left_pan, right_pan) = channel_pan_gains(pan, false, channel_controls.pan_law);
+                let gain = channel_gain * layer.layer_gain;
+                [
+                    layer.samples[source_sample] * gain * left_pan,
+                    layer.samples[source_sample + 1] * gain * right_pan,
+                ]
+            };
             let mut routed_frame = source_frame;
             let live_controls = live_source_control.map(|(control, targets)| {
                 let controls = control.next_frame_controls(targets);
@@ -10340,10 +10415,82 @@ struct PreparedSamplerArrangement {
     live_mixer_source_routes_by_channel: HashMap<u16, MixerLiveSourceRoutePlan>,
     mixer_meter_transforms_by_channel: HashMap<u16, Vec<(usize, MixerSourceRouteTransform)>>,
     mixer_effect_input_transforms_by_channel: HashMap<u16, Vec<(usize, MixerSourceRouteTransform)>>,
+    clap_channel_levels_by_channel: HashMap<u16, (Option<u32>, Option<i32>)>,
+    clap_channel_automation_by_channel: HashMap<u16, PreparedClapChannelAutomation>,
     pattern_clips_rendered: usize,
     pattern_clips_skipped_unsupported_scale: usize,
     source_paths: std::collections::BTreeSet<PathBuf>,
     unresolved_clip_indices: BTreeSet<usize>,
+}
+
+#[derive(Clone, Copy)]
+struct PreparedChannelAutomationPoint {
+    frame: u64,
+    value: f64,
+    tension: f32,
+}
+
+#[derive(Default)]
+struct PreparedClapChannelAutomation {
+    volume: Vec<PreparedChannelAutomationPoint>,
+    pan: Vec<PreparedChannelAutomationPoint>,
+}
+
+fn prepare_playlist_channel_automation(
+    points: &[PlaylistChannelAutomationPoint],
+    tempo_map: &PlaylistTempoMap,
+    sample_rate: u32,
+) -> Result<Vec<PreparedChannelAutomationPoint>, String> {
+    let mut prepared = points
+        .iter()
+        .filter(|point| point.value.is_finite() && point.tension.is_finite())
+        .map(|point| {
+            Ok(PreparedChannelAutomationPoint {
+                frame: tempo_map.frame_at_tick(point.tick, sample_rate)?,
+                value: point.value.clamp(0.0, 1.0),
+                tension: point.tension.clamp(-1.0, 1.0),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    prepared.sort_by_key(|point| point.frame);
+    let mut unique = Vec::<PreparedChannelAutomationPoint>::with_capacity(prepared.len());
+    for point in prepared {
+        if let Some(previous) = unique.last_mut()
+            && previous.frame == point.frame
+        {
+            *previous = point;
+        } else {
+            unique.push(point);
+        }
+    }
+    Ok(unique)
+}
+
+fn channel_automation_value_at_frame(
+    points: &[PreparedChannelAutomationPoint],
+    frame: u64,
+    fallback: f64,
+) -> f64 {
+    let next_index = points.partition_point(|point| point.frame <= frame);
+    let Some(previous) = next_index
+        .checked_sub(1)
+        .and_then(|index| points.get(index))
+    else {
+        return fallback;
+    };
+    let Some(next) = points.get(next_index) else {
+        return previous.value;
+    };
+    let span = next.frame.saturating_sub(previous.frame);
+    if span == 0 {
+        return next.value;
+    }
+    crate::automation_segment_value_with_tension(
+        previous.value,
+        next.value,
+        frame.saturating_sub(previous.frame) as f64 / span as f64,
+        next.tension,
+    )
 }
 
 fn prepare_sampler_arrangement(
@@ -10395,6 +10542,34 @@ fn prepare_sampler_arrangement(
         .iter()
         .map(|channel| (channel.id(), channel))
         .collect();
+    let mut clap_channel_levels_by_channel = HashMap::new();
+    let mut clap_channel_automation_by_channel =
+        HashMap::<u16, PreparedClapChannelAutomation>::new();
+    for layer in options.clap_audio_layers.iter() {
+        let Some(channel) = channels_by_id.get(&layer.channel_id) else {
+            continue;
+        };
+        clap_channel_levels_by_channel
+            .entry(layer.channel_id)
+            .or_insert_with(|| (channel.volume(), channel.pan()));
+        let automation = clap_channel_automation_by_channel
+            .entry(layer.channel_id)
+            .or_default();
+        if automation.volume.is_empty() {
+            automation.volume = prepare_playlist_channel_automation(
+                &layer.volume_automation,
+                &tempo_map,
+                options.sample_rate,
+            )?;
+        }
+        if automation.pan.is_empty() {
+            automation.pan = prepare_playlist_channel_automation(
+                &layer.pan_automation,
+                &tempo_map,
+                options.sample_rate,
+            )?;
+        }
+    }
     let mut mixer_transforms_by_channel = HashMap::<u16, MixerSourceRouteTransform>::new();
     let mut live_mixer_source_routes_by_channel = HashMap::<u16, MixerLiveSourceRoutePlan>::new();
     let mut mixer_meter_transforms_by_channel =
@@ -10517,6 +10692,8 @@ fn prepare_sampler_arrangement(
             live_mixer_source_routes_by_channel,
             mixer_meter_transforms_by_channel,
             mixer_effect_input_transforms_by_channel,
+            clap_channel_levels_by_channel,
+            clap_channel_automation_by_channel,
             pattern_clips_rendered: 0,
             pattern_clips_skipped_unsupported_scale: schedule.clips_skipped_unsupported_scale,
             source_paths: std::collections::BTreeSet::new(),
@@ -10927,6 +11104,8 @@ fn prepare_sampler_arrangement(
         live_mixer_source_routes_by_channel,
         mixer_meter_transforms_by_channel,
         mixer_effect_input_transforms_by_channel,
+        clap_channel_levels_by_channel,
+        clap_channel_automation_by_channel,
         pattern_clips_rendered: rendered_pattern_clip_indices.len(),
         pattern_clips_skipped_unsupported_scale: schedule.clips_skipped_unsupported_scale,
         source_paths: decoded_by_path.keys().cloned().collect(),
@@ -16930,12 +17109,31 @@ mod tests {
             channel_id: 9,
             left_gain: 1.0,
             right_gain: 1.0,
+            layer_gain: 1.0,
+            layer_pan_raw: 0,
+            volume_automation: Arc::new(Vec::new()),
+            pan_automation: Arc::new(Vec::new()),
             samples: vec![1.0, 10.0, 2.0, 20.0, 3.0, 30.0],
         };
         let mut output = vec![0.0; 6];
+        let empty_levels = HashMap::new();
+        let empty_automation = HashMap::new();
+        let channel_controls = PreparedClapChannelMixControls {
+            levels_by_channel: &empty_levels,
+            automation_by_channel: &empty_automation,
+            pan_law: PanLaw::Circular,
+        };
 
-        mix_playlist_clap_audio_layers(&mut output, 1, 3, &[layer], &HashMap::new(), None)
-            .expect("Playlist CLAP audio should mix without routing");
+        mix_playlist_clap_audio_layers(
+            &mut output,
+            1,
+            3,
+            &[layer],
+            &HashMap::new(),
+            channel_controls,
+            None,
+        )
+        .expect("Playlist CLAP audio should mix without routing");
 
         assert_eq!(output, [2.0, 20.0, 3.0, 30.0, 0.0, 0.0]);
     }
@@ -19312,6 +19510,8 @@ mod tests {
             },
             tempo_map: PlaylistTempoMap::constant(96, 120.0).unwrap(),
             pan_law: PanLaw::Circular,
+            clap_channel_levels_by_channel: HashMap::new(),
+            clap_channel_automation_by_channel: HashMap::new(),
             notes: vec![ScheduledSamplerNote {
                 clip_index: 0,
                 playlist_track_id: None,
