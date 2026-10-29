@@ -10,9 +10,15 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use clack_extensions::audio_ports::{AudioPortFlags, AudioPortInfoBuffer, PluginAudioPorts};
+use clack_extensions::gui::{
+    GuiApiType, GuiConfiguration, GuiSize, HostGui, HostGuiImpl, PluginGui, Window,
+};
 use clack_extensions::latency::{HostLatency, HostLatencyImpl, PluginLatency};
 use clack_extensions::note_ports::{NoteDialect, NotePortInfoBuffer, PluginNotePorts};
-use clack_extensions::params::{ParamInfoBuffer, ParamInfoFlags, PluginParams};
+use clack_extensions::params::{
+    HostParams, HostParamsImplMainThread, HostParamsImplShared, ParamClearFlags, ParamInfoBuffer,
+    ParamInfoFlags, ParamRescanFlags, PluginParams,
+};
 use clack_extensions::state::PluginState;
 use clack_extensions::tail::{HostTail, HostTailImpl, PluginTail, TailLength};
 use clack_host::events::event_types::{
@@ -22,22 +28,25 @@ use clack_host::events::event_types::{
 use clack_host::events::{EventFlags, EventHeader};
 use clack_host::prelude::{
     AudioPortBuffer, AudioPortBufferType, AudioPorts, AudioProcessorHandler, ClapId, EventBuffer,
-    HostExtensions, HostHandlers, HostInfo, InputAudioBuffers, InputChannel, MainThreadHandler,
-    Pckn, PluginAudioConfiguration, PluginEntry, PluginInstance, ProcessStatus, SharedHandler,
-    StartedPluginAudioProcessor,
+    HostError, HostExtensions, HostHandlers, HostInfo, InputAudioBuffers, InputChannel,
+    MainThreadHandler, Pckn, PluginAudioConfiguration, PluginEntry, PluginInstance, ProcessStatus,
+    SharedHandler, StartedPluginAudioProcessor,
 };
 use clack_host::utils::{BeatTime, SecondsTime};
+use eframe::egui;
 use flp_rebuild::plugin_settings::{
     ClapProjectMixerEffectAssignment, MAX_CLAP_PROJECT_PLUGIN_STATE_BYTES,
 };
 use flp_rebuild::sample_render::PlaylistTempoMap;
 use flp_rebuild::vst3::{MixerEffectProcessor, MixerEffectProcessorFactory};
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 pub const PROBE_FLAG: &str = "--clap-probe";
 pub const INSTANCE_PROBE_FLAG: &str = "--clap-instance-probe";
 pub const NOTE_PREVIEW_FLAG: &str = "--clap-note-preview";
 pub const NOTE_PREVIEW_SERVER_FLAG: &str = "--clap-note-preview-server";
 pub const MIXER_EFFECT_SERVER_FLAG: &str = "--clap-mixer-effect-server";
+pub const MIXER_EFFECT_EDITOR_FLAG: &str = "--clap-mixer-effect-editor";
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_PROBE_OUTPUT_BYTES: usize = 1024 * 1024;
@@ -111,6 +120,89 @@ impl HostHandlers for ClapMixerEffectHost {
 
     fn declare_extensions(builder: &mut HostExtensions<Self>, _shared: &Self::Shared<'_>) {
         builder.register::<HostLatency>().register::<HostTail>();
+    }
+}
+
+struct ClapMixerEffectEditorHost;
+
+struct ClapMixerEffectEditorHostShared {
+    parameter_flush_requested: Arc<AtomicBool>,
+    gui_closed: Arc<AtomicBool>,
+    gui_was_destroyed: Arc<AtomicBool>,
+    gui_show_requested: Arc<AtomicBool>,
+    gui_hide_requested: Arc<AtomicBool>,
+    resize_requested: Arc<Mutex<Option<GuiSize>>>,
+}
+
+struct ClapMixerEffectEditorHostMainThread;
+
+struct ClapMixerEffectEditorHostAudioProcessor;
+
+impl SharedHandler<'_> for ClapMixerEffectEditorHostShared {
+    fn request_restart(&self) {}
+
+    fn request_process(&self) {}
+
+    fn request_callback(&self) {}
+}
+
+impl MainThreadHandler<'_> for ClapMixerEffectEditorHostMainThread {}
+
+impl AudioProcessorHandler<'_> for ClapMixerEffectEditorHostAudioProcessor {}
+
+impl HostGuiImpl for ClapMixerEffectEditorHostShared {
+    fn resize_hints_changed(&self) {}
+
+    fn request_resize(&self, new_size: GuiSize) -> Result<(), HostError> {
+        if new_size.width == 0 || new_size.height == 0 {
+            return Err(HostError::Message("CLAP editor requested an empty size"));
+        }
+        *self
+            .resize_requested
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(new_size);
+        Ok(())
+    }
+
+    fn request_show(&self) -> Result<(), HostError> {
+        self.gui_show_requested.store(true, Ordering::Release);
+        self.gui_hide_requested.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    fn request_hide(&self) -> Result<(), HostError> {
+        self.gui_hide_requested.store(true, Ordering::Release);
+        self.gui_show_requested.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    fn closed(&self, was_destroyed: bool) {
+        self.gui_was_destroyed
+            .store(was_destroyed, Ordering::Release);
+        self.gui_closed.store(true, Ordering::Release);
+    }
+}
+
+impl HostParamsImplShared for ClapMixerEffectEditorHostShared {
+    fn request_flush(&self) {
+        self.parameter_flush_requested
+            .store(true, Ordering::Release);
+    }
+}
+
+impl HostParamsImplMainThread for ClapMixerEffectEditorHostMainThread {
+    fn rescan(&self, _flags: ParamRescanFlags) {}
+
+    fn clear(&self, _param_id: ClapId, _flags: ParamClearFlags) {}
+}
+
+impl HostHandlers for ClapMixerEffectEditorHost {
+    type Shared<'a> = ClapMixerEffectEditorHostShared;
+    type MainThread<'a> = ClapMixerEffectEditorHostMainThread;
+    type AudioProcessor<'a> = ClapMixerEffectEditorHostAudioProcessor;
+
+    fn declare_extensions(builder: &mut HostExtensions<Self>, _shared: &Self::Shared<'_>) {
+        builder.register::<HostGui>().register::<HostParams>();
     }
 }
 
@@ -950,6 +1042,162 @@ enum ClapMixerEffectProcessResponse {
     },
     Stopped,
     Error(String),
+}
+
+pub struct ClapMixerEffectEditorOutput {
+    pub state: Option<Vec<u8>>,
+    pub parameter_overrides: BTreeMap<u32, f64>,
+}
+
+type ClapMixerEffectEditorInput = (Option<Vec<u8>>, BTreeMap<u32, f64>);
+
+pub struct ClapMixerEffectEditorProcess {
+    child: Arc<Mutex<Child>>,
+    responses: Receiver<Result<ClapMixerEffectEditorOutput, String>>,
+    completed: Arc<AtomicBool>,
+}
+
+impl ClapMixerEffectEditorProcess {
+    pub fn spawn(
+        path: &Path,
+        plugin_id: &str,
+        state: Option<&[u8]>,
+        parameter_overrides: &BTreeMap<u32, f64>,
+    ) -> Result<Self, String> {
+        if state.is_some_and(|state| state.len() > MAX_CLAP_PROJECT_PLUGIN_STATE_BYTES) {
+            return Err("CLAP plug-in state exceeds the 32 MiB limit".to_owned());
+        }
+        if parameter_overrides.len() > MAX_INSTANCE_METADATA_ITEMS as usize {
+            return Err(
+                "CLAP Mixer parameter override count exceeds the metadata limit".to_owned(),
+            );
+        }
+        let executable = std::env::current_exe()
+            .map_err(|error| format!("could not locate the CLAP editor helper: {error}"))?;
+        let mut child = Command::new(executable)
+            .arg(MIXER_EFFECT_EDITOR_FLAG)
+            .arg(path)
+            .arg(plugin_id)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| format!("could not start the CLAP editor helper: {error}"))?;
+        let Some(mut stdin) = child.stdin.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("CLAP editor helper did not provide input".to_owned());
+        };
+        let Some(stdout) = child.stdout.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("CLAP editor helper did not provide output".to_owned());
+        };
+        let write_result = (|| {
+            if let Some(state) = state {
+                writeln!(stdin, "STATE 1 {}", state.len())?;
+                stdin.write_all(state)?;
+                stdin.write_all(b"\n")?;
+            } else {
+                writeln!(stdin, "STATE 0 0")?;
+            }
+            writeln!(stdin, "PARAMS {}", parameter_overrides.len())?;
+            for (parameter_id, value) in parameter_overrides {
+                if !value.is_finite() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "CLAP Mixer parameter override is not finite",
+                    ));
+                }
+                writeln!(stdin, "PARAM {parameter_id} {:016x}", value.to_bits())?;
+            }
+            writeln!(stdin, "END")?;
+            stdin.flush()
+        })();
+        drop(stdin);
+        if let Err(error) = write_result {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("could not send CLAP editor state: {error}"));
+        }
+
+        let child = Arc::new(Mutex::new(child));
+        let worker_child = Arc::clone(&child);
+        let completed = Arc::new(AtomicBool::new(false));
+        let worker_completed = Arc::clone(&completed);
+        let (response_sender, responses) = mpsc::channel();
+        thread::Builder::new()
+            .name("clap-mixer-effect-editor-response".to_owned())
+            .spawn(move || {
+                let result = read_mixer_effect_editor_response(stdout).and_then(|response| {
+                    let deadline = Instant::now() + CLAP_MIXER_EFFECT_PROCESS_TIMEOUT;
+                    loop {
+                        let status = worker_child
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .try_wait()
+                            .map_err(|error| {
+                                format!("could not wait for the CLAP editor helper: {error}")
+                            })?;
+                        if let Some(status) = status {
+                            if status.success() {
+                                return Ok(response);
+                            }
+                            return Err(
+                                "CLAP editor helper exited unsuccessfully after closing".to_owned()
+                            );
+                        }
+                        if Instant::now() >= deadline {
+                            let mut child = worker_child
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            return Err(
+                                "CLAP editor helper did not exit after saving state".to_owned()
+                            );
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                });
+                worker_completed.store(true, Ordering::Release);
+                let _ = response_sender.send(result);
+            })
+            .map_err(|error| {
+                let mut child = child
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let _ = child.kill();
+                let _ = child.wait();
+                format!("could not start the CLAP editor response reader: {error}")
+            })?;
+
+        Ok(Self {
+            child,
+            responses,
+            completed,
+        })
+    }
+
+    pub fn try_recv(
+        &self,
+    ) -> Result<Result<ClapMixerEffectEditorOutput, String>, mpsc::TryRecvError> {
+        self.responses.try_recv()
+    }
+}
+
+impl Drop for ClapMixerEffectEditorProcess {
+    fn drop(&mut self) {
+        if self.completed.load(Ordering::Acquire) {
+            return;
+        }
+        let mut child = self
+            .child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 }
 
 struct ClapMixerEffectProcess {
@@ -2590,6 +2838,31 @@ pub fn run_mixer_effect_server_child(path: &Path, plugin_id: &str, sample_rate: 
     }
 }
 
+pub fn run_mixer_effect_editor_child(path: &Path, plugin_id: &str) -> i32 {
+    let stdin = std::io::stdin();
+    let mut input = BufReader::new(stdin.lock());
+    let result = read_mixer_effect_editor_input(&mut input).and_then(|(state, parameters)| {
+        run_mixer_effect_editor_ui(path, plugin_id, state.as_deref(), &parameters)
+    });
+    let stdout = std::io::stdout();
+    let mut output = BufWriter::new(stdout.lock());
+    match result {
+        Ok(result) => match write_mixer_effect_editor_response(&mut output, &result) {
+            Ok(()) => 0,
+            Err(error) => {
+                eprintln!("could not return CLAP editor state: {error}");
+                1
+            }
+        },
+        Err(error) => {
+            let _ = write_preview_server_error(&mut output, &error);
+            let _ = output.flush();
+            eprintln!("{error}");
+            1
+        }
+    }
+}
+
 fn read_mixer_effect_sidechain_input(
     input: &mut impl Read,
     input_audio_storage: &mut [Vec<Vec<f32>>],
@@ -3901,6 +4174,227 @@ fn write_preview_server_state(output: &mut impl Write, state: &[u8]) -> std::io:
     output.flush()
 }
 
+fn read_mixer_effect_editor_input(
+    input: &mut impl Read,
+) -> Result<ClapMixerEffectEditorInput, String> {
+    let state_header = read_preview_protocol_header(input)
+        .map_err(|error| format!("could not read CLAP editor state header: {error}"))?
+        .ok_or_else(|| "CLAP editor request ended before its state header".to_owned())?;
+    let mut fields = state_header.split_whitespace();
+    let (Some("STATE"), Some(present), Some(length), None) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
+    else {
+        return Err("invalid CLAP editor state header".to_owned());
+    };
+    let present = present
+        .parse::<u8>()
+        .ok()
+        .filter(|present| *present <= 1)
+        .ok_or_else(|| "invalid CLAP editor state presence flag".to_owned())?;
+    let length = length
+        .parse::<usize>()
+        .ok()
+        .filter(|length| *length <= MAX_CLAP_PROJECT_PLUGIN_STATE_BYTES)
+        .ok_or_else(|| "CLAP editor state exceeds the 32 MiB limit".to_owned())?;
+    if present == 0 && length != 0 {
+        return Err("CLAP editor state presence and length do not match".to_owned());
+    }
+    let state = if present == 1 {
+        let mut state = vec![0; length];
+        input
+            .read_exact(&mut state)
+            .map_err(|error| format!("could not read CLAP editor state: {error}"))?;
+        let mut delimiter = [0; 1];
+        input
+            .read_exact(&mut delimiter)
+            .map_err(|error| format!("could not finish CLAP editor state: {error}"))?;
+        if delimiter[0] != b'\n' {
+            return Err("invalid CLAP editor state delimiter".to_owned());
+        }
+        Some(state)
+    } else {
+        None
+    };
+    let parameter_header = read_preview_protocol_header(input)
+        .map_err(|error| format!("could not read CLAP editor parameter header: {error}"))?
+        .ok_or_else(|| "CLAP editor request ended before its parameters".to_owned())?;
+    let mut fields = parameter_header.split_whitespace();
+    let (Some("PARAMS"), Some(count), None) = (fields.next(), fields.next(), fields.next()) else {
+        return Err("invalid CLAP editor parameter header".to_owned());
+    };
+    let count = count
+        .parse::<usize>()
+        .ok()
+        .filter(|count| *count <= MAX_INSTANCE_METADATA_ITEMS as usize)
+        .ok_or_else(|| "CLAP editor parameter count exceeds the metadata limit".to_owned())?;
+    let mut parameter_values = BTreeMap::new();
+    for _ in 0..count {
+        let line = read_preview_protocol_header(input)
+            .map_err(|error| format!("could not read CLAP editor parameter: {error}"))?
+            .ok_or_else(|| "CLAP editor request ended before all parameters arrived".to_owned())?;
+        let mut fields = line.split_whitespace();
+        let (Some("PARAM"), Some(parameter_id), Some(value_bits), None) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            return Err("invalid CLAP editor parameter".to_owned());
+        };
+        let parameter_id = parameter_id
+            .parse::<u32>()
+            .ok()
+            .filter(|id| ClapId::from_raw(*id).is_some())
+            .ok_or_else(|| "CLAP editor parameter ID is invalid".to_owned())?;
+        let value = u64::from_str_radix(value_bits, 16)
+            .ok()
+            .map(f64::from_bits)
+            .filter(|value| value.is_finite())
+            .ok_or_else(|| "CLAP editor parameter value is invalid".to_owned())?;
+        if parameter_values.insert(parameter_id, value).is_some() {
+            return Err("CLAP editor parameter ID is duplicated".to_owned());
+        }
+    }
+    let end = read_preview_protocol_header(input)
+        .map_err(|error| format!("could not read CLAP editor request terminator: {error}"))?
+        .ok_or_else(|| "CLAP editor request ended before its terminator".to_owned())?;
+    if end != "END" {
+        return Err("invalid CLAP editor request terminator".to_owned());
+    }
+    Ok((state, parameter_values))
+}
+
+fn read_mixer_effect_editor_response(
+    output: ChildStdout,
+) -> Result<ClapMixerEffectEditorOutput, String> {
+    let mut input = BufReader::new(output);
+    let header = read_preview_protocol_header(&mut input)
+        .map_err(|error| format!("could not read CLAP editor result: {error}"))?
+        .ok_or_else(|| "CLAP editor helper closed without a result".to_owned())?;
+    if let Some(error) = header.strip_prefix("ERR ") {
+        return Err(error.to_owned());
+    }
+    let mut fields = header.split_whitespace();
+    let (Some("RESULT"), Some(state_present), Some(state_length), Some(parameter_count), None) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    ) else {
+        return Err("invalid CLAP editor result header".to_owned());
+    };
+    let state_present = state_present
+        .parse::<u8>()
+        .ok()
+        .filter(|present| *present <= 1)
+        .ok_or_else(|| "invalid CLAP editor result state flag".to_owned())?;
+    let state_length = state_length
+        .parse::<usize>()
+        .ok()
+        .filter(|length| *length <= MAX_CLAP_PROJECT_PLUGIN_STATE_BYTES)
+        .ok_or_else(|| "CLAP editor state exceeds the 32 MiB limit".to_owned())?;
+    let parameter_count = parameter_count
+        .parse::<usize>()
+        .ok()
+        .filter(|count| *count <= MAX_INSTANCE_METADATA_ITEMS as usize)
+        .ok_or_else(|| "CLAP editor parameter count exceeds the metadata limit".to_owned())?;
+    if state_present == 0 && state_length != 0 {
+        return Err("CLAP editor result state presence and length do not match".to_owned());
+    }
+    let state = if state_present == 1 {
+        let mut state = vec![0; state_length];
+        input
+            .read_exact(&mut state)
+            .map_err(|error| format!("could not read CLAP editor result state: {error}"))?;
+        let mut delimiter = [0; 1];
+        input
+            .read_exact(&mut delimiter)
+            .map_err(|error| format!("could not finish CLAP editor result state: {error}"))?;
+        if delimiter[0] != b'\n' {
+            return Err("invalid CLAP editor result state delimiter".to_owned());
+        }
+        Some(state)
+    } else {
+        None
+    };
+    let mut parameter_overrides = BTreeMap::new();
+    for _ in 0..parameter_count {
+        let line = read_preview_protocol_header(&mut input)
+            .map_err(|error| format!("could not read CLAP editor result parameter: {error}"))?
+            .ok_or_else(|| "CLAP editor result ended before all parameters arrived".to_owned())?;
+        let mut fields = line.split_whitespace();
+        let (Some("PARAM"), Some(parameter_id), Some(value_bits), None) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            return Err("invalid CLAP editor result parameter".to_owned());
+        };
+        let parameter_id = parameter_id
+            .parse::<u32>()
+            .ok()
+            .filter(|id| ClapId::from_raw(*id).is_some())
+            .ok_or_else(|| "CLAP editor result parameter ID is invalid".to_owned())?;
+        let value = u64::from_str_radix(value_bits, 16)
+            .ok()
+            .map(f64::from_bits)
+            .filter(|value| value.is_finite())
+            .ok_or_else(|| "CLAP editor result parameter value is invalid".to_owned())?;
+        if parameter_overrides.insert(parameter_id, value).is_some() {
+            return Err("CLAP editor result parameter ID is duplicated".to_owned());
+        }
+    }
+    if read_preview_protocol_header(&mut input)
+        .map_err(|error| format!("could not finish reading CLAP editor result: {error}"))?
+        .is_some()
+    {
+        return Err("CLAP editor helper returned trailing data".to_owned());
+    }
+    Ok(ClapMixerEffectEditorOutput {
+        state,
+        parameter_overrides,
+    })
+}
+
+fn write_mixer_effect_editor_response(
+    output: &mut impl Write,
+    result: &ClapMixerEffectEditorOutput,
+) -> std::io::Result<()> {
+    if result
+        .state
+        .as_ref()
+        .is_some_and(|state| state.len() > MAX_CLAP_PROJECT_PLUGIN_STATE_BYTES)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "CLAP plug-in state exceeds the 32 MiB limit",
+        ));
+    }
+    if result.parameter_overrides.len() > MAX_INSTANCE_METADATA_ITEMS as usize {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "CLAP editor parameter count exceeds the metadata limit",
+        ));
+    }
+    let state_length = result.state.as_ref().map_or(0, Vec::len);
+    writeln!(
+        output,
+        "RESULT {} {state_length} {}",
+        u8::from(result.state.is_some()),
+        result.parameter_overrides.len()
+    )?;
+    if let Some(state) = &result.state {
+        output.write_all(state)?;
+        output.write_all(b"\n")?;
+    }
+    for (parameter_id, value) in &result.parameter_overrides {
+        if ClapId::from_raw(*parameter_id).is_none() || !value.is_finite() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "CLAP editor returned an invalid parameter value",
+            ));
+        }
+        writeln!(output, "PARAM {parameter_id} {:016x}", value.to_bits())?;
+    }
+    output.flush()
+}
+
 fn write_preview_server_error(output: &mut impl Write, error: &str) -> std::io::Result<()> {
     let message = error
         .chars()
@@ -3974,6 +4468,548 @@ impl Write for LimitedClapStateWriter {
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+}
+
+#[derive(Clone)]
+struct ClapMixerEffectEditorSignals {
+    parameter_flush_requested: Arc<AtomicBool>,
+    gui_closed: Arc<AtomicBool>,
+    gui_was_destroyed: Arc<AtomicBool>,
+    gui_show_requested: Arc<AtomicBool>,
+    gui_hide_requested: Arc<AtomicBool>,
+    resize_requested: Arc<Mutex<Option<GuiSize>>>,
+}
+
+impl ClapMixerEffectEditorSignals {
+    fn new() -> Self {
+        Self {
+            parameter_flush_requested: Arc::new(AtomicBool::new(false)),
+            gui_closed: Arc::new(AtomicBool::new(false)),
+            gui_was_destroyed: Arc::new(AtomicBool::new(false)),
+            gui_show_requested: Arc::new(AtomicBool::new(false)),
+            gui_hide_requested: Arc::new(AtomicBool::new(false)),
+            resize_requested: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn host_shared(&self) -> ClapMixerEffectEditorHostShared {
+        ClapMixerEffectEditorHostShared {
+            parameter_flush_requested: Arc::clone(&self.parameter_flush_requested),
+            gui_closed: Arc::clone(&self.gui_closed),
+            gui_was_destroyed: Arc::clone(&self.gui_was_destroyed),
+            gui_show_requested: Arc::clone(&self.gui_show_requested),
+            gui_hide_requested: Arc::clone(&self.gui_hide_requested),
+            resize_requested: Arc::clone(&self.resize_requested),
+        }
+    }
+}
+
+struct ClapMixerEffectEditorSession {
+    instance: PluginInstance<ClapMixerEffectEditorHost>,
+    signals: ClapMixerEffectEditorSignals,
+    gui: Option<PluginGui>,
+    gui_created: bool,
+    gui_floating: bool,
+    gui_size_scale: f64,
+    parameter_values_before_editor: BTreeMap<u32, f64>,
+}
+
+impl ClapMixerEffectEditorSession {
+    fn new(
+        path: &Path,
+        plugin_id: &str,
+        state: Option<&[u8]>,
+        parameter_overrides: &BTreeMap<u32, f64>,
+    ) -> Result<Self, String> {
+        if state.is_some_and(|state| state.len() > MAX_CLAP_PROJECT_PLUGIN_STATE_BYTES) {
+            return Err("CLAP plug-in state exceeds the 32 MiB limit".to_owned());
+        }
+        let entry = unsafe { PluginEntry::load(path) }
+            .map_err(|error| format!("could not load CLAP entry: {error}"))?;
+        let plugin_id = CString::new(plugin_id)
+            .map_err(|_| "CLAP plug-in ID contains an invalid null byte".to_owned())?;
+        let host_info = HostInfo::new(
+            "FL Studio Rebuild",
+            "fl-studio-rust contributors",
+            "https://github.com/cyroz1/fl-studio-rust",
+            env!("CARGO_PKG_VERSION"),
+        )
+        .map_err(|error| format!("could not describe the host to the CLAP plug-in: {error}"))?;
+        let signals = ClapMixerEffectEditorSignals::new();
+        let shared_signals = signals.clone();
+        let mut instance = PluginInstance::<ClapMixerEffectEditorHost>::new(
+            move |_| shared_signals.host_shared(),
+            |_| ClapMixerEffectEditorHostMainThread,
+            &entry,
+            &plugin_id,
+            &host_info,
+        )
+        .map_err(|error| format!("could not initialize CLAP plug-in instance: {error}"))?;
+        if let Some(state) = state {
+            let plugin = instance.plugin_handle();
+            let state_extension = plugin
+                .get_extension::<PluginState>()
+                .ok_or_else(|| "CLAP effect does not support state restoration".to_owned())?;
+            let mut input = std::io::Cursor::new(state);
+            state_extension
+                .load(&plugin, &mut input)
+                .map_err(|error| format!("CLAP effect could not restore its state: {error}"))?;
+        }
+        if !parameter_overrides.is_empty() {
+            apply_clap_editor_parameter_overrides(&mut instance, parameter_overrides)?;
+        }
+        let mut session = Self {
+            instance,
+            signals,
+            gui: None,
+            gui_created: false,
+            gui_floating: false,
+            gui_size_scale: 1.0,
+            parameter_values_before_editor: BTreeMap::new(),
+        };
+        session.parameter_values_before_editor = session.capture_parameters()?;
+        Ok(session)
+    }
+
+    fn open_gui(&mut self, creation: &eframe::CreationContext<'_>) -> Result<egui::Vec2, String> {
+        let parent = clap_editor_parent_window(creation)?;
+        let api_type = parent
+            .api_type()
+            .to_standard_api()
+            .ok_or_else(|| "the CLAP editor host window uses an unsupported API".to_owned())?;
+        let plugin = self.instance.plugin_handle();
+        let gui = plugin
+            .get_extension::<PluginGui>()
+            .ok_or_else(|| "CLAP effect does not expose a native editor".to_owned())?;
+        let configurations = if api_type.supports_embedding() {
+            [
+                Some(GuiConfiguration {
+                    api_type,
+                    is_floating: false,
+                }),
+                Some(GuiConfiguration {
+                    api_type,
+                    is_floating: true,
+                }),
+            ]
+        } else {
+            [
+                Some(GuiConfiguration {
+                    api_type,
+                    is_floating: true,
+                }),
+                None,
+            ]
+        };
+        let configuration = configurations
+            .into_iter()
+            .flatten()
+            .find(|configuration| gui.is_api_supported(&plugin, *configuration))
+            .ok_or_else(|| {
+                format!(
+                    "CLAP effect does not support a native editor on {}",
+                    api_type.0.to_string_lossy()
+                )
+            })?;
+        gui.create(&plugin, configuration)
+            .map_err(|error| format!("could not create CLAP editor: {error}"))?;
+        self.gui = Some(gui);
+        self.gui_created = true;
+        self.gui_floating = configuration.is_floating;
+
+        let logical_size = if !api_type.uses_logical_size() {
+            let scale = f64::from(creation.egui_ctx.pixels_per_point()).max(1.0);
+            let _ = gui.set_scale(&plugin, scale);
+            scale
+        } else {
+            1.0
+        };
+        self.gui_size_scale = logical_size;
+        let plugin_size = gui.get_size(&plugin).unwrap_or(GuiSize {
+            width: 800,
+            height: 600,
+        });
+        if configuration.is_floating {
+            let title = CString::new("CLAP Mixer editor")
+                .expect("constant editor title contains no null byte");
+            gui.suggest_title(&plugin, &title);
+            // SAFETY: `parent` is a live eframe window and remains alive until `gui.destroy`.
+            unsafe { gui.set_transient(&plugin, parent) }
+                .map_err(|error| format!("could not parent the floating CLAP editor: {error}"))?;
+        } else {
+            // SAFETY: `parent` is a live eframe window and remains alive until `gui.destroy`.
+            unsafe { gui.set_parent(&plugin, parent) }
+                .map_err(|error| format!("could not embed the CLAP editor: {error}"))?;
+        }
+        gui.show(&plugin)
+            .map_err(|error| format!("could not show the CLAP editor: {error}"))?;
+        if configuration.is_floating {
+            Ok(egui::vec2(480.0, 120.0))
+        } else {
+            Ok(egui::vec2(
+                (f64::from(plugin_size.width) / logical_size) as f32,
+                (f64::from(plugin_size.height) / logical_size) as f32,
+            ))
+        }
+    }
+
+    fn service_host_requests(&mut self) -> Result<Option<GuiSize>, String> {
+        if self
+            .signals
+            .parameter_flush_requested
+            .swap(false, Ordering::AcqRel)
+        {
+            self.flush_parameters()?;
+        }
+        let requested_size = self
+            .signals
+            .resize_requested
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if self.gui_floating || requested_size.is_none() {
+            return Ok(None);
+        }
+        let can_resize = self.gui.is_some_and(|gui| {
+            let plugin = self.instance.plugin_handle();
+            gui.can_resize(&plugin)
+        });
+        Ok(if can_resize { requested_size } else { None })
+    }
+
+    fn flush_parameters(&mut self) -> Result<(), String> {
+        let params = {
+            let plugin = self.instance.plugin_handle();
+            plugin.get_extension::<PluginParams>()
+        };
+        let Some(params) = params else {
+            return Ok(());
+        };
+        let mut input_events = EventBuffer::new();
+        let mut output_events = EventBuffer::new();
+        let mut plugin = self
+            .instance
+            .inactive_plugin_handle()
+            .ok_or_else(|| "CLAP editor plug-in unexpectedly became active".to_owned())?;
+        params.flush(
+            &mut plugin,
+            &input_events.as_input(),
+            &mut output_events.as_output(),
+        );
+        input_events.clear();
+        Ok(())
+    }
+
+    fn capture_parameters(&mut self) -> Result<BTreeMap<u32, f64>, String> {
+        let plugin = self.instance.plugin_handle();
+        let Some(params) = plugin.get_extension::<PluginParams>() else {
+            return Ok(BTreeMap::new());
+        };
+        let count = params.count(&plugin);
+        if count > MAX_INSTANCE_METADATA_ITEMS {
+            return Err(format!(
+                "CLAP effect exposes {count} parameters; the metadata limit is {MAX_INSTANCE_METADATA_ITEMS}"
+            ));
+        }
+        let mut buffer = ParamInfoBuffer::new();
+        let mut values = BTreeMap::new();
+        for index in 0..count {
+            let Some(info) = params.get_info(&plugin, index, &mut buffer) else {
+                continue;
+            };
+            if info.flags.contains(ParamInfoFlags::IS_READONLY) {
+                continue;
+            }
+            let parameter_id = info.id.get();
+            let Some(value) = params
+                .get_value(&plugin, info.id)
+                .filter(|value| value.is_finite())
+            else {
+                continue;
+            };
+            values.insert(parameter_id, value);
+        }
+        Ok(values)
+    }
+
+    fn save_state(&mut self) -> Result<Option<Vec<u8>>, String> {
+        let plugin = self.instance.plugin_handle();
+        let Some(state) = plugin.get_extension::<PluginState>() else {
+            return Ok(None);
+        };
+        let mut writer = LimitedClapStateWriter {
+            bytes: Vec::new(),
+            exceeded_limit: false,
+        };
+        let save_result = state.save(&plugin, &mut writer);
+        if writer.exceeded_limit {
+            return Err("CLAP plug-in state exceeds the 32 MiB limit".to_owned());
+        }
+        save_result.map_err(|error| format!("CLAP effect could not save its state: {error}"))?;
+        Ok(Some(writer.bytes))
+    }
+
+    fn acknowledge_gui_closed(&mut self) {
+        if self.signals.gui_was_destroyed.swap(false, Ordering::AcqRel) && self.gui_created {
+            if let Some(gui) = self.gui {
+                gui.destroy(&self.instance.plugin_handle());
+            }
+            self.gui_created = false;
+        }
+    }
+
+    fn close_and_capture(&mut self) -> Result<ClapMixerEffectEditorOutput, String> {
+        if self.gui_created {
+            if let Some(gui) = self.gui {
+                gui.destroy(&self.instance.plugin_handle());
+            }
+            self.gui_created = false;
+        }
+        let current_parameters = self.capture_parameters()?;
+        let parameter_overrides = current_parameters
+            .into_iter()
+            .filter(|(parameter_id, value)| {
+                self.parameter_values_before_editor
+                    .get(parameter_id)
+                    .is_none_or(|previous| previous.to_bits() != value.to_bits())
+            })
+            .collect();
+        let state = self.save_state()?;
+        Ok(ClapMixerEffectEditorOutput {
+            state,
+            parameter_overrides,
+        })
+    }
+}
+
+impl Drop for ClapMixerEffectEditorSession {
+    fn drop(&mut self) {
+        if self.gui_created {
+            if let Some(gui) = self.gui {
+                gui.destroy(&self.instance.plugin_handle());
+            }
+            self.gui_created = false;
+        }
+    }
+}
+
+fn apply_clap_editor_parameter_overrides(
+    instance: &mut PluginInstance<ClapMixerEffectEditorHost>,
+    parameter_overrides: &BTreeMap<u32, f64>,
+) -> Result<(), String> {
+    let params = {
+        let plugin = instance.plugin_handle();
+        plugin
+            .get_extension::<PluginParams>()
+            .ok_or_else(|| "CLAP effect does not expose parameters".to_owned())?
+    };
+    let ranges = {
+        let plugin = instance.plugin_handle();
+        let count = params.count(&plugin);
+        if count > MAX_INSTANCE_METADATA_ITEMS {
+            return Err(format!(
+                "CLAP effect exposes {count} parameters; the metadata limit is {MAX_INSTANCE_METADATA_ITEMS}"
+            ));
+        }
+        let mut ranges = BTreeMap::new();
+        let mut buffer = ParamInfoBuffer::new();
+        for index in 0..count {
+            let Some(info) = params.get_info(&plugin, index, &mut buffer) else {
+                continue;
+            };
+            if !info.flags.contains(ParamInfoFlags::IS_READONLY)
+                && info.min_value.is_finite()
+                && info.max_value.is_finite()
+                && info.min_value < info.max_value
+            {
+                ranges.insert(
+                    info.id.get(),
+                    (
+                        info.min_value,
+                        info.max_value,
+                        info.flags.contains(ParamInfoFlags::IS_STEPPED),
+                    ),
+                );
+            }
+        }
+        ranges
+    };
+    let mut input_events = EventBuffer::with_capacity(parameter_overrides.len());
+    for (parameter_id, value) in parameter_overrides {
+        let Some((minimum, maximum, stepped)) = ranges.get(parameter_id).copied() else {
+            return Err(format!("CLAP parameter {parameter_id} is not writable"));
+        };
+        if !value.is_finite()
+            || !(minimum..=maximum).contains(value)
+            || (stepped && value.fract() != 0.0)
+        {
+            return Err(format!(
+                "CLAP parameter {parameter_id} has an invalid saved value"
+            ));
+        }
+        let parameter_id = ClapId::from_raw(*parameter_id)
+            .ok_or_else(|| "CLAP parameter ID is invalid".to_owned())?;
+        input_events.push(&ParamValueEvent::new(
+            0,
+            parameter_id,
+            Pckn::match_all(),
+            *value,
+        ));
+    }
+    input_events.sort();
+    let mut output_events = EventBuffer::new();
+    let mut plugin = instance
+        .inactive_plugin_handle()
+        .ok_or_else(|| "CLAP editor plug-in unexpectedly became active".to_owned())?;
+    params.flush(
+        &mut plugin,
+        &input_events.as_input(),
+        &mut output_events.as_output(),
+    );
+    Ok(())
+}
+
+fn clap_editor_parent_window<'a>(
+    creation: &'a eframe::CreationContext<'_>,
+) -> Result<Window<'static, 'a>, String> {
+    let handle = creation
+        .window_handle()
+        .map_err(|error| format!("could not access the CLAP editor host window: {error}"))?;
+    match handle.as_raw() {
+        RawWindowHandle::Wayland(handle) => Ok(Window::from_generic_ptr(
+            GuiApiType::WAYLAND,
+            handle.surface.as_ptr(),
+        )),
+        _ => Window::from_window_handle(handle)
+            .ok_or_else(|| "CLAP editor host does not support this window system".to_owned()),
+    }
+}
+
+struct ClapMixerEffectEditorApp {
+    session: Option<ClapMixerEffectEditorSession>,
+    result: Arc<Mutex<Option<Result<ClapMixerEffectEditorOutput, String>>>>,
+    initial_window_size: egui::Vec2,
+    initial_window_size_applied: bool,
+    host_error: Option<String>,
+}
+
+impl ClapMixerEffectEditorApp {
+    fn finish(&mut self) {
+        let Some(mut session) = self.session.take() else {
+            return;
+        };
+        let result = session.close_and_capture();
+        *self
+            .result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result);
+    }
+}
+
+impl eframe::App for ClapMixerEffectEditorApp {
+    fn on_exit(&mut self) {
+        self.finish();
+    }
+
+    fn ui(&mut self, ui: &mut eframe::egui::Ui, _frame: &mut eframe::Frame) {
+        if !self.initial_window_size_applied {
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::InnerSize(self.initial_window_size));
+            self.initial_window_size_applied = true;
+        }
+        let Some(session) = self.session.as_mut() else {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        };
+        match session.service_host_requests() {
+            Ok(Some(size)) => {
+                ui.ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                        (f64::from(size.width) / session.gui_size_scale) as f32,
+                        (f64::from(size.height) / session.gui_size_scale) as f32,
+                    )));
+            }
+            Ok(None) => {}
+            Err(error) => self.host_error = Some(error),
+        }
+        if session.signals.gui_closed.swap(false, Ordering::AcqRel) {
+            session.acknowledge_gui_closed();
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if session
+            .signals
+            .gui_show_requested
+            .swap(false, Ordering::AcqRel)
+        {
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        }
+        if session
+            .signals
+            .gui_hide_requested
+            .swap(false, Ordering::AcqRel)
+        {
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+        if session.gui_floating {
+            ui.centered_and_justified(|ui| {
+                ui.label("Close this helper window to save native CLAP editor changes.");
+            });
+        }
+        if let Some(error) = &self.host_error {
+            ui.label(egui::RichText::new(error).color(egui::Color32::RED));
+        }
+        ui.ctx().request_repaint_after(Duration::from_millis(100));
+    }
+}
+
+impl Drop for ClapMixerEffectEditorApp {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+fn run_mixer_effect_editor_ui(
+    path: &Path,
+    plugin_id: &str,
+    state: Option<&[u8]>,
+    parameter_overrides: &BTreeMap<u32, f64>,
+) -> Result<ClapMixerEffectEditorOutput, String> {
+    let session = ClapMixerEffectEditorSession::new(path, plugin_id, state, parameter_overrides)?;
+    let output = Arc::new(Mutex::new(None));
+    let app_output = Arc::clone(&output);
+    let options = eframe::NativeOptions {
+        renderer: eframe::Renderer::Wgpu,
+        viewport: egui::ViewportBuilder::default()
+            .with_title(format!("{plugin_id} - CLAP editor"))
+            .with_inner_size([800.0, 600.0])
+            .with_min_inner_size([160.0, 80.0]),
+        ..Default::default()
+    };
+    let run_result = eframe::run_native(
+        "CLAP Mixer editor",
+        options,
+        Box::new(move |creation| {
+            let mut session = session;
+            let size = session.open_gui(creation).map_err(|error| {
+                Box::new(std::io::Error::other(error)) as Box<dyn std::error::Error + Send + Sync>
+            })?;
+            Ok(Box::new(ClapMixerEffectEditorApp {
+                session: Some(session),
+                result: app_output,
+                initial_window_size: size,
+                initial_window_size_applied: false,
+                host_error: None,
+            }))
+        }),
+    );
+    run_result.map_err(|error| format!("CLAP editor host window failed: {error}"))?;
+    Arc::try_unwrap(output)
+        .ok()
+        .and_then(|output| output.into_inner().ok())
+        .flatten()
+        .ok_or_else(|| "CLAP editor closed without saving its state".to_owned())?
 }
 
 impl ClapNotePreviewInstance {

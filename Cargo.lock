@@ -764,6 +764,7 @@ dependencies = [
  "clack-common",
  "clack-host",
  "clap-sys",
+ "raw-window-handle",
 ]
 
 [[package]]
@@ -1485,6 +1486,7 @@ dependencies = [
  "midir",
  "mp3lame-encoder",
  "plist",
+ "raw-window-handle",
  "rfd",
  "serde_json",
  "symphonia",
