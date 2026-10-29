@@ -1,5 +1,5 @@
 use std::ffi::{CString, OsString};
-use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -22,11 +22,12 @@ pub const NOTE_PREVIEW_SERVER_FLAG: &str = "--clap-note-preview-server";
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_PROBE_OUTPUT_BYTES: usize = 1024 * 1024;
-const MAX_NOTE_PREVIEW_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_NOTE_PREVIEW_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_NOTE_PREVIEW_PROTOCOL_HEADER_BYTES: usize = 4096;
 const MAX_INSTANCE_METADATA_ITEMS: u32 = 512;
 const MAX_NOTE_PREVIEW_AUDIO_PORTS: u32 = 16;
 const MAX_NOTE_PREVIEW_TOTAL_CHANNELS: u32 = 64;
+const MAX_PATTERN_PREVIEW_NOTES: usize = 16_384;
 const NOTE_PREVIEW_BLOCK_FRAMES: u32 = 512;
 const NOTE_PREVIEW_DURATION_MILLISECONDS: u32 = 1500;
 const DEFAULT_NOTE_PREVIEW_NOTE_MILLISECONDS: u32 = 500;
@@ -117,6 +118,25 @@ pub struct ClapNotePreviewSettings {
     pub note_duration_milliseconds: u32,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClapPatternNote {
+    pub position_ticks: u32,
+    pub length_ticks: u32,
+    pub key: u16,
+    pub velocity: u8,
+    pub midi_channel: u8,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClapPatternPreviewSettings {
+    pub pattern_id: u16,
+    pub channel_id: u16,
+    pub ppq: u16,
+    pub tempo_bpm: f64,
+    pub loop_length_ticks: u64,
+    pub notes: Vec<ClapPatternNote>,
+}
+
 pub type ClapInspectionResponse = (PathBuf, Result<Vec<ClapPluginDescriptor>, String>);
 pub type ClapInstanceInspectionResponse = (PathBuf, String, Result<ClapInstanceInfo, String>);
 pub type ClapNotePreviewRequest = (PathBuf, String, String, u32, u8, u8, u32, u64);
@@ -127,6 +147,22 @@ pub type ClapNotePreviewResponse = (
     u8,
     u8,
     u32,
+    u64,
+    Result<Vec<f32>, String>,
+);
+pub type ClapPatternPreviewRequest = (
+    PathBuf,
+    String,
+    String,
+    u32,
+    ClapPatternPreviewSettings,
+    u64,
+);
+pub type ClapPatternPreviewResponse = (
+    PathBuf,
+    String,
+    String,
+    ClapPatternPreviewSettings,
     u64,
     Result<Vec<f32>, String>,
 );
@@ -252,6 +288,60 @@ pub fn start_note_preview_worker(
     (request_sender, response_receiver)
 }
 
+pub fn start_pattern_preview_worker(
+    egui_context: eframe::egui::Context,
+) -> (
+    Sender<ClapPatternPreviewRequest>,
+    Receiver<ClapPatternPreviewResponse>,
+) {
+    let (request_sender, request_receiver) = mpsc::channel::<ClapPatternPreviewRequest>();
+    let (response_sender, response_receiver) = mpsc::channel::<ClapPatternPreviewResponse>();
+
+    thread::Builder::new()
+        .name("clap-pattern-preview".to_owned())
+        .spawn(move || {
+            let mut preview_process = None;
+            while let Ok((path, plugin_id, plugin_name, sample_rate, settings, request_id)) =
+                request_receiver.recv()
+            {
+                let process_matches =
+                    preview_process
+                        .as_ref()
+                        .is_some_and(|process: &ClapPreviewProcess| {
+                            process.matches(&path, &plugin_id, sample_rate)
+                        });
+                if !process_matches {
+                    preview_process.take();
+                }
+                let result = if let Some(process) = preview_process.as_mut() {
+                    process.render_pattern(&settings)
+                } else {
+                    match ClapPreviewProcess::spawn(&path, &plugin_id, sample_rate) {
+                        Ok(mut process) => {
+                            let result = process.render_pattern(&settings);
+                            preview_process = Some(process);
+                            result
+                        }
+                        Err(error) => Err(error),
+                    }
+                };
+                if result.is_err() {
+                    preview_process.take();
+                }
+                if response_sender
+                    .send((path, plugin_id, plugin_name, settings, request_id, result))
+                    .is_err()
+                {
+                    break;
+                }
+                egui_context.request_repaint();
+            }
+        })
+        .expect("CLAP Pattern preview worker should start");
+
+    (request_sender, response_receiver)
+}
+
 /// Loads one CLAP entry in a child process so a crashing plug-in cannot terminate the DAW.
 pub fn inspect_in_subprocess(path: &Path) -> Result<Vec<ClapPluginDescriptor>, String> {
     let arguments = [OsString::from(PROBE_FLAG), path.as_os_str().to_owned()];
@@ -360,6 +450,41 @@ impl ClapPreviewProcess {
         )
         .and_then(|_| self.stdin.flush())
         .map_err(|error| format!("could not send a CLAP preview request: {error}"))?;
+        match self.receive_response()? {
+            ClapPreviewProcessResponse::Audio(samples) => Ok(samples),
+            ClapPreviewProcessResponse::Error(error) => Err(error),
+            ClapPreviewProcessResponse::Ready => {
+                Err("CLAP preview helper restarted unexpectedly".to_owned())
+            }
+        }
+    }
+
+    fn render_pattern(
+        &mut self,
+        settings: &ClapPatternPreviewSettings,
+    ) -> Result<Vec<f32>, String> {
+        validate_pattern_preview_settings(settings, self.sample_rate)?;
+        writeln!(
+            self.stdin,
+            "PATTERN {} {:016x} {} {}",
+            settings.ppq,
+            settings.tempo_bpm.to_bits(),
+            settings.loop_length_ticks,
+            settings.notes.len(),
+        )
+        .map_err(|error| format!("could not send a CLAP Pattern preview request: {error}"))?;
+        for note in &settings.notes {
+            writeln!(
+                self.stdin,
+                "NOTE {} {} {} {} {}",
+                note.position_ticks, note.length_ticks, note.key, note.velocity, note.midi_channel,
+            )
+            .map_err(|error| format!("could not send a CLAP Pattern note: {error}"))?;
+        }
+        self.stdin
+            .write_all(b"END\n")
+            .and_then(|_| self.stdin.flush())
+            .map_err(|error| format!("could not finish a CLAP Pattern preview request: {error}"))?;
         match self.receive_response()? {
             ClapPreviewProcessResponse::Audio(samples) => Ok(samples),
             ClapPreviewProcessResponse::Error(error) => Err(error),
@@ -485,9 +610,7 @@ fn read_preview_process_responses(
     }
 }
 
-fn read_preview_protocol_header(
-    stdout: &mut BufReader<ChildStdout>,
-) -> std::io::Result<Option<String>> {
+fn read_preview_protocol_header(stdout: &mut impl Read) -> std::io::Result<Option<String>> {
     let mut bytes = Vec::with_capacity(64);
     let mut byte = [0; 1];
     loop {
@@ -706,9 +829,12 @@ pub fn run_note_preview_server_child(path: &Path, plugin_id: &str, sample_rate: 
         return 1;
     }
 
-    for line in std::io::stdin().lock().lines() {
-        let line = match line {
-            Ok(line) => line,
+    let stdin = std::io::stdin();
+    let mut input = BufReader::new(stdin.lock());
+    loop {
+        let line = match read_preview_protocol_header(&mut input) {
+            Ok(Some(line)) => line,
+            Ok(None) => return 0,
             Err(error) => {
                 let _ = write_preview_server_error(&mut output, &error.to_string());
                 let _ = output.flush();
@@ -719,25 +845,23 @@ pub fn run_note_preview_server_child(path: &Path, plugin_id: &str, sample_rate: 
             return 0;
         }
 
-        let mut fields = line.split_whitespace();
-        let request = match (
-            fields.next(),
-            fields.next().and_then(|field| field.parse::<u8>().ok()),
-            fields.next().and_then(|field| field.parse::<u8>().ok()),
-            fields.next().and_then(|field| field.parse::<u32>().ok()),
-            fields.next(),
-        ) {
-            (Some("PREVIEW"), Some(note_key), Some(velocity), Some(note_duration), None) => {
-                (note_key, velocity, note_duration)
+        let samples = if let Some(header) = line.strip_prefix("PREVIEW ") {
+            match parse_note_preview_request(header) {
+                Ok((note_key, velocity, note_duration)) => {
+                    instance.render(note_key, velocity, note_duration)
+                }
+                Err(error) => Err(error),
             }
-            _ => {
-                let _ = write_preview_server_error(&mut output, "invalid CLAP preview request");
-                let _ = output.flush();
-                return 1;
+        } else if let Some(header) = line.strip_prefix("PATTERN ") {
+            match parse_pattern_preview_request(header, &mut input, sample_rate) {
+                Ok(settings) => instance.render_pattern(&settings),
+                Err(error) => Err(error),
             }
+        } else {
+            Err("invalid CLAP preview request".to_owned())
         };
 
-        let samples = match instance.render(request.0, request.1, request.2) {
+        let samples = match samples {
             Ok(samples) => samples,
             Err(error) => {
                 let _ = write_preview_server_error(&mut output, &error);
@@ -745,32 +869,128 @@ pub fn run_note_preview_server_child(path: &Path, plugin_id: &str, sample_rate: 
                 return 1;
             }
         };
-        let Some(byte_count) = samples.len().checked_mul(std::mem::size_of::<f32>()) else {
-            let _ = write_preview_server_error(&mut output, "CLAP preview audio length overflowed");
+        if let Err(error) = write_preview_server_audio(&mut output, &samples) {
+            let _ = write_preview_server_error(&mut output, &error.to_string());
             let _ = output.flush();
-            return 1;
-        };
-        if byte_count == 0
-            || byte_count > MAX_NOTE_PREVIEW_OUTPUT_BYTES
-            || !byte_count.is_multiple_of(8)
-        {
-            let _ = write_preview_server_error(&mut output, "CLAP preview audio length is invalid");
-            let _ = output.flush();
-            return 1;
-        }
-        if writeln!(output, "OK {byte_count}").is_err() {
-            return 1;
-        }
-        for sample in samples {
-            if output.write_all(&sample.to_le_bytes()).is_err() {
-                return 1;
-            }
-        }
-        if output.flush().is_err() {
             return 1;
         }
     }
-    0
+}
+
+fn parse_note_preview_request(header: &str) -> Result<(u8, u8, u32), String> {
+    let mut fields = header.split_whitespace();
+    match (
+        fields.next().and_then(|field| field.parse::<u8>().ok()),
+        fields.next().and_then(|field| field.parse::<u8>().ok()),
+        fields.next().and_then(|field| field.parse::<u32>().ok()),
+        fields.next(),
+    ) {
+        (Some(note_key), Some(velocity), Some(note_duration), None) => {
+            Ok((note_key, velocity, note_duration))
+        }
+        _ => Err("invalid CLAP note preview request".to_owned()),
+    }
+}
+
+fn parse_pattern_preview_request(
+    header: &str,
+    input: &mut impl Read,
+    sample_rate: u32,
+) -> Result<ClapPatternPreviewSettings, String> {
+    let mut fields = header.split_whitespace();
+    let (Some(ppq), Some(tempo_bits), Some(loop_length_ticks), Some(note_count), None) = (
+        fields.next().and_then(|field| field.parse::<u16>().ok()),
+        fields.next(),
+        fields.next().and_then(|field| field.parse::<u64>().ok()),
+        fields.next().and_then(|field| field.parse::<usize>().ok()),
+        fields.next(),
+    ) else {
+        return Err("invalid CLAP Pattern preview header".to_owned());
+    };
+    let tempo_bpm = u64::from_str_radix(tempo_bits, 16)
+        .map(f64::from_bits)
+        .map_err(|_| "invalid CLAP Pattern preview tempo".to_owned())?;
+    if note_count > MAX_PATTERN_PREVIEW_NOTES {
+        return Err(format!(
+            "CLAP Pattern preview exceeds {MAX_PATTERN_PREVIEW_NOTES} notes"
+        ));
+    }
+    let mut notes = Vec::with_capacity(note_count);
+    for _ in 0..note_count {
+        let line = read_preview_protocol_header(input)
+            .map_err(|error| format!("could not read CLAP Pattern note: {error}"))?
+            .ok_or_else(|| "CLAP Pattern preview ended before all notes arrived".to_owned())?;
+        notes.push(parse_pattern_preview_note(&line)?);
+    }
+    let end = read_preview_protocol_header(input)
+        .map_err(|error| format!("could not read CLAP Pattern preview terminator: {error}"))?
+        .ok_or_else(|| "CLAP Pattern preview ended before its terminator".to_owned())?;
+    if end != "END" {
+        return Err("invalid CLAP Pattern preview terminator".to_owned());
+    }
+    let settings = ClapPatternPreviewSettings {
+        pattern_id: 0,
+        channel_id: 0,
+        ppq,
+        tempo_bpm,
+        loop_length_ticks,
+        notes,
+    };
+    validate_pattern_preview_settings(&settings, sample_rate)?;
+    Ok(settings)
+}
+
+fn parse_pattern_preview_note(line: &str) -> Result<ClapPatternNote, String> {
+    let mut fields = line.split_whitespace();
+    let (
+        Some("NOTE"),
+        Some(position_ticks),
+        Some(length_ticks),
+        Some(key),
+        Some(velocity),
+        Some(midi_channel),
+        None,
+    ) = (
+        fields.next(),
+        fields.next().and_then(|field| field.parse::<u32>().ok()),
+        fields.next().and_then(|field| field.parse::<u32>().ok()),
+        fields.next().and_then(|field| field.parse::<u16>().ok()),
+        fields.next().and_then(|field| field.parse::<u8>().ok()),
+        fields.next().and_then(|field| field.parse::<u8>().ok()),
+        fields.next(),
+    )
+    else {
+        return Err("invalid CLAP Pattern note".to_owned());
+    };
+    Ok(ClapPatternNote {
+        position_ticks,
+        length_ticks,
+        key,
+        velocity,
+        midi_channel,
+    })
+}
+
+fn write_preview_server_audio(output: &mut impl Write, samples: &[f32]) -> std::io::Result<()> {
+    let byte_count = samples
+        .len()
+        .checked_mul(std::mem::size_of::<f32>())
+        .filter(|byte_count| {
+            *byte_count > 0
+                && *byte_count <= MAX_NOTE_PREVIEW_OUTPUT_BYTES
+                && byte_count.is_multiple_of(8)
+        })
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "CLAP preview audio length is invalid",
+            )
+        })?;
+    writeln!(output, "OK {byte_count}")?;
+    for sample in samples {
+        output.write_all(&sample.to_le_bytes())?;
+    }
+    output.flush()
 }
 
 fn write_preview_server_error(output: &mut impl Write, error: &str) -> std::io::Result<()> {
@@ -902,6 +1122,48 @@ impl ClapNotePreviewInstance {
         }
         validate_note_preview_note_length(note_duration_milliseconds)?;
 
+        let note_off_frame = self.sample_rate * note_duration_milliseconds / 1000;
+        let events = [
+            ScheduledClapNoteEvent {
+                frame: 0,
+                priority: 1,
+                key: note_key,
+                velocity,
+                midi_channel: 0,
+                note_id: 0,
+                is_note_on: true,
+            },
+            ScheduledClapNoteEvent {
+                frame: u64::from(note_off_frame),
+                priority: 0,
+                key: note_key,
+                velocity: 0,
+                midi_channel: 0,
+                note_id: 0,
+                is_note_on: false,
+            },
+        ];
+        let total_frames = self.sample_rate * NOTE_PREVIEW_DURATION_MILLISECONDS / 1000;
+        self.render_scheduled_events(&events, total_frames)
+    }
+
+    fn render_pattern(
+        &mut self,
+        settings: &ClapPatternPreviewSettings,
+    ) -> Result<Vec<f32>, String> {
+        let (events, total_frames) = schedule_pattern_preview_events(settings, self.sample_rate)?;
+        self.render_scheduled_events(&events, total_frames)
+    }
+
+    fn render_scheduled_events(
+        &mut self,
+        events: &[ScheduledClapNoteEvent],
+        total_frames: u32,
+    ) -> Result<Vec<f32>, String> {
+        if total_frames == 0 {
+            return Err("CLAP preview has no audio frames to render".to_owned());
+        }
+
         let audio_configuration = PluginAudioConfiguration {
             sample_rate: f64::from(self.sample_rate),
             min_frames_count: 1,
@@ -920,8 +1182,6 @@ impl ClapNotePreviewInstance {
             }
         };
 
-        let total_frames = self.sample_rate * NOTE_PREVIEW_DURATION_MILLISECONDS / 1000;
-        let note_off_frame = self.sample_rate * note_duration_milliseconds / 1000;
         let main_output_channels = self.output_port_channels[self.main_output_index];
         let mut samples = Vec::with_capacity(total_frames as usize * 2);
         let mut input_audio_ports = AudioPorts::with_capacity(
@@ -934,63 +1194,68 @@ impl ClapNotePreviewInstance {
         );
         let render_start_time = self.next_steady_time;
         let mut frame_offset = 0;
+        let mut event_index = 0usize;
         let mut render_error = None;
 
         while frame_offset < total_frames {
             let frame_count = (total_frames - frame_offset).min(NOTE_PREVIEW_BLOCK_FRAMES);
             let frame_end = frame_offset + frame_count;
-            let mut input_event_buffer = EventBuffer::with_capacity(2);
-            let pckn = clack_host::prelude::Pckn::new(
-                self.note_port_index,
-                0u16,
-                u16::from(note_key),
-                0u32,
-            );
-            if frame_offset == 0 {
-                match self.dialect {
-                    PreviewNoteDialect::Clap => {
+            let block_event_start = event_index;
+            while event_index < events.len() && events[event_index].frame < u64::from(frame_end) {
+                event_index += 1;
+            }
+            let mut input_event_buffer =
+                EventBuffer::with_capacity(event_index.saturating_sub(block_event_start));
+            for event in &events[block_event_start..event_index] {
+                let event_time = u32::try_from(event.frame.saturating_sub(u64::from(frame_offset)))
+                    .map_err(|_| "CLAP note event offset exceeds the audio block".to_owned())?;
+                let pckn = clack_host::prelude::Pckn::new(
+                    self.note_port_index,
+                    u16::from(event.midi_channel),
+                    u16::from(event.key),
+                    event.note_id,
+                );
+                match (self.dialect, event.is_note_on) {
+                    (PreviewNoteDialect::Clap, true) => {
                         input_event_buffer.push(&NoteOnEvent::new(
-                            0,
+                            event_time,
                             pckn,
-                            f64::from(velocity) / 127.0,
+                            f64::from(event.velocity) / 127.0,
                         ));
                     }
-                    PreviewNoteDialect::Midi => {
+                    (PreviewNoteDialect::Clap, false) => {
+                        input_event_buffer.push(&NoteOffEvent::new(event_time, pckn, 0.0));
+                    }
+                    (PreviewNoteDialect::Midi, true) => {
                         input_event_buffer.push(&MidiEvent::new(
-                            0,
+                            event_time,
                             self.note_port_index,
-                            [0x90, note_key, velocity],
+                            [0x90 | event.midi_channel, event.key, event.velocity],
                         ));
                     }
-                    PreviewNoteDialect::Midi2 => {
-                        input_event_buffer.push(&midi2_preview_note_event(
-                            0,
+                    (PreviewNoteDialect::Midi, false) => {
+                        input_event_buffer.push(&MidiEvent::new(
+                            event_time,
                             self.note_port_index,
-                            note_key,
-                            midi2_preview_velocity(velocity),
+                            [0x80 | event.midi_channel, event.key, 0],
+                        ));
+                    }
+                    (PreviewNoteDialect::Midi2, true) => {
+                        input_event_buffer.push(&midi2_preview_note_event(
+                            event_time,
+                            self.note_port_index,
+                            event.midi_channel,
+                            event.key,
+                            midi2_preview_velocity(event.velocity),
                             true,
                         ));
                     }
-                }
-            }
-            if (frame_offset..frame_end).contains(&note_off_frame) {
-                let event_time = note_off_frame - frame_offset;
-                match self.dialect {
-                    PreviewNoteDialect::Clap => {
-                        input_event_buffer.push(&NoteOffEvent::new(event_time, pckn, 0.0));
-                    }
-                    PreviewNoteDialect::Midi => {
-                        input_event_buffer.push(&MidiEvent::new(
-                            event_time,
-                            self.note_port_index,
-                            [0x80, note_key, 0],
-                        ));
-                    }
-                    PreviewNoteDialect::Midi2 => {
+                    (PreviewNoteDialect::Midi2, false) => {
                         input_event_buffer.push(&midi2_preview_note_event(
                             event_time,
                             self.note_port_index,
-                            note_key,
+                            event.midi_channel,
+                            event.key,
                             0,
                             false,
                         ));
@@ -1089,6 +1354,132 @@ impl ClapNotePreviewInstance {
         self.next_steady_time = render_start_time.saturating_add(u64::from(total_frames));
         Ok(samples)
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ScheduledClapNoteEvent {
+    frame: u64,
+    priority: u8,
+    key: u8,
+    velocity: u8,
+    midi_channel: u8,
+    note_id: u32,
+    is_note_on: bool,
+}
+
+fn validate_pattern_preview_settings(
+    settings: &ClapPatternPreviewSettings,
+    sample_rate: u32,
+) -> Result<(), String> {
+    schedule_pattern_preview_events(settings, sample_rate).map(|_| ())
+}
+
+fn schedule_pattern_preview_events(
+    settings: &ClapPatternPreviewSettings,
+    sample_rate: u32,
+) -> Result<(Vec<ScheduledClapNoteEvent>, u32), String> {
+    if !(8_000..=192_000).contains(&sample_rate) {
+        return Err(format!(
+            "unsupported CLAP preview sample rate: {sample_rate}"
+        ));
+    }
+    if settings.ppq == 0 {
+        return Err("CLAP Pattern preview requires a positive project PPQ".to_owned());
+    }
+    if !settings.tempo_bpm.is_finite() || !(1.0..=1000.0).contains(&settings.tempo_bpm) {
+        return Err("CLAP Pattern preview tempo must be between 1 and 1000 BPM".to_owned());
+    }
+    if settings.loop_length_ticks == 0 {
+        return Err("CLAP Pattern preview loop must have a positive length".to_owned());
+    }
+    if settings.notes.is_empty() {
+        return Err("selected Pattern channel has no notes to preview".to_owned());
+    }
+    if settings.notes.len() > MAX_PATTERN_PREVIEW_NOTES {
+        return Err(format!(
+            "CLAP Pattern preview exceeds {MAX_PATTERN_PREVIEW_NOTES} notes"
+        ));
+    }
+
+    let frame_at_tick = |tick: u64| {
+        let frames = (tick as f64 * 60.0 * f64::from(sample_rate))
+            / (f64::from(settings.ppq) * settings.tempo_bpm);
+        if !frames.is_finite() || frames < 0.0 || frames > u64::MAX as f64 {
+            Err("CLAP Pattern note timing is outside the renderable range".to_owned())
+        } else {
+            Ok(frames.round() as u64)
+        }
+    };
+    let mut events = Vec::with_capacity(settings.notes.len().saturating_mul(2));
+    let mut last_event_frame = frame_at_tick(settings.loop_length_ticks)?;
+    for (index, note) in settings.notes.iter().enumerate() {
+        if note.length_ticks == 0 {
+            return Err("CLAP Pattern preview contains a zero-length note".to_owned());
+        }
+        if note.key > 127 {
+            return Err(format!(
+                "CLAP Pattern preview key {} is outside the MIDI range",
+                note.key
+            ));
+        }
+        if !(1..=127).contains(&note.velocity) {
+            return Err(format!(
+                "CLAP Pattern preview velocity {} is outside 1–127",
+                note.velocity
+            ));
+        }
+        if note.midi_channel > 15 {
+            return Err(format!(
+                "CLAP Pattern preview MIDI channel {} is outside 0–15",
+                note.midi_channel
+            ));
+        }
+        let end_tick = u64::from(note.position_ticks)
+            .checked_add(u64::from(note.length_ticks))
+            .ok_or_else(|| "CLAP Pattern note end position overflowed".to_owned())?;
+        let start_frame = frame_at_tick(u64::from(note.position_ticks))?;
+        let end_frame = frame_at_tick(end_tick)?.max(start_frame.saturating_add(1));
+        let note_id = u32::try_from(index + 1)
+            .map_err(|_| "CLAP Pattern preview note ID overflowed".to_owned())?;
+        events.push(ScheduledClapNoteEvent {
+            frame: start_frame,
+            priority: 1,
+            key: note.key as u8,
+            velocity: note.velocity,
+            midi_channel: note.midi_channel,
+            note_id,
+            is_note_on: true,
+        });
+        events.push(ScheduledClapNoteEvent {
+            frame: end_frame,
+            priority: 0,
+            key: note.key as u8,
+            velocity: 0,
+            midi_channel: note.midi_channel,
+            note_id,
+            is_note_on: false,
+        });
+        last_event_frame = last_event_frame.max(end_frame);
+    }
+    events.sort_by_key(|event| (event.frame, event.priority));
+
+    let release_tail_frames =
+        u64::from(sample_rate) * u64::from(NOTE_PREVIEW_DURATION_MILLISECONDS) / 1000;
+    let total_frames = last_event_frame
+        .checked_add(release_tail_frames)
+        .ok_or_else(|| "CLAP Pattern preview duration overflowed".to_owned())?;
+    let byte_count = total_frames
+        .checked_mul(8)
+        .ok_or_else(|| "CLAP Pattern preview audio size overflowed".to_owned())?;
+    if byte_count == 0 || byte_count > MAX_NOTE_PREVIEW_OUTPUT_BYTES as u64 {
+        return Err(format!(
+            "CLAP Pattern preview exceeds the {} MiB audio limit at this sample rate",
+            MAX_NOTE_PREVIEW_OUTPUT_BYTES / (1024 * 1024)
+        ));
+    }
+    let total_frames = u32::try_from(total_frames)
+        .map_err(|_| "CLAP Pattern preview duration exceeds the supported range".to_owned())?;
+    Ok((events, total_frames))
 }
 
 fn validate_note_preview_note_length(note_duration_milliseconds: u32) -> Result<(), String> {
@@ -1213,12 +1604,14 @@ fn preview_note_dialect(dialect: NoteDialect) -> Option<PreviewNoteDialect> {
 fn midi2_preview_note_event(
     time: u32,
     port_index: u16,
+    channel: u8,
     key: u8,
     velocity: u16,
     note_on: bool,
 ) -> Midi2Event {
     let status = if note_on { 0x9_u32 } else { 0x8_u32 };
-    let header = 0x4000_0000 | (status << 20) | (u32::from(key) << 8);
+    let header =
+        0x4000_0000 | (status << 20) | (u32::from(channel & 0x0f) << 16) | (u32::from(key) << 8);
     Midi2Event::new(time, port_index, [header, u32::from(velocity) << 16, 0, 0])
 }
 
@@ -1624,10 +2017,13 @@ fn parse_f64_bits(value: &str) -> Result<f64, String> {
 mod tests {
     use super::{
         ClapAudioPortDescriptor, ClapInstanceInfo, ClapNotePortDescriptor, ClapParameterDescriptor,
-        ClapPluginDescriptor, MAX_NOTE_PREVIEW_NOTE_MILLISECONDS,
-        MIN_NOTE_PREVIEW_NOTE_MILLISECONDS, encode_instance_probe_output, encode_probe_output,
-        parse_instance_probe_output, parse_probe_output, validate_note_preview_note_length,
+        ClapPatternNote, ClapPatternPreviewSettings, ClapPluginDescriptor,
+        MAX_NOTE_PREVIEW_NOTE_MILLISECONDS, MIN_NOTE_PREVIEW_NOTE_MILLISECONDS,
+        encode_instance_probe_output, encode_probe_output, parse_instance_probe_output,
+        parse_pattern_preview_request, parse_probe_output, schedule_pattern_preview_events,
+        validate_note_preview_note_length,
     };
+    use std::io::Cursor;
 
     #[test]
     fn descriptor_probe_protocol_round_trips_unicode_and_delimiters() {
@@ -1707,5 +2103,83 @@ mod tests {
         assert!(validate_note_preview_note_length(MAX_NOTE_PREVIEW_NOTE_MILLISECONDS).is_ok());
         assert!(validate_note_preview_note_length(MIN_NOTE_PREVIEW_NOTE_MILLISECONDS - 1).is_err());
         assert!(validate_note_preview_note_length(MAX_NOTE_PREVIEW_NOTE_MILLISECONDS + 1).is_err());
+    }
+
+    fn pattern_preview_settings() -> ClapPatternPreviewSettings {
+        ClapPatternPreviewSettings {
+            pattern_id: 4,
+            channel_id: 9,
+            ppq: 96,
+            tempo_bpm: 120.0,
+            loop_length_ticks: 192,
+            notes: vec![
+                ClapPatternNote {
+                    position_ticks: 0,
+                    length_ticks: 96,
+                    key: 60,
+                    velocity: 100,
+                    midi_channel: 0,
+                },
+                ClapPatternNote {
+                    position_ticks: 96,
+                    length_ticks: 96,
+                    key: 60,
+                    velocity: 80,
+                    midi_channel: 0,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn pattern_preview_schedules_tick_positions_and_orders_note_off_before_note_on() {
+        let (events, total_frames) =
+            schedule_pattern_preview_events(&pattern_preview_settings(), 48_000)
+                .expect("valid Pattern notes should schedule");
+
+        assert_eq!(total_frames, 120_000);
+        assert_eq!(events.len(), 4);
+        assert_eq!((events[0].frame, events[0].is_note_on), (0, true));
+        assert_eq!(events[1].frame, 24_000);
+        assert!(!events[1].is_note_on);
+        assert_eq!(events[2].frame, 24_000);
+        assert!(events[2].is_note_on);
+        assert_eq!((events[3].frame, events[3].is_note_on), (48_000, false));
+    }
+
+    #[test]
+    fn pattern_preview_parser_reads_bounded_note_records() {
+        let tempo_bpm = 123.5_f64;
+        let header = format!("96 {:016x} 192 2", tempo_bpm.to_bits());
+        let mut input = Cursor::new(b"NOTE 0 96 60 100 0\nNOTE 96 96 64 80 2\nEND\n".as_slice());
+
+        let parsed = parse_pattern_preview_request(&header, &mut input, 48_000)
+            .expect("valid Pattern protocol should parse");
+
+        assert_eq!(parsed.ppq, 96);
+        assert_eq!(parsed.tempo_bpm, tempo_bpm);
+        assert_eq!(parsed.loop_length_ticks, 192);
+        assert_eq!(parsed.notes.len(), 2);
+        assert_eq!(parsed.notes[1].key, 64);
+        assert_eq!(parsed.notes[1].midi_channel, 2);
+    }
+
+    #[test]
+    fn pattern_preview_rejects_invalid_timing_and_midi_values() {
+        let mut settings = pattern_preview_settings();
+        settings.ppq = 0;
+        assert!(schedule_pattern_preview_events(&settings, 48_000).is_err());
+
+        let mut settings = pattern_preview_settings();
+        settings.tempo_bpm = f64::NAN;
+        assert!(schedule_pattern_preview_events(&settings, 48_000).is_err());
+
+        let mut settings = pattern_preview_settings();
+        settings.notes[0].midi_channel = 16;
+        assert!(schedule_pattern_preview_events(&settings, 48_000).is_err());
+
+        let mut settings = pattern_preview_settings();
+        settings.notes[0].key = 128;
+        assert!(schedule_pattern_preview_events(&settings, 48_000).is_err());
     }
 }

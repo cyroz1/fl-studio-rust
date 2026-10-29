@@ -15,7 +15,8 @@ use audio_unit_probe::{
 use clap_probe::{
     ClapInspectionResponse, ClapInspectionState, ClapInstanceInspectionResponse,
     ClapInstanceInspectionState, ClapNotePreviewRequest, ClapNotePreviewResponse,
-    ClapNotePreviewSettings, ClapNotePreviewState, MAX_NOTE_PREVIEW_NOTE_MILLISECONDS,
+    ClapNotePreviewSettings, ClapNotePreviewState, ClapPatternNote, ClapPatternPreviewRequest,
+    ClapPatternPreviewResponse, ClapPatternPreviewSettings, MAX_NOTE_PREVIEW_NOTE_MILLISECONDS,
     MIN_NOTE_PREVIEW_NOTE_MILLISECONDS,
 };
 use eframe::egui::{self, Align2, Color32, FontId, Id, PointerButton, Sense, Stroke, Vec2};
@@ -5177,6 +5178,10 @@ struct DawUi {
     clap_note_preview_receiver: Receiver<ClapNotePreviewResponse>,
     clap_note_preview_states: BTreeMap<(PathBuf, String, u8, u8, u32), ClapNotePreviewState>,
     clap_note_preview_request_id: u64,
+    clap_pattern_preview_sender: Sender<ClapPatternPreviewRequest>,
+    clap_pattern_preview_receiver: Receiver<ClapPatternPreviewResponse>,
+    clap_pattern_preview_states: BTreeMap<(PathBuf, String, u16, u16), ClapNotePreviewState>,
+    clap_pattern_preview_request_id: u64,
     clap_preview_note_key: u8,
     clap_preview_velocity: u8,
     clap_preview_note_duration_milliseconds: u32,
@@ -6637,6 +6642,8 @@ impl DawUi {
             clap_probe::start_instance_worker(creation.egui_ctx.clone());
         let (clap_note_preview_sender, clap_note_preview_receiver) =
             clap_probe::start_note_preview_worker(creation.egui_ctx.clone());
+        let (clap_pattern_preview_sender, clap_pattern_preview_receiver) =
+            clap_probe::start_pattern_preview_worker(creation.egui_ctx.clone());
         let audio_catalog = enumerate_devices();
         let (midi_message_sender, midi_message_receiver) =
             mpsc::sync_channel(midi_input::MIDI_INPUT_QUEUE_CAPACITY);
@@ -7140,6 +7147,10 @@ impl DawUi {
             clap_note_preview_receiver,
             clap_note_preview_states: BTreeMap::new(),
             clap_note_preview_request_id: 0,
+            clap_pattern_preview_sender,
+            clap_pattern_preview_receiver,
+            clap_pattern_preview_states: BTreeMap::new(),
+            clap_pattern_preview_request_id: 0,
             clap_preview_note_key: 60,
             clap_preview_velocity: 100,
             clap_preview_note_duration_milliseconds: 500,
@@ -19487,6 +19498,10 @@ impl DawUi {
                 .clap_note_preview_states
                 .values()
                 .any(|state| matches!(state, ClapNotePreviewState::Rendering))
+            || self
+                .clap_pattern_preview_states
+                .values()
+                .any(|state| matches!(state, ClapNotePreviewState::Rendering))
         {
             return;
         }
@@ -19609,6 +19624,10 @@ impl DawUi {
             .values()
             .any(|state| matches!(state, ClapNotePreviewState::Rendering))
             || self
+                .clap_pattern_preview_states
+                .values()
+                .any(|state| matches!(state, ClapNotePreviewState::Rendering))
+            || self
                 .audio_unit_note_preview_states
                 .values()
                 .any(|state| matches!(state, AudioUnitNotePreviewState::Rendering))
@@ -19699,6 +19718,204 @@ impl DawUi {
         }
     }
 
+    fn selected_clap_pattern_preview_settings(
+        &self,
+    ) -> Result<Option<ClapPatternPreviewSettings>, String> {
+        let (Some(pattern_id), Some(channel_id)) =
+            (self.selected_pattern, self.selected_note_channel)
+        else {
+            return Ok(None);
+        };
+        let Some(document) = self.document.as_ref() else {
+            return Ok(None);
+        };
+        let pattern = document
+            .patterns()
+            .map_err(|error| format!("Could not decode Pattern notes: {error}"))?
+            .into_iter()
+            .find(|pattern| pattern.id == pattern_id)
+            .ok_or_else(|| format!("Pattern {pattern_id} was not found"))?;
+        let notes = pattern
+            .notes
+            .iter()
+            .filter(|note| {
+                note.channel_id == channel_id
+                    && !note.is_muted()
+                    && note.length > 0
+                    && note.velocity > 0
+            })
+            .map(|note| ClapPatternNote {
+                position_ticks: note.position,
+                length_ticks: note.length,
+                key: note.key,
+                velocity: note.velocity,
+                midi_channel: note.midi_channel_index(),
+            })
+            .collect::<Vec<_>>();
+        if notes.is_empty() {
+            return Ok(None);
+        }
+        let ppq = document.header().ppq();
+        let loop_length_ticks = pattern_lfo_loop_length_ticks(
+            &pattern,
+            ppq,
+            document.metadata().time_signature().unwrap_or((4, 4)),
+        );
+        Ok(Some(ClapPatternPreviewSettings {
+            pattern_id,
+            channel_id,
+            ppq,
+            tempo_bpm: document.metadata().tempo_bpm().unwrap_or(self.tempo_bpm),
+            loop_length_ticks,
+            notes,
+        }))
+    }
+
+    fn request_clap_pattern_preview(
+        &mut self,
+        path: PathBuf,
+        plugin_id: String,
+        plugin_name: String,
+        settings: ClapPatternPreviewSettings,
+        ctx: &egui::Context,
+    ) {
+        if self
+            .clap_pattern_preview_states
+            .values()
+            .any(|state| matches!(state, ClapNotePreviewState::Rendering))
+            || self
+                .clap_note_preview_states
+                .values()
+                .any(|state| matches!(state, ClapNotePreviewState::Rendering))
+            || self
+                .audio_unit_note_preview_states
+                .values()
+                .any(|state| matches!(state, AudioUnitNotePreviewState::Rendering))
+        {
+            return;
+        }
+        self.clap_pattern_preview_request_id =
+            self.clap_pattern_preview_request_id.wrapping_add(1).max(1);
+        let request_id = self.clap_pattern_preview_request_id;
+        let key = (
+            path.clone(),
+            plugin_id.clone(),
+            settings.pattern_id,
+            settings.channel_id,
+        );
+        if self.audio_engine.is_none() {
+            match AudioEngine::start(&self.audio_settings) {
+                Ok(engine) => self.audio_engine = Some(engine),
+                Err(error) => {
+                    self.clap_pattern_preview_states
+                        .insert(key, ClapNotePreviewState::Failed(error.clone()));
+                    self.status = format!("Could not start CLAP Pattern preview audio: {error}");
+                    return;
+                }
+            }
+        }
+        let Some(engine) = self.audio_engine.as_ref() else {
+            return;
+        };
+        if !engine.output_active() {
+            let error = "Enable an output device before previewing a CLAP Pattern".to_owned();
+            self.clap_pattern_preview_states
+                .insert(key, ClapNotePreviewState::Failed(error.clone()));
+            self.status = error;
+            return;
+        }
+
+        let sample_rate = engine.sample_rate();
+        self.browser_preview_queued = None;
+        self.browser_preview_cancelled = self.browser_preview_pending.is_some();
+        self.browser_preview_path = None;
+        self.browser_preview_error = None;
+        engine.stop_browser_preview();
+        engine.set_browser_preview_looping(false);
+
+        self.clap_pattern_preview_states
+            .insert(key.clone(), ClapNotePreviewState::Rendering);
+        if self
+            .clap_pattern_preview_sender
+            .send((
+                path,
+                plugin_id,
+                plugin_name.clone(),
+                sample_rate,
+                settings.clone(),
+                request_id,
+            ))
+            .is_err()
+        {
+            let error = "CLAP Pattern preview worker is unavailable".to_owned();
+            self.clap_pattern_preview_states
+                .insert(key, ClapNotePreviewState::Failed(error.clone()));
+            self.status = error;
+        } else {
+            self.status = format!(
+                "Rendering Pattern {} channel {} through {plugin_name}",
+                settings.pattern_id, settings.channel_id
+            );
+            ctx.request_repaint_after(Duration::from_millis(40));
+        }
+    }
+
+    fn poll_clap_pattern_preview(&mut self, ctx: &egui::Context) {
+        while let Ok((path, plugin_id, plugin_name, settings, request_id, result)) =
+            self.clap_pattern_preview_receiver.try_recv()
+        {
+            if request_id != self.clap_pattern_preview_request_id {
+                continue;
+            }
+            let key = (path, plugin_id, settings.pattern_id, settings.channel_id);
+            if !matches!(
+                self.clap_pattern_preview_states.get(&key),
+                Some(ClapNotePreviewState::Rendering)
+            ) {
+                continue;
+            }
+
+            let result = result.and_then(|samples| {
+                let engine = self
+                    .audio_engine
+                    .as_ref()
+                    .ok_or_else(|| "Audio output is not available".to_owned())?;
+                if !engine.output_active() {
+                    return Err("Enable an output device before previewing a CLAP Pattern".into());
+                }
+                engine.set_browser_preview_gain(self.browser_preview_volume);
+                engine.set_browser_preview_looping(false);
+                engine.set_browser_preview(samples)
+            });
+            match result {
+                Ok(()) => {
+                    self.browser_preview_path = None;
+                    self.browser_preview_error = None;
+                    self.clap_pattern_preview_states
+                        .insert(key, ClapNotePreviewState::Ready);
+                    self.status = format!(
+                        "Previewing Pattern {} channel {} through {plugin_name}",
+                        settings.pattern_id, settings.channel_id
+                    );
+                }
+                Err(error) => {
+                    self.clap_pattern_preview_states
+                        .insert(key, ClapNotePreviewState::Failed(error.clone()));
+                    self.status =
+                        format!("Could not preview Pattern through {plugin_name}: {error}");
+                }
+            }
+        }
+
+        if self
+            .clap_pattern_preview_states
+            .values()
+            .any(|state| matches!(state, ClapNotePreviewState::Rendering))
+        {
+            ctx.request_repaint_after(Duration::from_millis(40));
+        }
+    }
+
     fn poll_clap_note_preview(&mut self, ctx: &egui::Context) {
         while let Ok((
             path,
@@ -19772,7 +19989,14 @@ impl DawUi {
     fn cancel_clap_note_previews(&mut self) {
         self.clap_note_preview_request_id =
             self.clap_note_preview_request_id.wrapping_add(1).max(1);
+        self.clap_pattern_preview_request_id =
+            self.clap_pattern_preview_request_id.wrapping_add(1).max(1);
         for state in self.clap_note_preview_states.values_mut() {
+            if matches!(state, ClapNotePreviewState::Rendering) {
+                *state = ClapNotePreviewState::Cancelled;
+            }
+        }
+        for state in self.clap_pattern_preview_states.values_mut() {
             if matches!(state, ClapNotePreviewState::Rendering) {
                 *state = ClapNotePreviewState::Cancelled;
             }
@@ -60469,6 +60693,7 @@ impl DawUi {
         let mut inspect_clap_path = None;
         let mut inspect_clap_instance = None;
         let mut preview_clap_note = None;
+        let mut preview_clap_pattern = None;
         let mut probe_audio_unit = None;
         let mut preview_audio_unit = None;
         let mut open_id = None;
@@ -60548,7 +60773,12 @@ impl DawUi {
         let clap_note_preview_busy = self
             .clap_note_preview_states
             .values()
-            .any(|state| matches!(state, ClapNotePreviewState::Rendering));
+            .any(|state| matches!(state, ClapNotePreviewState::Rendering))
+            || self
+                .clap_pattern_preview_states
+                .values()
+                .any(|state| matches!(state, ClapNotePreviewState::Rendering));
+        let clap_pattern_preview_settings = self.selected_clap_pattern_preview_settings();
         let audio_unit_note_preview_busy = self
             .audio_unit_note_preview_states
             .values()
@@ -60819,7 +61049,7 @@ impl DawUi {
             ui.heading(format!("Detected CLAP plug-ins ({})", clap_candidates.len()));
             ui.label(
                 egui::RichText::new(
-                "Repeated auditions reuse the loaded CLAP instrument while the plug-in and output rate stay the same. Project playback and native plug-in editors are not available yet.",
+                "CLAP note and selected Pattern/channel previews render in an isolated helper, which reuses the instrument while the plug-in and output rate stay the same. Full Playlist playback, project-state mapping, Mixer/Layer routing, and native plug-in editors are not available yet.",
                 )
                 .color(MUTED),
             );
@@ -60849,6 +61079,24 @@ impl DawUi {
             ui.small(format!(
                 "MIDI note is 0–127; velocity is 1–127; note length is {MIN_NOTE_PREVIEW_NOTE_MILLISECONDS}–{MAX_NOTE_PREVIEW_NOTE_MILLISECONDS} ms. The default note 60 is C4."
             ));
+            match &clap_pattern_preview_settings {
+                Ok(Some(settings)) => {
+                    ui.small(format!(
+                        "Selected project source: Pattern {} · Channel {} · {} active note(s) · {:.3} BPM",
+                        settings.pattern_id,
+                        settings.channel_id,
+                        settings.notes.len(),
+                        settings.tempo_bpm,
+                    ));
+                }
+                Ok(None) => {
+                    ui.small("Select a Pattern and a channel with unmuted notes to preview project notes.");
+                }
+                Err(error) => {
+                    ui.colored_label(ORANGE, error);
+                }
+            }
+            ui.small("Pattern previews use the project base tempo; Playlist tempo automation, Layer routing, and Mixer routing are not applied.");
             for candidate in clap_candidates {
                 let inspection = self.clap_inspection_states.get(&candidate.path);
                 egui::Frame::new()
@@ -60976,6 +61224,60 @@ impl DawUi {
                                                         note_duration_milliseconds: self
                                                             .clap_preview_note_duration_milliseconds,
                                                     },
+                                                ));
+                                            }
+                                            match preview_state {
+                                                Some(ClapNotePreviewState::Rendering) => {
+                                                    ui.spinner();
+                                                }
+                                                Some(ClapNotePreviewState::Ready) => {
+                                                    ui.small("Rendered and sent to audio output");
+                                                }
+                                                Some(ClapNotePreviewState::Cancelled) => {
+                                                    ui.small("Preview cancelled");
+                                                }
+                                                Some(ClapNotePreviewState::Failed(error)) => {
+                                                    ui.colored_label(ORANGE, error);
+                                                }
+                                                None => {}
+                                            }
+                                        });
+                                    }
+                                    if clap_descriptor_supports_note_preview(&descriptor.features)
+                                        && let Ok(Some(settings)) =
+                                            clap_pattern_preview_settings.as_ref()
+                                    {
+                                        let preview_key = (
+                                            candidate.path.clone(),
+                                            descriptor.id.clone(),
+                                            settings.pattern_id,
+                                            settings.channel_id,
+                                        );
+                                        let preview_state = self
+                                            .clap_pattern_preview_states
+                                            .get(&preview_key);
+                                        ui.horizontal(|ui| {
+                                            let button_label = if matches!(
+                                                preview_state,
+                                                Some(ClapNotePreviewState::Rendering)
+                                            ) {
+                                                "Rendering Pattern…"
+                                            } else {
+                                                "Preview selected Pattern channel"
+                                            };
+                                            if ui
+                                                .add_enabled(
+                                                    !clap_note_preview_busy
+                                                        && !audio_unit_note_preview_busy,
+                                                    egui::Button::new(button_label),
+                                                )
+                                                .clicked()
+                                            {
+                                                preview_clap_pattern = Some((
+                                                    candidate.path.clone(),
+                                                    descriptor.id.clone(),
+                                                    descriptor.name.clone(),
+                                                    settings.clone(),
                                                 ));
                                             }
                                             match preview_state {
@@ -61340,6 +61642,10 @@ impl DawUi {
 
         if let Some((path, plugin_id, plugin_name, settings)) = preview_clap_note {
             self.request_clap_note_preview(path, plugin_id, plugin_name, settings, ui.ctx());
+        }
+
+        if let Some((path, plugin_id, plugin_name, settings)) = preview_clap_pattern {
+            self.request_clap_pattern_preview(path, plugin_id, plugin_name, settings, ui.ctx());
         }
 
         if let Some((path, channel_id, class_uid)) = restore_request {
@@ -62881,6 +63187,7 @@ impl eframe::App for DawUi {
         self.poll_browser_preview(ui.ctx());
         self.poll_sample_editor_preview(ui.ctx());
         self.poll_clap_note_preview(ui.ctx());
+        self.poll_clap_pattern_preview(ui.ctx());
         self.poll_audio_unit_note_preview(ui.ctx());
         self.poll_sample_editor_recording(ui.ctx());
         self.poll_sample_editor(ui.ctx());
