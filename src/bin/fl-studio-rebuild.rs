@@ -43452,7 +43452,7 @@ impl DawUi {
         self.view = MainView::Playlist;
         self.refresh_audio_waveform_paths();
         self.status = format!(
-            "Froze Playlist track {} from song start to {}; source clips muted. Mixer effects and automation were not rendered",
+            "Froze Playlist track {} from song start to {}; source clips muted. Supported loaded VST3 Mixer effects, linked effect automation, tails, and automatic PDC were included when available",
             freeze.track_id,
             output_path.display()
         );
@@ -43632,10 +43632,11 @@ impl DawUi {
             .vst3_host
             .as_ref()
             .map(|host| {
-                host.prepare_playlist_stream_with_automation_sources(
+                host.prepare_playlist_stream_with_mixer_effects_and_automation_sources(
                     document,
                     options.clone(),
                     &self.channel_vst3_instances,
+                    &self.mixer_effect_vst3_instances,
                     self.playlist_render_include_plugin_tails,
                     &playlist_parameter_automation,
                 )
