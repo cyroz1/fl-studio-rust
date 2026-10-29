@@ -11805,7 +11805,7 @@ impl PlaylistPerformanceRuntime {
             let source_id = sources.audio.audio_sources.len();
             let mut left = Vec::with_capacity(frame_count);
             let mut right = Vec::with_capacity(frame_count);
-            for frame in layer.samples.chunks_exact(2) {
+            for frame in layer.samples.as_chunks::<2>().0 {
                 left.push(frame[0]);
                 right.push(frame[1]);
             }
