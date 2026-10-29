@@ -5320,6 +5320,7 @@ struct DawUi {
     pending_audio_render: Option<PendingAudioRender>,
     audio_render_workers: Vec<PendingAudioRender>,
     pending_song_render: Option<PendingSongRender>,
+    pending_clap_playlist_offline_render: Option<PendingClapPlaylistOfflineRender>,
     song_render_workers: Vec<PendingSongRender>,
     pending_sampler_pattern_render: Option<PendingSamplerPatternRender>,
     pending_vst3_stream: Option<Vst3PatternStreamHandle>,
@@ -5483,6 +5484,34 @@ struct PendingSongRender {
     kind: PendingSongRenderKind,
     track_freeze: Option<PendingPlaylistTrackFreeze>,
     pattern_clip_placement: Option<PendingPlaylistPatternClipPlacement>,
+}
+
+struct PendingClapPlaylistOfflineRender {
+    request_routes: BTreeMap<u64, ClapPlaylistAudioRoute>,
+    audio_layers: Vec<PlaylistAudioLayer>,
+    job: PlaylistOfflineRenderJob,
+}
+
+struct PlaylistOfflineRenderJob {
+    document: FlpDocument,
+    project_path: PathBuf,
+    output_path: PathBuf,
+    options: PlaylistRenderOptions,
+    vst3_processor: Option<Vst3PlaylistStreamProcessor>,
+    kind: PlaylistOfflineRenderKind,
+}
+
+#[derive(Clone, Copy)]
+enum PlaylistOfflineRenderKind {
+    Mix {
+        output_format: PlaylistSongOutputFormat,
+        flac_bits_per_sample: u8,
+        ogg_bitrate_kbps: u16,
+        mp3_bitrate_kbps: u16,
+    },
+    MixerStems {
+        options: MixerStemRenderOptions,
+    },
 }
 
 struct PendingPlaylistTrackFreeze {
@@ -7407,6 +7436,7 @@ impl DawUi {
             pending_audio_render: None,
             audio_render_workers: Vec::new(),
             pending_song_render: None,
+            pending_clap_playlist_offline_render: None,
             song_render_workers: Vec::new(),
             pending_sampler_pattern_render: None,
             pending_vst3_stream: None,
@@ -13236,7 +13266,7 @@ impl DawUi {
         staged_handoff_reason: Option<PdcStreamHandoffReason>,
     ) {
         self.midi_script_transport_move = None;
-        if self.pending_song_render.is_some() {
+        if self.playlist_render_is_pending() {
             self.status = "Stop the Playlist render before starting playback".to_owned();
             return;
         }
@@ -13974,7 +14004,7 @@ impl DawUi {
     }
 
     fn start_performance_mode_playback(&mut self) {
-        if self.pending_song_render.is_some() {
+        if self.playlist_render_is_pending() {
             self.status = "Stop the Playlist render before starting playback".to_owned();
             return;
         }
@@ -14459,7 +14489,7 @@ impl DawUi {
 
     fn toggle_project_playback(&mut self) {
         self.midi_script_transport_move = None;
-        if self.pending_song_render.is_some() {
+        if self.playlist_render_is_pending() {
             self.status = "Stop the Playlist render before starting playback".to_owned();
             return;
         }
@@ -14507,7 +14537,7 @@ impl DawUi {
         if self.pattern_playback_mode == pattern_mode {
             return;
         }
-        if self.pending_song_render.is_some() {
+        if self.playlist_render_is_pending() {
             self.status = "Stop the Playlist render before changing transport mode".to_owned();
             return;
         }
@@ -14531,6 +14561,7 @@ impl DawUi {
     fn stop_project_playback(&mut self) {
         self.pending_clap_pattern_playback = None;
         self.pending_clap_playlist_playback = None;
+        self.pending_clap_playlist_offline_render = None;
         self.midi_script_transport_move = None;
         self.held_performance_clips.clear();
         self.midi_held_performance_clips.clear();
@@ -14977,7 +15008,7 @@ impl DawUi {
                         .add_enabled(
                             self.document.is_some()
                                 && self.current_path.is_some()
-                                && self.pending_song_render.is_none(),
+                                && !self.playlist_render_is_pending(),
                             egui::Button::new("Render Playlist mix…"),
                         )
                         .clicked()
@@ -14990,7 +15021,7 @@ impl DawUi {
                         .add_enabled(
                             self.document.is_some()
                                 && self.current_path.is_some()
-                                && self.pending_song_render.is_none(),
+                                && !self.playlist_render_is_pending(),
                             egui::Button::new("Render Mixer stems…"),
                         )
                         .clicked()
@@ -15074,7 +15105,7 @@ impl DawUi {
                     ui.menu_button(render_pattern_clips_label, |ui| {
                         let can_render = selected_pattern_clips.is_some()
                             && self.sample_project_path().is_some()
-                            && self.pending_song_render.is_none()
+                            && !self.playlist_render_is_pending()
                             && self.pending_audio_clip_export.is_none();
                         if ui
                             .add_enabled(can_render, egui::Button::new(pattern_clip_start_choice))
@@ -15134,7 +15165,7 @@ impl DawUi {
                                 .document
                                 .as_ref()
                                 .is_some_and(project_has_audio_clip_template)
-                            && self.pending_song_render.is_none()
+                            && !self.playlist_render_is_pending()
                             && self.pending_audio_clip_export.is_none();
                         if ui
                             .add_enabled(
@@ -18324,7 +18355,7 @@ impl DawUi {
             }
             if ui.button("■").on_hover_text("Stop").clicked() {
                 let was_preparing = self.pending_audio_render.is_some()
-                    || self.pending_song_render.is_some()
+                    || self.playlist_render_is_pending()
                     || self.pending_clap_pattern_playback.is_some()
                     || self.pending_clap_playlist_playback.is_some();
                 self.stop_project_playback();
@@ -20653,6 +20684,219 @@ impl DawUi {
         false
     }
 
+    fn prepare_clap_playlist_offline_render(&mut self, job: PlaylistOfflineRenderJob) {
+        if self.clap_pattern_playback_instruments.is_empty() {
+            self.start_playlist_offline_render_worker(job);
+            return;
+        }
+        let tempo_map =
+            match PlaylistTempoMap::for_arrangement(&job.document, job.options.arrangement_id) {
+                Ok(tempo_map) => tempo_map,
+                Err(error) => {
+                    self.status =
+                        format!("Could not prepare Playlist tempo map for CLAP rendering: {error}");
+                    return;
+                }
+            };
+        let requests = match self.clap_playlist_preview_settings_for_arrangement(
+            &job.document,
+            job.options.arrangement_id,
+            &tempo_map,
+        ) {
+            Ok(requests) => requests,
+            Err(error) => {
+                self.status = format!("Could not prepare CLAP Playlist render: {error}");
+                return;
+            }
+        };
+        let requests = requests
+            .into_iter()
+            .filter_map(|request| {
+                self.clap_pattern_playback_instruments
+                    .get(&request.settings.channel_id)
+                    .cloned()
+                    .map(|instrument| (instrument, request))
+            })
+            .collect::<Vec<_>>();
+        if requests.is_empty() {
+            self.start_playlist_offline_render_worker(job);
+            return;
+        }
+
+        let mut request_routes = BTreeMap::new();
+        for (instrument, request) in requests {
+            let channel_id = request.settings.channel_id;
+            self.clap_pattern_preview_request_id =
+                self.clap_pattern_preview_request_id.wrapping_add(1).max(1);
+            let request_id = self.clap_pattern_preview_request_id;
+            request_routes.insert(
+                request_id,
+                ClapPlaylistAudioRoute {
+                    channel_id,
+                    left_gain: request.left_gain,
+                    right_gain: request.right_gain,
+                    layer_gain: request.layer_gain,
+                    layer_pan_raw: request.layer_pan_raw,
+                    volume_automation: request.volume_automation,
+                    pan_automation: request.pan_automation,
+                },
+            );
+            let parameter_values = self.clap_parameter_overrides_for(
+                channel_id,
+                &instrument.path,
+                &instrument.plugin_id,
+            );
+            if self
+                .clap_pattern_preview_sender
+                .send((
+                    instrument.path,
+                    instrument.plugin_id,
+                    instrument.plugin_name,
+                    job.options.sample_rate,
+                    channel_id,
+                    Some(request.settings),
+                    instrument.state,
+                    parameter_values,
+                    ClapPatternPreviewPurpose::Playlist,
+                    request_id,
+                ))
+                .is_err()
+            {
+                self.status = "CLAP Playlist render worker is unavailable".to_owned();
+                return;
+            }
+        }
+        let request_count = request_routes.len();
+        self.pending_clap_playlist_offline_render = Some(PendingClapPlaylistOfflineRender {
+            request_routes,
+            audio_layers: Vec::with_capacity(request_count),
+            job,
+        });
+        self.status = format!("Preparing {request_count} CLAP instrument(s) for Playlist render");
+    }
+
+    fn start_playlist_offline_render_worker(&mut self, job: PlaylistOfflineRenderJob) {
+        let PlaylistOfflineRenderJob {
+            document,
+            project_path,
+            output_path,
+            options,
+            vst3_processor,
+            kind,
+        } = job;
+        let worker_output_path = output_path.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name(match kind {
+                PlaylistOfflineRenderKind::Mix { .. } => "playlist-render".to_owned(),
+                PlaylistOfflineRenderKind::MixerStems { .. } => "mixer-stem-render".to_owned(),
+            })
+            .spawn(move || {
+                let result = match kind {
+                    PlaylistOfflineRenderKind::Mix {
+                        output_format,
+                        flac_bits_per_sample,
+                        ogg_bitrate_kbps,
+                        mp3_bitrate_kbps,
+                    } => match output_format {
+                        PlaylistSongOutputFormat::Wav => {
+                            render_playlist_with_vst3_to_wav_cancellable(
+                                &document,
+                                &project_path,
+                                options,
+                                &worker_output_path,
+                                vst3_processor,
+                                &worker_cancelled,
+                            )
+                        }
+                        PlaylistSongOutputFormat::Flac => {
+                            render_playlist_with_vst3_to_flac_cancellable(
+                                &document,
+                                &project_path,
+                                options,
+                                &worker_output_path,
+                                flac_bits_per_sample,
+                                vst3_processor,
+                                &worker_cancelled,
+                            )
+                        }
+                        PlaylistSongOutputFormat::Ogg => {
+                            render_playlist_with_vst3_to_ogg_cancellable(
+                                &document,
+                                &project_path,
+                                options,
+                                &worker_output_path,
+                                ogg_bitrate_kbps,
+                                vst3_processor,
+                                &worker_cancelled,
+                            )
+                        }
+                        PlaylistSongOutputFormat::Mp3 => {
+                            render_playlist_with_vst3_to_mp3_cancellable(
+                                &document,
+                                &project_path,
+                                options,
+                                &worker_output_path,
+                                mp3_bitrate_kbps,
+                                vst3_processor,
+                                &worker_cancelled,
+                            )
+                        }
+                    },
+                    PlaylistOfflineRenderKind::MixerStems {
+                        options: stem_options,
+                    } => render_playlist_mixer_stems_with_vst3_cancellable(
+                        &document,
+                        &project_path,
+                        options,
+                        &worker_output_path,
+                        stem_options,
+                        vst3_processor,
+                        &worker_cancelled,
+                    ),
+                };
+                let _ = sender.send(result);
+            });
+        match worker {
+            Ok(worker) => {
+                self.pending_song_render = Some(PendingSongRender {
+                    receiver,
+                    cancelled,
+                    worker,
+                    output_path: output_path.clone(),
+                    kind: match kind {
+                        PlaylistOfflineRenderKind::Mix { .. } => PendingSongRenderKind::Mix,
+                        PlaylistOfflineRenderKind::MixerStems { .. } => {
+                            PendingSongRenderKind::MixerStems
+                        }
+                    },
+                    track_freeze: None,
+                    pattern_clip_placement: None,
+                });
+                self.status = match kind {
+                    PlaylistOfflineRenderKind::Mix { .. } => {
+                        format!("Rendering Playlist mix to {}…", output_path.display())
+                    }
+                    PlaylistOfflineRenderKind::MixerStems { .. } => {
+                        format!("Rendering Mixer stems into {}…", output_path.display())
+                    }
+                };
+            }
+            Err(error) => {
+                self.status = match kind {
+                    PlaylistOfflineRenderKind::Mix { .. } => {
+                        format!("Could not start Playlist render worker: {error}")
+                    }
+                    PlaylistOfflineRenderKind::MixerStems { .. } => {
+                        format!("Could not start Mixer stem render worker: {error}")
+                    }
+                };
+            }
+        }
+    }
+
     fn clap_parameter_overrides_for(
         &self,
         channel_id: u16,
@@ -20917,12 +21161,25 @@ impl DawUi {
                 continue;
             }
             if purpose == ClapPatternPreviewPurpose::Playlist {
-                self.handle_clap_playlist_playback_response(
-                    settings,
-                    plugin_name,
-                    request_id,
-                    result,
-                );
+                let is_offline_render_request = self
+                    .pending_clap_playlist_offline_render
+                    .as_ref()
+                    .is_some_and(|pending| pending.request_routes.contains_key(&request_id));
+                if is_offline_render_request {
+                    self.handle_clap_playlist_offline_render_response(
+                        settings,
+                        plugin_name,
+                        request_id,
+                        result,
+                    );
+                } else {
+                    self.handle_clap_playlist_playback_response(
+                        settings,
+                        plugin_name,
+                        request_id,
+                        result,
+                    );
+                }
                 continue;
             }
             if request_id != self.clap_pattern_preview_request_id {
@@ -21330,6 +21587,102 @@ impl DawUi {
             pending.staged_start_frame,
             pending.staged_handoff_reason,
         );
+    }
+
+    fn handle_clap_playlist_offline_render_response(
+        &mut self,
+        settings: Option<ClapPatternPreviewSettings>,
+        plugin_name: String,
+        request_id: u64,
+        result: Result<ClapPatternPreviewOutput, String>,
+    ) {
+        let Some(pending) = self.pending_clap_playlist_offline_render.as_mut() else {
+            return;
+        };
+        let Some(route) = pending.request_routes.remove(&request_id) else {
+            return;
+        };
+        let channel_id = route.channel_id;
+        let Some(settings) = settings else {
+            self.pending_clap_playlist_offline_render = None;
+            self.status = "CLAP Playlist render response was missing its source settings".into();
+            return;
+        };
+        if settings.channel_id != channel_id || settings.playlist.is_none() {
+            self.pending_clap_playlist_offline_render = None;
+            self.status = "CLAP Playlist render returned a mismatched source".into();
+            return;
+        }
+        match result {
+            Ok(ClapPatternPreviewOutput::Audio(samples))
+                if !samples.is_empty() && samples.len().is_multiple_of(2) =>
+            {
+                let current_bytes = pending
+                    .audio_layers
+                    .iter()
+                    .map(|layer| {
+                        layer
+                            .samples
+                            .len()
+                            .saturating_mul(std::mem::size_of::<f32>())
+                    })
+                    .sum::<usize>();
+                let new_bytes = samples.len().saturating_mul(std::mem::size_of::<f32>());
+                if current_bytes.saturating_add(new_bytes) > 512 * 1024 * 1024 {
+                    self.pending_clap_playlist_offline_render = None;
+                    self.status =
+                        "Prepared CLAP Playlist render audio exceeds the 512 MiB limit".into();
+                    return;
+                }
+                pending.audio_layers.push(PlaylistAudioLayer {
+                    channel_id,
+                    left_gain: route.left_gain,
+                    right_gain: route.right_gain,
+                    layer_gain: route.layer_gain,
+                    layer_pan_raw: route.layer_pan_raw,
+                    volume_automation: route.volume_automation,
+                    pan_automation: route.pan_automation,
+                    samples,
+                });
+            }
+            Ok(ClapPatternPreviewOutput::Audio(_)) => {
+                self.pending_clap_playlist_offline_render = None;
+                self.status = format!(
+                    "CLAP Playlist render for Channel {channel_id} returned invalid stereo audio"
+                );
+                return;
+            }
+            Ok(ClapPatternPreviewOutput::SavedState(_)) => {
+                self.pending_clap_playlist_offline_render = None;
+                self.status = format!(
+                    "CLAP Playlist render for Channel {channel_id} returned plug-in state instead of audio"
+                );
+                return;
+            }
+            Ok(ClapPatternPreviewOutput::ParametersSet) => {
+                self.pending_clap_playlist_offline_render = None;
+                self.status = format!(
+                    "CLAP Playlist render for Channel {channel_id} returned a parameter acknowledgement instead of audio"
+                );
+                return;
+            }
+            Err(error) => {
+                self.pending_clap_playlist_offline_render = None;
+                self.status = format!(
+                    "Could not prepare CLAP Playlist render for Channel {channel_id} through {plugin_name}: {error}"
+                );
+                return;
+            }
+        }
+        if !pending.request_routes.is_empty() {
+            return;
+        }
+        let Some(mut pending) = self.pending_clap_playlist_offline_render.take() else {
+            return;
+        };
+        pending.audio_layers.sort_by_key(|layer| layer.channel_id);
+        pending.job.options.clap_audio_layers = Arc::new(pending.audio_layers);
+        self.start_playlist_offline_render_worker(pending.job);
     }
 
     fn poll_clap_note_preview(&mut self, ctx: &egui::Context) {
@@ -27123,7 +27476,7 @@ impl DawUi {
                                     let can_render_pattern_clip = !clip.is_muted()
                                         && clip.track_index.is_some()
                                         && self.sample_project_path().is_some()
-                                        && self.pending_song_render.is_none()
+                                        && !self.playlist_render_is_pending()
                                         && self.pending_audio_clip_export.is_none();
                                     let render_pattern_clip_indices =
                                         selected_pattern_context_indices
@@ -45511,7 +45864,7 @@ impl DawUi {
             self.status = format!("Open a project before {operation} {clip_subject}");
             return;
         };
-        if self.pending_song_render.is_some() {
+        if self.playlist_render_is_pending() {
             self.status = "A Playlist or Mixer stem render is already running".to_owned();
             return;
         }
@@ -46576,7 +46929,7 @@ impl DawUi {
             self.status = "Open a project before freezing a Playlist track".to_owned();
             return;
         };
-        if self.pending_song_render.is_some() {
+        if self.playlist_render_is_pending() {
             self.status = "A Playlist or Mixer stem render is already running".to_owned();
             return;
         }
@@ -46838,6 +47191,10 @@ impl DawUi {
         }
     }
 
+    fn playlist_render_is_pending(&self) -> bool {
+        self.pending_song_render.is_some() || self.pending_clap_playlist_offline_render.is_some()
+    }
+
     fn render_playlist_dialog(&mut self) {
         let (Some(project_path), Some(document)) =
             (self.current_path.as_deref(), self.document.as_ref())
@@ -46845,7 +47202,7 @@ impl DawUi {
             self.status = "Open a project before rendering the Playlist".to_owned();
             return;
         };
-        if self.pending_song_render.is_some() {
+        if self.playlist_render_is_pending() {
             self.status = "A Playlist render is already running".to_owned();
             return;
         }
@@ -46923,76 +47280,22 @@ impl DawUi {
             }
         };
 
-        let project_path = self
-            .sample_project_path()
-            .unwrap_or_else(|| project_path.to_path_buf());
-        let document = document.clone();
-        let output_path_for_worker = output_path.clone();
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let worker_cancelled = Arc::clone(&cancelled);
-        let (sender, receiver) = mpsc::sync_channel(1);
-        let worker_options = options.clone();
-        let worker = thread::Builder::new()
-            .name("playlist-render".to_owned())
-            .spawn(move || {
-                let result = match output_format {
-                    PlaylistSongOutputFormat::Wav => render_playlist_with_vst3_to_wav_cancellable(
-                        &document,
-                        &project_path,
-                        worker_options,
-                        &output_path_for_worker,
-                        vst3_processor,
-                        &worker_cancelled,
-                    ),
-                    PlaylistSongOutputFormat::Flac => {
-                        render_playlist_with_vst3_to_flac_cancellable(
-                            &document,
-                            &project_path,
-                            options,
-                            &output_path_for_worker,
-                            flac_bits_per_sample,
-                            vst3_processor,
-                            &worker_cancelled,
-                        )
-                    }
-                    PlaylistSongOutputFormat::Ogg => render_playlist_with_vst3_to_ogg_cancellable(
-                        &document,
-                        &project_path,
-                        options,
-                        &output_path_for_worker,
-                        ogg_bitrate_kbps,
-                        vst3_processor,
-                        &worker_cancelled,
-                    ),
-                    PlaylistSongOutputFormat::Mp3 => render_playlist_with_vst3_to_mp3_cancellable(
-                        &document,
-                        &project_path,
-                        options,
-                        &output_path_for_worker,
-                        mp3_bitrate_kbps,
-                        vst3_processor,
-                        &worker_cancelled,
-                    ),
-                };
-                let _ = sender.send(result);
-            });
-        match worker {
-            Ok(worker) => {
-                self.pending_song_render = Some(PendingSongRender {
-                    receiver,
-                    cancelled,
-                    worker,
-                    output_path: output_path.clone(),
-                    kind: PendingSongRenderKind::Mix,
-                    track_freeze: None,
-                    pattern_clip_placement: None,
-                });
-                self.status = format!("Rendering Playlist mix to {}…", output_path.display());
-            }
-            Err(error) => {
-                self.status = format!("Could not start Playlist render worker: {error}");
-            }
-        }
+        let job = PlaylistOfflineRenderJob {
+            document: document.clone(),
+            project_path: self
+                .sample_project_path()
+                .unwrap_or_else(|| project_path.to_path_buf()),
+            output_path,
+            options,
+            vst3_processor,
+            kind: PlaylistOfflineRenderKind::Mix {
+                output_format,
+                flac_bits_per_sample,
+                ogg_bitrate_kbps,
+                mp3_bitrate_kbps,
+            },
+        };
+        self.prepare_clap_playlist_offline_render(job);
     }
 
     fn render_mixer_stems_dialog(&mut self) {
@@ -47002,7 +47305,7 @@ impl DawUi {
             self.status = "Open a project before rendering Mixer stems".to_owned();
             return;
         };
-        if self.pending_song_render.is_some() {
+        if self.playlist_render_is_pending() {
             self.status = "A Playlist or Mixer stem render is already running".to_owned();
             return;
         }
@@ -47064,11 +47367,6 @@ impl DawUi {
                 return;
             }
         };
-        let project_path = self
-            .sample_project_path()
-            .unwrap_or_else(|| project_path.to_path_buf());
-        let document = document.clone();
-        let output_directory_for_worker = output_directory.clone();
         let stem_options = MixerStemRenderOptions {
             include_master: self.playlist_render_include_master_stem,
             current_track: self
@@ -47076,41 +47374,19 @@ impl DawUi {
                 .then_some(self.playlist_render_current_track)
                 .flatten(),
         };
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let worker_cancelled = Arc::clone(&cancelled);
-        let (sender, receiver) = mpsc::sync_channel(1);
-        let worker_options = options.clone();
-        let worker = thread::Builder::new()
-            .name("mixer-stem-render".to_owned())
-            .spawn(move || {
-                let result = render_playlist_mixer_stems_with_vst3_cancellable(
-                    &document,
-                    &project_path,
-                    worker_options,
-                    &output_directory_for_worker,
-                    stem_options,
-                    vst3_processor,
-                    &worker_cancelled,
-                );
-                let _ = sender.send(result);
-            });
-        match worker {
-            Ok(worker) => {
-                self.pending_song_render = Some(PendingSongRender {
-                    receiver,
-                    cancelled,
-                    worker,
-                    output_path: output_directory.clone(),
-                    kind: PendingSongRenderKind::MixerStems,
-                    track_freeze: None,
-                    pattern_clip_placement: None,
-                });
-                self.status = format!("Rendering Mixer stems into {}…", output_directory.display());
-            }
-            Err(error) => {
-                self.status = format!("Could not start Mixer stem render worker: {error}");
-            }
-        }
+        let job = PlaylistOfflineRenderJob {
+            document: document.clone(),
+            project_path: self
+                .sample_project_path()
+                .unwrap_or_else(|| project_path.to_path_buf()),
+            output_path: output_directory,
+            options,
+            vst3_processor,
+            kind: PlaylistOfflineRenderKind::MixerStems {
+                options: stem_options,
+            },
+        };
+        self.prepare_clap_playlist_offline_render(job);
     }
 
     fn poll_song_render(&mut self, history_snapshot_available: bool) {
@@ -64578,7 +64854,7 @@ impl DawUi {
                 let playback_active = self.playing
                     || self.project_playback_loaded
                     || self.pending_audio_render.is_some()
-                    || self.pending_song_render.is_some()
+                    || self.playlist_render_is_pending()
                     || self.pending_vst3_stream.is_some();
                 let resumed_tick = if staged_pattern_handoff {
                     Some(self.pattern_seek_tick)
@@ -64841,7 +65117,7 @@ impl eframe::App for DawUi {
         if render_playlist_requested
             && self.document.is_some()
             && self.current_path.is_some()
-            && self.pending_song_render.is_none()
+            && !self.playlist_render_is_pending()
         {
             self.playlist_render_mixer_stems = false;
             self.playlist_render_options_open = true;
@@ -65198,7 +65474,7 @@ impl eframe::App for DawUi {
                 let playback_active = self.playing
                     || self.project_playback_loaded
                     || self.pending_audio_render.is_some()
-                    || self.pending_song_render.is_some()
+                    || self.playlist_render_is_pending()
                     || self.pending_vst3_stream.is_some()
                     || changes.latency_changed_while_processing;
                 let performance_latency_refresh_queued = changes.latency_changed
