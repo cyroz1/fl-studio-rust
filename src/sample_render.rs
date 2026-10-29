@@ -753,6 +753,19 @@ pub struct PlaylistAudioLayer {
     pub samples: Vec<f32>,
 }
 
+/// One pre-rendered CLAP source that can be launched as a Performance Mode clip.
+#[derive(Clone, Debug)]
+pub struct PlaylistPerformanceClapLayer {
+    pub clip_index: usize,
+    pub channel_id: u16,
+    pub sample_rate: u32,
+    pub layer_gain: f32,
+    pub layer_pan_raw: i32,
+    pub volume_automation: Arc<Vec<PlaylistChannelAutomationPoint>>,
+    pub pan_automation: Arc<Vec<PlaylistChannelAutomationPoint>>,
+    pub samples: Vec<f32>,
+}
+
 /// One normalized point in a channel volume or pan automation curve.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PlaylistChannelAutomationPoint {
@@ -1434,6 +1447,8 @@ pub struct PlaylistPerformanceStream {
     pub latency_reports: Sender<Vst3LatencyReport>,
     pub live_status: Arc<Mutex<PlaylistPerformanceLiveStatus>>,
     pub meters: Option<Arc<MixerTrackPeakMeters>>,
+    /// CLAP Pattern Clip loops rendered before Performance Mode starts.
+    pub clap_audio_layers: Arc<Vec<PlaylistPerformanceClapLayer>>,
 }
 
 /// Return the supported Sampler Pattern Clips that can be launched before the Start marker.
@@ -1791,6 +1806,106 @@ fn playlist_performance_vst3_clip_candidates(
         .collect())
 }
 
+fn playlist_performance_clap_note_source_supported(
+    source_channel_id: u16,
+    channels: &HashMap<u16, ChannelSummary>,
+    assigned_clap_channels: &BTreeSet<u16>,
+) -> bool {
+    let Some(source) = channels.get(&source_channel_id) else {
+        return false;
+    };
+    if source.enabled() == Some(false) {
+        return false;
+    }
+    if source.layer_child_ids().is_some() {
+        return performance_layer_leaf_channel_ids(source_channel_id, channels).is_some_and(
+            |leaf_ids| {
+                !leaf_ids.is_empty()
+                    && leaf_ids.iter().all(|channel_id| {
+                        assigned_clap_channels.contains(channel_id)
+                            && channels
+                                .get(channel_id)
+                                .is_some_and(|child| child.enabled() != Some(false))
+                    })
+            },
+        );
+    }
+    assigned_clap_channels.contains(&source_channel_id)
+}
+
+fn playlist_performance_clap_clip_candidates(
+    document: &FlpDocument,
+    arrangement_id: u16,
+    performance_zone_end_tick: u32,
+    assigned_clap_channels: &BTreeSet<u16>,
+) -> Result<BTreeSet<usize>, String> {
+    if assigned_clap_channels.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let tempo_map = PlaylistTempoMap::for_arrangement(document, arrangement_id)?;
+    if tempo_map.tempo_segments().count() != 1 {
+        return Ok(BTreeSet::new());
+    }
+    let arrangement = document
+        .arrangements()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|arrangement| arrangement.id == arrangement_id)
+        .ok_or_else(|| format!("arrangement {arrangement_id} was not found"))?;
+    let patterns = document
+        .patterns()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|pattern| (pattern.id, pattern))
+        .collect::<HashMap<_, _>>();
+    let channels = document
+        .channels()
+        .into_iter()
+        .map(|channel| (channel.id(), channel))
+        .collect::<HashMap<_, _>>();
+    let disabled_tracks = document
+        .playlist_tracks()
+        .into_iter()
+        .filter(|track| track.enabled == Some(false))
+        .map(|track| track.id)
+        .collect::<BTreeSet<_>>();
+    Ok(arrangement
+        .clips
+        .iter()
+        .enumerate()
+        .filter_map(|(index, clip)| {
+            let PlaylistClipTarget::Pattern { id } = clip.target() else {
+                return None;
+            };
+            let track_id = clip.playlist_track_id()?;
+            let pattern = patterns.get(&id)?;
+            let notes = pattern
+                .notes
+                .iter()
+                .filter(|note| !note.is_muted() && note.velocity > 0 && note.length > 0)
+                .collect::<Vec<_>>();
+            (clip.position_ticks < performance_zone_end_tick
+                && clip.length_ticks > 0
+                && !clip.is_muted()
+                && !disabled_tracks.contains(&track_id)
+                && clip
+                    .scale
+                    .is_none_or(|scale| scale.is_finite() && (scale - 1.0).abs() <= 1e-9)
+                && clip.uses_full_source_window()
+                && pattern.controllers.is_empty()
+                && !notes.is_empty()
+                && notes.iter().all(|note| {
+                    playlist_performance_clap_note_source_supported(
+                        note.channel_id,
+                        &channels,
+                        assigned_clap_channels,
+                    )
+                }))
+            .then_some(index)
+        })
+        .collect())
+}
+
 fn playlist_performance_mixed_source_clip_candidates(
     document: &FlpDocument,
     arrangement_id: u16,
@@ -1892,6 +2007,23 @@ pub fn playlist_performance_clip_indices_with_vst3(
     performance_zone_end_tick: u32,
     loaded_vst3_channels: &BTreeSet<u16>,
 ) -> Result<BTreeSet<usize>, String> {
+    playlist_performance_clip_indices_with_vst3_and_clap(
+        document,
+        arrangement_id,
+        performance_zone_end_tick,
+        loaded_vst3_channels,
+        &BTreeSet::new(),
+    )
+}
+
+/// Return supported Performance Mode clips, including clips rendered from assigned CLAP channels.
+pub fn playlist_performance_clip_indices_with_vst3_and_clap(
+    document: &FlpDocument,
+    arrangement_id: u16,
+    performance_zone_end_tick: u32,
+    loaded_vst3_channels: &BTreeSet<u16>,
+    assigned_clap_channels: &BTreeSet<u16>,
+) -> Result<BTreeSet<usize>, String> {
     let mut clip_indices = playlist_performance_sampler_clip_candidates(
         document,
         arrangement_id,
@@ -1913,6 +2045,12 @@ pub fn playlist_performance_clip_indices_with_vst3(
         arrangement_id,
         performance_zone_end_tick,
         loaded_vst3_channels,
+    )?);
+    clip_indices.extend(playlist_performance_clap_clip_candidates(
+        document,
+        arrangement_id,
+        performance_zone_end_tick,
+        assigned_clap_channels,
     )?);
     let arrangement = document
         .arrangements()
@@ -1956,6 +2094,23 @@ pub fn playlist_performance_vst3_clip_indices(
     performance_zone_end_tick: u32,
     loaded_vst3_channels: &BTreeSet<u16>,
 ) -> Result<BTreeSet<usize>, String> {
+    playlist_performance_vst3_clip_indices_with_clap(
+        document,
+        arrangement_id,
+        performance_zone_end_tick,
+        loaded_vst3_channels,
+        &BTreeSet::new(),
+    )
+}
+
+/// Return loaded VST3 Pattern Clips whose tracks can also contain assigned CLAP Pattern Clips.
+pub fn playlist_performance_vst3_clip_indices_with_clap(
+    document: &FlpDocument,
+    arrangement_id: u16,
+    performance_zone_end_tick: u32,
+    loaded_vst3_channels: &BTreeSet<u16>,
+    assigned_clap_channels: &BTreeSet<u16>,
+) -> Result<BTreeSet<usize>, String> {
     let mut candidates = playlist_performance_vst3_clip_candidates(
         document,
         arrangement_id,
@@ -1968,11 +2123,36 @@ pub fn playlist_performance_vst3_clip_indices(
         performance_zone_end_tick,
         loaded_vst3_channels,
     )?);
-    let supported = playlist_performance_clip_indices_with_vst3(
+    let supported = playlist_performance_clip_indices_with_vst3_and_clap(
         document,
         arrangement_id,
         performance_zone_end_tick,
         loaded_vst3_channels,
+        assigned_clap_channels,
+    )?;
+    Ok(candidates.intersection(&supported).copied().collect())
+}
+
+/// Return assigned CLAP-only Pattern Clips that can be pre-rendered for Performance Mode.
+pub fn playlist_performance_clap_clip_indices(
+    document: &FlpDocument,
+    arrangement_id: u16,
+    performance_zone_end_tick: u32,
+    loaded_vst3_channels: &BTreeSet<u16>,
+    assigned_clap_channels: &BTreeSet<u16>,
+) -> Result<BTreeSet<usize>, String> {
+    let candidates = playlist_performance_clap_clip_candidates(
+        document,
+        arrangement_id,
+        performance_zone_end_tick,
+        assigned_clap_channels,
+    )?;
+    let supported = playlist_performance_clip_indices_with_vst3_and_clap(
+        document,
+        arrangement_id,
+        performance_zone_end_tick,
+        loaded_vst3_channels,
+        assigned_clap_channels,
     )?;
     Ok(candidates.intersection(&supported).copied().collect())
 }
@@ -2054,11 +2234,30 @@ pub fn playlist_performance_static_document_with_vst3(
     performance_zone_end_tick: u32,
     loaded_vst3_channels: &BTreeSet<u16>,
 ) -> Result<(FlpDocument, BTreeSet<usize>), String> {
-    let performance_clip_indices = playlist_performance_clip_indices_with_vst3(
+    playlist_performance_static_document_with_vst3_and_clap(
         document,
         arrangement_id,
         performance_zone_end_tick,
         loaded_vst3_channels,
+        &BTreeSet::new(),
+    )
+}
+
+/// Return an arrangement with supported Sampler, Audio, loaded VST3, and assigned CLAP clips
+/// removed from static playback.
+pub fn playlist_performance_static_document_with_vst3_and_clap(
+    document: &FlpDocument,
+    arrangement_id: u16,
+    performance_zone_end_tick: u32,
+    loaded_vst3_channels: &BTreeSet<u16>,
+    assigned_clap_channels: &BTreeSet<u16>,
+) -> Result<(FlpDocument, BTreeSet<usize>), String> {
+    let performance_clip_indices = playlist_performance_clip_indices_with_vst3_and_clap(
+        document,
+        arrangement_id,
+        performance_zone_end_tick,
+        loaded_vst3_channels,
+        assigned_clap_channels,
     )?;
     let mut static_document = document.clone();
     for clip_index in performance_clip_indices.iter().rev().copied() {
@@ -2859,17 +3058,36 @@ pub fn stream_playlist_with_vst3_to_device_with_monitor_and_latency_updates(
 ///
 /// The arrangement must contain supported clips before the named Start marker. Launches replace
 /// content from the same Playlist track and repeat at the clip's tick length. Loaded VST3 Pattern
-/// Clips can receive live launches alongside Sampler and Audio Clips.
+/// Clips and constant-tempo assigned CLAP-only Pattern Clips can launch alongside Sampler and
+/// Audio Clips.
 pub fn stream_playlist_performance_with_vst3_to_device(
     document: &FlpDocument,
     project_path: impl AsRef<Path>,
-    options: PlaylistRenderOptions,
+    mut options: PlaylistRenderOptions,
     writer: &StreamingAudioWriter,
     cancelled: &AtomicBool,
     mut vst3_processor: Option<Vst3PlaylistStreamProcessor>,
     performance: PlaylistPerformanceStream,
 ) -> Result<PlaylistRenderSummary, String> {
     let project_path = project_path.as_ref();
+    let clap_audio_layers = Arc::clone(&performance.clap_audio_layers);
+    let mut assigned_clap_channels = (*options.clap_audio_channel_ids).clone();
+    assigned_clap_channels.extend(clap_audio_layers.iter().map(|layer| layer.channel_id));
+    let mut performance_clap_route_layers = options.clap_audio_layers.as_ref().clone();
+    performance_clap_route_layers.extend(clap_audio_layers.iter().map(|layer| {
+        PlaylistAudioLayer {
+            channel_id: layer.channel_id,
+            left_gain: 1.0,
+            right_gain: 1.0,
+            layer_gain: layer.layer_gain,
+            layer_pan_raw: layer.layer_pan_raw,
+            volume_automation: Arc::clone(&layer.volume_automation),
+            pan_automation: Arc::clone(&layer.pan_automation),
+            samples: Vec::new(),
+        }
+    }));
+    options.clap_audio_layers = Arc::new(performance_clap_route_layers);
+    options.clap_audio_channel_ids = Arc::new(assigned_clap_channels.clone());
     let loaded_vst3_channels = vst3_processor
         .as_ref()
         .map(Vst3PlaylistStreamProcessor::performance_channel_ids)
@@ -2883,11 +3101,12 @@ pub fn stream_playlist_performance_with_vst3_to_device(
         .map(|processor| processor.volume_expression_channel_ids().clone())
         .unwrap_or_default();
     let (static_document, performance_clip_indices) =
-        playlist_performance_static_document_with_vst3(
+        playlist_performance_static_document_with_vst3_and_clap(
             document,
             options.arrangement_id,
             performance.performance_zone_end_tick,
             &loaded_vst3_channels,
+            &assigned_clap_channels,
         )?;
     if performance_clip_indices.is_empty() {
         return Err("arrangement has no supported clips before the Start marker".into());
@@ -2910,12 +3129,25 @@ pub fn stream_playlist_performance_with_vst3_to_device(
     )?;
     performance_sampler_clip_indices.retain(|index| performance_clip_indices.contains(index));
     performance_audio_clip_indices.retain(|index| performance_clip_indices.contains(index));
-    let mut performance_vst3_clip_indices = playlist_performance_vst3_clip_indices(
+    let mut performance_clap_clip_indices = playlist_performance_clap_clip_candidates(
+        document,
+        options.arrangement_id,
+        performance.performance_zone_end_tick,
+        &assigned_clap_channels,
+    )?;
+    performance_clap_clip_indices.retain(|index| performance_clip_indices.contains(index));
+    let mut performance_vst3_clip_indices = playlist_performance_vst3_clip_candidates(
         document,
         options.arrangement_id,
         performance.performance_zone_end_tick,
         &loaded_vst3_channels,
     )?;
+    performance_vst3_clip_indices.extend(playlist_performance_mixed_source_clip_candidates(
+        document,
+        options.arrangement_id,
+        performance.performance_zone_end_tick,
+        &loaded_vst3_channels,
+    )?);
     performance_vst3_clip_indices.retain(|index| performance_clip_indices.contains(index));
     let mut audio = prepare_audio_clip_render(
         document,
@@ -2965,11 +3197,13 @@ pub fn stream_playlist_performance_with_vst3_to_device(
             sampler_clip_indices: &performance_sampler_clip_indices,
             audio_clip_indices: &performance_audio_clip_indices,
             vst3_clip_indices: &performance_vst3_clip_indices,
+            clap_clip_indices: &performance_clap_clip_indices,
+            clap_audio_layers: clap_audio_layers.as_slice(),
             vst3_channel_ids: &loaded_vst3_channels,
             vst3_volume_expression_channel_ids: &vst3_volume_expression_channels,
             pattern_automation: &performance_pattern_automation,
             sampler: &sampler,
-            audio: &audio,
+            audio: &mut audio,
         },
     )?;
     audio
@@ -10145,6 +10379,7 @@ fn prepare_audio_clip_render(
                 .pan_override
                 .map_or(*pan, |pan| f32::from(pan) / 100.0),
             pan_law,
+            performance_clap_mix_controls: None,
             mixer_transform: mixer_route_plan.output_transform,
             live_mixer_source_control,
             mixer_meter_transforms: mixer_route_plan.insert_meter_transforms.clone(),
@@ -10441,14 +10676,14 @@ struct PreparedSamplerArrangement {
     unresolved_clip_indices: BTreeSet<usize>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct PreparedChannelAutomationPoint {
     frame: u64,
     value: f64,
     tension: f32,
 }
 
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 struct PreparedClapChannelAutomation {
     volume: Vec<PreparedChannelAutomationPoint>,
     pan: Vec<PreparedChannelAutomationPoint>,
@@ -11283,6 +11518,7 @@ struct PerformanceAudioClip {
     length_ticks: u64,
     source_duration_frames: u64,
     template: PreparedClip,
+    additional_templates: Vec<PreparedClip>,
 }
 
 #[derive(Clone)]
@@ -11348,11 +11584,13 @@ struct PlaylistPerformanceSources<'a> {
     sampler_clip_indices: &'a BTreeSet<usize>,
     audio_clip_indices: &'a BTreeSet<usize>,
     vst3_clip_indices: &'a BTreeSet<usize>,
+    clap_clip_indices: &'a BTreeSet<usize>,
+    clap_audio_layers: &'a [PlaylistPerformanceClapLayer],
     vst3_channel_ids: &'a BTreeSet<u16>,
     vst3_volume_expression_channel_ids: &'a BTreeSet<u16>,
     pattern_automation: &'a BTreeMap<(u16, u16), Vec<Vst3ParameterAutomation>>,
     sampler: &'a PreparedSamplerArrangement,
-    audio: &'a PreparedAudioClipRender,
+    audio: &'a mut PreparedAudioClipRender,
 }
 
 struct PlaylistPerformanceRuntime {
@@ -11522,6 +11760,184 @@ impl PlaylistPerformanceRuntime {
                     length_ticks,
                     source_duration_frames,
                     template,
+                    additional_templates: Vec::new(),
+                },
+            );
+        }
+        let channels_by_id = document
+            .channels()
+            .into_iter()
+            .map(|channel| (channel.id(), channel))
+            .collect::<HashMap<_, _>>();
+        let mut clap_templates_by_clip = HashMap::<usize, Vec<PreparedClip>>::new();
+        for layer in sources
+            .clap_audio_layers
+            .iter()
+            .filter(|layer| sources.clap_clip_indices.contains(&layer.clip_index))
+        {
+            if layer.samples.is_empty()
+                || !layer.samples.len().is_multiple_of(2)
+                || !(8_000..=192_000).contains(&layer.sample_rate)
+                || !layer.layer_gain.is_finite()
+                || layer.layer_gain < 0.0
+            {
+                return Err(format!(
+                    "Performance CLAP Pattern Clip {} has invalid stereo audio",
+                    layer.clip_index + 1
+                ));
+            }
+            let clip = arrangement.clips.get(layer.clip_index).ok_or_else(|| {
+                format!(
+                    "Performance CLAP Pattern Clip {} disappeared",
+                    layer.clip_index + 1
+                )
+            })?;
+            let track_id = clip.playlist_track_id().ok_or_else(|| {
+                format!(
+                    "Performance CLAP Pattern Clip {} has no Playlist track",
+                    layer.clip_index + 1
+                )
+            })?;
+            let channel = channels_by_id.get(&layer.channel_id).ok_or_else(|| {
+                format!("Performance CLAP channel {} disappeared", layer.channel_id)
+            })?;
+            let frame_count = layer.samples.len() / 2;
+            let source_id = sources.audio.audio_sources.len();
+            let mut left = Vec::with_capacity(frame_count);
+            let mut right = Vec::with_capacity(frame_count);
+            for frame in layer.samples.chunks_exact(2) {
+                left.push(frame[0]);
+                right.push(frame[1]);
+            }
+            sources.audio.audio_sources.push(DecodedAudio {
+                sample_rate: layer.sample_rate,
+                channels: vec![left, right],
+            });
+            let route_plan = sources
+                .sampler
+                .live_mixer_source_routes_by_channel
+                .get(&layer.channel_id)
+                .cloned();
+            let template = PreparedClip {
+                clip_index: layer.clip_index,
+                playlist_track_id: Some(track_id),
+                channel_id: layer.channel_id,
+                mixer_track: channel.mixer_track(),
+                path: PathBuf::from(format!("<CLAP channel {}>", layer.channel_id)),
+                source_id,
+                start_frame: 0,
+                source_bounds: SampleBounds {
+                    start: 0,
+                    end: frame_count,
+                },
+                reverse: false,
+                pitch_ratio: 1.0,
+                duration_frames: frame_count as u64,
+                gain: 1.0,
+                envelope_gain: 1.0,
+                fade_in_frames: 0,
+                fade_out_frames: 0,
+                fade_in_curve: PlaylistAudioClipFadeCurve::Linear,
+                fade_in_tension: 0,
+                fade_out_curve: PlaylistAudioClipFadeCurve::Linear,
+                fade_out_tension: 0,
+                pan: 0.0,
+                pan_law: sources.sampler.pan_law,
+                performance_clap_mix_controls: Some(PerformanceClapMixControls {
+                    saved_volume: sources
+                        .sampler
+                        .clap_channel_levels_by_channel
+                        .get(&layer.channel_id)
+                        .and_then(|levels| levels.0),
+                    saved_pan: sources
+                        .sampler
+                        .clap_channel_levels_by_channel
+                        .get(&layer.channel_id)
+                        .and_then(|levels| levels.1),
+                    layer_gain: layer.layer_gain,
+                    layer_pan_raw: layer.layer_pan_raw,
+                    automation: sources
+                        .sampler
+                        .clap_channel_automation_by_channel
+                        .get(&layer.channel_id)
+                        .cloned()
+                        .unwrap_or_default(),
+                }),
+                mixer_transform: sources
+                    .sampler
+                    .mixer_transforms_by_channel
+                    .get(&layer.channel_id)
+                    .copied()
+                    .unwrap_or_default(),
+                live_mixer_source_control: route_plan
+                    .map(|route_plan| LiveMixerSourceControl::new(route_plan, options.sample_rate)),
+                mixer_meter_transforms: sources
+                    .sampler
+                    .mixer_meter_transforms_by_channel
+                    .get(&layer.channel_id)
+                    .cloned()
+                    .unwrap_or_default(),
+                mixer_effect_input_transforms: sources
+                    .sampler
+                    .mixer_effect_input_transforms_by_channel
+                    .get(&layer.channel_id)
+                    .cloned()
+                    .unwrap_or_default(),
+                mixer_route_override: Arc::new(ArcSwapOption::empty()),
+            };
+            clap_templates_by_clip
+                .entry(layer.clip_index)
+                .or_default()
+                .push(template);
+        }
+        for &clip_index in sources.clap_clip_indices {
+            let clip = arrangement.clips.get(clip_index).ok_or_else(|| {
+                format!(
+                    "Performance CLAP Pattern Clip {} disappeared",
+                    clip_index + 1
+                )
+            })?;
+            let track_id = clip.playlist_track_id().ok_or_else(|| {
+                format!(
+                    "Performance CLAP Pattern Clip {} has no Playlist track",
+                    clip_index + 1
+                )
+            })?;
+            let mut templates = clap_templates_by_clip
+                .remove(&clip_index)
+                .unwrap_or_default();
+            if templates.is_empty() {
+                return Err(format!(
+                    "Performance CLAP Pattern Clip {} has no prepared instrument audio",
+                    clip_index + 1
+                ));
+            }
+            let template = templates.remove(0);
+            let source = sources
+                .audio
+                .audio_sources
+                .get(template.source_id)
+                .ok_or_else(|| {
+                    format!(
+                        "Performance CLAP Pattern Clip {} has no decoded instrument audio",
+                        clip_index + 1
+                    )
+                })?;
+            let source_duration_frames = source_duration_to_frames(
+                template.source_bounds.end - template.source_bounds.start,
+                source.sample_rate,
+                options.sample_rate,
+                template.pitch_ratio,
+            )?;
+            audio_clips_by_index.insert(
+                clip_index,
+                PerformanceAudioClip {
+                    track_id,
+                    source_start_tick: clip.position_ticks,
+                    length_ticks: u64::from(clip.length_ticks),
+                    source_duration_frames,
+                    template,
+                    additional_templates: templates,
                 },
             );
         }
@@ -11858,7 +12274,10 @@ impl PlaylistPerformanceRuntime {
             &self
                 .audio_clips_by_index
                 .values()
-                .map(|clip| clip.template.clone())
+                .flat_map(|clip| {
+                    std::iter::once(clip.template.clone())
+                        .chain(clip.additional_templates.iter().cloned())
+                })
                 .collect::<Vec<_>>(),
             &routing,
             audio_context.sample_rate,
@@ -12274,25 +12693,29 @@ impl PlaylistPerformanceRuntime {
                     .saturating_sub(source_offset_output_frames)
                     .min(timeline_duration_frames);
                 if duration_frames > 0 {
-                    let mut playback = clip.template.clone();
-                    playback.start_frame = loop_frame;
-                    playback.duration_frames = duration_frames;
-                    if loop_offset_ticks > 0 {
-                        let source_frames = playback
-                            .source_bounds
-                            .end
-                            .saturating_sub(playback.source_bounds.start);
-                        let source_offset_frames =
-                            (source_frames as u128 * u128::from(loop_offset_ticks)
-                                / u128::from(clip.length_ticks))
-                            .min(usize::MAX as u128) as usize;
-                        playback.source_bounds.start = playback
-                            .source_bounds
-                            .start
-                            .saturating_add(source_offset_frames)
-                            .min(playback.source_bounds.end.saturating_sub(1));
+                    for template in
+                        std::iter::once(&clip.template).chain(clip.additional_templates.iter())
+                    {
+                        let mut playback = template.clone();
+                        playback.start_frame = loop_frame;
+                        playback.duration_frames = duration_frames;
+                        if loop_offset_ticks > 0 {
+                            let source_frames = playback
+                                .source_bounds
+                                .end
+                                .saturating_sub(playback.source_bounds.start);
+                            let source_offset_frames =
+                                (source_frames as u128 * u128::from(loop_offset_ticks)
+                                    / u128::from(clip.length_ticks))
+                                .min(usize::MAX as u128) as usize;
+                            playback.source_bounds.start = playback
+                                .source_bounds
+                                .start
+                                .saturating_add(source_offset_frames)
+                                .min(playback.source_bounds.end.saturating_sub(1));
+                        }
+                        self.active_audio_playbacks.push(playback);
                     }
-                    self.active_audio_playbacks.push(playback);
                 }
                 active.next_loop_tick = loop_end_tick;
                 active.initial_offset_ticks = 0;
@@ -15585,11 +16008,21 @@ struct PreparedClip {
     fade_out_tension: i16,
     pan: f32,
     pan_law: PanLaw,
+    performance_clap_mix_controls: Option<PerformanceClapMixControls>,
     mixer_transform: MixerSourceRouteTransform,
     live_mixer_source_control: Option<LiveMixerSourceControl>,
     mixer_meter_transforms: Vec<(usize, MixerSourceRouteTransform)>,
     mixer_effect_input_transforms: Vec<(usize, MixerSourceRouteTransform)>,
     mixer_route_override: Arc<ArcSwapOption<PreparedClipMixerRouteOverride>>,
+}
+
+#[derive(Clone, Debug)]
+struct PerformanceClapMixControls {
+    saved_volume: Option<u32>,
+    saved_pan: Option<i32>,
+    layer_gain: f32,
+    layer_pan_raw: i32,
+    automation: PreparedClapChannelAutomation,
 }
 
 struct PreparedAudioClipRender {
@@ -16661,8 +17094,7 @@ fn mix_clip_window_into_stereo_with_quality_and_meter(
     let live_mixer_targets = live_mixer_source_control.and_then(|source_control| {
         live_mixer_source_targets.and_then(|meters| source_control.targets(meters))
     });
-    let (left_pan_gain, right_pan_gain) =
-        channel_pan_gains(clip.pan, source.channels.len() == 1, clip.pan_law);
+    let base_pan_gains = channel_pan_gains(clip.pan, source.channels.len() == 1, clip.pan_law);
     let source_frames_per_output =
         f64::from(source.sample_rate) / f64::from(output_rate) * clip.pitch_ratio;
     for output_frame in overlap_start..overlap_end {
@@ -16697,9 +17129,44 @@ fn mix_clip_window_into_stereo_with_quality_and_meter(
             .map_err(|_| "audio output frame index exceeds this platform".to_owned())?
             * 2;
         let envelope_gain = playlist_audio_clip_envelope_gain(clip, output_offset);
+        let (gain, (left_pan_gain, right_pan_gain)) =
+            if let Some(controls) = clip.performance_clap_mix_controls.as_ref() {
+                let volume = if controls.automation.volume.is_empty() {
+                    controls.saved_volume
+                } else {
+                    let fallback =
+                        f64::from(controls.saved_volume.unwrap_or(10_000).min(12_800)) / 12_800.0;
+                    let normalized = channel_automation_value_at_frame(
+                        &controls.automation.volume,
+                        output_frame,
+                        fallback,
+                    );
+                    Some((normalized.clamp(0.0, 1.0) * 12_800.0).round() as u32)
+                };
+                let pan = if controls.automation.pan.is_empty() {
+                    controls.saved_pan
+                } else {
+                    let fallback =
+                        f64::from(controls.saved_pan.unwrap_or(6_400).clamp(0, 12_800)) / 12_800.0;
+                    let normalized = channel_automation_value_at_frame(
+                        &controls.automation.pan,
+                        output_frame,
+                        fallback,
+                    );
+                    Some((normalized.clamp(0.0, 1.0) * 12_800.0).round() as i32)
+                };
+                let (channel_gain, channel_pan) = channel_gain_pan(volume, pan);
+                let pan = (channel_pan + controls.layer_pan_raw as f32 / 6_400.0).clamp(-1.0, 1.0);
+                (
+                    channel_gain * controls.layer_gain,
+                    channel_pan_gains(pan, false, clip.pan_law),
+                )
+            } else {
+                (clip.gain, base_pan_gains)
+            };
         let mut frame = [
-            left * clip.gain * envelope_gain * left_pan_gain,
-            right * clip.gain * envelope_gain * right_pan_gain,
+            left * gain * envelope_gain * left_pan_gain,
+            right * gain * envelope_gain * right_pan_gain,
         ];
         let live_controls = match (live_mixer_source_control, live_mixer_targets.as_ref()) {
             (Some(source_control), Some(targets)) => {
@@ -16724,8 +17191,8 @@ fn mix_clip_window_into_stereo_with_quality_and_meter(
                     return Err("Mixer meter route exceeds the supported track range".to_owned());
                 }
                 let mut meter_frame = [
-                    left * clip.gain * envelope_gain * left_pan_gain,
-                    right * clip.gain * envelope_gain * right_pan_gain,
+                    left * gain * envelope_gain * left_pan_gain,
+                    right * gain * envelope_gain * right_pan_gain,
                 ];
                 if let Some((source_control, controls)) = live_controls {
                     source_control.apply_meter_frame(
@@ -18273,6 +18740,7 @@ mod tests {
             fade_out_tension: 0,
             pan: 0.0,
             pan_law: PanLaw::Circular,
+            performance_clap_mix_controls: None,
             mixer_transform: saved_transform,
             live_mixer_source_control: Some(test_live_mixer_source_control(
                 1,
@@ -18369,6 +18837,7 @@ mod tests {
             fade_out_tension: 0,
             pan: 0.0,
             pan_law: PanLaw::Triangular,
+            performance_clap_mix_controls: None,
             mixer_transform: MixerSourceRouteTransform::default(),
             live_mixer_source_control: Some(test_live_mixer_source_control(
                 1,
@@ -18478,6 +18947,7 @@ mod tests {
             fade_out_tension: 0,
             pan: 0.0,
             pan_law: PanLaw::Circular,
+            performance_clap_mix_controls: None,
             mixer_transform,
             live_mixer_source_control: Some(test_live_mixer_source_control(
                 1,
@@ -18527,6 +18997,7 @@ mod tests {
                     length_ticks: 384,
                     source_duration_frames: 50,
                     template: clip,
+                    additional_templates: Vec::new(),
                 },
             )]),
             vst3_clips_by_index: HashMap::new(),
@@ -19492,6 +19963,7 @@ mod tests {
                 fade_out_tension: 0,
                 pan: 0.0,
                 pan_law: PanLaw::Circular,
+                performance_clap_mix_controls: None,
                 mixer_transform: MixerSourceRouteTransform::from_insert_transform(
                     MixerInsertSignalTransform::default().with_fader_volume_raw(Some(15_000)),
                 ),
@@ -19889,6 +20361,7 @@ mod tests {
                 fade_out_tension: 0,
                 pan: 0.0,
                 pan_law: PanLaw::Circular,
+                performance_clap_mix_controls: None,
                 mixer_transform: transform,
                 live_mixer_source_control: None,
                 mixer_meter_transforms: vec![(usize::try_from(mixer_track).unwrap(), transform)],
@@ -19974,6 +20447,7 @@ mod tests {
             fade_out_tension: 0,
             pan: 0.0,
             pan_law: PanLaw::Circular,
+            performance_clap_mix_controls: None,
             mixer_transform: MixerSourceRouteTransform::default(),
             live_mixer_source_control: None,
             mixer_meter_transforms: Vec::new(),
@@ -20026,6 +20500,7 @@ mod tests {
             fade_out_tension: 0,
             pan: 0.0,
             pan_law: PanLaw::Circular,
+            performance_clap_mix_controls: None,
             mixer_transform: MixerSourceRouteTransform::default(),
             live_mixer_source_control: None,
             mixer_meter_transforms: Vec::new(),
@@ -20134,6 +20609,7 @@ mod tests {
             fade_out_tension: 0,
             pan: 0.0,
             pan_law: PanLaw::Circular,
+            performance_clap_mix_controls: None,
             mixer_transform: MixerSourceRouteTransform::default(),
             live_mixer_source_control: None,
             mixer_meter_transforms: Vec::new(),
@@ -20580,6 +21056,7 @@ mod tests {
             fade_out_tension: 0,
             pan: 0.0,
             pan_law: PanLaw::Circular,
+            performance_clap_mix_controls: None,
             mixer_transform: MixerSourceRouteTransform::from_insert_transform(
                 MixerInsertSignalTransform::new(true, true),
             ),
@@ -20627,6 +21104,7 @@ mod tests {
             fade_out_tension: 0,
             pan: 0.5,
             pan_law: PanLaw::Circular,
+            performance_clap_mix_controls: None,
             mixer_transform: MixerSourceRouteTransform::default(),
             live_mixer_source_control: None,
             mixer_meter_transforms: Vec::new(),

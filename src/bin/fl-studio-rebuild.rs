@@ -48,19 +48,20 @@ use flp_rebuild::sample_render::{
     LayerLiveInputSender, MP3_BITRATES_KBPS, MixerStemRenderOptions,
     PLAYLIST_AUDIO_CLIP_GAIN_MINUS_INFINITY, PatternAudioLayer, PlaylistAudioClipEnvelope,
     PlaylistAudioClipFadeCurve, PlaylistAudioLayer, PlaylistChannelAutomationPoint,
-    PlaylistLiveStreamControls, PlaylistPatternScheduleOptions, PlaylistPerformanceCommand,
-    PlaylistPerformanceLaunch, PlaylistPerformanceLiveStatus, PlaylistPerformanceStream,
-    PlaylistRenderOptions, PlaylistRenderRange, PlaylistRenderSummary, PlaylistStreamMonitor,
-    PlaylistTailMode, PlaylistTempoMap, PlaylistTrackFilter, ResamplingQuality,
-    SamplerLiveInputRouting, SamplerLiveNoteEvent, SamplerLiveNoteSender,
+    PlaylistLiveStreamControls, PlaylistPatternScheduleOptions, PlaylistPerformanceClapLayer,
+    PlaylistPerformanceCommand, PlaylistPerformanceLaunch, PlaylistPerformanceLiveStatus,
+    PlaylistPerformanceStream, PlaylistRenderOptions, PlaylistRenderRange, PlaylistRenderSummary,
+    PlaylistStreamMonitor, PlaylistTailMode, PlaylistTempoMap, PlaylistTrackFilter,
+    ResamplingQuality, SamplerLiveInputRouting, SamplerLiveNoteEvent, SamplerLiveNoteSender,
     SamplerPatternLoopPlayback, SamplerPatternLoopStreamControls, SamplerPatternRenderOptions,
     SamplerPatternRenderSummary, SamplerPatternStreamControls, Vst3LatencyUpdateControls,
     Vst3LiveInputEvent, Vst3LiveInputSender, Vst3PatternLoopPlayback,
     Vst3PatternLoopStreamControls, Vst3PatternPlayback, Vst3PatternStreamControls, WavChannelMode,
     WavDitherMode, WavSampleFormat, layer_live_input_queue,
     nearest_playlist_audio_clip_zero_crossing_tick, playlist_audio_clip_fade_gain,
-    playlist_performance_clip_indices_with_vst3, playlist_performance_static_document_with_vst3,
-    playlist_performance_vst3_channel_ids, playlist_performance_vst3_clip_indices,
+    playlist_performance_clap_clip_indices, playlist_performance_clip_indices_with_vst3_and_clap,
+    playlist_performance_static_document_with_vst3_and_clap, playlist_performance_vst3_channel_ids,
+    playlist_performance_vst3_clip_indices_with_clap,
     project_channel_stereo_output_gains_with_layer_adjustments, render_audio_clips_to_file,
     render_playlist_mixer_stems_with_vst3_cancellable,
     render_playlist_with_vst3_to_file_from_frame_cancellable,
@@ -5198,6 +5199,9 @@ struct DawUi {
     pending_clap_playlist_playback: Option<PendingClapPlaylistPlayback>,
     active_clap_playlist_cache_key: Option<ClapPlaylistCacheKey>,
     active_clap_playlist_audio_layers: Arc<Vec<PlaylistAudioLayer>>,
+    pending_clap_performance_playback: Option<PendingClapPerformancePlayback>,
+    active_clap_performance_cache_key: Option<ClapPerformanceCacheKey>,
+    active_clap_performance_audio_layers: Arc<Vec<PlaylistPerformanceClapLayer>>,
     pending_clap_state_capture: Option<PendingClapStateCapture>,
     active_clap_pattern_audio_layers: Vec<PatternAudioLayer>,
     clap_preview_note_key: u8,
@@ -5611,6 +5615,34 @@ struct PendingClapPlaylistPlayback {
     audio_layers: Vec<PlaylistAudioLayer>,
     staged_start_frame: Option<u64>,
     staged_handoff_reason: Option<PdcStreamHandoffReason>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ClapPerformanceCacheKey {
+    project_generation: u64,
+    project_fingerprint: [u8; 16],
+    arrangement_id: u16,
+    sample_rate: u32,
+    performance_zone_end_tick: u32,
+    soloed_playlist_track_range: Option<(u32, u32)>,
+    assigned_channel_ids: BTreeSet<u16>,
+}
+
+struct PendingClapPerformancePlayback {
+    cache_key: ClapPerformanceCacheKey,
+    request_routes: BTreeMap<u64, ClapPerformanceAudioRoute>,
+    audio_layers: Vec<PlaylistPerformanceClapLayer>,
+}
+
+#[derive(Clone)]
+struct ClapPerformanceAudioRoute {
+    clip_index: usize,
+    pattern_id: u16,
+    channel_id: u16,
+    layer_gain: f32,
+    layer_pan_raw: i32,
+    volume_automation: Arc<Vec<PlaylistChannelAutomationPoint>>,
+    pan_automation: Arc<Vec<PlaylistChannelAutomationPoint>>,
 }
 
 #[derive(Clone)]
@@ -7314,6 +7346,9 @@ impl DawUi {
             pending_clap_playlist_playback: None,
             active_clap_playlist_cache_key: None,
             active_clap_playlist_audio_layers: Arc::new(Vec::new()),
+            pending_clap_performance_playback: None,
+            active_clap_performance_cache_key: None,
+            active_clap_performance_audio_layers: Arc::new(Vec::new()),
             pending_clap_state_capture: None,
             active_clap_pattern_audio_layers: Vec::new(),
             clap_preview_note_key: 60,
@@ -12348,11 +12383,17 @@ impl DawUi {
             .keys()
             .copied()
             .collect::<BTreeSet<_>>();
-        playlist_performance_clip_indices_with_vst3(
+        let assigned_clap_channels = self
+            .clap_pattern_playback_instruments
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        playlist_performance_clip_indices_with_vst3_and_clap(
             document,
             arrangement_id,
             performance_zone_end_tick,
             &loaded_vst3_channels,
+            &assigned_clap_channels,
         )
     }
 
@@ -14071,6 +14112,11 @@ impl DawUi {
             .keys()
             .copied()
             .collect::<BTreeSet<_>>();
+        let assigned_clap_channel_ids = self
+            .clap_pattern_playback_instruments
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>();
         let performance_clip_indices =
             match self.performance_supported_clip_indices(document, arrangement_id, start_tick) {
                 Ok(clip_indices) => clip_indices,
@@ -14081,15 +14127,16 @@ impl DawUi {
             };
         if performance_clip_indices.is_empty() {
             self.status =
-                "Add a supported Audio Clip, Sampler Pattern Clip, or loaded VST3 Pattern Clip before Start"
+                "Add a supported Audio Clip, Sampler Pattern Clip, loaded VST3 Pattern Clip, or assigned CLAP Pattern Clip before Start"
                     .into();
             return;
         }
-        let performance_vst3_clip_indices = match playlist_performance_vst3_clip_indices(
+        let performance_vst3_clip_indices = match playlist_performance_vst3_clip_indices_with_clap(
             document,
             arrangement_id,
             start_tick,
             &loaded_vst3_channels,
+            &assigned_clap_channel_ids,
         ) {
             Ok(indices) => indices
                 .intersection(&performance_clip_indices)
@@ -14108,6 +14155,22 @@ impl DawUi {
             Ok(channels) => channels,
             Err(error) => {
                 self.status = format!("Could not prepare Performance Mode VST3 channels: {error}");
+                return;
+            }
+        };
+        let performance_clap_clip_indices = match playlist_performance_clap_clip_indices(
+            document,
+            arrangement_id,
+            start_tick,
+            &loaded_vst3_channels,
+            &assigned_clap_channel_ids,
+        ) {
+            Ok(indices) => indices
+                .intersection(&performance_clip_indices)
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            Err(error) => {
+                self.status = format!("Could not prepare Performance Mode CLAP clips: {error}");
                 return;
             }
         };
@@ -14140,13 +14203,14 @@ impl DawUi {
             self.audio_test_tone = false;
         }
         let sample_rate = engine.sample_rate();
-        let options = PlaylistRenderOptions {
+        let mut options = PlaylistRenderOptions {
             arrangement_id,
             sample_rate,
             resampling_quality: self.live_resampling_quality,
             tail_seconds: 2,
             soloed_playlist_track_range: self.soloed_playlist_track_range,
             read_sample_root_note: self.read_sample_root_note,
+            clap_audio_channel_ids: Arc::new(assigned_clap_channel_ids.clone()),
             clip_envelopes: self.playlist_audio_clip_envelopes_for_current_project(arrangement_id),
             ..PlaylistRenderOptions::default()
         };
@@ -14172,12 +14236,66 @@ impl DawUi {
                 return;
             }
         };
+        let performance_clap_audio_layers = if performance_clap_clip_indices.is_empty() {
+            Arc::new(Vec::new())
+        } else {
+            let cache_key = ClapPerformanceCacheKey {
+                project_generation: self.project_generation,
+                project_fingerprint: Md5::digest(&project_bytes).into(),
+                arrangement_id,
+                sample_rate,
+                performance_zone_end_tick: start_tick,
+                soloed_playlist_track_range: self.soloed_playlist_track_range,
+                assigned_channel_ids: assigned_clap_channel_ids.clone(),
+            };
+            if self.active_clap_performance_cache_key.as_ref() != Some(&cache_key) {
+                let vst3_volume_expression_channels = self
+                    .vst3_host
+                    .as_ref()
+                    .map(|host| host.volume_expression_channels(&self.channel_vst3_instances))
+                    .unwrap_or_default();
+                let requests = match self.clap_performance_preview_settings_for_arrangement(
+                    document,
+                    arrangement_id,
+                    start_tick,
+                    &playlist_tempo_map,
+                    &performance_clap_clip_indices,
+                    &vst3_volume_expression_channels,
+                ) {
+                    Ok(requests) => requests,
+                    Err(error) => {
+                        self.status =
+                            format!("Could not prepare CLAP Performance playback: {error}");
+                        return;
+                    }
+                };
+                self.prepare_clap_performance_playback(cache_key, requests);
+                return;
+            }
+            Arc::clone(&self.active_clap_performance_audio_layers)
+        };
+        options.clap_audio_layers = Arc::new(
+            performance_clap_audio_layers
+                .iter()
+                .map(|layer| PlaylistAudioLayer {
+                    channel_id: layer.channel_id,
+                    left_gain: 1.0,
+                    right_gain: 1.0,
+                    layer_gain: layer.layer_gain,
+                    layer_pan_raw: layer.layer_pan_raw,
+                    volume_automation: Arc::clone(&layer.volume_automation),
+                    pan_automation: Arc::clone(&layer.pan_automation),
+                    samples: Vec::new(),
+                })
+                .collect(),
+        );
         self.initialize_live_mixer_insert_fader_targets(document);
-        let static_document = match playlist_performance_static_document_with_vst3(
+        let static_document = match playlist_performance_static_document_with_vst3_and_clap(
             document,
             arrangement_id,
             start_tick,
             &loaded_vst3_channels,
+            &assigned_clap_channel_ids,
         ) {
             Ok((static_document, _)) => static_document,
             Err(error) => {
@@ -14250,6 +14368,7 @@ impl DawUi {
         let live_status = Arc::new(Mutex::new(PlaylistPerformanceLiveStatus::default()));
         let worker_live_status = Arc::clone(&live_status);
         let worker_options = options.clone();
+        let worker_clap_performance_audio_layers = Arc::clone(&performance_clap_audio_layers);
         let worker = thread::Builder::new()
             .name("performance-audio-render".to_owned())
             .spawn(move || {
@@ -14272,6 +14391,7 @@ impl DawUi {
                                 latency_reports: latency_report_sender,
                                 live_status: Arc::clone(&worker_live_status),
                                 meters: Some(worker_mixer_meters),
+                                clap_audio_layers: worker_clap_performance_audio_layers,
                             },
                         )
                     });
@@ -14303,7 +14423,7 @@ impl DawUi {
                 });
                 self.stop_midi_pattern_preview();
                 self.status = format!(
-                    "Preparing Performance Mode from Start at tick {start_tick}; launch Audio, Sampler, or loaded VST3 clips at the next bar"
+                    "Preparing Performance Mode from Start at tick {start_tick}; launch Audio, Sampler, loaded VST3, or assigned CLAP clips at the next bar"
                 );
                 self.start_midi_clock(false);
             }
@@ -20151,6 +20271,9 @@ impl DawUi {
         self.pending_clap_playlist_playback = None;
         self.active_clap_playlist_cache_key = None;
         self.active_clap_playlist_audio_layers = Arc::new(Vec::new());
+        self.pending_clap_performance_playback = None;
+        self.active_clap_performance_cache_key = None;
+        self.active_clap_performance_audio_layers = Arc::new(Vec::new());
     }
 
     fn clap_pattern_preview_settings_for_channel(
@@ -20514,6 +20637,190 @@ impl DawUi {
             .collect()
     }
 
+    fn clap_performance_preview_settings_for_arrangement(
+        &self,
+        document: &FlpDocument,
+        arrangement_id: u16,
+        performance_zone_end_tick: u32,
+        tempo_map: &PlaylistTempoMap,
+        clip_indices: &BTreeSet<usize>,
+        vst3_volume_expression_channels: &BTreeSet<u16>,
+    ) -> Result<Vec<(ClapPatternPreviewSettings, ClapPerformanceAudioRoute)>, String> {
+        let assigned_channel_ids = self
+            .clap_pattern_playback_instruments
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if assigned_channel_ids.is_empty() || clip_indices.is_empty() {
+            return Ok(Vec::new());
+        }
+        let arrangement = document
+            .arrangements()
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|arrangement| arrangement.id == arrangement_id)
+            .ok_or_else(|| format!("arrangement {arrangement_id} was not found"))?;
+        let patterns = document.patterns().map_err(|error| error.to_string())?;
+        let channels = document.channels();
+        let channels_by_id = channels
+            .iter()
+            .map(|channel| (channel.id(), channel))
+            .collect::<HashMap<_, _>>();
+        let channel_router = ChannelNoteRouter::new(channels.clone());
+        let disabled_track_ids = document
+            .playlist_tracks()
+            .into_iter()
+            .filter(|track| track.enabled == Some(false))
+            .map(|track| track.id)
+            .collect::<BTreeSet<_>>();
+        let track_filter =
+            PlaylistTrackFilter::new(&disabled_track_ids, self.soloed_playlist_track_range);
+        let schedule = schedule_playlist_pattern_notes_with_adjustments(
+            &patterns,
+            &arrangement,
+            track_filter,
+            PlaylistPatternScheduleOptions {
+                ppq: document.header().ppq(),
+                global_swing_mix_raw: document.metadata().global_swing_mix(),
+                play_truncated_notes_in_clips: document
+                    .project_settings()
+                    .is_none_or(|settings| settings.play_truncated_notes_in_clips),
+            },
+            |channel_id| {
+                channels_by_id
+                    .get(&channel_id)
+                    .map_or(128, |channel| channel.swing_mix())
+            },
+            |channel_id, seed, key| {
+                channel_router
+                    .targets_for_note_with_clap_and_mixed_crossfade(
+                        channel_id,
+                        seed,
+                        key,
+                        vst3_volume_expression_channels,
+                        &assigned_channel_ids,
+                    )
+                    .into_iter()
+                    .filter(|(target_channel_id, gain, _)| {
+                        assigned_channel_ids.contains(target_channel_id)
+                            && gain.is_finite()
+                            && *gain > 0.0
+                            && channels_by_id
+                                .get(target_channel_id)
+                                .is_some_and(|channel| channel.enabled() != Some(false))
+                    })
+                    .collect()
+            },
+        )?;
+        let mut notes_by_route =
+            BTreeMap::<(usize, u16, u16, u32, i32), Vec<ClapPatternNote>>::new();
+        for placed in schedule.notes {
+            if !clip_indices.contains(&placed.clip_index)
+                || placed.note.velocity == 0
+                || !placed.target_gain.is_finite()
+                || placed.target_gain <= 0.0
+            {
+                continue;
+            }
+            let Some(clip) = arrangement.clips.get(placed.clip_index) else {
+                continue;
+            };
+            let PlaylistClipTarget::Pattern { id: pattern_id } = clip.target() else {
+                continue;
+            };
+            let relative_start_tick = placed
+                .start_tick
+                .saturating_sub(u64::from(clip.position_ticks));
+            if relative_start_tick >= u64::from(clip.length_ticks) {
+                continue;
+            }
+            let absolute_stop_tick = placed
+                .stop_tick
+                .unwrap_or_else(|| placed.start_tick.saturating_add(1));
+            let relative_stop_tick = absolute_stop_tick
+                .saturating_sub(u64::from(clip.position_ticks))
+                .min(u64::from(clip.length_ticks));
+            let note_length = relative_stop_tick
+                .saturating_sub(relative_start_tick)
+                .max(1);
+            let position_ticks = u32::try_from(relative_start_tick).map_err(|_| {
+                "Performance CLAP note position exceeds the supported range".to_owned()
+            })?;
+            let length_ticks = u32::try_from(note_length).map_err(|_| {
+                "Performance CLAP note length exceeds the supported range".to_owned()
+            })?;
+            let note = ClapPatternNote {
+                position_ticks,
+                length_ticks,
+                key: placed.note.key,
+                velocity: placed.note.velocity,
+                midi_channel: placed.note.midi_channel_index(),
+                fine_pitch_cents: placed.note.fine_pitch_offset_cents(),
+                pan: placed.note.pan.min(128),
+                release: placed.note.release.min(128),
+                mod_x: placed.note.mod_x,
+            };
+            notes_by_route
+                .entry((
+                    placed.clip_index,
+                    pattern_id,
+                    placed.target_channel_id,
+                    placed.target_gain.to_bits(),
+                    placed.target_pan_raw,
+                ))
+                .or_default()
+                .push(note);
+        }
+        let ppq = document.header().ppq();
+        notes_by_route
+            .into_iter()
+            .map(
+                |((clip_index, pattern_id, channel_id, left_gain, right_gain), notes)| {
+                    let clip = arrangement.clips.get(clip_index).ok_or_else(|| {
+                        format!(
+                            "Performance CLAP Pattern Clip {} disappeared",
+                            clip_index + 1
+                        )
+                    })?;
+                    if clip.position_ticks >= performance_zone_end_tick {
+                        return Err(format!(
+                            "Performance CLAP Pattern Clip {} is outside the Performance Zone",
+                            clip_index + 1
+                        ));
+                    }
+                    let settings = ClapPatternPreviewSettings {
+                        pattern_id,
+                        channel_id,
+                        ppq,
+                        tempo_bpm: tempo_map.tempo_bpm_at_tick(u64::from(clip.position_ticks)),
+                        loop_length_ticks: u64::from(clip.length_ticks),
+                        notes,
+                        playlist: None,
+                    };
+                    let (volume_automation, pan_automation) = self
+                        .clap_playlist_control_automation_for_channel(
+                            document,
+                            &arrangement,
+                            track_filter,
+                            channel_id,
+                        )?;
+                    Ok((
+                        settings,
+                        ClapPerformanceAudioRoute {
+                            clip_index,
+                            pattern_id,
+                            channel_id,
+                            layer_gain: f32::from_bits(left_gain),
+                            layer_pan_raw: right_gain,
+                            volume_automation,
+                            pan_automation,
+                        },
+                    ))
+                },
+            )
+            .collect()
+    }
+
     fn clap_playlist_control_automation_for_channel(
         &self,
         document: &FlpDocument,
@@ -20710,6 +21017,79 @@ impl DawUi {
             staged_handoff_reason,
         });
         self.status = format!("Preparing {request_count} CLAP instrument(s) for Playlist playback");
+        false
+    }
+
+    fn prepare_clap_performance_playback(
+        &mut self,
+        cache_key: ClapPerformanceCacheKey,
+        requests: Vec<(ClapPatternPreviewSettings, ClapPerformanceAudioRoute)>,
+    ) -> bool {
+        if self.active_clap_performance_cache_key.as_ref() == Some(&cache_key) {
+            return true;
+        }
+        if self
+            .pending_clap_performance_playback
+            .as_ref()
+            .is_some_and(|pending| pending.cache_key == cache_key)
+        {
+            return false;
+        }
+        self.pending_clap_performance_playback = None;
+        if requests.is_empty() {
+            self.status = "CLAP Performance preparation produced no clip audio".into();
+            return false;
+        }
+        let mut request_routes = BTreeMap::new();
+        for (settings, route) in requests {
+            let Some(instrument) = self
+                .clap_pattern_playback_instruments
+                .get(&route.channel_id)
+                .cloned()
+            else {
+                self.status = format!(
+                    "CLAP Performance Channel {} has no assigned instrument",
+                    route.channel_id
+                );
+                return false;
+            };
+            self.clap_pattern_preview_request_id =
+                self.clap_pattern_preview_request_id.wrapping_add(1).max(1);
+            let request_id = self.clap_pattern_preview_request_id;
+            request_routes.insert(request_id, route.clone());
+            let parameter_values = self.clap_parameter_overrides_for(
+                route.channel_id,
+                &instrument.path,
+                &instrument.plugin_id,
+            );
+            if self
+                .clap_pattern_preview_sender
+                .send((
+                    instrument.path,
+                    instrument.plugin_id,
+                    instrument.plugin_name,
+                    cache_key.sample_rate.clamp(8_000, 192_000),
+                    route.channel_id,
+                    Some(settings),
+                    instrument.state,
+                    parameter_values,
+                    ClapPatternPreviewPurpose::Transport,
+                    request_id,
+                ))
+                .is_err()
+            {
+                self.status = "CLAP Performance playback worker is unavailable".to_owned();
+                return false;
+            }
+        }
+        let request_count = request_routes.len();
+        self.pending_clap_performance_playback = Some(PendingClapPerformancePlayback {
+            cache_key,
+            request_routes,
+            audio_layers: Vec::with_capacity(request_count),
+        });
+        self.status =
+            format!("Preparing {request_count} CLAP Pattern loop(s) for Performance Mode");
         false
     }
 
@@ -21187,12 +21567,25 @@ impl DawUi {
                 continue;
             }
             if purpose == ClapPatternPreviewPurpose::Transport {
-                self.handle_clap_pattern_transport_response(
-                    settings,
-                    plugin_name,
-                    request_id,
-                    result,
-                );
+                let is_performance_request = self
+                    .pending_clap_performance_playback
+                    .as_ref()
+                    .is_some_and(|pending| pending.request_routes.contains_key(&request_id));
+                if is_performance_request {
+                    self.handle_clap_performance_playback_response(
+                        settings,
+                        plugin_name,
+                        request_id,
+                        result,
+                    );
+                } else {
+                    self.handle_clap_pattern_transport_response(
+                        settings,
+                        plugin_name,
+                        request_id,
+                        result,
+                    );
+                }
                 continue;
             }
             if purpose == ClapPatternPreviewPurpose::Playlist {
@@ -21503,6 +21896,134 @@ impl DawUi {
             pending.loop_start_tick,
             pending.audio_layers,
         );
+    }
+
+    fn handle_clap_performance_playback_response(
+        &mut self,
+        settings: Option<ClapPatternPreviewSettings>,
+        plugin_name: String,
+        request_id: u64,
+        result: Result<ClapPatternPreviewOutput, String>,
+    ) {
+        let Some(pending) = self.pending_clap_performance_playback.as_mut() else {
+            return;
+        };
+        let Some(route) = pending.request_routes.remove(&request_id) else {
+            return;
+        };
+        let Some(settings) = settings else {
+            self.pending_clap_performance_playback = None;
+            self.status = "CLAP Performance response was missing its source settings".into();
+            return;
+        };
+        if settings.pattern_id != route.pattern_id
+            || settings.channel_id != route.channel_id
+            || settings.playlist.is_some()
+        {
+            self.pending_clap_performance_playback = None;
+            self.status = "CLAP Performance preparation returned a mismatched source".into();
+            return;
+        }
+        match result {
+            Ok(ClapPatternPreviewOutput::Audio(samples))
+                if !samples.is_empty() && samples.len().is_multiple_of(2) =>
+            {
+                let current_bytes = pending
+                    .audio_layers
+                    .iter()
+                    .map(|layer| {
+                        layer
+                            .samples
+                            .len()
+                            .saturating_mul(std::mem::size_of::<f32>())
+                    })
+                    .sum::<usize>();
+                let new_bytes = samples.len().saturating_mul(std::mem::size_of::<f32>());
+                if current_bytes.saturating_add(new_bytes) > 512 * 1024 * 1024 {
+                    self.pending_clap_performance_playback = None;
+                    self.status =
+                        "Prepared CLAP Performance audio exceeds the 512 MiB limit".into();
+                    return;
+                }
+                pending.audio_layers.push(PlaylistPerformanceClapLayer {
+                    clip_index: route.clip_index,
+                    channel_id: route.channel_id,
+                    sample_rate: pending.cache_key.sample_rate.clamp(8_000, 192_000),
+                    layer_gain: route.layer_gain,
+                    layer_pan_raw: route.layer_pan_raw,
+                    volume_automation: route.volume_automation,
+                    pan_automation: route.pan_automation,
+                    samples,
+                });
+            }
+            Ok(ClapPatternPreviewOutput::Audio(_)) => {
+                self.pending_clap_performance_playback = None;
+                self.status = format!(
+                    "CLAP Performance loop for Channel {} returned invalid stereo audio",
+                    route.channel_id
+                );
+                return;
+            }
+            Ok(ClapPatternPreviewOutput::SavedState(_)) => {
+                self.pending_clap_performance_playback = None;
+                self.status = format!(
+                    "CLAP Performance loop for Channel {} returned plug-in state instead of audio",
+                    route.channel_id
+                );
+                return;
+            }
+            Ok(ClapPatternPreviewOutput::ParametersSet) => {
+                self.pending_clap_performance_playback = None;
+                self.status = format!(
+                    "CLAP Performance loop for Channel {} returned a parameter acknowledgement instead of audio",
+                    route.channel_id
+                );
+                return;
+            }
+            Err(error) => {
+                self.pending_clap_performance_playback = None;
+                self.status = format!(
+                    "Could not prepare CLAP Performance audio for Channel {} through {plugin_name}: {error}",
+                    route.channel_id
+                );
+                return;
+            }
+        }
+        if !pending.request_routes.is_empty() {
+            return;
+        }
+        let Some(pending) = self.pending_clap_performance_playback.take() else {
+            return;
+        };
+        let Some(document) = self.document.as_ref() else {
+            return;
+        };
+        let fingerprint = match document.encode_lossless() {
+            Ok(bytes) => <[u8; 16]>::from(Md5::digest(&bytes)),
+            Err(error) => {
+                self.status = format!("Could not verify CLAP Performance preparation: {error}");
+                return;
+            }
+        };
+        let assigned_channel_ids = self
+            .clap_pattern_playback_instruments
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let selected_arrangement = self.selected_arrangement.unwrap_or(0);
+        if pending.cache_key.project_generation != self.project_generation
+            || pending.cache_key.project_fingerprint != fingerprint
+            || pending.cache_key.arrangement_id != selected_arrangement
+            || pending.cache_key.soloed_playlist_track_range != self.soloed_playlist_track_range
+            || pending.cache_key.assigned_channel_ids != assigned_channel_ids
+            || !self.performance_mode_active
+        {
+            self.status = "Discarded CLAP Performance audio because the project or playback mode changed during preparation".into();
+            return;
+        }
+        self.active_clap_performance_cache_key = Some(pending.cache_key);
+        self.active_clap_performance_audio_layers = Arc::new(pending.audio_layers);
+        self.start_performance_mode_playback();
     }
 
     fn handle_clap_playlist_playback_response(
@@ -24229,7 +24750,7 @@ impl DawUi {
                     egui::Button::new("Performance Mode").selected(self.performance_mode_active),
                 )
                 .on_hover_text(if performance_zone_end_tick.is_some() {
-                    "Start playback from the non-signature marker named Start; launch supported Sampler Pattern Clips, loaded VST3 Pattern Clips, or Audio Clips at the next bar. Right-click for the Performance MIDI channel and Global Snap settings."
+                    "Start at the non-signature marker named Start; launch supported Sampler Pattern Clips, loaded VST3 Pattern Clips, constant-tempo CLAP-only Pattern Clips, or Audio Clips at the next bar. Right-click for the Performance MIDI channel and Global Snap settings."
                 } else {
                     "Add a non-signature time marker named Start to define the Performance Zone. Right-click for the Performance MIDI channel and Global Snap settings."
                 });
@@ -27459,7 +27980,7 @@ impl DawUi {
                                             {
                                                 "Start Performance Mode playback before launching a clip."
                                             } else {
-                                                "Uses this Playlist track's Queue, Trigger Sync, Tolerant, and Position Sync settings. Requires a supported, unmuted Pattern Clip before Start, using enabled Sampler channels, default scale, and no Pattern controllers; all non-muted media clips on its track must also be supported."
+                                                "Uses this Playlist track's Queue, Trigger Sync, Tolerant, and Position Sync settings. Requires a supported, unmuted Pattern Clip before Start with default scale and no Pattern controllers; sources must be enabled Samplers, loaded VST3s, or assigned CLAP instruments. CLAP clips also require constant arrangement tempo. All non-muted media clips on the track must be supported."
                                             },
                                         )
                                         .clicked()
@@ -63021,7 +63542,7 @@ impl DawUi {
             ui.heading(format!("Detected CLAP plug-ins ({})", clap_candidates.len()));
             ui.label(
                 egui::RichText::new(
-                "CLAP note and Pattern/channel previews render in an isolated helper, which reuses the instrument while the plug-in and output rate stay the same. Pattern transport pre-renders assigned channels at project base tempo, expands Layer notes, and follows saved Mixer routes and loaded VST3 Mixer effects. Playlist transport pre-renders assigned CLAP instruments across supported Pattern Clips and follows clip repeats, track mute/solo, and tempo changes. Full-song Playlist mix and Mixer stem renders also pre-render assigned instruments with saved state and linked fader/pan automation. Channel assignments and captured plug-in state are saved in machine-local settings per project path; Pattern Event automation, Performance Mode, CLAP Mixer effects, scaled/source-windowed Pattern Clips, native FLP state embedding, and native plug-in editors remain unsupported.",
+                "CLAP note and Pattern/channel previews render in an isolated helper, which reuses the instrument while the plug-in and output rate stay the same. Pattern transport pre-renders assigned channels at project base tempo, expands Layer notes, and follows saved Mixer routes and loaded VST3 Mixer effects. Playlist transport pre-renders assigned CLAP instruments across supported Pattern Clips and follows clip repeats, track mute/solo, and tempo changes. Performance Mode pre-renders assigned CLAP-only Pattern Clip loops for constant-tempo arrangements, with saved channel and Layer gains, pan automation, and Mixer routes. Full-song Playlist mix and Mixer stem renders also pre-render assigned instruments with saved state and linked fader/pan automation. Channel assignments and captured plug-in state are saved in machine-local settings per project path; Pattern Event automation, mixed Sampler/VST3/CLAP Performance clips, tempo-changing CLAP Performance clips, CLAP Mixer effects, scaled/source-windowed Pattern Clips, native FLP state embedding, and native plug-in editors remain unsupported.",
                 )
                 .color(MUTED),
             );
@@ -63068,7 +63589,7 @@ impl DawUi {
                     ui.colored_label(ORANGE, error);
                 }
             }
-                ui.small("Pattern previews use project base tempo. CLAP Pattern transport expands Layer notes to assigned CLAP child channels, applies Layer gain/pan and source-channel gain/pan, and follows Mixer routes including loaded VST3 insert effects. Layer Crossfade applies when every active leaf is a Sampler, an assigned CLAP channel, or a loaded VST3 channel whose plug-in advertises Volume note expression. CLAP Playlist playback follows clip repeats, track mute/solo, Layer routing and gain/pan, and tempo automation for default-scale, full-source Pattern clips. It applies source-channel fader/pan and saved Mixer insert routes, including loaded VST3 insert effects. CLAP-format Mixer effect processing, scaled/source-windowed clips, and Performance playback remain unsupported. Full-song Playlist mix and Mixer stem renders also pre-render assigned CLAP instruments, including linked Playlist fader/pan automation. CLAP note-dialect plug-ins receive per-note tuning, pan, Mod X brightness, and release; MIDI 1.0/2.0 inputs receive key, velocity, channel, and release.");
+                ui.small("Pattern previews use project base tempo. CLAP Pattern transport expands Layer notes to assigned CLAP child channels, applies Layer gain/pan and source-channel gain/pan, and follows Mixer routes including loaded VST3 insert effects. Layer Crossfade applies when every active leaf is a Sampler, an assigned CLAP channel, or a loaded VST3 channel whose plug-in advertises Volume note expression. CLAP Playlist playback follows clip repeats, track mute/solo, Layer routing and gain/pan, and tempo automation for default-scale, full-source Pattern clips. Performance Mode launches pre-rendered CLAP-only Pattern Clip loops for constant-tempo arrangements and applies saved channel and Layer gain/pan plus linked fader/pan automation. Mixed Sampler/VST3/CLAP Performance clips, tempo-changing CLAP clips, CLAP-format Mixer effect processing, scaled/source-windowed clips, and Pattern Event automation remain unsupported. Full-song Playlist mix and Mixer stem renders also pre-render assigned CLAP instruments, including linked Playlist fader/pan automation. CLAP note-dialect plug-ins receive per-note tuning, pan, Mod X brightness, and release; MIDI 1.0/2.0 inputs receive key, velocity, channel, and release.");
             if let Ok(Some(settings)) = &clap_pattern_preview_settings {
                 ui.horizontal(|ui| {
                     if let Some(instrument) = self
