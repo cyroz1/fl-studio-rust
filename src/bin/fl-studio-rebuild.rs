@@ -20803,8 +20803,24 @@ impl DawUi {
         }
         match result {
             Ok(ClapPatternPreviewOutput::Audio(samples)) => {
+                let Some(document) = self.document.as_ref() else {
+                    self.pending_clap_pattern_playback = None;
+                    self.status = "CLAP Pattern playback lost its project document".into();
+                    return;
+                };
+                let Some((left_gain, right_gain)) =
+                    project_channel_stereo_output_gains(document, channel_id)
+                else {
+                    self.pending_clap_pattern_playback = None;
+                    self.status = format!(
+                        "CLAP Pattern source Channel {channel_id} disappeared during preparation"
+                    );
+                    return;
+                };
                 pending.audio_layers.push(PatternAudioLayer {
                     channel_id,
+                    left_gain,
+                    right_gain,
                     samples,
                 })
             }
@@ -44206,7 +44222,7 @@ impl DawUi {
                         format!("; {} assigned CLAP channel(s)", clap_pattern_layer_count)
                     };
                     format!(
-                        "Looping Pattern {pattern_id} through enabled Sampler channels{vst3_status}{clap_status}; CLAP audio is mixed directly to Master without Mixer or Layer routing"
+                        "Looping Pattern {pattern_id} through enabled Sampler channels{vst3_status}{clap_status}; CLAP audio follows source gain/pan and Mixer routes, including loaded VST3 insert effects"
                     )
                 } else if let Some(summary) = vst3_summary
                     && summary.plugin_channels_rendered > 0
@@ -62220,7 +62236,7 @@ impl DawUi {
                     ui.colored_label(ORANGE, error);
                 }
             }
-            ui.small("Pattern previews use project base tempo. CLAP Playlist playback follows clip repeats, track mute/solo, and tempo automation for default-scale, full-source Pattern clips; it applies source-channel fader/pan and saved Mixer insert routes, including loaded VST3 insert effects. Layer channel expansion, CLAP Mixer effects, scaled/source-windowed clips, Performance playback, and offline song/stem export remain unsupported. CLAP note-dialect plug-ins receive per-note tuning, pan, Mod X brightness, and release; MIDI 1.0/2.0 inputs receive key, velocity, channel, and release.");
+            ui.small("Pattern previews use project base tempo. CLAP Pattern transport applies source-channel gain/pan and Mixer routes, including loaded VST3 insert effects. CLAP Playlist playback follows clip repeats, track mute/solo, and tempo automation for default-scale, full-source Pattern clips; it applies source-channel fader/pan and saved Mixer insert routes, including loaded VST3 insert effects. Layer channel expansion, CLAP Mixer effect processing, scaled/source-windowed clips, Performance playback, and offline song/stem export remain unsupported. CLAP note-dialect plug-ins receive per-note tuning, pan, Mod X brightness, and release; MIDI 1.0/2.0 inputs receive key, velocity, channel, and release.");
             if let Ok(Some(settings)) = &clap_pattern_preview_settings {
                 ui.horizontal(|ui| {
                     if let Some(instrument) = self
@@ -62241,7 +62257,7 @@ impl DawUi {
                         ));
                     }
                 });
-                ui.small("Assignments and captured CLAP plug-in state are saved per project on this machine, outside the FLP. Pattern loops render at project base tempo and mix directly to Master. Playlist playback uses the clip schedule and tempo changes, follows saved Mixer routes, and can pass through loaded VST3 insert effects.");
+                ui.small("Assignments and captured CLAP plug-in state are saved per project on this machine, outside the FLP. Pattern loops render at project base tempo, apply source-channel gain/pan and saved Mixer routes, and can pass through loaded VST3 insert effects. Playlist playback uses the clip schedule and tempo changes, follows saved Mixer routes, and can pass through loaded VST3 insert effects.");
             }
             if !self.clap_pattern_playback_instruments.is_empty() {
                 ui.collapsing("Assigned CLAP Pattern channels", |ui| {

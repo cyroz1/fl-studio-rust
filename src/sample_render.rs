@@ -735,6 +735,8 @@ pub struct SamplerPatternLoopPlayback {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PatternAudioLayer {
     pub channel_id: u16,
+    pub left_gain: f32,
+    pub right_gain: f32,
     pub samples: Vec<f32>,
 }
 
@@ -6881,22 +6883,113 @@ fn mix_pattern_audio_layers(
     block_start: u64,
     loop_frames: u64,
     layers: &[PatternAudioLayer],
-) {
+    routes_by_channel: &HashMap<u16, PreparedClapMixerRoute>,
+    mixer_buses: Option<&mut [f32]>,
+) -> Result<(), String> {
     if layers.is_empty() || loop_frames == 0 {
-        return;
+        return Ok(());
     }
     debug_assert_eq!(output.len(), frame_count * 2);
-    let loop_frames = loop_frames as usize;
-    let start_frame = (block_start % loop_frames as u64) as usize;
-    for frame in 0..frame_count {
-        let source_frame = (start_frame + frame) % loop_frames;
-        let source_sample = source_frame * 2;
-        let target_sample = frame * 2;
-        for layer in layers {
-            output[target_sample] += layer.samples[source_sample];
-            output[target_sample + 1] += layer.samples[source_sample + 1];
+    let sample_count = frame_count * 2;
+    let meter_bus_samples = MIXER_TRACK_METER_COUNT * sample_count;
+    let (mut meter_buses, mut effect_input_buses) = match mixer_buses {
+        Some(buses) if buses.len() >= meter_bus_samples * 2 => {
+            let (meter_buses, effect_input_buses) = buses.split_at_mut(meter_bus_samples);
+            (Some(meter_buses), Some(effect_input_buses))
+        }
+        Some(buses) => (Some(buses), None),
+        None => (None, None),
+    };
+    for layer in layers {
+        let route = routes_by_channel.get(&layer.channel_id);
+        let live_source_control = route.and_then(|route| route.live_source_control.as_ref());
+        for frame_index in 0..frame_count {
+            let source_frame_index =
+                (block_start.saturating_add(frame_index as u64) % loop_frames) as usize;
+            let source_sample = source_frame_index * 2;
+            let target_sample = frame_index * 2;
+            let source_frame = [
+                layer.samples[source_sample] * layer.left_gain,
+                layer.samples[source_sample + 1] * layer.right_gain,
+            ];
+            let mut routed_frame = source_frame;
+            let live_controls = live_source_control.map(|(control, targets)| {
+                let controls = control.next_frame_controls(targets);
+                control.apply_output_frame(controls, &mut routed_frame);
+                controls
+            });
+            if live_controls.is_none() {
+                route.map_or_else(
+                    || (),
+                    |route| route.mixer_transform.apply_frame(&mut routed_frame),
+                );
+            }
+            output[target_sample] += routed_frame[0];
+            output[target_sample + 1] += routed_frame[1];
+
+            if let Some(meter_buses) = meter_buses.as_deref_mut() {
+                let meter_transforms = live_source_control.map_or_else(
+                    || route.map_or(&[][..], |route| route.mixer_meter_transforms.as_slice()),
+                    |(control, _)| control.insert_meter_transforms(),
+                );
+                for (track, transform) in meter_transforms {
+                    if *track >= MIXER_TRACK_METER_COUNT {
+                        return Err(
+                            "CLAP Pattern Mixer meter route exceeds the supported track range"
+                                .to_owned(),
+                        );
+                    }
+                    let mut meter_frame = source_frame;
+                    if let (Some((control, _)), Some(controls)) =
+                        (live_source_control, live_controls)
+                    {
+                        control.apply_meter_frame(controls, *track, *transform, &mut meter_frame);
+                    } else {
+                        transform.apply_frame(&mut meter_frame);
+                    }
+                    let meter_offset = *track * sample_count + target_sample;
+                    meter_buses[meter_offset] += meter_frame[0];
+                    meter_buses[meter_offset + 1] += meter_frame[1];
+                }
+            }
+
+            if let Some(effect_input_buses) = effect_input_buses.as_deref_mut() {
+                let effect_input_transforms = live_source_control.map_or_else(
+                    || {
+                        route.map_or(&[][..], |route| {
+                            route.mixer_effect_input_transforms.as_slice()
+                        })
+                    },
+                    |(control, _)| control.insert_effect_input_transforms(),
+                );
+                for (track, transform) in effect_input_transforms {
+                    if *track >= MIXER_TRACK_METER_COUNT {
+                        return Err(
+                            "CLAP Pattern Mixer effect route exceeds the supported track range"
+                                .to_owned(),
+                        );
+                    }
+                    let mut effect_input_frame = source_frame;
+                    if let (Some((control, _)), Some(controls)) =
+                        (live_source_control, live_controls)
+                    {
+                        control.apply_effect_input_frame(
+                            controls,
+                            *track,
+                            *transform,
+                            &mut effect_input_frame,
+                        );
+                    } else {
+                        transform.apply_frame(&mut effect_input_frame);
+                    }
+                    let effect_input_offset = *track * sample_count + target_sample;
+                    effect_input_buses[effect_input_offset] += effect_input_frame[0];
+                    effect_input_buses[effect_input_offset + 1] += effect_input_frame[1];
+                }
+            }
         }
     }
+    Ok(())
 }
 
 fn playlist_clap_audio_frames(layers: &[PlaylistAudioLayer]) -> u64 {
@@ -6907,11 +7000,66 @@ fn playlist_clap_audio_frames(layers: &[PlaylistAudioLayer]) -> u64 {
         .unwrap_or(0)
 }
 
-struct PreparedPlaylistClapMixerRoute {
+struct PreparedClapMixerRoute {
     mixer_transform: MixerSourceRouteTransform,
     live_source_control: Option<(LiveMixerSourceControl, LiveMixerSourceTargets)>,
     mixer_meter_transforms: Vec<(usize, MixerSourceRouteTransform)>,
     mixer_effect_input_transforms: Vec<(usize, MixerSourceRouteTransform)>,
+}
+
+fn prepare_pattern_clap_mixer_routes(
+    layers: &[PatternAudioLayer],
+    document: &FlpDocument,
+    meters: Option<&MixerTrackPeakMeters>,
+    sample_rate: u32,
+) -> HashMap<u16, PreparedClapMixerRoute> {
+    let routing = MixerRouteAudibility::from_document(document);
+    let channels_by_id = document
+        .channels()
+        .into_iter()
+        .map(|channel| (channel.id(), channel))
+        .collect::<HashMap<_, _>>();
+    layers
+        .iter()
+        .map(|layer| {
+            let mixer_track = channels_by_id
+                .get(&layer.channel_id)
+                .and_then(|channel| channel.mixer_track());
+            let statically_audible = routing.allows_channel(mixer_track);
+            let route_plan = routing.source_route_plan_for_channel(mixer_track);
+            let live_source_control = meters.and_then(|meters| {
+                routing
+                    .allows_live_source_channel(mixer_track)
+                    .then(|| routing.live_source_route_plan_for_channel(mixer_track))
+                    .flatten()
+                    .and_then(|route_plan| {
+                        let control = LiveMixerSourceControl::new(route_plan, sample_rate);
+                        control.targets(meters).map(|targets| (control, targets))
+                    })
+            });
+            (
+                layer.channel_id,
+                PreparedClapMixerRoute {
+                    mixer_transform: if statically_audible {
+                        route_plan.output_transform
+                    } else {
+                        MixerSourceRouteTransform::zero()
+                    },
+                    live_source_control,
+                    mixer_meter_transforms: if statically_audible {
+                        route_plan.insert_meter_transforms
+                    } else {
+                        Vec::new()
+                    },
+                    mixer_effect_input_transforms: if statically_audible {
+                        route_plan.insert_effect_input_transforms
+                    } else {
+                        Vec::new()
+                    },
+                },
+            )
+        })
+        .collect()
 }
 
 fn prepare_playlist_clap_mixer_routes(
@@ -6919,7 +7067,7 @@ fn prepare_playlist_clap_mixer_routes(
     sampler: &PreparedSamplerArrangement,
     meters: Option<&MixerTrackPeakMeters>,
     sample_rate: u32,
-) -> HashMap<u16, PreparedPlaylistClapMixerRoute> {
+) -> HashMap<u16, PreparedClapMixerRoute> {
     layers
         .iter()
         .map(|layer| {
@@ -6950,7 +7098,7 @@ fn prepare_playlist_clap_mixer_routes(
                 .unwrap_or_default();
             (
                 layer.channel_id,
-                PreparedPlaylistClapMixerRoute {
+                PreparedClapMixerRoute {
                     mixer_transform,
                     live_source_control,
                     mixer_meter_transforms,
@@ -6966,7 +7114,7 @@ fn mix_playlist_clap_audio_layers(
     block_start: u64,
     frame_count: usize,
     layers: &[PlaylistAudioLayer],
-    routes_by_channel: &HashMap<u16, PreparedPlaylistClapMixerRoute>,
+    routes_by_channel: &HashMap<u16, PreparedClapMixerRoute>,
     mixer_buses: Option<&mut [f32]>,
 ) -> Result<(), String> {
     if layers.is_empty() {
@@ -7190,6 +7338,12 @@ fn stream_pattern_from_tick_with_vst3_to_device(
             Some(cancelled),
         )?
     };
+    let pattern_clap_mixer_routes = prepare_pattern_clap_mixer_routes(
+        &playback.pattern_audio_layers,
+        document,
+        live_master_meters,
+        options.sample_rate,
+    );
     let mut master_output = render.master_output.clone();
     if let Some(meters) = live_master_meters {
         master_output = master_output.with_live_master_targets(meters, options.sample_rate);
@@ -7359,7 +7513,9 @@ fn stream_pattern_from_tick_with_vst3_to_device(
                 block_start,
                 loop_frames,
                 &playback.pattern_audio_layers,
-            );
+                &pattern_clap_mixer_routes,
+                mixer_buses.as_deref_mut(),
+            )?;
             sampler_delay.process_interleaved(&mut block[..sample_count])?;
             if let Some(processor) = playback.vst3_processor.as_mut() {
                 if let Some(mixer_buses) = mixer_buses.as_mut() {
@@ -7488,7 +7644,9 @@ fn stream_pattern_from_tick_with_vst3_to_device(
                 block_start,
                 loop_frames,
                 &playback.pattern_audio_layers,
-            );
+                &pattern_clap_mixer_routes,
+                mixer_buses.as_deref_mut(),
+            )?;
             sampler_delay.process_interleaved(&mut block[..sample_count])?;
             if let Some(processor) = playback.vst3_processor.as_mut() {
                 if let Some(mixer_buses) = mixer_buses.as_mut() {
@@ -16693,11 +16851,22 @@ mod tests {
     fn pattern_audio_layers_follow_the_transport_seek_and_loop_phase() {
         let layer = PatternAudioLayer {
             channel_id: 7,
+            left_gain: 1.0,
+            right_gain: 1.0,
             samples: vec![1.0, 10.0, 2.0, 20.0, 3.0, 30.0],
         };
         let mut output = vec![0.0; 8];
+        let routes = HashMap::from([(
+            7,
+            PreparedClapMixerRoute {
+                mixer_transform: MixerSourceRouteTransform::default(),
+                live_source_control: None,
+                mixer_meter_transforms: Vec::new(),
+                mixer_effect_input_transforms: Vec::new(),
+            },
+        )]);
 
-        mix_pattern_audio_layers(&mut output, 4, 2, 3, &[layer]);
+        mix_pattern_audio_layers(&mut output, 4, 2, 3, &[layer], &routes, None).unwrap();
 
         assert_eq!(output, [3.0, 30.0, 1.0, 10.0, 2.0, 20.0, 3.0, 30.0]);
     }
