@@ -1230,6 +1230,31 @@ fn main() -> eframe::Result {
             sample_rate,
         ));
     }
+    if args.get(1).is_some_and(|argument| {
+        argument == std::ffi::OsStr::new(clap_probe::MIXER_EFFECT_SERVER_FLAG)
+    }) {
+        let Some(path) = args.get(2).map(PathBuf::from) else {
+            eprintln!("CLAP Mixer effect server needs a bundle or library path");
+            std::process::exit(2);
+        };
+        let Some(plugin_id) = args.get(3).and_then(|value| value.to_str()) else {
+            eprintln!("CLAP Mixer effect server needs a UTF-8 plug-in ID");
+            std::process::exit(2);
+        };
+        let Some(sample_rate) = args.get(4).and_then(|value| value.to_str()) else {
+            eprintln!("CLAP Mixer effect server needs a sample rate");
+            std::process::exit(2);
+        };
+        let Ok(sample_rate) = sample_rate.parse::<u32>() else {
+            eprintln!("CLAP Mixer effect server sample rate must be an integer");
+            std::process::exit(2);
+        };
+        std::process::exit(clap_probe::run_mixer_effect_server_child(
+            &path,
+            plugin_id,
+            sample_rate,
+        ));
+    }
     if args
         .get(1)
         .is_some_and(|argument| argument == std::ffi::OsStr::new(clap_probe::NOTE_PREVIEW_FLAG))

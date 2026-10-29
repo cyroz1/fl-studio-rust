@@ -7,6 +7,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use clack_extensions::audio_ports::{AudioPortFlags, AudioPortInfoBuffer, PluginAudioPorts};
+use clack_extensions::latency::PluginLatency;
 use clack_extensions::note_ports::{NoteDialect, NotePortInfoBuffer, PluginNotePorts};
 use clack_extensions::params::{ParamInfoBuffer, ParamInfoFlags, PluginParams};
 use clack_extensions::state::PluginState;
@@ -28,6 +29,7 @@ pub const PROBE_FLAG: &str = "--clap-probe";
 pub const INSTANCE_PROBE_FLAG: &str = "--clap-instance-probe";
 pub const NOTE_PREVIEW_FLAG: &str = "--clap-note-preview";
 pub const NOTE_PREVIEW_SERVER_FLAG: &str = "--clap-note-preview-server";
+pub const MIXER_EFFECT_SERVER_FLAG: &str = "--clap-mixer-effect-server";
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_PROBE_OUTPUT_BYTES: usize = 1024 * 1024;
@@ -36,6 +38,7 @@ const MAX_NOTE_PREVIEW_PROTOCOL_HEADER_BYTES: usize = 4096;
 const MAX_INSTANCE_METADATA_ITEMS: u32 = 512;
 const MAX_NOTE_PREVIEW_AUDIO_PORTS: u32 = 16;
 const MAX_NOTE_PREVIEW_TOTAL_CHANNELS: u32 = 64;
+const MAX_CLAP_MIXER_EFFECT_BLOCK_FRAMES: u32 = 512;
 const MAX_PATTERN_PREVIEW_NOTES: usize = 16_384;
 const MAX_CLAP_PREVIEW_PARAMETER_CHANGES: usize = 512;
 const NOTE_PREVIEW_BLOCK_FRAMES: u32 = 512;
@@ -1289,6 +1292,375 @@ pub fn run_note_preview_server_child(path: &Path, plugin_id: &str, sample_rate: 
             let _ = output.flush();
             return 1;
         }
+    }
+}
+
+/// Serves Mixer effect blocks from one isolated CLAP instance until the parent exits.
+pub fn run_mixer_effect_server_child(path: &Path, plugin_id: &str, sample_rate: u32) -> i32 {
+    let mut output = BufWriter::new(std::io::stdout().lock());
+    let mut instance = match ClapMixerEffectInstance::new(path, plugin_id, sample_rate) {
+        Ok(instance) => instance,
+        Err(error) => {
+            let _ = write_preview_server_error(&mut output, &error);
+            let _ = output.flush();
+            return 1;
+        }
+    };
+    if writeln!(output, "READY")
+        .and_then(|_| output.flush())
+        .is_err()
+    {
+        return 1;
+    }
+
+    let stdin = std::io::stdin();
+    let mut input = BufReader::new(stdin.lock());
+    loop {
+        let line = match read_preview_protocol_header(&mut input) {
+            Ok(Some(line)) => line,
+            Ok(None) => return 0,
+            Err(error) => {
+                let _ = write_preview_server_error(&mut output, &error.to_string());
+                let _ = output.flush();
+                return 1;
+            }
+        };
+        if line == "STOP" {
+            return 0;
+        }
+        if let Some(header) = line.strip_prefix("LOAD_STATE ") {
+            let state = match read_preview_server_state(&mut input, header) {
+                Ok(state) => state,
+                Err(error) => {
+                    let _ = write_preview_server_error(&mut output, &error);
+                    let _ = output.flush();
+                    return 1;
+                }
+            };
+            match instance.load_state(&state) {
+                Ok(()) => {
+                    if writeln!(output, "STATE_LOADED")
+                        .and_then(|_| output.flush())
+                        .is_err()
+                    {
+                        return 1;
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    let _ = write_preview_server_error(&mut output, &error);
+                    let _ = output.flush();
+                    return 1;
+                }
+            }
+        }
+        if line == "START" {
+            return instance.run_processing_server(&mut input, &mut output);
+        }
+
+        let _ = write_preview_server_error(&mut output, "invalid CLAP Mixer effect command");
+        let _ = output.flush();
+        return 1;
+    }
+}
+
+struct ClapMixerEffectInstance {
+    instance: PluginInstance<()>,
+    sample_rate: u32,
+    input_port_channels: Vec<u32>,
+    main_input_index: usize,
+    output_port_channels: Vec<u32>,
+    main_output_index: usize,
+    latency_samples: u32,
+}
+
+impl ClapMixerEffectInstance {
+    fn new(path: &Path, plugin_id: &str, sample_rate: u32) -> Result<Self, String> {
+        if !(8_000..=192_000).contains(&sample_rate) {
+            return Err(format!(
+                "unsupported CLAP Mixer effect sample rate: {sample_rate}"
+            ));
+        }
+
+        let entry = unsafe { PluginEntry::load(path) }
+            .map_err(|error| format!("could not load CLAP entry: {error}"))?;
+        let plugin_id = CString::new(plugin_id)
+            .map_err(|_| "CLAP plug-in ID contains an invalid null byte".to_owned())?;
+        let host_info = HostInfo::new(
+            "FL Studio Rebuild",
+            "fl-studio-rust contributors",
+            "https://github.com/cyroz1/fl-studio-rust",
+            env!("CARGO_PKG_VERSION"),
+        )
+        .map_err(|error| format!("could not describe the host to the CLAP plug-in: {error}"))?;
+        let mut instance =
+            PluginInstance::<()>::new(|_| (), |_| (), &entry, &plugin_id, &host_info)
+                .map_err(|error| format!("could not initialize CLAP plug-in instance: {error}"))?;
+
+        let (input_port_channels, main_input_index, output_port_channels, main_output_index) = {
+            let plugin = instance.plugin_handle();
+            let audio_ports = plugin
+                .get_extension::<PluginAudioPorts>()
+                .ok_or_else(|| "CLAP effect does not expose audio ports".to_owned())?;
+            let (input_port_channels, main_input_index) =
+                read_preview_audio_inputs(&audio_ports, &plugin)?;
+            let (output_port_channels, main_output_index) =
+                read_preview_audio_outputs(&audio_ports, &plugin)?;
+            let main_input_channels = input_port_channels[main_input_index];
+            let main_output_channels = output_port_channels[main_output_index];
+            if !(1..=2).contains(&main_input_channels) || !(1..=2).contains(&main_output_channels) {
+                return Err(format!(
+                    "CLAP Mixer effects need mono or stereo main buses; plug-in reports {main_input_channels} input and {main_output_channels} output channels"
+                ));
+            }
+            (
+                input_port_channels,
+                main_input_index,
+                output_port_channels,
+                main_output_index,
+            )
+        };
+
+        Ok(Self {
+            instance,
+            sample_rate,
+            input_port_channels,
+            main_input_index,
+            output_port_channels,
+            main_output_index,
+            latency_samples: 0,
+        })
+    }
+
+    fn load_state(&mut self, bytes: &[u8]) -> Result<(), String> {
+        if bytes.len() > MAX_CLAP_PROJECT_PLUGIN_STATE_BYTES {
+            return Err("CLAP plug-in state exceeds the 32 MiB limit".to_owned());
+        }
+        let plugin = self.instance.plugin_handle();
+        let state = plugin
+            .get_extension::<PluginState>()
+            .ok_or_else(|| "CLAP effect does not support state restoration".to_owned())?;
+        let mut input = std::io::Cursor::new(bytes);
+        state
+            .load(&plugin, &mut input)
+            .map_err(|error| format!("CLAP effect could not restore its state: {error}"))
+    }
+
+    fn run_processing_server(&mut self, input: &mut impl Read, output: &mut impl Write) -> i32 {
+        let audio_configuration = PluginAudioConfiguration {
+            sample_rate: f64::from(self.sample_rate),
+            min_frames_count: 1,
+            max_frames_count: MAX_CLAP_MIXER_EFFECT_BLOCK_FRAMES,
+        };
+        let stopped_processor = match self.instance.activate(|_, _| (), audio_configuration) {
+            Ok(processor) => processor,
+            Err(error) => {
+                let _ = write_preview_server_error(
+                    output,
+                    &format!("could not activate CLAP effect: {error}"),
+                );
+                let _ = output.flush();
+                return 1;
+            }
+        };
+        self.latency_samples = {
+            let plugin = self.instance.plugin_handle();
+            plugin
+                .get_extension::<PluginLatency>()
+                .map_or(0, |latency| latency.get(&plugin))
+        };
+        let mut audio_processor = match stopped_processor.start_processing() {
+            Ok(processor) => processor,
+            Err(error) => {
+                let stopped_processor = error.into_stopped_processor();
+                self.instance.deactivate(stopped_processor);
+                let _ = write_preview_server_error(
+                    output,
+                    "CLAP effect could not start audio processing",
+                );
+                let _ = output.flush();
+                return 1;
+            }
+        };
+        if writeln!(output, "STARTED {}", self.latency_samples)
+            .and_then(|_| output.flush())
+            .is_err()
+        {
+            let stopped_processor = audio_processor.stop_processing();
+            self.instance.deactivate(stopped_processor);
+            return 1;
+        }
+
+        let mut steady_time = 0u64;
+        let mut input_audio_ports = AudioPorts::with_capacity(
+            self.input_port_channels.iter().sum::<u32>() as usize,
+            self.input_port_channels.len(),
+        );
+        let mut output_audio_ports = AudioPorts::with_capacity(
+            self.output_port_channels.iter().sum::<u32>() as usize,
+            self.output_port_channels.len(),
+        );
+        let mut result = 0;
+        loop {
+            let line = match read_preview_protocol_header(input) {
+                Ok(Some(line)) => line,
+                Ok(None) => break,
+                Err(error) => {
+                    let _ = write_preview_server_error(output, &error.to_string());
+                    let _ = output.flush();
+                    result = 1;
+                    break;
+                }
+            };
+            if line == "STOP" {
+                let _ = writeln!(output, "BYE").and_then(|_| output.flush());
+                break;
+            }
+            let Some(frame_count) = line
+                .strip_prefix("BLOCK ")
+                .and_then(|value| value.parse::<u32>().ok())
+                .filter(|frames| (1..=MAX_CLAP_MIXER_EFFECT_BLOCK_FRAMES).contains(frames))
+            else {
+                let _ =
+                    write_preview_server_error(output, "invalid CLAP Mixer effect block header");
+                let _ = output.flush();
+                result = 1;
+                break;
+            };
+            let sample_count = frame_count as usize * 2;
+            let byte_count = sample_count * std::mem::size_of::<f32>();
+            let mut input_bytes = vec![0; byte_count];
+            if let Err(error) = input.read_exact(&mut input_bytes) {
+                let _ = write_preview_server_error(
+                    output,
+                    &format!("could not read CLAP effect audio: {error}"),
+                );
+                let _ = output.flush();
+                result = 1;
+                break;
+            }
+            let mut delimiter = [0; 1];
+            if input.read_exact(&mut delimiter).is_err() || delimiter[0] != b'\n' {
+                let _ =
+                    write_preview_server_error(output, "invalid CLAP Mixer effect block delimiter");
+                let _ = output.flush();
+                result = 1;
+                break;
+            }
+
+            let mut input_audio_storage = self
+                .input_port_channels
+                .iter()
+                .map(|channel_count| {
+                    (0..*channel_count)
+                        .map(|_| vec![0.0f32; frame_count as usize])
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let main_input = &mut input_audio_storage[self.main_input_index];
+            for frame in 0..frame_count as usize {
+                let left = f32::from_le_bytes(
+                    input_bytes[frame * 8..frame * 8 + 4]
+                        .try_into()
+                        .expect("left sample has a fixed width"),
+                );
+                let right = f32::from_le_bytes(
+                    input_bytes[frame * 8 + 4..frame * 8 + 8]
+                        .try_into()
+                        .expect("right sample has a fixed width"),
+                );
+                let left = if left.is_finite() { left } else { 0.0 };
+                let right = if right.is_finite() { right } else { 0.0 };
+                if main_input.len() == 1 {
+                    main_input[0][frame] = (left + right) * 0.5;
+                } else {
+                    main_input[0][frame] = left;
+                    main_input[1][frame] = right;
+                }
+            }
+            let mut output_audio_storage = self
+                .output_port_channels
+                .iter()
+                .map(|channel_count| {
+                    (0..*channel_count)
+                        .map(|_| vec![0.0f32; frame_count as usize])
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let mut output_events = EventBuffer::new();
+            let process_result = {
+                let input_audio =
+                    input_audio_ports.with_input_buffers(input_audio_storage.iter_mut().map(
+                        |channels| AudioPortBuffer {
+                            latency: 0,
+                            channels: AudioPortBufferType::f32_input_only(
+                                channels.iter_mut().map(InputChannel::constant),
+                            ),
+                        },
+                    ));
+                let mut output_audio =
+                    output_audio_ports.with_output_buffers(output_audio_storage.iter_mut().map(
+                        |channels| AudioPortBuffer {
+                            latency: 0,
+                            channels: AudioPortBufferType::f32_output_only(
+                                channels.iter_mut().map(Vec::as_mut_slice),
+                            ),
+                        },
+                    ));
+                let input_events = EventBuffer::new();
+                audio_processor.process(
+                    &input_audio,
+                    &mut output_audio,
+                    &input_events.as_input(),
+                    &mut output_events.as_output(),
+                    Some(steady_time),
+                    None,
+                )
+            };
+            if let Err(error) = process_result {
+                let _ = write_preview_server_error(
+                    output,
+                    &format!("CLAP effect failed while processing audio: {error}"),
+                );
+                let _ = output.flush();
+                result = 1;
+                break;
+            }
+            steady_time = steady_time.saturating_add(u64::from(frame_count));
+            let main_output = &output_audio_storage[self.main_output_index];
+            if writeln!(output, "BLOCK {frame_count}").is_err() {
+                result = 1;
+                break;
+            }
+            for frame in 0..frame_count as usize {
+                let left = main_output[0][frame];
+                let right = if main_output.len() == 1 {
+                    left
+                } else {
+                    main_output[1][frame]
+                };
+                let left = if left.is_finite() { left } else { 0.0 };
+                let right = if right.is_finite() { right } else { 0.0 };
+                if output.write_all(&left.to_le_bytes()).is_err()
+                    || output.write_all(&right.to_le_bytes()).is_err()
+                {
+                    result = 1;
+                    break;
+                }
+            }
+            if result != 0
+                || output
+                    .write_all(b"\n")
+                    .and_then(|_| output.flush())
+                    .is_err()
+            {
+                result = 1;
+                break;
+            }
+        }
+        let stopped_processor = audio_processor.stop_processing();
+        self.instance.deactivate(stopped_processor);
+        result
     }
 }
 
@@ -2997,6 +3369,31 @@ fn read_preview_audio_outputs(
     let main_output_index = main_output_index
         .ok_or_else(|| "CLAP instrument does not identify a main audio output".to_owned())?;
     Ok((channels, main_output_index))
+}
+
+fn read_preview_audio_inputs(
+    ports: &PluginAudioPorts,
+    plugin: &clack_host::plugin::PluginMainThreadHandle<'_>,
+) -> Result<(Vec<u32>, usize), String> {
+    let channels = read_preview_audio_port_channels(ports, plugin, true)?;
+    if channels.is_empty() {
+        return Err("CLAP effect has no audio input ports".to_owned());
+    }
+    let mut main_input_index = None;
+    let mut buffer = AudioPortInfoBuffer::new();
+    for index in 0..channels.len() as u32 {
+        let port = ports
+            .get(plugin, index, true, &mut buffer)
+            .ok_or_else(|| "CLAP effect returned incomplete audio input information".to_owned())?;
+        if port.flags.contains(AudioPortFlags::IS_MAIN)
+            && main_input_index.replace(index as usize).is_some()
+        {
+            return Err("CLAP effect reports multiple main audio inputs".to_owned());
+        }
+    }
+    let main_input_index = main_input_index
+        .ok_or_else(|| "CLAP effect does not identify a main audio input".to_owned())?;
+    Ok((channels, main_input_index))
 }
 
 fn find_preview_note_input(
