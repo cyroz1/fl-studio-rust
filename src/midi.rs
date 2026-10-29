@@ -1,7 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
-use crate::{FlpDocument, PatternNote, PlaylistClip, PlaylistClipTarget};
+use crate::{
+    FlpDocument, PatternNote, PlaylistClip, PlaylistClipTarget,
+    automation_segment_value_with_tension,
+};
 
 const MTHD: &[u8; 4] = b"MThd";
 const MTRK: &[u8; 4] = b"MTrk";
@@ -2239,13 +2242,15 @@ pub(crate) fn song_tempo_events(
                 Ok((
                     automation_point_tick(point.position_beats(), ppq)?,
                     point.value(),
+                    point.tension(),
                 ))
             })
             .collect::<Result<Vec<_>, MidiError>>()?;
-        source_points.sort_by_key(|(tick, _)| *tick);
+        source_points.sort_by_key(|(tick, _, _)| *tick);
         source_points.dedup_by(|current, previous| {
             if current.0 == previous.0 {
                 previous.1 = current.1;
+                previous.2 = current.2;
                 true
             } else {
                 false
@@ -2255,32 +2260,34 @@ pub(crate) fn song_tempo_events(
         if source_start_tick > 0
             && !source_points
                 .iter()
-                .any(|(tick, _)| *tick == source_start_tick)
-            && let Some((from_tick, from_value)) = source_points
+                .any(|(tick, _, _)| *tick == source_start_tick)
+            && let Some((from_tick, from_value, _)) = source_points
                 .iter()
                 .rev()
-                .find(|(tick, _)| *tick < source_start_tick)
+                .find(|(tick, _, _)| *tick < source_start_tick)
         {
             let next = source_points
                 .iter()
-                .find(|(tick, _)| *tick > source_start_tick);
-            let boundary_value = next.map_or(*from_value, |(to_tick, to_value)| {
+                .find(|(tick, _, _)| *tick > source_start_tick);
+            let boundary_value = next.map_or(*from_value, |(to_tick, to_value, to_tension)| {
                 let fraction =
                     (source_start_tick - from_tick) as f64 / (*to_tick - from_tick) as f64;
-                from_value + (to_value - from_value) * fraction
+                automation_segment_value_with_tension(*from_value, *to_value, fraction, *to_tension)
             });
-            points.push((0, boundary_value));
+            points.push((0, boundary_value, 0.0));
         }
         if explicit_source_window {
             points.extend(
                 source_points
                     .iter()
                     .copied()
-                    .filter(|(tick, _)| *tick >= source_start_tick && *tick < source_end_tick)
-                    .map(|(tick, value)| (tick - source_start_tick, value)),
+                    .filter(|(tick, _, _)| *tick >= source_start_tick && *tick < source_end_tick)
+                    .map(|(tick, value, tension)| (tick - source_start_tick, value, tension)),
             );
-            if let Some(value) = automation_value_at_tick(&source_points, source_end_tick) {
-                points.push((source_end_tick - source_start_tick, value));
+            if let Some((value, tension)) =
+                automation_value_at_tick(&source_points, source_end_tick)
+            {
+                points.push((source_end_tick - source_start_tick, value, tension));
             }
         } else {
             // Legacy clips have no decoded source window. Keep the original
@@ -2326,7 +2333,7 @@ pub(crate) fn song_tempo_events(
             for tick in first_sample_tick..sample_end {
                 let elapsed = tick.saturating_add(1).saturating_sub(segment_start) as f64;
                 let fraction = (elapsed / span).clamp(0.0, 1.0);
-                let value = from.1 + (to.1 - from.1) * fraction;
+                let value = automation_segment_value_with_tension(from.1, to.1, fraction, to.2);
                 events.push((tick, tempo_automation_bpm(value)?));
                 clip_event_count = clip_event_count.saturating_add(1);
                 if clip_event_count > MAX_EXPORTED_TEMPO_EVENTS {
@@ -2363,21 +2370,32 @@ fn automation_point_tick(position_beats: f64, ppq: u16) -> Result<u64, MidiError
     Ok(ticks.round() as u64)
 }
 
-fn automation_value_at_tick(points: &[(u64, f64)], tick: u64) -> Option<f64> {
+fn automation_value_at_tick(points: &[(u64, f64, f32)], tick: u64) -> Option<(f64, f32)> {
     let previous = points
         .iter()
         .rev()
-        .find(|(point_tick, _)| *point_tick <= tick)?;
+        .find(|(point_tick, _, _)| *point_tick <= tick)?;
     if previous.0 == tick {
-        return Some(previous.1);
+        return Some((previous.1, previous.2));
     }
     points
         .iter()
-        .find(|(point_tick, _)| *point_tick > tick)
-        .map_or(Some(previous.1), |(next_tick, next_value)| {
-            let fraction = (tick - previous.0) as f64 / (*next_tick - previous.0) as f64;
-            Some(previous.1 + (next_value - previous.1) * fraction)
-        })
+        .find(|(point_tick, _, _)| *point_tick > tick)
+        .map_or(
+            Some((previous.1, previous.2)),
+            |(next_tick, next_value, next_tension)| {
+                let fraction = (tick - previous.0) as f64 / (*next_tick - previous.0) as f64;
+                Some((
+                    automation_segment_value_with_tension(
+                        previous.1,
+                        *next_value,
+                        fraction,
+                        *next_tension,
+                    ),
+                    *next_tension,
+                ))
+            },
+        )
 }
 
 impl MidiEvent {

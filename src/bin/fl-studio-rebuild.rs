@@ -8753,6 +8753,7 @@ impl DawUi {
                 .map(|point| Vst3AutomationPoint {
                     position_beats: point.position_beats(),
                     value: point.value(),
+                    tension: point.tension(),
                 })
                 .collect::<Vec<_>>();
             if points.is_empty() {
@@ -8802,6 +8803,7 @@ impl DawUi {
                 .map(|point| Vst3AutomationPoint {
                     position_beats: point.position_beats(),
                     value: point.value(),
+                    tension: point.tension(),
                 })
                 .collect::<Vec<_>>();
             if points.is_empty() {
@@ -33867,7 +33869,10 @@ impl DawUi {
             } else {
                 ui.colored_label(MUTED, "Drag a point to edit its position and value");
             }
-            ui.colored_label(MUTED, "Straight-line preview; tension is not rendered yet");
+            ui.colored_label(
+                MUTED,
+                "Tension uses a single-curve approximation; other native curve modes are not decoded",
+            );
         });
 
         if points_are_editable && let Some(point_index) = selected_index {
@@ -33964,10 +33969,27 @@ impl DawUi {
             automation_point_screen_position(point, plot_rect, visible_beats)
         };
         for pair in points.windows(2) {
-            painter.line_segment(
-                [point_position(&pair[0]), point_position(&pair[1])],
-                Stroke::new(1.5, ORANGE),
-            );
+            let mut previous = point_position(&pair[0]);
+            for step in 1..=32 {
+                let fraction = f64::from(step) / 32.0;
+                let position = pair[0].position_beats()
+                    + (pair[1].position_beats() - pair[0].position_beats()) * fraction;
+                let value = flp_rebuild::automation_segment_value_with_tension(
+                    pair[0].value(),
+                    pair[1].value(),
+                    fraction,
+                    pair[1].tension(),
+                );
+                let next = egui::pos2(
+                    egui::lerp(
+                        plot_rect.left()..=plot_rect.right(),
+                        (position / visible_beats) as f32,
+                    ),
+                    egui::lerp(plot_rect.bottom()..=plot_rect.top(), value as f32),
+                );
+                painter.line_segment([previous, next], Stroke::new(1.5, ORANGE));
+                previous = next;
+            }
         }
         let mut interacted_with_point = false;
         for (point_index, point) in points.iter().enumerate() {
@@ -66668,6 +66690,7 @@ fn internal_lfo_parameter_automation(
             Vst3AutomationPoint {
                 position_beats,
                 value: minimum + (maximum - minimum) * wave,
+                tension: 0.0,
             }
         })
         .collect();
@@ -66694,6 +66717,7 @@ fn internal_lfo_mixer_effect_parameter_automation(
                     Vst3PlaylistAutomationPoint {
                         tick: tick.round() as u64,
                         value: point.value,
+                        tension: 0.0,
                     },
                 )
             })
@@ -66738,6 +66762,7 @@ fn pattern_vst3_parameter_automation_for_channel(
                         Vst3AutomationPoint {
                             position_beats: f64::from(point.position) / f64::from(ppq),
                             value: f64::from(value),
+                            tension: 0.0,
                         },
                     )
                 })
@@ -66801,6 +66826,7 @@ fn pattern_vst3_mixer_effect_parameter_automation_for_target(
                         Vst3PlaylistAutomationPoint {
                             tick: u64::from(point.position),
                             value: f64::from(value),
+                            tension: 0.0,
                         },
                     )
                 })
@@ -76808,10 +76834,12 @@ mod tests {
                     flp_rebuild::vst3::Vst3AutomationPoint {
                         position_beats: 0.0,
                         value: 0.25,
+                        tension: 0.0,
                     },
                     flp_rebuild::vst3::Vst3AutomationPoint {
                         position_beats: 1.0,
                         value: 0.75,
+                        tension: 0.0,
                     },
                 ],
             }]
@@ -76925,10 +76953,12 @@ mod tests {
                     Vst3PlaylistAutomationPoint {
                         tick: 0,
                         value: 0.25,
+                        tension: 0.0,
                     },
                     Vst3PlaylistAutomationPoint {
                         tick: 96,
                         value: 0.75,
+                        tension: 0.0,
                     },
                 ],
             }]
@@ -77015,6 +77045,7 @@ mod tests {
                 points: vec![Vst3PlaylistAutomationPoint {
                     tick: 96,
                     value: 0.75,
+                    tension: 0.0,
                 }],
             }]
         );

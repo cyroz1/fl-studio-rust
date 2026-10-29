@@ -12315,12 +12315,32 @@ fn performance_parameter_automation_points_for_loop(
                 .filter(|point| point.tick < loop_offset_ticks)
                 .max_by_key(|point| point.tick)
             {
+                let value = lane
+                    .points
+                    .iter()
+                    .find(|point| point.tick > loop_offset_ticks)
+                    .map_or(previous.value, |next| {
+                        let span = next.tick.saturating_sub(previous.tick);
+                        if span == 0 {
+                            previous.value
+                        } else {
+                            let fraction = loop_offset_ticks.saturating_sub(previous.tick) as f64
+                                / span as f64;
+                            crate::automation_segment_value_with_tension(
+                                previous.value,
+                                next.value,
+                                fraction,
+                                next.tension,
+                            )
+                        }
+                    });
                 points_by_lane
                     .entry((channel_id, lane.parameter_id))
                     .or_insert_with(Vec::new)
                     .push(Vst3PlaylistAutomationPoint {
                         tick: loop_start_tick,
-                        value: previous.value,
+                        value,
+                        tension: 0.0,
                     });
             }
             for point in lane
@@ -12344,6 +12364,7 @@ fn performance_parameter_automation_points_for_loop(
                     .push(Vst3PlaylistAutomationPoint {
                         tick: absolute_tick,
                         value: point.value,
+                        tension: point.tension,
                     });
             }
         }
@@ -18039,18 +18060,22 @@ mod tests {
                     Vst3PlaylistAutomationPoint {
                         tick: 24,
                         value: 0.2,
+                        tension: 0.0,
                     },
                     Vst3PlaylistAutomationPoint {
                         tick: 48,
                         value: 0.8,
+                        tension: 0.0,
                     },
                     Vst3PlaylistAutomationPoint {
                         tick: 120,
                         value: 0.4,
+                        tension: 0.0,
                     },
                     Vst3PlaylistAutomationPoint {
                         tick: 192,
                         value: 0.6,
+                        tension: 0.0,
                     },
                 ],
             }],
@@ -18065,14 +18090,17 @@ mod tests {
                 Vst3PlaylistAutomationPoint {
                     tick: 500,
                     value: 0.2,
+                    tension: 0.0,
                 },
                 Vst3PlaylistAutomationPoint {
                     tick: 516,
                     value: 0.8,
+                    tension: 0.0,
                 },
                 Vst3PlaylistAutomationPoint {
                     tick: 588,
                     value: 0.4,
+                    tension: 0.0,
                 },
             ]
         );
@@ -18085,14 +18113,17 @@ mod tests {
                 Vst3PlaylistAutomationPoint {
                     tick: 684,
                     value: 0.2,
+                    tension: 0.0,
                 },
                 Vst3PlaylistAutomationPoint {
                     tick: 708,
                     value: 0.8,
+                    tension: 0.0,
                 },
                 Vst3PlaylistAutomationPoint {
                     tick: 780,
                     value: 0.4,
+                    tension: 0.0,
                 },
             ]
         );

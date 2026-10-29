@@ -1975,6 +1975,31 @@ impl AutomationPoint {
     }
 }
 
+/// Evaluate one Automation segment with the destination point's saved tension.
+///
+/// This bounded, monotonic easing curve is a local single-curve approximation
+/// applied where the saved segment mode is not decoded. FL Studio also stores
+/// other segment modes, whose point-state encoding is not decoded here.
+pub fn automation_segment_value_with_tension(
+    start_value: f64,
+    end_value: f64,
+    fraction: f64,
+    tension: f32,
+) -> f64 {
+    let fraction = if fraction.is_finite() {
+        fraction.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let tension = if tension.is_finite() {
+        f64::from(tension.clamp(-1.0, 1.0))
+    } else {
+        0.0
+    };
+    let eased_fraction = fraction + tension * fraction * (1.0 - fraction);
+    start_value + (end_value - start_value) * eased_fraction
+}
+
 /// Decoded automation points attached to one type-5 Channel Rack channel.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AutomationChannel {
