@@ -5452,8 +5452,9 @@ struct PendingPlaylistPatternClipConsolidation {
 enum PendingSongRenderKind {
     Mix,
     MixerStems,
-    PatternClip {
-        clip_index: usize,
+    PatternClips {
+        clip_count: usize,
+        first_clip_index: usize,
         start_from_song_start: bool,
     },
 }
@@ -8931,6 +8932,19 @@ impl DawUi {
         let clip = arrangement.clips.get(clip_index)?;
         matches!(clip.target(), PlaylistClipTarget::Pattern { .. })
             .then_some((arrangement_id, clip_index))
+    }
+
+    fn selected_playlist_pattern_clips(&self) -> Option<(u16, Vec<usize>)> {
+        let arrangement_id = self.selected_arrangement.unwrap_or_default();
+        if self.selected_arrangement == Some(arrangement_id)
+            && self.selected_playlist_clips.len() > 1
+        {
+            return self
+                .selected_playlist_pattern_clip_indices(arrangement_id)
+                .map(|clip_indices| (arrangement_id, clip_indices));
+        }
+        self.selected_playlist_pattern_clip()
+            .map(|(arrangement_id, clip_index)| (arrangement_id, vec![clip_index]))
     }
 
     fn playlist_audio_clip_envelopes_for_current_project(
@@ -14539,21 +14553,38 @@ impl DawUi {
                             ui.close();
                         }
                     });
-                    ui.menu_button("Render selected Pattern Clip…", |ui| {
-                        let can_render = self.selected_playlist_pattern_clip().is_some()
+                    let selected_pattern_clips = self.selected_playlist_pattern_clips();
+                    let render_pattern_clips_label = if selected_pattern_clips
+                        .as_ref()
+                        .is_some_and(|(_, indices)| indices.len() > 1)
+                    {
+                        "Render selected Pattern Clips…"
+                    } else {
+                        "Render selected Pattern Clip…"
+                    };
+                    let pattern_clip_start_choice = if selected_pattern_clips
+                        .as_ref()
+                        .is_some_and(|(_, indices)| indices.len() > 1)
+                    {
+                        "From earliest clip start…"
+                    } else {
+                        "From clip start…"
+                    };
+                    ui.menu_button(render_pattern_clips_label, |ui| {
+                        let can_render = selected_pattern_clips.is_some()
                             && self.sample_project_path().is_some()
                             && self.pending_song_render.is_none()
                             && self.pending_audio_clip_export.is_none();
                         if ui
-                            .add_enabled(can_render, egui::Button::new("From clip start…"))
+                            .add_enabled(can_render, egui::Button::new(pattern_clip_start_choice))
                             .clicked()
                         {
-                            if let Some((arrangement_id, clip_index)) =
-                                self.selected_playlist_pattern_clip()
+                            if let Some((arrangement_id, clip_indices)) =
+                                selected_pattern_clips.clone()
                             {
                                 self.render_playlist_pattern_clip_dialog(
                                     arrangement_id,
-                                    clip_index,
+                                    &clip_indices,
                                     PlaylistPatternClipRenderAction::Export {
                                         start_from_song_start: false,
                                     },
@@ -14565,12 +14596,12 @@ impl DawUi {
                             .add_enabled(can_render, egui::Button::new("From song start…"))
                             .clicked()
                         {
-                            if let Some((arrangement_id, clip_index)) =
-                                self.selected_playlist_pattern_clip()
+                            if let Some((arrangement_id, clip_indices)) =
+                                selected_pattern_clips.clone()
                             {
                                 self.render_playlist_pattern_clip_dialog(
                                     arrangement_id,
-                                    clip_index,
+                                    &clip_indices,
                                     PlaylistPatternClipRenderAction::Export {
                                         start_from_song_start: true,
                                     },
@@ -25156,16 +25187,36 @@ impl DawUi {
                                         && self.sample_project_path().is_some()
                                         && self.pending_song_render.is_none()
                                         && self.pending_audio_clip_export.is_none();
-                                    ui.menu_button("Render Pattern Clip…", |ui| {
+                                    let render_pattern_clip_indices =
+                                        selected_pattern_context_indices
+                                            .clone()
+                                            .unwrap_or_else(|| vec![clip_index]);
+                                    let render_pattern_clip_label =
+                                        if render_pattern_clip_indices.len() > 1 {
+                                            "Render selected Pattern Clips…"
+                                        } else {
+                                            "Render Pattern Clip…"
+                                        };
+                                    let render_pattern_clip_start_choice =
+                                        if render_pattern_clip_indices.len() > 1 {
+                                            "From earliest clip start…"
+                                        } else {
+                                            "From clip start…"
+                                        };
+                                    ui.menu_button(render_pattern_clip_label, |ui| {
                                         if ui
                                             .add_enabled(
                                                 can_render_pattern_clip,
-                                                egui::Button::new("From clip start…"),
+                                                egui::Button::new(
+                                                    render_pattern_clip_start_choice,
+                                                ),
                                             )
                                             .clicked()
                                         {
-                                            render_pattern_clip_requested =
-                                                Some((clip_index, false));
+                                            render_pattern_clip_requested = Some((
+                                                render_pattern_clip_indices.clone(),
+                                                false,
+                                            ));
                                             ui.close();
                                         }
                                         if ui
@@ -25175,8 +25226,10 @@ impl DawUi {
                                             )
                                             .clicked()
                                         {
-                                            render_pattern_clip_requested =
-                                                Some((clip_index, true));
+                                            render_pattern_clip_requested = Some((
+                                                render_pattern_clip_indices.clone(),
+                                                true,
+                                            ));
                                             ui.close();
                                         }
                                     });
@@ -27227,19 +27280,21 @@ impl DawUi {
             self.selected_playlist_clips.insert(clip_index);
             self.render_playlist_pattern_clip_dialog(
                 arrangement.id,
-                clip_index,
+                &[clip_index],
                 PlaylistPatternClipRenderAction::Consolidate,
             );
         }
 
-        if let Some((clip_index, start_from_song_start)) = render_pattern_clip_requested {
+        if let Some((clip_indices, start_from_song_start)) = render_pattern_clip_requested {
+            let Some(&first_clip_index) = clip_indices.first() else {
+                return;
+            };
             self.selected_arrangement = Some(arrangement.id);
-            self.selected_clip = Some(clip_index);
-            self.selected_playlist_clips.clear();
-            self.selected_playlist_clips.insert(clip_index);
+            self.selected_clip = Some(first_clip_index);
+            self.selected_playlist_clips = clip_indices.iter().copied().collect();
             self.render_playlist_pattern_clip_dialog(
                 arrangement.id,
-                clip_index,
+                &clip_indices,
                 PlaylistPatternClipRenderAction::Export {
                     start_from_song_start,
                 },
@@ -42800,7 +42855,7 @@ impl DawUi {
     fn render_playlist_pattern_clip_dialog(
         &mut self,
         arrangement_id: u16,
-        clip_index: usize,
+        clip_indices: &[usize],
         action: PlaylistPatternClipRenderAction,
     ) {
         let (operation, start_from_song_start) = match action {
@@ -42813,12 +42868,31 @@ impl DawUi {
             PlaylistPatternClipRenderAction::Export { .. } => "rendered",
             PlaylistPatternClipRenderAction::Consolidate => "consolidated",
         };
+        if clip_indices.is_empty() {
+            self.status = "Select at least one Pattern Clip to render".to_owned();
+            return;
+        }
+        if action == PlaylistPatternClipRenderAction::Consolidate && clip_indices.len() != 1 {
+            self.status = "Consolidate one Pattern Clip at a time".to_owned();
+            return;
+        }
+        let selected_clip_indices = clip_indices.iter().copied().collect::<BTreeSet<_>>();
+        if selected_clip_indices.len() != clip_indices.len() {
+            self.status = "The selected Pattern Clip list contains duplicate clips".to_owned();
+            return;
+        }
+        let clip_index = clip_indices[0];
+        let clip_subject = if selected_clip_indices.len() == 1 {
+            "a Pattern Clip"
+        } else {
+            "the selected Pattern Clips"
+        };
         let Some(project_path) = self.sample_project_path() else {
-            self.status = format!("Save the project before {operation} a Pattern Clip");
+            self.status = format!("Save the project before {operation} {clip_subject}");
             return;
         };
         let Some(document) = self.document.as_ref() else {
-            self.status = format!("Open a project before {operation} a Pattern Clip");
+            self.status = format!("Open a project before {operation} {clip_subject}");
             return;
         };
         if self.pending_song_render.is_some() {
@@ -42836,7 +42910,7 @@ impl DawUi {
             || self.pending_sampler_stream.is_some()
         {
             self.status =
-                format!("Stop Song playback or pattern preview before {operation} a Pattern Clip");
+                format!("Stop Song playback or pattern preview before {operation} {clip_subject}");
             return;
         }
 
@@ -42861,41 +42935,6 @@ impl DawUi {
             self.status = "Select a Pattern Clip before rendering or consolidating".to_owned();
             return;
         };
-        if clip.is_muted() {
-            self.status = format!("Unmute the selected Pattern Clip before {operation} it");
-            return;
-        }
-        let Some(track_index) = clip.track_index else {
-            self.status = "The selected Pattern Clip has no Playlist track".to_owned();
-            return;
-        };
-        let track_id = u32::from(track_index).saturating_add(1);
-        if document
-            .playlist_tracks()
-            .iter()
-            .any(|track| track.id == track_id && track.enabled == Some(false))
-        {
-            self.status = format!("Unmute Playlist track {track_id} before {operation} it");
-            return;
-        }
-        if clip.length_ticks == 0 {
-            self.status = "The selected Pattern Clip has no timeline length".to_owned();
-            return;
-        }
-        if clip
-            .scale
-            .is_some_and(|scale| !scale.is_finite() || (scale - 1.0).abs() > 1e-9)
-        {
-            self.status = match action {
-                PlaylistPatternClipRenderAction::Export { .. } => {
-                    "Pattern Clip rendering requires the default clip scale".to_owned()
-                }
-                PlaylistPatternClipRenderAction::Consolidate => {
-                    "Pattern Clip consolidation requires the default clip scale".to_owned()
-                }
-            };
-            return;
-        }
         let patterns = match document.patterns() {
             Ok(patterns) => patterns,
             Err(error) => {
@@ -42903,22 +42942,107 @@ impl DawUi {
                 return;
             }
         };
-        let Some(pattern) = patterns.iter().find(|pattern| pattern.id == pattern_id) else {
-            self.status = "The selected Pattern Clip references a missing pattern".to_owned();
-            return;
-        };
         let channels = document.channels();
         let loaded_vst3_channels = self
             .channel_vst3_instances
             .keys()
             .copied()
             .collect::<BTreeSet<_>>();
-        if let Err(reason) =
-            playlist_freeze_pattern_sources_supported(pattern, &channels, &loaded_vst3_channels)
-        {
-            self.status =
-                format!("Pattern Clip cannot be {rendered_or_consolidated} safely: {reason}");
-            return;
+        let playlist_tracks = document.playlist_tracks();
+        let mut source_start_tick = u32::MAX;
+        let mut clip_end_tick = 0_u64;
+        for selected_index in &selected_clip_indices {
+            let Some(selected_clip) = arrangement.clips.get(*selected_index) else {
+                self.status = format!(
+                    "Selected Playlist clip {} no longer exists",
+                    selected_index + 1
+                );
+                return;
+            };
+            let PlaylistClipTarget::Pattern {
+                id: selected_pattern_id,
+            } = selected_clip.target()
+            else {
+                self.status = format!(
+                    "Selected Playlist clip {} is not a Pattern Clip",
+                    selected_index + 1
+                );
+                return;
+            };
+            if selected_clip.is_muted() {
+                self.status = format!(
+                    "Unmute selected Pattern Clip {} before {operation}",
+                    selected_index + 1
+                );
+                return;
+            }
+            let Some(selected_track_index) = selected_clip.track_index else {
+                self.status = format!(
+                    "Selected Pattern Clip {} has no Playlist track",
+                    selected_index + 1
+                );
+                return;
+            };
+            let selected_track_id = u32::from(selected_track_index).saturating_add(1);
+            if playlist_tracks
+                .iter()
+                .any(|track| track.id == selected_track_id && track.enabled == Some(false))
+            {
+                self.status =
+                    format!("Unmute Playlist track {selected_track_id} before {operation}");
+                return;
+            }
+            if selected_clip.length_ticks == 0 {
+                self.status = format!(
+                    "Selected Pattern Clip {} has no timeline length",
+                    selected_index + 1
+                );
+                return;
+            }
+            if selected_clip
+                .scale
+                .is_some_and(|scale| !scale.is_finite() || (scale - 1.0).abs() > 1e-9)
+            {
+                self.status = match action {
+                    PlaylistPatternClipRenderAction::Export { .. } => {
+                        "Pattern Clip rendering requires the default clip scale".to_owned()
+                    }
+                    PlaylistPatternClipRenderAction::Consolidate => {
+                        "Pattern Clip consolidation requires the default clip scale".to_owned()
+                    }
+                };
+                return;
+            }
+            let Some(pattern) = patterns
+                .iter()
+                .find(|pattern| pattern.id == selected_pattern_id)
+            else {
+                self.status = format!(
+                    "Pattern Clip {} references a missing pattern",
+                    selected_index + 1
+                );
+                return;
+            };
+            if let Err(reason) =
+                playlist_freeze_pattern_sources_supported(pattern, &channels, &loaded_vst3_channels)
+            {
+                self.status = format!(
+                    "Pattern Clip {} cannot be {rendered_or_consolidated} safely: {reason}",
+                    selected_index + 1
+                );
+                return;
+            }
+            source_start_tick = source_start_tick.min(selected_clip.position_ticks);
+            let Some(selected_clip_end_tick) = u64::from(selected_clip.position_ticks)
+                .checked_add(u64::from(selected_clip.length_ticks))
+            else {
+                self.status = format!(
+                    "Pattern Clip {} endpoint exceeds the Playlist timeline",
+                    selected_index + 1
+                );
+                return;
+            };
+            clip_end_tick = clip_end_tick.max(selected_clip_end_tick);
         }
         if action == PlaylistPatternClipRenderAction::Consolidate
             && !project_has_audio_clip_template(document)
@@ -42930,10 +43054,8 @@ impl DawUi {
         }
         let source_position_ticks = clip.position_ticks;
         let source_length_ticks = clip.length_ticks;
-        let clip_end_tick =
-            u64::from(source_position_ticks).checked_add(u64::from(source_length_ticks));
-        let Some(clip_end_tick) = clip_end_tick else {
-            self.status = "The Pattern Clip endpoint exceeds the Playlist timeline".to_owned();
+        let Some(track_index) = clip.track_index else {
+            self.status = "The selected Pattern Clip has no Playlist track".to_owned();
             return;
         };
         let tempo_map = match PlaylistTempoMap::for_arrangement(document, arrangement_id) {
@@ -42944,7 +43066,7 @@ impl DawUi {
             }
         };
         let clip_start_frame = match tempo_map.frame_at_tick(
-            u64::from(source_position_ticks),
+            u64::from(source_start_tick),
             self.audio_settings.sample_rate,
         ) {
             Ok(frame) => frame,
@@ -42994,7 +43116,7 @@ impl DawUi {
                     candidate.target(),
                     PlaylistClipTarget::Channel { id } if automation_channel_ids.contains(&id)
                 );
-                (index != clip_index && !is_automation_clip).then_some(index)
+                (!selected_clip_indices.contains(&index) && !is_automation_clip).then_some(index)
             })
             .collect::<Vec<_>>();
         let mut render_document = document.clone();
@@ -43010,25 +43132,41 @@ impl DawUi {
             .map(|stem| stem.to_string_lossy().into_owned())
             .unwrap_or_else(|| "FL_Studio_Project".to_owned());
         let output_format = self.playlist_song_output_format;
+        let clip_number_label = selected_clip_indices
+            .iter()
+            .map(|index| (index + 1).to_string())
+            .collect::<Vec<_>>()
+            .join("-");
+        let clip_file_label = if selected_clip_indices.len() == 1 {
+            format!("pattern_clip_{}", clip_index + 1)
+        } else {
+            format!("pattern_clips_{clip_number_label}")
+        };
         let (dialog_title, output_suffix) = match action {
             PlaylistPatternClipRenderAction::Export {
                 start_from_song_start,
-            } => (
-                format!(
-                    "Render Pattern Clip {} from {}",
-                    clip_index + 1,
-                    if start_from_song_start {
-                        "song start"
-                    } else {
-                        "clip start"
-                    }
-                ),
-                if start_from_song_start {
-                    "song_start"
+            } => {
+                let start_label = if start_from_song_start {
+                    "song start"
+                } else if selected_clip_indices.len() > 1 {
+                    "earliest selected clip start"
                 } else {
-                    "clip_start"
-                },
-            ),
+                    "clip start"
+                };
+                let selection_label = if selected_clip_indices.len() == 1 {
+                    format!("Pattern Clip {}", clip_index + 1)
+                } else {
+                    format!("{} Pattern Clips", selected_clip_indices.len())
+                };
+                (
+                    format!("Render {selection_label} from {start_label}"),
+                    if start_from_song_start {
+                        "song_start"
+                    } else {
+                        "clip_start"
+                    },
+                )
+            }
             PlaylistPatternClipRenderAction::Consolidate => (
                 format!("Consolidate Pattern Clip {}", clip_index + 1),
                 "consolidated",
@@ -43038,8 +43176,7 @@ impl DawUi {
             rfd::FileDialog::new()
                 .set_title(dialog_title)
                 .set_file_name(format!(
-                    "{project_stem}_pattern_clip_{}_{output_suffix}.{}",
-                    clip_index + 1,
+                    "{project_stem}_{clip_file_label}_{output_suffix}.{}",
                     output_format.extension()
                 )),
             output_format,
@@ -43160,8 +43297,9 @@ impl DawUi {
                     kind: match action {
                         PlaylistPatternClipRenderAction::Export {
                             start_from_song_start,
-                        } => PendingSongRenderKind::PatternClip {
-                            clip_index,
+                        } => PendingSongRenderKind::PatternClips {
+                            clip_count: selected_clip_indices.len(),
+                            first_clip_index: clip_index,
                             start_from_song_start,
                         },
                         PlaylistPatternClipRenderAction::Consolidate => PendingSongRenderKind::Mix,
@@ -43172,16 +43310,27 @@ impl DawUi {
                 self.status = match action {
                     PlaylistPatternClipRenderAction::Export {
                         start_from_song_start,
-                    } => format!(
-                        "Rendering Playlist Pattern Clip {} from {} to {}…",
-                        clip_index + 1,
-                        if start_from_song_start {
-                            "song start"
+                    } => {
+                        let clip_description = if selected_clip_indices.len() == 1 {
+                            format!("Playlist Pattern Clip {}", clip_index + 1)
                         } else {
-                            "clip start"
-                        },
-                        output_path.display()
-                    ),
+                            format!(
+                                "{} selected Playlist Pattern Clips",
+                                selected_clip_indices.len()
+                            )
+                        };
+                        format!(
+                            "Rendering {clip_description} from {} to {}…",
+                            if start_from_song_start {
+                                "song start"
+                            } else if selected_clip_indices.len() > 1 {
+                                "earliest selected clip start"
+                            } else {
+                                "clip start"
+                            },
+                            output_path.display()
+                        )
+                    }
                     PlaylistPatternClipRenderAction::Consolidate => format!(
                         "Consolidating Playlist Pattern Clip {} to {}…",
                         clip_index + 1,
@@ -44310,24 +44459,33 @@ impl DawUi {
                             "Current stem not written"
                         },
                     ),
-                    PendingSongRenderKind::PatternClip {
-                        clip_index,
+                    PendingSongRenderKind::PatternClips {
+                        clip_count,
+                        first_clip_index,
                         start_from_song_start,
-                    } => format!(
-                        "Rendered Playlist Pattern Clip {} from {} to {} at {} Hz ({} Sampler notes, {} VST3 notes; {} unresolved sample notes, {} unloaded VST3 channels skipped). Supported Mixer effects and linked effect automation were included",
-                        clip_index + 1,
-                        if start_from_song_start {
-                            "song start"
+                    } => {
+                        let clip_description = if clip_count == 1 {
+                            format!("Playlist Pattern Clip {}", first_clip_index + 1)
                         } else {
-                            "clip start"
-                        },
-                        pending.output_path.display(),
-                        summary.sample_rate,
-                        summary.sampler_notes_rendered,
-                        summary.vst3_notes_rendered,
-                        summary.notes_skipped_unresolved_sample,
-                        summary.vst3_plugin_channels_unloaded,
-                    ),
+                            format!("{clip_count} selected Playlist Pattern Clips")
+                        };
+                        format!(
+                            "Rendered {clip_description} from {} to {} at {} Hz ({} Sampler notes, {} VST3 notes; {} unresolved sample notes, {} unloaded VST3 channels skipped). Supported Mixer effects and linked effect automation were included",
+                            if start_from_song_start {
+                                "song start"
+                            } else if clip_count > 1 {
+                                "earliest selected clip start"
+                            } else {
+                                "clip start"
+                            },
+                            pending.output_path.display(),
+                            summary.sample_rate,
+                            summary.sampler_notes_rendered,
+                            summary.vst3_notes_rendered,
+                            summary.notes_skipped_unresolved_sample,
+                            summary.vst3_plugin_channels_unloaded,
+                        )
+                    }
                 };
             }
             Err(error) => {
@@ -44338,10 +44496,20 @@ impl DawUi {
                     PendingSongRenderKind::MixerStems => {
                         format!("Could not render Mixer stems: {error}")
                     }
-                    PendingSongRenderKind::PatternClip { clip_index, .. } => format!(
-                        "Could not render Playlist Pattern Clip {}: {error}",
-                        clip_index + 1
-                    ),
+                    PendingSongRenderKind::PatternClips {
+                        clip_count,
+                        first_clip_index,
+                        ..
+                    } => {
+                        if clip_count == 1 {
+                            format!(
+                                "Could not render Playlist Pattern Clip {}: {error}",
+                                first_clip_index + 1
+                            )
+                        } else {
+                            format!("Could not render {clip_count} selected Pattern Clips: {error}")
+                        }
+                    }
                 }
             }
         }

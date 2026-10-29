@@ -358,19 +358,21 @@ are applied where the Mixer rows below describe. Full export surface:
   song-start renders. Loaded VST3 insert and Master effects apply supported linked
   Playlist Automation Clip and Pattern Event/LFO effect automation, reported effect
   tails, and automatic PDC. Looping or stretching clips beyond their source duration,
-  Pattern Clip multiple selection, unsupported effect automation links, and native
+  multiple Audio Clip selection, unsupported effect automation links, and native
   FL Studio output comparison remain incomplete
   ([Image-Line Playlist
   manual](https://www.image-line.com/fl-studio-learning-content/fl-studio-online-manual/html/playlist.htm)).
 - `[partial]` Pattern Clip render and consolidation: File > Export and the Playlist context
-  menu can render one selected, unmuted, default-scale Pattern Clip from clip start or song
-  start, through its timeline endpoint and configured tail, using the shared output formats
-  and settings. Supported Sampler and loaded VST3 note sources render with tempo automation,
-  supported linked Automation Clip and Pattern Event/LFO effect automation, loaded Mixer
-  insert and Master effects, reported tails, and automatic PDC. The context menu can also
-  insert the render at the source position and mute the Pattern Clip as one undoable edit.
-  Unsupported source or effect layouts, multiple selection, and native FL Studio output
-  comparison remain incomplete.
+  menu can render one selected, unmuted, default-scale Pattern Clip or mix multiple selected
+  Pattern Clips into one file, from the earliest selected clip start or song start through
+  the latest selected endpoint and configured tail. Group renders preserve relative song
+  positions and use the shared output formats and settings. Supported Sampler and loaded VST3
+  note sources render with tempo automation, supported linked Automation Clip and Pattern
+  Event/LFO effect automation, loaded Mixer insert and Master effects, reported tails, and
+  automatic PDC. The
+  context menu can also consolidate one Pattern Clip by inserting the render at its source
+  position and muting the source as one undoable edit. Unsupported source or effect layouts,
+  multi-clip consolidation, and native FL Studio output comparison remain incomplete.
 - `[partial]` Playlist track freeze: **Freeze track from song start…** renders the selected track from tick zero, places the resulting Audio Clip on the same track, and mutes all original clips in one undoable edit. The action uses the selected Playlist output format and includes supported loaded VST3 Mixer insert/Master effects, linked Automation Clip and Pattern Event/LFO effect automation, reported effect tails, and automatic PDC when available. It leaves the arrangement unchanged when known scaled clips, unresolved Sampler sources, unloaded VST3 channels, unsupported loaded effect layouts, or a changed project prevent safe placement. Non-render-based smart disable and native output comparison remain incomplete.
 - `[partial]` Pattern render: the Piano roll can render enabled Sampler notes
   from the selected pattern to WAV with the shared bit depth, dither, and
