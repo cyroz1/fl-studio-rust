@@ -634,6 +634,7 @@ struct PlaylistMixerEffectStream {
     input_channels: usize,
     output_channels: usize,
     external_auxiliary_input_buses: Vec<(usize, usize)>,
+    external_auxiliary_input_source_map: Option<Vec<(usize, usize)>>,
     external_auxiliary_scratch: Vec<f32>,
     sidechain_inputs: Vec<PlaylistMixerEffectSidechainInput>,
     parameter_automation: Vec<PreparedParameterAutomation>,
@@ -2620,8 +2621,15 @@ fn fill_external_playlist_mixer_sidechain_inputs(
             .checked_add(sample_count)
             .filter(|end| *end <= effect.external_auxiliary_scratch.len())
             .ok_or_else(|| "CLAP Mixer sidechain scratch is too small".to_owned())?;
-        effect.external_auxiliary_scratch[destination_start..destination_end]
-            .copy_from_slice(source);
+        for (destination, source) in effect.external_auxiliary_scratch
+            [destination_start..destination_end]
+            .iter_mut()
+            .zip(source)
+        {
+            if source.is_finite() {
+                *destination += *source;
+            }
+        }
     }
     Ok(())
 }
@@ -2690,7 +2698,7 @@ fn update_playlist_mixer_effect_sidechain_inputs(
     } else {
         effect.external_auxiliary_input_buses.clone()
     };
-    if effect.external_processor.is_some() {
+    if effect.external_processor.is_some() && effect.external_auxiliary_input_source_map.is_none() {
         let active_source_count = sources
             .iter()
             .filter(|(_, saved_enabled, live_control)| *saved_enabled || *live_control)
@@ -2704,6 +2712,42 @@ fn update_playlist_mixer_effect_sidechain_inputs(
             ));
         }
     }
+    let sidechain_pairs = if let Some(mapping) = &effect.external_auxiliary_input_source_map {
+        let mut mapped_sources = Vec::new();
+        mapped_sources
+            .try_reserve_exact(mapping.len())
+            .map_err(|error| format!("could not allocate Mixer sidechain mappings: {error}"))?;
+        for (source_track, bus_index) in mapping {
+            let Some((source_track, saved_enabled, live_control)) = sources
+                .iter()
+                .copied()
+                .find(|source| source.0 == *source_track)
+            else {
+                continue;
+            };
+            let Some((bus_index, channel_count)) = auxiliary_buses
+                .iter()
+                .copied()
+                .find(|(available_bus, _)| available_bus == bus_index)
+            else {
+                return Err(format!(
+                    "CLAP Mixer insert {} effect slot {} maps source insert {source_track} to unavailable auxiliary input {bus_index}",
+                    effect.insert_ordinal,
+                    effect.slot_index + 1
+                ));
+            };
+            mapped_sources.push((
+                (bus_index, channel_count),
+                (source_track, saved_enabled, live_control),
+            ));
+        }
+        mapped_sources
+    } else {
+        auxiliary_buses
+            .into_iter()
+            .zip(sources.iter().copied())
+            .collect()
+    };
     let smoothing_frames = (sample_rate * f64::from(MIXER_EFFECT_MIX_SMOOTHING_SECONDS))
         .round()
         .clamp(1.0, f64::from(u32::MAX)) as u32;
@@ -2718,13 +2762,11 @@ fn update_playlist_mixer_effect_sidechain_inputs(
         .collect::<BTreeMap<_, _>>();
     let mut sidechain_inputs = Vec::new();
     sidechain_inputs
-        .try_reserve_exact(sources.len().min(auxiliary_buses.len()))
+        .try_reserve_exact(sidechain_pairs.len())
         .map_err(|error| format!("could not allocate Mixer sidechain inputs: {error}"))?;
-    // VST3 bus layouts expose index, activation, and channel count here. Pair active
-    // auxiliary buses with sources by ascending bus index and source-track order. CLAP
-    // auxiliary ports use the same stable order reported by the isolated helper.
-    for ((bus_index, channel_count), (source_track, saved_enabled, live_control)) in
-        auxiliary_buses.into_iter().zip(sources.iter().copied())
+    // VST3 buses and unmapped CLAP ports retain stable source-order pairing. Explicit
+    // CLAP maps may route several source inserts into one auxiliary port.
+    for ((bus_index, channel_count), (source_track, saved_enabled, live_control)) in sidechain_pairs
     {
         let mut input = previous_inputs
             .remove(&(bus_index, source_track))
@@ -3845,6 +3887,10 @@ pub trait MixerEffectProcessor: Send {
     fn output_channels(&self) -> usize;
     fn auxiliary_input_buses(&self) -> &[(usize, usize)] {
         &[]
+    }
+    /// Optional source-insert to auxiliary-port mapping for external processors.
+    fn auxiliary_input_source_map(&self) -> Option<&[(usize, usize)]> {
+        None
     }
     fn latency_samples(&self) -> u32;
     fn tail_samples(&self) -> Option<u64> {
@@ -6385,6 +6431,7 @@ impl Vst3HostRuntime {
                     input_channels,
                     output_channels,
                     external_auxiliary_input_buses,
+                    external_auxiliary_input_source_map,
                     external_auxiliary_scratch,
                     sample_rate,
                     latency_samples,
@@ -6425,6 +6472,9 @@ impl Vst3HostRuntime {
                         .block_size()
                         .clamp(1, VST3_EFFECT_RENDER_BLOCK_FRAMES);
                     let external_auxiliary_input_buses = processor.auxiliary_input_buses().to_vec();
+                    let external_auxiliary_input_source_map = processor
+                        .auxiliary_input_source_map()
+                        .map(<[(usize, usize)]>::to_vec);
                     if external_auxiliary_input_buses.len() > 16
                         || external_auxiliary_input_buses
                             .iter()
@@ -6453,6 +6503,7 @@ impl Vst3HostRuntime {
                         input_channels,
                         output_channels,
                         external_auxiliary_input_buses,
+                        external_auxiliary_input_source_map,
                         external_auxiliary_scratch,
                         sample_rate,
                         latency_samples,
@@ -6536,6 +6587,7 @@ impl Vst3HostRuntime {
                         input_channels,
                         output_channels,
                         Vec::new(),
+                        None,
                         Vec::new(),
                         sample_rate,
                         latency_samples,
@@ -6630,6 +6682,7 @@ impl Vst3HostRuntime {
                     input_channels,
                     output_channels,
                     external_auxiliary_input_buses,
+                    external_auxiliary_input_source_map,
                     external_auxiliary_scratch,
                     sidechain_inputs: Vec::new(),
                     parameter_automation,

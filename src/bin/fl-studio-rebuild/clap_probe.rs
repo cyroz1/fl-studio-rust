@@ -710,6 +710,7 @@ pub fn start_mixer_effect_state_capture_worker(
                     plugin_id,
                     plugin_name,
                     state,
+                    ..
                 } = assignment;
                 let result = match capture_controller.capture_active_state(
                     insert_ordinal,
@@ -958,6 +959,7 @@ struct ClapMixerEffectProcess {
     input_channels: usize,
     output_channels: usize,
     auxiliary_input_buses: Vec<(usize, usize)>,
+    auxiliary_input_source_map: Vec<(usize, usize)>,
     sample_rate: u32,
     latency_samples: u32,
     tail_samples: Option<u64>,
@@ -1019,6 +1021,7 @@ impl ClapMixerEffectProcess {
             input_channels: 0,
             output_channels: 0,
             auxiliary_input_buses: Vec::new(),
+            auxiliary_input_source_map: Vec::new(),
             sample_rate,
             latency_samples: 0,
             tail_samples: None,
@@ -1363,6 +1366,10 @@ impl MixerEffectProcessor for ClapMixerEffectProcess {
         &self.auxiliary_input_buses
     }
 
+    fn auxiliary_input_source_map(&self) -> Option<&[(usize, usize)]> {
+        (!self.auxiliary_input_source_map.is_empty()).then_some(&self.auxiliary_input_source_map)
+    }
+
     fn latency_samples(&self) -> u32 {
         self.latency_samples
     }
@@ -1410,6 +1417,21 @@ impl MixerEffectProcessorFactory for ClapProjectMixerEffectProcessorFactory {
             sample_rate,
             assignment.state.as_deref(),
         )?;
+        for (source_track, bus_index) in &assignment.auxiliary_input_source_map {
+            if !process
+                .auxiliary_input_buses
+                .iter()
+                .any(|(available_bus, _)| available_bus == bus_index)
+            {
+                return Err(format!(
+                    "CLAP Mixer insert {insert_ordinal} slot {} maps source insert {source_track} to unavailable auxiliary input {bus_index}",
+                    slot_index + 1
+                ));
+            }
+            process
+                .auxiliary_input_source_map
+                .push((*source_track, *bus_index));
+        }
         process.register_for_state_capture(
             &self.capture_controller,
             (insert_ordinal, slot_index),

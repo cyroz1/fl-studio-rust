@@ -53926,6 +53926,8 @@ impl DawUi {
         let mut effect_slot_move = None;
         let mut effect_editor_open = None;
         let mut inspect_clap_effect_path = None;
+        let mut inspect_clap_instance = None;
+        let mut clap_effect_sidechain_mapping_edits = Vec::new();
         let mut clap_effect_assignment_edit = None;
         let mut clap_effect_assignment_remove = None;
         let mut capture_clap_mixer_effect_state = None;
@@ -55526,6 +55528,14 @@ impl DawUi {
                                 let slot_key = (insert.ordinal(), slot.slot_index());
                                 let clap_effect_assignment =
                                     clap_mixer_effect_assignments.get(&slot_key);
+                                let clap_instance_inspection_state = clap_effect_assignment
+                                    .and_then(|assignment| {
+                                        self.clap_instance_inspection_states.get(&(
+                                            assignment.path.clone(),
+                                            assignment.plugin_id.clone(),
+                                        ))
+                                    })
+                                    .cloned();
                                 let saved_state = if let Some(assignment) = clap_effect_assignment {
                                     if assignment.state.is_some() {
                                         format!("{saved_state} · CLAP assigned · state captured")
@@ -55719,16 +55729,27 @@ impl DawUi {
                                                                             ))
                                                                             .clicked()
                                                                         {
-                                                                            let state = clap_effect_assignment
-                                                                                .filter(|assignment| {
-                                                                                    assignment.path
-                                                                                        == candidate.path
-                                                                                        && assignment.plugin_id
-                                                                                            == descriptor.id
-                                                                                })
-                                                                                .and_then(|assignment| {
-                                                                                    assignment.state.clone()
-                                                                                });
+                                                                            let existing_assignment =
+                                                                                clap_effect_assignment
+                                                                                    .filter(|assignment| {
+                                                                                        assignment.path
+                                                                                            == candidate.path
+                                                                                            && assignment.plugin_id
+                                                                                                == descriptor.id
+                                                                                    });
+                                                                            let state =
+                                                                                existing_assignment
+                                                                                    .and_then(|assignment| {
+                                                                                        assignment.state.clone()
+                                                                                    });
+                                                                            let auxiliary_input_source_map =
+                                                                                existing_assignment
+                                                                                    .map(|assignment| {
+                                                                                        assignment
+                                                                                            .auxiliary_input_source_map
+                                                                                            .clone()
+                                                                                    })
+                                                                                    .unwrap_or_default();
                                                                             clap_effect_assignment_edit = Some((
                                                                                 slot_key,
                                                                                 ClapProjectMixerEffectAssignment {
@@ -55736,6 +55757,7 @@ impl DawUi {
                                                                                     plugin_id: descriptor.id.clone(),
                                                                                     plugin_name: descriptor.name.clone(),
                                                                                     state,
+                                                                                    auxiliary_input_source_map,
                                                                                 },
                                                                             ));
                                                                             ui.close();
@@ -55774,7 +55796,7 @@ impl DawUi {
                                                             "Assignments are stored on this machine for project {project_id}."
                                                         ));
                                                     });
-                                                    if clap_effect_assignment.is_some() {
+                                                    if let Some(assignment) = clap_effect_assignment {
                                                         ui.horizontal(|ui| {
                                                             if ui
                                                                 .small_button("Capture state")
@@ -55787,6 +55809,109 @@ impl DawUi {
                                                             if ui.small_button("Remove CLAP").clicked() {
                                                                 clap_effect_assignment_remove =
                                                                     Some(slot_key);
+                                                            }
+                                                        });
+                                                        ui.collapsing("Sidechain input mapping", |ui| {
+                                                            match &clap_instance_inspection_state {
+                                                                Some(ClapInstanceInspectionState::Inspected(info)) => {
+                                                                    let auxiliary_ports = info
+                                                                        .audio_inputs
+                                                                        .iter()
+                                                                        .enumerate()
+                                                                        .filter(|(_, port)| {
+                                                                            !port.is_main
+                                                                                && matches!(port.channel_count, 1 | 2)
+                                                                        })
+                                                                        .collect::<Vec<_>>();
+                                                                    if auxiliary_ports.is_empty() {
+                                                                        ui.small("This effect has no supported mono or stereo auxiliary input ports.");
+                                                                    } else {
+                                                                        if assignment
+                                                                            .auxiliary_input_source_map
+                                                                            .is_empty()
+                                                                        {
+                                                                            ui.small("Automatic source/bus ordering is active. Selecting sources switches to an explicit map; only selected sources are routed.");
+                                                                        }
+                                                                        for (bus_index, port) in auxiliary_ports {
+                                                                            let mapped_source_count = assignment
+                                                                                .auxiliary_input_source_map
+                                                                                .values()
+                                                                                .filter(|mapped_bus| **mapped_bus == bus_index)
+                                                                                .count();
+                                                                            ui.menu_button(
+                                                                                format!(
+                                                                                    "{} · {mapped_source_count} source(s)",
+                                                                                    port.name
+                                                                                ),
+                                                                                |menu| {
+                                                                                    egui::ScrollArea::vertical()
+                                                                                        .max_height(220.0)
+                                                                                        .show(menu, |menu| {
+                                                                                            for source in inserts.iter().filter(|source| {
+                                                                                                source.ordinal() != 0
+                                                                                                    && source.ordinal() != insert.ordinal()
+                                                                                            }) {
+                                                                                                let mut mapped = assignment
+                                                                                                    .auxiliary_input_source_map
+                                                                                                    .get(&source.ordinal())
+                                                                                                    == Some(&bus_index);
+                                                                                                if menu
+                                                                                                    .checkbox(
+                                                                                                        &mut mapped,
+                                                                                                        format!(
+                                                                                                            "Insert {} · {}",
+                                                                                                            source.ordinal(),
+                                                                                                            source.name().unwrap_or("(unnamed)")
+                                                                                                        ),
+                                                                                                    )
+                                                                                                    .changed()
+                                                                                                {
+                                                                                                    clap_effect_sidechain_mapping_edits.push((
+                                                                                                        slot_key,
+                                                                                                        source.ordinal(),
+                                                                                                        mapped.then_some(bus_index),
+                                                                                                    ));
+                                                                                                }
+                                                                                            }
+                                                                                        });
+                                                                                },
+                                                                            );
+                                                                            ui.small(
+                                                                                egui::RichText::new(format!(
+                                                                                    "Input {} · {} channel(s){}",
+                                                                                    port.id,
+                                                                                    port.channel_count,
+                                                                                    port.port_type.as_deref().map_or_else(
+                                                                                        String::new,
+                                                                                        |port_type| format!(" · {port_type}"),
+                                                                                    )
+                                                                                ))
+                                                                                .color(MUTED),
+                                                                            );
+                                                                        }
+                                                                        ui.small("Mapped sources need an enabled Mixer send to this insert. Multiple sources assigned to one port are summed.");
+                                                                    }
+                                                                }
+                                                                Some(ClapInstanceInspectionState::Inspecting) => {
+                                                                    ui.small("Inspecting CLAP input ports…");
+                                                                }
+                                                                Some(ClapInstanceInspectionState::Failed(error)) => {
+                                                                    ui.colored_label(RED, error);
+                                                                    if ui.small_button("Retry input inspection").clicked() {
+                                                                        inspect_clap_instance = Some((
+                                                                            assignment.path.clone(),
+                                                                            assignment.plugin_id.clone(),
+                                                                        ));
+                                                                    }
+                                                                }
+                                                                None => {
+                                                                    if ui.small_button("Inspect CLAP input ports").clicked() {
+                                                                        inspect_clap_instance = Some((
+                                                                            assignment.path.clone(),
+                                                                            assignment.plugin_id.clone(),
+                                                                        ));
+                                                                    }
+                                                                }
                                                             }
                                                         });
                                                     }
@@ -55818,7 +55943,7 @@ impl DawUi {
                             }
                             ui.small(
                                 egui::RichText::new(
-                                    "Open editor controls a loaded VST3 effect through its native editor. Move up/down carries saved slot events with the effect. CLAP assignments process in saved slot order with timed parameter automation and reported-latency PDC. CLAP sidechains feed supported mono/stereo auxiliary inputs in source-track and bus order with PDC; runtime latency/tail reports refresh between audio blocks. Capture state reads one active effect at the next block boundary, or refreshes the prior machine-local snapshot if none is active; simultaneous active instances must be stopped to avoid an ambiguous capture. Native bus mapping and editors remain incomplete. VST3 Mix edits use a 20 ms ramp.",
+                                    "Open editor controls a loaded VST3 effect through its native editor. Move up/down carries saved slot events with the effect. CLAP assignments process in saved slot order with timed parameter automation and reported-latency PDC. CLAP sidechains feed supported mono/stereo auxiliary inputs in source-track and bus order by default; a slot can save explicit source-insert-to-input maps that sum multiple sources on one port. PDC and runtime latency/tail reports apply between audio blocks. Capture state reads one active effect at the next block boundary, or refreshes the prior machine-local snapshot if none is active; simultaneous active instances must be stopped to avoid an ambiguous capture. Native FLP bus mapping and editors remain incomplete. VST3 Mix edits use a 20 ms ramp.",
                                 )
                                 .color(MUTED),
                             );
@@ -56191,6 +56316,25 @@ impl DawUi {
                 ui.ctx().request_repaint();
             }
         }
+        if let Some((path, plugin_id)) = inspect_clap_instance {
+            let key = (path.clone(), plugin_id.clone());
+            self.clap_instance_inspection_states
+                .insert(key.clone(), ClapInstanceInspectionState::Inspecting);
+            if self
+                .clap_instance_inspection_sender
+                .send((path, plugin_id))
+                .is_err()
+            {
+                self.clap_instance_inspection_states.insert(
+                    key,
+                    ClapInstanceInspectionState::Failed(
+                        "CLAP instance inspection worker is unavailable".to_owned(),
+                    ),
+                );
+            } else {
+                ui.ctx().request_repaint();
+            }
+        }
         let assignment_edit = clap_effect_assignment_edit.map(|(key, value)| (key, Some(value)));
         let assignment_remove = clap_effect_assignment_remove
             .map(|key| (key, None::<ClapProjectMixerEffectAssignment>));
@@ -56233,6 +56377,42 @@ impl DawUi {
                 Err(error) => {
                     self.status = format!("Could not save CLAP Mixer effect assignment: {error}");
                 }
+            }
+        }
+        if !clap_effect_sidechain_mapping_edits.is_empty() {
+            if let Some(project_id) = project_id.as_deref() {
+                let mut assignments = self.clap_mixer_effect_assignments.clone();
+                for (slot_key, source_track, bus_index) in clap_effect_sidechain_mapping_edits {
+                    let Some(assignment) = assignments.get_mut(&slot_key) else {
+                        continue;
+                    };
+                    if let Some(bus_index) = bus_index {
+                        assignment
+                            .auxiliary_input_source_map
+                            .insert(source_track, bus_index);
+                    } else {
+                        assignment.auxiliary_input_source_map.remove(&source_track);
+                    }
+                }
+                match save_clap_project_mixer_effects(project_id, &assignments) {
+                    Ok(()) => {
+                        self.stop_project_playback();
+                        self.clap_mixer_effect_assignments = assignments;
+                        let reload_status = self.load_project_vst3_plugins();
+                        self.status = reload_status.map_or_else(
+                            || "Updated CLAP Mixer sidechain input mapping".to_owned(),
+                            |message| {
+                                format!("Updated CLAP Mixer sidechain input mapping; {message}")
+                            },
+                        );
+                    }
+                    Err(error) => {
+                        self.status =
+                            format!("Could not save CLAP Mixer sidechain input mapping: {error}");
+                    }
+                }
+            } else {
+                self.status = "Save the project before mapping CLAP sidechain inputs".to_owned();
             }
         }
         if let Some((insert_ordinal, slot_index)) = capture_clap_mixer_effect_state {
@@ -64375,7 +64555,7 @@ impl DawUi {
         });
         ui.label(
             egui::RichText::new(
-                "Matching VST3 instrument channels and recognized Mixer effect slots load with the project; supported VST3 Mixer effects process on loaded Mixer routes. Machine-local CLAP effect assignments process in saved Mixer slot order with timed parameter automation and reported-latency PDC. CLAP sidechains feed supported mono/stereo auxiliary inputs in source-track and bus order with PDC; runtime latency/tail reports refresh between audio blocks. Capture state reads one active effect at the next block boundary, or refreshes the prior machine-local snapshot if none is active; simultaneous active instances must be stopped to avoid an ambiguous capture. Native bus mapping and editors remain incomplete. Detected CLAP and macOS Audio Unit bundles are listed below.",
+                "Matching VST3 instrument channels and recognized Mixer effect slots load with the project; supported VST3 Mixer effects process on loaded Mixer routes. Machine-local CLAP effect assignments process in saved Mixer slot order with timed parameter automation and reported-latency PDC. CLAP sidechains use source-track and input-bus order by default, with optional machine-local source-to-input maps and summing for multiple sources on one port. PDC and runtime latency/tail reports apply between audio blocks. Capture state reads one active effect at the next block boundary, or refreshes the prior machine-local snapshot if none is active; simultaneous active instances must be stopped to avoid an ambiguous capture. Native FLP bus mapping and editors remain incomplete. Detected CLAP and macOS Audio Unit bundles are listed below.",
             )
             .color(MUTED),
         );

@@ -8,6 +8,7 @@ const VST3_PROJECT_MANUAL_LATENCY_OFFSETS_DIRECTORY: &str = "vst3-project-manual
 const CLAP_PROJECT_INSTRUMENTS_DIRECTORY: &str = "clap-project-instruments";
 const CLAP_PROJECT_MIXER_EFFECTS_DIRECTORY: &str = "clap-project-mixer-effects";
 pub const MAX_CLAP_PROJECT_PLUGIN_STATE_BYTES: usize = 32 * 1024 * 1024;
+pub const MAX_CLAP_PROJECT_MIXER_AUXILIARY_BUSES: usize = 16;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClapProjectInstrumentAssignment {
@@ -23,6 +24,8 @@ pub struct ClapProjectMixerEffectAssignment {
     pub plugin_id: String,
     pub plugin_name: String,
     pub state: Option<Vec<u8>>,
+    /// Maps source Mixer insert ordinals to CLAP auxiliary input port indices.
+    pub auxiliary_input_source_map: BTreeMap<usize, usize>,
 }
 
 fn app_settings_directory() -> Option<PathBuf> {
@@ -211,7 +214,11 @@ pub fn parse_clap_project_mixer_effects(
     contents: &str,
 ) -> BTreeMap<(usize, u16), ClapProjectMixerEffectAssignment> {
     let mut assignments = BTreeMap::new();
-    if contents.lines().next() != Some("clap-project-mixer-effects-v1") {
+    let Some(version) = contents.lines().next() else {
+        return assignments;
+    };
+    let version_two = version == "clap-project-mixer-effects-v2";
+    if !version_two && version != "clap-project-mixer-effects-v1" {
         return assignments;
     }
     for line in contents.lines().skip(1) {
@@ -247,6 +254,17 @@ pub fn parse_clap_project_mixer_effects(
         } else {
             continue;
         };
+        let auxiliary_input_source_map = if version_two {
+            let Some(encoded_map) = fields.next() else {
+                continue;
+            };
+            let Some(map) = parse_clap_mixer_auxiliary_input_source_map(encoded_map) else {
+                continue;
+            };
+            map
+        } else {
+            BTreeMap::new()
+        };
         if fields.next().is_some()
             || insert_ordinal >= crate::audio::MIXER_TRACK_METER_COUNT
             || slot_index >= 10
@@ -263,6 +281,7 @@ pub fn parse_clap_project_mixer_effects(
                 plugin_id,
                 plugin_name,
                 state,
+                auxiliary_input_source_map,
             },
         );
     }
@@ -272,7 +291,7 @@ pub fn parse_clap_project_mixer_effects(
 pub fn serialize_clap_project_mixer_effects(
     assignments: &BTreeMap<(usize, u16), ClapProjectMixerEffectAssignment>,
 ) -> String {
-    let mut contents = String::from("clap-project-mixer-effects-v1\n");
+    let mut contents = String::from("clap-project-mixer-effects-v2\n");
     for ((insert_ordinal, slot_index), assignment) in assignments {
         if *insert_ordinal >= crate::audio::MIXER_TRACK_METER_COUNT
             || *slot_index >= 10
@@ -283,6 +302,14 @@ pub fn serialize_clap_project_mixer_effects(
                 .state
                 .as_ref()
                 .is_some_and(|state| state.len() > MAX_CLAP_PROJECT_PLUGIN_STATE_BYTES)
+            || assignment
+                .auxiliary_input_source_map
+                .iter()
+                .any(|(source_track, bus_index)| {
+                    *source_track == 0
+                        || *source_track >= crate::audio::MIXER_TRACK_METER_COUNT
+                        || *bus_index >= MAX_CLAP_PROJECT_MIXER_AUXILIARY_BUSES
+                })
         {
             continue;
         }
@@ -301,9 +328,42 @@ pub fn serialize_clap_project_mixer_effects(
         } else {
             contents.push('-');
         }
+        contents.push('\t');
+        if assignment.auxiliary_input_source_map.is_empty() {
+            contents.push('-');
+        } else {
+            for (index, (source_track, bus_index)) in
+                assignment.auxiliary_input_source_map.iter().enumerate()
+            {
+                if index > 0 {
+                    contents.push(',');
+                }
+                contents.push_str(&format!("{source_track}:{bus_index}"));
+            }
+        }
         contents.push('\n');
     }
     contents
+}
+
+fn parse_clap_mixer_auxiliary_input_source_map(encoded: &str) -> Option<BTreeMap<usize, usize>> {
+    if encoded == "-" {
+        return Some(BTreeMap::new());
+    }
+    let mut mapping = BTreeMap::new();
+    for entry in encoded.split(',') {
+        let (source_track, bus_index) = entry.split_once(':')?;
+        let source_track = source_track.parse::<usize>().ok()?;
+        let bus_index = bus_index.parse::<usize>().ok()?;
+        if source_track == 0
+            || source_track >= crate::audio::MIXER_TRACK_METER_COUNT
+            || bus_index >= MAX_CLAP_PROJECT_MIXER_AUXILIARY_BUSES
+            || mapping.insert(source_track, bus_index).is_some()
+        {
+            return None;
+        }
+    }
+    Some(mapping)
 }
 
 pub fn parse_clap_project_instruments(
