@@ -1008,7 +1008,7 @@ impl MidiFile {
                     .checked_mul(loop_length)
                     .ok_or(MidiError::LengthOverflow)?;
                 for note in &pattern.notes {
-                    if excluded_project_channels.contains(&note.channel_id) {
+                    if note.is_muted() || excluded_project_channels.contains(&note.channel_id) {
                         continue;
                     }
                     let relative_start = repeat_start
