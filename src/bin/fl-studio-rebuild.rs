@@ -26060,6 +26060,7 @@ impl DawUi {
             })
             .collect::<BTreeSet<_>>();
         let stacked_clip_indices = Self::stacked_playlist_clip_indices(&arrangement.clips);
+        let overlapping_clip_indices = Self::overlapping_playlist_clip_indices(&arrangement.clips);
         let selected_track_solo_range = selected_track_ids
             .first()
             .zip(selected_track_ids.last())
@@ -26509,6 +26510,21 @@ impl DawUi {
                     .clicked()
                 {
                     self.select_muted_playlist_clips(arrangement.id, &arrangement.clips);
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        !overlapping_clip_indices.is_empty(),
+                        egui::Button::new("Select overlapping clips"),
+                    )
+                    .clicked()
+                {
+                    let selected_count = overlapping_clip_indices.len();
+                    self.set_playlist_clip_selection_to_indices(
+                        arrangement.id,
+                        overlapping_clip_indices.clone(),
+                    );
+                    self.status = format!("Selected {selected_count} overlapping Playlist clips");
                     ui.close();
                 }
                 if ui
@@ -32262,6 +32278,52 @@ impl DawUi {
             if let Some(lowest_clip) = lowest_clip {
                 selected.extend(stack.iter().copied().filter(|index| *index != lowest_clip));
             }
+        }
+        selected
+    }
+
+    fn overlapping_playlist_clip_indices(clips: &[PlaylistClip]) -> BTreeSet<usize> {
+        let mut intervals = clips
+            .iter()
+            .enumerate()
+            .filter_map(|(index, clip)| {
+                let track_index = clip.track_index?;
+                (clip.length_ticks > 0).then_some((
+                    u64::from(clip.position_ticks),
+                    u64::from(clip.position_ticks) + u64::from(clip.length_ticks),
+                    track_index,
+                    index,
+                ))
+            })
+            .collect::<Vec<_>>();
+        intervals.sort_unstable_by_key(|(start, end, track_index, index)| {
+            (*start, *end, *track_index, *index)
+        });
+
+        let mut components = Vec::<(u64, Vec<(u16, usize)>)>::new();
+        for (start, end, track_index, index) in intervals {
+            if let Some((component_end, members)) = components.last_mut()
+                && start < *component_end
+            {
+                *component_end = (*component_end).max(end);
+                members.push((track_index, index));
+            } else {
+                components.push((end, vec![(track_index, index)]));
+            }
+        }
+
+        let mut selected = BTreeSet::new();
+        for (_, component) in components
+            .into_iter()
+            .filter(|(_, members)| members.len() > 1)
+        {
+            let lowest_clip = component
+                .iter()
+                .copied()
+                .max_by_key(|(track_index, index)| (*track_index, std::cmp::Reverse(*index)));
+            selected.extend(component.into_iter().filter_map(|(_, index)| {
+                (Some(index) != lowest_clip.map(|(_, i)| i)).then_some(index)
+            }));
         }
         selected
     }
