@@ -14711,8 +14711,24 @@ impl DawUi {
                             ui.close();
                         }
                     });
-                    ui.menu_button("Render and insert selected Audio Clip…", |ui| {
-                        let can_insert = self.selected_playlist_audio_clip().is_some()
+                    let insert_audio_clips_label = if selected_audio_clips
+                        .as_ref()
+                        .is_some_and(|(_, indices)| indices.len() > 1)
+                    {
+                        "Render and insert selected Audio Clips…"
+                    } else {
+                        "Render and insert selected Audio Clip…"
+                    };
+                    let insert_audio_clip_start_choice = if selected_audio_clips
+                        .as_ref()
+                        .is_some_and(|(_, indices)| indices.len() > 1)
+                    {
+                        "At earliest clip start…"
+                    } else {
+                        "At clip start…"
+                    };
+                    ui.menu_button(insert_audio_clips_label, |ui| {
+                        let can_insert = selected_audio_clips.is_some()
                             && self.sample_project_path().is_some()
                             && self
                                 .document
@@ -14720,7 +14736,10 @@ impl DawUi {
                                 .is_some_and(project_has_audio_clip_template)
                             && self.pending_audio_clip_export.is_none();
                         if ui
-                            .add_enabled(can_insert, egui::Button::new("At clip start…"))
+                            .add_enabled(
+                                can_insert,
+                                egui::Button::new(insert_audio_clip_start_choice),
+                            )
                             .clicked()
                         {
                             self.render_selected_audio_clip_dialog(
@@ -14740,7 +14759,6 @@ impl DawUi {
                             ui.close();
                         }
                     });
-                    let selected_audio_clips = self.selected_playlist_audio_clips();
                     let consolidate_audio_clips_label = if selected_audio_clips
                         .as_ref()
                         .is_some_and(|(_, indices)| indices.len() > 1)
@@ -42431,14 +42449,7 @@ impl DawUi {
         start_from_song_start: bool,
         action: SelectedAudioClipRenderAction,
     ) {
-        let selection = match action {
-            SelectedAudioClipRenderAction::Export | SelectedAudioClipRenderAction::Consolidate => {
-                self.selected_playlist_audio_clips()
-            }
-            SelectedAudioClipRenderAction::Insert => self
-                .selected_playlist_audio_clip()
-                .map(|(arrangement_id, clip_index)| (arrangement_id, vec![clip_index])),
-        };
+        let selection = self.selected_playlist_audio_clips();
         let Some((arrangement_id, clip_indices)) = selection else {
             self.status = "Select an enabled audio-channel clip in the Playlist first".to_owned();
             return;
@@ -42680,8 +42691,13 @@ impl DawUi {
                         },
                         output_path.display()
                     ),
-                    (SelectedAudioClipRenderAction::Export, None, Some(indices)) => format!(
-                        "Rendering {} selected Playlist Audio Clips from {} to {}…",
+                    (_, None, Some(indices)) => format!(
+                        "{} {} selected Playlist Audio Clips from {} to {}…",
+                        match action {
+                            SelectedAudioClipRenderAction::Export => "Rendering",
+                            SelectedAudioClipRenderAction::Insert => "Rendering and inserting",
+                            SelectedAudioClipRenderAction::Consolidate => "Consolidating",
+                        },
                         indices.len(),
                         if options.start_from_song_start {
                             "song start"
@@ -43071,11 +43087,23 @@ impl DawUi {
                 summary.sample_rate
             )
         } else {
+            let selected_source_description = if source.source_clips.len() == 1 {
+                format!(
+                    "Playlist Audio Clip {}",
+                    source.source_clips[0].clip_index + 1
+                )
+            } else {
+                format!(
+                    "{} selected Playlist Audio Clips",
+                    source.source_clips.len()
+                )
+            };
             format!(
-                "Inserted render of selected Playlist Audio Clip {} from {} to {} at {} Hz; source unchanged",
-                source.source_clips[0].clip_index + 1,
+                "Inserted render of {selected_source_description} from {} to {} at {} Hz; sources unchanged",
                 if pending.start_from_song_start {
                     "song start"
+                } else if source.source_clips.len() > 1 {
+                    "earliest clip start"
                 } else {
                     "clip start"
                 },
