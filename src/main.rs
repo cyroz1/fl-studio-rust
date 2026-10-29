@@ -3306,6 +3306,37 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 full_source_lengths_ms,
             )
         }
+        [command, input, output, arrangement_id, start_tick, end_tick, full_source_lengths @ ..]
+            if command == "insert-playlist-time-range" =>
+        {
+            let mut full_source_lengths_ms = BTreeMap::new();
+            for value in full_source_lengths {
+                let (clip_index, length_ms) = value.split_once('=').ok_or_else(|| {
+                    format!(
+                        "invalid full-source length `{value}`; expected clip-index=milliseconds"
+                    )
+                })?;
+                let clip_index = parse_usize(clip_index, "clip index")?;
+                let length_ms = parse_f32(length_ms, "full-source sample length in milliseconds")?;
+                if full_source_lengths_ms
+                    .insert(clip_index, length_ms)
+                    .is_some()
+                {
+                    return Err(format!(
+                        "full-source sample length was provided more than once for clip {}",
+                        clip_index.saturating_add(1)
+                    ));
+                }
+            }
+            insert_playlist_time_range(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(arrangement_id, "arrangement id")?,
+                parse_u32(start_tick, "selection start tick")?,
+                parse_u32(end_tick, "selection end tick")?,
+                full_source_lengths_ms,
+            )
+        }
         [command, input, output, arrangement_id, clip_index, muted]
             if command == "set-clip-muted" =>
         {
@@ -4414,6 +4445,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild edit-clip <input.flp> <output.flp> <arrangement-id> <clip-index> <position> <length>\n",
             "  flp-rebuild delete-playlist-clip <input.flp> <output.flp> <arrangement-id> <clip-index>\n",
             "  flp-rebuild ripple-delete-playlist-time-range <input.flp> <output.flp> <arrangement-id> <start-tick> <end-tick> [clip-index=full-source-ms ...]\n",
+            "  flp-rebuild insert-playlist-time-range <input.flp> <output.flp> <arrangement-id> <start-tick> <end-tick> [clip-index=full-source-ms ...]\n",
             "  flp-rebuild set-clip-muted <input.flp> <output.flp> <arrangement-id> <clip-index> <muted:0|1>\n",
             "  flp-rebuild edit-playlist-track <input.flp> <output.flp> <track-id> <enabled:0|1|-> <grouped:0|1|->\n",
             "  flp-rebuild set-playlist-track-press <input.flp> <output.flp> <arrangement-id> <track-id> <retrigger|hold-stop|hold-motion|latch>\n",
@@ -11066,6 +11098,35 @@ fn ripple_delete_playlist_time_range(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "ripple-deleted Playlist time {start_tick}..{end_tick} in arrangement {arrangement_id} to {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn insert_playlist_time_range(
+    input: &Path,
+    output: &Path,
+    arrangement_id: u16,
+    start_tick: u32,
+    end_tick: u32,
+    full_source_lengths_ms: BTreeMap<usize, f32>,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .insert_playlist_time_range(
+            arrangement_id,
+            start_tick,
+            end_tick,
+            &full_source_lengths_ms,
+        )
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "inserted Playlist time {start_tick}..{end_tick} in arrangement {arrangement_id} to {}",
         output.display()
     );
     Ok(())
