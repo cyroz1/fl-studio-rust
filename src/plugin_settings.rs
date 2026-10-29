@@ -25,7 +25,8 @@ pub struct ClapProjectMixerEffectAssignment {
     pub plugin_name: String,
     pub state: Option<Vec<u8>>,
     /// Maps source Mixer insert ordinals to CLAP auxiliary input port indices.
-    pub auxiliary_input_source_map: BTreeMap<usize, usize>,
+    /// `None` uses stable automatic ordering; `Some(empty)` explicitly disables sidechains.
+    pub auxiliary_input_source_map: Option<BTreeMap<usize, usize>>,
 }
 
 fn app_settings_directory() -> Option<PathBuf> {
@@ -263,7 +264,7 @@ pub fn parse_clap_project_mixer_effects(
             };
             map
         } else {
-            BTreeMap::new()
+            None
         };
         if fields.next().is_some()
             || insert_ordinal >= crate::audio::MIXER_TRACK_METER_COUNT
@@ -304,11 +305,13 @@ pub fn serialize_clap_project_mixer_effects(
                 .is_some_and(|state| state.len() > MAX_CLAP_PROJECT_PLUGIN_STATE_BYTES)
             || assignment
                 .auxiliary_input_source_map
-                .iter()
-                .any(|(source_track, bus_index)| {
-                    *source_track == 0
-                        || *source_track >= crate::audio::MIXER_TRACK_METER_COUNT
-                        || *bus_index >= MAX_CLAP_PROJECT_MIXER_AUXILIARY_BUSES
+                .as_ref()
+                .is_some_and(|mapping| {
+                    mapping.iter().any(|(source_track, bus_index)| {
+                        *source_track == 0
+                            || *source_track >= crate::audio::MIXER_TRACK_METER_COUNT
+                            || *bus_index >= MAX_CLAP_PROJECT_MIXER_AUXILIARY_BUSES
+                    })
                 })
         {
             continue;
@@ -329,16 +332,16 @@ pub fn serialize_clap_project_mixer_effects(
             contents.push('-');
         }
         contents.push('\t');
-        if assignment.auxiliary_input_source_map.is_empty() {
-            contents.push('-');
-        } else {
-            for (index, (source_track, bus_index)) in
-                assignment.auxiliary_input_source_map.iter().enumerate()
-            {
-                if index > 0 {
-                    contents.push(',');
+        match &assignment.auxiliary_input_source_map {
+            None => contents.push('-'),
+            Some(mapping) if mapping.is_empty() => contents.push('!'),
+            Some(mapping) => {
+                for (index, (source_track, bus_index)) in mapping.iter().enumerate() {
+                    if index > 0 {
+                        contents.push(',');
+                    }
+                    contents.push_str(&format!("{source_track}:{bus_index}"));
                 }
-                contents.push_str(&format!("{source_track}:{bus_index}"));
             }
         }
         contents.push('\n');
@@ -346,9 +349,14 @@ pub fn serialize_clap_project_mixer_effects(
     contents
 }
 
-fn parse_clap_mixer_auxiliary_input_source_map(encoded: &str) -> Option<BTreeMap<usize, usize>> {
+fn parse_clap_mixer_auxiliary_input_source_map(
+    encoded: &str,
+) -> Option<Option<BTreeMap<usize, usize>>> {
     if encoded == "-" {
-        return Some(BTreeMap::new());
+        return Some(None);
+    }
+    if encoded == "!" {
+        return Some(Some(BTreeMap::new()));
     }
     let mut mapping = BTreeMap::new();
     for entry in encoded.split(',') {
@@ -363,7 +371,7 @@ fn parse_clap_mixer_auxiliary_input_source_map(encoded: &str) -> Option<BTreeMap
             return None;
         }
     }
-    Some(mapping)
+    Some(Some(mapping))
 }
 
 pub fn parse_clap_project_instruments(

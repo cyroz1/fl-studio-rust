@@ -53928,6 +53928,7 @@ impl DawUi {
         let mut inspect_clap_effect_path = None;
         let mut inspect_clap_instance = None;
         let mut clap_effect_sidechain_mapping_edits = Vec::new();
+        let mut clap_effect_sidechain_mapping_use_auto = Vec::new();
         let mut clap_effect_assignment_edit = None;
         let mut clap_effect_assignment_remove = None;
         let mut capture_clap_mixer_effect_state = None;
@@ -55823,24 +55824,37 @@ impl DawUi {
                                                                                 && matches!(port.channel_count, 1 | 2)
                                                                         })
                                                                         .collect::<Vec<_>>();
+                                                                    if assignment.auxiliary_input_source_map.is_some()
+                                                                        && ui.small_button("Use automatic source/bus ordering").clicked()
+                                                                    {
+                                                                        clap_effect_sidechain_mapping_use_auto.push(slot_key);
+                                                                    }
                                                                     if auxiliary_ports.is_empty() {
                                                                         ui.small("This effect has no supported mono or stereo auxiliary input ports.");
                                                                     } else {
-                                                                        if assignment
-                                                                            .auxiliary_input_source_map
-                                                                            .is_empty()
-                                                                        {
+                                                                        if assignment.auxiliary_input_source_map.is_none() {
                                                                             ui.small("Automatic source/bus ordering is active. Selecting sources switches to an explicit map; only selected sources are routed.");
+                                                                        } else if assignment
+                                                                            .auxiliary_input_source_map
+                                                                            .as_ref()
+                                                                            .is_some_and(BTreeMap::is_empty)
+                                                                        {
+                                                                            ui.small("Explicit mapping is active with no sources routed.");
                                                                         }
                                                                         for (bus_index, port) in auxiliary_ports {
-                                                                            let mapped_source_count = assignment
+                                                                            let mapping_label = assignment
                                                                                 .auxiliary_input_source_map
-                                                                                .values()
-                                                                                .filter(|mapped_bus| **mapped_bus == bus_index)
-                                                                                .count();
+                                                                                .as_ref()
+                                                                                .map(|mapping| {
+                                                                                    format!(
+                                                                                        "{} mapped",
+                                                                                        mapping.values().filter(|mapped_bus| **mapped_bus == bus_index).count()
+                                                                                    )
+                                                                                })
+                                                                                .unwrap_or_else(|| "automatic".to_owned());
                                                                             ui.menu_button(
                                                                                 format!(
-                                                                                    "{} · {mapped_source_count} source(s)",
+                                                                                    "{} · {mapping_label}",
                                                                                     port.name
                                                                                 ),
                                                                                 |menu| {
@@ -55853,7 +55867,8 @@ impl DawUi {
                                                                                             }) {
                                                                                                 let mut mapped = assignment
                                                                                                     .auxiliary_input_source_map
-                                                                                                    .get(&source.ordinal())
+                                                                            .as_ref()
+                                                                            .and_then(|mapping| mapping.get(&source.ordinal()))
                                                                                                     == Some(&bus_index);
                                                                                                 if menu
                                                                                                     .checkbox(
@@ -56379,9 +56394,17 @@ impl DawUi {
                 }
             }
         }
-        if !clap_effect_sidechain_mapping_edits.is_empty() {
+        if !clap_effect_sidechain_mapping_edits.is_empty()
+            || !clap_effect_sidechain_mapping_use_auto.is_empty()
+        {
             if let Some(project_id) = project_id.as_deref() {
                 let mut assignments = self.clap_mixer_effect_assignments.clone();
+                for slot_key in clap_effect_sidechain_mapping_use_auto {
+                    let Some(assignment) = assignments.get_mut(&slot_key) else {
+                        continue;
+                    };
+                    assignment.auxiliary_input_source_map = None;
+                }
                 for (slot_key, source_track, bus_index) in clap_effect_sidechain_mapping_edits {
                     let Some(assignment) = assignments.get_mut(&slot_key) else {
                         continue;
@@ -56389,9 +56412,12 @@ impl DawUi {
                     if let Some(bus_index) = bus_index {
                         assignment
                             .auxiliary_input_source_map
+                            .get_or_insert_with(BTreeMap::new)
                             .insert(source_track, bus_index);
                     } else {
-                        assignment.auxiliary_input_source_map.remove(&source_track);
+                        if let Some(mapping) = &mut assignment.auxiliary_input_source_map {
+                            mapping.remove(&source_track);
+                        }
                     }
                 }
                 match save_clap_project_mixer_effects(project_id, &assignments) {
