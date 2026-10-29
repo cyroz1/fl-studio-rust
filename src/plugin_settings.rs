@@ -428,9 +428,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        ClapProjectInstrumentAssignment, encode_plugin_uid, parse_clap_project_instruments,
-        parse_vst3_manual_latency_offsets, serialize_clap_project_instruments,
-        serialize_vst3_manual_latency_offsets,
+        ClapProjectInstrumentAssignment, encode_path, encode_plugin_uid,
+        parse_clap_project_instruments, parse_vst3_manual_latency_offsets,
+        serialize_clap_project_instruments, serialize_vst3_manual_latency_offsets,
     };
     use std::path::PathBuf;
 
@@ -482,13 +482,18 @@ mod tests {
 
     #[test]
     fn clap_project_instrument_assignments_read_v1_without_state() {
-        let parsed = parse_clap_project_instruments(
-            "clap-project-instruments-v1\n8\t2f746d702f78\t6964\t6e616d65\n",
+        let path = PathBuf::from("/tmp/x");
+        let contents = format!(
+            "clap-project-instruments-v1\n8\t{}\t{}\t{}\n",
+            encode_path(&path),
+            encode_plugin_uid("id"),
+            encode_plugin_uid("name"),
         );
+        let parsed = parse_clap_project_instruments(&contents);
         assert_eq!(
             parsed.get(&8),
             Some(&ClapProjectInstrumentAssignment {
-                path: PathBuf::from("/tmp/x"),
+                path,
                 plugin_id: "id".to_owned(),
                 plugin_name: "name".to_owned(),
                 state: None,
