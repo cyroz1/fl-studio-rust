@@ -1892,7 +1892,6 @@ fn playlist_performance_clap_clip_candidates(
                     .scale
                     .is_none_or(|scale| scale.is_finite() && (scale - 1.0).abs() <= 1e-9)
                 && clip.uses_full_source_window()
-                && pattern.controllers.is_empty()
                 && !notes.is_empty()
                 && notes.iter().all(|note| {
                     playlist_performance_clap_note_source_supported(

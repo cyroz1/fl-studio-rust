@@ -165,6 +165,7 @@ const PURPLE: Color32 = Color32::from_rgb(150, 93, 181);
 const ORANGE: Color32 = Color32::from_rgb(195, 129, 61);
 const RED: Color32 = Color32::from_rgb(252, 67, 46);
 const MAX_INTERNAL_LFO_AUTOMATION_POINTS: usize = 4_096;
+const MAX_CLAP_PARAMETER_AUTOMATION_POINTS: usize = 16_384;
 
 fn tempo_relative_note_division_ticks(ppq: u16, denominator: u16) -> Option<u32> {
     if ppq == 0 || !matches!(denominator, 1 | 2 | 4 | 8 | 16 | 32 | 64 | 128) {
@@ -20291,9 +20292,7 @@ impl DawUi {
         plugin_path: &Path,
         plugin_id: &str,
     ) -> Vec<ClapParameterAutomation> {
-        let (Some(project_path), Some(document)) =
-            (self.current_path.as_deref(), self.document.as_ref())
-        else {
+        let Some(document) = self.document.as_ref() else {
             return Vec::new();
         };
         let Ok(patterns) = document.patterns() else {
@@ -20302,11 +20301,29 @@ impl DawUi {
         let Some(pattern) = patterns.iter().find(|pattern| pattern.id == pattern_id) else {
             return Vec::new();
         };
+        self.pattern_clap_parameter_automations_for_pattern_target(
+            pattern,
+            channel_id,
+            plugin_path,
+            plugin_id,
+        )
+    }
+
+    fn pattern_clap_parameter_automations_for_pattern_target(
+        &self,
+        pattern: &Pattern,
+        channel_id: u16,
+        plugin_path: &Path,
+        plugin_id: &str,
+    ) -> Vec<ClapParameterAutomation> {
+        let Some(project_path) = self.current_path.as_deref() else {
+            return Vec::new();
+        };
         self.pattern_clap_parameter_links
             .iter()
             .filter(|link| {
                 project_paths_equal(Path::new(&link.project_path), project_path)
-                    && link.pattern_id == pattern_id
+                    && link.pattern_id == pattern.id
                     && link.project_channel_id == channel_id
                     && Path::new(&link.plugin_path) == plugin_path
                     && link.plugin_id == plugin_id
@@ -20640,6 +20657,10 @@ impl DawUi {
         )?;
 
         let mut notes_by_layer_route = BTreeMap::<(u16, u32, i32), Vec<ClapPlaylistNote>>::new();
+        let mut parameter_points_by_layer_route =
+            BTreeMap::<(u16, u32, i32), BTreeMap<u32, Vec<(u64, usize, usize, f64)>>>::new();
+        let mut parameter_point_counts_by_layer_route = BTreeMap::<(u16, u32, i32), usize>::new();
+        let mut expanded_automation_routes = BTreeSet::new();
         for placed in schedule.notes {
             if placed.note.velocity == 0 {
                 continue;
@@ -20650,12 +20671,72 @@ impl DawUi {
             if !placed.target_gain.is_finite() || placed.target_gain <= 0.0 {
                 continue;
             }
-            notes_by_layer_route
-                .entry((
+            let route = (
+                placed.target_channel_id,
+                placed.target_gain.to_bits(),
+                placed.target_pan_raw,
+            );
+            if expanded_automation_routes.insert((placed.clip_index, route)) {
+                let Some(clip) = arrangement.clips.get(placed.clip_index) else {
+                    continue;
+                };
+                let PlaylistClipTarget::Pattern { id: pattern_id } = clip.target() else {
+                    continue;
+                };
+                let Some(pattern) = patterns_by_id.get(&pattern_id).copied() else {
+                    continue;
+                };
+                let Some(instrument) = self
+                    .clap_pattern_playback_instruments
+                    .get(&placed.target_channel_id)
+                else {
+                    continue;
+                };
+                let lanes = self.pattern_clap_parameter_automations_for_pattern_target(
+                    pattern,
                     placed.target_channel_id,
-                    placed.target_gain.to_bits(),
-                    placed.target_pan_raw,
-                ))
+                    &instrument.path,
+                    &instrument.plugin_id,
+                );
+                let expanded_lanes = expand_clap_parameter_automation_for_clip(
+                    pattern,
+                    clip,
+                    &lanes,
+                    document.header().ppq(),
+                    document.metadata().time_signature().unwrap_or((4, 4)),
+                    true,
+                )?;
+                for lane in expanded_lanes {
+                    let point_count = parameter_point_counts_by_layer_route
+                        .entry(route)
+                        .or_default();
+                    *point_count = point_count
+                        .checked_add(lane.points.len())
+                        .filter(|count| *count <= MAX_CLAP_PARAMETER_AUTOMATION_POINTS)
+                        .ok_or_else(|| {
+                            format!(
+                                "Playlist CLAP automation exceeds {MAX_CLAP_PARAMETER_AUTOMATION_POINTS} points"
+                            )
+                        })?;
+                    let points = parameter_points_by_layer_route
+                        .entry(route)
+                        .or_default()
+                        .entry(lane.parameter_id)
+                        .or_default();
+                    points.extend(lane.points.into_iter().enumerate().map(
+                        |(point_index, point)| {
+                            (
+                                point.tick,
+                                placed.clip_index,
+                                point_index,
+                                point.normalized_value,
+                            )
+                        },
+                    ));
+                }
+            }
+            notes_by_layer_route
+                .entry(route)
                 .or_default()
                 .push(ClapPlaylistNote {
                     start_tick: placed.start_tick,
@@ -20676,9 +20757,39 @@ impl DawUi {
             .collect::<Vec<_>>();
         let ppq = document.header().ppq();
         let tempo_bpm = document.metadata().tempo_bpm().unwrap_or(140.0);
+        let mut parameter_automation_by_layer_route = parameter_points_by_layer_route
+            .into_iter()
+            .map(|(route, parameters)| {
+                let lanes = parameters
+                    .into_iter()
+                    .filter_map(|(parameter_id, mut points)| {
+                        points.sort_by_key(|point| (point.0, point.1, point.2));
+                        let mut unique_points =
+                            Vec::<ClapParameterAutomationPoint>::with_capacity(points.len());
+                        for (tick, _, _, normalized_value) in points {
+                            if let Some(previous) = unique_points.last_mut()
+                                && previous.tick == tick
+                            {
+                                previous.normalized_value = normalized_value;
+                            } else {
+                                unique_points.push(ClapParameterAutomationPoint {
+                                    tick,
+                                    normalized_value,
+                                });
+                            }
+                        }
+                        (!unique_points.is_empty()).then_some(ClapParameterAutomation {
+                            parameter_id,
+                            points: unique_points,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                (route, lanes)
+            })
+            .collect::<BTreeMap<_, _>>();
         notes_by_layer_route
             .into_iter()
-            .map(|((channel_id, layer_gain_bits, layer_pan_raw), notes)| {
+            .map(|(route @ (channel_id, layer_gain_bits, layer_pan_raw), notes)| {
                 let loop_length_ticks = notes
                     .iter()
                     .map(|note| note.stop_tick)
@@ -20716,7 +20827,9 @@ impl DawUi {
                         playlist: Some(ClapPlaylistPreviewSettings {
                             tempo_points: tempo_points.clone(),
                             notes,
-                            parameter_automation: Vec::new(),
+                            parameter_automation: parameter_automation_by_layer_route
+                                .remove(&route)
+                                .unwrap_or_default(),
                         }),
                     },
                     left_gain,
@@ -20881,6 +20994,38 @@ impl DawUi {
                             clip_index + 1
                         ));
                     }
+                    let pattern = patterns
+                        .iter()
+                        .find(|pattern| pattern.id == pattern_id)
+                        .ok_or_else(|| {
+                            format!(
+                                "Performance CLAP Pattern Clip {} has no Pattern",
+                                clip_index + 1
+                            )
+                        })?;
+                    let instrument = self
+                        .clap_pattern_playback_instruments
+                        .get(&channel_id)
+                        .ok_or_else(|| {
+                            format!(
+                                "Performance CLAP Channel {channel_id} has no assigned instrument"
+                            )
+                        })?;
+                    let automation_lanes = self
+                        .pattern_clap_parameter_automations_for_pattern_target(
+                            pattern,
+                            channel_id,
+                            &instrument.path,
+                            &instrument.plugin_id,
+                        );
+                    let parameter_automation = expand_clap_parameter_automation_for_clip(
+                        pattern,
+                        clip,
+                        &automation_lanes,
+                        ppq,
+                        document.metadata().time_signature().unwrap_or((4, 4)),
+                        false,
+                    )?;
                     let settings = ClapPatternPreviewSettings {
                         pattern_id,
                         channel_id,
@@ -20888,7 +21033,7 @@ impl DawUi {
                         tempo_bpm: tempo_map.tempo_bpm_at_tick(u64::from(clip.position_ticks)),
                         loop_length_ticks: u64::from(clip.length_ticks),
                         notes,
-                        parameter_automation: Vec::new(),
+                        parameter_automation,
                         playlist: None,
                     };
                     let (volume_automation, pan_automation) = self
@@ -63638,7 +63783,7 @@ impl DawUi {
             ui.heading(format!("Detected CLAP plug-ins ({})", clap_candidates.len()));
             ui.label(
                 egui::RichText::new(
-                "CLAP note and Pattern/channel previews render in an isolated helper, which reuses the instrument while the plug-in and output rate stay the same. Pattern transport pre-renders assigned channels at project base tempo, expands Layer notes, and follows saved Mixer routes and loaded VST3 Mixer effects. Playlist transport pre-renders assigned CLAP instruments across supported Pattern Clips and follows clip repeats, track mute/solo, and tempo changes. Performance Mode pre-renders assigned CLAP-only Pattern Clip loops for constant-tempo arrangements, with saved channel and Layer gains, pan automation, and Mixer routes. Full-song Playlist mix and Mixer stem renders also pre-render assigned instruments with saved state and linked fader/pan automation. Channel assignments and captured plug-in state are saved in machine-local settings per project path; Pattern Event automation, mixed Sampler/VST3/CLAP Performance clips, tempo-changing CLAP Performance clips, CLAP Mixer effects, scaled/source-windowed Pattern Clips, native FLP state embedding, and native plug-in editors remain unsupported.",
+                "CLAP note and Pattern/channel previews render in an isolated helper, which reuses the instrument while the plug-in and output rate stay the same. Pattern transport pre-renders assigned channels at project base tempo, expands Layer notes, and follows saved Mixer routes and loaded VST3 Mixer effects. Playlist transport pre-renders assigned CLAP instruments across supported Pattern Clips and follows clip repeats, track mute/solo, and tempo changes. Performance Mode pre-renders assigned CLAP-only Pattern Clip loops for constant-tempo arrangements, with saved channel and Layer gains, pan automation, and Mixer routes. Full-song Playlist mix and Mixer stem renders also pre-render assigned instruments with saved state, Pattern Event parameter automation, and linked fader/pan automation. Channel assignments and captured plug-in state are saved in machine-local settings per project path; mixed Sampler/VST3/CLAP Performance clips, tempo-changing CLAP Performance clips, CLAP Mixer effects, scaled/source-windowed Pattern Clips, native FLP state embedding, and native plug-in editors remain unsupported.",
                 )
                 .color(MUTED),
             );
@@ -63685,7 +63830,7 @@ impl DawUi {
                     ui.colored_label(ORANGE, error);
                 }
             }
-                ui.small("Pattern previews use project base tempo. CLAP Pattern transport expands Layer notes to assigned CLAP child channels, applies Layer gain/pan and source-channel gain/pan, and follows Mixer routes including loaded VST3 insert effects. Layer Crossfade applies when every active leaf is a Sampler, an assigned CLAP channel, or a loaded VST3 channel whose plug-in advertises Volume note expression. CLAP Playlist playback follows clip repeats, track mute/solo, Layer routing and gain/pan, and tempo automation for default-scale, full-source Pattern clips. Performance Mode launches pre-rendered CLAP-only Pattern Clip loops for constant-tempo arrangements and applies saved channel and Layer gain/pan plus linked fader/pan automation. Mixed Sampler/VST3/CLAP Performance clips, tempo-changing CLAP clips, CLAP-format Mixer effect processing, scaled/source-windowed clips, and Pattern Event automation remain unsupported. Full-song Playlist mix and Mixer stem renders also pre-render assigned CLAP instruments, including linked Playlist fader/pan automation. CLAP note-dialect plug-ins receive per-note tuning, pan, Mod X brightness, and release; MIDI 1.0/2.0 inputs receive key, velocity, channel, and release.");
+                ui.small("Pattern previews use project base tempo. CLAP Pattern transport expands Layer notes to assigned CLAP child channels, applies Layer gain/pan and source-channel gain/pan, and follows Mixer routes including loaded VST3 insert effects. Layer Crossfade applies when every active leaf is a Sampler, an assigned CLAP channel, or a loaded VST3 channel whose plug-in advertises Volume note expression. CLAP Playlist playback follows clip repeats, track mute/solo, Layer routing and gain/pan, and tempo automation for default-scale, full-source Pattern clips. Performance Mode launches pre-rendered CLAP-only Pattern Clip loops for constant-tempo arrangements and applies saved channel and Layer gain/pan, linked fader/pan automation, and Pattern Event parameter automation. Mixed Sampler/VST3/CLAP Performance clips, tempo-changing CLAP clips, CLAP-format Mixer effect processing, scaled/source-windowed clips remain unsupported. Full-song Playlist mix and Mixer stem renders also pre-render assigned CLAP instruments, including Pattern Event parameter automation and linked Playlist fader/pan automation. CLAP note-dialect plug-ins receive per-note tuning, pan, Mod X brightness, and release; MIDI 1.0/2.0 inputs receive key, velocity, channel, and release.");
             if let Ok(Some(settings)) = &clap_pattern_preview_settings {
                 ui.horizontal(|ui| {
                     if let Some(instrument) = self
@@ -70255,6 +70400,104 @@ fn pattern_lfo_loop_length_ticks(
         Some(explicit_length) => explicit_length.max(last_note_end),
         None => last_note_end.max(bar_ticks),
     }
+}
+
+fn expand_clap_parameter_automation_for_clip(
+    pattern: &Pattern,
+    clip: &PlaylistClip,
+    lanes: &[ClapParameterAutomation],
+    ppq: u16,
+    default_time_signature: (u8, u8),
+    absolute_positions: bool,
+) -> Result<Vec<ClapParameterAutomation>, String> {
+    if ppq == 0 {
+        return Err("project PPQ must be greater than zero".to_owned());
+    }
+    if clip.length_ticks == 0
+        || clip
+            .scale
+            .is_some_and(|scale| !scale.is_finite() || (scale - 1.0).abs() > 1e-9)
+    {
+        return Ok(Vec::new());
+    }
+    let clip_length = u64::from(clip.length_ticks);
+    let loop_length = pattern_lfo_loop_length_ticks(pattern, ppq, default_time_signature);
+    if loop_length == 0 {
+        return Ok(Vec::new());
+    }
+    let repetitions = clip_length.div_ceil(loop_length);
+    let mut points_by_parameter = BTreeMap::<u32, Vec<(u64, u64, usize, usize, f64)>>::new();
+    let mut expanded_point_count = 0usize;
+    for (lane_index, lane) in lanes.iter().enumerate() {
+        for repetition in 0..repetitions {
+            let repeat_start = repetition
+                .checked_mul(loop_length)
+                .ok_or_else(|| "CLAP Pattern automation repeat position overflow".to_owned())?;
+            for (point_index, point) in lane.points.iter().enumerate() {
+                if !point.normalized_value.is_finite()
+                    || !(0.0..=1.0).contains(&point.normalized_value)
+                {
+                    return Err("CLAP Pattern automation values must be normalized to 0–1".into());
+                }
+                let relative_tick = repeat_start
+                    .checked_add(point.tick)
+                    .ok_or_else(|| "CLAP Pattern automation point position overflow".to_owned())?;
+                if relative_tick >= clip_length {
+                    continue;
+                }
+                expanded_point_count = expanded_point_count
+                    .checked_add(1)
+                    .filter(|count| *count <= MAX_CLAP_PARAMETER_AUTOMATION_POINTS)
+                    .ok_or_else(|| {
+                        format!(
+                            "CLAP Pattern clip automation exceeds {MAX_CLAP_PARAMETER_AUTOMATION_POINTS} points"
+                        )
+                    })?;
+                let tick = if absolute_positions {
+                    u64::from(clip.position_ticks)
+                        .checked_add(relative_tick)
+                        .ok_or_else(|| "Playlist CLAP automation position overflow".to_owned())?
+                } else {
+                    relative_tick
+                };
+                points_by_parameter
+                    .entry(lane.parameter_id)
+                    .or_default()
+                    .push((
+                        tick,
+                        repetition,
+                        lane_index,
+                        point_index,
+                        point.normalized_value,
+                    ));
+            }
+        }
+    }
+
+    Ok(points_by_parameter
+        .into_iter()
+        .filter_map(|(parameter_id, mut points)| {
+            points.sort_by_key(|point| (point.0, point.1, point.2, point.3));
+            let mut unique_points =
+                Vec::<ClapParameterAutomationPoint>::with_capacity(points.len());
+            for (tick, _, _, _, normalized_value) in points {
+                if let Some(previous) = unique_points.last_mut()
+                    && previous.tick == tick
+                {
+                    previous.normalized_value = normalized_value;
+                } else {
+                    unique_points.push(ClapParameterAutomationPoint {
+                        tick,
+                        normalized_value,
+                    });
+                }
+            }
+            (!unique_points.is_empty()).then_some(ClapParameterAutomation {
+                parameter_id,
+                points: unique_points,
+            })
+        })
+        .collect())
 }
 
 fn should_prepare_pattern_vst3_stream(
