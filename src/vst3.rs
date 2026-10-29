@@ -4852,6 +4852,40 @@ impl Vst3HostRuntime {
         Ok(processor)
     }
 
+    /// Prepare loaded Mixer effects for an offline Audio Clip render.
+    ///
+    /// Audio Clip callers render the source into the processor's Mixer buses, then the processor
+    /// applies the active insert and Master chains, reported tails, and automatic PDC.
+    pub fn prepare_audio_clip_mixer_effects_processor(
+        &self,
+        document: &FlpDocument,
+        arrangement_id: u16,
+        output_sample_rate: u32,
+        mixer_effect_instances: &BTreeMap<(usize, u16), u64>,
+    ) -> Result<Vst3PlaylistStreamProcessor, String> {
+        let mut processor = self.prepare_playlist_stream_with_automation_sources(
+            document,
+            PlaylistRenderOptions {
+                arrangement_id,
+                sample_rate: output_sample_rate,
+                ..PlaylistRenderOptions::default()
+            },
+            &BTreeMap::new(),
+            false,
+            &Vst3PlaylistAutomationSources::default(),
+        )?;
+        self.attach_mixer_effects(
+            document,
+            mixer_effect_instances,
+            &mut processor,
+            true,
+            false,
+            &BTreeMap::new(),
+            None,
+        )?;
+        Ok(processor)
+    }
+
     /// Render one Pattern through its loaded VST3 instruments and the project's loaded Mixer FX.
     ///
     /// The prepared Pattern stream applies the same channel routing, effect automation, and PDC

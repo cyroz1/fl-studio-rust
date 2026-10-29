@@ -2155,7 +2155,8 @@ fn take_mixer_insert_peaks(meters: &MixerTrackPeakMeters) -> Vec<MixerInsertPeak
 /// 88-byte tick windows convert at the project base tempo. The raw volume/pan mapping is
 /// provisional and has not been compared against native FL Studio output. Unstretched sources
 /// follow project Master pitch when their channel enables it. Tempo-sync and time-stretch modes,
-/// Pattern instruments, plug-ins, and Mixer effects are not rendered.
+/// Pattern instruments, and plug-ins are not rendered by this source-mix path; the selected
+/// single-clip file renderer can apply loaded VST3 Mixer effects.
 pub fn render_audio_clips_to_wav(
     document: &FlpDocument,
     project_path: impl AsRef<Path>,
@@ -2198,6 +2199,63 @@ pub fn render_audio_clips_to_file(
         },
         output_format,
     )?;
+    Ok(summary)
+}
+
+/// Render one selected Audio Clip through prepared loaded Mixer effects to an audio file.
+pub fn render_selected_audio_clip_to_file_with_mixer_effects(
+    document: &FlpDocument,
+    project_path: impl AsRef<Path>,
+    options: AudioClipRenderOptions,
+    output_path: impl AsRef<Path>,
+    output_format: AudioRenderOutput,
+    mut processor: Vst3PlaylistStreamProcessor,
+) -> Result<AudioClipRenderSummary, String> {
+    if options.clip_index.is_none() {
+        return Err("Mixer-effect Audio Clip renders require one selected clip".to_owned());
+    }
+    let project_path = project_path.as_ref();
+    let output_path = output_path.as_ref();
+    validate_output_path_with_extension(project_path, output_path, output_format.extension())?;
+    if processor.summary().sample_rate != options.sample_rate {
+        return Err("Audio Clip and Mixer effect sample rates do not match".to_owned());
+    }
+
+    let render = prepare_audio_clip_render(document, project_path, options.clone(), false, None)?;
+    require_audio_clips(&render)?;
+    processor.extend_to_output_frames(render.summary.frames.max(processor.content_frames()))?;
+    let processor_summary = processor.summary();
+    let trim_frames = processor
+        .pdc_render_start_trim_frames()
+        .min(processor_summary.frames);
+    let master_output = MixerMasterOutput::from_document(document);
+
+    processor.start_processing()?;
+    let render_result = render_stereo_audio_to_file(
+        output_path,
+        processor_summary.frames.saturating_sub(trim_frames),
+        processor_summary.sample_rate,
+        AudioRenderEncodingOptions {
+            wav_sample_format: options.wav_sample_format,
+            wav_dither_mode: options.wav_dither_mode,
+            wav_channel_mode: options.wav_channel_mode,
+        },
+        output_format,
+        |write_block| {
+            stream_prepared_audio_clip_render_with_mixer_effects(
+                &render,
+                &mut processor,
+                processor_summary.frames,
+                trim_frames,
+                &master_output,
+                || false,
+                write_block,
+            )
+        },
+    );
+    let stop_result = processor.stop_processing();
+    let summary = render_result?;
+    stop_result?;
     Ok(summary)
 }
 
@@ -8300,6 +8358,70 @@ fn stream_prepared_audio_clip_render(
         block_start += frame_count as u64;
     }
     Ok(())
+}
+
+fn stream_prepared_audio_clip_render_with_mixer_effects(
+    render: &PreparedAudioClipRender,
+    processor: &mut Vst3PlaylistStreamProcessor,
+    render_frames: u64,
+    trim_frames: u64,
+    master_output: &MixerMasterOutput,
+    mut stream_cancelled: impl FnMut() -> bool,
+    mut write_block: impl FnMut(&[f32]) -> Result<(), String>,
+) -> Result<AudioClipRenderSummary, String> {
+    crate::audio::enable_denormal_protection();
+    let cancelled = AtomicBool::new(false);
+    let context = PreparedAudioClipMixContext {
+        clips: &render.clips,
+        audio_sources: &render.audio_sources,
+        sample_rate: render.summary.sample_rate,
+        resampling_quality: render.resampling_quality,
+        cancelled: &cancelled,
+        live_mixer_source_targets: None,
+    };
+    let mut block = vec![0.0f32; STREAM_BLOCK_FRAMES * 2];
+    let mut mixer_buses = Vec::new();
+    let mut block_start = 0u64;
+    while block_start < render_frames {
+        check_cancelled(Some(&cancelled))?;
+        if stream_cancelled() {
+            return Err("audio clip render was stopped".to_owned());
+        }
+        let frame_count = (render_frames - block_start).min(STREAM_BLOCK_FRAMES as u64) as usize;
+        let sample_count = frame_count * 2;
+        let block_samples = &mut block[..sample_count];
+        block_samples.fill(0.0);
+        let bus_samples = sample_count
+            .checked_mul(MIXER_TRACK_METER_COUNT)
+            .and_then(|samples| samples.checked_mul(2))
+            .ok_or_else(|| "Audio Clip Mixer effect bus size overflow".to_owned())?;
+        mixer_buses.resize(bus_samples, 0.0);
+        mixer_buses.fill(0.0);
+        mix_prepared_audio_clip_block(
+            &context,
+            block_start,
+            block_samples,
+            Some(&mut mixer_buses),
+            None,
+        )?;
+        processor.mix_next_block_with_meter_buses(block_samples, &mut mixer_buses)?;
+        master_output.apply(block_samples);
+
+        let skipped_frames = trim_frames
+            .saturating_sub(block_start)
+            .min(frame_count as u64);
+        if skipped_frames < frame_count as u64 {
+            let skip_samples = usize::try_from(skipped_frames)
+                .ok()
+                .and_then(|frames| frames.checked_mul(2))
+                .ok_or_else(|| "Audio Clip PDC trim overflow".to_owned())?;
+            write_block(&block_samples[skip_samples..])?;
+        }
+        block_start += frame_count as u64;
+    }
+    let mut summary = render.summary.clone();
+    summary.frames = render_frames.saturating_sub(trim_frames);
+    Ok(summary)
 }
 
 fn render_audio_clips_to_stereo_buffer_inner(

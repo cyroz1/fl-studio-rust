@@ -58,8 +58,8 @@ use flp_rebuild::sample_render::{
     render_playlist_with_vst3_to_flac_cancellable, render_playlist_with_vst3_to_mp3_cancellable,
     render_playlist_with_vst3_to_ogg_cancellable, render_playlist_with_vst3_to_wav_cancellable,
     render_sampler_pattern_to_file, render_sampler_pattern_to_file_with_mixer_effects,
-    sampler_live_note_queue, stream_input_monitor_through_mixer,
-    stream_mixed_layer_midi_input_to_device,
+    render_selected_audio_clip_to_file_with_mixer_effects, sampler_live_note_queue,
+    stream_input_monitor_through_mixer, stream_mixed_layer_midi_input_to_device,
     stream_pattern_loop_with_vst3_from_tick_to_device_with_live_controls,
     stream_pattern_with_vst3_to_device_with_live_controls,
     stream_playlist_performance_with_vst3_to_device,
@@ -42237,6 +42237,29 @@ impl DawUi {
             self.status = "An audio clip render is already running".to_owned();
             return;
         }
+        let mixer_effect_processor = if options.clip_index.is_none()
+            || self.mixer_effect_vst3_instances.is_empty()
+        {
+            None
+        } else {
+            let Some(host) = self.vst3_host.as_ref() else {
+                self.status = "VST3 host is not initialized".to_owned();
+                return;
+            };
+            match host.prepare_audio_clip_mixer_effects_processor(
+                document,
+                options.arrangement_id,
+                options.sample_rate,
+                &self.mixer_effect_vst3_instances,
+            ) {
+                Ok(processor) => Some(processor),
+                Err(error) => {
+                    self.status =
+                        format!("Could not prepare Mixer effects for Audio Clip render: {error}");
+                    return;
+                }
+            }
+        };
         let document = document.clone();
         let package_workspace = self.package_workspace.clone();
         let output_path_for_worker = output_path.clone();
@@ -42246,13 +42269,23 @@ impl DawUi {
             .name("playlist-audio-clip-render".to_owned())
             .spawn(move || {
                 let _package_workspace = package_workspace;
-                let result = render_audio_clips_to_file(
-                    &document,
-                    &project_path,
-                    worker_options,
-                    &output_path_for_worker,
-                    output_format,
-                );
+                let result = match mixer_effect_processor {
+                    Some(processor) => render_selected_audio_clip_to_file_with_mixer_effects(
+                        &document,
+                        &project_path,
+                        worker_options,
+                        &output_path_for_worker,
+                        output_format,
+                        processor,
+                    ),
+                    None => render_audio_clips_to_file(
+                        &document,
+                        &project_path,
+                        worker_options,
+                        &output_path_for_worker,
+                        output_format,
+                    ),
+                };
                 let _ = sender.send(result);
             });
         match worker {
