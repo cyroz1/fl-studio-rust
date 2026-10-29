@@ -18089,7 +18089,7 @@ mod tests {
             vec![
                 Vst3PlaylistAutomationPoint {
                     tick: 500,
-                    value: 0.2,
+                    value: 0.4,
                     tension: 0.0,
                 },
                 Vst3PlaylistAutomationPoint {
