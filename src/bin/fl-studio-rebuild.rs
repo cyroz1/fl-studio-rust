@@ -35432,6 +35432,7 @@ impl DawUi {
         let mut delete_all_markers = false;
         let mut create_selection_markers = false;
         let mut create_markers_every_bars: Option<u8> = None;
+        let mut apply_signature_to_selection = false;
         ui.separator();
         ui.horizontal(|ui| {
             ui.strong("Time markers");
@@ -35557,6 +35558,15 @@ impl DawUi {
             }
             ui.text_edit_singleline(&mut self.new_time_marker_name);
             create_marker = ui.button("Add marker").clicked();
+            apply_signature_to_selection = ui
+                .add_enabled(
+                    selection_bounds.is_some() && self.new_time_marker_is_signature,
+                    egui::Button::new("Apply to selection"),
+                )
+                .on_hover_text(
+                    "Apply this time signature across the selected range and restore the previous signature at its end",
+                )
+                .clicked();
         });
 
         if delete_selected {
@@ -35608,6 +35618,73 @@ impl DawUi {
                 }
                 Err(error) => {
                     self.status = format!("Could not delete Playlist time markers: {error}");
+                }
+            }
+        } else if apply_signature_to_selection {
+            if let Some((start_tick, end_tick)) = selection_bounds {
+                let has_internal_signature_change = markers.iter().any(|marker| {
+                    marker.is_signature()
+                        && marker.position_ticks() > start_tick
+                        && marker.position_ticks() < end_tick
+                });
+                let result = if has_internal_signature_change {
+                    Err("the selected range contains an existing time-signature marker".to_owned())
+                } else {
+                    let previous_signature = playlist_signature_at_tick(
+                        initial_time_signature,
+                        &signature_changes,
+                        start_tick,
+                    );
+                    self.document
+                        .as_ref()
+                        .cloned()
+                        .ok_or_else(|| "no project is open".to_owned())
+                        .and_then(|mut document| {
+                            document
+                                .create_time_marker(
+                                    arrangement_id,
+                                    TimeMarkerEdit {
+                                        position_ticks: Some(start_tick),
+                                        is_signature: Some(true),
+                                        numerator: Some(self.new_time_marker_numerator.max(1)),
+                                        denominator: Some(self.new_time_marker_denominator.max(1)),
+                                        ..TimeMarkerEdit::default()
+                                    },
+                                )
+                                .map_err(|error| error.to_string())?;
+                            let end_index = document
+                                .create_time_marker(
+                                    arrangement_id,
+                                    TimeMarkerEdit {
+                                        position_ticks: Some(end_tick),
+                                        is_signature: Some(true),
+                                        numerator: Some(previous_signature.0),
+                                        denominator: Some(previous_signature.1),
+                                        ..TimeMarkerEdit::default()
+                                    },
+                                )
+                                .map_err(|error| error.to_string())?;
+                            Ok((document, end_index, previous_signature))
+                        })
+                };
+                match result {
+                    Ok((document, end_index, previous_signature)) => {
+                        self.stop_project_playback();
+                        self.document = Some(document);
+                        self.selected_time_marker = Some(end_index);
+                        self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+                        self.status = format!(
+                            "Applied {}/{} to ticks {start_tick}–{end_tick}; restored {}/{} at the end",
+                            self.new_time_marker_numerator.max(1),
+                            self.new_time_marker_denominator.max(1),
+                            previous_signature.0,
+                            previous_signature.1
+                        );
+                    }
+                    Err(error) => {
+                        self.status = format!("Could not apply time signature: {error}");
+                    }
                 }
             }
         } else if create_selection_markers {
