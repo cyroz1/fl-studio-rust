@@ -42838,14 +42838,9 @@ impl DawUi {
         };
         let project_fingerprint: [u8; 16] = Md5::digest(&project_bytes).into();
 
-        let tempo_channel_ids = channels
+        let automation_channel_ids = channels
             .iter()
-            .filter(|channel| {
-                channel.kind() == Some(5)
-                    && channel
-                        .display_name()
-                        .is_some_and(|name| name.eq_ignore_ascii_case("TEMPO"))
-            })
+            .filter(|channel| channel.kind() == Some(5))
             .map(ChannelSummary::id)
             .collect::<BTreeSet<_>>();
         let clips_to_remove = arrangement
@@ -42853,11 +42848,11 @@ impl DawUi {
             .iter()
             .enumerate()
             .filter_map(|(index, candidate)| {
-                let is_tempo_clip = matches!(
+                let is_automation_clip = matches!(
                     candidate.target(),
-                    PlaylistClipTarget::Channel { id } if tempo_channel_ids.contains(&id)
+                    PlaylistClipTarget::Channel { id } if automation_channel_ids.contains(&id)
                 );
-                (index != clip_index && !is_tempo_clip).then_some(index)
+                (index != clip_index && !is_automation_clip).then_some(index)
             })
             .collect::<Vec<_>>();
         let mut render_document = document.clone();
@@ -42889,7 +42884,7 @@ impl DawUi {
         let options = PlaylistRenderOptions {
             arrangement_id,
             sample_rate: self.audio_settings.sample_rate,
-            soloed_playlist_track_range: Some((track_id, track_id)),
+            soloed_playlist_track_range: None,
             read_sample_root_note: self.read_sample_root_note,
             clip_envelopes: self.playlist_audio_clip_envelopes_for_current_project(arrangement_id),
             wav_sample_format: self.playlist_render_format,
@@ -42902,15 +42897,22 @@ impl DawUi {
             tail_mode: self.playlist_render_tail_mode,
             ..PlaylistRenderOptions::default()
         };
-        let playlist_parameter_automation = self.vst3_playlist_automation_sources(&render_document);
+        let linked_automation_sources = self.vst3_playlist_automation_sources(&render_document);
+        let playlist_parameter_automation = Vst3PlaylistAutomationSources {
+            pattern_clips: linked_automation_sources.pattern_clips,
+            mixer_effect_pattern_clips: linked_automation_sources.mixer_effect_pattern_clips,
+            mixer_effect_automation_clips: linked_automation_sources.mixer_effect_automation_clips,
+            ..Vst3PlaylistAutomationSources::default()
+        };
         let vst3_processor = self
             .vst3_host
             .as_ref()
             .map(|host| {
-                host.prepare_playlist_stream_with_automation_sources(
+                host.prepare_playlist_stream_with_mixer_effects_and_automation_sources(
                     &render_document,
                     options.clone(),
                     &self.channel_vst3_instances,
+                    &self.mixer_effect_vst3_instances,
                     self.playlist_render_include_plugin_tails,
                     &playlist_parameter_automation,
                 )
@@ -42919,7 +42921,9 @@ impl DawUi {
         let vst3_processor = match vst3_processor {
             Ok(processor) => processor,
             Err(error) => {
-                self.status = format!("Could not prepare Playlist VST3 instruments: {error}");
+                self.status = format!(
+                    "Could not prepare Playlist VST3 instruments or Mixer effects: {error}"
+                );
                 return;
             }
         };
