@@ -5150,6 +5150,7 @@ struct DawUi {
     selected_arrangement: Option<u16>,
     selected_clip: Option<usize>,
     selected_playlist_clips: BTreeSet<usize>,
+    playlist_time_selection: Option<(u16, u32, u32)>,
     playlist_selection_anchor: Option<usize>,
     selected_playlist_track: Option<u32>,
     selected_playlist_tracks: BTreeSet<u32>,
@@ -7517,6 +7518,7 @@ impl DawUi {
             selected_arrangement: None,
             selected_clip: None,
             selected_playlist_clips: BTreeSet::new(),
+            playlist_time_selection: None,
             playlist_selection_anchor: None,
             selected_playlist_track: None,
             selected_playlist_tracks: BTreeSet::new(),
@@ -8902,6 +8904,7 @@ impl DawUi {
                 self.rack_selection_anchor = self.selected_graph_channel;
                 self.selected_clip = None;
                 self.selected_playlist_clips.clear();
+                self.playlist_time_selection = None;
                 self.playlist_selection_anchor = None;
                 self.selected_playlist_track = None;
                 self.selected_playlist_tracks.clear();
@@ -12214,6 +12217,7 @@ impl DawUi {
         self.selected_note = None;
         self.selected_clip = None;
         self.selected_playlist_clips.clear();
+        self.playlist_time_selection = None;
         self.playlist_selection_anchor = None;
         self.selected_playlist_track = None;
         self.selected_playlist_tracks.clear();
@@ -26503,6 +26507,13 @@ impl DawUi {
                     ui.close();
                 }
                 if ui
+                    .button("Select time around selection (Ctrl/Cmd+Enter)")
+                    .clicked()
+                {
+                    self.select_time_around_playlist_selection();
+                    ui.close();
+                }
+                if ui
                     .add_enabled(
                         arrangement.clips.iter().any(PlaylistClip::is_muted),
                         egui::Button::new("Select muted clips"),
@@ -26548,8 +26559,14 @@ impl DawUi {
                 }
                 if ui
                     .add_enabled(
-                        !self.selected_playlist_clips.is_empty() || self.selected_clip.is_some(),
-                        egui::Button::new("Deselect clips (Ctrl/Cmd+D)"),
+                        !self.selected_playlist_clips.is_empty()
+                            || self.selected_clip.is_some()
+                            || self
+                                .playlist_time_selection
+                                .is_some_and(|(selected_arrangement, _, _)| {
+                                    selected_arrangement == arrangement.id
+                                }),
+                        egui::Button::new("Deselect clips and time (Ctrl/Cmd+D)"),
                     )
                     .clicked()
                 {
@@ -26949,6 +26966,29 @@ impl DawUi {
                     }
                     let painter = ui.painter_at(ruler_rect);
                     painter.rect_filled(ruler_rect, 0, PANEL_DARK);
+                    if let Some((selection_arrangement, start_tick, end_tick)) =
+                        self.playlist_time_selection
+                        && selection_arrangement == arrangement.id
+                    {
+                        let selection_rect = egui::Rect::from_min_max(
+                            egui::pos2(
+                                ruler_rect.left() + start_tick as f32 * tick_scale,
+                                ruler_rect.top(),
+                            ),
+                            egui::pos2(
+                                ruler_rect.left() + end_tick as f32 * tick_scale,
+                                ruler_rect.bottom(),
+                            ),
+                        )
+                        .intersect(ruler_rect);
+                        if selection_rect.is_positive() {
+                            painter.rect_filled(
+                                selection_rect,
+                                0,
+                                Color32::from_rgba_unmultiplied(73, 128, 174, 32),
+                            );
+                        }
+                    }
                     for (measure_tick, measure_number) in &measure_boundaries {
                         let x = ruler_rect.left() + *measure_tick as f32 * tick_scale;
                         painter.line_segment(
@@ -27789,6 +27829,29 @@ impl DawUi {
                             .allocate_exact_size(Vec2::new(grid_width, row_height), Sense::hover());
                         let painter = ui.painter_at(grid_rect);
                         painter.rect_filled(grid_rect, 0, PANEL_DARK);
+                        if let Some((selection_arrangement, start_tick, end_tick)) =
+                            self.playlist_time_selection
+                            && selection_arrangement == arrangement.id
+                        {
+                            let selection_rect = egui::Rect::from_min_max(
+                                egui::pos2(
+                                    grid_rect.left() + start_tick as f32 * tick_scale,
+                                    grid_rect.top(),
+                                ),
+                                egui::pos2(
+                                    grid_rect.left() + end_tick as f32 * tick_scale,
+                                    grid_rect.bottom(),
+                                ),
+                            )
+                            .intersect(grid_rect);
+                            if selection_rect.is_positive() {
+                                painter.rect_filled(
+                                    selection_rect,
+                                    0,
+                                    Color32::from_rgba_unmultiplied(73, 128, 174, 32),
+                                );
+                            }
+                        }
                         painter.line_segment(
                             [grid_rect.left_bottom(), grid_rect.right_bottom()],
                             Stroke::new(1.0, GRID),
@@ -32344,11 +32407,88 @@ impl DawUi {
         self.selected_playlist_clips = selection;
     }
 
+    fn select_time_around_playlist_selection(&mut self) {
+        let selection = self.document.as_ref().and_then(|document| {
+            let arrangements = document.arrangements().ok()?;
+            let arrangement = self
+                .selected_arrangement
+                .and_then(|arrangement_id| {
+                    arrangements
+                        .iter()
+                        .find(|arrangement| arrangement.id == arrangement_id)
+                })
+                .or_else(|| arrangements.first())?;
+            let has_clip_selection = self.selected_arrangement == Some(arrangement.id)
+                && (!self.selected_playlist_clips.is_empty() || self.selected_clip.is_some());
+
+            let time_range = if has_clip_selection {
+                let selected_indices = if self.selected_playlist_clips.is_empty() {
+                    self.selected_clip.into_iter().collect::<Vec<_>>()
+                } else {
+                    self.selected_playlist_clips
+                        .iter()
+                        .copied()
+                        .collect::<Vec<_>>()
+                };
+                selected_indices
+                    .into_iter()
+                    .filter_map(|index| arrangement.clips.get(index))
+                    .filter(|clip| clip.length_ticks > 0)
+                    .fold(None::<(u32, u32)>, |range, clip| {
+                        let clip_start = clip.position_ticks;
+                        let clip_end = clip_start.saturating_add(clip.length_ticks);
+                        Some(range.map_or((clip_start, clip_end), |(start, end)| {
+                            (start.min(clip_start), end.max(clip_end))
+                        }))
+                    })
+            } else {
+                self.playlist_grid_viewport.map(|viewport| {
+                    let zoom = self.timeline_zoom.max(0.001);
+                    let start_tick =
+                        (self.playlist_grid_scroll_offset.x - PLAYLIST_LABEL_WIDTH).max(0.0) / zoom;
+                    let visible_tick_width =
+                        (viewport.width() - PLAYLIST_LABEL_WIDTH).max(0.0) / zoom;
+                    let start = start_tick.floor().clamp(0.0, u32::MAX as f32) as u32;
+                    let end = (start_tick + visible_tick_width)
+                        .ceil()
+                        .clamp(0.0, u32::MAX as f32) as u32;
+                    (start, end)
+                })
+            };
+
+            Some((arrangement.id, time_range, has_clip_selection))
+        });
+        let (arrangement_id, start, end) = match selection {
+            Some((arrangement_id, Some((start, end)), _)) => (arrangement_id, start, end),
+            Some((_, None, true)) => {
+                self.status = "Selected Playlist clips have no timeline duration".to_owned();
+                return;
+            }
+            Some((_, None, false)) => {
+                self.status = "Playlist time viewport is not available".to_owned();
+                return;
+            }
+            None => {
+                self.status = "No Playlist arrangement is available to select".to_owned();
+                return;
+            }
+        };
+        if end <= start {
+            self.status = "Playlist time viewport is not available".to_owned();
+            return;
+        }
+
+        self.selected_arrangement = Some(arrangement_id);
+        self.playlist_time_selection = Some((arrangement_id, start, end));
+        self.status = format!("Selected Playlist time from {start} to {end} ticks");
+    }
+
     fn deselect_playlist_clips(&mut self) {
         self.selected_clip = None;
         self.selected_playlist_clips.clear();
+        self.playlist_time_selection = None;
         self.playlist_selection_anchor = None;
-        self.status = "Deselected Playlist clips".to_owned();
+        self.status = "Deselected Playlist clips and time selection".to_owned();
     }
 
     fn invert_playlist_clip_selection(&mut self) {
@@ -68317,6 +68457,7 @@ impl eframe::App for DawUi {
             select_all_playlist_clips_requested,
             deselect_playlist_clips_requested,
             invert_playlist_clip_selection_requested,
+            select_playlist_time_around_clips_requested,
         ) = if playlist_clip_shortcuts_enabled {
             ui.input_mut(|input| {
                 (
@@ -68328,10 +68469,13 @@ impl eframe::App for DawUi {
                     input.consume_key(egui::Modifiers::COMMAND, egui::Key::A),
                     input.consume_key(egui::Modifiers::COMMAND, egui::Key::D),
                     input.consume_key(egui::Modifiers::SHIFT, egui::Key::I),
+                    input.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter),
                 )
             })
         } else {
-            (false, false, false, false, false, false, false, false)
+            (
+                false, false, false, false, false, false, false, false, false,
+            )
         };
         if copy_playlist_clip_requested {
             self.copy_selected_playlist_clip();
@@ -68354,6 +68498,9 @@ impl eframe::App for DawUi {
         }
         if invert_playlist_clip_selection_requested {
             self.invert_playlist_clip_selection();
+        }
+        if select_playlist_time_around_clips_requested {
+            self.select_time_around_playlist_selection();
         }
         let delete_playlist_clip_requested = self.view == MainView::Playlist
             && self.selected_clip.is_some()
