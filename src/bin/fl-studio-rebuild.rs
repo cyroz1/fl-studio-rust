@@ -15309,6 +15309,7 @@ impl DawUi {
             .as_ref()
             .map_or(96, |document| document.header().ppq());
         let bars = self.recording_precount_bars;
+        let click_samples = self.metronome_click_samples();
         let samples = render_recording_precount_samples(
             sample_rate,
             ppq,
@@ -15316,8 +15317,7 @@ impl DawUi {
             start_tick,
             signature,
             bars,
-            self.metronome_accent_sample.as_deref(),
-            self.metronome_beat_sample.as_deref(),
+            click_samples.as_deref(),
         )?;
         let duration =
             Duration::from_secs_f64((samples.len() / 2) as f64 / f64::from(sample_rate.max(1)));
@@ -77493,9 +77493,10 @@ fn decode_metronome_click_sample(path: &Path) -> Result<MetronomeClickSample, St
     const SAMPLE_RATE: u32 = 48_000;
     const MAX_SECONDS: f64 = 10.0;
     let interleaved = decode_audio_preview(path, SAMPLE_RATE, Some(MAX_SECONDS))?;
-    let mut left = Vec::with_capacity(interleaved.len() / 2);
-    let mut right = Vec::with_capacity(interleaved.len() / 2);
-    for frame in interleaved.chunks_exact(2) {
+    let (frames, _) = interleaved.as_chunks::<2>();
+    let mut left = Vec::with_capacity(frames.len());
+    let mut right = Vec::with_capacity(frames.len());
+    for frame in frames {
         left.push(frame[0]);
         right.push(frame[1]);
     }
@@ -80428,8 +80429,7 @@ fn render_recording_precount_samples(
     start_tick: u32,
     time_signature: (u8, u8),
     bars: u8,
-    accent_sample: Option<&MetronomeClickSample>,
-    beat_sample: Option<&MetronomeClickSample>,
+    click_samples: Option<&MetronomeClickSamples>,
 ) -> Result<Vec<f32>, String> {
     if sample_rate == 0 || ppq == 0 || bars == 0 {
         return Err(
@@ -80461,7 +80461,13 @@ fn render_recording_precount_samples(
             continue;
         }
         let accented = beat % u32::from(numerator) == 0;
-        let custom_sample = if accented { accent_sample } else { beat_sample };
+        let custom_sample = click_samples.and_then(|samples| {
+            if accented {
+                samples.accent.as_deref()
+            } else {
+                samples.beat.as_deref()
+            }
+        });
         let click_frames = custom_sample.map_or(default_click_frames, |sample| {
             (sample.duration_seconds() * f64::from(sample_rate)).ceil() as u64
         });
