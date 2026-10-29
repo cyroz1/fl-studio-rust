@@ -60,8 +60,8 @@ use flp_rebuild::sample_render::{
     layer_live_input_queue, nearest_playlist_audio_clip_zero_crossing_tick,
     playlist_audio_clip_fade_gain, playlist_performance_clip_indices_with_vst3,
     playlist_performance_static_document_with_vst3, playlist_performance_vst3_channel_ids,
-    playlist_performance_vst3_clip_indices, render_audio_clips_to_file,
-    render_playlist_mixer_stems_with_vst3_cancellable,
+    playlist_performance_vst3_clip_indices, project_channel_stereo_output_gains,
+    render_audio_clips_to_file, render_playlist_mixer_stems_with_vst3_cancellable,
     render_playlist_with_vst3_to_file_from_frame_cancellable,
     render_playlist_with_vst3_to_flac_cancellable, render_playlist_with_vst3_to_mp3_cancellable,
     render_playlist_with_vst3_to_ogg_cancellable, render_playlist_with_vst3_to_wav_cancellable,
@@ -20892,8 +20892,23 @@ impl DawUi {
                     self.status = "Prepared CLAP Playlist audio exceeds the 512 MiB limit".into();
                     return;
                 }
+                let Some(document) = self.document.as_ref() else {
+                    self.pending_clap_playlist_playback = None;
+                    return;
+                };
+                let Some((left_gain, right_gain)) =
+                    project_channel_stereo_output_gains(document, channel_id)
+                else {
+                    self.pending_clap_playlist_playback = None;
+                    self.status = format!(
+                        "CLAP Playlist source Channel {channel_id} disappeared during preparation"
+                    );
+                    return;
+                };
                 pending.audio_layers.push(PlaylistAudioLayer {
                     channel_id,
+                    left_gain,
+                    right_gain,
                     samples,
                 });
             }

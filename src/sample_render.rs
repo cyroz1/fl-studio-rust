@@ -742,12 +742,16 @@ pub struct PatternAudioLayer {
 #[derive(Clone, Debug)]
 pub struct PlaylistAudioLayer {
     pub channel_id: u16,
+    pub left_gain: f32,
+    pub right_gain: f32,
     pub samples: Vec<f32>,
 }
 
 impl PartialEq for PlaylistAudioLayer {
     fn eq(&self, other: &Self) -> bool {
         self.channel_id == other.channel_id
+            && self.left_gain.to_bits() == other.left_gain.to_bits()
+            && self.right_gain.to_bits() == other.right_gain.to_bits()
             && self.samples.len() == other.samples.len()
             && self
                 .samples
@@ -6917,11 +6921,12 @@ fn mix_playlist_clap_audio_layers(
         let source_end = (end_frame * 2) as usize;
         let target_start = ((start_frame - block_start) * 2) as usize;
         let target_end = target_start + source_end - source_start;
-        for (target, source) in output[target_start..target_end]
-            .iter_mut()
-            .zip(&layer.samples[source_start..source_end])
+        for (target_frame, source_frame) in output[target_start..target_end]
+            .chunks_exact_mut(2)
+            .zip(layer.samples[source_start..source_end].chunks_exact(2))
         {
-            *target += *source;
+            target_frame[0] += source_frame[0] * layer.left_gain;
+            target_frame[1] += source_frame[1] * layer.right_gain;
         }
     }
 }
@@ -15789,6 +15794,20 @@ pub(crate) fn channel_gain_pan(volume: Option<u32>, pan: Option<i32>) -> (f32, f
     (gain, pan)
 }
 
+/// Return stereo output gains for a project channel's saved volume and pan controls.
+pub fn project_channel_stereo_output_gains(
+    document: &FlpDocument,
+    channel_id: u16,
+) -> Option<(f32, f32)> {
+    let channel = document
+        .channels()
+        .into_iter()
+        .find(|channel| channel.id() == channel_id)?;
+    let (gain, pan) = channel_gain_pan(channel.volume(), channel.pan());
+    let (left_pan, right_pan) = channel_pan_gains(pan, false, project_pan_law(document));
+    Some((gain * left_pan, gain * right_pan))
+}
+
 /// Returns the steady-state fallback for a Sampler Volume envelope when full timing is unavailable.
 ///
 /// The envelope's saved raw time minimum (100) is documented as 0%, so an envelope whose
@@ -16507,6 +16526,8 @@ mod tests {
     fn playlist_clap_audio_layers_mix_at_their_absolute_timeline_frames() {
         let layer = PlaylistAudioLayer {
             channel_id: 9,
+            left_gain: 1.0,
+            right_gain: 1.0,
             samples: vec![1.0, 10.0, 2.0, 20.0, 3.0, 30.0],
         };
         let mut output = vec![0.0; 6];
