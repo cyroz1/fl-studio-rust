@@ -2148,6 +2148,39 @@ impl MetronomeTimeline {
     }
 }
 
+/// A live metronome view used by project stream renderers.
+///
+/// The renderer reads the current timeline, samples, enable state, and playback rate at each
+/// block boundary so transport controls remain live while clicks pass through the Mixer.
+#[derive(Clone)]
+pub struct MetronomeStreamPlayback {
+    playback: Arc<PlaybackState>,
+}
+
+impl MetronomeStreamPlayback {
+    pub(crate) fn mix_into_interleaved_stereo(&self, start_frame: u64, samples: &mut [f32]) {
+        if !samples.len().is_multiple_of(2)
+            || !self.playback.metronome_enabled.load(Ordering::Acquire)
+        {
+            return;
+        }
+        let timeline_snapshot = self.playback.metronome_timeline.load();
+        let Some(timeline) = timeline_snapshot.as_deref() else {
+            return;
+        };
+        let click_samples_snapshot = self.playback.metronome_click_samples.load();
+        let click_samples = click_samples_snapshot.as_deref();
+        let playback_speed = f32::from_bits(self.playback.playback_speed.load(Ordering::Acquire));
+        let (frames, _) = samples.as_chunks_mut::<2>();
+        for (frame_index, frame) in frames.iter_mut().enumerate() {
+            let project_frame = start_frame.saturating_add(frame_index as u64);
+            let click = timeline.click_sample(project_frame, playback_speed, click_samples);
+            frame[0] += click;
+            frame[1] += click;
+        }
+    }
+}
+
 impl Default for AudioSettings {
     fn default() -> Self {
         Self {
@@ -2300,6 +2333,7 @@ struct StreamingPlayback {
     producer_state: Mutex<StreamingProducerState>,
     project_source_index: Option<usize>,
     project_source_finished: AtomicBool,
+    metronome_mixer_routed: AtomicBool,
     active: AtomicBool,
     paused: AtomicBool,
     finished: AtomicBool,
@@ -2401,6 +2435,7 @@ fn create_streaming_playback(
         }),
         project_source_index: project_source.then_some(0),
         project_source_finished: AtomicBool::new(!project_source),
+        metronome_mixer_routed: AtomicBool::new(false),
         active: AtomicBool::new(false),
         paused: AtomicBool::new(false),
         finished: AtomicBool::new(false),
@@ -2531,6 +2566,13 @@ impl StagedStreamingPlayback {
 }
 
 impl StreamingAudioWriter {
+    /// Have the project renderer mix live metronome clicks before Master processing.
+    pub fn set_metronome_mixer_routed(&self, routed: bool) {
+        self.playback
+            .metronome_mixer_routed
+            .store(routed, Ordering::Release);
+    }
+
     /// Make the reported project position wrap over a Playlist loop range.
     ///
     /// The consumed output-frame counter remains monotonic for stream buffering and staged
@@ -4015,6 +4057,13 @@ impl AudioEngine {
             .store(enabled, Ordering::Release);
     }
 
+    /// Return a live metronome handle for project stream renderers.
+    pub fn metronome_stream_playback(&self) -> MetronomeStreamPlayback {
+        MetronomeStreamPlayback {
+            playback: Arc::clone(&self.playback),
+        }
+    }
+
     /// Replace the timing map used by the live project metronome.
     pub fn set_metronome_timeline(&self, timeline: Option<Arc<MetronomeTimeline>>) {
         self.playback.metronome_timeline.store(timeline);
@@ -5084,13 +5133,18 @@ where
                 let browser_preview_samples = playback_for_callback.browser_preview_samples.load();
                 let recording_precount_samples =
                     playback_for_callback.recording_precount_samples.load();
-                let metronome_timeline = playback_for_callback
-                    .metronome_enabled
-                    .load(Ordering::Acquire)
+                let metronome_is_in_project_stream = source.load(Ordering::Acquire)
+                    == AUDIO_SOURCE_STREAM
+                    && streaming.as_ref().is_some_and(|streaming| {
+                        streaming.metronome_mixer_routed.load(Ordering::Acquire)
+                    });
+                let metronome_direct_overlay = !metronome_is_in_project_stream
+                    && playback_for_callback
+                        .metronome_enabled
+                        .load(Ordering::Acquire);
+                let metronome_timeline = metronome_direct_overlay
                     .then(|| playback_for_callback.metronome_timeline.load());
-                let metronome_click_samples = playback_for_callback
-                    .metronome_enabled
-                    .load(Ordering::Acquire)
+                let metronome_click_samples = metronome_direct_overlay
                     .then(|| playback_for_callback.metronome_click_samples.load());
                 let target_gain =
                     f32::from_bits(playback_for_callback.output_gain.load(Ordering::Relaxed));

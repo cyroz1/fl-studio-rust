@@ -13935,6 +13935,8 @@ impl DawUi {
                 return;
             }
         };
+        writer.set_metronome_mixer_routed(true);
+        let worker_metronome = engine.metronome_stream_playback();
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
         if let Some(document) = self.document.as_ref() {
@@ -13978,6 +13980,7 @@ impl DawUi {
                                     reports: latency_report_sender,
                                     pdc_updates: playlist_pdc_update_receiver,
                                 }),
+                                metronome: Some(worker_metronome),
                             },
                         )
                     });
@@ -14767,6 +14770,8 @@ impl DawUi {
                 return;
             }
         };
+        writer.set_metronome_mixer_routed(true);
+        let worker_metronome = engine.metronome_stream_playback();
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
         self.initialize_live_master_mixer_targets(document);
@@ -14806,6 +14811,7 @@ impl DawUi {
                                 latency_reports: latency_report_sender,
                                 live_status: Arc::clone(&worker_live_status),
                                 meters: Some(worker_mixer_meters),
+                                metronome: Some(worker_metronome),
                                 clap_audio_layers: worker_clap_performance_audio_layers,
                             },
                         )
@@ -48327,6 +48333,11 @@ impl DawUi {
                 return;
             }
         };
+        writer.set_metronome_mixer_routed(true);
+        let worker_metronome = self
+            .audio_engine
+            .as_ref()
+            .map(AudioEngine::metronome_stream_playback);
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
         let read_sample_root_note = self.read_sample_root_note;
@@ -48376,6 +48387,7 @@ impl DawUi {
                                             processor: vst3_processor,
                                         },
                                         meters: &worker_mixer_meters,
+                                        metronome: worker_metronome.clone(),
                                         latency_updates: pattern_latency_update_receiver
                                             .zip(pattern_latency_report_sender)
                                             .map(|(updates, reports)| {
@@ -48403,6 +48415,7 @@ impl DawUi {
                                             processor: vst3_processor,
                                         },
                                         meters: &worker_mixer_meters,
+                                        metronome: worker_metronome.clone(),
                                         latency_updates: pattern_latency_update_receiver
                                             .zip(pattern_latency_report_sender)
                                             .map(|(updates, reports)| Vst3LatencyUpdateControls {
@@ -48426,6 +48439,7 @@ impl DawUi {
                                         start_tick: loop_start_tick,
                                     },
                                     meters: &worker_mixer_meters,
+                                    metronome: worker_metronome.clone(),
                                     latency_updates: pattern_latency_update_receiver
                                         .zip(pattern_latency_report_sender)
                                         .map(|(updates, reports)| Vst3LatencyUpdateControls {
@@ -48446,6 +48460,7 @@ impl DawUi {
                                 options,
                                 SamplerPatternStreamControls {
                                     meters: &worker_mixer_meters,
+                                    metronome: worker_metronome.clone(),
                                     latency_updates: pattern_latency_update_receiver
                                         .zip(pattern_latency_report_sender)
                                         .map(|(updates, reports)| Vst3LatencyUpdateControls {

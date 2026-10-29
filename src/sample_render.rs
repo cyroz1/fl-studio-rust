@@ -28,7 +28,8 @@ use vst3_host::midi::{MidiChannel, MidiEvent};
 
 use crate::audio::{
     AudioInputMonitorOutput, AudioInputRecording, LiveMixerSourceControl, LiveMixerSourceTargets,
-    MIXER_TRACK_METER_COUNT, MixerTrackPeakMeters, StereoFrameDelay, StreamingAudioWriter,
+    MIXER_TRACK_METER_COUNT, MetronomeStreamPlayback, MixerTrackPeakMeters, StereoFrameDelay,
+    StreamingAudioWriter,
 };
 use crate::media::{
     DecodedAudio, SamplePathResolver, decode_audio_file, process_audio_range_for_playback,
@@ -799,6 +800,7 @@ pub struct SamplerPatternLoopStreamControls<'a> {
     pub playback: SamplerPatternLoopPlayback,
     pub meters: &'a crate::audio::MixerTrackPeakMeters,
     pub latency_updates: Option<Vst3LatencyUpdateControls>,
+    pub metronome: Option<MetronomeStreamPlayback>,
     /// Assigned CLAP destinations, including channels with zero crossfade gain.
     pub clap_audio_channel_ids: BTreeSet<u16>,
     pub pattern_audio_layers: Vec<PatternAudioLayer>,
@@ -808,6 +810,7 @@ pub struct SamplerPatternLoopStreamControls<'a> {
 pub struct SamplerPatternStreamControls<'a> {
     pub meters: &'a crate::audio::MixerTrackPeakMeters,
     pub latency_updates: Option<Vst3LatencyUpdateControls>,
+    pub metronome: Option<MetronomeStreamPlayback>,
 }
 
 /// Timing and prepared plug-in stream for live Pattern-mode playback.
@@ -822,6 +825,7 @@ pub struct Vst3PatternLoopStreamControls<'a> {
     pub playback: Vst3PatternLoopPlayback,
     pub meters: &'a crate::audio::MixerTrackPeakMeters,
     pub latency_updates: Option<Vst3LatencyUpdateControls>,
+    pub metronome: Option<MetronomeStreamPlayback>,
     /// Assigned CLAP destinations, including channels with zero crossfade gain.
     pub clap_audio_channel_ids: BTreeSet<u16>,
     pub pattern_audio_layers: Vec<PatternAudioLayer>,
@@ -838,6 +842,7 @@ pub struct Vst3PatternStreamControls<'a> {
     pub playback: Vst3PatternPlayback,
     pub meters: &'a crate::audio::MixerTrackPeakMeters,
     pub latency_updates: Option<Vst3LatencyUpdateControls>,
+    pub metronome: Option<MetronomeStreamPlayback>,
 }
 
 impl Default for SamplerPatternRenderOptions {
@@ -1449,6 +1454,7 @@ pub struct PlaylistPerformanceStream {
     pub latency_reports: Sender<Vst3LatencyReport>,
     pub live_status: Arc<Mutex<PlaylistPerformanceLiveStatus>>,
     pub meters: Option<Arc<MixerTrackPeakMeters>>,
+    pub metronome: Option<MetronomeStreamPlayback>,
     /// CLAP Pattern Clip loops rendered before Performance Mode starts.
     pub clap_audio_layers: Arc<Vec<PlaylistPerformanceClapLayer>>,
 }
@@ -2387,6 +2393,7 @@ pub struct Vst3LatencyUpdateControls {
 pub struct PlaylistLiveStreamControls<'a> {
     pub monitor: PlaylistStreamMonitor<'a>,
     pub latency_updates: Option<Vst3LatencyUpdateControls>,
+    pub metronome: Option<MetronomeStreamPlayback>,
 }
 
 struct LiveLatencyUpdateState {
@@ -3077,6 +3084,7 @@ pub fn stream_playlist_with_vst3_to_device_from_frame(
         PlaylistLiveStreamControls {
             monitor: PlaylistStreamMonitor::from_frame(start_frame),
             latency_updates: None,
+            metronome: None,
         },
     )
 }
@@ -3101,6 +3109,7 @@ pub fn stream_playlist_with_vst3_to_device_with_monitor(
         PlaylistLiveStreamControls {
             monitor,
             latency_updates: None,
+            metronome: None,
         },
     )
 }
@@ -3142,6 +3151,7 @@ pub fn stream_playlist_performance_with_vst3_to_device(
     performance: PlaylistPerformanceStream,
 ) -> Result<PlaylistRenderSummary, String> {
     let project_path = project_path.as_ref();
+    let metronome = performance.metronome.clone();
     let clap_audio_layers = Arc::clone(&performance.clap_audio_layers);
     let mut assigned_clap_channels = (*options.clap_audio_channel_ids).clone();
     assigned_clap_channels.extend(clap_audio_layers.iter().map(|layer| layer.channel_id));
@@ -3351,6 +3361,7 @@ pub fn stream_playlist_performance_with_vst3_to_device(
             performance: Some(runtime),
             latency_updates: None,
             meters: performance.meters.as_deref(),
+            metronome,
             cancelled,
             capture_post_effect_buses: false,
             loop_range: None,
@@ -3378,6 +3389,7 @@ fn stream_playlist_with_vst3_to_device_from_frame_inner(
     let PlaylistLiveStreamControls {
         monitor,
         latency_updates: latency_controls,
+        metronome,
     } = controls;
     let start_frame = monitor.start_frame;
     let loop_range = monitor.loop_range;
@@ -3533,7 +3545,10 @@ fn stream_playlist_with_vst3_to_device_from_frame_inner(
             latency_updates,
             meters,
             cancelled,
-            loop_range,
+            PlaylistStreamRenderOptions {
+                loop_range,
+                metronome,
+            },
             || writer.is_cancelled(),
             |block, _mixer_buses| {
                 let skipped_frames = frames_to_skip.min((block.len() / 2) as u64) as usize;
@@ -3546,7 +3561,10 @@ fn stream_playlist_with_vst3_to_device_from_frame_inner(
             render,
             meters,
             cancelled,
-            loop_range,
+            PlaylistStreamRenderOptions {
+                loop_range,
+                metronome,
+            },
             || writer.is_cancelled(),
             |block, _mixer_buses| {
                 let skipped_frames = frames_to_skip.min((block.len() / 2) as u64) as usize;
@@ -6041,7 +6059,7 @@ fn stream_prepared_playlist_render(
         render,
         meters,
         cancelled,
-        None,
+        PlaylistStreamRenderOptions::default(),
         stream_cancelled,
         write_block,
     )
@@ -6051,7 +6069,7 @@ fn stream_prepared_playlist_render_with_loop(
     render: PreparedPlaylistBlockMix<'_>,
     meters: Option<&MixerTrackPeakMeters>,
     cancelled: &AtomicBool,
-    loop_range: Option<PlaylistPlaybackLoopRange>,
+    stream_options: PlaylistStreamRenderOptions,
     stream_cancelled: impl FnMut() -> bool,
     write_block: impl FnMut(&[f32], PlaylistRenderMixerBuses<'_>) -> Result<(), String>,
 ) -> Result<PlaylistBlockRenderSummary, String> {
@@ -6061,9 +6079,10 @@ fn stream_prepared_playlist_render_with_loop(
             performance: None,
             latency_updates: None,
             meters,
+            metronome: stream_options.metronome,
             cancelled,
             capture_post_effect_buses: false,
-            loop_range,
+            loop_range: stream_options.loop_range,
         },
         stream_cancelled,
         write_block,
@@ -6075,7 +6094,7 @@ fn stream_prepared_playlist_render_with_live_latency_updates_and_loop(
     latency_updates: LiveLatencyUpdateState,
     meters: Option<&MixerTrackPeakMeters>,
     cancelled: &AtomicBool,
-    loop_range: Option<PlaylistPlaybackLoopRange>,
+    stream_options: PlaylistStreamRenderOptions,
     stream_cancelled: impl FnMut() -> bool,
     write_block: impl FnMut(&[f32], PlaylistRenderMixerBuses<'_>) -> Result<(), String>,
 ) -> Result<PlaylistBlockRenderSummary, String> {
@@ -6085,13 +6104,20 @@ fn stream_prepared_playlist_render_with_live_latency_updates_and_loop(
             performance: None,
             latency_updates: Some(latency_updates),
             meters,
+            metronome: stream_options.metronome,
             cancelled,
             capture_post_effect_buses: false,
-            loop_range,
+            loop_range: stream_options.loop_range,
         },
         stream_cancelled,
         write_block,
     )
+}
+
+#[derive(Default)]
+struct PlaylistStreamRenderOptions {
+    loop_range: Option<PlaylistPlaybackLoopRange>,
+    metronome: Option<MetronomeStreamPlayback>,
 }
 
 fn stream_prepared_playlist_render_with_post_effect_stems(
@@ -6107,6 +6133,7 @@ fn stream_prepared_playlist_render_with_post_effect_stems(
             performance: None,
             latency_updates: None,
             meters,
+            metronome: None,
             cancelled,
             capture_post_effect_buses: true,
             loop_range: None,
@@ -6126,6 +6153,7 @@ struct PlaylistPreparedRenderControls<'runtime> {
     performance: Option<PlaylistPerformanceRuntime>,
     latency_updates: Option<LiveLatencyUpdateState>,
     meters: Option<&'runtime MixerTrackPeakMeters>,
+    metronome: Option<MetronomeStreamPlayback>,
     cancelled: &'runtime AtomicBool,
     capture_post_effect_buses: bool,
     loop_range: Option<PlaylistPlaybackLoopRange>,
@@ -6274,6 +6302,7 @@ fn stream_prepared_playlist_render_with_performance(
         mut performance,
         mut latency_updates,
         meters,
+        metronome,
         cancelled,
         capture_post_effect_buses,
         loop_range,
@@ -6521,6 +6550,9 @@ fn stream_prepared_playlist_render_with_performance(
                     clap_channel_mix_controls,
                     meter_buses.as_deref_mut(),
                 )?;
+                if let Some(metronome) = metronome.as_ref() {
+                    metronome.mix_into_interleaved_stereo(source_frame, block);
+                }
                 direct_source_delay.process_interleaved(block)?;
                 if let Some(meter_buses) = meter_buses.as_deref_mut() {
                     for (bus_index, delay) in mixer_bus_delays.iter_mut().enumerate() {
@@ -7024,6 +7056,7 @@ pub fn stream_sampler_pattern_to_device_with_live_controls(
         PatternLiveStreamControls {
             meters: Some(controls.meters),
             latency_updates: controls.latency_updates,
+            metronome: controls.metronome,
         },
         writer,
         cancelled,
@@ -7080,6 +7113,7 @@ pub fn stream_sampler_pattern_loop_from_tick_to_device(
         PatternLiveStreamControls {
             meters: None,
             latency_updates: None,
+            metronome: None,
         },
         writer,
         cancelled,
@@ -7104,6 +7138,7 @@ pub fn stream_sampler_pattern_loop_from_tick_to_device_with_live_master_controls
             playback,
             meters,
             latency_updates: None,
+            metronome: None,
             clap_audio_channel_ids: BTreeSet::new(),
             pattern_audio_layers: Vec::new(),
         },
@@ -7139,6 +7174,7 @@ pub fn stream_sampler_pattern_loop_from_tick_to_device_with_live_controls(
         PatternLiveStreamControls {
             meters: Some(controls.meters),
             latency_updates: controls.latency_updates,
+            metronome: controls.metronome,
         },
         writer,
         cancelled,
@@ -7171,6 +7207,7 @@ pub fn stream_pattern_loop_with_vst3_from_tick_to_device(
         PatternLiveStreamControls {
             meters: None,
             latency_updates: None,
+            metronome: None,
         },
         writer,
         cancelled,
@@ -7204,6 +7241,7 @@ pub fn stream_pattern_loop_with_vst3_from_tick_to_device_with_live_master_contro
         PatternLiveStreamControls {
             meters: Some(meters),
             latency_updates: None,
+            metronome: None,
         },
         writer,
         cancelled,
@@ -7236,6 +7274,7 @@ pub fn stream_pattern_loop_with_vst3_from_tick_to_device_with_live_controls(
         PatternLiveStreamControls {
             meters: Some(controls.meters),
             latency_updates: controls.latency_updates,
+            metronome: controls.metronome,
         },
         writer,
         cancelled,
@@ -7260,6 +7299,7 @@ pub fn stream_pattern_with_vst3_to_device_with_live_master_controls(
             playback,
             meters,
             latency_updates: None,
+            metronome: None,
         },
         writer,
         cancelled,
@@ -7292,6 +7332,7 @@ pub fn stream_pattern_with_vst3_to_device_with_live_controls(
         PatternLiveStreamControls {
             meters: Some(controls.meters),
             latency_updates: controls.latency_updates,
+            metronome: controls.metronome,
         },
         writer,
         cancelled,
@@ -7714,6 +7755,7 @@ fn mix_playlist_clap_audio_layers(
 struct PatternLiveStreamControls<'a> {
     meters: Option<&'a crate::audio::MixerTrackPeakMeters>,
     latency_updates: Option<Vst3LatencyUpdateControls>,
+    metronome: Option<MetronomeStreamPlayback>,
 }
 
 struct SamplerPatternChannelOptions<'a> {
@@ -7736,6 +7778,7 @@ fn stream_pattern_from_tick_with_vst3_to_device(
     let PatternLiveStreamControls {
         meters: live_master_meters,
         latency_updates,
+        metronome,
     } = controls;
     let mut latency_updates = latency_updates.map(|controls| LiveLatencyUpdateState {
         document: document.clone(),
@@ -8005,6 +8048,9 @@ fn stream_pattern_from_tick_with_vst3_to_device(
                 &pattern_clap_mixer_routes,
                 mixer_buses.as_deref_mut(),
             )?;
+            if let Some(metronome) = metronome.as_ref() {
+                metronome.mix_into_interleaved_stereo(block_start, &mut block[..sample_count]);
+            }
             sampler_delay.process_interleaved(&mut block[..sample_count])?;
             if let Some(processor) = playback.vst3_processor.as_mut() {
                 if let Some(mixer_buses) = mixer_buses.as_mut() {
@@ -8136,6 +8182,9 @@ fn stream_pattern_from_tick_with_vst3_to_device(
                 &pattern_clap_mixer_routes,
                 mixer_buses.as_deref_mut(),
             )?;
+            if let Some(metronome) = metronome.as_ref() {
+                metronome.mix_into_interleaved_stereo(block_start, &mut block[..sample_count]);
+            }
             sampler_delay.process_interleaved(&mut block[..sample_count])?;
             if let Some(processor) = playback.vst3_processor.as_mut() {
                 if let Some(mixer_buses) = mixer_buses.as_mut() {
