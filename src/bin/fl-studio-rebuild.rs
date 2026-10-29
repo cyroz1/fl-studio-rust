@@ -26544,6 +26544,16 @@ impl DawUi {
                 }
                 if ui
                     .add_enabled(
+                        has_time_selection,
+                        egui::Button::new("Zoom on time selection (Shift+5)"),
+                    )
+                    .clicked()
+                {
+                    self.zoom_playlist_to_time_selection();
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
                         arrangement.clips.iter().any(PlaylistClip::is_muted),
                         egui::Button::new("Select muted clips"),
                     )
@@ -32556,10 +32566,10 @@ impl DawUi {
             } else {
                 self.playlist_grid_viewport.map(|viewport| {
                     let zoom = self.timeline_zoom.max(0.001);
-                    let start_tick =
-                        (self.playlist_grid_scroll_offset.x - PLAYLIST_LABEL_WIDTH).max(0.0) / zoom;
-                    let visible_tick_width =
-                        (viewport.width() - PLAYLIST_LABEL_WIDTH).max(0.0) / zoom;
+                    let visible_left = self.playlist_grid_scroll_offset.x.max(PLAYLIST_LABEL_WIDTH);
+                    let visible_right = self.playlist_grid_scroll_offset.x + viewport.width();
+                    let start_tick = (visible_left - PLAYLIST_LABEL_WIDTH) / zoom;
+                    let visible_tick_width = (visible_right - visible_left).max(0.0) / zoom;
                     let start = start_tick.floor().clamp(0.0, u32::MAX as f32) as u32;
                     let end = (start_tick + visible_tick_width)
                         .ceil()
@@ -32617,6 +32627,37 @@ impl DawUi {
         let shifted_end = shifted_start.saturating_add(width);
         self.playlist_time_selection = Some((arrangement_id, shifted_start, shifted_end));
         self.status = format!("Selected Playlist time from {shifted_start} to {shifted_end} ticks");
+    }
+
+    fn zoom_playlist_to_time_selection(&mut self) {
+        let Some((arrangement_id, start, end)) = self.playlist_time_selection else {
+            self.status = "Select a Playlist time range first".to_owned();
+            return;
+        };
+        if self.selected_arrangement != Some(arrangement_id) {
+            self.status = "Select a time range in this arrangement first".to_owned();
+            return;
+        }
+        let Some(viewport) = self.playlist_grid_viewport else {
+            self.status = "Playlist time viewport is not available".to_owned();
+            return;
+        };
+        let width_ticks = end.saturating_sub(start);
+        if width_ticks == 0 {
+            self.status = "Select a Playlist time range first".to_owned();
+            return;
+        }
+
+        self.timeline_zoom = zoom_to_fit(
+            (viewport.width() - 24.0).max(1.0),
+            width_ticks as f32,
+            0.04,
+            0.24,
+        );
+        let target_x = PLAYLIST_LABEL_WIDTH + start as f32 * self.timeline_zoom;
+        self.playlist_pending_scroll_offset =
+            Some(Vec2::new(target_x, self.playlist_grid_scroll_offset.y));
+        self.status = format!("Zoomed to Playlist time from {start} to {end} ticks");
     }
 
     fn deselect_playlist_clips(&mut self) {
@@ -68647,6 +68688,11 @@ impl eframe::App for DawUi {
         }
         if select_playlist_next_time_requested {
             self.shift_playlist_time_selection(false);
+        }
+        let zoom_playlist_time_selection_requested = playlist_clip_shortcuts_enabled
+            && ui.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::Num5));
+        if zoom_playlist_time_selection_requested {
+            self.zoom_playlist_to_time_selection();
         }
         let delete_playlist_clip_requested = self.view == MainView::Playlist
             && self.selected_clip.is_some()
