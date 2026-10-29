@@ -60,7 +60,7 @@ use flp_rebuild::sample_render::{
     layer_live_input_queue, nearest_playlist_audio_clip_zero_crossing_tick,
     playlist_audio_clip_fade_gain, playlist_performance_clip_indices_with_vst3,
     playlist_performance_static_document_with_vst3, playlist_performance_vst3_channel_ids,
-    playlist_performance_vst3_clip_indices, project_channel_stereo_output_gains,
+    playlist_performance_vst3_clip_indices,
     project_channel_stereo_output_gains_with_layer_adjustments, render_audio_clips_to_file,
     render_playlist_mixer_stems_with_vst3_cancellable,
     render_playlist_with_vst3_to_file_from_frame_cancellable,
@@ -68,7 +68,7 @@ use flp_rebuild::sample_render::{
     render_playlist_with_vst3_to_ogg_cancellable, render_playlist_with_vst3_to_wav_cancellable,
     render_sampler_pattern_to_file, render_sampler_pattern_to_file_with_mixer_effects,
     render_selected_audio_clips_to_file_with_mixer_effects, sampler_live_note_queue,
-    schedule_playlist_pattern_notes, stream_input_monitor_through_mixer,
+    schedule_playlist_pattern_notes_with_adjustments, stream_input_monitor_through_mixer,
     stream_mixed_layer_midi_input_to_device,
     stream_pattern_loop_with_vst3_from_tick_to_device_with_live_controls,
     stream_pattern_with_vst3_to_device_with_live_controls,
@@ -5577,10 +5577,23 @@ struct ClapPlaylistCacheKey {
 
 struct PendingClapPlaylistPlayback {
     cache_key: ClapPlaylistCacheKey,
-    request_channels: BTreeMap<u64, u16>,
+    request_routes: BTreeMap<u64, ClapPlaylistAudioRoute>,
     audio_layers: Vec<PlaylistAudioLayer>,
     staged_start_frame: Option<u64>,
     staged_handoff_reason: Option<PdcStreamHandoffReason>,
+}
+
+#[derive(Clone, Copy)]
+struct ClapPlaylistAudioRoute {
+    channel_id: u16,
+    left_gain: f32,
+    right_gain: f32,
+}
+
+struct ClapPlaylistPreviewRequest {
+    settings: ClapPatternPreviewSettings,
+    left_gain: f32,
+    right_gain: f32,
 }
 
 struct PendingClapStateCapture {
@@ -20189,14 +20202,14 @@ impl DawUi {
         document: &FlpDocument,
         arrangement_id: u16,
         tempo_map: &PlaylistTempoMap,
-    ) -> Result<BTreeMap<u16, ClapPatternPreviewSettings>, String> {
+    ) -> Result<Vec<ClapPlaylistPreviewRequest>, String> {
         let assigned_channel_ids = self
             .clap_pattern_playback_instruments
             .keys()
             .copied()
             .collect::<BTreeSet<_>>();
         if assigned_channel_ids.is_empty() {
-            return Ok(BTreeMap::new());
+            return Ok(Vec::new());
         }
 
         let arrangement = document
@@ -20218,6 +20231,12 @@ impl DawUi {
             .collect::<BTreeSet<_>>();
         let track_filter =
             PlaylistTrackFilter::new(&disabled_track_ids, self.soloed_playlist_track_range);
+        let channels = document.channels();
+        let channels_by_id = channels
+            .iter()
+            .map(|channel| (channel.id(), channel))
+            .collect::<HashMap<_, _>>();
+        let channel_router = ChannelNoteRouter::new(channels.clone());
         for clip in &arrangement.clips {
             if track_filter.clip_is_muted(clip) {
                 continue;
@@ -20233,11 +20252,21 @@ impl DawUi {
                 continue;
             };
             if patterns_by_id.get(&id).is_some_and(|pattern| {
-                pattern.notes.iter().any(|note| {
-                    assigned_channel_ids.contains(&note.channel_id)
-                        && !note.is_muted()
+                pattern.notes.iter().enumerate().any(|(note_index, note)| {
+                    !note.is_muted()
                         && note.length > 0
                         && note.velocity > 0
+                        && channel_router
+                            .targets_for_note_with_clap_audio_layers(
+                                note.channel_id,
+                                note_index as u64,
+                                note.key,
+                                &assigned_channel_ids,
+                            )
+                            .iter()
+                            .any(|(target_channel_id, _, _)| {
+                                assigned_channel_ids.contains(target_channel_id)
+                            })
                 })
             }) {
                 let reason = if unsupported_scale {
@@ -20252,12 +20281,7 @@ impl DawUi {
             }
         }
 
-        let channels = document.channels();
-        let channels_by_id = channels
-            .iter()
-            .map(|channel| (channel.id(), channel))
-            .collect::<HashMap<_, _>>();
-        let schedule = schedule_playlist_pattern_notes(
+        let schedule = schedule_playlist_pattern_notes_with_adjustments(
             &patterns,
             &arrangement,
             track_filter,
@@ -20273,18 +20297,28 @@ impl DawUi {
                     .get(&channel_id)
                     .map_or(128, |channel| channel.swing_mix())
             },
-            |channel_id, _, _| {
-                (assigned_channel_ids.contains(&channel_id)
-                    && channels_by_id
-                        .get(&channel_id)
-                        .is_some_and(|channel| channel.enabled() != Some(false)))
-                .then_some(channel_id)
-                .into_iter()
-                .collect()
+            |channel_id, seed, key| {
+                channel_router
+                    .targets_for_note_with_clap_audio_layers(
+                        channel_id,
+                        seed,
+                        key,
+                        &assigned_channel_ids,
+                    )
+                    .into_iter()
+                    .filter(|(target_channel_id, gain, _)| {
+                        assigned_channel_ids.contains(target_channel_id)
+                            && gain.is_finite()
+                            && *gain > 0.0
+                            && channels_by_id
+                                .get(target_channel_id)
+                                .is_some_and(|channel| channel.enabled() != Some(false))
+                    })
+                    .collect()
             },
         )?;
 
-        let mut notes_by_channel = BTreeMap::<u16, Vec<ClapPlaylistNote>>::new();
+        let mut notes_by_layer_route = BTreeMap::<(u16, u32, i32), Vec<ClapPlaylistNote>>::new();
         for placed in schedule.notes {
             if placed.note.velocity == 0 {
                 continue;
@@ -20292,8 +20326,15 @@ impl DawUi {
             let Some(stop_tick) = placed.stop_tick.filter(|stop| *stop > placed.start_tick) else {
                 continue;
             };
-            notes_by_channel
-                .entry(placed.target_channel_id)
+            if !placed.target_gain.is_finite() || placed.target_gain <= 0.0 {
+                continue;
+            }
+            notes_by_layer_route
+                .entry((
+                    placed.target_channel_id,
+                    placed.target_gain.to_bits(),
+                    placed.target_pan_raw,
+                ))
                 .or_default()
                 .push(ClapPlaylistNote {
                     start_tick: placed.start_tick,
@@ -20314,18 +20355,29 @@ impl DawUi {
             .collect::<Vec<_>>();
         let ppq = document.header().ppq();
         let tempo_bpm = document.metadata().tempo_bpm().unwrap_or(140.0);
-        Ok(notes_by_channel
+        notes_by_layer_route
             .into_iter()
-            .map(|(channel_id, notes)| {
+            .map(|((channel_id, layer_gain_bits, layer_pan_raw), notes)| {
                 let loop_length_ticks = notes
                     .iter()
                     .map(|note| note.stop_tick)
                     .max()
                     .unwrap_or(1)
                     .max(1);
-                (
-                    channel_id,
-                    ClapPatternPreviewSettings {
+                let (left_gain, right_gain) =
+                    project_channel_stereo_output_gains_with_layer_adjustments(
+                        document,
+                        channel_id,
+                        f32::from_bits(layer_gain_bits),
+                        layer_pan_raw,
+                    )
+                    .ok_or_else(|| {
+                        format!(
+                            "CLAP Playlist source Channel {channel_id} disappeared during preparation"
+                        )
+                    })?;
+                Ok(ClapPlaylistPreviewRequest {
+                    settings: ClapPatternPreviewSettings {
                         pattern_id: arrangement_id,
                         channel_id,
                         ppq,
@@ -20337,15 +20389,17 @@ impl DawUi {
                             notes,
                         }),
                     },
-                )
+                    left_gain,
+                    right_gain,
+                })
             })
-            .collect())
+            .collect()
     }
 
     fn prepare_clap_playlist_playback(
         &mut self,
         cache_key: ClapPlaylistCacheKey,
-        settings_by_channel: Option<BTreeMap<u16, ClapPatternPreviewSettings>>,
+        requests: Option<Vec<ClapPlaylistPreviewRequest>>,
         staged_start_frame: Option<u64>,
         staged_handoff_reason: Option<PdcStreamHandoffReason>,
     ) -> bool {
@@ -20366,18 +20420,18 @@ impl DawUi {
             return false;
         }
         self.pending_clap_playlist_playback = None;
-        let Some(settings_by_channel) = settings_by_channel else {
+        let Some(requests) = requests else {
             self.status = "CLAP Playlist preparation did not include its project schedule".into();
             return false;
         };
-        let requests = self
-            .clap_pattern_playback_instruments
-            .iter()
-            .filter_map(|(channel_id, instrument)| {
-                settings_by_channel
-                    .get(channel_id)
+        let requests = requests
+            .into_iter()
+            .filter_map(|request| {
+                let channel_id = request.settings.channel_id;
+                self.clap_pattern_playback_instruments
+                    .get(&channel_id)
                     .cloned()
-                    .map(|settings| (*channel_id, instrument.clone(), settings))
+                    .map(|instrument| (channel_id, instrument, request))
             })
             .collect::<Vec<_>>();
         if requests.is_empty() {
@@ -20386,12 +20440,19 @@ impl DawUi {
             return true;
         }
 
-        let mut request_channels = BTreeMap::new();
-        for (channel_id, instrument, settings) in requests {
+        let mut request_routes = BTreeMap::new();
+        for (channel_id, instrument, request) in requests {
             self.clap_pattern_preview_request_id =
                 self.clap_pattern_preview_request_id.wrapping_add(1).max(1);
             let request_id = self.clap_pattern_preview_request_id;
-            request_channels.insert(request_id, channel_id);
+            request_routes.insert(
+                request_id,
+                ClapPlaylistAudioRoute {
+                    channel_id,
+                    left_gain: request.left_gain,
+                    right_gain: request.right_gain,
+                },
+            );
             let parameter_values = self.clap_parameter_overrides_for(
                 channel_id,
                 &instrument.path,
@@ -20405,7 +20466,7 @@ impl DawUi {
                     instrument.plugin_name,
                     cache_key.sample_rate,
                     channel_id,
-                    Some(settings),
+                    Some(request.settings),
                     instrument.state,
                     parameter_values,
                     ClapPatternPreviewPurpose::Playlist,
@@ -20417,10 +20478,10 @@ impl DawUi {
                 return false;
             }
         }
-        let request_count = request_channels.len();
+        let request_count = request_routes.len();
         self.pending_clap_playlist_playback = Some(PendingClapPlaylistPlayback {
             cache_key,
-            request_channels,
+            request_routes,
             audio_layers: Vec::with_capacity(request_count),
             staged_start_frame,
             staged_handoff_reason,
@@ -20999,9 +21060,10 @@ impl DawUi {
         let Some(pending) = self.pending_clap_playlist_playback.as_mut() else {
             return;
         };
-        let Some(channel_id) = pending.request_channels.remove(&request_id) else {
+        let Some(route) = pending.request_routes.remove(&request_id) else {
             return;
         };
+        let channel_id = route.channel_id;
         let Some(settings) = settings else {
             self.pending_clap_playlist_playback = None;
             self.status = "CLAP Playlist response was missing its source settings".into();
@@ -21032,23 +21094,10 @@ impl DawUi {
                     self.status = "Prepared CLAP Playlist audio exceeds the 512 MiB limit".into();
                     return;
                 }
-                let Some(document) = self.document.as_ref() else {
-                    self.pending_clap_playlist_playback = None;
-                    return;
-                };
-                let Some((left_gain, right_gain)) =
-                    project_channel_stereo_output_gains(document, channel_id)
-                else {
-                    self.pending_clap_playlist_playback = None;
-                    self.status = format!(
-                        "CLAP Playlist source Channel {channel_id} disappeared during preparation"
-                    );
-                    return;
-                };
                 pending.audio_layers.push(PlaylistAudioLayer {
                     channel_id,
-                    left_gain,
-                    right_gain,
+                    left_gain: route.left_gain,
+                    right_gain: route.right_gain,
                     samples,
                 });
             }
@@ -21081,7 +21130,7 @@ impl DawUi {
                 return;
             }
         }
-        if !pending.request_channels.is_empty() {
+        if !pending.request_routes.is_empty() {
             return;
         }
         let Some(mut pending) = self.pending_clap_playlist_playback.take() else {
@@ -62364,7 +62413,7 @@ impl DawUi {
                     ui.colored_label(ORANGE, error);
                 }
             }
-            ui.small("Pattern previews use project base tempo. CLAP Pattern transport expands Layer notes to assigned CLAP child channels, applies Layer gain/pan and source-channel gain/pan, and follows Mixer routes including loaded VST3 insert effects. Layer crossfade applies when active leaves are Sampler or assigned CLAP channels. CLAP Playlist playback follows clip repeats, track mute/solo, and tempo automation for default-scale, full-source Pattern clips; it applies source-channel fader/pan and saved Mixer insert routes, including loaded VST3 insert effects. Playlist Layer expansion, Layer crossfade in trees containing VST3 descendants, CLAP-format Mixer effect processing, scaled/source-windowed clips, Performance playback, and offline song/stem export remain unsupported. CLAP note-dialect plug-ins receive per-note tuning, pan, Mod X brightness, and release; MIDI 1.0/2.0 inputs receive key, velocity, channel, and release.");
+            ui.small("Pattern previews use project base tempo. CLAP Pattern transport expands Layer notes to assigned CLAP child channels, applies Layer gain/pan and source-channel gain/pan, and follows Mixer routes including loaded VST3 insert effects. Layer crossfade applies when active leaves are Sampler or assigned CLAP channels. CLAP Playlist playback follows clip repeats, track mute/solo, Layer routing and gain/pan, and tempo automation for default-scale, full-source Pattern clips; Layer crossfade applies when active leaves are Sampler or assigned CLAP channels. It applies source-channel fader/pan and saved Mixer insert routes, including loaded VST3 insert effects. Layer crossfade in trees containing VST3 descendants, CLAP-format Mixer effect processing, scaled/source-windowed clips, Performance playback, and offline song/stem export remain unsupported. CLAP note-dialect plug-ins receive per-note tuning, pan, Mod X brightness, and release; MIDI 1.0/2.0 inputs receive key, velocity, channel, and release.");
             if let Ok(Some(settings)) = &clap_pattern_preview_settings {
                 ui.horizontal(|ui| {
                     if let Some(instrument) = self

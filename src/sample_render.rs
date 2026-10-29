@@ -10192,7 +10192,7 @@ pub fn schedule_playlist_pattern_notes<'a>(
     )
 }
 
-pub(crate) fn schedule_playlist_pattern_notes_with_adjustments<'a>(
+pub fn schedule_playlist_pattern_notes_with_adjustments<'a>(
     patterns: &'a [Pattern],
     arrangement: &Arrangement,
     track_filter: PlaylistTrackFilter<'_>,
@@ -10435,6 +10435,11 @@ fn prepare_sampler_arrangement(
         }
     }
     let channel_router = ChannelNoteRouter::new(channels.clone());
+    let clap_audio_channels = options
+        .clap_audio_layers
+        .iter()
+        .map(|layer| layer.channel_id)
+        .collect::<BTreeSet<_>>();
     let schedule = schedule_playlist_pattern_notes_with_adjustments(
         &patterns,
         &arrangement,
@@ -10452,13 +10457,27 @@ fn prepare_sampler_arrangement(
                 .map_or(128, |channel| channel.swing_mix())
         },
         |channel_id, seed, key| {
-            channel_router
-                .targets_for_note_with_mixed_crossfade(
+            let has_clap_target = !clap_audio_channels.is_empty()
+                && channel_router
+                    .targets_for_note(channel_id, seed, key)
+                    .iter()
+                    .any(|target_channel_id| clap_audio_channels.contains(target_channel_id));
+            let targets = if has_clap_target {
+                channel_router.targets_for_note_with_clap_audio_layers(
+                    channel_id,
+                    seed,
+                    key,
+                    &clap_audio_channels,
+                )
+            } else {
+                channel_router.targets_for_note_with_mixed_crossfade(
                     channel_id,
                     seed,
                     key,
                     vst3_volume_expression_channels,
                 )
+            };
+            targets
                 .into_iter()
                 .filter(|(target_channel_id, _, _)| {
                     channels_by_id
