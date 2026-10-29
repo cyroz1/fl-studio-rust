@@ -24,7 +24,7 @@ timestretch = "0.15.0"
 wavicle = { version = "0.1.0", default-features = false, features = ["decode"] }
 vst3-host = { version = "0.10.0", default-features = false, features = ["process-isolation"] }
 vorbis_rs = "0.5.6"
-zip = { version = "8.6.0", default-features = false, features = ["deflate", "unreserved"] }
+zip = { version = "8.6.0", default-features = false, features = ["bzip2", "deflate", "deflate64", "legacy-zip", "lzma", "ppmd", "unreserved", "xz", "zstd"] }
 plist = "1.10.1"
 
 [target.'cfg(windows)'.dependencies]

@@ -188,8 +188,9 @@ pub struct SampleBundleSummary {
 }
 
 impl ProjectPackageWorkspace {
-    /// Opens a standard ZIP package, extracts its files, and reads the first FLP.
+    /// Opens a ZIP package, extracts its files, and reads the first FLP.
     /// Root-level projects are preferred when an archive contains more than one.
+    /// Read-only compression methods are rewritten as Deflate when the package is saved.
     pub fn open(path: impl AsRef<Path>) -> Result<(Self, Vec<u8>), String> {
         let archive_comment = read_archive_comment(path.as_ref())?;
         let source = File::open(path.as_ref())
@@ -223,7 +224,12 @@ impl ProjectPackageWorkspace {
                 return Err(format!("ZIP project contains an unsafe path {raw_name:?}"));
             }
             let target = root.join(&relative_path);
+            let compression = entry.compression();
             let mut options = entry.options();
+            let output_compression = package_output_compression(compression);
+            if output_compression != compression {
+                options = options.compression_method(output_compression);
+            }
             if entry.is_dir() {
                 options = options.unix_permissions(entry.unix_mode().unwrap_or(0o755) | 0o040000);
             }
@@ -649,6 +655,19 @@ impl ProjectPackageWorkspace {
             .map_err(|error| format!("could not finish ZIP project: {error}"))?;
         file.sync_all()
             .map_err(|error| format!("could not flush ZIP project: {error}"))
+    }
+}
+
+fn package_output_compression(method: CompressionMethod) -> CompressionMethod {
+    match method {
+        // zip-rs can decode these methods, but cannot encode them when writing the
+        // package back. Keep the contents and metadata while using a writable method.
+        CompressionMethod::Deflate64
+        | CompressionMethod::Lzma
+        | CompressionMethod::Shrink
+        | CompressionMethod::Reduce(_)
+        | CompressionMethod::Implode => CompressionMethod::Deflated,
+        method => method,
     }
 }
 
