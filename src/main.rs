@@ -1096,6 +1096,17 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_f32(tension, "automation point tension")?,
             )
         }
+        [command, input, output, channel_id, point_index, trailing_bytes]
+            if command == "set-automation-point-tail" =>
+        {
+            set_automation_point_trailing_bytes(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(channel_id, "automation channel id")?,
+                parse_usize(point_index, "automation point index")?,
+                parse_automation_point_tail(trailing_bytes)?,
+            )
+        }
         [command, input, output, channel_id, amount]
             if command == "set-automation-lfo-amount" =>
         {
@@ -4191,6 +4202,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild set-layer-flags <input.flp> <output.flp> <layer-channel-id> <random:0|1|-> <crossfade:0|1|->\n",
             "  flp-rebuild set-layer-fade <input.flp> <output.flp> <layer-channel-id> <fade:0..256>\n",
             "  flp-rebuild edit-automation-point <input.flp> <output.flp> <channel-id> <point-index> <position-beats> <value> <tension>\n",
+            "  flp-rebuild set-automation-point-tail <input.flp> <output.flp> <channel-id> <point-index> <8-hex-digits>\n",
             "  flp-rebuild flip-automation-points <input.flp> <output.flp> <channel-id>\n",
             "  flp-rebuild normalize-automation-points <input.flp> <output.flp> <channel-id>\n",
             "  flp-rebuild scale-automation-levels <input.flp> <output.flp> <channel-id> <center:-100..100> <tension:-100..100> <multiply:-200..200> <offset:-100..100>\n",
@@ -4704,6 +4716,26 @@ fn parse_raw_byte(value: &str, description: &str) -> Result<u8, String> {
     } else {
         parse_u8(value, description)
     }
+}
+
+fn parse_automation_point_tail(value: &str) -> Result<[u8; 4], String> {
+    let digits = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .unwrap_or(value);
+    if digits.len() != 8 {
+        return Err("automation point tail must contain exactly 8 hexadecimal digits".to_owned());
+    }
+    let mut bytes = [0; 4];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        let start = index * 2;
+        let pair = digits.get(start..start + 2).ok_or_else(|| {
+            "automation point tail must contain exactly 8 hexadecimal digits".to_owned()
+        })?;
+        *byte = u8::from_str_radix(pair, 16)
+            .map_err(|_| "automation point tail must contain exactly 8 hexadecimal digits")?;
+    }
+    Ok(bytes)
 }
 
 fn parse_u16(value: &str, description: &str) -> Result<u16, String> {
@@ -8221,6 +8253,29 @@ fn edit_automation_point(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "edited automation channel {channel_id} point {point_index} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn set_automation_point_trailing_bytes(
+    input: &Path,
+    output: &Path,
+    channel_id: u16,
+    point_index: usize,
+    trailing_bytes: [u8; 4],
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .set_automation_point_trailing_bytes(channel_id, point_index, trailing_bytes)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "set automation channel {channel_id} point {point_index} raw tail to {trailing_bytes:02X?} in {}",
         output.display()
     );
     Ok(())

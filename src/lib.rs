@@ -21904,6 +21904,56 @@ impl FlpDocument {
         Ok(())
     }
 
+    /// Sets the opaque four-byte state stored at the end of one type-5 automation point.
+    ///
+    /// The bytes are preserved verbatim and are not interpreted as a curve mode. This
+    /// operation is intended for projects where the point state is already known.
+    pub fn set_automation_point_trailing_bytes(
+        &mut self,
+        channel_id: u16,
+        point_index: usize,
+        trailing_bytes: [u8; 4],
+    ) -> Result<(), FlpError> {
+        let channels = self.channels();
+        let mut matching = channels.iter().filter(|channel| channel.id == channel_id);
+        let Some(channel) = matching.next() else {
+            return Err(FlpError::ChannelNotFound(channel_id));
+        };
+        if matching.next().is_some() {
+            return Err(FlpError::AmbiguousChannelId(channel_id));
+        }
+        if channel.kind != Some(5) {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel is not a type-5 automation channel",
+            ));
+        }
+        let event_index = channel
+            .event_range()
+            .find(|index| self.events[*index].opcode == 0xEA)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the selected automation channel has no existing 0xEA point blob",
+            ))?;
+        let points = decode_automation_points(&self.events[event_index])?;
+        if point_index >= points.len() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested automation point does not exist",
+            ));
+        }
+
+        let point_offset = FLP_AUTOMATION_POINTS_OFFSET
+            .checked_add(
+                point_index
+                    .checked_mul(FLP_AUTOMATION_POINT_SIZE)
+                    .ok_or(FlpError::LengthOverflow)?,
+            )
+            .ok_or(FlpError::LengthOverflow)?;
+        let mut payload = self.events[event_index].payload.clone();
+        payload[point_offset + 20..point_offset + 24].copy_from_slice(&trailing_bytes);
+        self.events[event_index].replace_data_payload(payload)?;
+        self.refresh_event_offsets()?;
+        Ok(())
+    }
+
     /// Vertically flips every value in a type-5 automation channel around 0.5.
     /// Positions, tension, opaque point state, and the automation blob's header and trailer
     /// are retained. Returns the number of points changed.
@@ -25515,7 +25565,7 @@ mod tests {
         AutomationInterpolationMode, AutomationScaleLevelsOptions, ChannelGroupSummary,
         ChannelLevelAdjustmentsEdit, ChannelNoteRouter, ChannelSortOrder, ChannelStretchMode,
         ChannelStretchSettingsEdit, ChannelSummary, ClawMachineOptions,
-        FLP_AUTOMATION_COUNT_OFFSET, FLP_AUTOMATION_LFO_AMOUNT_OFFSET,
+        FLP_AUTOMATION_COUNT_OFFSET, FLP_AUTOMATION_LFO_AMOUNT_OFFSET, FLP_AUTOMATION_POINT_SIZE,
         FLP_AUTOMATION_POINTS_OFFSET, FlpDocument, FlpError, FlpEvent, FstPreset, FstPresetKind,
         LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerInsertSummary,
         MixerLiveInsertEnabledGain, MixerLiveSendGain, MixerLiveSendOutputPath,
@@ -39402,6 +39452,59 @@ mod tests {
                 Some(amount)
             );
         }
+    }
+
+    #[test]
+    fn automation_point_tail_edit_changes_only_the_selected_raw_state() {
+        let source_points = [
+            (0.0, 0.2, 0.0, [1, 2, 3, 4]),
+            (2.0, 0.8, 0.25, [5, 6, 7, 8]),
+        ];
+        let trailer = (0..136)
+            .map(|index| (index * 13 % 256) as u8)
+            .collect::<Vec<_>>();
+        let original = automation_channel_fixture(&source_points, &trailer);
+        let mut document = FlpDocument::parse(&original).expect("automation project should parse");
+        let event_index = document
+            .events()
+            .iter()
+            .position(|event| event.opcode() == 0xEA)
+            .expect("fixture should contain an automation event");
+        let original_payload = document.events()[event_index].payload().to_vec();
+
+        let unchanged = document.clone();
+        assert!(
+            document
+                .set_automation_point_trailing_bytes(9, 2, [9, 9, 9, 9])
+                .is_err()
+        );
+        assert_eq!(
+            document, unchanged,
+            "failed edits should leave the project unchanged"
+        );
+
+        let replacement = [0xDE, 0xAD, 0xBE, 0xEF];
+        document
+            .set_automation_point_trailing_bytes(9, 1, replacement)
+            .expect("a valid automation point tail should be editable");
+        let edited_payload = document.events()[event_index].payload();
+        let offset = FLP_AUTOMATION_POINTS_OFFSET + FLP_AUTOMATION_POINT_SIZE;
+        assert_eq!(
+            &edited_payload[..offset + 20],
+            &original_payload[..offset + 20]
+        );
+        assert_eq!(&edited_payload[offset + 20..offset + 24], &replacement);
+        assert_eq!(
+            &edited_payload[offset + 24..],
+            &original_payload[offset + 24..]
+        );
+
+        let reparsed = FlpDocument::parse(&document.encode_lossless().unwrap())
+            .expect("edited automation should round-trip");
+        assert_eq!(
+            reparsed.automation_channels().unwrap()[0].points()[1].trailing_bytes(),
+            replacement
+        );
     }
 
     #[test]
