@@ -6921,10 +6921,12 @@ fn mix_playlist_clap_audio_layers(
         let source_end = (end_frame * 2) as usize;
         let target_start = ((start_frame - block_start) * 2) as usize;
         let target_end = target_start + source_end - source_start;
-        for (target_frame, source_frame) in output[target_start..target_end]
-            .chunks_exact_mut(2)
-            .zip(layer.samples[source_start..source_end].chunks_exact(2))
-        {
+        let (target_frames, target_remainder) =
+            output[target_start..target_end].as_chunks_mut::<2>();
+        let (source_frames, source_remainder) =
+            layer.samples[source_start..source_end].as_chunks::<2>();
+        debug_assert!(target_remainder.is_empty() && source_remainder.is_empty());
+        for (target_frame, source_frame) in target_frames.iter_mut().zip(source_frames) {
             target_frame[0] += source_frame[0] * layer.left_gain;
             target_frame[1] += source_frame[1] * layer.right_gain;
         }
