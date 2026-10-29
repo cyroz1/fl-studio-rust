@@ -1882,6 +1882,176 @@ pub struct AudioSettings {
     pub access: AudioAccess,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MetronomeTempoSegment {
+    start_tick: u64,
+    start_frame: u64,
+    tempo_bpm: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MetronomeMeterSegment {
+    start_tick: u32,
+    numerator: u8,
+    denominator: u8,
+}
+
+/// Realtime click timing for project playback. Tempo and meter changes are
+/// prepared off the audio callback so the callback only performs bounded lookups.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MetronomeTimeline {
+    ppq: u16,
+    sample_rate: u32,
+    tempo_segments: Vec<MetronomeTempoSegment>,
+    meter_segments: Vec<MetronomeMeterSegment>,
+    loop_frame_length: Option<u64>,
+}
+
+impl MetronomeTimeline {
+    /// Build click timing from tempo segments and project or Pattern time signatures.
+    ///
+    /// Tempo tuples contain `(start_tick, start_frame, bpm)`. Meter changes contain
+    /// `(start_tick, numerator, denominator)` and begin a new measure at their tick.
+    pub fn new(
+        ppq: u16,
+        sample_rate: u32,
+        tempo_segments: Vec<(u64, u64, f64)>,
+        initial_time_signature: Option<(u8, u8)>,
+        signature_changes: Vec<(u32, u8, u8)>,
+        loop_frame_length: Option<u64>,
+    ) -> Result<Self, String> {
+        if ppq == 0 {
+            return Err("metronome timing requires a positive project PPQ".to_owned());
+        }
+        if sample_rate == 0 {
+            return Err("metronome timing requires a positive audio sample rate".to_owned());
+        }
+        if loop_frame_length == Some(0) {
+            return Err("metronome loop length must be positive".to_owned());
+        }
+
+        let mut tempos = tempo_segments
+            .into_iter()
+            .map(|(start_tick, start_frame, tempo_bpm)| {
+                if !tempo_bpm.is_finite() || tempo_bpm <= 0.0 {
+                    return Err("metronome tempo must be finite and positive".to_owned());
+                }
+                Ok(MetronomeTempoSegment {
+                    start_tick,
+                    start_frame,
+                    tempo_bpm,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        tempos.sort_by_key(|segment| segment.start_tick);
+        let mut collapsed_tempos = Vec::<MetronomeTempoSegment>::with_capacity(tempos.len());
+        for segment in tempos {
+            if let Some(previous) = collapsed_tempos.last_mut()
+                && previous.start_tick == segment.start_tick
+            {
+                *previous = segment;
+            } else {
+                collapsed_tempos.push(segment);
+            }
+        }
+        if collapsed_tempos
+            .first()
+            .is_none_or(|segment| segment.start_tick != 0 || segment.start_frame != 0)
+        {
+            return Err("metronome tempo map must begin at tick and frame zero".to_owned());
+        }
+        if collapsed_tempos
+            .windows(2)
+            .any(|segments| segments[1].start_frame < segments[0].start_frame)
+        {
+            return Err("metronome tempo frames must be ordered".to_owned());
+        }
+
+        let (initial_numerator, initial_denominator) = initial_time_signature.unwrap_or((4, 4));
+        let mut meters = vec![MetronomeMeterSegment {
+            start_tick: 0,
+            numerator: initial_numerator.max(1),
+            denominator: initial_denominator.max(1),
+        }];
+        let mut changes = signature_changes;
+        changes.sort_by_key(|(start_tick, _, _)| *start_tick);
+        for (start_tick, numerator, denominator) in changes {
+            let segment = MetronomeMeterSegment {
+                start_tick,
+                numerator: numerator.max(1),
+                denominator: denominator.max(1),
+            };
+            if let Some(previous) = meters.last_mut()
+                && previous.start_tick == start_tick
+            {
+                *previous = segment;
+            } else {
+                meters.push(segment);
+            }
+        }
+
+        Ok(Self {
+            ppq,
+            sample_rate,
+            tempo_segments: collapsed_tempos,
+            meter_segments: meters,
+            loop_frame_length,
+        })
+    }
+
+    fn click_sample(&self, frame: u64, playback_speed: f32) -> f32 {
+        if !playback_speed.is_finite() || playback_speed <= 0.0 {
+            return 0.0;
+        }
+        let frame = self
+            .loop_frame_length
+            .map_or(frame, |length| frame % length);
+        let frame_f64 = frame as f64;
+        let tempo_index = self
+            .tempo_segments
+            .partition_point(|segment| segment.start_frame as f64 <= frame_f64)
+            .saturating_sub(1);
+        let tempo = self.tempo_segments[tempo_index];
+        let ticks_per_second = tempo.tempo_bpm * f64::from(self.ppq) / 60.0;
+        let tick = tempo.start_tick as f64
+            + (frame_f64 - tempo.start_frame as f64) * ticks_per_second
+                / f64::from(self.sample_rate);
+        if !tick.is_finite() || tick < 0.0 {
+            return 0.0;
+        }
+        let meter_index = self
+            .meter_segments
+            .partition_point(|segment| segment.start_tick as f64 <= tick)
+            .saturating_sub(1);
+        let meter = self.meter_segments[meter_index];
+        let ticks_per_beat = f64::from(self.ppq) * 4.0 / f64::from(meter.denominator);
+        let beat_index = ((tick - f64::from(meter.start_tick)) / ticks_per_beat)
+            .floor()
+            .max(0.0) as u64;
+        let beat_start_tick = f64::from(meter.start_tick) + beat_index as f64 * ticks_per_beat;
+        let beat_tempo_index = self
+            .tempo_segments
+            .partition_point(|segment| segment.start_tick as f64 <= beat_start_tick)
+            .saturating_sub(1);
+        let beat_tempo = self.tempo_segments[beat_tempo_index];
+        let beat_start_frame = beat_tempo.start_frame as f64
+            + (beat_start_tick - beat_tempo.start_tick as f64) * f64::from(self.sample_rate) * 60.0
+                / (f64::from(self.ppq) * beat_tempo.tempo_bpm);
+        let elapsed_seconds = (frame_f64 - beat_start_frame)
+            / f64::from(self.sample_rate)
+            / f64::from(playback_speed);
+        const CLICK_SECONDS: f64 = 0.055;
+        if !(0.0..CLICK_SECONDS).contains(&elapsed_seconds) {
+            return 0.0;
+        }
+        let accented = beat_index.is_multiple_of(u64::from(meter.numerator));
+        let frequency = if accented { 1_760.0 } else { 1_320.0 };
+        let level = if accented { 0.32 } else { 0.21 };
+        let phase = std::f64::consts::TAU * frequency * elapsed_seconds;
+        (phase.sin() * (-elapsed_seconds * 92.0).exp() * level) as f32
+    }
+}
+
 impl Default for AudioSettings {
     fn default() -> Self {
         Self {
@@ -1920,6 +2090,8 @@ struct PlaybackState {
     output_peak_left: AtomicU32,
     output_peak_right: AtomicU32,
     output_callback_frames: AtomicU32,
+    metronome_enabled: AtomicBool,
+    metronome_timeline: RetiredArcSwapOption<MetronomeTimeline>,
     output_latency_estimate: AudioLatencyEstimate,
     input_monitor_ring_flush_requested: AtomicBool,
     input_monitor_active: Arc<AtomicBool>,
@@ -2657,6 +2829,8 @@ impl PlaybackState {
             output_peak_left: AtomicU32::new(0.0_f32.to_bits()),
             output_peak_right: AtomicU32::new(0.0_f32.to_bits()),
             output_callback_frames: AtomicU32::new(0),
+            metronome_enabled: AtomicBool::new(false),
+            metronome_timeline: RetiredArcSwapOption::new(),
             output_latency_estimate: AudioLatencyEstimate::default(),
             input_monitor_ring_flush_requested: AtomicBool::new(false),
             input_monitor_active: Arc::new(AtomicBool::new(false)),
@@ -3646,6 +3820,18 @@ impl AudioEngine {
         self.playback
             .output_gain
             .store(gain.to_bits(), Ordering::Release);
+    }
+
+    /// Enable or disable the live project metronome.
+    pub fn set_metronome_enabled(&self, enabled: bool) {
+        self.playback
+            .metronome_enabled
+            .store(enabled, Ordering::Release);
+    }
+
+    /// Replace the timing map used by the live project metronome.
+    pub fn set_metronome_timeline(&self, timeline: Option<Arc<MetronomeTimeline>>) {
+        self.playback.metronome_timeline.store(timeline);
     }
 
     /// Set the transport playback rate, changing both pitch and song duration.
@@ -4705,6 +4891,10 @@ where
                 let playback_samples = playback_for_callback.samples.load();
                 let streaming = playback_for_callback.streaming.load();
                 let browser_preview_samples = playback_for_callback.browser_preview_samples.load();
+                let metronome_timeline = playback_for_callback
+                    .metronome_enabled
+                    .load(Ordering::Acquire)
+                    .then(|| playback_for_callback.metronome_timeline.load());
                 let target_gain =
                     f32::from_bits(playback_for_callback.output_gain.load(Ordering::Relaxed));
                 let mut output_peak = 0.0_f32;
@@ -4712,6 +4902,27 @@ where
                 let mut output_peak_right = 0.0_f32;
                 for frame in output.chunks_mut(channels) {
                     output_gain = smooth_output_gain(output_gain, target_gain, gain_alpha);
+                    let metronome_sample = metronome_timeline
+                        .as_ref()
+                        .and_then(|timeline| timeline.as_deref())
+                        .and_then(|timeline| {
+                            active_project_position_for_metronome(
+                                &source,
+                                &playback_for_callback,
+                                streaming.as_deref(),
+                            )
+                            .map(|frame| {
+                                timeline.click_sample(
+                                    frame,
+                                    f32::from_bits(
+                                        playback_for_callback
+                                            .playback_speed
+                                            .load(Ordering::Acquire),
+                                    ),
+                                )
+                            })
+                        })
+                        .unwrap_or(0.0);
                     let [left, right] = next_output_frame_with_browser_preview(AudioFrameInputs {
                         source: &source,
                         ring: &ring,
@@ -4726,8 +4937,8 @@ where
                     });
                     for (channel, destination) in frame.iter_mut().enumerate() {
                         let raw_sample = match channel {
-                            0 => left,
-                            1 => right,
+                            0 => left + metronome_sample,
+                            1 => right + metronome_sample,
                             _ => 0.0,
                         } * output_gain;
                         let sample = sanitize_output_sample(raw_sample);
@@ -5115,6 +5326,28 @@ fn next_output_frame(
         output[1] += monitored[1];
     }
     output
+}
+
+fn active_project_position_for_metronome(
+    source: &AtomicU8,
+    playback: &PlaybackState,
+    streaming: Option<&StreamingPlayback>,
+) -> Option<u64> {
+    match source.load(Ordering::Acquire) {
+        AUDIO_SOURCE_PROJECT if playback.active.load(Ordering::Acquire) => {
+            Some(playback.cursor_frames.load(Ordering::Relaxed))
+        }
+        AUDIO_SOURCE_STREAM => {
+            let streaming = streaming?;
+            if !streaming.project_source_active()
+                || (!streaming.active.load(Ordering::Acquire) && !streaming.is_ready())
+            {
+                return None;
+            }
+            Some(streaming.project_position_frames())
+        }
+        _ => None,
+    }
 }
 
 fn valid_project_playback_speed(speed_multiplier: f32) -> bool {

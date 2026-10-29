@@ -27,8 +27,8 @@ use clap_probe::{
 use eframe::egui::{self, Align2, Color32, FontId, Id, PointerButton, Sense, Stroke, Vec2};
 use flp_rebuild::audio::{
     AudioAccess, AudioDeviceCatalog, AudioEngine, AudioInputMonitorRecorder, AudioInputRecording,
-    AudioSettings, MIXER_TRACK_METER_COUNT, MixerTrackPeakMeters, StagedStreamingPlayback,
-    enumerate_devices,
+    AudioSettings, MIXER_TRACK_METER_COUNT, MetronomeTimeline, MixerTrackPeakMeters,
+    StagedStreamingPlayback, enumerate_devices,
 };
 use flp_rebuild::media::{
     AudioExportOptions, AudioWaveform, DecodedAudio, SamplePathResolver, WaveformPeak,
@@ -4882,6 +4882,7 @@ struct DawUi {
     history_navigation_during_frame: bool,
     history_snapshot_available_this_frame: bool,
     playing: bool,
+    metronome_enabled: bool,
     pattern_playback_mode: bool,
     pattern_mode_playback_source: Option<(u16, u64)>,
     pattern_seek_tick: u64,
@@ -7250,6 +7251,7 @@ impl DawUi {
             history_navigation_during_frame: false,
             history_snapshot_available_this_frame: false,
             playing: false,
+            metronome_enabled: false,
             pattern_playback_mode: false,
             pattern_mode_playback_source: None,
             pattern_seek_tick: 0,
@@ -13720,6 +13722,18 @@ impl DawUi {
                 return;
             }
         };
+        let metronome_timeline = match metronome_timeline_for_arrangement(
+            self.document.as_ref().expect("project was checked above"),
+            arrangement_id,
+            &playlist_tempo_map,
+            sample_rate,
+        ) {
+            Ok(timeline) => Arc::new(timeline),
+            Err(error) => {
+                self.status = format!("Could not prepare the metronome timing map: {error}");
+                return;
+            }
+        };
         let playlist_loop_range = self
             .playlist_time_selection
             .filter(|(selected_arrangement, start_tick, end_tick)| {
@@ -13870,6 +13884,8 @@ impl DawUi {
             self.status = "Audio output is not available".to_owned();
             return;
         };
+        engine.set_metronome_timeline(Some(metronome_timeline));
+        engine.set_metronome_enabled(self.metronome_enabled);
         let staged_stream_result = match staged_start_frame {
             Some(_) => engine
                 .begin_staged_streaming_playback_from_frame(start_frame)
@@ -14571,6 +14587,20 @@ impl DawUi {
                 return;
             }
         };
+        let metronome_timeline = match metronome_timeline_for_arrangement(
+            document,
+            arrangement_id,
+            &playlist_tempo_map,
+            sample_rate,
+        ) {
+            Ok(timeline) => Arc::new(timeline),
+            Err(error) => {
+                self.status = format!("Could not prepare the metronome timing map: {error}");
+                return;
+            }
+        };
+        engine.set_metronome_timeline(Some(metronome_timeline));
+        engine.set_metronome_enabled(self.metronome_enabled);
         let start_frame = match playlist_tempo_map.frame_at_tick(u64::from(start_tick), sample_rate)
         {
             Ok(frame) => frame,
@@ -15027,6 +15057,18 @@ impl DawUi {
         }
     }
 
+    fn toggle_metronome(&mut self) {
+        self.metronome_enabled = !self.metronome_enabled;
+        if let Some(engine) = self.audio_engine.as_ref() {
+            engine.set_metronome_enabled(self.metronome_enabled);
+        }
+        self.status = if self.metronome_enabled {
+            "Metronome enabled".to_owned()
+        } else {
+            "Metronome disabled".to_owned()
+        };
+    }
+
     fn set_pattern_playback_mode(&mut self, pattern_mode: bool) {
         if self.pattern_playback_mode == pattern_mode {
             return;
@@ -15098,6 +15140,7 @@ impl DawUi {
         }
         if let Some(engine) = &self.audio_engine {
             engine.stop_project_playback();
+            engine.set_metronome_timeline(None);
         }
         self.playing = false;
         self.project_playback_loaded = false;
@@ -18694,6 +18737,11 @@ impl DawUi {
     fn transport_bar(&mut self, ui: &mut egui::Ui) {
         let scale = self.toolbar_scale;
         apply_local_ui_scale(ui, scale);
+        let metronome_shortcut_requested = !ui.ctx().egui_wants_keyboard_input()
+            && ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::M));
+        if metronome_shortcut_requested {
+            self.toggle_metronome();
+        }
         let patterns = self
             .document
             .as_ref()
@@ -18880,6 +18928,13 @@ impl DawUi {
                 .clicked()
             {
                 self.set_pattern_playback_mode(false);
+            }
+            if ui
+                .selectable_label(self.metronome_enabled, "MET")
+                .on_hover_text("Metronome: click each beat and accent each bar (Ctrl/Cmd+M)")
+                .clicked()
+            {
+                self.toggle_metronome();
             }
             let play_label = if self.pending_audio_render.is_some()
                 || self.pending_clap_pattern_playback.is_some()
@@ -47661,6 +47716,25 @@ impl DawUi {
         } else {
             0
         };
+        let metronome_timeline = loop_length_ticks
+            .map(|loop_length_ticks| {
+                metronome_timeline_for_pattern(
+                    document,
+                    pattern_id,
+                    document.metadata().tempo_bpm().unwrap_or(140.0),
+                    loop_length_ticks,
+                    device_rate,
+                )
+                .map(Arc::new)
+            })
+            .transpose();
+        let metronome_timeline = match metronome_timeline {
+            Ok(timeline) => timeline,
+            Err(error) => {
+                self.status = format!("Could not prepare the metronome timing map: {error}");
+                return;
+            }
+        };
         let mut clap_pattern_channels = clap_audio_channel_ids;
         clap_pattern_channels.extend(pattern_audio_layers.iter().map(|layer| layer.channel_id));
         let pattern_vst3_instances = self
@@ -47803,6 +47877,8 @@ impl DawUi {
                     engine,
                 );
             }
+            engine.set_metronome_timeline(metronome_timeline);
+            engine.set_metronome_enabled(self.metronome_enabled && loop_length_ticks.is_some());
         }
         self.audio_test_tone = false;
 
@@ -69782,6 +69858,9 @@ impl eframe::App for DawUi {
             self.project_playback_loaded = false;
             self.playlist_playback_loaded = false;
             self.playlist_tempo_map = None;
+            if let Some(engine) = self.audio_engine.as_ref() {
+                engine.set_metronome_timeline(None);
+            }
             self.status = "Project playback reached the end".to_owned();
             self.stop_midi_clock();
         }
@@ -79735,6 +79814,94 @@ fn playlist_seek_tick_to_frame(
     sample_rate: u32,
 ) -> Result<u64, String> {
     tempo_map.frame_at_tick(u64::from(tick), sample_rate)
+}
+
+fn metronome_timeline_from_map(
+    document: &FlpDocument,
+    tempo_map: &PlaylistTempoMap,
+    sample_rate: u32,
+    signature_changes: Vec<(u32, u8, u8)>,
+    loop_frame_length: Option<u64>,
+) -> Result<MetronomeTimeline, String> {
+    let tempo_segments = tempo_map
+        .tempo_segments()
+        .map(|(start_tick, tempo_bpm)| {
+            tempo_map
+                .frame_at_tick(start_tick, sample_rate)
+                .map(|start_frame| (start_tick, start_frame, tempo_bpm))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    MetronomeTimeline::new(
+        document.header().ppq(),
+        sample_rate,
+        tempo_segments,
+        document.metadata().time_signature(),
+        signature_changes,
+        loop_frame_length,
+    )
+}
+
+fn metronome_timeline_for_arrangement(
+    document: &FlpDocument,
+    arrangement_id: u16,
+    tempo_map: &PlaylistTempoMap,
+    sample_rate: u32,
+) -> Result<MetronomeTimeline, String> {
+    let arrangement = document
+        .arrangements()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|arrangement| arrangement.id == arrangement_id)
+        .ok_or_else(|| format!("arrangement {arrangement_id} was not found"))?;
+    let signature_changes = arrangement
+        .time_markers
+        .iter()
+        .filter(|marker| marker.is_signature())
+        .filter_map(|marker| {
+            Some((
+                marker.position_ticks(),
+                marker.numerator()?,
+                marker.denominator()?,
+            ))
+        })
+        .collect();
+    metronome_timeline_from_map(document, tempo_map, sample_rate, signature_changes, None)
+}
+
+fn metronome_timeline_for_pattern(
+    document: &FlpDocument,
+    pattern_id: u16,
+    tempo_bpm: f64,
+    loop_length_ticks: u64,
+    sample_rate: u32,
+) -> Result<MetronomeTimeline, String> {
+    let pattern = document
+        .patterns()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|pattern| pattern.id == pattern_id)
+        .ok_or_else(|| format!("Pattern {pattern_id} was not found"))?;
+    let tempo_map = PlaylistTempoMap::constant(document.header().ppq(), tempo_bpm)?;
+    let loop_frame_length = tempo_map.frame_at_tick(loop_length_ticks, sample_rate)?;
+    let signature_changes = pattern
+        .time_markers
+        .iter()
+        .filter(|marker| marker.is_signature())
+        .filter_map(|marker| {
+            Some((
+                marker.position_ticks(),
+                marker.numerator()?,
+                marker.denominator()?,
+            ))
+        })
+        .collect();
+    metronome_timeline_from_map(
+        document,
+        &tempo_map,
+        sample_rate,
+        signature_changes,
+        Some(loop_frame_length),
+    )
 }
 
 fn first_available_playlist_track(
