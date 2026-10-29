@@ -355,9 +355,11 @@ are applied where the Mixer rows below describe. Full export surface:
   song position, clipped to the Playlist endpoint. The result can be inserted
   as a new Audio Clip on the source track while keeping the original, or used to
   consolidate the source with it muted; both placements support clip-start and
-  song-start renders. Looping or stretching clips beyond their source duration,
-  per-clip Pattern Clip rendering and consolidation, multiple selection, Playlist and
-  Pattern effect automation, and native FL Studio output comparison remain incomplete
+  song-start renders. Loaded VST3 insert and Master effects apply supported linked
+  Playlist Automation Clip and Pattern Event/LFO effect automation, reported effect
+  tails, and automatic PDC. Looping or stretching clips beyond their source duration,
+  per-clip Pattern Clip rendering and consolidation, multiple selection, unsupported
+  effect automation links, and native FL Studio output comparison remain incomplete
   ([Image-Line Playlist
   manual](https://www.image-line.com/fl-studio-learning-content/fl-studio-online-manual/html/playlist.htm)).
 - `[partial]` Playlist track freeze: **Freeze track from song start…** renders the selected track from tick zero, places the resulting Audio Clip on the same track, and mutes all original clips in one undoable edit. The action uses the selected Playlist output format and leaves the arrangement unchanged when known scaled clips, unresolved Sampler sources, unloaded VST3 channels, or a changed project prevent safe placement. Mixer effects and automation are not rendered; non-render-based smart disable and native output comparison remain incomplete.

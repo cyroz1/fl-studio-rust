@@ -4856,34 +4856,70 @@ impl Vst3HostRuntime {
     ///
     /// Audio Clip callers render the source into the processor's Mixer buses, then the processor
     /// applies the active insert and Master chains, reported tails, and automatic PDC.
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare_audio_clip_mixer_effects_processor(
         &self,
         document: &FlpDocument,
         arrangement_id: u16,
         output_sample_rate: u32,
+        selected_clip_index: usize,
+        soloed_playlist_track_range: Option<(u32, u32)>,
         mixer_effect_instances: &BTreeMap<(usize, u16), u64>,
-    ) -> Result<Vst3PlaylistStreamProcessor, String> {
+        automation_sources: &Vst3PlaylistAutomationSources,
+    ) -> Result<(Vst3PlaylistStreamProcessor, bool), String> {
+        let arrangement = document
+            .arrangements()
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|arrangement| arrangement.id == arrangement_id)
+            .ok_or_else(|| format!("arrangement {arrangement_id} was not found"))?;
+        let clip = arrangement
+            .clips
+            .get(selected_clip_index)
+            .ok_or_else(|| format!("Playlist clip {selected_clip_index} does not exist"))?;
+        let content_end_tick = u64::from(clip.position_ticks)
+            .checked_add(u64::from(clip.length_ticks))
+            .ok_or_else(|| "selected Audio Clip endpoint overflow".to_owned())?;
+        let options = PlaylistRenderOptions {
+            arrangement_id,
+            sample_rate: output_sample_rate,
+            soloed_playlist_track_range,
+            ..PlaylistRenderOptions::default()
+        };
+        let effect_automation = expand_playlist_mixer_effect_parameter_automation(
+            document,
+            options.clone(),
+            &automation_sources.mixer_effect_pattern_clips,
+            &automation_sources.mixer_effect_automation_clips,
+        )?;
+        let render_from_song_start = effect_automation.values().flatten().any(|lane| {
+            lane.points
+                .iter()
+                .any(|point| point.tick < content_end_tick)
+        });
         let mut processor = self.prepare_playlist_stream_with_automation_sources(
             document,
-            PlaylistRenderOptions {
-                arrangement_id,
-                sample_rate: output_sample_rate,
-                ..PlaylistRenderOptions::default()
-            },
+            options,
             &BTreeMap::new(),
             false,
             &Vst3PlaylistAutomationSources::default(),
         )?;
+        if render_from_song_start {
+            let content_frames = processor
+                .tempo_map
+                .frame_at_tick(content_end_tick, output_sample_rate)?;
+            processor.extend_to_output_frames(content_frames)?;
+        }
         self.attach_mixer_effects(
             document,
             mixer_effect_instances,
             &mut processor,
             true,
             false,
-            &BTreeMap::new(),
+            &effect_automation,
             None,
         )?;
-        Ok(processor)
+        Ok((processor, render_from_song_start))
     }
 
     /// Render one Pattern through its loaded VST3 instruments and the project's loaded Mixer FX.

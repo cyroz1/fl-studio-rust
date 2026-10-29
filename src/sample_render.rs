@@ -2210,6 +2210,7 @@ pub fn render_selected_audio_clip_to_file_with_mixer_effects(
     output_path: impl AsRef<Path>,
     output_format: AudioRenderOutput,
     mut processor: Vst3PlaylistStreamProcessor,
+    render_from_song_start: bool,
 ) -> Result<AudioClipRenderSummary, String> {
     if options.clip_index.is_none() {
         return Err("Mixer-effect Audio Clip renders require one selected clip".to_owned());
@@ -2221,19 +2222,36 @@ pub fn render_selected_audio_clip_to_file_with_mixer_effects(
         return Err("Audio Clip and Mixer effect sample rates do not match".to_owned());
     }
 
-    let render = prepare_audio_clip_render(document, project_path, options.clone(), false, None)?;
+    let mut source_options = options.clone();
+    source_options.start_from_song_start = options.start_from_song_start || render_from_song_start;
+    let render = prepare_audio_clip_render(document, project_path, source_options, false, None)?;
     require_audio_clips(&render)?;
+    let clip_start_frame = render
+        .clips
+        .first()
+        .map(|clip| clip.start_frame)
+        .ok_or_else(|| "selected Audio Clip produced no render source".to_owned())?;
+    let output_start_frame = if options.start_from_song_start {
+        0
+    } else {
+        clip_start_frame
+    };
     processor.extend_to_output_frames(render.summary.frames.max(processor.content_frames()))?;
     let processor_summary = processor.summary();
     let trim_frames = processor
         .pdc_render_start_trim_frames()
         .min(processor_summary.frames);
+    let output_frames = processor_summary
+        .frames
+        .checked_sub(trim_frames)
+        .and_then(|frames| frames.checked_sub(output_start_frame))
+        .ok_or_else(|| "Audio Clip render endpoint precedes the selected clip".to_owned())?;
     let master_output = MixerMasterOutput::from_document(document);
 
     processor.start_processing()?;
     let render_result = render_stereo_audio_to_file(
         output_path,
-        processor_summary.frames.saturating_sub(trim_frames),
+        output_frames,
         processor_summary.sample_rate,
         AudioRenderEncodingOptions {
             wav_sample_format: options.wav_sample_format,
@@ -2247,6 +2265,7 @@ pub fn render_selected_audio_clip_to_file_with_mixer_effects(
                 &mut processor,
                 processor_summary.frames,
                 trim_frames,
+                output_start_frame,
                 &master_output,
                 || false,
                 write_block,
@@ -8360,11 +8379,13 @@ fn stream_prepared_audio_clip_render(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stream_prepared_audio_clip_render_with_mixer_effects(
     render: &PreparedAudioClipRender,
     processor: &mut Vst3PlaylistStreamProcessor,
     render_frames: u64,
     trim_frames: u64,
+    output_start_frame: u64,
     master_output: &MixerMasterOutput,
     mut stream_cancelled: impl FnMut() -> bool,
     mut write_block: impl FnMut(&[f32]) -> Result<(), String>,
@@ -8381,6 +8402,9 @@ fn stream_prepared_audio_clip_render_with_mixer_effects(
     };
     let mut block = vec![0.0f32; STREAM_BLOCK_FRAMES * 2];
     let mut mixer_buses = Vec::new();
+    let first_output_frame = trim_frames
+        .checked_add(output_start_frame)
+        .ok_or_else(|| "Audio Clip render output start overflow".to_owned())?;
     let mut block_start = 0u64;
     while block_start < render_frames {
         check_cancelled(Some(&cancelled))?;
@@ -8407,7 +8431,7 @@ fn stream_prepared_audio_clip_render_with_mixer_effects(
         processor.mix_next_block_with_meter_buses(block_samples, &mut mixer_buses)?;
         master_output.apply(block_samples);
 
-        let skipped_frames = trim_frames
+        let skipped_frames = first_output_frame
             .saturating_sub(block_start)
             .min(frame_count as u64);
         if skipped_frames < frame_count as u64 {
@@ -8420,7 +8444,9 @@ fn stream_prepared_audio_clip_render_with_mixer_effects(
         block_start += frame_count as u64;
     }
     let mut summary = render.summary.clone();
-    summary.frames = render_frames.saturating_sub(trim_frames);
+    summary.frames = render_frames
+        .checked_sub(first_output_frame)
+        .ok_or_else(|| "Audio Clip render endpoint precedes its output start".to_owned())?;
     Ok(summary)
 }
 

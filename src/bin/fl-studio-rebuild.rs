@@ -42237,28 +42237,34 @@ impl DawUi {
             self.status = "An audio clip render is already running".to_owned();
             return;
         }
-        let mixer_effect_processor = if options.clip_index.is_none()
-            || self.mixer_effect_vst3_instances.is_empty()
-        {
-            None
-        } else {
-            let Some(host) = self.vst3_host.as_ref() else {
-                self.status = "VST3 host is not initialized".to_owned();
-                return;
-            };
-            match host.prepare_audio_clip_mixer_effects_processor(
-                document,
-                options.arrangement_id,
-                options.sample_rate,
-                &self.mixer_effect_vst3_instances,
-            ) {
-                Ok(processor) => Some(processor),
-                Err(error) => {
-                    self.status =
-                        format!("Could not prepare Mixer effects for Audio Clip render: {error}");
+        let mixer_effect_processor = match options.clip_index {
+            Some(selected_clip_index) if !self.mixer_effect_vst3_instances.is_empty() => {
+                let Some(host) = self.vst3_host.as_ref() else {
+                    self.status = "VST3 host is not initialized".to_owned();
                     return;
+                };
+                let automation_sources = self.vst3_playlist_automation_sources(document);
+                match host.prepare_audio_clip_mixer_effects_processor(
+                    document,
+                    options.arrangement_id,
+                    options.sample_rate,
+                    selected_clip_index,
+                    options.soloed_playlist_track_range,
+                    &self.mixer_effect_vst3_instances,
+                    &automation_sources,
+                ) {
+                    Ok((processor, render_from_song_start)) => {
+                        Some((processor, render_from_song_start))
+                    }
+                    Err(error) => {
+                        self.status = format!(
+                            "Could not prepare Mixer effects for Audio Clip render: {error}"
+                        );
+                        return;
+                    }
                 }
             }
+            _ => None,
         };
         let document = document.clone();
         let package_workspace = self.package_workspace.clone();
@@ -42270,14 +42276,17 @@ impl DawUi {
             .spawn(move || {
                 let _package_workspace = package_workspace;
                 let result = match mixer_effect_processor {
-                    Some(processor) => render_selected_audio_clip_to_file_with_mixer_effects(
-                        &document,
-                        &project_path,
-                        worker_options,
-                        &output_path_for_worker,
-                        output_format,
-                        processor,
-                    ),
+                    Some((processor, render_from_song_start)) => {
+                        render_selected_audio_clip_to_file_with_mixer_effects(
+                            &document,
+                            &project_path,
+                            worker_options,
+                            &output_path_for_worker,
+                            output_format,
+                            processor,
+                            render_from_song_start,
+                        )
+                    }
                     None => render_audio_clips_to_file(
                         &document,
                         &project_path,
