@@ -12,6 +12,7 @@ use clack_extensions::latency::PluginLatency;
 use clack_extensions::note_ports::{NoteDialect, NotePortInfoBuffer, PluginNotePorts};
 use clack_extensions::params::{ParamInfoBuffer, ParamInfoFlags, PluginParams};
 use clack_extensions::state::PluginState;
+use clack_extensions::tail::{PluginTail, TailLength};
 use clack_host::events::event_types::{
     Midi2Event, MidiEvent, NoteExpressionEvent, NoteExpressionType, NoteOffEvent, NoteOnEvent,
     ParamGestureBeginEvent, ParamGestureEndEvent, ParamValueEvent, TransportEvent, TransportFlags,
@@ -525,7 +526,10 @@ enum ClapMixerEffectProcessResponse {
         output_channels: usize,
     },
     StateLoaded,
-    Started(u32),
+    Started {
+        latency_samples: u32,
+        tail_samples: Option<u64>,
+    },
     Audio(Vec<f32>),
     Stopped,
     Error(String),
@@ -540,6 +544,7 @@ struct ClapMixerEffectProcess {
     output_channels: usize,
     sample_rate: u32,
     latency_samples: u32,
+    tail_samples: Option<u64>,
     stopped: bool,
 }
 
@@ -595,6 +600,7 @@ impl ClapMixerEffectProcess {
             output_channels: 0,
             sample_rate,
             latency_samples: 0,
+            tail_samples: None,
             stopped: false,
         };
         match process.receive_response()? {
@@ -638,8 +644,12 @@ impl ClapMixerEffectProcess {
             .and_then(|_| process.stdin.flush())
             .map_err(|error| format!("could not start CLAP Mixer effect processing: {error}"))?;
         match process.receive_response()? {
-            ClapMixerEffectProcessResponse::Started(latency_samples) => {
+            ClapMixerEffectProcessResponse::Started {
+                latency_samples,
+                tail_samples,
+            } => {
                 process.latency_samples = latency_samples;
+                process.tail_samples = tail_samples;
                 Ok(process)
             }
             ClapMixerEffectProcessResponse::Error(error) => Err(error),
@@ -809,6 +819,10 @@ impl MixerEffectProcessor for ClapMixerEffectProcess {
 
     fn latency_samples(&self) -> u32 {
         self.latency_samples
+    }
+
+    fn tail_samples(&self) -> Option<u64> {
+        self.tail_samples
     }
 
     fn process_block(
@@ -1337,9 +1351,21 @@ fn read_mixer_effect_process_responses(
             continue;
         }
         if let Some(value) = header.strip_prefix("STARTED ") {
-            if let Ok(latency_samples) = value.parse::<u32>() {
+            let mut fields = value.split_whitespace();
+            let latency_samples = fields.next().and_then(|field| field.parse::<u32>().ok());
+            let tail_samples = match fields.next() {
+                Some("NONE") => Some(None),
+                Some(field) => field.parse::<u64>().ok().map(Some),
+                None => None,
+            };
+            if let (Some(latency_samples), Some(tail_samples), None) =
+                (latency_samples, tail_samples, fields.next())
+            {
                 if response_sender
-                    .send(ClapMixerEffectProcessResponse::Started(latency_samples))
+                    .send(ClapMixerEffectProcessResponse::Started {
+                        latency_samples,
+                        tail_samples,
+                    })
                     .is_err()
                 {
                     return;
@@ -1347,7 +1373,7 @@ fn read_mixer_effect_process_responses(
                 continue;
             }
             let _ = response_sender.send(ClapMixerEffectProcessResponse::Error(
-                "CLAP Mixer effect helper sent an invalid latency".to_owned(),
+                "CLAP Mixer effect helper sent an invalid start report".to_owned(),
             ));
             return;
         }
@@ -1385,9 +1411,11 @@ fn read_mixer_effect_process_responses(
             return;
         }
         let samples = bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|sample| {
-                let sample = f32::from_le_bytes(sample.try_into().expect("sample width is four"));
+                let sample = f32::from_le_bytes(*sample);
                 if sample.is_finite() { sample } else { 0.0 }
             })
             .collect();
@@ -1975,7 +2003,17 @@ impl ClapMixerEffectInstance {
                 return 1;
             }
         };
-        if writeln!(output, "STARTED {}", self.latency_samples)
+        let tail_samples = {
+            let plugin = audio_processor.plugin_handle();
+            plugin
+                .get_extension::<PluginTail>()
+                .map(|tail| match tail.get(&plugin) {
+                    TailLength::Finite(samples) => u64::from(samples),
+                    TailLength::Infinite => u64::from(i32::MAX as u32),
+                })
+        };
+        let tail_report = tail_samples.map_or_else(|| "NONE".to_owned(), |tail| tail.to_string());
+        if writeln!(output, "STARTED {} {tail_report}", self.latency_samples)
             .and_then(|_| output.flush())
             .is_err()
         {
