@@ -1899,6 +1899,87 @@ struct MetronomeMeterSegment {
 /// Realtime click timing for project playback. Tempo and meter changes are
 /// prepared off the audio callback so the callback only performs bounded lookups.
 #[derive(Clone, Debug, PartialEq)]
+pub struct MetronomeClickSample {
+    sample_rate: u32,
+    samples: Vec<f32>,
+}
+
+impl MetronomeClickSample {
+    const MAX_SECONDS: usize = 10;
+
+    /// Downmix decoded channels to a bounded, mono click sample.
+    pub fn from_channels(sample_rate: u32, channels: &[Vec<f32>]) -> Result<Self, String> {
+        if sample_rate == 0 {
+            return Err("metronome click sample requires a positive sample rate".to_owned());
+        }
+        if channels.is_empty() {
+            return Err("metronome click sample has no audio channels".to_owned());
+        }
+        let frame_count = channels.iter().map(Vec::len).min().unwrap_or(0);
+        if frame_count == 0 {
+            return Err("metronome click sample is empty".to_owned());
+        }
+        let max_frames = usize::try_from(sample_rate)
+            .ok()
+            .and_then(|rate| rate.checked_mul(Self::MAX_SECONDS))
+            .ok_or_else(|| "metronome click sample is too large".to_owned())?;
+        let frame_count = frame_count.min(max_frames);
+        let channel_count = channels.len() as f64;
+        let mut samples = Vec::with_capacity(frame_count);
+        for frame in 0..frame_count {
+            let sample = channels
+                .iter()
+                .map(|channel| f64::from(channel[frame]))
+                .sum::<f64>()
+                / channel_count;
+            samples.push(if sample.is_finite() {
+                (sample as f32).clamp(-1.0, 1.0)
+            } else {
+                0.0
+            });
+        }
+        Ok(Self {
+            sample_rate,
+            samples,
+        })
+    }
+
+    /// Read the sample at a time offset, with linear interpolation across rates.
+    pub fn sample_at_time(&self, elapsed_seconds: f64) -> f32 {
+        if !elapsed_seconds.is_finite() || elapsed_seconds < 0.0 {
+            return 0.0;
+        }
+        let position = elapsed_seconds * f64::from(self.sample_rate);
+        if !position.is_finite() || position < 0.0 {
+            return 0.0;
+        }
+        let first = position.floor() as usize;
+        let Some(&first_sample) = self.samples.get(first) else {
+            return 0.0;
+        };
+        let second_sample = self
+            .samples
+            .get(first.saturating_add(1))
+            .copied()
+            .unwrap_or(first_sample);
+        let fraction = (position - first as f64) as f32;
+        first_sample + (second_sample - first_sample) * fraction
+    }
+
+    /// Duration of the bounded sample in seconds.
+    pub fn duration_seconds(&self) -> f64 {
+        self.samples.len() as f64 / f64::from(self.sample_rate)
+    }
+}
+
+/// User-selected metronome samples, shared safely with the realtime callback.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MetronomeClickSamples {
+    pub accent: Option<Arc<MetronomeClickSample>>,
+    pub beat: Option<Arc<MetronomeClickSample>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct MetronomeTimeline {
     ppq: u16,
     sample_rate: u32,
@@ -1999,7 +2080,12 @@ impl MetronomeTimeline {
         })
     }
 
-    fn click_sample(&self, frame: u64, playback_speed: f32) -> f32 {
+    fn click_sample(
+        &self,
+        frame: u64,
+        playback_speed: f32,
+        click_samples: Option<&MetronomeClickSamples>,
+    ) -> f32 {
         if !playback_speed.is_finite() || playback_speed <= 0.0 {
             return 0.0;
         }
@@ -2040,11 +2126,21 @@ impl MetronomeTimeline {
         let elapsed_seconds = (frame_f64 - beat_start_frame)
             / f64::from(self.sample_rate)
             / f64::from(playback_speed);
+        let accented = beat_index.is_multiple_of(u64::from(meter.numerator));
+        let custom_sample = click_samples.and_then(|samples| {
+            if accented {
+                samples.accent.as_deref()
+            } else {
+                samples.beat.as_deref()
+            }
+        });
+        if let Some(custom_sample) = custom_sample {
+            return custom_sample.sample_at_time(elapsed_seconds);
+        }
         const CLICK_SECONDS: f64 = 0.055;
         if !(0.0..CLICK_SECONDS).contains(&elapsed_seconds) {
             return 0.0;
         }
-        let accented = beat_index.is_multiple_of(u64::from(meter.numerator));
         let frequency = if accented { 1_760.0 } else { 1_320.0 };
         let level = if accented { 0.32 } else { 0.21 };
         let phase = std::f64::consts::TAU * frequency * elapsed_seconds;
@@ -2092,6 +2188,7 @@ struct PlaybackState {
     output_callback_frames: AtomicU32,
     metronome_enabled: AtomicBool,
     metronome_timeline: RetiredArcSwapOption<MetronomeTimeline>,
+    metronome_click_samples: RetiredArcSwapOption<MetronomeClickSamples>,
     recording_precount_samples: RetiredArcSwapOption<Vec<f32>>,
     recording_precount_state: AtomicU64,
     output_latency_estimate: AudioLatencyEstimate,
@@ -2833,6 +2930,7 @@ impl PlaybackState {
             output_callback_frames: AtomicU32::new(0),
             metronome_enabled: AtomicBool::new(false),
             metronome_timeline: RetiredArcSwapOption::new(),
+            metronome_click_samples: RetiredArcSwapOption::new(),
             recording_precount_samples: RetiredArcSwapOption::new(),
             recording_precount_state: AtomicU64::new(0),
             output_latency_estimate: AudioLatencyEstimate::default(),
@@ -3922,6 +4020,11 @@ impl AudioEngine {
         self.playback.metronome_timeline.store(timeline);
     }
 
+    /// Replace the custom accent and beat samples used by the live project metronome.
+    pub fn set_metronome_click_samples(&self, samples: Option<Arc<MetronomeClickSamples>>) {
+        self.playback.metronome_click_samples.store(samples);
+    }
+
     /// Set the transport playback rate, changing both pitch and song duration.
     pub fn set_project_playback_speed(&self, speed_multiplier: f32) -> Result<(), String> {
         if !valid_project_playback_speed(speed_multiplier) {
@@ -4985,6 +5088,10 @@ where
                     .metronome_enabled
                     .load(Ordering::Acquire)
                     .then(|| playback_for_callback.metronome_timeline.load());
+                let metronome_click_samples = playback_for_callback
+                    .metronome_enabled
+                    .load(Ordering::Acquire)
+                    .then(|| playback_for_callback.metronome_click_samples.load());
                 let target_gain =
                     f32::from_bits(playback_for_callback.output_gain.load(Ordering::Relaxed));
                 let mut output_peak = 0.0_f32;
@@ -5009,6 +5116,9 @@ where
                                             .playback_speed
                                             .load(Ordering::Acquire),
                                     ),
+                                    metronome_click_samples
+                                        .as_ref()
+                                        .and_then(|samples| samples.as_deref()),
                                 )
                             })
                         })

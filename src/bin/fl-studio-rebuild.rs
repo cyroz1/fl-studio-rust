@@ -27,8 +27,8 @@ use clap_probe::{
 use eframe::egui::{self, Align2, Color32, FontId, Id, PointerButton, Sense, Stroke, Vec2};
 use flp_rebuild::audio::{
     AudioAccess, AudioDeviceCatalog, AudioEngine, AudioInputMonitorRecorder, AudioInputRecording,
-    AudioSettings, MIXER_TRACK_METER_COUNT, MetronomeTimeline, MixerTrackPeakMeters,
-    StagedStreamingPlayback, enumerate_devices,
+    AudioSettings, MIXER_TRACK_METER_COUNT, MetronomeClickSample, MetronomeClickSamples,
+    MetronomeTimeline, MixerTrackPeakMeters, StagedStreamingPlayback, enumerate_devices,
 };
 use flp_rebuild::media::{
     AudioExportOptions, AudioWaveform, DecodedAudio, SamplePathResolver, WaveformPeak,
@@ -4883,6 +4883,10 @@ struct DawUi {
     history_snapshot_available_this_frame: bool,
     playing: bool,
     metronome_enabled: bool,
+    metronome_accent_sample_path: Option<PathBuf>,
+    metronome_accent_sample: Option<Arc<MetronomeClickSample>>,
+    metronome_beat_sample_path: Option<PathBuf>,
+    metronome_beat_sample: Option<Arc<MetronomeClickSample>>,
     recording_precount_enabled: bool,
     recording_precount_bars: u8,
     pending_recording_precount: Option<PendingRecordingPrecount>,
@@ -7213,6 +7217,12 @@ impl DawUi {
         let window_layout_presets = load_window_layout_presets();
         let read_sample_root_note = load_read_sample_root_note();
         let metronome_enabled = load_metronome_enabled();
+        let (metronome_accent_sample_path, metronome_beat_sample_path) =
+            load_metronome_click_sample_paths();
+        let metronome_accent_sample =
+            load_metronome_click_sample(metronome_accent_sample_path.as_deref());
+        let metronome_beat_sample =
+            load_metronome_click_sample(metronome_beat_sample_path.as_deref());
         let (recording_precount_enabled, recording_precount_bars) =
             load_recording_precount_settings();
         let audio_recording_offset_ms = load_audio_recording_offset_ms();
@@ -7267,6 +7277,10 @@ impl DawUi {
             history_snapshot_available_this_frame: false,
             playing: false,
             metronome_enabled,
+            metronome_accent_sample_path,
+            metronome_accent_sample,
+            metronome_beat_sample_path,
+            metronome_beat_sample,
             recording_precount_enabled,
             recording_precount_bars,
             pending_recording_precount: None,
@@ -13904,6 +13918,7 @@ impl DawUi {
             return;
         };
         engine.set_metronome_timeline(Some(metronome_timeline));
+        engine.set_metronome_click_samples(self.metronome_click_samples());
         engine.set_metronome_enabled(self.metronome_enabled);
         let staged_stream_result = match staged_start_frame {
             Some(_) => engine
@@ -14619,6 +14634,7 @@ impl DawUi {
             }
         };
         engine.set_metronome_timeline(Some(metronome_timeline));
+        engine.set_metronome_click_samples(self.metronome_click_samples());
         engine.set_metronome_enabled(self.metronome_enabled);
         let start_frame = match playlist_tempo_map.frame_at_tick(u64::from(start_tick), sample_rate)
         {
@@ -15092,6 +15108,76 @@ impl DawUi {
         };
     }
 
+    fn metronome_click_samples(&self) -> Option<Arc<MetronomeClickSamples>> {
+        if self.metronome_accent_sample.is_none() && self.metronome_beat_sample.is_none() {
+            return None;
+        }
+        Some(Arc::new(MetronomeClickSamples {
+            accent: self.metronome_accent_sample.clone(),
+            beat: self.metronome_beat_sample.clone(),
+        }))
+    }
+
+    fn apply_metronome_click_samples(&self) {
+        if let Some(engine) = self.audio_engine.as_ref() {
+            engine.set_metronome_click_samples(self.metronome_click_samples());
+        }
+    }
+
+    fn choose_metronome_click_sample(&mut self, accent: bool) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter(
+                "Audio samples",
+                &["wav", "aif", "aiff", "flac", "ogg", "mp3", "m4a"],
+            )
+            .pick_file()
+        else {
+            return;
+        };
+        let sample = match decode_metronome_click_sample(&path) {
+            Ok(sample) => Arc::new(sample),
+            Err(error) => {
+                self.status = format!("Could not load metronome sample: {error}");
+                return;
+            }
+        };
+        if accent {
+            self.metronome_accent_sample_path = Some(path);
+            self.metronome_accent_sample = Some(sample);
+        } else {
+            self.metronome_beat_sample_path = Some(path);
+            self.metronome_beat_sample = Some(sample);
+        }
+        self.apply_metronome_click_samples();
+        self.status = match save_metronome_click_sample_paths(
+            self.metronome_accent_sample_path.as_deref(),
+            self.metronome_beat_sample_path.as_deref(),
+        ) {
+            Ok(()) if accent => "Metronome accent sample updated".to_owned(),
+            Ok(()) => "Metronome beat sample updated".to_owned(),
+            Err(error) => format!("Metronome sample updated but preference not saved: {error}"),
+        };
+    }
+
+    fn clear_metronome_click_sample(&mut self, accent: bool) {
+        if accent {
+            self.metronome_accent_sample_path = None;
+            self.metronome_accent_sample = None;
+        } else {
+            self.metronome_beat_sample_path = None;
+            self.metronome_beat_sample = None;
+        }
+        self.apply_metronome_click_samples();
+        self.status = match save_metronome_click_sample_paths(
+            self.metronome_accent_sample_path.as_deref(),
+            self.metronome_beat_sample_path.as_deref(),
+        ) {
+            Ok(()) if accent => "Metronome accent sample cleared".to_owned(),
+            Ok(()) => "Metronome beat sample cleared".to_owned(),
+            Err(error) => format!("Metronome sample cleared but preference not saved: {error}"),
+        };
+    }
+
     fn toggle_recording_precount(&mut self) {
         self.set_recording_precount_enabled(!self.recording_precount_enabled);
     }
@@ -15230,6 +15316,8 @@ impl DawUi {
             start_tick,
             signature,
             bars,
+            self.metronome_accent_sample.as_deref(),
+            self.metronome_beat_sample.as_deref(),
         )?;
         let duration =
             Duration::from_secs_f64((samples.len() / 2) as f64 / f64::from(sample_rate.max(1)));
@@ -19192,11 +19280,57 @@ impl DawUi {
             {
                 self.set_pattern_playback_mode(false);
             }
-            if ui
+            let metronome_response = ui
                 .selectable_label(self.metronome_enabled, "MET")
-                .on_hover_text("Metronome: click each beat and accent each bar (Ctrl/Cmd+M)")
-                .clicked()
-            {
+                .on_hover_text(
+                    "Metronome: click each beat and accent each bar (Ctrl/Cmd+M; right-click to choose samples)",
+                );
+            let mut choose_accent_sample = false;
+            let mut choose_beat_sample = false;
+            let mut clear_accent_sample = false;
+            let mut clear_beat_sample = false;
+            let _ = metronome_response.context_menu(|ui| {
+                apply_local_ui_scale(ui, self.popup_menu_scale);
+                ui.label(format!(
+                    "Accent: {}",
+                    metronome_click_sample_label(self.metronome_accent_sample_path.as_deref())
+                ));
+                if ui.button("Choose accent sample…").clicked() {
+                    choose_accent_sample = true;
+                    ui.close();
+                }
+                if self.metronome_accent_sample_path.is_some()
+                    && ui.button("Clear accent sample").clicked()
+                {
+                    clear_accent_sample = true;
+                    ui.close();
+                }
+                ui.separator();
+                ui.label(format!(
+                    "Beat: {}",
+                    metronome_click_sample_label(self.metronome_beat_sample_path.as_deref())
+                ));
+                if ui.button("Choose beat sample…").clicked() {
+                    choose_beat_sample = true;
+                    ui.close();
+                }
+                if self.metronome_beat_sample_path.is_some()
+                    && ui.button("Clear beat sample").clicked()
+                {
+                    clear_beat_sample = true;
+                    ui.close();
+                }
+            });
+            if choose_accent_sample {
+                self.choose_metronome_click_sample(true);
+            } else if choose_beat_sample {
+                self.choose_metronome_click_sample(false);
+            } else if clear_accent_sample {
+                self.clear_metronome_click_sample(true);
+            } else if clear_beat_sample {
+                self.clear_metronome_click_sample(false);
+            }
+            if metronome_response.clicked() {
                 self.toggle_metronome();
             }
             let precount_response = ui
@@ -48169,6 +48303,7 @@ impl DawUi {
                 );
             }
             engine.set_metronome_timeline(metronome_timeline);
+            engine.set_metronome_click_samples(self.metronome_click_samples());
             engine.set_metronome_enabled(self.metronome_enabled && loop_length_ticks.is_some());
         }
         self.audio_test_tone = false;
@@ -77314,6 +77449,65 @@ fn save_metronome_enabled(enabled: bool) -> Result<(), String> {
         .map_err(|error| format!("could not write {}: {error}", path.display()))
 }
 
+fn metronome_click_samples_settings_file() -> Option<PathBuf> {
+    browser_favorites_file()?
+        .parent()
+        .map(|directory| directory.join("metronome-click-samples.txt"))
+}
+
+fn load_metronome_click_sample_paths() -> (Option<PathBuf>, Option<PathBuf>) {
+    let Some(contents) =
+        metronome_click_samples_settings_file().and_then(|path| fs::read_to_string(path).ok())
+    else {
+        return (None, None);
+    };
+    let mut paths = contents.split('\n').map(|line| {
+        let line = line.trim_end_matches('\r');
+        (!line.is_empty()).then(|| PathBuf::from(line))
+    });
+    (paths.next().flatten(), paths.next().flatten())
+}
+
+fn save_metronome_click_sample_paths(
+    accent_path: Option<&Path>,
+    beat_path: Option<&Path>,
+) -> Result<(), String> {
+    let path = metronome_click_samples_settings_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the metronome sample preference path has no parent folder".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    let accent = accent_path.map_or_else(String::new, |path| path.to_string_lossy().into_owned());
+    let beat = beat_path.map_or_else(String::new, |path| path.to_string_lossy().into_owned());
+    fs::write(&path, format!("{accent}\n{beat}\n"))
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
+fn load_metronome_click_sample(path: Option<&Path>) -> Option<Arc<MetronomeClickSample>> {
+    decode_metronome_click_sample(path?).ok().map(Arc::new)
+}
+
+fn decode_metronome_click_sample(path: &Path) -> Result<MetronomeClickSample, String> {
+    const SAMPLE_RATE: u32 = 48_000;
+    const MAX_SECONDS: f64 = 10.0;
+    let interleaved = decode_audio_preview(path, SAMPLE_RATE, Some(MAX_SECONDS))?;
+    let mut left = Vec::with_capacity(interleaved.len() / 2);
+    let mut right = Vec::with_capacity(interleaved.len() / 2);
+    for frame in interleaved.chunks_exact(2) {
+        left.push(frame[0]);
+        right.push(frame[1]);
+    }
+    MetronomeClickSample::from_channels(SAMPLE_RATE, &[left, right])
+}
+
+fn metronome_click_sample_label(path: Option<&Path>) -> String {
+    path.and_then(Path::file_name)
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Default tone".to_owned())
+}
+
 fn recording_precount_settings_file() -> Option<PathBuf> {
     browser_favorites_file()?
         .parent()
@@ -80234,6 +80428,8 @@ fn render_recording_precount_samples(
     start_tick: u32,
     time_signature: (u8, u8),
     bars: u8,
+    accent_sample: Option<&MetronomeClickSample>,
+    beat_sample: Option<&MetronomeClickSample>,
 ) -> Result<Vec<f32>, String> {
     if sample_rate == 0 || ppq == 0 || bars == 0 {
         return Err(
@@ -80255,7 +80451,7 @@ fn render_recording_precount_samples(
         .and_then(|frames| frames.checked_mul(2))
         .ok_or_else(|| "Recording count-in audio is too large".to_owned())?;
     let mut samples = vec![0.0_f32; sample_count];
-    let click_frames = (f64::from(sample_rate) * 0.055).ceil() as u64;
+    let default_click_frames = (f64::from(sample_rate) * 0.055).ceil() as u64;
     for beat in 0..beat_count {
         let beat_tick = f64::from(start_tick) + f64::from(beat) * ticks_per_beat;
         let beat_frame = tempo_map
@@ -80265,13 +80461,22 @@ fn render_recording_precount_samples(
             continue;
         }
         let accented = beat % u32::from(numerator) == 0;
+        let custom_sample = if accented { accent_sample } else { beat_sample };
+        let click_frames = custom_sample.map_or(default_click_frames, |sample| {
+            (sample.duration_seconds() * f64::from(sample_rate)).ceil() as u64
+        });
         let frequency = if accented { 1_760.0 } else { 1_320.0 };
         let level = if accented { 0.32 } else { 0.21 };
         let frames = click_frames.min(frame_count - beat_frame);
         for click_frame in 0..frames {
             let elapsed_seconds = click_frame as f64 / f64::from(sample_rate);
-            let phase = std::f64::consts::TAU * frequency * elapsed_seconds;
-            let sample = (phase.sin() * (-elapsed_seconds * 92.0).exp() * level) as f32;
+            let sample = custom_sample.map_or_else(
+                || {
+                    let phase = std::f64::consts::TAU * frequency * elapsed_seconds;
+                    (phase.sin() * (-elapsed_seconds * 92.0).exp() * level) as f32
+                },
+                |sample| sample.sample_at_time(elapsed_seconds),
+            );
             let offset = usize::try_from(beat_frame + click_frame)
                 .ok()
                 .and_then(|frame| frame.checked_mul(2))
