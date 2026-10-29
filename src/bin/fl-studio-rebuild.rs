@@ -7200,6 +7200,7 @@ impl DawUi {
         let detached_window_placements = load_detached_window_placements();
         let window_layout_presets = load_window_layout_presets();
         let read_sample_root_note = load_read_sample_root_note();
+        let metronome_enabled = load_metronome_enabled();
         let audio_recording_offset_ms = load_audio_recording_offset_ms();
         let audio_recording_auto_latency_compensation =
             load_audio_recording_auto_latency_compensation();
@@ -7251,7 +7252,7 @@ impl DawUi {
             history_navigation_during_frame: false,
             history_snapshot_available_this_frame: false,
             playing: false,
-            metronome_enabled: false,
+            metronome_enabled,
             pattern_playback_mode: false,
             pattern_mode_playback_source: None,
             pattern_seek_tick: 0,
@@ -15062,10 +15063,14 @@ impl DawUi {
         if let Some(engine) = self.audio_engine.as_ref() {
             engine.set_metronome_enabled(self.metronome_enabled);
         }
-        self.status = if self.metronome_enabled {
-            "Metronome enabled".to_owned()
+        let label = if self.metronome_enabled {
+            "enabled"
         } else {
-            "Metronome disabled".to_owned()
+            "disabled"
+        };
+        self.status = match save_metronome_enabled(self.metronome_enabled) {
+            Ok(()) => format!("Metronome {label}"),
+            Err(error) => format!("Metronome {label}; preference not saved: {error}"),
         };
     }
 
@@ -76938,6 +76943,31 @@ fn read_sample_root_note_settings_file() -> Option<PathBuf> {
     browser_favorites_file()?
         .parent()
         .map(|directory| directory.join("read-sample-root-note.txt"))
+}
+
+fn metronome_settings_file() -> Option<PathBuf> {
+    browser_favorites_file()?
+        .parent()
+        .map(|directory| directory.join("metronome-enabled.txt"))
+}
+
+fn load_metronome_enabled() -> bool {
+    metronome_settings_file()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|contents| contents.trim().parse::<bool>().ok())
+        .unwrap_or(false)
+}
+
+fn save_metronome_enabled(enabled: bool) -> Result<(), String> {
+    let path = metronome_settings_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the metronome preference path has no parent folder".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    fs::write(&path, format!("{enabled}\n"))
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
 }
 
 fn midi_recording_offset_settings_file() -> Option<PathBuf> {
