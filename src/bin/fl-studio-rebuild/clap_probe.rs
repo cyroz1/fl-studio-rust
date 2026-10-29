@@ -311,6 +311,17 @@ pub type ClapPatternPreviewResponse = (
     u64,
     Result<ClapPatternPreviewOutput, String>,
 );
+pub type ClapMixerEffectStateCaptureRequest =
+    (usize, u16, ClapProjectMixerEffectAssignment, u32, u64);
+pub type ClapMixerEffectStateCaptureResponse = (
+    usize,
+    u16,
+    PathBuf,
+    String,
+    String,
+    u64,
+    Result<Vec<u8>, String>,
+);
 
 pub fn start_worker(
     egui_context: eframe::egui::Context,
@@ -549,6 +560,205 @@ pub fn start_pattern_preview_worker(
         .expect("CLAP Pattern preview worker should start");
 
     (request_sender, response_receiver)
+}
+
+pub fn start_mixer_effect_state_capture_worker(
+    egui_context: eframe::egui::Context,
+) -> (
+    Sender<ClapMixerEffectStateCaptureRequest>,
+    Receiver<ClapMixerEffectStateCaptureResponse>,
+) {
+    let (request_sender, request_receiver) = mpsc::channel::<ClapMixerEffectStateCaptureRequest>();
+    let (response_sender, response_receiver) =
+        mpsc::channel::<ClapMixerEffectStateCaptureResponse>();
+
+    thread::Builder::new()
+        .name("clap-mixer-effect-state-capture".to_owned())
+        .spawn(move || {
+            while let Ok((insert_ordinal, slot_index, assignment, sample_rate, request_id)) =
+                request_receiver.recv()
+            {
+                let ClapProjectMixerEffectAssignment {
+                    path,
+                    plugin_id,
+                    plugin_name,
+                    state,
+                } = assignment;
+                let result =
+                    capture_mixer_effect_state_in_subprocess(&path, &plugin_id, sample_rate, state);
+                if response_sender
+                    .send((
+                        insert_ordinal,
+                        slot_index,
+                        path,
+                        plugin_id,
+                        plugin_name,
+                        request_id,
+                        result,
+                    ))
+                    .is_err()
+                {
+                    break;
+                }
+                egui_context.request_repaint();
+            }
+        })
+        .expect("CLAP Mixer effect state-capture worker should start");
+
+    (request_sender, response_receiver)
+}
+
+fn capture_mixer_effect_state_in_subprocess(
+    path: &Path,
+    plugin_id: &str,
+    sample_rate: u32,
+    previous_state: Option<Vec<u8>>,
+) -> Result<Vec<u8>, String> {
+    if previous_state
+        .as_ref()
+        .is_some_and(|state| state.len() > MAX_CLAP_PROJECT_PLUGIN_STATE_BYTES)
+    {
+        return Err("CLAP plug-in state exceeds the 32 MiB limit".to_owned());
+    }
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("could not locate the CLAP Mixer effect helper: {error}"))?;
+    let mut child = Command::new(executable)
+        .arg(MIXER_EFFECT_SERVER_FLAG)
+        .arg(path)
+        .arg(plugin_id)
+        .arg(sample_rate.to_string())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("could not start the CLAP Mixer effect helper: {error}"))?;
+    let Some(stdin) = child.stdin.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("CLAP Mixer effect helper did not provide input".to_owned());
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("CLAP Mixer effect helper did not provide output".to_owned());
+    };
+    let (response_sender, response_receiver) = mpsc::sync_channel(1);
+    let protocol = thread::Builder::new()
+        .name("clap-mixer-effect-state-response".to_owned())
+        .spawn(move || {
+            let result = capture_mixer_effect_state_protocol(stdin, stdout, previous_state);
+            let _ = response_sender.send(result);
+        })
+        .map_err(|error| {
+            let _ = child.kill();
+            let _ = child.wait();
+            format!("could not start the CLAP Mixer effect state reader: {error}")
+        })?;
+
+    let result = match response_receiver.recv_timeout(CLAP_MIXER_EFFECT_PROCESS_TIMEOUT) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = protocol.join();
+            return Err("CLAP Mixer effect state capture timed out after 10 seconds".to_owned());
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = protocol.join();
+            return Err("CLAP Mixer effect state helper stopped unexpectedly".to_owned());
+        }
+    };
+    if result.is_err() {
+        let _ = child.kill();
+    }
+    let deadline = Instant::now() + CLAP_MIXER_EFFECT_PROCESS_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = protocol.join();
+                return Err("CLAP Mixer effect helper did not exit after state capture".to_owned());
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = protocol.join();
+                return Err(format!(
+                    "could not wait for the CLAP Mixer effect helper: {error}"
+                ));
+            }
+        }
+    };
+    protocol
+        .join()
+        .map_err(|_| "CLAP Mixer effect state reader stopped unexpectedly".to_owned())?;
+    let state = result?;
+    if !status.success() {
+        return Err(
+            "CLAP Mixer effect helper exited unsuccessfully after state capture".to_owned(),
+        );
+    }
+    Ok(state)
+}
+
+fn capture_mixer_effect_state_protocol(
+    stdin: ChildStdin,
+    stdout: ChildStdout,
+    previous_state: Option<Vec<u8>>,
+) -> Result<Vec<u8>, String> {
+    let mut input = BufReader::new(stdout);
+    let mut output = BufWriter::new(stdin);
+    let ready = read_preview_protocol_header(&mut input)
+        .map_err(|error| format!("could not read CLAP Mixer effect helper status: {error}"))?
+        .ok_or_else(|| "CLAP Mixer effect helper closed before initialization".to_owned())?;
+    if let Some(error) = ready.strip_prefix("ERR ") {
+        return Err(error.to_owned());
+    }
+    if !ready.starts_with("READY ") {
+        return Err("CLAP Mixer effect helper sent an invalid initialization response".to_owned());
+    }
+
+    if let Some(state) = previous_state {
+        writeln!(output, "LOAD_STATE {}", state.len())
+            .and_then(|_| output.write_all(&state))
+            .and_then(|_| output.write_all(b"\n"))
+            .and_then(|_| output.flush())
+            .map_err(|error| format!("could not restore CLAP Mixer effect state: {error}"))?;
+        let loaded = read_preview_protocol_header(&mut input)
+            .map_err(|error| format!("could not read CLAP Mixer effect state response: {error}"))?
+            .ok_or_else(|| "CLAP Mixer effect helper closed during state restore".to_owned())?;
+        if let Some(error) = loaded.strip_prefix("ERR ") {
+            return Err(error.to_owned());
+        }
+        if loaded != "STATE_LOADED" {
+            return Err("CLAP Mixer effect helper did not acknowledge its state".to_owned());
+        }
+    }
+
+    output
+        .write_all(b"SAVE_STATE\n")
+        .and_then(|_| output.flush())
+        .map_err(|error| format!("could not request CLAP Mixer effect state: {error}"))?;
+    let response = read_preview_protocol_header(&mut input)
+        .map_err(|error| format!("could not read CLAP Mixer effect state: {error}"))?
+        .ok_or_else(|| "CLAP Mixer effect helper closed before saving state".to_owned())?;
+    if let Some(error) = response.strip_prefix("ERR ") {
+        return Err(error.to_owned());
+    }
+    let state_header = response
+        .strip_prefix("STATE ")
+        .ok_or_else(|| "CLAP Mixer effect helper returned no saved state".to_owned())?;
+    let state = read_preview_server_state(&mut input, state_header)?;
+    output
+        .write_all(b"STOP\n")
+        .and_then(|_| output.flush())
+        .map_err(|error| format!("could not stop the CLAP Mixer effect helper: {error}"))?;
+    Ok(state)
 }
 
 /// Loads one CLAP entry in a child process so a crashing plug-in cannot terminate the DAW.
@@ -2015,6 +2225,21 @@ pub fn run_mixer_effect_server_child(path: &Path, plugin_id: &str, sample_rate: 
                 }
             }
         }
+        if line == "SAVE_STATE" {
+            match instance.save_state() {
+                Ok(state) => {
+                    if write_preview_server_state(&mut output, &state).is_err() {
+                        return 1;
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    let _ = write_preview_server_error(&mut output, &error);
+                    let _ = output.flush();
+                    return 1;
+                }
+            }
+        }
         if line == "START" {
             return instance.run_processing_server(&mut input, &mut output);
         }
@@ -2244,6 +2469,23 @@ impl ClapMixerEffectInstance {
         state
             .load(&plugin, &mut input)
             .map_err(|error| format!("CLAP effect could not restore its state: {error}"))
+    }
+
+    fn save_state(&mut self) -> Result<Vec<u8>, String> {
+        let plugin = self.instance.plugin_handle();
+        let state = plugin
+            .get_extension::<PluginState>()
+            .ok_or_else(|| "CLAP effect does not support state saving".to_owned())?;
+        let mut writer = LimitedClapStateWriter {
+            bytes: Vec::new(),
+            exceeded_limit: false,
+        };
+        let save_result = state.save(&plugin, &mut writer);
+        if writer.exceeded_limit {
+            return Err("CLAP plug-in state exceeds the 32 MiB limit".to_owned());
+        }
+        save_result.map_err(|error| format!("CLAP effect could not save its state: {error}"))?;
+        Ok(writer.bytes)
     }
 
     fn read_latency_samples(&mut self) -> u32 {
