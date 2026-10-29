@@ -12,14 +12,17 @@ use clack_extensions::params::{ParamInfoBuffer, PluginParams};
 use clack_extensions::state::PluginState;
 use clack_host::events::event_types::{
     Midi2Event, MidiEvent, NoteExpressionEvent, NoteExpressionType, NoteOffEvent, NoteOnEvent,
-    ParamGestureBeginEvent, ParamGestureEndEvent, ParamValueEvent,
+    ParamGestureBeginEvent, ParamGestureEndEvent, ParamValueEvent, TransportEvent, TransportFlags,
 };
+use clack_host::events::{EventFlags, EventHeader};
 use clack_host::prelude::{
     AudioPortBuffer, AudioPortBufferType, AudioPorts, ClapId, EventBuffer, HostInfo,
     InputAudioBuffers, InputChannel, Pckn, PluginAudioConfiguration, PluginEntry, PluginInstance,
     ProcessStatus,
 };
+use clack_host::utils::{BeatTime, SecondsTime};
 use flp_rebuild::plugin_settings::MAX_CLAP_PROJECT_PLUGIN_STATE_BYTES;
+use flp_rebuild::sample_render::PlaylistTempoMap;
 
 pub const PROBE_FLAG: &str = "--clap-probe";
 pub const INSTANCE_PROBE_FLAG: &str = "--clap-instance-probe";
@@ -28,7 +31,7 @@ pub const NOTE_PREVIEW_SERVER_FLAG: &str = "--clap-note-preview-server";
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_PROBE_OUTPUT_BYTES: usize = 1024 * 1024;
-const MAX_NOTE_PREVIEW_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
+const MAX_NOTE_PREVIEW_OUTPUT_BYTES: usize = 128 * 1024 * 1024;
 const MAX_NOTE_PREVIEW_PROTOCOL_HEADER_BYTES: usize = 4096;
 const MAX_INSTANCE_METADATA_ITEMS: u32 = 512;
 const MAX_NOTE_PREVIEW_AUDIO_PORTS: u32 = 16;
@@ -146,12 +149,39 @@ pub struct ClapPatternPreviewSettings {
     pub tempo_bpm: f64,
     pub loop_length_ticks: u64,
     pub notes: Vec<ClapPatternNote>,
+    pub playlist: Option<ClapPlaylistPreviewSettings>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClapPlaylistTempoPoint {
+    pub tick: u64,
+    pub tempo_bpm: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClapPlaylistNote {
+    pub start_tick: u64,
+    pub stop_tick: u64,
+    pub key: u16,
+    pub velocity: u8,
+    pub midi_channel: u8,
+    pub fine_pitch_cents: i16,
+    pub pan: u8,
+    pub release: u8,
+    pub mod_x: u8,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClapPlaylistPreviewSettings {
+    pub tempo_points: Vec<ClapPlaylistTempoPoint>,
+    pub notes: Vec<ClapPlaylistNote>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ClapPatternPreviewPurpose {
     Audition,
     Transport,
+    Playlist,
     SetParameters,
     SaveState,
 }
@@ -379,6 +409,11 @@ pub fn start_pattern_preview_worker(
                                 "CLAP Pattern transport is missing its settings".to_owned()
                             })?)
                             .map(ClapPatternPreviewOutput::Audio),
+                        ClapPatternPreviewPurpose::Playlist => process
+                            .render_playlist(settings.as_ref().ok_or_else(|| {
+                                "CLAP Playlist playback is missing its settings".to_owned()
+                            })?)
+                            .map(ClapPatternPreviewOutput::Audio),
                         ClapPatternPreviewPurpose::SetParameters => {
                             if parameter_values.is_empty() {
                                 Err("CLAP parameter update did not contain any values".to_owned())
@@ -570,36 +605,85 @@ impl ClapPreviewProcess {
         self.render_pattern_request("PATTERN_LOOP", settings)
     }
 
+    fn render_playlist(
+        &mut self,
+        settings: &ClapPatternPreviewSettings,
+    ) -> Result<Vec<f32>, String> {
+        self.render_pattern_request("PLAYLIST", settings)
+    }
+
     fn render_pattern_request(
         &mut self,
         command: &str,
         settings: &ClapPatternPreviewSettings,
     ) -> Result<Vec<f32>, String> {
-        validate_pattern_preview_settings(settings, self.sample_rate)?;
-        writeln!(
-            self.stdin,
-            "{command} {} {:016x} {} {}",
-            settings.ppq,
-            settings.tempo_bpm.to_bits(),
-            settings.loop_length_ticks,
-            settings.notes.len(),
-        )
-        .map_err(|error| format!("could not send a CLAP Pattern preview request: {error}"))?;
-        for note in &settings.notes {
+        if command == "PLAYLIST" {
+            let playlist = settings
+                .playlist
+                .as_ref()
+                .ok_or_else(|| "CLAP Playlist playback is missing its schedule".to_owned())?;
+            validate_playlist_preview_settings(settings, self.sample_rate)?;
             writeln!(
                 self.stdin,
-                "NOTE {} {} {} {} {} {} {} {} {}",
-                note.position_ticks,
-                note.length_ticks,
-                note.key,
-                note.velocity,
-                note.midi_channel,
-                note.fine_pitch_cents,
-                note.pan,
-                note.release,
-                note.mod_x,
+                "PLAYLIST {} {:016x} {} {}",
+                settings.ppq,
+                settings.tempo_bpm.to_bits(),
+                playlist.tempo_points.len(),
+                playlist.notes.len(),
             )
-            .map_err(|error| format!("could not send a CLAP Pattern note: {error}"))?;
+            .map_err(|error| format!("could not send a CLAP Playlist request: {error}"))?;
+            for point in &playlist.tempo_points {
+                writeln!(
+                    self.stdin,
+                    "TEMPO {} {:016x}",
+                    point.tick,
+                    point.tempo_bpm.to_bits()
+                )
+                .map_err(|error| format!("could not send a CLAP Playlist tempo: {error}"))?;
+            }
+            for note in &playlist.notes {
+                writeln!(
+                    self.stdin,
+                    "NOTE {} {} {} {} {} {} {} {} {}",
+                    note.start_tick,
+                    note.stop_tick,
+                    note.key,
+                    note.velocity,
+                    note.midi_channel,
+                    note.fine_pitch_cents,
+                    note.pan,
+                    note.release,
+                    note.mod_x,
+                )
+                .map_err(|error| format!("could not send a CLAP Playlist note: {error}"))?;
+            }
+        } else {
+            validate_pattern_preview_settings(settings, self.sample_rate)?;
+            writeln!(
+                self.stdin,
+                "{command} {} {:016x} {} {}",
+                settings.ppq,
+                settings.tempo_bpm.to_bits(),
+                settings.loop_length_ticks,
+                settings.notes.len(),
+            )
+            .map_err(|error| format!("could not send a CLAP Pattern preview request: {error}"))?;
+            for note in &settings.notes {
+                writeln!(
+                    self.stdin,
+                    "NOTE {} {} {} {} {} {} {} {} {}",
+                    note.position_ticks,
+                    note.length_ticks,
+                    note.key,
+                    note.velocity,
+                    note.midi_channel,
+                    note.fine_pitch_cents,
+                    note.pan,
+                    note.release,
+                    note.mod_x,
+                )
+                .map_err(|error| format!("could not send a CLAP Pattern note: {error}"))?;
+            }
         }
         self.stdin
             .write_all(b"END\n")
@@ -764,22 +848,27 @@ fn read_preview_process_responses(
                 ));
                 return;
             }
-            let mut output = vec![0; byte_count];
-            if let Err(error) = stdout.read_exact(&mut output) {
-                let _ = response_sender.send(ClapPreviewProcessResponse::Error(format!(
-                    "could not read CLAP preview audio: {error}"
-                )));
-                return;
+            let mut samples = Vec::with_capacity(byte_count / std::mem::size_of::<f32>());
+            let mut remaining_bytes = byte_count;
+            let mut chunk = [0_u8; 16 * 1024];
+            while remaining_bytes > 0 {
+                let chunk_length = remaining_bytes.min(chunk.len());
+                if let Err(error) = stdout.read_exact(&mut chunk[..chunk_length]) {
+                    let _ = response_sender.send(ClapPreviewProcessResponse::Error(format!(
+                        "could not read CLAP preview audio: {error}"
+                    )));
+                    return;
+                }
+                for sample_bytes in chunk[..chunk_length].chunks_exact(4) {
+                    let sample = f32::from_le_bytes(
+                        sample_bytes
+                            .try_into()
+                            .expect("sample chunks contain four bytes"),
+                    );
+                    samples.push(if sample.is_finite() { sample } else { 0.0 });
+                }
+                remaining_bytes -= chunk_length;
             }
-            let samples = output
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|sample| {
-                    let sample = f32::from_le_bytes(*sample);
-                    if sample.is_finite() { sample } else { 0.0 }
-                })
-                .collect();
             if response_sender
                 .send(ClapPreviewProcessResponse::Audio(samples))
                 .is_err()
@@ -1160,6 +1249,11 @@ pub fn run_note_preview_server_child(path: &Path, plugin_id: &str, sample_rate: 
                 Ok(settings) => instance.render_pattern_loop(&settings),
                 Err(error) => Err(error),
             }
+        } else if let Some(header) = line.strip_prefix("PLAYLIST ") {
+            match parse_playlist_preview_request(header, &mut input, sample_rate) {
+                Ok(settings) => instance.render_playlist(&settings),
+                Err(error) => Err(error),
+            }
         } else {
             Err("invalid CLAP preview request".to_owned())
         };
@@ -1238,9 +1332,126 @@ fn parse_pattern_preview_request(
         tempo_bpm,
         loop_length_ticks,
         notes,
+        playlist: None,
     };
     validate_pattern_preview_settings(&settings, sample_rate)?;
     Ok(settings)
+}
+
+fn parse_playlist_preview_request(
+    header: &str,
+    input: &mut impl Read,
+    sample_rate: u32,
+) -> Result<ClapPatternPreviewSettings, String> {
+    let mut fields = header.split_whitespace();
+    let (Some(ppq), Some(tempo_bits), Some(tempo_count), Some(note_count), None) = (
+        fields.next().and_then(|field| field.parse::<u16>().ok()),
+        fields.next(),
+        fields.next().and_then(|field| field.parse::<usize>().ok()),
+        fields.next().and_then(|field| field.parse::<usize>().ok()),
+        fields.next(),
+    ) else {
+        return Err("invalid CLAP Playlist preview header".to_owned());
+    };
+    let tempo_bpm = u64::from_str_radix(tempo_bits, 16)
+        .map(f64::from_bits)
+        .map_err(|_| "invalid CLAP Playlist base tempo".to_owned())?;
+    if tempo_count > MAX_PATTERN_PREVIEW_NOTES || note_count > MAX_PATTERN_PREVIEW_NOTES {
+        return Err("CLAP Playlist request exceeds its event limit".to_owned());
+    }
+    let mut tempo_points = Vec::with_capacity(tempo_count);
+    for _ in 0..tempo_count {
+        let line = read_preview_protocol_header(input)
+            .map_err(|error| format!("could not read CLAP Playlist tempo: {error}"))?
+            .ok_or_else(|| "CLAP Playlist request ended before all tempos arrived".to_owned())?;
+        tempo_points.push(parse_playlist_tempo_point(&line)?);
+    }
+    let mut notes = Vec::with_capacity(note_count);
+    for _ in 0..note_count {
+        let line = read_preview_protocol_header(input)
+            .map_err(|error| format!("could not read CLAP Playlist note: {error}"))?
+            .ok_or_else(|| "CLAP Playlist request ended before all notes arrived".to_owned())?;
+        notes.push(parse_playlist_note(&line)?);
+    }
+    let end = read_preview_protocol_header(input)
+        .map_err(|error| format!("could not read CLAP Playlist terminator: {error}"))?
+        .ok_or_else(|| "CLAP Playlist request ended before its terminator".to_owned())?;
+    if end != "END" {
+        return Err("invalid CLAP Playlist preview terminator".to_owned());
+    }
+    let settings = ClapPatternPreviewSettings {
+        pattern_id: 0,
+        channel_id: 0,
+        ppq,
+        tempo_bpm,
+        loop_length_ticks: 1,
+        notes: Vec::new(),
+        playlist: Some(ClapPlaylistPreviewSettings {
+            tempo_points,
+            notes,
+        }),
+    };
+    validate_playlist_preview_settings(&settings, sample_rate)?;
+    Ok(settings)
+}
+
+fn parse_playlist_tempo_point(line: &str) -> Result<ClapPlaylistTempoPoint, String> {
+    let mut fields = line.split_whitespace();
+    let (Some("TEMPO"), Some(tick), Some(tempo_bits), None) = (
+        fields.next(),
+        fields.next().and_then(|field| field.parse::<u64>().ok()),
+        fields.next(),
+        fields.next(),
+    ) else {
+        return Err("invalid CLAP Playlist tempo record".to_owned());
+    };
+    let tempo_bpm = u64::from_str_radix(tempo_bits, 16)
+        .map(f64::from_bits)
+        .map_err(|_| "invalid CLAP Playlist tempo value".to_owned())?;
+    Ok(ClapPlaylistTempoPoint { tick, tempo_bpm })
+}
+
+fn parse_playlist_note(line: &str) -> Result<ClapPlaylistNote, String> {
+    let mut fields = line.split_whitespace();
+    let (
+        Some("NOTE"),
+        Some(start_tick),
+        Some(stop_tick),
+        Some(key),
+        Some(velocity),
+        Some(midi_channel),
+        Some(fine_pitch_cents),
+        Some(pan),
+        Some(release),
+        Some(mod_x),
+        None,
+    ) = (
+        fields.next(),
+        fields.next().and_then(|field| field.parse::<u64>().ok()),
+        fields.next().and_then(|field| field.parse::<u64>().ok()),
+        fields.next().and_then(|field| field.parse::<u16>().ok()),
+        fields.next().and_then(|field| field.parse::<u8>().ok()),
+        fields.next().and_then(|field| field.parse::<u8>().ok()),
+        fields.next().and_then(|field| field.parse::<i16>().ok()),
+        fields.next().and_then(|field| field.parse::<u8>().ok()),
+        fields.next().and_then(|field| field.parse::<u8>().ok()),
+        fields.next().and_then(|field| field.parse::<u8>().ok()),
+        fields.next(),
+    )
+    else {
+        return Err("invalid CLAP Playlist note".to_owned());
+    };
+    Ok(ClapPlaylistNote {
+        start_tick,
+        stop_tick,
+        key,
+        velocity,
+        midi_channel,
+        fine_pitch_cents,
+        pan,
+        release,
+        mod_x,
+    })
 }
 
 fn parse_pattern_preview_note(line: &str) -> Result<ClapPatternNote, String> {
@@ -1653,7 +1864,7 @@ impl ClapNotePreviewInstance {
             },
         ];
         let total_frames = self.sample_rate * NOTE_PREVIEW_DURATION_MILLISECONDS / 1000;
-        self.render_scheduled_events(&events, total_frames)
+        self.render_scheduled_events(&events, total_frames, None)
     }
 
     fn render_pattern(
@@ -1661,7 +1872,7 @@ impl ClapNotePreviewInstance {
         settings: &ClapPatternPreviewSettings,
     ) -> Result<Vec<f32>, String> {
         let (events, total_frames) = schedule_pattern_preview_events(settings, self.sample_rate)?;
-        self.render_scheduled_events(&events, total_frames)
+        self.render_scheduled_events(&events, total_frames, None)
     }
 
     fn render_pattern_loop(
@@ -1712,14 +1923,28 @@ impl ClapNotePreviewInstance {
         }
         let total_frames = u32::try_from(total_frames)
             .map_err(|_| "CLAP Pattern loop render exceeds the supported range".to_owned())?;
-        let rendered = self.render_scheduled_events(&events, total_frames)?;
+        let rendered = self.render_scheduled_events(&events, total_frames, None)?;
         second_pattern_loop_audio(&rendered, loop_frames)
+    }
+
+    fn render_playlist(
+        &mut self,
+        settings: &ClapPatternPreviewSettings,
+    ) -> Result<Vec<f32>, String> {
+        let (events, total_frames, transport_points) =
+            schedule_playlist_preview_events(settings, self.sample_rate)?;
+        self.render_scheduled_events(
+            &events,
+            total_frames,
+            Some((&transport_points, settings.ppq)),
+        )
     }
 
     fn render_scheduled_events(
         &mut self,
         events: &[ScheduledClapNoteEvent],
         total_frames: u32,
+        transport: Option<(&[ClapTransportPoint], u16)>,
     ) -> Result<Vec<f32>, String> {
         if total_frames == 0 {
             return Err("CLAP preview has no audio frames to render".to_owned());
@@ -1756,10 +1981,25 @@ impl ClapNotePreviewInstance {
         let render_start_time = self.next_steady_time;
         let mut frame_offset = 0;
         let mut event_index = 0usize;
+        let mut transport_index = 0usize;
         let mut render_error = None;
 
         while frame_offset < total_frames {
-            let frame_count = (total_frames - frame_offset).min(NOTE_PREVIEW_BLOCK_FRAMES);
+            let mut frame_count = (total_frames - frame_offset).min(NOTE_PREVIEW_BLOCK_FRAMES);
+            if let Some((points, _)) = transport {
+                while transport_index + 1 < points.len()
+                    && points[transport_index + 1].frame <= u64::from(frame_offset)
+                {
+                    transport_index += 1;
+                }
+                if let Some(next_point) = points.get(transport_index + 1) {
+                    let frames_to_change = next_point.frame.saturating_sub(u64::from(frame_offset));
+                    if frames_to_change > 0 {
+                        frame_count = u32::try_from(frames_to_change.min(u64::from(frame_count)))
+                            .expect("the block limit fits in u32");
+                    }
+                }
+            }
             let frame_end = frame_offset + frame_count;
             let block_event_start = event_index;
             while event_index < events.len() && events[event_index].frame < u64::from(frame_end) {
@@ -1871,6 +2111,34 @@ impl ClapNotePreviewInstance {
                 .collect::<Vec<_>>();
 
             let steady_time = render_start_time.saturating_add(u64::from(frame_offset));
+            let transport_event = transport.map(|(points, ppq)| {
+                let point = points[transport_index];
+                let elapsed_frames = u64::from(frame_offset).saturating_sub(point.frame);
+                let current_tick = point.tick as f64
+                    + elapsed_frames as f64 * point.tempo_bpm * f64::from(ppq)
+                        / (60.0 * f64::from(self.sample_rate));
+                TransportEvent {
+                    header: EventHeader::<TransportEvent>::new_core(0, EventFlags::empty()),
+                    flags: TransportFlags::HAS_TEMPO
+                        | TransportFlags::HAS_BEATS_TIMELINE
+                        | TransportFlags::HAS_SECONDS_TIMELINE
+                        | TransportFlags::IS_PLAYING,
+                    song_pos_beats: BeatTime::from_float(current_tick / f64::from(ppq)),
+                    song_pos_seconds: SecondsTime::from_float(
+                        f64::from(frame_offset) / f64::from(self.sample_rate),
+                    ),
+                    tempo: point.tempo_bpm,
+                    tempo_inc: 0.0,
+                    loop_start_beats: BeatTime::default(),
+                    loop_end_beats: BeatTime::default(),
+                    loop_start_seconds: SecondsTime::default(),
+                    loop_end_seconds: SecondsTime::default(),
+                    bar_start: BeatTime::default(),
+                    bar_number: 0,
+                    time_signature_numerator: 0,
+                    time_signature_denominator: 0,
+                }
+            });
             let process_result: Result<(), String> = {
                 let input_audio = if input_audio_storage.is_empty() {
                     InputAudioBuffers::empty()
@@ -1902,7 +2170,7 @@ impl ClapNotePreviewInstance {
                         &input_events,
                         &mut output_events,
                         Some(steady_time),
-                        None,
+                        transport_event.as_ref(),
                     )
                     .map(|_: ProcessStatus| ())
                     .map_err(|error| {
@@ -1958,11 +2226,175 @@ struct ScheduledClapNoteEvent {
     is_note_on: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ClapTransportPoint {
+    frame: u64,
+    tick: u64,
+    tempo_bpm: f64,
+}
+
 fn validate_pattern_preview_settings(
     settings: &ClapPatternPreviewSettings,
     sample_rate: u32,
 ) -> Result<(), String> {
     schedule_pattern_preview_events(settings, sample_rate).map(|_| ())
+}
+
+fn validate_playlist_preview_settings(
+    settings: &ClapPatternPreviewSettings,
+    sample_rate: u32,
+) -> Result<(), String> {
+    schedule_playlist_preview_events(settings, sample_rate).map(|_| ())
+}
+
+fn schedule_playlist_preview_events(
+    settings: &ClapPatternPreviewSettings,
+    sample_rate: u32,
+) -> Result<(Vec<ScheduledClapNoteEvent>, u32, Vec<ClapTransportPoint>), String> {
+    if !(8_000..=192_000).contains(&sample_rate) {
+        return Err(format!(
+            "unsupported CLAP preview sample rate: {sample_rate}"
+        ));
+    }
+    if settings.ppq == 0 {
+        return Err("CLAP Playlist playback requires a positive project PPQ".to_owned());
+    }
+    if !settings.tempo_bpm.is_finite() || !(1.0..=1000.0).contains(&settings.tempo_bpm) {
+        return Err("CLAP Playlist tempo must be between 1 and 1000 BPM".to_owned());
+    }
+    let playlist = settings
+        .playlist
+        .as_ref()
+        .ok_or_else(|| "CLAP Playlist playback is missing its schedule".to_owned())?;
+    if playlist.notes.is_empty() {
+        return Err("CLAP Playlist schedule has no notes".to_owned());
+    }
+    if playlist.notes.len() > MAX_PATTERN_PREVIEW_NOTES {
+        return Err(format!(
+            "CLAP Playlist schedule exceeds {MAX_PATTERN_PREVIEW_NOTES} notes"
+        ));
+    }
+    if playlist.tempo_points.len() > MAX_PATTERN_PREVIEW_NOTES {
+        return Err(format!(
+            "CLAP Playlist tempo map exceeds {MAX_PATTERN_PREVIEW_NOTES} changes"
+        ));
+    }
+    let mut tempo_events = Vec::with_capacity(playlist.tempo_points.len());
+    for point in &playlist.tempo_points {
+        if !point.tempo_bpm.is_finite() || !(1.0..=1000.0).contains(&point.tempo_bpm) {
+            return Err("CLAP Playlist tempo must be between 1 and 1000 BPM".to_owned());
+        }
+        tempo_events.push((point.tick, point.tempo_bpm));
+    }
+    let tempo_map =
+        PlaylistTempoMap::from_tempo_events(settings.ppq, settings.tempo_bpm, &tempo_events)?;
+    let mut events = Vec::with_capacity(playlist.notes.len().saturating_mul(2));
+    let mut last_event_frame = 0u64;
+    for (index, note) in playlist.notes.iter().enumerate() {
+        if note.stop_tick <= note.start_tick {
+            return Err("CLAP Playlist schedule contains a zero-length note".to_owned());
+        }
+        if note.key > 127 {
+            return Err(format!(
+                "CLAP Playlist key {} is outside the MIDI range",
+                note.key
+            ));
+        }
+        if !(1..=127).contains(&note.velocity) {
+            return Err(format!(
+                "CLAP Playlist velocity {} is outside 1–127",
+                note.velocity
+            ));
+        }
+        if !(-1200..=1200).contains(&note.fine_pitch_cents) {
+            return Err(format!(
+                "CLAP Playlist fine pitch {} is outside −1200…1200 cents",
+                note.fine_pitch_cents
+            ));
+        }
+        if note.pan > 128 {
+            return Err(format!("CLAP Playlist pan {} is outside 0–128", note.pan));
+        }
+        if note.release > 128 {
+            return Err(format!(
+                "CLAP Playlist release {} is outside 0–128",
+                note.release
+            ));
+        }
+        if note.midi_channel > 15 {
+            return Err(format!(
+                "CLAP Playlist MIDI channel {} is outside 0–15",
+                note.midi_channel
+            ));
+        }
+        let start_frame = tempo_map.frame_at_tick(note.start_tick, sample_rate)?;
+        let stop_frame = tempo_map
+            .frame_at_tick(note.stop_tick, sample_rate)?
+            .max(start_frame.saturating_add(1));
+        let note_id =
+            u32::try_from(index + 1).map_err(|_| "CLAP Playlist note ID overflowed".to_owned())?;
+        events.push(ScheduledClapNoteEvent {
+            frame: start_frame,
+            priority: 1,
+            key: note.key as u8,
+            velocity: note.velocity,
+            midi_channel: note.midi_channel,
+            note_id,
+            fine_pitch_cents: note.fine_pitch_cents,
+            pan: note.pan,
+            release: note.release,
+            mod_x: note.mod_x,
+            is_note_on: true,
+        });
+        events.push(ScheduledClapNoteEvent {
+            frame: stop_frame,
+            priority: 0,
+            key: note.key as u8,
+            velocity: 0,
+            midi_channel: note.midi_channel,
+            note_id,
+            fine_pitch_cents: note.fine_pitch_cents,
+            pan: note.pan,
+            release: note.release,
+            mod_x: note.mod_x,
+            is_note_on: false,
+        });
+        last_event_frame = last_event_frame.max(stop_frame);
+    }
+    events.sort_by_key(|event| (event.frame, event.priority));
+
+    let mut transport_points = Vec::<ClapTransportPoint>::new();
+    for (tick, tempo_bpm) in tempo_map.tempo_segments() {
+        let point = ClapTransportPoint {
+            frame: tempo_map.frame_at_tick(tick, sample_rate)?,
+            tick,
+            tempo_bpm,
+        };
+        if let Some(previous) = transport_points.last_mut()
+            && previous.frame == point.frame
+        {
+            *previous = point;
+        } else {
+            transport_points.push(point);
+        }
+    }
+    let release_tail_frames =
+        u64::from(sample_rate) * u64::from(NOTE_PREVIEW_DURATION_MILLISECONDS) / 1000;
+    let total_frames = last_event_frame
+        .checked_add(release_tail_frames)
+        .ok_or_else(|| "CLAP Playlist render length overflowed".to_owned())?;
+    let byte_count = total_frames
+        .checked_mul(8)
+        .ok_or_else(|| "CLAP Playlist audio size overflowed".to_owned())?;
+    if byte_count == 0 || byte_count > MAX_NOTE_PREVIEW_OUTPUT_BYTES as u64 {
+        return Err(format!(
+            "CLAP Playlist render exceeds the {} MiB audio limit at this sample rate",
+            MAX_NOTE_PREVIEW_OUTPUT_BYTES / (1024 * 1024)
+        ));
+    }
+    let total_frames = u32::try_from(total_frames)
+        .map_err(|_| "CLAP Playlist render exceeds the supported range".to_owned())?;
+    Ok((events, total_frames, transport_points))
 }
 
 fn pattern_preview_frame_at_tick(
@@ -2660,12 +3092,13 @@ fn parse_f64_bits(value: &str) -> Result<f64, String> {
 mod tests {
     use super::{
         ClapAudioPortDescriptor, ClapInstanceInfo, ClapNotePortDescriptor, ClapParameterDescriptor,
-        ClapPatternNote, ClapPatternPreviewSettings, ClapPluginDescriptor,
-        MAX_NOTE_PREVIEW_NOTE_MILLISECONDS, MIN_NOTE_PREVIEW_NOTE_MILLISECONDS,
-        encode_instance_probe_output, encode_probe_output, parse_instance_probe_output,
-        parse_pattern_preview_request, parse_probe_output, read_preview_server_parameter_values,
-        read_preview_server_state, schedule_pattern_preview_events, second_pattern_loop_audio,
-        validate_note_preview_note_length, write_preview_server_state,
+        ClapPatternNote, ClapPatternPreviewSettings, ClapPlaylistNote, ClapPlaylistPreviewSettings,
+        ClapPlaylistTempoPoint, ClapPluginDescriptor, MAX_NOTE_PREVIEW_NOTE_MILLISECONDS,
+        MIN_NOTE_PREVIEW_NOTE_MILLISECONDS, encode_instance_probe_output, encode_probe_output,
+        parse_instance_probe_output, parse_pattern_preview_request, parse_playlist_preview_request,
+        parse_probe_output, read_preview_server_parameter_values, read_preview_server_state,
+        schedule_pattern_preview_events, schedule_playlist_preview_events,
+        second_pattern_loop_audio, validate_note_preview_note_length, write_preview_server_state,
     };
     use std::io::Cursor;
 
@@ -2806,6 +3239,7 @@ mod tests {
             ppq: 96,
             tempo_bpm: 120.0,
             loop_length_ticks: 192,
+            playlist: None,
             notes: vec![
                 ClapPatternNote {
                     position_ticks: 0,
@@ -2851,6 +3285,79 @@ mod tests {
         assert_eq!(events[2].pan, 64);
         assert_eq!(events[2].mod_x, 128);
         assert_eq!((events[3].frame, events[3].is_note_on), (48_000, false));
+    }
+
+    #[test]
+    fn playlist_preview_schedules_notes_and_transport_across_tempo_changes() {
+        let settings = ClapPatternPreviewSettings {
+            pattern_id: 0,
+            channel_id: 9,
+            ppq: 96,
+            tempo_bpm: 120.0,
+            loop_length_ticks: 192,
+            notes: Vec::new(),
+            playlist: Some(ClapPlaylistPreviewSettings {
+                tempo_points: vec![
+                    ClapPlaylistTempoPoint {
+                        tick: 0,
+                        tempo_bpm: 120.0,
+                    },
+                    ClapPlaylistTempoPoint {
+                        tick: 96,
+                        tempo_bpm: 60.0,
+                    },
+                ],
+                notes: vec![ClapPlaylistNote {
+                    start_tick: 0,
+                    stop_tick: 192,
+                    key: 60,
+                    velocity: 100,
+                    midi_channel: 0,
+                    fine_pitch_cents: -35,
+                    pan: 48,
+                    release: 32,
+                    mod_x: 100,
+                }],
+            }),
+        };
+
+        let (events, total_frames, transport_points) =
+            schedule_playlist_preview_events(&settings, 48_000)
+                .expect("Playlist note should follow the tempo map");
+
+        assert_eq!(total_frames, 144_000);
+        assert_eq!(events.len(), 2);
+        assert_eq!((events[0].frame, events[0].is_note_on), (0, true));
+        assert_eq!((events[1].frame, events[1].is_note_on), (72_000, false));
+        assert_eq!(transport_points.len(), 2);
+        assert_eq!(transport_points[0].frame, 0);
+        assert_eq!(transport_points[0].tempo_bpm, 120.0);
+        assert_eq!(transport_points[1].frame, 24_000);
+        assert_eq!(transport_points[1].tick, 96);
+        assert_eq!(transport_points[1].tempo_bpm, 60.0);
+    }
+
+    #[test]
+    fn playlist_preview_parser_reads_tempo_and_note_records() {
+        let base_tempo = 123.5_f64;
+        let header = format!("96 {:016x} 2 1", base_tempo.to_bits());
+        let mut input = Cursor::new(
+            b"TEMPO 0 405e000000000000\nTEMPO 96 404e000000000000\nNOTE 0 192 60 100 0 -35 48 32 100\nEND\n".as_slice(),
+        );
+
+        let parsed = parse_playlist_preview_request(&header, &mut input, 48_000)
+            .expect("valid Playlist protocol should parse");
+
+        assert_eq!(parsed.ppq, 96);
+        assert_eq!(parsed.tempo_bpm, base_tempo);
+        let playlist = parsed.playlist.expect("Playlist schedule should parse");
+        assert_eq!(playlist.tempo_points.len(), 2);
+        assert_eq!(playlist.tempo_points[0].tempo_bpm, 120.0);
+        assert_eq!(playlist.tempo_points[1].tempo_bpm, 60.0);
+        assert_eq!(playlist.notes.len(), 1);
+        assert_eq!(playlist.notes[0].start_tick, 0);
+        assert_eq!(playlist.notes[0].stop_tick, 192);
+        assert_eq!(playlist.notes[0].fine_pitch_cents, -35);
     }
 
     #[test]

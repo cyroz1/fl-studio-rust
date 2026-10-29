@@ -107,7 +107,8 @@ impl PlaylistTempoMap {
         Self::from_tempo_events(ppq, tempo_bpm, &[])
     }
 
-    pub(crate) fn from_tempo_events(
+    /// Build a timing map from the base tempo and absolute tick/tempo pairs.
+    pub fn from_tempo_events(
         ppq: u16,
         base_tempo_bpm: f64,
         events: &[(u64, f64)],
@@ -210,6 +211,13 @@ impl PlaylistTempoMap {
             .partition_point(|segment| segment.start_tick <= tick)
             .saturating_sub(1);
         self.segments[segment_index].tempo_bpm
+    }
+
+    /// Return the tempo map's start tick and tempo for each constant-tempo segment.
+    pub fn tempo_segments(&self) -> impl Iterator<Item = (u64, f64)> + '_ {
+        self.segments
+            .iter()
+            .map(|segment| (segment.start_tick, segment.tempo_bpm))
     }
 
     /// Convert a fractional Playlist tick position to a rounded sample-frame position.
@@ -729,6 +737,27 @@ pub struct PatternAudioLayer {
     pub channel_id: u16,
     pub samples: Vec<f32>,
 }
+
+/// Pre-rendered stereo audio from one CLAP instrument across a Playlist timeline.
+#[derive(Clone, Debug)]
+pub struct PlaylistAudioLayer {
+    pub channel_id: u16,
+    pub samples: Vec<f32>,
+}
+
+impl PartialEq for PlaylistAudioLayer {
+    fn eq(&self, other: &Self) -> bool {
+        self.channel_id == other.channel_id
+            && self.samples.len() == other.samples.len()
+            && self
+                .samples
+                .iter()
+                .zip(&other.samples)
+                .all(|(left, right)| left.to_bits() == right.to_bits())
+    }
+}
+
+impl Eq for PlaylistAudioLayer {}
 
 /// Live Sampler Pattern loop inputs, meters, and block-boundary Mixer updates.
 pub struct SamplerPatternLoopStreamControls<'a> {
@@ -1300,6 +1329,8 @@ pub struct PlaylistRenderOptions {
     pub read_sample_root_note: bool,
     /// App-local per-instance Audio Clip controls applied in live playback and renders.
     pub clip_envelopes: Arc<Vec<PlaylistAudioClipEnvelope>>,
+    /// Pre-rendered CLAP instruments scheduled on the Playlist timeline.
+    pub clap_audio_layers: Arc<Vec<PlaylistAudioLayer>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -2028,6 +2059,7 @@ impl Default for PlaylistRenderOptions {
             soloed_playlist_track_range: None,
             read_sample_root_note: true,
             clip_envelopes: Arc::new(Vec::new()),
+            clap_audio_layers: Arc::new(Vec::new()),
         }
     }
 }
@@ -3070,6 +3102,7 @@ fn stream_playlist_with_vst3_to_device_from_frame_inner(
     )?;
     if audio.clips.is_empty()
         && sampler.notes.is_empty()
+        && options.clap_audio_layers.is_empty()
         && vst3_processor
             .as_ref()
             .is_none_or(|processor| processor.summary().plugin_channels_rendered == 0)
@@ -3088,12 +3121,16 @@ fn stream_playlist_with_vst3_to_device_from_frame_inner(
             }
         }
         return Err(
-            "arrangement contains no supported audio clips, Sampler notes, or loaded VST3 notes in Pattern Clips"
+            "arrangement contains no supported audio clips, Sampler notes, CLAP audio, or loaded VST3 notes in Pattern Clips"
                 .to_owned(),
         );
     }
 
-    let mut frames = audio.summary.frames.max(sampler.summary.frames);
+    let mut frames = audio
+        .summary
+        .frames
+        .max(sampler.summary.frames)
+        .max(playlist_clap_audio_frames(&options.clap_audio_layers));
     if let Some(processor) = vst3_processor.as_mut() {
         frames = frames.max(processor.content_frames());
         processor.extend_to_output_frames(frames)?;
@@ -6044,6 +6081,12 @@ fn stream_prepared_playlist_render_with_performance(
                 for (mixed, sampler_sample) in block.iter_mut().zip(sampler_samples) {
                     *mixed += *sampler_sample;
                 }
+                mix_playlist_clap_audio_layers(
+                    block,
+                    block_start,
+                    frame_count,
+                    &options.clap_audio_layers,
+                );
                 direct_source_delay.process_interleaved(block)?;
                 if let Some(meter_buses) = meter_buses.as_deref_mut() {
                     for (bus_index, delay) in mixer_bus_delays.iter_mut().enumerate() {
@@ -6840,6 +6883,45 @@ fn mix_pattern_audio_layers(
         for layer in layers {
             output[target_sample] += layer.samples[source_sample];
             output[target_sample + 1] += layer.samples[source_sample + 1];
+        }
+    }
+}
+
+fn playlist_clap_audio_frames(layers: &[PlaylistAudioLayer]) -> u64 {
+    layers
+        .iter()
+        .map(|layer| (layer.samples.len() / 2) as u64)
+        .max()
+        .unwrap_or(0)
+}
+
+fn mix_playlist_clap_audio_layers(
+    output: &mut [f32],
+    block_start: u64,
+    frame_count: usize,
+    layers: &[PlaylistAudioLayer],
+) {
+    if layers.is_empty() {
+        return;
+    }
+    debug_assert_eq!(output.len(), frame_count * 2);
+    let block_end = block_start.saturating_add(frame_count as u64);
+    for layer in layers {
+        let layer_frames = (layer.samples.len() / 2) as u64;
+        let start_frame = block_start.min(layer_frames);
+        let end_frame = block_end.min(layer_frames);
+        if end_frame <= start_frame {
+            continue;
+        }
+        let source_start = (start_frame * 2) as usize;
+        let source_end = (end_frame * 2) as usize;
+        let target_start = ((start_frame - block_start) * 2) as usize;
+        let target_end = target_start + source_end - source_start;
+        for (target, source) in output[target_start..target_end]
+            .iter_mut()
+            .zip(&layer.samples[source_start..source_end])
+        {
+            *target += *source;
         }
     }
 }
@@ -9723,29 +9805,29 @@ pub(crate) fn swing_note_start_tick(
         .map_err(|_| "swing-adjusted note position exceeds the supported tick range".to_owned())
 }
 
-pub(crate) struct PlaylistPatternNote<'a> {
-    pub(crate) note: &'a PatternNote,
-    pub(crate) target_channel_id: u16,
-    pub(crate) target_gain: f32,
-    pub(crate) target_pan_raw: i32,
-    pub(crate) start_tick: u64,
-    pub(crate) stop_tick: Option<u64>,
-    pub(crate) clip_index: usize,
+pub struct PlaylistPatternNote<'a> {
+    pub note: &'a PatternNote,
+    pub target_channel_id: u16,
+    pub target_gain: f32,
+    pub target_pan_raw: i32,
+    pub start_tick: u64,
+    pub stop_tick: Option<u64>,
+    pub clip_index: usize,
 }
 
-pub(crate) struct PlaylistPatternSchedule<'a> {
-    pub(crate) notes: Vec<PlaylistPatternNote<'a>>,
-    pub(crate) clips_skipped_unsupported_scale: usize,
+pub struct PlaylistPatternSchedule<'a> {
+    pub notes: Vec<PlaylistPatternNote<'a>>,
+    pub clips_skipped_unsupported_scale: usize,
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct PlaylistTrackFilter<'a> {
+pub struct PlaylistTrackFilter<'a> {
     disabled_track_ids: &'a BTreeSet<u32>,
     soloed_track_range: Option<(u32, u32)>,
 }
 
 impl<'a> PlaylistTrackFilter<'a> {
-    pub(crate) const fn new(
+    pub const fn new(
         disabled_track_ids: &'a BTreeSet<u32>,
         soloed_track_range: Option<(u32, u32)>,
     ) -> Self {
@@ -9755,7 +9837,7 @@ impl<'a> PlaylistTrackFilter<'a> {
         }
     }
 
-    fn clip_is_muted(self, clip: &PlaylistClip) -> bool {
+    pub fn clip_is_muted(self, clip: &PlaylistClip) -> bool {
         if clip.is_muted() {
             return true;
         }
@@ -9769,13 +9851,13 @@ impl<'a> PlaylistTrackFilter<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct PlaylistPatternScheduleOptions {
-    pub(crate) ppq: u16,
-    pub(crate) global_swing_mix_raw: u8,
-    pub(crate) play_truncated_notes_in_clips: bool,
+pub struct PlaylistPatternScheduleOptions {
+    pub ppq: u16,
+    pub global_swing_mix_raw: u8,
+    pub play_truncated_notes_in_clips: bool,
 }
 
-pub(crate) fn schedule_playlist_pattern_notes<'a>(
+pub fn schedule_playlist_pattern_notes<'a>(
     patterns: &'a [Pattern],
     arrangement: &Arrangement,
     track_filter: PlaylistTrackFilter<'_>,
@@ -16421,6 +16503,19 @@ mod tests {
         assert_eq!(output, [3.0, 30.0, 1.0, 10.0, 2.0, 20.0, 3.0, 30.0]);
     }
 
+    #[test]
+    fn playlist_clap_audio_layers_mix_at_their_absolute_timeline_frames() {
+        let layer = PlaylistAudioLayer {
+            channel_id: 9,
+            samples: vec![1.0, 10.0, 2.0, 20.0, 3.0, 30.0],
+        };
+        let mut output = vec![0.0; 6];
+
+        mix_playlist_clap_audio_layers(&mut output, 1, 3, &[layer]);
+
+        assert_eq!(output, [2.0, 20.0, 3.0, 30.0, 0.0, 0.0]);
+    }
+
     fn performance_audio_clip_fixture(record_size: usize, scale: Option<f64>) -> FlpDocument {
         fn append_data_event(event_stream: &mut Vec<u8>, opcode: u8, payload: &[u8]) {
             assert!(payload.len() < 128);
@@ -18900,6 +18995,7 @@ mod tests {
                     soloed_playlist_track_range: None,
                     read_sample_root_note: true,
                     clip_envelopes: Arc::new(Vec::new()),
+                    clap_audio_layers: Arc::new(Vec::new()),
                 },
                 frames: 2,
                 master_output: MixerMasterOutput::default(),
