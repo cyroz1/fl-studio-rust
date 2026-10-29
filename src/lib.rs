@@ -12079,6 +12079,170 @@ impl FlpDocument {
         Ok(())
     }
 
+    /// Removes a Playlist time interval and shifts all later content left by its width.
+    /// Clips crossing either boundary are split while retaining their source windows. Legacy
+    /// full-source Audio Clips need their decoded sample lengths in milliseconds, keyed by the
+    /// clip's original zero-based arrangement index. The operation is atomic: unsupported splits
+    /// leave the document unchanged.
+    pub fn ripple_delete_playlist_time_range(
+        &mut self,
+        arrangement_id: u16,
+        start_tick: u32,
+        end_tick: u32,
+        full_source_lengths_ms: &BTreeMap<usize, f32>,
+    ) -> Result<(), FlpError> {
+        let range_ticks = end_tick
+            .checked_sub(start_tick)
+            .filter(|length| *length > 0);
+        let Some(range_ticks) = range_ticks else {
+            return Err(FlpError::UnsupportedEdit(
+                "the Playlist time range must have a positive width",
+            ));
+        };
+
+        let arrangements = self.arrangements()?;
+        let mut matching_arrangements = arrangements
+            .iter()
+            .filter(|arrangement| arrangement.id == arrangement_id);
+        let Some(arrangement) = matching_arrangements.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested arrangement does not exist",
+            ));
+        };
+        if matching_arrangements.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested arrangement id is ambiguous",
+            ));
+        }
+        let original_clips = arrangement.clips.clone();
+        let mut candidate = self.clone();
+
+        for (clip_index, clip) in original_clips.iter().enumerate().rev() {
+            let clip_start = clip.position_ticks;
+            let clip_end = clip_start
+                .checked_add(clip.length_ticks)
+                .ok_or(FlpError::LengthOverflow)?;
+            if clip_start >= end_tick || clip_end <= start_tick {
+                continue;
+            }
+
+            let full_source_length_ms = full_source_lengths_ms.get(&clip_index).copied();
+            let mut selected_piece_index = clip_index;
+            if clip_start < start_tick {
+                selected_piece_index = candidate.split_playlist_clip_at_for_time_edit(
+                    arrangement_id,
+                    selected_piece_index,
+                    start_tick,
+                    full_source_length_ms,
+                )?;
+            }
+            if clip_end > end_tick {
+                candidate.split_playlist_clip_at_for_time_edit(
+                    arrangement_id,
+                    selected_piece_index,
+                    end_tick,
+                    full_source_length_ms,
+                )?;
+            }
+            candidate.delete_playlist_clip(arrangement_id, selected_piece_index)?;
+        }
+
+        let arrangements = candidate.arrangements()?;
+        let mut matching_arrangements = arrangements
+            .iter()
+            .filter(|arrangement| arrangement.id == arrangement_id);
+        let Some(arrangement) = matching_arrangements.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the updated Playlist arrangement does not exist",
+            ));
+        };
+        if matching_arrangements.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the updated Playlist arrangement id is ambiguous",
+            ));
+        }
+        for (clip_index, clip) in arrangement.clips.iter().enumerate().rev() {
+            if clip.position_ticks < end_tick {
+                continue;
+            }
+            candidate.edit_playlist_clip(
+                arrangement_id,
+                clip_index,
+                PlaylistClipEdit {
+                    position_ticks: Some(clip.position_ticks - range_ticks),
+                    ..PlaylistClipEdit::default()
+                },
+            )?;
+        }
+
+        *self = candidate;
+        Ok(())
+    }
+
+    fn split_playlist_clip_at_for_time_edit(
+        &mut self,
+        arrangement_id: u16,
+        clip_index: usize,
+        split_position_ticks: u32,
+        full_source_length_ms: Option<f32>,
+    ) -> Result<usize, FlpError> {
+        let arrangements = self.arrangements()?;
+        let mut matching_arrangements = arrangements
+            .iter()
+            .filter(|arrangement| arrangement.id == arrangement_id);
+        let Some(arrangement) = matching_arrangements.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested arrangement does not exist",
+            ));
+        };
+        if matching_arrangements.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested arrangement id is ambiguous",
+            ));
+        }
+        let Some(clip) = arrangement.clips.get(clip_index) else {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested Playlist clip does not exist",
+            ));
+        };
+        let target = clip.target();
+        match target {
+            PlaylistClipTarget::Pattern { .. } => {
+                self.split_playlist_pattern_clip(arrangement_id, clip_index, split_position_ticks)
+            }
+            PlaylistClipTarget::Channel { id } => {
+                let channels = self.channels();
+                let mut matching_channels = channels.iter().filter(|channel| channel.id() == id);
+                let Some(channel) = matching_channels.next() else {
+                    return Err(FlpError::UnsupportedEdit(
+                        "the Playlist clip channel does not exist",
+                    ));
+                };
+                if matching_channels.next().is_some() {
+                    return Err(FlpError::UnsupportedEdit(
+                        "the Playlist clip channel is ambiguous",
+                    ));
+                }
+                match channel.kind() {
+                    Some(4) => self.split_playlist_audio_clip(
+                        arrangement_id,
+                        clip_index,
+                        split_position_ticks,
+                        full_source_length_ms,
+                    ),
+                    Some(5) => self.split_playlist_automation_clip(
+                        arrangement_id,
+                        clip_index,
+                        split_position_ticks,
+                    ),
+                    _ => Err(FlpError::UnsupportedEdit(
+                        "the Playlist clip channel type does not support a time-range split",
+                    )),
+                }
+            }
+        }
+    }
+
     /// Copies a complete Playlist clip record for a later lossless paste.
     pub fn copy_playlist_clip(
         &self,

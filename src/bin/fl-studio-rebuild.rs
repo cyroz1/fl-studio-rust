@@ -27065,7 +27065,7 @@ impl DawUi {
                     let (ruler_rect, ruler_response) =
                         ui.allocate_exact_size(Vec2::new(grid_width, 34.0), Sense::click_and_drag());
                     let ruler_response = ruler_response.on_hover_text(
-                        "Click to move song position; Ctrl/Cmd+drag to select time",
+                        "Click to move song position; Ctrl/Cmd+drag to select time; Ctrl/Cmd+Delete ripple-deletes the selection",
                     );
                     let time_selection_modifier =
                         ui.input(|input| input.modifiers.ctrl || input.modifiers.command);
@@ -32731,6 +32731,82 @@ impl DawUi {
         self.playlist_pending_scroll_offset =
             Some(Vec2::new(target_x, self.playlist_grid_scroll_offset.y));
         self.status = format!("Zoomed to Playlist time from {start} to {end} ticks");
+    }
+
+    fn ripple_delete_playlist_time_selection(&mut self) {
+        let Some((arrangement_id, start_tick, end_tick)) = self.playlist_time_selection else {
+            self.status = "Select a Playlist time range first".to_owned();
+            return;
+        };
+        if self.selected_arrangement != Some(arrangement_id) {
+            self.status = "Select a time range in this arrangement first".to_owned();
+            return;
+        }
+        let Some(document) = self.document.as_ref() else {
+            self.status = "Open a project to delete Playlist time".to_owned();
+            return;
+        };
+        let mut updated = document.clone();
+        let arrangements = match updated.arrangements() {
+            Ok(arrangements) => arrangements,
+            Err(error) => {
+                self.status = format!("Could not read Playlist time range: {error}");
+                return;
+            }
+        };
+        let mut matching_arrangements = arrangements
+            .iter()
+            .filter(|arrangement| arrangement.id == arrangement_id);
+        let Some(arrangement) = matching_arrangements.next() else {
+            self.status = "The selected Playlist arrangement no longer exists".to_owned();
+            return;
+        };
+        if matching_arrangements.next().is_some() {
+            self.status = "The selected Playlist arrangement is ambiguous".to_owned();
+            return;
+        }
+        let channel_kinds = updated
+            .channels()
+            .into_iter()
+            .map(|channel| (channel.id(), channel.kind()))
+            .collect::<BTreeMap<_, _>>();
+        let full_source_lengths_ms = arrangement
+            .clips
+            .iter()
+            .enumerate()
+            .filter_map(|(clip_index, clip)| {
+                clip.uses_full_source_window()
+                    .then(|| {
+                        playlist_clip_sample_length_ms(
+                            clip,
+                            &channel_kinds,
+                            &self.audio_waveform_paths,
+                            &self.audio_waveforms,
+                        )
+                    })
+                    .flatten()
+                    .map(|length_ms| (clip_index, length_ms))
+            })
+            .collect::<BTreeMap<_, _>>();
+        if let Err(error) = updated.ripple_delete_playlist_time_range(
+            arrangement_id,
+            start_tick,
+            end_tick,
+            &full_source_lengths_ms,
+        ) {
+            self.status = format!("Could not ripple-delete Playlist time: {error}");
+            return;
+        }
+
+        self.stop_project_playback();
+        self.document = Some(updated);
+        self.selected_clip = None;
+        self.selected_playlist_clips.clear();
+        self.playlist_selection_anchor = None;
+        self.playlist_time_selection = None;
+        self.dirty = true;
+        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+        self.status = format!("Ripple-deleted Playlist time {start_tick}..{end_tick}");
     }
 
     fn deselect_playlist_clips(&mut self) {
@@ -68862,6 +68938,7 @@ impl eframe::App for DawUi {
             select_playlist_time_around_clips_requested,
             select_playlist_previous_time_requested,
             select_playlist_next_time_requested,
+            ripple_delete_playlist_time_requested,
         ) = if playlist_clip_shortcuts_enabled {
             ui.input_mut(|input| {
                 (
@@ -68876,11 +68953,12 @@ impl eframe::App for DawUi {
                     input.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter),
                     input.consume_key(egui::Modifiers::COMMAND, egui::Key::ArrowLeft),
                     input.consume_key(egui::Modifiers::COMMAND, egui::Key::ArrowRight),
+                    input.consume_key(egui::Modifiers::COMMAND, egui::Key::Delete),
                 )
             })
         } else {
             (
-                false, false, false, false, false, false, false, false, false, false, false,
+                false, false, false, false, false, false, false, false, false, false, false, false,
             )
         };
         if copy_playlist_clip_requested {
@@ -68913,6 +68991,9 @@ impl eframe::App for DawUi {
         }
         if select_playlist_next_time_requested {
             self.shift_playlist_time_selection(false);
+        }
+        if ripple_delete_playlist_time_requested {
+            self.ripple_delete_playlist_time_selection();
         }
         let zoom_playlist_time_selection_requested = playlist_clip_shortcuts_enabled
             && ui.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::Num5));
