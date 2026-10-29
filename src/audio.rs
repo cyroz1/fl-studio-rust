@@ -2092,6 +2092,8 @@ struct PlaybackState {
     output_callback_frames: AtomicU32,
     metronome_enabled: AtomicBool,
     metronome_timeline: RetiredArcSwapOption<MetronomeTimeline>,
+    recording_precount_samples: RetiredArcSwapOption<Vec<f32>>,
+    recording_precount_state: AtomicU64,
     output_latency_estimate: AudioLatencyEstimate,
     input_monitor_ring_flush_requested: AtomicBool,
     input_monitor_active: Arc<AtomicBool>,
@@ -2831,6 +2833,8 @@ impl PlaybackState {
             output_callback_frames: AtomicU32::new(0),
             metronome_enabled: AtomicBool::new(false),
             metronome_timeline: RetiredArcSwapOption::new(),
+            recording_precount_samples: RetiredArcSwapOption::new(),
+            recording_precount_state: AtomicU64::new(0),
             output_latency_estimate: AudioLatencyEstimate::default(),
             input_monitor_ring_flush_requested: AtomicBool::new(false),
             input_monitor_active: Arc::new(AtomicBool::new(false)),
@@ -2998,6 +3002,7 @@ impl PlaybackState {
     fn reap_retired_sample_buffers(&self) {
         self.samples.reap();
         self.browser_preview_samples.reap();
+        self.recording_precount_samples.reap();
     }
 
     fn browser_preview_active(&self) -> bool {
@@ -3080,6 +3085,67 @@ impl PlaybackState {
         };
         let gain = f32::from_bits(self.browser_preview_gain.load(Ordering::Relaxed));
         [frame_samples[0] * gain, frame_samples[1] * gain]
+    }
+
+    fn start_recording_precount(&self, samples: Vec<f32>) {
+        self.stop_recording_precount();
+        self.recording_precount_samples
+            .store(Some(Arc::new(samples)));
+        self.recording_precount_state
+            .store(BROWSER_PREVIEW_ACTIVE_BIT, Ordering::Release);
+    }
+
+    fn stop_recording_precount(&self) {
+        self.recording_precount_state.store(0, Ordering::Release);
+        self.recording_precount_samples.store(None);
+    }
+
+    fn recording_precount_active(&self) -> bool {
+        self.recording_precount_state.load(Ordering::Acquire) & BROWSER_PREVIEW_ACTIVE_BIT != 0
+    }
+
+    fn next_recording_precount_frame(&self, samples: Option<&[f32]>) -> [f32; 2] {
+        if !self.recording_precount_active() {
+            return [0.0, 0.0];
+        }
+        let Some(samples) = samples else {
+            return [0.0, 0.0];
+        };
+        let frame_count = (samples.len() / 2) as u64;
+        if frame_count == 0 {
+            self.stop_recording_precount();
+            return [0.0, 0.0];
+        }
+        let mut state = self.recording_precount_state.load(Ordering::Relaxed);
+        let frame = loop {
+            if state & BROWSER_PREVIEW_ACTIVE_BIT == 0 {
+                return [0.0, 0.0];
+            }
+            let cursor = state & BROWSER_PREVIEW_FRAME_MASK;
+            if cursor >= frame_count {
+                self.recording_precount_state.store(0, Ordering::Release);
+                return [0.0, 0.0];
+            }
+            match self.recording_precount_state.compare_exchange_weak(
+                state,
+                BROWSER_PREVIEW_ACTIVE_BIT | (cursor + 1),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break cursor,
+                Err(observed) => state = observed,
+            }
+        };
+        let Some(offset) = usize::try_from(frame)
+            .ok()
+            .and_then(|frame| frame.checked_mul(2))
+        else {
+            return [0.0, 0.0];
+        };
+        let Some(frame_samples) = samples.get(offset..offset.saturating_add(2)) else {
+            return [0.0, 0.0];
+        };
+        [frame_samples[0], frame_samples[1]]
     }
 
     fn start_streaming(&self, initial_position_frames: u64) -> StreamingAudioWriter {
@@ -3766,6 +3832,28 @@ impl AudioEngine {
     /// Stop the independent Browser preview voice without stopping project playback.
     pub fn stop_browser_preview(&self) {
         self.playback.stop_browser_preview();
+    }
+
+    /// Play a prepared recording count-in without changing project or Browser playback.
+    pub fn set_recording_precount(&self, samples: Vec<f32>) -> Result<(), String> {
+        if !self.output_active {
+            return Err("Start an output device before playing a recording count-in".into());
+        }
+        if samples.is_empty() || !samples.len().is_multiple_of(2) {
+            return Err("Recording count-in audio must contain stereo sample frames".into());
+        }
+        self.playback.start_recording_precount(samples);
+        Ok(())
+    }
+
+    /// Stop the recording count-in voice.
+    pub fn stop_recording_precount(&self) {
+        self.playback.stop_recording_precount();
+    }
+
+    /// Whether the recording count-in voice is still playing.
+    pub fn recording_precount_active(&self) -> bool {
+        self.playback.recording_precount_active()
     }
 
     pub fn browser_preview_active(&self) -> bool {
@@ -4891,6 +4979,8 @@ where
                 let playback_samples = playback_for_callback.samples.load();
                 let streaming = playback_for_callback.streaming.load();
                 let browser_preview_samples = playback_for_callback.browser_preview_samples.load();
+                let recording_precount_samples =
+                    playback_for_callback.recording_precount_samples.load();
                 let metronome_timeline = playback_for_callback
                     .metronome_enabled
                     .load(Ordering::Acquire)
@@ -4930,6 +5020,9 @@ where
                         streaming: streaming.as_deref(),
                         playback: &playback_for_callback,
                         browser_preview_samples: browser_preview_samples
+                            .as_deref()
+                            .map(Vec::as_slice),
+                        recording_precount_samples: recording_precount_samples
                             .as_deref()
                             .map(Vec::as_slice),
                         sample_rate,
@@ -5361,6 +5454,7 @@ struct AudioFrameInputs<'a> {
     streaming: Option<&'a StreamingPlayback>,
     playback: &'a PlaybackState,
     browser_preview_samples: Option<&'a [f32]>,
+    recording_precount_samples: Option<&'a [f32]>,
     sample_rate: f32,
     phase: &'a mut f32,
 }
@@ -5373,6 +5467,7 @@ fn next_output_frame_with_browser_preview(inputs: AudioFrameInputs<'_>) -> [f32;
         streaming,
         playback,
         browser_preview_samples,
+        recording_precount_samples,
         sample_rate,
         phase,
     } = inputs;
@@ -5386,9 +5481,10 @@ fn next_output_frame_with_browser_preview(inputs: AudioFrameInputs<'_>) -> [f32;
         phase,
     );
     let preview = playback.next_browser_preview_frame(browser_preview_samples);
+    let recording_precount = playback.next_recording_precount_frame(recording_precount_samples);
     [
-        (project[0] + preview[0]).clamp(-1.0, 1.0),
-        (project[1] + preview[1]).clamp(-1.0, 1.0),
+        (project[0] + preview[0] + recording_precount[0]).clamp(-1.0, 1.0),
+        (project[1] + preview[1] + recording_precount[1]).clamp(-1.0, 1.0),
     ]
 }
 
@@ -6127,6 +6223,7 @@ fn render_wasapi_buffer(
     let playback_samples = playback.samples.load();
     let streaming = playback.streaming.load();
     let browser_preview_samples = playback.browser_preview_samples.load();
+    let recording_precount_samples = playback.recording_precount_samples.load();
     let mut output_peak = 0.0_f32;
     let mut output_peak_left = 0.0_f32;
     let mut output_peak_right = 0.0_f32;
@@ -6140,6 +6237,7 @@ fn render_wasapi_buffer(
             streaming: streaming.as_deref(),
             playback,
             browser_preview_samples: browser_preview_samples.as_deref().map(Vec::as_slice),
+            recording_precount_samples: recording_precount_samples.as_deref().map(Vec::as_slice),
             sample_rate,
             phase: &mut render_state.phase,
         });

@@ -4883,6 +4883,9 @@ struct DawUi {
     history_snapshot_available_this_frame: bool,
     playing: bool,
     metronome_enabled: bool,
+    recording_precount_enabled: bool,
+    recording_precount_bars: u8,
+    pending_recording_precount: Option<PendingRecordingPrecount>,
     pattern_playback_mode: bool,
     pattern_mode_playback_source: Option<(u16, u64)>,
     pattern_seek_tick: u64,
@@ -5967,6 +5970,15 @@ struct AudioRecordingSession {
     tempo_map: PlaylistTempoMap,
     project_generation: u64,
     capture_active: bool,
+}
+
+struct PendingRecordingPrecount {
+    timeout_at: Instant,
+    start_tick: u32,
+    project_generation: u64,
+    bars: u8,
+    midi: bool,
+    audio_path: Option<PathBuf>,
 }
 
 struct AudioInputMonitorSession {
@@ -7201,6 +7213,8 @@ impl DawUi {
         let window_layout_presets = load_window_layout_presets();
         let read_sample_root_note = load_read_sample_root_note();
         let metronome_enabled = load_metronome_enabled();
+        let (recording_precount_enabled, recording_precount_bars) =
+            load_recording_precount_settings();
         let audio_recording_offset_ms = load_audio_recording_offset_ms();
         let audio_recording_auto_latency_compensation =
             load_audio_recording_auto_latency_compensation();
@@ -7253,6 +7267,9 @@ impl DawUi {
             history_snapshot_available_this_frame: false,
             playing: false,
             metronome_enabled,
+            recording_precount_enabled,
+            recording_precount_bars,
+            pending_recording_precount: None,
             pattern_playback_mode: false,
             pattern_mode_playback_source: None,
             pattern_seek_tick: 0,
@@ -13622,6 +13639,7 @@ impl DawUi {
         staged_start_frame: Option<u64>,
         staged_handoff_reason: Option<PdcStreamHandoffReason>,
     ) {
+        self.cancel_recording_precount();
         self.midi_script_transport_move = None;
         if self.playlist_render_is_pending() {
             self.status = "Stop the Playlist render before starting playback".to_owned();
@@ -15074,6 +15092,233 @@ impl DawUi {
         };
     }
 
+    fn toggle_recording_precount(&mut self) {
+        self.set_recording_precount_enabled(!self.recording_precount_enabled);
+    }
+
+    fn set_recording_precount_enabled(&mut self, enabled: bool) {
+        if self.recording_precount_enabled == enabled {
+            return;
+        }
+        self.recording_precount_enabled = enabled;
+        self.status = match save_recording_precount_settings(
+            self.recording_precount_enabled,
+            self.recording_precount_bars,
+        ) {
+            Ok(()) if self.recording_precount_enabled => "Recording count-in enabled".to_owned(),
+            Ok(()) => "Recording count-in disabled".to_owned(),
+            Err(error) => format!("Recording count-in preference changed but not saved: {error}"),
+        };
+    }
+
+    fn set_recording_precount_bars(&mut self, bars: u8) {
+        if !matches!(bars, 1 | 2 | 4) || self.recording_precount_bars == bars {
+            return;
+        }
+        self.recording_precount_bars = bars;
+        self.status = match save_recording_precount_settings(
+            self.recording_precount_enabled,
+            self.recording_precount_bars,
+        ) {
+            Ok(()) => format!("Recording count-in set to {bars} bar(s)"),
+            Err(error) => format!("Recording count-in changed but not saved: {error}"),
+        };
+    }
+
+    fn recording_precount_timing(
+        &self,
+        start_tick: u32,
+    ) -> Result<(PlaylistTempoMap, (u8, u8)), String> {
+        let document = self
+            .document
+            .as_ref()
+            .ok_or_else(|| "Open a project before recording".to_owned())?;
+        let ppq = document.header().ppq();
+        let initial_signature = document.metadata().time_signature();
+        if self.pattern_playback_mode {
+            let patterns = document
+                .patterns()
+                .map_err(|error| format!("Could not read Pattern timing: {error}"))?;
+            let pattern = self
+                .selected_pattern
+                .and_then(|selected| patterns.iter().find(|pattern| pattern.id == selected))
+                .or_else(|| patterns.first())
+                .ok_or_else(|| "Create or select a Pattern before recording".to_owned())?;
+            let signature_changes = pattern
+                .time_markers
+                .iter()
+                .filter(|marker| marker.is_signature())
+                .filter_map(|marker| {
+                    Some((
+                        marker.position_ticks(),
+                        marker.numerator()?,
+                        marker.denominator()?,
+                    ))
+                })
+                .collect::<Vec<_>>();
+            let tempo_map =
+                PlaylistTempoMap::constant(ppq, document.metadata().tempo_bpm().unwrap_or(140.0))?;
+            let signature =
+                playlist_signature_at_tick(initial_signature, &signature_changes, start_tick);
+            return Ok((tempo_map, signature));
+        }
+
+        let arrangements = document
+            .arrangements()
+            .map_err(|error| format!("Could not read Playlist timing: {error}"))?;
+        let arrangement = self
+            .selected_arrangement
+            .and_then(|selected| {
+                arrangements
+                    .iter()
+                    .find(|arrangement| arrangement.id == selected)
+            })
+            .or_else(|| arrangements.first())
+            .ok_or_else(|| "The project has no Playlist arrangement".to_owned())?;
+        let signature_changes = arrangement
+            .time_markers
+            .iter()
+            .filter(|marker| marker.is_signature())
+            .filter_map(|marker| {
+                Some((
+                    marker.position_ticks(),
+                    marker.numerator()?,
+                    marker.denominator()?,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let tempo_map = PlaylistTempoMap::for_arrangement(document, arrangement.id)?;
+        let signature =
+            playlist_signature_at_tick(initial_signature, &signature_changes, start_tick);
+        Ok((tempo_map, signature))
+    }
+
+    fn queue_recording_precount(
+        &mut self,
+        start_tick: u32,
+        midi: bool,
+        audio_path: Option<PathBuf>,
+    ) -> Result<bool, String> {
+        if let Some(precount) = self.pending_recording_precount.as_mut() {
+            precount.midi |= midi;
+            if audio_path.is_some() {
+                precount.audio_path = audio_path;
+            }
+            return Ok(true);
+        }
+        if !self.recording_precount_enabled || self.playing {
+            return Ok(false);
+        }
+        let (tempo_map, signature) = self.recording_precount_timing(start_tick)?;
+        if self.audio_engine.is_none() {
+            self.audio_engine = Some(AudioEngine::start(&self.audio_settings)?);
+        }
+        let engine = self
+            .audio_engine
+            .as_ref()
+            .ok_or_else(|| "Audio output is not available".to_owned())?;
+        let sample_rate = engine.sample_rate();
+        let ppq = self
+            .document
+            .as_ref()
+            .map_or(96, |document| document.header().ppq());
+        let bars = self.recording_precount_bars;
+        let samples = render_recording_precount_samples(
+            sample_rate,
+            ppq,
+            &tempo_map,
+            start_tick,
+            signature,
+            bars,
+        )?;
+        let duration =
+            Duration::from_secs_f64((samples.len() / 2) as f64 / f64::from(sample_rate.max(1)));
+        engine.set_recording_precount(samples)?;
+        self.pending_recording_precount = Some(PendingRecordingPrecount {
+            timeout_at: Instant::now() + duration + Duration::from_secs(3),
+            start_tick,
+            project_generation: self.project_generation,
+            bars,
+            midi,
+            audio_path,
+        });
+        self.status = format!("Recording count-in · {bars} bar(s)");
+        Ok(true)
+    }
+
+    fn cancel_recording_precount(&mut self) -> bool {
+        if self.pending_recording_precount.take().is_none() {
+            return false;
+        }
+        if let Some(engine) = self.audio_engine.as_ref() {
+            engine.stop_recording_precount();
+        }
+        self.status = "Recording count-in canceled".to_owned();
+        true
+    }
+
+    fn poll_recording_precount(&mut self) {
+        let Some(precount) = self.pending_recording_precount.as_ref() else {
+            return;
+        };
+        let timed_out = Instant::now() >= precount.timeout_at;
+        let finished = self
+            .audio_engine
+            .as_ref()
+            .is_none_or(|engine| !engine.recording_precount_active())
+            || timed_out;
+        if !finished {
+            return;
+        }
+        let Some(precount) = self.pending_recording_precount.take() else {
+            return;
+        };
+        if let Some(engine) = self.audio_engine.as_ref() {
+            engine.stop_recording_precount();
+        }
+        if precount.project_generation != self.project_generation {
+            self.status = "Recording count-in canceled because the project changed".to_owned();
+            return;
+        }
+
+        let mut audio_started = false;
+        let mut audio_status = None;
+        if let Some(output_path) = precount.audio_path {
+            self.start_audio_recording(Some(output_path), Some(precount.start_tick));
+            audio_started = self
+                .audio_recording
+                .as_ref()
+                .is_some_and(|recording| recording.capture_active);
+            if !audio_started {
+                audio_status = Some(self.status.clone());
+            }
+        }
+        if precount.midi {
+            self.start_midi_recording_at(Some(precount.start_tick));
+        }
+        let midi_started = precount.midi && self.midi_recording.is_some();
+        let midi_status = (!midi_started && precount.midi).then(|| self.status.clone());
+        if audio_started && midi_started {
+            self.status = format!(
+                "Recording audio and MIDI after {}-bar count-in",
+                precount.bars
+            );
+        } else if audio_started && let Some(error) = midi_status {
+            self.status = format!("Recording audio after count-in; MIDI: {error}");
+        } else if audio_started {
+            self.status = format!("Recording audio after {}-bar count-in", precount.bars);
+        } else if midi_started && let Some(error) = audio_status {
+            self.status = format!("Recording MIDI after count-in; audio: {error}");
+        } else if midi_started {
+            self.status = format!("Recording MIDI after {}-bar count-in", precount.bars);
+        } else if let Some(error) = midi_status.or(audio_status) {
+            self.status = error;
+        }
+        if timed_out {
+            self.status.push_str(" · count-in output ended early");
+        }
+    }
+
     fn set_pattern_playback_mode(&mut self, pattern_mode: bool) {
         if self.pattern_playback_mode == pattern_mode {
             return;
@@ -15100,6 +15345,7 @@ impl DawUi {
     }
 
     fn stop_project_playback(&mut self) {
+        self.cancel_recording_precount();
         self.pending_clap_pattern_playback = None;
         self.pending_clap_playlist_playback = None;
         self.pending_clap_playlist_offline_render = None;
@@ -18747,6 +18993,11 @@ impl DawUi {
         if metronome_shortcut_requested {
             self.toggle_metronome();
         }
+        let precount_shortcut_requested = !ui.ctx().egui_wants_keyboard_input()
+            && ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::P));
+        if precount_shortcut_requested {
+            self.toggle_recording_precount();
+        }
         let patterns = self
             .document
             .as_ref()
@@ -18754,6 +19005,7 @@ impl DawUi {
             .unwrap_or_default();
         ui.horizontal_centered(|ui| {
             ui.add_space(4.0 * scale);
+            let recording_precount = self.pending_recording_precount.is_some();
             let recording_midi = self.midi_recording.is_some();
             let recording_audio = self
                 .audio_recording
@@ -18787,7 +19039,7 @@ impl DawUi {
                 || recording_audio
                 || start_audio_recording
                 || start_midi_recording;
-            let recording = recording_midi || recording_audio;
+            let recording = recording_midi || recording_audio || recording_precount;
             let record_button = egui::Button::new(
                 egui::RichText::new(if recording { "■" } else { "●" }).color(if recording {
                     Color32::WHITE
@@ -18799,7 +19051,9 @@ impl DawUi {
             .stroke(Stroke::NONE);
             let record_response =
                 ui.add(record_button)
-                    .on_hover_text(if recording_audio && recording_midi {
+                    .on_hover_text(if recording_precount {
+                        "Cancel recording count-in"
+                    } else if recording_audio && recording_midi {
                         "Finish audio and MIDI note recording"
                     } else if recording_audio {
                         "Finish audio recording"
@@ -18882,22 +19136,26 @@ impl DawUi {
                 self.persist_midi_device_selections();
             }
             if record_response.clicked() {
-                if recording_audio {
-                    self.audio_record_stop_requested = true;
-                }
-                if recording_midi {
-                    self.midi_record_toggle_requested = true;
-                }
-                if !recording && can_record {
-                    if start_midi_recording {
+                if recording_precount {
+                    self.cancel_recording_precount();
+                } else {
+                    if recording_audio {
+                        self.audio_record_stop_requested = true;
+                    }
+                    if recording_midi {
                         self.midi_record_toggle_requested = true;
                     }
-                    if start_audio_recording {
-                        self.audio_record_start_requested = true;
+                    if !recording && can_record {
+                        if start_midi_recording {
+                            self.midi_record_toggle_requested = true;
+                        }
+                        if start_audio_recording {
+                            self.audio_record_start_requested = true;
+                        }
+                    } else if !recording && !can_record {
+                        self.status =
+                            "Enable a recording filter and connect its input first".to_owned();
                     }
-                } else if !recording && !can_record {
-                    self.status =
-                        "Enable a recording filter and connect its input first".to_owned();
                 }
             }
             if ui.button("■").on_hover_text("Stop").clicked() {
@@ -18940,6 +19198,34 @@ impl DawUi {
                 .clicked()
             {
                 self.toggle_metronome();
+            }
+            let precount_response = ui
+                .selectable_label(self.recording_precount_enabled, "PRE")
+                .on_hover_text(
+                    "Recording count-in: play clicks before starting a stopped recording (Ctrl/Cmd+P; right-click for bar count)",
+                );
+            let _ = precount_response.context_menu(|ui| {
+                apply_local_ui_scale(ui, self.popup_menu_scale);
+                let mut enabled = self.recording_precount_enabled;
+                if ui.checkbox(&mut enabled, "Recording count-in").changed() {
+                    self.set_recording_precount_enabled(enabled);
+                }
+                ui.separator();
+                ui.label("Count-in bars");
+                for bars in [1, 2, 4] {
+                    if ui
+                        .selectable_label(
+                            self.recording_precount_bars == bars,
+                            format!("{bars} bar(s)"),
+                        )
+                        .clicked()
+                    {
+                        self.set_recording_precount_bars(bars);
+                    }
+                }
+            });
+            if precount_response.clicked() {
+                self.toggle_recording_precount();
             }
             let play_label = if self.pending_audio_render.is_some()
                 || self.pending_clap_pattern_playback.is_some()
@@ -59514,6 +59800,37 @@ impl DawUi {
     }
 
     fn start_midi_recording(&mut self) {
+        if let Some(precount) = self.pending_recording_precount.as_mut() {
+            precount.midi = true;
+            return;
+        }
+        let start_tick = self
+            .current_playhead_tick()
+            .unwrap_or(self.playlist_seek_tick as f64)
+            .round()
+            .clamp(0.0, f64::from(u32::MAX)) as u32;
+        if self.recording_precount_enabled
+            && !self.playing
+            && self.audio_recording.is_none()
+            && !(self.record_automation_enabled && self.record_automation_to_playlist)
+        {
+            match self.queue_recording_precount(start_tick, true, None) {
+                Ok(true) => return,
+                Ok(false) => {}
+                Err(error) => {
+                    self.start_midi_recording_at(Some(start_tick));
+                    if self.midi_recording.is_some() {
+                        self.status
+                            .push_str(&format!(" · count-in skipped: {error}"));
+                    }
+                    return;
+                }
+            }
+        }
+        self.start_midi_recording_at(None);
+    }
+
+    fn start_midi_recording_at(&mut self, start_tick_override: Option<u32>) {
         let record_notes = self.record_notes_enabled;
         let record_automation = self.record_automation_enabled;
         if !record_notes && !record_automation {
@@ -59566,7 +59883,9 @@ impl DawUi {
             (false, None) => 0,
         };
         let playback_arrangement_id = self.selected_arrangement.unwrap_or(0);
-        let playhead_tick = self.current_playhead_tick();
+        let playhead_tick = start_tick_override
+            .map(f64::from)
+            .or_else(|| self.current_playhead_tick());
         let recording_started_at = Instant::now();
         let song_timeline_start = if self.playing && self.playlist_playback_loaded {
             self.playlist_tempo_map.clone().zip(playhead_tick)
@@ -64054,7 +64373,11 @@ impl DawUi {
         }
     }
 
-    fn start_audio_recording(&mut self) {
+    fn start_audio_recording(
+        &mut self,
+        selected_output_path: Option<PathBuf>,
+        start_tick_override: Option<u32>,
+    ) {
         if self.audio_recording.is_some() {
             self.status = "An audio recording is already active or being finalized".to_owned();
             return;
@@ -64127,26 +64450,62 @@ impl DawUi {
             return;
         }
 
-        let mut dialog = rfd::FileDialog::new()
-            .set_title("Record audio to Playlist")
-            .add_filter("Wave audio", &["wav"])
-            .set_file_name("Audio recording.wav");
-        if let Some(directory) = self
-            .current_path
-            .as_deref()
-            .and_then(Path::parent)
-            .filter(|directory| directory.is_dir())
-        {
-            dialog = dialog.set_directory(directory);
-        }
-        let Some(mut output_path) = dialog.save_file() else {
-            return;
+        let selecting_output_path = selected_output_path.is_none();
+        let mut output_path = if let Some(path) = selected_output_path {
+            path
+        } else {
+            let mut dialog = rfd::FileDialog::new()
+                .set_title("Record audio to Playlist")
+                .add_filter("Wave audio", &["wav"])
+                .set_file_name("Audio recording.wav");
+            if let Some(directory) = self
+                .current_path
+                .as_deref()
+                .and_then(Path::parent)
+                .filter(|directory| directory.is_dir())
+            {
+                dialog = dialog.set_directory(directory);
+            }
+            let Some(path) = dialog.save_file() else {
+                return;
+            };
+            path
         };
         if !output_path
             .extension()
             .is_some_and(|extension| extension.eq_ignore_ascii_case("wav"))
         {
             output_path.set_extension("wav");
+        }
+
+        let tempo_map = match PlaylistTempoMap::for_arrangement(document, arrangement_id) {
+            Ok(tempo_map) => tempo_map,
+            Err(error) => {
+                self.status =
+                    format!("Could not prepare Playlist tempo map for recording: {error}");
+                return;
+            }
+        };
+
+        let start_tick = start_tick_override.unwrap_or_else(|| {
+            self.current_playhead_tick()
+                .unwrap_or(0.0)
+                .round()
+                .clamp(0.0, f64::from(u32::MAX)) as u32
+        });
+        if selecting_output_path && self.recording_precount_enabled && !self.playing {
+            match self.queue_recording_precount(start_tick, false, Some(output_path.clone())) {
+                Ok(true) => return,
+                Ok(false) => {}
+                Err(error) => {
+                    self.start_audio_recording(Some(output_path), Some(start_tick));
+                    if self.audio_recording.is_some() {
+                        self.status
+                            .push_str(&format!(" · count-in skipped: {error}"));
+                    }
+                    return;
+                }
+            }
         }
 
         let previous_input_channel_pair = self
@@ -64203,22 +64562,6 @@ impl DawUi {
         let recording_offset_ms = self
             .audio_recording_offset_ms
             .saturating_add(automatic_input_latency_ms);
-        let start_tick = self
-            .current_playhead_tick()
-            .unwrap_or(0.0)
-            .round()
-            .clamp(0.0, f64::from(u32::MAX)) as u32;
-        let tempo_map = match PlaylistTempoMap::for_arrangement(document, arrangement_id) {
-            Ok(tempo_map) => tempo_map,
-            Err(error) => {
-                if let Some(engine) = self.audio_engine.as_ref() {
-                    let _ = engine.set_input_channel_pair(previous_input_channel_pair);
-                }
-                self.status =
-                    format!("Could not prepare Playlist tempo map for recording: {error}");
-                return;
-            }
-        };
         let project_generation = self.project_generation;
         let post_effect_capture = if self.audio_recording_post_effects {
             match self.start_audio_input_monitor(true) {
@@ -70770,11 +71113,12 @@ impl eframe::App for DawUi {
         if audio_record_stop_requested {
             self.stop_audio_recording();
         } else if audio_record_start_requested {
-            self.start_audio_recording();
+            self.start_audio_recording(None, None);
         }
         if std::mem::take(&mut self.midi_record_toggle_requested) {
             self.toggle_midi_recording(history_snapshot_available);
         }
+        self.poll_recording_precount();
         let midi_output_refresh_requested = std::mem::take(&mut self.midi_output_refresh_requested);
         let midi_output_toggle_requested = std::mem::take(&mut self.midi_output_toggle_requested);
         let midi_output_test_requested = std::mem::take(&mut self.midi_output_test_requested);
@@ -76970,6 +77314,43 @@ fn save_metronome_enabled(enabled: bool) -> Result<(), String> {
         .map_err(|error| format!("could not write {}: {error}", path.display()))
 }
 
+fn recording_precount_settings_file() -> Option<PathBuf> {
+    browser_favorites_file()?
+        .parent()
+        .map(|directory| directory.join("recording-precount.txt"))
+}
+
+fn load_recording_precount_settings() -> (bool, u8) {
+    let Some(contents) =
+        recording_precount_settings_file().and_then(|path| fs::read_to_string(path).ok())
+    else {
+        return (false, 1);
+    };
+    let mut lines = contents.lines();
+    let enabled = lines
+        .next()
+        .and_then(|line| line.trim().parse::<bool>().ok())
+        .unwrap_or(false);
+    let bars = lines
+        .next()
+        .and_then(|line| line.trim().parse::<u8>().ok())
+        .filter(|bars| matches!(bars, 1 | 2 | 4))
+        .unwrap_or(1);
+    (enabled, bars)
+}
+
+fn save_recording_precount_settings(enabled: bool, bars: u8) -> Result<(), String> {
+    let path = recording_precount_settings_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the recording count-in preference path has no parent folder".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    fs::write(&path, format!("{enabled}\n{}\n", bars.clamp(1, 4)))
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
 fn midi_recording_offset_settings_file() -> Option<PathBuf> {
     browser_favorites_file()?
         .parent()
@@ -79844,6 +80225,62 @@ fn playlist_seek_tick_to_frame(
     sample_rate: u32,
 ) -> Result<u64, String> {
     tempo_map.frame_at_tick(u64::from(tick), sample_rate)
+}
+
+fn render_recording_precount_samples(
+    sample_rate: u32,
+    ppq: u16,
+    tempo_map: &PlaylistTempoMap,
+    start_tick: u32,
+    time_signature: (u8, u8),
+    bars: u8,
+) -> Result<Vec<f32>, String> {
+    if sample_rate == 0 || ppq == 0 || bars == 0 {
+        return Err(
+            "Recording count-in timing requires a positive sample rate, PPQ, and bar count".into(),
+        );
+    }
+    let (numerator, denominator) = (time_signature.0.max(1), time_signature.1.max(1));
+    let ticks_per_beat = f64::from(ppq) * 4.0 / f64::from(denominator);
+    let beat_count = u32::from(numerator) * u32::from(bars);
+    let end_tick = f64::from(start_tick) + f64::from(beat_count) * ticks_per_beat;
+    let start_frame = tempo_map.frame_at_fractional_tick(f64::from(start_tick), sample_rate)?;
+    let end_frame = tempo_map.frame_at_fractional_tick(end_tick, sample_rate)?;
+    let frame_count = end_frame.saturating_sub(start_frame);
+    if frame_count == 0 || frame_count > u64::from(sample_rate) * 120 {
+        return Err("Recording count-in duration is outside the supported range".into());
+    }
+    let sample_count = usize::try_from(frame_count)
+        .ok()
+        .and_then(|frames| frames.checked_mul(2))
+        .ok_or_else(|| "Recording count-in audio is too large".to_owned())?;
+    let mut samples = vec![0.0_f32; sample_count];
+    let click_frames = (f64::from(sample_rate) * 0.055).ceil() as u64;
+    for beat in 0..beat_count {
+        let beat_tick = f64::from(start_tick) + f64::from(beat) * ticks_per_beat;
+        let beat_frame = tempo_map
+            .frame_at_fractional_tick(beat_tick, sample_rate)?
+            .saturating_sub(start_frame);
+        if beat_frame >= frame_count {
+            continue;
+        }
+        let accented = beat % u32::from(numerator) == 0;
+        let frequency = if accented { 1_760.0 } else { 1_320.0 };
+        let level = if accented { 0.32 } else { 0.21 };
+        let frames = click_frames.min(frame_count - beat_frame);
+        for click_frame in 0..frames {
+            let elapsed_seconds = click_frame as f64 / f64::from(sample_rate);
+            let phase = std::f64::consts::TAU * frequency * elapsed_seconds;
+            let sample = (phase.sin() * (-elapsed_seconds * 92.0).exp() * level) as f32;
+            let offset = usize::try_from(beat_frame + click_frame)
+                .ok()
+                .and_then(|frame| frame.checked_mul(2))
+                .ok_or_else(|| "Recording count-in sample offset overflowed".to_owned())?;
+            samples[offset] = (samples[offset] + sample).clamp(-1.0, 1.0);
+            samples[offset + 1] = (samples[offset + 1] + sample).clamp(-1.0, 1.0);
+        }
+    }
+    Ok(samples)
 }
 
 fn metronome_timeline_from_map(
