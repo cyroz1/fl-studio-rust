@@ -5402,6 +5402,7 @@ enum SelectedAudioClipRenderAction {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PlaylistPatternClipRenderAction {
     Export { start_from_song_start: bool },
+    Insert { start_from_song_start: bool },
     Consolidate,
 }
 
@@ -5428,7 +5429,7 @@ struct PendingSongRender {
     output_path: PathBuf,
     kind: PendingSongRenderKind,
     track_freeze: Option<PendingPlaylistTrackFreeze>,
-    pattern_clip_consolidation: Option<PendingPlaylistPatternClipConsolidation>,
+    pattern_clip_placement: Option<PendingPlaylistPatternClipPlacement>,
 }
 
 struct PendingPlaylistTrackFreeze {
@@ -5441,11 +5442,12 @@ struct PendingPlaylistTrackFreeze {
     project_fingerprint: [u8; 16],
 }
 
-struct PendingPlaylistPatternClipConsolidation {
+struct PendingPlaylistPatternClipPlacement {
     arrangement_id: u16,
     source_clips: Vec<PendingPlaylistPatternClipSource>,
     source_position_ticks: u32,
     source_track_index: u16,
+    mute_source_clips: bool,
     project_generation: u64,
     project_path: PathBuf,
     project_fingerprint: [u8; 16],
@@ -14704,6 +14706,69 @@ impl DawUi {
                                     arrangement_id,
                                     &clip_indices,
                                     PlaylistPatternClipRenderAction::Export {
+                                        start_from_song_start: true,
+                                    },
+                                );
+                            }
+                            ui.close();
+                        }
+                    });
+                    let insert_pattern_clips_label = if selected_pattern_clips
+                        .as_ref()
+                        .is_some_and(|(_, indices)| indices.len() > 1)
+                    {
+                        "Render and insert selected Pattern Clips…"
+                    } else {
+                        "Render and insert selected Pattern Clip…"
+                    };
+                    let insert_pattern_clip_start_choice = if selected_pattern_clips
+                        .as_ref()
+                        .is_some_and(|(_, indices)| indices.len() > 1)
+                    {
+                        "At earliest clip start…"
+                    } else {
+                        "At clip start…"
+                    };
+                    ui.menu_button(insert_pattern_clips_label, |ui| {
+                        let can_insert = selected_pattern_clips.is_some()
+                            && self.sample_project_path().is_some()
+                            && self
+                                .document
+                                .as_ref()
+                                .is_some_and(project_has_audio_clip_template)
+                            && self.pending_song_render.is_none()
+                            && self.pending_audio_clip_export.is_none();
+                        if ui
+                            .add_enabled(
+                                can_insert,
+                                egui::Button::new(insert_pattern_clip_start_choice),
+                            )
+                            .clicked()
+                        {
+                            if let Some((arrangement_id, clip_indices)) =
+                                selected_pattern_clips.clone()
+                            {
+                                self.render_playlist_pattern_clip_dialog(
+                                    arrangement_id,
+                                    &clip_indices,
+                                    PlaylistPatternClipRenderAction::Insert {
+                                        start_from_song_start: false,
+                                    },
+                                );
+                            }
+                            ui.close();
+                        }
+                        if ui
+                            .add_enabled(can_insert, egui::Button::new("At song start…"))
+                            .clicked()
+                        {
+                            if let Some((arrangement_id, clip_indices)) =
+                                selected_pattern_clips.clone()
+                            {
+                                self.render_playlist_pattern_clip_dialog(
+                                    arrangement_id,
+                                    &clip_indices,
+                                    PlaylistPatternClipRenderAction::Insert {
                                         start_from_song_start: true,
                                     },
                                 );
@@ -43123,10 +43188,14 @@ impl DawUi {
             PlaylistPatternClipRenderAction::Export {
                 start_from_song_start,
             } => ("rendering", start_from_song_start),
+            PlaylistPatternClipRenderAction::Insert {
+                start_from_song_start,
+            } => ("rendering and inserting", start_from_song_start),
             PlaylistPatternClipRenderAction::Consolidate => ("consolidating", false),
         };
         let rendered_or_consolidated = match action {
             PlaylistPatternClipRenderAction::Export { .. } => "rendered",
+            PlaylistPatternClipRenderAction::Insert { .. } => "rendered and inserted",
             PlaylistPatternClipRenderAction::Consolidate => "consolidated",
         };
         if clip_indices.is_empty() {
@@ -43189,7 +43258,7 @@ impl DawUi {
             return;
         };
         let PlaylistClipTarget::Pattern { .. } = clip.target() else {
-            self.status = "Select a Pattern Clip before rendering or consolidating".to_owned();
+            self.status = "Select a Pattern Clip before rendering or placing a render".to_owned();
             return;
         };
         let patterns = match document.patterns() {
@@ -43241,7 +43310,7 @@ impl DawUi {
                 );
                 return;
             };
-            if action == PlaylistPatternClipRenderAction::Consolidate {
+            if !matches!(action, PlaylistPatternClipRenderAction::Export { .. }) {
                 consolidation_sources.push(PendingPlaylistPatternClipSource {
                     clip_index: *selected_index,
                     pattern_id: selected_pattern_id,
@@ -43271,7 +43340,8 @@ impl DawUi {
                 .is_some_and(|scale| !scale.is_finite() || (scale - 1.0).abs() > 1e-9)
             {
                 self.status = match action {
-                    PlaylistPatternClipRenderAction::Export { .. } => {
+                    PlaylistPatternClipRenderAction::Export { .. }
+                    | PlaylistPatternClipRenderAction::Insert { .. } => {
                         "Pattern Clip rendering requires the default clip scale".to_owned()
                     }
                     PlaylistPatternClipRenderAction::Consolidate => {
@@ -43311,20 +43381,23 @@ impl DawUi {
             };
             clip_end_tick = clip_end_tick.max(selected_clip_end_tick);
         }
-        if action == PlaylistPatternClipRenderAction::Consolidate
+        if !matches!(action, PlaylistPatternClipRenderAction::Export { .. })
             && !project_has_audio_clip_template(document)
         {
-            self.status =
-                "This project needs a recognized Audio Clip template before consolidating Pattern Clips"
-                    .to_owned();
+            self.status = format!(
+                "This project needs a recognized Audio Clip template before {operation} Pattern Clips"
+            );
             return;
         }
-        let source_position_ticks = if action == PlaylistPatternClipRenderAction::Consolidate {
-            source_start_tick
-        } else {
-            clip.position_ticks
-        };
-        let track_index = if action == PlaylistPatternClipRenderAction::Consolidate {
+        let source_position_ticks =
+            if matches!(action, PlaylistPatternClipRenderAction::Export { .. }) {
+                clip.position_ticks
+            } else if start_from_song_start {
+                0
+            } else {
+                source_start_tick
+            };
+        let track_index = if !matches!(action, PlaylistPatternClipRenderAction::Export { .. }) {
             let Some(source) = consolidation_sources.iter().min_by_key(|source| {
                 (source.position_ticks, source.track_index, source.clip_index)
             }) else {
@@ -43369,19 +43442,20 @@ impl DawUi {
                     return;
                 }
             };
-        let project_fingerprint = if action == PlaylistPatternClipRenderAction::Consolidate {
-            let project_bytes = match document.encode_lossless() {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    self.status =
-                        format!("Could not verify the project before consolidation: {error}");
-                    return;
-                }
+        let project_fingerprint =
+            if !matches!(action, PlaylistPatternClipRenderAction::Export { .. }) {
+                let project_bytes = match document.encode_lossless() {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        self.status =
+                            format!("Could not verify the project before {operation}: {error}");
+                        return;
+                    }
+                };
+                Some(Md5::digest(&project_bytes).into())
+            } else {
+                None
             };
-            Some(Md5::digest(&project_bytes).into())
-        } else {
-            None
-        };
 
         let automation_channel_ids = channels
             .iter()
@@ -43445,6 +43519,30 @@ impl DawUi {
                         "song_start"
                     } else {
                         "clip_start"
+                    },
+                )
+            }
+            PlaylistPatternClipRenderAction::Insert {
+                start_from_song_start,
+            } => {
+                let start_label = if start_from_song_start {
+                    "song start"
+                } else if selected_clip_indices.len() > 1 {
+                    "earliest selected clip start"
+                } else {
+                    "clip start"
+                };
+                let selection_label = if selected_clip_indices.len() == 1 {
+                    format!("Pattern Clip {}", clip_index + 1)
+                } else {
+                    format!("{} Pattern Clips", selected_clip_indices.len())
+                };
+                (
+                    format!("Render and insert {selection_label} from {start_label}"),
+                    if start_from_song_start {
+                        "inserted_song_start"
+                    } else {
+                        "inserted"
                     },
                 )
             }
@@ -43527,17 +43625,19 @@ impl DawUi {
                 bitrate_kbps: self.playlist_render_mp3_bitrate_kbps,
             },
         };
-        let pattern_clip_consolidation = match action {
-            PlaylistPatternClipRenderAction::Consolidate => {
+        let pattern_clip_placement = match action {
+            PlaylistPatternClipRenderAction::Insert { .. }
+            | PlaylistPatternClipRenderAction::Consolidate => {
                 let Some(project_fingerprint) = project_fingerprint else {
-                    self.status = "Could not verify the project before consolidation".to_owned();
+                    self.status = format!("Could not verify the project before {operation}");
                     return;
                 };
-                Some(PendingPlaylistPatternClipConsolidation {
+                Some(PendingPlaylistPatternClipPlacement {
                     arrangement_id,
                     source_clips: consolidation_sources,
                     source_position_ticks,
                     source_track_index: track_index,
+                    mute_source_clips: action == PlaylistPatternClipRenderAction::Consolidate,
                     project_generation: self.project_generation,
                     project_path: project_path.clone(),
                     project_fingerprint,
@@ -43585,10 +43685,13 @@ impl DawUi {
                             first_clip_index: clip_index,
                             start_from_song_start,
                         },
+                        PlaylistPatternClipRenderAction::Insert { .. } => {
+                            PendingSongRenderKind::Mix
+                        }
                         PlaylistPatternClipRenderAction::Consolidate => PendingSongRenderKind::Mix,
                     },
                     track_freeze: None,
-                    pattern_clip_consolidation,
+                    pattern_clip_placement,
                 });
                 self.status = match action {
                     PlaylistPatternClipRenderAction::Export {
@@ -43604,6 +43707,29 @@ impl DawUi {
                         };
                         format!(
                             "Rendering {clip_description} from {} to {}…",
+                            if start_from_song_start {
+                                "song start"
+                            } else if selected_clip_indices.len() > 1 {
+                                "earliest selected clip start"
+                            } else {
+                                "clip start"
+                            },
+                            output_path.display()
+                        )
+                    }
+                    PlaylistPatternClipRenderAction::Insert {
+                        start_from_song_start,
+                    } => {
+                        let clip_description = if selected_clip_indices.len() == 1 {
+                            format!("Playlist Pattern Clip {}", clip_index + 1)
+                        } else {
+                            format!(
+                                "{} selected Playlist Pattern Clips",
+                                selected_clip_indices.len()
+                            )
+                        };
+                        format!(
+                            "Rendering and inserting {clip_description} from {} to {}…",
                             if start_from_song_start {
                                 "song start"
                             } else if selected_clip_indices.len() > 1 {
@@ -43632,6 +43758,9 @@ impl DawUi {
                     PlaylistPatternClipRenderAction::Export { .. } => {
                         format!("Could not start Pattern Clip render: {error}")
                     }
+                    PlaylistPatternClipRenderAction::Insert { .. } => {
+                        format!("Could not start Pattern Clip render-and-insert: {error}")
+                    }
                     PlaylistPatternClipRenderAction::Consolidate => {
                         format!("Could not start Pattern Clip consolidation: {error}")
                     }
@@ -43640,27 +43769,26 @@ impl DawUi {
         }
     }
 
-    fn finish_playlist_pattern_clip_consolidation(
+    fn finish_playlist_pattern_clip_placement(
         &mut self,
         output_path: &Path,
         summary: &PlaylistRenderSummary,
-        consolidation: &PendingPlaylistPatternClipConsolidation,
+        placement: &PendingPlaylistPatternClipPlacement,
         history_snapshot_available: bool,
     ) {
-        let source_description = if consolidation.source_clips.len() == 1 {
-            format!(
-                "Pattern Clip {}",
-                consolidation.source_clips[0].clip_index + 1
-            )
+        let operation = if placement.mute_source_clips {
+            "consolidation"
         } else {
-            format!(
-                "{} selected Pattern Clips",
-                consolidation.source_clips.len()
-            )
+            "render insertion"
+        };
+        let source_description = if placement.source_clips.len() == 1 {
+            format!("Pattern Clip {}", placement.source_clips[0].clip_index + 1)
+        } else {
+            format!("{} selected Pattern Clips", placement.source_clips.len())
         };
         if summary.frames == 0 || summary.sample_rate == 0 {
             self.status = format!(
-                "Rendered {}, but it contains no audio frames to consolidate",
+                "Rendered {}, but it contains no audio frames for {operation}",
                 output_path.display()
             );
             return;
@@ -43685,14 +43813,14 @@ impl DawUi {
         }
         let Some(project_path) = self.sample_project_path() else {
             self.status = format!(
-                "Rendered {}, but could not consolidate the Pattern Clip because no project is open",
+                "Rendered {}, but could not complete {operation} because no project is open",
                 output_path.display()
             );
             return;
         };
         let Some(document) = self.document.as_ref() else {
             self.status = format!(
-                "Rendered {}, but could not consolidate the Pattern Clip because no project is open",
+                "Rendered {}, but could not complete {operation} because no project is open",
                 output_path.display()
             );
             return;
@@ -43701,19 +43829,19 @@ impl DawUi {
             Ok(bytes) => bytes,
             Err(error) => {
                 self.status = format!(
-                    "Rendered {}, but could not verify the project before consolidation: {error}",
+                    "Rendered {}, but could not verify the project before {operation}: {error}",
                     output_path.display()
                 );
                 return;
             }
         };
         let current_fingerprint: [u8; 16] = Md5::digest(&current_bytes).into();
-        if consolidation.project_generation != self.project_generation
-            || project_path != consolidation.project_path
-            || current_fingerprint != consolidation.project_fingerprint
+        if placement.project_generation != self.project_generation
+            || project_path != placement.project_path
+            || current_fingerprint != placement.project_fingerprint
         {
             self.status = format!(
-                "Rendered {}, but did not consolidate {source_description} because the project changed while rendering",
+                "Rendered {}, but did not complete {operation} for {source_description} because the project changed while rendering",
                 output_path.display(),
             );
             return;
@@ -43721,7 +43849,7 @@ impl DawUi {
         let arrangement = match document.arrangements().map(|arrangements| {
             arrangements
                 .into_iter()
-                .find(|arrangement| arrangement.id == consolidation.arrangement_id)
+                .find(|arrangement| arrangement.id == placement.arrangement_id)
         }) {
             Ok(Some(arrangement)) => arrangement,
             Ok(None) => {
@@ -43739,10 +43867,10 @@ impl DawUi {
                 return;
             }
         };
-        for source in &consolidation.source_clips {
+        for source in &placement.source_clips {
             let Some(source_clip) = arrangement.clips.get(source.clip_index) else {
                 self.status = format!(
-                    "Rendered {}, but a source Pattern Clip no longer exists",
+                    "Rendered {}, but a source Pattern Clip no longer exists for {operation}",
                     output_path.display()
                 );
                 return;
@@ -43757,26 +43885,26 @@ impl DawUi {
                 || source_clip.is_muted()
             {
                 self.status = format!(
-                    "Rendered {}, but a source Pattern Clip changed before consolidation",
+                    "Rendered {}, but a source Pattern Clip changed before {operation}",
                     output_path.display()
                 );
                 return;
             }
         }
-        let tempo_map =
-            match PlaylistTempoMap::for_arrangement(document, consolidation.arrangement_id) {
-                Ok(tempo_map) => tempo_map,
-                Err(error) => {
-                    self.status = format!(
-                        "Rendered {}, but could not determine its Playlist tempo map: {error}",
-                        output_path.display()
-                    );
-                    return;
-                }
-            };
+        let tempo_map = match PlaylistTempoMap::for_arrangement(document, placement.arrangement_id)
+        {
+            Ok(tempo_map) => tempo_map,
+            Err(error) => {
+                self.status = format!(
+                    "Rendered {}, but could not determine its Playlist tempo map for {operation}: {error}",
+                    output_path.display()
+                );
+                return;
+            }
+        };
         let length_ticks = match tempo_map
             .ticks_for_audio_frames(
-                u64::from(consolidation.source_position_ticks),
+                u64::from(placement.source_position_ticks),
                 summary.frames,
                 summary.sample_rate,
             )
@@ -43787,14 +43915,14 @@ impl DawUi {
             Ok(length_ticks) if length_ticks > 0 => length_ticks,
             Ok(_) => {
                 self.status = format!(
-                    "Rendered {}, but its duration is shorter than one Playlist tick",
+                    "Rendered {}, but its duration is shorter than one Playlist tick for {operation}",
                     output_path.display()
                 );
                 return;
             }
             Err(error) => {
                 self.status = format!(
-                    "Rendered {}, but could not determine its Playlist length: {error}",
+                    "Rendered {}, but could not determine its Playlist length for {operation}: {error}",
                     output_path.display()
                 );
                 return;
@@ -43810,27 +43938,32 @@ impl DawUi {
             }
             Ok(None) => {
                 self.status =
-                    "Could not capture undo state before Pattern Clip consolidation".to_owned();
+                    format!("Could not capture undo state before Pattern Clip {operation}");
                 return;
             }
             Err(error) => {
                 self.status = format!(
-                    "Could not capture undo state before Pattern Clip consolidation: {error}"
+                    "Could not capture undo state before Pattern Clip {operation}: {error}"
                 );
                 return;
             }
         };
         let mut updated = document.clone();
         let channel_path = output_path.to_string_lossy();
-        let channel_name = if consolidation.source_clips.len() == 1 {
+        let channel_name_prefix = if placement.mute_source_clips {
+            "Consolidated"
+        } else {
+            "Rendered"
+        };
+        let channel_name = if placement.source_clips.len() == 1 {
             format!(
-                "Consolidated Pattern {}",
-                consolidation.source_clips[0].pattern_id
+                "{channel_name_prefix} Pattern {}",
+                placement.source_clips[0].pattern_id
             )
         } else {
             format!(
-                "Consolidated {} Pattern Clips",
-                consolidation.source_clips.len()
+                "{channel_name_prefix} {} Pattern Clips",
+                placement.source_clips.len()
             )
         };
         let channel_id = match updated.create_audio_channel(&channel_path, &channel_name) {
@@ -43844,11 +43977,11 @@ impl DawUi {
             }
         };
         let new_clip_index = match updated.create_playlist_audio_clip(
-            consolidation.arrangement_id,
+            placement.arrangement_id,
             channel_id,
-            consolidation.source_position_ticks,
+            placement.source_position_ticks,
             length_ticks,
-            consolidation.source_track_index,
+            placement.source_track_index,
         ) {
             Ok(clip_index) => clip_index,
             Err(error) => {
@@ -43859,20 +43992,22 @@ impl DawUi {
                 return;
             }
         };
-        for source in &consolidation.source_clips {
-            if let Err(error) = updated.edit_playlist_clip(
-                consolidation.arrangement_id,
-                source.clip_index,
-                PlaylistClipEdit {
-                    muted: Some(true),
-                    ..PlaylistClipEdit::default()
-                },
-            ) {
-                self.status = format!(
-                    "Rendered {}, but could not mute source Pattern Clips: {error}",
-                    output_path.display()
-                );
-                return;
+        if placement.mute_source_clips {
+            for source in &placement.source_clips {
+                if let Err(error) = updated.edit_playlist_clip(
+                    placement.arrangement_id,
+                    source.clip_index,
+                    PlaylistClipEdit {
+                        muted: Some(true),
+                        ..PlaylistClipEdit::default()
+                    },
+                ) {
+                    self.status = format!(
+                        "Rendered {}, but could not mute source Pattern Clips: {error}",
+                        output_path.display()
+                    );
+                    return;
+                }
             }
         }
         self.stop_project_playback();
@@ -43880,7 +44015,7 @@ impl DawUi {
         if let Some(snapshot) = undo_snapshot {
             self.remember_undo_snapshot(snapshot);
         }
-        self.selected_arrangement = Some(consolidation.arrangement_id);
+        self.selected_arrangement = Some(placement.arrangement_id);
         self.selected_clip = Some(new_clip_index);
         self.selected_playlist_clips.clear();
         self.selected_playlist_clips.insert(new_clip_index);
@@ -43891,11 +44026,19 @@ impl DawUi {
         self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
         self.view = MainView::Playlist;
         self.refresh_audio_waveform_paths();
-        self.status = format!(
-            "Consolidated {source_description} to {} on Playlist track {}; source clips muted. Tempo automation, supported linked effect automation, and loaded Mixer effects were included",
-            output_path.display(),
-            usize::from(consolidation.source_track_index) + 1
-        );
+        self.status = if placement.mute_source_clips {
+            format!(
+                "Consolidated {source_description} to {} on Playlist track {}; source clips muted. Tempo automation, supported linked effect automation, and loaded Mixer effects were included",
+                output_path.display(),
+                usize::from(placement.source_track_index) + 1
+            )
+        } else {
+            format!(
+                "Inserted render of {source_description} to {} on Playlist track {}; source clips unchanged. Tempo automation, supported linked effect automation, and loaded Mixer effects were included",
+                output_path.display(),
+                usize::from(placement.source_track_index) + 1
+            )
+        };
     }
 
     fn finish_playlist_track_freeze(
@@ -44389,7 +44532,7 @@ impl DawUi {
                         project_path,
                         project_fingerprint,
                     }),
-                    pattern_clip_consolidation: None,
+                    pattern_clip_placement: None,
                 });
                 self.status = format!(
                     "Freezing Playlist track {track_id} from song start to {}…",
@@ -44548,7 +44691,7 @@ impl DawUi {
                     output_path: output_path.clone(),
                     kind: PendingSongRenderKind::Mix,
                     track_freeze: None,
-                    pattern_clip_consolidation: None,
+                    pattern_clip_placement: None,
                 });
                 self.status = format!("Rendering Playlist mix to {}…", output_path.display());
             }
@@ -44665,7 +44808,7 @@ impl DawUi {
                     output_path: output_directory.clone(),
                     kind: PendingSongRenderKind::MixerStems,
                     track_freeze: None,
-                    pattern_clip_consolidation: None,
+                    pattern_clip_placement: None,
                 });
                 self.status = format!("Rendering Mixer stems into {}…", output_directory.display());
             }
@@ -44712,28 +44855,27 @@ impl DawUi {
             }
             return;
         }
-        if let Some(consolidation) = pending.pattern_clip_consolidation.as_ref() {
+        if let Some(placement) = pending.pattern_clip_placement.as_ref() {
             match result {
-                Ok(summary) => self.finish_playlist_pattern_clip_consolidation(
+                Ok(summary) => self.finish_playlist_pattern_clip_placement(
                     &pending.output_path,
                     &summary,
-                    consolidation,
+                    placement,
                     history_snapshot_available,
                 ),
                 Err(error) => {
-                    let source_description = if consolidation.source_clips.len() == 1 {
-                        format!(
-                            "Pattern Clip {}",
-                            consolidation.source_clips[0].clip_index + 1
-                        )
+                    let source_description = if placement.source_clips.len() == 1 {
+                        format!("Pattern Clip {}", placement.source_clips[0].clip_index + 1)
+                    } else {
+                        format!("{} selected Pattern Clips", placement.source_clips.len())
+                    };
+                    self.status = if placement.mute_source_clips {
+                        format!("Could not consolidate Playlist {source_description}: {error}")
                     } else {
                         format!(
-                            "{} selected Pattern Clips",
-                            consolidation.source_clips.len()
+                            "Could not render and insert Playlist {source_description}: {error}"
                         )
                     };
-                    self.status =
-                        format!("Could not consolidate Playlist {source_description}: {error}");
                 }
             }
             return;

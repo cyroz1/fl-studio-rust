@@ -369,10 +369,13 @@ are applied where the Mixer rows below describe. Full export surface:
   positions and use the shared output formats and settings. Supported Sampler and loaded VST3
   note sources render with tempo automation, supported linked Automation Clip and Pattern
   Event/LFO effect automation, loaded Mixer insert and Master effects, reported tails, and
-  automatic PDC. The context menu can consolidate one Pattern Clip or multiple selected
-  Pattern Clips across Playlist tracks into one Audio Clip at the earliest source position,
-  on the earliest source clip's track, muting all source clips as one undoable edit. Unsupported
-  effect automation links and native FL Studio output comparison remain incomplete.
+  automatic PDC. File > Export can also render and insert one or more selected Pattern Clips as
+  one unmuted Audio Clip at the earliest source position or song start, on the earliest source
+  clip's track, leaving the Pattern Clips unchanged. The context menu can consolidate one
+  Pattern Clip or multiple selected Pattern Clips across Playlist tracks into one Audio Clip
+  at the earliest source position, on the earliest source clip's track, muting all source clips
+  as one undoable edit. Unsupported effect automation links and native FL Studio output
+  comparison remain incomplete.
 - `[partial]` Playlist track freeze: **Freeze track from song start…** renders the selected track from tick zero, places the resulting Audio Clip on the same track, and mutes all original clips in one undoable edit. The action uses the selected Playlist output format and includes supported loaded VST3 Mixer insert/Master effects, linked Automation Clip and Pattern Event/LFO effect automation, reported effect tails, and automatic PDC when available. It leaves the arrangement unchanged when known scaled clips, unresolved Sampler sources, unloaded VST3 channels, unsupported loaded effect layouts, or a changed project prevent safe placement. Non-render-based smart disable and native output comparison remain incomplete.
 - `[partial]` Pattern render: the Piano roll can render enabled Sampler notes
   from the selected pattern to WAV with the shared bit depth, dither, and
