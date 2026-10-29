@@ -34,6 +34,22 @@ pub struct ScheduledMidiFrameMessage {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PlaylistMidiLoopSelection {
+    pub start_tick: u64,
+    pub start_frame: u64,
+    pub loop_start_tick: u64,
+    pub loop_end_tick: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlaylistLoopMidiMessages {
+    pub initial_messages: Vec<ScheduledMidiFrameMessage>,
+    pub loop_messages: Vec<ScheduledMidiFrameMessage>,
+    pub loop_start_frame: u64,
+    pub loop_frames: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct OrderedMidiMessage {
     tick: u64,
     priority: u8,
@@ -261,6 +277,16 @@ pub fn playlist_playback_messages(
     start_tick: u64,
     soloed_playlist_track_range: Option<(u32, u32)>,
 ) -> Result<Vec<ScheduledMidiTickMessage>, String> {
+    let midi =
+        playlist_midi_file_for_playback(document, arrangement_id, soloed_playlist_track_range)?;
+    midi_tick_messages(&midi, start_tick)
+}
+
+fn playlist_midi_file_for_playback(
+    document: &FlpDocument,
+    arrangement_id: u16,
+    soloed_playlist_track_range: Option<(u32, u32)>,
+) -> Result<MidiFile, String> {
     let excluded_project_channels = disabled_project_channel_ids(document);
     let disabled_playlist_track_ids = document
         .playlist_tracks()
@@ -277,8 +303,84 @@ pub fn playlist_playback_messages(
         soloed_playlist_track_range,
     )
     .map_err(|error| error.to_string())?;
-    let midi = MidiFile::parse(&bytes).map_err(|error| error.to_string())?;
-    midi_tick_messages(&midi, start_tick)
+    MidiFile::parse(&bytes).map_err(|error| error.to_string())
+}
+
+pub fn playlist_loop_frame_messages(
+    document: &FlpDocument,
+    arrangement_id: u16,
+    selection: PlaylistMidiLoopSelection,
+    soloed_playlist_track_range: Option<(u32, u32)>,
+    tempo_map: &PlaylistTempoMap,
+    sample_rate: u32,
+) -> Result<PlaylistLoopMidiMessages, String> {
+    let PlaylistMidiLoopSelection {
+        start_tick,
+        start_frame,
+        loop_start_tick,
+        loop_end_tick,
+    } = selection;
+    if loop_end_tick <= loop_start_tick
+        || start_tick < loop_start_tick
+        || start_tick >= loop_end_tick
+        || sample_rate == 0
+    {
+        return Err("Playlist MIDI loop requires a valid tick range and sample rate".to_owned());
+    }
+    let loop_start_frame = tempo_map.frame_at_tick(loop_start_tick, sample_rate)?;
+    let loop_end_frame = tempo_map.frame_at_tick(loop_end_tick, sample_rate)?;
+    let loop_frames = loop_end_frame.saturating_sub(loop_start_frame);
+    if loop_frames == 0 {
+        return Err("Playlist MIDI loop is shorter than one audio frame".to_owned());
+    }
+
+    if start_frame < loop_start_frame || start_frame >= loop_end_frame {
+        return Err("Playlist MIDI start frame is outside the selected range".to_owned());
+    }
+    let midi =
+        playlist_midi_file_for_playback(document, arrangement_id, soloed_playlist_track_range)?;
+    let initial_messages = midi_tick_messages(&midi, start_tick)?
+        .into_iter()
+        .filter(|message| message.tick < loop_end_tick)
+        .map(|message| {
+            let frame = tempo_map.frame_at_tick(message.tick, sample_rate)?;
+            if frame >= loop_end_frame {
+                return Ok(None);
+            }
+            Ok(Some(ScheduledMidiFrameMessage {
+                frame: frame.max(start_frame),
+                bytes: message.bytes,
+            }))
+        })
+        .collect::<Result<Vec<_>, String>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+
+    let loop_messages = midi_tick_messages(&midi, loop_start_tick)?
+        .into_iter()
+        .filter(|message| message.tick < loop_end_tick)
+        .map(|message| {
+            let frame = tempo_map.frame_at_tick(message.tick, sample_rate)?;
+            if frame < loop_start_frame || frame >= loop_end_frame {
+                return Ok(None);
+            }
+            Ok(Some(ScheduledMidiFrameMessage {
+                frame: frame - loop_start_frame,
+                bytes: message.bytes,
+            }))
+        })
+        .collect::<Result<Vec<_>, String>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+
+    Ok(PlaylistLoopMidiMessages {
+        initial_messages,
+        loop_messages,
+        loop_start_frame,
+        loop_frames,
+    })
 }
 
 pub(super) fn disabled_project_channel_ids(document: &FlpDocument) -> BTreeSet<u16> {
@@ -694,11 +796,65 @@ impl MidiPlaylistScheduler {
         playback_clock: ProjectPlaybackClock,
         script_output: Option<MidiScriptOutputHandle>,
     ) -> Result<Self, String> {
+        Self::start_inner(output, messages, None, None, playback_clock, script_output)
+    }
+
+    pub fn start_looping(
+        output: ConnectedMidiOutput,
+        loop_messages: PlaylistLoopMidiMessages,
+        playback_clock: ProjectPlaybackClock,
+        script_output: Option<MidiScriptOutputHandle>,
+    ) -> Result<Self, String> {
+        if loop_messages.loop_frames == 0 {
+            return Err("Playlist MIDI loop must contain at least one audio frame".to_owned());
+        }
+        Self::start_inner(
+            output,
+            loop_messages.loop_messages,
+            Some(loop_messages.initial_messages),
+            Some((loop_messages.loop_start_frame, loop_messages.loop_frames)),
+            playback_clock,
+            script_output,
+        )
+    }
+
+    fn start_inner(
+        output: ConnectedMidiOutput,
+        messages: Vec<ScheduledMidiFrameMessage>,
+        initial_messages: Option<Vec<ScheduledMidiFrameMessage>>,
+        loop_range: Option<(u64, u64)>,
+        playback_clock: ProjectPlaybackClock,
+        script_output: Option<MidiScriptOutputHandle>,
+    ) -> Result<Self, String> {
         if messages
             .windows(2)
             .any(|pair| pair[0].frame > pair[1].frame)
         {
             return Err("Playlist MIDI messages must be sorted by audio frame".to_owned());
+        }
+        if initial_messages.as_ref().is_some_and(|messages| {
+            messages
+                .windows(2)
+                .any(|pair| pair[0].frame > pair[1].frame)
+        }) {
+            return Err("Initial Playlist MIDI messages must be sorted by audio frame".to_owned());
+        }
+        if loop_range.is_some_and(|(_, loop_frames)| {
+            messages.iter().any(|message| message.frame >= loop_frames)
+        }) {
+            return Err("Playlist MIDI loop messages must be within the selected range".to_owned());
+        }
+        if let Some((loop_start_frame, loop_frames)) = loop_range
+            && initial_messages.as_ref().is_some_and(|messages| {
+                let loop_end_frame = loop_start_frame.saturating_add(loop_frames);
+                messages.iter().any(|message| {
+                    message.frame < loop_start_frame || message.frame >= loop_end_frame
+                })
+            })
+        {
+            return Err(
+                "Initial Playlist MIDI messages must fall within the selected range".to_owned(),
+            );
         }
 
         let (stop_sender, stop_receiver) = mpsc::channel();
@@ -707,15 +863,30 @@ impl MidiPlaylistScheduler {
         let worker = thread::Builder::new()
             .name("Playlist MIDI scheduler".to_owned())
             .spawn(move || {
-                schedule_midi_playlist(
-                    output,
-                    messages,
-                    playback_clock,
-                    stop_receiver,
-                    error_sender,
-                    completion_sender,
-                    script_output,
-                )
+                if let Some((loop_start_frame, loop_frames)) = loop_range {
+                    schedule_midi_playlist_loop(
+                        output,
+                        messages,
+                        initial_messages.unwrap_or_default(),
+                        loop_start_frame,
+                        loop_frames,
+                        playback_clock,
+                        stop_receiver,
+                        error_sender,
+                        completion_sender,
+                        script_output,
+                    );
+                } else {
+                    schedule_midi_playlist(
+                        output,
+                        messages,
+                        playback_clock,
+                        stop_receiver,
+                        error_sender,
+                        completion_sender,
+                        script_output,
+                    );
+                }
             })
             .map_err(|error| format!("could not start Playlist MIDI scheduler: {error}"))?;
 
@@ -799,6 +970,108 @@ fn schedule_midi_playlist(
             }
             if next_message == messages.len() {
                 break Ok(());
+            }
+
+            match stop_receiver.recv_timeout(Duration::from_millis(1)) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break Ok(()),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        }
+    };
+
+    let mut errors = Vec::new();
+    if let Err(error) = result {
+        errors.push(error);
+    }
+    if let Err(error) = output.send_all_notes_off() {
+        errors.push(error);
+    }
+    if !errors.is_empty() {
+        let _ = error_sender.send(errors.join("; "));
+    }
+    let _ = completion_sender.send(());
+}
+
+#[allow(clippy::too_many_arguments)]
+fn schedule_midi_playlist_loop(
+    mut output: ConnectedMidiOutput,
+    messages: Vec<ScheduledMidiFrameMessage>,
+    initial_messages: Vec<ScheduledMidiFrameMessage>,
+    loop_start_frame: u64,
+    loop_frames: u64,
+    playback_clock: ProjectPlaybackClock,
+    stop_receiver: Receiver<()>,
+    error_sender: Sender<String>,
+    completion_sender: Sender<()>,
+    script_output: Option<MidiScriptOutputHandle>,
+) {
+    let result = 'scheduler: {
+        let mut next_message = 0;
+        let mut was_active = false;
+        let mut last_cycle = None;
+        loop {
+            if midi_playlist_stop_requested(&stop_receiver) {
+                break Ok(());
+            }
+            if !playback_clock.is_active() {
+                if was_active && let Err(error) = output.send_all_notes_off() {
+                    break Err(error);
+                }
+                was_active = false;
+                last_cycle = None;
+                next_message = 0;
+                match stop_receiver.recv_timeout(Duration::from_millis(1)) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break Ok(()),
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                }
+            }
+
+            let stream_frame = playback_clock.stream_position_frames();
+            let elapsed_frames = stream_frame.saturating_sub(loop_start_frame);
+            let cycle = elapsed_frames / loop_frames;
+            let phase_frame = elapsed_frames % loop_frames;
+            if !was_active || last_cycle != Some(cycle) {
+                if let Err(error) = output.send_all_notes_off() {
+                    break Err(error);
+                }
+                if cycle == 0 {
+                    next_message =
+                        initial_messages.partition_point(|message| message.frame < stream_frame);
+                } else {
+                    for note_on in midi_active_note_ons_at_frame(&messages, phase_frame) {
+                        if let Err(error) = send_scheduled_midi_message(
+                            &mut output,
+                            script_output.as_ref(),
+                            &note_on,
+                        ) {
+                            break 'scheduler Err(error);
+                        }
+                    }
+                    next_message = messages.partition_point(|message| message.frame < phase_frame);
+                }
+                last_cycle = Some(cycle);
+                was_active = true;
+            }
+
+            let (schedule_messages, schedule_frame) = if cycle == 0 {
+                (&initial_messages, stream_frame)
+            } else {
+                (&messages, phase_frame)
+            };
+            let due_end =
+                due_midi_playlist_message_end(schedule_messages, next_message, schedule_frame);
+            while next_message < due_end {
+                if midi_playlist_stop_requested(&stop_receiver) {
+                    break 'scheduler Ok(());
+                }
+                if let Err(error) = send_scheduled_midi_message(
+                    &mut output,
+                    script_output.as_ref(),
+                    &schedule_messages[next_message].bytes,
+                ) {
+                    break 'scheduler Err(error);
+                }
+                next_message += 1;
             }
 
             match stop_receiver.recv_timeout(Duration::from_millis(1)) {
@@ -941,6 +1214,13 @@ fn midi_pattern_active_note_ons(
     messages: &[ScheduledMidiFrameMessage],
     phase_frame: u64,
 ) -> Vec<[u8; 3]> {
+    midi_active_note_ons_at_frame(messages, phase_frame)
+}
+
+fn midi_active_note_ons_at_frame(
+    messages: &[ScheduledMidiFrameMessage],
+    phase_frame: u64,
+) -> Vec<[u8; 3]> {
     let mut active = Vec::<[u8; 3]>::new();
     let before_phase = messages.partition_point(|message| message.frame < phase_frame);
     for message in &messages[..before_phase] {
@@ -986,6 +1266,7 @@ struct MidiClockSchedule {
     sample_rate: u32,
     ppq: u16,
     next_pulse_index: u64,
+    loop_range: Option<(u64, u64, u64, u64)>,
     playback_clock: ProjectPlaybackClock,
     stop_receiver: Receiver<()>,
     error_sender: Sender<String>,
@@ -993,12 +1274,75 @@ struct MidiClockSchedule {
 
 impl MidiClockScheduler {
     pub fn start(
+        output: ConnectedMidiOutput,
+        resume: bool,
+        current_tick: f64,
+        sample_rate: u32,
+        ppq: u16,
+        tempo_map: PlaylistTempoMap,
+        playback_clock: ProjectPlaybackClock,
+    ) -> Result<Self, String> {
+        Self::start_inner(
+            output,
+            resume,
+            current_tick,
+            sample_rate,
+            ppq,
+            tempo_map,
+            None,
+            playback_clock,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_looping(
+        output: ConnectedMidiOutput,
+        resume: bool,
+        current_tick: f64,
+        sample_rate: u32,
+        ppq: u16,
+        tempo_map: PlaylistTempoMap,
+        loop_start_tick: u64,
+        loop_end_tick: u64,
+        playback_clock: ProjectPlaybackClock,
+    ) -> Result<Self, String> {
+        if loop_end_tick <= loop_start_tick {
+            return Err("Playlist MIDI clock loop end must be after its start".to_owned());
+        }
+        let loop_start_frame = tempo_map.frame_at_tick(loop_start_tick, sample_rate)?;
+        let loop_end_frame = tempo_map.frame_at_tick(loop_end_tick, sample_rate)?;
+        let loop_frames = loop_end_frame.saturating_sub(loop_start_frame);
+        if loop_frames == 0 {
+            return Err("Playlist MIDI clock loop is shorter than one audio frame".to_owned());
+        }
+        let loop_start_pulse_index =
+            midi_clock_pulse_count_at_tick(loop_start_tick as f64, ppq).saturating_add(1);
+        Self::start_inner(
+            output,
+            resume,
+            current_tick,
+            sample_rate,
+            ppq,
+            tempo_map,
+            Some((
+                loop_start_frame,
+                loop_frames,
+                loop_start_tick,
+                loop_start_pulse_index,
+            )),
+            playback_clock,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_inner(
         mut output: ConnectedMidiOutput,
         resume: bool,
         current_tick: f64,
         sample_rate: u32,
         ppq: u16,
         tempo_map: PlaylistTempoMap,
+        loop_range: Option<(u64, u64, u64, u64)>,
         playback_clock: ProjectPlaybackClock,
     ) -> Result<Self, String> {
         if ppq == 0 || sample_rate == 0 || !current_tick.is_finite() || current_tick < 0.0 {
@@ -1031,6 +1375,7 @@ impl MidiClockScheduler {
                         sample_rate,
                         ppq,
                         next_pulse_index,
+                        loop_range,
                         playback_clock,
                         stop_receiver,
                         error_sender,
@@ -1090,16 +1435,40 @@ fn schedule_midi_clock(mut output: ConnectedMidiOutput, schedule: MidiClockSched
         sample_rate,
         ppq,
         mut next_pulse_index,
+        loop_range,
         playback_clock,
         stop_receiver,
         error_sender,
     } = schedule;
+    let mut last_loop_cycle = None;
     loop {
         if !playback_clock.is_active() {
             stop_clock_output(&mut output, &error_sender);
             return;
         }
         let current_frame = playback_clock.position_frames();
+        if let Some((loop_start_frame, loop_frames, loop_start_tick, loop_start_pulse_index)) =
+            loop_range
+        {
+            let stream_frame = playback_clock.stream_position_frames();
+            let cycle = stream_frame.saturating_sub(loop_start_frame) / loop_frames;
+            if let Some(previous_cycle) = last_loop_cycle
+                && cycle != previous_cycle
+            {
+                if let Err(error) = output
+                    .send(&midi_song_position_pointer_message(
+                        midi_sixteenth_notes_from_tick(loop_start_tick as f64, ppq),
+                    ))
+                    .and_then(|()| output.send(&MIDI_CONTINUE))
+                {
+                    stop_clock_output(&mut output, &error_sender);
+                    let _ = error_sender.send(error);
+                    return;
+                }
+                next_pulse_index = loop_start_pulse_index;
+            }
+            last_loop_cycle = Some(cycle);
+        }
         let mut sent = 0;
         while sent < 4 {
             let pulse_frame =

@@ -134,11 +134,12 @@ use midi_input::{
 };
 use midi_output::{
     ConnectedMidiOutput, MIDI_TEST_NOTE_OFF, MIDI_TEST_NOTE_ON, MidiClockScheduler,
-    MidiOutputDevice, MidiPatternLoopScheduler, MidiPlaylistScheduler, ScheduledMidiFrameMessage,
-    ScheduledMidiMessage, ScheduledMidiTickMessage, connect_output_device_with_routes,
-    disabled_project_channel_ids, enumerate_output_devices, midi_patch_setup_messages,
+    MidiOutputDevice, MidiPatternLoopScheduler, MidiPlaylistScheduler, PlaylistLoopMidiMessages,
+    PlaylistMidiLoopSelection, ScheduledMidiFrameMessage, ScheduledMidiMessage,
+    ScheduledMidiTickMessage, connect_output_device_with_routes, disabled_project_channel_ids,
+    enumerate_output_devices, midi_patch_setup_messages,
     pattern_loop_frame_messages_excluding_channels, pattern_preview_messages_excluding_channels,
-    playlist_playback_messages,
+    playlist_loop_frame_messages, playlist_playback_messages,
 };
 use midi_script::{
     MidiControllerScript, MidiScriptTransportState, MixerSendRouteSnapshot, MixerTrackFlag,
@@ -4796,6 +4797,11 @@ struct ActiveMidiPatternPlayback {
 struct ActiveMidiPlaylistPlayback {
     arrangement_id: u16,
     scheduler: MidiPlaylistScheduler,
+}
+
+enum PlaylistMidiPlaybackPlan {
+    OneShot(Vec<ScheduledMidiFrameMessage>),
+    Looping(PlaylistLoopMidiMessages),
 }
 
 struct ActiveMidiPatternTransport {
@@ -58300,15 +58306,40 @@ impl DawUi {
             };
             (tempo_map, current_tick)
         };
-        match MidiClockScheduler::start(
-            output,
-            resume,
-            current_tick,
-            sample_rate,
-            ppq,
-            tempo_map,
-            playback_clock,
-        ) {
+        let loop_ticks = (!self.pattern_playback_mode && !self.performance_mode_active)
+            .then(|| {
+                self.playlist_time_selection
+                    .filter(|(arrangement_id, start_tick, end_tick)| {
+                        *arrangement_id == self.selected_arrangement.unwrap_or(0)
+                            && end_tick > start_tick
+                    })
+                    .map(|(_, start_tick, end_tick)| (u64::from(start_tick), u64::from(end_tick)))
+            })
+            .flatten();
+        let clock_result = if let Some((loop_start_tick, loop_end_tick)) = loop_ticks {
+            MidiClockScheduler::start_looping(
+                output,
+                resume,
+                current_tick,
+                sample_rate,
+                ppq,
+                tempo_map,
+                loop_start_tick,
+                loop_end_tick,
+                playback_clock,
+            )
+        } else {
+            MidiClockScheduler::start(
+                output,
+                resume,
+                current_tick,
+                sample_rate,
+                ppq,
+                tempo_map,
+                playback_clock,
+            )
+        };
+        match clock_result {
             Ok(clock) => self.midi_output_clock = Some(clock),
             Err(error) => {
                 self.midi_output_error = Some(error.clone());
@@ -58349,7 +58380,7 @@ impl DawUi {
             return;
         }
         self.stop_midi_playlist_playback();
-        let result =
+        let result: Result<PlaylistMidiPlaybackPlan, String> =
             (|| {
                 let document = self.document.as_ref().ok_or_else(|| {
                     "Open a project before sending Playlist MIDI notes".to_owned()
@@ -58363,28 +58394,59 @@ impl DawUi {
                     .map(AudioEngine::sample_rate)
                     .filter(|sample_rate| *sample_rate > 0)
                     .ok_or_else(|| "Audio sample rate is unavailable for MIDI output".to_owned())?;
-                let messages = playlist_playback_messages(
-                    document,
-                    arrangement_id,
-                    start_tick,
-                    self.soloed_playlist_track_range,
-                )?;
-                messages
-                    .into_iter()
-                    .map(|message: ScheduledMidiTickMessage| {
-                        tempo_map
-                            .frame_at_tick(message.tick, sample_rate)
-                            .map(|frame| ScheduledMidiFrameMessage {
-                                frame: frame.max(start_frame),
-                                bytes: message.bytes,
-                            })
-                            .map_err(|error| error.to_string())
+                let loop_selection = self
+                    .playlist_time_selection
+                    .filter(|(selected_arrangement, loop_start, loop_end)| {
+                        *selected_arrangement == arrangement_id && loop_end > loop_start
                     })
-                    .collect::<Result<Vec<_>, String>>()
+                    .map(|(_, loop_start, loop_end)| PlaylistMidiLoopSelection {
+                        start_tick,
+                        start_frame,
+                        loop_start_tick: u64::from(loop_start),
+                        loop_end_tick: u64::from(loop_end),
+                    });
+                if let Some(loop_selection) = loop_selection {
+                    let messages = playlist_loop_frame_messages(
+                        document,
+                        arrangement_id,
+                        loop_selection,
+                        self.soloed_playlist_track_range,
+                        tempo_map,
+                        sample_rate,
+                    )?;
+                    Ok(PlaylistMidiPlaybackPlan::Looping(messages))
+                } else {
+                    let messages = playlist_playback_messages(
+                        document,
+                        arrangement_id,
+                        start_tick,
+                        self.soloed_playlist_track_range,
+                    )?;
+                    let messages = messages
+                        .into_iter()
+                        .map(|message: ScheduledMidiTickMessage| {
+                            tempo_map
+                                .frame_at_tick(message.tick, sample_rate)
+                                .map(|frame| ScheduledMidiFrameMessage {
+                                    frame: frame.max(start_frame),
+                                    bytes: message.bytes,
+                                })
+                                .map_err(|error| error.to_string())
+                        })
+                        .collect::<Result<Vec<_>, String>>()?;
+                    Ok(PlaylistMidiPlaybackPlan::OneShot(messages))
+                }
             })();
         match result {
-            Ok(messages) if messages.is_empty() => self.midi_output_error = None,
-            Ok(messages) => {
+            Ok(PlaylistMidiPlaybackPlan::Looping(messages))
+                if messages.initial_messages.is_empty() && messages.loop_messages.is_empty() =>
+            {
+                self.midi_output_error = None
+            }
+            Ok(PlaylistMidiPlaybackPlan::OneShot(messages)) if messages.is_empty() => {
+                self.midi_output_error = None
+            }
+            Ok(plan) => {
                 if let Err(error) = self.send_midi_output_channel_setup() {
                     self.midi_output_error = Some(error.clone());
                     self.status = format!("Could not send MIDI bank/program setup: {error}");
@@ -58401,12 +58463,25 @@ impl DawUi {
                             .midi_input_connection
                             .as_ref()
                             .and_then(ConnectedMidiInput::midi_script_output_handle);
-                        match MidiPlaylistScheduler::start(
-                            output,
-                            messages,
-                            playback_clock,
-                            script_output,
-                        ) {
+                        let scheduler_result = match plan {
+                            PlaylistMidiPlaybackPlan::Looping(messages) => {
+                                MidiPlaylistScheduler::start_looping(
+                                    output,
+                                    messages,
+                                    playback_clock,
+                                    script_output,
+                                )
+                            }
+                            PlaylistMidiPlaybackPlan::OneShot(messages) => {
+                                MidiPlaylistScheduler::start(
+                                    output,
+                                    messages,
+                                    playback_clock,
+                                    script_output,
+                                )
+                            }
+                        };
+                        match scheduler_result {
                             Ok(scheduler) => {
                                 self.midi_playlist_playback = Some(ActiveMidiPlaylistPlayback {
                                     arrangement_id,

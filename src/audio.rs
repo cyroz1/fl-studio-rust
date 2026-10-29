@@ -3507,6 +3507,11 @@ impl ProjectPlaybackClock {
         self.playback.position_frames()
     }
 
+    /// Monotonic stream frame used by schedulers that must detect loop cycles.
+    pub fn stream_position_frames(&self) -> u64 {
+        self.playback.stream_position_frames()
+    }
+
     pub fn is_active(&self) -> bool {
         self.playback.is_project_active()
     }
