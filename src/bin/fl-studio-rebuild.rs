@@ -13347,6 +13347,12 @@ impl DawUi {
             clip_envelopes: self.playlist_audio_clip_envelopes_for_current_project(
                 self.selected_arrangement.unwrap_or(0),
             ),
+            clap_audio_channel_ids: Arc::new(
+                self.clap_pattern_playback_instruments
+                    .keys()
+                    .copied()
+                    .collect(),
+            ),
             ..PlaylistRenderOptions::default()
         };
         let arrangement_id = options.arrangement_id;
@@ -13373,12 +13379,18 @@ impl DawUi {
                 .pending_clap_playlist_playback
                 .as_ref()
                 .is_some_and(|pending| pending.cache_key == clap_cache_key);
+        let vst3_volume_expression_channels = self
+            .vst3_host
+            .as_ref()
+            .map(|host| host.volume_expression_channels(&self.channel_vst3_instances))
+            .unwrap_or_default();
         let settings_by_channel = if needs_clap_preparation {
             let schedule_result = self.document.as_ref().map(|document| {
                 self.clap_playlist_preview_settings_for_arrangement(
                     document,
                     arrangement_id,
                     &playlist_tempo_map,
+                    &vst3_volume_expression_channels,
                 )
             });
             match schedule_result {
@@ -13727,10 +13739,16 @@ impl DawUi {
             .keys()
             .copied()
             .collect::<BTreeSet<_>>();
+        let vst3_volume_expression_channels = self
+            .vst3_host
+            .as_ref()
+            .map(|host| host.volume_expression_channels(&self.channel_vst3_instances))
+            .unwrap_or_default();
         let transport_settings = match self.clap_pattern_transport_preview_settings(
             pattern_id,
             loop_length_ticks,
             &assigned_channel_ids,
+            &vst3_volume_expression_channels,
         ) {
             Ok(settings) => settings,
             Err(error) => {
@@ -13774,10 +13792,16 @@ impl DawUi {
         audio_layers: Vec<PatternAudioLayer>,
     ) {
         self.active_clap_pattern_audio_layers = audio_layers.clone();
+        let clap_audio_channel_ids = self
+            .clap_pattern_playback_instruments
+            .keys()
+            .copied()
+            .collect();
         self.stream_selected_sampler_pattern_with_clap_layers(
             Some(loop_length_ticks),
             loop_start_tick,
             audio_layers,
+            clap_audio_channel_ids,
         );
         self.pattern_seek_tick = loop_start_tick;
         if self.playing {
@@ -20192,6 +20216,7 @@ impl DawUi {
         pattern_id: u16,
         loop_length_ticks: u64,
         assigned_channel_ids: &BTreeSet<u16>,
+        vst3_volume_expression_channels: &BTreeSet<u16>,
     ) -> Result<Vec<(ClapPatternPreviewSettings, f32, f32)>, String> {
         let Some(document) = self.document.as_ref() else {
             return Ok(Vec::new());
@@ -20212,10 +20237,11 @@ impl DawUi {
                 continue;
             }
             for (channel_id, target_gain, target_pan_raw) in channel_router
-                .targets_for_note_with_clap_audio_layers(
+                .targets_for_note_with_clap_and_mixed_crossfade(
                     note.channel_id,
                     note_index as u64,
                     note.key,
+                    vst3_volume_expression_channels,
                     assigned_channel_ids,
                 )
             {
@@ -20280,6 +20306,7 @@ impl DawUi {
         document: &FlpDocument,
         arrangement_id: u16,
         tempo_map: &PlaylistTempoMap,
+        vst3_volume_expression_channels: &BTreeSet<u16>,
     ) -> Result<Vec<ClapPlaylistPreviewRequest>, String> {
         let assigned_channel_ids = self
             .clap_pattern_playback_instruments
@@ -20335,10 +20362,11 @@ impl DawUi {
                         && note.length > 0
                         && note.velocity > 0
                         && channel_router
-                            .targets_for_note_with_clap_audio_layers(
+                            .targets_for_note_with_clap_and_mixed_crossfade(
                                 note.channel_id,
                                 note_index as u64,
                                 note.key,
+                                vst3_volume_expression_channels,
                                 &assigned_channel_ids,
                             )
                             .iter()
@@ -20377,10 +20405,11 @@ impl DawUi {
             },
             |channel_id, seed, key| {
                 channel_router
-                    .targets_for_note_with_clap_audio_layers(
+                    .targets_for_note_with_clap_and_mixed_crossfade(
                         channel_id,
                         seed,
                         key,
+                        vst3_volume_expression_channels,
                         &assigned_channel_ids,
                     )
                     .into_iter()
@@ -20698,10 +20727,16 @@ impl DawUi {
                     return;
                 }
             };
+        let vst3_volume_expression_channels = job
+            .vst3_processor
+            .as_ref()
+            .map(|processor| processor.volume_expression_channel_ids().clone())
+            .unwrap_or_default();
         let requests = match self.clap_playlist_preview_settings_for_arrangement(
             &job.document,
             job.options.arrangement_id,
             &tempo_map,
+            &vst3_volume_expression_channels,
         ) {
             Ok(requests) => requests,
             Err(error) => {
@@ -34205,7 +34240,7 @@ impl DawUi {
                                         egui::Slider::new(&mut layer_fade, 0..=256).text("Fade"),
                                     )
                                     .on_hover_text(
-                                        "Crossfade position from the first to last child Sampler",
+                                        "Crossfade position from the first to last active child",
                                     );
                                 if fade_response.changed() {
                                     layer_fade_apply = Some(layer_fade);
@@ -44602,12 +44637,14 @@ impl DawUi {
         loop_length_ticks: Option<u64>,
         loop_start_tick: u64,
         pattern_audio_layers: Vec<PatternAudioLayer>,
+        clap_audio_channel_ids: BTreeSet<u16>,
     ) {
         self.stream_selected_sampler_pattern_with_audio_layers(
             loop_length_ticks,
             loop_start_tick,
             None,
             pattern_audio_layers,
+            clap_audio_channel_ids,
         );
     }
 
@@ -44636,11 +44673,20 @@ impl DawUi {
         } else {
             Vec::new()
         };
+        let clap_audio_channel_ids = if loop_length_ticks.is_some() {
+            self.clap_pattern_playback_instruments
+                .keys()
+                .copied()
+                .collect()
+        } else {
+            BTreeSet::new()
+        };
         self.stream_selected_sampler_pattern_with_audio_layers(
             loop_length_ticks,
             loop_start_tick,
             staged_handoff,
             pattern_audio_layers,
+            clap_audio_channel_ids,
         );
     }
 
@@ -44650,6 +44696,7 @@ impl DawUi {
         loop_start_tick: u64,
         staged_handoff: Option<(u64, PdcStreamHandoffReason)>,
         pattern_audio_layers: Vec<PatternAudioLayer>,
+        clap_audio_channel_ids: BTreeSet<u16>,
     ) {
         let Some(pattern_id) = self.selected_pattern else {
             self.status = "Select a pattern before previewing Sampler channels".to_owned();
@@ -44713,10 +44760,8 @@ impl DawUi {
         } else {
             0
         };
-        let clap_pattern_channels = pattern_audio_layers
-            .iter()
-            .map(|layer| layer.channel_id)
-            .collect::<BTreeSet<_>>();
+        let mut clap_pattern_channels = clap_audio_channel_ids;
+        clap_pattern_channels.extend(pattern_audio_layers.iter().map(|layer| layer.channel_id));
         let pattern_vst3_instances = self
             .channel_vst3_instances
             .iter()
@@ -44785,7 +44830,7 @@ impl DawUi {
             self.vst3_host
                 .as_ref()
                 .map(|host| {
-                    host.prepare_pattern_loop_stream_with_mixer_effects_and_automation(
+                    host.prepare_pattern_loop_stream_with_mixer_effects_and_automation_and_clap_audio_channels(
                         document,
                         pattern_id,
                         duration_ticks,
@@ -44794,6 +44839,7 @@ impl DawUi {
                         &self.mixer_effect_vst3_instances,
                         &pattern_automations,
                         &pattern_mixer_effect_automations,
+                        &clap_pattern_channels,
                     )
                 })
                 .transpose()
@@ -44889,6 +44935,7 @@ impl DawUi {
             .collect::<BTreeSet<_>>()
             .len();
         let worker_pattern_audio_layers = pattern_audio_layers;
+        let worker_clap_pattern_channels = clap_pattern_channels.clone();
         if staged_handoff.is_none() {
             worker_mixer_meters.clear();
             self.mixer_insert_peak_holds.fill(0.0);
@@ -44935,6 +44982,7 @@ impl DawUi {
                                                     pdc_updates: pattern_pdc_update_receiver,
                                                 }
                                             }),
+                                        clap_audio_channel_ids: worker_clap_pattern_channels.clone(),
                                         pattern_audio_layers: worker_pattern_audio_layers,
                                     },
                                     &writer,
@@ -44982,6 +45030,7 @@ impl DawUi {
                                             reports,
                                             pdc_updates: pattern_pdc_update_receiver,
                                         }),
+                                    clap_audio_channel_ids: worker_clap_pattern_channels.clone(),
                                     pattern_audio_layers: worker_pattern_audio_layers,
                                 },
                                 &writer,
@@ -47246,6 +47295,12 @@ impl DawUi {
             clip_envelopes: self.playlist_audio_clip_envelopes_for_current_project(
                 self.selected_arrangement.unwrap_or_default(),
             ),
+            clap_audio_channel_ids: Arc::new(
+                self.clap_pattern_playback_instruments
+                    .keys()
+                    .copied()
+                    .collect(),
+            ),
             wav_sample_format: self.playlist_render_format,
             wav_dither_mode: self.playlist_render_dither_mode,
             wav_save_playlist_markers: self.playlist_render_save_markers,
@@ -47333,6 +47388,12 @@ impl DawUi {
             read_sample_root_note: self.read_sample_root_note,
             clip_envelopes: self.playlist_audio_clip_envelopes_for_current_project(
                 self.selected_arrangement.unwrap_or_default(),
+            ),
+            clap_audio_channel_ids: Arc::new(
+                self.clap_pattern_playback_instruments
+                    .keys()
+                    .copied()
+                    .collect(),
             ),
             wav_sample_format: self.playlist_render_format,
             wav_dither_mode: self.playlist_render_dither_mode,
@@ -63007,7 +63068,7 @@ impl DawUi {
                     ui.colored_label(ORANGE, error);
                 }
             }
-            ui.small("Pattern previews use project base tempo. CLAP Pattern transport expands Layer notes to assigned CLAP child channels, applies Layer gain/pan and source-channel gain/pan, and follows Mixer routes including loaded VST3 insert effects. Layer crossfade applies when active leaves are Sampler or assigned CLAP channels. CLAP Playlist playback follows clip repeats, track mute/solo, Layer routing and gain/pan, and tempo automation for default-scale, full-source Pattern clips; Layer crossfade applies when active leaves are Sampler or assigned CLAP channels. It applies source-channel fader/pan and saved Mixer insert routes, including loaded VST3 insert effects. Layer crossfade in trees containing VST3 descendants, CLAP-format Mixer effect processing, scaled/source-windowed clips, and Performance playback remain unsupported. Full-song Playlist mix and Mixer stem renders also pre-render assigned CLAP instruments, including linked Playlist fader/pan automation. CLAP note-dialect plug-ins receive per-note tuning, pan, Mod X brightness, and release; MIDI 1.0/2.0 inputs receive key, velocity, channel, and release.");
+                ui.small("Pattern previews use project base tempo. CLAP Pattern transport expands Layer notes to assigned CLAP child channels, applies Layer gain/pan and source-channel gain/pan, and follows Mixer routes including loaded VST3 insert effects. Layer Crossfade applies when every active leaf is a Sampler, an assigned CLAP channel, or a loaded VST3 channel whose plug-in advertises Volume note expression. CLAP Playlist playback follows clip repeats, track mute/solo, Layer routing and gain/pan, and tempo automation for default-scale, full-source Pattern clips. It applies source-channel fader/pan and saved Mixer insert routes, including loaded VST3 insert effects. CLAP-format Mixer effect processing, scaled/source-windowed clips, and Performance playback remain unsupported. Full-song Playlist mix and Mixer stem renders also pre-render assigned CLAP instruments, including linked Playlist fader/pan automation. CLAP note-dialect plug-ins receive per-note tuning, pan, Mod X brightness, and release; MIDI 1.0/2.0 inputs receive key, velocity, channel, and release.");
             if let Ok(Some(settings)) = &clap_pattern_preview_settings {
                 ui.horizontal(|ui| {
                     if let Some(instrument) = self

@@ -1063,7 +1063,8 @@ impl Vst3PlaylistStreamProcessor {
             .collect()
     }
 
-    pub(crate) fn volume_expression_channel_ids(&self) -> &BTreeSet<u16> {
+    /// Channels whose prepared VST3 instances support per-note volume expression.
+    pub fn volume_expression_channel_ids(&self) -> &BTreeSet<u16> {
         &self.volume_expression_channel_ids
     }
 
@@ -5497,6 +5498,30 @@ impl Vst3HostRuntime {
         channel_instances: &BTreeMap<u16, u64>,
         parameter_automation: &BTreeMap<u16, Vec<Vst3ParameterAutomation>>,
     ) -> Result<Vst3PlaylistStreamProcessor, String> {
+        self.prepare_pattern_loop_stream_with_automation_and_clap_audio_channels(
+            document,
+            pattern_id,
+            loop_length_ticks,
+            output_sample_rate,
+            channel_instances,
+            parameter_automation,
+            &BTreeSet::new(),
+        )
+    }
+
+    /// Prepare a repeating Pattern loop while accounting for assigned CLAP
+    /// channels when deciding whether mixed Layer Crossfade is supported.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_pattern_loop_stream_with_automation_and_clap_audio_channels(
+        &self,
+        document: &FlpDocument,
+        pattern_id: u16,
+        loop_length_ticks: u64,
+        output_sample_rate: u32,
+        channel_instances: &BTreeMap<u16, u64>,
+        parameter_automation: &BTreeMap<u16, Vec<Vst3ParameterAutomation>>,
+        clap_audio_channels: &BTreeSet<u16>,
+    ) -> Result<Vst3PlaylistStreamProcessor, String> {
         if !(8_000..=384_000).contains(&output_sample_rate) {
             return Err("Pattern audio rate must be between 8000 and 384000 Hz".to_owned());
         }
@@ -5556,11 +5581,12 @@ impl Vst3HostRuntime {
                 .and_then(|tick| tick.checked_add(swing_offset))
                 .ok_or_else(|| "Pattern VST3 note end position overflow".to_owned())?;
             for (target_channel_id, layer_gain, layer_pan_raw) in router
-                .targets_for_note_with_mixed_crossfade(
+                .targets_for_note_with_clap_and_mixed_crossfade(
                     note.channel_id,
                     note_index as u64,
                     note.key,
                     &vst3_volume_expression_channels,
+                    clap_audio_channels,
                 )
             {
                 if !plugin_channels.contains(&target_channel_id)
@@ -5792,14 +5818,47 @@ impl Vst3HostRuntime {
             Vec<Vst3PlaylistParameterAutomation>,
         >,
     ) -> Result<Vst3PlaylistStreamProcessor, String> {
-        let mut processor = self.prepare_pattern_loop_stream_with_automation(
+        self.prepare_pattern_loop_stream_with_mixer_effects_and_automation_and_clap_audio_channels(
             document,
             pattern_id,
             loop_length_ticks,
             output_sample_rate,
             channel_instances,
+            mixer_effect_instances,
             parameter_automation,
-        )?;
+            mixer_effect_parameter_automation,
+            &BTreeSet::new(),
+        )
+    }
+
+    /// Prepare a repeating Pattern loop and Mixer effects with CLAP channel
+    /// identities available for mixed-format Layer Crossfade routing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_pattern_loop_stream_with_mixer_effects_and_automation_and_clap_audio_channels(
+        &self,
+        document: &FlpDocument,
+        pattern_id: u16,
+        loop_length_ticks: u64,
+        output_sample_rate: u32,
+        channel_instances: &BTreeMap<u16, u64>,
+        mixer_effect_instances: &BTreeMap<(usize, u16), u64>,
+        parameter_automation: &BTreeMap<u16, Vec<Vst3ParameterAutomation>>,
+        mixer_effect_parameter_automation: &BTreeMap<
+            (usize, u16),
+            Vec<Vst3PlaylistParameterAutomation>,
+        >,
+        clap_audio_channels: &BTreeSet<u16>,
+    ) -> Result<Vst3PlaylistStreamProcessor, String> {
+        let mut processor = self
+            .prepare_pattern_loop_stream_with_automation_and_clap_audio_channels(
+                document,
+                pattern_id,
+                loop_length_ticks,
+                output_sample_rate,
+                channel_instances,
+                parameter_automation,
+                clap_audio_channels,
+            )?;
         let automation_loop_frames = processor.content_frames;
         self.attach_mixer_effects(
             document,
@@ -6183,6 +6242,17 @@ impl Vst3HostRuntime {
             .collect::<BTreeSet<_>>();
         let track_filter =
             PlaylistTrackFilter::new(&disabled_track_ids, options.soloed_playlist_track_range);
+        let mut clap_audio_channels = options
+            .clap_audio_channel_ids
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        clap_audio_channels.extend(
+            options
+                .clap_audio_layers
+                .iter()
+                .map(|layer| layer.channel_id),
+        );
         plugin_channels.extend(
             channels
                 .iter()
@@ -6209,11 +6279,12 @@ impl Vst3HostRuntime {
             },
             |channel_id, seed, key| {
                 channel_router
-                    .targets_for_note_with_mixed_crossfade(
+                    .targets_for_note_with_clap_and_mixed_crossfade(
                         channel_id,
                         seed,
                         key,
                         &vst3_volume_expression_channels,
+                        &clap_audio_channels,
                     )
                     .into_iter()
                     .filter(|(target_channel_id, _, _)| {

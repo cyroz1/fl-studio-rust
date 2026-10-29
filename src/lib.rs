@@ -1523,6 +1523,29 @@ impl ChannelNoteRouter {
         )
     }
 
+    /// Returns Layer-adjusted routes for a render that combines Samplers,
+    /// assigned CLAP audio layers, and VST3 channels whose plug-ins advertise
+    /// Volume note expression. Every active child subtree must end in one of
+    /// those supported destinations for Layer Crossfade to apply.
+    pub fn targets_for_note_with_clap_and_mixed_crossfade(
+        &self,
+        source_channel_id: u16,
+        note_seed: u64,
+        key: u16,
+        vst3_volume_expression_channels: &BTreeSet<u16>,
+        clap_audio_channels: &BTreeSet<u16>,
+    ) -> Vec<(u16, f32, i32)> {
+        self.targets_for_note_with_controls(
+            source_channel_id,
+            note_seed,
+            key,
+            true,
+            true,
+            Some(vst3_volume_expression_channels),
+            Some(clap_audio_channels),
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn targets_for_note_with_controls(
         &self,

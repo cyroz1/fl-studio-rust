@@ -786,6 +786,8 @@ pub struct SamplerPatternLoopStreamControls<'a> {
     pub playback: SamplerPatternLoopPlayback,
     pub meters: &'a crate::audio::MixerTrackPeakMeters,
     pub latency_updates: Option<Vst3LatencyUpdateControls>,
+    /// Assigned CLAP destinations, including channels with zero crossfade gain.
+    pub clap_audio_channel_ids: BTreeSet<u16>,
     pub pattern_audio_layers: Vec<PatternAudioLayer>,
 }
 
@@ -807,6 +809,8 @@ pub struct Vst3PatternLoopStreamControls<'a> {
     pub playback: Vst3PatternLoopPlayback,
     pub meters: &'a crate::audio::MixerTrackPeakMeters,
     pub latency_updates: Option<Vst3LatencyUpdateControls>,
+    /// Assigned CLAP destinations, including channels with zero crossfade gain.
+    pub clap_audio_channel_ids: BTreeSet<u16>,
     pub pattern_audio_layers: Vec<PatternAudioLayer>,
 }
 
@@ -1353,6 +1357,8 @@ pub struct PlaylistRenderOptions {
     pub clip_envelopes: Arc<Vec<PlaylistAudioClipEnvelope>>,
     /// Pre-rendered CLAP instruments scheduled on the Playlist timeline.
     pub clap_audio_layers: Arc<Vec<PlaylistAudioLayer>>,
+    /// Assigned CLAP channels, available before their Playlist audio is rendered.
+    pub clap_audio_channel_ids: Arc<BTreeSet<u16>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -2082,6 +2088,7 @@ impl Default for PlaylistRenderOptions {
             read_sample_root_note: true,
             clip_envelopes: Arc::new(Vec::new()),
             clap_audio_layers: Arc::new(Vec::new()),
+            clap_audio_channel_ids: Arc::new(BTreeSet::new()),
         }
     }
 }
@@ -6617,6 +6624,7 @@ pub fn stream_sampler_pattern_to_device_with_live_controls(
             allow_empty_sampler: false,
             repeat_pattern: false,
             extend_preview_tail: false,
+            clap_audio_channel_ids: BTreeSet::new(),
             pattern_audio_layers: Vec::new(),
         },
         PatternLiveStreamControls {
@@ -6672,6 +6680,7 @@ pub fn stream_sampler_pattern_loop_from_tick_to_device(
             allow_empty_sampler: false,
             repeat_pattern: true,
             extend_preview_tail: false,
+            clap_audio_channel_ids: BTreeSet::new(),
             pattern_audio_layers: Vec::new(),
         },
         PatternLiveStreamControls {
@@ -6701,6 +6710,7 @@ pub fn stream_sampler_pattern_loop_from_tick_to_device_with_live_master_controls
             playback,
             meters,
             latency_updates: None,
+            clap_audio_channel_ids: BTreeSet::new(),
             pattern_audio_layers: Vec::new(),
         },
         writer,
@@ -6729,6 +6739,7 @@ pub fn stream_sampler_pattern_loop_from_tick_to_device_with_live_controls(
             allow_empty_sampler,
             repeat_pattern: true,
             extend_preview_tail: false,
+            clap_audio_channel_ids: controls.clap_audio_channel_ids,
             pattern_audio_layers: controls.pattern_audio_layers,
         },
         PatternLiveStreamControls {
@@ -6760,6 +6771,7 @@ pub fn stream_pattern_loop_with_vst3_from_tick_to_device(
             allow_empty_sampler: true,
             repeat_pattern: true,
             extend_preview_tail: false,
+            clap_audio_channel_ids: BTreeSet::new(),
             pattern_audio_layers: Vec::new(),
         },
         PatternLiveStreamControls {
@@ -6792,6 +6804,7 @@ pub fn stream_pattern_loop_with_vst3_from_tick_to_device_with_live_master_contro
             allow_empty_sampler: true,
             repeat_pattern: true,
             extend_preview_tail: false,
+            clap_audio_channel_ids: BTreeSet::new(),
             pattern_audio_layers: Vec::new(),
         },
         PatternLiveStreamControls {
@@ -6823,6 +6836,7 @@ pub fn stream_pattern_loop_with_vst3_from_tick_to_device_with_live_controls(
             allow_empty_sampler: true,
             repeat_pattern: true,
             extend_preview_tail: false,
+            clap_audio_channel_ids: controls.clap_audio_channel_ids,
             pattern_audio_layers: controls.pattern_audio_layers,
         },
         PatternLiveStreamControls {
@@ -6878,6 +6892,7 @@ pub fn stream_pattern_with_vst3_to_device_with_live_controls(
             allow_empty_sampler: true,
             repeat_pattern: false,
             extend_preview_tail: true,
+            clap_audio_channel_ids: BTreeSet::new(),
             pattern_audio_layers: Vec::new(),
         },
         PatternLiveStreamControls {
@@ -6896,6 +6911,7 @@ struct PatternStreamConfig {
     allow_empty_sampler: bool,
     repeat_pattern: bool,
     extend_preview_tail: bool,
+    clap_audio_channel_ids: BTreeSet<u16>,
     pattern_audio_layers: Vec<PatternAudioLayer>,
 }
 
@@ -7369,11 +7385,13 @@ fn stream_pattern_from_tick_with_vst3_to_device(
         .as_ref()
         .map(|processor| processor.volume_expression_channel_ids().clone())
         .unwrap_or_default();
-    let clap_pattern_channels = playback
-        .pattern_audio_layers
-        .iter()
-        .map(|layer| layer.channel_id)
-        .collect::<BTreeSet<_>>();
+    let mut clap_pattern_channels = playback.clap_audio_channel_ids;
+    clap_pattern_channels.extend(
+        playback
+            .pattern_audio_layers
+            .iter()
+            .map(|layer| layer.channel_id),
+    );
     let render = if !clap_pattern_channels.is_empty() {
         let included_channels = document
             .channels()
@@ -10610,11 +10628,17 @@ fn prepare_sampler_arrangement(
         }
     }
     let channel_router = ChannelNoteRouter::new(channels.clone());
-    let clap_audio_channels = options
-        .clap_audio_layers
+    let mut clap_audio_channels = options
+        .clap_audio_channel_ids
         .iter()
-        .map(|layer| layer.channel_id)
+        .copied()
         .collect::<BTreeSet<_>>();
+    clap_audio_channels.extend(
+        options
+            .clap_audio_layers
+            .iter()
+            .map(|layer| layer.channel_id),
+    );
     let schedule = schedule_playlist_pattern_notes_with_adjustments(
         &patterns,
         &arrangement,
@@ -10632,26 +10656,13 @@ fn prepare_sampler_arrangement(
                 .map_or(128, |channel| channel.swing_mix())
         },
         |channel_id, seed, key| {
-            let has_clap_target = !clap_audio_channels.is_empty()
-                && channel_router
-                    .targets_for_note(channel_id, seed, key)
-                    .iter()
-                    .any(|target_channel_id| clap_audio_channels.contains(target_channel_id));
-            let targets = if has_clap_target {
-                channel_router.targets_for_note_with_clap_audio_layers(
-                    channel_id,
-                    seed,
-                    key,
-                    &clap_audio_channels,
-                )
-            } else {
-                channel_router.targets_for_note_with_mixed_crossfade(
-                    channel_id,
-                    seed,
-                    key,
-                    vst3_volume_expression_channels,
-                )
-            };
+            let targets = channel_router.targets_for_note_with_clap_and_mixed_crossfade(
+                channel_id,
+                seed,
+                key,
+                vst3_volume_expression_channels,
+                &clap_audio_channels,
+            );
             targets
                 .into_iter()
                 .filter(|(target_channel_id, _, _)| {
@@ -13505,32 +13516,34 @@ fn prepare_sampler_pattern_for_channel_internal(
         .enumerate()
         .filter(|(_, note)| !note.is_muted())
         .flat_map(|(note_index, note)| {
-            let has_clap_target = clap_audio_channels.is_some_and(|clap_channels| {
-                channel_router
-                    .targets_for_note(note.channel_id, note_index as u64, note.key)
-                    .iter()
-                    .any(|target_channel_id| clap_channels.contains(target_channel_id))
-            });
-            let routes = if has_clap_target {
-                channel_router.targets_for_note_with_clap_audio_layers(
+            let routes = match (vst3_volume_expression_channels, clap_audio_channels) {
+                (Some(vst3_channels), Some(clap_channels)) => channel_router
+                    .targets_for_note_with_clap_and_mixed_crossfade(
+                        note.channel_id,
+                        note_index as u64,
+                        note.key,
+                        vst3_channels,
+                        clap_channels,
+                    ),
+                (Some(vst3_channels), None) => channel_router
+                    .targets_for_note_with_mixed_crossfade(
+                        note.channel_id,
+                        note_index as u64,
+                        note.key,
+                        vst3_channels,
+                    ),
+                (None, Some(clap_channels)) => channel_router
+                    .targets_for_note_with_clap_audio_layers(
+                        note.channel_id,
+                        note_index as u64,
+                        note.key,
+                        clap_channels,
+                    ),
+                (None, None) => channel_router.targets_for_note_with_layer_adjustments(
                     note.channel_id,
                     note_index as u64,
                     note.key,
-                    clap_audio_channels.expect("a CLAP target requires the CLAP channel set"),
-                )
-            } else if let Some(volume_expression_channels) = vst3_volume_expression_channels {
-                channel_router.targets_for_note_with_mixed_crossfade(
-                    note.channel_id,
-                    note_index as u64,
-                    note.key,
-                    volume_expression_channels,
-                )
-            } else {
-                channel_router.targets_for_note_with_layer_adjustments(
-                    note.channel_id,
-                    note_index as u64,
-                    note.key,
-                )
+                ),
             };
             routes
                 .into_iter()
