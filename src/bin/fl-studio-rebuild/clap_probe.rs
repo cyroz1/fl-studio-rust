@@ -3,9 +3,9 @@ use std::ffi::{CString, OsString};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -323,6 +323,132 @@ pub type ClapMixerEffectStateCaptureResponse = (
     Result<Vec<u8>, String>,
 );
 
+type ClapMixerEffectStateCaptureKey = (usize, u16);
+
+struct ActiveClapMixerEffectStateCaptureRequest {
+    response: mpsc::SyncSender<Result<Vec<u8>, String>>,
+}
+
+struct ActiveClapMixerEffectCaptureProcessor {
+    path: PathBuf,
+    plugin_id: String,
+    request_sender: Sender<ActiveClapMixerEffectStateCaptureRequest>,
+}
+
+#[derive(Default)]
+struct ClapMixerEffectStateCaptureRegistry {
+    next_registration_id: u64,
+    processors: BTreeMap<
+        ClapMixerEffectStateCaptureKey,
+        BTreeMap<u64, ActiveClapMixerEffectCaptureProcessor>,
+    >,
+}
+
+#[derive(Clone, Default)]
+pub struct ClapMixerEffectStateCaptureController {
+    registry: Arc<Mutex<ClapMixerEffectStateCaptureRegistry>>,
+}
+
+struct ClapMixerEffectStateCaptureRegistration {
+    controller: ClapMixerEffectStateCaptureController,
+    key: ClapMixerEffectStateCaptureKey,
+    registration_id: u64,
+}
+
+impl ClapMixerEffectStateCaptureController {
+    fn register_processor(
+        &self,
+        key: ClapMixerEffectStateCaptureKey,
+        path: &Path,
+        plugin_id: &str,
+        request_sender: Sender<ActiveClapMixerEffectStateCaptureRequest>,
+    ) -> ClapMixerEffectStateCaptureRegistration {
+        let mut registry = self
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        registry.next_registration_id = registry.next_registration_id.wrapping_add(1).max(1);
+        let registration_id = registry.next_registration_id;
+        registry.processors.entry(key).or_default().insert(
+            registration_id,
+            ActiveClapMixerEffectCaptureProcessor {
+                path: path.to_owned(),
+                plugin_id: plugin_id.to_owned(),
+                request_sender,
+            },
+        );
+        ClapMixerEffectStateCaptureRegistration {
+            controller: self.clone(),
+            key,
+            registration_id,
+        }
+    }
+
+    fn capture_active_state(
+        &self,
+        insert_ordinal: usize,
+        slot_index: u16,
+        path: &Path,
+        plugin_id: &str,
+    ) -> Result<Option<Vec<u8>>, String> {
+        let request_sender = {
+            let registry = self
+                .registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(processors) = registry.processors.get(&(insert_ordinal, slot_index)) else {
+                return Ok(None);
+            };
+            let matching = processors
+                .values()
+                .filter(|processor| processor.path == path && processor.plugin_id == plugin_id)
+                .collect::<Vec<_>>();
+            match matching.as_slice() {
+                [] => return Ok(None),
+                [processor] => processor.request_sender.clone(),
+                _ => {
+                    return Err(format!(
+                        "multiple active instances of {plugin_id} are assigned to Mixer insert {insert_ordinal} slot {}; stop the other render or playback stream before capturing state",
+                        slot_index + 1
+                    ));
+                }
+            }
+        };
+        let (response_sender, response_receiver) = mpsc::sync_channel(1);
+        request_sender
+            .send(ActiveClapMixerEffectStateCaptureRequest {
+                response: response_sender,
+            })
+            .map_err(|_| "active CLAP Mixer effect processor is no longer available".to_owned())?;
+        match response_receiver.recv_timeout(CLAP_MIXER_EFFECT_PROCESS_TIMEOUT) {
+            Ok(result) => result.map(Some),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(
+                "active CLAP Mixer effect did not reach a block boundary within 10 seconds"
+                    .to_owned(),
+            ),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err("active CLAP Mixer effect stopped before its state was captured".to_owned())
+            }
+        }
+    }
+}
+
+impl Drop for ClapMixerEffectStateCaptureRegistration {
+    fn drop(&mut self) {
+        let mut registry = self
+            .controller
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(processors) = registry.processors.get_mut(&self.key) {
+            processors.remove(&self.registration_id);
+            if processors.is_empty() {
+                registry.processors.remove(&self.key);
+            }
+        }
+    }
+}
+
 pub fn start_worker(
     egui_context: eframe::egui::Context,
 ) -> (Sender<PathBuf>, Receiver<ClapInspectionResponse>) {
@@ -564,6 +690,7 @@ pub fn start_pattern_preview_worker(
 
 pub fn start_mixer_effect_state_capture_worker(
     egui_context: eframe::egui::Context,
+    capture_controller: ClapMixerEffectStateCaptureController,
 ) -> (
     Sender<ClapMixerEffectStateCaptureRequest>,
     Receiver<ClapMixerEffectStateCaptureResponse>,
@@ -584,8 +711,21 @@ pub fn start_mixer_effect_state_capture_worker(
                     plugin_name,
                     state,
                 } = assignment;
-                let result =
-                    capture_mixer_effect_state_in_subprocess(&path, &plugin_id, sample_rate, state);
+                let result = match capture_controller.capture_active_state(
+                    insert_ordinal,
+                    slot_index,
+                    &path,
+                    &plugin_id,
+                ) {
+                    Ok(Some(state)) => Ok(state),
+                    Ok(None) => capture_mixer_effect_state_in_subprocess(
+                        &path,
+                        &plugin_id,
+                        sample_rate,
+                        state,
+                    ),
+                    Err(error) => Err(error),
+                };
                 if response_sender
                     .send((
                         insert_ordinal,
@@ -795,6 +935,8 @@ enum ClapMixerEffectProcessResponse {
         auxiliary_input_buses: Vec<(usize, usize)>,
     },
     StateLoaded,
+    State(Vec<u8>),
+    StateError(String),
     Started {
         latency_samples: u32,
         tail_samples: Option<u64>,
@@ -820,6 +962,9 @@ struct ClapMixerEffectProcess {
     latency_samples: u32,
     tail_samples: Option<u64>,
     stopped: bool,
+    capture_request_sender: Sender<ActiveClapMixerEffectStateCaptureRequest>,
+    capture_request_receiver: Receiver<ActiveClapMixerEffectStateCaptureRequest>,
+    _capture_registration: Option<ClapMixerEffectStateCaptureRegistration>,
 }
 
 impl ClapMixerEffectProcess {
@@ -852,6 +997,7 @@ impl ClapMixerEffectProcess {
             return Err("CLAP Mixer effect helper did not provide output".to_owned());
         };
         let (response_sender, responses) = mpsc::channel();
+        let (capture_request_sender, capture_request_receiver) = mpsc::channel();
         let reader = match thread::Builder::new()
             .name("clap-mixer-effect-response".to_owned())
             .spawn(move || read_mixer_effect_process_responses(stdout, response_sender))
@@ -877,6 +1023,9 @@ impl ClapMixerEffectProcess {
             latency_samples: 0,
             tail_samples: None,
             stopped: false,
+            capture_request_sender,
+            capture_request_receiver,
+            _capture_registration: None,
         };
         match process.receive_response()? {
             ClapMixerEffectProcessResponse::Ready {
@@ -932,6 +1081,21 @@ impl ClapMixerEffectProcess {
             ClapMixerEffectProcessResponse::Error(error) => Err(error),
             _ => Err("CLAP Mixer effect helper did not start processing".to_owned()),
         }
+    }
+
+    fn register_for_state_capture(
+        &mut self,
+        controller: &ClapMixerEffectStateCaptureController,
+        key: ClapMixerEffectStateCaptureKey,
+        path: &Path,
+        plugin_id: &str,
+    ) {
+        self._capture_registration = Some(controller.register_processor(
+            key,
+            path,
+            plugin_id,
+            self.capture_request_sender.clone(),
+        ));
     }
 
     fn process_block(
@@ -1055,7 +1219,49 @@ impl ClapMixerEffectProcess {
                 }
             }
         }
+        self.capture_active_state_if_requested()?;
         Ok(())
+    }
+
+    fn capture_active_state_if_requested(&mut self) -> Result<(), String> {
+        let request = match self.capture_request_receiver.try_recv() {
+            Ok(request) => request,
+            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => return Ok(()),
+        };
+        while let Ok(additional_request) = self.capture_request_receiver.try_recv() {
+            let _ = additional_request.response.send(Err(
+                "another CLAP Mixer effect state capture is already in progress".to_owned(),
+            ));
+        }
+        if let Err(error) = self
+            .stdin
+            .write_all(b"SAVE_STATE\n")
+            .and_then(|_| self.stdin.flush())
+        {
+            let message = format!("could not request active CLAP Mixer effect state: {error}");
+            let _ = request.response.send(Err(message.clone()));
+            return Err(message);
+        }
+        match self.receive_response()? {
+            ClapMixerEffectProcessResponse::State(state) => {
+                let _ = request.response.send(Ok(state));
+                Ok(())
+            }
+            ClapMixerEffectProcessResponse::StateError(error) => {
+                let _ = request.response.send(Err(error));
+                Ok(())
+            }
+            ClapMixerEffectProcessResponse::Error(error) => {
+                let _ = request.response.send(Err(error.clone()));
+                Err(error)
+            }
+            _ => {
+                let error =
+                    "CLAP Mixer effect helper returned an invalid state response".to_owned();
+                let _ = request.response.send(Err(error.clone()));
+                Err(error)
+            }
+        }
     }
 
     fn stop(&mut self) -> Result<(), String> {
@@ -1094,6 +1300,7 @@ impl ClapMixerEffectProcess {
 
 impl Drop for ClapMixerEffectProcess {
     fn drop(&mut self) {
+        self._capture_registration.take();
         if !self.stopped {
             let _ = self.stdin.write_all(b"STOP\n");
             let _ = self.stdin.flush();
@@ -1120,11 +1327,18 @@ impl Drop for ClapMixerEffectProcess {
 
 pub struct ClapProjectMixerEffectProcessorFactory {
     assignments: BTreeMap<(usize, u16), ClapProjectMixerEffectAssignment>,
+    capture_controller: ClapMixerEffectStateCaptureController,
 }
 
 impl ClapProjectMixerEffectProcessorFactory {
-    pub fn new(assignments: BTreeMap<(usize, u16), ClapProjectMixerEffectAssignment>) -> Self {
-        Self { assignments }
+    pub fn new(
+        assignments: BTreeMap<(usize, u16), ClapProjectMixerEffectAssignment>,
+        capture_controller: ClapMixerEffectStateCaptureController,
+    ) -> Self {
+        Self {
+            assignments,
+            capture_controller,
+        }
     }
 }
 
@@ -1190,12 +1404,18 @@ impl MixerEffectProcessorFactory for ClapProjectMixerEffectProcessorFactory {
         let Some(assignment) = self.assignments.get(&(insert_ordinal, slot_index)) else {
             return Ok(None);
         };
-        let process = ClapMixerEffectProcess::spawn(
+        let mut process = ClapMixerEffectProcess::spawn(
             &assignment.path,
             &assignment.plugin_id,
             sample_rate,
             assignment.state.as_deref(),
         )?;
+        process.register_for_state_capture(
+            &self.capture_controller,
+            (insert_ordinal, slot_index),
+            &assignment.path,
+            &assignment.plugin_id,
+        );
         Ok(Some(Box::new(process)))
     }
 }
@@ -1702,6 +1922,32 @@ fn read_mixer_effect_process_responses(
         if header == "STATE_LOADED" {
             if response_sender
                 .send(ClapMixerEffectProcessResponse::StateLoaded)
+                .is_err()
+            {
+                return;
+            }
+            continue;
+        }
+        if let Some(state_header) = header.strip_prefix("STATE ") {
+            match read_preview_server_state(&mut stdout, state_header) {
+                Ok(state) => {
+                    if response_sender
+                        .send(ClapMixerEffectProcessResponse::State(state))
+                        .is_err()
+                    {
+                        return;
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    let _ = response_sender.send(ClapMixerEffectProcessResponse::Error(error));
+                    return;
+                }
+            }
+        }
+        if let Some(error) = header.strip_prefix("STATE_ERROR ") {
+            if response_sender
+                .send(ClapMixerEffectProcessResponse::StateError(error.to_owned()))
                 .is_err()
             {
                 return;
@@ -2678,6 +2924,37 @@ impl ClapMixerEffectInstance {
             if line == "STOP" {
                 let _ = writeln!(output, "BYE").and_then(|_| output.flush());
                 break;
+            }
+            if line == "SAVE_STATE" {
+                match self.save_state() {
+                    Ok(state) => {
+                        if write_preview_server_state(output, &state).is_err() {
+                            result = 1;
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let message = error
+                            .chars()
+                            .map(|character| {
+                                if character.is_control() {
+                                    ' '
+                                } else {
+                                    character
+                                }
+                            })
+                            .take((MAX_NOTE_PREVIEW_PROTOCOL_HEADER_BYTES - 32) / 4)
+                            .collect::<String>();
+                        if writeln!(output, "STATE_ERROR {message}")
+                            .and_then(|_| output.flush())
+                            .is_err()
+                        {
+                            result = 1;
+                            break;
+                        }
+                    }
+                }
+                continue;
             }
             let mut fields = line.split_whitespace();
             let (

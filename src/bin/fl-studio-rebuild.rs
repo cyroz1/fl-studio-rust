@@ -15,13 +15,14 @@ use audio_unit_probe::{
 use clack_extensions::params::ParamInfoFlags;
 use clap_probe::{
     ClapInspectionResponse, ClapInspectionState, ClapInstanceInspectionResponse,
-    ClapInstanceInspectionState, ClapMixerEffectStateCaptureRequest,
-    ClapMixerEffectStateCaptureResponse, ClapNotePreviewRequest, ClapNotePreviewResponse,
-    ClapNotePreviewSettings, ClapNotePreviewState, ClapParameterAutomation,
-    ClapParameterAutomationPoint, ClapPatternNote, ClapPatternPreviewOutput,
-    ClapPatternPreviewPurpose, ClapPatternPreviewRequest, ClapPatternPreviewResponse,
-    ClapPatternPreviewSettings, ClapPlaylistNote, ClapPlaylistPreviewSettings,
-    ClapPlaylistTempoPoint, MAX_NOTE_PREVIEW_NOTE_MILLISECONDS, MIN_NOTE_PREVIEW_NOTE_MILLISECONDS,
+    ClapInstanceInspectionState, ClapMixerEffectStateCaptureController,
+    ClapMixerEffectStateCaptureRequest, ClapMixerEffectStateCaptureResponse,
+    ClapNotePreviewRequest, ClapNotePreviewResponse, ClapNotePreviewSettings, ClapNotePreviewState,
+    ClapParameterAutomation, ClapParameterAutomationPoint, ClapPatternNote,
+    ClapPatternPreviewOutput, ClapPatternPreviewPurpose, ClapPatternPreviewRequest,
+    ClapPatternPreviewResponse, ClapPatternPreviewSettings, ClapPlaylistNote,
+    ClapPlaylistPreviewSettings, ClapPlaylistTempoPoint, MAX_NOTE_PREVIEW_NOTE_MILLISECONDS,
+    MIN_NOTE_PREVIEW_NOTE_MILLISECONDS,
 };
 use eframe::egui::{self, Align2, Color32, FontId, Id, PointerButton, Sense, Stroke, Vec2};
 use flp_rebuild::audio::{
@@ -5222,6 +5223,7 @@ struct DawUi {
     clap_pattern_preview_receiver: Receiver<ClapPatternPreviewResponse>,
     clap_mixer_effect_state_capture_sender: Sender<ClapMixerEffectStateCaptureRequest>,
     clap_mixer_effect_state_capture_receiver: Receiver<ClapMixerEffectStateCaptureResponse>,
+    clap_mixer_effect_state_capture_controller: ClapMixerEffectStateCaptureController,
     clap_mixer_effect_state_capture_request_id: u64,
     clap_pattern_preview_states: BTreeMap<(PathBuf, String, u16, u16), ClapNotePreviewState>,
     clap_pattern_preview_request_id: u64,
@@ -7043,8 +7045,13 @@ impl DawUi {
             clap_probe::start_note_preview_worker(creation.egui_ctx.clone());
         let (clap_pattern_preview_sender, clap_pattern_preview_receiver) =
             clap_probe::start_pattern_preview_worker(creation.egui_ctx.clone());
+        let clap_mixer_effect_state_capture_controller =
+            ClapMixerEffectStateCaptureController::default();
         let (clap_mixer_effect_state_capture_sender, clap_mixer_effect_state_capture_receiver) =
-            clap_probe::start_mixer_effect_state_capture_worker(creation.egui_ctx.clone());
+            clap_probe::start_mixer_effect_state_capture_worker(
+                creation.egui_ctx.clone(),
+                clap_mixer_effect_state_capture_controller.clone(),
+            );
         let audio_catalog = enumerate_devices();
         let (midi_message_sender, midi_message_receiver) =
             mpsc::sync_channel(midi_input::MIDI_INPUT_QUEUE_CAPACITY);
@@ -7556,6 +7563,7 @@ impl DawUi {
             clap_pattern_preview_receiver,
             clap_mixer_effect_state_capture_sender,
             clap_mixer_effect_state_capture_receiver,
+            clap_mixer_effect_state_capture_controller,
             clap_mixer_effect_state_capture_request_id: 0,
             clap_pattern_preview_states: BTreeMap::new(),
             clap_pattern_preview_request_id: 0,
@@ -10154,6 +10162,7 @@ impl DawUi {
             host.set_mixer_effect_processor_factory(Some(Arc::new(
                 clap_probe::ClapProjectMixerEffectProcessorFactory::new(
                     clap_effect_assignments.clone(),
+                    self.clap_mixer_effect_state_capture_controller.clone(),
                 ),
             )));
         }
@@ -22609,11 +22618,12 @@ impl DawUi {
                             host.set_mixer_effect_processor_factory(Some(Arc::new(
                                 clap_probe::ClapProjectMixerEffectProcessorFactory::new(
                                     self.clap_mixer_effect_assignments.clone(),
+                                    self.clap_mixer_effect_state_capture_controller.clone(),
                                 ),
                             )));
                         }
                         self.status = format!(
-                            "Captured and saved CLAP state for {plugin_name} on Mixer insert {insert_ordinal} slot {}",
+                            "Saved the CLAP state snapshot for {plugin_name} on Mixer insert {insert_ordinal} slot {}",
                             slot_index + 1
                         );
                     }
@@ -55768,7 +55778,7 @@ impl DawUi {
                                                         ui.horizontal(|ui| {
                                                             if ui
                                                                 .small_button("Capture state")
-                                                                .on_hover_text("Save this CLAP effect's state snapshot to its machine-local project assignment")
+                                                                .on_hover_text("Save one active CLAP effect instance at its next audio-block boundary. If none is active, refresh the machine-local snapshot from its stored state; concurrent active instances are ambiguous.")
                                                                 .clicked()
                                                             {
                                                                 capture_clap_mixer_effect_state =
@@ -55808,7 +55818,7 @@ impl DawUi {
                             }
                             ui.small(
                                 egui::RichText::new(
-                                    "Open editor controls a loaded VST3 effect through its native editor. Move up/down carries saved slot events with the effect. CLAP assignments process in saved slot order with timed parameter automation and reported-latency PDC. CLAP sidechains feed supported mono/stereo auxiliary inputs in source-track and bus order with PDC; runtime latency/tail reports refresh between audio blocks, and Capture state stores a machine-local snapshot; native bus mapping and native editors remain incomplete. VST3 Mix edits use a 20 ms ramp.",
+                                    "Open editor controls a loaded VST3 effect through its native editor. Move up/down carries saved slot events with the effect. CLAP assignments process in saved slot order with timed parameter automation and reported-latency PDC. CLAP sidechains feed supported mono/stereo auxiliary inputs in source-track and bus order with PDC; runtime latency/tail reports refresh between audio blocks. Capture state reads one active effect at the next block boundary, or refreshes the prior machine-local snapshot if none is active; simultaneous active instances must be stopped to avoid an ambiguous capture. Native bus mapping and editors remain incomplete. VST3 Mix edits use a 20 ms ramp.",
                                 )
                                 .color(MUTED),
                             );
@@ -56256,6 +56266,7 @@ impl DawUi {
                         host.set_mixer_effect_processor_factory(Some(Arc::new(
                             clap_probe::ClapProjectMixerEffectProcessorFactory::new(
                                 self.clap_mixer_effect_assignments.clone(),
+                                self.clap_mixer_effect_state_capture_controller.clone(),
                             ),
                         )));
                     }
@@ -64364,7 +64375,7 @@ impl DawUi {
         });
         ui.label(
             egui::RichText::new(
-                "Matching VST3 instrument channels and recognized Mixer effect slots load with the project; supported VST3 Mixer effects process on loaded Mixer routes. Machine-local CLAP effect assignments process in saved Mixer slot order with timed parameter automation and reported-latency PDC. CLAP sidechains feed supported mono/stereo auxiliary inputs in source-track and bus order with PDC; runtime latency/tail reports refresh between audio blocks, and Capture state stores a machine-local snapshot; native bus mapping and native editors remain incomplete. Detected CLAP and macOS Audio Unit bundles are listed below.",
+                "Matching VST3 instrument channels and recognized Mixer effect slots load with the project; supported VST3 Mixer effects process on loaded Mixer routes. Machine-local CLAP effect assignments process in saved Mixer slot order with timed parameter automation and reported-latency PDC. CLAP sidechains feed supported mono/stereo auxiliary inputs in source-track and bus order with PDC; runtime latency/tail reports refresh between audio blocks. Capture state reads one active effect at the next block boundary, or refreshes the prior machine-local snapshot if none is active; simultaneous active instances must be stopped to avoid an ambiguous capture. Native bus mapping and editors remain incomplete. Detected CLAP and macOS Audio Unit bundles are listed below.",
             )
             .color(MUTED),
         );
