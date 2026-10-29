@@ -26717,7 +26717,13 @@ impl DawUi {
                 };
             }
         });
-        self.time_marker_editor(ui, arrangement.id, &arrangement.time_markers);
+        self.time_marker_editor(
+            ui,
+            arrangement.id,
+            &arrangement.time_markers,
+            ppq,
+            project_time_signature,
+        );
 
         let max_tick = arrangement
             .clips
@@ -35371,6 +35377,8 @@ impl DawUi {
         ui: &mut egui::Ui,
         arrangement_id: u16,
         markers: &[TimeMarker],
+        ppq: u16,
+        initial_time_signature: Option<(u8, u8)>,
     ) {
         if self
             .selected_time_marker
@@ -35395,8 +35403,20 @@ impl DawUi {
                 *selected_arrangement == arrangement_id && end_tick > start_tick
             })
             .map(|(_, start_tick, end_tick)| (start_tick, end_tick));
+        let signature_changes = markers
+            .iter()
+            .filter(|marker| marker.is_signature())
+            .filter_map(|marker| {
+                Some((
+                    marker.position_ticks(),
+                    marker.numerator()?.max(1),
+                    marker.denominator()?.max(1),
+                ))
+            })
+            .collect::<Vec<_>>();
         let mut delete_selected = false;
         let mut create_selection_markers = false;
+        let mut create_markers_every_bars: Option<u8> = None;
         ui.separator();
         ui.horizontal(|ui| {
             ui.strong("Time markers");
@@ -35426,6 +35446,18 @@ impl DawUi {
                     "Add time markers at both ends of the current Playlist time selection",
                 )
                 .clicked();
+            ui.add_enabled_ui(selection_bounds.is_some(), |ui| {
+                ui.menu_button("Add one every", |ui| {
+                    for (label, interval_bars) in
+                        [("Bar", 1u8), ("2 bars", 2), ("4 bars", 4), ("8 bars", 8)]
+                    {
+                        if ui.button(label).clicked() {
+                            create_markers_every_bars = Some(interval_bars);
+                            ui.close();
+                        }
+                    }
+                });
+            });
         });
 
         let mut marker_edit = None;
@@ -35547,6 +35579,58 @@ impl DawUi {
                         self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                         self.status = format!(
                             "Added Playlist time markers at ticks {start_tick} and {end_tick}"
+                        );
+                    }
+                    Err(error) => {
+                        self.status = format!("Could not add Playlist time markers: {error}");
+                    }
+                }
+            }
+        } else if let Some(interval_bars) = create_markers_every_bars {
+            if let Some((start_tick, end_tick)) = selection_bounds {
+                let positions = playlist_time_marker_positions_every_bars(
+                    start_tick,
+                    end_tick,
+                    interval_bars,
+                    ppq,
+                    initial_time_signature,
+                    &signature_changes,
+                );
+                let result = positions.and_then(|positions| {
+                    self.document
+                        .as_ref()
+                        .cloned()
+                        .ok_or_else(|| "no project is open".to_owned())
+                        .and_then(|mut document| {
+                            let mut last_marker_index = None;
+                            for position_ticks in &positions {
+                                last_marker_index = Some(
+                                    document
+                                        .create_time_marker(
+                                            arrangement_id,
+                                            TimeMarkerEdit {
+                                                position_ticks: Some(*position_ticks),
+                                                ..TimeMarkerEdit::default()
+                                            },
+                                        )
+                                        .map_err(|error| error.to_string())?,
+                                );
+                            }
+                            let last_marker_index = last_marker_index.ok_or_else(|| {
+                                "the selected range contains no marker positions".to_owned()
+                            })?;
+                            Ok((document, last_marker_index, positions.len()))
+                        })
+                });
+                match result {
+                    Ok((document, last_marker_index, marker_count)) => {
+                        self.stop_project_playback();
+                        self.document = Some(document);
+                        self.selected_time_marker = Some(last_marker_index);
+                        self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+                        self.status = format!(
+                            "Added {marker_count} Playlist time markers every {interval_bars} bar(s)"
                         );
                     }
                     Err(error) => {
@@ -79765,6 +79849,57 @@ fn playlist_time_marker_at_x(
         })
         .min_by(|(_, _, left), (_, _, right)| left.total_cmp(right))
         .map(|(marker_index, _, _)| marker_index)
+}
+
+fn playlist_time_marker_positions_every_bars(
+    start_tick: u32,
+    end_tick: u32,
+    interval_bars: u8,
+    ppq: u16,
+    initial_time_signature: Option<(u8, u8)>,
+    signature_changes: &[(u32, u8, u8)],
+) -> Result<Vec<u32>, String> {
+    if end_tick <= start_tick || interval_bars == 0 {
+        return Err("the selected range or marker interval is empty".to_owned());
+    }
+
+    const MAX_MARKERS_PER_ACTION: usize = 512;
+    let mut positions = Vec::new();
+    let mut cursor_tick = start_tick;
+    loop {
+        let mut next_tick = cursor_tick;
+        let mut reached_tick_limit = false;
+        for _ in 0..interval_bars {
+            let Some(boundary_tick) = playlist_next_bar_tick(
+                f64::from(next_tick),
+                ppq,
+                initial_time_signature,
+                signature_changes,
+            ) else {
+                reached_tick_limit = true;
+                break;
+            };
+            if boundary_tick <= next_tick {
+                return Err("the active meter did not advance the Playlist timeline".to_owned());
+            }
+            next_tick = boundary_tick;
+        }
+        if reached_tick_limit || next_tick >= end_tick {
+            break;
+        }
+        if positions.len() == MAX_MARKERS_PER_ACTION {
+            return Err(format!(
+                "the selected range would create more than {MAX_MARKERS_PER_ACTION} markers"
+            ));
+        }
+        positions.push(next_tick);
+        cursor_tick = next_tick;
+    }
+
+    if positions.is_empty() {
+        return Err("the selected range contains no complete marker interval".to_owned());
+    }
+    Ok(positions)
 }
 
 fn playlist_performance_navigation_target_tick(
