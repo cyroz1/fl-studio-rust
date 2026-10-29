@@ -2310,6 +2310,63 @@ pub struct PlaylistStreamMonitor<'a> {
     live_master_stereo_separation_raw: Option<Arc<AtomicI32>>,
     live_master_enabled: Option<Arc<AtomicI32>>,
     live_master_signal_flags: Option<Arc<AtomicI32>>,
+    loop_range: Option<PlaylistPlaybackLoopRange>,
+}
+
+/// A frame range that repeats during live Playlist playback.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PlaylistPlaybackLoopRange {
+    start_frame: u64,
+    end_frame: u64,
+}
+
+impl PlaylistPlaybackLoopRange {
+    pub fn new(start_frame: u64, end_frame: u64) -> Result<Self, String> {
+        if end_frame <= start_frame {
+            return Err("Playlist loop end must be after its start".to_owned());
+        }
+        Ok(Self {
+            start_frame,
+            end_frame,
+        })
+    }
+
+    pub const fn start_frame(self) -> u64 {
+        self.start_frame
+    }
+
+    pub const fn end_frame(self) -> u64 {
+        self.end_frame
+    }
+
+    pub fn source_frame_at(self, output_frame: u64) -> u64 {
+        self.source_frame(output_frame)
+    }
+
+    fn length_frames(self) -> u64 {
+        self.end_frame - self.start_frame
+    }
+
+    fn source_frame(self, output_frame: u64) -> u64 {
+        if output_frame < self.end_frame {
+            output_frame
+        } else {
+            self.start_frame + (output_frame - self.end_frame) % self.length_frames()
+        }
+    }
+
+    fn frames_to_boundary(self, output_frame: u64) -> u64 {
+        if output_frame < self.end_frame {
+            self.end_frame - output_frame
+        } else {
+            self.length_frames() - (output_frame - self.end_frame) % self.length_frames()
+        }
+    }
+
+    fn is_cycle_start(self, output_frame: u64) -> bool {
+        output_frame >= self.end_frame
+            && (output_frame - self.end_frame).is_multiple_of(self.length_frames())
+    }
 }
 
 /// Channels for requesting and reporting live VST3 latency changes in a stream.
@@ -2344,6 +2401,7 @@ impl<'a> PlaylistStreamMonitor<'a> {
             live_master_stereo_separation_raw: None,
             live_master_enabled: None,
             live_master_signal_flags: None,
+            loop_range: None,
         }
     }
 
@@ -2357,7 +2415,14 @@ impl<'a> PlaylistStreamMonitor<'a> {
             live_master_stereo_separation_raw: Some(meters.live_master_stereo_separation_raw()),
             live_master_enabled: Some(meters.live_master_enabled()),
             live_master_signal_flags: Some(meters.live_master_signal_flags()),
+            loop_range: None,
         }
+    }
+
+    /// Repeat the selected absolute Playlist frame range during live playback.
+    pub fn with_loop_range(mut self, loop_range: PlaylistPlaybackLoopRange) -> Self {
+        self.loop_range = Some(loop_range);
+        self
     }
 }
 
@@ -3282,6 +3347,7 @@ pub fn stream_playlist_performance_with_vst3_to_device(
             meters: performance.meters.as_deref(),
             cancelled,
             capture_post_effect_buses: false,
+            loop_range: None,
         },
         || writer.is_cancelled(),
         |block, _mixer_buses| {
@@ -3308,12 +3374,19 @@ fn stream_playlist_with_vst3_to_device_from_frame_inner(
         latency_updates: latency_controls,
     } = controls;
     let start_frame = monitor.start_frame;
+    let loop_range = monitor.loop_range;
     let meters = monitor.meters;
     let live_master_fader_gain = monitor.live_master_fader_gain;
     let live_master_pan_raw = monitor.live_master_pan_raw;
     let live_master_stereo_separation_raw = monitor.live_master_stereo_separation_raw;
     let live_master_enabled = monitor.live_master_enabled;
     let live_master_signal_flags = monitor.live_master_signal_flags;
+    if let Some(loop_range) = loop_range {
+        writer.set_project_position_loop(loop_range.start_frame, loop_range.end_frame)?;
+        if let Some(processor) = vst3_processor.as_mut() {
+            processor.set_playlist_loop_range(loop_range.start_frame, loop_range.end_frame)?;
+        }
+    }
     let project_path = project_path.as_ref();
     let mut master_output = MixerMasterOutput::from_document(document);
     if let Some(gain_target) = live_master_fader_gain {
@@ -3400,6 +3473,9 @@ fn stream_playlist_with_vst3_to_device_from_frame_inner(
         processor.extend_to_output_frames(frames)?;
         frames = frames.max(processor.summary().frames);
     }
+    if loop_range.is_some() {
+        frames = u64::MAX;
+    }
     let mut source_paths: std::collections::BTreeSet<PathBuf> =
         audio.source_paths.iter().cloned().collect();
     source_paths.extend(sampler.source_paths.iter().cloned());
@@ -3446,11 +3522,12 @@ fn stream_playlist_with_vst3_to_device_from_frame_inner(
         remainder_stop: None,
     };
     let block_summary = if let Some(latency_updates) = latency_updates {
-        stream_prepared_playlist_render_with_live_latency_updates(
+        stream_prepared_playlist_render_with_live_latency_updates_and_loop(
             render,
             latency_updates,
             meters,
             cancelled,
+            loop_range,
             || writer.is_cancelled(),
             |block, _mixer_buses| {
                 let skipped_frames = frames_to_skip.min((block.len() / 2) as u64) as usize;
@@ -3459,10 +3536,11 @@ fn stream_playlist_with_vst3_to_device_from_frame_inner(
             },
         )?
     } else {
-        stream_prepared_playlist_render(
+        stream_prepared_playlist_render_with_loop(
             render,
             meters,
             cancelled,
+            loop_range,
             || writer.is_cancelled(),
             |block, _mixer_buses| {
                 let skipped_frames = frames_to_skip.min((block.len() / 2) as u64) as usize;
@@ -5953,6 +6031,24 @@ fn stream_prepared_playlist_render(
     stream_cancelled: impl FnMut() -> bool,
     write_block: impl FnMut(&[f32], PlaylistRenderMixerBuses<'_>) -> Result<(), String>,
 ) -> Result<PlaylistBlockRenderSummary, String> {
+    stream_prepared_playlist_render_with_loop(
+        render,
+        meters,
+        cancelled,
+        None,
+        stream_cancelled,
+        write_block,
+    )
+}
+
+fn stream_prepared_playlist_render_with_loop(
+    render: PreparedPlaylistBlockMix<'_>,
+    meters: Option<&MixerTrackPeakMeters>,
+    cancelled: &AtomicBool,
+    loop_range: Option<PlaylistPlaybackLoopRange>,
+    stream_cancelled: impl FnMut() -> bool,
+    write_block: impl FnMut(&[f32], PlaylistRenderMixerBuses<'_>) -> Result<(), String>,
+) -> Result<PlaylistBlockRenderSummary, String> {
     stream_prepared_playlist_render_with_performance(
         render,
         PlaylistPreparedRenderControls {
@@ -5961,17 +6057,19 @@ fn stream_prepared_playlist_render(
             meters,
             cancelled,
             capture_post_effect_buses: false,
+            loop_range,
         },
         stream_cancelled,
         write_block,
     )
 }
 
-fn stream_prepared_playlist_render_with_live_latency_updates(
+fn stream_prepared_playlist_render_with_live_latency_updates_and_loop(
     render: PreparedPlaylistBlockMix<'_>,
     latency_updates: LiveLatencyUpdateState,
     meters: Option<&MixerTrackPeakMeters>,
     cancelled: &AtomicBool,
+    loop_range: Option<PlaylistPlaybackLoopRange>,
     stream_cancelled: impl FnMut() -> bool,
     write_block: impl FnMut(&[f32], PlaylistRenderMixerBuses<'_>) -> Result<(), String>,
 ) -> Result<PlaylistBlockRenderSummary, String> {
@@ -5983,6 +6081,7 @@ fn stream_prepared_playlist_render_with_live_latency_updates(
             meters,
             cancelled,
             capture_post_effect_buses: false,
+            loop_range,
         },
         stream_cancelled,
         write_block,
@@ -6004,6 +6103,7 @@ fn stream_prepared_playlist_render_with_post_effect_stems(
             meters,
             cancelled,
             capture_post_effect_buses: true,
+            loop_range: None,
         },
         stream_cancelled,
         write_block,
@@ -6022,6 +6122,7 @@ struct PlaylistPreparedRenderControls<'runtime> {
     meters: Option<&'runtime MixerTrackPeakMeters>,
     cancelled: &'runtime AtomicBool,
     capture_post_effect_buses: bool,
+    loop_range: Option<PlaylistPlaybackLoopRange>,
 }
 
 fn update_live_source_pdc_delays(
@@ -6169,9 +6270,14 @@ fn stream_prepared_playlist_render_with_performance(
         meters,
         cancelled,
         capture_post_effect_buses,
+        loop_range,
     } = controls;
     crate::audio::enable_denormal_protection();
-    let mut frames = render.frames;
+    let mut frames = if loop_range.is_some() {
+        u64::MAX
+    } else {
+        render.frames
+    };
     let options = render.options;
     let mut remainder_detector = render.remainder_stop.map(PlaylistRemainderDetector::new);
     let release_frames = (f64::from(options.sample_rate) * SAMPLER_RELEASE_SECONDS)
@@ -6322,7 +6428,13 @@ fn stream_prepared_playlist_render_with_performance(
                 {
                     frames = frames.max(processor.summary().frames);
                 }
-                let frame_count = (frames - block_start).min(STREAM_BLOCK_FRAMES as u64) as usize;
+                let mut frame_count = (frames - block_start).min(STREAM_BLOCK_FRAMES as u64);
+                if let Some(loop_range) = loop_range {
+                    frame_count = frame_count.min(loop_range.frames_to_boundary(block_start));
+                }
+                let frame_count = frame_count as usize;
+                let source_frame =
+                    loop_range.map_or(block_start, |range| range.source_frame(block_start));
                 let sample_count = frame_count * 2;
                 let meter_bus_samples = MIXER_TRACK_METER_COUNT * sample_count;
                 let active_bus_samples = meter_bus_samples * mixer_bus_planes;
@@ -6340,7 +6452,7 @@ fn stream_prepared_playlist_render_with_performance(
                 }
                 mix_prepared_audio_clip_block(
                     &audio_mix_context,
-                    block_start,
+                    source_frame,
                     block,
                     meter_buses.as_deref_mut(),
                     parallel_mixer.as_ref(),
@@ -6365,24 +6477,29 @@ fn stream_prepared_playlist_render_with_performance(
                         mixer_bus_delay_count,
                     )?;
                 }
+                if let Some(loop_range) = loop_range
+                    && loop_range.is_cycle_start(block_start)
+                {
+                    sampler_engine.reset_for_playlist_loop(loop_range.start_frame);
+                }
                 let sampler_samples = &mut sampler_block[..sample_count];
                 if let Some(meter_buses) = meter_buses.as_deref_mut() {
                     sampler_engine.render_block_with_meters(
-                        block_start,
+                        source_frame,
                         frame_count,
                         sampler_samples,
                         Some(meter_buses),
                         sample_count,
                     );
                 } else {
-                    sampler_engine.render_block(block_start, frame_count, sampler_samples);
+                    sampler_engine.render_block(source_frame, frame_count, sampler_samples);
                 }
                 for (mixed, sampler_sample) in block.iter_mut().zip(sampler_samples) {
                     *mixed += *sampler_sample;
                 }
                 mix_playlist_clap_audio_layers(
                     block,
-                    block_start,
+                    source_frame,
                     frame_count,
                     &options.clap_audio_layers,
                     &clap_mixer_routes,
@@ -14804,6 +14921,25 @@ impl<'a> SamplerVoiceEngine<'a> {
 
     fn render_block(&mut self, block_start: u64, frame_count: usize, output: &mut [f32]) {
         self.render_block_with_meters(block_start, frame_count, output, None, 0);
+    }
+
+    fn reset_for_playlist_loop(&mut self, start_frame: u64) {
+        let declick_frames = (f64::from(self.output_sample_rate) * 0.010)
+            .round()
+            .max(1.0) as usize;
+        for voice in self.voices.iter_mut().flatten() {
+            if !voice.release_started {
+                begin_sampler_voice_fast_cut_declick(voice, start_frame, declick_frames);
+            }
+        }
+        self.current_frame = start_frame;
+        self.next_note = self
+            .notes
+            .partition_point(|note| note.start_frame < start_frame);
+        self.next_live_note = self
+            .live_notes
+            .partition_point(|note| note.start_frame < start_frame);
+        self.last_portamento_values_by_group.clear();
     }
 
     fn render_block_with_meters(

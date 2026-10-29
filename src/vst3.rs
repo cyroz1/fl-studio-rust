@@ -571,6 +571,7 @@ impl Drop for Vst3PlaylistLiveInputSession {
 }
 
 struct PatternLoopEventQueue {
+    loop_start_frame: u64,
     loop_frames: u64,
     template_events: Vec<ScheduledMidiEvent>,
     next_cycle: u64,
@@ -639,6 +640,7 @@ struct PlaylistMixerEffectStream {
     sidechain_inputs: Vec<PlaylistMixerEffectSidechainInput>,
     parameter_automation: Vec<PreparedParameterAutomation>,
     parameter_automation_loop_frames: Option<u64>,
+    parameter_automation_loop_start_frame: u64,
     wet_mix: f32,
     saved_enabled: bool,
     saved_insert_effects_enabled: bool,
@@ -850,6 +852,69 @@ impl Vst3PlaylistStreamProcessor {
 
     pub fn live_midi_input_senders(&self) -> BTreeMap<u16, Vst3PlaylistLiveInputSender> {
         self.live_input_senders.clone()
+    }
+
+    pub(crate) fn set_playlist_loop_range(
+        &mut self,
+        start_frame: u64,
+        end_frame: u64,
+    ) -> Result<(), String> {
+        if end_frame <= start_frame {
+            return Err("Playlist VST3 loop end must be after its start".to_owned());
+        }
+        if self.started_count != 0 || self.started_mixer_effect_count != 0 {
+            return Err("Playlist VST3 loop range must be set before processing starts".to_owned());
+        }
+        let output_sample_rate = self.output_sample_rate;
+        for stream in &mut self.streams {
+            if stream.pattern_loop.is_some() {
+                return Err(
+                    "Playlist time selection looping cannot be combined with a Pattern loop"
+                        .to_owned(),
+                );
+            }
+            if stream.next_event != 0 || stream.source_frame != 0 {
+                return Err("Playlist VST3 loop range must be set before rendering".to_owned());
+            }
+            let source_start = playlist_output_frame_to_plugin_frame(
+                start_frame,
+                stream.render.sample_rate,
+                output_sample_rate,
+            )?;
+            let source_end = playlist_output_frame_to_plugin_frame(
+                end_frame,
+                stream.render.sample_rate,
+                output_sample_rate,
+            )?;
+            if source_end <= source_start {
+                return Err("Playlist VST3 loop is shorter than one plug-in frame".to_owned());
+            }
+            validate_looped_parameter_automation_block_density(
+                &stream.render.parameter_automation,
+                stream.render.block_size,
+                source_end - source_start,
+            )?;
+            let (initial_events, template_events) =
+                playlist_loop_midi_events(&stream.render.events, source_start, source_end);
+            stream.render.events = initial_events;
+            stream.pattern_loop = Some(PatternLoopEventQueue {
+                loop_start_frame: source_start,
+                loop_frames: source_end - source_start,
+                template_events,
+                next_cycle: 1,
+            });
+            stream.live_performance = true;
+        }
+        for effect in &mut self.mixer_effects {
+            validate_looped_parameter_automation_block_density(
+                &effect.parameter_automation,
+                effect.block_size,
+                end_frame - start_frame,
+            )?;
+            effect.parameter_automation_loop_start_frame = start_frame;
+            effect.parameter_automation_loop_frames = Some(end_frame - start_frame);
+        }
+        Ok(())
     }
 
     pub(crate) fn set_live_mixer_source_targets(&mut self, meters: &MixerTrackPeakMeters) {
@@ -2307,11 +2372,12 @@ fn process_playlist_mixer_effect_block(
                 .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
             validate_vst3_audio_block(buffers, plugin.sample_rate(), plugin.block_size())?;
             if let Some(loop_frames) = effect.parameter_automation_loop_frames {
-                set_looped_parameter_automation_for_block(
+                set_looped_parameter_automation_for_block_at_range(
                     &mut plugin,
                     &effect.parameter_automation,
                     block_start_frame,
                     frame_count,
+                    effect.parameter_automation_loop_start_frame,
                     loop_frames,
                 )?;
             } else {
@@ -2368,7 +2434,9 @@ fn process_playlist_mixer_effect_block(
         &effect.parameter_automation,
         block_start_frame,
         frame_count,
-        effect.parameter_automation_loop_frames,
+        effect
+            .parameter_automation_loop_frames
+            .map(|loop_frames| (effect.parameter_automation_loop_start_frame, loop_frames)),
     )?;
     effect
         .external_processor
@@ -2638,7 +2706,7 @@ fn mixer_effect_parameter_changes_for_block(
     automation: &[PreparedParameterAutomation],
     block_start_frame: u64,
     frame_count: usize,
-    loop_frames: Option<u64>,
+    loop_range: Option<(u64, u64)>,
 ) -> Result<Vec<(u32, u32, f64)>, String> {
     let mut changes = Vec::new();
     let mut append_segment =
@@ -2663,9 +2731,14 @@ fn mixer_effect_parameter_changes_for_block(
             }
             Ok(())
         };
-    if let Some(loop_frames) = loop_frames {
+    if let Some((loop_start_frame, loop_frames)) = loop_range {
         for (pattern_frame, output_offset, segment_count) in
-            looped_parameter_automation_segments(block_start_frame, frame_count, loop_frames)?
+            looped_parameter_automation_segments_at_range(
+                block_start_frame,
+                frame_count,
+                loop_start_frame,
+                loop_frames,
+            )?
         {
             append_segment(pattern_frame, output_offset, segment_count)?;
         }
@@ -3292,13 +3365,24 @@ impl PlaylistPluginStream {
                         .lock()
                         .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
                     if let Some(pattern_loop) = self.pattern_loop.as_ref() {
-                        set_looped_parameter_automation_for_block(
-                            &mut plugin,
-                            &self.render.parameter_automation,
-                            self.source_frame,
-                            source_count,
-                            pattern_loop.loop_frames,
-                        )?;
+                        if pattern_loop.loop_start_frame == 0 {
+                            set_looped_parameter_automation_for_block(
+                                &mut plugin,
+                                &self.render.parameter_automation,
+                                self.source_frame,
+                                source_count,
+                                pattern_loop.loop_frames,
+                            )?;
+                        } else {
+                            set_looped_parameter_automation_for_block_at_range(
+                                &mut plugin,
+                                &self.render.parameter_automation,
+                                self.source_frame,
+                                source_count,
+                                pattern_loop.loop_start_frame,
+                                pattern_loop.loop_frames,
+                            )?;
+                        }
                     } else {
                         set_parameter_automation_for_block(
                             &mut plugin,
@@ -3619,17 +3703,27 @@ impl PlaylistPluginStream {
             .map(|event| event.frame)
             .min()
             .unwrap_or(0);
-        while queue
-            .loop_frames
-            .checked_mul(queue.next_cycle)
-            .and_then(|cycle_start| cycle_start.checked_add(first_event_frame))
-            .is_some_and(|first_frame| first_frame < block_end)
-        {
+        loop {
             let cycle_start = queue
                 .loop_frames
-                .checked_mul(queue.next_cycle)
-                .ok_or_else(|| "VST3 Pattern loop position overflow".to_owned())?;
-            let repeated = repeat_pattern_loop_events(&queue.template_events, cycle_start)?;
+                .checked_mul(queue.next_cycle.saturating_sub(1))
+                .and_then(|offset| {
+                    queue
+                        .loop_start_frame
+                        .checked_add(queue.loop_frames)?
+                        .checked_add(offset)
+                })
+                .ok_or_else(|| "VST3 Playlist loop position overflow".to_owned())?;
+            let first_frame = cycle_start
+                .checked_add(first_event_frame.saturating_sub(queue.loop_start_frame))
+                .ok_or_else(|| "VST3 Playlist loop event position overflow".to_owned())?;
+            if first_frame >= block_end {
+                break;
+            }
+            let cycle_offset = cycle_start
+                .checked_sub(queue.loop_start_frame)
+                .ok_or_else(|| "VST3 Playlist loop offset underflow".to_owned())?;
+            let repeated = repeat_pattern_loop_events(&queue.template_events, cycle_offset)?;
             self.render.events.extend(repeated);
             self.render.events[self.next_event..]
                 .sort_unstable_by_key(|event| (event.frame, event.priority));
@@ -3675,6 +3769,90 @@ fn repeat_pattern_loop_events(
             Ok(event)
         })
         .collect()
+}
+
+fn playlist_output_frame_to_plugin_frame(
+    output_frame: u64,
+    plugin_sample_rate: f64,
+    output_sample_rate: u32,
+) -> Result<u64, String> {
+    if !plugin_sample_rate.is_finite() || plugin_sample_rate <= 0.0 || output_sample_rate == 0 {
+        return Err("Playlist VST3 loop requires valid plug-in and output sample rates".to_owned());
+    }
+    let plugin_frame = output_frame as f64 * plugin_sample_rate / f64::from(output_sample_rate);
+    if !plugin_frame.is_finite() || plugin_frame < 0.0 || plugin_frame > u64::MAX as f64 {
+        return Err("Playlist VST3 loop position is outside the renderable range".to_owned());
+    }
+    Ok(plugin_frame.round() as u64)
+}
+
+fn playlist_loop_midi_events(
+    events: &[ScheduledMidiEvent],
+    loop_start_frame: u64,
+    loop_end_frame: u64,
+) -> (Vec<ScheduledMidiEvent>, Vec<ScheduledMidiEvent>) {
+    let active_before = |end_frame: u64| {
+        let mut active = HashMap::new();
+        for event in events.iter().take_while(|event| event.frame < end_frame) {
+            match event.event {
+                MidiEvent::NoteOn { velocity, .. } if velocity > 0 => {
+                    active.insert(event.note_id, *event);
+                }
+                MidiEvent::NoteOn { .. } | MidiEvent::NoteOff { .. } => {
+                    active.remove(&event.note_id);
+                }
+                _ => {}
+            }
+        }
+        active
+    };
+    let active_at_start = active_before(loop_start_frame);
+    let active_at_end = active_before(loop_end_frame);
+    let mut initial_events = events
+        .iter()
+        .copied()
+        .filter(|event| event.frame < loop_end_frame)
+        .collect::<Vec<_>>();
+    let mut template_events = events
+        .iter()
+        .copied()
+        .filter(|event| loop_start_frame <= event.frame && event.frame < loop_end_frame)
+        .collect::<Vec<_>>();
+    for note_on in active_at_start.values() {
+        if let MidiEvent::NoteOn { velocity, .. } = note_on.event
+            && velocity > 0
+        {
+            template_events.push(ScheduledMidiEvent {
+                frame: loop_start_frame,
+                ..*note_on
+            });
+        }
+    }
+    for note_on in active_at_end.values() {
+        if let Some(note_off) = playlist_loop_note_off(note_on, loop_end_frame) {
+            initial_events.push(note_off);
+            template_events.push(note_off);
+        }
+    }
+    initial_events.sort_unstable_by_key(|event| (event.frame, event.priority));
+    template_events.sort_unstable_by_key(|event| (event.frame, event.priority));
+    (initial_events, template_events)
+}
+
+fn playlist_loop_note_off(note_on: &ScheduledMidiEvent, frame: u64) -> Option<ScheduledMidiEvent> {
+    let MidiEvent::NoteOn { channel, note, .. } = note_on.event else {
+        return None;
+    };
+    Some(ScheduledMidiEvent {
+        frame,
+        priority: 0,
+        event: MidiEvent::NoteOff {
+            channel,
+            note,
+            velocity: 0,
+        },
+        ..*note_on
+    })
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -6215,6 +6393,7 @@ impl Vst3HostRuntime {
                 active_performance_notes: HashMap::new(),
                 note_pitch_offset_semitones,
                 pattern_loop: Some(PatternLoopEventQueue {
+                    loop_start_frame: 0,
                     loop_frames,
                     template_events,
                     next_cycle: 1,
@@ -6687,6 +6866,7 @@ impl Vst3HostRuntime {
                     sidechain_inputs: Vec::new(),
                     parameter_automation,
                     parameter_automation_loop_frames: effect_parameter_automation_loop_frames,
+                    parameter_automation_loop_start_frame: 0,
                     wet_mix,
                     saved_enabled,
                     saved_insert_effects_enabled,
@@ -8866,6 +9046,55 @@ fn looped_parameter_automation_segments(
     Ok(segments)
 }
 
+fn looped_parameter_automation_segments_at_range(
+    block_start_frame: u64,
+    frame_count: usize,
+    loop_start_frame: u64,
+    loop_frames: u64,
+) -> Result<Vec<(u64, usize, usize)>, String> {
+    if loop_start_frame == 0 {
+        return looped_parameter_automation_segments(block_start_frame, frame_count, loop_frames);
+    }
+    if loop_frames == 0 {
+        return Err("VST3 Pattern automation loop length must be greater than zero".to_owned());
+    }
+    let loop_end_frame = loop_start_frame
+        .checked_add(loop_frames)
+        .ok_or_else(|| "VST3 automation loop range overflow".to_owned())?;
+    let mut segments = Vec::new();
+    let mut block_offset = 0usize;
+    while block_offset < frame_count {
+        let absolute_frame = block_start_frame
+            .checked_add(
+                u64::try_from(block_offset)
+                    .map_err(|_| "VST3 automation block offset overflow".to_owned())?,
+            )
+            .ok_or_else(|| "VST3 automation position overflow".to_owned())?;
+        let (pattern_frame, frames_to_loop_end) = if absolute_frame < loop_end_frame {
+            (absolute_frame, loop_end_frame - absolute_frame)
+        } else {
+            let pattern_frame = loop_start_frame + (absolute_frame - loop_end_frame) % loop_frames;
+            (pattern_frame, loop_end_frame - pattern_frame)
+        };
+        let remaining = frame_count - block_offset;
+        let segment_count = usize::try_from(
+            frames_to_loop_end.min(
+                u64::try_from(remaining)
+                    .map_err(|_| "VST3 automation block size overflow".to_owned())?,
+            ),
+        )
+        .map_err(|_| "VST3 automation segment size overflow".to_owned())?;
+        if segment_count == 0 {
+            return Err("VST3 Pattern automation produced an empty loop segment".to_owned());
+        }
+        segments.push((pattern_frame, block_offset, segment_count));
+        block_offset = block_offset
+            .checked_add(segment_count)
+            .ok_or_else(|| "VST3 automation block offset overflow".to_owned())?;
+    }
+    Ok(segments)
+}
+
 fn set_looped_parameter_automation_for_block(
     plugin: &mut Plugin,
     automation: &[PreparedParameterAutomation],
@@ -8873,8 +9102,31 @@ fn set_looped_parameter_automation_for_block(
     frame_count: usize,
     loop_frames: u64,
 ) -> Result<(), String> {
+    set_looped_parameter_automation_for_block_at_range(
+        plugin,
+        automation,
+        block_start_frame,
+        frame_count,
+        0,
+        loop_frames,
+    )
+}
+
+fn set_looped_parameter_automation_for_block_at_range(
+    plugin: &mut Plugin,
+    automation: &[PreparedParameterAutomation],
+    block_start_frame: u64,
+    frame_count: usize,
+    loop_start_frame: u64,
+    loop_frames: u64,
+) -> Result<(), String> {
     for (pattern_frame, output_offset, segment_count) in
-        looped_parameter_automation_segments(block_start_frame, frame_count, loop_frames)?
+        looped_parameter_automation_segments_at_range(
+            block_start_frame,
+            frame_count,
+            loop_start_frame,
+            loop_frames,
+        )?
     {
         set_parameter_automation_for_block_at_offset(
             plugin,

@@ -55,16 +55,17 @@ use flp_rebuild::sample_render::{
     PlaylistAudioClipFadeCurve, PlaylistAudioLayer, PlaylistChannelAutomationPoint,
     PlaylistLiveStreamControls, PlaylistPatternScheduleOptions, PlaylistPerformanceClapLayer,
     PlaylistPerformanceCommand, PlaylistPerformanceLaunch, PlaylistPerformanceLiveStatus,
-    PlaylistPerformanceStream, PlaylistRenderOptions, PlaylistRenderRange, PlaylistRenderSummary,
-    PlaylistStreamMonitor, PlaylistTailMode, PlaylistTempoMap, PlaylistTrackFilter,
-    ResamplingQuality, SamplerLiveInputRouting, SamplerLiveNoteEvent, SamplerLiveNoteSender,
-    SamplerPatternLoopPlayback, SamplerPatternLoopStreamControls, SamplerPatternRenderOptions,
-    SamplerPatternRenderSummary, SamplerPatternStreamControls, Vst3LatencyUpdateControls,
-    Vst3LiveInputEvent, Vst3LiveInputSender, Vst3PatternLoopPlayback,
-    Vst3PatternLoopStreamControls, Vst3PatternPlayback, Vst3PatternStreamControls, WavChannelMode,
-    WavDitherMode, WavSampleFormat, layer_live_input_queue,
-    nearest_playlist_audio_clip_zero_crossing_tick, playlist_audio_clip_fade_gain,
-    playlist_performance_clap_clip_indices, playlist_performance_clip_indices_with_vst3_and_clap,
+    PlaylistPerformanceStream, PlaylistPlaybackLoopRange, PlaylistRenderOptions,
+    PlaylistRenderRange, PlaylistRenderSummary, PlaylistStreamMonitor, PlaylistTailMode,
+    PlaylistTempoMap, PlaylistTrackFilter, ResamplingQuality, SamplerLiveInputRouting,
+    SamplerLiveNoteEvent, SamplerLiveNoteSender, SamplerPatternLoopPlayback,
+    SamplerPatternLoopStreamControls, SamplerPatternRenderOptions, SamplerPatternRenderSummary,
+    SamplerPatternStreamControls, Vst3LatencyUpdateControls, Vst3LiveInputEvent,
+    Vst3LiveInputSender, Vst3PatternLoopPlayback, Vst3PatternLoopStreamControls,
+    Vst3PatternPlayback, Vst3PatternStreamControls, WavChannelMode, WavDitherMode, WavSampleFormat,
+    layer_live_input_queue, nearest_playlist_audio_clip_zero_crossing_tick,
+    playlist_audio_clip_fade_gain, playlist_performance_clap_clip_indices,
+    playlist_performance_clip_indices_with_vst3_and_clap,
     playlist_performance_static_document_with_vst3_and_clap, playlist_performance_vst3_channel_ids,
     playlist_performance_vst3_clip_indices_with_clap,
     project_channel_stereo_output_gains_with_layer_adjustments, render_audio_clips_to_file,
@@ -13713,6 +13714,26 @@ impl DawUi {
                 return;
             }
         };
+        let playlist_loop_range = self
+            .playlist_time_selection
+            .filter(|(selected_arrangement, start_tick, end_tick)| {
+                *selected_arrangement == arrangement_id && end_tick > start_tick
+            })
+            .map(|(_, start_tick, end_tick)| {
+                let start_frame =
+                    playlist_tempo_map.frame_at_tick(u64::from(start_tick), sample_rate)?;
+                let end_frame =
+                    playlist_tempo_map.frame_at_tick(u64::from(end_tick), sample_rate)?;
+                PlaylistPlaybackLoopRange::new(start_frame, end_frame)
+            })
+            .transpose();
+        let playlist_loop_range = match playlist_loop_range {
+            Ok(loop_range) => loop_range,
+            Err(error) => {
+                self.status = format!("Could not map Playlist time selection: {error}");
+                return;
+            }
+        };
         let project_fingerprint: [u8; 16] = Md5::digest(&project_bytes).into();
         let clap_cache_key = ClapPlaylistCacheKey {
             project_generation: self.project_generation,
@@ -13791,10 +13812,7 @@ impl DawUi {
             .as_ref()
             .map(Vst3PlaylistStreamProcessor::live_midi_input_senders)
             .unwrap_or_default();
-        let start_frame = if let Some(start_frame) = staged_start_frame {
-            if let Some(tick) = playlist_tempo_map.tick_at_frame(start_frame, sample_rate) {
-                self.playlist_seek_tick = tick.round().clamp(0.0, f64::from(u32::MAX)) as u32;
-            }
+        let requested_start_frame = if let Some(start_frame) = staged_start_frame {
             start_frame
         } else {
             match playlist_seek_tick_to_frame(
@@ -13809,6 +13827,24 @@ impl DawUi {
                 }
             }
         };
+        let start_frame = match (playlist_loop_range, staged_start_frame) {
+            (Some(_), Some(_)) | (None, _) => requested_start_frame,
+            (Some(loop_range), None) => {
+                if (loop_range.start_frame()..loop_range.end_frame())
+                    .contains(&requested_start_frame)
+                {
+                    requested_start_frame
+                } else {
+                    loop_range.start_frame()
+                }
+            }
+        };
+        let playhead_frame = playlist_loop_range.map_or(start_frame, |loop_range| {
+            loop_range.source_frame_at(start_frame)
+        });
+        if let Some(tick) = playlist_tempo_map.tick_at_frame(playhead_frame, sample_rate) {
+            self.playlist_seek_tick = tick.round().clamp(0.0, f64::from(u32::MAX)) as u32;
+        }
         if let Some(session) = self.live_sampler_input.take() {
             session.cancelled.store(true, Ordering::Release);
             self.live_sampler_workers.push(session.worker);
@@ -13864,6 +13900,11 @@ impl DawUi {
         let worker = thread::Builder::new()
             .name("project-audio-render".to_owned())
             .spawn(move || {
+                let monitor = PlaylistStreamMonitor::with_meters(start_frame, &worker_mixer_meters);
+                let monitor = match playlist_loop_range {
+                    Some(loop_range) => monitor.with_loop_range(loop_range),
+                    None => monitor,
+                };
                 let result = FlpDocument::parse(&project_bytes)
                     .map_err(|error| error.to_string())
                     .and_then(|document| {
@@ -13875,10 +13916,7 @@ impl DawUi {
                             &worker_cancelled,
                             vst3_processor,
                             PlaylistLiveStreamControls {
-                                monitor: PlaylistStreamMonitor::with_meters(
-                                    start_frame,
-                                    &worker_mixer_meters,
-                                ),
+                                monitor,
                                 latency_updates: Some(Vst3LatencyUpdateControls {
                                     updates: latency_update_receiver,
                                     reports: latency_report_sender,
@@ -13981,7 +14019,7 @@ impl DawUi {
         let Some(start_frame) = self
             .audio_engine
             .as_ref()
-            .map(AudioEngine::project_playback_position_frames)
+            .map(AudioEngine::project_stream_position_frames)
         else {
             return false;
         };

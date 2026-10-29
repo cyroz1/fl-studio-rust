@@ -3137,6 +3137,13 @@ impl PlaybackState {
             StreamingPlayback::project_position_frames,
         )
     }
+
+    fn stream_position_frames(&self) -> u64 {
+        self.streaming.load().as_deref().map_or_else(
+            || self.cursor_frames.load(Ordering::Acquire),
+            |streaming| streaming.consumed_frames.load(Ordering::Acquire),
+        )
+    }
 }
 
 /// Enumerate the default system host's active input and output endpoints.
@@ -3916,6 +3923,11 @@ impl AudioEngine {
     /// Current song position in device frames, including a streaming seek offset when present.
     pub fn project_playback_position_frames(&self) -> u64 {
         self.playback.position_frames()
+    }
+
+    /// Current monotonic stream frame used to stage a replacement audio producer.
+    pub fn project_stream_position_frames(&self) -> u64 {
+        self.playback.stream_position_frames()
     }
 
     /// Clone a lock-free playback clock for a realtime MIDI or metering worker.
