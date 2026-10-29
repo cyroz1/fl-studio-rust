@@ -62173,7 +62173,7 @@ impl DawUi {
             ui.heading(format!("Detected CLAP plug-ins ({})", clap_candidates.len()));
             ui.label(
                 egui::RichText::new(
-                "CLAP note and Pattern/channel previews render in an isolated helper, which reuses the instrument while the plug-in and output rate stay the same. Assigned CLAP Pattern channels can loop in Pattern transport; their audio is pre-rendered at project base tempo and mixed directly to Master. Channel assignments are saved in machine-local settings per project path; plug-in state save/restore, Full Playlist playback, Mixer/Layer routing, and native plug-in editors are not available yet.",
+                "CLAP note and Pattern/channel previews render in an isolated helper, which reuses the instrument while the plug-in and output rate stay the same. Pattern transport pre-renders assigned channels at project base tempo and mixes directly to Master. Playlist transport pre-renders assigned CLAP instruments across supported Pattern Clips and follows clip repeats, track mute/solo, and tempo changes. Channel assignments and captured plug-in state are saved in machine-local settings per project path; Layer channel expansion, native FLP state embedding, and native plug-in editors remain unsupported.",
                 )
                 .color(MUTED),
             );
@@ -62220,7 +62220,7 @@ impl DawUi {
                     ui.colored_label(ORANGE, error);
                 }
             }
-            ui.small("Pattern previews use project base tempo. CLAP Playlist playback follows clip repeats, track mute/solo, and tempo automation for default-scale, full-source Pattern clips. CLAP audio mixes directly to Master; Mixer and Layer routing are not applied. CLAP note-dialect plug-ins receive per-note tuning, pan, Mod X brightness, and release; MIDI 1.0/2.0 inputs receive key, velocity, channel, and release.");
+            ui.small("Pattern previews use project base tempo. CLAP Playlist playback follows clip repeats, track mute/solo, and tempo automation for default-scale, full-source Pattern clips; it applies source-channel fader/pan and saved Mixer insert routes, including loaded VST3 insert effects. Layer channel expansion, CLAP Mixer effects, scaled/source-windowed clips, Performance playback, and offline song/stem export remain unsupported. CLAP note-dialect plug-ins receive per-note tuning, pan, Mod X brightness, and release; MIDI 1.0/2.0 inputs receive key, velocity, channel, and release.");
             if let Ok(Some(settings)) = &clap_pattern_preview_settings {
                 ui.horizontal(|ui| {
                     if let Some(instrument) = self
@@ -62241,7 +62241,7 @@ impl DawUi {
                         ));
                     }
                 });
-                ui.small("Assignments and captured CLAP plug-in state are saved per project on this machine, outside the FLP. Pattern loops render at project base tempo. Playlist playback uses the clip schedule and tempo changes. Both mix directly to Master; Mixer and Layer routing remain unsupported.");
+                ui.small("Assignments and captured CLAP plug-in state are saved per project on this machine, outside the FLP. Pattern loops render at project base tempo and mix directly to Master. Playlist playback uses the clip schedule and tempo changes, follows saved Mixer routes, and can pass through loaded VST3 insert effects.");
             }
             if !self.clap_pattern_playback_instruments.is_empty() {
                 ui.collapsing("Assigned CLAP Pattern channels", |ui| {

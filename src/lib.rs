@@ -4084,7 +4084,7 @@ impl Default for MixerSourceRouteTransform {
 }
 
 impl MixerSourceRouteTransform {
-    const fn zero() -> Self {
+    pub(crate) const fn zero() -> Self {
         Self { matrix: [0.0; 4] }
     }
 
