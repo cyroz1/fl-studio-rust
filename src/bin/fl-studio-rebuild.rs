@@ -59573,6 +59573,32 @@ impl DawUi {
                         .arrangement_live_selection_start
                 };
                 selection_point.store(u64::from(tick), Ordering::Relaxed);
+                if stop {
+                    let start_tick = self
+                        .midi_script_transport_state
+                        .arrangement_live_selection_start
+                        .load(Ordering::Relaxed)
+                        .min(u64::from(u32::MAX)) as u32;
+                    let arrangement_id = self.selected_arrangement.or_else(|| {
+                        self.document.as_ref().and_then(|document| {
+                            document
+                                .arrangements()
+                                .ok()?
+                                .first()
+                                .map(|arrangement| arrangement.id)
+                        })
+                    });
+                    if let Some(arrangement_id) = arrangement_id {
+                        self.selected_arrangement = Some(arrangement_id);
+                        self.playlist_time_selection = (start_tick != tick).then_some((
+                            arrangement_id,
+                            start_tick.min(tick),
+                            start_tick.max(tick),
+                        ));
+                    }
+                } else {
+                    self.playlist_time_selection = None;
+                }
             }
             MidiTransportCommand::SetPlaylistTrackSelection(track_ids) => {
                 self.set_midi_script_playlist_track_selection(track_ids);
