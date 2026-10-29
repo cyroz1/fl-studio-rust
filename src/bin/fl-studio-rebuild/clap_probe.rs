@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 use clack_extensions::audio_ports::{AudioPortFlags, AudioPortInfoBuffer, PluginAudioPorts};
 use clack_extensions::note_ports::{NoteDialect, NotePortInfoBuffer, PluginNotePorts};
 use clack_extensions::params::{ParamInfoBuffer, PluginParams};
-use clack_host::events::event_types::{Midi2Event, MidiEvent, NoteOffEvent, NoteOnEvent};
+use clack_host::events::event_types::{
+    Midi2Event, MidiEvent, NoteExpressionEvent, NoteExpressionType, NoteOffEvent, NoteOnEvent,
+};
 use clack_host::prelude::{
     AudioPortBuffer, AudioPortBufferType, AudioPorts, EventBuffer, HostInfo, InputAudioBuffers,
     InputChannel, PluginAudioConfiguration, PluginEntry, PluginInstance, ProcessStatus,
@@ -125,6 +127,10 @@ pub struct ClapPatternNote {
     pub key: u16,
     pub velocity: u8,
     pub midi_channel: u8,
+    pub fine_pitch_cents: i16,
+    pub pan: u8,
+    pub release: u8,
+    pub mod_x: u8,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -476,8 +482,16 @@ impl ClapPreviewProcess {
         for note in &settings.notes {
             writeln!(
                 self.stdin,
-                "NOTE {} {} {} {} {}",
-                note.position_ticks, note.length_ticks, note.key, note.velocity, note.midi_channel,
+                "NOTE {} {} {} {} {} {} {} {} {}",
+                note.position_ticks,
+                note.length_ticks,
+                note.key,
+                note.velocity,
+                note.midi_channel,
+                note.fine_pitch_cents,
+                note.pan,
+                note.release,
+                note.mod_x,
             )
             .map_err(|error| format!("could not send a CLAP Pattern note: {error}"))?;
         }
@@ -949,12 +963,20 @@ fn parse_pattern_preview_note(line: &str) -> Result<ClapPatternNote, String> {
         Some(key),
         Some(velocity),
         Some(midi_channel),
+        Some(fine_pitch_cents),
+        Some(pan),
+        Some(release),
+        Some(mod_x),
         None,
     ) = (
         fields.next(),
         fields.next().and_then(|field| field.parse::<u32>().ok()),
         fields.next().and_then(|field| field.parse::<u32>().ok()),
         fields.next().and_then(|field| field.parse::<u16>().ok()),
+        fields.next().and_then(|field| field.parse::<u8>().ok()),
+        fields.next().and_then(|field| field.parse::<u8>().ok()),
+        fields.next().and_then(|field| field.parse::<i16>().ok()),
+        fields.next().and_then(|field| field.parse::<u8>().ok()),
         fields.next().and_then(|field| field.parse::<u8>().ok()),
         fields.next().and_then(|field| field.parse::<u8>().ok()),
         fields.next(),
@@ -968,6 +990,10 @@ fn parse_pattern_preview_note(line: &str) -> Result<ClapPatternNote, String> {
         key,
         velocity,
         midi_channel,
+        fine_pitch_cents,
+        pan,
+        release,
+        mod_x,
     })
 }
 
@@ -1131,6 +1157,10 @@ impl ClapNotePreviewInstance {
                 velocity,
                 midi_channel: 0,
                 note_id: 0,
+                fine_pitch_cents: 0,
+                pan: 64,
+                release: 0,
+                mod_x: 128,
                 is_note_on: true,
             },
             ScheduledClapNoteEvent {
@@ -1140,6 +1170,10 @@ impl ClapNotePreviewInstance {
                 velocity: 0,
                 midi_channel: 0,
                 note_id: 0,
+                fine_pitch_cents: 0,
+                pan: 64,
+                release: 0,
+                mod_x: 128,
                 is_note_on: false,
             },
         ];
@@ -1204,8 +1238,8 @@ impl ClapNotePreviewInstance {
             while event_index < events.len() && events[event_index].frame < u64::from(frame_end) {
                 event_index += 1;
             }
-            let mut input_event_buffer =
-                EventBuffer::with_capacity(event_index.saturating_sub(block_event_start));
+            let event_count = event_index.saturating_sub(block_event_start);
+            let mut input_event_buffer = EventBuffer::with_capacity(event_count.saturating_mul(4));
             for event in &events[block_event_start..event_index] {
                 let event_time = u32::try_from(event.frame.saturating_sub(u64::from(frame_offset)))
                     .map_err(|_| "CLAP note event offset exceeds the audio block".to_owned())?;
@@ -1222,9 +1256,31 @@ impl ClapNotePreviewInstance {
                             pckn,
                             f64::from(event.velocity) / 127.0,
                         ));
+                        input_event_buffer.push(&NoteExpressionEvent::new(
+                            event_time,
+                            pckn,
+                            NoteExpressionType::Tuning,
+                            f64::from(event.fine_pitch_cents) / 100.0,
+                        ));
+                        input_event_buffer.push(&NoteExpressionEvent::new(
+                            event_time,
+                            pckn,
+                            NoteExpressionType::Pan,
+                            f64::from(event.pan) / 128.0,
+                        ));
+                        input_event_buffer.push(&NoteExpressionEvent::new(
+                            event_time,
+                            pckn,
+                            NoteExpressionType::Brightness,
+                            f64::from(event.mod_x) / 255.0,
+                        ));
                     }
                     (PreviewNoteDialect::Clap, false) => {
-                        input_event_buffer.push(&NoteOffEvent::new(event_time, pckn, 0.0));
+                        input_event_buffer.push(&NoteOffEvent::new(
+                            event_time,
+                            pckn,
+                            f64::from(event.release) / 128.0,
+                        ));
                     }
                     (PreviewNoteDialect::Midi, true) => {
                         input_event_buffer.push(&MidiEvent::new(
@@ -1237,7 +1293,11 @@ impl ClapNotePreviewInstance {
                         input_event_buffer.push(&MidiEvent::new(
                             event_time,
                             self.note_port_index,
-                            [0x80 | event.midi_channel, event.key, 0],
+                            [
+                                0x80 | event.midi_channel,
+                                event.key,
+                                midi_preview_release_velocity(event.release),
+                            ],
                         ));
                     }
                     (PreviewNoteDialect::Midi2, true) => {
@@ -1256,7 +1316,7 @@ impl ClapNotePreviewInstance {
                             self.note_port_index,
                             event.midi_channel,
                             event.key,
-                            0,
+                            midi2_preview_velocity(midi_preview_release_velocity(event.release)),
                             false,
                         ));
                     }
@@ -1364,6 +1424,10 @@ struct ScheduledClapNoteEvent {
     velocity: u8,
     midi_channel: u8,
     note_id: u32,
+    fine_pitch_cents: i16,
+    pan: u8,
+    release: u8,
+    mod_x: u8,
     is_note_on: bool,
 }
 
@@ -1428,6 +1492,24 @@ fn schedule_pattern_preview_events(
                 note.velocity
             ));
         }
+        if !(-1200..=1200).contains(&note.fine_pitch_cents) {
+            return Err(format!(
+                "CLAP Pattern preview fine pitch {} is outside −1200…1200 cents",
+                note.fine_pitch_cents
+            ));
+        }
+        if note.pan > 128 {
+            return Err(format!(
+                "CLAP Pattern preview pan {} is outside 0–128",
+                note.pan
+            ));
+        }
+        if note.release > 128 {
+            return Err(format!(
+                "CLAP Pattern preview release {} is outside 0–128",
+                note.release
+            ));
+        }
         if note.midi_channel > 15 {
             return Err(format!(
                 "CLAP Pattern preview MIDI channel {} is outside 0–15",
@@ -1448,6 +1530,10 @@ fn schedule_pattern_preview_events(
             velocity: note.velocity,
             midi_channel: note.midi_channel,
             note_id,
+            fine_pitch_cents: note.fine_pitch_cents,
+            pan: note.pan,
+            release: note.release,
+            mod_x: note.mod_x,
             is_note_on: true,
         });
         events.push(ScheduledClapNoteEvent {
@@ -1457,6 +1543,10 @@ fn schedule_pattern_preview_events(
             velocity: 0,
             midi_channel: note.midi_channel,
             note_id,
+            fine_pitch_cents: note.fine_pitch_cents,
+            pan: note.pan,
+            release: note.release,
+            mod_x: note.mod_x,
             is_note_on: false,
         });
         last_event_frame = last_event_frame.max(end_frame);
@@ -1617,6 +1707,10 @@ fn midi2_preview_note_event(
 
 fn midi2_preview_velocity(velocity: u8) -> u16 {
     ((u32::from(velocity) * u32::from(u16::MAX)) / 127) as u16
+}
+
+fn midi_preview_release_velocity(release: u8) -> u8 {
+    ((u16::from(release.min(128)) * 127 + 64) / 128) as u8
 }
 
 fn inspect_plugin_instance(path: &Path, plugin_id: &str) -> Result<ClapInstanceInfo, String> {
@@ -2119,6 +2213,10 @@ mod tests {
                     key: 60,
                     velocity: 100,
                     midi_channel: 0,
+                    fine_pitch_cents: -35,
+                    pan: 48,
+                    release: 32,
+                    mod_x: 100,
                 },
                 ClapPatternNote {
                     position_ticks: 96,
@@ -2126,6 +2224,10 @@ mod tests {
                     key: 60,
                     velocity: 80,
                     midi_channel: 0,
+                    fine_pitch_cents: 0,
+                    pan: 64,
+                    release: 64,
+                    mod_x: 128,
                 },
             ],
         }
@@ -2142,8 +2244,12 @@ mod tests {
         assert_eq!((events[0].frame, events[0].is_note_on), (0, true));
         assert_eq!(events[1].frame, 24_000);
         assert!(!events[1].is_note_on);
+        assert_eq!(events[1].release, 32);
         assert_eq!(events[2].frame, 24_000);
         assert!(events[2].is_note_on);
+        assert_eq!(events[2].fine_pitch_cents, 0);
+        assert_eq!(events[2].pan, 64);
+        assert_eq!(events[2].mod_x, 128);
         assert_eq!((events[3].frame, events[3].is_note_on), (48_000, false));
     }
 
@@ -2151,7 +2257,9 @@ mod tests {
     fn pattern_preview_parser_reads_bounded_note_records() {
         let tempo_bpm = 123.5_f64;
         let header = format!("96 {:016x} 192 2", tempo_bpm.to_bits());
-        let mut input = Cursor::new(b"NOTE 0 96 60 100 0\nNOTE 96 96 64 80 2\nEND\n".as_slice());
+        let mut input = Cursor::new(
+            b"NOTE 0 96 60 100 0 -35 48 32 100\nNOTE 96 96 64 80 2 0 64 64 128\nEND\n".as_slice(),
+        );
 
         let parsed = parse_pattern_preview_request(&header, &mut input, 48_000)
             .expect("valid Pattern protocol should parse");
@@ -2162,6 +2270,10 @@ mod tests {
         assert_eq!(parsed.notes.len(), 2);
         assert_eq!(parsed.notes[1].key, 64);
         assert_eq!(parsed.notes[1].midi_channel, 2);
+        assert_eq!(parsed.notes[0].fine_pitch_cents, -35);
+        assert_eq!(parsed.notes[0].pan, 48);
+        assert_eq!(parsed.notes[0].release, 32);
+        assert_eq!(parsed.notes[0].mod_x, 100);
     }
 
     #[test]
@@ -2181,5 +2293,25 @@ mod tests {
         let mut settings = pattern_preview_settings();
         settings.notes[0].key = 128;
         assert!(schedule_pattern_preview_events(&settings, 48_000).is_err());
+
+        let mut settings = pattern_preview_settings();
+        settings.notes[0].fine_pitch_cents = 1201;
+        assert!(schedule_pattern_preview_events(&settings, 48_000).is_err());
+
+        let mut settings = pattern_preview_settings();
+        settings.notes[0].pan = 129;
+        assert!(schedule_pattern_preview_events(&settings, 48_000).is_err());
+
+        let mut settings = pattern_preview_settings();
+        settings.notes[0].release = 129;
+        assert!(schedule_pattern_preview_events(&settings, 48_000).is_err());
+    }
+
+    #[test]
+    fn pattern_release_maps_to_the_midi_note_off_velocity_range() {
+        assert_eq!(super::midi_preview_release_velocity(0), 0);
+        assert_eq!(super::midi_preview_release_velocity(64), 64);
+        assert_eq!(super::midi_preview_release_velocity(128), 127);
+        assert_eq!(super::midi_preview_release_velocity(255), 127);
     }
 }

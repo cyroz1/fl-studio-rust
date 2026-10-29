@@ -19750,6 +19750,10 @@ impl DawUi {
                 key: note.key,
                 velocity: note.velocity,
                 midi_channel: note.midi_channel_index(),
+                fine_pitch_cents: note.fine_pitch_offset_cents(),
+                pan: note.pan.min(128),
+                release: note.release.min(128),
+                mod_x: note.mod_x,
             })
             .collect::<Vec<_>>();
         if notes.is_empty() {
@@ -61096,7 +61100,7 @@ impl DawUi {
                     ui.colored_label(ORANGE, error);
                 }
             }
-            ui.small("Pattern previews use the project base tempo; Playlist tempo automation, Layer routing, and Mixer routing are not applied.");
+            ui.small("Pattern previews use project base tempo. CLAP note-dialect plug-ins receive per-note tuning, pan, Mod X brightness, and release; MIDI 1.0/2.0 inputs receive key, velocity, channel, and release. Playlist tempo automation, Layer routing, and Mixer routing are not applied.");
             for candidate in clap_candidates {
                 let inspection = self.clap_inspection_states.get(&candidate.path);
                 egui::Frame::new()
