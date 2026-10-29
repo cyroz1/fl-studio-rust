@@ -28272,6 +28272,64 @@ impl DawUi {
                                     Color32::WHITE,
                                 );
                             }
+                            if let Some((selection_arrangement, selection_start, selection_end)) =
+                                self.playlist_time_selection
+                                && selection_arrangement == arrangement.id
+                            {
+                                let clip_start = clip.position_ticks;
+                                let clip_end = clip_start.saturating_add(clip.length_ticks);
+                                let outside_ranges = [
+                                    (
+                                        clip_start,
+                                        clip_end.min(selection_start),
+                                        clip_start < selection_start
+                                            && clip_start < selection_end
+                                            && clip_end > selection_start,
+                                    ),
+                                    (
+                                        clip_start.max(selection_end),
+                                        clip_end,
+                                        clip_end > selection_end
+                                            && clip_start < selection_end
+                                            && clip_end > selection_start,
+                                    ),
+                                ];
+                                for (outside_start, outside_end, outside_selection) in
+                                    outside_ranges
+                                {
+                                    if !outside_selection || outside_end <= outside_start {
+                                        continue;
+                                    }
+                                    let outside_rect = egui::Rect::from_min_max(
+                                        egui::pos2(
+                                            grid_rect.left()
+                                                + outside_start as f32 * tick_scale,
+                                            clip_rect.top(),
+                                        ),
+                                        egui::pos2(
+                                            grid_rect.left() + outside_end as f32 * tick_scale,
+                                            clip_rect.bottom(),
+                                        ),
+                                    )
+                                    .intersect(clip_rect)
+                                    .intersect(grid_rect);
+                                    if outside_rect.is_positive() {
+                                        clip_painter.rect_filled(
+                                            outside_rect,
+                                            0,
+                                            Color32::from_rgba_unmultiplied(205, 52, 62, 110),
+                                        );
+                                    }
+                                }
+                                if clip_start < selection_end && clip_end > selection_start {
+                                    clip_painter.rect_stroke(
+                                        clip_rect,
+                                        egui::CornerRadius::same(3),
+                                        Stroke::new(1.0, color.gamma_multiply(0.65)),
+                                        egui::StrokeKind::Inside,
+                                    );
+                                }
+                            }
                             let response = ui.interact(
                                 clip_rect,
                                 Id::new(("playlist-clip", arrangement.id, clip_index)),
