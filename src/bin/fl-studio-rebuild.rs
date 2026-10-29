@@ -5564,6 +5564,7 @@ struct PlaylistOfflineRenderJob {
     output_path: PathBuf,
     options: PlaylistRenderOptions,
     vst3_processor: Option<Vst3PlaylistStreamProcessor>,
+    range: Option<PlaylistRenderRange>,
     kind: PlaylistOfflineRenderKind,
 }
 
@@ -21904,9 +21905,11 @@ impl DawUi {
             output_path,
             options,
             vst3_processor,
+            range,
             kind,
         } = job;
         let worker_output_path = output_path.clone();
+        let rendering_time_selection = range.is_some();
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
         let (sender, receiver) = mpsc::sync_channel(1);
@@ -21916,13 +21919,27 @@ impl DawUi {
                 PlaylistOfflineRenderKind::MixerStems { .. } => "mixer-stem-render".to_owned(),
             })
             .spawn(move || {
-                let result = match kind {
-                    PlaylistOfflineRenderKind::Mix {
-                        output_format,
-                        flac_bits_per_sample,
-                        ogg_bitrate_kbps,
-                        mp3_bitrate_kbps,
-                    } => match output_format {
+                let result = match (kind, range) {
+                    (PlaylistOfflineRenderKind::Mix { .. }, Some(range)) => {
+                        render_playlist_with_vst3_to_file_from_frame_cancellable(
+                            &document,
+                            &project_path,
+                            options,
+                            &worker_output_path,
+                            range,
+                            vst3_processor,
+                            &worker_cancelled,
+                        )
+                    }
+                    (
+                        PlaylistOfflineRenderKind::Mix {
+                            output_format,
+                            flac_bits_per_sample,
+                            ogg_bitrate_kbps,
+                            mp3_bitrate_kbps,
+                        },
+                        None,
+                    ) => match output_format {
                         PlaylistSongOutputFormat::Wav => {
                             render_playlist_with_vst3_to_wav_cancellable(
                                 &document,
@@ -21967,9 +21984,12 @@ impl DawUi {
                             )
                         }
                     },
-                    PlaylistOfflineRenderKind::MixerStems {
-                        options: stem_options,
-                    } => render_playlist_mixer_stems_with_vst3_cancellable(
+                    (
+                        PlaylistOfflineRenderKind::MixerStems {
+                            options: stem_options,
+                        },
+                        None,
+                    ) => render_playlist_mixer_stems_with_vst3_cancellable(
                         &document,
                         &project_path,
                         options,
@@ -21977,6 +21997,9 @@ impl DawUi {
                         stem_options,
                         vst3_processor,
                         &worker_cancelled,
+                    ),
+                    (PlaylistOfflineRenderKind::MixerStems { .. }, Some(_)) => Err(
+                        "time-range selection is not supported for Mixer stem export".to_owned(),
                     ),
                 };
                 let _ = sender.send(result);
@@ -21998,6 +22021,12 @@ impl DawUi {
                     pattern_clip_placement: None,
                 });
                 self.status = match kind {
+                    PlaylistOfflineRenderKind::Mix { .. } if rendering_time_selection => {
+                        format!(
+                            "Rendering Playlist time selection to {}…",
+                            output_path.display()
+                        )
+                    }
                     PlaylistOfflineRenderKind::Mix { .. } => {
                         format!("Rendering Playlist mix to {}…", output_path.display())
                     }
@@ -48605,6 +48634,7 @@ impl DawUi {
                     PlaylistRenderRange {
                         output_format,
                         output_start_frame,
+                        output_end_frame: None,
                         minimum_content_frames,
                     },
                     vst3_processor,
@@ -49519,8 +49549,16 @@ impl DawUi {
             .map(|stem| stem.to_string_lossy().into_owned())
             .unwrap_or_else(|| "FL_Studio_Project".to_owned());
         let output_format = self.playlist_song_output_format;
+        let arrangement_id = self.selected_arrangement.unwrap_or_default();
+        let selected_time_range = self
+            .playlist_time_selection
+            .filter(|(selection_arrangement, _, _)| *selection_arrangement == arrangement_id);
         let file_dialog = rfd::FileDialog::new()
-            .set_title("Render Playlist mix")
+            .set_title(if selected_time_range.is_some() {
+                "Render Playlist time selection"
+            } else {
+                "Render Playlist mix"
+            })
             .set_file_name(format!("{project_stem}.{}", output_format.extension()));
         let file_dialog = match output_format {
             PlaylistSongOutputFormat::Wav => file_dialog.add_filter("WAV audio", &["wav"]),
@@ -49535,8 +49573,50 @@ impl DawUi {
         let ogg_bitrate_kbps = self.playlist_render_ogg_bitrate_kbps;
         let mp3_bitrate_kbps = self.playlist_render_mp3_bitrate_kbps;
 
-        let options = PlaylistRenderOptions {
-            arrangement_id: self.selected_arrangement.unwrap_or_default(),
+        let render_range = if let Some((_, start_tick, end_tick)) = selected_time_range {
+            let tempo_map = match PlaylistTempoMap::for_arrangement(document, arrangement_id) {
+                Ok(tempo_map) => tempo_map,
+                Err(error) => {
+                    self.status =
+                        format!("Could not prepare Playlist time-selection tempo map: {error}");
+                    return;
+                }
+            };
+            let output_start_frame = match tempo_map
+                .frame_at_tick(u64::from(start_tick), self.audio_settings.sample_rate)
+            {
+                Ok(frame) => frame,
+                Err(error) => {
+                    self.status =
+                        format!("Could not calculate time-selection start frame: {error}");
+                    return;
+                }
+            };
+            let output_end_frame = match tempo_map
+                .frame_at_tick(u64::from(end_tick), self.audio_settings.sample_rate)
+            {
+                Ok(frame) => frame,
+                Err(error) => {
+                    self.status = format!("Could not calculate time-selection end frame: {error}");
+                    return;
+                }
+            };
+            if output_end_frame <= output_start_frame {
+                self.status = "Playlist time selection is shorter than one output frame".to_owned();
+                return;
+            }
+            Some(PlaylistRenderRange {
+                output_format: self.audio_render_output(),
+                output_start_frame,
+                output_end_frame: Some(output_end_frame),
+                minimum_content_frames: 0,
+            })
+        } else {
+            None
+        };
+
+        let mut options = PlaylistRenderOptions {
+            arrangement_id,
             sample_rate: self.audio_settings.sample_rate,
             soloed_playlist_track_range: self.soloed_playlist_track_range,
             read_sample_root_note: self.read_sample_root_note,
@@ -49560,6 +49640,10 @@ impl DawUi {
             tail_mode: self.playlist_render_tail_mode,
             ..PlaylistRenderOptions::default()
         };
+        if render_range.is_some() {
+            options.tail_mode = PlaylistTailMode::FixedDuration;
+            options.tail_seconds = 0;
+        }
         let playlist_parameter_automation = self.vst3_playlist_automation_sources(document);
         let vst3_processor = self
             .vst3_host
@@ -49591,6 +49675,7 @@ impl DawUi {
             output_path,
             options,
             vst3_processor,
+            range: render_range,
             kind: PlaylistOfflineRenderKind::Mix {
                 output_format,
                 flac_bits_per_sample,
@@ -49691,6 +49776,7 @@ impl DawUi {
             output_path: output_directory,
             options,
             vst3_processor,
+            range: None,
             kind: PlaylistOfflineRenderKind::MixerStems {
                 options: stem_options,
             },

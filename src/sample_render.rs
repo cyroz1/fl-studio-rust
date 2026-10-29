@@ -1390,6 +1390,8 @@ pub enum PlaylistTailMode {
 pub struct PlaylistRenderRange {
     pub output_format: AudioRenderOutput,
     pub output_start_frame: u64,
+    /// Stop output at this exclusive song-frame position, preserving timeline selection bounds.
+    pub output_end_frame: Option<u64>,
     pub minimum_content_frames: u64,
 }
 
@@ -3503,6 +3505,7 @@ pub fn render_playlist_with_vst3_to_wav_cancellable(
         PlaylistRenderWindow {
             output: PlaylistRenderOutput::Wav,
             output_start_frame: 0,
+            output_end_frame: None,
             minimum_content_frames: 0,
             full_song_wav: true,
         },
@@ -3529,6 +3532,7 @@ pub fn render_playlist_with_vst3_to_flac_cancellable(
         PlaylistRenderWindow {
             output: PlaylistRenderOutput::Flac { bits_per_sample },
             output_start_frame: 0,
+            output_end_frame: None,
             minimum_content_frames: 0,
             full_song_wav: false,
         },
@@ -3555,6 +3559,7 @@ pub fn render_playlist_with_vst3_to_ogg_cancellable(
         PlaylistRenderWindow {
             output: PlaylistRenderOutput::Ogg { bitrate_kbps },
             output_start_frame: 0,
+            output_end_frame: None,
             minimum_content_frames: 0,
             full_song_wav: false,
         },
@@ -3581,6 +3586,7 @@ pub fn render_playlist_with_vst3_to_mp3_cancellable(
         PlaylistRenderWindow {
             output: PlaylistRenderOutput::Mp3 { bitrate_kbps },
             output_start_frame: 0,
+            output_end_frame: None,
             minimum_content_frames: 0,
             full_song_wav: false,
         },
@@ -3617,6 +3623,7 @@ pub fn render_playlist_with_vst3_to_file_from_frame_cancellable(
         PlaylistRenderWindow {
             output,
             output_start_frame: range.output_start_frame,
+            output_end_frame: range.output_end_frame,
             minimum_content_frames: range.minimum_content_frames,
             full_song_wav: false,
         },
@@ -3637,6 +3644,7 @@ enum PlaylistRenderOutput {
 struct PlaylistRenderWindow {
     output: PlaylistRenderOutput,
     output_start_frame: u64,
+    output_end_frame: Option<u64>,
     minimum_content_frames: u64,
     full_song_wav: bool,
 }
@@ -3653,6 +3661,7 @@ fn render_playlist_with_vst3_cancellable(
     let PlaylistRenderWindow {
         output,
         output_start_frame,
+        output_end_frame,
         minimum_content_frames,
         full_song_wav,
     } = window;
@@ -3772,10 +3781,13 @@ fn render_playlist_with_vst3_cancellable(
     {
         content_frames = content_frames.max(last_cue_frame);
     }
-    if output_start_frame > 0 {
+    if output_start_frame > 0 || output_end_frame.is_some() {
         wav_cue_points.retain_mut(|point| {
-            let Some(offset) = u64::from(point.sample_offset).checked_sub(output_start_frame)
-            else {
+            let absolute_offset = u64::from(point.sample_offset);
+            if output_end_frame.is_some_and(|end_frame| absolute_offset >= end_frame) {
+                return false;
+            }
+            let Some(offset) = absolute_offset.checked_sub(output_start_frame) else {
                 return false;
             };
             let Ok(offset) = u32::try_from(offset) else {
@@ -3797,21 +3809,33 @@ fn render_playlist_with_vst3_cancellable(
         }
         PlaylistTailMode::FixedDuration => minimum_tail_end_frame,
     };
-    let remainder_stop = matches!(
-        options.tail_mode,
-        PlaylistTailMode::LeaveRemainder | PlaylistTailMode::WrapRemainder
-    )
-    .then(|| PlaylistRemainderStop {
-        start_frame: minimum_tail_end_frame.max(output_start_frame),
-        silence_frames: u64::from(options.sample_rate)
-            .saturating_mul(PLAYLIST_REMAINDER_SILENCE_SECONDS),
-    });
+    let remainder_stop = if output_end_frame.is_none()
+        && matches!(
+            options.tail_mode,
+            PlaylistTailMode::LeaveRemainder | PlaylistTailMode::WrapRemainder
+        ) {
+        Some(PlaylistRemainderStop {
+            start_frame: minimum_tail_end_frame.max(output_start_frame),
+            silence_frames: u64::from(options.sample_rate)
+                .saturating_mul(PLAYLIST_REMAINDER_SILENCE_SECONDS),
+        })
+    } else {
+        None
+    };
+    if output_end_frame.is_some_and(|end_frame| end_frame <= output_start_frame) {
+        return Err("render output end must be after its start".to_owned());
+    }
+    if let Some(end_frame) = output_end_frame {
+        frames = end_frame;
+    }
     if output_start_frame >= frames {
         return Err("render output start is after the end of the Playlist content".to_owned());
     }
     if let Some(processor) = vst3_processor.as_mut() {
         processor.extend_to_output_frames(frames)?;
-        frames = frames.max(processor.summary().frames);
+        if output_end_frame.is_none() {
+            frames = frames.max(processor.summary().frames);
+        }
     }
     let pdc_trim_frames = if full_song_wav
         && matches!(output, PlaylistRenderOutput::Wav)
@@ -3828,7 +3852,9 @@ fn render_playlist_with_vst3_cancellable(
     if render_skip_frames >= frames {
         return Err("PDC trim removes the entire Playlist render".to_owned());
     }
-    let output_frames = if options.tail_mode == PlaylistTailMode::WrapRemainder {
+    let output_frames = if let Some(end_frame) = output_end_frame {
+        end_frame - render_skip_frames
+    } else if options.tail_mode == PlaylistTailMode::WrapRemainder {
         content_frames
             .checked_sub(render_skip_frames)
             .filter(|frames| *frames > 0)
@@ -3877,7 +3903,7 @@ fn render_playlist_with_vst3_cancellable(
         .file
         .as_mut()
         .expect("temporary render file is open");
-    if options.tail_mode == PlaylistTailMode::WrapRemainder {
+    if options.tail_mode == PlaylistTailMode::WrapRemainder && output_end_frame.is_none() {
         let mut wrap_frames_to_skip = render_skip_frames;
         let mut float_spool = tempfile::tempfile()
             .map_err(|error| format!("could not create temporary render spool: {error}"))?;
