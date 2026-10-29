@@ -15,7 +15,8 @@ use audio_unit_probe::{
 use clap_probe::{
     ClapInspectionResponse, ClapInspectionState, ClapInstanceInspectionResponse,
     ClapInstanceInspectionState, ClapNotePreviewRequest, ClapNotePreviewResponse,
-    ClapNotePreviewState,
+    ClapNotePreviewSettings, ClapNotePreviewState, MAX_NOTE_PREVIEW_NOTE_MILLISECONDS,
+    MIN_NOTE_PREVIEW_NOTE_MILLISECONDS,
 };
 use eframe::egui::{self, Align2, Color32, FontId, Id, PointerButton, Sense, Stroke, Vec2};
 use flp_rebuild::audio::{
@@ -5174,10 +5175,11 @@ struct DawUi {
     clap_instance_inspection_states: BTreeMap<(PathBuf, String), ClapInstanceInspectionState>,
     clap_note_preview_sender: Sender<ClapNotePreviewRequest>,
     clap_note_preview_receiver: Receiver<ClapNotePreviewResponse>,
-    clap_note_preview_states: BTreeMap<(PathBuf, String, u8, u8), ClapNotePreviewState>,
+    clap_note_preview_states: BTreeMap<(PathBuf, String, u8, u8, u32), ClapNotePreviewState>,
     clap_note_preview_request_id: u64,
     clap_preview_note_key: u8,
     clap_preview_velocity: u8,
+    clap_preview_note_duration_milliseconds: u32,
     vst3_host: Option<Vst3HostRuntime>,
     vst3_manual_latency_offsets: BTreeMap<String, i32>,
     vst3_project_manual_latency_offsets: BTreeMap<String, i32>,
@@ -7140,6 +7142,7 @@ impl DawUi {
             clap_note_preview_request_id: 0,
             clap_preview_note_key: 60,
             clap_preview_velocity: 100,
+            clap_preview_note_duration_milliseconds: 500,
             vst3_host: None,
             vst3_manual_latency_offsets,
             vst3_project_manual_latency_offsets: BTreeMap::new(),
@@ -19593,10 +19596,14 @@ impl DawUi {
         path: PathBuf,
         plugin_id: String,
         plugin_name: String,
-        note_key: u8,
-        velocity: u8,
+        settings: ClapNotePreviewSettings,
         ctx: &egui::Context,
     ) {
+        let ClapNotePreviewSettings {
+            note_key,
+            velocity,
+            note_duration_milliseconds,
+        } = settings;
         if self
             .clap_note_preview_states
             .values()
@@ -19616,7 +19623,13 @@ impl DawUi {
                 Ok(engine) => self.audio_engine = Some(engine),
                 Err(error) => {
                     self.clap_note_preview_states.insert(
-                        (path, plugin_id, note_key, velocity),
+                        (
+                            path,
+                            plugin_id,
+                            note_key,
+                            velocity,
+                            note_duration_milliseconds,
+                        ),
                         ClapNotePreviewState::Failed(error.clone()),
                     );
                     self.status = format!("Could not start CLAP preview audio: {error}");
@@ -19630,7 +19643,13 @@ impl DawUi {
         if !engine.output_active() {
             let error = "Enable an output device before previewing a CLAP instrument".to_owned();
             self.clap_note_preview_states.insert(
-                (path, plugin_id, note_key, velocity),
+                (
+                    path,
+                    plugin_id,
+                    note_key,
+                    velocity,
+                    note_duration_milliseconds,
+                ),
                 ClapNotePreviewState::Failed(error.clone()),
             );
             self.status = error;
@@ -19645,7 +19664,13 @@ impl DawUi {
         engine.stop_browser_preview();
         engine.set_browser_preview_looping(false);
 
-        let key = (path.clone(), plugin_id.clone(), note_key, velocity);
+        let key = (
+            path.clone(),
+            plugin_id.clone(),
+            note_key,
+            velocity,
+            note_duration_milliseconds,
+        );
         self.clap_note_preview_states
             .insert(key.clone(), ClapNotePreviewState::Rendering);
         if self
@@ -19657,6 +19682,7 @@ impl DawUi {
                 sample_rate,
                 note_key,
                 velocity,
+                note_duration_milliseconds,
                 request_id,
             ))
             .is_err()
@@ -19666,20 +19692,35 @@ impl DawUi {
                 .insert(key, ClapNotePreviewState::Failed(error.clone()));
             self.status = error;
         } else {
-            self.status =
-                format!("Rendering MIDI note {note_key} at velocity {velocity} for {plugin_name}");
+            self.status = format!(
+                "Rendering MIDI note {note_key} at velocity {velocity} for {note_duration_milliseconds} ms for {plugin_name}"
+            );
             ctx.request_repaint_after(Duration::from_millis(40));
         }
     }
 
     fn poll_clap_note_preview(&mut self, ctx: &egui::Context) {
-        while let Ok((path, plugin_id, plugin_name, note_key, velocity, request_id, result)) =
-            self.clap_note_preview_receiver.try_recv()
+        while let Ok((
+            path,
+            plugin_id,
+            plugin_name,
+            note_key,
+            velocity,
+            note_duration_milliseconds,
+            request_id,
+            result,
+        )) = self.clap_note_preview_receiver.try_recv()
         {
             if request_id != self.clap_note_preview_request_id {
                 continue;
             }
-            let key = (path, plugin_id, note_key, velocity);
+            let key = (
+                path,
+                plugin_id,
+                note_key,
+                velocity,
+                note_duration_milliseconds,
+            );
             if !matches!(
                 self.clap_note_preview_states.get(&key),
                 Some(ClapNotePreviewState::Rendering)
@@ -19708,7 +19749,7 @@ impl DawUi {
                     self.clap_note_preview_states
                         .insert(key, ClapNotePreviewState::Ready);
                     self.status = format!(
-                        "Previewing {plugin_name} at MIDI note {note_key}, velocity {velocity}"
+                        "Previewing {plugin_name} at MIDI note {note_key}, velocity {velocity}, note length {note_duration_milliseconds} ms"
                     );
                 }
                 Err(error) => {
@@ -60795,8 +60836,19 @@ impl DawUi {
                         .range(1..=127)
                         .speed(1),
                 );
+                ui.label("Note length (ms)");
+                ui.add(
+                    egui::DragValue::new(&mut self.clap_preview_note_duration_milliseconds)
+                        .range(
+                            MIN_NOTE_PREVIEW_NOTE_MILLISECONDS
+                                ..=MAX_NOTE_PREVIEW_NOTE_MILLISECONDS,
+                        )
+                        .speed(10),
+                );
             });
-            ui.small("MIDI note is 0–127; velocity is 1–127. The default note 60 is C4.");
+            ui.small(format!(
+                "MIDI note is 0–127; velocity is 1–127; note length is {MIN_NOTE_PREVIEW_NOTE_MILLISECONDS}–{MAX_NOTE_PREVIEW_NOTE_MILLISECONDS} ms. The default note 60 is C4."
+            ));
             for candidate in clap_candidates {
                 let inspection = self.clap_inspection_states.get(&candidate.path);
                 egui::Frame::new()
@@ -60891,6 +60943,7 @@ impl DawUi {
                                             descriptor.id.clone(),
                                             self.clap_preview_note_key,
                                             self.clap_preview_velocity,
+                                            self.clap_preview_note_duration_milliseconds,
                                         );
                                     if clap_descriptor_supports_note_preview(&descriptor.features) {
                                         let preview_state = self
@@ -60917,8 +60970,12 @@ impl DawUi {
                                                     candidate.path.clone(),
                                                     descriptor.id.clone(),
                                                     descriptor.name.clone(),
-                                                    self.clap_preview_note_key,
-                                                    self.clap_preview_velocity,
+                                                    ClapNotePreviewSettings {
+                                                        note_key: self.clap_preview_note_key,
+                                                        velocity: self.clap_preview_velocity,
+                                                        note_duration_milliseconds: self
+                                                            .clap_preview_note_duration_milliseconds,
+                                                    },
                                                 ));
                                             }
                                             match preview_state {
@@ -61281,15 +61338,8 @@ impl DawUi {
             }
         }
 
-        if let Some((path, plugin_id, plugin_name, note_key, velocity)) = preview_clap_note {
-            self.request_clap_note_preview(
-                path,
-                plugin_id,
-                plugin_name,
-                note_key,
-                velocity,
-                ui.ctx(),
-            );
+        if let Some((path, plugin_id, plugin_name, settings)) = preview_clap_note {
+            self.request_clap_note_preview(path, plugin_id, plugin_name, settings, ui.ctx());
         }
 
         if let Some((path, channel_id, class_uid)) = restore_request {

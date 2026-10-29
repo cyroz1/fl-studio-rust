@@ -29,7 +29,9 @@ const MAX_NOTE_PREVIEW_AUDIO_PORTS: u32 = 16;
 const MAX_NOTE_PREVIEW_TOTAL_CHANNELS: u32 = 64;
 const NOTE_PREVIEW_BLOCK_FRAMES: u32 = 512;
 const NOTE_PREVIEW_DURATION_MILLISECONDS: u32 = 1500;
-const NOTE_PREVIEW_NOTE_MILLISECONDS: u32 = 500;
+const DEFAULT_NOTE_PREVIEW_NOTE_MILLISECONDS: u32 = 500;
+pub const MIN_NOTE_PREVIEW_NOTE_MILLISECONDS: u32 = 50;
+pub const MAX_NOTE_PREVIEW_NOTE_MILLISECONDS: u32 = 1000;
 const PROBE_HEADER: &str = "FL_STUDIO_REBUILD_CLAP_PROBE_V1";
 const INSTANCE_PROBE_HEADER: &str = "FL_STUDIO_REBUILD_CLAP_INSTANCE_V1";
 
@@ -108,15 +110,23 @@ pub enum ClapNotePreviewState {
     Failed(String),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClapNotePreviewSettings {
+    pub note_key: u8,
+    pub velocity: u8,
+    pub note_duration_milliseconds: u32,
+}
+
 pub type ClapInspectionResponse = (PathBuf, Result<Vec<ClapPluginDescriptor>, String>);
 pub type ClapInstanceInspectionResponse = (PathBuf, String, Result<ClapInstanceInfo, String>);
-pub type ClapNotePreviewRequest = (PathBuf, String, String, u32, u8, u8, u64);
+pub type ClapNotePreviewRequest = (PathBuf, String, String, u32, u8, u8, u32, u64);
 pub type ClapNotePreviewResponse = (
     PathBuf,
     String,
     String,
     u8,
     u8,
+    u32,
     u64,
     Result<Vec<f32>, String>,
 );
@@ -192,6 +202,7 @@ pub fn start_note_preview_worker(
                 sample_rate,
                 note_key,
                 velocity,
+                note_duration_milliseconds,
                 request_id,
             )) = request_receiver.recv()
             {
@@ -205,11 +216,12 @@ pub fn start_note_preview_worker(
                     preview_process.take();
                 }
                 let result = if let Some(process) = preview_process.as_mut() {
-                    process.render(note_key, velocity)
+                    process.render(note_key, velocity, note_duration_milliseconds)
                 } else {
                     match ClapPreviewProcess::spawn(&path, &plugin_id, sample_rate) {
                         Ok(mut process) => {
-                            let result = process.render(note_key, velocity);
+                            let result =
+                                process.render(note_key, velocity, note_duration_milliseconds);
                             preview_process = Some(process);
                             result
                         }
@@ -225,6 +237,7 @@ pub fn start_note_preview_worker(
                     plugin_name,
                     note_key,
                     velocity,
+                    note_duration_milliseconds,
                     request_id,
                     result,
                 );
@@ -335,10 +348,18 @@ impl ClapPreviewProcess {
         self.path == path && self.plugin_id == plugin_id && self.sample_rate == sample_rate
     }
 
-    fn render(&mut self, note_key: u8, velocity: u8) -> Result<Vec<f32>, String> {
-        writeln!(self.stdin, "PREVIEW {note_key} {velocity}")
-            .and_then(|_| self.stdin.flush())
-            .map_err(|error| format!("could not send a CLAP preview request: {error}"))?;
+    fn render(
+        &mut self,
+        note_key: u8,
+        velocity: u8,
+        note_duration_milliseconds: u32,
+    ) -> Result<Vec<f32>, String> {
+        writeln!(
+            self.stdin,
+            "PREVIEW {note_key} {velocity} {note_duration_milliseconds}"
+        )
+        .and_then(|_| self.stdin.flush())
+        .map_err(|error| format!("could not send a CLAP preview request: {error}"))?;
         match self.receive_response()? {
             ClapPreviewProcessResponse::Audio(samples) => Ok(samples),
             ClapPreviewProcessResponse::Error(error) => Err(error),
@@ -641,7 +662,14 @@ pub fn run_note_preview_child(
     note_key: u8,
     velocity: u8,
 ) -> i32 {
-    match render_note_preview(path, plugin_id, sample_rate, note_key, velocity) {
+    match render_note_preview(
+        path,
+        plugin_id,
+        sample_rate,
+        note_key,
+        velocity,
+        DEFAULT_NOTE_PREVIEW_NOTE_MILLISECONDS,
+    ) {
         Ok(samples) => {
             let mut bytes = Vec::with_capacity(samples.len() * std::mem::size_of::<f32>());
             for sample in samples {
@@ -696,9 +724,12 @@ pub fn run_note_preview_server_child(path: &Path, plugin_id: &str, sample_rate: 
             fields.next(),
             fields.next().and_then(|field| field.parse::<u8>().ok()),
             fields.next().and_then(|field| field.parse::<u8>().ok()),
+            fields.next().and_then(|field| field.parse::<u32>().ok()),
             fields.next(),
         ) {
-            (Some("PREVIEW"), Some(note_key), Some(velocity), None) => (note_key, velocity),
+            (Some("PREVIEW"), Some(note_key), Some(velocity), Some(note_duration), None) => {
+                (note_key, velocity, note_duration)
+            }
             _ => {
                 let _ = write_preview_server_error(&mut output, "invalid CLAP preview request");
                 let _ = output.flush();
@@ -706,7 +737,7 @@ pub fn run_note_preview_server_child(path: &Path, plugin_id: &str, sample_rate: 
             }
         };
 
-        let samples = match instance.render(request.0, request.1) {
+        let samples = match instance.render(request.0, request.1, request.2) {
             Ok(samples) => samples,
             Err(error) => {
                 let _ = write_preview_server_error(&mut output, &error);
@@ -770,9 +801,10 @@ fn render_note_preview(
     sample_rate: u32,
     note_key: u8,
     velocity: u8,
+    note_duration_milliseconds: u32,
 ) -> Result<Vec<f32>, String> {
     let mut instance = ClapNotePreviewInstance::new(path, plugin_id, sample_rate)?;
-    instance.render(note_key, velocity)
+    instance.render(note_key, velocity, note_duration_milliseconds)
 }
 
 struct ClapNotePreviewInstance {
@@ -856,13 +888,19 @@ impl ClapNotePreviewInstance {
         })
     }
 
-    fn render(&mut self, note_key: u8, velocity: u8) -> Result<Vec<f32>, String> {
+    fn render(
+        &mut self,
+        note_key: u8,
+        velocity: u8,
+        note_duration_milliseconds: u32,
+    ) -> Result<Vec<f32>, String> {
         if note_key > 127 {
             return Err("CLAP preview MIDI note must be between 0 and 127".to_owned());
         }
         if !(1..=127).contains(&velocity) {
             return Err("CLAP preview MIDI velocity must be between 1 and 127".to_owned());
         }
+        validate_note_preview_note_length(note_duration_milliseconds)?;
 
         let audio_configuration = PluginAudioConfiguration {
             sample_rate: f64::from(self.sample_rate),
@@ -883,7 +921,7 @@ impl ClapNotePreviewInstance {
         };
 
         let total_frames = self.sample_rate * NOTE_PREVIEW_DURATION_MILLISECONDS / 1000;
-        let note_off_frame = self.sample_rate * NOTE_PREVIEW_NOTE_MILLISECONDS / 1000;
+        let note_off_frame = self.sample_rate * note_duration_milliseconds / 1000;
         let main_output_channels = self.output_port_channels[self.main_output_index];
         let mut samples = Vec::with_capacity(total_frames as usize * 2);
         let mut input_audio_ports = AudioPorts::with_capacity(
@@ -1050,6 +1088,18 @@ impl ClapNotePreviewInstance {
         }
         self.next_steady_time = render_start_time.saturating_add(u64::from(total_frames));
         Ok(samples)
+    }
+}
+
+fn validate_note_preview_note_length(note_duration_milliseconds: u32) -> Result<(), String> {
+    if (MIN_NOTE_PREVIEW_NOTE_MILLISECONDS..=MAX_NOTE_PREVIEW_NOTE_MILLISECONDS)
+        .contains(&note_duration_milliseconds)
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "CLAP preview note length must be between {MIN_NOTE_PREVIEW_NOTE_MILLISECONDS} and {MAX_NOTE_PREVIEW_NOTE_MILLISECONDS} milliseconds"
+        ))
     }
 }
 
@@ -1574,8 +1624,9 @@ fn parse_f64_bits(value: &str) -> Result<f64, String> {
 mod tests {
     use super::{
         ClapAudioPortDescriptor, ClapInstanceInfo, ClapNotePortDescriptor, ClapParameterDescriptor,
-        ClapPluginDescriptor, encode_instance_probe_output, encode_probe_output,
-        parse_instance_probe_output, parse_probe_output,
+        ClapPluginDescriptor, MAX_NOTE_PREVIEW_NOTE_MILLISECONDS,
+        MIN_NOTE_PREVIEW_NOTE_MILLISECONDS, encode_instance_probe_output, encode_probe_output,
+        parse_instance_probe_output, parse_probe_output, validate_note_preview_note_length,
     };
 
     #[test]
@@ -1648,5 +1699,13 @@ mod tests {
             parse_instance_probe_output(&output).expect("instance metadata should parse"),
             info
         );
+    }
+
+    #[test]
+    fn preview_note_length_accepts_only_the_supported_range() {
+        assert!(validate_note_preview_note_length(MIN_NOTE_PREVIEW_NOTE_MILLISECONDS).is_ok());
+        assert!(validate_note_preview_note_length(MAX_NOTE_PREVIEW_NOTE_MILLISECONDS).is_ok());
+        assert!(validate_note_preview_note_length(MIN_NOTE_PREVIEW_NOTE_MILLISECONDS - 1).is_err());
+        assert!(validate_note_preview_note_length(MAX_NOTE_PREVIEW_NOTE_MILLISECONDS + 1).is_err());
     }
 }
