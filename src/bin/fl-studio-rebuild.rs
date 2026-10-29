@@ -27065,7 +27065,7 @@ impl DawUi {
                     let (ruler_rect, ruler_response) =
                         ui.allocate_exact_size(Vec2::new(grid_width, 34.0), Sense::click_and_drag());
                     let ruler_response = ruler_response.on_hover_text(
-                        "Click to move song position; Ctrl/Cmd+drag to select time; Ctrl/Cmd+Delete ripple-deletes, Ctrl/Cmd+Alt/Option+Insert inserts time",
+                        "Click to move song position; Ctrl/Cmd+drag to select time; double-click a time marker to select its region; Ctrl/Cmd+Delete ripple-deletes, Ctrl/Cmd+Alt/Option+Insert inserts time",
                     );
                     let time_selection_modifier =
                         ui.input(|input| input.modifiers.ctrl || input.modifiers.command);
@@ -27154,10 +27154,57 @@ impl DawUi {
                         );
                     }
                     if ruler_response.double_clicked_by(PointerButton::Primary) {
-                        self.playlist_time_selection = None;
-                        self.playlist_time_selection_drag = None;
-                        seek_tick_requested = None;
-                        self.status = "Cleared Playlist time selection".to_owned();
+                        let clicked_marker = ruler_response
+                            .interact_pointer_pos()
+                            .and_then(|pointer| {
+                                arrangement
+                                    .time_markers
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(marker_index, marker)| {
+                                        let marker_x = ruler_rect.left()
+                                            + marker.position_ticks() as f32 * tick_scale;
+                                        (marker_index, (pointer.x - marker_x).abs())
+                                    })
+                                    .filter(|(_, distance)| *distance <= 5.0)
+                                    .min_by(|(_, left), (_, right)| left.total_cmp(right))
+                                    .map(|(marker_index, _)| marker_index)
+                            });
+                        if let Some(marker_index) = clicked_marker {
+                            self.selected_arrangement = Some(arrangement.id);
+                            self.selected_time_marker = Some(marker_index);
+                            self.playlist_time_selection_drag = None;
+                            seek_tick_requested = None;
+                            if let Some((start_tick, end_tick)) = playlist_time_marker_selection(
+                                &arrangement.time_markers,
+                                marker_index,
+                                arrangement
+                                    .clips
+                                    .iter()
+                                    .map(|clip| {
+                                        clip.position_ticks.saturating_add(clip.length_ticks)
+                                    })
+                                    .max()
+                                    .unwrap_or(0),
+                            ) {
+                                self.playlist_time_selection =
+                                    Some((arrangement.id, start_tick, end_tick));
+                                self.status = format!(
+                                    "Selected Playlist marker range from {start_tick} to {end_tick} ticks"
+                                );
+                            } else {
+                                self.playlist_time_selection = None;
+                                self.status = format!(
+                                    "Time marker {} has no song region to its right",
+                                    marker_index + 1
+                                );
+                            }
+                        } else {
+                            self.playlist_time_selection = None;
+                            self.playlist_time_selection_drag = None;
+                            seek_tick_requested = None;
+                            self.status = "Cleared Playlist time selection".to_owned();
+                        }
                     }
                     let painter = ui.painter_at(ruler_rect);
                     painter.rect_filled(ruler_rect, 0, PANEL_DARK);
@@ -79589,6 +79636,21 @@ fn playlist_performance_zone_start_tick(markers: &[TimeMarker]) -> Option<u32> {
         })
         .map(TimeMarker::position_ticks)
         .min()
+}
+
+fn playlist_time_marker_selection(
+    markers: &[TimeMarker],
+    marker_index: usize,
+    song_end_tick: u32,
+) -> Option<(u32, u32)> {
+    let start_tick = markers.get(marker_index)?.position_ticks();
+    let end_tick = markers
+        .iter()
+        .map(TimeMarker::position_ticks)
+        .filter(|position| *position > start_tick)
+        .min()
+        .unwrap_or(song_end_tick);
+    (end_tick > start_tick).then_some((start_tick, end_tick))
 }
 
 fn playlist_performance_navigation_target_tick(
