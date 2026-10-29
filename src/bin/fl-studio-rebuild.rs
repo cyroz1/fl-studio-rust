@@ -16,7 +16,8 @@ use clack_extensions::params::ParamInfoFlags;
 use clap_probe::{
     ClapInspectionResponse, ClapInspectionState, ClapInstanceInspectionResponse,
     ClapInstanceInspectionState, ClapNotePreviewRequest, ClapNotePreviewResponse,
-    ClapNotePreviewSettings, ClapNotePreviewState, ClapPatternNote, ClapPatternPreviewOutput,
+    ClapNotePreviewSettings, ClapNotePreviewState, ClapParameterAutomation,
+    ClapParameterAutomationPoint, ClapPatternNote, ClapPatternPreviewOutput,
     ClapPatternPreviewPurpose, ClapPatternPreviewRequest, ClapPatternPreviewResponse,
     ClapPatternPreviewSettings, ClapPlaylistNote, ClapPlaylistPreviewSettings,
     ClapPlaylistTempoPoint, MAX_NOTE_PREVIEW_NOTE_MILLISECONDS, MIN_NOTE_PREVIEW_NOTE_MILLISECONDS,
@@ -5265,6 +5266,7 @@ struct DawUi {
     midi_output_gain_mapping: Option<MidiControlChangeMapping>,
     midi_mixer_control_mappings: Vec<MidiMixerControlMapping>,
     midi_vst3_parameter_mappings: Vec<MidiVst3ParameterMapping>,
+    pattern_clap_parameter_links: Vec<PatternClapParameterLink>,
     pattern_vst3_parameter_links: Vec<PatternVst3ParameterLink>,
     pattern_vst3_mixer_effect_parameter_links: Vec<PatternVst3MixerEffectParameterLink>,
     playlist_vst3_parameter_links: Vec<PlaylistVst3ParameterLink>,
@@ -6167,6 +6169,19 @@ struct PatternVst3ParameterLink {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct PatternClapParameterLink {
+    project_path: String,
+    pattern_id: u16,
+    stream_channel: u8,
+    stream_flags: u8,
+    project_channel_id: u16,
+    plugin_path: String,
+    plugin_id: String,
+    parameter_id: u32,
+    parameter_name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct PatternVst3MixerEffectParameterLink {
     project_path: String,
     pattern_id: u16,
@@ -6906,6 +6921,7 @@ impl DawUi {
         let midi_mixer_control_mappings = load_midi_mixer_control_mappings();
         let midi_vst3_parameter_mappings = load_midi_vst3_parameter_mappings();
         let vst3_manual_latency_offsets = load_vst3_manual_latency_offsets();
+        let pattern_clap_parameter_links = load_pattern_clap_parameter_links();
         let pattern_vst3_parameter_links = load_pattern_vst3_parameter_links();
         let pattern_vst3_mixer_effect_parameter_links =
             load_pattern_vst3_mixer_effect_parameter_links();
@@ -7412,6 +7428,7 @@ impl DawUi {
             midi_output_gain_mapping,
             midi_mixer_control_mappings,
             midi_vst3_parameter_mappings,
+            pattern_clap_parameter_links,
             pattern_vst3_parameter_links,
             pattern_vst3_mixer_effect_parameter_links,
             playlist_vst3_parameter_links,
@@ -20267,6 +20284,74 @@ impl DawUi {
         self.clap_pattern_preview_settings_for_channel(pattern_id, channel_id, None)
     }
 
+    fn pattern_clap_parameter_automations_for_target(
+        &self,
+        pattern_id: u16,
+        channel_id: u16,
+        plugin_path: &Path,
+        plugin_id: &str,
+    ) -> Vec<ClapParameterAutomation> {
+        let (Some(project_path), Some(document)) =
+            (self.current_path.as_deref(), self.document.as_ref())
+        else {
+            return Vec::new();
+        };
+        let Ok(patterns) = document.patterns() else {
+            return Vec::new();
+        };
+        let Some(pattern) = patterns.iter().find(|pattern| pattern.id == pattern_id) else {
+            return Vec::new();
+        };
+        self.pattern_clap_parameter_links
+            .iter()
+            .filter(|link| {
+                project_paths_equal(Path::new(&link.project_path), project_path)
+                    && link.pattern_id == pattern_id
+                    && link.project_channel_id == channel_id
+                    && Path::new(&link.plugin_path) == plugin_path
+                    && link.plugin_id == plugin_id
+            })
+            .filter_map(|link| {
+                let points = pattern
+                    .controllers
+                    .iter()
+                    .filter(|point| {
+                        point.channel == link.stream_channel && point.flags == link.stream_flags
+                    })
+                    .filter_map(|point| {
+                        let value = point.value();
+                        (value.is_finite() && (0.0..=1.0).contains(&value)).then_some(
+                            ClapParameterAutomationPoint {
+                                tick: u64::from(point.position),
+                                normalized_value: f64::from(value),
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                (!points.is_empty()).then_some(ClapParameterAutomation {
+                    parameter_id: link.parameter_id,
+                    points,
+                })
+            })
+            .collect()
+    }
+
+    fn pattern_clap_parameter_automations_for_assigned_channel(
+        &self,
+        pattern_id: u16,
+        channel_id: u16,
+    ) -> Vec<ClapParameterAutomation> {
+        let Some(instrument) = self.clap_pattern_playback_instruments.get(&channel_id) else {
+            return Vec::new();
+        };
+        self.pattern_clap_parameter_automations_for_target(
+            pattern_id,
+            channel_id,
+            &instrument.path,
+            &instrument.plugin_id,
+        )
+    }
+
     fn invalidate_clap_playlist_audio(&mut self) {
         self.pending_clap_playlist_playback = None;
         self.active_clap_playlist_cache_key = None;
@@ -20330,6 +20415,7 @@ impl DawUi {
             tempo_bpm: document.metadata().tempo_bpm().unwrap_or(self.tempo_bpm),
             loop_length_ticks,
             notes,
+            parameter_automation: Vec::new(),
             playlist: None,
         }))
     }
@@ -20415,6 +20501,11 @@ impl DawUi {
                         tempo_bpm,
                         loop_length_ticks,
                         notes,
+                        parameter_automation: self
+                            .pattern_clap_parameter_automations_for_assigned_channel(
+                                pattern_id,
+                                channel_id,
+                            ),
                         playlist: None,
                     },
                     left_gain,
@@ -20621,9 +20712,11 @@ impl DawUi {
                         tempo_bpm,
                         loop_length_ticks,
                         notes: Vec::new(),
+                        parameter_automation: Vec::new(),
                         playlist: Some(ClapPlaylistPreviewSettings {
                             tempo_points: tempo_points.clone(),
                             notes,
+                            parameter_automation: Vec::new(),
                         }),
                     },
                     left_gain,
@@ -20795,6 +20888,7 @@ impl DawUi {
                         tempo_bpm: tempo_map.tempo_bpm_at_tick(u64::from(clip.position_ticks)),
                         loop_length_ticks: u64::from(clip.length_ticks),
                         notes,
+                        parameter_automation: Vec::new(),
                         playlist: None,
                     };
                     let (volume_automation, pan_automation) = self
@@ -63196,6 +63290,8 @@ impl DawUi {
         let mut midi_vst3_learn_request = None;
         let mut midi_vst3_cancel_learning = false;
         let mut midi_vst3_remove_mapping = None;
+        let mut pattern_clap_link_request: Option<PatternClapParameterLink> = None;
+        let mut pattern_clap_unlink_request: Option<PatternClapParameterLink> = None;
         let mut pattern_vst3_link_request: Option<(String, u16, u8, u8, MidiVst3ParameterTarget)> =
             None;
         let mut pattern_vst3_unlink_request: Option<(PathBuf, u16, MidiVst3ParameterTarget)> = None;
@@ -63833,11 +63929,19 @@ impl DawUi {
                                                 )
                                                 .clicked()
                                             {
+                                                let mut preview_settings = settings.clone();
+                                                preview_settings.parameter_automation = self
+                                                    .pattern_clap_parameter_automations_for_target(
+                                                        settings.pattern_id,
+                                                        settings.channel_id,
+                                                        &candidate.path,
+                                                        &descriptor.id,
+                                                    );
                                                 preview_clap_pattern = Some((
                                                     candidate.path.clone(),
                                                     descriptor.id.clone(),
                                                     descriptor.name.clone(),
-                                                    settings.clone(),
+                                                    preview_settings,
                                                 ));
                                             }
                                             match preview_state {
@@ -63937,12 +64041,16 @@ impl DawUi {
                                                             .or(parameter.current_value)
                                                             .unwrap_or(parameter.default_value);
                                                         let value_is_finite = stored_value.is_finite();
-                                                        let can_edit = !flags
-                                                            .contains(ParamInfoFlags::IS_READONLY)
+                                                        let can_automate = flags.contains(
+                                                            ParamInfoFlags::IS_AUTOMATABLE,
+                                                        )
+                                                            && !flags.contains(
+                                                                ParamInfoFlags::IS_READONLY,
+                                                            )
                                                             && parameter.min_value.is_finite()
                                                             && parameter.max_value.is_finite()
-                                                            && parameter.min_value
-                                                                < parameter.max_value
+                                                            && parameter.min_value < parameter.max_value;
+                                                        let can_edit = can_automate
                                                             && clap_parameter_channel_id.is_some();
                                                         ui.horizontal(|ui| {
                                                             let label = format!(
@@ -64031,6 +64139,119 @@ impl DawUi {
                                                                 ui.small(&parameter.module);
                                                             }
                                                         });
+                                                        let pattern_source = pattern_vst3_source
+                                                            .as_ref()
+                                                            .filter(|(_, pattern_id, _, _)| {
+                                                                self.selected_pattern
+                                                                    == Some(*pattern_id)
+                                                                    && clap_parameter_channel_id
+                                                                        .is_some()
+                                                            });
+                                                        let pattern_link = self
+                                                            .current_path
+                                                            .as_deref()
+                                                            .zip(self.selected_pattern)
+                                                            .and_then(
+                                                                |(project_path, pattern_id)| {
+                                                                    clap_parameter_channel_id
+                                                                        .and_then(|project_channel_id| {
+                                                                            pattern_clap_parameter_link_for_target(
+                                                                                &self.pattern_clap_parameter_links,
+                                                                                project_path,
+                                                                                pattern_id,
+                                                                                project_channel_id,
+                                                                                &candidate.path,
+                                                                                &descriptor.id,
+                                                                                parameter.id,
+                                                                            )
+                                                                        })
+                                                                },
+                                                            );
+                                                        let source_matches_link = pattern_link
+                                                            .zip(pattern_source)
+                                                            .is_some_and(|(link, source)| {
+                                                                project_paths_equal(
+                                                                    Path::new(&link.project_path),
+                                                                    Path::new(&source.0),
+                                                                )
+                                                                    && link.pattern_id == source.1
+                                                                    && link.stream_channel == source.2
+                                                                    && link.stream_flags == source.3
+                                                            });
+                                                        if can_automate {
+                                                            ui.horizontal(|ui| {
+                                                                if let Some(link) = pattern_link {
+                                                                    ui.small(format!(
+                                                                        "Pattern {} · event channel {} · flags 0x{:02X}",
+                                                                        link.pattern_id,
+                                                                        link.stream_channel,
+                                                                        link.stream_flags
+                                                                    ));
+                                                                    if source_matches_link {
+                                                                        ui.small("Linked");
+                                                                    }
+                                                                    if let Some((
+                                                                        project_path,
+                                                                        pattern_id,
+                                                                        stream_channel,
+                                                                        stream_flags,
+                                                                    )) = pattern_source
+                                                                        && !source_matches_link
+                                                                        && ui
+                                                                            .button("Relink Event")
+                                                                            .clicked()
+                                                                    {
+                                                                        pattern_clap_link_request =
+                                                                            Some(PatternClapParameterLink {
+                                                                                project_path: project_path.clone(),
+                                                                                pattern_id: *pattern_id,
+                                                                                stream_channel: *stream_channel,
+                                                                                stream_flags: *stream_flags,
+                                                                                project_channel_id: clap_parameter_channel_id.unwrap_or(channel_id),
+                                                                                plugin_path: candidate.path.to_string_lossy().into_owned(),
+                                                                                plugin_id: descriptor.id.clone(),
+                                                                                parameter_id: parameter.id,
+                                                                                parameter_name: parameter.name.clone(),
+                                                                            });
+                                                                    }
+                                                                    if ui.small_button("Clear event").clicked() {
+                                                                        pattern_clap_unlink_request =
+                                                                            Some(link.clone());
+                                                                    }
+                                                                } else if let Some((
+                                                                    project_path,
+                                                                    pattern_id,
+                                                                    stream_channel,
+                                                                    stream_flags,
+                                                                )) = pattern_source
+                                                                {
+                                                                    if ui.button("Link Event").clicked() {
+                                                                        pattern_clap_link_request =
+                                                                            Some(PatternClapParameterLink {
+                                                                                project_path: project_path.clone(),
+                                                                                pattern_id: *pattern_id,
+                                                                                stream_channel: *stream_channel,
+                                                                                stream_flags: *stream_flags,
+                                                                                project_channel_id: clap_parameter_channel_id.unwrap_or(channel_id),
+                                                                                plugin_path: candidate.path.to_string_lossy().into_owned(),
+                                                                                plugin_id: descriptor.id.clone(),
+                                                                                parameter_id: parameter.id,
+                                                                                parameter_name: parameter.name.clone(),
+                                                                            });
+                                                                    }
+                                                                } else {
+                                                                    ui.add_enabled(
+                                                                        false,
+                                                                        egui::Button::new("Link Event"),
+                                                                    )
+                                                                    .on_hover_text(
+                                                                        pattern_vst3_link_hint.unwrap_or(
+                                                                            "Select an existing Pattern Event stream to link it.",
+                                                                        ),
+                                                                    );
+                                                                }
+                                                            });
+                                                        }
                                                     }
                                                     ui.small("Parameter edits apply to Pattern audition and transport. Use Capture state on an assigned channel to save them for this project.");
                                                     if info.parameters.len()
@@ -65017,6 +65238,43 @@ impl DawUi {
         if let Some(target) = midi_vst3_learn_request {
             self.midi_vst3_parameter_learning = Some(target.clone());
             self.status = format!("Move a MIDI CC to link it to {}", target.parameter_name());
+        }
+
+        if let Some(link) = pattern_clap_link_request {
+            upsert_pattern_clap_parameter_link(
+                &mut self.pattern_clap_parameter_links,
+                link.clone(),
+            );
+            self.invalidate_clap_playlist_audio();
+            self.status = save_pattern_clap_parameter_links(&self.pattern_clap_parameter_links)
+                .err()
+                .map_or_else(
+                    || {
+                        format!(
+                            "Linked Pattern {} event stream to {} on this machine",
+                            link.pattern_id, link.parameter_name
+                        )
+                    },
+                    |error| {
+                        format!(
+                            "Linked Pattern event stream for this session; could not save it: {error}"
+                        )
+                    },
+                );
+        }
+        if let Some(link) = pattern_clap_unlink_request {
+            remove_pattern_clap_parameter_link(&mut self.pattern_clap_parameter_links, &link);
+            self.invalidate_clap_playlist_audio();
+            self.status = save_pattern_clap_parameter_links(&self.pattern_clap_parameter_links)
+                .err()
+                .map_or_else(
+                    || format!("Cleared Pattern event link for {}", link.parameter_name),
+                    |error| {
+                        format!(
+                            "Cleared Pattern event link for this session; could not save it: {error}"
+                        )
+                    },
+                );
         }
 
         if let Some((project_path, pattern_id, stream_channel, stream_flags, target)) =
@@ -68775,6 +69033,10 @@ fn pattern_vst3_parameter_links_file() -> Option<PathBuf> {
     midi_control_change_mapping_file("pattern-vst3-parameter-links.txt")
 }
 
+fn pattern_clap_parameter_links_file() -> Option<PathBuf> {
+    midi_control_change_mapping_file("pattern-clap-parameter-links.txt")
+}
+
 fn pattern_vst3_mixer_effect_parameter_links_file() -> Option<PathBuf> {
     midi_control_change_mapping_file("pattern-vst3-mixer-effect-parameter-links.txt")
 }
@@ -68847,6 +69109,13 @@ fn load_pattern_vst3_parameter_links() -> Vec<PatternVst3ParameterLink> {
     pattern_vst3_parameter_links_file()
         .and_then(|path| fs::read_to_string(path).ok())
         .map(|contents| parse_pattern_vst3_parameter_links(&contents))
+        .unwrap_or_default()
+}
+
+fn load_pattern_clap_parameter_links() -> Vec<PatternClapParameterLink> {
+    pattern_clap_parameter_links_file()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .map(|contents| parse_pattern_clap_parameter_links(&contents))
         .unwrap_or_default()
 }
 
@@ -69122,6 +69391,18 @@ fn save_pattern_vst3_parameter_links(links: &[PatternVst3ParameterLink]) -> Resu
     fs::create_dir_all(parent)
         .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
     fs::write(&path, serialize_pattern_vst3_parameter_links(links))
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
+fn save_pattern_clap_parameter_links(links: &[PatternClapParameterLink]) -> Result<(), String> {
+    let path = pattern_clap_parameter_links_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the Pattern CLAP parameter link path has no parent folder".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    fs::write(&path, serialize_pattern_clap_parameter_links(links))
         .map_err(|error| format!("could not write {}: {error}", path.display()))
 }
 
@@ -69523,6 +69804,91 @@ fn serialize_midi_vst3_parameter_mappings(mappings: &[MidiVst3ParameterMapping])
         contents.push('\n');
     }
     contents
+}
+
+fn valid_pattern_clap_parameter_link(link: &PatternClapParameterLink) -> bool {
+    !link.project_path.is_empty()
+        && link.project_channel_id != u16::MAX
+        && !link.plugin_path.is_empty()
+        && !link.plugin_id.is_empty()
+        && link.parameter_id != u32::MAX
+}
+
+fn same_pattern_clap_parameter_link_target(
+    link: &PatternClapParameterLink,
+    project_path: &Path,
+    pattern_id: u16,
+    project_channel_id: u16,
+    plugin_path: &Path,
+    plugin_id: &str,
+    parameter_id: u32,
+) -> bool {
+    project_paths_equal(Path::new(&link.project_path), project_path)
+        && link.pattern_id == pattern_id
+        && link.project_channel_id == project_channel_id
+        && Path::new(&link.plugin_path) == plugin_path
+        && link.plugin_id == plugin_id
+        && link.parameter_id == parameter_id
+}
+
+fn upsert_pattern_clap_parameter_link(
+    links: &mut Vec<PatternClapParameterLink>,
+    link: PatternClapParameterLink,
+) {
+    if !valid_pattern_clap_parameter_link(&link) {
+        return;
+    }
+    links.retain(|existing| {
+        !same_pattern_clap_parameter_link_target(
+            existing,
+            Path::new(&link.project_path),
+            link.pattern_id,
+            link.project_channel_id,
+            Path::new(&link.plugin_path),
+            &link.plugin_id,
+            link.parameter_id,
+        )
+    });
+    links.push(link);
+}
+
+fn remove_pattern_clap_parameter_link(
+    links: &mut Vec<PatternClapParameterLink>,
+    target: &PatternClapParameterLink,
+) {
+    links.retain(|link| {
+        !same_pattern_clap_parameter_link_target(
+            link,
+            Path::new(&target.project_path),
+            target.pattern_id,
+            target.project_channel_id,
+            Path::new(&target.plugin_path),
+            &target.plugin_id,
+            target.parameter_id,
+        )
+    });
+}
+
+fn pattern_clap_parameter_link_for_target<'a>(
+    links: &'a [PatternClapParameterLink],
+    project_path: &Path,
+    pattern_id: u16,
+    project_channel_id: u16,
+    plugin_path: &Path,
+    plugin_id: &str,
+    parameter_id: u32,
+) -> Option<&'a PatternClapParameterLink> {
+    links.iter().find(|link| {
+        same_pattern_clap_parameter_link_target(
+            link,
+            project_path,
+            pattern_id,
+            project_channel_id,
+            plugin_path,
+            plugin_id,
+            parameter_id,
+        )
+    })
 }
 
 fn valid_pattern_vst3_parameter_link(link: &PatternVst3ParameterLink) -> bool {
@@ -70586,6 +70952,92 @@ fn serialize_playlist_audio_clip_envelopes(
             Some(true) => contents.push('1'),
             None => contents.push('-'),
         }
+        contents.push('\n');
+    }
+    contents
+}
+
+fn parse_pattern_clap_parameter_links(contents: &str) -> Vec<PatternClapParameterLink> {
+    let mut links = Vec::new();
+    for line in contents.lines() {
+        let Some(encoded) = line.strip_prefix("link=") else {
+            continue;
+        };
+        let mut fields = encoded.split('\t');
+        let Some(project_path) = fields.next().and_then(decode_midi_device_id) else {
+            continue;
+        };
+        let Some(pattern_id) = fields.next().and_then(|field| field.parse::<u16>().ok()) else {
+            continue;
+        };
+        let Some(stream_channel) = fields.next().and_then(|field| field.parse::<u8>().ok()) else {
+            continue;
+        };
+        let Some(stream_flags) = fields.next().and_then(|field| field.parse::<u8>().ok()) else {
+            continue;
+        };
+        let Some(project_channel_id) = fields.next().and_then(|field| field.parse::<u16>().ok())
+        else {
+            continue;
+        };
+        let Some(plugin_path) = fields.next().and_then(decode_midi_device_id) else {
+            continue;
+        };
+        let Some(plugin_id) = fields.next().and_then(decode_midi_device_id) else {
+            continue;
+        };
+        let Some(parameter_id) = fields.next().and_then(|field| field.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(parameter_name) = fields.next().and_then(decode_midi_device_id) else {
+            continue;
+        };
+        if fields.next().is_some() {
+            continue;
+        }
+        upsert_pattern_clap_parameter_link(
+            &mut links,
+            PatternClapParameterLink {
+                project_path,
+                pattern_id,
+                stream_channel,
+                stream_flags,
+                project_channel_id,
+                plugin_path,
+                plugin_id,
+                parameter_id,
+                parameter_name,
+            },
+        );
+    }
+    links
+}
+
+fn serialize_pattern_clap_parameter_links(links: &[PatternClapParameterLink]) -> String {
+    let mut contents = String::from("version=1\n");
+    let mut normalized = Vec::new();
+    for link in links {
+        upsert_pattern_clap_parameter_link(&mut normalized, link.clone());
+    }
+    for link in normalized {
+        contents.push_str("link=");
+        contents.push_str(&encode_midi_device_id(&link.project_path));
+        contents.push('\t');
+        contents.push_str(&link.pattern_id.to_string());
+        contents.push('\t');
+        contents.push_str(&link.stream_channel.to_string());
+        contents.push('\t');
+        contents.push_str(&link.stream_flags.to_string());
+        contents.push('\t');
+        contents.push_str(&link.project_channel_id.to_string());
+        contents.push('\t');
+        contents.push_str(&encode_midi_device_id(&link.plugin_path));
+        contents.push('\t');
+        contents.push_str(&encode_midi_device_id(&link.plugin_id));
+        contents.push('\t');
+        contents.push_str(&link.parameter_id.to_string());
+        contents.push('\t');
+        contents.push_str(&encode_midi_device_id(&link.parameter_name));
         contents.push('\n');
     }
     contents

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use clack_extensions::audio_ports::{AudioPortFlags, AudioPortInfoBuffer, PluginAudioPorts};
 use clack_extensions::note_ports::{NoteDialect, NotePortInfoBuffer, PluginNotePorts};
-use clack_extensions::params::{ParamInfoBuffer, PluginParams};
+use clack_extensions::params::{ParamInfoBuffer, ParamInfoFlags, PluginParams};
 use clack_extensions::state::PluginState;
 use clack_host::events::event_types::{
     Midi2Event, MidiEvent, NoteExpressionEvent, NoteExpressionType, NoteOffEvent, NoteOnEvent,
@@ -142,6 +142,18 @@ pub struct ClapPatternNote {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct ClapParameterAutomationPoint {
+    pub tick: u64,
+    pub normalized_value: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClapParameterAutomation {
+    pub parameter_id: u32,
+    pub points: Vec<ClapParameterAutomationPoint>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct ClapPatternPreviewSettings {
     pub pattern_id: u16,
     pub channel_id: u16,
@@ -149,6 +161,8 @@ pub struct ClapPatternPreviewSettings {
     pub tempo_bpm: f64,
     pub loop_length_ticks: u64,
     pub notes: Vec<ClapPatternNote>,
+    /// Normalized CLAP parameter lanes in Pattern-relative ticks.
+    pub parameter_automation: Vec<ClapParameterAutomation>,
     pub playlist: Option<ClapPlaylistPreviewSettings>,
 }
 
@@ -175,6 +189,8 @@ pub struct ClapPlaylistNote {
 pub struct ClapPlaylistPreviewSettings {
     pub tempo_points: Vec<ClapPlaylistTempoPoint>,
     pub notes: Vec<ClapPlaylistNote>,
+    /// Normalized CLAP parameter lanes in arrangement ticks.
+    pub parameter_automation: Vec<ClapParameterAutomation>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -625,11 +641,12 @@ impl ClapPreviewProcess {
             validate_playlist_preview_settings(settings, self.sample_rate)?;
             writeln!(
                 self.stdin,
-                "PLAYLIST {} {:016x} {} {}",
+                "PLAYLIST {} {:016x} {} {} {}",
                 settings.ppq,
                 settings.tempo_bpm.to_bits(),
                 playlist.tempo_points.len(),
                 playlist.notes.len(),
+                parameter_automation_point_count(&playlist.parameter_automation),
             )
             .map_err(|error| format!("could not send a CLAP Playlist request: {error}"))?;
             for point in &playlist.tempo_points {
@@ -657,15 +674,17 @@ impl ClapPreviewProcess {
                 )
                 .map_err(|error| format!("could not send a CLAP Playlist note: {error}"))?;
             }
+            write_parameter_automation(&mut self.stdin, &playlist.parameter_automation)?;
         } else {
             validate_pattern_preview_settings(settings, self.sample_rate)?;
             writeln!(
                 self.stdin,
-                "{command} {} {:016x} {} {}",
+                "{command} {} {:016x} {} {} {}",
                 settings.ppq,
                 settings.tempo_bpm.to_bits(),
                 settings.loop_length_ticks,
                 settings.notes.len(),
+                parameter_automation_point_count(&settings.parameter_automation),
             )
             .map_err(|error| format!("could not send a CLAP Pattern preview request: {error}"))?;
             for note in &settings.notes {
@@ -684,6 +703,7 @@ impl ClapPreviewProcess {
                 )
                 .map_err(|error| format!("could not send a CLAP Pattern note: {error}"))?;
             }
+            write_parameter_automation(&mut self.stdin, &settings.parameter_automation)?;
         }
         self.stdin
             .write_all(b"END\n")
@@ -1293,22 +1313,29 @@ fn parse_pattern_preview_request(
     sample_rate: u32,
 ) -> Result<ClapPatternPreviewSettings, String> {
     let mut fields = header.split_whitespace();
-    let (Some(ppq), Some(tempo_bits), Some(loop_length_ticks), Some(note_count), None) = (
+    let (
+        Some(ppq),
+        Some(tempo_bits),
+        Some(loop_length_ticks),
+        Some(note_count),
+        Some(parameter_count),
+        None,
+    ) = (
         fields.next().and_then(|field| field.parse::<u16>().ok()),
         fields.next(),
         fields.next().and_then(|field| field.parse::<u64>().ok()),
         fields.next().and_then(|field| field.parse::<usize>().ok()),
+        fields.next().and_then(|field| field.parse::<usize>().ok()),
         fields.next(),
-    ) else {
+    )
+    else {
         return Err("invalid CLAP Pattern preview header".to_owned());
     };
     let tempo_bpm = u64::from_str_radix(tempo_bits, 16)
         .map(f64::from_bits)
         .map_err(|_| "invalid CLAP Pattern preview tempo".to_owned())?;
-    if note_count > MAX_PATTERN_PREVIEW_NOTES {
-        return Err(format!(
-            "CLAP Pattern preview exceeds {MAX_PATTERN_PREVIEW_NOTES} notes"
-        ));
+    if note_count > MAX_PATTERN_PREVIEW_NOTES || parameter_count > MAX_PATTERN_PREVIEW_NOTES {
+        return Err("CLAP Pattern preview request exceeds its event limit".to_owned());
     }
     let mut notes = Vec::with_capacity(note_count);
     for _ in 0..note_count {
@@ -1317,6 +1344,7 @@ fn parse_pattern_preview_request(
             .ok_or_else(|| "CLAP Pattern preview ended before all notes arrived".to_owned())?;
         notes.push(parse_pattern_preview_note(&line)?);
     }
+    let parameter_automation = read_parameter_automation(input, parameter_count, "Pattern")?;
     let end = read_preview_protocol_header(input)
         .map_err(|error| format!("could not read CLAP Pattern preview terminator: {error}"))?
         .ok_or_else(|| "CLAP Pattern preview ended before its terminator".to_owned())?;
@@ -1330,6 +1358,7 @@ fn parse_pattern_preview_request(
         tempo_bpm,
         loop_length_ticks,
         notes,
+        parameter_automation,
         playlist: None,
     };
     validate_pattern_preview_settings(&settings, sample_rate)?;
@@ -1342,19 +1371,31 @@ fn parse_playlist_preview_request(
     sample_rate: u32,
 ) -> Result<ClapPatternPreviewSettings, String> {
     let mut fields = header.split_whitespace();
-    let (Some(ppq), Some(tempo_bits), Some(tempo_count), Some(note_count), None) = (
+    let (
+        Some(ppq),
+        Some(tempo_bits),
+        Some(tempo_count),
+        Some(note_count),
+        Some(parameter_count),
+        None,
+    ) = (
         fields.next().and_then(|field| field.parse::<u16>().ok()),
         fields.next(),
         fields.next().and_then(|field| field.parse::<usize>().ok()),
         fields.next().and_then(|field| field.parse::<usize>().ok()),
+        fields.next().and_then(|field| field.parse::<usize>().ok()),
         fields.next(),
-    ) else {
+    )
+    else {
         return Err("invalid CLAP Playlist preview header".to_owned());
     };
     let tempo_bpm = u64::from_str_radix(tempo_bits, 16)
         .map(f64::from_bits)
         .map_err(|_| "invalid CLAP Playlist base tempo".to_owned())?;
-    if tempo_count > MAX_PATTERN_PREVIEW_NOTES || note_count > MAX_PATTERN_PREVIEW_NOTES {
+    if tempo_count > MAX_PATTERN_PREVIEW_NOTES
+        || note_count > MAX_PATTERN_PREVIEW_NOTES
+        || parameter_count > MAX_PATTERN_PREVIEW_NOTES
+    {
         return Err("CLAP Playlist request exceeds its event limit".to_owned());
     }
     let mut tempo_points = Vec::with_capacity(tempo_count);
@@ -1371,6 +1412,7 @@ fn parse_playlist_preview_request(
             .ok_or_else(|| "CLAP Playlist request ended before all notes arrived".to_owned())?;
         notes.push(parse_playlist_note(&line)?);
     }
+    let parameter_automation = read_parameter_automation(input, parameter_count, "Playlist")?;
     let end = read_preview_protocol_header(input)
         .map_err(|error| format!("could not read CLAP Playlist terminator: {error}"))?
         .ok_or_else(|| "CLAP Playlist request ended before its terminator".to_owned())?;
@@ -1384,13 +1426,95 @@ fn parse_playlist_preview_request(
         tempo_bpm,
         loop_length_ticks: 1,
         notes: Vec::new(),
+        parameter_automation: Vec::new(),
         playlist: Some(ClapPlaylistPreviewSettings {
             tempo_points,
             notes,
+            parameter_automation,
         }),
     };
     validate_playlist_preview_settings(&settings, sample_rate)?;
     Ok(settings)
+}
+
+fn parameter_automation_point_count(lanes: &[ClapParameterAutomation]) -> usize {
+    lanes.iter().fold(0usize, |count, lane| {
+        count.saturating_add(lane.points.len())
+    })
+}
+
+fn write_parameter_automation(
+    output: &mut impl Write,
+    lanes: &[ClapParameterAutomation],
+) -> Result<(), String> {
+    for lane in lanes {
+        for point in &lane.points {
+            writeln!(
+                output,
+                "PARAM {} {} {:016x}",
+                lane.parameter_id,
+                point.tick,
+                point.normalized_value.to_bits(),
+            )
+            .map_err(|error| {
+                format!("could not send a CLAP parameter automation event: {error}")
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn read_parameter_automation(
+    input: &mut impl Read,
+    parameter_count: usize,
+    label: &str,
+) -> Result<Vec<ClapParameterAutomation>, String> {
+    let mut lanes = std::collections::BTreeMap::<u32, Vec<ClapParameterAutomationPoint>>::new();
+    for _ in 0..parameter_count {
+        let line = read_preview_protocol_header(input)
+            .map_err(|error| format!("could not read CLAP {label} parameter event: {error}"))?
+            .ok_or_else(|| {
+                format!("CLAP {label} request ended before all parameter events arrived")
+            })?;
+        let (parameter_id, tick, normalized_value) = parse_parameter_automation_point(&line)?;
+        lanes
+            .entry(parameter_id)
+            .or_default()
+            .push(ClapParameterAutomationPoint {
+                tick,
+                normalized_value,
+            });
+    }
+    Ok(lanes
+        .into_iter()
+        .map(|(parameter_id, points)| ClapParameterAutomation {
+            parameter_id,
+            points,
+        })
+        .collect())
+}
+
+fn parse_parameter_automation_point(line: &str) -> Result<(u32, u64, f64), String> {
+    let mut fields = line.split_whitespace();
+    let (Some("PARAM"), Some(parameter_id), Some(tick), Some(value_bits), None) = (
+        fields.next(),
+        fields.next().and_then(|field| field.parse::<u32>().ok()),
+        fields.next().and_then(|field| field.parse::<u64>().ok()),
+        fields.next(),
+        fields.next(),
+    ) else {
+        return Err("invalid CLAP parameter automation event".to_owned());
+    };
+    let normalized_value = u64::from_str_radix(value_bits, 16)
+        .map(f64::from_bits)
+        .map_err(|_| "invalid CLAP parameter automation value".to_owned())?;
+    if ClapId::from_raw(parameter_id).is_none()
+        || !normalized_value.is_finite()
+        || !(0.0..=1.0).contains(&normalized_value)
+    {
+        return Err("CLAP parameter automation event has an invalid ID or value".to_owned());
+    }
+    Ok((parameter_id, tick, normalized_value))
 }
 
 fn parse_playlist_tempo_point(line: &str) -> Result<ClapPlaylistTempoPoint, String> {
@@ -1800,6 +1924,67 @@ impl ClapNotePreviewInstance {
         Ok(())
     }
 
+    fn parameter_ranges_for_automation(
+        &mut self,
+        events: &[ScheduledClapParameterEvent],
+    ) -> Result<std::collections::BTreeMap<u32, (f64, f64, bool)>, String> {
+        let mut ranges = std::collections::BTreeMap::new();
+        if events.is_empty() {
+            return Ok(ranges);
+        }
+
+        let requested_ids = events
+            .iter()
+            .map(|event| event.parameter_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        let plugin = self.instance.plugin_handle();
+        let params = plugin
+            .get_extension::<PluginParams>()
+            .ok_or_else(|| "CLAP instrument does not expose parameter metadata".to_owned())?;
+        let parameter_count = params.count(&plugin);
+        if parameter_count > MAX_INSTANCE_METADATA_ITEMS {
+            return Err(format!(
+                "CLAP instrument exposes {parameter_count} parameters; the metadata limit is {MAX_INSTANCE_METADATA_ITEMS}"
+            ));
+        }
+        for index in 0..parameter_count {
+            let mut buffer = ParamInfoBuffer::new();
+            let Some(info) = params.get_info(&plugin, index, &mut buffer) else {
+                continue;
+            };
+            let id = info.id.get();
+            if !requested_ids.contains(&id) {
+                continue;
+            }
+            if !info.flags.contains(ParamInfoFlags::IS_AUTOMATABLE)
+                || info.flags.contains(ParamInfoFlags::IS_READONLY)
+                || !info.min_value.is_finite()
+                || !info.max_value.is_finite()
+                || info.min_value >= info.max_value
+            {
+                return Err(format!(
+                    "CLAP parameter {id} is not available for Pattern Event automation"
+                ));
+            }
+            ranges.insert(
+                id,
+                (
+                    info.min_value,
+                    info.max_value,
+                    info.flags.contains(ParamInfoFlags::IS_STEPPED),
+                ),
+            );
+        }
+        for id in requested_ids {
+            if !ranges.contains_key(&id) {
+                return Err(format!(
+                    "CLAP instrument does not expose automatable parameter {id}"
+                ));
+            }
+        }
+        Ok(ranges)
+    }
+
     fn save_state(&mut self) -> Result<Vec<u8>, String> {
         let plugin = self.instance.plugin_handle();
         let state = plugin
@@ -1862,7 +2047,7 @@ impl ClapNotePreviewInstance {
             },
         ];
         let total_frames = self.sample_rate * NOTE_PREVIEW_DURATION_MILLISECONDS / 1000;
-        self.render_scheduled_events(&events, total_frames, None)
+        self.render_scheduled_events(&events, &[], total_frames, None)
     }
 
     fn render_pattern(
@@ -1870,7 +2055,8 @@ impl ClapNotePreviewInstance {
         settings: &ClapPatternPreviewSettings,
     ) -> Result<Vec<f32>, String> {
         let (events, total_frames) = schedule_pattern_preview_events(settings, self.sample_rate)?;
-        self.render_scheduled_events(&events, total_frames, None)
+        let parameter_events = schedule_pattern_parameter_events(settings, self.sample_rate)?;
+        self.render_scheduled_events(&events, &parameter_events, total_frames, None)
     }
 
     fn render_pattern_loop(
@@ -1878,6 +2064,8 @@ impl ClapNotePreviewInstance {
         settings: &ClapPatternPreviewSettings,
     ) -> Result<Vec<f32>, String> {
         let (one_loop_events, _) = schedule_pattern_preview_events(settings, self.sample_rate)?;
+        let one_loop_parameter_events =
+            schedule_pattern_parameter_events(settings, self.sample_rate)?;
         let loop_frames = pattern_preview_frame_at_tick(
             settings.loop_length_ticks,
             settings.ppq,
@@ -1903,6 +2091,18 @@ impl ClapNotePreviewInstance {
             events.push(repeated);
         }
         events.sort_by_key(|event| (event.frame, event.priority));
+        let mut parameter_events =
+            Vec::with_capacity(one_loop_parameter_events.len().saturating_mul(2));
+        parameter_events.extend_from_slice(&one_loop_parameter_events);
+        for event in &one_loop_parameter_events {
+            let mut repeated = *event;
+            repeated.frame = repeated
+                .frame
+                .checked_add(loop_frames)
+                .ok_or_else(|| "CLAP Pattern parameter loop position overflowed".to_owned())?;
+            parameter_events.push(repeated);
+        }
+        parameter_events.sort_by_key(|event| (event.frame, event.priority, event.order));
 
         let tail_frames =
             u64::from(self.sample_rate) * u64::from(NOTE_PREVIEW_DURATION_MILLISECONDS) / 1000;
@@ -1921,7 +2121,8 @@ impl ClapNotePreviewInstance {
         }
         let total_frames = u32::try_from(total_frames)
             .map_err(|_| "CLAP Pattern loop render exceeds the supported range".to_owned())?;
-        let rendered = self.render_scheduled_events(&events, total_frames, None)?;
+        let rendered =
+            self.render_scheduled_events(&events, &parameter_events, total_frames, None)?;
         second_pattern_loop_audio(&rendered, loop_frames)
     }
 
@@ -1931,8 +2132,10 @@ impl ClapNotePreviewInstance {
     ) -> Result<Vec<f32>, String> {
         let (events, total_frames, transport_points) =
             schedule_playlist_preview_events(settings, self.sample_rate)?;
+        let parameter_events = schedule_playlist_parameter_events(settings, self.sample_rate)?;
         self.render_scheduled_events(
             &events,
+            &parameter_events,
             total_frames,
             Some((&transport_points, settings.ppq)),
         )
@@ -1941,6 +2144,7 @@ impl ClapNotePreviewInstance {
     fn render_scheduled_events(
         &mut self,
         events: &[ScheduledClapNoteEvent],
+        parameter_events: &[ScheduledClapParameterEvent],
         total_frames: u32,
         transport: Option<(&[ClapTransportPoint], u16)>,
     ) -> Result<Vec<f32>, String> {
@@ -1948,6 +2152,7 @@ impl ClapNotePreviewInstance {
             return Err("CLAP preview has no audio frames to render".to_owned());
         }
 
+        let parameter_ranges = self.parameter_ranges_for_automation(parameter_events)?;
         let audio_configuration = PluginAudioConfiguration {
             sample_rate: f64::from(self.sample_rate),
             min_frames_count: 1,
@@ -1979,6 +2184,7 @@ impl ClapNotePreviewInstance {
         let render_start_time = self.next_steady_time;
         let mut frame_offset = 0;
         let mut event_index = 0usize;
+        let mut parameter_event_index = 0usize;
         let mut transport_index = 0usize;
         let mut render_error = None;
 
@@ -2004,8 +2210,74 @@ impl ClapNotePreviewInstance {
                 event_index += 1;
             }
             let event_count = event_index.saturating_sub(block_event_start);
-            let mut input_event_buffer = EventBuffer::with_capacity(event_count.saturating_mul(4));
-            for event in &events[block_event_start..event_index] {
+            let block_parameter_start = parameter_event_index;
+            while parameter_event_index < parameter_events.len()
+                && parameter_events[parameter_event_index].frame < u64::from(frame_end)
+            {
+                parameter_event_index += 1;
+            }
+            let parameter_event_count = parameter_event_index.saturating_sub(block_parameter_start);
+            let mut scheduled_block_events =
+                Vec::with_capacity(event_count.saturating_add(parameter_event_count));
+            for (event_index, event) in events
+                .iter()
+                .enumerate()
+                .take(event_index)
+                .skip(block_event_start)
+            {
+                scheduled_block_events.push((
+                    event.frame,
+                    if event.is_note_on { 2 } else { 0 },
+                    event_index,
+                    false,
+                ));
+            }
+            for (parameter_index, event) in parameter_events
+                .iter()
+                .enumerate()
+                .take(parameter_event_index)
+                .skip(block_parameter_start)
+            {
+                scheduled_block_events.push((event.frame, event.priority, parameter_index, true));
+            }
+            scheduled_block_events.sort_by_key(|event| (event.0, event.1, event.2));
+            let mut input_event_buffer = EventBuffer::with_capacity(
+                event_count
+                    .saturating_mul(4)
+                    .saturating_add(parameter_event_count),
+            );
+            for (_, _, event_index, is_parameter) in scheduled_block_events {
+                if is_parameter {
+                    let event = parameter_events[event_index];
+                    let event_time =
+                        u32::try_from(event.frame.saturating_sub(u64::from(frame_offset)))
+                            .map_err(|_| {
+                                "CLAP parameter event offset exceeds the audio block".to_owned()
+                            })?;
+                    let id = ClapId::from_raw(event.parameter_id)
+                        .expect("parameter IDs were validated before processing");
+                    let (minimum, maximum, stepped) = parameter_ranges[&event.parameter_id];
+                    let mut value =
+                        minimum * (1.0 - event.normalized_value) + maximum * event.normalized_value;
+                    if !value.is_finite() {
+                        return Err(format!(
+                            "CLAP parameter {} could not map its normalized value",
+                            event.parameter_id
+                        ));
+                    }
+                    value = value.clamp(minimum, maximum);
+                    if stepped {
+                        value = value.trunc();
+                    }
+                    input_event_buffer.push(&ParamValueEvent::new(
+                        event_time,
+                        id,
+                        Pckn::match_all(),
+                        value,
+                    ));
+                    continue;
+                }
+                let event = &events[event_index];
                 let event_time = u32::try_from(event.frame.saturating_sub(u64::from(frame_offset)))
                     .map_err(|_| "CLAP note event offset exceeds the audio block".to_owned())?;
                 let pckn = clack_host::prelude::Pckn::new(
@@ -2225,6 +2497,15 @@ struct ScheduledClapNoteEvent {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct ScheduledClapParameterEvent {
+    frame: u64,
+    priority: u8,
+    order: usize,
+    parameter_id: u32,
+    normalized_value: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct ClapTransportPoint {
     frame: u64,
     tick: u64,
@@ -2235,14 +2516,102 @@ fn validate_pattern_preview_settings(
     settings: &ClapPatternPreviewSettings,
     sample_rate: u32,
 ) -> Result<(), String> {
-    schedule_pattern_preview_events(settings, sample_rate).map(|_| ())
+    schedule_pattern_preview_events(settings, sample_rate)?;
+    schedule_pattern_parameter_events(settings, sample_rate).map(|_| ())
 }
 
 fn validate_playlist_preview_settings(
     settings: &ClapPatternPreviewSettings,
     sample_rate: u32,
 ) -> Result<(), String> {
-    schedule_playlist_preview_events(settings, sample_rate).map(|_| ())
+    schedule_playlist_preview_events(settings, sample_rate)?;
+    schedule_playlist_parameter_events(settings, sample_rate).map(|_| ())
+}
+
+fn schedule_pattern_parameter_events(
+    settings: &ClapPatternPreviewSettings,
+    sample_rate: u32,
+) -> Result<Vec<ScheduledClapParameterEvent>, String> {
+    let lanes = settings
+        .parameter_automation
+        .iter()
+        .filter_map(|lane| {
+            let points = lane
+                .points
+                .iter()
+                .filter(|point| point.tick <= settings.loop_length_ticks)
+                .cloned()
+                .collect::<Vec<_>>();
+            (!points.is_empty()).then_some(ClapParameterAutomation {
+                parameter_id: lane.parameter_id,
+                points,
+            })
+        })
+        .collect::<Vec<_>>();
+    schedule_parameter_events(&lanes, |tick| {
+        pattern_preview_frame_at_tick(tick, settings.ppq, settings.tempo_bpm, sample_rate)
+    })
+}
+
+fn schedule_playlist_parameter_events(
+    settings: &ClapPatternPreviewSettings,
+    sample_rate: u32,
+) -> Result<Vec<ScheduledClapParameterEvent>, String> {
+    if !(8_000..=192_000).contains(&sample_rate) {
+        return Err(format!(
+            "unsupported CLAP preview sample rate: {sample_rate}"
+        ));
+    }
+    let playlist = settings
+        .playlist
+        .as_ref()
+        .ok_or_else(|| "CLAP Playlist playback is missing its schedule".to_owned())?;
+    let mut tempo_events = Vec::with_capacity(playlist.tempo_points.len());
+    for point in &playlist.tempo_points {
+        tempo_events.push((point.tick, point.tempo_bpm));
+    }
+    let tempo_map =
+        PlaylistTempoMap::from_tempo_events(settings.ppq, settings.tempo_bpm, &tempo_events)?;
+    schedule_parameter_events(&playlist.parameter_automation, |tick| {
+        tempo_map.frame_at_tick(tick, sample_rate)
+    })
+}
+
+fn schedule_parameter_events(
+    lanes: &[ClapParameterAutomation],
+    mut frame_at_tick: impl FnMut(u64) -> Result<u64, String>,
+) -> Result<Vec<ScheduledClapParameterEvent>, String> {
+    let mut point_count = 0usize;
+    let mut seen_ids = std::collections::BTreeSet::new();
+    let mut events = Vec::new();
+    for lane in lanes {
+        if ClapId::from_raw(lane.parameter_id).is_none() || !seen_ids.insert(lane.parameter_id) {
+            return Err(
+                "CLAP parameter automation contains an invalid or duplicate parameter ID".into(),
+            );
+        }
+        point_count = point_count.saturating_add(lane.points.len());
+        if point_count > MAX_PATTERN_PREVIEW_NOTES {
+            return Err(format!(
+                "CLAP parameter automation exceeds {MAX_PATTERN_PREVIEW_NOTES} points"
+            ));
+        }
+        for point in &lane.points {
+            if !point.normalized_value.is_finite() || !(0.0..=1.0).contains(&point.normalized_value)
+            {
+                return Err("CLAP parameter automation values must be normalized to 0–1".into());
+            }
+            events.push(ScheduledClapParameterEvent {
+                frame: frame_at_tick(point.tick)?,
+                priority: 1,
+                order: events.len(),
+                parameter_id: lane.parameter_id,
+                normalized_value: point.normalized_value,
+            });
+        }
+    }
+    events.sort_by_key(|event| (event.frame, event.priority, event.order));
+    Ok(events)
 }
 
 fn schedule_playlist_preview_events(
@@ -2360,6 +2729,14 @@ fn schedule_playlist_preview_events(
         last_event_frame = last_event_frame.max(stop_frame);
     }
     events.sort_by_key(|event| (event.frame, event.priority));
+    if let Some(last_parameter_event) =
+        schedule_parameter_events(&playlist.parameter_automation, |tick| {
+            tempo_map.frame_at_tick(tick, sample_rate)
+        })?
+        .last()
+    {
+        last_event_frame = last_event_frame.max(last_parameter_event.frame);
+    }
 
     let mut transport_points = Vec::<ClapTransportPoint>::new();
     for (tick, tempo_bpm) in tempo_map.tempo_segments() {
@@ -3237,6 +3614,7 @@ mod tests {
             ppq: 96,
             tempo_bpm: 120.0,
             loop_length_ticks: 192,
+            parameter_automation: Vec::new(),
             playlist: None,
             notes: vec![
                 ClapPatternNote {
@@ -3294,6 +3672,7 @@ mod tests {
             tempo_bpm: 120.0,
             loop_length_ticks: 192,
             notes: Vec::new(),
+            parameter_automation: Vec::new(),
             playlist: Some(ClapPlaylistPreviewSettings {
                 tempo_points: vec![
                     ClapPlaylistTempoPoint {
@@ -3316,6 +3695,7 @@ mod tests {
                     release: 32,
                     mod_x: 100,
                 }],
+                parameter_automation: Vec::new(),
             }),
         };
 
@@ -3338,7 +3718,7 @@ mod tests {
     #[test]
     fn playlist_preview_parser_reads_tempo_and_note_records() {
         let base_tempo = 123.5_f64;
-        let header = format!("96 {:016x} 2 1", base_tempo.to_bits());
+        let header = format!("96 {:016x} 2 1 0", base_tempo.to_bits());
         let mut input = Cursor::new(
             b"TEMPO 0 405e000000000000\nTEMPO 96 404e000000000000\nNOTE 0 192 60 100 0 -35 48 32 100\nEND\n".as_slice(),
         );
@@ -3371,7 +3751,7 @@ mod tests {
     #[test]
     fn pattern_preview_parser_reads_bounded_note_records() {
         let tempo_bpm = 123.5_f64;
-        let header = format!("96 {:016x} 192 2", tempo_bpm.to_bits());
+        let header = format!("96 {:016x} 192 2 0", tempo_bpm.to_bits());
         let mut input = Cursor::new(
             b"NOTE 0 96 60 100 0 -35 48 32 100\nNOTE 96 96 64 80 2 0 64 64 128\nEND\n".as_slice(),
         );
