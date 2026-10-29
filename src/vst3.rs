@@ -633,6 +633,8 @@ struct PlaylistMixerEffectStream {
     block_size: usize,
     input_channels: usize,
     output_channels: usize,
+    external_auxiliary_input_buses: Vec<(usize, usize)>,
+    external_auxiliary_scratch: Vec<f32>,
     sidechain_inputs: Vec<PlaylistMixerEffectSidechainInput>,
     parameter_automation: Vec<PreparedParameterAutomation>,
     parameter_automation_loop_frames: Option<u64>,
@@ -659,6 +661,7 @@ struct PlaylistMixerEffectSidechainInput {
     live_enabled_target: Option<Arc<AtomicI32>>,
     enabled_ramp: LiveWetMixRamp,
     delay: StereoFrameDelay,
+    stereo_scratch: Vec<f32>,
 }
 
 impl PlaylistMixerEffectStream {
@@ -2233,14 +2236,14 @@ fn process_playlist_mixer_effect_block(
         return Ok(());
     }
 
-    if !effect.sidechain_inputs.is_empty() {
-        return Err(format!(
-            "Mixer insert {} CLAP effect slot {} has sidechain inputs, which this processor does not support yet",
-            effect.insert_ordinal,
-            effect.slot_index + 1
-        ));
-    }
     effect.wet_scratch[..sample_count].copy_from_slice(&effect.dry_delay_scratch[..sample_count]);
+    fill_external_playlist_mixer_sidechain_inputs(
+        effect,
+        post_effect_buses,
+        samples_per_track,
+        block_offset,
+        frame_count,
+    )?;
     let parameter_changes = mixer_effect_parameter_changes_for_block(
         &effect.parameter_automation,
         block_start_frame,
@@ -2251,7 +2254,11 @@ fn process_playlist_mixer_effect_block(
         .external_processor
         .as_mut()
         .ok_or_else(|| "Mixer effect has no audio processor".to_owned())?
-        .process_block(&mut effect.wet_scratch[..sample_count], &parameter_changes)
+        .process_block(
+            &mut effect.wet_scratch[..sample_count],
+            &effect.external_auxiliary_scratch,
+            &parameter_changes,
+        )
         .map_err(|error| {
             format!(
                 "Mixer insert {} external effect slot {} failed: {error}",
@@ -2338,11 +2345,56 @@ fn fill_playlist_mixer_sidechain_inputs(
     frame_offset: usize,
     frame_count: usize,
 ) -> Result<(), String> {
+    fill_playlist_mixer_sidechain_audio_scratch(
+        sidechain_inputs,
+        post_effect_buses,
+        samples_per_track,
+        frame_offset,
+        frame_count,
+    )?;
+    for sidechain in sidechain_inputs {
+        let input_bus = input_buses
+            .get_mut(sidechain.bus_index)
+            .ok_or_else(|| "VST3 Mixer sidechain input bus is unavailable".to_owned())?;
+        if !input_bus.active
+            || input_bus.channels.len() != sidechain.channel_count
+            || !matches!(sidechain.channel_count, 1 | 2)
+        {
+            return Err("VST3 Mixer sidechain input bus has an unsupported layout".to_owned());
+        }
+        if input_bus
+            .channels
+            .iter()
+            .any(|channel| channel.len() != frame_count)
+        {
+            return Err("VST3 Mixer sidechain input bus has an unexpected block size".to_owned());
+        }
+        for frame_index in 0..frame_count {
+            let left = sidechain.stereo_scratch[frame_index * 2];
+            let right = sidechain.stereo_scratch[frame_index * 2 + 1];
+            if sidechain.channel_count == 1 {
+                input_bus.channels[0][frame_index] = (left + right) * 0.5;
+            } else {
+                input_bus.channels[0][frame_index] = left;
+                input_bus.channels[1][frame_index] = right;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn fill_playlist_mixer_sidechain_audio_scratch(
+    sidechain_inputs: &mut [PlaylistMixerEffectSidechainInput],
+    post_effect_buses: Option<&[f32]>,
+    samples_per_track: usize,
+    frame_offset: usize,
+    frame_count: usize,
+) -> Result<(), String> {
     if sidechain_inputs.is_empty() {
         return Ok(());
     }
     let post_effect_buses = post_effect_buses
-        .ok_or_else(|| "VST3 Mixer sidechain inputs require post-effect Mixer buses".to_owned())?;
+        .ok_or_else(|| "Mixer sidechain inputs require post-effect Mixer buses".to_owned())?;
     if !samples_per_track.is_multiple_of(2) {
         return Err("post-effect Mixer bus stride must contain stereo frames".to_owned());
     }
@@ -2371,21 +2423,11 @@ fn fill_playlist_mixer_sidechain_inputs(
             .filter(|end| *end <= post_effect_buses.len())
             .ok_or_else(|| "post-effect Mixer bus is too small for a sidechain".to_owned())?;
         let source = &post_effect_buses[source_start..source_end];
-        let input_bus = input_buses
-            .get_mut(sidechain.bus_index)
-            .ok_or_else(|| "VST3 Mixer sidechain input bus is unavailable".to_owned())?;
-        if !input_bus.active
-            || input_bus.channels.len() != sidechain.channel_count
-            || !matches!(sidechain.channel_count, 1 | 2)
-        {
-            return Err("VST3 Mixer sidechain input bus has an unsupported layout".to_owned());
-        }
-        if input_bus
-            .channels
-            .iter()
-            .any(|channel| channel.len() != frame_count)
-        {
-            return Err("VST3 Mixer sidechain input bus has an unexpected block size".to_owned());
+        let sample_count = frame_count
+            .checked_mul(2)
+            .ok_or_else(|| "Mixer sidechain block size overflow".to_owned())?;
+        if sidechain.stereo_scratch.len() < sample_count {
+            return Err("Mixer sidechain scratch buffer is too small".to_owned());
         }
         if let Some(target) = &sidechain.live_enabled_target {
             let enabled = match target.load(Ordering::Acquire) {
@@ -2407,13 +2449,60 @@ fn fill_playlist_mixer_sidechain_inputs(
             let enabled_gain = sidechain.enabled_ramp.next();
             frame[0] *= enabled_gain;
             frame[1] *= enabled_gain;
-            if sidechain.channel_count == 1 {
-                input_bus.channels[0][frame_index] = (frame[0] + frame[1]) * 0.5;
-            } else {
-                input_bus.channels[0][frame_index] = frame[0];
-                input_bus.channels[1][frame_index] = frame[1];
-            }
+            sidechain.stereo_scratch[source_offset] = frame[0];
+            sidechain.stereo_scratch[source_offset + 1] = frame[1];
         }
+    }
+    Ok(())
+}
+
+fn fill_external_playlist_mixer_sidechain_inputs(
+    effect: &mut PlaylistMixerEffectStream,
+    post_effect_buses: Option<&[f32]>,
+    samples_per_track: usize,
+    frame_offset: usize,
+    frame_count: usize,
+) -> Result<(), String> {
+    fill_playlist_mixer_sidechain_audio_scratch(
+        &mut effect.sidechain_inputs,
+        post_effect_buses,
+        samples_per_track,
+        frame_offset,
+        frame_count,
+    )?;
+    let sample_count = frame_count
+        .checked_mul(2)
+        .ok_or_else(|| "CLAP Mixer sidechain block size overflow".to_owned())?;
+    let total_sample_count = effect
+        .external_auxiliary_input_buses
+        .len()
+        .checked_mul(sample_count)
+        .ok_or_else(|| "CLAP Mixer sidechain scratch size overflow".to_owned())?;
+    if total_sample_count > effect.external_auxiliary_scratch.capacity() {
+        return Err("CLAP Mixer sidechain scratch capacity is too small".to_owned());
+    }
+    effect
+        .external_auxiliary_scratch
+        .resize(total_sample_count, 0.0);
+    effect.external_auxiliary_scratch.fill(0.0);
+    for sidechain in &effect.sidechain_inputs {
+        let bus_position = effect
+            .external_auxiliary_input_buses
+            .iter()
+            .position(|(bus_index, channel_count)| {
+                *bus_index == sidechain.bus_index && *channel_count == sidechain.channel_count
+            })
+            .ok_or_else(|| "CLAP Mixer sidechain bus is unavailable".to_owned())?;
+        let source = &sidechain.stereo_scratch[..sample_count];
+        let destination_start = bus_position
+            .checked_mul(sample_count)
+            .ok_or_else(|| "CLAP Mixer sidechain offset overflow".to_owned())?;
+        let destination_end = destination_start
+            .checked_add(sample_count)
+            .filter(|end| *end <= effect.external_auxiliary_scratch.len())
+            .ok_or_else(|| "CLAP Mixer sidechain scratch is too small".to_owned())?;
+        effect.external_auxiliary_scratch[destination_start..destination_end]
+            .copy_from_slice(source);
     }
     Ok(())
 }
@@ -2470,49 +2559,60 @@ fn update_playlist_mixer_effect_sidechain_inputs(
     sources: &[(usize, bool, bool)],
     sample_rate: f64,
 ) -> Result<(), String> {
-    let Some(buffers) = effect.buffers.as_ref() else {
-        if sources
+    let auxiliary_buses = if let Some(buffers) = effect.buffers.as_ref() {
+        buffers
+            .inputs
             .iter()
-            .any(|(_, saved_enabled, live_control)| *saved_enabled || *live_control)
-        {
+            .enumerate()
+            .skip(1)
+            .filter(|(_, bus)| bus.active && matches!(bus.channels.len(), 1 | 2))
+            .map(|(bus_index, bus)| (bus_index, bus.channels.len()))
+            .collect::<Vec<_>>()
+    } else {
+        effect.external_auxiliary_input_buses.clone()
+    };
+    if effect.external_processor.is_some() {
+        let active_source_count = sources
+            .iter()
+            .filter(|(_, saved_enabled, live_control)| *saved_enabled || *live_control)
+            .count();
+        if active_source_count > auxiliary_buses.len() {
             return Err(format!(
-                "Mixer insert {} CLAP effect slot {} has sidechain routing, which this processor does not support yet",
+                "Mixer insert {} CLAP effect slot {} has {active_source_count} active sidechain routes but only {} supported auxiliary inputs",
                 effect.insert_ordinal,
-                effect.slot_index + 1
+                effect.slot_index + 1,
+                auxiliary_buses.len()
             ));
         }
-        effect.sidechain_inputs.clear();
-        return Ok(());
-    };
+    }
     let smoothing_frames = (sample_rate * f64::from(MIXER_EFFECT_MIX_SMOOTHING_SECONDS))
         .round()
         .clamp(1.0, f64::from(u32::MAX)) as u32;
+    let scratch_sample_count = effect
+        .block_size
+        .checked_mul(2)
+        .ok_or_else(|| "Mixer sidechain scratch size overflow".to_owned())?;
     let previous_inputs = std::mem::take(&mut effect.sidechain_inputs);
     let mut previous_inputs = previous_inputs
         .into_iter()
         .map(|input| ((input.bus_index, input.source_track), input))
         .collect::<BTreeMap<_, _>>();
-    let active_auxiliary_buses = buffers
-        .inputs
-        .iter()
-        .enumerate()
-        .skip(1)
-        .filter(|(_, bus)| bus.active && matches!(bus.channels.len(), 1 | 2));
     let mut sidechain_inputs = Vec::new();
     sidechain_inputs
-        .try_reserve_exact(sources.len())
-        .map_err(|error| format!("could not allocate VST3 Mixer sidechain inputs: {error}"))?;
+        .try_reserve_exact(sources.len().min(auxiliary_buses.len()))
+        .map_err(|error| format!("could not allocate Mixer sidechain inputs: {error}"))?;
     // VST3 bus layouts expose index, activation, and channel count here. Pair active
-    // auxiliary buses with sources by ascending bus index and source-track order.
-    for ((bus_index, bus), (source_track, saved_enabled, live_control)) in
-        active_auxiliary_buses.zip(sources.iter().copied())
+    // auxiliary buses with sources by ascending bus index and source-track order. CLAP
+    // auxiliary ports use the same stable order reported by the isolated helper.
+    for ((bus_index, channel_count), (source_track, saved_enabled, live_control)) in
+        auxiliary_buses.into_iter().zip(sources.iter().copied())
     {
         let mut input = previous_inputs
             .remove(&(bus_index, source_track))
             .unwrap_or_else(|| PlaylistMixerEffectSidechainInput {
                 bus_index,
                 source_track,
-                channel_count: bus.channels.len(),
+                channel_count,
                 saved_enabled,
                 live_control,
                 live_enabled_target: None,
@@ -2521,8 +2621,10 @@ fn update_playlist_mixer_effect_sidechain_inputs(
                     smoothing_frames,
                 ),
                 delay: StereoFrameDelay::default(),
+                stereo_scratch: vec![0.0; scratch_sample_count],
             });
-        input.channel_count = bus.channels.len();
+        input.channel_count = channel_count;
+        input.stereo_scratch.resize(scratch_sample_count, 0.0);
         input.saved_enabled = saved_enabled;
         input.live_control = live_control;
         input.live_enabled_target = None;
@@ -3613,13 +3715,18 @@ pub struct Vst3HostRuntime {
 
 /// Processes a Mixer effect block through a non-VST3 plug-in host.
 ///
-/// External processors receive the interleaved stereo main bus in place. Parameter changes
-/// contain (frame_offset, parameter_id, value) tuples for the current block.
+/// External processors receive the interleaved stereo main bus in place. Auxiliary bus layouts
+/// are (bus index, channel count) pairs. Auxiliary audio contains one interleaved stereo block per
+/// layout entry, in the same order. Parameter changes contain (frame_offset, parameter_id, value)
+/// tuples for the current block.
 pub trait MixerEffectProcessor: Send {
     fn sample_rate(&self) -> f64;
     fn block_size(&self) -> usize;
     fn input_channels(&self) -> usize;
     fn output_channels(&self) -> usize;
+    fn auxiliary_input_buses(&self) -> &[(usize, usize)] {
+        &[]
+    }
     fn latency_samples(&self) -> u32;
     fn tail_samples(&self) -> Option<u64> {
         None
@@ -3627,6 +3734,7 @@ pub trait MixerEffectProcessor: Send {
     fn process_block(
         &mut self,
         samples: &mut [f32],
+        auxiliary_input_samples: &[f32],
         parameter_changes: &[(u32, u32, f64)],
     ) -> Result<(), String>;
     fn stop_processing(&mut self) -> Result<(), String>;
@@ -6153,6 +6261,8 @@ impl Vst3HostRuntime {
                     block_size,
                     input_channels,
                     output_channels,
+                    external_auxiliary_input_buses,
+                    external_auxiliary_scratch,
                     sample_rate,
                     latency_samples,
                     tail_samples,
@@ -6191,6 +6301,24 @@ impl Vst3HostRuntime {
                     let block_size = processor
                         .block_size()
                         .clamp(1, VST3_EFFECT_RENDER_BLOCK_FRAMES);
+                    let external_auxiliary_input_buses = processor.auxiliary_input_buses().to_vec();
+                    if external_auxiliary_input_buses.len() > 16
+                        || external_auxiliary_input_buses
+                            .iter()
+                            .any(|(_, channels)| !matches!(channels, 1 | 2))
+                    {
+                        return Err(format!(
+                            "CLAP Mixer insert {} effect slot {} reports an unsupported auxiliary input layout",
+                            key.0,
+                            key.1 + 1
+                        ));
+                    }
+                    let auxiliary_scratch_capacity = external_auxiliary_input_buses
+                        .len()
+                        .checked_mul(block_size)
+                        .and_then(|count| count.checked_mul(2))
+                        .ok_or_else(|| "CLAP sidechain scratch size overflow".to_owned())?;
+                    let external_auxiliary_scratch = Vec::with_capacity(auxiliary_scratch_capacity);
                     let latency_samples = processor.latency_samples();
                     let tail_samples = processor.tail_samples();
                     (
@@ -6201,6 +6329,8 @@ impl Vst3HostRuntime {
                         block_size,
                         input_channels,
                         output_channels,
+                        external_auxiliary_input_buses,
+                        external_auxiliary_scratch,
                         sample_rate,
                         latency_samples,
                         tail_samples,
@@ -6282,6 +6412,8 @@ impl Vst3HostRuntime {
                         block_size,
                         input_channels,
                         output_channels,
+                        Vec::new(),
+                        Vec::new(),
                         sample_rate,
                         latency_samples,
                         tail_samples,
@@ -6374,6 +6506,8 @@ impl Vst3HostRuntime {
                     block_size,
                     input_channels,
                     output_channels,
+                    external_auxiliary_input_buses,
+                    external_auxiliary_scratch,
                     sidechain_inputs: Vec::new(),
                     parameter_automation,
                     parameter_automation_loop_frames: effect_parameter_automation_loop_frames,
@@ -11246,6 +11380,7 @@ mod tests {
                 live_enabled_target: Some(Arc::new(AtomicI32::new(1))),
                 enabled_ramp: LiveWetMixRamp::new(0.0, 1),
                 delay: StereoFrameDelay::default(),
+                stereo_scratch: vec![0.0; 4],
             },
             PlaylistMixerEffectSidechainInput {
                 bus_index: 2,
@@ -11256,6 +11391,7 @@ mod tests {
                 live_enabled_target: None,
                 enabled_ramp: LiveWetMixRamp::new(1.0, 1),
                 delay: StereoFrameDelay::default(),
+                stereo_scratch: vec![0.0; 4],
             },
         ];
         let mut post_effect_buses = vec![0.0; crate::audio::MIXER_TRACK_METER_COUNT * 4];

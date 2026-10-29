@@ -55583,7 +55583,7 @@ impl DawUi {
                             }
                             ui.small(
                                 egui::RichText::new(
-                                    "Open editor controls a loaded VST3 effect through its native editor. Move up/down carries saved slot events with the effect. CLAP assignments process in saved slot order with timed parameter automation and reported-latency PDC. CLAP sidechains, dynamic latency/tail updates, native editors, and state capture remain unsupported. VST3 Mix edits use a 20 ms ramp.",
+                                    "Open editor controls a loaded VST3 effect through its native editor. Move up/down carries saved slot events with the effect. CLAP assignments process in saved slot order with timed parameter automation and reported-latency PDC. CLAP sidechains feed supported mono/stereo auxiliary inputs in source-track and bus order with PDC; native bus mapping, dynamic latency/tail updates, native editors, and state capture remain incomplete. VST3 Mix edits use a 20 ms ramp.",
                                 )
                                 .color(MUTED),
                             );
@@ -64136,7 +64136,7 @@ impl DawUi {
         });
         ui.label(
             egui::RichText::new(
-                "Matching VST3 instrument channels and recognized Mixer effect slots load with the project; supported VST3 Mixer effects process on loaded Mixer routes. Machine-local CLAP effect assignments process in saved Mixer slot order with timed parameter automation and reported-latency PDC. CLAP sidechains, dynamic latency/tail updates, native editors, and state capture remain unsupported. Detected CLAP and macOS Audio Unit bundles are listed below.",
+                "Matching VST3 instrument channels and recognized Mixer effect slots load with the project; supported VST3 Mixer effects process on loaded Mixer routes. Machine-local CLAP effect assignments process in saved Mixer slot order with timed parameter automation and reported-latency PDC. CLAP sidechains feed supported mono/stereo auxiliary inputs in source-track and bus order with PDC; native bus mapping, dynamic latency/tail updates, native editors, and state capture remain incomplete. Detected CLAP and macOS Audio Unit bundles are listed below.",
             )
             .color(MUTED),
         );
@@ -64367,7 +64367,7 @@ impl DawUi {
             ui.heading(format!("Detected CLAP plug-ins ({})", clap_candidates.len()));
             ui.label(
                 egui::RichText::new(
-                "CLAP note and Pattern/channel previews render in an isolated helper, which reuses the instrument while the plug-in and output rate stay the same. Pattern transport pre-renders assigned channels at project base tempo, expands Layer notes, and follows saved Mixer routes and loaded VST3 Mixer effects. Playlist transport pre-renders assigned CLAP instruments across supported Pattern Clips and follows clip repeats, track mute/solo, and tempo changes. Performance Mode pre-renders assigned CLAP-only Pattern Clip loops for constant-tempo arrangements, with saved channel and Layer gains, pan automation, and Mixer routes. Full-song Playlist mix and Mixer stem renders also pre-render assigned instruments with saved state, Pattern Event, Pattern LFO, and Playlist Automation parameter links, and linked fader/pan automation. Channel assignments and captured plug-in state are saved in machine-local settings per project path; mixed Sampler/VST3/CLAP Performance clips, tempo-changing CLAP Performance clips, CLAP Mixer effect sidechains, dynamic latency/tail updates, native editors, and effect-state capture; nondefault-scale or unrecognized legacy-window Pattern Clips, native FLP state embedding, and native plug-in editors remain unsupported.",
+                "CLAP note and Pattern/channel previews render in an isolated helper, which reuses the instrument while the plug-in and output rate stay the same. Pattern transport pre-renders assigned channels at project base tempo, expands Layer notes, and follows saved Mixer routes and loaded VST3 Mixer effects. Playlist transport pre-renders assigned CLAP instruments across supported Pattern Clips and follows clip repeats, track mute/solo, and tempo changes. Performance Mode pre-renders assigned CLAP-only Pattern Clip loops for constant-tempo arrangements, with saved channel and Layer gains, pan automation, and Mixer routes. Full-song Playlist mix and Mixer stem renders also pre-render assigned instruments with saved state, Pattern Event, Pattern LFO, and Playlist Automation parameter links, and linked fader/pan automation. Channel assignments and captured plug-in state are saved in machine-local settings per project path. CLAP Mixer sidechains feed supported mono/stereo auxiliary inputs in source-track and bus order with PDC; native bus mapping, dynamic latency/tail updates, native editors, and effect-state capture remain incomplete. Mixed Sampler/VST3/CLAP Performance clips, tempo-changing CLAP Performance clips, nondefault-scale or unrecognized legacy-window Pattern Clips, native FLP state embedding, and native plug-in editors remain unsupported.",
                 )
                 .color(MUTED),
             );

@@ -524,6 +524,7 @@ enum ClapMixerEffectProcessResponse {
     Ready {
         input_channels: usize,
         output_channels: usize,
+        auxiliary_input_buses: Vec<(usize, usize)>,
     },
     StateLoaded,
     Started {
@@ -542,6 +543,7 @@ struct ClapMixerEffectProcess {
     reader: Option<JoinHandle<()>>,
     input_channels: usize,
     output_channels: usize,
+    auxiliary_input_buses: Vec<(usize, usize)>,
     sample_rate: u32,
     latency_samples: u32,
     tail_samples: Option<u64>,
@@ -598,6 +600,7 @@ impl ClapMixerEffectProcess {
             reader: Some(reader),
             input_channels: 0,
             output_channels: 0,
+            auxiliary_input_buses: Vec::new(),
             sample_rate,
             latency_samples: 0,
             tail_samples: None,
@@ -607,9 +610,11 @@ impl ClapMixerEffectProcess {
             ClapMixerEffectProcessResponse::Ready {
                 input_channels,
                 output_channels,
+                auxiliary_input_buses,
             } if matches!(input_channels, 1 | 2) && matches!(output_channels, 1 | 2) => {
                 process.input_channels = input_channels;
                 process.output_channels = output_channels;
+                process.auxiliary_input_buses = auxiliary_input_buses;
             }
             ClapMixerEffectProcessResponse::Ready { .. } => {
                 return Err(
@@ -660,10 +665,20 @@ impl ClapMixerEffectProcess {
     fn process_block(
         &mut self,
         samples: &mut [f32],
+        auxiliary_input_samples: &[f32],
         parameter_changes: &[(u32, u32, f64)],
     ) -> Result<(), String> {
         if samples.is_empty() || !samples.len().is_multiple_of(2) {
             return Err("CLAP Mixer effect input must contain non-empty stereo frames".to_owned());
+        }
+        let input_sample_count = samples.len();
+        let expected_auxiliary_sample_count = self
+            .auxiliary_input_buses
+            .len()
+            .checked_mul(input_sample_count)
+            .ok_or_else(|| "CLAP Mixer sidechain block size overflow".to_owned())?;
+        if auxiliary_input_samples.len() != expected_auxiliary_sample_count {
+            return Err("CLAP Mixer sidechain block has an invalid size".to_owned());
         }
         let block_sample_limit = MAX_CLAP_MIXER_EFFECT_BLOCK_FRAMES as usize * 2;
         for (chunk_index, chunk) in samples.chunks_mut(block_sample_limit).enumerate() {
@@ -685,8 +700,13 @@ impl ClapMixerEffectProcess {
             if block_changes.len() > MAX_CLAP_MIXER_EFFECT_PARAMETER_CHANGES {
                 return Err("CLAP Mixer effect block has too many parameter changes".to_owned());
             }
-            writeln!(self.stdin, "BLOCK {frame_count} {}", block_changes.len())
-                .map_err(|error| format!("could not send CLAP Mixer effect block: {error}"))?;
+            writeln!(
+                self.stdin,
+                "BLOCK {frame_count} {} {}",
+                block_changes.len(),
+                self.auxiliary_input_buses.len()
+            )
+            .map_err(|error| format!("could not send CLAP Mixer effect block: {error}"))?;
             for (frame_offset, parameter_id, value) in block_changes {
                 let frame_offset = usize::try_from(frame_offset)
                     .ok()
@@ -712,6 +732,36 @@ impl ClapMixerEffectProcess {
                 .write_all(b"\n")
                 .and_then(|_| self.stdin.flush())
                 .map_err(|error| format!("could not finish CLAP Mixer effect block: {error}"))?;
+            for (bus_position, (bus_index, _)) in self.auxiliary_input_buses.iter().enumerate() {
+                let block_sample_offset = block_start
+                    .checked_mul(2)
+                    .ok_or_else(|| "CLAP Mixer sidechain offset overflow".to_owned())?;
+                let bus_start = bus_position
+                    .checked_mul(input_sample_count)
+                    .and_then(|start| start.checked_add(block_sample_offset))
+                    .ok_or_else(|| "CLAP Mixer sidechain offset overflow".to_owned())?;
+                let bus_end = bus_start
+                    .checked_add(chunk.len())
+                    .filter(|end| *end <= auxiliary_input_samples.len())
+                    .ok_or_else(|| "CLAP Mixer sidechain block end overflow".to_owned())?;
+                writeln!(self.stdin, "SIDECHAIN {bus_index}").map_err(|error| {
+                    format!("could not send CLAP Mixer sidechain header: {error}")
+                })?;
+                for sample in &auxiliary_input_samples[bus_start..bus_end] {
+                    let sample = if sample.is_finite() { *sample } else { 0.0 };
+                    self.stdin
+                        .write_all(&sample.to_le_bytes())
+                        .map_err(|error| {
+                            format!("could not send CLAP Mixer sidechain audio: {error}")
+                        })?;
+                }
+                self.stdin.write_all(b"\n").map_err(|error| {
+                    format!("could not finish CLAP Mixer sidechain block: {error}")
+                })?;
+            }
+            self.stdin
+                .flush()
+                .map_err(|error| format!("could not flush CLAP Mixer sidechain audio: {error}"))?;
             match self.receive_response()? {
                 ClapMixerEffectProcessResponse::Audio(output) if output.len() == chunk.len() => {
                     chunk.copy_from_slice(&output);
@@ -817,6 +867,10 @@ impl MixerEffectProcessor for ClapMixerEffectProcess {
         self.output_channels
     }
 
+    fn auxiliary_input_buses(&self) -> &[(usize, usize)] {
+        &self.auxiliary_input_buses
+    }
+
     fn latency_samples(&self) -> u32 {
         self.latency_samples
     }
@@ -828,9 +882,15 @@ impl MixerEffectProcessor for ClapMixerEffectProcess {
     fn process_block(
         &mut self,
         samples: &mut [f32],
+        auxiliary_input_samples: &[f32],
         parameter_changes: &[(u32, u32, f64)],
     ) -> Result<(), String> {
-        ClapMixerEffectProcess::process_block(self, samples, parameter_changes)
+        ClapMixerEffectProcess::process_block(
+            self,
+            samples,
+            auxiliary_input_samples,
+            parameter_changes,
+        )
     }
 
     fn stop_processing(&mut self) -> Result<(), String> {
@@ -1322,13 +1382,33 @@ fn read_mixer_effect_process_responses(
             let mut fields = rest.split_whitespace();
             let input_channels = fields.next().and_then(|value| value.parse::<usize>().ok());
             let output_channels = fields.next().and_then(|value| value.parse::<usize>().ok());
-            if let (Some(input_channels), Some(output_channels), None) =
-                (input_channels, output_channels, fields.next())
+            let auxiliary_bus_count = fields.next().and_then(|value| value.parse::<usize>().ok());
+            let auxiliary_input_buses = auxiliary_bus_count.and_then(|count| {
+                if count > MAX_NOTE_PREVIEW_AUDIO_PORTS as usize {
+                    return None;
+                }
+                let mut buses = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let bus_index = fields.next()?.parse::<usize>().ok()?;
+                    let channel_count = fields.next()?.parse::<usize>().ok()?;
+                    if bus_index >= MAX_NOTE_PREVIEW_AUDIO_PORTS as usize
+                        || !matches!(channel_count, 1 | 2)
+                        || buses.iter().any(|(existing, _)| *existing == bus_index)
+                    {
+                        return None;
+                    }
+                    buses.push((bus_index, channel_count));
+                }
+                (fields.next().is_none()).then_some(buses)
+            });
+            if let (Some(input_channels), Some(output_channels), Some(auxiliary_input_buses)) =
+                (input_channels, output_channels, auxiliary_input_buses)
             {
                 if response_sender
                     .send(ClapMixerEffectProcessResponse::Ready {
                         input_channels,
                         output_channels,
+                        auxiliary_input_buses,
                     })
                     .is_err()
                 {
@@ -1788,10 +1868,19 @@ pub fn run_mixer_effect_server_child(path: &Path, plugin_id: &str, sample_rate: 
     };
     let input_channels = instance.input_port_channels[instance.main_input_index];
     let output_channels = instance.output_port_channels[instance.main_output_index];
-    if writeln!(output, "READY {input_channels} {output_channels}")
-        .and_then(|_| output.flush())
-        .is_err()
-    {
+    let ready_result = (|| {
+        write!(
+            output,
+            "READY {input_channels} {output_channels} {}",
+            instance.auxiliary_input_buses.len()
+        )?;
+        for (bus_index, channel_count) in &instance.auxiliary_input_buses {
+            write!(output, " {bus_index} {channel_count}")?;
+        }
+        writeln!(output)?;
+        output.flush()
+    })();
+    if ready_result.is_err() {
         return 1;
     }
 
@@ -1846,11 +1935,70 @@ pub fn run_mixer_effect_server_child(path: &Path, plugin_id: &str, sample_rate: 
     }
 }
 
+fn read_mixer_effect_sidechain_input(
+    input: &mut impl Read,
+    input_audio_storage: &mut [Vec<Vec<f32>>],
+    frame_count: usize,
+    bus_index: usize,
+    channel_count: usize,
+) -> Result<(), String> {
+    let header = read_preview_protocol_header(input)
+        .map_err(|error| format!("could not read CLAP Mixer sidechain header: {error}"))?
+        .ok_or_else(|| "CLAP Mixer sidechain header ended early".to_owned())?;
+    let mut fields = header.split_whitespace();
+    if fields.next() != Some("SIDECHAIN")
+        || fields.next().and_then(|value| value.parse::<usize>().ok()) != Some(bus_index)
+        || fields.next().is_some()
+    {
+        return Err("CLAP Mixer sidechain bus order does not match the plug-in".to_owned());
+    }
+    let byte_count = frame_count
+        .checked_mul(2)
+        .and_then(|samples| samples.checked_mul(std::mem::size_of::<f32>()))
+        .ok_or_else(|| "CLAP Mixer sidechain block size overflow".to_owned())?;
+    let mut bytes = vec![0; byte_count];
+    input
+        .read_exact(&mut bytes)
+        .map_err(|error| format!("could not read CLAP Mixer sidechain audio: {error}"))?;
+    let mut delimiter = [0; 1];
+    if input.read_exact(&mut delimiter).is_err() || delimiter[0] != b'\n' {
+        return Err("invalid CLAP Mixer sidechain block delimiter".to_owned());
+    }
+    let channels = input_audio_storage
+        .get_mut(bus_index)
+        .ok_or_else(|| "CLAP Mixer sidechain input bus is unavailable".to_owned())?;
+    if channels.len() != channel_count || !matches!(channel_count, 1 | 2) {
+        return Err("CLAP Mixer sidechain input bus has an unsupported layout".to_owned());
+    }
+    for frame in 0..frame_count {
+        let left = f32::from_le_bytes(
+            bytes[frame * 8..frame * 8 + 4]
+                .try_into()
+                .expect("left sample has a fixed width"),
+        );
+        let right = f32::from_le_bytes(
+            bytes[frame * 8 + 4..frame * 8 + 8]
+                .try_into()
+                .expect("right sample has a fixed width"),
+        );
+        let left = if left.is_finite() { left } else { 0.0 };
+        let right = if right.is_finite() { right } else { 0.0 };
+        if channel_count == 1 {
+            channels[0][frame] = (left + right) * 0.5;
+        } else {
+            channels[0][frame] = left;
+            channels[1][frame] = right;
+        }
+    }
+    Ok(())
+}
+
 struct ClapMixerEffectInstance {
     instance: PluginInstance<()>,
     sample_rate: u32,
     input_port_channels: Vec<u32>,
     main_input_index: usize,
+    auxiliary_input_buses: Vec<(usize, usize)>,
     output_port_channels: Vec<u32>,
     main_output_index: usize,
     parameter_ranges: BTreeMap<u32, (f64, f64, bool)>,
@@ -1883,6 +2031,7 @@ impl ClapMixerEffectInstance {
         let (
             input_port_channels,
             main_input_index,
+            auxiliary_input_buses,
             output_port_channels,
             main_output_index,
             parameter_ranges,
@@ -1893,6 +2042,14 @@ impl ClapMixerEffectInstance {
                 .ok_or_else(|| "CLAP effect does not expose audio ports".to_owned())?;
             let (input_port_channels, main_input_index) =
                 read_preview_audio_inputs(&audio_ports, &plugin)?;
+            let auxiliary_input_buses = input_port_channels
+                .iter()
+                .enumerate()
+                .filter_map(|(bus_index, channel_count)| {
+                    (bus_index != main_input_index && matches!(channel_count, 1 | 2))
+                        .then_some((bus_index, *channel_count as usize))
+                })
+                .collect::<Vec<_>>();
             let (output_port_channels, main_output_index) =
                 read_preview_audio_outputs(&audio_ports, &plugin)?;
             let main_input_channels = input_port_channels[main_input_index];
@@ -1935,6 +2092,7 @@ impl ClapMixerEffectInstance {
             (
                 input_port_channels,
                 main_input_index,
+                auxiliary_input_buses,
                 output_port_channels,
                 main_output_index,
                 parameter_ranges,
@@ -1946,6 +2104,7 @@ impl ClapMixerEffectInstance {
             sample_rate,
             input_port_channels,
             main_input_index,
+            auxiliary_input_buses,
             output_port_channels,
             main_output_index,
             parameter_ranges,
@@ -2048,12 +2207,20 @@ impl ClapMixerEffectInstance {
                 break;
             }
             let mut fields = line.split_whitespace();
-            let (Some("BLOCK"), Some(frame_count), Some(parameter_count), None) = (
+            let (
+                Some("BLOCK"),
+                Some(frame_count),
+                Some(parameter_count),
+                Some(sidechain_count),
+                None,
+            ) = (
                 fields.next(),
                 fields.next().and_then(|value| value.parse::<u32>().ok()),
                 fields.next().and_then(|value| value.parse::<usize>().ok()),
+                fields.next().and_then(|value| value.parse::<usize>().ok()),
                 fields.next(),
-            ) else {
+            )
+            else {
                 let _ =
                     write_preview_server_error(output, "invalid CLAP Mixer effect block header");
                 let _ = output.flush();
@@ -2062,6 +2229,7 @@ impl ClapMixerEffectInstance {
             };
             if !(1..=MAX_CLAP_MIXER_EFFECT_BLOCK_FRAMES).contains(&frame_count)
                 || parameter_count > MAX_CLAP_MIXER_EFFECT_PARAMETER_CHANGES
+                || sidechain_count != self.auxiliary_input_buses.len()
             {
                 let _ = write_preview_server_error(
                     output,
@@ -2230,6 +2398,23 @@ impl ClapMixerEffectInstance {
                     main_input[0][frame] = left;
                     main_input[1][frame] = right;
                 }
+            }
+            for (bus_index, channel_count) in &self.auxiliary_input_buses {
+                if let Err(error) = read_mixer_effect_sidechain_input(
+                    input,
+                    &mut input_audio_storage,
+                    frame_count as usize,
+                    *bus_index,
+                    *channel_count,
+                ) {
+                    let _ = write_preview_server_error(output, &error);
+                    let _ = output.flush();
+                    result = 1;
+                    break;
+                }
+            }
+            if result != 0 {
+                break;
             }
             let mut output_audio_storage = self
                 .output_port_channels
