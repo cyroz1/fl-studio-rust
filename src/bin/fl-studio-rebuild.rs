@@ -27065,7 +27065,7 @@ impl DawUi {
                     let (ruler_rect, ruler_response) =
                         ui.allocate_exact_size(Vec2::new(grid_width, 34.0), Sense::click_and_drag());
                     let ruler_response = ruler_response.on_hover_text(
-                        "Click to move song position; Ctrl/Cmd+drag to select time; double-click a time marker to select its region; Ctrl/Cmd+Delete ripple-deletes, Ctrl/Cmd+Alt/Option+Insert inserts time",
+                        "Click to move song position; Ctrl/Cmd+drag to select time; Ctrl/Cmd-click or double-click a time marker to select its region; Ctrl/Cmd+Delete ripple-deletes, Ctrl/Cmd+Alt/Option+Insert inserts time",
                     );
                     let time_selection_modifier =
                         ui.input(|input| input.modifiers.ctrl || input.modifiers.command);
@@ -27122,6 +27122,7 @@ impl DawUi {
                             self.playlist_time_selection_drag = None;
                         }
                     }
+                    let mut cleared_time_selection = false;
                     if time_selection_modifier
                         && ruler_response.clicked_by(PointerButton::Primary)
                         && let Some((selection_arrangement, start_tick, end_tick)) =
@@ -27137,7 +27138,46 @@ impl DawUi {
                                 as u32;
                         if (start_tick..=end_tick).contains(&click_tick) {
                             self.playlist_time_selection = None;
+                            cleared_time_selection = true;
                             self.status = "Cleared Playlist time selection".to_owned();
+                        }
+                    }
+                    if time_selection_modifier
+                        && ruler_response.clicked_by(PointerButton::Primary)
+                        && !cleared_time_selection
+                        && let Some(pointer) = ruler_response.interact_pointer_pos()
+                        && let Some(marker_index) = playlist_time_marker_at_x(
+                            &arrangement.time_markers,
+                            ruler_rect,
+                            tick_scale,
+                            pointer.x,
+                        )
+                    {
+                        self.selected_arrangement = Some(arrangement.id);
+                        self.selected_time_marker = Some(marker_index);
+                        self.playlist_time_selection_drag = None;
+                        seek_tick_requested = None;
+                        if let Some((start_tick, end_tick)) = playlist_time_marker_selection(
+                            &arrangement.time_markers,
+                            marker_index,
+                            arrangement
+                                .clips
+                                .iter()
+                                .map(|clip| clip.position_ticks.saturating_add(clip.length_ticks))
+                                .max()
+                                .unwrap_or(0),
+                        ) {
+                            self.playlist_time_selection =
+                                Some((arrangement.id, start_tick, end_tick));
+                            self.status = format!(
+                                "Selected Playlist marker range from {start_tick} to {end_tick} ticks"
+                            );
+                        } else {
+                            self.playlist_time_selection = None;
+                            self.status = format!(
+                                "Time marker {} has no song region to its right",
+                                marker_index + 1
+                            );
                         }
                     }
                     if ruler_response.clicked_by(PointerButton::Primary)
@@ -27157,18 +27197,12 @@ impl DawUi {
                         let clicked_marker = ruler_response
                             .interact_pointer_pos()
                             .and_then(|pointer| {
-                                arrangement
-                                    .time_markers
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(marker_index, marker)| {
-                                        let marker_x = ruler_rect.left()
-                                            + marker.position_ticks() as f32 * tick_scale;
-                                        (marker_index, (pointer.x - marker_x).abs())
-                                    })
-                                    .filter(|(_, distance)| *distance <= 5.0)
-                                    .min_by(|(_, left), (_, right)| left.total_cmp(right))
-                                    .map(|(marker_index, _)| marker_index)
+                                playlist_time_marker_at_x(
+                                    &arrangement.time_markers,
+                                    ruler_rect,
+                                    tick_scale,
+                                    pointer.x,
+                                )
                             });
                         if let Some(marker_index) = clicked_marker {
                             self.selected_arrangement = Some(arrangement.id);
@@ -79711,6 +79745,26 @@ fn playlist_time_marker_selection(
         .min()
         .unwrap_or(song_end_tick);
     (end_tick > start_tick).then_some((start_tick, end_tick))
+}
+
+fn playlist_time_marker_at_x(
+    markers: &[TimeMarker],
+    ruler_rect: egui::Rect,
+    tick_scale: f32,
+    pointer_x: f32,
+) -> Option<usize> {
+    markers
+        .iter()
+        .enumerate()
+        .map(|(marker_index, marker)| {
+            let marker_x = ruler_rect.left() + marker.position_ticks() as f32 * tick_scale;
+            (marker_index, marker_x, (pointer_x - marker_x).abs())
+        })
+        .filter(|(_, marker_x, distance)| {
+            (ruler_rect.left()..=ruler_rect.right()).contains(marker_x) && *distance <= 5.0
+        })
+        .min_by(|(_, _, left), (_, _, right)| left.total_cmp(right))
+        .map(|(marker_index, _, _)| marker_index)
 }
 
 fn playlist_performance_navigation_target_tick(
