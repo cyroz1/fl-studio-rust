@@ -2356,11 +2356,17 @@ impl PlaylistPlaybackLoopRange {
     }
 
     fn frames_to_boundary(self, output_frame: u64) -> u64 {
-        if output_frame < self.end_frame {
+        if output_frame < self.start_frame {
+            self.start_frame - output_frame
+        } else if output_frame < self.end_frame {
             self.end_frame - output_frame
         } else {
             self.length_frames() - (output_frame - self.end_frame) % self.length_frames()
         }
+    }
+
+    fn is_loop_start(self, output_frame: u64) -> bool {
+        output_frame == self.start_frame
     }
 
     fn is_cycle_start(self, output_frame: u64) -> bool {
@@ -6478,9 +6484,18 @@ fn stream_prepared_playlist_render_with_performance(
                     )?;
                 }
                 if let Some(loop_range) = loop_range
+                    && loop_range.is_loop_start(block_start)
+                {
+                    sampler_engine.capture_playlist_loop_start();
+                }
+                if let Some(loop_range) = loop_range
                     && loop_range.is_cycle_start(block_start)
                 {
-                    sampler_engine.reset_for_playlist_loop(loop_range.start_frame);
+                    sampler_engine.reset_for_playlist_loop(
+                        loop_range.start_frame,
+                        loop_range.end_frame,
+                        loop_range.length_frames(),
+                    );
                 }
                 let sampler_samples = &mut sampler_block[..sample_count];
                 if let Some(meter_buses) = meter_buses.as_deref_mut() {
@@ -14673,6 +14688,9 @@ struct SamplerVoiceEngine<'a> {
     release_frames: usize,
     output_sample_rate: u32,
     resampling_quality: ResamplingQuality,
+    voice_limit: usize,
+    playlist_loop_start_voices: Option<Vec<Option<SamplerVoice>>>,
+    playlist_loop_start_portamento_values: Option<HashMap<(u16, u8), SamplerPortamentoValues>>,
     voices_stolen: usize,
     pitch_bend_cents: [i16; 16],
     live_midi_pan: [f32; 16],
@@ -14682,6 +14700,7 @@ struct SamplerVoiceEngine<'a> {
     sostenuto_down: [bool; 16],
 }
 
+#[derive(Clone)]
 struct SamplerVoice {
     source: Arc<DecodedAudio>,
     channel_id: u16,
@@ -14851,6 +14870,9 @@ impl<'a> SamplerVoiceEngine<'a> {
             release_frames,
             output_sample_rate,
             resampling_quality,
+            voice_limit,
+            playlist_loop_start_voices: None,
+            playlist_loop_start_portamento_values: None,
             voices_stolen: 0,
             pitch_bend_cents: [0; 16],
             live_midi_pan: [64.0; 16],
@@ -14923,15 +14945,36 @@ impl<'a> SamplerVoiceEngine<'a> {
         self.render_block_with_meters(block_start, frame_count, output, None, 0);
     }
 
-    fn reset_for_playlist_loop(&mut self, start_frame: u64) {
+    fn capture_playlist_loop_start(&mut self) {
+        self.playlist_loop_start_voices =
+            Some(self.voices.iter().take(self.voice_limit).cloned().collect());
+        self.playlist_loop_start_portamento_values =
+            Some(self.last_portamento_values_by_group.clone());
+    }
+
+    fn reset_for_playlist_loop(&mut self, start_frame: u64, end_frame: u64, loop_frames: u64) {
         let declick_frames = (f64::from(self.output_sample_rate) * 0.010)
             .round()
             .max(1.0) as usize;
-        for voice in self.voices.iter_mut().flatten() {
-            if !voice.release_started {
-                begin_sampler_voice_fast_cut_declick(voice, start_frame, declick_frames);
+        let loop_frames = usize::try_from(loop_frames).unwrap_or(usize::MAX).max(1);
+        let declick_frames = declick_frames.min(loop_frames);
+        let mut fading_voices = Vec::with_capacity(self.voice_limit);
+        for voice in self.voices.iter_mut().take(self.voice_limit) {
+            if let Some(mut voice) = voice.take() {
+                begin_sampler_voice_fast_cut_declick(&mut voice, end_frame, declick_frames);
+                fading_voices.push(Some(voice));
+            } else {
+                fading_voices.push(None);
             }
         }
+        let mut loop_start_voices = self
+            .playlist_loop_start_voices
+            .clone()
+            .unwrap_or_else(|| vec![None; self.voice_limit]);
+        loop_start_voices.resize_with(self.voice_limit, || None);
+        loop_start_voices.truncate(self.voice_limit);
+        self.voices = loop_start_voices;
+        self.voices.extend(fading_voices);
         self.current_frame = start_frame;
         self.next_note = self
             .notes
@@ -14939,7 +14982,10 @@ impl<'a> SamplerVoiceEngine<'a> {
         self.next_live_note = self
             .live_notes
             .partition_point(|note| note.start_frame < start_frame);
-        self.last_portamento_values_by_group.clear();
+        self.last_portamento_values_by_group = self
+            .playlist_loop_start_portamento_values
+            .clone()
+            .unwrap_or_default();
     }
 
     fn render_block_with_meters(
@@ -15217,6 +15263,7 @@ impl<'a> SamplerVoiceEngine<'a> {
             let voices_to_cut = self
                 .voices
                 .iter()
+                .take(self.voice_limit)
                 .enumerate()
                 .filter_map(|(index, voice)| {
                     let voice = voice.as_ref()?;
@@ -15256,11 +15303,17 @@ impl<'a> SamplerVoiceEngine<'a> {
             None
         };
         if source.mono_enabled {
-            for voice in self.voices.iter_mut().flatten().filter(|voice| {
-                voice.channel_id == note.channel_id
-                    && voice.midi_channel == note_midi_channel
-                    && !voice.release_started
-            }) {
+            for voice in self
+                .voices
+                .iter_mut()
+                .take(self.voice_limit)
+                .flatten()
+                .filter(|voice| {
+                    voice.channel_id == note.channel_id
+                        && voice.midi_channel == note_midi_channel
+                        && !voice.release_started
+                })
+            {
                 begin_sampler_voice_release(voice, note.start_frame, self.release_frames);
             }
         } else if let Some(max_polyphony) = source
@@ -15271,6 +15324,7 @@ impl<'a> SamplerVoiceEngine<'a> {
             while self
                 .voices
                 .iter()
+                .take(self.voice_limit)
                 .flatten()
                 .filter(|voice| voice.channel_id == note.channel_id)
                 .count()
@@ -15279,6 +15333,7 @@ impl<'a> SamplerVoiceEngine<'a> {
                 let oldest_channel_voice = self
                     .voices
                     .iter()
+                    .take(self.voice_limit)
                     .enumerate()
                     .filter_map(|(index, voice)| {
                         voice.as_ref().and_then(|voice| {
@@ -15298,10 +15353,12 @@ impl<'a> SamplerVoiceEngine<'a> {
         let slot_index = self
             .voices
             .iter()
+            .take(self.voice_limit)
             .position(Option::is_none)
             .unwrap_or_else(|| {
                 self.voices
                     .iter()
+                    .take(self.voice_limit)
                     .enumerate()
                     .filter_map(|(index, voice)| {
                         voice.as_ref().map(|voice| (index, voice.started_frame))
