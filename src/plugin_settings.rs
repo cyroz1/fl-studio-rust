@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -26,7 +26,7 @@ pub struct ClapProjectMixerEffectAssignment {
     pub state: Option<Vec<u8>>,
     /// Maps source Mixer insert ordinals to CLAP auxiliary input port indices.
     /// `None` uses stable automatic ordering; `Some(empty)` explicitly disables sidechains.
-    pub auxiliary_input_source_map: Option<BTreeMap<usize, usize>>,
+    pub auxiliary_input_source_map: Option<BTreeSet<(usize, usize)>>,
 }
 
 fn app_settings_directory() -> Option<PathBuf> {
@@ -218,8 +218,11 @@ pub fn parse_clap_project_mixer_effects(
     let Some(version) = contents.lines().next() else {
         return assignments;
     };
-    let version_two = version == "clap-project-mixer-effects-v2";
-    if !version_two && version != "clap-project-mixer-effects-v1" {
+    let has_auxiliary_map = matches!(
+        version,
+        "clap-project-mixer-effects-v2" | "clap-project-mixer-effects-v3"
+    );
+    if !has_auxiliary_map && version != "clap-project-mixer-effects-v1" {
         return assignments;
     }
     for line in contents.lines().skip(1) {
@@ -255,7 +258,7 @@ pub fn parse_clap_project_mixer_effects(
         } else {
             continue;
         };
-        let auxiliary_input_source_map = if version_two {
+        let auxiliary_input_source_map = if has_auxiliary_map {
             let Some(encoded_map) = fields.next() else {
                 continue;
             };
@@ -292,7 +295,7 @@ pub fn parse_clap_project_mixer_effects(
 pub fn serialize_clap_project_mixer_effects(
     assignments: &BTreeMap<(usize, u16), ClapProjectMixerEffectAssignment>,
 ) -> String {
-    let mut contents = String::from("clap-project-mixer-effects-v2\n");
+    let mut contents = String::from("clap-project-mixer-effects-v3\n");
     for ((insert_ordinal, slot_index), assignment) in assignments {
         if *insert_ordinal >= crate::audio::MIXER_TRACK_METER_COUNT
             || *slot_index >= 10
@@ -351,14 +354,14 @@ pub fn serialize_clap_project_mixer_effects(
 
 fn parse_clap_mixer_auxiliary_input_source_map(
     encoded: &str,
-) -> Option<Option<BTreeMap<usize, usize>>> {
+) -> Option<Option<BTreeSet<(usize, usize)>>> {
     if encoded == "-" {
         return Some(None);
     }
     if encoded == "!" {
-        return Some(Some(BTreeMap::new()));
+        return Some(Some(BTreeSet::new()));
     }
-    let mut mapping = BTreeMap::new();
+    let mut mapping = BTreeSet::new();
     for entry in encoded.split(',') {
         let (source_track, bus_index) = entry.split_once(':')?;
         let source_track = source_track.parse::<usize>().ok()?;
@@ -366,7 +369,7 @@ fn parse_clap_mixer_auxiliary_input_source_map(
         if source_track == 0
             || source_track >= crate::audio::MIXER_TRACK_METER_COUNT
             || bus_index >= MAX_CLAP_PROJECT_MIXER_AUXILIARY_BUSES
-            || mapping.insert(source_track, bus_index).is_some()
+            || !mapping.insert((source_track, bus_index))
         {
             return None;
         }

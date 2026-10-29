@@ -55837,7 +55837,7 @@ impl DawUi {
                                                                         } else if assignment
                                                                             .auxiliary_input_source_map
                                                                             .as_ref()
-                                                                            .is_some_and(BTreeMap::is_empty)
+                                                                            .is_some_and(BTreeSet::is_empty)
                                                                         {
                                                                             ui.small("Explicit mapping is active with no sources routed.");
                                                                         }
@@ -55848,7 +55848,7 @@ impl DawUi {
                                                                                 .map(|mapping| {
                                                                                     format!(
                                                                                         "{} mapped",
-                                                                                        mapping.values().filter(|mapped_bus| **mapped_bus == bus_index).count()
+                                                                                        mapping.iter().filter(|(_, mapped_bus)| *mapped_bus == bus_index).count()
                                                                                     )
                                                                                 })
                                                                                 .unwrap_or_else(|| "automatic".to_owned());
@@ -55867,9 +55867,10 @@ impl DawUi {
                                                                                             }) {
                                                                                                 let mut mapped = assignment
                                                                                                     .auxiliary_input_source_map
-                                                                            .as_ref()
-                                                                            .and_then(|mapping| mapping.get(&source.ordinal()))
-                                                                                                    == Some(&bus_index);
+                                                                                                    .as_ref()
+                                                                                                    .is_some_and(|mapping| {
+                                                                                                        mapping.contains(&(source.ordinal(), bus_index))
+                                                                                                    });
                                                                                                 if menu
                                                                                                     .checkbox(
                                                                                                         &mut mapped,
@@ -55884,7 +55885,8 @@ impl DawUi {
                                                                                                     clap_effect_sidechain_mapping_edits.push((
                                                                                                         slot_key,
                                                                                                         source.ordinal(),
-                                                                                                        mapped.then_some(bus_index),
+                                                                                                        bus_index,
+                                                                                                        mapped,
                                                                                                     ));
                                                                                                 }
                                                                                             }
@@ -55904,7 +55906,7 @@ impl DawUi {
                                                                                 .color(MUTED),
                                                                             );
                                                                         }
-                                                                        ui.small("Mapped sources need an enabled Mixer send to this insert. Multiple sources assigned to one port are summed.");
+                                                                        ui.small("Mapped sources need an enabled Mixer send to this insert. A source can feed multiple inputs; sources assigned to one input are summed.");
                                                                     }
                                                                 }
                                                                 Some(ClapInstanceInspectionState::Inspecting) => {
@@ -56405,19 +56407,19 @@ impl DawUi {
                     };
                     assignment.auxiliary_input_source_map = None;
                 }
-                for (slot_key, source_track, bus_index) in clap_effect_sidechain_mapping_edits {
+                for (slot_key, source_track, bus_index, mapped) in
+                    clap_effect_sidechain_mapping_edits
+                {
                     let Some(assignment) = assignments.get_mut(&slot_key) else {
                         continue;
                     };
-                    if let Some(bus_index) = bus_index {
-                        assignment
-                            .auxiliary_input_source_map
-                            .get_or_insert_with(BTreeMap::new)
-                            .insert(source_track, bus_index);
+                    let mapping = assignment
+                        .auxiliary_input_source_map
+                        .get_or_insert_with(BTreeSet::new);
+                    if mapped {
+                        mapping.insert((source_track, bus_index));
                     } else {
-                        if let Some(mapping) = &mut assignment.auxiliary_input_source_map {
-                            mapping.remove(&source_track);
-                        }
+                        mapping.remove(&(source_track, bus_index));
                     }
                 }
                 match save_clap_project_mixer_effects(project_id, &assignments) {
