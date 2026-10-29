@@ -466,7 +466,7 @@ Ordered by dependency and by "most compatibility per unit effort":
     Pattern previews, Pattern transport, Playlist and Performance playback, and offline
     song/stem renders; Pattern Event points take precedence for a shared parameter.
     Nondefault-scale or unrecognized legacy-window Pattern Clips remain unsupported for CLAP.
-    CLAP Mixer sidechains route through supported mono/stereo auxiliary inputs in source-track and bus order with PDC; native bus mapping, dynamic latency/tail updates, effect-state capture, and native editors remain incomplete.
+    CLAP Mixer sidechains route through supported mono/stereo auxiliary inputs in source-track and bus order with PDC. CLAP restart, latency, and tail notifications now refresh between audio blocks; latency changes rebuild Mixer PDC and longer finite tails extend active Playlist renders, up to the existing 60-second cap. Native bus mapping, effect-state capture, native editors, and resizing Pattern-specific exports after a runtime tail change remain incomplete.
     Validate Playlist playback on each platform and compare timing, levels, and
     instrument behavior against native FL Studio output.
 3. **Realtime sampler + scheduler (partial)** — selected-pattern and Playlist

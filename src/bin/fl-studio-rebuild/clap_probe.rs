@@ -3,25 +3,28 @@ use std::ffi::{CString, OsString};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use clack_extensions::audio_ports::{AudioPortFlags, AudioPortInfoBuffer, PluginAudioPorts};
-use clack_extensions::latency::PluginLatency;
+use clack_extensions::latency::{HostLatency, HostLatencyImpl, PluginLatency};
 use clack_extensions::note_ports::{NoteDialect, NotePortInfoBuffer, PluginNotePorts};
 use clack_extensions::params::{ParamInfoBuffer, ParamInfoFlags, PluginParams};
 use clack_extensions::state::PluginState;
-use clack_extensions::tail::{PluginTail, TailLength};
+use clack_extensions::tail::{HostTail, HostTailImpl, PluginTail, TailLength};
 use clack_host::events::event_types::{
     Midi2Event, MidiEvent, NoteExpressionEvent, NoteExpressionType, NoteOffEvent, NoteOnEvent,
     ParamGestureBeginEvent, ParamGestureEndEvent, ParamValueEvent, TransportEvent, TransportFlags,
 };
 use clack_host::events::{EventFlags, EventHeader};
 use clack_host::prelude::{
-    AudioPortBuffer, AudioPortBufferType, AudioPorts, ClapId, EventBuffer, HostInfo,
-    InputAudioBuffers, InputChannel, Pckn, PluginAudioConfiguration, PluginEntry, PluginInstance,
-    ProcessStatus,
+    AudioPortBuffer, AudioPortBufferType, AudioPorts, AudioProcessorHandler, ClapId, EventBuffer,
+    HostExtensions, HostHandlers, HostInfo, InputAudioBuffers, InputChannel, MainThreadHandler,
+    Pckn, PluginAudioConfiguration, PluginEntry, PluginInstance, ProcessStatus, SharedHandler,
+    StartedPluginAudioProcessor,
 };
 use clack_host::utils::{BeatTime, SecondsTime};
 use flp_rebuild::plugin_settings::{
@@ -55,6 +58,61 @@ pub const MIN_NOTE_PREVIEW_NOTE_MILLISECONDS: u32 = 50;
 pub const MAX_NOTE_PREVIEW_NOTE_MILLISECONDS: u32 = 1000;
 const PROBE_HEADER: &str = "FL_STUDIO_REBUILD_CLAP_PROBE_V1";
 const INSTANCE_PROBE_HEADER: &str = "FL_STUDIO_REBUILD_CLAP_INSTANCE_V1";
+
+struct ClapMixerEffectHost;
+
+struct ClapMixerEffectHostShared {
+    restart_requested: Arc<AtomicBool>,
+    callback_requested: Arc<AtomicBool>,
+    latency_changed: Arc<AtomicBool>,
+    tail_changed: Arc<AtomicBool>,
+}
+
+struct ClapMixerEffectHostMainThread<'a> {
+    latency_changed: &'a AtomicBool,
+}
+
+struct ClapMixerEffectHostAudioProcessor<'a> {
+    tail_changed: &'a AtomicBool,
+}
+
+impl<'a> SharedHandler<'a> for ClapMixerEffectHostShared {
+    fn request_restart(&self) {
+        self.restart_requested.store(true, Ordering::Release);
+    }
+
+    fn request_process(&self) {}
+
+    fn request_callback(&self) {
+        self.callback_requested.store(true, Ordering::Release);
+    }
+}
+
+impl<'a> MainThreadHandler<'a> for ClapMixerEffectHostMainThread<'a> {}
+
+impl HostLatencyImpl for ClapMixerEffectHostMainThread<'_> {
+    fn changed(&self) {
+        self.latency_changed.store(true, Ordering::Release);
+    }
+}
+
+impl<'a> AudioProcessorHandler<'a> for ClapMixerEffectHostAudioProcessor<'a> {}
+
+impl HostTailImpl for ClapMixerEffectHostAudioProcessor<'_> {
+    fn changed(&mut self) {
+        self.tail_changed.store(true, Ordering::Release);
+    }
+}
+
+impl HostHandlers for ClapMixerEffectHost {
+    type Shared<'a> = ClapMixerEffectHostShared;
+    type MainThread<'a> = ClapMixerEffectHostMainThread<'a>;
+    type AudioProcessor<'a> = ClapMixerEffectHostAudioProcessor<'a>;
+
+    fn declare_extensions(builder: &mut HostExtensions<Self>, _shared: &Self::Shared<'_>) {
+        builder.register::<HostLatency>().register::<HostTail>();
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClapPluginDescriptor {
@@ -531,7 +589,11 @@ enum ClapMixerEffectProcessResponse {
         latency_samples: u32,
         tail_samples: Option<u64>,
     },
-    Audio(Vec<f32>),
+    Audio {
+        samples: Vec<f32>,
+        latency_samples: u32,
+        tail_samples: Option<u64>,
+    },
     Stopped,
     Error(String),
 }
@@ -763,10 +825,16 @@ impl ClapMixerEffectProcess {
                 .flush()
                 .map_err(|error| format!("could not flush CLAP Mixer sidechain audio: {error}"))?;
             match self.receive_response()? {
-                ClapMixerEffectProcessResponse::Audio(output) if output.len() == chunk.len() => {
-                    chunk.copy_from_slice(&output);
+                ClapMixerEffectProcessResponse::Audio {
+                    samples,
+                    latency_samples,
+                    tail_samples,
+                } if samples.len() == chunk.len() => {
+                    chunk.copy_from_slice(&samples);
+                    self.latency_samples = latency_samples;
+                    self.tail_samples = tail_samples;
                 }
-                ClapMixerEffectProcessResponse::Audio(_) => {
+                ClapMixerEffectProcessResponse::Audio { .. } => {
                     return Err("CLAP Mixer effect helper returned the wrong block size".to_owned());
                 }
                 ClapMixerEffectProcessResponse::Error(error) => return Err(error),
@@ -1465,16 +1533,34 @@ fn read_mixer_effect_process_responses(
             let _ = response_sender.send(ClapMixerEffectProcessResponse::Error(message.to_owned()));
             return;
         }
-        let Some(frame_count) = header
-            .strip_prefix("BLOCK ")
-            .and_then(|value| value.parse::<u32>().ok())
-            .filter(|frames| (1..=MAX_CLAP_MIXER_EFFECT_BLOCK_FRAMES).contains(frames))
-        else {
+        let Some(value) = header.strip_prefix("BLOCK ") else {
             let _ = response_sender.send(ClapMixerEffectProcessResponse::Error(
                 "CLAP Mixer effect helper sent an invalid block header".to_owned(),
             ));
             return;
         };
+        let mut fields = value.split_whitespace();
+        let frame_count = fields.next().and_then(|field| field.parse::<u32>().ok());
+        let latency_samples = fields.next().and_then(|field| field.parse::<u32>().ok());
+        let tail_samples = match fields.next() {
+            Some("NONE") => Some(None),
+            Some(field) => field.parse::<u64>().ok().map(Some),
+            None => None,
+        };
+        let (Some(frame_count), Some(latency_samples), Some(tail_samples), None) =
+            (frame_count, latency_samples, tail_samples, fields.next())
+        else {
+            let _ = response_sender.send(ClapMixerEffectProcessResponse::Error(
+                "CLAP Mixer effect helper sent an invalid dynamic report".to_owned(),
+            ));
+            return;
+        };
+        if !(1..=MAX_CLAP_MIXER_EFFECT_BLOCK_FRAMES).contains(&frame_count) {
+            let _ = response_sender.send(ClapMixerEffectProcessResponse::Error(
+                "CLAP Mixer effect helper sent an invalid block size".to_owned(),
+            ));
+            return;
+        }
         let byte_count = frame_count as usize * 2 * std::mem::size_of::<f32>();
         let mut bytes = vec![0; byte_count];
         if let Err(error) = stdout.read_exact(&mut bytes) {
@@ -1500,7 +1586,11 @@ fn read_mixer_effect_process_responses(
             })
             .collect();
         if response_sender
-            .send(ClapMixerEffectProcessResponse::Audio(samples))
+            .send(ClapMixerEffectProcessResponse::Audio {
+                samples,
+                latency_samples,
+                tail_samples,
+            })
             .is_err()
         {
             return;
@@ -1994,7 +2084,7 @@ fn read_mixer_effect_sidechain_input(
 }
 
 struct ClapMixerEffectInstance {
-    instance: PluginInstance<()>,
+    instance: PluginInstance<ClapMixerEffectHost>,
     sample_rate: u32,
     input_port_channels: Vec<u32>,
     main_input_index: usize,
@@ -2003,6 +2093,11 @@ struct ClapMixerEffectInstance {
     main_output_index: usize,
     parameter_ranges: BTreeMap<u32, (f64, f64, bool)>,
     latency_samples: u32,
+    tail_samples: Option<u64>,
+    restart_requested: Arc<AtomicBool>,
+    callback_requested: Arc<AtomicBool>,
+    latency_changed: Arc<AtomicBool>,
+    tail_changed: Arc<AtomicBool>,
 }
 
 impl ClapMixerEffectInstance {
@@ -2024,9 +2119,29 @@ impl ClapMixerEffectInstance {
             env!("CARGO_PKG_VERSION"),
         )
         .map_err(|error| format!("could not describe the host to the CLAP plug-in: {error}"))?;
-        let mut instance =
-            PluginInstance::<()>::new(|_| (), |_| (), &entry, &plugin_id, &host_info)
-                .map_err(|error| format!("could not initialize CLAP plug-in instance: {error}"))?;
+        let restart_requested = Arc::new(AtomicBool::new(false));
+        let callback_requested = Arc::new(AtomicBool::new(false));
+        let latency_changed = Arc::new(AtomicBool::new(false));
+        let tail_changed = Arc::new(AtomicBool::new(false));
+        let shared_restart_requested = Arc::clone(&restart_requested);
+        let shared_callback_requested = Arc::clone(&callback_requested);
+        let shared_latency_changed = Arc::clone(&latency_changed);
+        let shared_tail_changed = Arc::clone(&tail_changed);
+        let mut instance = PluginInstance::<ClapMixerEffectHost>::new(
+            move |_| ClapMixerEffectHostShared {
+                restart_requested: shared_restart_requested,
+                callback_requested: shared_callback_requested,
+                latency_changed: shared_latency_changed,
+                tail_changed: shared_tail_changed,
+            },
+            |shared| ClapMixerEffectHostMainThread {
+                latency_changed: shared.latency_changed.as_ref(),
+            },
+            &entry,
+            &plugin_id,
+            &host_info,
+        )
+        .map_err(|error| format!("could not initialize CLAP plug-in instance: {error}"))?;
 
         let (
             input_port_channels,
@@ -2109,6 +2224,11 @@ impl ClapMixerEffectInstance {
             main_output_index,
             parameter_ranges,
             latency_samples: 0,
+            tail_samples: None,
+            restart_requested,
+            callback_requested,
+            latency_changed,
+            tail_changed,
         })
     }
 
@@ -2126,13 +2246,120 @@ impl ClapMixerEffectInstance {
             .map_err(|error| format!("CLAP effect could not restore its state: {error}"))
     }
 
+    fn read_latency_samples(&mut self) -> u32 {
+        let plugin = self.instance.plugin_handle();
+        plugin
+            .get_extension::<PluginLatency>()
+            .map_or(0, |latency| latency.get(&plugin))
+    }
+
+    fn read_tail_samples(
+        &self,
+        audio_processor: &mut StartedPluginAudioProcessor<ClapMixerEffectHost>,
+    ) -> Option<u64> {
+        let plugin = audio_processor.plugin_handle();
+        plugin
+            .get_extension::<PluginTail>()
+            .map(|tail| match tail.get(&plugin) {
+                TailLength::Finite(samples) => u64::from(samples),
+                TailLength::Infinite => u64::from(i32::MAX as u32),
+            })
+    }
+
+    fn validate_audio_layout_after_restart(&mut self) -> Result<(), String> {
+        let plugin = self.instance.plugin_handle();
+        let audio_ports = plugin
+            .get_extension::<PluginAudioPorts>()
+            .ok_or_else(|| "CLAP effect no longer exposes audio ports after restart".to_owned())?;
+        let (input_channels, main_input_index) = read_preview_audio_inputs(&audio_ports, &plugin)?;
+        let (output_channels, main_output_index) =
+            read_preview_audio_outputs(&audio_ports, &plugin)?;
+        if input_channels != self.input_port_channels
+            || main_input_index != self.main_input_index
+            || output_channels != self.output_port_channels
+            || main_output_index != self.main_output_index
+        {
+            return Err(
+                "CLAP effect changed its audio port layout during restart, which is unsupported"
+                    .to_owned(),
+            );
+        }
+        Ok(())
+    }
+
+    fn restart_audio_processor(
+        &mut self,
+        audio_processor: StartedPluginAudioProcessor<ClapMixerEffectHost>,
+        audio_configuration: PluginAudioConfiguration,
+    ) -> Result<StartedPluginAudioProcessor<ClapMixerEffectHost>, String> {
+        let stopped_processor = audio_processor.stop_processing();
+        self.instance.deactivate(stopped_processor);
+        let stopped_processor = self
+            .instance
+            .activate(
+                |shared, _| ClapMixerEffectHostAudioProcessor {
+                    tail_changed: shared.tail_changed.as_ref(),
+                },
+                audio_configuration,
+            )
+            .map_err(|error| format!("could not reactivate CLAP effect: {error}"))?;
+        if let Err(error) = self.validate_audio_layout_after_restart() {
+            self.instance.deactivate(stopped_processor);
+            return Err(error);
+        }
+        self.latency_samples = self.read_latency_samples();
+        self.latency_changed.store(false, Ordering::Release);
+        self.tail_changed.store(false, Ordering::Release);
+        match stopped_processor.start_processing() {
+            Ok(mut audio_processor) => {
+                self.tail_samples = self.read_tail_samples(&mut audio_processor);
+                self.tail_changed.store(false, Ordering::Release);
+                Ok(audio_processor)
+            }
+            Err(error) => {
+                self.instance.deactivate(error.into_stopped_processor());
+                Err("CLAP effect could not restart audio processing".to_owned())
+            }
+        }
+    }
+
+    fn service_host_requests(
+        &mut self,
+        audio_processor: &mut Option<StartedPluginAudioProcessor<ClapMixerEffectHost>>,
+        audio_configuration: PluginAudioConfiguration,
+    ) -> Result<(), String> {
+        if self.callback_requested.swap(false, Ordering::AcqRel) {
+            self.instance.call_on_main_thread_callback();
+        }
+        if self.restart_requested.swap(false, Ordering::AcqRel) {
+            let current = audio_processor
+                .take()
+                .ok_or_else(|| "CLAP effect processor is unavailable for restart".to_owned())?;
+            *audio_processor = Some(self.restart_audio_processor(current, audio_configuration)?);
+        } else if self.latency_changed.swap(false, Ordering::AcqRel) {
+            self.latency_samples = self.read_latency_samples();
+        }
+        if self.tail_changed.swap(false, Ordering::AcqRel) {
+            let audio_processor = audio_processor.as_mut().ok_or_else(|| {
+                "CLAP effect processor is unavailable for tail refresh".to_owned()
+            })?;
+            self.tail_samples = self.read_tail_samples(audio_processor);
+        }
+        Ok(())
+    }
+
     fn run_processing_server(&mut self, input: &mut impl Read, output: &mut impl Write) -> i32 {
         let audio_configuration = PluginAudioConfiguration {
             sample_rate: f64::from(self.sample_rate),
             min_frames_count: 1,
             max_frames_count: MAX_CLAP_MIXER_EFFECT_BLOCK_FRAMES,
         };
-        let stopped_processor = match self.instance.activate(|_, _| (), audio_configuration) {
+        let stopped_processor = match self.instance.activate(
+            |shared, _| ClapMixerEffectHostAudioProcessor {
+                tail_changed: shared.tail_changed.as_ref(),
+            },
+            audio_configuration,
+        ) {
             Ok(processor) => processor,
             Err(error) => {
                 let _ = write_preview_server_error(
@@ -2143,14 +2370,9 @@ impl ClapMixerEffectInstance {
                 return 1;
             }
         };
-        self.latency_samples = {
-            let plugin = self.instance.plugin_handle();
-            plugin
-                .get_extension::<PluginLatency>()
-                .map_or(0, |latency| latency.get(&plugin))
-        };
+        self.latency_samples = self.read_latency_samples();
         let mut audio_processor = match stopped_processor.start_processing() {
-            Ok(processor) => processor,
+            Ok(processor) => Some(processor),
             Err(error) => {
                 let stopped_processor = error.into_stopped_processor();
                 self.instance.deactivate(stopped_processor);
@@ -2162,22 +2384,31 @@ impl ClapMixerEffectInstance {
                 return 1;
             }
         };
-        let tail_samples = {
-            let plugin = audio_processor.plugin_handle();
-            plugin
-                .get_extension::<PluginTail>()
-                .map(|tail| match tail.get(&plugin) {
-                    TailLength::Finite(samples) => u64::from(samples),
-                    TailLength::Infinite => u64::from(i32::MAX as u32),
-                })
-        };
-        let tail_report = tail_samples.map_or_else(|| "NONE".to_owned(), |tail| tail.to_string());
+        self.tail_samples = self.read_tail_samples(
+            audio_processor
+                .as_mut()
+                .expect("started CLAP effect processor is present"),
+        );
+        self.latency_changed.store(false, Ordering::Release);
+        self.tail_changed.store(false, Ordering::Release);
+        if let Err(error) = self.service_host_requests(&mut audio_processor, audio_configuration) {
+            if let Some(audio_processor) = audio_processor.take() {
+                self.instance.deactivate(audio_processor.stop_processing());
+            }
+            let _ = write_preview_server_error(output, &error);
+            let _ = output.flush();
+            return 1;
+        }
+        let tail_report = self
+            .tail_samples
+            .map_or_else(|| "NONE".to_owned(), |tail| tail.to_string());
         if writeln!(output, "STARTED {} {tail_report}", self.latency_samples)
             .and_then(|_| output.flush())
             .is_err()
         {
-            let stopped_processor = audio_processor.stop_processing();
-            self.instance.deactivate(stopped_processor);
+            if let Some(audio_processor) = audio_processor.take() {
+                self.instance.deactivate(audio_processor.stop_processing());
+            }
             return 1;
         }
 
@@ -2445,14 +2676,17 @@ impl ClapMixerEffectInstance {
                             ),
                         },
                     ));
-                audio_processor.process(
-                    &input_audio,
-                    &mut output_audio,
-                    &input_events.as_input(),
-                    &mut output_events.as_output(),
-                    Some(steady_time),
-                    None,
-                )
+                audio_processor
+                    .as_mut()
+                    .expect("started CLAP effect processor is present")
+                    .process(
+                        &input_audio,
+                        &mut output_audio,
+                        &input_events.as_input(),
+                        &mut output_events.as_output(),
+                        Some(steady_time),
+                        None,
+                    )
             };
             if let Err(error) = process_result {
                 let _ = write_preview_server_error(
@@ -2463,9 +2697,26 @@ impl ClapMixerEffectInstance {
                 result = 1;
                 break;
             }
+            if let Err(error) =
+                self.service_host_requests(&mut audio_processor, audio_configuration)
+            {
+                let _ = write_preview_server_error(output, &error);
+                let _ = output.flush();
+                result = 1;
+                break;
+            }
             steady_time = steady_time.saturating_add(u64::from(frame_count));
             let main_output = &output_audio_storage[self.main_output_index];
-            if writeln!(output, "BLOCK {frame_count}").is_err() {
+            let tail_report = self
+                .tail_samples
+                .map_or_else(|| "NONE".to_owned(), |tail| tail.to_string());
+            if writeln!(
+                output,
+                "BLOCK {frame_count} {} {tail_report}",
+                self.latency_samples
+            )
+            .is_err()
+            {
                 result = 1;
                 break;
             }
@@ -2495,8 +2746,10 @@ impl ClapMixerEffectInstance {
                 break;
             }
         }
-        let stopped_processor = audio_processor.stop_processing();
-        self.instance.deactivate(stopped_processor);
+        if let Some(audio_processor) = audio_processor {
+            let stopped_processor = audio_processor.stop_processing();
+            self.instance.deactivate(stopped_processor);
+        }
         result
     }
 }

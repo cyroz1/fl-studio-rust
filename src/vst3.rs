@@ -646,6 +646,8 @@ struct PlaylistMixerEffectStream {
     live_insert_effects_enabled_target: Option<Arc<AtomicI32>>,
     wet_mix_ramp: LiveWetMixRamp,
     latency_frames: u64,
+    tail_frames: u64,
+    dry_delay_required: bool,
     manual_latency_offset_samples: i32,
     dry_delay_line: StereoFrameDelay,
     dry_delay_scratch: Vec<f32>,
@@ -823,6 +825,8 @@ pub struct Vst3PlaylistStreamProcessor {
     mixer_effect_meter_input_delays: Vec<StereoFrameDelay>,
     mixer_effect_input_delays: Vec<StereoFrameDelay>,
     mixer_post_effect_stem_delays: Vec<StereoFrameDelay>,
+    mixer_routing: MixerRouteAudibility,
+    include_effect_tails: bool,
     live_input_senders: BTreeMap<u16, Vst3PlaylistLiveInputSender>,
     volume_expression_channel_ids: BTreeSet<u16>,
     performance_pattern_automation: BTreeMap<(u16, u16), Vec<Vst3ParameterAutomation>>,
@@ -894,6 +898,7 @@ impl Vst3PlaylistStreamProcessor {
     ) -> Result<(), String> {
         self.automatic_pdc_enabled = document.mixer_automatic_pdc_enabled().unwrap_or(true);
         let routing = MixerRouteAudibility::from_document(document);
+        self.mixer_routing = routing.clone();
         let channels_by_id = document
             .channels()
             .into_iter()
@@ -969,6 +974,119 @@ impl Vst3PlaylistStreamProcessor {
             self.set_live_mixer_source_targets(meters);
         }
         Ok(())
+    }
+
+    fn refresh_external_mixer_effect_reports(&mut self) -> Result<bool, String> {
+        let mut latency_changed = false;
+        let mut tail_changed = false;
+        let max_total_tail_frames = u64::from(self.output_sample_rate)
+            .saturating_mul(MAX_REPORTED_TAIL_SECONDS.ceil() as u64);
+        let mut total_tail_frames = 0_u64;
+
+        for effect in &mut self.mixer_effects {
+            let Some(external_processor) = effect.external_processor.as_ref() else {
+                total_tail_frames = total_tail_frames.saturating_add(effect.tail_frames);
+                continue;
+            };
+            let sample_rate = external_processor.sample_rate();
+            if !sample_rate.is_finite() || sample_rate <= 0.0 {
+                return Err(format!(
+                    "CLAP Mixer insert {} effect slot {} reported an invalid sample rate",
+                    effect.insert_ordinal,
+                    effect.slot_index + 1
+                ));
+            }
+            let latency_frames = u64::from(external_processor.latency_samples());
+            let maximum_latency_frames =
+                (sample_rate * MAX_VST3_EFFECT_LATENCY_SECONDS).ceil() as u64;
+            if latency_frames > maximum_latency_frames {
+                return Err(format!(
+                    "CLAP Mixer insert {} effect slot {} reports {latency_frames} frames of latency, exceeding the {MAX_VST3_EFFECT_LATENCY_SECONDS}-second processing limit",
+                    effect.insert_ordinal,
+                    effect.slot_index + 1
+                ));
+            }
+            if latency_frames != effect.latency_frames {
+                effect.latency_frames = latency_frames;
+                latency_changed = true;
+            }
+
+            let tail_frames = if self.include_effect_tails {
+                external_processor
+                    .tail_samples()
+                    .map(|tail_samples| {
+                        ((tail_samples as f64 / sample_rate).min(MAX_REPORTED_TAIL_SECONDS)
+                            * f64::from(self.output_sample_rate))
+                        .ceil() as u64
+                    })
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            if tail_frames != effect.tail_frames {
+                effect.tail_frames = tail_frames;
+                tail_changed = true;
+            }
+            total_tail_frames = total_tail_frames.saturating_add(effect.tail_frames);
+        }
+
+        if !latency_changed && !tail_changed {
+            return Ok(false);
+        }
+
+        self.mixer_effect_tail_frames = total_tail_frames.min(max_total_tail_frames);
+        if latency_changed {
+            let chain_latencies = self
+                .mixer_effect_chains
+                .iter()
+                .map(|chain| {
+                    self.mixer_effects[chain.first_effect_index..chain.end_effect_index]
+                        .iter()
+                        .try_fold(0_u64, |total, effect| {
+                            total
+                                .checked_add(effect.latency_frames)
+                                .ok_or_else(|| "Mixer effect chain latency overflow".to_owned())
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            for (chain, latency_frames) in self.mixer_effect_chains.iter_mut().zip(chain_latencies)
+            {
+                chain.latency_frames = latency_frames;
+            }
+
+            let mut dry_delay_frames = 0_u64;
+            for effect in &mut self.mixer_effects {
+                let delay_frames = if effect.dry_delay_required {
+                    effect.latency_frames
+                } else {
+                    0
+                };
+                dry_delay_frames = dry_delay_frames
+                    .checked_add(delay_frames)
+                    .ok_or_else(|| "Mixer effect PDC delay size overflow".to_owned())?;
+                effect.dry_delay_line.set_delay_frames(delay_frames)?;
+            }
+            self.mixer_effect_dry_delay_frames = dry_delay_frames;
+
+            let instrument_delay_frames = if self.automatic_pdc_enabled {
+                self.streams
+                    .iter()
+                    .try_fold(self.maximum_latency_frames, |total, stream| {
+                        total
+                            .checked_add(
+                                self.maximum_latency_frames
+                                    .saturating_sub(stream.latency_frames),
+                            )
+                            .ok_or_else(|| "PDC delay storage size overflow".to_owned())
+                    })?
+            } else {
+                0
+            };
+            let routing = self.mixer_routing.clone();
+            configure_mixer_effect_pdc(self, &routing, instrument_delay_frames)?;
+        }
+        self.extend_to_output_frames(self.content_frames)?;
+        Ok(true)
     }
 
     /// Refresh plug-in latency reports at a stream block boundary and rebuild PDC while
@@ -1833,6 +1951,7 @@ impl Vst3PlaylistStreamProcessor {
                     .map_err(|_| "Mixer effect automation frame count overflow".to_owned())?,
             )
             .ok_or_else(|| "Mixer effect automation frame position overflow".to_owned())?;
+        self.refresh_external_mixer_effect_reports()?;
         Ok(())
     }
 
@@ -6078,6 +6197,8 @@ impl Vst3HostRuntime {
             mixer_effect_meter_input_delays: Vec::new(),
             mixer_effect_input_delays: Vec::new(),
             mixer_post_effect_stem_delays: Vec::new(),
+            mixer_routing: MixerRouteAudibility::default(),
+            include_effect_tails: false,
             live_input_senders,
             volume_expression_channel_ids: vst3_volume_expression_channels,
             performance_pattern_automation: BTreeMap::new(),
@@ -6180,6 +6301,8 @@ impl Vst3HostRuntime {
         let inserts = document.mixer_inserts();
         let effect_slots = document.mixer_effect_slots();
         let routing = crate::MixerRouteAudibility::from_document(document);
+        processor.mixer_routing = routing.clone();
+        processor.include_effect_tails = include_effect_tails;
         let has_loaded_non_master_effect = effect_slots.iter().any(|slot| {
             if slot.insert_ordinal() == 0
                 || (slot.enabled() == Some(false) && !live_mix_changes)
@@ -6528,6 +6651,12 @@ impl Vst3HostRuntime {
                             .clamp(1.0, f64::from(u32::MAX)) as u32,
                     ),
                     latency_frames,
+                    tail_frames: if include_effect_tails {
+                        reported_tail
+                    } else {
+                        0
+                    },
+                    dry_delay_required: live_mix_changes || wet_mix < 1.0,
                     manual_latency_offset_samples,
                     dry_delay_line,
                     dry_delay_scratch: vec![0.0; block_size * 2],
@@ -6950,6 +7079,8 @@ impl Vst3HostRuntime {
             mixer_effect_meter_input_delays: Vec::new(),
             mixer_effect_input_delays: Vec::new(),
             mixer_post_effect_stem_delays: Vec::new(),
+            mixer_routing: MixerRouteAudibility::default(),
+            include_effect_tails: false,
             live_input_senders,
             volume_expression_channel_ids: vst3_volume_expression_channels,
             performance_pattern_automation: BTreeMap::new(),

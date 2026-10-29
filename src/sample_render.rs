@@ -6387,6 +6387,9 @@ fn stream_prepared_playlist_render_with_performance(
                         processor.mix_next_block(block)?;
                     }
                 }
+                if let Some(processor) = render.vst3_processor.as_deref() {
+                    frames = frames.max(processor.summary().frames);
+                }
                 if let (Some(meters), Some(meter_buses)) = (meters, meter_buses.as_deref()) {
                     let meter_buses = &meter_buses[..meter_bus_samples];
                     for (track, track_samples) in meter_buses.chunks_exact(sample_count).enumerate()
