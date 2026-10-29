@@ -7236,6 +7236,7 @@ struct SamplerPatternChannelOptions<'a> {
     allow_empty: bool,
     include_muted_mixer_sources: bool,
     vst3_volume_expression_channels: Option<&'a BTreeSet<u16>>,
+    clap_audio_channels: Option<&'a BTreeSet<u16>>,
 }
 
 fn stream_pattern_from_tick_with_vst3_to_device(
@@ -7318,6 +7319,7 @@ fn stream_pattern_from_tick_with_vst3_to_device(
                     .vst3_processor
                     .as_ref()
                     .map(Vst3PlaylistStreamProcessor::volume_expression_channel_ids),
+                clap_audio_channels: Some(&clap_pattern_channels),
             },
         )?
     } else if playback.allow_empty_sampler {
@@ -13197,6 +13199,7 @@ fn prepare_sampler_pattern(
                 allow_empty: false,
                 include_muted_mixer_sources: true,
                 vst3_volume_expression_channels: None,
+                clap_audio_channels: None,
             },
         )
     } else {
@@ -13221,6 +13224,7 @@ fn prepare_sampler_pattern_for_channel(
             allow_empty: false,
             include_muted_mixer_sources: false,
             vst3_volume_expression_channels: None,
+            clap_audio_channels: None,
         },
     )
 }
@@ -13243,6 +13247,7 @@ fn prepare_sampler_pattern_allow_empty(
             allow_empty: true,
             include_muted_mixer_sources,
             vst3_volume_expression_channels: Some(vst3_volume_expression_channels),
+            clap_audio_channels: None,
         },
     )
 }
@@ -13259,6 +13264,7 @@ fn prepare_sampler_pattern_for_channel_internal(
         allow_empty,
         include_muted_mixer_sources,
         vst3_volume_expression_channels,
+        clap_audio_channels,
     } = channel_options;
     check_cancelled(cancelled)?;
     if !(8_000..=384_000).contains(&options.sample_rate) {
@@ -13301,7 +13307,20 @@ fn prepare_sampler_pattern_for_channel_internal(
         .enumerate()
         .filter(|(_, note)| !note.is_muted())
         .flat_map(|(note_index, note)| {
-            let routes = if let Some(volume_expression_channels) = vst3_volume_expression_channels {
+            let has_clap_target = clap_audio_channels.is_some_and(|clap_channels| {
+                channel_router
+                    .targets_for_note(note.channel_id, note_index as u64, note.key)
+                    .iter()
+                    .any(|target_channel_id| clap_channels.contains(target_channel_id))
+            });
+            let routes = if has_clap_target {
+                channel_router.targets_for_note_with_clap_audio_layers(
+                    note.channel_id,
+                    note_index as u64,
+                    note.key,
+                    clap_audio_channels.expect("a CLAP target requires the CLAP channel set"),
+                )
+            } else if let Some(volume_expression_channels) = vst3_volume_expression_channels {
                 channel_router.targets_for_note_with_mixed_crossfade(
                     note.channel_id,
                     note_index as u64,
@@ -16137,12 +16156,27 @@ pub fn project_channel_stereo_output_gains(
     document: &FlpDocument,
     channel_id: u16,
 ) -> Option<(f32, f32)> {
+    project_channel_stereo_output_gains_with_layer_adjustments(document, channel_id, 1.0, 0)
+}
+
+/// Return project channel stereo gains with provisional Layer volume and pan adjustments applied.
+pub fn project_channel_stereo_output_gains_with_layer_adjustments(
+    document: &FlpDocument,
+    channel_id: u16,
+    layer_gain: f32,
+    layer_pan_raw: i32,
+) -> Option<(f32, f32)> {
+    if !layer_gain.is_finite() || layer_gain < 0.0 {
+        return None;
+    }
     let channel = document
         .channels()
         .into_iter()
         .find(|channel| channel.id() == channel_id)?;
-    let (gain, pan) = channel_gain_pan(channel.volume(), channel.pan());
+    let (channel_gain, channel_pan) = channel_gain_pan(channel.volume(), channel.pan());
+    let pan = (channel_pan + layer_pan_raw.clamp(-6_400, 6_400) as f32 / 6_400.0).clamp(-1.0, 1.0);
     let (left_pan, right_pan) = channel_pan_gains(pan, false, project_pan_law(document));
+    let gain = channel_gain * layer_gain;
     Some((gain * left_pan, gain * right_pan))
 }
 

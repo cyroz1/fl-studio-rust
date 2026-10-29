@@ -1398,8 +1398,8 @@ impl ChannelSummary {
 /// reached through any Layer children.
 ///
 /// Layer Random uses a stable per-note pseudo-random choice in this runtime so
-/// Sampler and VST3 paths can share a routing seed. FL Studio's native random
-/// sequence is not known, so rendered choices may differ from FL Studio.
+/// Sampler, VST3, and CLAP paths share a routing seed. FL Studio's native
+/// random sequence is not known, so rendered choices may differ from FL Studio.
 pub struct ChannelNoteRouter {
     channels_by_id: HashMap<u16, ChannelSummary>,
 }
@@ -1410,6 +1410,7 @@ struct ChannelRouteState<'a> {
     apply_layer_level_adjustments: bool,
     crossfade_samplers: bool,
     vst3_volume_expression_channels: Option<&'a BTreeSet<u16>>,
+    clap_audio_channels: Option<&'a BTreeSet<u16>>,
     active_layers: HashSet<u16>,
     seen_targets: HashSet<u16>,
     targets: Vec<(u16, f32, i32)>,
@@ -1446,7 +1447,15 @@ impl ChannelNoteRouter {
         note_seed: u64,
         key: u16,
     ) -> Vec<(u16, f32, i32)> {
-        self.targets_for_note_with_controls(source_channel_id, note_seed, key, true, true, None)
+        self.targets_for_note_with_controls(
+            source_channel_id,
+            note_seed,
+            key,
+            true,
+            true,
+            None,
+            None,
+        )
     }
 
     /// Returns Layer-adjusted routes for a VST3-only render path, applying
@@ -1467,6 +1476,7 @@ impl ChannelNoteRouter {
             true,
             false,
             Some(vst3_volume_expression_channels),
+            None,
         )
     }
 
@@ -1488,9 +1498,32 @@ impl ChannelNoteRouter {
             true,
             true,
             Some(vst3_volume_expression_channels),
+            None,
         )
     }
 
+    /// Returns Layer-adjusted routes for a Pattern mix that renders assigned
+    /// CLAP channels as prepared audio layers. Crossfade includes Samplers and
+    /// assigned CLAP leaves, whose output gain and pan can be applied after rendering.
+    pub fn targets_for_note_with_clap_audio_layers(
+        &self,
+        source_channel_id: u16,
+        note_seed: u64,
+        key: u16,
+        clap_audio_channels: &BTreeSet<u16>,
+    ) -> Vec<(u16, f32, i32)> {
+        self.targets_for_note_with_controls(
+            source_channel_id,
+            note_seed,
+            key,
+            true,
+            true,
+            None,
+            Some(clap_audio_channels),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn targets_for_note_with_controls(
         &self,
         source_channel_id: u16,
@@ -1499,6 +1532,7 @@ impl ChannelNoteRouter {
         apply_layer_level_adjustments: bool,
         crossfade_samplers: bool,
         vst3_volume_expression_channels: Option<&BTreeSet<u16>>,
+        clap_audio_channels: Option<&BTreeSet<u16>>,
     ) -> Vec<(u16, f32, i32)> {
         let mut state = ChannelRouteState {
             note_seed,
@@ -1506,6 +1540,7 @@ impl ChannelNoteRouter {
             apply_layer_level_adjustments,
             crossfade_samplers,
             vst3_volume_expression_channels,
+            clap_audio_channels,
             active_layers: HashSet::new(),
             seen_targets: HashSet::new(),
             targets: Vec::new(),
@@ -1523,10 +1558,18 @@ impl ChannelNoteRouter {
         note_seed: u64,
         key: u16,
     ) -> Vec<(u16, f32)> {
-        self.targets_for_note_with_controls(source_channel_id, note_seed, key, false, true, None)
-            .into_iter()
-            .map(|(channel_id, gain, _)| (channel_id, gain))
-            .collect()
+        self.targets_for_note_with_controls(
+            source_channel_id,
+            note_seed,
+            key,
+            false,
+            true,
+            None,
+            None,
+        )
+        .into_iter()
+        .map(|(channel_id, gain, _)| (channel_id, gain))
+        .collect()
     }
 
     fn route_channel(
@@ -1598,6 +1641,7 @@ impl ChannelNoteRouter {
                     state.key,
                     state.crossfade_samplers,
                     state.vst3_volume_expression_channels,
+                    state.clap_audio_channels,
                     &mut active_layers,
                 )
             })
@@ -1632,6 +1676,7 @@ impl ChannelNoteRouter {
         key: u16,
         crossfade_samplers: bool,
         vst3_volume_expression_channels: Option<&BTreeSet<u16>>,
+        clap_audio_channels: Option<&BTreeSet<u16>>,
         active_layers: &mut HashSet<u16>,
     ) -> bool {
         let Some(channel) = self.channels_by_id.get(&channel_id) else {
@@ -1643,9 +1688,10 @@ impl ChannelNoteRouter {
         match channel.channel_type() {
             Some(ChannelType::Sampler) => crossfade_samplers,
             Some(ChannelType::Native) => {
-                channel.plugin_identifier().is_some()
+                (channel.plugin_identifier().is_some()
                     && vst3_volume_expression_channels
-                        .is_some_and(|channels| channels.contains(&channel_id))
+                        .is_some_and(|channels| channels.contains(&channel_id)))
+                    || clap_audio_channels.is_some_and(|channels| channels.contains(&channel_id))
             }
             Some(ChannelType::Layer) => {
                 if !active_layers.insert(channel_id) {
@@ -1673,6 +1719,7 @@ impl ChannelNoteRouter {
                             key,
                             crossfade_samplers,
                             vst3_volume_expression_channels,
+                            clap_audio_channels,
                             active_layers,
                         )
                     });
