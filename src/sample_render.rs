@@ -19633,6 +19633,7 @@ mod tests {
                     read_sample_root_note: true,
                     clip_envelopes: Arc::new(Vec::new()),
                     clap_audio_layers: Arc::new(Vec::new()),
+                    clap_audio_channel_ids: Arc::new(BTreeSet::new()),
                 },
                 frames: 2,
                 master_output: MixerMasterOutput::default(),
