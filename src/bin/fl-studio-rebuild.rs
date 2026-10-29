@@ -35403,6 +35403,19 @@ impl DawUi {
                 *selected_arrangement == arrangement_id && end_tick > start_tick
             })
             .map(|(_, start_tick, end_tick)| (start_tick, end_tick));
+        let selection_marker_indices = selection_bounds
+            .map(|(start_tick, end_tick)| {
+                markers
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, marker)| {
+                        (start_tick..=end_tick)
+                            .contains(&marker.position_ticks())
+                            .then_some(index)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let signature_changes = markers
             .iter()
             .filter(|marker| marker.is_signature())
@@ -35415,6 +35428,8 @@ impl DawUi {
             })
             .collect::<Vec<_>>();
         let mut delete_selected = false;
+        let mut delete_markers_in_selection = false;
+        let mut delete_all_markers = false;
         let mut create_selection_markers = false;
         let mut create_markers_every_bars: Option<u8> = None;
         ui.separator();
@@ -35437,6 +35452,25 @@ impl DawUi {
                     egui::Button::new("Delete marker"),
                 )
                 .clicked();
+            ui.menu_button("Delete markers", |ui| {
+                if ui
+                    .add_enabled(
+                        !selection_marker_indices.is_empty(),
+                        egui::Button::new("In selected range"),
+                    )
+                    .clicked()
+                {
+                    delete_markers_in_selection = true;
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(!markers.is_empty(), egui::Button::new("All markers"))
+                    .clicked()
+                {
+                    delete_all_markers = true;
+                    ui.close();
+                }
+            });
             create_selection_markers = ui
                 .add_enabled(
                     selection_bounds.is_some(),
@@ -35540,6 +35574,40 @@ impl DawUi {
                     self.status = format!("Deleted time marker {}", marker_index + 1);
                 } else {
                     self.status = "Could not delete the selected time marker".to_owned();
+                }
+            }
+        } else if delete_markers_in_selection || delete_all_markers {
+            let mut marker_indices = if delete_all_markers {
+                (0..markers.len()).collect::<Vec<_>>()
+            } else {
+                selection_marker_indices
+            };
+            marker_indices.sort_unstable_by(|left, right| right.cmp(left));
+            let marker_count = marker_indices.len();
+            let result = self
+                .document
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| "no project is open".to_owned())
+                .and_then(|mut document| {
+                    for marker_index in marker_indices {
+                        document
+                            .delete_time_marker(arrangement_id, marker_index)
+                            .map_err(|error| error.to_string())?;
+                    }
+                    Ok(document)
+                });
+            match result {
+                Ok(document) => {
+                    self.stop_project_playback();
+                    self.document = Some(document);
+                    self.selected_time_marker = None;
+                    self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+                    self.status = format!("Deleted {marker_count} Playlist time marker(s)");
+                }
+                Err(error) => {
+                    self.status = format!("Could not delete Playlist time markers: {error}");
                 }
             }
         } else if create_selection_markers {
