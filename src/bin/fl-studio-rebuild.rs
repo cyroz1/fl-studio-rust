@@ -5269,6 +5269,7 @@ struct DawUi {
     midi_mixer_control_mappings: Vec<MidiMixerControlMapping>,
     midi_vst3_parameter_mappings: Vec<MidiVst3ParameterMapping>,
     pattern_clap_parameter_links: Vec<PatternClapParameterLink>,
+    pattern_clap_lfo_parameter_links: Vec<PatternClapLfoParameterLink>,
     pattern_vst3_parameter_links: Vec<PatternVst3ParameterLink>,
     pattern_vst3_mixer_effect_parameter_links: Vec<PatternVst3MixerEffectParameterLink>,
     playlist_vst3_parameter_links: Vec<PlaylistVst3ParameterLink>,
@@ -6261,6 +6262,22 @@ enum InternalLfoWaveform {
     Square,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PatternClapLfoParameterLink {
+    project_path: String,
+    pattern_id: u16,
+    project_channel_id: u16,
+    plugin_path: String,
+    plugin_id: String,
+    parameter_id: u32,
+    parameter_name: String,
+    waveform: InternalLfoWaveform,
+    period_millibeats: u32,
+    minimum_raw: u16,
+    maximum_raw: u16,
+    phase_degrees: u16,
+}
+
 impl InternalLfoWaveform {
     const ALL: [Self; 3] = [Self::Sine, Self::Triangle, Self::Square];
 
@@ -6413,6 +6430,130 @@ fn show_internal_lfo_parameter_link_controls(
     if link.is_none() && scope.is_none() {
         ui.small(
             egui::RichText::new("Save the project and select a Pattern to add an LFO link.")
+                .color(MUTED),
+        );
+    }
+    (upsert, unlink)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn show_pattern_clap_lfo_parameter_link_controls(
+    ui: &mut egui::Ui,
+    link: Option<&PatternClapLfoParameterLink>,
+    scope: Option<(&Path, u16, u16)>,
+    plugin_path: &Path,
+    plugin_id: &str,
+    parameter_id: u32,
+    parameter_name: &str,
+    parameter_is_read_only: bool,
+    widget_id: u64,
+) -> (Option<PatternClapLfoParameterLink>, bool) {
+    let mut upsert = None;
+    let mut unlink = false;
+    ui.horizontal(|ui| {
+        if let Some(link) = link {
+            let mut updated = link.clone();
+            let label = format!(
+                "CLAP LFO · {} · {:.2} beats",
+                updated.waveform.label(),
+                updated.period_millibeats as f32 / 1_000.0
+            );
+            ui.menu_button(label, |ui| {
+                egui::ComboBox::from_id_salt((
+                    "clap_internal_lfo_waveform",
+                    widget_id,
+                    parameter_id,
+                ))
+                .selected_text(updated.waveform.label())
+                .show_ui(ui, |ui| {
+                    for waveform in InternalLfoWaveform::ALL {
+                        ui.selectable_value(&mut updated.waveform, waveform, waveform.label());
+                    }
+                });
+
+                let mut period_beats = updated.period_millibeats as f32 / 1_000.0;
+                if ui
+                    .add(
+                        egui::Slider::new(&mut period_beats, 0.25..=64.0)
+                            .step_by(0.25)
+                            .text("Period (beats)"),
+                    )
+                    .changed()
+                {
+                    updated.period_millibeats = (period_beats * 1_000.0).round() as u32;
+                }
+
+                let mut minimum = updated.minimum_raw as f32 / 10_000.0;
+                if ui
+                    .add(
+                        egui::Slider::new(&mut minimum, 0.0..=1.0)
+                            .step_by(0.01)
+                            .text("Min"),
+                    )
+                    .changed()
+                {
+                    updated.minimum_raw = (minimum.min(f32::from(updated.maximum_raw) / 10_000.0)
+                        * 10_000.0)
+                        .round() as u16;
+                }
+
+                let mut maximum = updated.maximum_raw as f32 / 10_000.0;
+                if ui
+                    .add(
+                        egui::Slider::new(&mut maximum, 0.0..=1.0)
+                            .step_by(0.01)
+                            .text("Max"),
+                    )
+                    .changed()
+                {
+                    updated.maximum_raw = (maximum.max(f32::from(updated.minimum_raw) / 10_000.0)
+                        * 10_000.0)
+                        .round() as u16;
+                }
+
+                let mut phase = f32::from(updated.phase_degrees);
+                if ui
+                    .add(
+                        egui::Slider::new(&mut phase, 0.0..=359.0)
+                            .step_by(1.0)
+                            .text("Phase°"),
+                    )
+                    .changed()
+                {
+                    updated.phase_degrees = phase.round() as u16;
+                }
+                unlink = ui.small_button("Clear LFO").clicked();
+            });
+            if updated != *link && !unlink {
+                upsert = Some(updated);
+            }
+        } else if ui
+            .add_enabled(
+                !parameter_is_read_only && scope.is_some(),
+                egui::Button::new("Add CLAP LFO"),
+            )
+            .clicked()
+            && let Some((project_path, pattern_id, project_channel_id)) = scope
+        {
+            upsert = Some(PatternClapLfoParameterLink {
+                project_path: project_path.to_string_lossy().into_owned(),
+                pattern_id,
+                project_channel_id,
+                plugin_path: plugin_path.to_string_lossy().into_owned(),
+                plugin_id: plugin_id.to_owned(),
+                parameter_id,
+                parameter_name: parameter_name.to_owned(),
+                waveform: InternalLfoWaveform::Sine,
+                period_millibeats: 4_000,
+                minimum_raw: 0,
+                maximum_raw: 10_000,
+                phase_degrees: 0,
+            });
+        }
+    });
+    if link.is_none() && scope.is_none() {
+        ui.small(
+            egui::RichText::new("Save the project and select a Pattern to add a CLAP LFO link.")
                 .color(MUTED),
         );
     }
@@ -6936,6 +7077,7 @@ impl DawUi {
         let midi_vst3_parameter_mappings = load_midi_vst3_parameter_mappings();
         let vst3_manual_latency_offsets = load_vst3_manual_latency_offsets();
         let pattern_clap_parameter_links = load_pattern_clap_parameter_links();
+        let pattern_clap_lfo_parameter_links = load_pattern_clap_lfo_parameter_links();
         let pattern_vst3_parameter_links = load_pattern_vst3_parameter_links();
         let pattern_vst3_mixer_effect_parameter_links =
             load_pattern_vst3_mixer_effect_parameter_links();
@@ -7444,6 +7586,7 @@ impl DawUi {
             midi_mixer_control_mappings,
             midi_vst3_parameter_mappings,
             pattern_clap_parameter_links,
+            pattern_clap_lfo_parameter_links,
             pattern_vst3_parameter_links,
             pattern_vst3_mixer_effect_parameter_links,
             playlist_vst3_parameter_links,
@@ -20334,7 +20477,8 @@ impl DawUi {
         let Some(project_path) = self.current_path.as_deref() else {
             return Vec::new();
         };
-        self.pattern_clap_parameter_links
+        let mut lanes = self
+            .pattern_clap_parameter_links
             .iter()
             .filter(|link| {
                 project_paths_equal(Path::new(&link.project_path), project_path)
@@ -20365,7 +20509,40 @@ impl DawUi {
                     points,
                 })
             })
-            .collect()
+            .collect::<Vec<_>>();
+        let event_linked_parameters = lanes
+            .iter()
+            .map(|lane| lane.parameter_id)
+            .collect::<BTreeSet<_>>();
+        let Some(document) = self.document.as_ref() else {
+            return lanes;
+        };
+        let ppq = document.header().ppq();
+        if ppq == 0 {
+            return lanes;
+        }
+        let loop_length_ticks = pattern_lfo_loop_length_ticks(
+            pattern,
+            ppq,
+            document.metadata().time_signature().unwrap_or((4, 4)),
+        );
+        if loop_length_ticks == 0 {
+            return lanes;
+        }
+        lanes.extend(
+            self.pattern_clap_lfo_parameter_links
+                .iter()
+                .filter(|link| {
+                    project_paths_equal(Path::new(&link.project_path), project_path)
+                        && link.pattern_id == pattern.id
+                        && link.project_channel_id == channel_id
+                        && Path::new(&link.plugin_path) == plugin_path
+                        && link.plugin_id == plugin_id
+                        && !event_linked_parameters.contains(&link.parameter_id)
+                })
+                .map(|link| clap_internal_lfo_parameter_automation(link, ppq, loop_length_ticks)),
+        );
+        lanes
     }
 
     fn pattern_clap_parameter_automations_for_assigned_channel(
@@ -63599,6 +63776,8 @@ impl DawUi {
         let mut midi_vst3_remove_mapping = None;
         let mut pattern_clap_link_request: Option<PatternClapParameterLink> = None;
         let mut pattern_clap_unlink_request: Option<PatternClapParameterLink> = None;
+        let mut pattern_clap_lfo_upserts = Vec::new();
+        let mut pattern_clap_lfo_unlinks = Vec::new();
         let mut pattern_vst3_link_request: Option<(String, u16, u8, u8, MidiVst3ParameterTarget)> =
             None;
         let mut pattern_vst3_unlink_request: Option<(PathBuf, u16, MidiVst3ParameterTarget)> = None;
@@ -63947,7 +64126,7 @@ impl DawUi {
             ui.heading(format!("Detected CLAP plug-ins ({})", clap_candidates.len()));
             ui.label(
                 egui::RichText::new(
-                "CLAP note and Pattern/channel previews render in an isolated helper, which reuses the instrument while the plug-in and output rate stay the same. Pattern transport pre-renders assigned channels at project base tempo, expands Layer notes, and follows saved Mixer routes and loaded VST3 Mixer effects. Playlist transport pre-renders assigned CLAP instruments across supported Pattern Clips and follows clip repeats, track mute/solo, and tempo changes. Performance Mode pre-renders assigned CLAP-only Pattern Clip loops for constant-tempo arrangements, with saved channel and Layer gains, pan automation, and Mixer routes. Full-song Playlist mix and Mixer stem renders also pre-render assigned instruments with saved state, Pattern Event and Playlist Automation parameter links, and linked fader/pan automation. Channel assignments and captured plug-in state are saved in machine-local settings per project path; mixed Sampler/VST3/CLAP Performance clips, tempo-changing CLAP Performance clips, CLAP Mixer effects, scaled/source-windowed Pattern Clips, native FLP state embedding, and native plug-in editors remain unsupported.",
+                "CLAP note and Pattern/channel previews render in an isolated helper, which reuses the instrument while the plug-in and output rate stay the same. Pattern transport pre-renders assigned channels at project base tempo, expands Layer notes, and follows saved Mixer routes and loaded VST3 Mixer effects. Playlist transport pre-renders assigned CLAP instruments across supported Pattern Clips and follows clip repeats, track mute/solo, and tempo changes. Performance Mode pre-renders assigned CLAP-only Pattern Clip loops for constant-tempo arrangements, with saved channel and Layer gains, pan automation, and Mixer routes. Full-song Playlist mix and Mixer stem renders also pre-render assigned instruments with saved state, Pattern Event, Pattern LFO, and Playlist Automation parameter links, and linked fader/pan automation. Channel assignments and captured plug-in state are saved in machine-local settings per project path; mixed Sampler/VST3/CLAP Performance clips, tempo-changing CLAP Performance clips, CLAP Mixer effects, scaled/source-windowed Pattern Clips, native FLP state embedding, and native plug-in editors remain unsupported.",
                 )
                 .color(MUTED),
             );
@@ -63994,7 +64173,7 @@ impl DawUi {
                     ui.colored_label(ORANGE, error);
                 }
             }
-                ui.small("Pattern previews use project base tempo. CLAP Pattern transport expands Layer notes to assigned CLAP child channels, applies Layer gain/pan and source-channel gain/pan, and follows Mixer routes including loaded VST3 insert effects. Layer Crossfade applies when every active leaf is a Sampler, an assigned CLAP channel, or a loaded VST3 channel whose plug-in advertises Volume note expression. CLAP Playlist playback follows clip repeats, track mute/solo, Layer routing and gain/pan, and tempo automation for default-scale, full-source Pattern clips. Performance Mode launches pre-rendered CLAP-only Pattern Clip loops for constant-tempo arrangements and applies saved channel and Layer gain/pan, linked fader/pan automation, Pattern Event links, and Playlist Automation parameter links. Mixed Sampler/VST3/CLAP Performance clips, tempo-changing CLAP clips, CLAP-format Mixer effect processing, scaled/source-windowed clips remain unsupported. Full-song Playlist mix and Mixer stem renders also pre-render assigned CLAP instruments, including Pattern Event and Playlist Automation parameter links plus linked Playlist fader/pan automation. CLAP note-dialect plug-ins receive per-note tuning, pan, Mod X brightness, and release; MIDI 1.0/2.0 inputs receive key, velocity, channel, and release.");
+                ui.small("Pattern previews use project base tempo. CLAP Pattern transport expands Layer notes to assigned CLAP child channels, applies Layer gain/pan and source-channel gain/pan, and follows Mixer routes including loaded VST3 insert effects. Layer Crossfade applies when every active leaf is a Sampler, an assigned CLAP channel, or a loaded VST3 channel whose plug-in advertises Volume note expression. CLAP Playlist playback follows clip repeats, track mute/solo, Layer routing and gain/pan, and tempo automation for default-scale, full-source Pattern clips. Performance Mode launches pre-rendered CLAP-only Pattern Clip loops for constant-tempo arrangements and applies saved channel and Layer gain/pan, linked fader/pan automation, Pattern Event links, Pattern LFO links, and Playlist Automation parameter links. Pattern Event points take precedence over LFOs for a shared parameter. Mixed Sampler/VST3/CLAP Performance clips, tempo-changing CLAP clips, CLAP-format Mixer effect processing, scaled/source-windowed clips remain unsupported. Full-song Playlist mix and Mixer stem renders also pre-render assigned CLAP instruments, including Pattern Event, Pattern LFO, and Playlist Automation parameter links plus linked Playlist fader/pan automation. CLAP note-dialect plug-ins receive per-note tuning, pan, Mod X brightness, and release; MIDI 1.0/2.0 inputs receive key, velocity, channel, and release.");
             if let Ok(Some(settings)) = &clap_pattern_preview_settings {
                 ui.horizontal(|ui| {
                     if let Some(instrument) = self
@@ -64561,6 +64740,72 @@ impl DawUi {
                                                                 }
                                                             });
                                                         }
+                                                        let clap_lfo_scope = self
+                                                            .current_path
+                                                            .as_deref()
+                                                            .zip(self.selected_pattern)
+                                                            .and_then(
+                                                                |(project_path, pattern_id)| {
+                                                                    clap_parameter_channel_id.map(
+                                                                        |project_channel_id| {
+                                                                            (
+                                                                                project_path,
+                                                                                pattern_id,
+                                                                                project_channel_id,
+                                                                            )
+                                                                        },
+                                                                    )
+                                                                },
+                                                            );
+                                                        let clap_lfo_link = clap_lfo_scope.and_then(
+                                                            |(
+                                                                project_path,
+                                                                pattern_id,
+                                                                project_channel_id,
+                                                            )| {
+                                                                pattern_clap_lfo_parameter_link_for_target(
+                                                                    &self
+                                                                        .pattern_clap_lfo_parameter_links,
+                                                                    project_path,
+                                                                    pattern_id,
+                                                                    project_channel_id,
+                                                                    &candidate.path,
+                                                                    &descriptor.id,
+                                                                    parameter.id,
+                                                                )
+                                                            },
+                                                        );
+                                                        if can_automate || clap_lfo_link.is_some() {
+                                                            let (lfo_upsert, clear_lfo) =
+                                                                show_pattern_clap_lfo_parameter_link_controls(
+                                                                    ui,
+                                                                    clap_lfo_link,
+                                                                    clap_lfo_scope,
+                                                                    &candidate.path,
+                                                                    &descriptor.id,
+                                                                    parameter.id,
+                                                                    &parameter.name,
+                                                                    !can_automate
+                                                                        || pattern_link.is_some(),
+                                                                    u64::from(parameter.id),
+                                                                );
+                                                            if let Some(link) = lfo_upsert {
+                                                                pattern_clap_lfo_upserts.push(link);
+                                                            }
+                                                            if clear_lfo
+                                                                && let Some(link) = clap_lfo_link
+                                                            {
+                                                                pattern_clap_lfo_unlinks
+                                                                    .push(link.clone());
+                                                            }
+                                                            if clap_lfo_link.is_some()
+                                                                && pattern_link.is_some()
+                                                            {
+                                                                ui.small(
+                                                                    "Pattern Event link takes precedence over this LFO.",
+                                                                );
+                                                            }
+                                                        }
                                                     if can_automate
                                                         && let Some(target_channel_id) =
                                                             clap_parameter_channel_id.filter(
@@ -64641,7 +64886,7 @@ impl DawUi {
                                                         });
                                                     }
                                                     }
-                                                    ui.small("Parameter edits apply to Pattern audition and transport. Pattern Event links and Playlist Automation links drive assigned CLAP parameters during supported playback and song/stem renders. Use Capture state on an assigned channel to save them for this project.");
+                                                    ui.small("Parameter edits apply to Pattern audition and transport. Pattern Event and Pattern LFO links and Playlist Automation links drive assigned CLAP parameters during supported playback and song/stem renders. Pattern Event points take precedence over LFO automation for a shared parameter. Use Capture state on an assigned channel to save plug-in parameter values for this project.");
                                                     if info.parameters.len()
                                                         < info.parameter_count as usize
                                                     {
@@ -65663,6 +65908,49 @@ impl DawUi {
                         )
                     },
                 );
+        }
+        for link in pattern_clap_lfo_upserts {
+            upsert_pattern_clap_lfo_parameter_link(
+                &mut self.pattern_clap_lfo_parameter_links,
+                link.clone(),
+            );
+            self.invalidate_clap_playlist_audio();
+            self.status = save_pattern_clap_lfo_parameter_links(
+                &self.pattern_clap_lfo_parameter_links,
+            )
+            .err()
+            .map_or_else(
+                || {
+                    format!(
+                        "Linked {} to a CLAP Pattern LFO on this machine",
+                        link.parameter_name
+                    )
+                },
+                |error| {
+                    format!(
+                        "Updated the CLAP Pattern LFO for this session; could not save it: {error}"
+                    )
+                },
+            );
+        }
+        for link in pattern_clap_lfo_unlinks {
+            remove_pattern_clap_lfo_parameter_link(
+                &mut self.pattern_clap_lfo_parameter_links,
+                &link,
+            );
+            self.invalidate_clap_playlist_audio();
+            self.status = save_pattern_clap_lfo_parameter_links(
+                &self.pattern_clap_lfo_parameter_links,
+            )
+            .err()
+            .map_or_else(
+                || format!("Cleared CLAP Pattern LFO link for {}", link.parameter_name),
+                |error| {
+                    format!(
+                        "Cleared CLAP Pattern LFO link for this session; could not save it: {error}"
+                    )
+                },
+            );
         }
         if let Some(link) = playlist_clap_link_request {
             upsert_playlist_clap_parameter_link(
@@ -69461,6 +69749,10 @@ fn pattern_clap_parameter_links_file() -> Option<PathBuf> {
     midi_control_change_mapping_file("pattern-clap-parameter-links.txt")
 }
 
+fn pattern_clap_lfo_parameter_links_file() -> Option<PathBuf> {
+    midi_control_change_mapping_file("pattern-clap-lfo-parameter-links.txt")
+}
+
 fn pattern_vst3_mixer_effect_parameter_links_file() -> Option<PathBuf> {
     midi_control_change_mapping_file("pattern-vst3-mixer-effect-parameter-links.txt")
 }
@@ -69544,6 +69836,13 @@ fn load_pattern_clap_parameter_links() -> Vec<PatternClapParameterLink> {
     pattern_clap_parameter_links_file()
         .and_then(|path| fs::read_to_string(path).ok())
         .map(|contents| parse_pattern_clap_parameter_links(&contents))
+        .unwrap_or_default()
+}
+
+fn load_pattern_clap_lfo_parameter_links() -> Vec<PatternClapLfoParameterLink> {
+    pattern_clap_lfo_parameter_links_file()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .map(|contents| parse_pattern_clap_lfo_parameter_links(&contents))
         .unwrap_or_default()
 }
 
@@ -69838,6 +70137,20 @@ fn save_pattern_clap_parameter_links(links: &[PatternClapParameterLink]) -> Resu
     fs::create_dir_all(parent)
         .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
     fs::write(&path, serialize_pattern_clap_parameter_links(links))
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
+fn save_pattern_clap_lfo_parameter_links(
+    links: &[PatternClapLfoParameterLink],
+) -> Result<(), String> {
+    let path = pattern_clap_lfo_parameter_links_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path.parent().ok_or_else(|| {
+        "the Pattern CLAP LFO parameter link path has no parent folder".to_owned()
+    })?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    fs::write(&path, serialize_pattern_clap_lfo_parameter_links(links))
         .map_err(|error| format!("could not write {}: {error}", path.display()))
 }
 
@@ -70327,6 +70640,96 @@ fn pattern_clap_parameter_link_for_target<'a>(
 ) -> Option<&'a PatternClapParameterLink> {
     links.iter().find(|link| {
         same_pattern_clap_parameter_link_target(
+            link,
+            project_path,
+            pattern_id,
+            project_channel_id,
+            plugin_path,
+            plugin_id,
+            parameter_id,
+        )
+    })
+}
+
+fn same_pattern_clap_lfo_parameter_link_target(
+    link: &PatternClapLfoParameterLink,
+    project_path: &Path,
+    pattern_id: u16,
+    project_channel_id: u16,
+    plugin_path: &Path,
+    plugin_id: &str,
+    parameter_id: u32,
+) -> bool {
+    project_paths_equal(Path::new(&link.project_path), project_path)
+        && link.pattern_id == pattern_id
+        && link.project_channel_id == project_channel_id
+        && Path::new(&link.plugin_path) == plugin_path
+        && link.plugin_id == plugin_id
+        && link.parameter_id == parameter_id
+}
+
+fn valid_pattern_clap_lfo_parameter_link(link: &PatternClapLfoParameterLink) -> bool {
+    !link.project_path.is_empty()
+        && link.project_channel_id != u16::MAX
+        && !link.plugin_path.is_empty()
+        && !link.plugin_id.is_empty()
+        && link.parameter_id != u32::MAX
+        && !link.parameter_name.is_empty()
+        && (250..=64_000).contains(&link.period_millibeats)
+        && link.minimum_raw <= link.maximum_raw
+        && link.maximum_raw <= 10_000
+        && link.phase_degrees < 360
+}
+
+fn upsert_pattern_clap_lfo_parameter_link(
+    links: &mut Vec<PatternClapLfoParameterLink>,
+    link: PatternClapLfoParameterLink,
+) {
+    if !valid_pattern_clap_lfo_parameter_link(&link) {
+        return;
+    }
+    links.retain(|existing| {
+        !same_pattern_clap_lfo_parameter_link_target(
+            existing,
+            Path::new(&link.project_path),
+            link.pattern_id,
+            link.project_channel_id,
+            Path::new(&link.plugin_path),
+            &link.plugin_id,
+            link.parameter_id,
+        )
+    });
+    links.push(link);
+}
+
+fn remove_pattern_clap_lfo_parameter_link(
+    links: &mut Vec<PatternClapLfoParameterLink>,
+    target: &PatternClapLfoParameterLink,
+) {
+    links.retain(|link| {
+        !same_pattern_clap_lfo_parameter_link_target(
+            link,
+            Path::new(&target.project_path),
+            target.pattern_id,
+            target.project_channel_id,
+            Path::new(&target.plugin_path),
+            &target.plugin_id,
+            target.parameter_id,
+        )
+    });
+}
+
+fn pattern_clap_lfo_parameter_link_for_target<'a>(
+    links: &'a [PatternClapLfoParameterLink],
+    project_path: &Path,
+    pattern_id: u16,
+    project_channel_id: u16,
+    plugin_path: &Path,
+    plugin_id: &str,
+    parameter_id: u32,
+) -> Option<&'a PatternClapLfoParameterLink> {
+    links.iter().find(|link| {
+        same_pattern_clap_lfo_parameter_link_target(
             link,
             project_path,
             pattern_id,
@@ -71066,6 +71469,35 @@ fn internal_lfo_parameter_automation(
     }
 }
 
+fn clap_internal_lfo_parameter_automation(
+    link: &PatternClapLfoParameterLink,
+    ppq: u16,
+    loop_length_ticks: u64,
+) -> ClapParameterAutomation {
+    let duration_beats = loop_length_ticks as f64 / f64::from(ppq.max(1));
+    let period_beats = f64::from(link.period_millibeats) / 1_000.0;
+    let requested_steps = (duration_beats / period_beats * 32.0).ceil().max(8.0);
+    let step_count = requested_steps.min((MAX_INTERNAL_LFO_AUTOMATION_POINTS - 1) as f64) as usize;
+    let minimum = f64::from(link.minimum_raw) / 10_000.0;
+    let maximum = f64::from(link.maximum_raw) / 10_000.0;
+    let phase_offset = f64::from(link.phase_degrees) / 360.0;
+    let points = (0..=step_count)
+        .map(|step| {
+            let fraction = step as f64 / step_count as f64;
+            let phase = duration_beats * fraction / period_beats + phase_offset;
+            let wave = internal_lfo_value_at_phase(link.waveform, phase);
+            ClapParameterAutomationPoint {
+                tick: (loop_length_ticks as f64 * fraction).round() as u64,
+                normalized_value: minimum + (maximum - minimum) * wave,
+            }
+        })
+        .collect();
+    ClapParameterAutomation {
+        parameter_id: link.parameter_id,
+        points,
+    }
+}
+
 fn internal_lfo_mixer_effect_parameter_automation(
     link: &InternalLfoParameterLink,
     ppq: u16,
@@ -71794,6 +72226,115 @@ fn serialize_pattern_clap_parameter_links(links: &[PatternClapParameterLink]) ->
         contents.push_str(&link.parameter_id.to_string());
         contents.push('\t');
         contents.push_str(&encode_midi_device_id(&link.parameter_name));
+        contents.push('\n');
+    }
+    contents
+}
+
+fn parse_pattern_clap_lfo_parameter_links(contents: &str) -> Vec<PatternClapLfoParameterLink> {
+    let mut links = Vec::new();
+    for line in contents.lines() {
+        let Some(encoded) = line.strip_prefix("link=") else {
+            continue;
+        };
+        let mut fields = encoded.split('\t');
+        let Some(project_path) = fields.next().and_then(decode_midi_device_id) else {
+            continue;
+        };
+        let Some(pattern_id) = fields.next().and_then(|field| field.parse::<u16>().ok()) else {
+            continue;
+        };
+        let Some(project_channel_id) = fields.next().and_then(|field| field.parse::<u16>().ok())
+        else {
+            continue;
+        };
+        let Some(plugin_path) = fields.next().and_then(decode_midi_device_id) else {
+            continue;
+        };
+        let Some(plugin_id) = fields.next().and_then(decode_midi_device_id) else {
+            continue;
+        };
+        let Some(parameter_id) = fields.next().and_then(|field| field.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(parameter_name) = fields.next().and_then(decode_midi_device_id) else {
+            continue;
+        };
+        let Some(waveform) = fields
+            .next()
+            .and_then(|field| field.parse::<u8>().ok())
+            .and_then(InternalLfoWaveform::from_code)
+        else {
+            continue;
+        };
+        let Some(period_millibeats) = fields.next().and_then(|field| field.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Some(minimum_raw) = fields.next().and_then(|field| field.parse::<u16>().ok()) else {
+            continue;
+        };
+        let Some(maximum_raw) = fields.next().and_then(|field| field.parse::<u16>().ok()) else {
+            continue;
+        };
+        let Some(phase_degrees) = fields.next().and_then(|field| field.parse::<u16>().ok()) else {
+            continue;
+        };
+        if fields.next().is_some() {
+            continue;
+        }
+        upsert_pattern_clap_lfo_parameter_link(
+            &mut links,
+            PatternClapLfoParameterLink {
+                project_path,
+                pattern_id,
+                project_channel_id,
+                plugin_path,
+                plugin_id,
+                parameter_id,
+                parameter_name,
+                waveform,
+                period_millibeats,
+                minimum_raw,
+                maximum_raw,
+                phase_degrees,
+            },
+        );
+    }
+    links
+}
+
+fn serialize_pattern_clap_lfo_parameter_links(links: &[PatternClapLfoParameterLink]) -> String {
+    let mut contents = String::from("version=1\n");
+    let mut normalized = Vec::new();
+    for link in links {
+        upsert_pattern_clap_lfo_parameter_link(&mut normalized, link.clone());
+    }
+    for link in normalized {
+        contents.push_str("link=");
+        contents.push_str(&encode_midi_device_id(&link.project_path));
+        contents.push('\t');
+        contents.push_str(&link.pattern_id.to_string());
+        contents.push('\t');
+        contents.push_str(&link.project_channel_id.to_string());
+        contents.push('\t');
+        contents.push_str(&encode_midi_device_id(&link.plugin_path));
+        contents.push('\t');
+        contents.push_str(&encode_midi_device_id(&link.plugin_id));
+        contents.push('\t');
+        contents.push_str(&link.parameter_id.to_string());
+        contents.push('\t');
+        contents.push_str(&encode_midi_device_id(&link.parameter_name));
+        contents.push('\t');
+        contents.push_str(&link.waveform.code().to_string());
+        contents.push('\t');
+        contents.push_str(&link.period_millibeats.to_string());
+        contents.push('\t');
+        contents.push_str(&link.minimum_raw.to_string());
+        contents.push('\t');
+        contents.push_str(&link.maximum_raw.to_string());
+        contents.push('\t');
+        contents.push_str(&link.phase_degrees.to_string());
         contents.push('\n');
     }
     contents
