@@ -6860,8 +6860,11 @@ fn expand_automation_clip_parameter_automation_for_clip(
     {
         return Ok(BTreeMap::new());
     }
-
-    let clip_length = u64::from(clip.length_ticks);
+    let Some((source_start_tick, source_end_tick, explicit_source_window)) =
+        playlist_automation_source_window(clip)
+    else {
+        return Ok(BTreeMap::new());
+    };
     let mut expanded_point_count = 0usize;
     let mut automation_by_channel = BTreeMap::<u16, Vec<Vst3PlaylistParameterAutomation>>::new();
     for ((linked_automation_channel_id, target_channel_id), lanes) in automation_clip_automation {
@@ -6869,23 +6872,15 @@ fn expand_automation_clip_parameter_automation_for_clip(
             continue;
         }
         for lane in lanes {
-            let mut points = Vec::new();
-            for point in &lane.points {
-                if !point.position_beats.is_finite()
-                    || point.position_beats < 0.0
-                    || !point.value.is_finite()
-                    || !(0.0..=1.0).contains(&point.value)
-                {
-                    continue;
-                }
-                let point_tick = point.position_beats * f64::from(ppq);
-                if !point_tick.is_finite() || point_tick >= u64::MAX as f64 {
-                    continue;
-                }
-                let relative_tick = point_tick.round() as u64;
-                if relative_tick >= clip_length {
-                    continue;
-                }
+            let mapped_points = playlist_automation_points_in_source_window(
+                &lane.points,
+                ppq,
+                source_start_tick,
+                source_end_tick,
+                explicit_source_window,
+            );
+            let mut points = Vec::with_capacity(mapped_points.len());
+            for point in mapped_points {
                 expanded_point_count = expanded_point_count
                     .checked_add(1)
                     .filter(|count| *count <= MAX_VST3_AUTOMATION_POINTS)
@@ -6895,7 +6890,7 @@ fn expand_automation_clip_parameter_automation_for_clip(
                         )
                     })?;
                 points.push(Vst3PlaylistAutomationPoint {
-                    tick: relative_tick,
+                    tick: point.tick,
                     value: point.value,
                 });
             }
@@ -6911,6 +6906,145 @@ fn expand_automation_clip_parameter_automation_for_clip(
         }
     }
     Ok(automation_by_channel)
+}
+
+fn playlist_automation_source_window(clip: &crate::PlaylistClip) -> Option<(u64, u64, bool)> {
+    let clip_length = u64::from(clip.length_ticks);
+    match clip.source_window_ticks() {
+        Some((0, 0)) | None => Some((0, clip_length, false)),
+        Some((start, end)) if end.checked_sub(start) == Some(clip.length_ticks) => {
+            Some((u64::from(start), u64::from(end), true))
+        }
+        Some(_) => None,
+    }
+}
+
+fn playlist_automation_points_in_source_window(
+    points: &[Vst3AutomationPoint],
+    ppq: u16,
+    source_start_tick: u64,
+    source_end_tick: u64,
+    explicit_source_window: bool,
+) -> Vec<Vst3PlaylistAutomationPoint> {
+    let mut source_points = points
+        .iter()
+        .filter_map(|point| {
+            if !point.position_beats.is_finite()
+                || point.position_beats < 0.0
+                || !point.value.is_finite()
+                || !(0.0..=1.0).contains(&point.value)
+            {
+                return None;
+            }
+            let point_tick = point.position_beats * f64::from(ppq);
+            if !point_tick.is_finite() || point_tick >= u64::MAX as f64 {
+                return None;
+            }
+            Some((point_tick.round() as u64, point.value))
+        })
+        .collect::<Vec<_>>();
+    source_points.sort_by_key(|(tick, _)| *tick);
+    source_points.dedup_by(|current, previous| {
+        if current.0 == previous.0 {
+            previous.1 = current.1;
+            true
+        } else {
+            false
+        }
+    });
+
+    let boundary_value = if source_start_tick == 0
+        || source_points
+            .iter()
+            .any(|(tick, _)| *tick == source_start_tick)
+    {
+        None
+    } else {
+        let previous = source_points
+            .iter()
+            .rev()
+            .find(|(tick, _)| *tick < source_start_tick);
+        let next = source_points
+            .iter()
+            .find(|(tick, _)| *tick > source_start_tick);
+        previous.map(|(from_tick, from_value)| {
+            if let Some((to_tick, to_value)) = next {
+                let fraction =
+                    (source_start_tick - from_tick) as f64 / (*to_tick - from_tick) as f64;
+                from_value + (to_value - from_value) * fraction
+            } else {
+                *from_value
+            }
+        })
+    };
+
+    let mut mapped_points = Vec::new();
+    if let Some(value) = boundary_value {
+        mapped_points.push(Vst3PlaylistAutomationPoint { tick: 0, value });
+    }
+    mapped_points.extend(
+        source_points
+            .into_iter()
+            .filter(|(tick, _)| *tick >= source_start_tick && *tick < source_end_tick)
+            .map(|(tick, value)| Vst3PlaylistAutomationPoint {
+                tick: tick - source_start_tick,
+                value,
+            }),
+    );
+    if explicit_source_window
+        && let Some(value) = playlist_automation_value_at_tick(points, ppq, source_end_tick)
+    {
+        mapped_points.push(Vst3PlaylistAutomationPoint {
+            tick: source_end_tick - source_start_tick,
+            value,
+        });
+    }
+    mapped_points
+}
+
+fn playlist_automation_value_at_tick(
+    points: &[Vst3AutomationPoint],
+    ppq: u16,
+    tick: u64,
+) -> Option<f64> {
+    let mut source_points = points
+        .iter()
+        .filter_map(|point| {
+            if !point.position_beats.is_finite()
+                || point.position_beats < 0.0
+                || !point.value.is_finite()
+                || !(0.0..=1.0).contains(&point.value)
+            {
+                return None;
+            }
+            let point_tick = point.position_beats * f64::from(ppq);
+            (point_tick.is_finite() && point_tick < u64::MAX as f64)
+                .then_some((point_tick.round() as u64, point.value))
+        })
+        .collect::<Vec<_>>();
+    source_points.sort_by_key(|(point_tick, _)| *point_tick);
+    source_points.dedup_by(|current, previous| {
+        if current.0 == previous.0 {
+            previous.1 = current.1;
+            true
+        } else {
+            false
+        }
+    });
+    let previous = source_points
+        .iter()
+        .rev()
+        .find(|(point_tick, _)| *point_tick <= tick)?;
+    if previous.0 == tick {
+        return Some(previous.1);
+    }
+    source_points
+        .iter()
+        .find(|(point_tick, _)| *point_tick > tick)
+        .map_or(Some(previous.1), |(next_tick, next_value)| {
+            let fraction = (tick - previous.0) as f64 / (*next_tick - previous.0) as f64;
+            Some(previous.1 + (next_value - previous.1) * fraction)
+        })
 }
 
 fn expand_playlist_mixer_effect_parameter_automation(
@@ -7193,7 +7327,11 @@ fn expand_mixer_effect_automation_clip_parameter_automation_for_clip(
     {
         return Ok(BTreeMap::new());
     }
-    let clip_length = u64::from(clip.length_ticks);
+    let Some((source_start_tick, source_end_tick, explicit_source_window)) =
+        playlist_automation_source_window(clip)
+    else {
+        return Ok(BTreeMap::new());
+    };
     let mut expanded_point_count = 0usize;
     let mut automation_by_effect =
         BTreeMap::<(usize, u16), Vec<Vst3PlaylistParameterAutomation>>::new();
@@ -7204,23 +7342,15 @@ fn expand_mixer_effect_automation_clip_parameter_automation_for_clip(
             continue;
         }
         for lane in lanes {
-            let mut points = Vec::new();
-            for point in &lane.points {
-                if !point.position_beats.is_finite()
-                    || point.position_beats < 0.0
-                    || !point.value.is_finite()
-                    || !(0.0..=1.0).contains(&point.value)
-                {
-                    continue;
-                }
-                let point_tick = point.position_beats * f64::from(ppq);
-                if !point_tick.is_finite() || point_tick >= u64::MAX as f64 {
-                    continue;
-                }
-                let relative_tick = point_tick.round() as u64;
-                if relative_tick >= clip_length {
-                    continue;
-                }
+            let mapped_points = playlist_automation_points_in_source_window(
+                &lane.points,
+                ppq,
+                source_start_tick,
+                source_end_tick,
+                explicit_source_window,
+            );
+            let mut points = Vec::with_capacity(mapped_points.len());
+            for point in mapped_points {
                 expanded_point_count = expanded_point_count
                     .checked_add(1)
                     .filter(|count| *count <= MAX_VST3_AUTOMATION_POINTS)
@@ -7230,7 +7360,7 @@ fn expand_mixer_effect_automation_clip_parameter_automation_for_clip(
                         )
                     })?;
                 points.push(Vst3PlaylistAutomationPoint {
-                    tick: relative_tick,
+                    tick: point.tick,
                     value: point.value,
                 });
             }
@@ -9895,6 +10025,77 @@ mod tests {
                 value: 0.2,
             }]
         );
+    }
+
+    #[test]
+    fn automation_clip_source_windows_map_curve_boundaries_for_instrument_and_effects() {
+        let document = playlist_parameter_automation_fixture();
+        let mut clip = document
+            .arrangements()
+            .expect("arrangements should decode")
+            .into_iter()
+            .find(|arrangement| arrangement.id == 3)
+            .and_then(|arrangement| arrangement.clips.first().cloned())
+            .expect("fixture clip should exist");
+        clip.length_ticks = 192;
+        clip.record_size = 88;
+        clip.source_window_ticks = Some((48, 240));
+        clip.scale = None;
+        let lane = Vst3ParameterAutomation {
+            parameter_id: 81,
+            points: vec![
+                Vst3AutomationPoint {
+                    position_beats: 0.25,
+                    value: 0.2,
+                },
+                Vst3AutomationPoint {
+                    position_beats: 1.0,
+                    value: 0.8,
+                },
+                Vst3AutomationPoint {
+                    position_beats: 3.0,
+                    value: 0.3,
+                },
+            ],
+        };
+
+        let instrument = expand_automation_clip_parameter_automation_for_clip(
+            11,
+            &clip,
+            96,
+            &BTreeMap::from([((11, 4), vec![lane.clone()])]),
+        )
+        .expect("Automation Clip source window should expand for instruments");
+        let instrument_points = &instrument[&4][0].points;
+        assert_eq!(
+            instrument_points
+                .iter()
+                .map(|point| point.tick)
+                .collect::<Vec<_>>(),
+            vec![0, 48, 192]
+        );
+        assert!((instrument_points[0].value - 0.4).abs() < 1e-12);
+        assert!((instrument_points[1].value - 0.8).abs() < 1e-12);
+        assert!((instrument_points[2].value - 0.425).abs() < 1e-12);
+
+        let effect = expand_mixer_effect_automation_clip_parameter_automation_for_clip(
+            11,
+            &clip,
+            96,
+            &BTreeMap::from([((11, 1, 2), vec![lane])]),
+        )
+        .expect("Automation Clip source window should expand for Mixer effects");
+        let effect_points = &effect[&(1, 2)][0].points;
+        assert_eq!(
+            effect_points
+                .iter()
+                .map(|point| point.tick)
+                .collect::<Vec<_>>(),
+            vec![0, 48, 192]
+        );
+        assert!((effect_points[0].value - 0.4).abs() < 1e-12);
+        assert!((effect_points[1].value - 0.8).abs() < 1e-12);
+        assert!((effect_points[2].value - 0.425).abs() < 1e-12);
     }
 
     #[test]

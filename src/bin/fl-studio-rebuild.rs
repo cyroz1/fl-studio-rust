@@ -22069,6 +22069,8 @@ impl DawUi {
         let mut split_selected_audio_clips_requested = None;
         let mut split_pattern_clip_requested = None;
         let mut split_selected_pattern_clips_requested = None;
+        let mut split_automation_clip_requested = None;
+        let mut split_selected_automation_clips_requested = None;
         let mut join_clip_requested = None;
         let mut join_selected_audio_clips_requested = None;
         let mut join_pattern_clip_requested = None;
@@ -24153,6 +24155,13 @@ impl DawUi {
                                 clip.target(),
                                 flp_rebuild::PlaylistClipTarget::Pattern { .. }
                             );
+                            let is_automation_clip = match clip.target() {
+                                flp_rebuild::PlaylistClipTarget::Channel { id } => {
+                                    channel_kinds.get(&id).copied().flatten() == Some(5)
+                                        && automation_channel_ids.contains(&id)
+                                }
+                                flp_rebuild::PlaylistClipTarget::Pattern { .. } => false,
+                            };
                             let can_trigger_performance_clip = self.performance_mode_active
                                 && self.playing
                                 && self.performance_launch_sender.is_some()
@@ -24378,6 +24387,16 @@ impl DawUi {
                                         &arrangement.clips,
                                         &patterns,
                                         &tempo_channel_ids,
+                                    )
+                                },
+                            );
+                            let can_split_automation_clip = context_split_position.is_some_and(
+                                |split_position| {
+                                    playlist_automation_clip_split_supported(
+                                        clip,
+                                        split_position,
+                                        &channel_kinds,
+                                        &automation_channel_ids,
                                     )
                                 },
                             );
@@ -25596,6 +25615,61 @@ impl DawUi {
                                         join_pattern_clip_requested =
                                             Some((clip_index, next_clip_index));
                                         ui.close();
+                                    }
+                                } else if is_automation_clip {
+                                    ui.separator();
+                                    let button = ui.add_enabled(
+                                        can_split_automation_clip,
+                                        egui::Button::new("Split Automation Clip at cursor"),
+                                    );
+                                    if button
+                                        .on_disabled_hover_text(
+                                            "Requires an 88-byte Automation Clip with a recognized source window matching its timeline and a split point inside the clip.",
+                                        )
+                                        .clicked()
+                                        && let Some(split_position_ticks) = context_split_position
+                                    {
+                                        split_automation_clip_requested =
+                                            Some((clip_index, split_position_ticks));
+                                        ui.close();
+                                    }
+                                    if let Some(selected_indices) = self
+                                        .selected_playlist_automation_clip_indices(
+                                            arrangement.id,
+                                            &automation_channel_ids,
+                                        )
+                                        .filter(|indices| indices.contains(&clip_index))
+                                    {
+                                        let selection_can_split = context_split_position
+                                            .is_some_and(|split_position_ticks| {
+                                                playlist_automation_clip_selection_split_supported(
+                                                    &arrangement.clips,
+                                                    &selected_indices,
+                                                    split_position_ticks,
+                                                    &channel_kinds,
+                                                    &automation_channel_ids,
+                                                )
+                                            });
+                                        let button = ui.add_enabled(
+                                            selection_can_split,
+                                            egui::Button::new(
+                                                "Split selected Automation Clips at cursor",
+                                            ),
+                                        );
+                                        if button
+                                            .on_disabled_hover_text(
+                                                "Every selected clip must use a recognized 88-byte source window that matches its timeline and contain the split point.",
+                                            )
+                                            .clicked()
+                                            && let Some(split_position_ticks) =
+                                                context_split_position
+                                        {
+                                            split_selected_automation_clips_requested = Some((
+                                                selected_indices,
+                                                split_position_ticks,
+                                            ));
+                                            ui.close();
+                                        }
                                     }
                                 }
                                 ui.separator();
@@ -27571,6 +27645,46 @@ impl DawUi {
             );
         }
 
+        if let Some((clip_index, split_position_ticks)) = split_automation_clip_requested {
+            if let Some(document) = self.document.as_mut() {
+                match document.split_playlist_automation_clip(
+                    arrangement.id,
+                    clip_index,
+                    split_position_ticks,
+                ) {
+                    Ok(right_clip_index) => {
+                        self.stop_project_playback();
+                        self.selected_arrangement = Some(arrangement.id);
+                        self.selected_clip = Some(right_clip_index);
+                        self.playlist_clip_context_split = None;
+                        self.active_playlist_clip_drag = None;
+                        self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+                        self.status = format!(
+                            "Split Automation Clip {} at tick {split_position_ticks}",
+                            clip_index + 1
+                        );
+                        playlist_clip_list_changed = true;
+                    }
+                    Err(error) => {
+                        self.status = format!("Could not split Automation Clip: {error}");
+                    }
+                }
+            } else {
+                self.status = "Open a project to split Playlist Automation Clips".to_owned();
+            }
+        }
+
+        if let Some((clip_indices, split_position_ticks)) =
+            split_selected_automation_clips_requested
+        {
+            playlist_clip_list_changed |= self.split_selected_playlist_automation_clips(
+                arrangement.id,
+                &clip_indices,
+                split_position_ticks,
+            );
+        }
+
         if let Some((clip_index, split_position_ticks, full_source_length_ms)) =
             split_clip_requested
         {
@@ -28008,6 +28122,33 @@ impl DawUi {
                     .clips
                     .get(index)
                     .is_some_and(|clip| matches!(clip.target(), PlaylistClipTarget::Pattern { .. }))
+            })
+            .then(|| self.selected_playlist_clips.iter().copied().collect())
+    }
+
+    fn selected_playlist_automation_clip_indices(
+        &self,
+        arrangement_id: u16,
+        automation_channel_ids: &BTreeSet<u16>,
+    ) -> Option<Vec<usize>> {
+        if self.selected_arrangement != Some(arrangement_id)
+            || self.selected_playlist_clips.len() < 2
+        {
+            return None;
+        }
+        let document = self.document.as_ref()?;
+        let arrangement = document
+            .arrangements()
+            .ok()?
+            .into_iter()
+            .find(|arrangement| arrangement.id == arrangement_id)?;
+        self.selected_playlist_clips
+            .iter()
+            .copied()
+            .all(|index| {
+                arrangement.clips.get(index).is_some_and(|clip| {
+                    matches!(clip.target(), PlaylistClipTarget::Channel { id } if automation_channel_ids.contains(&id))
+                })
             })
             .then(|| self.selected_playlist_clips.iter().copied().collect())
     }
@@ -29265,6 +29406,130 @@ impl DawUi {
             }
             None => {
                 self.status = "Open a project to split selected Playlist Pattern Clips".to_owned();
+                false
+            }
+        }
+    }
+
+    fn split_selected_playlist_automation_clips(
+        &mut self,
+        arrangement_id: u16,
+        clip_indices: &[usize],
+        split_position_ticks: u32,
+    ) -> bool {
+        let mut clip_indices = clip_indices.to_vec();
+        clip_indices.sort_unstable();
+        clip_indices.dedup();
+        if clip_indices.len() < 2 {
+            self.status = "Select at least two Automation Clips to split together".to_owned();
+            return false;
+        }
+
+        let result = self.document.as_ref().map(|document| {
+            let mut updated = document.clone();
+            let arrangements = updated.arrangements().map_err(|error| error.to_string())?;
+            let mut matching_arrangements = arrangements
+                .iter()
+                .filter(|arrangement| arrangement.id == arrangement_id);
+            let Some(arrangement) = matching_arrangements.next() else {
+                return Err("The requested Playlist arrangement does not exist".to_owned());
+            };
+            if matching_arrangements.next().is_some() {
+                return Err("The requested Playlist arrangement is ambiguous".to_owned());
+            }
+            let channel_kinds = updated
+                .channels()
+                .into_iter()
+                .map(|channel| (channel.id(), channel.kind()))
+                .collect::<BTreeMap<_, _>>();
+            let automation_channel_ids = updated
+                .automation_channels()
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .filter(|channel| channel.data_event_index().is_some())
+                .map(|channel| channel.channel_id())
+                .collect::<BTreeSet<_>>();
+            if !playlist_automation_clip_selection_split_supported(
+                &arrangement.clips,
+                &clip_indices,
+                split_position_ticks,
+                &channel_kinds,
+                &automation_channel_ids,
+            ) {
+                return Err(
+                    "Every selected Automation Clip must support the requested split point"
+                        .to_owned(),
+                );
+            }
+
+            let mut split_indices = Vec::with_capacity(clip_indices.len().saturating_mul(2));
+            for clip_index in clip_indices.iter().rev() {
+                for current_index in &mut split_indices {
+                    if *current_index > *clip_index {
+                        *current_index += 1;
+                    }
+                }
+                let right_clip_index = updated
+                    .split_playlist_automation_clip(
+                        arrangement_id,
+                        *clip_index,
+                        split_position_ticks,
+                    )
+                    .map_err(|error| error.to_string())?;
+                split_indices.push(*clip_index);
+                split_indices.push(right_clip_index);
+            }
+
+            let arrangements = updated.arrangements().map_err(|error| error.to_string())?;
+            let mut matching_arrangements = arrangements
+                .iter()
+                .filter(|arrangement| arrangement.id == arrangement_id);
+            let Some(arrangement) = matching_arrangements.next() else {
+                return Err("The updated Playlist arrangement no longer exists".to_owned());
+            };
+            if matching_arrangements.next().is_some() {
+                return Err("The updated Playlist arrangement is ambiguous".to_owned());
+            }
+            split_indices.sort_unstable_by_key(|clip_index| {
+                arrangement
+                    .clips
+                    .get(*clip_index)
+                    .map(|clip| (clip.position_ticks, *clip_index))
+                    .unwrap_or((u32::MAX, *clip_index))
+            });
+
+            Ok::<_, String>((updated, split_indices))
+        });
+
+        match result {
+            Some(Ok((updated, split_indices))) => {
+                let Some(active_clip_index) = split_indices.first().copied() else {
+                    self.status = "No selected Automation Clips were split".to_owned();
+                    return false;
+                };
+                self.stop_project_playback();
+                self.document = Some(updated);
+                self.selected_arrangement = Some(arrangement_id);
+                self.selected_clip = Some(active_clip_index);
+                self.selected_playlist_clips = split_indices.iter().copied().collect();
+                self.playlist_selection_anchor = Some(active_clip_index);
+                self.playlist_clip_context_split = None;
+                self.active_playlist_clip_drag = None;
+                self.dirty = true;
+                self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+                self.status = format!(
+                    "Split {} selected Automation Clips at tick {split_position_ticks}",
+                    clip_indices.len()
+                );
+                true
+            }
+            Some(Err(error)) => {
+                self.status = format!("Could not split selected Automation Clips: {error}");
+                false
+            }
+            None => {
+                self.status =
+                    "Open a project to split selected Playlist Automation Clips".to_owned();
                 false
             }
         }
@@ -70947,6 +71212,61 @@ fn playlist_pattern_clip_selection_split_supported(
                     clips,
                     patterns,
                     tempo_channel_ids,
+                )
+            })
+        })
+}
+
+fn playlist_automation_clip_split_supported(
+    clip: &PlaylistClip,
+    split_position_ticks: u32,
+    channel_kinds: &BTreeMap<u16, Option<u8>>,
+    automation_channel_ids: &BTreeSet<u16>,
+) -> bool {
+    let PlaylistClipTarget::Channel { id } = clip.target() else {
+        return false;
+    };
+    if channel_kinds.get(&id).copied().flatten() != Some(5)
+        || !automation_channel_ids.contains(&id)
+        || clip.record_size != 88
+        || clip
+            .scale
+            .is_some_and(|scale| !scale.is_finite() || (scale - 1.0).abs() > 1e-9)
+    {
+        return false;
+    }
+    let Some(relative_split_ticks) = split_position_ticks
+        .checked_sub(clip.position_ticks)
+        .filter(|ticks| *ticks > 0 && *ticks < clip.length_ticks)
+    else {
+        return false;
+    };
+    clip.source_window_ticks()
+        .is_some_and(|(source_start, source_end)| {
+            source_end.checked_sub(source_start) == Some(clip.length_ticks)
+                && source_start
+                    .checked_add(relative_split_ticks)
+                    .is_some_and(|split_source| {
+                        split_source > source_start && split_source < source_end
+                    })
+        })
+}
+
+fn playlist_automation_clip_selection_split_supported(
+    clips: &[PlaylistClip],
+    clip_indices: &[usize],
+    split_position_ticks: u32,
+    channel_kinds: &BTreeMap<u16, Option<u8>>,
+    automation_channel_ids: &BTreeSet<u16>,
+) -> bool {
+    clip_indices.len() >= 2
+        && clip_indices.iter().all(|clip_index| {
+            clips.get(*clip_index).is_some_and(|clip| {
+                playlist_automation_clip_split_supported(
+                    clip,
+                    split_position_ticks,
+                    channel_kinds,
+                    automation_channel_ids,
                 )
             })
         })

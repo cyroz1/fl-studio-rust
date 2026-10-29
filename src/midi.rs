@@ -2219,31 +2219,98 @@ pub(crate) fn song_tempo_events(
             continue;
         }
 
+        let (source_start_tick, source_end_tick, explicit_source_window) =
+            match clip.source_window_ticks() {
+                Some((0, 0)) | None => (0, u64::from(clip.length_ticks), false),
+                Some((start, end)) if end.checked_sub(start) == Some(clip.length_ticks) => {
+                    (u64::from(start), u64::from(end), true)
+                }
+                Some(_) => {
+                    return Err(MidiError::InvalidExport(
+                        "Playlist tempo automation source windows must match their clip length",
+                    ));
+                }
+            };
+
+        let mut source_points = channel
+            .points()
+            .iter()
+            .map(|point| {
+                Ok((
+                    automation_point_tick(point.position_beats(), ppq)?,
+                    point.value(),
+                ))
+            })
+            .collect::<Result<Vec<_>, MidiError>>()?;
+        source_points.sort_by_key(|(tick, _)| *tick);
+        source_points.dedup_by(|current, previous| {
+            if current.0 == previous.0 {
+                previous.1 = current.1;
+                true
+            } else {
+                false
+            }
+        });
+        let mut points = Vec::new();
+        if source_start_tick > 0
+            && !source_points
+                .iter()
+                .any(|(tick, _)| *tick == source_start_tick)
+            && let Some((from_tick, from_value)) = source_points
+                .iter()
+                .rev()
+                .find(|(tick, _)| *tick < source_start_tick)
+        {
+            let next = source_points
+                .iter()
+                .find(|(tick, _)| *tick > source_start_tick);
+            let boundary_value = next.map_or(*from_value, |(to_tick, to_value)| {
+                let fraction =
+                    (source_start_tick - from_tick) as f64 / (*to_tick - from_tick) as f64;
+                from_value + (to_value - from_value) * fraction
+            });
+            points.push((0, boundary_value));
+        }
+        points.extend(
+            source_points
+                .iter()
+                .copied()
+                .filter(|(tick, _)| *tick >= source_start_tick && *tick < source_end_tick)
+                .map(|(tick, value)| (tick - source_start_tick, value)),
+        );
+        if explicit_source_window
+            && let Some(value) = automation_value_at_tick(&source_points, source_end_tick)
+        {
+            points.push((source_end_tick - source_start_tick, value));
+        }
+        if points.is_empty() {
+            continue;
+        }
+
         let clip_start = u64::from(clip.position_ticks);
         let clip_end = clip_start
             .checked_add(u64::from(clip.length_ticks))
             .ok_or(MidiError::LengthOverflow)?;
-        let points = channel.points();
         let first_point_tick = clip_start
-            .checked_add(automation_point_tick(points[0].position_beats(), ppq)?)
+            .checked_add(points[0].0)
             .ok_or(MidiError::LengthOverflow)?;
         if first_point_tick < clip_end {
-            events.push((first_point_tick, tempo_automation_bpm(points[0].value())?));
+            events.push((first_point_tick, tempo_automation_bpm(points[0].1)?));
         }
 
         let mut clip_event_count = 0usize;
         for pair in points.windows(2) {
             let from = &pair[0];
             let to = &pair[1];
-            if from.value() == to.value() {
+            if from.1 == to.1 {
                 continue;
             }
 
             let segment_start = clip_start
-                .checked_add(automation_point_tick(from.position_beats(), ppq)?)
+                .checked_add(from.0)
                 .ok_or(MidiError::LengthOverflow)?;
             let segment_end = clip_start
-                .checked_add(automation_point_tick(to.position_beats(), ppq)?)
+                .checked_add(to.0)
                 .ok_or(MidiError::LengthOverflow)?;
             if segment_start >= clip_end || segment_end <= segment_start {
                 continue;
@@ -2254,7 +2321,7 @@ pub(crate) fn song_tempo_events(
             for tick in first_sample_tick..sample_end {
                 let elapsed = tick.saturating_add(1).saturating_sub(segment_start) as f64;
                 let fraction = (elapsed / span).clamp(0.0, 1.0);
-                let value = from.value() + (to.value() - from.value()) * fraction;
+                let value = from.1 + (to.1 - from.1) * fraction;
                 events.push((tick, tempo_automation_bpm(value)?));
                 clip_event_count = clip_event_count.saturating_add(1);
                 if clip_event_count > MAX_EXPORTED_TEMPO_EVENTS {
@@ -2289,6 +2356,23 @@ fn automation_point_tick(position_beats: f64, ppq: u16) -> Result<u64, MidiError
         ));
     }
     Ok(ticks.round() as u64)
+}
+
+fn automation_value_at_tick(points: &[(u64, f64)], tick: u64) -> Option<f64> {
+    let previous = points
+        .iter()
+        .rev()
+        .find(|(point_tick, _)| *point_tick <= tick)?;
+    if previous.0 == tick {
+        return Some(previous.1);
+    }
+    points
+        .iter()
+        .find(|(point_tick, _)| *point_tick > tick)
+        .map_or(Some(previous.1), |(next_tick, next_value)| {
+            let fraction = (tick - previous.0) as f64 / (*next_tick - previous.0) as f64;
+            Some(previous.1 + (next_value - previous.1) * fraction)
+        })
 }
 
 impl MidiEvent {

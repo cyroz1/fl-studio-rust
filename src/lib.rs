@@ -13092,6 +13092,159 @@ impl FlpDocument {
         Ok(clip_index.saturating_add(1))
     }
 
+    /// Splits a modern Automation Clip while keeping both clips linked to the
+    /// same automation channel and advancing the right clip's source window.
+    /// Only 88-byte records with a recognized one-to-one tick source window
+    /// are supported.
+    pub fn split_playlist_automation_clip(
+        &mut self,
+        arrangement_id: u16,
+        clip_index: usize,
+        split_position_ticks: u32,
+    ) -> Result<usize, FlpError> {
+        let arrangements = self.arrangements()?;
+        let mut matching_arrangements = arrangements
+            .iter()
+            .filter(|arrangement| arrangement.id == arrangement_id);
+        let Some(arrangement) = matching_arrangements.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested arrangement does not exist",
+            ));
+        };
+        if matching_arrangements.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested arrangement id is ambiguous",
+            ));
+        }
+        let Some(clip) = arrangement.clips.get(clip_index) else {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested Playlist clip does not exist",
+            ));
+        };
+        let PlaylistClipTarget::Channel { id: channel_id } = clip.target() else {
+            return Err(FlpError::UnsupportedEdit(
+                "only Playlist Automation Clips can be split",
+            ));
+        };
+        if clip.record_size != 88 {
+            return Err(FlpError::UnsupportedEdit(
+                "only modern 88-byte Automation Clips with tick source windows can be split",
+            ));
+        }
+        if clip
+            .scale
+            .is_some_and(|scale| !scale.is_finite() || (scale - 1.0).abs() > 1e-9)
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "Automation Clips with a non-default or invalid scale cannot be split",
+            ));
+        }
+        let (source_start, source_end) = clip.source_window_ticks().ok_or(
+            FlpError::UnsupportedEdit("this Automation Clip has no recognized tick source window"),
+        )?;
+        if clip.length_ticks == 0 || source_end.checked_sub(source_start) != Some(clip.length_ticks)
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "this Automation Clip source window does not match its timeline length",
+            ));
+        }
+        let relative_split_ticks = split_position_ticks.checked_sub(clip.position_ticks);
+        let Some(relative_split_ticks) =
+            relative_split_ticks.filter(|ticks| *ticks > 0 && *ticks < clip.length_ticks)
+        else {
+            return Err(FlpError::UnsupportedEdit(
+                "the split point must fall inside the Playlist Automation Clip",
+            ));
+        };
+        let split_source_tick = source_start
+            .checked_add(relative_split_ticks)
+            .ok_or(FlpError::LengthOverflow)?;
+        if split_source_tick >= source_end {
+            return Err(FlpError::UnsupportedEdit(
+                "the split point falls outside the Automation Clip source window",
+            ));
+        }
+
+        let matching_channels = self
+            .channels()
+            .into_iter()
+            .filter(|channel| channel.id() == channel_id);
+        let matching_channels = matching_channels.collect::<Vec<_>>();
+        if matching_channels.len() != 1 || matching_channels[0].kind() != Some(5) {
+            return Err(FlpError::UnsupportedEdit(
+                "the Playlist clip does not target a unique automation channel",
+            ));
+        }
+        let automation_channels = self.automation_channels()?;
+        let mut matching_automation_channels = automation_channels
+            .iter()
+            .filter(|channel| channel.channel_id() == channel_id);
+        let Some(automation_channel) = matching_automation_channels.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the Playlist Automation Clip channel has no automation data",
+            ));
+        };
+        if matching_automation_channels.next().is_some()
+            || automation_channel.data_event_index().is_none()
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "the Playlist Automation Clip channel data is ambiguous or missing",
+            ));
+        }
+
+        let record_size = clip.record_size;
+        let record_start = clip
+            .source_record_index
+            .checked_mul(record_size)
+            .ok_or(FlpError::LengthOverflow)?;
+        let record_end = record_start
+            .checked_add(record_size)
+            .ok_or(FlpError::LengthOverflow)?;
+        let event_index = clip.source_event_index;
+        let event = self
+            .events
+            .get(event_index)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the Playlist Automation Clip event no longer exists",
+            ))?;
+        if event.opcode != 0xE9
+            || !matches!(event.encoding, PayloadEncoding::Data { .. })
+            || record_end > event.payload.len()
+            || !event.payload.len().is_multiple_of(record_size)
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "the Playlist Automation Clip record does not fit its event payload",
+            ));
+        }
+
+        let left_length = relative_split_ticks;
+        let right_length = clip.length_ticks - relative_split_ticks;
+        let mut left_record = event.payload[record_start..record_end].to_vec();
+        let mut right_record = left_record.clone();
+        left_record[8..12].copy_from_slice(&left_length.to_le_bytes());
+        left_record[28..32].copy_from_slice(&split_source_tick.to_le_bytes());
+        right_record[0..4].copy_from_slice(&split_position_ticks.to_le_bytes());
+        right_record[8..12].copy_from_slice(&right_length.to_le_bytes());
+        right_record[24..28].copy_from_slice(&split_source_tick.to_le_bytes());
+        right_record[28..32].copy_from_slice(&source_end.to_le_bytes());
+        if playlist_record_has_clip_id(record_size) {
+            right_record[32..36]
+                .copy_from_slice(&next_playlist_clip_id(arrangement, None)?.to_le_bytes());
+        }
+
+        let mut candidate = self.clone();
+        let mut payload = event.payload.clone();
+        payload.splice(record_start..record_end, left_record);
+        let right_record_start = record_start
+            .checked_add(record_size)
+            .ok_or(FlpError::LengthOverflow)?;
+        payload.splice(right_record_start..right_record_start, right_record);
+        candidate.events[event_index].replace_data_payload(payload)?;
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(clip_index.saturating_add(1))
+    }
+
     fn pattern_score_for_playlist_merge(
         &self,
         pattern_id: u16,
@@ -25968,6 +26121,42 @@ mod tests {
         FlpDocument::parse(&input).expect("Automation Clip fixture should parse")
     }
 
+    fn modern_automation_playlist_fixture_with_window(
+        length_ticks: u32,
+        source_start_ticks: u32,
+        source_end_ticks: u32,
+    ) -> FlpDocument {
+        let mut event_stream = vec![0x40, 11, 0, 0x15, 5];
+        append_project_info_string(&mut event_stream, 0xCB, "TEMPO");
+        let mut automation = vec![0xA5; FLP_AUTOMATION_POINTS_OFFSET];
+        automation[FLP_AUTOMATION_COUNT_OFFSET..FLP_AUTOMATION_POINTS_OFFSET]
+            .copy_from_slice(&2_u32.to_le_bytes());
+        for (position_delta, value, tail) in [
+            (0.0_f64, 0.2_f64, [0x10, 0x20, 0x30, 0x40]),
+            (2.0_f64, 0.8_f64, [0x50, 0x60, 0x70, 0x80]),
+        ] {
+            automation.extend_from_slice(&position_delta.to_le_bytes());
+            automation.extend_from_slice(&value.to_le_bytes());
+            automation.extend_from_slice(&0.0_f32.to_le_bytes());
+            automation.extend_from_slice(&tail);
+        }
+        append_data_event(&mut event_stream, 0xEA, &automation);
+        event_stream.extend_from_slice(&[0x62, 0, 0, 0x63, 3, 0]);
+
+        let mut clip = [0xA5_u8; 88];
+        clip[0..4].copy_from_slice(&0_u32.to_le_bytes());
+        clip[4..6].copy_from_slice(&0x5000_u16.to_le_bytes());
+        clip[6..8].copy_from_slice(&11_u16.to_le_bytes());
+        clip[8..12].copy_from_slice(&length_ticks.to_le_bytes());
+        clip[12..14].copy_from_slice(&499_u16.to_le_bytes());
+        clip[24..28].copy_from_slice(&source_start_ticks.to_le_bytes());
+        clip[28..32].copy_from_slice(&source_end_ticks.to_le_bytes());
+        append_data_event(&mut event_stream, 0xC7, b"26.1.0.0\0");
+        append_data_event(&mut event_stream, 0xE9, &clip);
+        FlpDocument::parse(&flp_fixture(&event_stream, &[], &[]))
+            .expect("modern Automation Clip fixture should parse")
+    }
+
     fn merge_pattern_clips_fixture(include_unsupported_pattern_event: bool) -> FlpDocument {
         let mut event_stream = vec![0x40, 0, 0, 0x41, 7, 0];
         let receiver_note = note_record(0, 7, 48, 60, 100);
@@ -28171,6 +28360,80 @@ mod tests {
         assert_eq!(&clip_payload[32..88], &clip_payload[88 + 32..]);
         let encoded = document.encode_lossless().unwrap();
         FlpDocument::parse(&encoded).expect("the split project should parse again");
+    }
+
+    #[test]
+    fn splits_modern_automation_clip_and_advances_the_source_window() {
+        let mut document = modern_automation_playlist_fixture_with_window(192, 24, 216);
+        let original_automation_data = document
+            .events()
+            .iter()
+            .find(|event| event.opcode() == 0xEA)
+            .expect("automation source data should be present")
+            .payload()
+            .to_vec();
+
+        let right_clip_index = document
+            .split_playlist_automation_clip(3, 0, 72)
+            .expect("a one-to-one modern Automation Clip source window should split");
+
+        assert_eq!(right_clip_index, 1);
+        let arrangements = document.arrangements().unwrap();
+        assert_eq!(arrangements[0].clips.len(), 2);
+        assert_eq!(
+            arrangements[0].clips[0].target(),
+            PlaylistClipTarget::Channel { id: 11 }
+        );
+        assert_eq!(arrangements[0].clips[0].length_ticks, 48);
+        assert_eq!(
+            arrangements[0].clips[0].source_window_ticks(),
+            Some((24, 72))
+        );
+        assert_eq!(
+            arrangements[0].clips[1].target(),
+            PlaylistClipTarget::Channel { id: 11 }
+        );
+        assert_eq!(arrangements[0].clips[1].position_ticks, 72);
+        assert_eq!(arrangements[0].clips[1].length_ticks, 144);
+        assert_eq!(
+            arrangements[0].clips[1].source_window_ticks(),
+            Some((72, 216))
+        );
+        assert_eq!(
+            document
+                .events()
+                .iter()
+                .find(|event| event.opcode() == 0xEA)
+                .expect("automation source data should remain present")
+                .payload(),
+            original_automation_data
+        );
+        let encoded = document.encode_lossless().unwrap();
+        FlpDocument::parse(&encoded).expect("the split project should parse again");
+    }
+
+    #[test]
+    fn automation_clip_split_rejects_unverified_windows_atomically() {
+        let mut legacy_clip = automation_playlist_fixture(Some(3));
+        let legacy_before = legacy_clip.encode_lossless().unwrap();
+        assert!(
+            legacy_clip
+                .split_playlist_automation_clip(3, 0, 480)
+                .is_err()
+        );
+        assert_eq!(legacy_clip.encode_lossless().unwrap(), legacy_before);
+
+        let mut mismatched_window = modern_automation_playlist_fixture_with_window(192, 24, 312);
+        let mismatch_before = mismatched_window.encode_lossless().unwrap();
+        assert!(
+            mismatched_window
+                .split_playlist_automation_clip(3, 0, 72)
+                .is_err()
+        );
+        assert_eq!(
+            mismatched_window.encode_lossless().unwrap(),
+            mismatch_before
+        );
     }
 
     #[test]
@@ -38492,6 +38755,23 @@ mod tests {
                 .any(|tempo| tempo.tick() == 769 && (tempo.bpm() - 140.0).abs() < 0.001)
         );
         assert_eq!(conductor.end_tick(), 769);
+    }
+
+    #[test]
+    fn split_tempo_automation_uses_the_source_value_at_the_new_clip_boundary() {
+        let mut document = modern_automation_playlist_fixture_with_window(192, 96, 288);
+        document
+            .split_playlist_automation_clip(3, 0, 96)
+            .expect("modern tempo Automation Clip should split");
+        let arrangements = document.arrangements().unwrap();
+        let events = crate::midi::song_tempo_events(&document, &arrangements[0].clips)
+            .expect("split tempo automation should map to the Playlist timeline");
+
+        assert!(
+            events
+                .iter()
+                .any(|(tick, bpm)| *tick == 96 && (*bpm - 156.0).abs() < 1e-9)
+        );
     }
 
     #[test]
