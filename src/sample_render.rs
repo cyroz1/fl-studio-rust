@@ -722,11 +722,20 @@ pub struct SamplerPatternLoopPlayback {
     pub start_tick: u64,
 }
 
+/// Pre-rendered stereo audio from a CLAP instrument for one Pattern loop.
+/// Samples must contain exactly one loop at the Pattern stream's sample rate.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PatternAudioLayer {
+    pub channel_id: u16,
+    pub samples: Vec<f32>,
+}
+
 /// Live Sampler Pattern loop inputs, meters, and block-boundary Mixer updates.
 pub struct SamplerPatternLoopStreamControls<'a> {
     pub playback: SamplerPatternLoopPlayback,
     pub meters: &'a crate::audio::MixerTrackPeakMeters,
     pub latency_updates: Option<Vst3LatencyUpdateControls>,
+    pub pattern_audio_layers: Vec<PatternAudioLayer>,
 }
 
 /// Live Sampler Pattern preview inputs, meters, and block-boundary Mixer updates.
@@ -747,6 +756,7 @@ pub struct Vst3PatternLoopStreamControls<'a> {
     pub playback: Vst3PatternLoopPlayback,
     pub meters: &'a crate::audio::MixerTrackPeakMeters,
     pub latency_updates: Option<Vst3LatencyUpdateControls>,
+    pub pattern_audio_layers: Vec<PatternAudioLayer>,
 }
 
 /// Prepared Sampler/VST3 streams for one-shot playback of a complete Pattern.
@@ -6528,6 +6538,7 @@ pub fn stream_sampler_pattern_to_device_with_live_controls(
             allow_empty_sampler: false,
             repeat_pattern: false,
             extend_preview_tail: false,
+            pattern_audio_layers: Vec::new(),
         },
         PatternLiveStreamControls {
             meters: Some(controls.meters),
@@ -6582,6 +6593,7 @@ pub fn stream_sampler_pattern_loop_from_tick_to_device(
             allow_empty_sampler: false,
             repeat_pattern: true,
             extend_preview_tail: false,
+            pattern_audio_layers: Vec::new(),
         },
         PatternLiveStreamControls {
             meters: None,
@@ -6610,6 +6622,7 @@ pub fn stream_sampler_pattern_loop_from_tick_to_device_with_live_master_controls
             playback,
             meters,
             latency_updates: None,
+            pattern_audio_layers: Vec::new(),
         },
         writer,
         cancelled,
@@ -6625,6 +6638,7 @@ pub fn stream_sampler_pattern_loop_from_tick_to_device_with_live_controls(
     writer: &StreamingAudioWriter,
     cancelled: &AtomicBool,
 ) -> Result<SamplerPatternRenderSummary, String> {
+    let allow_empty_sampler = !controls.pattern_audio_layers.is_empty();
     stream_pattern_from_tick_with_vst3_to_device(
         document,
         project_path,
@@ -6633,9 +6647,10 @@ pub fn stream_sampler_pattern_loop_from_tick_to_device_with_live_controls(
             loop_length_ticks: controls.playback.loop_length_ticks,
             start_tick: controls.playback.start_tick,
             vst3_processor: None,
-            allow_empty_sampler: false,
+            allow_empty_sampler,
             repeat_pattern: true,
             extend_preview_tail: false,
+            pattern_audio_layers: controls.pattern_audio_layers,
         },
         PatternLiveStreamControls {
             meters: Some(controls.meters),
@@ -6666,6 +6681,7 @@ pub fn stream_pattern_loop_with_vst3_from_tick_to_device(
             allow_empty_sampler: true,
             repeat_pattern: true,
             extend_preview_tail: false,
+            pattern_audio_layers: Vec::new(),
         },
         PatternLiveStreamControls {
             meters: None,
@@ -6697,6 +6713,7 @@ pub fn stream_pattern_loop_with_vst3_from_tick_to_device_with_live_master_contro
             allow_empty_sampler: true,
             repeat_pattern: true,
             extend_preview_tail: false,
+            pattern_audio_layers: Vec::new(),
         },
         PatternLiveStreamControls {
             meters: Some(meters),
@@ -6727,6 +6744,7 @@ pub fn stream_pattern_loop_with_vst3_from_tick_to_device_with_live_controls(
             allow_empty_sampler: true,
             repeat_pattern: true,
             extend_preview_tail: false,
+            pattern_audio_layers: controls.pattern_audio_layers,
         },
         PatternLiveStreamControls {
             meters: Some(controls.meters),
@@ -6781,6 +6799,7 @@ pub fn stream_pattern_with_vst3_to_device_with_live_controls(
             allow_empty_sampler: true,
             repeat_pattern: false,
             extend_preview_tail: true,
+            pattern_audio_layers: Vec::new(),
         },
         PatternLiveStreamControls {
             meters: Some(controls.meters),
@@ -6798,6 +6817,31 @@ struct PatternStreamConfig {
     allow_empty_sampler: bool,
     repeat_pattern: bool,
     extend_preview_tail: bool,
+    pattern_audio_layers: Vec<PatternAudioLayer>,
+}
+
+fn mix_pattern_audio_layers(
+    output: &mut [f32],
+    frame_count: usize,
+    block_start: u64,
+    loop_frames: u64,
+    layers: &[PatternAudioLayer],
+) {
+    if layers.is_empty() || loop_frames == 0 {
+        return;
+    }
+    debug_assert_eq!(output.len(), frame_count * 2);
+    let loop_frames = loop_frames as usize;
+    let start_frame = (block_start % loop_frames as u64) as usize;
+    for frame in 0..frame_count {
+        let source_frame = (start_frame + frame) % loop_frames;
+        let source_sample = source_frame * 2;
+        let target_sample = frame * 2;
+        for layer in layers {
+            output[target_sample] += layer.samples[source_sample];
+            output[target_sample + 1] += layer.samples[source_sample + 1];
+        }
+    }
 }
 
 struct PatternLiveStreamControls<'a> {
@@ -6841,6 +6885,22 @@ fn stream_pattern_from_tick_with_vst3_to_device(
     if loop_frames == 0 {
         return Err("pattern loop length rounds to zero audio frames".to_owned());
     }
+    if !playback.repeat_pattern && !playback.pattern_audio_layers.is_empty() {
+        return Err("pre-rendered Pattern audio layers require looping playback".to_owned());
+    }
+    let loop_sample_count = loop_frames
+        .checked_mul(2)
+        .and_then(|samples| usize::try_from(samples).ok())
+        .ok_or_else(|| "Pattern audio loop size overflow".to_owned())?;
+    for layer in &playback.pattern_audio_layers {
+        if layer.samples.len() != loop_sample_count {
+            return Err(format!(
+                "CLAP audio layer for channel {} has {} samples; expected {loop_sample_count} for this Pattern loop",
+                layer.channel_id,
+                layer.samples.len()
+            ));
+        }
+    }
     let start_tick = playback.start_tick % loop_length_ticks;
     let start_frame = ticks_to_frames(start_tick, ppq, tempo_bpm, options.sample_rate)?;
     if start_frame >= loop_frames {
@@ -6851,7 +6911,34 @@ fn stream_pattern_from_tick_with_vst3_to_device(
         .as_ref()
         .map(|processor| processor.volume_expression_channel_ids().clone())
         .unwrap_or_default();
-    let render = if playback.allow_empty_sampler {
+    let clap_pattern_channels = playback
+        .pattern_audio_layers
+        .iter()
+        .map(|layer| layer.channel_id)
+        .collect::<BTreeSet<_>>();
+    let render = if !clap_pattern_channels.is_empty() {
+        let included_channels = document
+            .channels()
+            .iter()
+            .map(|channel| channel.id())
+            .filter(|channel_id| !clap_pattern_channels.contains(channel_id))
+            .collect::<BTreeSet<_>>();
+        prepare_sampler_pattern_for_channel_internal(
+            document,
+            project_path.as_ref(),
+            options,
+            Some(cancelled),
+            SamplerPatternChannelOptions {
+                channel_filter: Some(&included_channels),
+                allow_empty: true,
+                include_muted_mixer_sources: live_master_meters.is_some(),
+                vst3_volume_expression_channels: playback
+                    .vst3_processor
+                    .as_ref()
+                    .map(Vst3PlaylistStreamProcessor::volume_expression_channel_ids),
+            },
+        )?
+    } else if playback.allow_empty_sampler {
         prepare_sampler_pattern_allow_empty(
             document,
             project_path.as_ref(),
@@ -6878,6 +6965,7 @@ fn stream_pattern_from_tick_with_vst3_to_device(
             .vst3_processor
             .as_ref()
             .is_none_or(|processor| processor.summary().plugin_channels_rendered == 0)
+        && playback.pattern_audio_layers.is_empty()
     {
         return Err(format!(
             "Pattern {} has no supported Sampler notes or loaded VST3 instruments",
@@ -7031,6 +7119,13 @@ fn stream_pattern_from_tick_with_vst3_to_device(
             } else {
                 engine.render_block(block_start, frame_count, &mut block[..sample_count]);
             }
+            mix_pattern_audio_layers(
+                &mut block[..sample_count],
+                frame_count,
+                block_start,
+                loop_frames,
+                &playback.pattern_audio_layers,
+            );
             sampler_delay.process_interleaved(&mut block[..sample_count])?;
             if let Some(processor) = playback.vst3_processor.as_mut() {
                 if let Some(mixer_buses) = mixer_buses.as_mut() {
@@ -7153,6 +7248,13 @@ fn stream_pattern_from_tick_with_vst3_to_device(
             } else {
                 engine.render_block(block_start, frame_count, &mut block[..sample_count]);
             }
+            mix_pattern_audio_layers(
+                &mut block[..sample_count],
+                frame_count,
+                block_start,
+                loop_frames,
+                &playback.pattern_audio_layers,
+            );
             sampler_delay.process_interleaved(&mut block[..sample_count])?;
             if let Some(processor) = playback.vst3_processor.as_mut() {
                 if let Some(mixer_buses) = mixer_buses.as_mut() {
@@ -16305,6 +16407,19 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64};
 
     static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn pattern_audio_layers_follow_the_transport_seek_and_loop_phase() {
+        let layer = PatternAudioLayer {
+            channel_id: 7,
+            samples: vec![1.0, 10.0, 2.0, 20.0, 3.0, 30.0],
+        };
+        let mut output = vec![0.0; 8];
+
+        mix_pattern_audio_layers(&mut output, 4, 2, 3, &[layer]);
+
+        assert_eq!(output, [3.0, 30.0, 1.0, 10.0, 2.0, 20.0, 3.0, 30.0]);
+    }
 
     fn performance_audio_clip_fixture(record_size: usize, scale: Option<f64>) -> FlpDocument {
         fn append_data_event(event_stream: &mut Vec<u8>, opcode: u8, payload: &[u8]) {

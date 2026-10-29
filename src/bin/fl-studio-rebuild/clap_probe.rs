@@ -143,6 +143,12 @@ pub struct ClapPatternPreviewSettings {
     pub notes: Vec<ClapPatternNote>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClapPatternPreviewPurpose {
+    Audition,
+    Transport,
+}
+
 pub type ClapInspectionResponse = (PathBuf, Result<Vec<ClapPluginDescriptor>, String>);
 pub type ClapInstanceInspectionResponse = (PathBuf, String, Result<ClapInstanceInfo, String>);
 pub type ClapNotePreviewRequest = (PathBuf, String, String, u32, u8, u8, u32, u64);
@@ -162,6 +168,7 @@ pub type ClapPatternPreviewRequest = (
     String,
     u32,
     ClapPatternPreviewSettings,
+    ClapPatternPreviewPurpose,
     u64,
 );
 pub type ClapPatternPreviewResponse = (
@@ -169,6 +176,7 @@ pub type ClapPatternPreviewResponse = (
     String,
     String,
     ClapPatternPreviewSettings,
+    ClapPatternPreviewPurpose,
     u64,
     Result<Vec<f32>, String>,
 );
@@ -307,8 +315,15 @@ pub fn start_pattern_preview_worker(
         .name("clap-pattern-preview".to_owned())
         .spawn(move || {
             let mut preview_process = None;
-            while let Ok((path, plugin_id, plugin_name, sample_rate, settings, request_id)) =
-                request_receiver.recv()
+            while let Ok((
+                path,
+                plugin_id,
+                plugin_name,
+                sample_rate,
+                settings,
+                purpose,
+                request_id,
+            )) = request_receiver.recv()
             {
                 let process_matches =
                     preview_process
@@ -319,12 +334,16 @@ pub fn start_pattern_preview_worker(
                 if !process_matches {
                     preview_process.take();
                 }
+                let render = |process: &mut ClapPreviewProcess| match purpose {
+                    ClapPatternPreviewPurpose::Audition => process.render_pattern(&settings),
+                    ClapPatternPreviewPurpose::Transport => process.render_pattern_loop(&settings),
+                };
                 let result = if let Some(process) = preview_process.as_mut() {
-                    process.render_pattern(&settings)
+                    render(process)
                 } else {
                     match ClapPreviewProcess::spawn(&path, &plugin_id, sample_rate) {
                         Ok(mut process) => {
-                            let result = process.render_pattern(&settings);
+                            let result = render(&mut process);
                             preview_process = Some(process);
                             result
                         }
@@ -335,7 +354,15 @@ pub fn start_pattern_preview_worker(
                     preview_process.take();
                 }
                 if response_sender
-                    .send((path, plugin_id, plugin_name, settings, request_id, result))
+                    .send((
+                        path,
+                        plugin_id,
+                        plugin_name,
+                        settings,
+                        purpose,
+                        request_id,
+                        result,
+                    ))
                     .is_err()
                 {
                     break;
@@ -469,10 +496,25 @@ impl ClapPreviewProcess {
         &mut self,
         settings: &ClapPatternPreviewSettings,
     ) -> Result<Vec<f32>, String> {
+        self.render_pattern_request("PATTERN", settings)
+    }
+
+    fn render_pattern_loop(
+        &mut self,
+        settings: &ClapPatternPreviewSettings,
+    ) -> Result<Vec<f32>, String> {
+        self.render_pattern_request("PATTERN_LOOP", settings)
+    }
+
+    fn render_pattern_request(
+        &mut self,
+        command: &str,
+        settings: &ClapPatternPreviewSettings,
+    ) -> Result<Vec<f32>, String> {
         validate_pattern_preview_settings(settings, self.sample_rate)?;
         writeln!(
             self.stdin,
-            "PATTERN {} {:016x} {} {}",
+            "{command} {} {:016x} {} {}",
             settings.ppq,
             settings.tempo_bpm.to_bits(),
             settings.loop_length_ticks,
@@ -871,6 +913,11 @@ pub fn run_note_preview_server_child(path: &Path, plugin_id: &str, sample_rate: 
                 Ok(settings) => instance.render_pattern(&settings),
                 Err(error) => Err(error),
             }
+        } else if let Some(header) = line.strip_prefix("PATTERN_LOOP ") {
+            match parse_pattern_preview_request(header, &mut input, sample_rate) {
+                Ok(settings) => instance.render_pattern_loop(&settings),
+                Err(error) => Err(error),
+            }
         } else {
             Err("invalid CLAP preview request".to_owned())
         };
@@ -1189,6 +1236,58 @@ impl ClapNotePreviewInstance {
         self.render_scheduled_events(&events, total_frames)
     }
 
+    fn render_pattern_loop(
+        &mut self,
+        settings: &ClapPatternPreviewSettings,
+    ) -> Result<Vec<f32>, String> {
+        let (one_loop_events, _) = schedule_pattern_preview_events(settings, self.sample_rate)?;
+        let loop_frames = pattern_preview_frame_at_tick(
+            settings.loop_length_ticks,
+            settings.ppq,
+            settings.tempo_bpm,
+            self.sample_rate,
+        )?;
+        if loop_frames == 0
+            || one_loop_events
+                .iter()
+                .any(|event| event.frame > loop_frames)
+        {
+            return Err("CLAP Pattern notes extend beyond the playback loop".to_owned());
+        }
+
+        let mut events = Vec::with_capacity(one_loop_events.len().saturating_mul(2));
+        events.extend_from_slice(&one_loop_events);
+        for event in &one_loop_events {
+            let mut repeated = *event;
+            repeated.frame = repeated
+                .frame
+                .checked_add(loop_frames)
+                .ok_or_else(|| "CLAP Pattern loop event position overflowed".to_owned())?;
+            events.push(repeated);
+        }
+        events.sort_by_key(|event| (event.frame, event.priority));
+
+        let tail_frames =
+            u64::from(self.sample_rate) * u64::from(NOTE_PREVIEW_DURATION_MILLISECONDS) / 1000;
+        let total_frames = loop_frames
+            .checked_mul(2)
+            .and_then(|frames| frames.checked_add(tail_frames))
+            .ok_or_else(|| "CLAP Pattern loop render length overflowed".to_owned())?;
+        let byte_count = total_frames
+            .checked_mul(8)
+            .ok_or_else(|| "CLAP Pattern loop audio size overflowed".to_owned())?;
+        if byte_count == 0 || byte_count > MAX_NOTE_PREVIEW_OUTPUT_BYTES as u64 {
+            return Err(format!(
+                "CLAP Pattern loop exceeds the {} MiB audio limit at this sample rate",
+                MAX_NOTE_PREVIEW_OUTPUT_BYTES / (1024 * 1024)
+            ));
+        }
+        let total_frames = u32::try_from(total_frames)
+            .map_err(|_| "CLAP Pattern loop render exceeds the supported range".to_owned())?;
+        let rendered = self.render_scheduled_events(&events, total_frames)?;
+        second_pattern_loop_audio(&rendered, loop_frames)
+    }
+
     fn render_scheduled_events(
         &mut self,
         events: &[ScheduledClapNoteEvent],
@@ -1438,6 +1537,34 @@ fn validate_pattern_preview_settings(
     schedule_pattern_preview_events(settings, sample_rate).map(|_| ())
 }
 
+fn pattern_preview_frame_at_tick(
+    tick: u64,
+    ppq: u16,
+    tempo_bpm: f64,
+    sample_rate: u32,
+) -> Result<u64, String> {
+    let frames = (tick as f64 * 60.0 * f64::from(sample_rate)) / (f64::from(ppq) * tempo_bpm);
+    if !frames.is_finite() || frames < 0.0 || frames > u64::MAX as f64 {
+        Err("CLAP Pattern note timing is outside the renderable range".to_owned())
+    } else {
+        Ok(frames.round() as u64)
+    }
+}
+
+fn second_pattern_loop_audio(rendered: &[f32], loop_frames: u64) -> Result<Vec<f32>, String> {
+    let loop_samples = loop_frames
+        .checked_mul(2)
+        .and_then(|samples| usize::try_from(samples).ok())
+        .ok_or_else(|| "CLAP Pattern loop sample count overflowed".to_owned())?;
+    let loop_end = loop_samples
+        .checked_mul(2)
+        .ok_or_else(|| "CLAP Pattern loop sample range overflowed".to_owned())?;
+    rendered
+        .get(loop_samples..loop_end)
+        .map(<[f32]>::to_vec)
+        .ok_or_else(|| "CLAP Pattern helper rendered an incomplete loop".to_owned())
+}
+
 fn schedule_pattern_preview_events(
     settings: &ClapPatternPreviewSettings,
     sample_rate: u32,
@@ -1466,13 +1593,7 @@ fn schedule_pattern_preview_events(
     }
 
     let frame_at_tick = |tick: u64| {
-        let frames = (tick as f64 * 60.0 * f64::from(sample_rate))
-            / (f64::from(settings.ppq) * settings.tempo_bpm);
-        if !frames.is_finite() || frames < 0.0 || frames > u64::MAX as f64 {
-            Err("CLAP Pattern note timing is outside the renderable range".to_owned())
-        } else {
-            Ok(frames.round() as u64)
-        }
+        pattern_preview_frame_at_tick(tick, settings.ppq, settings.tempo_bpm, sample_rate)
     };
     let mut events = Vec::with_capacity(settings.notes.len().saturating_mul(2));
     let mut last_event_frame = frame_at_tick(settings.loop_length_ticks)?;
@@ -2115,7 +2236,7 @@ mod tests {
         MAX_NOTE_PREVIEW_NOTE_MILLISECONDS, MIN_NOTE_PREVIEW_NOTE_MILLISECONDS,
         encode_instance_probe_output, encode_probe_output, parse_instance_probe_output,
         parse_pattern_preview_request, parse_probe_output, schedule_pattern_preview_events,
-        validate_note_preview_note_length,
+        second_pattern_loop_audio, validate_note_preview_note_length,
     };
     use std::io::Cursor;
 
@@ -2251,6 +2372,16 @@ mod tests {
         assert_eq!(events[2].pan, 64);
         assert_eq!(events[2].mod_x, 128);
         assert_eq!((events[3].frame, events[3].is_note_on), (48_000, false));
+    }
+
+    #[test]
+    fn pattern_loop_audio_discards_warmup_cycle_and_tail() {
+        let rendered = [1.0, 2.0, 3.0, 4.0, 90.0, 91.0];
+
+        let loop_audio = second_pattern_loop_audio(&rendered, 1)
+            .expect("second Pattern loop should be extracted from helper audio");
+
+        assert_eq!(loop_audio, [3.0, 4.0]);
     }
 
     #[test]
