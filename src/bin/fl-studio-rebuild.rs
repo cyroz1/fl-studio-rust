@@ -12,6 +12,7 @@ use audio_unit_probe::{
     AudioUnitNotePreviewRequest, AudioUnitNotePreviewResponse, AudioUnitNotePreviewState,
     AudioUnitProbeKey, AudioUnitProbeRequest, AudioUnitProbeResponse, AudioUnitProbeState,
 };
+use clack_extensions::params::ParamInfoFlags;
 use clap_probe::{
     ClapInspectionResponse, ClapInspectionState, ClapInstanceInspectionResponse,
     ClapInstanceInspectionState, ClapNotePreviewRequest, ClapNotePreviewResponse,
@@ -5186,6 +5187,9 @@ struct DawUi {
     clap_pattern_preview_receiver: Receiver<ClapPatternPreviewResponse>,
     clap_pattern_preview_states: BTreeMap<(PathBuf, String, u16, u16), ClapNotePreviewState>,
     clap_pattern_preview_request_id: u64,
+    clap_parameter_overrides: BTreeMap<(u16, PathBuf, String, u32), f64>,
+    clap_parameter_request_id: u64,
+    pending_clap_parameter_edit: Option<PendingClapParameterEdit>,
     clap_pattern_playback_instruments: BTreeMap<u16, ClapPatternPlaybackInstrument>,
     pending_clap_pattern_playback: Option<PendingClapPatternPlayback>,
     pending_clap_state_capture: Option<PendingClapStateCapture>,
@@ -5555,6 +5559,15 @@ struct PendingClapStateCapture {
     channel_id: u16,
     path: PathBuf,
     plugin_id: String,
+}
+
+struct PendingClapParameterEdit {
+    request_id: u64,
+    channel_id: u16,
+    path: PathBuf,
+    plugin_id: String,
+    parameter_id: u32,
+    previous_value: Option<f64>,
 }
 
 struct LiveSamplerInputSession {
@@ -7175,6 +7188,9 @@ impl DawUi {
             clap_pattern_preview_receiver,
             clap_pattern_preview_states: BTreeMap::new(),
             clap_pattern_preview_request_id: 0,
+            clap_parameter_overrides: BTreeMap::new(),
+            clap_parameter_request_id: 0,
+            pending_clap_parameter_edit: None,
             clap_pattern_playback_instruments: BTreeMap::new(),
             pending_clap_pattern_playback: None,
             pending_clap_state_capture: None,
@@ -8378,6 +8394,8 @@ impl DawUi {
                 self.stop_project_playback();
                 self.project_generation = self.project_generation.wrapping_add(1);
                 self.pending_clap_state_capture = None;
+                self.pending_clap_parameter_edit = None;
+                self.clap_parameter_overrides.clear();
                 self.armed_audio_recording_tracks.clear();
                 self.audio_recording_track_input_pairs.clear();
                 self.piano_roll_hidden_ghost_channels.clear();
@@ -13614,6 +13632,11 @@ impl DawUi {
                 self.clap_pattern_preview_request_id.wrapping_add(1).max(1);
             let request_id = self.clap_pattern_preview_request_id;
             request_channels.insert(request_id, settings.channel_id);
+            let parameter_values = self.clap_parameter_overrides_for(
+                settings.channel_id,
+                &instrument.path,
+                &instrument.plugin_id,
+            );
             if self
                 .clap_pattern_preview_sender
                 .send((
@@ -13621,8 +13644,10 @@ impl DawUi {
                     instrument.plugin_id,
                     instrument.plugin_name,
                     sample_rate,
+                    settings.channel_id,
                     Some(settings),
                     instrument.state,
+                    parameter_values,
                     ClapPatternPreviewPurpose::Transport,
                     request_id,
                 ))
@@ -19946,6 +19971,134 @@ impl DawUi {
         }))
     }
 
+    fn clap_parameter_overrides_for(
+        &self,
+        channel_id: u16,
+        path: &Path,
+        plugin_id: &str,
+    ) -> Vec<(u32, f64)> {
+        self.clap_parameter_overrides
+            .iter()
+            .filter_map(
+                |((saved_channel_id, saved_path, saved_plugin_id, parameter_id), value)| {
+                    (*saved_channel_id == channel_id
+                        && saved_path == path
+                        && saved_plugin_id == plugin_id)
+                        .then_some((*parameter_id, *value))
+                },
+            )
+            .collect()
+    }
+
+    fn request_clap_parameter_update(
+        &mut self,
+        path: PathBuf,
+        plugin_id: String,
+        plugin_name: String,
+        channel_id: u16,
+        parameter_id: u32,
+        value: f64,
+    ) {
+        if self.pending_clap_state_capture.is_some() {
+            self.status = "Wait for CLAP state capture to finish before changing parameters".into();
+            return;
+        }
+        let key = (channel_id, path.clone(), plugin_id.clone(), parameter_id);
+        let previous_value = self.clap_parameter_overrides.insert(key, value);
+        let parameter_values = self.clap_parameter_overrides_for(channel_id, &path, &plugin_id);
+        self.clap_parameter_request_id = self.clap_parameter_request_id.wrapping_add(1).max(1);
+        let request_id = self.clap_parameter_request_id;
+        self.pending_clap_parameter_edit = Some(PendingClapParameterEdit {
+            request_id,
+            channel_id,
+            path: path.clone(),
+            plugin_id: plugin_id.clone(),
+            parameter_id,
+            previous_value,
+        });
+        let state = self
+            .clap_pattern_playback_instruments
+            .get(&channel_id)
+            .filter(|instrument| instrument.path == path && instrument.plugin_id == plugin_id)
+            .and_then(|instrument| instrument.state.clone());
+        let sample_rate = self
+            .audio_engine
+            .as_ref()
+            .map(AudioEngine::sample_rate)
+            .unwrap_or(self.audio_settings.sample_rate);
+        if self
+            .clap_pattern_preview_sender
+            .send((
+                path,
+                plugin_id,
+                plugin_name.clone(),
+                sample_rate,
+                channel_id,
+                None,
+                state,
+                parameter_values,
+                ClapPatternPreviewPurpose::SetParameters,
+                request_id,
+            ))
+            .is_err()
+        {
+            let pending = self.pending_clap_parameter_edit.take().unwrap();
+            self.restore_clap_parameter_edit(pending);
+            self.status = "CLAP Pattern preview worker is unavailable".to_owned();
+        } else {
+            self.status = format!("Applying CLAP parameter changes to {plugin_name}");
+        }
+    }
+
+    fn restore_clap_parameter_edit(&mut self, pending: PendingClapParameterEdit) {
+        let key = (
+            pending.channel_id,
+            pending.path,
+            pending.plugin_id,
+            pending.parameter_id,
+        );
+        if let Some(value) = pending.previous_value {
+            self.clap_parameter_overrides.insert(key, value);
+        } else {
+            self.clap_parameter_overrides.remove(&key);
+        }
+    }
+
+    fn handle_clap_parameter_update_response(
+        &mut self,
+        path: PathBuf,
+        plugin_id: String,
+        plugin_name: String,
+        request_id: u64,
+        result: Result<ClapPatternPreviewOutput, String>,
+    ) {
+        let Some(pending) = self.pending_clap_parameter_edit.as_ref() else {
+            return;
+        };
+        if pending.request_id != request_id {
+            return;
+        }
+        let pending = self.pending_clap_parameter_edit.take().unwrap();
+        if pending.path != path || pending.plugin_id != plugin_id {
+            self.restore_clap_parameter_edit(pending);
+            self.status = "CLAP parameter update returned a mismatched plug-in".to_owned();
+            return;
+        }
+        match result {
+            Ok(ClapPatternPreviewOutput::ParametersSet) => {
+                self.status = format!("Applied parameter changes to {plugin_name}");
+            }
+            Ok(ClapPatternPreviewOutput::Audio(_) | ClapPatternPreviewOutput::SavedState(_)) => {
+                self.restore_clap_parameter_edit(pending);
+                self.status = "CLAP parameter update returned an unexpected result".to_owned();
+            }
+            Err(error) => {
+                self.restore_clap_parameter_edit(pending);
+                self.status = format!("Could not update {plugin_name}: {error}");
+            }
+        }
+    }
+
     fn request_clap_pattern_preview(
         &mut self,
         path: PathBuf,
@@ -20007,6 +20160,8 @@ impl DawUi {
             .get(&settings.channel_id)
             .filter(|instrument| instrument.path == path && instrument.plugin_id == plugin_id)
             .and_then(|instrument| instrument.state.clone());
+        let parameter_values =
+            self.clap_parameter_overrides_for(settings.channel_id, &path, &plugin_id);
         self.browser_preview_queued = None;
         self.browser_preview_cancelled = self.browser_preview_pending.is_some();
         self.browser_preview_path = None;
@@ -20023,8 +20178,10 @@ impl DawUi {
                 plugin_id,
                 plugin_name.clone(),
                 sample_rate,
+                settings.channel_id,
                 Some(settings.clone()),
                 saved_state,
+                parameter_values,
                 ClapPatternPreviewPurpose::Audition,
                 request_id,
             ))
@@ -20047,6 +20204,16 @@ impl DawUi {
         while let Ok((path, plugin_id, plugin_name, settings, purpose, request_id, result)) =
             self.clap_pattern_preview_receiver.try_recv()
         {
+            if purpose == ClapPatternPreviewPurpose::SetParameters {
+                self.handle_clap_parameter_update_response(
+                    path,
+                    plugin_id,
+                    plugin_name,
+                    request_id,
+                    result,
+                );
+                continue;
+            }
             if purpose == ClapPatternPreviewPurpose::SaveState {
                 self.handle_clap_state_capture_response(
                     path,
@@ -20128,8 +20295,9 @@ impl DawUi {
     }
 
     fn request_clap_state_capture(&mut self, channel_id: u16) {
-        if self.pending_clap_state_capture.is_some() {
-            self.status = "A CLAP state capture is already in progress".to_owned();
+        if self.pending_clap_state_capture.is_some() || self.pending_clap_parameter_edit.is_some() {
+            self.status =
+                "Wait for the active CLAP plug-in operation before capturing state".into();
             return;
         }
         if self
@@ -20163,6 +20331,8 @@ impl DawUi {
             .as_ref()
             .map(AudioEngine::sample_rate)
             .unwrap_or(self.audio_settings.sample_rate);
+        let parameter_values =
+            self.clap_parameter_overrides_for(channel_id, &instrument.path, &instrument.plugin_id);
         if self
             .clap_pattern_preview_sender
             .send((
@@ -20170,8 +20340,10 @@ impl DawUi {
                 instrument.plugin_id,
                 instrument.plugin_name.clone(),
                 sample_rate,
+                channel_id,
                 None,
                 instrument.state,
+                parameter_values,
                 ClapPatternPreviewPurpose::SaveState,
                 request_id,
             ))
@@ -20245,8 +20417,8 @@ impl DawUi {
                     )
                 };
             }
-            Ok(ClapPatternPreviewOutput::Audio(_)) => {
-                self.status = "CLAP state capture returned audio instead of state".to_owned();
+            Ok(ClapPatternPreviewOutput::Audio(_) | ClapPatternPreviewOutput::ParametersSet) => {
+                self.status = "CLAP state capture returned an unexpected result".to_owned();
             }
             Err(error) => {
                 self.status = format!(
@@ -20291,6 +20463,13 @@ impl DawUi {
                 self.pending_clap_pattern_playback = None;
                 self.status = format!(
                     "CLAP Pattern playback for channel {channel_id} returned plug-in state instead of audio"
+                );
+                return;
+            }
+            Ok(ClapPatternPreviewOutput::ParametersSet) => {
+                self.pending_clap_pattern_playback = None;
+                self.status = format!(
+                    "CLAP Pattern playback for channel {channel_id} returned a parameter acknowledgement instead of audio"
                 );
                 return;
             }
@@ -61154,6 +61333,7 @@ impl DawUi {
         let mut inspect_clap_instance = None;
         let mut preview_clap_note = None;
         let mut preview_clap_pattern = None;
+        let mut edit_clap_parameter = None;
         let mut assign_clap_pattern_transport = None;
         let mut remove_clap_pattern_transport = None;
         let mut capture_clap_state = None;
@@ -61599,7 +61779,8 @@ impl DawUi {
                             });
                             if ui
                                 .add_enabled(
-                                    self.pending_clap_state_capture.is_none(),
+                                    self.pending_clap_state_capture.is_none()
+                                        && self.pending_clap_parameter_edit.is_none(),
                                     egui::Button::new(if self
                                         .pending_clap_state_capture
                                         .as_ref()
@@ -61621,6 +61802,11 @@ impl DawUi {
                     }
                 });
             }
+            let clap_parameter_channel_id = clap_pattern_preview_settings
+                .as_ref()
+                .ok()
+                .and_then(|settings| settings.as_ref().map(|settings| settings.channel_id))
+                .or(self.selected_note_channel);
             for candidate in clap_candidates {
                 let inspection = self.clap_inspection_states.get(&candidate.path);
                 egui::Frame::new()
@@ -61880,30 +62066,123 @@ impl DawUi {
                                                 format!("Parameters ({})", info.parameter_count),
                                                 |ui| {
                                                     for parameter in &info.parameters {
-                                                        let mut label = format!(
-                                                            "{} · {}",
-                                                            parameter.id, parameter.name
+                                                        let flags = ParamInfoFlags::from_bits_truncate(
+                                                            parameter.flags,
                                                         );
-                                                        if !parameter.module.is_empty() {
-                                                            label.push_str(&format!(
-                                                                " · {}",
-                                                                parameter.module
-                                                            ));
+                                                        if flags.contains(ParamInfoFlags::IS_HIDDEN) {
+                                                            continue;
                                                         }
-                                                        label.push_str(&format!(
-                                                            " · {:.3} to {:.3} (default {:.3})",
-                                                            parameter.min_value,
-                                                            parameter.max_value,
-                                                            parameter.default_value,
-                                                        ));
-                                                        if let Some(value) = parameter.current_value {
-                                                            label.push_str(&format!(
-                                                                " · current {:.3}",
-                                                                value
-                                                            ));
-                                                        }
-                                                        ui.small(label);
+                                                        let channel_id =
+                                                            clap_parameter_channel_id.unwrap_or(0);
+                                                        let key = (
+                                                            channel_id,
+                                                            candidate.path.clone(),
+                                                            descriptor.id.clone(),
+                                                            parameter.id,
+                                                        );
+                                                        let stored_value = self
+                                                            .clap_parameter_overrides
+                                                            .get(&key)
+                                                            .copied()
+                                                            .or(parameter.current_value)
+                                                            .unwrap_or(parameter.default_value);
+                                                        let value_is_finite = stored_value.is_finite();
+                                                        let can_edit = !flags
+                                                            .contains(ParamInfoFlags::IS_READONLY)
+                                                            && parameter.min_value.is_finite()
+                                                            && parameter.max_value.is_finite()
+                                                            && parameter.min_value
+                                                                < parameter.max_value
+                                                            && clap_parameter_channel_id.is_some();
+                                                        ui.horizontal(|ui| {
+                                                            let label = format!(
+                                                                "{} · {}",
+                                                                parameter.id, parameter.name
+                                                            );
+                                                            if can_edit {
+                                                                let fallback = if parameter
+                                                                    .default_value
+                                                                    .is_finite()
+                                                                {
+                                                                    parameter.default_value.clamp(
+                                                                        parameter.min_value,
+                                                                        parameter.max_value,
+                                                                    )
+                                                                } else {
+                                                                    parameter.min_value
+                                                                };
+                                                                let mut value = if value_is_finite {
+                                                                    stored_value.clamp(
+                                                                        parameter.min_value,
+                                                                        parameter.max_value,
+                                                                    )
+                                                                } else {
+                                                                    fallback
+                                                                };
+                                                                let mut slider = egui::Slider::new(
+                                                                    &mut value,
+                                                                    parameter.min_value
+                                                                        ..=parameter.max_value,
+                                                                )
+                                                                .text(label);
+                                                                if flags.contains(
+                                                                    ParamInfoFlags::IS_STEPPED,
+                                                                ) {
+                                                                    slider = slider.step_by(1.0);
+                                                                }
+                                                                if ui
+                                                                    .add_enabled(
+                                                                        self.pending_clap_parameter_edit
+                                                                            .is_none()
+                                                                            && self.pending_clap_state_capture.is_none(),
+                                                                        slider,
+                                                                    )
+                                                                    .changed()
+                                                                {
+                                                                    edit_clap_parameter = Some((
+                                                                        candidate.path.clone(),
+                                                                        descriptor.id.clone(),
+                                                                        descriptor.name.clone(),
+                                                                        channel_id,
+                                                                        parameter.id,
+                                                                        value,
+                                                                    ));
+                                                                }
+                                                            } else {
+                                                                let unavailable_reason = if flags
+                                                                    .contains(ParamInfoFlags::IS_READONLY)
+                                                                {
+                                                                    "read-only"
+                                                                } else if parameter.min_value
+                                                                    == parameter.max_value
+                                                                {
+                                                                    "fixed"
+                                                                } else if clap_parameter_channel_id
+                                                                    .is_none()
+                                                                {
+                                                                    "select a Pattern channel"
+                                                                } else {
+                                                                    "unavailable"
+                                                                };
+                                                                let display_value = if value_is_finite {
+                                                                    stored_value
+                                                                } else if parameter.default_value
+                                                                    .is_finite()
+                                                                {
+                                                                    parameter.default_value
+                                                                } else {
+                                                                    parameter.min_value
+                                                                };
+                                                                ui.small(format!(
+                                                                    "{label} · {display_value:.3} ({unavailable_reason})"
+                                                                ));
+                                                            }
+                                                            if !parameter.module.is_empty() {
+                                                                ui.small(&parameter.module);
+                                                            }
+                                                        });
                                                     }
+                                                    ui.small("Parameter edits apply to Pattern audition and transport. Use Capture state on an assigned channel to save them for this project.");
                                                     if info.parameters.len()
                                                         < info.parameter_count as usize
                                                     {
@@ -62218,11 +62497,27 @@ impl DawUi {
             self.request_clap_pattern_preview(path, plugin_id, plugin_name, settings, ui.ctx());
         }
 
+        if let Some((path, plugin_id, plugin_name, channel_id, parameter_id, value)) =
+            edit_clap_parameter
+        {
+            self.request_clap_parameter_update(
+                path,
+                plugin_id,
+                plugin_name,
+                channel_id,
+                parameter_id,
+                value,
+            );
+        }
+
         if let Some(channel_id) = capture_clap_state {
             self.request_clap_state_capture(channel_id);
         }
 
         if let Some((channel_id, instrument)) = assign_clap_pattern_transport {
+            self.pending_clap_parameter_edit = None;
+            self.clap_parameter_overrides
+                .retain(|(saved_channel_id, _, _, _), _| *saved_channel_id != channel_id);
             self.clap_pattern_playback_instruments
                 .insert(channel_id, instrument.clone());
             self.status = if let Some(project_path) = self.current_path.as_deref() {
@@ -62247,6 +62542,9 @@ impl DawUi {
             };
         }
         if let Some(channel_id) = remove_clap_pattern_transport {
+            self.pending_clap_parameter_edit = None;
+            self.clap_parameter_overrides
+                .retain(|(saved_channel_id, _, _, _), _| *saved_channel_id != channel_id);
             self.clap_pattern_playback_instruments.remove(&channel_id);
             self.status = if let Some(project_path) = self.current_path.as_deref() {
                 match save_clap_project_instruments(

@@ -12,10 +12,12 @@ use clack_extensions::params::{ParamInfoBuffer, PluginParams};
 use clack_extensions::state::PluginState;
 use clack_host::events::event_types::{
     Midi2Event, MidiEvent, NoteExpressionEvent, NoteExpressionType, NoteOffEvent, NoteOnEvent,
+    ParamGestureBeginEvent, ParamGestureEndEvent, ParamValueEvent,
 };
 use clack_host::prelude::{
-    AudioPortBuffer, AudioPortBufferType, AudioPorts, EventBuffer, HostInfo, InputAudioBuffers,
-    InputChannel, PluginAudioConfiguration, PluginEntry, PluginInstance, ProcessStatus,
+    AudioPortBuffer, AudioPortBufferType, AudioPorts, ClapId, EventBuffer, HostInfo,
+    InputAudioBuffers, InputChannel, Pckn, PluginAudioConfiguration, PluginEntry, PluginInstance,
+    ProcessStatus,
 };
 use flp_rebuild::plugin_settings::MAX_CLAP_PROJECT_PLUGIN_STATE_BYTES;
 
@@ -32,6 +34,7 @@ const MAX_INSTANCE_METADATA_ITEMS: u32 = 512;
 const MAX_NOTE_PREVIEW_AUDIO_PORTS: u32 = 16;
 const MAX_NOTE_PREVIEW_TOTAL_CHANNELS: u32 = 64;
 const MAX_PATTERN_PREVIEW_NOTES: usize = 16_384;
+const MAX_CLAP_PREVIEW_PARAMETER_CHANGES: usize = 512;
 const NOTE_PREVIEW_BLOCK_FRAMES: u32 = 512;
 const NOTE_PREVIEW_DURATION_MILLISECONDS: u32 = 1500;
 const DEFAULT_NOTE_PREVIEW_NOTE_MILLISECONDS: u32 = 500;
@@ -149,12 +152,14 @@ pub struct ClapPatternPreviewSettings {
 pub enum ClapPatternPreviewPurpose {
     Audition,
     Transport,
+    SetParameters,
     SaveState,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ClapPatternPreviewOutput {
     Audio(Vec<f32>),
+    ParametersSet,
     SavedState(Vec<u8>),
 }
 
@@ -176,8 +181,10 @@ pub type ClapPatternPreviewRequest = (
     String,
     String,
     u32,
+    u16,
     Option<ClapPatternPreviewSettings>,
     Option<Vec<u8>>,
+    Vec<(u32, f64)>,
     ClapPatternPreviewPurpose,
     u64,
 );
@@ -325,30 +332,41 @@ pub fn start_pattern_preview_worker(
         .name("clap-pattern-preview".to_owned())
         .spawn(move || {
             let mut preview_process = None;
+            let mut preview_process_channel = None;
             let mut preview_process_has_loaded_state = false;
             while let Ok((
                 path,
                 plugin_id,
                 plugin_name,
                 sample_rate,
+                channel_id,
                 settings,
                 state,
+                parameter_values,
                 purpose,
                 request_id,
             )) = request_receiver.recv()
             {
-                let process_matches =
-                    preview_process
+                let process_matches = preview_process_channel == Some(channel_id)
+                    && preview_process
                         .as_ref()
                         .is_some_and(|process: &ClapPreviewProcess| {
                             process.matches(&path, &plugin_id, sample_rate)
                         });
-                if !process_matches || (state.is_none() && preview_process_has_loaded_state) {
+                if !process_matches
+                    || (state.is_none()
+                        && preview_process_has_loaded_state
+                        && parameter_values.is_empty())
+                {
                     preview_process.take();
+                    preview_process_channel = None;
                 }
                 let render = |process: &mut ClapPreviewProcess| {
                     if let Some(state) = &state {
                         process.load_state(state)?;
+                    }
+                    if !parameter_values.is_empty() {
+                        process.set_parameter_values(&parameter_values)?;
                     }
                     match purpose {
                         ClapPatternPreviewPurpose::Audition => process
@@ -361,6 +379,13 @@ pub fn start_pattern_preview_worker(
                                 "CLAP Pattern transport is missing its settings".to_owned()
                             })?)
                             .map(ClapPatternPreviewOutput::Audio),
+                        ClapPatternPreviewPurpose::SetParameters => {
+                            if parameter_values.is_empty() {
+                                Err("CLAP parameter update did not contain any values".to_owned())
+                            } else {
+                                Ok(ClapPatternPreviewOutput::ParametersSet)
+                            }
+                        }
                         ClapPatternPreviewPurpose::SaveState => process
                             .save_state()
                             .map(ClapPatternPreviewOutput::SavedState),
@@ -373,6 +398,7 @@ pub fn start_pattern_preview_worker(
                         Ok(mut process) => {
                             let result = render(&mut process);
                             preview_process = Some(process);
+                            preview_process_channel = Some(channel_id);
                             result
                         }
                         Err(error) => Err(error),
@@ -380,8 +406,10 @@ pub fn start_pattern_preview_worker(
                 };
                 if result.is_err() {
                     preview_process.take();
+                    preview_process_channel = None;
                 }
-                preview_process_has_loaded_state = result.is_ok() && state.is_some();
+                preview_process_has_loaded_state =
+                    result.is_ok() && (state.is_some() || !parameter_values.is_empty());
                 if response_sender
                     .send((
                         path,
@@ -618,6 +646,38 @@ impl ClapPreviewProcess {
             ClapPreviewProcessResponse::Audio(_) | ClapPreviewProcessResponse::Ready => {
                 Err("CLAP preview helper sent an unexpected response to state save".to_owned())
             }
+        }
+    }
+
+    fn set_parameter_values(&mut self, values: &[(u32, f64)]) -> Result<(), String> {
+        if values.is_empty() || values.len() > MAX_CLAP_PREVIEW_PARAMETER_CHANGES {
+            return Err(format!(
+                "CLAP parameter update must contain between 1 and {MAX_CLAP_PREVIEW_PARAMETER_CHANGES} values"
+            ));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for &(param_id, value) in values {
+            if ClapId::from_raw(param_id).is_none() || !value.is_finite() || !seen.insert(param_id)
+            {
+                return Err("CLAP parameter update contains an invalid value or ID".to_owned());
+            }
+        }
+        writeln!(self.stdin, "SET_PARAMS {}", values.len())
+            .map_err(|error| format!("could not send CLAP parameter updates: {error}"))?;
+        for &(param_id, value) in values {
+            writeln!(self.stdin, "PARAM {param_id} {:016x}", value.to_bits())
+                .map_err(|error| format!("could not send a CLAP parameter value: {error}"))?;
+        }
+        self.stdin
+            .write_all(b"END\n")
+            .and_then(|_| self.stdin.flush())
+            .map_err(|error| format!("could not finish CLAP parameter updates: {error}"))?;
+        match self.receive_response()? {
+            ClapPreviewProcessResponse::Ready => Ok(()),
+            ClapPreviewProcessResponse::Error(error) => Err(error),
+            ClapPreviewProcessResponse::Audio(_) | ClapPreviewProcessResponse::State(_) => Err(
+                "CLAP preview helper sent an unexpected response to parameter updates".to_owned(),
+            ),
         }
     }
 
@@ -1056,6 +1116,33 @@ pub fn run_note_preview_server_child(path: &Path, plugin_id: &str, sample_rate: 
             }
         }
 
+        if let Some(header) = line.strip_prefix("SET_PARAMS ") {
+            let values = match read_preview_server_parameter_values(&mut input, header) {
+                Ok(values) => values,
+                Err(error) => {
+                    let _ = write_preview_server_error(&mut output, &error);
+                    let _ = output.flush();
+                    return 1;
+                }
+            };
+            match instance.set_parameter_values(&values) {
+                Ok(()) => {
+                    if writeln!(output, "READY")
+                        .and_then(|_| output.flush())
+                        .is_err()
+                    {
+                        return 1;
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    let _ = write_preview_server_error(&mut output, &error);
+                    let _ = output.flush();
+                    return 1;
+                }
+            }
+        }
+
         let samples = if let Some(header) = line.strip_prefix("PREVIEW ") {
             match parse_note_preview_request(header) {
                 Ok((note_key, velocity, note_duration)) => {
@@ -1243,6 +1330,49 @@ fn read_preview_server_state(input: &mut impl Read, header: &str) -> Result<Vec<
     Ok(state)
 }
 
+fn read_preview_server_parameter_values(
+    input: &mut impl Read,
+    header: &str,
+) -> Result<Vec<(u32, f64)>, String> {
+    let mut fields = header.split_whitespace();
+    let Some(count) = fields.next().and_then(|field| field.parse::<usize>().ok()) else {
+        return Err("invalid CLAP parameter update count".to_owned());
+    };
+    if fields.next().is_some() || count == 0 || count > MAX_CLAP_PREVIEW_PARAMETER_CHANGES {
+        return Err("CLAP parameter update count is outside its supported range".to_owned());
+    }
+    let mut values = Vec::with_capacity(count);
+    let mut seen = std::collections::BTreeSet::new();
+    for _ in 0..count {
+        let line = read_preview_protocol_header(input)
+            .map_err(|error| format!("could not read CLAP parameter value: {error}"))?
+            .ok_or_else(|| "CLAP parameter update ended before all values arrived".to_owned())?;
+        let mut fields = line.split_whitespace();
+        let (Some("PARAM"), Some(param_id), Some(value_bits), None) = (
+            fields.next(),
+            fields.next().and_then(|field| field.parse::<u32>().ok()),
+            fields.next(),
+            fields.next(),
+        ) else {
+            return Err("invalid CLAP parameter value record".to_owned());
+        };
+        let value = u64::from_str_radix(value_bits, 16)
+            .map(f64::from_bits)
+            .map_err(|_| "invalid CLAP parameter value".to_owned())?;
+        if ClapId::from_raw(param_id).is_none() || !value.is_finite() || !seen.insert(param_id) {
+            return Err("CLAP parameter update contains an invalid value or ID".to_owned());
+        }
+        values.push((param_id, value));
+    }
+    let end = read_preview_protocol_header(input)
+        .map_err(|error| format!("could not read CLAP parameter update terminator: {error}"))?
+        .ok_or_else(|| "CLAP parameter update ended before its terminator".to_owned())?;
+    if end != "END" {
+        return Err("invalid CLAP parameter update terminator".to_owned());
+    }
+    Ok(values)
+}
+
 fn write_preview_server_state(output: &mut impl Write, state: &[u8]) -> std::io::Result<()> {
     if state.len() > MAX_CLAP_PROJECT_PLUGIN_STATE_BYTES {
         return Err(std::io::Error::new(
@@ -1413,6 +1543,52 @@ impl ClapNotePreviewInstance {
         state
             .load(&plugin, &mut input)
             .map_err(|error| format!("CLAP instrument could not restore its state: {error}"))
+    }
+
+    fn set_parameter_values(&mut self, values: &[(u32, f64)]) -> Result<(), String> {
+        if values.is_empty() || values.len() > MAX_CLAP_PREVIEW_PARAMETER_CHANGES {
+            return Err("CLAP parameter update contains an unsupported number of values".into());
+        }
+        let mut plugin = self
+            .instance
+            .inactive_plugin_handle()
+            .ok_or_else(|| "CLAP instrument is active during parameter update".to_owned())?;
+        let params = plugin
+            .get_extension::<PluginParams>()
+            .ok_or_else(|| "CLAP instrument does not support parameter updates".to_owned())?;
+        let mut input_buffer = EventBuffer::with_capacity(values.len() * 3);
+        for &(param_id, value) in values {
+            let id = ClapId::from_raw(param_id)
+                .ok_or_else(|| "CLAP parameter update contains an invalid ID".to_owned())?;
+            if !value.is_finite() || params.get_value(&plugin, id).is_none() {
+                return Err(format!(
+                    "CLAP instrument does not expose parameter {param_id}"
+                ));
+            }
+            input_buffer.push(&ParamGestureBeginEvent::new(0, id));
+            input_buffer.push(&ParamValueEvent::new(0, id, Pckn::match_all(), value));
+            input_buffer.push(&ParamGestureEndEvent::new(0, id));
+        }
+        let input_events = input_buffer.as_input();
+        let mut output_buffer = EventBuffer::new();
+        params.flush(&mut plugin, &input_events, &mut output_buffer.as_output());
+        for &(param_id, value) in values {
+            let id = ClapId::from_raw(param_id).expect("parameter IDs were validated above");
+            let current = params
+                .get_value(&plugin, id)
+                .ok_or_else(|| format!("CLAP parameter {param_id} became unavailable"))?;
+            if !current.is_finite() {
+                return Err(format!(
+                    "CLAP parameter {param_id} returned a non-finite value"
+                ));
+            }
+            if (current - value).abs() > 1e-8 * value.abs().max(1.0) {
+                return Err(format!(
+                    "CLAP instrument did not accept parameter {param_id} value {value}"
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn save_state(&mut self) -> Result<Vec<u8>, String> {
@@ -2487,8 +2663,8 @@ mod tests {
         ClapPatternNote, ClapPatternPreviewSettings, ClapPluginDescriptor,
         MAX_NOTE_PREVIEW_NOTE_MILLISECONDS, MIN_NOTE_PREVIEW_NOTE_MILLISECONDS,
         encode_instance_probe_output, encode_probe_output, parse_instance_probe_output,
-        parse_pattern_preview_request, parse_probe_output, read_preview_server_state,
-        schedule_pattern_preview_events, second_pattern_loop_audio,
+        parse_pattern_preview_request, parse_probe_output, read_preview_server_parameter_values,
+        read_preview_server_state, schedule_pattern_preview_events, second_pattern_loop_audio,
         validate_note_preview_note_length, write_preview_server_state,
     };
     use std::io::Cursor;
@@ -2596,6 +2772,31 @@ mod tests {
             state
         );
         assert_eq!(input.position() as usize, state.len() + 1);
+    }
+
+    #[test]
+    fn clap_parameter_protocol_reads_finite_unique_values() {
+        let expected = [(42, 0.25_f64), (17, -1.5_f64)];
+        let input = format!(
+            "PARAM 42 {:016x}\nPARAM 17 {:016x}\nEND\n",
+            expected[0].1.to_bits(),
+            expected[1].1.to_bits(),
+        );
+        let parsed =
+            read_preview_server_parameter_values(&mut Cursor::new(input.into_bytes()), "2")
+                .expect("valid parameter values should parse");
+
+        assert_eq!(parsed, expected);
+    }
+
+    #[test]
+    fn clap_parameter_protocol_rejects_duplicate_and_non_finite_values() {
+        let duplicate = b"PARAM 42 3fd0000000000000\nPARAM 42 3fe0000000000000\nEND\n";
+        assert!(read_preview_server_parameter_values(&mut Cursor::new(duplicate), "2").is_err());
+
+        let non_finite = b"PARAM 42 7ff8000000000000\nEND\n";
+        assert!(read_preview_server_parameter_values(&mut Cursor::new(non_finite), "1").is_err());
+        assert!(read_preview_server_parameter_values(&mut Cursor::new([]), "0").is_err());
     }
 
     fn pattern_preview_settings() -> ClapPatternPreviewSettings {
