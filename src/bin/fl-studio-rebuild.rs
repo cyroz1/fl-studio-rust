@@ -63895,7 +63895,7 @@ impl DawUi {
         });
         ui.label(
             egui::RichText::new(
-                "Matching VST3 instrument channels and recognized Mixer effect slots load with the project. Effect audio processing in the Mixer is not yet connected. Detected CLAP and macOS Audio Unit bundles are listed below.",
+                "Matching VST3 instrument channels and recognized Mixer effect slots load with the project; supported VST3 Mixer effects process on loaded Mixer routes. CLAP Mixer effect slots remain unsupported. Detected CLAP and macOS Audio Unit bundles are listed below.",
             )
             .color(MUTED),
         );

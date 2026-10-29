@@ -6,10 +6,19 @@ use std::path::{Path, PathBuf};
 const VST3_MANUAL_LATENCY_OFFSETS_FILE: &str = "vst3-manual-latency-offsets.txt";
 const VST3_PROJECT_MANUAL_LATENCY_OFFSETS_DIRECTORY: &str = "vst3-project-manual-latency-offsets";
 const CLAP_PROJECT_INSTRUMENTS_DIRECTORY: &str = "clap-project-instruments";
+const CLAP_PROJECT_MIXER_EFFECTS_DIRECTORY: &str = "clap-project-mixer-effects";
 pub const MAX_CLAP_PROJECT_PLUGIN_STATE_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClapProjectInstrumentAssignment {
+    pub path: PathBuf,
+    pub plugin_id: String,
+    pub plugin_name: String,
+    pub state: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClapProjectMixerEffectAssignment {
     pub path: PathBuf,
     pub plugin_id: String,
     pub plugin_name: String,
@@ -61,6 +70,17 @@ fn clap_project_instruments_file(project_id: &str) -> Option<PathBuf> {
     Some(
         app_settings_directory()?
             .join(CLAP_PROJECT_INSTRUMENTS_DIRECTORY)
+            .join(format!("{}.txt", project_id.to_ascii_lowercase())),
+    )
+}
+
+fn clap_project_mixer_effects_file(project_id: &str) -> Option<PathBuf> {
+    if project_id.len() != 16 || !project_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(
+        app_settings_directory()?
+            .join(CLAP_PROJECT_MIXER_EFFECTS_DIRECTORY)
             .join(format!("{}.txt", project_id.to_ascii_lowercase())),
     )
 }
@@ -148,6 +168,142 @@ pub fn save_clap_project_instruments(
         .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
     fs::write(&path, serialize_clap_project_instruments(assignments))
         .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
+/// Read machine-local CLAP effect assignments for project Mixer insert slots.
+pub fn load_clap_project_mixer_effects(
+    project_id: &str,
+) -> BTreeMap<(usize, u16), ClapProjectMixerEffectAssignment> {
+    clap_project_mixer_effects_file(project_id)
+        .and_then(|path| fs::read_to_string(path).ok())
+        .map(|contents| parse_clap_project_mixer_effects(&contents))
+        .unwrap_or_default()
+}
+
+/// Save machine-local CLAP effect assignments outside the FLP file.
+pub fn save_clap_project_mixer_effects(
+    project_id: &str,
+    assignments: &BTreeMap<(usize, u16), ClapProjectMixerEffectAssignment>,
+) -> Result<(), String> {
+    if assignments.values().any(|assignment| {
+        assignment
+            .state
+            .as_ref()
+            .is_some_and(|state| state.len() > MAX_CLAP_PROJECT_PLUGIN_STATE_BYTES)
+    }) {
+        return Err(format!(
+            "CLAP plug-in state exceeds the {} MiB project limit",
+            MAX_CLAP_PROJECT_PLUGIN_STATE_BYTES / (1024 * 1024)
+        ));
+    }
+    let path = clap_project_mixer_effects_file(project_id)
+        .ok_or_else(|| "the project CLAP Mixer effect path is not valid".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the project CLAP Mixer effect path has no parent folder".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    fs::write(&path, serialize_clap_project_mixer_effects(assignments))
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
+pub fn parse_clap_project_mixer_effects(
+    contents: &str,
+) -> BTreeMap<(usize, u16), ClapProjectMixerEffectAssignment> {
+    let mut assignments = BTreeMap::new();
+    if contents.lines().next() != Some("clap-project-mixer-effects-v1") {
+        return assignments;
+    }
+    for line in contents.lines().skip(1) {
+        let mut fields = line.split('\t');
+        let Some(insert_ordinal) = fields.next().and_then(|field| field.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        let Some(slot_index) = fields.next().and_then(|field| field.parse::<u16>().ok()) else {
+            continue;
+        };
+        let Some(path) = fields.next().and_then(decode_path) else {
+            continue;
+        };
+        let Some(plugin_id) = fields.next().and_then(decode_plugin_uid) else {
+            continue;
+        };
+        let Some(plugin_name) = fields.next().and_then(decode_plugin_uid) else {
+            continue;
+        };
+        let Some(encoded_state) = fields.next() else {
+            continue;
+        };
+        let state = if encoded_state == "-" {
+            None
+        } else if encoded_state.len() <= MAX_CLAP_PROJECT_PLUGIN_STATE_BYTES * 2 {
+            let Some(state) = decode_bytes_hex(encoded_state)
+                .filter(|state| state.len() <= MAX_CLAP_PROJECT_PLUGIN_STATE_BYTES)
+            else {
+                continue;
+            };
+            Some(state)
+        } else {
+            continue;
+        };
+        if fields.next().is_some()
+            || insert_ordinal >= crate::audio::MIXER_TRACK_METER_COUNT
+            || slot_index >= 10
+            || path.as_os_str().is_empty()
+            || plugin_id.is_empty()
+            || plugin_name.is_empty()
+        {
+            continue;
+        }
+        assignments.insert(
+            (insert_ordinal, slot_index),
+            ClapProjectMixerEffectAssignment {
+                path,
+                plugin_id,
+                plugin_name,
+                state,
+            },
+        );
+    }
+    assignments
+}
+
+pub fn serialize_clap_project_mixer_effects(
+    assignments: &BTreeMap<(usize, u16), ClapProjectMixerEffectAssignment>,
+) -> String {
+    let mut contents = String::from("clap-project-mixer-effects-v1\n");
+    for ((insert_ordinal, slot_index), assignment) in assignments {
+        if *insert_ordinal >= crate::audio::MIXER_TRACK_METER_COUNT
+            || *slot_index >= 10
+            || assignment.path.as_os_str().is_empty()
+            || assignment.plugin_id.is_empty()
+            || assignment.plugin_name.is_empty()
+            || assignment
+                .state
+                .as_ref()
+                .is_some_and(|state| state.len() > MAX_CLAP_PROJECT_PLUGIN_STATE_BYTES)
+        {
+            continue;
+        }
+        contents.push_str(&insert_ordinal.to_string());
+        contents.push('\t');
+        contents.push_str(&slot_index.to_string());
+        contents.push('\t');
+        contents.push_str(&encode_path(&assignment.path));
+        contents.push('\t');
+        contents.push_str(&encode_plugin_uid(&assignment.plugin_id));
+        contents.push('\t');
+        contents.push_str(&encode_plugin_uid(&assignment.plugin_name));
+        contents.push('\t');
+        if let Some(state) = &assignment.state {
+            contents.push_str(&encode_bytes_hex(state));
+        } else {
+            contents.push('-');
+        }
+        contents.push('\n');
+    }
+    contents
 }
 
 pub fn parse_clap_project_instruments(
