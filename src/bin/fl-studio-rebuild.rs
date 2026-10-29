@@ -35355,7 +35355,14 @@ impl DawUi {
             })
             .unwrap_or_else(|| "Select marker".to_owned());
 
+        let selection_bounds = self
+            .playlist_time_selection
+            .filter(|(selected_arrangement, start_tick, end_tick)| {
+                *selected_arrangement == arrangement_id && end_tick > start_tick
+            })
+            .map(|(_, start_tick, end_tick)| (start_tick, end_tick));
         let mut delete_selected = false;
+        let mut create_selection_markers = false;
         ui.separator();
         ui.horizontal(|ui| {
             ui.strong("Time markers");
@@ -35374,6 +35381,15 @@ impl DawUi {
                 .add_enabled(
                     self.selected_time_marker.is_some(),
                     egui::Button::new("Delete marker"),
+                )
+                .clicked();
+            create_selection_markers = ui
+                .add_enabled(
+                    selection_bounds.is_some(),
+                    egui::Button::new("Add at selection ends"),
+                )
+                .on_hover_text(
+                    "Add time markers at both ends of the current Playlist time selection",
                 )
                 .clicked();
         });
@@ -35458,6 +35474,50 @@ impl DawUi {
                     self.status = format!("Deleted time marker {}", marker_index + 1);
                 } else {
                     self.status = "Could not delete the selected time marker".to_owned();
+                }
+            }
+        } else if create_selection_markers {
+            if let Some((start_tick, end_tick)) = selection_bounds {
+                let result = self
+                    .document
+                    .as_ref()
+                    .cloned()
+                    .ok_or_else(|| "no project is open".to_owned())
+                    .and_then(|mut document| {
+                        document
+                            .create_time_marker(
+                                arrangement_id,
+                                TimeMarkerEdit {
+                                    position_ticks: Some(start_tick),
+                                    ..TimeMarkerEdit::default()
+                                },
+                            )
+                            .map_err(|error| error.to_string())?;
+                        let end_index = document
+                            .create_time_marker(
+                                arrangement_id,
+                                TimeMarkerEdit {
+                                    position_ticks: Some(end_tick),
+                                    ..TimeMarkerEdit::default()
+                                },
+                            )
+                            .map_err(|error| error.to_string())?;
+                        Ok((document, end_index))
+                    });
+                match result {
+                    Ok((document, end_index)) => {
+                        self.stop_project_playback();
+                        self.document = Some(document);
+                        self.selected_time_marker = Some(end_index);
+                        self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+                        self.status = format!(
+                            "Added Playlist time markers at ticks {start_tick} and {end_tick}"
+                        );
+                    }
+                    Err(error) => {
+                        self.status = format!("Could not add Playlist time markers: {error}");
+                    }
                 }
             }
         } else if create_marker {
