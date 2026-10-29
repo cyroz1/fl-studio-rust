@@ -5674,8 +5674,8 @@ impl PlaylistClip {
     }
 
     /// Returns a recognized Pattern Clip source window in ticks. Modern
-    /// Playlist records use an explicit one-to-one tick window; older records
-    /// are recognized only when they retain the full-source sentinel.
+    /// Playlist records use an explicit one-to-one tick window; older Pattern
+    /// records are recognized only when they retain an untrimmed offset pair.
     pub fn recognized_pattern_source_window_ticks(&self) -> Option<(u32, u32)> {
         if !matches!(self.target(), PlaylistClipTarget::Pattern { .. }) {
             return None;
@@ -5684,7 +5684,9 @@ impl PlaylistClip {
             let (start, end) = self.source_window_ticks?;
             (start < end && end.checked_sub(start) == Some(self.length_ticks))
                 .then_some((start, end))
-        } else if self.uses_full_source_window() {
+        } else if self.uses_full_source_window()
+            || (self.start_offset == 0.0 && self.end_offset == 0.0)
+        {
             (self.length_ticks > 0).then_some((0, self.length_ticks))
         } else {
             None
