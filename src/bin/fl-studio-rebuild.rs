@@ -37,9 +37,11 @@ use flp_rebuild::media::{
 use flp_rebuild::midi::{MidiChannelMapping, MidiFile, MidiImportOptions};
 use flp_rebuild::plugin_settings::{
     ClapProjectInstrumentAssignment as ClapPatternPlaybackInstrument,
-    load_clap_project_instruments, load_vst3_manual_latency_offsets,
+    ClapProjectMixerEffectAssignment, load_clap_project_instruments,
+    load_clap_project_mixer_effects, load_vst3_manual_latency_offsets,
     load_vst3_project_manual_latency_offsets, save_clap_project_instruments,
-    save_vst3_manual_latency_offsets, save_vst3_project_manual_latency_offsets,
+    save_clap_project_mixer_effects, save_vst3_manual_latency_offsets,
+    save_vst3_project_manual_latency_offsets,
 };
 use flp_rebuild::plugins::{PluginCandidate, PluginFormat, scan_installed_plugins};
 use flp_rebuild::project_package::{ProjectPackageWorkspace, copy_unique_sample_file};
@@ -936,8 +938,8 @@ fn matching_vst3_candidate<'a>(
         .find(|candidate| candidate_matches_vst_metadata(candidate, metadata))
 }
 
-fn remap_mixer_effect_instances_after_move(
-    instances: &mut BTreeMap<(usize, u16), u64>,
+fn remap_mixer_effect_instances_after_move<T>(
+    instances: &mut BTreeMap<(usize, u16), T>,
     insert_ordinal: usize,
     from_slot: u16,
     to_slot: u16,
@@ -5242,6 +5244,7 @@ struct DawUi {
     vst3_manual_latency_offset_labels: BTreeMap<u64, String>,
     channel_vst3_instances: BTreeMap<u16, u64>,
     mixer_effect_vst3_instances: BTreeMap<(usize, u16), u64>,
+    clap_mixer_effect_assignments: BTreeMap<(usize, u16), ClapProjectMixerEffectAssignment>,
     audio_catalog: AudioDeviceCatalog,
     audio_settings: AudioSettings,
     live_resampling_quality: ResamplingQuality,
@@ -7559,6 +7562,7 @@ impl DawUi {
             vst3_manual_latency_offset_labels: BTreeMap::new(),
             channel_vst3_instances: BTreeMap::new(),
             mixer_effect_vst3_instances: BTreeMap::new(),
+            clap_mixer_effect_assignments: BTreeMap::new(),
             audio_catalog,
             audio_settings,
             live_resampling_quality,
@@ -10049,6 +10053,11 @@ impl DawUi {
         self.vst3_manual_latency_offset_labels.clear();
         self.channel_vst3_instances.clear();
         self.mixer_effect_vst3_instances.clear();
+        self.clap_mixer_effect_assignments = self
+            .current_path
+            .as_ref()
+            .map(|path| load_clap_project_mixer_effects(&stable_project_id(path)))
+            .unwrap_or_default();
         let document = self.document.as_ref()?;
         let states = document.channel_plugin_states();
         let effect_slots = document.mixer_effect_slots();
@@ -10100,11 +10109,13 @@ impl DawUi {
             }
         }
 
-        let eligible_plugins = eligible_channels + eligible_effects;
+        let clap_effect_assignments = self.clap_mixer_effect_assignments.clone();
+        let eligible_plugins = eligible_channels + eligible_effects + clap_effect_assignments.len();
         if eligible_plugins == 0 {
             return None;
         }
-        if channel_plans.is_empty() && effect_plans.is_empty() {
+        if channel_plans.is_empty() && effect_plans.is_empty() && clap_effect_assignments.is_empty()
+        {
             return Some(format!(
                 "no installed VST3 matched {} project channel(s) or {} Mixer effect slot(s)",
                 eligible_channels, eligible_effects
@@ -10117,6 +10128,13 @@ impl DawUi {
                 return Some(format!("VST3 host initialization failed: {error}"));
             }
         };
+        if !clap_effect_assignments.is_empty() {
+            host.set_mixer_effect_processor_factory(Some(Arc::new(
+                clap_probe::ClapProjectMixerEffectProcessorFactory::new(
+                    clap_effect_assignments.clone(),
+                ),
+            )));
+        }
         host.set_manual_latency_offsets(&self.vst3_manual_latency_offsets);
         let mut channel_instances = BTreeMap::new();
         let mut mixer_effect_instances = BTreeMap::new();
@@ -10197,7 +10215,7 @@ impl DawUi {
         self.mixer_effect_vst3_instances = mixer_effect_instances;
         self.vst3_manual_latency_offset_keys = manual_latency_offset_keys;
         self.vst3_manual_latency_offset_labels = manual_latency_offset_labels;
-        if !host.loaded_plugins().is_empty() {
+        if !host.loaded_plugins().is_empty() || !clap_effect_assignments.is_empty() {
             self.vst3_host = Some(host);
         }
 
@@ -53591,6 +53609,8 @@ impl DawUi {
         };
         let inserts = document.mixer_inserts();
         let effect_slots = document.mixer_effect_slots();
+        let clap_mixer_effect_assignments = self.clap_mixer_effect_assignments.clone();
+        let project_id = self.current_path.as_deref().map(stable_project_id);
         let parameters = document.mixer_parameter_records().unwrap_or_default();
         let eq_parameters = document.mixer_eq_parameter_summaries().unwrap_or_default();
         let send_summaries = document.mixer_send_summaries().unwrap_or_default();
@@ -53685,6 +53705,9 @@ impl DawUi {
         let mut save_insert_state = None;
         let mut effect_slot_move = None;
         let mut effect_editor_open = None;
+        let mut inspect_clap_effect_path = None;
+        let mut clap_effect_assignment_edit = None;
+        let mut clap_effect_assignment_remove = None;
         let available_height = ui.available_height();
         let inspector_width = 238.0_f32.min((ui.available_width() * 0.3).max(190.0));
         let bank_width = (ui.available_width() - inspector_width - 10.0).max(180.0);
@@ -55279,9 +55302,17 @@ impl DawUi {
                                     1 => "1 saved state record".to_owned(),
                                     count => format!("{count} saved state records"),
                                 };
+                                let slot_key = (insert.ordinal(), slot.slot_index());
+                                let clap_effect_assignment =
+                                    clap_mixer_effect_assignments.get(&slot_key);
+                                let saved_state = if clap_effect_assignment.is_some() {
+                                    format!("{saved_state} · CLAP assigned")
+                                } else {
+                                    saved_state
+                                };
                                 let loaded_effect_instance = self
                                     .mixer_effect_vst3_instances
-                                    .get(&(insert.ordinal(), slot.slot_index()))
+                                    .get(&slot_key)
                                     .copied();
                                 let saved_state = if loaded_effect_instance.is_some() {
                                     format!("{saved_state} · VST3 loaded")
@@ -55425,6 +55456,114 @@ impl DawUi {
                                                     );
                                                 }
                                             });
+                                            ui.horizontal(|ui| {
+                                                if let Some(project_id) = project_id.as_ref() {
+                                                    let selected_text = clap_effect_assignment
+                                                        .map_or("Assign CLAP effect", |assignment| {
+                                                            assignment.plugin_name.as_str()
+                                                        });
+                                                    ui.menu_button(selected_text, |ui| {
+                                                        let mut found_candidate = false;
+                                                        for candidate in self
+                                                            .plugin_candidates
+                                                            .iter()
+                                                            .filter(|candidate| {
+                                                                candidate.format == PluginFormat::Clap
+                                                            })
+                                                        {
+                                                            found_candidate = true;
+                                                            match self
+                                                                .clap_inspection_states
+                                                                .get(&candidate.path)
+                                                            {
+                                                                Some(ClapInspectionState::Inspected(
+                                                                    descriptors,
+                                                                )) => {
+                                                                    for descriptor in descriptors.iter().filter(
+                                                                        |descriptor| {
+                                                                            descriptor.features.iter().any(
+                                                                                |feature| feature == "audio-effect",
+                                                                            )
+                                                                        },
+                                                                    ) {
+                                                                        if ui
+                                                                            .button(format!(
+                                                                                "{} · {}",
+                                                                                candidate.name,
+                                                                                descriptor.name
+                                                                            ))
+                                                                            .clicked()
+                                                                        {
+                                                                            let state = clap_effect_assignment
+                                                                                .filter(|assignment| {
+                                                                                    assignment.path
+                                                                                        == candidate.path
+                                                                                        && assignment.plugin_id
+                                                                                            == descriptor.id
+                                                                                })
+                                                                                .and_then(|assignment| {
+                                                                                    assignment.state.clone()
+                                                                                });
+                                                                            clap_effect_assignment_edit = Some((
+                                                                                slot_key,
+                                                                                ClapProjectMixerEffectAssignment {
+                                                                                    path: candidate.path.clone(),
+                                                                                    plugin_id: descriptor.id.clone(),
+                                                                                    plugin_name: descriptor.name.clone(),
+                                                                                    state,
+                                                                                },
+                                                                            ));
+                                                                            ui.close();
+                                                                        }
+                                                                    }
+                                                                }
+                                                                Some(ClapInspectionState::Inspecting) => {
+                                                                    ui.add_enabled(
+                                                                        false,
+                                                                        egui::Button::new(format!(
+                                                                            "Inspecting {}…",
+                                                                            candidate.name
+                                                                        )),
+                                                                    );
+                                                                }
+                                                                Some(ClapInspectionState::Failed(_))
+                                                                | None => {
+                                                                    if ui
+                                                                        .button(format!(
+                                                                            "Inspect {}",
+                                                                            candidate.name
+                                                                        ))
+                                                                        .clicked()
+                                                                    {
+                                                                        inspect_clap_effect_path =
+                                                                            Some(candidate.path.clone());
+                                                                        ui.close();
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                        if !found_candidate {
+                                                            ui.small("No CLAP plug-ins were detected.");
+                                                        }
+                                                        ui.small(format!(
+                                                            "Assignments are stored on this machine for project {project_id}."
+                                                        ));
+                                                    });
+                                                    if clap_effect_assignment.is_some()
+                                                        && ui.small_button("Remove CLAP").clicked()
+                                                    {
+                                                        clap_effect_assignment_remove =
+                                                            Some(slot_key);
+                                                    }
+                                                } else {
+                                                    ui.small(
+                                                        egui::RichText::new(
+                                                            "Save the project before assigning a CLAP effect.",
+                                                        )
+                                                        .color(MUTED),
+                                                    );
+                                                }
+                                            });
                                         });
                                     },
                                 );
@@ -55444,7 +55583,7 @@ impl DawUi {
                             }
                             ui.small(
                                 egui::RichText::new(
-                                    "Open editor controls a loaded VST3 effect through its native editor. Move up/down carries saved slot events with the effect. Loaded VST3 effects process in saved slot order on supported playback streams; Mix edits use a 20 ms ramp, and native wet/dry response remains to be checked.",
+                                    "Open editor controls a loaded VST3 effect through its native editor. Move up/down carries saved slot events with the effect. CLAP assignments process in saved slot order with timed parameter automation and reported-latency PDC. CLAP sidechains, tail reporting, native editors, and state capture remain unsupported. VST3 Mix edits use a 20 ms ramp.",
                                 )
                                 .color(MUTED),
                             );
@@ -55805,6 +55944,62 @@ impl DawUi {
         if let Some((source, destination)) = send_route_creation {
             self.set_mixer_route(source, destination, true, "Mixer");
         }
+        if let Some(path) = inspect_clap_effect_path {
+            self.clap_inspection_states
+                .insert(path.clone(), ClapInspectionState::Inspecting);
+            if self.clap_inspection_sender.send(path.clone()).is_err() {
+                self.clap_inspection_states.insert(
+                    path,
+                    ClapInspectionState::Failed("descriptor worker is unavailable".to_owned()),
+                );
+            } else {
+                ui.ctx().request_repaint();
+            }
+        }
+        let assignment_edit = clap_effect_assignment_edit.map(|(key, value)| (key, Some(value)));
+        let assignment_remove = clap_effect_assignment_remove
+            .map(|key| (key, None::<ClapProjectMixerEffectAssignment>));
+        if let Some((slot_key, assignment)) = assignment_edit.or(assignment_remove)
+            && let Some(project_id) = project_id.as_deref()
+        {
+            let mut assignments = clap_mixer_effect_assignments.clone();
+            let status = if let Some(assignment) = assignment {
+                let name = assignment.plugin_name.clone();
+                assignments.insert(slot_key, assignment);
+                format!(
+                    "Assigned CLAP effect {name} to Mixer insert {} slot {}",
+                    slot_key.0,
+                    slot_key.1 + 1
+                )
+            } else {
+                assignments.remove(&slot_key);
+                format!(
+                    "Removed CLAP effect assignment from Mixer insert {} slot {}",
+                    slot_key.0,
+                    slot_key.1 + 1
+                )
+            };
+            match save_clap_project_mixer_effects(project_id, &assignments) {
+                Ok(()) => {
+                    self.stop_project_playback();
+                    self.clap_mixer_effect_assignments = assignments;
+                    let reload_status = self.load_project_vst3_plugins();
+                    self.status = reload_status.map_or(status.clone(), |message| {
+                        if message.contains("failed")
+                            || message.contains("issue")
+                            || message.contains("could not")
+                        {
+                            format!("{status}; {message}")
+                        } else {
+                            status
+                        }
+                    });
+                }
+                Err(error) => {
+                    self.status = format!("Could not save CLAP Mixer effect assignment: {error}");
+                }
+            }
+        }
         if let Some((insert_ordinal, from_slot, to_slot)) = effect_slot_move
             && let Some(document) = self.document.as_mut()
         {
@@ -55816,6 +56011,26 @@ impl DawUi {
                         from_slot,
                         to_slot,
                     );
+                    remap_mixer_effect_instances_after_move(
+                        &mut self.clap_mixer_effect_assignments,
+                        insert_ordinal,
+                        from_slot,
+                        to_slot,
+                    );
+                    let clap_assignment_save_error = project_id.as_deref().and_then(|project_id| {
+                        save_clap_project_mixer_effects(
+                            project_id,
+                            &self.clap_mixer_effect_assignments,
+                        )
+                        .err()
+                    });
+                    if let Some(host) = &mut self.vst3_host {
+                        host.set_mixer_effect_processor_factory(Some(Arc::new(
+                            clap_probe::ClapProjectMixerEffectProcessorFactory::new(
+                                self.clap_mixer_effect_assignments.clone(),
+                            ),
+                        )));
+                    }
                     let mappings_changed =
                         remap_midi_vst3_mixer_effect_parameter_targets_after_move(
                             &mut self.midi_vst3_parameter_mappings,
@@ -55827,7 +56042,8 @@ impl DawUi {
                         .then(|| {
                             save_midi_vst3_parameter_mappings(&self.midi_vst3_parameter_mappings)
                         })
-                        .and_then(Result::err);
+                        .and_then(Result::err)
+                        .or(clap_assignment_save_error);
                     self.dirty = true;
                     self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     let moved_status = format!(
@@ -63920,7 +64136,7 @@ impl DawUi {
         });
         ui.label(
             egui::RichText::new(
-                "Matching VST3 instrument channels and recognized Mixer effect slots load with the project; supported VST3 Mixer effects process on loaded Mixer routes. CLAP Mixer effect slots remain unsupported. Detected CLAP and macOS Audio Unit bundles are listed below.",
+                "Matching VST3 instrument channels and recognized Mixer effect slots load with the project; supported VST3 Mixer effects process on loaded Mixer routes. Machine-local CLAP effect assignments process in saved Mixer slot order with timed parameter automation and reported-latency PDC. CLAP sidechains, tail reporting, native editors, and state capture remain unsupported. Detected CLAP and macOS Audio Unit bundles are listed below.",
             )
             .color(MUTED),
         );
@@ -64151,7 +64367,7 @@ impl DawUi {
             ui.heading(format!("Detected CLAP plug-ins ({})", clap_candidates.len()));
             ui.label(
                 egui::RichText::new(
-                "CLAP note and Pattern/channel previews render in an isolated helper, which reuses the instrument while the plug-in and output rate stay the same. Pattern transport pre-renders assigned channels at project base tempo, expands Layer notes, and follows saved Mixer routes and loaded VST3 Mixer effects. Playlist transport pre-renders assigned CLAP instruments across supported Pattern Clips and follows clip repeats, track mute/solo, and tempo changes. Performance Mode pre-renders assigned CLAP-only Pattern Clip loops for constant-tempo arrangements, with saved channel and Layer gains, pan automation, and Mixer routes. Full-song Playlist mix and Mixer stem renders also pre-render assigned instruments with saved state, Pattern Event, Pattern LFO, and Playlist Automation parameter links, and linked fader/pan automation. Channel assignments and captured plug-in state are saved in machine-local settings per project path; mixed Sampler/VST3/CLAP Performance clips, tempo-changing CLAP Performance clips, CLAP Mixer effects, nondefault-scale or unrecognized legacy-window Pattern Clips, native FLP state embedding, and native plug-in editors remain unsupported.",
+                "CLAP note and Pattern/channel previews render in an isolated helper, which reuses the instrument while the plug-in and output rate stay the same. Pattern transport pre-renders assigned channels at project base tempo, expands Layer notes, and follows saved Mixer routes and loaded VST3 Mixer effects. Playlist transport pre-renders assigned CLAP instruments across supported Pattern Clips and follows clip repeats, track mute/solo, and tempo changes. Performance Mode pre-renders assigned CLAP-only Pattern Clip loops for constant-tempo arrangements, with saved channel and Layer gains, pan automation, and Mixer routes. Full-song Playlist mix and Mixer stem renders also pre-render assigned instruments with saved state, Pattern Event, Pattern LFO, and Playlist Automation parameter links, and linked fader/pan automation. Channel assignments and captured plug-in state are saved in machine-local settings per project path; mixed Sampler/VST3/CLAP Performance clips, tempo-changing CLAP Performance clips, CLAP Mixer effect sidechains, tail reporting, native editors, and effect-state capture; nondefault-scale or unrecognized legacy-window Pattern Clips, native FLP state embedding, and native plug-in editors remain unsupported.",
                 )
                 .color(MUTED),
             );
@@ -64198,7 +64414,7 @@ impl DawUi {
                     ui.colored_label(ORANGE, error);
                 }
             }
-                ui.small("Pattern previews use project base tempo. CLAP Pattern transport expands Layer notes to assigned CLAP child channels, applies Layer gain/pan and source-channel gain/pan, and follows Mixer routes including loaded VST3 insert effects. Layer Crossfade applies when every active leaf is a Sampler, an assigned CLAP channel, or a loaded VST3 channel whose plug-in advertises Volume note expression. CLAP Playlist playback follows clip repeats, track mute/solo, Layer routing and gain/pan, and tempo automation for default-scale Pattern clips with recognized 88-byte source windows whose span matches the clip length. Performance Mode launches pre-rendered CLAP-only Pattern Clip loops for constant-tempo arrangements and applies saved channel and Layer gain/pan, linked fader/pan automation, Pattern Event links, Pattern LFO links, and Playlist Automation parameter links. Pattern Event points take precedence over LFOs for a shared parameter. Nondefault scales and unrecognized legacy source windows remain unsupported. Performance Mode still requires default-scale, full-source clips. Mixed Sampler/VST3/CLAP Performance clips, tempo-changing CLAP clips, and CLAP-format Mixer effect processing remain unsupported. Full-song Playlist mix and Mixer stem renders also pre-render assigned CLAP instruments, including Pattern Event, Pattern LFO, and Playlist Automation parameter links plus linked Playlist fader/pan automation. CLAP note-dialect plug-ins receive per-note tuning, pan, Mod X brightness, and release; MIDI 1.0/2.0 inputs receive key, velocity, channel, and release.");
+                ui.small("Pattern previews use project base tempo. CLAP Pattern transport expands Layer notes to assigned CLAP child channels, applies Layer gain/pan and source-channel gain/pan, and follows Mixer routes including loaded VST3 insert effects. Layer Crossfade applies when every active leaf is a Sampler, an assigned CLAP channel, or a loaded VST3 channel whose plug-in advertises Volume note expression. CLAP Playlist playback follows clip repeats, track mute/solo, Layer routing and gain/pan, and tempo automation for default-scale Pattern clips with recognized 88-byte source windows whose span matches the clip length. Performance Mode launches pre-rendered CLAP-only Pattern Clip loops for constant-tempo arrangements and applies saved channel and Layer gain/pan, linked fader/pan automation, Pattern Event links, Pattern LFO links, and Playlist Automation parameter links. Pattern Event points take precedence over LFOs for a shared parameter. Nondefault scales and unrecognized legacy source windows remain unsupported. Performance Mode still requires default-scale, full-source clips. Mixed Sampler/VST3/CLAP Performance clips, tempo-changing CLAP clips, and CLAP Mixer effect sidechains, tail reporting, native editors, and effect-state capture remain unsupported. Full-song Playlist mix and Mixer stem renders also pre-render assigned CLAP instruments, including Pattern Event, Pattern LFO, and Playlist Automation parameter links plus linked Playlist fader/pan automation. CLAP note-dialect plug-ins receive per-note tuning, pan, Mod X brightness, and release; MIDI 1.0/2.0 inputs receive key, velocity, channel, and release.");
             if let Ok(Some(settings)) = &clap_pattern_preview_settings {
                 ui.horizontal(|ui| {
                     if let Some(instrument) = self

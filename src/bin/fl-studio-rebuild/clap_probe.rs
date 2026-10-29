@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::ffi::{CString, OsString};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -22,8 +23,11 @@ use clack_host::prelude::{
     ProcessStatus,
 };
 use clack_host::utils::{BeatTime, SecondsTime};
-use flp_rebuild::plugin_settings::MAX_CLAP_PROJECT_PLUGIN_STATE_BYTES;
+use flp_rebuild::plugin_settings::{
+    ClapProjectMixerEffectAssignment, MAX_CLAP_PROJECT_PLUGIN_STATE_BYTES,
+};
 use flp_rebuild::sample_render::PlaylistTempoMap;
+use flp_rebuild::vst3::{MixerEffectProcessor, MixerEffectProcessorFactory};
 
 pub const PROBE_FLAG: &str = "--clap-probe";
 pub const INSTANCE_PROBE_FLAG: &str = "--clap-instance-probe";
@@ -41,7 +45,9 @@ const MAX_NOTE_PREVIEW_TOTAL_CHANNELS: u32 = 64;
 const MAX_CLAP_MIXER_EFFECT_BLOCK_FRAMES: u32 = 512;
 const MAX_PATTERN_PREVIEW_NOTES: usize = 16_384;
 const MAX_CLAP_PREVIEW_PARAMETER_CHANGES: usize = 512;
+const MAX_CLAP_MIXER_EFFECT_PARAMETER_CHANGES: usize = 2_048;
 const NOTE_PREVIEW_BLOCK_FRAMES: u32 = 512;
+const CLAP_MIXER_EFFECT_PROCESS_TIMEOUT: Duration = Duration::from_secs(10);
 const NOTE_PREVIEW_DURATION_MILLISECONDS: u32 = 1500;
 const DEFAULT_NOTE_PREVIEW_NOTE_MILLISECONDS: u32 = 500;
 pub const MIN_NOTE_PREVIEW_NOTE_MILLISECONDS: u32 = 50;
@@ -513,6 +519,335 @@ enum ClapPreviewProcessResponse {
     Error(String),
 }
 
+enum ClapMixerEffectProcessResponse {
+    Ready {
+        input_channels: usize,
+        output_channels: usize,
+    },
+    StateLoaded,
+    Started(u32),
+    Audio(Vec<f32>),
+    Stopped,
+    Error(String),
+}
+
+struct ClapMixerEffectProcess {
+    child: Child,
+    stdin: BufWriter<ChildStdin>,
+    responses: Receiver<ClapMixerEffectProcessResponse>,
+    reader: Option<JoinHandle<()>>,
+    input_channels: usize,
+    output_channels: usize,
+    sample_rate: u32,
+    latency_samples: u32,
+    stopped: bool,
+}
+
+impl ClapMixerEffectProcess {
+    fn spawn(
+        path: &Path,
+        plugin_id: &str,
+        sample_rate: u32,
+        state: Option<&[u8]>,
+    ) -> Result<Self, String> {
+        let executable = std::env::current_exe()
+            .map_err(|error| format!("could not locate the application executable: {error}"))?;
+        let mut child = Command::new(executable)
+            .arg(MIXER_EFFECT_SERVER_FLAG)
+            .arg(path)
+            .arg(plugin_id)
+            .arg(sample_rate.to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| format!("could not start the CLAP Mixer effect helper: {error}"))?;
+        let Some(stdin) = child.stdin.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("CLAP Mixer effect helper did not provide input".to_owned());
+        };
+        let Some(stdout) = child.stdout.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("CLAP Mixer effect helper did not provide output".to_owned());
+        };
+        let (response_sender, responses) = mpsc::channel();
+        let reader = match thread::Builder::new()
+            .name("clap-mixer-effect-response".to_owned())
+            .spawn(move || read_mixer_effect_process_responses(stdout, response_sender))
+        {
+            Ok(reader) => reader,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "could not start the CLAP Mixer effect response reader: {error}"
+                ));
+            }
+        };
+        let mut process = Self {
+            child,
+            stdin: BufWriter::new(stdin),
+            responses,
+            reader: Some(reader),
+            input_channels: 0,
+            output_channels: 0,
+            sample_rate,
+            latency_samples: 0,
+            stopped: false,
+        };
+        match process.receive_response()? {
+            ClapMixerEffectProcessResponse::Ready {
+                input_channels,
+                output_channels,
+            } if matches!(input_channels, 1 | 2) && matches!(output_channels, 1 | 2) => {
+                process.input_channels = input_channels;
+                process.output_channels = output_channels;
+            }
+            ClapMixerEffectProcessResponse::Ready { .. } => {
+                return Err(
+                    "CLAP Mixer effect helper reported an unsupported bus layout".to_owned(),
+                );
+            }
+            ClapMixerEffectProcessResponse::Error(error) => return Err(error),
+            _ => {
+                return Err(
+                    "CLAP Mixer effect helper sent an invalid initialization response".to_owned(),
+                );
+            }
+        }
+        if let Some(state) = state {
+            if state.len() > MAX_CLAP_PROJECT_PLUGIN_STATE_BYTES {
+                return Err("CLAP plug-in state exceeds the 32 MiB limit".to_owned());
+            }
+            writeln!(process.stdin, "LOAD_STATE {}", state.len())
+                .and_then(|_| process.stdin.write_all(state))
+                .and_then(|_| process.stdin.write_all(b"\n"))
+                .and_then(|_| process.stdin.flush())
+                .map_err(|error| format!("could not send CLAP Mixer effect state: {error}"))?;
+            match process.receive_response()? {
+                ClapMixerEffectProcessResponse::StateLoaded => {}
+                ClapMixerEffectProcessResponse::Error(error) => return Err(error),
+                _ => {
+                    return Err("CLAP Mixer effect helper did not acknowledge its state".to_owned());
+                }
+            }
+        }
+        writeln!(process.stdin, "START")
+            .and_then(|_| process.stdin.flush())
+            .map_err(|error| format!("could not start CLAP Mixer effect processing: {error}"))?;
+        match process.receive_response()? {
+            ClapMixerEffectProcessResponse::Started(latency_samples) => {
+                process.latency_samples = latency_samples;
+                Ok(process)
+            }
+            ClapMixerEffectProcessResponse::Error(error) => Err(error),
+            _ => Err("CLAP Mixer effect helper did not start processing".to_owned()),
+        }
+    }
+
+    fn process_block(
+        &mut self,
+        samples: &mut [f32],
+        parameter_changes: &[(u32, u32, f64)],
+    ) -> Result<(), String> {
+        if samples.is_empty() || !samples.len().is_multiple_of(2) {
+            return Err("CLAP Mixer effect input must contain non-empty stereo frames".to_owned());
+        }
+        let block_sample_limit = MAX_CLAP_MIXER_EFFECT_BLOCK_FRAMES as usize * 2;
+        for (chunk_index, chunk) in samples.chunks_mut(block_sample_limit).enumerate() {
+            let block_start = chunk_index
+                .checked_mul(block_sample_limit / 2)
+                .ok_or_else(|| "CLAP Mixer effect block offset overflow".to_owned())?;
+            let frame_count = chunk.len() / 2;
+            let block_end = block_start
+                .checked_add(frame_count)
+                .ok_or_else(|| "CLAP Mixer effect block end overflow".to_owned())?;
+            let block_changes = parameter_changes
+                .iter()
+                .filter(|(frame_offset, _, _)| {
+                    usize::try_from(*frame_offset)
+                        .is_ok_and(|offset| (block_start..block_end).contains(&offset))
+                })
+                .copied()
+                .collect::<Vec<_>>();
+            if block_changes.len() > MAX_CLAP_MIXER_EFFECT_PARAMETER_CHANGES {
+                return Err("CLAP Mixer effect block has too many parameter changes".to_owned());
+            }
+            writeln!(self.stdin, "BLOCK {frame_count} {}", block_changes.len())
+                .map_err(|error| format!("could not send CLAP Mixer effect block: {error}"))?;
+            for (frame_offset, parameter_id, value) in block_changes {
+                let frame_offset = usize::try_from(frame_offset)
+                    .ok()
+                    .and_then(|offset| offset.checked_sub(block_start))
+                    .ok_or_else(|| "CLAP Mixer parameter frame offset overflow".to_owned())?;
+                if frame_offset >= frame_count || !value.is_finite() {
+                    return Err("CLAP Mixer effect parameter change is invalid".to_owned());
+                }
+                writeln!(
+                    self.stdin,
+                    "PARAM {frame_offset} {parameter_id} {:016x}",
+                    value.to_bits()
+                )
+                .map_err(|error| format!("could not send CLAP Mixer parameter change: {error}"))?;
+            }
+            for sample in chunk.iter() {
+                let sample = if sample.is_finite() { *sample } else { 0.0 };
+                self.stdin
+                    .write_all(&sample.to_le_bytes())
+                    .map_err(|error| format!("could not send CLAP Mixer effect audio: {error}"))?;
+            }
+            self.stdin
+                .write_all(b"\n")
+                .and_then(|_| self.stdin.flush())
+                .map_err(|error| format!("could not finish CLAP Mixer effect block: {error}"))?;
+            match self.receive_response()? {
+                ClapMixerEffectProcessResponse::Audio(output) if output.len() == chunk.len() => {
+                    chunk.copy_from_slice(&output);
+                }
+                ClapMixerEffectProcessResponse::Audio(_) => {
+                    return Err("CLAP Mixer effect helper returned the wrong block size".to_owned());
+                }
+                ClapMixerEffectProcessResponse::Error(error) => return Err(error),
+                _ => {
+                    return Err(
+                        "CLAP Mixer effect helper returned an invalid audio response".to_owned(),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn stop(&mut self) -> Result<(), String> {
+        if self.stopped {
+            return Ok(());
+        }
+        self.stdin
+            .write_all(b"STOP\n")
+            .and_then(|_| self.stdin.flush())
+            .map_err(|error| format!("could not stop CLAP Mixer effect processing: {error}"))?;
+        match self.receive_response()? {
+            ClapMixerEffectProcessResponse::Stopped => {
+                self.stopped = true;
+                Ok(())
+            }
+            ClapMixerEffectProcessResponse::Error(error) => Err(error),
+            _ => Err("CLAP Mixer effect helper did not stop cleanly".to_owned()),
+        }
+    }
+
+    fn receive_response(&self) -> Result<ClapMixerEffectProcessResponse, String> {
+        match self
+            .responses
+            .recv_timeout(CLAP_MIXER_EFFECT_PROCESS_TIMEOUT)
+        {
+            Ok(response) => Ok(response),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                Err("CLAP Mixer effect helper timed out after 10 seconds".to_owned())
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err("CLAP Mixer effect helper stopped unexpectedly".to_owned())
+            }
+        }
+    }
+}
+
+impl Drop for ClapMixerEffectProcess {
+    fn drop(&mut self) {
+        if !self.stopped {
+            let _ = self.stdin.write_all(b"STOP\n");
+            let _ = self.stdin.flush();
+        }
+        let deadline = Instant::now() + Duration::from_millis(250);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) | Err(_) => {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    break;
+                }
+            }
+        }
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
+pub struct ClapProjectMixerEffectProcessorFactory {
+    assignments: BTreeMap<(usize, u16), ClapProjectMixerEffectAssignment>,
+}
+
+impl ClapProjectMixerEffectProcessorFactory {
+    pub fn new(assignments: BTreeMap<(usize, u16), ClapProjectMixerEffectAssignment>) -> Self {
+        Self { assignments }
+    }
+}
+
+impl MixerEffectProcessor for ClapMixerEffectProcess {
+    fn sample_rate(&self) -> f64 {
+        f64::from(self.sample_rate)
+    }
+
+    fn block_size(&self) -> usize {
+        MAX_CLAP_MIXER_EFFECT_BLOCK_FRAMES as usize
+    }
+
+    fn input_channels(&self) -> usize {
+        self.input_channels
+    }
+
+    fn output_channels(&self) -> usize {
+        self.output_channels
+    }
+
+    fn latency_samples(&self) -> u32 {
+        self.latency_samples
+    }
+
+    fn process_block(
+        &mut self,
+        samples: &mut [f32],
+        parameter_changes: &[(u32, u32, f64)],
+    ) -> Result<(), String> {
+        ClapMixerEffectProcess::process_block(self, samples, parameter_changes)
+    }
+
+    fn stop_processing(&mut self) -> Result<(), String> {
+        self.stop()
+    }
+}
+
+impl MixerEffectProcessorFactory for ClapProjectMixerEffectProcessorFactory {
+    fn contains(&self, insert_ordinal: usize, slot_index: u16) -> bool {
+        self.assignments.contains_key(&(insert_ordinal, slot_index))
+    }
+
+    fn create(
+        &self,
+        insert_ordinal: usize,
+        slot_index: u16,
+        sample_rate: u32,
+    ) -> Result<Option<Box<dyn MixerEffectProcessor>>, String> {
+        let Some(assignment) = self.assignments.get(&(insert_ordinal, slot_index)) else {
+            return Ok(None);
+        };
+        let process = ClapMixerEffectProcess::spawn(
+            &assignment.path,
+            &assignment.plugin_id,
+            sample_rate,
+            assignment.state.as_deref(),
+        )?;
+        Ok(Some(Box::new(process)))
+    }
+}
+
 struct ClapPreviewProcess {
     path: PathBuf,
     plugin_id: String,
@@ -948,6 +1283,123 @@ fn read_preview_process_responses(
     }
 }
 
+fn read_mixer_effect_process_responses(
+    stdout: ChildStdout,
+    response_sender: Sender<ClapMixerEffectProcessResponse>,
+) {
+    let mut stdout = BufReader::new(stdout);
+    loop {
+        let header = match read_preview_protocol_header(&mut stdout) {
+            Ok(Some(header)) => header,
+            Ok(None) => {
+                let _ = response_sender.send(ClapMixerEffectProcessResponse::Error(
+                    "CLAP Mixer effect helper closed its output".to_owned(),
+                ));
+                return;
+            }
+            Err(error) => {
+                let _ = response_sender.send(ClapMixerEffectProcessResponse::Error(format!(
+                    "could not read from the CLAP Mixer effect helper: {error}"
+                )));
+                return;
+            }
+        };
+        if let Some(rest) = header.strip_prefix("READY ") {
+            let mut fields = rest.split_whitespace();
+            let input_channels = fields.next().and_then(|value| value.parse::<usize>().ok());
+            let output_channels = fields.next().and_then(|value| value.parse::<usize>().ok());
+            if let (Some(input_channels), Some(output_channels), None) =
+                (input_channels, output_channels, fields.next())
+            {
+                if response_sender
+                    .send(ClapMixerEffectProcessResponse::Ready {
+                        input_channels,
+                        output_channels,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                continue;
+            }
+            let _ = response_sender.send(ClapMixerEffectProcessResponse::Error(
+                "CLAP Mixer effect helper sent an invalid bus layout".to_owned(),
+            ));
+            return;
+        }
+        if header == "STATE_LOADED" {
+            if response_sender
+                .send(ClapMixerEffectProcessResponse::StateLoaded)
+                .is_err()
+            {
+                return;
+            }
+            continue;
+        }
+        if let Some(value) = header.strip_prefix("STARTED ") {
+            if let Ok(latency_samples) = value.parse::<u32>() {
+                if response_sender
+                    .send(ClapMixerEffectProcessResponse::Started(latency_samples))
+                    .is_err()
+                {
+                    return;
+                }
+                continue;
+            }
+            let _ = response_sender.send(ClapMixerEffectProcessResponse::Error(
+                "CLAP Mixer effect helper sent an invalid latency".to_owned(),
+            ));
+            return;
+        }
+        if header == "BYE" {
+            let _ = response_sender.send(ClapMixerEffectProcessResponse::Stopped);
+            return;
+        }
+        if let Some(message) = header.strip_prefix("ERR ") {
+            let _ = response_sender.send(ClapMixerEffectProcessResponse::Error(message.to_owned()));
+            return;
+        }
+        let Some(frame_count) = header
+            .strip_prefix("BLOCK ")
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|frames| (1..=MAX_CLAP_MIXER_EFFECT_BLOCK_FRAMES).contains(frames))
+        else {
+            let _ = response_sender.send(ClapMixerEffectProcessResponse::Error(
+                "CLAP Mixer effect helper sent an invalid block header".to_owned(),
+            ));
+            return;
+        };
+        let byte_count = frame_count as usize * 2 * std::mem::size_of::<f32>();
+        let mut bytes = vec![0; byte_count];
+        if let Err(error) = stdout.read_exact(&mut bytes) {
+            let _ = response_sender.send(ClapMixerEffectProcessResponse::Error(format!(
+                "could not read CLAP Mixer effect audio: {error}"
+            )));
+            return;
+        }
+        let mut delimiter = [0; 1];
+        if stdout.read_exact(&mut delimiter).is_err() || delimiter[0] != b'\n' {
+            let _ = response_sender.send(ClapMixerEffectProcessResponse::Error(
+                "CLAP Mixer effect helper sent an invalid block delimiter".to_owned(),
+            ));
+            return;
+        }
+        let samples = bytes
+            .chunks_exact(4)
+            .map(|sample| {
+                let sample = f32::from_le_bytes(sample.try_into().expect("sample width is four"));
+                if sample.is_finite() { sample } else { 0.0 }
+            })
+            .collect();
+        if response_sender
+            .send(ClapMixerEffectProcessResponse::Audio(samples))
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
 fn read_preview_protocol_header(stdout: &mut impl Read) -> std::io::Result<Option<String>> {
     let mut bytes = Vec::with_capacity(64);
     let mut byte = [0; 1];
@@ -1306,7 +1758,9 @@ pub fn run_mixer_effect_server_child(path: &Path, plugin_id: &str, sample_rate: 
             return 1;
         }
     };
-    if writeln!(output, "READY")
+    let input_channels = instance.input_port_channels[instance.main_input_index];
+    let output_channels = instance.output_port_channels[instance.main_output_index];
+    if writeln!(output, "READY {input_channels} {output_channels}")
         .and_then(|_| output.flush())
         .is_err()
     {
@@ -1371,6 +1825,7 @@ struct ClapMixerEffectInstance {
     main_input_index: usize,
     output_port_channels: Vec<u32>,
     main_output_index: usize,
+    parameter_ranges: BTreeMap<u32, (f64, f64, bool)>,
     latency_samples: u32,
 }
 
@@ -1397,7 +1852,13 @@ impl ClapMixerEffectInstance {
             PluginInstance::<()>::new(|_| (), |_| (), &entry, &plugin_id, &host_info)
                 .map_err(|error| format!("could not initialize CLAP plug-in instance: {error}"))?;
 
-        let (input_port_channels, main_input_index, output_port_channels, main_output_index) = {
+        let (
+            input_port_channels,
+            main_input_index,
+            output_port_channels,
+            main_output_index,
+            parameter_ranges,
+        ) = {
             let plugin = instance.plugin_handle();
             let audio_ports = plugin
                 .get_extension::<PluginAudioPorts>()
@@ -1413,11 +1874,42 @@ impl ClapMixerEffectInstance {
                     "CLAP Mixer effects need mono or stereo main buses; plug-in reports {main_input_channels} input and {main_output_channels} output channels"
                 ));
             }
+            let mut parameter_ranges = BTreeMap::new();
+            if let Some(params) = plugin.get_extension::<PluginParams>() {
+                let count = params.count(&plugin);
+                if count > MAX_INSTANCE_METADATA_ITEMS {
+                    return Err(format!(
+                        "CLAP effect exposes {count} parameters; the metadata limit is {MAX_INSTANCE_METADATA_ITEMS}"
+                    ));
+                }
+                let mut buffer = ParamInfoBuffer::new();
+                for index in 0..count {
+                    let Some(info) = params.get_info(&plugin, index, &mut buffer) else {
+                        continue;
+                    };
+                    if info.flags.contains(ParamInfoFlags::IS_AUTOMATABLE)
+                        && !info.flags.contains(ParamInfoFlags::IS_READONLY)
+                        && info.min_value.is_finite()
+                        && info.max_value.is_finite()
+                        && info.min_value < info.max_value
+                    {
+                        parameter_ranges.insert(
+                            info.id.get(),
+                            (
+                                info.min_value,
+                                info.max_value,
+                                info.flags.contains(ParamInfoFlags::IS_STEPPED),
+                            ),
+                        );
+                    }
+                }
+            }
             (
                 input_port_channels,
                 main_input_index,
                 output_port_channels,
                 main_output_index,
+                parameter_ranges,
             )
         };
 
@@ -1428,6 +1920,7 @@ impl ClapMixerEffectInstance {
             main_input_index,
             output_port_channels,
             main_output_index,
+            parameter_ranges,
             latency_samples: 0,
         })
     }
@@ -1516,17 +2009,139 @@ impl ClapMixerEffectInstance {
                 let _ = writeln!(output, "BYE").and_then(|_| output.flush());
                 break;
             }
-            let Some(frame_count) = line
-                .strip_prefix("BLOCK ")
-                .and_then(|value| value.parse::<u32>().ok())
-                .filter(|frames| (1..=MAX_CLAP_MIXER_EFFECT_BLOCK_FRAMES).contains(frames))
-            else {
+            let mut fields = line.split_whitespace();
+            let (Some("BLOCK"), Some(frame_count), Some(parameter_count), None) = (
+                fields.next(),
+                fields.next().and_then(|value| value.parse::<u32>().ok()),
+                fields.next().and_then(|value| value.parse::<usize>().ok()),
+                fields.next(),
+            ) else {
                 let _ =
                     write_preview_server_error(output, "invalid CLAP Mixer effect block header");
                 let _ = output.flush();
                 result = 1;
                 break;
             };
+            if !(1..=MAX_CLAP_MIXER_EFFECT_BLOCK_FRAMES).contains(&frame_count)
+                || parameter_count > MAX_CLAP_MIXER_EFFECT_PARAMETER_CHANGES
+            {
+                let _ = write_preview_server_error(
+                    output,
+                    "CLAP Mixer effect block exceeds its limits",
+                );
+                let _ = output.flush();
+                result = 1;
+                break;
+            }
+            let mut input_events = EventBuffer::with_capacity(parameter_count);
+            for _ in 0..parameter_count {
+                let event_line = match read_preview_protocol_header(input) {
+                    Ok(Some(line)) => line,
+                    Ok(None) => {
+                        let _ = write_preview_server_error(
+                            output,
+                            "CLAP Mixer effect parameter list ended early",
+                        );
+                        let _ = output.flush();
+                        result = 1;
+                        break;
+                    }
+                    Err(error) => {
+                        let _ = write_preview_server_error(output, &error.to_string());
+                        let _ = output.flush();
+                        result = 1;
+                        break;
+                    }
+                };
+                let mut event_fields = event_line.split_whitespace();
+                let (Some("PARAM"), Some(frame_offset), Some(parameter_id), Some(value_bits), None) = (
+                    event_fields.next(),
+                    event_fields
+                        .next()
+                        .and_then(|value| value.parse::<u32>().ok()),
+                    event_fields
+                        .next()
+                        .and_then(|value| value.parse::<u32>().ok()),
+                    event_fields.next(),
+                    event_fields.next(),
+                ) else {
+                    let _ = write_preview_server_error(
+                        output,
+                        "invalid CLAP Mixer effect parameter record",
+                    );
+                    let _ = output.flush();
+                    result = 1;
+                    break;
+                };
+                let Some(parameter_id) = ClapId::from_raw(parameter_id) else {
+                    let _ = write_preview_server_error(
+                        output,
+                        "CLAP Mixer effect parameter ID is invalid",
+                    );
+                    let _ = output.flush();
+                    result = 1;
+                    break;
+                };
+                let normalized_value = match u64::from_str_radix(value_bits, 16) {
+                    Ok(bits) => f64::from_bits(bits),
+                    Err(_) => {
+                        let _ = write_preview_server_error(
+                            output,
+                            "CLAP Mixer effect parameter value is invalid",
+                        );
+                        let _ = output.flush();
+                        result = 1;
+                        break;
+                    }
+                };
+                if frame_offset >= frame_count
+                    || !normalized_value.is_finite()
+                    || !(0.0..=1.0).contains(&normalized_value)
+                {
+                    let _ = write_preview_server_error(
+                        output,
+                        "CLAP Mixer effect parameter change is outside its block",
+                    );
+                    let _ = output.flush();
+                    result = 1;
+                    break;
+                }
+                let Some((minimum, maximum, stepped)) =
+                    self.parameter_ranges.get(&parameter_id.get()).copied()
+                else {
+                    let _ = write_preview_server_error(
+                        output,
+                        "CLAP Mixer effect parameter is not automatable",
+                    );
+                    let _ = output.flush();
+                    result = 1;
+                    break;
+                };
+                let mut value = minimum * (1.0 - normalized_value) + maximum * normalized_value;
+                if !value.is_finite() {
+                    let _ = write_preview_server_error(
+                        output,
+                        "CLAP Mixer effect parameter value is invalid",
+                    );
+                    let _ = output.flush();
+                    result = 1;
+                    break;
+                }
+                value = value.clamp(minimum, maximum);
+                if stepped {
+                    value = value.trunc();
+                }
+                input_events.push(&ParamValueEvent::new(
+                    frame_offset,
+                    parameter_id,
+                    Pckn::match_all(),
+                    value,
+                ));
+            }
+            if result != 0 {
+                break;
+            }
+            input_events.sort();
             let sample_count = frame_count as usize * 2;
             let byte_count = sample_count * std::mem::size_of::<f32>();
             let mut input_bytes = vec![0; byte_count];
@@ -1607,7 +2222,6 @@ impl ClapMixerEffectInstance {
                             ),
                         },
                     ));
-                let input_events = EventBuffer::new();
                 audio_processor.process(
                     &input_audio,
                     &mut output_audio,

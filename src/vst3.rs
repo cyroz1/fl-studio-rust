@@ -627,8 +627,9 @@ struct PlaylistMixerEffectStream {
     id: u64,
     insert_ordinal: usize,
     slot_index: u16,
-    plugin: Arc<Mutex<Plugin>>,
-    buffers: BusAudioBuffers,
+    plugin: Option<Arc<Mutex<Plugin>>>,
+    external_processor: Option<Box<dyn MixerEffectProcessor>>,
+    buffers: Option<BusAudioBuffers>,
     block_size: usize,
     input_channels: usize,
     output_channels: usize,
@@ -646,6 +647,7 @@ struct PlaylistMixerEffectStream {
     manual_latency_offset_samples: i32,
     dry_delay_line: StereoFrameDelay,
     dry_delay_scratch: Vec<f32>,
+    wet_scratch: Vec<f32>,
 }
 
 struct PlaylistMixerEffectSidechainInput {
@@ -1006,10 +1008,13 @@ impl Vst3PlaylistStreamProcessor {
             reports.push(report);
         }
         for effect in &mut self.mixer_effects {
+            let Some(plugin) = &effect.plugin else {
+                continue;
+            };
             if !plugin_ids.contains(&effect.id) {
                 continue;
             }
-            let report = refresh_plugin_latency_report(effect.id, &effect.plugin)?;
+            let report = refresh_plugin_latency_report(effect.id, plugin)?;
             if !report.sample_rate_hz.is_finite() || report.sample_rate_hz <= 0.0 {
                 return Err(format!(
                     "VST3 Mixer insert {} effect slot {} reports an invalid sample rate",
@@ -1617,13 +1622,18 @@ impl Vst3PlaylistStreamProcessor {
         }
         for index in 0..self.mixer_effects.len() {
             let slot_index = self.mixer_effects[index].slot_index;
-            let result = self.mixer_effects[index]
-                .plugin
-                .lock()
-                .map_err(|_| "plug-in state lock was poisoned".to_owned())
-                .and_then(|mut plugin| {
-                    plugin.start_processing().map_err(|error| error.to_string())
-                });
+            let result = if let Some(plugin) = &self.mixer_effects[index].plugin {
+                plugin
+                    .lock()
+                    .map_err(|_| "plug-in state lock was poisoned".to_owned())
+                    .and_then(|mut plugin| {
+                        plugin.start_processing().map_err(|error| error.to_string())
+                    })
+            } else if self.mixer_effects[index].external_processor.is_some() {
+                Ok(())
+            } else {
+                Err("Mixer effect has no audio processor".to_owned())
+            };
             if let Err(error) = result {
                 let _ = self.stop_processing();
                 return Err(format!(
@@ -2083,11 +2093,18 @@ impl Vst3PlaylistStreamProcessor {
         while self.started_mixer_effect_count > 0 {
             self.started_mixer_effect_count -= 1;
             let effect = &mut self.mixer_effects[self.started_mixer_effect_count];
-            let result = effect
-                .plugin
-                .lock()
-                .map_err(|_| "plug-in state lock was poisoned".to_owned())
-                .and_then(|mut plugin| plugin.stop_processing().map_err(|error| error.to_string()));
+            let result = if let Some(plugin) = &effect.plugin {
+                plugin
+                    .lock()
+                    .map_err(|_| "plug-in state lock was poisoned".to_owned())
+                    .and_then(|mut plugin| {
+                        plugin.stop_processing().map_err(|error| error.to_string())
+                    })
+            } else if let Some(processor) = effect.external_processor.as_mut() {
+                processor.stop_processing()
+            } else {
+                Err("Mixer effect has no audio processor".to_owned())
+            };
             if let Err(error) = result
                 && first_error.is_none()
             {
@@ -2120,6 +2137,128 @@ impl Vst3PlaylistStreamProcessor {
         }
         first_error.map_or(Ok(()), Err)
     }
+}
+
+fn process_playlist_mixer_effect_block(
+    effect: &mut PlaylistMixerEffectStream,
+    post_effect_buses: Option<&[f32]>,
+    samples_per_track: usize,
+    block_offset: usize,
+    block_start_frame: u64,
+    frame_count: usize,
+) -> Result<(), String> {
+    let sample_count = frame_count
+        .checked_mul(2)
+        .ok_or_else(|| "Mixer effect stereo block size overflow".to_owned())?;
+    if let Some(plugin_cell) = effect.plugin.as_ref().map(Arc::clone) {
+        let buffers = effect
+            .buffers
+            .as_mut()
+            .ok_or_else(|| "VST3 Mixer effect audio buffers are unavailable".to_owned())?;
+        resize_vst3_bus_audio_buffers(buffers, frame_count);
+        let input = buffers
+            .inputs
+            .first_mut()
+            .ok_or_else(|| "VST3 Mixer effect main input bus is unavailable".to_owned())?;
+        for frame_index in 0..frame_count {
+            let left = effect.dry_delay_scratch[frame_index * 2];
+            let right = effect.dry_delay_scratch[frame_index * 2 + 1];
+            if effect.input_channels == 1 {
+                input.channels[0][frame_index] = (left + right) * 0.5;
+            } else {
+                input.channels[0][frame_index] = left;
+                input.channels[1][frame_index] = right;
+            }
+        }
+        fill_playlist_mixer_sidechain_inputs(
+            &mut effect.sidechain_inputs,
+            &mut buffers.inputs,
+            post_effect_buses,
+            samples_per_track,
+            block_offset,
+            frame_count,
+        )?;
+        {
+            let mut plugin = plugin_cell
+                .lock()
+                .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
+            validate_vst3_audio_block(buffers, plugin.sample_rate(), plugin.block_size())?;
+            if let Some(loop_frames) = effect.parameter_automation_loop_frames {
+                set_looped_parameter_automation_for_block(
+                    &mut plugin,
+                    &effect.parameter_automation,
+                    block_start_frame,
+                    frame_count,
+                    loop_frames,
+                )?;
+            } else {
+                set_parameter_automation_for_block(
+                    &mut plugin,
+                    &effect.parameter_automation,
+                    block_start_frame,
+                    frame_count,
+                )?;
+            }
+            plugin
+                .process_bus_audio(buffers)
+                .map_err(|error| error.to_string())
+                .map_err(|error| {
+                    format!(
+                        "VST3 Mixer insert {} effect slot {} (instance {}) failed: {error}",
+                        effect.insert_ordinal,
+                        effect.slot_index + 1,
+                        effect.id
+                    )
+                })?;
+        }
+        let wet = buffers
+            .outputs
+            .first()
+            .ok_or_else(|| "VST3 Mixer effect main output bus is unavailable".to_owned())?;
+        let wet_left = wet
+            .channels
+            .first()
+            .ok_or_else(|| "VST3 Mixer effect main output has no channels".to_owned())?;
+        let wet_right = if effect.output_channels == 1 {
+            wet_left
+        } else {
+            wet.channels
+                .get(1)
+                .ok_or_else(|| "VST3 Mixer effect main output has no right channel".to_owned())?
+        };
+        for frame_index in 0..frame_count {
+            effect.wet_scratch[frame_index * 2] = finite_sample(wet_left[frame_index]);
+            effect.wet_scratch[frame_index * 2 + 1] = finite_sample(wet_right[frame_index]);
+        }
+        return Ok(());
+    }
+
+    if !effect.sidechain_inputs.is_empty() {
+        return Err(format!(
+            "Mixer insert {} CLAP effect slot {} has sidechain inputs, which this processor does not support yet",
+            effect.insert_ordinal,
+            effect.slot_index + 1
+        ));
+    }
+    effect.wet_scratch[..sample_count].copy_from_slice(&effect.dry_delay_scratch[..sample_count]);
+    let parameter_changes = mixer_effect_parameter_changes_for_block(
+        &effect.parameter_automation,
+        block_start_frame,
+        frame_count,
+        effect.parameter_automation_loop_frames,
+    )?;
+    effect
+        .external_processor
+        .as_mut()
+        .ok_or_else(|| "Mixer effect has no audio processor".to_owned())?
+        .process_block(&mut effect.wet_scratch[..sample_count], &parameter_changes)
+        .map_err(|error| {
+            format!(
+                "Mixer insert {} external effect slot {} failed: {error}",
+                effect.insert_ordinal,
+                effect.slot_index + 1
+            )
+        })
 }
 
 fn process_playlist_mixer_effect_chain(
@@ -2155,80 +2294,25 @@ fn process_playlist_mixer_effect_chain(
                     effect.dry_delay_scratch[frame_index * 2] = finite_sample(frame[0]);
                     effect.dry_delay_scratch[frame_index * 2 + 1] = finite_sample(frame[1]);
                 }
-                resize_vst3_bus_audio_buffers(&mut effect.buffers, frame_count);
-                let input = &mut effect.buffers.inputs[0];
-                for frame_index in 0..frame_count {
-                    let left = effect.dry_delay_scratch[frame_index * 2];
-                    let right = effect.dry_delay_scratch[frame_index * 2 + 1];
-                    if effect.input_channels == 1 {
-                        input.channels[0][frame_index] = (left + right) * 0.5;
-                    } else {
-                        input.channels[0][frame_index] = left;
-                        input.channels[1][frame_index] = right;
-                    }
-                }
-                fill_playlist_mixer_sidechain_inputs(
-                    &mut effect.sidechain_inputs,
-                    &mut effect.buffers.inputs,
+                process_playlist_mixer_effect_block(
+                    effect,
                     post_effect_buses,
                     samples_per_track,
                     effect_block_offset,
+                    effect_block_start_frame,
                     frame_count,
                 )?;
-                {
-                    let mut plugin = effect
-                        .plugin
-                        .lock()
-                        .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
-                    validate_vst3_audio_block(
-                        &effect.buffers,
-                        plugin.sample_rate(),
-                        plugin.block_size(),
-                    )?;
-                    if let Some(loop_frames) = effect.parameter_automation_loop_frames {
-                        set_looped_parameter_automation_for_block(
-                            &mut plugin,
-                            &effect.parameter_automation,
-                            effect_block_start_frame,
-                            frame_count,
-                            loop_frames,
-                        )?;
-                    } else {
-                        set_parameter_automation_for_block(
-                            &mut plugin,
-                            &effect.parameter_automation,
-                            effect_block_start_frame,
-                            frame_count,
-                        )?;
-                    }
-                    plugin
-                        .process_bus_audio(&mut effect.buffers)
-                        .map_err(|error| error.to_string())
-                        .map_err(|error| {
-                            format!(
-                                "VST3 Mixer insert {} effect slot {} (instance {}) failed: {error}",
-                                effect.insert_ordinal,
-                                effect.slot_index + 1,
-                                effect.id
-                            )
-                        })?;
-                }
                 effect
                     .dry_delay_line
                     .process_interleaved(&mut effect.dry_delay_scratch[..frame_count * 2])?;
-                let wet = &effect.buffers.outputs[0];
                 let wet_mix_ramp = &mut effect.wet_mix_ramp;
                 for (frame_index, frame) in block.as_chunks_mut::<2>().0.iter_mut().enumerate() {
                     let wet_mix = wet_mix_ramp.next();
                     let dry_gain = 1.0 - wet_mix;
                     let dry_left = effect.dry_delay_scratch[frame_index * 2];
                     let dry_right = effect.dry_delay_scratch[frame_index * 2 + 1];
-                    let wet_left = finite_sample(wet.channels[0][frame_index]);
-                    let wet_right = if effect.output_channels == 1 {
-                        wet_left
-                    } else {
-                        finite_sample(wet.channels[1][frame_index])
-                    };
+                    let wet_left = effect.wet_scratch[frame_index * 2];
+                    let wet_right = effect.wet_scratch[frame_index * 2 + 1];
                     frame[0] = dry_left * dry_gain + wet_left * wet_mix;
                     frame[1] = dry_right * dry_gain + wet_right * wet_mix;
                 }
@@ -2334,11 +2418,72 @@ fn fill_playlist_mixer_sidechain_inputs(
     Ok(())
 }
 
+fn mixer_effect_parameter_changes_for_block(
+    automation: &[PreparedParameterAutomation],
+    block_start_frame: u64,
+    frame_count: usize,
+    loop_frames: Option<u64>,
+) -> Result<Vec<(u32, u32, f64)>, String> {
+    let mut changes = Vec::new();
+    let mut append_segment =
+        |pattern_frame: u64, output_offset: usize, segment_count: usize| -> Result<(), String> {
+            for lane in automation {
+                for_each_parameter_change_for_block(
+                    lane,
+                    pattern_frame,
+                    segment_count,
+                    |offset, value| {
+                        let frame_offset = usize::try_from(offset)
+                            .ok()
+                            .and_then(|offset| offset.checked_add(output_offset))
+                            .and_then(|offset| u32::try_from(offset).ok())
+                            .ok_or_else(|| {
+                                "Mixer effect automation offset exceeds the host range".to_owned()
+                            })?;
+                        changes.push((frame_offset, lane.parameter_id, value));
+                        Ok(())
+                    },
+                )?;
+            }
+            Ok(())
+        };
+    if let Some(loop_frames) = loop_frames {
+        for (pattern_frame, output_offset, segment_count) in
+            looped_parameter_automation_segments(block_start_frame, frame_count, loop_frames)?
+        {
+            append_segment(pattern_frame, output_offset, segment_count)?;
+        }
+    } else {
+        append_segment(block_start_frame, 0, frame_count)?;
+    }
+    if changes.len() > MAX_VST3_AUTOMATION_CHANGES_PER_BLOCK {
+        return Err(format!(
+            "Mixer effect automation exceeds {} changes in one processing block",
+            MAX_VST3_AUTOMATION_CHANGES_PER_BLOCK
+        ));
+    }
+    Ok(changes)
+}
+
 fn update_playlist_mixer_effect_sidechain_inputs(
     effect: &mut PlaylistMixerEffectStream,
     sources: &[(usize, bool, bool)],
     sample_rate: f64,
 ) -> Result<(), String> {
+    let Some(buffers) = effect.buffers.as_ref() else {
+        if sources
+            .iter()
+            .any(|(_, saved_enabled, live_control)| *saved_enabled || *live_control)
+        {
+            return Err(format!(
+                "Mixer insert {} CLAP effect slot {} has sidechain routing, which this processor does not support yet",
+                effect.insert_ordinal,
+                effect.slot_index + 1
+            ));
+        }
+        effect.sidechain_inputs.clear();
+        return Ok(());
+    };
     let smoothing_frames = (sample_rate * f64::from(MIXER_EFFECT_MIX_SMOOTHING_SECONDS))
         .round()
         .clamp(1.0, f64::from(u32::MAX)) as u32;
@@ -2347,8 +2492,7 @@ fn update_playlist_mixer_effect_sidechain_inputs(
         .into_iter()
         .map(|input| ((input.bus_index, input.source_track), input))
         .collect::<BTreeMap<_, _>>();
-    let active_auxiliary_buses = effect
-        .buffers
+    let active_auxiliary_buses = buffers
         .inputs
         .iter()
         .enumerate()
@@ -3460,10 +3604,43 @@ fn build_isolated_vst3_host(
 pub struct Vst3HostRuntime {
     host: Vst3Host,
     loaded: Vec<HostedPlugin>,
+    mixer_effect_processor_factory: Option<Arc<dyn MixerEffectProcessorFactory>>,
     pending_latency_refresh: BTreeSet<u64>,
     manual_latency_offsets_by_uid: BTreeMap<String, i32>,
     manual_latency_offset_overrides: BTreeSet<u64>,
     next_id: u64,
+}
+
+/// Processes a Mixer effect block through a non-VST3 plug-in host.
+///
+/// External processors receive the interleaved stereo main bus in place. Parameter changes
+/// contain (frame_offset, parameter_id, value) tuples for the current block.
+pub trait MixerEffectProcessor: Send {
+    fn sample_rate(&self) -> f64;
+    fn block_size(&self) -> usize;
+    fn input_channels(&self) -> usize;
+    fn output_channels(&self) -> usize;
+    fn latency_samples(&self) -> u32;
+    fn tail_samples(&self) -> Option<u64> {
+        None
+    }
+    fn process_block(
+        &mut self,
+        samples: &mut [f32],
+        parameter_changes: &[(u32, u32, f64)],
+    ) -> Result<(), String>;
+    fn stop_processing(&mut self) -> Result<(), String>;
+}
+
+/// Creates one independent external processor for each prepared Mixer stream.
+pub trait MixerEffectProcessorFactory: Send + Sync {
+    fn contains(&self, insert_ordinal: usize, slot_index: u16) -> bool;
+    fn create(
+        &self,
+        insert_ordinal: usize,
+        slot_index: u16,
+        sample_rate: u32,
+    ) -> Result<Option<Box<dyn MixerEffectProcessor>>, String>;
 }
 
 fn encode_flp_vst3_state_snapshot(nested: &[u8]) -> Result<Vec<u8>, String> {
@@ -3705,11 +3882,20 @@ impl Vst3HostRuntime {
         Ok(Self {
             host,
             loaded: Vec::new(),
+            mixer_effect_processor_factory: None,
             pending_latency_refresh: BTreeSet::new(),
             manual_latency_offsets_by_uid: BTreeMap::new(),
             manual_latency_offset_overrides: BTreeSet::new(),
             next_id: 1,
         })
+    }
+
+    /// Install the external processor factory used for CLAP or other non-VST3 Mixer effects.
+    pub fn set_mixer_effect_processor_factory(
+        &mut self,
+        factory: Option<Arc<dyn MixerEffectProcessorFactory>>,
+    ) {
+        self.mixer_effect_processor_factory = factory;
     }
 
     /// Install per-class manual latency offsets before loading project plug-ins.
@@ -5890,7 +6076,14 @@ impl Vst3HostRuntime {
             if slot.insert_ordinal() == 0
                 || (slot.enabled() == Some(false) && !live_mix_changes)
                 || (!live_mix_changes && mixer_effect_wet_mix(slot.mix_raw()) == 0.0)
-                || !mixer_effect_instances.contains_key(&(slot.insert_ordinal(), slot.slot_index()))
+                || (!mixer_effect_instances
+                    .contains_key(&(slot.insert_ordinal(), slot.slot_index()))
+                    && !self
+                        .mixer_effect_processor_factory
+                        .as_ref()
+                        .is_some_and(|factory| {
+                            factory.contains(slot.insert_ordinal(), slot.slot_index())
+                        }))
             {
                 return false;
             }
@@ -5943,16 +6136,19 @@ impl Vst3HostRuntime {
                     continue;
                 }
                 let key = (slot.insert_ordinal(), slot.slot_index());
-                let Some(id) = mixer_effect_instances.get(&key).copied() else {
-                    continue;
-                };
                 let wet_mix = mixer_effect_wet_mix(slot.mix_raw());
                 if wet_mix == 0.0 && !live_mix_changes {
                     continue;
                 }
                 let saved_enabled = slot.enabled() != Some(false);
-                let plugin = Arc::clone(self.plugin(id)?);
+                let has_external_processor = self
+                    .mixer_effect_processor_factory
+                    .as_ref()
+                    .is_some_and(|factory| factory.contains(key.0, key.1));
                 let (
+                    id,
+                    plugin,
+                    external_processor,
                     buffers,
                     block_size,
                     input_channels,
@@ -5960,58 +6156,136 @@ impl Vst3HostRuntime {
                     sample_rate,
                     latency_samples,
                     tail_samples,
-                ) = {
-                    let plugin_guard = plugin
-                        .lock()
-                        .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
-                    let sample_rate = plugin_guard.sample_rate();
+                    manual_latency_offset_samples,
+                ) = if has_external_processor {
+                    let processor = self
+                        .mixer_effect_processor_factory
+                        .as_ref()
+                        .expect("external Mixer processor factory was checked")
+                        .create(key.0, key.1, output_sample_rate)?
+                        .ok_or_else(|| {
+                            format!(
+                                "Mixer insert {} effect slot {} has a CLAP assignment but no processor",
+                                key.0,
+                                key.1 + 1
+                            )
+                        })?;
+                    let sample_rate = processor.sample_rate();
                     let rate_tolerance = sample_rate.abs().max(1.0) * 1e-12;
                     if (sample_rate - f64::from(output_sample_rate)).abs() > rate_tolerance {
                         return Err(format!(
-                            "VST3 Mixer insert {} effect slot {} uses {sample_rate} Hz but Playlist output is {output_sample_rate} Hz",
-                            insert_ordinal,
-                            slot.slot_index() + 1
+                            "CLAP Mixer insert {} effect slot {} uses {sample_rate} Hz but Playlist output is {output_sample_rate} Hz",
+                            key.0,
+                            key.1 + 1
                         ));
                     }
-                    let layout = plugin_guard
-                        .audio_bus_layout()
-                        .map_err(|error| error.to_string())?;
-                    let input = layout
-                        .inputs
-                        .first()
-                        .filter(|bus| bus.active && matches!(bus.channel_count, 1 | 2))
-                        .ok_or_else(|| {
-                            format!(
-                                "VST3 Mixer insert {} effect slot {} has no active mono or stereo main input bus",
-                                insert_ordinal,
-                                slot.slot_index() + 1
-                            )
-                        })?;
-                    let output = layout
-                        .outputs
-                        .first()
-                        .filter(|bus| bus.active && matches!(bus.channel_count, 1 | 2))
-                        .ok_or_else(|| {
-                            format!(
-                                "VST3 Mixer insert {} effect slot {} has no active mono or stereo main output bus",
-                                insert_ordinal,
-                                slot.slot_index() + 1
-                            )
-                        })?;
-                    let block_size = plugin_guard
+                    let input_channels = processor.input_channels();
+                    let output_channels = processor.output_channels();
+                    if !matches!(input_channels, 1 | 2) || !matches!(output_channels, 1 | 2) {
+                        return Err(format!(
+                            "CLAP Mixer insert {} effect slot {} needs mono or stereo main buses",
+                            key.0,
+                            key.1 + 1
+                        ));
+                    }
+                    let block_size = processor
                         .block_size()
                         .clamp(1, VST3_EFFECT_RENDER_BLOCK_FRAMES);
-                    let buffers = plugin_guard
-                        .create_bus_audio_buffers(block_size)
-                        .map_err(|error| error.to_string())?;
+                    let latency_samples = processor.latency_samples();
+                    let tail_samples = processor.tail_samples();
                     (
+                        0u64,
+                        None,
+                        Some(processor),
+                        None,
+                        block_size,
+                        input_channels,
+                        output_channels,
+                        sample_rate,
+                        latency_samples,
+                        tail_samples,
+                        0i32,
+                    )
+                } else {
+                    let Some(id) = mixer_effect_instances.get(&key).copied() else {
+                        continue;
+                    };
+                    let plugin = Arc::clone(self.plugin(id)?);
+                    let (
                         buffers,
                         block_size,
-                        input.channel_count,
-                        output.channel_count,
+                        input_channels,
+                        output_channels,
                         sample_rate,
-                        self.pdc_latency_samples_for_plugin(id, plugin_guard.latency_samples()),
-                        plugin_guard.tail_samples(),
+                        latency_samples,
+                        tail_samples,
+                    ) = {
+                        let plugin_guard = plugin
+                            .lock()
+                            .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
+                        let sample_rate = plugin_guard.sample_rate();
+                        let rate_tolerance = sample_rate.abs().max(1.0) * 1e-12;
+                        if (sample_rate - f64::from(output_sample_rate)).abs() > rate_tolerance {
+                            return Err(format!(
+                                "VST3 Mixer insert {} effect slot {} uses {sample_rate} Hz but Playlist output is {output_sample_rate} Hz",
+                                insert_ordinal,
+                                slot.slot_index() + 1
+                            ));
+                        }
+                        let layout = plugin_guard
+                            .audio_bus_layout()
+                            .map_err(|error| error.to_string())?;
+                        let input = layout
+                            .inputs
+                            .first()
+                            .filter(|bus| bus.active && matches!(bus.channel_count, 1 | 2))
+                            .ok_or_else(|| {
+                                format!(
+                                    "VST3 Mixer insert {} effect slot {} has no active mono or stereo main input bus",
+                                    insert_ordinal,
+                                    slot.slot_index() + 1
+                                )
+                            })?;
+                        let output = layout
+                            .outputs
+                            .first()
+                            .filter(|bus| bus.active && matches!(bus.channel_count, 1 | 2))
+                            .ok_or_else(|| {
+                                format!(
+                                    "VST3 Mixer insert {} effect slot {} has no active mono or stereo main output bus",
+                                    insert_ordinal,
+                                    slot.slot_index() + 1
+                                )
+                            })?;
+                        let block_size = plugin_guard
+                            .block_size()
+                            .clamp(1, VST3_EFFECT_RENDER_BLOCK_FRAMES);
+                        let buffers = plugin_guard
+                            .create_bus_audio_buffers(block_size)
+                            .map_err(|error| error.to_string())?;
+                        (
+                            buffers,
+                            block_size,
+                            input.channel_count,
+                            output.channel_count,
+                            sample_rate,
+                            self.pdc_latency_samples_for_plugin(id, plugin_guard.latency_samples()),
+                            (plugin_guard.tail_samples() != u32::MAX)
+                                .then(|| u64::from(plugin_guard.tail_samples())),
+                        )
+                    };
+                    (
+                        id,
+                        Some(plugin),
+                        None,
+                        Some(buffers),
+                        block_size,
+                        input_channels,
+                        output_channels,
+                        sample_rate,
+                        latency_samples,
+                        tail_samples,
+                        self.manual_latency_offset_for_plugin(id),
                     )
                 };
                 if !sample_rate.is_finite() || sample_rate <= 0.0 {
@@ -6077,8 +6351,12 @@ impl Vst3HostRuntime {
                     })
                     .transpose()?
                     .unwrap_or_default();
-                let reported_tail = reported_tail_seconds(tail_samples, sample_rate)
-                    .map(|seconds| (seconds * f64::from(output_sample_rate)).ceil() as u64)
+                let reported_tail = tail_samples
+                    .map(|tail_samples| {
+                        ((tail_samples as f64 / sample_rate).min(MAX_REPORTED_TAIL_SECONDS)
+                            * f64::from(output_sample_rate))
+                        .ceil() as u64
+                    })
                     .unwrap_or(0);
                 if include_effect_tails {
                     processor.mixer_effect_tail_frames = processor
@@ -6091,6 +6369,7 @@ impl Vst3HostRuntime {
                     insert_ordinal,
                     slot_index: slot.slot_index(),
                     plugin,
+                    external_processor,
                     buffers,
                     block_size,
                     input_channels,
@@ -6115,9 +6394,10 @@ impl Vst3HostRuntime {
                             .clamp(1.0, f64::from(u32::MAX)) as u32,
                     ),
                     latency_frames,
-                    manual_latency_offset_samples: self.manual_latency_offset_for_plugin(id),
+                    manual_latency_offset_samples,
                     dry_delay_line,
                     dry_delay_scratch: vec![0.0; block_size * 2],
+                    wet_scratch: vec![0.0; block_size * 2],
                 });
                 update_playlist_mixer_effect_sidechain_inputs(
                     processor
