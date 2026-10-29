@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 use std::ffi::{CString, OsString};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -425,6 +425,7 @@ struct ActiveClapMixerEffectCaptureProcessor {
     path: PathBuf,
     plugin_id: String,
     request_sender: Sender<ActiveClapMixerEffectStateCaptureRequest>,
+    parameter_update_sender: Sender<BTreeMap<u32, f64>>,
 }
 
 #[derive(Default)]
@@ -454,6 +455,7 @@ impl ClapMixerEffectStateCaptureController {
         path: &Path,
         plugin_id: &str,
         request_sender: Sender<ActiveClapMixerEffectStateCaptureRequest>,
+        parameter_update_sender: Sender<BTreeMap<u32, f64>>,
     ) -> ClapMixerEffectStateCaptureRegistration {
         let mut registry = self
             .registry
@@ -467,6 +469,7 @@ impl ClapMixerEffectStateCaptureController {
                 path: path.to_owned(),
                 plugin_id: plugin_id.to_owned(),
                 request_sender,
+                parameter_update_sender,
             },
         );
         ClapMixerEffectStateCaptureRegistration {
@@ -521,6 +524,36 @@ impl ClapMixerEffectStateCaptureController {
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 Err("active CLAP Mixer effect stopped before its state was captured".to_owned())
             }
+        }
+    }
+
+    pub fn update_active_parameters(
+        &self,
+        insert_ordinal: usize,
+        slot_index: u16,
+        path: &Path,
+        plugin_id: &str,
+        parameter_values: &BTreeMap<u32, f64>,
+    ) {
+        if parameter_values.is_empty() {
+            return;
+        }
+        let request_senders = {
+            let registry = self
+                .registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            registry
+                .processors
+                .get(&(insert_ordinal, slot_index))
+                .into_iter()
+                .flat_map(BTreeMap::values)
+                .filter(|processor| processor.path == path && processor.plugin_id == plugin_id)
+                .map(|processor| processor.parameter_update_sender.clone())
+                .collect::<Vec<_>>()
+        };
+        for sender in request_senders {
+            let _ = sender.send(parameter_values.clone());
         }
     }
 }
@@ -1049,11 +1082,16 @@ pub struct ClapMixerEffectEditorOutput {
     pub parameter_overrides: BTreeMap<u32, f64>,
 }
 
+pub enum ClapMixerEffectEditorEvent {
+    LiveParameters(BTreeMap<u32, f64>),
+    Finished(Result<ClapMixerEffectEditorOutput, String>),
+}
+
 type ClapMixerEffectEditorInput = (Option<Vec<u8>>, BTreeMap<u32, f64>);
 
 pub struct ClapMixerEffectEditorProcess {
     child: Arc<Mutex<Child>>,
-    responses: Receiver<Result<ClapMixerEffectEditorOutput, String>>,
+    responses: Receiver<ClapMixerEffectEditorEvent>,
     completed: Arc<AtomicBool>,
 }
 
@@ -1080,7 +1118,7 @@ impl ClapMixerEffectEditorProcess {
             .arg(plugin_id)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|error| format!("could not start the CLAP editor helper: {error}"))?;
         let Some(mut stdin) = child.stdin.take() else {
@@ -1092,6 +1130,11 @@ impl ClapMixerEffectEditorProcess {
             let _ = child.kill();
             let _ = child.wait();
             return Err("CLAP editor helper did not provide output".to_owned());
+        };
+        let Some(stderr) = child.stderr.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("CLAP editor helper did not provide live parameter updates".to_owned());
         };
         let write_result = (|| {
             if let Some(state) = state {
@@ -1126,6 +1169,18 @@ impl ClapMixerEffectEditorProcess {
         let completed = Arc::new(AtomicBool::new(false));
         let worker_completed = Arc::clone(&completed);
         let (response_sender, responses) = mpsc::channel();
+        let live_sender = response_sender.clone();
+        thread::Builder::new()
+            .name("clap-mixer-effect-editor-live-parameters".to_owned())
+            .spawn(move || read_mixer_effect_editor_live_parameters(stderr, live_sender))
+            .map_err(|error| {
+                let mut child = child
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let _ = child.kill();
+                let _ = child.wait();
+                format!("could not start the CLAP editor parameter reader: {error}")
+            })?;
         thread::Builder::new()
             .name("clap-mixer-effect-editor-response".to_owned())
             .spawn(move || {
@@ -1161,7 +1216,7 @@ impl ClapMixerEffectEditorProcess {
                     }
                 });
                 worker_completed.store(true, Ordering::Release);
-                let _ = response_sender.send(result);
+                let _ = response_sender.send(ClapMixerEffectEditorEvent::Finished(result));
             })
             .map_err(|error| {
                 let mut child = child
@@ -1179,9 +1234,7 @@ impl ClapMixerEffectEditorProcess {
         })
     }
 
-    pub fn try_recv(
-        &self,
-    ) -> Result<Result<ClapMixerEffectEditorOutput, String>, mpsc::TryRecvError> {
+    pub fn try_recv(&self) -> Result<ClapMixerEffectEditorEvent, mpsc::TryRecvError> {
         self.responses.try_recv()
     }
 }
@@ -1215,6 +1268,9 @@ struct ClapMixerEffectProcess {
     stopped: bool,
     capture_request_sender: Sender<ActiveClapMixerEffectStateCaptureRequest>,
     capture_request_receiver: Receiver<ActiveClapMixerEffectStateCaptureRequest>,
+    parameter_update_sender: Sender<BTreeMap<u32, f64>>,
+    parameter_update_receiver: Receiver<BTreeMap<u32, f64>>,
+    pending_parameter_updates: BTreeMap<u32, f64>,
     _capture_registration: Option<ClapMixerEffectStateCaptureRegistration>,
 }
 
@@ -1250,6 +1306,7 @@ impl ClapMixerEffectProcess {
         };
         let (response_sender, responses) = mpsc::channel();
         let (capture_request_sender, capture_request_receiver) = mpsc::channel();
+        let (parameter_update_sender, parameter_update_receiver) = mpsc::channel();
         let reader = match thread::Builder::new()
             .name("clap-mixer-effect-response".to_owned())
             .spawn(move || read_mixer_effect_process_responses(stdout, response_sender))
@@ -1278,6 +1335,9 @@ impl ClapMixerEffectProcess {
             stopped: false,
             capture_request_sender,
             capture_request_receiver,
+            parameter_update_sender,
+            parameter_update_receiver,
+            pending_parameter_updates: BTreeMap::new(),
             _capture_registration: None,
         };
         match process.receive_response()? {
@@ -1384,6 +1444,7 @@ impl ClapMixerEffectProcess {
             path,
             plugin_id,
             self.capture_request_sender.clone(),
+            self.parameter_update_sender.clone(),
         ));
     }
 
@@ -1414,14 +1475,39 @@ impl ClapMixerEffectProcess {
             let block_end = block_start
                 .checked_add(frame_count)
                 .ok_or_else(|| "CLAP Mixer effect block end overflow".to_owned())?;
-            let block_changes = parameter_changes
+            self.collect_pending_parameter_updates();
+            let block_parameter_change_count = parameter_changes
                 .iter()
                 .filter(|(frame_offset, _, _)| {
                     usize::try_from(*frame_offset)
                         .is_ok_and(|offset| (block_start..block_end).contains(&offset))
                 })
-                .copied()
+                .count();
+            if self
+                .pending_parameter_updates
+                .len()
+                .checked_add(block_parameter_change_count)
+                .is_none_or(|count| count > MAX_CLAP_MIXER_EFFECT_PARAMETER_CHANGES)
+            {
+                return Err("CLAP Mixer effect block has too many parameter changes".to_owned());
+            }
+            let live_parameter_frame_offset = u32::try_from(block_start)
+                .map_err(|_| "CLAP Mixer block offset exceeds its parameter range".to_owned())?;
+            let mut block_changes = self
+                .pending_parameter_updates
+                .iter()
+                .map(|(parameter_id, value)| (live_parameter_frame_offset, *parameter_id, *value))
                 .collect::<Vec<_>>();
+            self.pending_parameter_updates.clear();
+            block_changes.extend(
+                parameter_changes
+                    .iter()
+                    .filter(|(frame_offset, _, _)| {
+                        usize::try_from(*frame_offset)
+                            .is_ok_and(|offset| (block_start..block_end).contains(&offset))
+                    })
+                    .copied(),
+            );
             if block_changes.len() > MAX_CLAP_MIXER_EFFECT_PARAMETER_CHANGES {
                 return Err("CLAP Mixer effect block has too many parameter changes".to_owned());
             }
@@ -1510,6 +1596,14 @@ impl ClapMixerEffectProcess {
         }
         self.capture_active_state_if_requested()?;
         Ok(())
+    }
+
+    fn collect_pending_parameter_updates(&mut self) {
+        while let Ok(parameter_values) = self.parameter_update_receiver.try_recv() {
+            for (parameter_id, value) in parameter_values {
+                self.pending_parameter_updates.insert(parameter_id, value);
+            }
+        }
     }
 
     fn capture_active_state_if_requested(&mut self) -> Result<(), String> {
@@ -4174,6 +4268,90 @@ fn write_preview_server_state(output: &mut impl Write, state: &[u8]) -> std::io:
     output.flush()
 }
 
+fn read_mixer_effect_editor_live_parameters(
+    stderr: ChildStderr,
+    sender: Sender<ClapMixerEffectEditorEvent>,
+) {
+    let mut input = BufReader::new(stderr);
+    loop {
+        let line = match read_bounded_editor_stderr_line(&mut input, 128) {
+            Ok(Some(line)) if !line.is_empty() => line,
+            Ok(Some(_)) => continue,
+            Ok(None) | Err(_) => break,
+        };
+        let line = String::from_utf8_lossy(&line);
+        let mut fields = line.split_whitespace();
+        let (Some("LIVE_PARAMETER"), Some(parameter_id), Some(value_bits), None) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let Some(parameter_id) = parameter_id
+            .parse::<u32>()
+            .ok()
+            .filter(|id| ClapId::from_raw(*id).is_some())
+        else {
+            continue;
+        };
+        let Some(value) = u64::from_str_radix(value_bits, 16)
+            .ok()
+            .map(f64::from_bits)
+            .filter(|value| value.is_finite())
+        else {
+            continue;
+        };
+        if sender
+            .send(ClapMixerEffectEditorEvent::LiveParameters(BTreeMap::from(
+                [(parameter_id, value)],
+            )))
+            .is_err()
+        {
+            break;
+        }
+    }
+}
+
+fn read_bounded_editor_stderr_line(
+    input: &mut impl BufRead,
+    maximum_length: usize,
+) -> std::io::Result<Option<Vec<u8>>> {
+    let mut line = Vec::with_capacity(maximum_length);
+    let mut too_long = false;
+    loop {
+        let available = input.fill_buf()?;
+        if available.is_empty() {
+            return Ok((!line.is_empty() || too_long).then_some(if too_long {
+                Vec::new()
+            } else {
+                line
+            }));
+        }
+        let newline_offset = available.iter().position(|byte| *byte == b'\n');
+        let consumed = newline_offset.map_or(available.len(), |offset| offset + 1);
+        if !too_long {
+            let Some(new_length) = line.len().checked_add(consumed) else {
+                too_long = true;
+                line.clear();
+                input.consume(consumed);
+                if newline_offset.is_some() {
+                    return Ok(Some(Vec::new()));
+                }
+                continue;
+            };
+            if new_length > maximum_length {
+                too_long = true;
+                line.clear();
+            } else {
+                line.extend_from_slice(&available[..consumed]);
+            }
+        }
+        input.consume(consumed);
+        if newline_offset.is_some() {
+            return Ok(Some(if too_long { Vec::new() } else { line }));
+        }
+    }
+}
+
 fn read_mixer_effect_editor_input(
     input: &mut impl Read,
 ) -> Result<ClapMixerEffectEditorInput, String> {
@@ -4888,9 +5066,11 @@ fn clap_editor_parent_window<'a>(
 struct ClapMixerEffectEditorApp {
     session: Option<ClapMixerEffectEditorSession>,
     result: Arc<Mutex<Option<Result<ClapMixerEffectEditorOutput, String>>>>,
+    last_reported_parameter_values: BTreeMap<u32, f64>,
     initial_window_size: egui::Vec2,
     initial_window_size_applied: bool,
     host_error: Option<String>,
+    last_parameter_poll: Instant,
 }
 
 impl ClapMixerEffectEditorApp {
@@ -4952,6 +5132,25 @@ impl eframe::App for ClapMixerEffectEditorApp {
             ui.ctx()
                 .send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
+        if self.last_parameter_poll.elapsed() >= Duration::from_millis(100) {
+            self.last_parameter_poll = Instant::now();
+            match session.capture_parameters() {
+                Ok(parameter_values) => {
+                    for (parameter_id, value) in parameter_values {
+                        let changed = self
+                            .last_reported_parameter_values
+                            .get(&parameter_id)
+                            .is_none_or(|previous| previous.to_bits() != value.to_bits());
+                        if changed {
+                            self.last_reported_parameter_values
+                                .insert(parameter_id, value);
+                            eprintln!("LIVE_PARAMETER {parameter_id} {:016x}", value.to_bits());
+                        }
+                    }
+                }
+                Err(error) => self.host_error = Some(error),
+            }
+        }
         if session.gui_floating {
             ui.centered_and_justified(|ui| {
                 ui.label("Close this helper window to save native CLAP editor changes.");
@@ -4995,12 +5194,15 @@ fn run_mixer_effect_editor_ui(
             let size = session.open_gui(creation).map_err(|error| {
                 Box::new(std::io::Error::other(error)) as Box<dyn std::error::Error + Send + Sync>
             })?;
+            let last_reported_parameter_values = session.parameter_values_before_editor.clone();
             Ok(Box::new(ClapMixerEffectEditorApp {
                 session: Some(session),
                 result: app_output,
+                last_reported_parameter_values,
                 initial_window_size: size,
                 initial_window_size_applied: false,
                 host_error: None,
+                last_parameter_poll: Instant::now(),
             }))
         }),
     );

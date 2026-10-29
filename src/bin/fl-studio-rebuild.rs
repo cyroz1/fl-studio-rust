@@ -22669,75 +22669,103 @@ impl DawUi {
     fn poll_clap_mixer_effect_editors(&mut self, ctx: &egui::Context) {
         let mut pending_editors = Vec::with_capacity(self.clap_mixer_effect_editor_processes.len());
         for editor in std::mem::take(&mut self.clap_mixer_effect_editor_processes) {
-            match editor.process.try_recv() {
-                Ok(Ok(output)) => {
-                    let project_matches = editor.project_generation == self.project_generation
-                        && self
-                            .current_path
-                            .as_deref()
-                            .is_some_and(|path| stable_project_id(path) == editor.project_id);
-                    let Some(assignment) = self
-                        .clap_mixer_effect_assignments
-                        .get_mut(&(editor.insert_ordinal, editor.slot_index))
-                        .filter(|assignment| {
-                            assignment.path == editor.path
-                                && assignment.plugin_id == editor.plugin_id
-                        })
-                    else {
-                        continue;
-                    };
-                    if !project_matches {
-                        continue;
+            let mut keep_editor = true;
+            loop {
+                match editor.process.try_recv() {
+                    Ok(clap_probe::ClapMixerEffectEditorEvent::LiveParameters(
+                        parameter_values,
+                    )) => {
+                        let project_matches = editor.project_generation == self.project_generation
+                            && self
+                                .current_path
+                                .as_deref()
+                                .is_some_and(|path| stable_project_id(path) == editor.project_id);
+                        if project_matches {
+                            self.clap_mixer_effect_state_capture_controller
+                                .update_active_parameters(
+                                    editor.insert_ordinal,
+                                    editor.slot_index,
+                                    &editor.path,
+                                    &editor.plugin_id,
+                                    &parameter_values,
+                                );
+                        }
                     }
-                    let previous_assignment = assignment.clone();
-                    if let Some(state) = output.state {
-                        assignment.state = Some(state);
-                    }
-                    if !output.parameter_overrides.is_empty() {
-                        assignment
-                            .parameter_overrides
-                            .extend(output.parameter_overrides);
-                    }
-                    let assignments = self.clap_mixer_effect_assignments.clone();
-                    match save_clap_project_mixer_effects(&editor.project_id, &assignments) {
-                        Ok(()) => {
-                            self.stop_project_playback();
-                            if let Some(host) = &mut self.vst3_host {
-                                host.set_mixer_effect_processor_factory(Some(Arc::new(
-                                    clap_probe::ClapProjectMixerEffectProcessorFactory::new(
-                                        assignments,
-                                        self.clap_mixer_effect_state_capture_controller.clone(),
-                                    ),
-                                )));
+                    Ok(clap_probe::ClapMixerEffectEditorEvent::Finished(Ok(output))) => {
+                        keep_editor = false;
+                        let project_matches = editor.project_generation == self.project_generation
+                            && self
+                                .current_path
+                                .as_deref()
+                                .is_some_and(|path| stable_project_id(path) == editor.project_id);
+                        let Some(assignment) = self
+                            .clap_mixer_effect_assignments
+                            .get_mut(&(editor.insert_ordinal, editor.slot_index))
+                            .filter(|assignment| {
+                                assignment.path == editor.path
+                                    && assignment.plugin_id == editor.plugin_id
+                            })
+                        else {
+                            continue;
+                        };
+                        if !project_matches {
+                            continue;
+                        }
+                        let previous_assignment = assignment.clone();
+                        if let Some(state) = output.state {
+                            assignment.state = Some(state);
+                        }
+                        if !output.parameter_overrides.is_empty() {
+                            assignment
+                                .parameter_overrides
+                                .extend(output.parameter_overrides);
+                        }
+                        let assignments = self.clap_mixer_effect_assignments.clone();
+                        match save_clap_project_mixer_effects(&editor.project_id, &assignments) {
+                            Ok(()) => {
+                                self.stop_project_playback();
+                                if let Some(host) = &mut self.vst3_host {
+                                    host.set_mixer_effect_processor_factory(Some(Arc::new(
+                                        clap_probe::ClapProjectMixerEffectProcessorFactory::new(
+                                            assignments,
+                                            self.clap_mixer_effect_state_capture_controller.clone(),
+                                        ),
+                                    )));
+                                }
+                                self.clap_effect_parameter_drafts
+                                    .retain(|(slot_key, _), _| {
+                                        *slot_key != (editor.insert_ordinal, editor.slot_index)
+                                    });
+                                self.status = format!(
+                                    "Saved native CLAP editor changes for Mixer insert {} slot {}",
+                                    editor.insert_ordinal,
+                                    editor.slot_index + 1
+                                );
                             }
-                            self.clap_effect_parameter_drafts
-                                .retain(|(slot_key, _), _| {
-                                    *slot_key != (editor.insert_ordinal, editor.slot_index)
-                                });
-                            self.status = format!(
-                                "Saved native CLAP editor changes for Mixer insert {} slot {}",
-                                editor.insert_ordinal,
-                                editor.slot_index + 1
-                            );
-                        }
-                        Err(error) => {
-                            self.clap_mixer_effect_assignments.insert(
-                                (editor.insert_ordinal, editor.slot_index),
-                                previous_assignment,
-                            );
-                            self.status = format!(
-                                "Captured CLAP editor changes but could not save them: {error}"
-                            );
+                            Err(error) => {
+                                self.clap_mixer_effect_assignments.insert(
+                                    (editor.insert_ordinal, editor.slot_index),
+                                    previous_assignment,
+                                );
+                                self.status = format!(
+                                    "Captured CLAP editor changes but could not save them: {error}"
+                                );
+                            }
                         }
                     }
+                    Ok(clap_probe::ClapMixerEffectEditorEvent::Finished(Err(error))) => {
+                        keep_editor = false;
+                        self.status = format!("CLAP editor closed without saved changes: {error}");
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        keep_editor = false;
+                        self.status = "CLAP editor result reader stopped unexpectedly".to_owned();
+                    }
                 }
-                Ok(Err(error)) => {
-                    self.status = format!("CLAP editor closed without saved changes: {error}");
-                }
-                Err(mpsc::TryRecvError::Empty) => pending_editors.push(editor),
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.status = "CLAP editor result reader stopped unexpectedly".to_owned();
-                }
+            }
+            if keep_editor {
+                pending_editors.push(editor);
             }
         }
         self.clap_mixer_effect_editor_processes = pending_editors;
