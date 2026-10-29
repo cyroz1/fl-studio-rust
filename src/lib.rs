@@ -26149,6 +26149,7 @@ mod tests {
         clip[6..8].copy_from_slice(&11_u16.to_le_bytes());
         clip[8..12].copy_from_slice(&length_ticks.to_le_bytes());
         clip[12..14].copy_from_slice(&499_u16.to_le_bytes());
+        clip[18..20].copy_from_slice(&0_u16.to_le_bytes());
         clip[24..28].copy_from_slice(&source_start_ticks.to_le_bytes());
         clip[28..32].copy_from_slice(&source_end_ticks.to_le_bytes());
         append_data_event(&mut event_stream, 0xC7, b"26.1.0.0\0");
@@ -28374,7 +28375,7 @@ mod tests {
             .to_vec();
 
         let right_clip_index = document
-            .split_playlist_automation_clip(3, 0, 72)
+            .split_playlist_automation_clip(3, 0, 48)
             .expect("a one-to-one modern Automation Clip source window should split");
 
         assert_eq!(right_clip_index, 1);
@@ -28393,7 +28394,7 @@ mod tests {
             arrangements[0].clips[1].target(),
             PlaylistClipTarget::Channel { id: 11 }
         );
-        assert_eq!(arrangements[0].clips[1].position_ticks, 72);
+        assert_eq!(arrangements[0].clips[1].position_ticks, 48);
         assert_eq!(arrangements[0].clips[1].length_ticks, 144);
         assert_eq!(
             arrangements[0].clips[1].source_window_ticks(),

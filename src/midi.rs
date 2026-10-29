@@ -2271,17 +2271,22 @@ pub(crate) fn song_tempo_events(
             });
             points.push((0, boundary_value));
         }
-        points.extend(
-            source_points
-                .iter()
-                .copied()
-                .filter(|(tick, _)| *tick >= source_start_tick && *tick < source_end_tick)
-                .map(|(tick, value)| (tick - source_start_tick, value)),
-        );
-        if explicit_source_window
-            && let Some(value) = automation_value_at_tick(&source_points, source_end_tick)
-        {
-            points.push((source_end_tick - source_start_tick, value));
+        if explicit_source_window {
+            points.extend(
+                source_points
+                    .iter()
+                    .copied()
+                    .filter(|(tick, _)| *tick >= source_start_tick && *tick < source_end_tick)
+                    .map(|(tick, value)| (tick - source_start_tick, value)),
+            );
+            if let Some(value) = automation_value_at_tick(&source_points, source_end_tick) {
+                points.push((source_end_tick - source_start_tick, value));
+            }
+        } else {
+            // Legacy clips have no decoded source window. Keep the original
+            // point sequence, including the first point beyond the visible
+            // end, so the final in-clip tempo ramp can be sampled faithfully.
+            points.extend(source_points.iter().copied());
         }
         if points.is_empty() {
             continue;
