@@ -2037,9 +2037,21 @@ struct StreamingPlayback {
     handoff_committed: AtomicBool,
     underrun_frames: AtomicU64,
     consumed_frames: AtomicU64,
+    project_position_loop_start: AtomicU64,
+    project_position_loop_end: AtomicU64,
 }
 
 impl StreamingPlayback {
+    fn project_position_frames(&self) -> u64 {
+        let frame = self.consumed_frames.load(Ordering::Acquire);
+        let loop_start = self.project_position_loop_start.load(Ordering::Acquire);
+        let loop_end = self.project_position_loop_end.load(Ordering::Acquire);
+        if loop_start == u64::MAX || loop_end <= loop_start || frame < loop_end {
+            return frame;
+        }
+        loop_start + (frame - loop_start) % (loop_end - loop_start)
+    }
+
     fn available_stereo_frames(&self) -> usize {
         self.rings
             .iter()
@@ -2126,6 +2138,8 @@ fn create_streaming_playback(
         handoff_committed: AtomicBool::new(false),
         underrun_frames: AtomicU64::new(0),
         consumed_frames: AtomicU64::new(initial_position_frames),
+        project_position_loop_start: AtomicU64::new(u64::MAX),
+        project_position_loop_end: AtomicU64::new(u64::MAX),
     });
     let writers = (0..source_count)
         .map(|ring_index| StreamingAudioWriter {
@@ -2246,6 +2260,38 @@ impl StagedStreamingPlayback {
 }
 
 impl StreamingAudioWriter {
+    /// Make the reported project position wrap over a Playlist loop range.
+    ///
+    /// The consumed output-frame counter remains monotonic for stream buffering and staged
+    /// handoffs. Configure this before the device starts consuming the stream.
+    pub fn set_project_position_loop(
+        &self,
+        start_frame: u64,
+        end_frame: u64,
+    ) -> Result<(), String> {
+        if !self.is_project_source {
+            return Err("Playlist position looping requires the project audio stream".to_owned());
+        }
+        if end_frame <= start_frame {
+            return Err("Playlist position loop end must be after its start".to_owned());
+        }
+        if self
+            .playback
+            .project_position_loop_start
+            .load(Ordering::Acquire)
+            != u64::MAX
+        {
+            return Err("Playlist position loop is already configured".to_owned());
+        }
+        self.playback
+            .project_position_loop_end
+            .store(end_frame, Ordering::Release);
+        self.playback
+            .project_position_loop_start
+            .store(start_frame, Ordering::Release);
+        Ok(())
+    }
+
     /// Write interleaved stereo samples, waiting outside the audio callback when the ring fills.
     pub fn write_stereo_samples(&self, samples: &[f32]) -> Result<(), String> {
         if !samples.len().is_multiple_of(2) {
@@ -3088,7 +3134,7 @@ impl PlaybackState {
     fn position_frames(&self) -> u64 {
         self.streaming.load().as_deref().map_or_else(
             || self.cursor_frames.load(Ordering::Acquire),
-            |streaming| streaming.consumed_frames.load(Ordering::Acquire),
+            StreamingPlayback::project_position_frames,
         )
     }
 }
