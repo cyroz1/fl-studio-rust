@@ -25260,12 +25260,16 @@ impl DawUi {
                                             .unwrap_or_else(|| vec![clip_index]);
                                     let can_consolidate_pattern_clips = can_render_pattern_clip
                                         && render_pattern_clip_indices.iter().all(|selected_index| {
-                                            arrangement
-                                                .clips
-                                                .get(*selected_index)
-                                                .is_some_and(|selected_clip| {
-                                                    selected_clip.track_index == clip.track_index
-                                                })
+                                            arrangement.clips.get(*selected_index).is_some_and(
+                                                |selected_clip| {
+                                                    !selected_clip.is_muted()
+                                                        && selected_clip.track_index.is_some()
+                                                        && matches!(
+                                                            selected_clip.target(),
+                                                            PlaylistClipTarget::Pattern { .. }
+                                                        )
+                                                },
+                                            )
                                         });
                                     let render_pattern_clip_label =
                                         if render_pattern_clip_indices.len() > 1 {
@@ -25321,7 +25325,7 @@ impl DawUi {
                                             egui::Button::new(consolidate_pattern_clip_label),
                                         )
                                         .on_disabled_hover_text(
-                                            "Selected clips must be supported and on one Playlist track. Save the project and stop playback before consolidating.",
+                                            "Selected clips must be unmuted Pattern Clips with Playlist tracks. Save the project and stop playback before consolidating.",
                                         )
                                         .clicked()
                                     {
@@ -43085,7 +43089,6 @@ impl DawUi {
         let playlist_tracks = document.playlist_tracks();
         let mut source_start_tick = u32::MAX;
         let mut clip_end_tick = 0_u64;
-        let mut consolidation_track_index = None;
         let mut consolidation_sources = Vec::with_capacity(selected_clip_indices.len());
         for selected_index in &selected_clip_indices {
             let Some(selected_clip) = arrangement.clips.get(*selected_index) else {
@@ -43120,15 +43123,6 @@ impl DawUi {
                 return;
             };
             if action == PlaylistPatternClipRenderAction::Consolidate {
-                if consolidation_track_index
-                    .is_some_and(|track_index| track_index != selected_track_index)
-                {
-                    self.status =
-                        "Consolidating multiple Pattern Clips requires all selected clips to be on the same Playlist track"
-                            .to_owned();
-                    return;
-                }
-                consolidation_track_index = Some(selected_track_index);
                 consolidation_sources.push(PendingPlaylistPatternClipSource {
                     clip_index: *selected_index,
                     pattern_id: selected_pattern_id,
@@ -43212,11 +43206,13 @@ impl DawUi {
             clip.position_ticks
         };
         let track_index = if action == PlaylistPatternClipRenderAction::Consolidate {
-            let Some(track_index) = consolidation_track_index else {
+            let Some(source) = consolidation_sources.iter().min_by_key(|source| {
+                (source.position_ticks, source.track_index, source.clip_index)
+            }) else {
                 self.status = "The selected Pattern Clips have no Playlist track".to_owned();
                 return;
             };
-            track_index
+            source.track_index
         } else {
             let Some(track_index) = clip.track_index else {
                 self.status = "The selected Pattern Clip has no Playlist track".to_owned();
@@ -43499,11 +43495,17 @@ impl DawUi {
                             output_path.display()
                         )
                     }
-                    PlaylistPatternClipRenderAction::Consolidate => format!(
-                        "Consolidating Playlist Pattern Clip {} to {}…",
-                        clip_index + 1,
-                        output_path.display()
-                    ),
+                    PlaylistPatternClipRenderAction::Consolidate => {
+                        let description = if selected_clip_indices.len() == 1 {
+                            format!("Playlist Pattern Clip {}", clip_index + 1)
+                        } else {
+                            format!(
+                                "{} selected Playlist Pattern Clips",
+                                selected_clip_indices.len()
+                            )
+                        };
+                        format!("Consolidating {description} to {}…", output_path.display())
+                    }
                 };
             }
             Err(error) => {
@@ -43771,8 +43773,9 @@ impl DawUi {
         self.view = MainView::Playlist;
         self.refresh_audio_waveform_paths();
         self.status = format!(
-            "Consolidated {source_description} to {}; source clips muted. Tempo automation, supported linked effect automation, and loaded Mixer effects were included",
-            output_path.display()
+            "Consolidated {source_description} to {} on Playlist track {}; source clips muted. Tempo automation, supported linked effect automation, and loaded Mixer effects were included",
+            output_path.display(),
+            usize::from(consolidation.source_track_index) + 1
         );
     }
 
