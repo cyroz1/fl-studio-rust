@@ -11049,6 +11049,202 @@ impl FlpDocument {
         Ok(new_id)
     }
 
+    /// Makes one Playlist Automation Clip use a new copied type-5 channel.
+    /// The saved curve data and the clip's visible source window are retained;
+    /// only the copied channel ID and selected clip target change.
+    pub fn make_playlist_automation_clip_unique(
+        &mut self,
+        arrangement_id: u16,
+        clip_index: usize,
+    ) -> Result<u16, FlpError> {
+        let arrangements = self.arrangements()?;
+        let mut matching_arrangements = arrangements
+            .iter()
+            .filter(|arrangement| arrangement.id == arrangement_id);
+        let Some(arrangement) = matching_arrangements.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested arrangement does not exist",
+            ));
+        };
+        if matching_arrangements.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested arrangement id is ambiguous",
+            ));
+        }
+        let Some(clip) = arrangement.clips.get(clip_index) else {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested Playlist clip does not exist",
+            ));
+        };
+        let PlaylistClipTarget::Channel { id: source_id } = clip.target() else {
+            return Err(FlpError::UnsupportedEdit(
+                "Make unique applies to Playlist Automation Clips",
+            ));
+        };
+        if clip.record_size < 8 {
+            return Err(FlpError::UnsupportedEdit(
+                "the Playlist Automation Clip record is too short to retarget",
+            ));
+        }
+
+        let channels = self.channels();
+        let mut matching_channels = channels.iter().filter(|channel| channel.id() == source_id);
+        let Some(source_channel) = matching_channels.next() else {
+            return Err(FlpError::ChannelNotFound(source_id));
+        };
+        if matching_channels.next().is_some() {
+            return Err(FlpError::AmbiguousChannelId(source_id));
+        }
+        if source_channel.kind() != Some(5) {
+            return Err(FlpError::UnsupportedEdit(
+                "Make unique applies to kind-5 Automation channels",
+            ));
+        }
+        let source_range = source_channel.event_range();
+        if source_range
+            .clone()
+            .any(|index| matches!(self.events[index].opcode, 0x41 | 0x63))
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "the Automation channel range includes pattern or arrangement data",
+            ));
+        }
+        let marker_indices = source_range
+            .clone()
+            .filter(|index| {
+                self.events[*index].opcode == 0x40
+                    && self.events[*index].encoding == PayloadEncoding::Word
+                    && self.events[*index].payload.len() == 2
+            })
+            .collect::<Vec<_>>();
+        if marker_indices.len() != 1 {
+            return Err(FlpError::UnsupportedEdit(
+                "the Automation channel has no unique recognized ID marker",
+            ));
+        }
+        let name_events = source_range
+            .clone()
+            .filter(|index| {
+                self.events[*index].opcode == 0xCB
+                    && matches!(self.events[*index].encoding, PayloadEncoding::Data { .. })
+            })
+            .collect::<Vec<_>>();
+        if name_events.len() != 1
+            || !project_string_is_utf16(
+                &self.events[name_events[0]].payload,
+                self.project_version.as_deref(),
+            )
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "the Automation channel has no unique verified UTF-16LE display name",
+            ));
+        }
+        let automation_channels = self.automation_channels()?;
+        let mut matching_automation_channels = automation_channels
+            .iter()
+            .filter(|channel| channel.channel_id() == source_id);
+        let Some(automation_channel) = matching_automation_channels.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the Playlist Automation Clip channel has no point data",
+            ));
+        };
+        if matching_automation_channels.next().is_some()
+            || automation_channel.data_event_index().is_none()
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "the Playlist Automation Clip channel data is ambiguous or missing",
+            ));
+        }
+
+        let record_start = clip
+            .source_record_index
+            .checked_mul(clip.record_size)
+            .ok_or(FlpError::LengthOverflow)?;
+        let record_end = record_start
+            .checked_add(clip.record_size)
+            .ok_or(FlpError::LengthOverflow)?;
+        let source_clip_event =
+            self.events
+                .get(clip.source_event_index)
+                .ok_or(FlpError::UnsupportedEdit(
+                    "the Playlist Automation Clip event no longer exists",
+                ))?;
+        if source_clip_event.opcode != 0xE9
+            || !matches!(source_clip_event.encoding, PayloadEncoding::Data { .. })
+            || record_end > source_clip_event.payload.len()
+            || !source_clip_event
+                .payload
+                .len()
+                .is_multiple_of(clip.record_size)
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "the Playlist Automation Clip record is not recognized",
+            ));
+        }
+
+        let used_ids = channels
+            .iter()
+            .map(ChannelSummary::id)
+            .collect::<HashSet<_>>();
+        let new_id = used_ids
+            .iter()
+            .copied()
+            .filter(|id| *id < clip.pattern_base)
+            .max()
+            .and_then(|id| id.checked_add(1))
+            .filter(|id| *id < clip.pattern_base && !used_ids.contains(id))
+            .or_else(|| (0..clip.pattern_base).find(|id| !used_ids.contains(id)))
+            .ok_or(FlpError::UnsupportedEdit(
+                "the project has no unused channel ID below this clip's pattern base",
+            ))?;
+        let insertion_index = channels
+            .last()
+            .map(|channel| channel.event_range().end)
+            .or_else(|| self.events.iter().position(|event| event.opcode == 0x62))
+            .unwrap_or(self.events.len());
+        if insertion_index > self.events.len() {
+            return Err(FlpError::UnsupportedEdit(
+                "Channel Rack event ranges are inconsistent",
+            ));
+        }
+        let channel_count = u16::try_from(channels.len().checked_add(1).ok_or(
+            FlpError::UnsupportedEdit("the project has too many channels to make one unique"),
+        )?)
+        .map_err(|_| {
+            FlpError::UnsupportedEdit("the project has too many channels to make one unique")
+        })?;
+        let mut copied_events = self.events[source_range.clone()].to_vec();
+        copied_events[marker_indices[0] - source_range.start].replace_word_payload(new_id)?;
+
+        let source_name = source_channel.display_name().unwrap_or("Automation");
+        let unique_name = format!("{source_name} (Unique)");
+        if unique_name.contains('\0') {
+            return Err(FlpError::UnsupportedEdit(
+                "channel names cannot contain an embedded NUL character",
+            ));
+        }
+
+        let mut candidate = self.clone();
+        write_event_payload_bytes(
+            candidate
+                .events
+                .get_mut(clip.source_event_index)
+                .ok_or(FlpError::UnsupportedEdit(
+                    "the Playlist Automation Clip event no longer exists",
+                ))?,
+            record_start + 6,
+            &new_id.to_le_bytes(),
+        )?;
+        candidate
+            .events
+            .splice(insertion_index..insertion_index, copied_events);
+        candidate.header.legacy_channel_count = channel_count;
+        candidate.refresh_event_offsets()?;
+        candidate.set_channel_name(new_id, &unique_name)?;
+        *self = candidate;
+        Ok(new_id)
+    }
+
     fn retarget_playlist_audio_clip_channel(
         &mut self,
         arrangement_id: u16,
@@ -28435,6 +28631,92 @@ mod tests {
             mismatched_window.encode_lossless().unwrap(),
             mismatch_before
         );
+    }
+
+    #[test]
+    fn makes_playlist_automation_clip_unique_without_changing_its_source_window() {
+        let mut document = modern_automation_playlist_fixture_with_window(192, 24, 216);
+        let original_automation_data = document
+            .events()
+            .iter()
+            .find(|event| event.opcode() == 0xEA)
+            .expect("automation source data should be present")
+            .payload()
+            .to_vec();
+        let original_clip_record = document
+            .events()
+            .iter()
+            .find(|event| event.opcode() == 0xE9)
+            .expect("Playlist clip record should be present")
+            .payload()
+            .to_vec();
+
+        let new_channel_id = document
+            .make_playlist_automation_clip_unique(3, 0)
+            .expect("Automation Clip should receive a copied channel");
+
+        assert_eq!(new_channel_id, 12);
+        let arrangements = document.arrangements().unwrap();
+        assert_eq!(
+            arrangements[0].clips[0].target(),
+            PlaylistClipTarget::Channel { id: 12 }
+        );
+        assert_eq!(
+            arrangements[0].clips[0].source_window_ticks(),
+            Some((24, 216))
+        );
+        assert_eq!(arrangements[0].clips[0].length_ticks, 192);
+        let channels = document.channels();
+        assert_eq!(channels.len(), 2);
+        assert_eq!(
+            channels
+                .iter()
+                .find(|channel| channel.id() == 11)
+                .unwrap()
+                .display_name(),
+            Some("TEMPO")
+        );
+        assert_eq!(
+            channels
+                .iter()
+                .find(|channel| channel.id() == 12)
+                .unwrap()
+                .display_name(),
+            Some("TEMPO (Unique)")
+        );
+        let automation_channels = document.automation_channels().unwrap();
+        assert_eq!(automation_channels.len(), 2);
+        assert!(
+            automation_channels
+                .iter()
+                .find(|channel| channel.channel_id() == 12)
+                .unwrap()
+                .data_event_index()
+                .is_some()
+        );
+        assert_eq!(
+            document
+                .events()
+                .iter()
+                .filter(|event| event.opcode() == 0xEA)
+                .map(|event| event.payload())
+                .collect::<Vec<_>>(),
+            vec![
+                original_automation_data.as_slice(),
+                original_automation_data.as_slice()
+            ]
+        );
+        let clip_record = document
+            .events()
+            .iter()
+            .find(|event| event.opcode() == 0xE9)
+            .expect("Playlist clip record should remain present")
+            .payload();
+        let mut expected_clip_record = original_clip_record;
+        expected_clip_record[6..8].copy_from_slice(&new_channel_id.to_le_bytes());
+        assert_eq!(clip_record, expected_clip_record);
+        let encoded = document.encode_lossless().unwrap();
+        FlpDocument::parse(&encoded).expect("unique Automation Clip project should parse again");
     }
 
     #[test]

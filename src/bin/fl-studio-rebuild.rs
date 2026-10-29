@@ -22060,6 +22060,7 @@ impl DawUi {
         let mut cut_clip_requested = None;
         let mut paste_clip_after_requested = None;
         let mut make_audio_clip_unique_requested = None;
+        let mut make_automation_clip_unique_requested = None;
         let mut make_audio_clip_unique_as_sample_requested = None;
         let mut consolidate_audio_clip_requested = None;
         let mut consolidate_pattern_clip_requested: Option<Vec<usize>> = None;
@@ -25618,6 +25619,10 @@ impl DawUi {
                                     }
                                 } else if is_automation_clip {
                                     ui.separator();
+                                    if ui.button("Make unique").clicked() {
+                                        make_automation_clip_unique_requested = Some(clip_index);
+                                        ui.close();
+                                    }
                                     let button = ui.add_enabled(
                                         can_split_automation_clip,
                                         egui::Button::new("Split Automation Clip at cursor"),
@@ -27548,6 +27553,37 @@ impl DawUi {
                     self.status = format!("Could not make Audio Clip unique: {error}");
                 }
                 None => self.status = "Open a project to make an Audio Clip unique".to_owned(),
+            }
+        }
+
+        if let Some(clip_index) = make_automation_clip_unique_requested {
+            let result = self.document.as_mut().map(|document| {
+                document.make_playlist_automation_clip_unique(arrangement.id, clip_index)
+            });
+            match result {
+                Some(Ok(channel_id)) => {
+                    self.stop_project_playback();
+                    self.selected_arrangement = Some(arrangement.id);
+                    self.selected_clip = Some(clip_index);
+                    self.selected_automation_channel = Some(channel_id);
+                    self.selected_playlist_clips.clear();
+                    self.selected_playlist_clips.insert(clip_index);
+                    self.playlist_clip_context_split = None;
+                    self.active_playlist_clip_drag = None;
+                    self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+                    self.status = format!(
+                        "Made Automation Clip {} unique as channel {channel_id}",
+                        clip_index + 1
+                    );
+                    playlist_clip_list_changed = true;
+                }
+                Some(Err(error)) => {
+                    self.status = format!("Could not make Automation Clip unique: {error}");
+                }
+                None => {
+                    self.status = "Open a project to make an Automation Clip unique".to_owned();
+                }
             }
         }
 
