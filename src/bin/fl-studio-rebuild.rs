@@ -4210,6 +4210,10 @@ enum AutomationEditAction {
         point_index: usize,
         edit: AutomationPointEdit,
     },
+    SetPointTail {
+        point_index: usize,
+        trailing_bytes: [u8; 4],
+    },
     Delete {
         point_index: usize,
     },
@@ -4220,6 +4224,27 @@ enum AutomationEditAction {
         last_point_index: usize,
         mode: AutomationInterpolationMode,
     },
+}
+
+fn parse_automation_point_tail_hex(value: &str) -> Option<[u8; 4]> {
+    let digits = value.as_bytes();
+    if digits.len() != 8 || !digits.iter().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut trailing_bytes = [0; 4];
+    for (index, byte) in trailing_bytes.iter_mut().enumerate() {
+        let start = index * 2;
+        let pair = std::str::from_utf8(&digits[start..start + 2]).ok()?;
+        *byte = u8::from_str_radix(pair, 16).ok()?;
+    }
+    Some(trailing_bytes)
+}
+
+fn format_automation_point_tail_hex(trailing_bytes: [u8; 4]) -> String {
+    format!(
+        "{:02X}{:02X}{:02X}{:02X}",
+        trailing_bytes[0], trailing_bytes[1], trailing_bytes[2], trailing_bytes[3]
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -5117,6 +5142,8 @@ struct DawUi {
     selected_playlist_audio_channel: Option<u16>,
     selected_automation_channel: Option<u16>,
     selected_automation_point: Option<usize>,
+    automation_point_tail_edit_index: Option<usize>,
+    automation_point_tail_hex: String,
     automation_add_mode: bool,
     automation_interpolate_mode: bool,
     automation_interpolation_mode: AutomationInterpolationMode,
@@ -7076,6 +7103,8 @@ impl DawUi {
             selected_playlist_audio_channel: None,
             selected_automation_channel: None,
             selected_automation_point: None,
+            automation_point_tail_edit_index: None,
+            automation_point_tail_hex: String::new(),
             automation_add_mode: false,
             automation_interpolate_mode: false,
             automation_interpolation_mode: AutomationInterpolationMode::Linear,
@@ -33790,6 +33819,8 @@ impl DawUi {
         });
         if old_channel_id != Some(channel_id) {
             self.selected_automation_point = None;
+            self.automation_point_tail_edit_index = None;
+            self.automation_point_tail_hex.clear();
             self.automation_add_mode = false;
             self.automation_interpolate_mode = false;
             self.automation_interpolation_anchor = None;
@@ -33833,6 +33864,12 @@ impl DawUi {
         let selected_index = self
             .selected_automation_point
             .filter(|index| *index < points.len());
+        if self.automation_point_tail_edit_index != selected_index {
+            self.automation_point_tail_edit_index = selected_index;
+            self.automation_point_tail_hex = selected_index
+                .map(|index| format_automation_point_tail_hex(points[index].trailing_bytes()))
+                .unwrap_or_default();
+        }
         self.selected_automation_point = selected_index;
         ui.horizontal(|ui| {
             ui.label(format!("{} points", points.len()));
@@ -33880,6 +33917,7 @@ impl DawUi {
             let mut position = point.position_beats();
             let mut value = point.value();
             let mut tension = point.tension();
+            let saved_tail = point.trailing_bytes();
             let position_changed = ui
                 .add(
                     egui::DragValue::new(&mut position)
@@ -33904,6 +33942,33 @@ impl DawUi {
                     },
                 });
             }
+            ui.horizontal(|ui| {
+                ui.label("Raw point tail");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.automation_point_tail_hex)
+                        .desired_width(82.0)
+                        .char_limit(8),
+                )
+                .on_hover_text("Four opaque point bytes, entered as eight hexadecimal digits");
+                let trailing_bytes =
+                    parse_automation_point_tail_hex(&self.automation_point_tail_hex);
+                if ui
+                    .add_enabled(
+                        trailing_bytes.is_some_and(|bytes| bytes != saved_tail),
+                        egui::Button::new("Apply raw state"),
+                    )
+                    .clicked()
+                    && let Some(trailing_bytes) = trailing_bytes
+                {
+                    action = Some(AutomationEditAction::SetPointTail {
+                        point_index,
+                        trailing_bytes,
+                    });
+                }
+                if trailing_bytes.is_none() {
+                    ui.colored_label(ORANGE, "Enter 8 hexadecimal digits");
+                }
+            });
         }
 
         let chart_height = ui.available_height().clamp(230.0, 430.0);
@@ -34171,6 +34236,17 @@ impl DawUi {
                 AutomationEditAction::Edit { point_index, edit } => {
                     self.selected_automation_point = Some(point_index);
                     document.edit_automation_point(channel_id, point_index, edit)
+                }
+                AutomationEditAction::SetPointTail {
+                    point_index,
+                    trailing_bytes,
+                } => {
+                    self.selected_automation_point = Some(point_index);
+                    document.set_automation_point_trailing_bytes(
+                        channel_id,
+                        point_index,
+                        trailing_bytes,
+                    )
                 }
                 AutomationEditAction::Delete { point_index } => {
                     self.selected_automation_point = None;
