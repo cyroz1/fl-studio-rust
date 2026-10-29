@@ -5407,13 +5407,18 @@ enum PlaylistPatternClipRenderAction {
 
 struct PendingAudioClipSource {
     arrangement_id: u16,
-    source_clip_index: usize,
-    source_channel_id: u16,
-    source_position_ticks: u32,
-    source_track_index: u16,
+    source_clips: Vec<PendingAudioClipSourceClip>,
     project_generation: u64,
     project_path: PathBuf,
     project_fingerprint: [u8; 16],
+}
+
+#[derive(Clone, Copy)]
+struct PendingAudioClipSourceClip {
+    clip_index: usize,
+    channel_id: u16,
+    position_ticks: u32,
+    track_index: u16,
 }
 
 struct PendingSongRender {
@@ -9227,7 +9232,7 @@ impl DawUi {
     fn audio_clip_render_source_details(
         &self,
         arrangement_id: u16,
-        clip_index: usize,
+        clip_indices: &[usize],
     ) -> Result<PendingAudioClipSource, String> {
         let document = self
             .document
@@ -9245,25 +9250,57 @@ impl DawUi {
             .into_iter()
             .find(|arrangement| arrangement.id == arrangement_id)
             .ok_or_else(|| "The selected Playlist arrangement no longer exists".to_owned())?;
-        let clip = arrangement
-            .clips
-            .get(clip_index)
-            .ok_or_else(|| "The selected Playlist clip no longer exists".to_owned())?;
-        if clip.muted {
-            return Err(
-                "Unmute the selected Audio Clip before inserting or consolidating its render"
-                    .to_owned(),
-            );
+        if clip_indices.is_empty() {
+            return Err("Select at least one Audio Clip to consolidate".to_owned());
         }
-        let Some(track_index) = clip.track_index else {
-            return Err("The selected Audio Clip has no recognized Playlist track".to_owned());
-        };
-        let PlaylistClipTarget::Channel {
-            id: source_channel_id,
-        } = clip.target()
-        else {
-            return Err("Consolidate selected Audio Clip applies to Audio Clips".to_owned());
-        };
+        let channels = document.channels();
+        let mut unique_indices = BTreeSet::new();
+        let mut source_clips = Vec::with_capacity(clip_indices.len());
+        for &clip_index in clip_indices {
+            if !unique_indices.insert(clip_index) {
+                return Err("The selected Audio Clip list contains duplicate clips".to_owned());
+            }
+            let clip = arrangement.clips.get(clip_index).ok_or_else(|| {
+                format!("Selected Audio Clip {} no longer exists", clip_index + 1)
+            })?;
+            if clip.muted {
+                return Err(format!(
+                    "Unmute selected Audio Clip {} before inserting or consolidating its render",
+                    clip_index + 1
+                ));
+            }
+            let Some(track_index) = clip.track_index else {
+                return Err(format!(
+                    "Selected Audio Clip {} has no recognized Playlist track",
+                    clip_index + 1
+                ));
+            };
+            let PlaylistClipTarget::Channel {
+                id: source_channel_id,
+            } = clip.target()
+            else {
+                return Err(format!(
+                    "Selected Playlist clip {} is not an Audio Clip",
+                    clip_index + 1
+                ));
+            };
+            if !channels.iter().any(|channel| {
+                channel.id() == source_channel_id
+                    && channel.kind() == Some(4)
+                    && channel.enabled() != Some(false)
+            }) {
+                return Err(format!(
+                    "Selected Playlist clip {} does not target an enabled Audio Clip channel",
+                    clip_index + 1
+                ));
+            }
+            source_clips.push(PendingAudioClipSourceClip {
+                clip_index,
+                channel_id: source_channel_id,
+                position_ticks: clip.position_ticks,
+                track_index,
+            });
+        }
         let project_path = self
             .sample_project_path()
             .ok_or_else(|| "Save the project before placing a rendered Audio Clip".to_owned())?;
@@ -9274,10 +9311,7 @@ impl DawUi {
 
         Ok(PendingAudioClipSource {
             arrangement_id,
-            source_clip_index: clip_index,
-            source_channel_id,
-            source_position_ticks: clip.position_ticks,
-            source_track_index: track_index,
+            source_clips,
             project_generation: self.project_generation,
             project_path,
             project_fingerprint,
@@ -14706,12 +14740,32 @@ impl DawUi {
                             ui.close();
                         }
                     });
-                    ui.menu_button("Consolidate selected Audio Clip…", |ui| {
-                        let can_consolidate = self.selected_playlist_audio_clip().is_some()
+                    let selected_audio_clips = self.selected_playlist_audio_clips();
+                    let consolidate_audio_clips_label = if selected_audio_clips
+                        .as_ref()
+                        .is_some_and(|(_, indices)| indices.len() > 1)
+                    {
+                        "Consolidate selected Audio Clips…"
+                    } else {
+                        "Consolidate selected Audio Clip…"
+                    };
+                    let consolidate_audio_clip_start_choice = if selected_audio_clips
+                        .as_ref()
+                        .is_some_and(|(_, indices)| indices.len() > 1)
+                    {
+                        "From earliest clip start…"
+                    } else {
+                        "From clip start…"
+                    };
+                    ui.menu_button(consolidate_audio_clips_label, |ui| {
+                        let can_consolidate = selected_audio_clips.is_some()
                             && self.sample_project_path().is_some()
                             && self.pending_audio_clip_export.is_none();
                         if ui
-                            .add_enabled(can_consolidate, egui::Button::new("From clip start…"))
+                            .add_enabled(
+                                can_consolidate,
+                                egui::Button::new(consolidate_audio_clip_start_choice),
+                            )
                             .clicked()
                         {
                             self.render_selected_audio_clip_dialog(
@@ -42377,11 +42431,13 @@ impl DawUi {
         start_from_song_start: bool,
         action: SelectedAudioClipRenderAction,
     ) {
-        let selection = if action == SelectedAudioClipRenderAction::Export {
-            self.selected_playlist_audio_clips()
-        } else {
-            self.selected_playlist_audio_clip()
-                .map(|(arrangement_id, clip_index)| (arrangement_id, vec![clip_index]))
+        let selection = match action {
+            SelectedAudioClipRenderAction::Export | SelectedAudioClipRenderAction::Consolidate => {
+                self.selected_playlist_audio_clips()
+            }
+            SelectedAudioClipRenderAction::Insert => self
+                .selected_playlist_audio_clip()
+                .map(|(arrangement_id, clip_index)| (arrangement_id, vec![clip_index])),
         };
         let Some((arrangement_id, clip_indices)) = selection else {
             self.status = "Select an enabled audio-channel clip in the Playlist first".to_owned();
@@ -42408,7 +42464,7 @@ impl DawUi {
         let source = if action == SelectedAudioClipRenderAction::Export {
             None
         } else {
-            match self.audio_clip_render_source_details(arrangement_id, clip_index) {
+            match self.audio_clip_render_source_details(arrangement_id, &clip_indices) {
                 Ok(source) => Some(source),
                 Err(error) => {
                     self.status = error;
@@ -42797,32 +42853,52 @@ impl DawUi {
                 return;
             }
         };
-        let Some(source_clip) = arrangement.clips.get(source.source_clip_index) else {
-            self.status = format!(
-                "Rendered {}, but its source clip no longer exists",
-                pending.output_path.display()
-            );
-            return;
-        };
-        if source_clip.target()
-            != (PlaylistClipTarget::Channel {
-                id: source.source_channel_id,
-            })
-            || source_clip.position_ticks != source.source_position_ticks
-            || source_clip.track_index != Some(source.source_track_index)
-            || source_clip.muted
-        {
-            self.status = format!(
-                "Rendered {}, but its source clip changed before placement",
-                pending.output_path.display()
-            );
-            return;
+        for source_clip in &source.source_clips {
+            let Some(current_clip) = arrangement.clips.get(source_clip.clip_index) else {
+                self.status = format!(
+                    "Rendered {}, but selected source Audio Clip {} no longer exists",
+                    pending.output_path.display(),
+                    source_clip.clip_index + 1
+                );
+                return;
+            };
+            if current_clip.target()
+                != (PlaylistClipTarget::Channel {
+                    id: source_clip.channel_id,
+                })
+                || current_clip.position_ticks != source_clip.position_ticks
+                || current_clip.track_index != Some(source_clip.track_index)
+                || current_clip.muted
+            {
+                self.status = format!(
+                    "Rendered {}, but selected source Audio Clip {} changed before placement",
+                    pending.output_path.display(),
+                    source_clip.clip_index + 1
+                );
+                return;
+            }
         }
 
         let position_ticks = if pending.start_from_song_start {
             0
         } else {
-            source.source_position_ticks
+            let Some(earliest_source) = source
+                .source_clips
+                .iter()
+                .min_by_key(|clip| (clip.position_ticks, clip.track_index, clip.clip_index))
+            else {
+                self.status = "Select at least one Audio Clip to place the render".to_owned();
+                return;
+            };
+            earliest_source.position_ticks
+        };
+        let Some(earliest_source) = source
+            .source_clips
+            .iter()
+            .min_by_key(|clip| (clip.position_ticks, clip.track_index, clip.clip_index))
+        else {
+            self.status = "Select at least one Audio Clip to place the render".to_owned();
+            return;
         };
         let tempo_map = match PlaylistTempoMap::for_arrangement(document, source.arrangement_id) {
             Ok(tempo_map) => tempo_map,
@@ -42909,7 +42985,7 @@ impl DawUi {
             channel_id,
             position_ticks,
             length_ticks,
-            source.source_track_index,
+            earliest_source.track_index,
         ) {
             Ok(clip_index) => clip_index,
             Err(error) => {
@@ -42934,21 +43010,24 @@ impl DawUi {
             );
             return;
         }
-        if mute_source
-            && let Err(error) = updated.edit_playlist_clip(
-                source.arrangement_id,
-                source.source_clip_index,
-                PlaylistClipEdit {
-                    muted: Some(true),
-                    ..PlaylistClipEdit::default()
-                },
-            )
-        {
-            self.status = format!(
-                "Rendered {}, but could not mute its source Audio Clip: {error}",
-                pending.output_path.display()
-            );
-            return;
+        if mute_source {
+            for source_clip in &source.source_clips {
+                if let Err(error) = updated.edit_playlist_clip(
+                    source.arrangement_id,
+                    source_clip.clip_index,
+                    PlaylistClipEdit {
+                        muted: Some(true),
+                        ..PlaylistClipEdit::default()
+                    },
+                ) {
+                    self.status = format!(
+                        "Rendered {}, but could not mute selected source Audio Clip {}: {error}",
+                        pending.output_path.display(),
+                        source_clip.clip_index + 1
+                    );
+                    return;
+                }
+            }
         }
 
         self.stop_project_playback();
@@ -42968,11 +43047,23 @@ impl DawUi {
         self.view = MainView::Playlist;
         self.refresh_audio_waveform_paths();
         self.status = if mute_source {
+            let selected_source_description = if source.source_clips.len() == 1 {
+                format!(
+                    "Playlist Audio Clip {}",
+                    source.source_clips[0].clip_index + 1
+                )
+            } else {
+                format!(
+                    "{} selected Playlist Audio Clips",
+                    source.source_clips.len()
+                )
+            };
             format!(
-                "Consolidated selected Playlist Audio Clip {} from {} to {} at {} Hz; source muted",
-                source.source_clip_index + 1,
+                "Consolidated {selected_source_description} from {} to {} at {} Hz; sources muted",
                 if pending.start_from_song_start {
                     "song start"
+                } else if source.source_clips.len() > 1 {
+                    "earliest clip start"
                 } else {
                     "clip start"
                 },
@@ -42982,7 +43073,7 @@ impl DawUi {
         } else {
             format!(
                 "Inserted render of selected Playlist Audio Clip {} from {} to {} at {} Hz; source unchanged",
-                source.source_clip_index + 1,
+                source.source_clips[0].clip_index + 1,
                 if pending.start_from_song_start {
                     "song start"
                 } else {
