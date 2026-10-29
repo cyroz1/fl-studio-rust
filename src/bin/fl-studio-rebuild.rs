@@ -33,7 +33,9 @@ use flp_rebuild::media::{
 };
 use flp_rebuild::midi::{MidiChannelMapping, MidiFile, MidiImportOptions};
 use flp_rebuild::plugin_settings::{
-    load_vst3_manual_latency_offsets, load_vst3_project_manual_latency_offsets,
+    ClapProjectInstrumentAssignment as ClapPatternPlaybackInstrument,
+    load_clap_project_instruments, load_vst3_manual_latency_offsets,
+    load_vst3_project_manual_latency_offsets, save_clap_project_instruments,
     save_vst3_manual_latency_offsets, save_vst3_project_manual_latency_offsets,
 };
 use flp_rebuild::plugins::{PluginCandidate, PluginFormat, scan_installed_plugins};
@@ -5537,13 +5539,6 @@ struct PendingSamplerStream {
     staged_handoff_reason: Option<PdcStreamHandoffReason>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ClapPatternPlaybackInstrument {
-    path: PathBuf,
-    plugin_id: String,
-    plugin_name: String,
-}
-
 struct PendingClapPatternPlayback {
     pattern_id: u16,
     loop_length_ticks: u64,
@@ -8472,7 +8467,8 @@ impl DawUi {
                 self.vst3_manual_latency_offset_labels.clear();
                 self.channel_vst3_instances.clear();
                 self.mixer_effect_vst3_instances.clear();
-                self.clap_pattern_playback_instruments.clear();
+                self.clap_pattern_playback_instruments =
+                    load_clap_project_instruments(&stable_project_id(target_path));
                 self.active_clap_pattern_audio_layers.clear();
                 self.selected_arrangement = document.arrangements().ok().and_then(|arrangements| {
                     arrangements.first().map(|arrangement| arrangement.id)
@@ -11896,6 +11892,11 @@ impl DawUi {
                     } else {
                         None
                     };
+                let clap_pattern_assignment_save_error = save_clap_project_instruments(
+                    &stable_project_id(path),
+                    &self.clap_pattern_playback_instruments,
+                )
+                .err();
                 self.new_project_template_path = None;
                 if let Some(workspace) = package_workspace_after_save {
                     self.package_workspace = Some(workspace);
@@ -11923,6 +11924,11 @@ impl DawUi {
                 if let Some(error) = project_latency_offset_save_error {
                     self.status.push_str(&format!(
                         " · project VST3 PDC offsets could not be saved: {error}"
+                    ));
+                }
+                if let Some(error) = clap_pattern_assignment_save_error {
+                    self.status.push_str(&format!(
+                        " · project CLAP instrument assignments could not be saved: {error}"
                     ));
                 }
                 if let Some(summary) = sample_bundle_summary {
@@ -61323,7 +61329,7 @@ impl DawUi {
             ui.heading(format!("Detected CLAP plug-ins ({})", clap_candidates.len()));
             ui.label(
                 egui::RichText::new(
-                "CLAP note and Pattern/channel previews render in an isolated helper, which reuses the instrument while the plug-in and output rate stay the same. Assigned CLAP Pattern channels can loop in Pattern transport; their audio is pre-rendered at project base tempo and mixed directly to Master. Full Playlist playback, project-state mapping, Mixer/Layer routing, and native plug-in editors are not available yet.",
+                "CLAP note and Pattern/channel previews render in an isolated helper, which reuses the instrument while the plug-in and output rate stay the same. Assigned CLAP Pattern channels can loop in Pattern transport; their audio is pre-rendered at project base tempo and mixed directly to Master. Channel assignments are saved in machine-local settings per project path; plug-in state save/restore, Full Playlist playback, Mixer/Layer routing, and native plug-in editors are not available yet.",
                 )
                 .color(MUTED),
             );
@@ -61372,19 +61378,43 @@ impl DawUi {
             }
             ui.small("Pattern previews use project base tempo. CLAP note-dialect plug-ins receive per-note tuning, pan, Mod X brightness, and release; MIDI 1.0/2.0 inputs receive key, velocity, channel, and release. Playlist tempo automation, Layer routing, and Mixer routing are not applied.");
             if let Ok(Some(settings)) = &clap_pattern_preview_settings {
-                match self.clap_pattern_playback_instruments.get(&settings.channel_id) {
-                    Some(instrument) => ui.small(format!(
-                        "Pattern transport Channel {} uses {} ({})",
-                        settings.channel_id,
-                        instrument.plugin_name,
-                        instrument.plugin_id
-                    )),
-                    None => ui.small(format!(
-                        "Pattern transport Channel {} uses its project instrument",
-                        settings.channel_id
-                    )),
-                };
-                ui.small("Assigned CLAP loops are rendered at the project base tempo and mixed directly to Master; Mixer and Layer routing, tempo automation, and plug-in state restoration are not applied.");
+                ui.horizontal(|ui| {
+                    if let Some(instrument) = self
+                        .clap_pattern_playback_instruments
+                        .get(&settings.channel_id)
+                    {
+                        ui.small(format!(
+                            "Pattern transport Channel {} uses {} ({}) · {}",
+                            settings.channel_id,
+                            instrument.plugin_name,
+                            instrument.plugin_id,
+                            instrument.path.display()
+                        ));
+                    } else {
+                        ui.small(format!(
+                            "Pattern transport Channel {} uses its project instrument",
+                            settings.channel_id
+                        ));
+                    }
+                });
+                ui.small("Assignments are saved per project on this machine. CLAP loops render at project base tempo and mix directly to Master; Mixer and Layer routing, tempo automation, and plug-in state restoration are not applied.");
+            }
+            if !self.clap_pattern_playback_instruments.is_empty() {
+                ui.collapsing("Assigned CLAP Pattern channels", |ui| {
+                    for (channel_id, instrument) in &self.clap_pattern_playback_instruments {
+                        ui.horizontal(|ui| {
+                            ui.small(format!(
+                                "Channel {channel_id} · {} ({}) · {}",
+                                instrument.plugin_name,
+                                instrument.plugin_id,
+                                instrument.path.display()
+                            ));
+                            if ui.button("Remove").clicked() {
+                                remove_clap_pattern_transport = Some(*channel_id);
+                            }
+                        });
+                    }
+                });
             }
             for candidate in clap_candidates {
                 let inspection = self.clap_inspection_states.get(&candidate.path);
@@ -61982,15 +62012,46 @@ impl DawUi {
         if let Some((channel_id, instrument)) = assign_clap_pattern_transport {
             self.clap_pattern_playback_instruments
                 .insert(channel_id, instrument.clone());
-            self.status = format!(
-                "Assigned {} to Pattern transport Channel {channel_id}; it will be used on the next Pattern start",
-                instrument.plugin_name
-            );
+            self.status = if let Some(project_path) = self.current_path.as_deref() {
+                match save_clap_project_instruments(
+                    &stable_project_id(project_path),
+                    &self.clap_pattern_playback_instruments,
+                ) {
+                    Ok(()) => format!(
+                        "Assigned {} to Pattern transport Channel {channel_id}; saved for this project",
+                        instrument.plugin_name
+                    ),
+                    Err(error) => format!(
+                        "Assigned {} to Pattern transport Channel {channel_id}, but could not save the project mapping: {error}",
+                        instrument.plugin_name
+                    ),
+                }
+            } else {
+                format!(
+                    "Assigned {} to Pattern transport Channel {channel_id}; it will be saved with this project after you save it",
+                    instrument.plugin_name
+                )
+            };
         }
         if let Some(channel_id) = remove_clap_pattern_transport {
             self.clap_pattern_playback_instruments.remove(&channel_id);
-            self.status =
-                format!("Removed the CLAP Pattern transport assignment for Channel {channel_id}");
+            self.status = if let Some(project_path) = self.current_path.as_deref() {
+                match save_clap_project_instruments(
+                    &stable_project_id(project_path),
+                    &self.clap_pattern_playback_instruments,
+                ) {
+                    Ok(()) => format!(
+                        "Removed and saved the CLAP Pattern transport assignment for Channel {channel_id}"
+                    ),
+                    Err(error) => format!(
+                        "Removed the CLAP Pattern transport assignment for Channel {channel_id}, but could not save the project mapping: {error}"
+                    ),
+                }
+            } else {
+                format!(
+                    "Removed the CLAP Pattern transport assignment for Channel {channel_id}; it will be saved with this project after you save it"
+                )
+            };
         }
 
         if let Some((path, channel_id, class_uid)) = restore_request {

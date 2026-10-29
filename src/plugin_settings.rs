@@ -1,10 +1,18 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const VST3_MANUAL_LATENCY_OFFSETS_FILE: &str = "vst3-manual-latency-offsets.txt";
 const VST3_PROJECT_MANUAL_LATENCY_OFFSETS_DIRECTORY: &str = "vst3-project-manual-latency-offsets";
+const CLAP_PROJECT_INSTRUMENTS_DIRECTORY: &str = "clap-project-instruments";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClapProjectInstrumentAssignment {
+    pub path: PathBuf,
+    pub plugin_id: String,
+    pub plugin_name: String,
+}
 
 fn app_settings_directory() -> Option<PathBuf> {
     let root = if cfg!(target_os = "windows") {
@@ -40,6 +48,17 @@ fn vst3_project_manual_latency_offsets_file(project_id: &str) -> Option<PathBuf>
     Some(
         app_settings_directory()?
             .join(VST3_PROJECT_MANUAL_LATENCY_OFFSETS_DIRECTORY)
+            .join(format!("{}.txt", project_id.to_ascii_lowercase())),
+    )
+}
+
+fn clap_project_instruments_file(project_id: &str) -> Option<PathBuf> {
+    if project_id.len() != 16 || !project_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(
+        app_settings_directory()?
+            .join(CLAP_PROJECT_INSTRUMENTS_DIRECTORY)
             .join(format!("{}.txt", project_id.to_ascii_lowercase())),
     )
 }
@@ -90,6 +109,96 @@ pub fn save_vst3_project_manual_latency_offsets(
         serialize_vst3_project_manual_latency_offsets(offsets),
     )
     .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
+/// Read machine-local CLAP instrument assignments for a project and channel.
+pub fn load_clap_project_instruments(
+    project_id: &str,
+) -> BTreeMap<u16, ClapProjectInstrumentAssignment> {
+    clap_project_instruments_file(project_id)
+        .and_then(|path| fs::read_to_string(path).ok())
+        .map(|contents| parse_clap_project_instruments(&contents))
+        .unwrap_or_default()
+}
+
+/// Save machine-local CLAP instrument assignments outside the FLP file.
+pub fn save_clap_project_instruments(
+    project_id: &str,
+    assignments: &BTreeMap<u16, ClapProjectInstrumentAssignment>,
+) -> Result<(), String> {
+    let path = clap_project_instruments_file(project_id)
+        .ok_or_else(|| "the project CLAP instrument path is not valid".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the project CLAP instrument path has no parent folder".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    fs::write(&path, serialize_clap_project_instruments(assignments))
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
+pub fn parse_clap_project_instruments(
+    contents: &str,
+) -> BTreeMap<u16, ClapProjectInstrumentAssignment> {
+    let mut assignments = BTreeMap::new();
+    let mut lines = contents.lines();
+    if lines.next() != Some("clap-project-instruments-v1") {
+        return assignments;
+    }
+    for line in lines {
+        let mut fields = line.split('\t');
+        let Some(channel_id) = fields.next().and_then(|field| field.parse::<u16>().ok()) else {
+            continue;
+        };
+        let Some(path) = fields.next().and_then(decode_path) else {
+            continue;
+        };
+        let Some(plugin_id) = fields.next().and_then(decode_plugin_uid) else {
+            continue;
+        };
+        let Some(plugin_name) = fields.next().and_then(decode_plugin_uid) else {
+            continue;
+        };
+        if fields.next().is_some()
+            || path.as_os_str().is_empty()
+            || plugin_id.is_empty()
+            || plugin_name.is_empty()
+        {
+            continue;
+        }
+        assignments.insert(
+            channel_id,
+            ClapProjectInstrumentAssignment {
+                path,
+                plugin_id,
+                plugin_name,
+            },
+        );
+    }
+    assignments
+}
+
+pub fn serialize_clap_project_instruments(
+    assignments: &BTreeMap<u16, ClapProjectInstrumentAssignment>,
+) -> String {
+    let mut contents = String::from("clap-project-instruments-v1\n");
+    for (channel_id, assignment) in assignments {
+        if assignment.path.as_os_str().is_empty()
+            || assignment.plugin_id.is_empty()
+            || assignment.plugin_name.is_empty()
+        {
+            continue;
+        }
+        contents.push_str(&channel_id.to_string());
+        contents.push('\t');
+        contents.push_str(&encode_path(&assignment.path));
+        contents.push('\t');
+        contents.push_str(&encode_plugin_uid(&assignment.plugin_id));
+        contents.push('\t');
+        contents.push_str(&encode_plugin_uid(&assignment.plugin_name));
+        contents.push('\n');
+    }
+    contents
 }
 
 pub fn parse_vst3_manual_latency_offsets(contents: &str) -> BTreeMap<String, i32> {
@@ -188,6 +297,82 @@ fn decode_plugin_uid(encoded: &str) -> Option<String> {
     String::from_utf8(bytes).ok().filter(|uid| !uid.is_empty())
 }
 
+#[cfg(unix)]
+fn encode_path(path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+
+    encode_bytes_hex(path.as_os_str().as_bytes())
+}
+
+#[cfg(windows)]
+fn encode_path(path: &Path) -> String {
+    use std::os::windows::ffi::OsStrExt;
+
+    let bytes = path
+        .as_os_str()
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    encode_bytes_hex(&bytes)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn encode_path(path: &Path) -> String {
+    encode_bytes_hex(path.to_string_lossy().as_bytes())
+}
+
+#[cfg(unix)]
+fn decode_path(encoded: &str) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+
+    Some(PathBuf::from(std::ffi::OsString::from_vec(
+        decode_bytes_hex(encoded)?,
+    )))
+}
+
+#[cfg(windows)]
+fn decode_path(encoded: &str) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+
+    let bytes = decode_bytes_hex(encoded)?;
+    if !bytes.len().is_multiple_of(2) {
+        return None;
+    }
+    let wide = bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect::<Vec<_>>();
+    Some(PathBuf::from(std::ffi::OsString::from_wide(&wide)))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn decode_path(encoded: &str) -> Option<PathBuf> {
+    String::from_utf8(decode_bytes_hex(encoded)?)
+        .ok()
+        .map(PathBuf::from)
+}
+
+fn encode_bytes_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+fn decode_bytes_hex(encoded: &str) -> Option<Vec<u8>> {
+    let (pairs, remainder) = encoded.as_bytes().as_chunks::<2>();
+    if !remainder.is_empty() {
+        return None;
+    }
+    pairs
+        .iter()
+        .map(|pair| Some((hex_digit(pair[0])? << 4) | hex_digit(pair[1])?))
+        .collect()
+}
+
 fn hex_digit(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),
@@ -202,8 +387,11 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        encode_plugin_uid, parse_vst3_manual_latency_offsets, serialize_vst3_manual_latency_offsets,
+        ClapProjectInstrumentAssignment, encode_plugin_uid, parse_clap_project_instruments,
+        parse_vst3_manual_latency_offsets, serialize_clap_project_instruments,
+        serialize_vst3_manual_latency_offsets,
     };
+    use std::path::PathBuf;
 
     #[test]
     fn vst3_manual_latency_offsets_round_trip_and_normalize_class_uids() {
@@ -222,6 +410,53 @@ mod tests {
         assert_eq!(
             parse_vst3_manual_latency_offsets(&mixed_case),
             BTreeMap::from([("com.example.plugin".to_owned(), -16)])
+        );
+    }
+
+    #[test]
+    fn clap_project_instrument_assignments_round_trip_escaped_fields() {
+        let assignments = BTreeMap::from([(
+            7,
+            ClapProjectInstrumentAssignment {
+                path: PathBuf::from("/tmp/Écho Synth\tMk II.clap"),
+                plugin_id: "org.example\tvoice".to_owned(),
+                plugin_name: "Écho\nMk II".to_owned(),
+            },
+        )]);
+
+        let serialized = serialize_clap_project_instruments(&assignments);
+
+        assert_eq!(parse_clap_project_instruments(&serialized), assignments);
+    }
+
+    #[test]
+    fn clap_project_instrument_assignments_reject_malformed_records() {
+        let parsed = parse_clap_project_instruments(
+            "clap-project-instruments-v1\nnot-a-channel\t2f746d702f78\t6964\t6e616d65\n8\t2f746d702f78\t6964\t\n",
+        );
+
+        assert!(parsed.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clap_project_instrument_assignments_preserve_non_utf8_paths() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let assignments = BTreeMap::from([(
+            4,
+            ClapProjectInstrumentAssignment {
+                path: PathBuf::from(std::ffi::OsString::from_vec(
+                    b"/tmp/plug-\xff.clap".to_vec(),
+                )),
+                plugin_id: "org.example.synth".to_owned(),
+                plugin_name: "Example Synth".to_owned(),
+            },
+        )]);
+
+        assert_eq!(
+            parse_clap_project_instruments(&serialize_clap_project_instruments(&assignments)),
+            assignments
         );
     }
 }
