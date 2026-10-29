@@ -10557,6 +10557,16 @@ pub fn schedule_playlist_pattern_notes_with_adjustments<'a>(
         if clip_length == 0 {
             continue;
         }
+        let (source_start_tick, source_end_tick) = clip
+            .recognized_pattern_source_window_ticks()
+            .ok_or_else(|| {
+                format!(
+                    "Playlist Pattern Clip {} has an unsupported or mismatched source window",
+                    clip_index + 1
+                )
+            })?;
+        let source_start_tick = u64::from(source_start_tick);
+        let source_end_tick = u64::from(source_end_tick);
         let inferred_length = pattern
             .notes
             .iter()
@@ -10582,8 +10592,38 @@ pub fn schedule_playlist_pattern_notes_with_adjustments<'a>(
         let clip_end = u64::from(clip.position_ticks)
             .checked_add(clip_length)
             .ok_or_else(|| "Playlist pattern clip end position overflow".to_owned())?;
-        let repetitions = clip_length.div_ceil(loop_length);
-        for repetition in 0..repetitions {
+        let first_repetition = pattern
+            .notes
+            .iter()
+            .filter(|note| !note.is_muted())
+            .map(|note| {
+                let note_start = u64::from(note.position);
+                let note_length = u64::from(note.length);
+                if options.play_truncated_notes_in_clips {
+                    if note_length == 0 {
+                        if source_start_tick <= note_start {
+                            0
+                        } else {
+                            (source_start_tick - 1 - note_start) / loop_length
+                        }
+                    } else {
+                        let note_end = note_start.saturating_add(note_length);
+                        if note_end > source_start_tick {
+                            0
+                        } else {
+                            (source_start_tick - note_end) / loop_length + 1
+                        }
+                    }
+                } else if source_start_tick <= note_start {
+                    0
+                } else {
+                    (source_start_tick - note_start).div_ceil(loop_length)
+                }
+            })
+            .min()
+            .unwrap_or_else(|| source_start_tick / loop_length);
+        let last_repetition = (source_end_tick - 1) / loop_length;
+        for repetition in first_repetition..=last_repetition {
             let repeat_start = repetition
                 .checked_mul(loop_length)
                 .ok_or_else(|| "pattern repeat position overflow".to_owned())?;
@@ -10591,33 +10631,66 @@ pub fn schedule_playlist_pattern_notes_with_adjustments<'a>(
                 if note.is_muted() {
                     continue;
                 }
-                let relative_start = repeat_start
+                let source_note_start = repeat_start
                     .checked_add(u64::from(note.position))
                     .ok_or_else(|| "repeated pattern note position overflow".to_owned())?;
-                if relative_start >= clip_length {
+                if source_note_start >= source_end_tick {
                     continue;
                 }
+                let source_note_end = if note.length == 0 {
+                    None
+                } else {
+                    Some(
+                        source_note_start
+                            .checked_add(u64::from(note.length))
+                            .ok_or_else(|| {
+                                "Playlist pattern note end position overflow".to_owned()
+                            })?,
+                    )
+                };
+                let starts_before_source_window = source_note_start < source_start_tick;
+                if starts_before_source_window
+                    && (!options.play_truncated_notes_in_clips
+                        || source_note_end.is_some_and(|end| end <= source_start_tick))
+                {
+                    continue;
+                }
+                let relative_start = source_note_start
+                    .max(source_start_tick)
+                    .checked_sub(source_start_tick)
+                    .ok_or_else(|| "Playlist Pattern source offset underflow".to_owned())?;
                 let nominal_start_tick = u64::from(clip.position_ticks)
                     .checked_add(relative_start)
                     .ok_or_else(|| "Playlist pattern note position overflow".to_owned())?;
-                let swung_relative_start = swing_note_start_tick(
-                    relative_start,
-                    options.ppq,
-                    options.global_swing_mix_raw,
-                    channel_swing_mix_raw(note.channel_id),
-                )?;
-                let swing_offset = swung_relative_start.saturating_sub(relative_start);
+                let swing_offset = if starts_before_source_window {
+                    0
+                } else {
+                    swing_note_start_tick(
+                        source_note_start,
+                        options.ppq,
+                        options.global_swing_mix_raw,
+                        channel_swing_mix_raw(note.channel_id),
+                    )?
+                    .saturating_sub(source_note_start)
+                };
+                let swung_relative_start = relative_start
+                    .checked_add(swing_offset)
+                    .ok_or_else(|| "swung Playlist Pattern note position overflow".to_owned())?;
                 let start_tick = u64::from(clip.position_ticks)
                     .checked_add(swung_relative_start)
                     .ok_or_else(|| "swung Playlist pattern note position overflow".to_owned())?;
                 if start_tick >= clip_end {
                     continue;
                 }
-                let stop_tick = if note.length == 0 {
-                    None
-                } else {
-                    let note_end_tick = nominal_start_tick
-                        .checked_add(u64::from(note.length))
+                let stop_tick = if let Some(source_note_end) = source_note_end {
+                    let relative_end =
+                        source_note_end
+                            .checked_sub(source_start_tick)
+                            .ok_or_else(|| {
+                                "Playlist Pattern note end precedes its source window".to_owned()
+                            })?;
+                    let note_end_tick = u64::from(clip.position_ticks)
+                        .checked_add(relative_end)
                         .and_then(|stop_tick| stop_tick.checked_add(swing_offset))
                         .ok_or_else(|| "Playlist pattern note end position overflow".to_owned())?;
                     Some(if options.play_truncated_notes_in_clips {
@@ -10625,6 +10698,8 @@ pub fn schedule_playlist_pattern_notes_with_adjustments<'a>(
                     } else {
                         note_end_tick.min(clip_end)
                     })
+                } else {
+                    None
                 };
                 let note_seed = (clip_index as u64).rotate_left(32)
                     ^ repetition.rotate_left(17)

@@ -20772,7 +20772,7 @@ impl DawUi {
             let unsupported_scale = clip
                 .scale
                 .is_some_and(|scale| !scale.is_finite() || (scale - 1.0).abs() > 1e-9);
-            let unsupported_source_window = !clip.uses_full_source_window();
+            let unsupported_source_window = clip.recognized_pattern_source_window_ticks().is_none();
             if !unsupported_scale && !unsupported_source_window {
                 continue;
             }
@@ -64126,7 +64126,7 @@ impl DawUi {
             ui.heading(format!("Detected CLAP plug-ins ({})", clap_candidates.len()));
             ui.label(
                 egui::RichText::new(
-                "CLAP note and Pattern/channel previews render in an isolated helper, which reuses the instrument while the plug-in and output rate stay the same. Pattern transport pre-renders assigned channels at project base tempo, expands Layer notes, and follows saved Mixer routes and loaded VST3 Mixer effects. Playlist transport pre-renders assigned CLAP instruments across supported Pattern Clips and follows clip repeats, track mute/solo, and tempo changes. Performance Mode pre-renders assigned CLAP-only Pattern Clip loops for constant-tempo arrangements, with saved channel and Layer gains, pan automation, and Mixer routes. Full-song Playlist mix and Mixer stem renders also pre-render assigned instruments with saved state, Pattern Event, Pattern LFO, and Playlist Automation parameter links, and linked fader/pan automation. Channel assignments and captured plug-in state are saved in machine-local settings per project path; mixed Sampler/VST3/CLAP Performance clips, tempo-changing CLAP Performance clips, CLAP Mixer effects, scaled/source-windowed Pattern Clips, native FLP state embedding, and native plug-in editors remain unsupported.",
+                "CLAP note and Pattern/channel previews render in an isolated helper, which reuses the instrument while the plug-in and output rate stay the same. Pattern transport pre-renders assigned channels at project base tempo, expands Layer notes, and follows saved Mixer routes and loaded VST3 Mixer effects. Playlist transport pre-renders assigned CLAP instruments across supported Pattern Clips and follows clip repeats, track mute/solo, and tempo changes. Performance Mode pre-renders assigned CLAP-only Pattern Clip loops for constant-tempo arrangements, with saved channel and Layer gains, pan automation, and Mixer routes. Full-song Playlist mix and Mixer stem renders also pre-render assigned instruments with saved state, Pattern Event, Pattern LFO, and Playlist Automation parameter links, and linked fader/pan automation. Channel assignments and captured plug-in state are saved in machine-local settings per project path; mixed Sampler/VST3/CLAP Performance clips, tempo-changing CLAP Performance clips, CLAP Mixer effects, nondefault-scale or unrecognized legacy-window Pattern Clips, native FLP state embedding, and native plug-in editors remain unsupported.",
                 )
                 .color(MUTED),
             );
@@ -64173,7 +64173,7 @@ impl DawUi {
                     ui.colored_label(ORANGE, error);
                 }
             }
-                ui.small("Pattern previews use project base tempo. CLAP Pattern transport expands Layer notes to assigned CLAP child channels, applies Layer gain/pan and source-channel gain/pan, and follows Mixer routes including loaded VST3 insert effects. Layer Crossfade applies when every active leaf is a Sampler, an assigned CLAP channel, or a loaded VST3 channel whose plug-in advertises Volume note expression. CLAP Playlist playback follows clip repeats, track mute/solo, Layer routing and gain/pan, and tempo automation for default-scale, full-source Pattern clips. Performance Mode launches pre-rendered CLAP-only Pattern Clip loops for constant-tempo arrangements and applies saved channel and Layer gain/pan, linked fader/pan automation, Pattern Event links, Pattern LFO links, and Playlist Automation parameter links. Pattern Event points take precedence over LFOs for a shared parameter. Mixed Sampler/VST3/CLAP Performance clips, tempo-changing CLAP clips, CLAP-format Mixer effect processing, scaled/source-windowed clips remain unsupported. Full-song Playlist mix and Mixer stem renders also pre-render assigned CLAP instruments, including Pattern Event, Pattern LFO, and Playlist Automation parameter links plus linked Playlist fader/pan automation. CLAP note-dialect plug-ins receive per-note tuning, pan, Mod X brightness, and release; MIDI 1.0/2.0 inputs receive key, velocity, channel, and release.");
+                ui.small("Pattern previews use project base tempo. CLAP Pattern transport expands Layer notes to assigned CLAP child channels, applies Layer gain/pan and source-channel gain/pan, and follows Mixer routes including loaded VST3 insert effects. Layer Crossfade applies when every active leaf is a Sampler, an assigned CLAP channel, or a loaded VST3 channel whose plug-in advertises Volume note expression. CLAP Playlist playback follows clip repeats, track mute/solo, Layer routing and gain/pan, and tempo automation for default-scale Pattern clips with recognized 88-byte source windows whose span matches the clip length. Performance Mode launches pre-rendered CLAP-only Pattern Clip loops for constant-tempo arrangements and applies saved channel and Layer gain/pan, linked fader/pan automation, Pattern Event links, Pattern LFO links, and Playlist Automation parameter links. Pattern Event points take precedence over LFOs for a shared parameter. Nondefault scales and unrecognized legacy source windows remain unsupported. Performance Mode still requires default-scale, full-source clips. Mixed Sampler/VST3/CLAP Performance clips, tempo-changing CLAP clips, and CLAP-format Mixer effect processing remain unsupported. Full-song Playlist mix and Mixer stem renders also pre-render assigned CLAP instruments, including Pattern Event, Pattern LFO, and Playlist Automation parameter links plus linked Playlist fader/pan automation. CLAP note-dialect plug-ins receive per-note tuning, pan, Mod X brightness, and release; MIDI 1.0/2.0 inputs receive key, velocity, channel, and release.");
             if let Ok(Some(settings)) = &clap_pattern_preview_settings {
                 ui.horizontal(|ui| {
                     if let Some(instrument) = self
@@ -71211,16 +71211,30 @@ fn expand_clap_parameter_automation_for_clip(
     {
         return Ok(Vec::new());
     }
-    let clip_length = u64::from(clip.length_ticks);
     let loop_length = pattern_lfo_loop_length_ticks(pattern, ppq, default_time_signature);
     if loop_length == 0 {
         return Ok(Vec::new());
     }
-    let repetitions = clip_length.div_ceil(loop_length);
+    let (source_start_tick, source_end_tick) = clip
+        .recognized_pattern_source_window_ticks()
+        .ok_or_else(|| {
+            "CLAP Pattern automation requires a recognized source window matching the clip length"
+                .to_owned()
+        })?;
+    let source_start_tick = u64::from(source_start_tick);
+    let source_end_tick = u64::from(source_end_tick);
+    let max_point_tick = lanes
+        .iter()
+        .flat_map(|lane| lane.points.iter().map(|point| point.tick))
+        .max()
+        .unwrap_or(0);
+    let first_repetition = source_start_tick.saturating_sub(max_point_tick) / loop_length;
+    let last_repetition = (source_end_tick - 1) / loop_length;
     let mut points_by_parameter = BTreeMap::<u32, Vec<(u64, u64, usize, usize, f64)>>::new();
     let mut expanded_point_count = 0usize;
     for (lane_index, lane) in lanes.iter().enumerate() {
-        for repetition in 0..repetitions {
+        let mut previous_point = None::<(u64, u64, usize, f64)>;
+        for repetition in first_repetition..=last_repetition {
             let repeat_start = repetition
                 .checked_mul(loop_length)
                 .ok_or_else(|| "CLAP Pattern automation repeat position overflow".to_owned())?;
@@ -71233,9 +71247,25 @@ fn expand_clap_parameter_automation_for_clip(
                 let relative_tick = repeat_start
                     .checked_add(point.tick)
                     .ok_or_else(|| "CLAP Pattern automation point position overflow".to_owned())?;
-                if relative_tick >= clip_length {
+                if relative_tick < source_start_tick {
+                    let candidate = (
+                        relative_tick,
+                        repetition,
+                        point_index,
+                        point.normalized_value,
+                    );
+                    if previous_point.is_none_or(|previous| {
+                        (candidate.0, candidate.1, candidate.2)
+                            > (previous.0, previous.1, previous.2)
+                    }) {
+                        previous_point = Some(candidate);
+                    }
                     continue;
                 }
+                if relative_tick >= source_end_tick {
+                    continue;
+                }
+                let clip_relative_tick = relative_tick - source_start_tick;
                 expanded_point_count = expanded_point_count
                     .checked_add(1)
                     .filter(|count| *count <= MAX_CLAP_PARAMETER_AUTOMATION_POINTS)
@@ -71246,10 +71276,10 @@ fn expand_clap_parameter_automation_for_clip(
                     })?;
                 let tick = if absolute_positions {
                     u64::from(clip.position_ticks)
-                        .checked_add(relative_tick)
+                        .checked_add(clip_relative_tick)
                         .ok_or_else(|| "Playlist CLAP automation position overflow".to_owned())?
                 } else {
-                    relative_tick
+                    clip_relative_tick
                 };
                 points_by_parameter
                     .entry(lane.parameter_id)
@@ -71262,6 +71292,27 @@ fn expand_clap_parameter_automation_for_clip(
                         point.normalized_value,
                     ));
             }
+        }
+        if source_start_tick > 0
+            && let Some((_, repetition, point_index, normalized_value)) = previous_point
+        {
+            expanded_point_count = expanded_point_count
+                .checked_add(1)
+                .filter(|count| *count <= MAX_CLAP_PARAMETER_AUTOMATION_POINTS)
+                .ok_or_else(|| {
+                    format!(
+                        "CLAP Pattern clip automation exceeds {MAX_CLAP_PARAMETER_AUTOMATION_POINTS} points"
+                    )
+                })?;
+            let tick = if absolute_positions {
+                u64::from(clip.position_ticks)
+            } else {
+                0
+            };
+            points_by_parameter
+                .entry(lane.parameter_id)
+                .or_default()
+                .push((tick, repetition, lane_index, point_index, normalized_value));
         }
     }
 
