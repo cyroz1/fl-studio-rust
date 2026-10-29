@@ -18,7 +18,7 @@ pub struct ClapProjectInstrumentAssignment {
     pub state: Option<Vec<u8>>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ClapProjectMixerEffectAssignment {
     pub path: PathBuf,
     pub plugin_id: String,
@@ -27,6 +27,8 @@ pub struct ClapProjectMixerEffectAssignment {
     /// Maps source Mixer insert ordinals to CLAP auxiliary input port indices.
     /// `None` uses stable automatic ordering; `Some(empty)` explicitly disables sidechains.
     pub auxiliary_input_source_map: Option<BTreeSet<(usize, usize)>>,
+    /// Machine-local plain values forced after state restoration when the effect starts.
+    pub parameter_overrides: BTreeMap<u32, f64>,
 }
 
 fn app_settings_directory() -> Option<PathBuf> {
@@ -220,8 +222,11 @@ pub fn parse_clap_project_mixer_effects(
     };
     let has_auxiliary_map = matches!(
         version,
-        "clap-project-mixer-effects-v2" | "clap-project-mixer-effects-v3"
+        "clap-project-mixer-effects-v2"
+            | "clap-project-mixer-effects-v3"
+            | "clap-project-mixer-effects-v4"
     );
+    let has_parameter_overrides = version == "clap-project-mixer-effects-v4";
     if !has_auxiliary_map && version != "clap-project-mixer-effects-v1" {
         return assignments;
     }
@@ -269,6 +274,17 @@ pub fn parse_clap_project_mixer_effects(
         } else {
             None
         };
+        let parameter_overrides = if has_parameter_overrides {
+            let Some(encoded_overrides) = fields.next() else {
+                continue;
+            };
+            let Some(overrides) = parse_clap_mixer_parameter_overrides(encoded_overrides) else {
+                continue;
+            };
+            overrides
+        } else {
+            BTreeMap::new()
+        };
         if fields.next().is_some()
             || insert_ordinal >= crate::audio::MIXER_TRACK_METER_COUNT
             || slot_index >= 10
@@ -286,6 +302,7 @@ pub fn parse_clap_project_mixer_effects(
                 plugin_name,
                 state,
                 auxiliary_input_source_map,
+                parameter_overrides,
             },
         );
     }
@@ -295,7 +312,7 @@ pub fn parse_clap_project_mixer_effects(
 pub fn serialize_clap_project_mixer_effects(
     assignments: &BTreeMap<(usize, u16), ClapProjectMixerEffectAssignment>,
 ) -> String {
-    let mut contents = String::from("clap-project-mixer-effects-v3\n");
+    let mut contents = String::from("clap-project-mixer-effects-v4\n");
     for ((insert_ordinal, slot_index), assignment) in assignments {
         if *insert_ordinal >= crate::audio::MIXER_TRACK_METER_COUNT
             || *slot_index >= 10
@@ -316,6 +333,11 @@ pub fn serialize_clap_project_mixer_effects(
                             || *bus_index >= MAX_CLAP_PROJECT_MIXER_AUXILIARY_BUSES
                     })
                 })
+            || assignment.parameter_overrides.len() > 512
+            || assignment
+                .parameter_overrides
+                .values()
+                .any(|value| !value.is_finite())
         {
             continue;
         }
@@ -347,6 +369,18 @@ pub fn serialize_clap_project_mixer_effects(
                 }
             }
         }
+        contents.push('\t');
+        if assignment.parameter_overrides.is_empty() {
+            contents.push('-');
+        } else {
+            for (index, (parameter_id, value)) in assignment.parameter_overrides.iter().enumerate()
+            {
+                if index > 0 {
+                    contents.push(',');
+                }
+                contents.push_str(&format!("{parameter_id}:{:016x}", value.to_bits()));
+            }
+        }
         contents.push('\n');
     }
     contents
@@ -375,6 +409,25 @@ fn parse_clap_mixer_auxiliary_input_source_map(
         }
     }
     Some(Some(mapping))
+}
+
+fn parse_clap_mixer_parameter_overrides(encoded: &str) -> Option<BTreeMap<u32, f64>> {
+    if encoded == "-" {
+        return Some(BTreeMap::new());
+    }
+    let mut overrides = BTreeMap::new();
+    for entry in encoded.split(',') {
+        let (parameter_id, encoded_value) = entry.split_once(':')?;
+        let parameter_id = parameter_id.parse::<u32>().ok()?;
+        let value = f64::from_bits(u64::from_str_radix(encoded_value, 16).ok()?);
+        if !value.is_finite() || overrides.insert(parameter_id, value).is_some() {
+            return None;
+        }
+        if overrides.len() > 512 {
+            return None;
+        }
+    }
+    Some(overrides)
 }
 
 pub fn parse_clap_project_instruments(

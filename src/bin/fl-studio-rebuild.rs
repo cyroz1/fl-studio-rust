@@ -5252,6 +5252,7 @@ struct DawUi {
     channel_vst3_instances: BTreeMap<u16, u64>,
     mixer_effect_vst3_instances: BTreeMap<(usize, u16), u64>,
     clap_mixer_effect_assignments: BTreeMap<(usize, u16), ClapProjectMixerEffectAssignment>,
+    clap_effect_parameter_drafts: BTreeMap<((usize, u16), u32), f64>,
     audio_catalog: AudioDeviceCatalog,
     audio_settings: AudioSettings,
     live_resampling_quality: ResamplingQuality,
@@ -7592,6 +7593,7 @@ impl DawUi {
             channel_vst3_instances: BTreeMap::new(),
             mixer_effect_vst3_instances: BTreeMap::new(),
             clap_mixer_effect_assignments: BTreeMap::new(),
+            clap_effect_parameter_drafts: BTreeMap::new(),
             audio_catalog,
             audio_settings,
             live_resampling_quality,
@@ -53929,6 +53931,8 @@ impl DawUi {
         let mut inspect_clap_instance = None;
         let mut clap_effect_sidechain_mapping_edits = Vec::new();
         let mut clap_effect_sidechain_mapping_use_auto = Vec::new();
+        let mut clap_effect_parameter_override_apply = Vec::new();
+        let mut clap_effect_parameter_override_clear = Vec::new();
         let mut clap_effect_assignment_edit = None;
         let mut clap_effect_assignment_remove = None;
         let mut capture_clap_mixer_effect_state = None;
@@ -55751,6 +55755,14 @@ impl DawUi {
                                                                                             .clone()
                                                                                     })
                                                                                     .unwrap_or_default();
+                                                                            let parameter_overrides =
+                                                                                existing_assignment
+                                                                                    .map(|assignment| {
+                                                                                        assignment
+                                                                                            .parameter_overrides
+                                                                                            .clone()
+                                                                                    })
+                                                                                    .unwrap_or_default();
                                                                             clap_effect_assignment_edit = Some((
                                                                                 slot_key,
                                                                                 ClapProjectMixerEffectAssignment {
@@ -55759,6 +55771,7 @@ impl DawUi {
                                                                                     plugin_name: descriptor.name.clone(),
                                                                                     state,
                                                                                     auxiliary_input_source_map,
+                                                                                    parameter_overrides,
                                                                                 },
                                                                             ));
                                                                             ui.close();
@@ -55931,6 +55944,101 @@ impl DawUi {
                                                                 }
                                                             }
                                                         });
+                                                        ui.collapsing("CLAP parameter overrides", |ui| {
+                                                            match &clap_instance_inspection_state {
+                                                                Some(ClapInstanceInspectionState::Inspected(info)) => {
+                                                                    ui.small("Values are machine-local overrides applied after the saved state snapshot loads. Sliders without overrides start at the plug-in's reported value. Apply stops playback and reloads the effect.");
+                                                                    let mut editable_count = 0usize;
+                                                                    for parameter in &info.parameters {
+                                                                        let flags = ParamInfoFlags::from_bits_truncate(parameter.flags);
+                                                                        if flags.contains(ParamInfoFlags::IS_HIDDEN) {
+                                                                            continue;
+                                                                        }
+                                                                        if flags.contains(ParamInfoFlags::IS_READONLY)
+                                                                            || !parameter.min_value.is_finite()
+                                                                            || !parameter.max_value.is_finite()
+                                                                            || parameter.min_value >= parameter.max_value
+                                                                        {
+                                                                            continue;
+                                                                        }
+                                                                        editable_count += 1;
+                                                                        let key = (slot_key, parameter.id);
+                                                                        let fallback = if parameter.default_value.is_finite() {
+                                                                            parameter.default_value.clamp(parameter.min_value, parameter.max_value)
+                                                                        } else {
+                                                                            parameter.min_value
+                                                                        };
+                                                                        let stored_value = self
+                                                                            .clap_effect_parameter_drafts
+                                                                            .get(&key)
+                                                                            .copied()
+                                                                            .or_else(|| assignment.parameter_overrides.get(&parameter.id).copied())
+                                                                            .or(parameter.current_value.filter(|value| value.is_finite()))
+                                                                            .unwrap_or(fallback);
+                                                                        let mut value = stored_value
+                                                                            .clamp(parameter.min_value, parameter.max_value);
+                                                                        let mut slider = egui::Slider::new(
+                                                                            &mut value,
+                                                                            parameter.min_value..=parameter.max_value,
+                                                                        )
+                                                                        .text(format!("{} · {}", parameter.id, parameter.name));
+                                                                        if flags.contains(ParamInfoFlags::IS_STEPPED) {
+                                                                            slider = slider.step_by(1.0);
+                                                                        }
+                                                                        if ui.add(slider).changed() {
+                                                                            self.clap_effect_parameter_drafts.insert(key, value);
+                                                                        }
+                                                                        if !parameter.module.is_empty() {
+                                                                            ui.small(&parameter.module);
+                                                                        }
+                                                                    }
+                                                                    if editable_count == 0 {
+                                                                        ui.small("No writable ranged parameters were reported.");
+                                                                    }
+                                                                    let has_draft = self
+                                                                        .clap_effect_parameter_drafts
+                                                                        .keys()
+                                                                        .any(|(draft_slot, _)| *draft_slot == slot_key);
+                                                                    ui.horizontal(|ui| {
+                                                                        if ui
+                                                                            .add_enabled(has_draft, egui::Button::new("Apply overrides"))
+                                                                            .clicked()
+                                                                        {
+                                                                            clap_effect_parameter_override_apply.push(slot_key);
+                                                                        }
+                                                                        if ui
+                                                                            .add_enabled(
+                                                                                !assignment.parameter_overrides.is_empty(),
+                                                                                egui::Button::new("Clear overrides"),
+                                                                            )
+                                                                            .clicked()
+                                                                        {
+                                                                            clap_effect_parameter_override_clear.push(slot_key);
+                                                                        }
+                                                                    });
+                                                                }
+                                                                Some(ClapInstanceInspectionState::Inspecting) => {
+                                                                    ui.small("Inspecting CLAP parameters…");
+                                                                }
+                                                                Some(ClapInstanceInspectionState::Failed(error)) => {
+                                                                    ui.colored_label(RED, error);
+                                                                    if ui.small_button("Retry parameter inspection").clicked() {
+                                                                        inspect_clap_instance = Some((
+                                                                            assignment.path.clone(),
+                                                                            assignment.plugin_id.clone(),
+                                                                        ));
+                                                                    }
+                                                                }
+                                                                None => {
+                                                                    if ui.small_button("Inspect CLAP parameters").clicked() {
+                                                                        inspect_clap_instance = Some((
+                                                                            assignment.path.clone(),
+                                                                            assignment.plugin_id.clone(),
+                                                                        ));
+                                                                    }
+                                                                }
+                                                            }
+                                                        });
                                                     }
                                                 } else {
                                                     ui.small(
@@ -55960,7 +56068,7 @@ impl DawUi {
                             }
                             ui.small(
                                 egui::RichText::new(
-                                    "Open editor controls a loaded VST3 effect through its native editor. Move up/down carries saved slot events with the effect. CLAP assignments process in saved slot order with timed parameter automation and reported-latency PDC. CLAP sidechains feed supported mono/stereo auxiliary inputs in source-track and bus order by default; a slot can save explicit source-insert-to-input maps that sum multiple sources on one port. PDC and runtime latency/tail reports apply between audio blocks. Capture state reads one active effect at the next block boundary, or refreshes the prior machine-local snapshot if none is active; simultaneous active instances must be stopped to avoid an ambiguous capture. Native FLP bus mapping and editors remain incomplete. VST3 Mix edits use a 20 ms ramp.",
+                                    "Open editor controls a loaded VST3 effect through its native editor. Move up/down carries saved slot events with the effect. CLAP assignments process in saved slot order with timed parameter automation, saved machine-local parameter overrides, and reported-latency PDC. CLAP sidechains feed supported mono/stereo auxiliary inputs in source-track and bus order by default; a slot can save explicit source-insert-to-input maps that sum multiple sources on one port. PDC and runtime latency/tail reports apply between audio blocks. Capture state reads one active effect at the next block boundary, or refreshes the prior machine-local snapshot if none is active; simultaneous active instances must be stopped to avoid an ambiguous capture. Native FLP bus mapping and editors remain incomplete. VST3 Mix edits use a 20 ms ramp.",
                                 )
                                 .color(MUTED),
                             );
@@ -56441,6 +56549,51 @@ impl DawUi {
                 }
             } else {
                 self.status = "Save the project before mapping CLAP sidechain inputs".to_owned();
+            }
+        }
+        if !clap_effect_parameter_override_apply.is_empty()
+            || !clap_effect_parameter_override_clear.is_empty()
+        {
+            if let Some(project_id) = project_id.as_deref() {
+                let mut assignments = self.clap_mixer_effect_assignments.clone();
+                let mut changed_slots = BTreeSet::new();
+                for slot_key in clap_effect_parameter_override_clear {
+                    let Some(assignment) = assignments.get_mut(&slot_key) else {
+                        continue;
+                    };
+                    assignment.parameter_overrides.clear();
+                    changed_slots.insert(slot_key);
+                }
+                for slot_key in clap_effect_parameter_override_apply {
+                    let Some(assignment) = assignments.get_mut(&slot_key) else {
+                        continue;
+                    };
+                    for ((draft_slot, parameter_id), value) in &self.clap_effect_parameter_drafts {
+                        if *draft_slot == slot_key {
+                            assignment.parameter_overrides.insert(*parameter_id, *value);
+                        }
+                    }
+                    changed_slots.insert(slot_key);
+                }
+                match save_clap_project_mixer_effects(project_id, &assignments) {
+                    Ok(()) => {
+                        self.stop_project_playback();
+                        self.clap_mixer_effect_assignments = assignments;
+                        self.clap_effect_parameter_drafts
+                            .retain(|(slot_key, _), _| !changed_slots.contains(slot_key));
+                        let reload_status = self.load_project_vst3_plugins();
+                        self.status = reload_status.map_or_else(
+                            || "Updated CLAP Mixer parameter overrides".to_owned(),
+                            |message| format!("Updated CLAP Mixer parameter overrides; {message}"),
+                        );
+                    }
+                    Err(error) => {
+                        self.status =
+                            format!("Could not save CLAP Mixer parameter overrides: {error}");
+                    }
+                }
+            } else {
+                self.status = "Save the project before editing CLAP parameters".to_owned();
             }
         }
         if let Some((insert_ordinal, slot_index)) = capture_clap_mixer_effect_state {
@@ -64583,7 +64736,7 @@ impl DawUi {
         });
         ui.label(
             egui::RichText::new(
-                "Matching VST3 instrument channels and recognized Mixer effect slots load with the project; supported VST3 Mixer effects process on loaded Mixer routes. Machine-local CLAP effect assignments process in saved Mixer slot order with timed parameter automation and reported-latency PDC. CLAP sidechains use source-track and input-bus order by default, with optional machine-local source-to-input maps and summing for multiple sources on one port. PDC and runtime latency/tail reports apply between audio blocks. Capture state reads one active effect at the next block boundary, or refreshes the prior machine-local snapshot if none is active; simultaneous active instances must be stopped to avoid an ambiguous capture. Native FLP bus mapping and editors remain incomplete. Detected CLAP and macOS Audio Unit bundles are listed below.",
+                "Matching VST3 instrument channels and recognized Mixer effect slots load with the project; supported VST3 Mixer effects process on loaded Mixer routes. Machine-local CLAP effect assignments process in saved Mixer slot order with timed parameter automation, saved machine-local parameter overrides, and reported-latency PDC. CLAP sidechains use source-track and input-bus order by default, with optional machine-local source-to-input maps and summing for multiple sources on one port. PDC and runtime latency/tail reports apply between audio blocks. Capture state reads one active effect at the next block boundary, or refreshes the prior machine-local snapshot if none is active; simultaneous active instances must be stopped to avoid an ambiguous capture. Native FLP bus mapping and editors remain incomplete. Detected CLAP and macOS Audio Unit bundles are listed below.",
             )
             .color(MUTED),
         );

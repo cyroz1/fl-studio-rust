@@ -935,6 +935,7 @@ enum ClapMixerEffectProcessResponse {
         output_channels: usize,
         auxiliary_input_buses: Vec<(usize, usize)>,
     },
+    ParametersSet,
     StateLoaded,
     State(Vec<u8>),
     StateError(String),
@@ -975,6 +976,7 @@ impl ClapMixerEffectProcess {
         plugin_id: &str,
         sample_rate: u32,
         state: Option<&[u8]>,
+        parameter_overrides: &BTreeMap<u32, f64>,
     ) -> Result<Self, String> {
         let executable = std::env::current_exe()
             .map_err(|error| format!("could not locate the application executable: {error}"))?;
@@ -1066,6 +1068,42 @@ impl ClapMixerEffectProcess {
                 ClapMixerEffectProcessResponse::Error(error) => return Err(error),
                 _ => {
                     return Err("CLAP Mixer effect helper did not acknowledge its state".to_owned());
+                }
+            }
+        }
+        if !parameter_overrides.is_empty() {
+            if parameter_overrides.len() > MAX_INSTANCE_METADATA_ITEMS as usize {
+                return Err(
+                    "CLAP Mixer parameter override count exceeds the metadata limit".to_owned(),
+                );
+            }
+            writeln!(process.stdin, "SET_PARAMS {}", parameter_overrides.len()).map_err(
+                |error| format!("could not send CLAP Mixer parameter overrides: {error}"),
+            )?;
+            for (parameter_id, value) in parameter_overrides {
+                if !value.is_finite() {
+                    return Err("CLAP Mixer parameter override is not finite".to_owned());
+                }
+                writeln!(
+                    process.stdin,
+                    "PARAMETER {parameter_id} {:016x}",
+                    value.to_bits()
+                )
+                .map_err(|error| {
+                    format!("could not send CLAP Mixer parameter override: {error}")
+                })?;
+            }
+            process.stdin.flush().map_err(|error| {
+                format!("could not flush CLAP Mixer parameter overrides: {error}")
+            })?;
+            match process.receive_response()? {
+                ClapMixerEffectProcessResponse::ParametersSet => {}
+                ClapMixerEffectProcessResponse::Error(error) => return Err(error),
+                _ => {
+                    return Err(
+                        "CLAP Mixer effect helper did not acknowledge parameter overrides"
+                            .to_owned(),
+                    );
                 }
             }
         }
@@ -1416,6 +1454,7 @@ impl MixerEffectProcessorFactory for ClapProjectMixerEffectProcessorFactory {
             &assignment.plugin_id,
             sample_rate,
             assignment.state.as_deref(),
+            &assignment.parameter_overrides,
         )?;
         if let Some(mapping) = &assignment.auxiliary_input_source_map {
             let mut validated_mapping = Vec::with_capacity(mapping.len());
@@ -1946,6 +1985,15 @@ fn read_mixer_effect_process_responses(
         if header == "STATE_LOADED" {
             if response_sender
                 .send(ClapMixerEffectProcessResponse::StateLoaded)
+                .is_err()
+            {
+                return;
+            }
+            continue;
+        }
+        if header == "PARAMETERS_SET" {
+            if response_sender
+                .send(ClapMixerEffectProcessResponse::ParametersSet)
                 .is_err()
             {
                 return;
@@ -2510,6 +2558,28 @@ pub fn run_mixer_effect_server_child(path: &Path, plugin_id: &str, sample_rate: 
                 }
             }
         }
+        if let Some(encoded_count) = line.strip_prefix("SET_PARAMS ") {
+            let Some(count) = encoded_count.parse::<usize>().ok() else {
+                let _ = write_preview_server_error(
+                    &mut output,
+                    "invalid CLAP Mixer parameter override count",
+                );
+                let _ = output.flush();
+                return 1;
+            };
+            if let Err(error) = instance.set_initial_parameter_values(&mut input, count) {
+                let _ = write_preview_server_error(&mut output, &error);
+                let _ = output.flush();
+                return 1;
+            }
+            if writeln!(output, "PARAMETERS_SET")
+                .and_then(|_| output.flush())
+                .is_err()
+            {
+                return 1;
+            }
+            continue;
+        }
         if line == "START" {
             return instance.run_processing_server(&mut input, &mut output);
         }
@@ -2587,6 +2657,7 @@ struct ClapMixerEffectInstance {
     output_port_channels: Vec<u32>,
     main_output_index: usize,
     parameter_ranges: BTreeMap<u32, (f64, f64, bool)>,
+    initial_parameter_values: Vec<(u32, f64)>,
     latency_samples: u32,
     tail_samples: Option<u64>,
     restart_requested: Arc<AtomicBool>,
@@ -2682,8 +2753,7 @@ impl ClapMixerEffectInstance {
                     let Some(info) = params.get_info(&plugin, index, &mut buffer) else {
                         continue;
                     };
-                    if info.flags.contains(ParamInfoFlags::IS_AUTOMATABLE)
-                        && !info.flags.contains(ParamInfoFlags::IS_READONLY)
+                    if !info.flags.contains(ParamInfoFlags::IS_READONLY)
                         && info.min_value.is_finite()
                         && info.max_value.is_finite()
                         && info.min_value < info.max_value
@@ -2718,6 +2788,7 @@ impl ClapMixerEffectInstance {
             output_port_channels,
             main_output_index,
             parameter_ranges,
+            initial_parameter_values: Vec::new(),
             latency_samples: 0,
             tail_samples: None,
             restart_requested,
@@ -2739,6 +2810,66 @@ impl ClapMixerEffectInstance {
         state
             .load(&plugin, &mut input)
             .map_err(|error| format!("CLAP effect could not restore its state: {error}"))
+    }
+
+    fn set_initial_parameter_values(
+        &mut self,
+        input: &mut impl Read,
+        count: usize,
+    ) -> Result<(), String> {
+        if count > MAX_INSTANCE_METADATA_ITEMS as usize {
+            return Err(
+                "CLAP Mixer parameter override count exceeds the metadata limit".to_owned(),
+            );
+        }
+        let mut values = Vec::with_capacity(count);
+        for _ in 0..count {
+            let line = read_preview_protocol_header(input)
+                .map_err(|error| format!("could not read CLAP Mixer parameter override: {error}"))?
+                .ok_or_else(|| "CLAP Mixer parameter override ended early".to_owned())?;
+            let mut fields = line.split_whitespace();
+            let (Some("PARAMETER"), Some(parameter_id), Some(value_bits), None) =
+                (fields.next(), fields.next(), fields.next(), fields.next())
+            else {
+                return Err("invalid CLAP Mixer parameter override".to_owned());
+            };
+            let parameter_id = parameter_id
+                .parse::<u32>()
+                .ok()
+                .and_then(ClapId::from_raw)
+                .ok_or_else(|| "CLAP Mixer parameter ID is invalid".to_owned())?;
+            let value = u64::from_str_radix(value_bits, 16)
+                .ok()
+                .map(f64::from_bits)
+                .filter(|value| value.is_finite())
+                .ok_or_else(|| "CLAP Mixer parameter value is invalid".to_owned())?;
+            let Some((minimum, maximum, stepped)) =
+                self.parameter_ranges.get(&parameter_id.get()).copied()
+            else {
+                return Err(format!(
+                    "CLAP Mixer parameter {} is not writable",
+                    parameter_id.get()
+                ));
+            };
+            if !(minimum..=maximum).contains(&value) || (stepped && value.fract() != 0.0) {
+                return Err(format!(
+                    "CLAP Mixer parameter {} override is outside its supported range",
+                    parameter_id.get()
+                ));
+            }
+            if values
+                .iter()
+                .any(|(existing_id, _)| *existing_id == parameter_id.get())
+            {
+                return Err(format!(
+                    "CLAP Mixer parameter {} override is duplicated",
+                    parameter_id.get()
+                ));
+            }
+            values.push((parameter_id.get(), value));
+        }
+        self.initial_parameter_values = values;
+        Ok(())
     }
 
     fn save_state(&mut self) -> Result<Vec<u8>, String> {
@@ -2776,6 +2907,39 @@ impl ClapMixerEffectInstance {
                 TailLength::Finite(samples) => u64::from(samples),
                 TailLength::Infinite => u64::from(i32::MAX as u32),
             })
+    }
+
+    fn flush_initial_parameter_values(
+        &mut self,
+        audio_processor: &mut StartedPluginAudioProcessor<ClapMixerEffectHost>,
+    ) -> Result<(), String> {
+        if self.initial_parameter_values.is_empty() {
+            return Ok(());
+        }
+        let mut input_events = EventBuffer::with_capacity(self.initial_parameter_values.len());
+        for (parameter_id, value) in &self.initial_parameter_values {
+            let parameter_id = ClapId::from_raw(*parameter_id)
+                .ok_or_else(|| "CLAP Mixer parameter ID is invalid".to_owned())?;
+            input_events.push(&ParamValueEvent::new(
+                0,
+                parameter_id,
+                Pckn::match_all(),
+                *value,
+            ));
+        }
+        input_events.sort();
+        let mut output_events = EventBuffer::new();
+        let mut plugin = audio_processor.plugin_handle();
+        let params = plugin
+            .get_extension::<PluginParams>()
+            .ok_or_else(|| "CLAP effect does not support parameter updates".to_owned())?;
+        params.flush_active(
+            &mut plugin,
+            &input_events.as_input(),
+            &mut output_events.as_output(),
+        );
+        self.initial_parameter_values.clear();
+        Ok(())
     }
 
     fn validate_audio_layout_after_restart(&mut self) -> Result<(), String> {
@@ -2896,6 +3060,19 @@ impl ClapMixerEffectInstance {
                 return 1;
             }
         };
+        let initial_parameter_result = self.flush_initial_parameter_values(
+            audio_processor
+                .as_mut()
+                .expect("started CLAP effect processor is present"),
+        );
+        if let Err(error) = initial_parameter_result {
+            if let Some(audio_processor) = audio_processor.take() {
+                self.instance.deactivate(audio_processor.stop_processing());
+            }
+            let _ = write_preview_server_error(output, &error);
+            let _ = output.flush();
+            return 1;
+        }
         self.tail_samples = self.read_tail_samples(
             audio_processor
                 .as_mut()
