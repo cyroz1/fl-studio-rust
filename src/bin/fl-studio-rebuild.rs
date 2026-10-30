@@ -93,7 +93,6 @@ use flp_rebuild::vst3::{
     Vst3PatternStreamHandle, Vst3PlaylistAutomationPoint, Vst3PlaylistAutomationSources,
     Vst3PlaylistLiveInputSender, Vst3PlaylistLiveInputSession, Vst3PlaylistParameterAutomation,
     Vst3PlaylistStreamProcessor, expand_automation_channel_curve_for_clip,
-    normalized_automation_point_value,
 };
 use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, ArpeggioRangePattern, ArpeggioScoreOptions,
@@ -115,7 +114,7 @@ use flp_rebuild::{
     QuantizeNoteOptions, RandomNoteChordMap, RandomNoteGeneratorOptions, RandomizerOptions,
     RiffMachineOptions, RiffMachineQuantizeMode, RiffMachineStage, SamplerEnvelopeLfo,
     SamplerEnvelopeLfoEdit, SamplerEnvelopeLfoTarget, ScaleLevelsOptions, StrumOptions, TimeMarker,
-    TimeMarkerEdit, VstPluginStateMetadata,
+    TimeMarkerEdit, VstPluginStateMetadata, normalized_automation_point_value,
 };
 use md5::{Digest, Md5};
 use vst3_host::midi::{MidiChannel as Vst3MidiChannel, MidiEvent as Vst3MidiEvent};

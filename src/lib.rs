@@ -2232,6 +2232,16 @@ fn arpeggio_score_octave_order(range_octaves: u8, range_pattern: ArpeggioRangePa
     order
 }
 
+/// FL-authored projects can contain small floating-point overshoots around the
+/// normalized range. This helper accepts values within the 0.001 tolerance used
+/// by the Automation editor and clamps them for normalized playback targets;
+/// it does not change the stored point value.
+pub fn normalized_automation_point_value(value: f64) -> Option<f64> {
+    const VALUE_SLACK: f64 = 0.001;
+    (value.is_finite() && (-VALUE_SLACK..=1.0 + VALUE_SLACK).contains(&value))
+        .then(|| value.clamp(0.0, 1.0))
+}
+
 /// One point from the `0xEA` payload of a kind-5 automation channel.
 ///
 /// Positions are cumulative beats from the start of the automation clip. The

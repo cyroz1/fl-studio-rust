@@ -1,10 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
-use crate::vst3::normalized_automation_point_value;
 use crate::{
     ChannelMidiOutSettings, FlpDocument, PatternNote, PlaylistClip, PlaylistClipTarget,
-    automation_segment_value_with_tension,
+    automation_segment_value_with_tension, normalized_automation_point_value,
 };
 
 const MTHD: &[u8; 4] = b"MThd";

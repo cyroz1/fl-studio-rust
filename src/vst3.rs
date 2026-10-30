@@ -26,7 +26,7 @@ use crate::sample_render::{
 use crate::{
     ChannelNoteRouter, ChannelPluginState, ChannelType, FlpDocument, MixerEffectSlotSummary,
     MixerRouteAudibility, MixerSourceRouteTransform, PlaylistClipTarget,
-    automation_segment_value_with_tension,
+    automation_segment_value_with_tension, normalized_automation_point_value,
 };
 use vst3_host::audio::{AudioBuffers, AudioBusLayout, BusAudioBuffers, BusDirection, MediaType};
 use vst3_host::midi::{
@@ -296,18 +296,6 @@ pub struct Vst3AutomationPoint {
     pub value: f64,
     /// Approximate single-curve tension for the segment ending at this point.
     pub tension: f32,
-}
-
-/// Normalize a stored Automation Clip value for plug-in playback.
-///
-/// FL-authored projects can contain small floating-point overshoots around the
-/// normalized range. Accept values within the same 0.001 slack used by the
-/// Automation editor, then clamp them for normalized plug-in parameters. The
-/// serialized point value remains unchanged.
-pub fn normalized_automation_point_value(value: f64) -> Option<f64> {
-    const VALUE_SLACK: f64 = 0.001;
-    (value.is_finite() && (-VALUE_SLACK..=1.0 + VALUE_SLACK).contains(&value))
-        .then(|| value.clamp(0.0, 1.0))
 }
 
 /// Explicit VST3 parameter automation for a pattern render.
