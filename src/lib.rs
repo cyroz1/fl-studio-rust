@@ -6268,25 +6268,25 @@ impl FlpDocument {
                 0xC7 if matches!(event.encoding, PayloadEncoding::Data { .. })
                     && ascii_version(&event.payload).is_none() =>
                 {
-                    if event.payload.len() >= 116 && channel.stretch_settings.is_none() {
+                    if event.payload.len() >= 112 && channel.stretch_settings.is_none() {
                         channel.stretch_settings = Some(ChannelStretchSettings {
                             time_raw: u32::from_le_bytes(
-                                event.payload[100..104]
+                                event.payload[96..100]
                                     .try_into()
                                     .expect("the stretch-time field has four bytes"),
                             ),
                             pitch_raw: i32::from_le_bytes(
-                                event.payload[104..108]
+                                event.payload[100..104]
                                     .try_into()
                                     .expect("the stretch-pitch field has four bytes"),
                             ),
                             multiplier_raw: i32::from_le_bytes(
-                                event.payload[108..112]
+                                event.payload[104..108]
                                     .try_into()
                                     .expect("the stretch-multiplier field has four bytes"),
                             ),
                             mode_raw: i32::from_le_bytes(
-                                event.payload[112..116]
+                                event.payload[108..112]
                                     .try_into()
                                     .expect("the stretch-mode field has four bytes"),
                             ),
@@ -23751,8 +23751,8 @@ impl FlpDocument {
 
     /// Edits raw time-stretch settings in an existing channel Parameters (`0xC7`) event.
     ///
-    /// The 32-bit fields at payload offsets 100, 104, 108, and 112 are preserved unless
-    /// selected. The edit requires a unique Parameters event of at least 116 bytes and
+    /// The 32-bit fields at payload offsets 96, 100, 104, and 108 are preserved unless
+    /// selected. The edit requires a unique Parameters event of at least 112 bytes and
     /// does not create missing state or change audio playback behavior.
     pub fn edit_channel_stretch_settings(
         &mut self,
@@ -23812,7 +23812,7 @@ impl FlpDocument {
                 "the selected channel's `0xC7` event is not a recognized Parameters payload"
             }));
         };
-        if self.events[parameters_index].payload.len() < 116 {
+        if self.events[parameters_index].payload.len() < 112 {
             return Err(FlpError::UnsupportedEdit(
                 "the selected channel's Parameters event does not contain all time-stretch fields",
             ));
@@ -23821,16 +23821,16 @@ impl FlpDocument {
         let mut candidate = self.clone();
         let mut payload = candidate.events[parameters_index].payload.clone();
         if let Some(time_raw) = edit.time_raw {
-            payload[100..104].copy_from_slice(&time_raw.to_le_bytes());
+            payload[96..100].copy_from_slice(&time_raw.to_le_bytes());
         }
         if let Some(pitch_raw) = edit.pitch_raw {
-            payload[104..108].copy_from_slice(&pitch_raw.to_le_bytes());
+            payload[100..104].copy_from_slice(&pitch_raw.to_le_bytes());
         }
         if let Some(multiplier_raw) = edit.multiplier_raw {
-            payload[108..112].copy_from_slice(&multiplier_raw.to_le_bytes());
+            payload[104..108].copy_from_slice(&multiplier_raw.to_le_bytes());
         }
         if let Some(mode_raw) = edit.mode_raw {
-            payload[112..116].copy_from_slice(&mode_raw.to_le_bytes());
+            payload[108..112].copy_from_slice(&mode_raw.to_le_bytes());
         }
         candidate.events[parameters_index].replace_data_payload(payload)?;
         candidate.refresh_event_offsets()?;
@@ -33160,10 +33160,10 @@ mod tests {
     #[test]
     fn decodes_and_edits_channel_time_stretch_settings_losslessly() {
         let mut parameters = vec![0xA5; 168];
-        parameters[100..104].copy_from_slice(&0x1234_5678_u32.to_le_bytes());
-        parameters[104..108].copy_from_slice(&(-1200_i32).to_le_bytes());
-        parameters[108..112].copy_from_slice(&1250_i32.to_le_bytes());
-        parameters[112..116].copy_from_slice(&1_i32.to_le_bytes());
+        parameters[96..100].copy_from_slice(&0x1234_5678_u32.to_le_bytes());
+        parameters[100..104].copy_from_slice(&(-1200_i32).to_le_bytes());
+        parameters[104..108].copy_from_slice(&1250_i32.to_le_bytes());
+        parameters[108..112].copy_from_slice(&1_i32.to_le_bytes());
         let mut event_stream = vec![0x40, 7, 0, 0x15, 0];
         append_data_event(&mut event_stream, 0xC7, &parameters);
         event_stream.extend_from_slice(&[0x62, 0, 0]);
@@ -33181,10 +33181,10 @@ mod tests {
         assert_eq!(document.encode_lossless().unwrap(), input);
 
         let mut expected_parameters = parameters.clone();
-        expected_parameters[100..104].copy_from_slice(&192_u32.to_le_bytes());
-        expected_parameters[104..108].copy_from_slice(&300_i32.to_le_bytes());
-        expected_parameters[108..112].copy_from_slice(&(-250_i32).to_le_bytes());
-        expected_parameters[112..116].copy_from_slice(&0_i32.to_le_bytes());
+        expected_parameters[96..100].copy_from_slice(&192_u32.to_le_bytes());
+        expected_parameters[100..104].copy_from_slice(&300_i32.to_le_bytes());
+        expected_parameters[104..108].copy_from_slice(&(-250_i32).to_le_bytes());
+        expected_parameters[108..112].copy_from_slice(&0_i32.to_le_bytes());
         document
             .edit_channel_stretch_settings(
                 7,
@@ -33230,7 +33230,7 @@ mod tests {
         assert_eq!(missing, before);
 
         let mut short_stream = vec![0x40, 7, 0, 0x15, 0];
-        append_data_event(&mut short_stream, 0xC7, &[0; 115]);
+        append_data_event(&mut short_stream, 0xC7, &[0; 111]);
         short_stream.extend_from_slice(&[0x62, 0, 0]);
         let mut short = FlpDocument::parse(&flp_fixture(&short_stream, &[], &[]))
             .expect("short fixture should parse");
@@ -33242,8 +33242,8 @@ mod tests {
         assert_eq!(short, before);
 
         let mut duplicate_stream = vec![0x40, 7, 0, 0x15, 0];
-        append_data_event(&mut duplicate_stream, 0xC7, &[0; 116]);
-        append_data_event(&mut duplicate_stream, 0xC7, &[0; 116]);
+        append_data_event(&mut duplicate_stream, 0xC7, &[0; 112]);
+        append_data_event(&mut duplicate_stream, 0xC7, &[0; 112]);
         duplicate_stream.extend_from_slice(&[0x62, 0, 0]);
         let mut duplicate = FlpDocument::parse(&flp_fixture(&duplicate_stream, &[], &[]))
             .expect("duplicate fixture should parse");
@@ -33255,8 +33255,45 @@ mod tests {
         assert_eq!(duplicate, before);
 
         let mut full_stream = vec![0x40, 7, 0, 0x15, 0];
-        append_data_event(&mut full_stream, 0xC7, &[0; 116]);
+        append_data_event(&mut full_stream, 0xC7, &[0; 112]);
         full_stream.extend_from_slice(&[0x62, 0, 0]);
+        let mut unknown_mode = FlpDocument::parse(&flp_fixture(&full_stream, &[], &[]))
+            .expect("full fixture should parse");
+        assert_eq!(
+            unknown_mode.channels()[0]
+                .stretch_settings()
+                .expect("112-byte Parameters event contains all four fields")
+                .mode(),
+            ChannelStretchMode::Resample
+        );
+        unknown_mode
+            .edit_channel_stretch_settings(
+                7,
+                ChannelStretchSettingsEdit {
+                    mode_raw: Some(1),
+                    ..ChannelStretchSettingsEdit::default()
+                },
+            )
+            .expect("112-byte Parameters event should support edits");
+        let minimum_parameters = unknown_mode
+            .events()
+            .iter()
+            .find(|event| event.opcode() == 0xC7)
+            .expect("Parameters event should remain present");
+        assert_eq!(
+            minimum_parameters.payload().len(),
+            112,
+            "editing the minimum-size event should not change its length"
+        );
+        assert_eq!(
+            i32::from_le_bytes(
+                minimum_parameters.payload()[108..112]
+                    .try_into()
+                    .expect("mode field has four bytes")
+            ),
+            1
+        );
+
         let mut unknown_mode = FlpDocument::parse(&flp_fixture(&full_stream, &[], &[]))
             .expect("full fixture should parse");
         let before = unknown_mode.clone();
