@@ -98,13 +98,14 @@ use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, ArpeggioRangePattern, ArpeggioScoreOptions,
     ArpeggioScorePatternMode, ArpeggioScoreTimeMultiplier, ArpeggioSyncMode, Arrangement,
     ArticulateOptions, AutomationChannel, AutomationInterpolationMode, AutomationPoint,
-    AutomationPointEdit, AutomationScaleLevelsOptions, ChannelGroupSummary, ChannelNoteRouter,
-    ChannelSampleCrossfadeEdit, ChannelSampleEffectsEdit, ChannelSampleFxFlagsEdit,
-    ChannelSampleTrimEdit, ChannelSampleWindowEdit, ChannelSortOrder, ChannelStretchMode,
-    ChannelStretchSettingsEdit, ChannelSummary, ChannelType, ClawMachineOptions, FlamOptions,
-    FlpDocument, FlpError, FscControllerStreamImportOptions, FscScore, FstPreset, FstPresetKind,
-    HumanizerOptions, LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerInsertSummary,
-    MixerParameterKind, MixerParameterRecord, MixerSendSummary, PATTERN_NOTE_DEFAULT_FLAGS,
+    AutomationPointEdit, AutomationScaleLevelsOptions, ChannelGroupSummary,
+    ChannelMidiOutSettingsEdit, ChannelNoteRouter, ChannelSampleCrossfadeEdit,
+    ChannelSampleEffectsEdit, ChannelSampleFxFlagsEdit, ChannelSampleTrimEdit,
+    ChannelSampleWindowEdit, ChannelSortOrder, ChannelStretchMode, ChannelStretchSettingsEdit,
+    ChannelSummary, ChannelType, ClawMachineOptions, FlamOptions, FlpDocument, FlpError,
+    FscControllerStreamImportOptions, FscScore, FstPreset, FstPresetKind, HumanizerOptions,
+    LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerInsertSummary, MixerParameterKind,
+    MixerParameterRecord, MixerSendSummary, PATTERN_NOTE_DEFAULT_FLAGS,
     PATTERN_NOTE_DEFAULT_RELEASE, PATTERN_NOTE_SLIDE_FLAG, Pattern, PatternController,
     PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation, PayloadEncoding,
     PlaylistClip, PlaylistClipEdit, PlaylistClipSelectionClipboard, PlaylistClipTarget,
@@ -37169,6 +37170,7 @@ impl DawUi {
         let mut sampler_portamento_edits = Vec::new();
         let mut sampler_envelope_lfo_edits = Vec::new();
         let mut channel_fine_tune_edits = Vec::new();
+        let mut midi_out_settings_edits = Vec::<(u16, ChannelMidiOutSettingsEdit)>::new();
         let mut layer_edits = Vec::new();
         let mut layer_flag_edits = Vec::new();
         let mut layer_fade_edits = Vec::new();
@@ -38013,6 +38015,40 @@ impl DawUi {
                                         });
                                     }
                                 });
+                                if channel.channel_type() == Some(ChannelType::MidiOut) {
+                                    ui.menu_button("MIDI Out settings", |ui| {
+                                        if let Some(settings) = channel.midi_out_settings() {
+                                            let mut midi_channel = settings.midi_channel();
+                                            let channel_changed = ui
+                                                .add(
+                                                    egui::Slider::new(&mut midi_channel, 1..=16)
+                                                        .text("MIDI channel"),
+                                                )
+                                                .changed();
+                                            let mut use_note_color_channel =
+                                                settings.use_note_color_channel();
+                                            let note_color_changed = ui
+                                                .checkbox(
+                                                    &mut use_note_color_channel,
+                                                    "Map note color to MIDI channel",
+                                                )
+                                                .changed();
+                                            if channel_changed || note_color_changed {
+                                                midi_out_settings_edits.push((
+                                                    channel.id(),
+                                                    ChannelMidiOutSettingsEdit {
+                                                        midi_channel: channel_changed
+                                                            .then_some(midi_channel),
+                                                        use_note_color_channel: note_color_changed
+                                                            .then_some(use_note_color_channel),
+                                                    },
+                                                ));
+                                            }
+                                        } else {
+                                            ui.weak("MIDI Out state settings are not recognized");
+                                        }
+                                    });
+                                }
                                 if channel.kind() == Some(2)
                                     && let Some(output_offsets) =
                                         vst3_output_routes_by_channel.get(&channel.id())
@@ -39315,6 +39351,23 @@ impl DawUi {
                 }
                 Some(Err(error)) => {
                     self.status = format!("Could not change channel Fine Tune: {error}");
+                }
+                None => {}
+            }
+        }
+        for (channel_id, edit) in midi_out_settings_edits {
+            let result = self
+                .document
+                .as_mut()
+                .map(|document| document.edit_channel_midi_out_settings(channel_id, edit));
+            match result {
+                Some(Ok(())) => {
+                    self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+                    self.status = format!("MIDI Out settings updated for channel {channel_id}");
+                }
+                Some(Err(error)) => {
+                    self.status = format!("Could not change MIDI Out settings: {error}");
                 }
                 None => {}
             }
