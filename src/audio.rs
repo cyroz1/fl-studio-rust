@@ -2155,13 +2155,21 @@ impl MetronomeTimeline {
 #[derive(Clone)]
 pub struct MetronomeStreamPlayback {
     playback: Arc<PlaybackState>,
+    mixer_track: i8,
 }
 
 impl MetronomeStreamPlayback {
-    pub(crate) fn mix_into_interleaved_stereo(&self, start_frame: u64, samples: &mut [f32]) {
-        if !samples.len().is_multiple_of(2)
-            || !self.playback.metronome_enabled.load(Ordering::Acquire)
-        {
+    pub(crate) const fn mixer_track(&self) -> i8 {
+        self.mixer_track
+    }
+
+    pub(crate) fn for_each_click_sample(
+        &self,
+        start_frame: u64,
+        frame_count: usize,
+        mut mix_sample: impl FnMut(usize, f32),
+    ) {
+        if !self.playback.metronome_enabled.load(Ordering::Acquire) {
             return;
         }
         let timeline_snapshot = self.playback.metronome_timeline.load();
@@ -2171,12 +2179,10 @@ impl MetronomeStreamPlayback {
         let click_samples_snapshot = self.playback.metronome_click_samples.load();
         let click_samples = click_samples_snapshot.as_deref();
         let playback_speed = f32::from_bits(self.playback.playback_speed.load(Ordering::Acquire));
-        let (frames, _) = samples.as_chunks_mut::<2>();
-        for (frame_index, frame) in frames.iter_mut().enumerate() {
+        for frame_index in 0..frame_count {
             let project_frame = start_frame.saturating_add(frame_index as u64);
             let click = timeline.click_sample(project_frame, playback_speed, click_samples);
-            frame[0] += click;
-            frame[1] += click;
+            mix_sample(frame_index, click);
         }
     }
 }
@@ -2220,6 +2226,7 @@ struct PlaybackState {
     output_peak_right: AtomicU32,
     output_callback_frames: AtomicU32,
     metronome_enabled: AtomicBool,
+    metronome_mixer_track: AtomicI32,
     metronome_timeline: RetiredArcSwapOption<MetronomeTimeline>,
     metronome_click_samples: RetiredArcSwapOption<MetronomeClickSamples>,
     recording_precount_samples: RetiredArcSwapOption<Vec<f32>>,
@@ -2566,7 +2573,7 @@ impl StagedStreamingPlayback {
 }
 
 impl StreamingAudioWriter {
-    /// Have the project renderer mix live metronome clicks before Master processing.
+    /// Have the project renderer mix live metronome clicks through its selected Mixer route.
     pub fn set_metronome_mixer_routed(&self, routed: bool) {
         self.playback
             .metronome_mixer_routed
@@ -2971,6 +2978,7 @@ impl PlaybackState {
             output_peak_right: AtomicU32::new(0.0_f32.to_bits()),
             output_callback_frames: AtomicU32::new(0),
             metronome_enabled: AtomicBool::new(false),
+            metronome_mixer_track: AtomicI32::new(0),
             metronome_timeline: RetiredArcSwapOption::new(),
             metronome_click_samples: RetiredArcSwapOption::new(),
             recording_precount_samples: RetiredArcSwapOption::new(),
@@ -4061,7 +4069,21 @@ impl AudioEngine {
     pub fn metronome_stream_playback(&self) -> MetronomeStreamPlayback {
         MetronomeStreamPlayback {
             playback: Arc::clone(&self.playback),
+            mixer_track: i8::try_from(
+                self.playback
+                    .metronome_mixer_track
+                    .load(Ordering::Acquire)
+                    .clamp(0, i32::from(i8::MAX)),
+            )
+            .unwrap_or_default(),
         }
+    }
+
+    /// Select the Mixer insert for the live metronome; zero selects Master.
+    pub fn set_metronome_mixer_track(&self, track: i8) {
+        self.playback
+            .metronome_mixer_track
+            .store(i32::from(track.max(0)), Ordering::Release);
     }
 
     /// Replace the timing map used by the live project metronome.

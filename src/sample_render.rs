@@ -3190,6 +3190,14 @@ pub fn stream_playlist_performance_with_vst3_to_device(
             &loaded_vst3_channels,
             &assigned_clap_channels,
         )?;
+    let metronome_route = metronome.as_ref().map(|metronome| {
+        prepare_metronome_mixer_route(
+            &static_document,
+            metronome.mixer_track(),
+            options.sample_rate,
+            performance.meters.as_deref(),
+        )
+    });
     if performance_clip_indices.is_empty() {
         return Err("arrangement has no supported clips before the Start marker".into());
     }
@@ -3362,6 +3370,7 @@ pub fn stream_playlist_performance_with_vst3_to_device(
             latency_updates: None,
             meters: performance.meters.as_deref(),
             metronome,
+            metronome_route,
             cancelled,
             capture_post_effect_buses: false,
             loop_range: None,
@@ -3394,6 +3403,14 @@ fn stream_playlist_with_vst3_to_device_from_frame_inner(
     let start_frame = monitor.start_frame;
     let loop_range = monitor.loop_range;
     let meters = monitor.meters;
+    let metronome_route = metronome.as_ref().map(|metronome| {
+        prepare_metronome_mixer_route(
+            document,
+            metronome.mixer_track(),
+            options.sample_rate,
+            meters,
+        )
+    });
     let live_master_fader_gain = monitor.live_master_fader_gain;
     let live_master_pan_raw = monitor.live_master_pan_raw;
     let live_master_stereo_separation_raw = monitor.live_master_stereo_separation_raw;
@@ -3548,6 +3565,7 @@ fn stream_playlist_with_vst3_to_device_from_frame_inner(
             PlaylistStreamRenderOptions {
                 loop_range,
                 metronome,
+                metronome_route,
             },
             || writer.is_cancelled(),
             |block, _mixer_buses| {
@@ -3564,6 +3582,7 @@ fn stream_playlist_with_vst3_to_device_from_frame_inner(
             PlaylistStreamRenderOptions {
                 loop_range,
                 metronome,
+                metronome_route,
             },
             || writer.is_cancelled(),
             |block, _mixer_buses| {
@@ -6080,6 +6099,7 @@ fn stream_prepared_playlist_render_with_loop(
             latency_updates: None,
             meters,
             metronome: stream_options.metronome,
+            metronome_route: stream_options.metronome_route,
             cancelled,
             capture_post_effect_buses: false,
             loop_range: stream_options.loop_range,
@@ -6105,6 +6125,7 @@ fn stream_prepared_playlist_render_with_live_latency_updates_and_loop(
             latency_updates: Some(latency_updates),
             meters,
             metronome: stream_options.metronome,
+            metronome_route: stream_options.metronome_route,
             cancelled,
             capture_post_effect_buses: false,
             loop_range: stream_options.loop_range,
@@ -6118,6 +6139,164 @@ fn stream_prepared_playlist_render_with_live_latency_updates_and_loop(
 struct PlaylistStreamRenderOptions {
     loop_range: Option<PlaylistPlaybackLoopRange>,
     metronome: Option<MetronomeStreamPlayback>,
+    metronome_route: Option<PreparedMetronomeMixerRoute>,
+}
+
+struct PreparedMetronomeMixerRoute {
+    route_plan: MixerSourceRoutePlan,
+    live_source_control: Option<LiveMixerSourceControl>,
+    live_source_targets: Option<LiveMixerSourceTargets>,
+    route_is_audible: bool,
+}
+
+fn prepare_metronome_mixer_route(
+    document: &FlpDocument,
+    requested_track: i8,
+    sample_rate: u32,
+    meters: Option<&MixerTrackPeakMeters>,
+) -> PreparedMetronomeMixerRoute {
+    let track = (requested_track > 0)
+        .then_some(requested_track)
+        .filter(|track| {
+            usize::try_from(*track).ok().is_some_and(|track| {
+                document
+                    .mixer_inserts()
+                    .iter()
+                    .any(|insert| insert.ordinal() == track)
+            })
+        });
+    let routing = MixerRouteAudibility::from_document(document);
+    let route_plan = routing.source_route_plan_for_channel(track);
+    let live_source_control = routing
+        .live_source_route_plan_for_channel(track)
+        .map(|route_plan| LiveMixerSourceControl::new(route_plan, sample_rate));
+    let live_source_targets = live_source_control
+        .as_ref()
+        .and_then(|control| meters.and_then(|meters| control.targets(meters)));
+    let live_route_controls_active = live_source_control.is_some() && live_source_targets.is_some();
+    let route_is_audible =
+        track.is_none() || live_route_controls_active || routing.allows_channel(track);
+
+    PreparedMetronomeMixerRoute {
+        route_plan,
+        live_source_control,
+        live_source_targets,
+        route_is_audible,
+    }
+}
+
+fn mix_metronome_through_mixer(
+    metronome: &MetronomeStreamPlayback,
+    route: &mut PreparedMetronomeMixerRoute,
+    start_frame: u64,
+    output: &mut [f32],
+    mixer_buses: Option<&mut [f32]>,
+) -> Result<(), String> {
+    if !output.len().is_multiple_of(2) {
+        return Err("metronome Mixer output must contain stereo frames".to_owned());
+    }
+    if !route.route_is_audible {
+        return Ok(());
+    }
+    let sample_count = output.len();
+    let frame_count = sample_count / 2;
+    let mut meter_buses = None;
+    let mut effect_input_buses = None;
+    if let Some(buses) = mixer_buses {
+        let (meters, effects) = crate::audio::split_mixer_track_buses_mut(buses, sample_count)?;
+        meter_buses = Some(meters);
+        effect_input_buses = effects;
+    }
+    let meter_transforms = route.live_source_control.as_ref().map_or(
+        route.route_plan.insert_meter_transforms.as_slice(),
+        |control| control.insert_meter_transforms(),
+    );
+    let effect_input_transforms = route.live_source_control.as_ref().map_or(
+        route.route_plan.insert_effect_input_transforms.as_slice(),
+        |control| control.insert_effect_input_transforms(),
+    );
+    if meter_transforms
+        .iter()
+        .any(|(track, _)| *track >= MIXER_TRACK_METER_COUNT)
+        || effect_input_transforms
+            .iter()
+            .any(|(track, _)| *track >= MIXER_TRACK_METER_COUNT)
+    {
+        return Err("metronome Mixer route exceeds the supported track range".to_owned());
+    }
+
+    metronome.for_each_click_sample(start_frame, frame_count, |frame_index, click| {
+        let live_controls = route
+            .live_source_control
+            .as_ref()
+            .zip(route.live_source_targets.as_ref())
+            .map(|(control, targets)| control.next_frame_controls(targets));
+        let mut output_frame = [click; 2];
+        if let (Some(control), Some(controls)) = (route.live_source_control.as_ref(), live_controls)
+        {
+            control.apply_output_frame(controls, &mut output_frame);
+        } else {
+            route
+                .route_plan
+                .output_transform
+                .apply_frame(&mut output_frame);
+        }
+        let output_offset = frame_index * 2;
+        output[output_offset] += output_frame[0];
+        output[output_offset + 1] += output_frame[1];
+
+        if let Some(meter_buses) = meter_buses.as_deref_mut() {
+            let transforms = route
+                .live_source_control
+                .as_ref()
+                .zip(live_controls)
+                .map_or(meter_transforms, |(control, _)| {
+                    control.insert_meter_transforms()
+                });
+            for (track, transform) in transforms {
+                let mut meter_frame = [click; 2];
+                if let (Some(control), Some(controls)) =
+                    (route.live_source_control.as_ref(), live_controls)
+                {
+                    control.apply_meter_frame(controls, *track, *transform, &mut meter_frame);
+                } else {
+                    transform.apply_frame(&mut meter_frame);
+                }
+                let offset = *track * sample_count + output_offset;
+                meter_buses[offset] += meter_frame[0];
+                meter_buses[offset + 1] += meter_frame[1];
+            }
+        }
+
+        if let Some(effect_input_buses) = effect_input_buses.as_deref_mut() {
+            let transforms = route
+                .live_source_control
+                .as_ref()
+                .zip(live_controls)
+                .map_or(effect_input_transforms, |(control, _)| {
+                    control.insert_effect_input_transforms()
+                });
+            for (track, transform) in transforms {
+                let mut effect_frame = [click; 2];
+                if let (Some(control), Some(controls)) =
+                    (route.live_source_control.as_ref(), live_controls)
+                {
+                    control.apply_effect_input_frame(
+                        controls,
+                        *track,
+                        *transform,
+                        &mut effect_frame,
+                    );
+                } else {
+                    transform.apply_frame(&mut effect_frame);
+                }
+                let offset = *track * sample_count + output_offset;
+                effect_input_buses[offset] += effect_frame[0];
+                effect_input_buses[offset + 1] += effect_frame[1];
+            }
+        }
+    });
+    Ok(())
 }
 
 fn stream_prepared_playlist_render_with_post_effect_stems(
@@ -6134,6 +6313,7 @@ fn stream_prepared_playlist_render_with_post_effect_stems(
             latency_updates: None,
             meters,
             metronome: None,
+            metronome_route: None,
             cancelled,
             capture_post_effect_buses: true,
             loop_range: None,
@@ -6154,6 +6334,7 @@ struct PlaylistPreparedRenderControls<'runtime> {
     latency_updates: Option<LiveLatencyUpdateState>,
     meters: Option<&'runtime MixerTrackPeakMeters>,
     metronome: Option<MetronomeStreamPlayback>,
+    metronome_route: Option<PreparedMetronomeMixerRoute>,
     cancelled: &'runtime AtomicBool,
     capture_post_effect_buses: bool,
     loop_range: Option<PlaylistPlaybackLoopRange>,
@@ -6303,6 +6484,7 @@ fn stream_prepared_playlist_render_with_performance(
         mut latency_updates,
         meters,
         metronome,
+        mut metronome_route,
         cancelled,
         capture_post_effect_buses,
         loop_range,
@@ -6550,8 +6732,16 @@ fn stream_prepared_playlist_render_with_performance(
                     clap_channel_mix_controls,
                     meter_buses.as_deref_mut(),
                 )?;
-                if let Some(metronome) = metronome.as_ref() {
-                    metronome.mix_into_interleaved_stereo(source_frame, block);
+                if let (Some(metronome), Some(route)) =
+                    (metronome.as_ref(), metronome_route.as_mut())
+                {
+                    mix_metronome_through_mixer(
+                        metronome,
+                        route,
+                        source_frame,
+                        block,
+                        meter_buses.as_deref_mut(),
+                    )?;
                 }
                 direct_source_delay.process_interleaved(block)?;
                 if let Some(meter_buses) = meter_buses.as_deref_mut() {
@@ -7780,6 +7970,14 @@ fn stream_pattern_from_tick_with_vst3_to_device(
         latency_updates,
         metronome,
     } = controls;
+    let mut metronome_route = metronome.as_ref().map(|metronome| {
+        prepare_metronome_mixer_route(
+            document,
+            metronome.mixer_track(),
+            options.sample_rate,
+            live_master_meters,
+        )
+    });
     let mut latency_updates = latency_updates.map(|controls| LiveLatencyUpdateState {
         document: document.clone(),
         pdc_updates: controls.pdc_updates,
@@ -8048,8 +8246,14 @@ fn stream_pattern_from_tick_with_vst3_to_device(
                 &pattern_clap_mixer_routes,
                 mixer_buses.as_deref_mut(),
             )?;
-            if let Some(metronome) = metronome.as_ref() {
-                metronome.mix_into_interleaved_stereo(block_start, &mut block[..sample_count]);
+            if let (Some(metronome), Some(route)) = (metronome.as_ref(), metronome_route.as_mut()) {
+                mix_metronome_through_mixer(
+                    metronome,
+                    route,
+                    block_start,
+                    &mut block[..sample_count],
+                    mixer_buses.as_deref_mut(),
+                )?;
             }
             sampler_delay.process_interleaved(&mut block[..sample_count])?;
             if let Some(processor) = playback.vst3_processor.as_mut() {
@@ -8182,8 +8386,14 @@ fn stream_pattern_from_tick_with_vst3_to_device(
                 &pattern_clap_mixer_routes,
                 mixer_buses.as_deref_mut(),
             )?;
-            if let Some(metronome) = metronome.as_ref() {
-                metronome.mix_into_interleaved_stereo(block_start, &mut block[..sample_count]);
+            if let (Some(metronome), Some(route)) = (metronome.as_ref(), metronome_route.as_mut()) {
+                mix_metronome_through_mixer(
+                    metronome,
+                    route,
+                    block_start,
+                    &mut block[..sample_count],
+                    mixer_buses.as_deref_mut(),
+                )?;
             }
             sampler_delay.process_interleaved(&mut block[..sample_count])?;
             if let Some(processor) = playback.vst3_processor.as_mut() {

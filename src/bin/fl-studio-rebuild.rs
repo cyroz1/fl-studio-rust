@@ -4883,6 +4883,7 @@ struct DawUi {
     history_snapshot_available_this_frame: bool,
     playing: bool,
     metronome_enabled: bool,
+    metronome_mixer_track: i8,
     metronome_accent_sample_path: Option<PathBuf>,
     metronome_accent_sample: Option<Arc<MetronomeClickSample>>,
     metronome_beat_sample_path: Option<PathBuf>,
@@ -7217,6 +7218,7 @@ impl DawUi {
         let window_layout_presets = load_window_layout_presets();
         let read_sample_root_note = load_read_sample_root_note();
         let metronome_enabled = load_metronome_enabled();
+        let metronome_mixer_track = load_metronome_mixer_track();
         let (metronome_accent_sample_path, metronome_beat_sample_path) =
             load_metronome_click_sample_paths();
         let metronome_accent_sample =
@@ -7277,6 +7279,7 @@ impl DawUi {
             history_snapshot_available_this_frame: false,
             playing: false,
             metronome_enabled,
+            metronome_mixer_track,
             metronome_accent_sample_path,
             metronome_accent_sample,
             metronome_beat_sample_path,
@@ -13920,6 +13923,7 @@ impl DawUi {
         engine.set_metronome_timeline(Some(metronome_timeline));
         engine.set_metronome_click_samples(self.metronome_click_samples());
         engine.set_metronome_enabled(self.metronome_enabled);
+        engine.set_metronome_mixer_track(self.metronome_mixer_track);
         let staged_stream_result = match staged_start_frame {
             Some(_) => engine
                 .begin_staged_streaming_playback_from_frame(start_frame)
@@ -14639,6 +14643,7 @@ impl DawUi {
         engine.set_metronome_timeline(Some(metronome_timeline));
         engine.set_metronome_click_samples(self.metronome_click_samples());
         engine.set_metronome_enabled(self.metronome_enabled);
+        engine.set_metronome_mixer_track(self.metronome_mixer_track);
         let start_frame = match playlist_tempo_map.frame_at_tick(u64::from(start_tick), sample_rate)
         {
             Ok(frame) => frame,
@@ -15111,6 +15116,28 @@ impl DawUi {
         self.status = match save_metronome_enabled(self.metronome_enabled) {
             Ok(()) => format!("Metronome {label}"),
             Err(error) => format!("Metronome {label}; preference not saved: {error}"),
+        };
+    }
+
+    fn set_metronome_mixer_track(&mut self, track: i8) {
+        let track = track.max(0);
+        self.metronome_mixer_track = track;
+        if let Some(engine) = self.audio_engine.as_ref() {
+            engine.set_metronome_mixer_track(track);
+        }
+        let route_label = if track == 0 {
+            "Master".to_owned()
+        } else {
+            format!("Insert {track:02}")
+        };
+        self.status = match save_metronome_mixer_track(track) {
+            Ok(()) if self.playing => {
+                format!("Metronome route set to {route_label}; it applies on next playback")
+            }
+            Ok(()) => format!("Metronome route set to {route_label}"),
+            Err(error) => {
+                format!("Metronome route set to {route_label}; preference not saved: {error}")
+            }
         };
     }
 
@@ -19289,12 +19316,42 @@ impl DawUi {
             let metronome_response = ui
                 .selectable_label(self.metronome_enabled, "MET")
                 .on_hover_text(
-                    "Metronome: click each beat and accent each bar (Ctrl/Cmd+M; right-click to choose samples)",
+                    "Metronome: click each beat and accent each bar (Ctrl/Cmd+M; right-click for samples and Mixer route)",
                 );
+            let metronome_mixer_tracks = self.document.as_ref().map_or_else(
+                || vec![(0_i8, "Master".to_owned())],
+                |document| {
+                    let mut tracks = vec![(0_i8, "Master".to_owned())];
+                    tracks.extend(document.mixer_inserts().into_iter().filter_map(|insert| {
+                        let track = i8::try_from(insert.ordinal()).ok()?;
+                        if track <= 0 {
+                            return None;
+                        }
+                        let name = insert
+                            .name()
+                            .map(str::trim)
+                            .filter(|name| !name.is_empty())
+                            .map_or_else(|| format!("Insert {track:02}"), str::to_owned);
+                        Some((track, format!("{track:02} · {name}")))
+                    }));
+                    tracks
+                },
+            );
+            let current_metronome_mixer_route = metronome_mixer_tracks
+                .iter()
+                .find(|(track, _)| *track == self.metronome_mixer_track)
+                .map(|(_, label)| label.clone())
+                .unwrap_or_else(|| {
+                    format!(
+                        "Insert {:02} unavailable; using Master",
+                        self.metronome_mixer_track
+                    )
+                });
             let mut choose_accent_sample = false;
             let mut choose_beat_sample = false;
             let mut clear_accent_sample = false;
             let mut clear_beat_sample = false;
+            let mut selected_metronome_mixer_track = None;
             let _ = metronome_response.context_menu(|ui| {
                 apply_local_ui_scale(ui, self.popup_menu_scale);
                 ui.label(format!(
@@ -19326,6 +19383,17 @@ impl DawUi {
                     clear_beat_sample = true;
                     ui.close();
                 }
+                ui.separator();
+                ui.label(format!("Mixer route: {current_metronome_mixer_route}"));
+                for (track, label) in &metronome_mixer_tracks {
+                    if ui
+                        .selectable_label(self.metronome_mixer_track == *track, label)
+                        .clicked()
+                    {
+                        selected_metronome_mixer_track = Some(*track);
+                        ui.close();
+                    }
+                }
             });
             if choose_accent_sample {
                 self.choose_metronome_click_sample(true);
@@ -19335,6 +19403,9 @@ impl DawUi {
                 self.clear_metronome_click_sample(true);
             } else if clear_beat_sample {
                 self.clear_metronome_click_sample(false);
+            }
+            if let Some(track) = selected_metronome_mixer_track {
+                self.set_metronome_mixer_track(track);
             }
             if metronome_response.clicked() {
                 self.toggle_metronome();
@@ -48311,6 +48382,7 @@ impl DawUi {
             engine.set_metronome_timeline(metronome_timeline);
             engine.set_metronome_click_samples(self.metronome_click_samples());
             engine.set_metronome_enabled(self.metronome_enabled && loop_length_ticks.is_some());
+            engine.set_metronome_mixer_track(self.metronome_mixer_track);
         }
         self.audio_test_tone = false;
 
@@ -77443,6 +77515,32 @@ fn metronome_settings_file() -> Option<PathBuf> {
     browser_favorites_file()?
         .parent()
         .map(|directory| directory.join("metronome-enabled.txt"))
+}
+
+fn metronome_mixer_track_settings_file() -> Option<PathBuf> {
+    browser_favorites_file()?
+        .parent()
+        .map(|directory| directory.join("metronome-mixer-track.txt"))
+}
+
+fn load_metronome_mixer_track() -> i8 {
+    metronome_mixer_track_settings_file()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|contents| contents.trim().parse::<i8>().ok())
+        .filter(|track| *track >= 0)
+        .unwrap_or_default()
+}
+
+fn save_metronome_mixer_track(track: i8) -> Result<(), String> {
+    let path = metronome_mixer_track_settings_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the metronome Mixer route path has no parent folder".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    fs::write(&path, format!("{}\n", track.max(0)))
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
 }
 
 fn load_metronome_enabled() -> bool {
