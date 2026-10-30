@@ -6864,9 +6864,16 @@ fn list_mixer(path: &Path) -> Result<(), String> {
     println!("recognized insert records: {}", inserts.len());
     for insert in inserts {
         println!(
-            "ordinal={} name={} input_raw={} output_raw={} color_raw=0x{:08X} icon_raw={:?} events={:?}",
+            "ordinal={} name={} enabled={:?} soloed={:?} polarity_reversed={:?} swap_left_right={:?} effects_enabled={:?} mute_locked={:?} flags={:?} input_raw={} output_raw={} color_raw=0x{:08X} icon_raw={:?} events={:?}",
             insert.ordinal(),
             insert.name().unwrap_or("(unnamed)"),
+            insert.enabled(),
+            insert.soloed(),
+            insert.polarity_reversed(),
+            insert.swap_left_right(),
+            insert.effects_enabled(),
+            insert.mute_locked(),
+            insert.flags(),
             insert.input_raw(),
             insert.output_raw(),
             insert.color_raw(),
