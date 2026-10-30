@@ -8556,28 +8556,7 @@ fn stream_pattern_from_tick_with_vst3_to_device(
             let block_end = block_start.saturating_add(SAMPLER_BLOCK_FRAMES as u64);
             if playback.repeat_pattern {
                 while next_loop_start <= block_end {
-                    let repeated_notes =
-                        render
-                            .notes
-                            .iter()
-                            .copied()
-                            .map(|mut note| {
-                                note.start_frame =
-                                    note.start_frame.checked_add(next_loop_start).ok_or_else(
-                                        || "Sampler Pattern loop position overflow".to_owned(),
-                                    )?;
-                                note.stop_frame = note
-                                    .stop_frame
-                                    .map(|stop_frame| {
-                                        stop_frame.checked_add(next_loop_start).ok_or_else(|| {
-                                            "Sampler Pattern note end overflow".to_owned()
-                                        })
-                                    })
-                                    .transpose()?;
-                                Ok(note)
-                            })
-                            .collect::<Result<Vec<_>, String>>()?;
-                    engine.queue_live_notes(repeated_notes);
+                    engine.queue_live_notes_with_frame_offset(&render.notes, next_loop_start)?;
                     next_loop_start = next_loop_start
                         .checked_add(loop_frames)
                         .ok_or_else(|| "Sampler Pattern loop position overflow".to_owned())?;
@@ -16091,6 +16070,50 @@ impl<'a> SamplerVoiceEngine<'a> {
                 note.clip_index,
             )
         });
+    }
+
+    fn queue_live_notes_with_frame_offset(
+        &mut self,
+        notes: &[ScheduledSamplerNote],
+        frame_offset: u64,
+    ) -> Result<(), String> {
+        debug_assert!(
+            notes
+                .windows(2)
+                .all(|pair| pair[0].start_frame <= pair[1].start_frame)
+        );
+        for note in notes {
+            note.start_frame
+                .checked_add(frame_offset)
+                .ok_or_else(|| "Sampler Pattern loop position overflow".to_owned())?;
+            note.stop_frame
+                .map(|stop_frame| {
+                    stop_frame
+                        .checked_add(frame_offset)
+                        .ok_or_else(|| "Sampler Pattern note end overflow".to_owned())
+                })
+                .transpose()?;
+        }
+
+        self.discard_consumed_live_notes();
+        self.live_notes.reserve(notes.len());
+        self.live_notes
+            .extend(notes.iter().copied().map(|mut note| {
+                note.start_frame += frame_offset;
+                note.stop_frame = note.stop_frame.map(|stop_frame| stop_frame + frame_offset);
+                note
+            }));
+        self.live_notes.sort_by_key(|note| {
+            (
+                note.start_frame,
+                note.slide_note,
+                note.playlist_track_id,
+                note.channel_id,
+                note.key,
+                note.clip_index,
+            )
+        });
+        Ok(())
     }
 
     fn remove_queued_track_notes_from(&mut self, track_id: u32, start_frame: u64) {
