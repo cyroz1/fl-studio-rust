@@ -5585,6 +5585,7 @@ struct PendingAudioRender {
 #[derive(Clone, Copy)]
 enum PdcStreamHandoffReason {
     Vst3Latency,
+    Vst3ChannelLoad,
     AutomaticPdc { enabled: bool },
     MixerRouting,
 }
@@ -14108,6 +14109,10 @@ impl DawUi {
                             "Preparing updated Playlist routing while current audio continues…"
                                 .to_owned()
                         }
+                        Some(PdcStreamHandoffReason::Vst3ChannelLoad) => {
+                            "Preparing the loaded VST3 channel while current audio continues…"
+                                .to_owned()
+                        }
                         _ => "Preparing updated Playlist PDC while current audio continues…"
                             .to_owned(),
                     }
@@ -14149,7 +14154,7 @@ impl DawUi {
         }
         pending.cancelled.store(true, Ordering::Release);
         if pending.worker.join().is_err() {
-            self.status = "Playlist audio worker panicked during a VST3 latency change".to_owned();
+            self.status = "Playlist audio worker panicked during a stream handoff".to_owned();
             return false;
         }
         if let Some(host) = self.vst3_host.as_mut() {
@@ -14198,7 +14203,7 @@ impl DawUi {
         }
         pending.cancelled.store(true, Ordering::Release);
         if pending.worker.join().is_err() {
-            self.status = "Pattern audio worker panicked during a PDC change".to_owned();
+            self.status = "Pattern audio worker panicked during a stream handoff".to_owned();
             return false;
         }
         if let Some(host) = self.vst3_host.as_mut() {
@@ -14977,6 +14982,9 @@ impl DawUi {
                 Some(PdcStreamHandoffReason::MixerRouting) => format!(
                     "Mixer routing change applied through a live Playlist handoff{tick_suffix}"
                 ),
+                Some(PdcStreamHandoffReason::Vst3ChannelLoad) => format!(
+                    "Loaded VST3 channel applied through a live Playlist handoff{tick_suffix}"
+                ),
                 Some(PdcStreamHandoffReason::Vst3Latency) | None => {
                     format!("VST3 latency update applied through a live PDC handoff{tick_suffix}")
                 }
@@ -15089,6 +15097,9 @@ impl DawUi {
                 ),
                 Some(PdcStreamHandoffReason::MixerRouting) => format!(
                     "Mixer routing change applied through a live Pattern handoff{tick_suffix}"
+                ),
+                Some(PdcStreamHandoffReason::Vst3ChannelLoad) => format!(
+                    "Loaded VST3 channel applied through a live Pattern handoff{tick_suffix}"
                 ),
                 Some(PdcStreamHandoffReason::Vst3Latency) | None => format!(
                     "VST3 latency update applied through a live Pattern PDC handoff{tick_suffix}"
@@ -48952,6 +48963,10 @@ impl DawUi {
                             "Preparing updated Pattern routing while current audio continues…"
                                 .to_owned()
                         }
+                        Some((_, PdcStreamHandoffReason::Vst3ChannelLoad)) => {
+                            "Preparing the loaded VST3 Pattern channel while current audio continues…"
+                                .to_owned()
+                        }
                         _ => "Preparing updated Pattern PDC while current audio continues…"
                             .to_owned(),
                     }
@@ -70074,6 +70089,14 @@ impl DawUi {
         restore_channel_id: Option<u16>,
         class_uid: Option<String>,
     ) {
+        let pattern_playback_was_active =
+            self.playing && self.pattern_playback_mode && !self.performance_mode_active;
+        let pattern_resume_tick = self
+            .current_pattern_mode_playhead_tick()
+            .map(|(_, tick)| tick)
+            .filter(|tick| tick.is_finite() && *tick >= 0.0)
+            .map(|tick| tick.round() as u64)
+            .unwrap_or(self.pattern_seek_tick);
         let project_plugin_state = restore_channel_id.and_then(|channel_id| {
             self.document
                 .as_ref()?
@@ -70152,12 +70175,41 @@ impl DawUi {
             }
             Err(error) => self.status = format!("Could not load VST3: {error}"),
         }
+        let loaded_channel_was_added = loaded_channel_instance.is_some();
         if let Some((channel_id, instance_id, offset_key, offset_label)) = loaded_channel_instance {
             self.channel_vst3_instances.insert(channel_id, instance_id);
             self.vst3_manual_latency_offset_keys
                 .insert(instance_id, offset_key);
             self.vst3_manual_latency_offset_labels
                 .insert(instance_id, offset_label);
+        }
+        if pattern_playback_was_active && loaded_channel_was_added {
+            let loaded_status = self.status.clone();
+            if !self.stage_pattern_stream_rebuild(PdcStreamHandoffReason::Vst3ChannelLoad) {
+                if self.pending_sampler_stream.is_none() {
+                    self.stop_project_playback();
+                    self.pattern_seek_tick = pattern_resume_tick;
+                    self.start_pattern_mode_playback();
+                    let restart_status = self.status.clone();
+                    self.status = if self.playing
+                        || self.pending_sampler_stream.is_some()
+                        || self.pending_clap_pattern_playback.is_some()
+                    {
+                        format!(
+                            "{loaded_status}; Pattern playback restarted at tick {}",
+                            self.pattern_seek_tick
+                        )
+                    } else {
+                        format!(
+                            "{loaded_status}; could not restart Pattern playback: {restart_status}"
+                        )
+                    };
+                } else {
+                    self.status = format!(
+                        "{loaded_status}; the new VST3 channel will be used when Pattern playback restarts"
+                    );
+                }
+            }
         }
         self.last_plugin_action = Some(self.status.clone());
     }
