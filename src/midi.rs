@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
+use crate::vst3::normalized_automation_point_value;
 use crate::{
     ChannelMidiOutSettings, FlpDocument, PatternNote, PlaylistClip, PlaylistClipTarget,
     automation_segment_value_with_tension,
@@ -2499,6 +2500,7 @@ impl MidiTempoEvent {
 /// This mapping is inferred from the installed FL Studio reference project and needs
 /// more oracle coverage for other control ranges and non-linear point shapes.
 fn tempo_automation_bpm(value: f64) -> Result<f64, MidiError> {
+    let value = normalized_automation_point_value(value).unwrap_or(value);
     let bpm = 60.0 + value * 120.0;
     midi_tempo_microseconds_per_quarter(bpm)?;
     Ok(bpm)
