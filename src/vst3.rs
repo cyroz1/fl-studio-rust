@@ -7894,11 +7894,7 @@ fn expand_playlist_parameter_automation(
     let mut expanded_point_count = 0usize;
 
     for (clip_index, clip) in arrangement.clips.iter().enumerate() {
-        if clip_is_muted(clip)
-            || clip
-                .scale
-                .is_some_and(|scale| !scale.is_finite() || (scale - 1.0).abs() > 1e-9)
-        {
+        if clip_is_muted(clip) || !clip.has_default_scale() {
             continue;
         }
         if clip.length_ticks == 0 {
@@ -7997,11 +7993,7 @@ pub(crate) fn expand_pattern_parameter_automation_for_clip(
     if ppq == 0 {
         return Err("project PPQ must be greater than zero".to_owned());
     }
-    if clip.length_ticks == 0
-        || clip
-            .scale
-            .is_some_and(|scale| !scale.is_finite() || (scale - 1.0).abs() > 1e-9)
-    {
+    if clip.length_ticks == 0 || !clip.has_default_scale() {
         return Ok(BTreeMap::new());
     }
     let clip_length = u64::from(clip.length_ticks);
@@ -8136,11 +8128,7 @@ fn expand_automation_clip_parameter_automation_for_clip(
     if ppq == 0 {
         return Err("project PPQ must be greater than zero".to_owned());
     }
-    if clip.length_ticks == 0
-        || clip
-            .scale
-            .is_some_and(|scale| !scale.is_finite() || (scale - 1.0).abs() > 1e-9)
-    {
+    if clip.length_ticks == 0 || !clip.has_default_scale() {
         return Ok(BTreeMap::new());
     }
     let Some((source_start_tick, source_end_tick, explicit_source_window)) =
@@ -8202,11 +8190,7 @@ pub fn expand_automation_channel_curve_for_clip(
     if ppq == 0 {
         return Err("project PPQ must be greater than zero".to_owned());
     }
-    if clip.length_ticks == 0
-        || clip
-            .scale
-            .is_some_and(|scale| !scale.is_finite() || (scale - 1.0).abs() > 1e-9)
-    {
+    if clip.length_ticks == 0 || !clip.has_default_scale() {
         return Ok(Vec::new());
     }
     let Some((source_start_tick, source_end_tick, explicit_source_window)) =
@@ -8448,12 +8432,7 @@ fn expand_playlist_mixer_effect_parameter_automation(
     let mut expanded_point_count = 0usize;
 
     for (clip_index, clip) in arrangement.clips.iter().enumerate() {
-        if clip_is_muted(clip)
-            || clip.length_ticks == 0
-            || clip
-                .scale
-                .is_some_and(|scale| !scale.is_finite() || (scale - 1.0).abs() > 1e-9)
-        {
+        if clip_is_muted(clip) || clip.length_ticks == 0 || !clip.has_default_scale() {
             continue;
         }
         let clip_automation = match clip.target() {
@@ -8552,11 +8531,7 @@ fn expand_pattern_mixer_effect_parameter_automation_for_clip(
     if ppq == 0 {
         return Err("project PPQ must be greater than zero".to_owned());
     }
-    if clip.length_ticks == 0
-        || clip
-            .scale
-            .is_some_and(|scale| !scale.is_finite() || (scale - 1.0).abs() > 1e-9)
-    {
+    if clip.length_ticks == 0 || !clip.has_default_scale() {
         return Ok(BTreeMap::new());
     }
     let clip_length = u64::from(clip.length_ticks);
@@ -8683,11 +8658,7 @@ fn expand_mixer_effect_automation_clip_parameter_automation_for_clip(
     if ppq == 0 {
         return Err("project PPQ must be greater than zero".to_owned());
     }
-    if clip.length_ticks == 0
-        || clip
-            .scale
-            .is_some_and(|scale| !scale.is_finite() || (scale - 1.0).abs() > 1e-9)
-    {
+    if clip.length_ticks == 0 || !clip.has_default_scale() {
         return Ok(BTreeMap::new());
     }
     let Some((source_start_tick, source_end_tick, explicit_source_window)) =

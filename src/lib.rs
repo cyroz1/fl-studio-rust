@@ -5703,6 +5703,25 @@ impl PlaylistClip {
         }
     }
 
+    /// Whether this clip uses the default, unscaled timeline mapping.
+    ///
+    /// FL 21–24 Pattern Clips can store NaN offsets and zero in the legacy
+    /// scale candidate field while still playing at their saved timeline
+    /// length. Treat that record-specific value as the default; non-unit
+    /// values remain unsupported until their mapping is verified.
+    pub fn has_default_scale(&self) -> bool {
+        let Some(scale) = self.scale else {
+            return true;
+        };
+        if !scale.is_finite() {
+            return false;
+        }
+        (scale - 1.0).abs() <= 1e-9
+            || (self.record_size == 60
+                && matches!(self.target(), PlaylistClipTarget::Pattern { .. })
+                && scale == 0.0)
+    }
+
     pub fn uses_full_source_window(&self) -> bool {
         if self.record_size == 88 {
             return match self.target() {
@@ -5711,6 +5730,12 @@ impl PlaylistClip {
                 }
                 PlaylistClipTarget::Channel { .. } => true,
             };
+        }
+        if matches!(self.target(), PlaylistClipTarget::Pattern { .. })
+            && self.start_offset.is_nan()
+            && self.end_offset.is_nan()
+        {
+            return true;
         }
         self.start_offset == -1.0 && self.end_offset == -1.0
     }
@@ -28051,6 +28076,55 @@ mod tests {
         assert_eq!(
             document.arrangements().unwrap()[0].clips[0].scale,
             Some(0.75)
+        );
+    }
+
+    #[test]
+    fn legacy_pattern_nan_offsets_and_zero_scale_are_full_source_defaults() {
+        let mut pattern_clip = [0u8; 60];
+        pattern_clip[4..6].copy_from_slice(&0x5000u16.to_le_bytes());
+        pattern_clip[6..8].copy_from_slice(&0x5003u16.to_le_bytes());
+        pattern_clip[8..12].copy_from_slice(&960u32.to_le_bytes());
+        pattern_clip[12..14].copy_from_slice(&499u16.to_le_bytes());
+        pattern_clip[24..28].copy_from_slice(&f32::NAN.to_le_bytes());
+        pattern_clip[28..32].copy_from_slice(&f32::NAN.to_le_bytes());
+        pattern_clip[52..56].copy_from_slice(&0.0f32.to_le_bytes());
+
+        let mut zero_scaled_audio_clip = pattern_clip;
+        zero_scaled_audio_clip[6..8].copy_from_slice(&3u16.to_le_bytes());
+        zero_scaled_audio_clip[24..28].copy_from_slice(&(-1.0f32).to_le_bytes());
+        zero_scaled_audio_clip[28..32].copy_from_slice(&(-1.0f32).to_le_bytes());
+
+        let mut non_default_pattern_clip = pattern_clip;
+        non_default_pattern_clip[52..56].copy_from_slice(&0.75f32.to_le_bytes());
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&pattern_clip);
+        payload.extend_from_slice(&zero_scaled_audio_clip);
+        payload.extend_from_slice(&non_default_pattern_clip);
+        let mut event_stream = Vec::new();
+        append_data_event(&mut event_stream, 0xC7, b"24.2.2.4597\0");
+        event_stream.extend_from_slice(&[0x63, 0, 0]);
+        append_data_event(&mut event_stream, 0xE9, &payload);
+        let document = FlpDocument::parse(&flp_fixture(&event_stream, &[], &[]))
+            .expect("the legacy Playlist records should parse");
+        let arrangements = document.arrangements().expect("arrangement should parse");
+        let clips = &arrangements[0].clips;
+
+        assert_eq!(clips[0].scale, Some(0.0));
+        assert!(clips[0].has_default_scale());
+        assert!(clips[0].uses_full_source_window());
+        assert_eq!(
+            clips[0].recognized_pattern_source_window_ticks(),
+            Some((0, 960))
+        );
+        assert!(
+            !clips[1].has_default_scale(),
+            "zero is not a default Audio Clip scale"
+        );
+        assert!(
+            !clips[2].has_default_scale(),
+            "non-unit Pattern Clip scale remains unsupported"
         );
     }
 

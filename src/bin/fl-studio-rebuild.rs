@@ -22020,9 +22020,7 @@ impl DawUi {
             if track_filter.clip_is_muted(clip) {
                 continue;
             }
-            let unsupported_scale = clip
-                .scale
-                .is_some_and(|scale| !scale.is_finite() || (scale - 1.0).abs() > 1e-9);
+            let unsupported_scale = !clip.has_default_scale();
             let unsupported_source_window = clip.recognized_pattern_source_window_ticks().is_none();
             if !unsupported_scale && !unsupported_source_window {
                 continue;
@@ -22596,10 +22594,7 @@ impl DawUi {
                 {
                     continue;
                 }
-                if clip
-                    .scale
-                    .is_some_and(|scale| !scale.is_finite() || (scale - 1.0).abs() > 1e-9)
-                {
+                if !clip.has_default_scale() {
                     return Err(format!(
                         "CLAP channel automation cannot yet expand scaled Automation clips (clip at tick {})",
                         clip.position_ticks,
@@ -22707,10 +22702,7 @@ impl DawUi {
                 {
                     continue;
                 }
-                if clip
-                    .scale
-                    .is_some_and(|scale| !scale.is_finite() || (scale - 1.0).abs() > 1e-9)
-                {
+                if !clip.has_default_scale() {
                     return Err(format!(
                         "CLAP parameter automation cannot yet expand scaled Automation clips (clip at tick {})",
                         clip.position_ticks,
@@ -72741,10 +72733,7 @@ fn piano_roll_cross_pattern_ghost_notes_for_anchor(
         clip.playlist_track_id()
             .is_none_or(|track_id| !disabled_track_ids.contains(&track_id))
     };
-    let clip_has_default_scale = |clip: &PlaylistClip| {
-        clip.scale
-            .is_none_or(|scale| scale.is_finite() && (scale - 1.0).abs() <= 1e-9)
-    };
+    let clip_has_default_scale = PlaylistClip::has_default_scale;
     let mut ghosts = BTreeSet::new();
 
     'anchors: for (current_anchor_clip_index, anchor) in arrangement.clips.iter().enumerate() {
@@ -75346,11 +75335,7 @@ fn expand_clap_parameter_automation_for_clip(
     if ppq == 0 {
         return Err("project PPQ must be greater than zero".to_owned());
     }
-    if clip.length_ticks == 0
-        || clip
-            .scale
-            .is_some_and(|scale| !scale.is_finite() || (scale - 1.0).abs() > 1e-9)
-    {
+    if clip.length_ticks == 0 || !clip.has_default_scale() {
         return Ok(Vec::new());
     }
     let loop_length = pattern_lfo_loop_length_ticks(pattern, ppq, default_time_signature);
@@ -80688,12 +80673,7 @@ fn playlist_pattern_clip_split_supported(
     let PlaylistClipTarget::Pattern { id: pattern_id } = clip.target() else {
         return false;
     };
-    if !clip.can_resize_timeline_length()
-        || clip.length_ticks == 0
-        || clip
-            .scale
-            .is_some_and(|scale| !scale.is_finite() || (scale - 1.0).abs() > 1e-9)
-    {
+    if !clip.can_resize_timeline_length() || clip.length_ticks == 0 || !clip.has_default_scale() {
         return false;
     }
     let Some(relative_split_ticks) = split_position_ticks
@@ -83919,10 +83899,7 @@ fn playlist_pattern_recording_source_clips(
 }
 
 fn playlist_pattern_recording_source_start(clip: &PlaylistClip) -> Option<u32> {
-    if clip
-        .scale
-        .is_some_and(|scale| !scale.is_finite() || (scale - 1.0).abs() > 1e-9)
-    {
+    if !clip.has_default_scale() {
         return None;
     }
     if clip.record_size == 88 {

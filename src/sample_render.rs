@@ -11414,10 +11414,7 @@ pub fn schedule_playlist_pattern_notes_with_adjustments<'a>(
         let PlaylistClipTarget::Pattern { id } = clip.target() else {
             continue;
         };
-        if clip
-            .scale
-            .is_some_and(|scale| !scale.is_finite() || (scale - 1.0).abs() > 1e-9)
-        {
+        if !clip.has_default_scale() {
             schedule.clips_skipped_unsupported_scale += 1;
             continue;
         }
@@ -20724,6 +20721,55 @@ mod tests {
                 (288, Some(384)),
                 (432, Some(480)),
             ]
+        );
+    }
+
+    #[test]
+    fn legacy_pattern_clip_nan_offsets_schedule_full_source_notes() {
+        let pattern = Pattern {
+            id: 5,
+            length_ticks: Some(96),
+            notes: vec![PatternNote {
+                position: 24,
+                length: 48,
+                channel_id: 2,
+                ..PatternNote::default()
+            }],
+            ..Pattern::default()
+        };
+        let mut legacy_clip = test_pattern_clip(5, 120, 192);
+        legacy_clip.record_size = 60;
+        legacy_clip.start_offset = f32::NAN;
+        legacy_clip.end_offset = f32::NAN;
+        legacy_clip.scale = Some(0.0);
+        let arrangement = Arrangement {
+            clips: vec![legacy_clip],
+            ..Arrangement::default()
+        };
+        let patterns = [pattern];
+
+        let schedule = schedule_playlist_pattern_notes(
+            &patterns,
+            &arrangement,
+            PlaylistTrackFilter::new(&BTreeSet::new(), None),
+            PlaylistPatternScheduleOptions {
+                ppq: 96,
+                global_swing_mix_raw: 0,
+                play_truncated_notes_in_clips: false,
+            },
+            |_| 128,
+            |channel_id, _, _| vec![channel_id],
+        )
+        .unwrap();
+
+        assert_eq!(schedule.clips_skipped_unsupported_scale, 0);
+        assert_eq!(
+            schedule
+                .notes
+                .iter()
+                .map(|placed| (placed.start_tick, placed.stop_tick))
+                .collect::<Vec<_>>(),
+            vec![(144, Some(192)), (240, Some(288))]
         );
     }
 

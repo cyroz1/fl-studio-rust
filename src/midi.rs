@@ -846,10 +846,7 @@ impl MidiFile {
             let Some(pattern) = patterns_by_id.get(&id).copied() else {
                 continue;
             };
-            if clip
-                .scale
-                .is_some_and(|scale| !scale.is_finite() || (scale - 1.0).abs() > 1e-9)
-            {
+            if !clip.has_default_scale() {
                 return Err(MidiError::InvalidExport(
                     "scaled Playlist Pattern Clips cannot be exported yet",
                 ));
@@ -1170,10 +1167,7 @@ impl MidiFile {
             let Some(pattern) = patterns_by_id.get(&id).copied() else {
                 continue;
             };
-            if clip
-                .scale
-                .is_some_and(|scale| !scale.is_finite() || (scale - 1.0).abs() > 1e-9)
-            {
+            if !clip.has_default_scale() {
                 return Err(MidiError::InvalidExport(
                     "scaled Playlist Pattern Clips cannot be exported yet",
                 ));
