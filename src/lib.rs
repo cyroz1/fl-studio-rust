@@ -7206,7 +7206,8 @@ impl FlpDocument {
                     detail: "automation target link payload is not a multiple of 20 bytes",
                 });
             }
-            for record in event.payload.chunks_exact(20) {
+            let (records, _) = event.payload.as_chunks::<20>();
+            for record in records {
                 links.push(AutomationTargetLink {
                     event_index,
                     source_channel_id: record[2],
