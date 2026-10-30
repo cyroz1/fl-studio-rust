@@ -11,6 +11,7 @@ const CLAP_PROJECT_INSTRUMENT_PARAMETER_OVERRIDES_DIRECTORY: &str =
 const CLAP_PROJECT_MIXER_EFFECTS_DIRECTORY: &str = "clap-project-mixer-effects";
 pub const MAX_CLAP_PROJECT_PLUGIN_STATE_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_CLAP_PROJECT_MIXER_AUXILIARY_BUSES: usize = 16;
+pub const MAX_CLAP_PROJECT_MIXER_EFFECT_MANUAL_LATENCY_OFFSET_SAMPLES: i32 = 100_000;
 const MAX_CLAP_PROJECT_PARAMETER_OVERRIDES: usize = 512;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -33,6 +34,8 @@ pub struct ClapProjectMixerEffectAssignment {
     pub auxiliary_input_source_map: Option<BTreeSet<(usize, usize)>>,
     /// Machine-local plain values forced after state restoration when the effect starts.
     pub parameter_overrides: BTreeMap<u32, f64>,
+    /// Machine-local sample offset added to the effect's reported latency for PDC.
+    pub manual_latency_offset_samples: i32,
 }
 
 fn app_settings_directory() -> Option<PathBuf> {
@@ -260,10 +263,13 @@ pub fn save_clap_project_mixer_effects(
             .state
             .as_ref()
             .is_some_and(|state| state.len() > MAX_CLAP_PROJECT_PLUGIN_STATE_BYTES)
+            || assignment.manual_latency_offset_samples.unsigned_abs()
+                > MAX_CLAP_PROJECT_MIXER_EFFECT_MANUAL_LATENCY_OFFSET_SAMPLES as u32
     }) {
         return Err(format!(
-            "CLAP plug-in state exceeds the {} MiB project limit",
-            MAX_CLAP_PROJECT_PLUGIN_STATE_BYTES / (1024 * 1024)
+            "CLAP plug-in state exceeds the {} MiB project limit or the manual PDC offset is outside ±{} samples",
+            MAX_CLAP_PROJECT_PLUGIN_STATE_BYTES / (1024 * 1024),
+            MAX_CLAP_PROJECT_MIXER_EFFECT_MANUAL_LATENCY_OFFSET_SAMPLES
         ));
     }
     let path = clap_project_mixer_effects_file(project_id)
@@ -289,8 +295,13 @@ pub fn parse_clap_project_mixer_effects(
         "clap-project-mixer-effects-v2"
             | "clap-project-mixer-effects-v3"
             | "clap-project-mixer-effects-v4"
+            | "clap-project-mixer-effects-v5"
     );
-    let has_parameter_overrides = version == "clap-project-mixer-effects-v4";
+    let has_parameter_overrides = matches!(
+        version,
+        "clap-project-mixer-effects-v4" | "clap-project-mixer-effects-v5"
+    );
+    let has_manual_latency_offset = version == "clap-project-mixer-effects-v5";
     if !has_auxiliary_map && version != "clap-project-mixer-effects-v1" {
         return assignments;
     }
@@ -349,12 +360,22 @@ pub fn parse_clap_project_mixer_effects(
         } else {
             BTreeMap::new()
         };
+        let manual_latency_offset_samples = if has_manual_latency_offset {
+            let Some(offset) = fields.next().and_then(|field| field.parse::<i32>().ok()) else {
+                continue;
+            };
+            offset
+        } else {
+            0
+        };
         if fields.next().is_some()
             || insert_ordinal >= crate::audio::MIXER_TRACK_METER_COUNT
             || slot_index >= 10
             || path.as_os_str().is_empty()
             || plugin_id.is_empty()
             || plugin_name.is_empty()
+            || manual_latency_offset_samples.unsigned_abs()
+                > MAX_CLAP_PROJECT_MIXER_EFFECT_MANUAL_LATENCY_OFFSET_SAMPLES as u32
         {
             continue;
         }
@@ -367,6 +388,7 @@ pub fn parse_clap_project_mixer_effects(
                 state,
                 auxiliary_input_source_map,
                 parameter_overrides,
+                manual_latency_offset_samples,
             },
         );
     }
@@ -376,7 +398,7 @@ pub fn parse_clap_project_mixer_effects(
 pub fn serialize_clap_project_mixer_effects(
     assignments: &BTreeMap<(usize, u16), ClapProjectMixerEffectAssignment>,
 ) -> String {
-    let mut contents = String::from("clap-project-mixer-effects-v4\n");
+    let mut contents = String::from("clap-project-mixer-effects-v5\n");
     for ((insert_ordinal, slot_index), assignment) in assignments {
         if *insert_ordinal >= crate::audio::MIXER_TRACK_METER_COUNT
             || *slot_index >= 10
@@ -402,6 +424,8 @@ pub fn serialize_clap_project_mixer_effects(
                 .parameter_overrides
                 .values()
                 .any(|value| !value.is_finite())
+            || assignment.manual_latency_offset_samples.unsigned_abs()
+                > MAX_CLAP_PROJECT_MIXER_EFFECT_MANUAL_LATENCY_OFFSET_SAMPLES as u32
         {
             continue;
         }
@@ -445,6 +469,8 @@ pub fn serialize_clap_project_mixer_effects(
                 contents.push_str(&format!("{parameter_id}:{:016x}", value.to_bits()));
             }
         }
+        contents.push('\t');
+        contents.push_str(&assignment.manual_latency_offset_samples.to_string());
         contents.push('\n');
     }
     contents
@@ -848,12 +874,13 @@ fn hex_digit(byte: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use super::{
-        ClapProjectInstrumentAssignment, encode_path, encode_plugin_uid,
-        parse_clap_project_instruments, parse_vst3_manual_latency_offsets,
-        serialize_clap_project_instruments, serialize_vst3_manual_latency_offsets,
+        ClapProjectInstrumentAssignment, ClapProjectMixerEffectAssignment, encode_path,
+        encode_plugin_uid, parse_clap_project_instruments, parse_clap_project_mixer_effects,
+        parse_vst3_manual_latency_offsets, serialize_clap_project_instruments,
+        serialize_clap_project_mixer_effects, serialize_vst3_manual_latency_offsets,
     };
     use std::path::PathBuf;
 
@@ -948,5 +975,49 @@ mod tests {
             parse_clap_project_instruments(&serialize_clap_project_instruments(&assignments)),
             assignments
         );
+    }
+
+    #[test]
+    fn clap_project_mixer_effect_assignments_round_trip_manual_pdc_offset() {
+        let assignments = BTreeMap::from([(
+            (3, 2),
+            ClapProjectMixerEffectAssignment {
+                path: PathBuf::from("/tmp/echo.clap"),
+                plugin_id: "org.example.echo".to_owned(),
+                plugin_name: "Echo".to_owned(),
+                state: Some(vec![0, 1, 0xff]),
+                auxiliary_input_source_map: Some(BTreeSet::from([(1, 0)])),
+                parameter_overrides: BTreeMap::from([(17, 0.375)]),
+                manual_latency_offset_samples: -512,
+            },
+        )]);
+
+        let serialized = serialize_clap_project_mixer_effects(&assignments);
+
+        assert!(serialized.starts_with("clap-project-mixer-effects-v5\n"));
+        assert_eq!(parse_clap_project_mixer_effects(&serialized), assignments);
+    }
+
+    #[test]
+    fn clap_project_mixer_effects_default_manual_pdc_offset_for_v4() {
+        let parsed = parse_clap_project_mixer_effects(
+            "clap-project-mixer-effects-v4\n1\t2\t2f746d702f78\t6964\t6e616d65\t-\t-\t-\n",
+        );
+
+        assert_eq!(
+            parsed
+                .get(&(1, 2))
+                .map(|assignment| assignment.manual_latency_offset_samples),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn clap_project_mixer_effects_reject_out_of_range_manual_pdc_offsets() {
+        let parsed = parse_clap_project_mixer_effects(
+            "clap-project-mixer-effects-v5\n1\t2\t2f746d702f78\t6964\t6e616d65\t-\t-\t-\t100001\n",
+        );
+
+        assert!(parsed.is_empty());
     }
 }

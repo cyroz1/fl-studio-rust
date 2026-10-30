@@ -39,11 +39,12 @@ use flp_rebuild::media::{
 use flp_rebuild::midi::{MidiChannelMapping, MidiExportFileFormat, MidiFile, MidiImportOptions};
 use flp_rebuild::plugin_settings::{
     ClapProjectInstrumentAssignment as ClapPatternPlaybackInstrument,
-    ClapProjectMixerEffectAssignment, load_clap_project_instruments,
-    load_clap_project_mixer_effects, load_vst3_manual_latency_offsets,
-    load_vst3_project_manual_latency_offsets, save_clap_project_instrument_parameter_overrides,
-    save_clap_project_instruments, save_clap_project_mixer_effects,
-    save_vst3_manual_latency_offsets, save_vst3_project_manual_latency_offsets,
+    ClapProjectMixerEffectAssignment, MAX_CLAP_PROJECT_MIXER_EFFECT_MANUAL_LATENCY_OFFSET_SAMPLES,
+    load_clap_project_instruments, load_clap_project_mixer_effects,
+    load_vst3_manual_latency_offsets, load_vst3_project_manual_latency_offsets,
+    save_clap_project_instrument_parameter_overrides, save_clap_project_instruments,
+    save_clap_project_mixer_effects, save_vst3_manual_latency_offsets,
+    save_vst3_project_manual_latency_offsets,
 };
 use flp_rebuild::plugins::{PluginCandidate, PluginFormat, scan_installed_plugins};
 use flp_rebuild::project_package::{ProjectPackageWorkspace, copy_unique_sample_file};
@@ -56832,6 +56833,7 @@ impl DawUi {
         let mut inspect_clap_instance = None;
         let mut clap_effect_sidechain_mapping_edits = Vec::new();
         let mut clap_effect_sidechain_mapping_use_auto = Vec::new();
+        let mut clap_effect_manual_latency_offset_edits = Vec::new();
         let mut clap_effect_parameter_override_apply = Vec::new();
         let mut clap_effect_parameter_override_clear = Vec::new();
         let mut clap_effect_assignment_edit = None;
@@ -58669,6 +58671,13 @@ impl DawUi {
                                                                                             .clone()
                                                                                     })
                                                                                     .unwrap_or_default();
+                                                                            let manual_latency_offset_samples =
+                                                                                existing_assignment
+                                                                                    .map(|assignment| {
+                                                                                        assignment
+                                                                                            .manual_latency_offset_samples
+                                                                                    })
+                                                                                    .unwrap_or_default();
                                                                             clap_effect_assignment_edit = Some((
                                                                                 slot_key,
                                                                                 ClapProjectMixerEffectAssignment {
@@ -58678,6 +58687,7 @@ impl DawUi {
                                                                                     state,
                                                                                     auxiliary_input_source_map,
                                                                                     parameter_overrides,
+                                                                                    manual_latency_offset_samples,
                                                                                 },
                                                                             ));
                                                                             ui.close();
@@ -58731,6 +58741,41 @@ impl DawUi {
                                                                     Some(slot_key);
                                                             }
                                                         });
+                                                        let mut offset_samples =
+                                                            assignment.manual_latency_offset_samples;
+                                                        let performance_stream_active =
+                                                            self.playing && self.performance_mode_active;
+                                                        ui.horizontal(|ui| {
+                                                            ui.label("Manual PDC offset");
+                                                            let response = ui
+                                                                .add_enabled(
+                                                                    !performance_stream_active,
+                                                                    egui::DragValue::new(
+                                                                        &mut offset_samples,
+                                                                    )
+                                                                    .range(
+                                                                        -MAX_CLAP_PROJECT_MIXER_EFFECT_MANUAL_LATENCY_OFFSET_SAMPLES
+                                                                            ..=MAX_CLAP_PROJECT_MIXER_EFFECT_MANUAL_LATENCY_OFFSET_SAMPLES,
+                                                                    )
+                                                                    .speed(1.0)
+                                                                    .suffix(" samples"),
+                                                                )
+                                                                .on_hover_text(
+                                                                    "Added to this CLAP effect's reported latency when planning Mixer PDC. Positive values add latency; negative values subtract it. Saved in app settings for this project; the FLP file is unchanged.",
+                                                                );
+                                                            if response.changed() {
+                                                                clap_effect_manual_latency_offset_edits
+                                                                    .push((slot_key, offset_samples));
+                                                            }
+                                                        });
+                                                        if performance_stream_active {
+                                                            ui.small(
+                                                                egui::RichText::new(
+                                                                    "Stop Performance playback to edit the PDC offset.",
+                                                                )
+                                                                .color(MUTED),
+                                                            );
+                                                        }
                                                         ui.collapsing("Sidechain input mapping", |ui| {
                                                             match &clap_instance_inspection_state {
                                                                 Some(ClapInstanceInspectionState::Inspected(info)) => {
@@ -59412,9 +59457,13 @@ impl DawUi {
         }
         if !clap_effect_sidechain_mapping_edits.is_empty()
             || !clap_effect_sidechain_mapping_use_auto.is_empty()
+            || !clap_effect_manual_latency_offset_edits.is_empty()
         {
             if let Some(project_id) = project_id.as_deref() {
                 let mut assignments = self.clap_mixer_effect_assignments.clone();
+                let sidechain_mapping_changed = !clap_effect_sidechain_mapping_edits.is_empty()
+                    || !clap_effect_sidechain_mapping_use_auto.is_empty();
+                let pdc_offsets_changed = !clap_effect_manual_latency_offset_edits.is_empty();
                 for slot_key in clap_effect_sidechain_mapping_use_auto {
                     let Some(assignment) = assignments.get_mut(&slot_key) else {
                         continue;
@@ -59436,25 +59485,34 @@ impl DawUi {
                         mapping.remove(&(source_track, bus_index));
                     }
                 }
+                for (slot_key, offset_samples) in clap_effect_manual_latency_offset_edits {
+                    let Some(assignment) = assignments.get_mut(&slot_key) else {
+                        continue;
+                    };
+                    assignment.manual_latency_offset_samples = offset_samples;
+                }
+                let update_label = match (sidechain_mapping_changed, pdc_offsets_changed) {
+                    (true, true) => "Updated CLAP Mixer sidechain mapping and PDC offset",
+                    (false, true) => "Updated CLAP Mixer PDC offset",
+                    _ => "Updated CLAP Mixer sidechain input mapping",
+                };
                 match save_clap_project_mixer_effects(project_id, &assignments) {
                     Ok(()) => {
                         self.stop_project_playback();
                         self.clap_mixer_effect_assignments = assignments;
                         let reload_status = self.load_project_vst3_plugins();
                         self.status = reload_status.map_or_else(
-                            || "Updated CLAP Mixer sidechain input mapping".to_owned(),
-                            |message| {
-                                format!("Updated CLAP Mixer sidechain input mapping; {message}")
-                            },
+                            || update_label.to_owned(),
+                            |message| format!("{update_label}; {message}"),
                         );
                     }
                     Err(error) => {
-                        self.status =
-                            format!("Could not save CLAP Mixer sidechain input mapping: {error}");
+                        self.status = format!("Could not save CLAP Mixer effect settings: {error}");
                     }
                 }
             } else {
-                self.status = "Save the project before mapping CLAP sidechain inputs".to_owned();
+                self.status =
+                    "Save the project before editing CLAP Mixer effect settings".to_owned();
             }
         }
         if !clap_effect_parameter_override_apply.is_empty()

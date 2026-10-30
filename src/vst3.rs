@@ -1355,12 +1355,16 @@ impl Vst3PlaylistStreamProcessor {
                     effect.slot_index + 1
                 ));
             }
-            let latency_frames = u64::from(external_processor.latency_samples());
+            let pdc_latency_samples = apply_manual_latency_offset(
+                external_processor.latency_samples(),
+                effect.manual_latency_offset_samples,
+            );
+            let latency_frames = u64::from(pdc_latency_samples);
             let maximum_latency_frames =
                 (sample_rate * MAX_VST3_EFFECT_LATENCY_SECONDS).ceil() as u64;
             if latency_frames > maximum_latency_frames {
                 return Err(format!(
-                    "CLAP Mixer insert {} effect slot {} reports {latency_frames} frames of latency, exceeding the {MAX_VST3_EFFECT_LATENCY_SECONDS}-second processing limit",
+                    "CLAP Mixer insert {} effect slot {} has a PDC-adjusted latency of {latency_frames} frames, exceeding the {MAX_VST3_EFFECT_LATENCY_SECONDS}-second processing limit",
                     effect.insert_ordinal,
                     effect.slot_index + 1
                 ));
@@ -4390,6 +4394,9 @@ pub trait MixerEffectProcessor: Send {
         None
     }
     fn latency_samples(&self) -> u32;
+    fn manual_latency_offset_samples(&self) -> i32 {
+        0
+    }
     fn tail_samples(&self) -> Option<u64> {
         None
     }
@@ -7079,7 +7086,11 @@ impl Vst3HostRuntime {
                         .and_then(|count| count.checked_mul(2))
                         .ok_or_else(|| "CLAP sidechain scratch size overflow".to_owned())?;
                     let external_auxiliary_scratch = Vec::with_capacity(auxiliary_scratch_capacity);
-                    let latency_samples = processor.latency_samples();
+                    let manual_latency_offset_samples = processor.manual_latency_offset_samples();
+                    let latency_samples = apply_manual_latency_offset(
+                        processor.latency_samples(),
+                        manual_latency_offset_samples,
+                    );
                     let tail_samples = processor.tail_samples();
                     (
                         0u64,
@@ -7095,7 +7106,7 @@ impl Vst3HostRuntime {
                         sample_rate,
                         latency_samples,
                         tail_samples,
-                        0i32,
+                        manual_latency_offset_samples,
                     )
                 } else {
                     let Some(id) = mixer_effect_instances.get(&key).copied() else {

@@ -1264,6 +1264,7 @@ struct ClapMixerEffectProcess {
     auxiliary_input_source_map: Option<Vec<(usize, usize)>>,
     sample_rate: u32,
     latency_samples: u32,
+    manual_latency_offset_samples: i32,
     tail_samples: Option<u64>,
     stopped: bool,
     capture_request_sender: Sender<ActiveClapMixerEffectStateCaptureRequest>,
@@ -1331,6 +1332,7 @@ impl ClapMixerEffectProcess {
             auxiliary_input_source_map: None,
             sample_rate,
             latency_samples: 0,
+            manual_latency_offset_samples: 0,
             tail_samples: None,
             stopped: false,
             capture_request_sender,
@@ -1754,6 +1756,10 @@ impl MixerEffectProcessor for ClapMixerEffectProcess {
         self.latency_samples
     }
 
+    fn manual_latency_offset_samples(&self) -> i32 {
+        self.manual_latency_offset_samples
+    }
+
     fn tail_samples(&self) -> Option<u64> {
         self.tail_samples
     }
@@ -1798,6 +1804,7 @@ impl MixerEffectProcessorFactory for ClapProjectMixerEffectProcessorFactory {
             assignment.state.as_deref(),
             &assignment.parameter_overrides,
         )?;
+        process.manual_latency_offset_samples = assignment.manual_latency_offset_samples;
         if let Some(mapping) = &assignment.auxiliary_input_source_map {
             let mut validated_mapping = Vec::with_capacity(mapping.len());
             for (source_track, bus_index) in mapping {
