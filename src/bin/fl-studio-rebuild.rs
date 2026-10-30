@@ -15166,6 +15166,9 @@ impl DawUi {
         if staged_handoff_committed {
             if staged_handoff_reason == Some(PdcStreamHandoffReason::PatternSeek) && self.playing {
                 self.start_midi_pattern_transport_for_active_pattern();
+                if self.midi_output_clock.is_some() {
+                    self.start_midi_clock(true);
+                }
             }
             let tick = self
                 .current_pattern_mode_playhead_tick()
@@ -60019,17 +60022,24 @@ impl DawUi {
                 }
             };
             let current_tick = if resume {
-                let Some(current_tick) =
-                    tempo_map.tick_at_frame(playback_clock.position_frames(), sample_rate)
-                else {
-                    self.midi_output_error =
-                        Some("Pattern position is unavailable for MIDI clock".to_owned());
-                    return;
-                };
-                current_tick
+                self.current_pattern_mode_playhead_tick()
+                    .map(|(_, tick)| tick)
+                    .or_else(|| {
+                        tempo_map.tick_at_frame(playback_clock.position_frames(), sample_rate)
+                    })
             } else {
-                0.0
+                Some(self.pattern_seek_tick as f64)
             };
+            let Some(current_tick) = current_tick else {
+                self.midi_output_error =
+                    Some("Pattern position is unavailable for MIDI clock".to_owned());
+                return;
+            };
+            if !current_tick.is_finite() || current_tick < 0.0 {
+                self.midi_output_error =
+                    Some("Pattern position is unavailable for MIDI clock".to_owned());
+                return;
+            }
             (tempo_map, current_tick)
         } else {
             let Some(current_tick) = self.current_playhead_tick() else {
@@ -60064,6 +60074,17 @@ impl DawUi {
                 tempo_map,
                 loop_start_tick,
                 loop_end_tick,
+                playback_clock,
+            )
+        } else if self.pattern_playback_mode {
+            MidiClockScheduler::start_with_phase_offset(
+                output,
+                resume,
+                current_tick,
+                sample_rate,
+                ppq,
+                tempo_map,
+                self.pattern_playback_phase_offset_frames,
                 playback_clock,
             )
         } else {

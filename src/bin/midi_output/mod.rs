@@ -1303,6 +1303,7 @@ struct MidiClockSchedule {
     sample_rate: u32,
     ppq: u16,
     next_pulse_index: u64,
+    phase_offset_frames: u64,
     loop_range: Option<(u64, u64, u64, u64)>,
     playback_clock: ProjectPlaybackClock,
     stop_receiver: Receiver<()>,
@@ -1319,6 +1320,29 @@ impl MidiClockScheduler {
         tempo_map: PlaylistTempoMap,
         playback_clock: ProjectPlaybackClock,
     ) -> Result<Self, String> {
+        Self::start_with_phase_offset(
+            output,
+            resume,
+            current_tick,
+            sample_rate,
+            ppq,
+            tempo_map,
+            0,
+            playback_clock,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_with_phase_offset(
+        output: ConnectedMidiOutput,
+        resume: bool,
+        current_tick: f64,
+        sample_rate: u32,
+        ppq: u16,
+        tempo_map: PlaylistTempoMap,
+        phase_offset_frames: u64,
+        playback_clock: ProjectPlaybackClock,
+    ) -> Result<Self, String> {
         Self::start_inner(
             output,
             resume,
@@ -1327,6 +1351,7 @@ impl MidiClockScheduler {
             ppq,
             tempo_map,
             None,
+            phase_offset_frames,
             playback_clock,
         )
     }
@@ -1367,6 +1392,7 @@ impl MidiClockScheduler {
                 loop_start_tick,
                 loop_start_pulse_index,
             )),
+            0,
             playback_clock,
         )
     }
@@ -1380,6 +1406,7 @@ impl MidiClockScheduler {
         ppq: u16,
         tempo_map: PlaylistTempoMap,
         loop_range: Option<(u64, u64, u64, u64)>,
+        phase_offset_frames: u64,
         playback_clock: ProjectPlaybackClock,
     ) -> Result<Self, String> {
         if ppq == 0 || sample_rate == 0 || !current_tick.is_finite() || current_tick < 0.0 {
@@ -1387,7 +1414,14 @@ impl MidiClockScheduler {
                 "MIDI clock requires a valid Playlist position and audio timing".to_owned(),
             );
         }
-        let next_pulse_index = midi_clock_pulse_count_at_tick(current_tick, ppq).saturating_add(1);
+        let pulse_timing_frame = playback_clock
+            .position_frames()
+            .saturating_add(phase_offset_frames);
+        let pulse_timing_tick = tempo_map
+            .tick_at_frame(pulse_timing_frame, sample_rate)
+            .unwrap_or(current_tick);
+        let next_pulse_index =
+            midi_clock_pulse_count_at_tick(pulse_timing_tick, ppq).saturating_add(1);
         let result = if resume || current_tick > 0.0 {
             output
                 .send(&midi_song_position_pointer_message(
@@ -1412,6 +1446,7 @@ impl MidiClockScheduler {
                         sample_rate,
                         ppq,
                         next_pulse_index,
+                        phase_offset_frames,
                         loop_range,
                         playback_clock,
                         stop_receiver,
@@ -1472,6 +1507,7 @@ fn schedule_midi_clock(mut output: ConnectedMidiOutput, schedule: MidiClockSched
         sample_rate,
         ppq,
         mut next_pulse_index,
+        phase_offset_frames,
         loop_range,
         playback_clock,
         stop_receiver,
@@ -1483,7 +1519,9 @@ fn schedule_midi_clock(mut output: ConnectedMidiOutput, schedule: MidiClockSched
             stop_clock_output(&mut output, &error_sender);
             return;
         }
-        let current_frame = playback_clock.position_frames();
+        let current_frame = playback_clock
+            .position_frames()
+            .saturating_add(phase_offset_frames);
         if let Some((loop_start_frame, loop_frames, loop_start_tick, loop_start_pulse_index)) =
             loop_range
         {
