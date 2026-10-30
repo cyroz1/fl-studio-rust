@@ -12101,6 +12101,11 @@ fn prepare_sampler_arrangement(
                     SamplerEnvelopeLfoTarget::Volume,
                     options.sample_rate,
                 ),
+                pitch_lfo: sampler_lfo_config(
+                    channel,
+                    SamplerEnvelopeLfoTarget::Pitch,
+                    options.sample_rate,
+                ),
                 max_polyphony_raw: channel.sampler_max_polyphony_raw(),
                 mono_enabled: channel.sampler_mono_enabled().unwrap_or(false),
                 portamento_enabled: channel.sampler_portamento_enabled().unwrap_or(false),
@@ -12378,6 +12383,7 @@ struct SamplerVoiceSource {
     volume_envelope: Option<SamplerVolumeEnvelope>,
     pan_lfo: Option<SamplerLfo>,
     volume_lfo: Option<SamplerLfo>,
+    pitch_lfo: Option<SamplerLfo>,
     max_polyphony_raw: Option<u32>,
     mono_enabled: bool,
     portamento_enabled: bool,
@@ -15243,6 +15249,11 @@ fn prepare_sampler_pattern_for_channel_internal(
                     SamplerEnvelopeLfoTarget::Volume,
                     options.sample_rate,
                 ),
+                pitch_lfo: sampler_lfo_config(
+                    channel,
+                    SamplerEnvelopeLfoTarget::Pitch,
+                    options.sample_rate,
+                ),
                 max_polyphony_raw: channel.sampler_max_polyphony_raw(),
                 mono_enabled: channel.sampler_mono_enabled().unwrap_or(false),
                 portamento_enabled: channel.sampler_portamento_enabled().unwrap_or(false),
@@ -15557,6 +15568,8 @@ struct SamplerVoice {
     volume_envelope: Option<SamplerVolumeEnvelope>,
     pan_lfo: Option<SamplerLfo>,
     volume_lfo: Option<SamplerLfo>,
+    pitch_lfo: Option<SamplerLfo>,
+    lfo_pitch_cents: f64,
     envelope_release_start_frame: Option<u64>,
     envelope_release_start_gain: f32,
     loop_bounds: Option<SampleBounds>,
@@ -15647,7 +15660,7 @@ fn update_sampler_voice_slide(
 }
 
 fn set_sampler_voice_source_step(voice: &mut SamplerVoice, pitch_bend_cents: i16) {
-    let slide_ratio = 2.0_f64.powf(voice.pitch_offset_cents / 1_200.0);
+    let slide_ratio = 2.0_f64.powf((voice.pitch_offset_cents + voice.lfo_pitch_cents) / 1_200.0);
     let direction = if voice.source_step == 0.0 {
         voice.base_source_step.signum()
     } else {
@@ -15873,6 +15886,7 @@ impl<'a> SamplerVoiceEngine<'a> {
             (None, None)
         };
         let pan_law = self.pan_law;
+        let pitch_bend_cents = self.pitch_bend_cents;
         let live_midi_channel_volume = self.live_midi_channel_volume;
         let live_midi_expression = self.live_midi_expression;
         let mut last_active_output_frame = None;
@@ -15897,7 +15911,7 @@ impl<'a> SamplerVoiceEngine<'a> {
                         voice,
                         frame,
                         current_tick,
-                        self.pitch_bend_cents,
+                        pitch_bend_cents,
                         self.pan_law,
                     );
                 }
@@ -15937,12 +15951,22 @@ impl<'a> SamplerVoiceEngine<'a> {
                             voice,
                             frame,
                             current_tick,
-                            self.pitch_bend_cents,
-                            self.pan_law,
+                            pitch_bend_cents,
+                            pan_law,
                         );
                     }
                     voice.note_slide = None;
                     begin_sampler_voice_release(voice, frame, self.release_frames);
+                }
+                if let Some(pitch_lfo) = voice.pitch_lfo {
+                    // Candidate depth pending a native render comparison: full raw amount spans
+                    // one octave in either direction.
+                    voice.lfo_pitch_cents =
+                        f64::from(pitch_lfo.value_at_frame(voice.started_frame, frame)) * 1_200.0;
+                    let pitch_bend = voice
+                        .input_midi_channel
+                        .map_or(0, |channel| pitch_bend_cents[usize::from(channel)]);
+                    set_sampler_voice_source_step(voice, pitch_bend);
                 }
                 let fade = match voice.release_remaining {
                     Some(0) => {
@@ -16299,6 +16323,8 @@ impl<'a> SamplerVoiceEngine<'a> {
             volume_envelope: source.volume_envelope,
             pan_lfo: source.pan_lfo,
             volume_lfo: source.volume_lfo,
+            pitch_lfo: source.pitch_lfo,
+            lfo_pitch_cents: 0.0,
             envelope_release_start_frame: None,
             envelope_release_start_gain: 1.0,
             loop_bounds: source.loop_bounds,
@@ -21550,6 +21576,7 @@ mod tests {
                     release_ping_pong_loop: false,
                     pan_lfo: None,
                     volume_lfo: None,
+                    pitch_lfo: None,
                 },
             )]),
             mixer_transforms_by_channel: HashMap::from([(
@@ -22756,6 +22783,7 @@ mod tests {
             release_ping_pong_loop: false,
             pan_lfo: None,
             volume_lfo: None,
+            pitch_lfo: None,
         };
         let sources = HashMap::from([(7, source)]);
         let notes = [ScheduledSamplerNote {
@@ -22911,6 +22939,7 @@ mod tests {
                 release_ping_pong_loop: false,
                 pan_lfo: None,
                 volume_lfo: None,
+                pitch_lfo: None,
             },
         )]);
         let notes = [ScheduledSamplerNote {
@@ -22979,6 +23008,7 @@ mod tests {
                 release_ping_pong_loop: false,
                 pan_lfo: None,
                 volume_lfo: None,
+                pitch_lfo: None,
             },
         )]);
         let notes = [ScheduledSamplerNote {
@@ -23043,6 +23073,7 @@ mod tests {
                 release_ping_pong_loop: false,
                 pan_lfo: None,
                 volume_lfo: None,
+                pitch_lfo: None,
             },
         )]);
         let notes = [ScheduledSamplerNote {
@@ -23179,6 +23210,7 @@ mod tests {
                 release_ping_pong_loop: false,
                 pan_lfo: None,
                 volume_lfo: None,
+                pitch_lfo: None,
             },
         )]);
         let notes = [ScheduledSamplerNote {
@@ -23244,6 +23276,7 @@ mod tests {
                 release_ping_pong_loop: false,
                 pan_lfo: None,
                 volume_lfo: None,
+                pitch_lfo: None,
             },
         )]);
         let notes = [
@@ -23332,6 +23365,7 @@ mod tests {
                 release_ping_pong_loop: false,
                 pan_lfo: None,
                 volume_lfo: None,
+                pitch_lfo: None,
             },
         )]);
         let mut engine = SamplerVoiceEngine::new(&sources, &[], 2, 4, 4);
@@ -23471,6 +23505,7 @@ mod tests {
                 release_ping_pong_loop: false,
                 pan_lfo: None,
                 volume_lfo: None,
+                pitch_lfo: None,
             },
         )]);
         let mut engine = SamplerVoiceEngine::new(&sources, &[], 3, 4, 4);
@@ -23558,6 +23593,7 @@ mod tests {
                 release_ping_pong_loop: false,
                 pan_lfo: None,
                 volume_lfo: None,
+                pitch_lfo: None,
             },
         )]);
         let transforms = HashMap::from([(
@@ -23624,6 +23660,7 @@ mod tests {
                 release_ping_pong_loop: false,
                 pan_lfo: None,
                 volume_lfo: None,
+                pitch_lfo: None,
             },
         )]);
         let notes = [ScheduledSamplerNote {
@@ -23683,6 +23720,7 @@ mod tests {
                 release_ping_pong_loop: false,
                 pan_lfo: None,
                 volume_lfo: None,
+                pitch_lfo: None,
             },
         )]);
         let notes = [ScheduledSamplerNote {
@@ -23745,6 +23783,7 @@ mod tests {
                 release_ping_pong_loop: false,
                 pan_lfo: None,
                 volume_lfo: None,
+                pitch_lfo: None,
             },
         )]);
         let notes = [ScheduledSamplerNote {
@@ -23803,6 +23842,7 @@ mod tests {
                 release_ping_pong_loop: false,
                 pan_lfo: None,
                 volume_lfo: None,
+                pitch_lfo: None,
             },
         )]);
         let notes = [ScheduledSamplerNote {
@@ -23867,6 +23907,7 @@ mod tests {
                 release_ping_pong_loop: false,
                 pan_lfo: None,
                 volume_lfo: None,
+                pitch_lfo: None,
             },
         )]);
         let notes = [ScheduledSamplerNote {
@@ -23931,6 +23972,7 @@ mod tests {
                 release_ping_pong_loop: false,
                 pan_lfo: None,
                 volume_lfo: None,
+                pitch_lfo: None,
             },
         )]);
         let notes = [ScheduledSamplerNote {
@@ -23995,6 +24037,7 @@ mod tests {
                 release_ping_pong_loop: false,
                 pan_lfo: None,
                 volume_lfo: None,
+                pitch_lfo: None,
             },
         )]);
         let notes = [ScheduledSamplerNote {
@@ -24074,6 +24117,7 @@ mod tests {
                 release_ping_pong_loop: false,
                 pan_lfo: None,
                 volume_lfo: None,
+                pitch_lfo: None,
             },
         )]);
         let notes = [ScheduledSamplerNote {
@@ -24134,6 +24178,7 @@ mod tests {
                 release_ping_pong_loop: false,
                 pan_lfo: None,
                 volume_lfo: None,
+                pitch_lfo: None,
             },
         )]);
         let notes = [ScheduledSamplerNote {
@@ -24201,6 +24246,7 @@ mod tests {
             release_ping_pong_loop: false,
             pan_lfo: None,
             volume_lfo: None,
+            pitch_lfo: None,
         };
 
         assert!(source.accepts_note(48, 32));
@@ -24280,6 +24326,7 @@ mod tests {
                 release_ping_pong_loop: false,
                 pan_lfo: None,
                 volume_lfo: None,
+                pitch_lfo: None,
             },
         )]);
         let notes = [ScheduledSamplerNote {
@@ -24359,6 +24406,7 @@ mod tests {
                 release_ping_pong_loop: false,
                 pan_lfo: None,
                 volume_lfo: None,
+                pitch_lfo: None,
             },
         )]);
         let notes = [ScheduledSamplerNote {
@@ -24427,6 +24475,7 @@ mod tests {
                     release_ping_pong_loop: false,
                     pan_lfo: None,
                     volume_lfo: None,
+                    pitch_lfo: None,
                 },
             ),
             (
@@ -24455,6 +24504,7 @@ mod tests {
                     release_ping_pong_loop: false,
                     pan_lfo: None,
                     volume_lfo: None,
+                    pitch_lfo: None,
                 },
             ),
         ]);
@@ -24538,6 +24588,7 @@ mod tests {
                     release_ping_pong_loop: false,
                     pan_lfo: None,
                     volume_lfo: None,
+                    pitch_lfo: None,
                 },
             ),
             (
@@ -24569,6 +24620,7 @@ mod tests {
                     release_ping_pong_loop: false,
                     pan_lfo: None,
                     volume_lfo: None,
+                    pitch_lfo: None,
                 },
             ),
         ]);
@@ -24686,6 +24738,7 @@ mod tests {
                 release_ping_pong_loop: false,
                 pan_lfo: None,
                 volume_lfo: None,
+                pitch_lfo: None,
             },
         )]);
         let notes = [
@@ -24779,6 +24832,7 @@ mod tests {
             release_ping_pong_loop: false,
             pan_lfo: None,
             volume_lfo: None,
+            pitch_lfo: None,
         };
         let sources = HashMap::from([
             (1, make_source(1.0, Some((0, 7)))),
@@ -24861,6 +24915,7 @@ mod tests {
             release_ping_pong_loop: false,
             pan_lfo: None,
             volume_lfo: None,
+            pitch_lfo: None,
         };
         let sources = HashMap::from([
             (1, make_source(1.0, Some((0, 7)), false)),
@@ -24942,6 +24997,7 @@ mod tests {
             release_ping_pong_loop: false,
             pan_lfo: None,
             volume_lfo: None,
+            pitch_lfo: None,
         };
         let sources = HashMap::from([(1, source)]);
         let make_note =
@@ -25038,6 +25094,7 @@ mod tests {
             release_ping_pong_loop: false,
             pan_lfo: None,
             volume_lfo: None,
+            pitch_lfo: None,
         };
         let sources = HashMap::from([(1, source)]);
         let note = |start_frame, stop_frame, key, slide_note| ScheduledSamplerNote {
@@ -25105,6 +25162,7 @@ mod tests {
             release_ping_pong_loop: false,
             pan_lfo: None,
             volume_lfo: None,
+            pitch_lfo: None,
         };
         let sources = HashMap::from([(1, source)]);
         let note = |start_frame, stop_frame, velocity, pan, slide_note| ScheduledSamplerNote {
@@ -25182,6 +25240,7 @@ mod tests {
             release_ping_pong_loop: false,
             pan_lfo: None,
             volume_lfo: None,
+            pitch_lfo: None,
         };
         let sources = HashMap::from([(1, source)]);
         let notes = [
@@ -25271,6 +25330,7 @@ mod tests {
             release_ping_pong_loop: false,
             pan_lfo: None,
             volume_lfo: None,
+            pitch_lfo: None,
         };
         let sources = HashMap::from([(1, source)]);
         let notes = [ScheduledSamplerNote {
