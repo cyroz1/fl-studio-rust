@@ -36,7 +36,9 @@ use flp_rebuild::media::{
     decode_audio_waveform, find_empty_project_template, process_audio_range_to_stereo_preview,
     summarize_audio_waveform, write_audio_range_to_wav_with_options,
 };
-use flp_rebuild::midi::{MidiChannelMapping, MidiExportFileFormat, MidiFile, MidiImportOptions};
+use flp_rebuild::midi::{
+    MidiAutomationSource, MidiChannelMapping, MidiExportFileFormat, MidiFile, MidiImportOptions,
+};
 use flp_rebuild::plugin_settings::{
     ClapProjectInstrumentAssignment as ClapPatternPlaybackInstrument,
     ClapProjectMixerEffectAssignment, MAX_CLAP_PROJECT_MIXER_EFFECT_MANUAL_LATENCY_OFFSET_SAMPLES,
@@ -4290,10 +4292,10 @@ struct StepGraphReset {
 }
 
 enum AutomationEditAction {
-    ImportMidiCc {
+    ImportMidiSource {
         midi: MidiFile,
         track_index: usize,
-        controller_number: u8,
+        source: MidiAutomationSource,
         midi_channel: Option<u8>,
     },
     InitializeFromTemplate {
@@ -4432,9 +4434,19 @@ struct PendingAutomationMidiCcImport {
     path: PathBuf,
     midi: MidiFile,
     selected_track: usize,
+    source_kind: MidiAutomationSourceKind,
     controller_number: u8,
+    pressure_key: u8,
     midi_channel: Option<u8>,
     automation_channel_id: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MidiAutomationSourceKind {
+    ControlChange,
+    PitchBend,
+    ChannelPressure,
+    PolyphonicKeyPressure,
 }
 
 fn next_unused_raw_controller_stream(
@@ -40788,12 +40800,19 @@ impl DawUi {
                                 .first()
                                 .map(|change| change.controller())
                                 .unwrap_or_default();
+                            let pressure_key = midi.tracks()[0]
+                                .polyphonic_key_pressures()
+                                .first()
+                                .map(|pressure| pressure.key())
+                                .unwrap_or(60);
                             self.pending_automation_midi_cc_import =
                                 Some(PendingAutomationMidiCcImport {
                                     path: path.clone(),
                                     midi,
                                     selected_track: 0,
+                                    source_kind: MidiAutomationSourceKind::ControlChange,
                                     controller_number,
+                                    pressure_key,
                                     midi_channel: None,
                                     automation_channel_id: channel_id,
                                 });
@@ -41017,7 +41036,7 @@ impl DawUi {
         {
             ui.group(|ui| {
                 ui.horizontal(|ui| {
-                    ui.strong("Replace Automation curve from MIDI CC");
+                    ui.strong("Replace Automation curve from MIDI");
                     ui.weak(pending.path.display().to_string());
                 });
                 let track_label = pending
@@ -41042,42 +41061,134 @@ impl DawUi {
                             ui.selectable_value(&mut pending.selected_track, index, label);
                         }
                     });
+                egui::ComboBox::from_id_salt(("automation-midi-source", channel_id))
+                    .selected_text(match pending.source_kind {
+                        MidiAutomationSourceKind::ControlChange => "Control Change",
+                        MidiAutomationSourceKind::PitchBend => "Pitch Bend",
+                        MidiAutomationSourceKind::ChannelPressure => "Channel Pressure",
+                        MidiAutomationSourceKind::PolyphonicKeyPressure => {
+                            "Polyphonic Key Pressure"
+                        }
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut pending.source_kind,
+                            MidiAutomationSourceKind::ControlChange,
+                            "Control Change",
+                        );
+                        ui.selectable_value(
+                            &mut pending.source_kind,
+                            MidiAutomationSourceKind::PitchBend,
+                            "Pitch Bend",
+                        );
+                        ui.selectable_value(
+                            &mut pending.source_kind,
+                            MidiAutomationSourceKind::ChannelPressure,
+                            "Channel Pressure",
+                        );
+                        ui.selectable_value(
+                            &mut pending.source_kind,
+                            MidiAutomationSourceKind::PolyphonicKeyPressure,
+                            "Polyphonic Key Pressure",
+                        );
+                    });
                 let changes = pending
                     .midi
                     .tracks()
                     .get(pending.selected_track)
                     .map(|track| track.control_changes())
                     .unwrap_or_default();
+                let pitch_bends = pending
+                    .midi
+                    .tracks()
+                    .get(pending.selected_track)
+                    .map(|track| track.pitch_bends())
+                    .unwrap_or_default();
+                let channel_pressures = pending
+                    .midi
+                    .tracks()
+                    .get(pending.selected_track)
+                    .map(|track| track.channel_pressures())
+                    .unwrap_or_default();
+                let polyphonic_pressures = pending
+                    .midi
+                    .tracks()
+                    .get(pending.selected_track)
+                    .map(|track| track.polyphonic_key_pressures())
+                    .unwrap_or_default();
                 let controller_numbers = changes
                     .iter()
                     .map(|change| change.controller())
                     .collect::<BTreeSet<_>>();
-                if let Some(first_controller) = controller_numbers.first().copied()
-                    && !controller_numbers.contains(&pending.controller_number)
-                {
-                    pending.controller_number = first_controller;
-                }
-                let controller_text = if controller_numbers.is_empty() {
-                    "No CC events".to_owned()
-                } else {
-                    format!("CC {}", pending.controller_number)
-                };
-                egui::ComboBox::from_id_salt(("automation-midi-cc-number", channel_id))
-                    .selected_text(controller_text)
-                    .show_ui(ui, |ui| {
-                        for controller in &controller_numbers {
-                            ui.selectable_value(
-                                &mut pending.controller_number,
-                                *controller,
-                                format!("CC {controller}"),
-                            );
-                        }
-                    });
-                let channels = changes
+                let pressure_keys = polyphonic_pressures
                     .iter()
-                    .filter(|change| change.controller() == pending.controller_number)
-                    .map(|change| change.channel())
+                    .map(|pressure| pressure.key())
                     .collect::<BTreeSet<_>>();
+                if pending.source_kind == MidiAutomationSourceKind::ControlChange {
+                    if let Some(first_controller) = controller_numbers.first().copied()
+                        && !controller_numbers.contains(&pending.controller_number)
+                    {
+                        pending.controller_number = first_controller;
+                    }
+                    egui::ComboBox::from_id_salt(("automation-midi-cc-number", channel_id))
+                        .selected_text(if controller_numbers.is_empty() {
+                            "No CC events".to_owned()
+                        } else {
+                            format!("CC {}", pending.controller_number)
+                        })
+                        .show_ui(ui, |ui| {
+                            for controller in &controller_numbers {
+                                ui.selectable_value(
+                                    &mut pending.controller_number,
+                                    *controller,
+                                    format!("CC {controller}"),
+                                );
+                            }
+                        });
+                } else if pending.source_kind
+                    == MidiAutomationSourceKind::PolyphonicKeyPressure
+                {
+                    if let Some(first_key) = pressure_keys.first().copied()
+                        && !pressure_keys.contains(&pending.pressure_key)
+                    {
+                        pending.pressure_key = first_key;
+                    }
+                    egui::ComboBox::from_id_salt(("automation-midi-pressure-key", channel_id))
+                        .selected_text(if pressure_keys.is_empty() {
+                            "No key pressure events".to_owned()
+                        } else {
+                            format!("MIDI key {}", pending.pressure_key)
+                        })
+                        .show_ui(ui, |ui| {
+                            for key in &pressure_keys {
+                                ui.selectable_value(
+                                    &mut pending.pressure_key,
+                                    *key,
+                                    format!("MIDI key {key}"),
+                                );
+                            }
+                        });
+                }
+                let channels = match pending.source_kind {
+                    MidiAutomationSourceKind::ControlChange => changes
+                        .iter()
+                        .filter(|change| change.controller() == pending.controller_number)
+                        .map(|change| change.channel())
+                        .collect::<BTreeSet<_>>(),
+                    MidiAutomationSourceKind::PitchBend => pitch_bends
+                        .iter()
+                        .map(|bend| bend.channel())
+                        .collect::<BTreeSet<_>>(),
+                    MidiAutomationSourceKind::ChannelPressure => channel_pressures
+                        .iter()
+                        .map(|pressure| pressure.channel())
+                        .collect::<BTreeSet<_>>(),
+                    MidiAutomationSourceKind::PolyphonicKeyPressure => polyphonic_pressures
+                        .iter()
+                        .filter(|pressure| pressure.key() == pending.pressure_key)
+                        .map(|pressure| pressure.channel())
+                        .collect::<BTreeSet<_>>(),
+                };
                 if pending
                     .midi_channel
                     .is_some_and(|channel| !channels.contains(&channel))
@@ -41103,17 +41214,41 @@ impl DawUi {
                 ui.weak(
                     "Replaces the current point curve. Saved Min/Max remains; new points use zeroed tail bytes.",
                 );
+                let source = match pending.source_kind {
+                    MidiAutomationSourceKind::ControlChange => {
+                        MidiAutomationSource::ControlChange(pending.controller_number)
+                    }
+                    MidiAutomationSourceKind::PitchBend => MidiAutomationSource::PitchBend,
+                    MidiAutomationSourceKind::ChannelPressure => {
+                        MidiAutomationSource::ChannelPressure
+                    }
+                    MidiAutomationSourceKind::PolyphonicKeyPressure => {
+                        MidiAutomationSource::PolyphonicKeyPressure(pending.pressure_key)
+                    }
+                };
+                let source_label = match pending.source_kind {
+                    MidiAutomationSourceKind::ControlChange => {
+                        format!("CC {}", pending.controller_number)
+                    }
+                    MidiAutomationSourceKind::PitchBend => "Pitch Bend".to_owned(),
+                    MidiAutomationSourceKind::ChannelPressure => {
+                        "Channel Pressure".to_owned()
+                    }
+                    MidiAutomationSourceKind::PolyphonicKeyPressure => {
+                        format!("Key Pressure for MIDI key {}", pending.pressure_key)
+                    }
+                };
                 let import_clicked = ui
                     .add_enabled(
-                        !controller_numbers.is_empty(),
-                        egui::Button::new("Replace curve from selected CC"),
+                        !channels.is_empty(),
+                        egui::Button::new(format!("Replace curve from {source_label}")),
                     )
                     .clicked();
                 if import_clicked {
-                    action = Some(AutomationEditAction::ImportMidiCc {
+                    action = Some(AutomationEditAction::ImportMidiSource {
                         midi: pending.midi.clone(),
                         track_index: pending.selected_track,
-                        controller_number: pending.controller_number,
+                        source,
                         midi_channel: pending.midi_channel,
                     });
                     cancel_midi_import = true;
@@ -41576,25 +41711,25 @@ impl DawUi {
             let mut scaled_levels = false;
             let mut automation_range_updated = false;
             let mut native_target_record_updated = false;
-            let mut imported_midi_cc = None;
+            let mut imported_midi_source = None;
             let result = match action {
-                AutomationEditAction::ImportMidiCc {
+                AutomationEditAction::ImportMidiSource {
                     midi,
                     track_index,
-                    controller_number,
+                    source,
                     midi_channel,
                 } => {
                     self.selected_automation_point = None;
                     self.automation_add_mode = false;
                     self.automation_interpolate_mode = false;
                     self.automation_interpolation_anchor = None;
-                    imported_midi_cc = Some(controller_number);
+                    imported_midi_source = Some(source);
                     document
-                        .replace_automation_channel_points_from_midi_control_change(
+                        .replace_automation_channel_points_from_midi_source(
                             &midi,
                             track_index,
                             channel_id,
-                            controller_number,
+                            source,
                             midi_channel,
                         )
                         .map(|count| changed_point_count = Some(count))
@@ -41739,9 +41874,9 @@ impl DawUi {
                         );
                     } else if let Some(count) = changed_point_count {
                         if count == 0 {
-                            self.status = if let Some(controller_number) = imported_midi_cc {
+                            self.status = if let Some(source) = imported_midi_source {
                                 format!(
-                                    "No matching MIDI CC {controller_number} events; Automation channel curve left unchanged"
+                                    "No matching MIDI {source:?} events; Automation channel curve left unchanged"
                                 )
                             } else if flipped_points {
                                 "There are no automation points to flip".to_owned()
@@ -41756,9 +41891,9 @@ impl DawUi {
                         } else {
                             self.dirty = true;
                             self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
-                            self.status = if let Some(controller_number) = imported_midi_cc {
+                            self.status = if let Some(source) = imported_midi_source {
                                 format!(
-                                    "Replaced Automation channel {channel_id} with {count} MIDI CC {controller_number} points"
+                                    "Replaced Automation channel {channel_id} with {count} points from MIDI {source:?}"
                                 )
                             } else if flipped_points {
                                 format!("Vertically flipped {count} automation point values")

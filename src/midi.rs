@@ -143,6 +143,19 @@ pub struct MidiPolyphonicKeyPressure {
     tick: u64,
 }
 
+/// Selects one MIDI channel-voice source for Automation-channel point import.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MidiAutomationSource {
+    /// One MIDI Control Change number in the range 0–127.
+    ControlChange(u8),
+    /// MIDI Pitch Bend, mapped from its unsigned 14-bit value.
+    PitchBend,
+    /// MIDI Channel Pressure, mapped from its seven-bit value.
+    ChannelPressure,
+    /// MIDI Polyphonic Key Pressure for one key in the range 0–127.
+    PolyphonicKeyPressure(u8),
+}
+
 impl MidiPolyphonicKeyPressure {
     /// Zero-based MIDI channel in the range 0–15.
     pub fn channel(self) -> u8 {

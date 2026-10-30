@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use flp_rebuild::media::{SamplePathResolver, decode_audio_file};
-use flp_rebuild::midi::{MidiChannelMapping, MidiExportFileFormat, MidiFile, MidiImportOptions};
+use flp_rebuild::midi::{
+    MidiAutomationSource, MidiChannelMapping, MidiExportFileFormat, MidiFile, MidiImportOptions,
+};
 use flp_rebuild::plugin_settings::load_vst3_manual_latency_offsets;
 use flp_rebuild::plugins::scan_installed_plugins;
 use flp_rebuild::project_package::copy_unique_sample_file;
@@ -85,6 +87,16 @@ struct MidiAutomationCcImport<'a> {
     track_index: usize,
     automation_channel_id: u16,
     controller_number: u8,
+    midi_channel: Option<u8>,
+}
+
+struct MidiAutomationSourceImport<'a> {
+    input: &'a Path,
+    midi_path: &'a Path,
+    output: &'a Path,
+    track_index: usize,
+    automation_channel_id: u16,
+    source: MidiAutomationSource,
     midi_channel: Option<u8>,
 }
 
@@ -3972,6 +3984,21 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 },
             )
         }
+        [command, input, midi_path, output, track, channel_id, source, midi_channel]
+            if command == "replace-automation-from-midi-source" =>
+        {
+            replace_automation_from_midi_source(
+                MidiAutomationSourceImport {
+                    input: Path::new(input),
+                    midi_path: Path::new(midi_path),
+                    output: Path::new(output),
+                    track_index: parse_usize(track, "MIDI track index")?,
+                    automation_channel_id: parse_u16(channel_id, "Automation channel id")?,
+                    source: parse_midi_automation_source(source)?,
+                    midi_channel: parse_midi_channel_filter(midi_channel)?,
+                },
+            )
+        }
         [command, input, score_path, output, pattern_id, channel_id]
             if command == "import-score" =>
         {
@@ -4761,6 +4788,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "    Polyphonic Key Pressure imports the selected key; 7-bit values map linearly from 0–127 to 0.0–1.0.\n",
             "  flp-rebuild replace-automation-from-midi-cc <input.flp> <input.mid> <output.flp> <track-index> <automation-channel-id> <cc-0..127> <midi-channel-1..16|all>\n",
             "    Replaces the selected Automation channel's curve points; its saved Min/Max range is retained.\n",
+            "  flp-rebuild replace-automation-from-midi-source <input.flp> <input.mid> <output.flp> <track-index> <automation-channel-id> <cc:N|pitch-bend|channel-pressure|poly-pressure:KEY> <midi-channel-1..16|all>\n",
+            "    Replaces the curve from one selected MIDI channel-voice source; poly-pressure requires a note key.\n",
             "  flp-rebuild import-midi-all <input.flp> <input.mid> <output.flp> <pattern-id|new> <channel-ids-comma-separated> [zero-velocity-note-ons:0|1] [realign-events:0|1] [midi-channels:all|none|1,2,...,16]\n",
             "  flp-rebuild import-midi-named-patterns <input.flp> <input.mid> <output.flp> <channel-id> [zero-velocity-note-ons:0|1] [realign-events:0|1] [midi-channels:all|none|1,2,...,16]\n",
             "  flp-rebuild import-midi-selected <input.flp> <input.mid> <output.flp> <pattern-id|new> <track-numbers:all|1,2,...> <selected-track-channel-ids-comma-separated> [zero-velocity-note-ons:0|1 realign-events:0|1 midi-channels:all|none|1,2,...,16]\n",
@@ -5141,6 +5170,31 @@ fn parse_midi_channel_filter(value: &str) -> Result<Option<u8>, String> {
         return Err("MIDI channel number must be from 1 through 16, or 'all'".to_owned());
     }
     Ok(Some(channel - 1))
+}
+
+fn parse_midi_automation_source(value: &str) -> Result<MidiAutomationSource, String> {
+    match value.split(':').collect::<Vec<_>>().as_slice() {
+        ["cc", controller] => {
+            let controller = parse_u8(controller, "MIDI Control Change number")?;
+            if controller > 127 {
+                return Err("MIDI Control Change number must be from 0 through 127".to_owned());
+            }
+            Ok(MidiAutomationSource::ControlChange(controller))
+        }
+        ["pitch-bend"] => Ok(MidiAutomationSource::PitchBend),
+        ["channel-pressure"] => Ok(MidiAutomationSource::ChannelPressure),
+        ["poly-pressure", key] => {
+            let key = parse_u8(key, "MIDI note key")?;
+            if key > 127 {
+                return Err("MIDI note key must be from 0 through 127".to_owned());
+            }
+            Ok(MidiAutomationSource::PolyphonicKeyPressure(key))
+        }
+        _ => Err(
+            "MIDI Automation source must be cc:<0..127>, pitch-bend, channel-pressure, or poly-pressure:<0..127>"
+                .to_owned(),
+        ),
+    }
 }
 
 fn parse_midi_track_selection(value: &str, track_count: usize) -> Result<Vec<usize>, String> {
@@ -11382,6 +11436,48 @@ fn replace_automation_from_midi_cc(request: MidiAutomationCcImport<'_>) -> Resul
     );
     println!(
         "replaced Automation channel {automation_channel_id} with {imported} MIDI CC {controller_number} points from track {track_index} ({source_channel}) in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn replace_automation_from_midi_source(
+    request: MidiAutomationSourceImport<'_>,
+) -> Result<(), String> {
+    let MidiAutomationSourceImport {
+        input,
+        midi_path,
+        output,
+        track_index,
+        automation_channel_id,
+        source,
+        midi_channel,
+    } = request;
+    let (_, mut document) = load_document(input)?;
+    let midi_bytes = fs::read(midi_path)
+        .map_err(|error| format!("could not read {}: {error}", midi_path.display()))?;
+    let midi = MidiFile::parse(&midi_bytes)
+        .map_err(|error| format!("could not parse {}: {error}", midi_path.display()))?;
+    let imported = document
+        .replace_automation_channel_points_from_midi_source(
+            &midi,
+            track_index,
+            automation_channel_id,
+            source,
+            midi_channel,
+        )
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    let source_channel = midi_channel.map_or_else(
+        || "all channels".to_owned(),
+        |channel| format!("MIDI channel {}", channel + 1),
+    );
+    println!(
+        "replaced Automation channel {automation_channel_id} with {imported} points from {source:?} on track {track_index} ({source_channel}) in {}",
         output.display()
     );
     Ok(())

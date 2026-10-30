@@ -20899,20 +20899,40 @@ impl FlpDocument {
         Ok(imported)
     }
 
-    /// Replaces the points of one type-5 Automation channel with one MIDI Control Change
-    /// controller from a selected track. MIDI values remain normalized from 0.0 to 1.0; the
-    /// channel's saved Min/Max range continues to scale them when its parameter link is applied.
-    /// Source tempo timing is converted to project beats. The blob header and trailing payload
-    /// are retained; replaced points receive zeroed opaque tail bytes. If the selected track has
+    /// Replaces one type-5 Automation channel's points with a selected MIDI channel-voice source.
+    /// Seven-bit sources map 0–127 linearly to 0.0–1.0; Pitch Bend maps its unsigned 14-bit
+    /// value from 0–16383. The channel's saved Min/Max range remains available for parameter
+    /// scaling. Source tempo timing is converted to project beats. The blob header and trailing
+    /// payload are retained; replaced points receive zeroed opaque tail bytes. If the track has
     /// no matching messages, the existing curve is left unchanged.
-    pub fn replace_automation_channel_points_from_midi_control_change(
+    pub fn replace_automation_channel_points_from_midi_source(
         &mut self,
         midi: &midi::MidiFile,
         track_index: usize,
         automation_channel_id: u16,
-        controller_number: u8,
+        source: midi::MidiAutomationSource,
         midi_channel: Option<u8>,
     ) -> Result<usize, FlpError> {
+        match source {
+            midi::MidiAutomationSource::ControlChange(controller_number)
+                if controller_number > 127 =>
+            {
+                return Err(FlpError::UnsupportedEdit(
+                    "MIDI Control Change number must be from 0 through 127",
+                ));
+            }
+            midi::MidiAutomationSource::PolyphonicKeyPressure(key) if key > 127 => {
+                return Err(FlpError::UnsupportedEdit(
+                    "MIDI note key must be from 0 through 127",
+                ));
+            }
+            _ => {}
+        }
+        if midi_channel.is_some_and(|channel| channel > 15) {
+            return Err(FlpError::UnsupportedEdit(
+                "MIDI channel must be from 0 through 15",
+            ));
+        }
         let automation_channels = self.automation_channels()?;
         let mut matching_channels = automation_channels
             .iter()
@@ -20928,28 +20948,120 @@ impl FlpDocument {
                 "the requested Automation channel has no existing point blob",
             ));
         }
-        let points = self.midi_control_change_points(
-            midi,
-            track_index,
-            None,
-            controller_number,
-            midi_channel,
-        )?;
-        if points.is_empty() {
+        if self.header.ppq == 0 {
+            return Err(FlpError::UnsupportedEdit(
+                "MIDI import requires a non-zero project PPQ value",
+            ));
+        }
+        let project_tempo_milli_bpm = self.metadata.tempo_milli_bpm.unwrap_or(140_000);
+        if project_tempo_milli_bpm == 0 {
+            return Err(FlpError::UnsupportedEdit(
+                "MIDI import requires a positive project tempo",
+            ));
+        }
+        let track = midi
+            .tracks()
+            .get(track_index)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested MIDI track does not exist",
+            ))?;
+        let default_microseconds_per_quarter =
+            60_000_000_000.0 / f64::from(project_tempo_milli_bpm);
+        midi.elapsed_microseconds_at_tick(0, track_index, default_microseconds_per_quarter)
+            .map_err(|_| {
+                FlpError::UnsupportedEdit(
+                    "MIDI import requires a supported time division and valid tempo map",
+                )
+            })?;
+
+        let source_events = match source {
+            midi::MidiAutomationSource::ControlChange(controller_number) => track
+                .control_changes()
+                .into_iter()
+                .filter(|event| event.controller() == controller_number)
+                .map(|event| {
+                    (
+                        event.channel(),
+                        event.tick(),
+                        f64::from(event.value()) / 127.0,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            midi::MidiAutomationSource::PitchBend => track
+                .pitch_bends()
+                .into_iter()
+                .map(|event| {
+                    (
+                        event.channel(),
+                        event.tick(),
+                        f64::from(event.value()) / 16_383.0,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            midi::MidiAutomationSource::ChannelPressure => track
+                .channel_pressures()
+                .into_iter()
+                .map(|event| {
+                    (
+                        event.channel(),
+                        event.tick(),
+                        f64::from(event.value()) / 127.0,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            midi::MidiAutomationSource::PolyphonicKeyPressure(key) => track
+                .polyphonic_key_pressures()
+                .into_iter()
+                .filter(|event| event.key() == key)
+                .map(|event| {
+                    (
+                        event.channel(),
+                        event.tick(),
+                        f64::from(event.value()) / 127.0,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        };
+        let mut points_in_beats = Vec::with_capacity(source_events.len());
+        for (event_channel, tick, value) in source_events {
+            if midi_channel.is_some_and(|channel| event_channel != channel) {
+                continue;
+            }
+            let elapsed_microseconds = midi
+                .elapsed_microseconds_at_tick(tick, track_index, default_microseconds_per_quarter)
+                .map_err(|_| FlpError::UnsupportedEdit("could not convert MIDI event time"))?;
+            let position = scale_midi_microseconds_to_project_ticks(
+                elapsed_microseconds,
+                project_tempo_milli_bpm,
+                self.header.ppq,
+            )?;
+            points_in_beats.push((f64::from(position) / f64::from(self.header.ppq), value, 0.0));
+        }
+        if points_in_beats.is_empty() {
             return Ok(0);
         }
-        let points_in_beats = points
-            .iter()
-            .map(|(position, value)| {
-                (
-                    f64::from(*position) / f64::from(self.header.ppq),
-                    f64::from(*value),
-                    0.0,
-                )
-            })
-            .collect::<Vec<_>>();
+        let imported = points_in_beats.len();
         self.replace_automation_points(automation_channel_id, &points_in_beats)?;
-        Ok(points.len())
+        Ok(imported)
+    }
+
+    /// Replaces one Automation channel's curve with a selected MIDI Control Change controller.
+    /// Values are normalized from 0–127 to 0.0–1.0; the channel's saved Min/Max range is retained.
+    pub fn replace_automation_channel_points_from_midi_control_change(
+        &mut self,
+        midi: &midi::MidiFile,
+        track_index: usize,
+        automation_channel_id: u16,
+        controller_number: u8,
+        midi_channel: Option<u8>,
+    ) -> Result<usize, FlpError> {
+        self.replace_automation_channel_points_from_midi_source(
+            midi,
+            track_index,
+            automation_channel_id,
+            midi::MidiAutomationSource::ControlChange(controller_number),
+            midi_channel,
+        )
     }
 
     /// Imports MIDI Pitch Bend messages from one track into an existing raw Pattern controller
