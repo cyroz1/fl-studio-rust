@@ -848,6 +848,24 @@ fn run(args: Vec<String>) -> Result<(), String> {
                         reverse_polarity,
                         "sample Reverse Polarity setting",
                     )?,
+                    remove_dc: None,
+                },
+            )
+        }
+        [command, input, output, channel_id, normalize, reverse_polarity, remove_dc]
+            if command == "edit-channel-sample-effects" =>
+        {
+            edit_channel_sample_effects(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(channel_id, "sample-bearing channel id")?,
+                ChannelSampleEffectsEdit {
+                    normalize: parse_optional_bool(normalize, "sample Normalize setting")?,
+                    reverse_polarity: parse_optional_bool(
+                        reverse_polarity,
+                        "sample Reverse Polarity setting",
+                    )?,
+                    remove_dc: parse_optional_bool(remove_dc, "sample Remove DC setting")?,
                 },
             )
         }
@@ -4364,7 +4382,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild set-channel-enabled <input.flp> <output.flp> <channel-id> <0|1>\n",
             "  flp-rebuild set-channel-sample-path <input.flp> <output.flp> <channel-id> <sample-path>\n",
             "  flp-rebuild set-channel-sample-reversed <input.flp> <output.flp> <channel-id> <0|1>\n",
-            "  flp-rebuild edit-channel-sample-effects <input.flp> <output.flp> <channel-id> <normalize:0|1|-> <reverse-polarity:0|1|->\n",
+            "  flp-rebuild edit-channel-sample-effects <input.flp> <output.flp> <channel-id> <normalize:0|1|-> <reverse-polarity:0|1|-> [remove-dc:0|1|->]\n",
             "  flp-rebuild set-channel-zipped <input.flp> <output.flp> <channel-id> <0|1>\n",
             "  flp-rebuild set-channel-main-pitch <input.flp> <output.flp> <channel-id> <0|1>\n",
             "  flp-rebuild set-channel-key-region <input.flp> <output.flp> <channel-id> <low-key:0..127> <high-key:0..127>\n",
@@ -6604,7 +6622,7 @@ fn list_channels(path: &Path) -> Result<(), String> {
     println!("channels: {}", channels.len());
     for channel in channels {
         println!(
-            "id={} kind={} type={:?} enabled={} zipped={} main_pitch={} add_to_key={} fine_tune_raw={:?} key_region={:?} stretch_settings={:?} sampler_fade_out_raw={:?} sampler_fade_in_raw={:?} sample_normalize={} sample_reverse_polarity={} sampler_portamento={:?} sampler_polyphony_slide_raw={:?} sampler_volume_envelope={:?} sampler_envelopes={:?} color={:?} volume={:?} pan={:?} level_adjusts_raw={:?} swing_mix_raw={:?} layer_children={:?} layer_flags={:?} plugin={} name={} sample_path={:?} events={:?}",
+            "id={} kind={} type={:?} enabled={} zipped={} main_pitch={} add_to_key={} fine_tune_raw={:?} key_region={:?} stretch_settings={:?} sampler_fade_out_raw={:?} sampler_fade_in_raw={:?} sample_remove_dc={} sample_normalize={} sample_reverse_polarity={} sampler_portamento={:?} sampler_polyphony_slide_raw={:?} sampler_volume_envelope={:?} sampler_envelopes={:?} color={:?} volume={:?} pan={:?} level_adjusts_raw={:?} swing_mix_raw={:?} layer_children={:?} layer_flags={:?} plugin={} name={} sample_path={:?} events={:?}",
             channel.id(),
             channel
                 .kind()
@@ -6621,6 +6639,7 @@ fn list_channels(path: &Path) -> Result<(), String> {
             channel.stretch_settings(),
             channel.sampler_fade_out_raw(),
             channel.sampler_fade_in_raw(),
+            channel.sample_remove_dc_enabled(),
             channel.sample_normalize_enabled(),
             channel.sample_reverse_polarity_enabled(),
             channel.sampler_portamento_enabled(),

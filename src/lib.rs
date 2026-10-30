@@ -716,6 +716,7 @@ pub struct ChannelSummary {
     sampler_fx_flags: Option<u16>,
     sampler_fade_out_raw: Option<u16>,
     sampler_fade_in_raw: Option<u16>,
+    sample_remove_dc: Option<bool>,
     sample_normalize: Option<bool>,
     sample_reverse_polarity: Option<bool>,
     sampler_envelope_lfos: [Option<SamplerEnvelopeLfo>; 5],
@@ -781,6 +782,7 @@ pub struct ChannelLevelAdjustmentsEdit {
 /// These apply to Sampler and sample-backed Audio Clip channels.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ChannelSampleEffectsEdit {
+    pub remove_dc: Option<bool>,
     pub normalize: Option<bool>,
     pub reverse_polarity: Option<bool>,
 }
@@ -1141,6 +1143,11 @@ impl ChannelSummary {
         (self.kind == Some(0))
             .then_some(self.sampler_fade_in_raw)
             .flatten()
+    }
+
+    /// Whether DC offset removal is enabled for this Sampler or Audio Clip source.
+    pub fn sample_remove_dc_enabled(&self) -> bool {
+        matches!(self.kind, Some(0 | 4)) && self.sample_remove_dc.unwrap_or(false)
     }
 
     /// Whether peak normalization is enabled for this Sampler or Audio Clip source.
@@ -6289,6 +6296,9 @@ impl FlpDocument {
                     && ascii_version(&event.payload).is_none() =>
                 {
                     if matches!(channel.kind, Some(0 | 4)) {
+                        if event.payload.len() >= 11 && channel.sample_remove_dc.is_none() {
+                            channel.sample_remove_dc = Some(event.payload[10] != 0);
+                        }
                         if event.payload.len() >= 81 && channel.sample_normalize.is_none() {
                             channel.sample_normalize = Some(event.payload[80] != 0);
                         }
@@ -23416,14 +23426,14 @@ impl FlpDocument {
         Ok(())
     }
 
-    /// Edits the saved Normalize and Reverse Polarity flags in a sample-bearing channel's
-    /// Parameters (`0xC7`) payload. Unknown bytes and every unrelated event are preserved.
+    /// Edits saved precomputed sample effect flags in a sample-bearing channel's Parameters
+    /// (`0xC7`) payload. Unknown bytes and every unrelated event are preserved.
     pub fn edit_channel_sample_effects(
         &mut self,
         channel_id: u16,
         edit: ChannelSampleEffectsEdit,
     ) -> Result<(), FlpError> {
-        if edit.normalize.is_none() && edit.reverse_polarity.is_none() {
+        if edit.remove_dc.is_none() && edit.normalize.is_none() && edit.reverse_polarity.is_none() {
             return Err(FlpError::UnsupportedEdit(
                 "at least one sample effect setting must be supplied",
             ));
@@ -23464,8 +23474,10 @@ impl FlpDocument {
         };
         let required_payload_len = if edit.reverse_polarity.is_some() {
             82
-        } else {
+        } else if edit.normalize.is_some() {
             81
+        } else {
+            11
         };
         if self.events[parameters_index].payload.len() < required_payload_len {
             return Err(FlpError::UnsupportedEdit(
@@ -23475,6 +23487,9 @@ impl FlpDocument {
 
         let mut candidate = self.clone();
         let mut payload = candidate.events[parameters_index].payload.clone();
+        if let Some(remove_dc) = edit.remove_dc {
+            payload[10] = u8::from(remove_dc);
+        }
         if let Some(normalize) = edit.normalize {
             payload[80] = u8::from(normalize);
         }
@@ -33041,6 +33056,7 @@ mod tests {
                 .edit_channel_sample_effects(
                     7,
                     ChannelSampleEffectsEdit {
+                        remove_dc: None,
                         normalize: Some(false),
                         reverse_polarity: Some(false),
                     },

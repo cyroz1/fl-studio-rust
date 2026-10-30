@@ -37705,6 +37705,23 @@ impl DawUi {
                                             .push((channel.id(), !reversed));
                                         ui.close();
                                     }
+                                    let remove_dc = channel.sample_remove_dc_enabled();
+                                    if ui
+                                        .selectable_label(remove_dc, "Remove DC offset")
+                                        .on_hover_text(
+                                            "Remove the sample's average waveform bias before playback.",
+                                        )
+                                        .clicked()
+                                    {
+                                        channel_sample_effect_edits.push((
+                                            channel.id(),
+                                            ChannelSampleEffectsEdit {
+                                                remove_dc: Some(!remove_dc),
+                                                ..ChannelSampleEffectsEdit::default()
+                                            },
+                                        ));
+                                        ui.close();
+                                    }
                                     let normalize = channel.sample_normalize_enabled();
                                     if ui
                                         .selectable_label(normalize, "Normalize sample")
@@ -38775,8 +38792,8 @@ impl DawUi {
                     self.dirty = true;
                     self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                     self.status = format!(
-                        "Channel {channel_id} sample effects updated: Normalize {:?}, Reverse Polarity {:?}",
-                        edit.normalize, edit.reverse_polarity
+                        "Channel {channel_id} sample effects updated: Remove DC {:?}, Normalize {:?}, Reverse Polarity {:?}",
+                        edit.remove_dc, edit.normalize, edit.reverse_polarity
                     );
                 }
                 Some(Err(error)) => {

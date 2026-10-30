@@ -16877,25 +16877,46 @@ fn supported_sampler_fade_raw(raw_value: Option<u16>) -> Option<u16> {
 
 fn sampler_precomputed_fx(channel: &ChannelSummary) -> SamplerPrecomputedFx {
     SamplerPrecomputedFx {
+        remove_dc: channel.sample_remove_dc_enabled(),
         normalize: channel.sample_normalize_enabled(),
         reverse_polarity: channel.sample_reverse_polarity_enabled(),
     }
 }
 
 /// Applies the saved whole-source sample processing before note/clip playback.
-/// Normalization uses the peak across all channels so stereo balance is preserved.
+/// DC offset is removed per channel; normalization uses the peak across all channels so stereo
+/// balance is preserved.
 fn apply_sampler_sample_fx(audio: &mut DecodedAudio, fx: SamplerPrecomputedFx) {
     if !fx.any() {
         return;
     }
 
+    let dc_offsets = if fx.remove_dc {
+        audio
+            .channels
+            .iter()
+            .map(|channel| {
+                let (sum, count) = channel
+                    .iter()
+                    .filter(|sample| sample.is_finite())
+                    .fold((0.0_f64, 0_usize), |(sum, count), sample| {
+                        (sum + f64::from(*sample), count + 1)
+                    });
+                if count == 0 { 0.0 } else { sum / count as f64 }
+            })
+            .collect::<Vec<_>>()
+    } else {
+        vec![0.0; audio.channels.len()]
+    };
+
     let peak = if fx.normalize {
         audio
             .channels
             .iter()
-            .flatten()
-            .filter(|sample| sample.is_finite())
-            .map(|sample| f64::from(*sample).abs())
+            .zip(&dc_offsets)
+            .flat_map(|(channel, dc_offset)| channel.iter().map(move |sample| (sample, dc_offset)))
+            .filter(|(sample, _)| sample.is_finite())
+            .map(|(sample, dc_offset)| (f64::from(*sample) - *dc_offset).abs())
             .fold(0.0_f64, f64::max)
     } else {
         1.0
@@ -16906,16 +16927,18 @@ fn apply_sampler_sample_fx(audio: &mut DecodedAudio, fx: SamplerPrecomputedFx) {
         1.0
     };
 
-    for sample in audio.channels.iter_mut().flatten() {
-        if sample.is_finite() {
-            let value = f64::from(*sample) * normalization_gain;
-            *sample = if fx.reverse_polarity {
-                (-value) as f32
-            } else {
-                value as f32
-            };
-        } else if fx.reverse_polarity {
-            *sample = -*sample;
+    for (channel, dc_offset) in audio.channels.iter_mut().zip(dc_offsets) {
+        for sample in channel {
+            if sample.is_finite() {
+                let value = (f64::from(*sample) - dc_offset) * normalization_gain;
+                *sample = if fx.reverse_polarity {
+                    (-value) as f32
+                } else {
+                    value as f32
+                };
+            } else if fx.reverse_polarity {
+                *sample = -*sample;
+            }
         }
     }
 }
@@ -17131,13 +17154,14 @@ struct ProcessedAudioCacheKey {
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 struct SamplerPrecomputedFx {
+    remove_dc: bool,
     normalize: bool,
     reverse_polarity: bool,
 }
 
 impl SamplerPrecomputedFx {
     const fn any(self) -> bool {
-        self.normalize || self.reverse_polarity
+        self.remove_dc || self.normalize || self.reverse_polarity
     }
 }
 
@@ -22808,6 +22832,7 @@ mod tests {
         let processed = sampler_precompute_sample_fx(
             &source,
             SamplerPrecomputedFx {
+                remove_dc: false,
                 normalize: true,
                 reverse_polarity: true,
             },
@@ -22827,6 +22852,7 @@ mod tests {
         apply_sampler_sample_fx(
             &mut silence,
             SamplerPrecomputedFx {
+                remove_dc: false,
                 normalize: true,
                 reverse_polarity: false,
             },
