@@ -9439,6 +9439,114 @@ impl DawUi {
             .map(|channel| (channel.channel_id(), channel))
             .collect::<BTreeMap<_, _>>();
         let loaded_plugins = host.loaded_plugins();
+        let points_for_channel = |automation_channel: &AutomationChannel| {
+            automation_channel
+                .points()
+                .iter()
+                .filter(|point| {
+                    point.position_beats().is_finite()
+                        && point.position_beats() >= 0.0
+                        && point.value().is_finite()
+                        && (0.0..=1.0).contains(&point.value())
+                })
+                .map(|point| Vst3AutomationPoint {
+                    position_beats: point.position_beats(),
+                    value: Self::automation_value_for_normalized_target(
+                        automation_channel,
+                        point.value(),
+                    ),
+                    tension: point.tension(),
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut native_parameter_ids = BTreeMap::<u64, Option<BTreeSet<u32>>>::new();
+        for link in document
+            .automation_target_links()
+            .unwrap_or_default()
+            .into_iter()
+        {
+            let destination_raw = link.destination_raw() as u16;
+            // Destination bits 14–15 remain unexplained in the producer survey.
+            // Keep those records inspectable, but do not use their candidate target
+            // coordinates to automate a live plug-in.
+            if destination_raw & 0xc000 != 0 || link.candidate_vst_parameter() != Some(true) {
+                continue;
+            }
+            let Some(parameter_id) = link.candidate_parameter_index().map(u32::from) else {
+                continue;
+            };
+            let Some(automation_channel) =
+                automation_channels.get(&link.source_channel_id()).copied()
+            else {
+                continue;
+            };
+            let points = points_for_channel(automation_channel);
+            if points.is_empty() {
+                continue;
+            }
+            let target = if let Some(channel_id) = link.candidate_channel_target_id() {
+                self.channel_vst3_instances
+                    .get(&channel_id)
+                    .copied()
+                    .map(|instance_id| (instance_id, Some(channel_id), None))
+            } else if let Some((insert, slot)) = link.candidate_mixer_effect_target() {
+                let effect_target = (usize::from(insert), slot);
+                self.mixer_effect_vst3_instances
+                    .get(&effect_target)
+                    .copied()
+                    .map(|instance_id| (instance_id, None, Some(effect_target)))
+            } else {
+                None
+            };
+            let Some((instance_id, channel_target, effect_target)) = target else {
+                continue;
+            };
+            if !loaded_plugins.iter().any(|plugin| plugin.id == instance_id) {
+                continue;
+            }
+            let parameter_ids = native_parameter_ids.entry(instance_id).or_insert_with(|| {
+                host.parameter_snapshot(instance_id).ok().map(|parameters| {
+                    parameters
+                        .into_iter()
+                        .filter(|parameter| parameter.can_automate && !parameter.is_read_only)
+                        .map(|parameter| parameter.id)
+                        .collect()
+                })
+            });
+            if !parameter_ids
+                .as_ref()
+                .is_some_and(|ids| ids.contains(&parameter_id))
+            {
+                continue;
+            }
+            let lane = Vst3ParameterAutomation {
+                parameter_id,
+                points,
+            };
+            if let Some(channel_id) = channel_target {
+                let lanes = sources
+                    .automation_clips
+                    .entry((link.source_channel_id(), channel_id))
+                    .or_default();
+                if !lanes
+                    .iter()
+                    .any(|existing| existing.parameter_id == parameter_id)
+                {
+                    lanes.push(lane);
+                }
+            } else if let Some(effect_target) = effect_target {
+                let lanes = sources
+                    .mixer_effect_automation_clips
+                    .entry((link.source_channel_id(), effect_target.0, effect_target.1))
+                    .or_default();
+                if !lanes
+                    .iter()
+                    .any(|existing| existing.parameter_id == parameter_id)
+                {
+                    lanes.push(lane);
+                }
+            }
+        }
         for link in self
             .playlist_vst3_parameter_links
             .iter()
@@ -9462,35 +9570,26 @@ impl DawUi {
             {
                 continue;
             }
-            let points = automation_channel
-                .points()
-                .iter()
-                .filter(|point| {
-                    point.position_beats().is_finite()
-                        && point.position_beats() >= 0.0
-                        && point.value().is_finite()
-                        && (0.0..=1.0).contains(&point.value())
-                })
-                .map(|point| Vst3AutomationPoint {
-                    position_beats: point.position_beats(),
-                    value: Self::automation_value_for_normalized_target(
-                        automation_channel,
-                        point.value(),
-                    ),
-                    tension: point.tension(),
-                })
-                .collect::<Vec<_>>();
+            let points = points_for_channel(automation_channel);
             if points.is_empty() {
                 continue;
             }
-            sources
+            let lanes = sources
                 .automation_clips
                 .entry((link.automation_channel_id, link.target.project_channel_id))
-                .or_default()
-                .push(Vst3ParameterAutomation {
-                    parameter_id: link.target.parameter_id,
-                    points,
-                });
+                .or_default();
+            let lane = Vst3ParameterAutomation {
+                parameter_id: link.target.parameter_id,
+                points,
+            };
+            if let Some(existing) = lanes
+                .iter_mut()
+                .find(|existing| existing.parameter_id == link.target.parameter_id)
+            {
+                *existing = lane;
+            } else {
+                lanes.push(lane);
+            }
         }
         for link in self
             .playlist_vst3_mixer_effect_parameter_links
@@ -9515,39 +9614,30 @@ impl DawUi {
             {
                 continue;
             }
-            let points = automation_channel
-                .points()
-                .iter()
-                .filter(|point| {
-                    point.position_beats().is_finite()
-                        && point.position_beats() >= 0.0
-                        && point.value().is_finite()
-                        && (0.0..=1.0).contains(&point.value())
-                })
-                .map(|point| Vst3AutomationPoint {
-                    position_beats: point.position_beats(),
-                    value: Self::automation_value_for_normalized_target(
-                        automation_channel,
-                        point.value(),
-                    ),
-                    tension: point.tension(),
-                })
-                .collect::<Vec<_>>();
+            let points = points_for_channel(automation_channel);
             if points.is_empty() {
                 continue;
             }
-            sources
+            let lanes = sources
                 .mixer_effect_automation_clips
                 .entry((
                     link.automation_channel_id,
                     link.target.insert_ordinal,
                     link.target.slot_index,
                 ))
-                .or_default()
-                .push(Vst3ParameterAutomation {
-                    parameter_id: link.target.parameter_id,
-                    points,
-                });
+                .or_default();
+            let lane = Vst3ParameterAutomation {
+                parameter_id: link.target.parameter_id,
+                points,
+            };
+            if let Some(existing) = lanes
+                .iter_mut()
+                .find(|existing| existing.parameter_id == link.target.parameter_id)
+            {
+                *existing = lane;
+            } else {
+                lanes.push(lane);
+            }
         }
         sources
     }

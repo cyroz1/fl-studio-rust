@@ -2395,19 +2395,20 @@ impl AutomationTargetLink {
         self.destination_raw
     }
 
-    /// Candidate channel destination when the observed Mixer-target flag is clear.
+    /// Candidate channel destination when the observed Mixer-target flag and
+    /// unexplained upper destination bits are clear.
     pub fn candidate_channel_target_id(&self) -> Option<u16> {
         if self.source_channel_type != Some(ChannelType::Automation) {
             return None;
         }
         let raw = self.destination_raw as u16;
-        (raw & 0x2000 == 0 && self.destination_raw >= 0).then_some(self.destination_raw as u16)
+        (raw & 0xe000 == 0).then_some(raw)
     }
 
     /// Candidate `(Mixer insert, slot)` from the observed packed destination field.
     /// The insert uses bits 6–12 and the slot uses bits 0–5. This layout was
     /// independently surveyed across a local producer corpus; native comparison
-    /// remains necessary before using the candidate for playback routing.
+    /// remains necessary before treating this candidate as definitive.
     pub fn candidate_mixer_effect_target(&self) -> Option<(u16, u16)> {
         if self.source_channel_type != Some(ChannelType::Automation) {
             return None;
