@@ -2307,6 +2307,44 @@ fn piano_roll_event_target_selector(ui: &mut egui::Ui, target: &mut PianoRollEve
         });
 }
 
+fn piano_roll_scale_levels_controls(
+    ui: &mut egui::Ui,
+    center_percent: &mut i16,
+    tension_percent: &mut i16,
+    multiplier_percent: &mut u16,
+    offset_percent: &mut i16,
+    edit_target: &str,
+    edit_scope_available: bool,
+) -> bool {
+    ui.label("Velocity");
+    ui.add(egui::Slider::new(center_percent, -100..=100).text("Center %"));
+    ui.add(egui::Slider::new(tension_percent, -100..=100).text("Tension %"));
+    ui.add(egui::Slider::new(multiplier_percent, 0..=200).text("Multiply %"));
+    ui.add(egui::Slider::new(offset_percent, -100..=100).text("Offset %"));
+    ui.small("Center shifts the pivot; Tension curves levels logarithmically.");
+    ui.small("Offset is relative to the full 0–127 velocity range.");
+
+    let mut apply_requested = false;
+    ui.horizontal(|ui| {
+        if ui.button("Reset").clicked() {
+            *center_percent = 0;
+            *tension_percent = 0;
+            *multiplier_percent = 100;
+            *offset_percent = 0;
+        }
+        if ui
+            .add_enabled(
+                edit_scope_available,
+                egui::Button::new(format!("Apply to {edit_target}")),
+            )
+            .clicked()
+        {
+            apply_requested = true;
+        }
+    });
+    apply_requested
+}
+
 #[derive(Clone, Copy, Debug)]
 struct PianoRollEventEditorGeometry {
     ppq: u16,
@@ -5072,6 +5110,7 @@ struct DawUi {
     random_note_generation_minimum_key: u8,
     random_note_generation_maximum_key: u8,
     random_note_generation_snap_to_scale: bool,
+    scale_levels_dialog_open: bool,
     scale_levels_center_percent: i16,
     scale_levels_tension_percent: i16,
     scale_levels_multiplier_percent: u16,
@@ -7475,6 +7514,7 @@ impl DawUi {
             random_note_generation_minimum_key: 0,
             random_note_generation_maximum_key: 127,
             random_note_generation_snap_to_scale: false,
+            scale_levels_dialog_open: false,
             scale_levels_center_percent: 0,
             scale_levels_tension_percent: 0,
             scale_levels_multiplier_percent: 100,
@@ -41388,6 +41428,7 @@ impl DawUi {
         let mut generate_random_notes_requested = false;
         let mut randomize_requested = false;
         let mut scale_levels_requested = false;
+        let mut open_scale_levels_dialog_requested = false;
         let mut articulate_requested = false;
         let mut humanize_requested = false;
         let mut limit_requested = false;
@@ -41425,6 +41466,8 @@ impl DawUi {
                 ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::T));
             open_new_pattern_marker =
                 ui.input_mut(|input| input.consume_key(egui::Modifiers::ALT, egui::Key::T));
+            open_scale_levels_dialog_requested =
+                ui.input_mut(|input| input.consume_key(egui::Modifiers::ALT, egui::Key::X));
             delete_selection_requested = ui.input_mut(|input| {
                 input.consume_key(egui::Modifiers::NONE, egui::Key::Delete)
                     || input.consume_key(egui::Modifiers::NONE, egui::Key::Backspace)
@@ -42330,6 +42373,37 @@ impl DawUi {
             && self.selected_note_channel.is_some()
             && (self.piano_roll_edit_scope != PianoRollEditScope::Selection
                 || !selected_quantize_indices.is_empty());
+        if open_scale_levels_dialog_requested {
+            if self.selected_pattern.is_some() && self.selected_note_channel.is_some() {
+                self.scale_levels_dialog_open = true;
+            } else {
+                self.status = "Select a Pattern and channel before opening Scale Levels".to_owned();
+            }
+        }
+        if self.scale_levels_dialog_open {
+            let mut dialog_open = true;
+            let mut apply_requested = false;
+            egui::Window::new("Scale Levels (Alt/Option+X)")
+                .id(egui::Id::new("piano-roll-scale-levels-dialog"))
+                .open(&mut dialog_open)
+                .resizable(false)
+                .show(ui.ctx(), |window_ui| {
+                    apply_requested = piano_roll_scale_levels_controls(
+                        window_ui,
+                        &mut self.scale_levels_center_percent,
+                        &mut self.scale_levels_tension_percent,
+                        &mut self.scale_levels_multiplier_percent,
+                        &mut self.scale_levels_offset_percent,
+                        edit_target,
+                        edit_scope_available,
+                    );
+                });
+            self.scale_levels_dialog_open = dialog_open;
+            if apply_requested {
+                scale_levels_requested = true;
+                self.scale_levels_dialog_open = false;
+            }
+        }
         let generate_random_notes_available = self.piano_roll_snap != PianoRollSnap::None
             && self.selected_pattern.is_some_and(|pattern_id| {
                 self.piano_roll_time_selection
@@ -42535,44 +42609,19 @@ impl DawUi {
                         humanize_requested = true;
                         ui.close();
                     }
-                    ui.menu_button("Scale levels", |ui| {
-                        ui.label("Velocity");
-                        ui.add(
-                            egui::Slider::new(&mut self.scale_levels_center_percent, -100..=100)
-                                .text("Center %"),
-                        );
-                        ui.add(
-                            egui::Slider::new(&mut self.scale_levels_tension_percent, -100..=100)
-                                .text("Tension %"),
-                        );
-                        ui.add(
-                            egui::Slider::new(&mut self.scale_levels_multiplier_percent, 0..=200)
-                                .text("Multiply %"),
-                        );
-                        ui.add(
-                            egui::Slider::new(&mut self.scale_levels_offset_percent, -100..=100)
-                                .text("Offset %"),
-                        );
-                        ui.small("Center shifts the pivot; Tension curves levels logarithmically.");
-                        ui.small("Offset is relative to the full 0–127 velocity range.");
-                        ui.horizontal(|ui| {
-                            if ui.button("Reset").clicked() {
-                                self.scale_levels_center_percent = 0;
-                                self.scale_levels_tension_percent = 0;
-                                self.scale_levels_multiplier_percent = 100;
-                                self.scale_levels_offset_percent = 0;
-                            }
-                            if ui
-                                .add_enabled(
-                                    edit_scope_available,
-                                    egui::Button::new(format!("Apply to {edit_target}")),
-                                )
-                                .clicked()
-                            {
-                                scale_levels_requested = true;
-                                ui.close();
-                            }
-                        });
+                    ui.menu_button("Scale levels (Alt/Option+X)", |ui| {
+                        if piano_roll_scale_levels_controls(
+                            ui,
+                            &mut self.scale_levels_center_percent,
+                            &mut self.scale_levels_tension_percent,
+                            &mut self.scale_levels_multiplier_percent,
+                            &mut self.scale_levels_offset_percent,
+                            edit_target,
+                            edit_scope_available,
+                        ) {
+                            scale_levels_requested = true;
+                            ui.close();
+                        }
                     });
                     ui.menu_button("Articulate", |ui| {
                         ui.menu_button("Options", |ui| {
