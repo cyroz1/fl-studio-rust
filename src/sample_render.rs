@@ -12044,11 +12044,18 @@ fn prepare_sampler_arrangement(
             let loop_points = trim_sampler_loop_points(loop_points, processed_window);
             let release_loop_points =
                 trim_sampler_loop_points(release_loop_points, processed_window);
-            let prepared_stretch_source = prepare_sampler_stretch_source(
-                channel,
+            let crossfaded_source = sampler_precompute_loop_crossfade(
                 audio,
                 loop_points,
                 release_loop_points,
+                channel.sample_crossfade_raw(),
+                &mut cached_source_bytes,
+            )?;
+            let prepared_stretch_source = prepare_sampler_stretch_source(
+                channel,
+                crossfaded_source.audio,
+                crossfaded_source.loop_points,
+                crossfaded_source.release_loop_points,
                 ppq,
                 tempo_map.tempo_bpm_at_tick(placed.start_tick),
                 &mut cached_source_bytes,
@@ -15199,11 +15206,18 @@ fn prepare_sampler_pattern_for_channel_internal(
             let loop_points = trim_sampler_loop_points(loop_points, processed_window);
             let release_loop_points =
                 trim_sampler_loop_points(release_loop_points, processed_window);
-            let prepared_stretch_source = prepare_sampler_stretch_source(
-                channel,
+            let crossfaded_source = sampler_precompute_loop_crossfade(
                 audio,
                 loop_points,
                 release_loop_points,
+                channel.sample_crossfade_raw(),
+                &mut cached_source_bytes,
+            )?;
+            let prepared_stretch_source = prepare_sampler_stretch_source(
+                channel,
+                crossfaded_source.audio,
+                crossfaded_source.loop_points,
+                crossfaded_source.release_loop_points,
                 ppq,
                 tempo_bpm,
                 &mut cached_source_bytes,
@@ -17160,6 +17174,107 @@ fn trim_sampler_loop_points(
         clipped_start - sample_window.start,
         clipped_end - sample_window.start,
     ))
+}
+
+struct PreparedSamplerLoopCrossfadeSource {
+    audio: Arc<DecodedAudio>,
+    loop_points: Option<(usize, usize)>,
+    release_loop_points: Option<(usize, usize)>,
+}
+
+/// Applies a candidate linear crossfade to each saved Sampler loop before playback. The saved
+/// amount is provisionally mapped to at most half of the loop length; advancing the loop start
+/// by the overlap prevents the blended head frames from being played twice after a wrap.
+fn sampler_precompute_loop_crossfade(
+    source: Arc<DecodedAudio>,
+    loop_points: Option<(usize, usize)>,
+    release_loop_points: Option<(usize, usize)>,
+    crossfade_raw: Option<u32>,
+    cached_source_bytes: &mut usize,
+) -> Result<PreparedSamplerLoopCrossfadeSource, String> {
+    let Some(crossfade_raw) = crossfade_raw.filter(|raw| (1..=256).contains(raw)) else {
+        return Ok(PreparedSamplerLoopCrossfadeSource {
+            audio: source,
+            loop_points,
+            release_loop_points,
+        });
+    };
+
+    let frame_count = source.frame_count();
+    let crossfade_span = |points: Option<(usize, usize)>| {
+        let (start, end) = points?;
+        if start >= end || end > frame_count {
+            return None;
+        }
+        let loop_length = end - start;
+        let overlap = ((loop_length as u128 * u128::from(crossfade_raw) + 256) / 512)
+            .min((loop_length / 2) as u128) as usize;
+        (overlap >= 2).then_some((start, end, overlap))
+    };
+
+    let mut spans = Vec::with_capacity(2);
+    if let Some(span) = crossfade_span(loop_points) {
+        spans.push(span);
+    }
+    if let Some(span) = crossfade_span(release_loop_points)
+        && !spans.contains(&span)
+    {
+        spans.push(span);
+    }
+    if spans.is_empty() {
+        return Ok(PreparedSamplerLoopCrossfadeSource {
+            audio: source,
+            loop_points,
+            release_loop_points,
+        });
+    }
+
+    let bytes = decoded_audio_bytes(&source)?;
+    *cached_source_bytes = cached_source_bytes
+        .checked_add(bytes)
+        .filter(|total| *total <= MAX_SOURCE_CACHE_BYTES)
+        .ok_or_else(|| {
+            format!(
+                "sampler sources exceed the {} MiB render cache limit",
+                MAX_SOURCE_CACHE_BYTES / (1024 * 1024)
+            )
+        })?;
+
+    let mut processed = (*source).clone();
+    for (start, end, overlap) in &spans {
+        let tail_start = end - overlap;
+        for (processed_channel, source_channel) in
+            processed.channels.iter_mut().zip(&source.channels)
+        {
+            if *end > processed_channel.len() || *end > source_channel.len() {
+                continue;
+            }
+            for offset in 0..*overlap {
+                let progress = offset as f32 / (*overlap - 1) as f32;
+                let tail_frame = tail_start + offset;
+                let head_frame = start + offset;
+                processed_channel[tail_frame] = source_channel[tail_frame] * (1.0 - progress)
+                    + source_channel[head_frame] * progress;
+            }
+        }
+    }
+
+    let advance_loop_start = |points: Option<(usize, usize)>| {
+        let (start, end) = points?;
+        let overlap = spans.iter().find_map(|(span_start, span_end, overlap)| {
+            (*span_start == start && *span_end == end).then_some(*overlap)
+        })?;
+        Some((start + overlap, end))
+    };
+    let adjusted_loop_points = advance_loop_start(loop_points).or(loop_points);
+    let adjusted_release_loop_points =
+        advance_loop_start(release_loop_points).or(release_loop_points);
+
+    Ok(PreparedSamplerLoopCrossfadeSource {
+        audio: Arc::new(processed),
+        loop_points: adjusted_loop_points,
+        release_loop_points: adjusted_release_loop_points,
+    })
 }
 
 fn sampler_precompute_sample_fx(
