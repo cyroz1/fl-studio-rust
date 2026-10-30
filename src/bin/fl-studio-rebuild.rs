@@ -4398,6 +4398,7 @@ struct PendingMidiCcImport {
     target_stream: (u8, u8),
     new_stream: bool,
     batch_new_streams: bool,
+    batch_existing_streams: bool,
     selected_controllers: BTreeSet<u8>,
     stream_mappings: BTreeMap<u8, (u8, u8)>,
 }
@@ -4431,6 +4432,16 @@ fn next_unused_raw_controller_stream(
         }
     }
     None
+}
+
+fn next_unused_existing_controller_stream(
+    existing_streams: &BTreeSet<(u8, u8)>,
+    mappings: &BTreeMap<u8, (u8, u8)>,
+) -> Option<(u8, u8)> {
+    existing_streams
+        .iter()
+        .copied()
+        .find(|stream| !mappings.values().any(|mapped| mapped == stream))
 }
 
 struct PendingMidiCcExport {
@@ -55947,6 +55958,7 @@ impl DawUi {
         let mut open_midi_cc_import_requested = false;
         let mut open_midi_cc_new_stream_requested = false;
         let mut open_midi_cc_batch_requested = false;
+        let mut open_midi_cc_batch_existing_requested = false;
         let mut open_midi_cc_export_requested = false;
         let mut open_midi_song_cc_export_requested = false;
         ui.horizontal_wrapped(|ui| {
@@ -56033,6 +56045,15 @@ impl DawUi {
             }
             if ui.button("Import multiple MIDI CCs…").clicked() {
                 open_midi_cc_batch_requested = true;
+            }
+            if ui
+                .add_enabled(
+                    !streams.is_empty(),
+                    egui::Button::new("Import multiple MIDI CCs into streams…"),
+                )
+                .clicked()
+            {
+                open_midi_cc_batch_existing_requested = true;
             }
             if ui
                 .add_enabled(
@@ -56213,6 +56234,7 @@ impl DawUi {
             open_midi_cc_import_requested,
             open_midi_cc_new_stream_requested,
             open_midi_cc_batch_requested,
+            open_midi_cc_batch_existing_requested,
         );
         self.draw_pending_midi_cc_export_ui(
             ui,
@@ -56853,10 +56875,16 @@ impl DawUi {
         open_existing_requested: bool,
         open_new_stream_requested: bool,
         open_batch_requested: bool,
+        open_batch_existing_requested: bool,
     ) {
-        if (open_existing_requested || open_new_stream_requested || open_batch_requested)
+        if (open_existing_requested
+            || open_new_stream_requested
+            || open_batch_requested
+            || open_batch_existing_requested)
             && let Some(target_stream) = if open_batch_requested {
                 Some((0, 0))
+            } else if open_batch_existing_requested {
+                selected_stream.or_else(|| existing_streams.first().copied())
             } else if open_new_stream_requested {
                 Some((
                     self.piano_roll_controller_new_channel,
@@ -56880,11 +56908,12 @@ impl DawUi {
                             .collect::<BTreeSet<_>>();
                         let controller_number =
                             controller_numbers.first().copied().unwrap_or_default();
-                        let selected_controllers = if open_batch_requested {
-                            controller_numbers.first().copied().into_iter().collect()
-                        } else {
-                            BTreeSet::new()
-                        };
+                        let selected_controllers =
+                            if open_batch_requested || open_batch_existing_requested {
+                                controller_numbers.first().copied().into_iter().collect()
+                            } else {
+                                BTreeSet::new()
+                            };
                         self.pending_midi_cc_import = Some(PendingMidiCcImport {
                             path: path.clone(),
                             midi,
@@ -56895,6 +56924,7 @@ impl DawUi {
                             target_stream,
                             new_stream: open_new_stream_requested || open_batch_requested,
                             batch_new_streams: open_batch_requested,
+                            batch_existing_streams: open_batch_existing_requested,
                             selected_controllers,
                             stream_mappings: BTreeMap::new(),
                         });
@@ -56923,6 +56953,11 @@ impl DawUi {
                 if pending.batch_new_streams {
                     ui.label(format!(
                         "Destination: multiple new raw streams in Pattern {}",
+                        pending.pattern_id
+                    ));
+                } else if pending.batch_existing_streams {
+                    ui.label(format!(
+                        "Destination: existing raw streams in Pattern {}",
                         pending.pattern_id
                     ));
                 } else if pending.new_stream {
@@ -56983,14 +57018,42 @@ impl DawUi {
                     .iter()
                     .map(|change| change.controller())
                     .collect::<BTreeSet<_>>();
-                if pending.batch_new_streams {
+                if pending.batch_new_streams || pending.batch_existing_streams {
                     pending
                         .selected_controllers
                         .retain(|controller| controller_numbers.contains(controller));
-                    pending
-                        .stream_mappings
-                        .retain(|controller, _| controller_numbers.contains(controller));
-                    ui.label("Select CCs and assign a raw channel/flags pair to each stream.");
+                    pending.stream_mappings.retain(|controller, stream| {
+                        controller_numbers.contains(controller)
+                            && (!pending.batch_existing_streams
+                                || existing_streams.contains(stream))
+                    });
+                    let missing_mappings = pending
+                        .selected_controllers
+                        .iter()
+                        .filter(|controller| !pending.stream_mappings.contains_key(controller))
+                        .copied()
+                        .collect::<Vec<_>>();
+                    for controller in missing_mappings {
+                        let stream = if pending.batch_new_streams {
+                            next_unused_raw_controller_stream(
+                                existing_streams,
+                                &pending.stream_mappings,
+                            )
+                        } else {
+                            next_unused_existing_controller_stream(
+                                existing_streams,
+                                &pending.stream_mappings,
+                            )
+                        };
+                        if let Some(stream) = stream {
+                            pending.stream_mappings.insert(controller, stream);
+                        }
+                    }
+                    ui.label(if pending.batch_new_streams {
+                        "Select CCs and assign a raw channel/flags pair to each new stream."
+                    } else {
+                        "Select CCs and choose a different existing raw stream for each."
+                    });
                     egui::ScrollArea::vertical()
                         .max_height(150.0)
                         .show(ui, |ui| {
@@ -57010,11 +57073,17 @@ impl DawUi {
                                             if !pending
                                                 .stream_mappings
                                                 .contains_key(controller_number)
-                                                && let Some(stream) =
+                                                && let Some(stream) = if pending.batch_new_streams {
                                                     next_unused_raw_controller_stream(
                                                         existing_streams,
                                                         &pending.stream_mappings,
                                                     )
+                                                } else {
+                                                    next_unused_existing_controller_stream(
+                                                        existing_streams,
+                                                        &pending.stream_mappings,
+                                                    )
+                                                }
                                             {
                                                 pending
                                                     .stream_mappings
@@ -57024,24 +57093,68 @@ impl DawUi {
                                             pending
                                                 .selected_controllers
                                                 .remove(controller_number);
+                                            pending.stream_mappings.remove(controller_number);
                                         }
                                     }
-                                    if selected
-                                        && let Some((channel, flags)) = pending
-                                            .stream_mappings
-                                            .get_mut(controller_number)
-                                    {
-                                        ui.add(
-                                            egui::DragValue::new(channel)
-                                                .range(0..=u8::MAX)
-                                                .prefix("Channel "),
-                                        );
-                                        ui.add(
-                                            egui::DragValue::new(flags)
-                                                .range(0..=u8::MAX)
-                                                .hexadecimal(2, false, true)
-                                                .prefix("Flags 0x"),
-                                        );
+                                    if selected {
+                                        if pending.batch_new_streams {
+                                            if let Some((channel, flags)) = pending
+                                                .stream_mappings
+                                                .get_mut(controller_number)
+                                            {
+                                            ui.add(
+                                                egui::DragValue::new(channel)
+                                                    .range(0..=u8::MAX)
+                                                    .prefix("Channel "),
+                                            );
+                                            ui.add(
+                                                egui::DragValue::new(flags)
+                                                    .range(0..=u8::MAX)
+                                                    .hexadecimal(2, false, true)
+                                                    .prefix("Flags 0x"),
+                                            );
+                                            }
+                                        } else {
+                                            let used_by_other_controllers = pending
+                                                .selected_controllers
+                                                .iter()
+                                                .filter(|other| *other != controller_number)
+                                                .filter_map(|other| {
+                                                    pending.stream_mappings.get(other).copied()
+                                                })
+                                                .collect::<BTreeSet<_>>();
+                                            if let Some(target_stream) = pending
+                                                .stream_mappings
+                                                .get_mut(controller_number)
+                                            {
+                                                let selected_text = format!(
+                                                    "Channel {} · flags 0x{:02X}",
+                                                    target_stream.0, target_stream.1
+                                                );
+                                                egui::ComboBox::from_id_salt((
+                                                    "piano-roll-midi-cc-target",
+                                                    pending.pattern_id,
+                                                    *controller_number,
+                                                ))
+                                                .selected_text(selected_text)
+                                                .show_ui(ui, |ui| {
+                                                    for stream in existing_streams {
+                                                        if !used_by_other_controllers
+                                                            .contains(stream)
+                                                        {
+                                                            ui.selectable_value(
+                                                                target_stream,
+                                                                *stream,
+                                                                format!(
+                                                                    "Channel {} · flags 0x{:02X}",
+                                                                    stream.0, stream.1
+                                                                ),
+                                                            );
+                                                        }
+                                                    }
+                                                });
+                                            }
+                                        }
                                     }
                                 });
                             }
@@ -57076,7 +57189,7 @@ impl DawUi {
                 let channels = changes
                     .iter()
                     .filter(|change| {
-                        if pending.batch_new_streams {
+                        if pending.batch_new_streams || pending.batch_existing_streams {
                             pending.selected_controllers.is_empty()
                                 || pending
                                     .selected_controllers
@@ -57111,16 +57224,23 @@ impl DawUi {
                     });
                 ui.weak(if pending.batch_new_streams {
                     "Raw stream bytes are uninterpreted; identifiers default to unused pairs and remain editable."
+                } else if pending.batch_existing_streams {
+                    "CC values map from 0–127 to 0.0–1.0. Each CC targets a different existing stream."
                 } else {
                     "CC values map from 0–127 to 0.0–1.0. Source timing is preserved."
                 });
 
-                let can_import = if pending.batch_new_streams {
+                let can_import = if pending.batch_new_streams || pending.batch_existing_streams {
                     let mut used_targets = BTreeSet::new();
                     !pending.selected_controllers.is_empty()
                         && pending.selected_controllers.iter().all(|controller| {
                             pending.stream_mappings.get(controller).is_some_and(|stream| {
-                                !existing_streams.contains(stream) && used_targets.insert(*stream)
+                                let valid_destination = if pending.batch_new_streams {
+                                    !existing_streams.contains(stream)
+                                } else {
+                                    existing_streams.contains(stream)
+                                };
+                                valid_destination && used_targets.insert(*stream)
                             })
                         })
                 } else {
@@ -57128,8 +57248,20 @@ impl DawUi {
                         && (!pending.new_stream
                             || !existing_streams.contains(&pending.target_stream))
                 };
+                if !can_import
+                    && !pending.selected_controllers.is_empty()
+                    && (pending.batch_new_streams || pending.batch_existing_streams)
+                {
+                    ui.weak(if pending.batch_new_streams {
+                        "Each selected CC needs a unique unused raw channel/flags pair."
+                    } else {
+                        "Choose a different existing raw stream for each selected CC."
+                    });
+                }
                 let import_label = if pending.batch_new_streams {
                     "Import selected CCs and create streams"
+                } else if pending.batch_existing_streams {
+                    "Import selected CCs into streams"
                 } else if pending.new_stream {
                     "Import CC and create stream"
                 } else {
@@ -57139,7 +57271,9 @@ impl DawUi {
                     .add_enabled(can_import, egui::Button::new(import_label))
                     .clicked()
                 {
-                    let batch_mappings = pending.batch_new_streams.then(|| {
+                    let batch_mappings = (pending.batch_new_streams
+                        || pending.batch_existing_streams)
+                        .then(|| {
                         pending
                             .selected_controllers
                             .iter()
@@ -57148,8 +57282,8 @@ impl DawUi {
                                     (*controller, *channel, *flags)
                                 })
                             })
-                            .collect()
-                    });
+                                .collect()
+                        });
                     import_request = Some(MidiCcImportAction {
                         midi: pending.midi.clone(),
                         track_index: pending.selected_track,
@@ -57192,15 +57326,24 @@ impl DawUi {
                 .ok_or_else(|| "no project is open".to_owned())
                 .and_then(|document| {
                     if let Some(mappings) = batch_mappings.as_ref() {
-                        document
-                            .import_midi_control_change_streams(
+                        let result = if new_stream {
+                            document.import_midi_control_change_streams(
                                 &midi,
                                 track_index,
                                 target_pattern,
                                 mappings,
                                 channel,
                             )
-                            .map_err(|error| error.to_string())
+                        } else {
+                            document.import_midi_control_changes_to_streams(
+                                &midi,
+                                track_index,
+                                target_pattern,
+                                mappings,
+                                channel,
+                            )
+                        };
+                        result.map_err(|error| error.to_string())
                     } else {
                         let result = if new_stream {
                             document.import_midi_control_changes_to_new_stream(
@@ -57232,7 +57375,7 @@ impl DawUi {
                         .iter()
                         .fold(0usize, |total, (_, count)| total.saturating_add(*count));
                     self.dirty |= imported > 0;
-                    if new_stream && imported > 0 {
+                    if imported > 0 {
                         let imported_stream = batch_mappings
                             .as_ref()
                             .and_then(|mappings| {
@@ -57261,7 +57404,8 @@ impl DawUi {
                         )
                     } else if batch_mappings.is_some() {
                         format!(
-                            "Imported {imported} MIDI CC events across {streams_with_events} new streams into Pattern {target_pattern}"
+                            "Imported {imported} MIDI CC events across {streams_with_events} {} streams into Pattern {target_pattern}",
+                            if new_stream { "new" } else { "existing" }
                         )
                     } else {
                         format!(
