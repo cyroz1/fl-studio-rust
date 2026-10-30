@@ -12089,7 +12089,7 @@ fn prepare_sampler_arrangement(
                     .insert(placed.target_channel_id, pitch_adjustment_cents);
             }
             let (gain, pan) = channel_gain_pan(channel.volume(), channel.pan());
-            let volume_envelope = sampler_volume_envelope_config(channel, options.sample_rate);
+            let volume_envelope = sampler_volume_envelope_config(channel, options.sample_rate, ppq);
             source_entry.insert(SamplerVoiceSource {
                 audio,
                 gain: gain
@@ -12307,7 +12307,13 @@ fn prepare_sampler_arrangement(
             None => natural_end_frame,
         };
         let tail_frames = if source.volume_envelope_enabled && stop_frame.is_some() {
-            sampler_envelope_release_frames(source.volume_envelope, release_frames as usize) as u64
+            sampler_envelope_release_tail_frames(
+                source.volume_envelope,
+                release_frames as usize,
+                placed.stop_tick,
+                &tempo_map,
+                options.sample_rate,
+            )?
         } else {
             0
         };
@@ -12337,7 +12343,7 @@ fn prepare_sampler_arrangement(
         });
     }
     notes.sort_by_key(|note| (note.start_frame, note.slide_note, note.channel_id, note.key));
-    output_frames = output_frames.max(sampler_voice_render_end_frame(
+    output_frames = output_frames.max(sampler_voice_render_end_frame_with_tempo_map(
         &notes,
         &sources_by_channel,
         options.sampler_voice_limit,
@@ -12345,6 +12351,7 @@ fn prepare_sampler_arrangement(
         options.sample_rate,
         options.resampling_quality,
         pan_law,
+        Some(&tempo_map),
     )?);
     Ok(PreparedSamplerArrangement {
         summary: SamplerPatternRenderSummary {
@@ -12419,13 +12426,36 @@ struct SamplerVoiceSource {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct SamplerVolumeEnvelope {
-    predelay_frames: u64,
-    attack_frames: u64,
-    hold_frames: u64,
-    decay_frames: u64,
-    release_frames: usize,
+    timing: SamplerEnvelopeTiming,
     sustain_level: f32,
     amount: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SamplerEnvelopeTiming {
+    Frames(SamplerEnvelopeFrameTimes),
+    Ticks {
+        ticks: SamplerEnvelopeTickTimes,
+        frame_fallback: SamplerEnvelopeFrameTimes,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SamplerEnvelopeFrameTimes {
+    predelay: u64,
+    attack: u64,
+    hold: u64,
+    decay: u64,
+    release: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SamplerEnvelopeTickTimes {
+    predelay: f64,
+    attack: f64,
+    hold: f64,
+    decay: f64,
+    release: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -12529,22 +12559,90 @@ impl SamplerLfo {
 }
 
 impl SamplerVolumeEnvelope {
-    fn level_at_frame(self, note_start_frame: u64, frame: u64) -> f32 {
-        let elapsed = frame.saturating_sub(note_start_frame);
-        if elapsed < self.predelay_frames {
+    fn uses_tempo_sync(self) -> bool {
+        matches!(self.timing, SamplerEnvelopeTiming::Ticks { .. })
+    }
+
+    fn frame_times(self) -> SamplerEnvelopeFrameTimes {
+        match self.timing {
+            SamplerEnvelopeTiming::Frames(times)
+            | SamplerEnvelopeTiming::Ticks {
+                frame_fallback: times,
+                ..
+            } => times,
+        }
+    }
+
+    fn tick_times(self) -> Option<SamplerEnvelopeTickTimes> {
+        match self.timing {
+            SamplerEnvelopeTiming::Frames(_) => None,
+            SamplerEnvelopeTiming::Ticks { ticks, .. } => Some(ticks),
+        }
+    }
+
+    fn release_progress_at_tick(self, start_tick: f64, current_tick: f64) -> Option<f32> {
+        let release_ticks = self.tick_times()?.release;
+        (release_ticks > 0.0 && start_tick.is_finite() && current_tick.is_finite())
+            .then(|| ((current_tick - start_tick) / release_ticks).clamp(0.0, 1.0) as f32)
+    }
+
+    fn release_finished_at_tick(self, start_tick: f64, current_tick: f64) -> bool {
+        self.release_progress_at_tick(start_tick, current_tick)
+            .is_some_and(|progress| progress >= 1.0)
+    }
+
+    fn level_at_frame(
+        self,
+        note_start_frame: u64,
+        frame: u64,
+        note_start_tick: Option<f64>,
+        current_tick: Option<f64>,
+    ) -> f32 {
+        let (elapsed, predelay, attack, hold, decay) = match self.timing {
+            SamplerEnvelopeTiming::Frames(times) => (
+                frame.saturating_sub(note_start_frame) as f64,
+                times.predelay as f64,
+                times.attack as f64,
+                times.hold as f64,
+                times.decay as f64,
+            ),
+            SamplerEnvelopeTiming::Ticks {
+                ticks,
+                frame_fallback,
+            } => match note_start_tick
+                .zip(current_tick)
+                .map(|(start, now)| now - start)
+            {
+                Some(elapsed) if elapsed.is_finite() && elapsed >= 0.0 => (
+                    elapsed,
+                    ticks.predelay,
+                    ticks.attack,
+                    ticks.hold,
+                    ticks.decay,
+                ),
+                _ => (
+                    frame.saturating_sub(note_start_frame) as f64,
+                    frame_fallback.predelay as f64,
+                    frame_fallback.attack as f64,
+                    frame_fallback.hold as f64,
+                    frame_fallback.decay as f64,
+                ),
+            },
+        };
+        if elapsed < predelay {
             return 0.0;
         }
-        let elapsed = elapsed - self.predelay_frames;
-        if self.attack_frames > 0 && elapsed < self.attack_frames {
-            return elapsed as f32 / self.attack_frames as f32;
+        let elapsed = elapsed - predelay;
+        if attack > 0.0 && elapsed < attack {
+            return (elapsed / attack) as f32;
         }
-        let elapsed = elapsed.saturating_sub(self.attack_frames);
-        if elapsed < self.hold_frames {
+        let elapsed = (elapsed - attack).max(0.0);
+        if elapsed < hold {
             return 1.0;
         }
-        let elapsed = elapsed - self.hold_frames;
-        if self.decay_frames > 0 && elapsed < self.decay_frames {
-            let progress = elapsed as f32 / self.decay_frames as f32;
+        let elapsed = (elapsed - hold).max(0.0);
+        if decay > 0.0 && elapsed < decay {
+            let progress = (elapsed / decay) as f32;
             return 1.0 + (self.sustain_level - 1.0) * progress;
         }
         self.sustain_level
@@ -12554,8 +12652,19 @@ impl SamplerVolumeEnvelope {
         (1.0 + self.amount * (level - 1.0)).clamp(0.0, 2.0)
     }
 
-    fn gain_at_frame(self, note_start_frame: u64, frame: u64) -> f32 {
-        self.gain_at_level(self.level_at_frame(note_start_frame, frame))
+    fn gain_at_frame(
+        self,
+        note_start_frame: u64,
+        frame: u64,
+        note_start_tick: Option<f64>,
+        current_tick: Option<f64>,
+    ) -> f32 {
+        self.gain_at_level(self.level_at_frame(
+            note_start_frame,
+            frame,
+            note_start_tick,
+            current_tick,
+        ))
     }
 }
 
@@ -15307,7 +15416,7 @@ fn prepare_sampler_pattern_for_channel_internal(
                 tempo_bpm,
             )?;
             let (gain, pan) = channel_gain_pan(channel.volume(), channel.pan());
-            let volume_envelope = sampler_volume_envelope_config(channel, options.sample_rate);
+            let volume_envelope = sampler_volume_envelope_config(channel, options.sample_rate, ppq);
             source_entry.insert(SamplerVoiceSource {
                 audio,
                 gain: gain
@@ -15418,18 +15527,22 @@ fn prepare_sampler_pattern_for_channel_internal(
                 target_channel_id
             ));
         }
-        let stop_frame = if note.length == 0 {
+        let stop_tick = if note.length == 0 {
             None
         } else {
-            let end_tick = nominal_start_tick
-                .checked_add(u64::from(note.length))
-                .and_then(|tick| tick.checked_add(swing_offset))
-                .ok_or_else(|| "Sampler note end position overflow".to_owned())?;
             Some(
-                ticks_to_frames(end_tick, ppq, tempo_bpm, options.sample_rate)?
-                    .max(start_frame.saturating_add(1)),
+                nominal_start_tick
+                    .checked_add(u64::from(note.length))
+                    .and_then(|tick| tick.checked_add(swing_offset))
+                    .ok_or_else(|| "Sampler note end position overflow".to_owned())?,
             )
         };
+        let stop_frame = stop_tick
+            .map(|end_tick| {
+                ticks_to_frames(end_tick, ppq, tempo_bpm, options.sample_rate)
+                    .map(|frame| frame.max(start_frame.saturating_add(1)))
+            })
+            .transpose()?;
         let slide_duration_frames = sampler_polyphony_slide_frames(
             channel.sampler_polyphony_slide_raw(),
             ppq,
@@ -15440,8 +15553,8 @@ fn prepare_sampler_pattern_for_channel_internal(
             notes.push(ScheduledSamplerNote {
                 clip_index: 0,
                 playlist_track_id: None,
-                start_tick: 0,
-                stop_tick: None,
+                start_tick: swung_start_tick,
+                stop_tick,
                 start_frame,
                 stop_frame,
                 channel_id: target_channel_id,
@@ -15484,7 +15597,13 @@ fn prepare_sampler_pattern_for_channel_internal(
             None => natural_end_frame,
         };
         let tail_frames = if source.volume_envelope_enabled && stop_frame.is_some() {
-            sampler_envelope_release_frames(source.volume_envelope, release_frames as usize) as u64
+            sampler_envelope_release_tail_frames(
+                source.volume_envelope,
+                release_frames as usize,
+                stop_tick,
+                &tempo_map,
+                options.sample_rate,
+            )?
         } else {
             0
         };
@@ -15496,8 +15615,8 @@ fn prepare_sampler_pattern_for_channel_internal(
         notes.push(ScheduledSamplerNote {
             clip_index: 0,
             playlist_track_id: None,
-            start_tick: 0,
-            stop_tick: None,
+            start_tick: swung_start_tick,
+            stop_tick,
             start_frame,
             stop_frame,
             channel_id: target_channel_id,
@@ -15525,7 +15644,7 @@ fn prepare_sampler_pattern_for_channel_internal(
         ));
     }
     notes.sort_by_key(|note| (note.start_frame, note.slide_note, note.channel_id, note.key));
-    output_frames = output_frames.max(sampler_voice_render_end_frame(
+    output_frames = output_frames.max(sampler_voice_render_end_frame_with_tempo_map(
         &notes,
         &sources_by_channel,
         options.voice_limit,
@@ -15533,6 +15652,7 @@ fn prepare_sampler_pattern_for_channel_internal(
         options.sample_rate,
         options.resampling_quality,
         pan_law,
+        Some(&tempo_map),
     )?);
     Ok(PreparedSamplerPattern {
         summary: SamplerPatternRenderSummary {
@@ -15604,7 +15724,7 @@ struct SamplerVoiceEngine<'a> {
     notes: &'a [ScheduledSamplerNote],
     tempo_map: Option<&'a PlaylistTempoMap>,
     tempo_override: Option<SamplerTempoAnchor>,
-    tempo_synced_lfos: bool,
+    tempo_synced_modulations: bool,
     live_notes: Vec<ScheduledSamplerNote>,
     mixer_transforms_by_channel: Option<&'a HashMap<u16, MixerSourceRouteTransform>>,
     live_mixer_source_routes_by_channel: Option<&'a HashMap<u16, MixerLiveSourceRoutePlan>>,
@@ -15667,6 +15787,7 @@ struct SamplerVoice {
     pitch_lfo: Option<SamplerLfo>,
     lfo_pitch_cents: f64,
     envelope_release_start_frame: Option<u64>,
+    envelope_release_start_tick: Option<f64>,
     envelope_release_start_gain: f32,
     loop_bounds: Option<SampleBounds>,
     ping_pong_loop: bool,
@@ -15798,8 +15919,11 @@ impl<'a> SamplerVoiceEngine<'a> {
         resampling_quality: ResamplingQuality,
         pan_law: PanLaw,
     ) -> Self {
-        let tempo_synced_lfos = sources_by_channel.values().any(|source| {
-            source.pan_lfo.is_some_and(SamplerLfo::needs_tempo_map)
+        let tempo_synced_modulations = sources_by_channel.values().any(|source| {
+            source
+                .volume_envelope
+                .is_some_and(SamplerVolumeEnvelope::uses_tempo_sync)
+                || source.pan_lfo.is_some_and(SamplerLfo::needs_tempo_map)
                 || source.volume_lfo.is_some_and(SamplerLfo::needs_tempo_map)
                 || source.pitch_lfo.is_some_and(SamplerLfo::needs_tempo_map)
         });
@@ -15808,7 +15932,7 @@ impl<'a> SamplerVoiceEngine<'a> {
             notes,
             tempo_map: None,
             tempo_override: None,
-            tempo_synced_lfos,
+            tempo_synced_modulations,
             live_notes: Vec::new(),
             mixer_transforms_by_channel: None,
             live_mixer_source_routes_by_channel: None,
@@ -15933,6 +16057,7 @@ impl<'a> SamplerVoiceEngine<'a> {
     }
 
     fn reset_for_playlist_loop(&mut self, start_frame: u64, end_frame: u64, loop_frames: u64) {
+        let end_tick = self.tick_at_frame(end_frame);
         let declick_frames = (f64::from(self.output_sample_rate) * 0.010)
             .round()
             .max(1.0) as usize;
@@ -15941,7 +16066,12 @@ impl<'a> SamplerVoiceEngine<'a> {
         let mut fading_voices = Vec::with_capacity(self.voice_limit);
         for voice in self.voices.iter_mut().take(self.voice_limit) {
             if let Some(mut voice) = voice.take() {
-                begin_sampler_voice_fast_cut_declick(&mut voice, end_frame, declick_frames);
+                begin_sampler_voice_fast_cut_declick(
+                    &mut voice,
+                    end_frame,
+                    end_tick,
+                    declick_frames,
+                );
                 fading_voices.push(Some(voice));
             } else {
                 fading_voices.push(None);
@@ -16021,7 +16151,7 @@ impl<'a> SamplerVoiceEngine<'a> {
         let mut last_active_output_frame = None;
         for offset in 0..frame_count {
             let frame = block_start + offset as u64;
-            let current_tick = (self.tempo_synced_lfos
+            let current_tick = (self.tempo_synced_modulations
                 || self.voices.iter().any(|voice| {
                     voice.as_ref().is_some_and(|voice| {
                         voice
@@ -16083,7 +16213,20 @@ impl<'a> SamplerVoiceEngine<'a> {
                         );
                     }
                     voice.note_slide = None;
-                    begin_sampler_voice_release(voice, frame, self.release_frames);
+                    begin_sampler_voice_release(voice, frame, current_tick, self.release_frames);
+                }
+                if voice.release_started
+                    && !voice.release_cosine
+                    && voice
+                        .volume_envelope
+                        .zip(voice.envelope_release_start_tick)
+                        .zip(current_tick)
+                        .is_some_and(|((envelope, start_tick), current_tick)| {
+                            envelope.release_finished_at_tick(start_tick, current_tick)
+                        })
+                {
+                    *voice_slot = None;
+                    continue;
                 }
                 if let Some(pitch_lfo) = voice.pitch_lfo {
                     // Candidate depth pending a native render comparison: full raw amount spans
@@ -16155,7 +16298,8 @@ impl<'a> SamplerVoiceEngine<'a> {
                             self.resampling_quality,
                         )
                     };
-                    let envelope_gain = sampler_voice_volume_envelope_gain(voice, frame);
+                    let envelope_gain =
+                        sampler_voice_volume_envelope_gain(voice, frame, current_tick);
                     let lfo_gain = voice.volume_lfo.map_or(1.0, |lfo| {
                         (1.0 + lfo.value_at_frame(
                             voice.started_frame,
@@ -16301,6 +16445,7 @@ impl<'a> SamplerVoiceEngine<'a> {
                         begin_sampler_voice_fast_cut_declick(
                             voice,
                             note.start_frame,
+                            started_tick,
                             fast_declick_frames,
                         );
                     }
@@ -16332,7 +16477,12 @@ impl<'a> SamplerVoiceEngine<'a> {
                         && !voice.release_started
                 })
             {
-                begin_sampler_voice_release(voice, note.start_frame, self.release_frames);
+                begin_sampler_voice_release(
+                    voice,
+                    note.start_frame,
+                    started_tick,
+                    self.release_frames,
+                );
             }
         } else if let Some(max_polyphony) = source
             .max_polyphony_raw
@@ -16471,6 +16621,7 @@ impl<'a> SamplerVoiceEngine<'a> {
             pitch_lfo: source.pitch_lfo,
             lfo_pitch_cents: 0.0,
             envelope_release_start_frame: None,
+            envelope_release_start_tick: None,
             envelope_release_start_gain: 1.0,
             loop_bounds: source.loop_bounds,
             ping_pong_loop: source.ping_pong_loop,
@@ -16786,10 +16937,11 @@ impl<'a> SamplerVoiceEngine<'a> {
         let sustain_down = self.sustain_down[usize::from(channel)];
         let release_frames = self.release_frames;
         let current_frame = self.current_frame;
+        let current_tick = self.tick_at_frame(current_frame);
         for voice in self.voices.iter_mut().filter_map(Option::as_mut) {
             if voice.input_midi_channel == Some(channel) && !voice.key_released {
                 if !sustain_down && !voice.sostenuto_held {
-                    begin_sampler_voice_release(voice, current_frame, release_frames);
+                    begin_sampler_voice_release(voice, current_frame, current_tick, release_frames);
                 } else {
                     voice.key_released = true;
                 }
@@ -16816,13 +16968,19 @@ impl<'a> SamplerVoiceEngine<'a> {
         self.sustain_down[channel_index] = down;
         if was_down && !down {
             let current_frame = self.current_frame;
+            let current_tick = self.tick_at_frame(current_frame);
             for voice in self.voices.iter_mut().filter_map(Option::as_mut) {
                 if voice.input_midi_channel == Some(channel)
                     && voice.key_released
                     && !voice.sostenuto_held
                     && !voice.release_started
                 {
-                    begin_sampler_voice_release(voice, current_frame, self.release_frames);
+                    begin_sampler_voice_release(
+                        voice,
+                        current_frame,
+                        current_tick,
+                        self.release_frames,
+                    );
                 }
             }
         }
@@ -16842,11 +17000,17 @@ impl<'a> SamplerVoiceEngine<'a> {
         } else if was_down && !down {
             let sustain_down = self.sustain_down[channel_index];
             let current_frame = self.current_frame;
+            let current_tick = self.tick_at_frame(current_frame);
             for voice in self.voices.iter_mut().filter_map(Option::as_mut) {
                 if voice.input_midi_channel == Some(channel) {
                     voice.sostenuto_held = false;
                     if voice.key_released && !sustain_down && !voice.release_started {
-                        begin_sampler_voice_release(voice, current_frame, self.release_frames);
+                        begin_sampler_voice_release(
+                            voice,
+                            current_frame,
+                            current_tick,
+                            self.release_frames,
+                        );
                     }
                 }
             }
@@ -16857,6 +17021,7 @@ impl<'a> SamplerVoiceEngine<'a> {
         let midi_channel = midi_channel & 0x0F;
         let sustain_down = self.sustain_down[usize::from(midi_channel)];
         let current_frame = self.current_frame;
+        let current_tick = self.tick_at_frame(current_frame);
         let voice = self
             .voices
             .iter_mut()
@@ -16870,7 +17035,12 @@ impl<'a> SamplerVoiceEngine<'a> {
             .min_by_key(|voice| voice.started_frame);
         if let Some(voice) = voice {
             if !sustain_down && !voice.sostenuto_held {
-                begin_sampler_voice_release(voice, current_frame, self.release_frames);
+                begin_sampler_voice_release(
+                    voice,
+                    current_frame,
+                    current_tick,
+                    self.release_frames,
+                );
             } else {
                 voice.key_released = true;
             }
@@ -16878,6 +17048,7 @@ impl<'a> SamplerVoiceEngine<'a> {
     }
 }
 
+#[cfg(test)]
 fn sampler_voice_render_end_frame(
     notes: &[ScheduledSamplerNote],
     sources_by_channel: &HashMap<u16, SamplerVoiceSource>,
@@ -16886,6 +17057,29 @@ fn sampler_voice_render_end_frame(
     sample_rate: u32,
     resampling_quality: ResamplingQuality,
     pan_law: PanLaw,
+) -> Result<u64, String> {
+    sampler_voice_render_end_frame_with_tempo_map(
+        notes,
+        sources_by_channel,
+        voice_limit,
+        release_frames,
+        sample_rate,
+        resampling_quality,
+        pan_law,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sampler_voice_render_end_frame_with_tempo_map(
+    notes: &[ScheduledSamplerNote],
+    sources_by_channel: &HashMap<u16, SamplerVoiceSource>,
+    voice_limit: usize,
+    release_frames: usize,
+    sample_rate: u32,
+    resampling_quality: ResamplingQuality,
+    pan_law: PanLaw,
+    tempo_map: Option<&PlaylistTempoMap>,
 ) -> Result<u64, String> {
     if !notes.iter().any(|note| note.slide_note) {
         return Ok(0);
@@ -16899,6 +17093,7 @@ fn sampler_voice_render_end_frame(
         resampling_quality,
         pan_law,
     );
+    engine.tempo_map = tempo_map;
     let mut block_start = 0u64;
     let mut last_active_output_frame = 0u64;
     while engine.next_note < notes.len() || engine.voices.iter().any(Option::is_some) {
@@ -16928,7 +17123,11 @@ fn sampler_voice_render_end_frame(
     Ok(last_active_output_frame)
 }
 
-fn sampler_voice_volume_envelope_gain(voice: &SamplerVoice, frame: u64) -> f32 {
+fn sampler_voice_volume_envelope_gain(
+    voice: &SamplerVoice,
+    frame: u64,
+    current_tick: Option<f64>,
+) -> f32 {
     let Some(envelope) = voice.volume_envelope else {
         return 1.0;
     };
@@ -16937,24 +17136,39 @@ fn sampler_voice_volume_envelope_gain(voice: &SamplerVoice, frame: u64) -> f32 {
             return voice.envelope_release_start_gain;
         }
         let start_frame = voice.envelope_release_start_frame.unwrap_or(frame);
-        let total_frames = voice
-            .release_total_frames
-            .unwrap_or(envelope.release_frames)
-            .max(1);
-        let elapsed = frame.saturating_sub(start_frame);
-        let progress = if total_frames <= 1 {
-            1.0
-        } else {
-            (elapsed as f32 / (total_frames - 1) as f32).clamp(0.0, 1.0)
-        };
+        let tick_progress = voice
+            .envelope_release_start_tick
+            .zip(current_tick)
+            .and_then(|(start_tick, current_tick)| {
+                envelope.release_progress_at_tick(start_tick, current_tick)
+            });
+        let progress = tick_progress.unwrap_or_else(|| {
+            let total_frames = voice
+                .release_total_frames
+                .unwrap_or_else(|| {
+                    usize::try_from(envelope.frame_times().release).unwrap_or(usize::MAX)
+                })
+                .max(1);
+            let elapsed = frame.saturating_sub(start_frame);
+            if total_frames <= 1 {
+                1.0
+            } else {
+                (elapsed as f32 / (total_frames - 1) as f32).clamp(0.0, 1.0)
+            }
+        });
         voice.envelope_release_start_gain * (1.0 - progress)
     } else {
-        envelope.gain_at_frame(voice.started_frame, frame)
+        envelope.gain_at_frame(voice.started_frame, frame, voice.started_tick, current_tick)
     }
 }
 
-fn begin_sampler_voice_release(voice: &mut SamplerVoice, start_frame: u64, release_frames: usize) {
-    let envelope_start_gain = sampler_voice_volume_envelope_gain(voice, start_frame);
+fn begin_sampler_voice_release(
+    voice: &mut SamplerVoice,
+    start_frame: u64,
+    start_tick: Option<f64>,
+    release_frames: usize,
+) {
+    let envelope_start_gain = sampler_voice_volume_envelope_gain(voice, start_frame, start_tick);
     voice.key_released = true;
     voice.release_started = true;
     voice.note_slide = None;
@@ -16963,8 +17177,19 @@ fn begin_sampler_voice_release(voice: &mut SamplerVoice, start_frame: u64, relea
     if voice.volume_envelope_enabled {
         let envelope_release_frames =
             sampler_envelope_release_frames(voice.volume_envelope, release_frames);
-        voice.release_remaining = Some(envelope_release_frames);
-        voice.release_total_frames = Some(envelope_release_frames);
+        let tick_synced_release = voice
+            .volume_envelope
+            .and_then(SamplerVolumeEnvelope::tick_times)
+            .is_some_and(|times| times.release > 0.0)
+            && start_tick.is_some();
+        voice.envelope_release_start_tick = tick_synced_release.then_some(start_tick).flatten();
+        if tick_synced_release {
+            voice.release_remaining = Some(usize::MAX);
+            voice.release_total_frames = None;
+        } else {
+            voice.release_remaining = Some(envelope_release_frames);
+            voice.release_total_frames = Some(envelope_release_frames);
+        }
         voice.release_cosine = false;
     }
 }
@@ -16974,22 +17199,49 @@ fn sampler_envelope_release_frames(
     default_release_frames: usize,
 ) -> usize {
     envelope
-        .map(|envelope| envelope.release_frames)
+        .map(|envelope| envelope.frame_times().release)
+        .and_then(|frames| usize::try_from(frames).ok())
         .filter(|frames| *frames > 0)
         .unwrap_or(default_release_frames)
         .max(1)
 }
 
+fn sampler_envelope_release_tail_frames(
+    envelope: Option<SamplerVolumeEnvelope>,
+    default_release_frames: usize,
+    stop_tick: Option<u64>,
+    tempo_map: &PlaylistTempoMap,
+    sample_rate: u32,
+) -> Result<u64, String> {
+    let Some(release_ticks) = envelope
+        .and_then(SamplerVolumeEnvelope::tick_times)
+        .map(|times| times.release)
+        .filter(|release_ticks| release_ticks.is_finite() && *release_ticks > 0.0)
+    else {
+        return Ok(sampler_envelope_release_frames(envelope, default_release_frames) as u64);
+    };
+    let Some(stop_tick) = stop_tick else {
+        return Ok(sampler_envelope_release_frames(envelope, default_release_frames) as u64);
+    };
+    let start_tick = stop_tick as f64;
+    let end_tick = start_tick + release_ticks;
+    let start_frame = tempo_map.frame_at_fractional_tick(start_tick, sample_rate)?;
+    let end_frame = tempo_map.frame_at_fractional_tick(end_tick, sample_rate)?;
+    Ok(end_frame.saturating_sub(start_frame).max(1))
+}
+
 fn begin_sampler_voice_fast_cut_declick(
     voice: &mut SamplerVoice,
     start_frame: u64,
+    start_tick: Option<f64>,
     fade_frames: usize,
 ) {
-    let envelope_start_gain = sampler_voice_volume_envelope_gain(voice, start_frame);
+    let envelope_start_gain = sampler_voice_volume_envelope_gain(voice, start_frame, start_tick);
     voice.key_released = true;
     voice.release_started = true;
     voice.note_slide = None;
     voice.envelope_release_start_frame = Some(start_frame);
+    voice.envelope_release_start_tick = None;
     voice.envelope_release_start_gain = envelope_start_gain;
     voice.release_remaining = Some(fade_frames);
     voice.release_total_frames = Some(fade_frames);
@@ -18561,9 +18813,14 @@ fn sampler_volume_envelope_sustain_gain_from_raw(
 fn sampler_volume_envelope_config(
     channel: &ChannelSummary,
     sample_rate: u32,
+    ppq: u16,
 ) -> Option<SamplerVolumeEnvelope> {
     let envelope = channel.sampler_volume_envelope()?;
     if !envelope.enabled() {
+        return None;
+    }
+    let tempo_sync = envelope.tempo_sync_enabled();
+    if sample_rate == 0 || (tempo_sync && ppq == 0) {
         return None;
     }
     let (
@@ -18594,20 +18851,33 @@ fn sampler_volume_envelope_config(
     {
         return None;
     }
-    if envelope.tempo_sync_enabled()
-        && [predelay, attack, hold, decay, release]
-            .into_iter()
-            .any(|raw| raw != 100)
-    {
-        return None;
-    }
     let frames = |raw| sampler_envelope_time_frames(raw, sample_rate);
+    let frame_times = SamplerEnvelopeFrameTimes {
+        predelay: frames(predelay)?,
+        attack: frames(attack)?,
+        hold: frames(hold)?,
+        decay: frames(decay)?,
+        release: frames(release)?,
+    };
+    let timing = if tempo_sync {
+        // Candidate interpretation: reuse the free-running time conversion at 60 BPM, then
+        // express those durations in PPQ ticks so project tempo changes scale every stage.
+        let ticks_per_frame = f64::from(ppq) / f64::from(sample_rate);
+        SamplerEnvelopeTiming::Ticks {
+            ticks: SamplerEnvelopeTickTimes {
+                predelay: frame_times.predelay as f64 * ticks_per_frame,
+                attack: frame_times.attack as f64 * ticks_per_frame,
+                hold: frame_times.hold as f64 * ticks_per_frame,
+                decay: frame_times.decay as f64 * ticks_per_frame,
+                release: frame_times.release as f64 * ticks_per_frame,
+            },
+            frame_fallback: frame_times,
+        }
+    } else {
+        SamplerEnvelopeTiming::Frames(frame_times)
+    };
     Some(SamplerVolumeEnvelope {
-        predelay_frames: frames(predelay)?,
-        attack_frames: frames(attack)?,
-        hold_frames: frames(hold)?,
-        decay_frames: frames(decay)?,
-        release_frames: usize::try_from(frames(release)?).ok()?,
+        timing,
         sustain_level: sustain as f32 / 128.0,
         amount: amount as f32 / 128.0,
     })
@@ -22989,15 +23259,17 @@ mod tests {
     #[test]
     fn sampler_volume_envelope_interpolates_linear_pahds_stages_and_amount() {
         let envelope = SamplerVolumeEnvelope {
-            predelay_frames: 2,
-            attack_frames: 4,
-            hold_frames: 2,
-            decay_frames: 4,
-            release_frames: 4,
+            timing: SamplerEnvelopeTiming::Frames(SamplerEnvelopeFrameTimes {
+                predelay: 2,
+                attack: 4,
+                hold: 2,
+                decay: 4,
+                release: 4,
+            }),
             sustain_level: 0.25,
             amount: 0.5,
         };
-        let gain = |frame| envelope.gain_at_frame(5, frame);
+        let gain = |frame| envelope.gain_at_frame(5, frame, None, None);
 
         assert_eq!(gain(5), 0.5);
         assert_eq!(gain(7), 0.5);
@@ -23021,11 +23293,13 @@ mod tests {
             reverse: false,
             volume_envelope_enabled: true,
             volume_envelope: Some(SamplerVolumeEnvelope {
-                predelay_frames: 0,
-                attack_frames: 4,
-                hold_frames: 0,
-                decay_frames: 0,
-                release_frames: 4,
+                timing: SamplerEnvelopeTiming::Frames(SamplerEnvelopeFrameTimes {
+                    predelay: 0,
+                    attack: 4,
+                    hold: 0,
+                    decay: 0,
+                    release: 4,
+                }),
                 sustain_level: 1.0,
                 amount: 1.0,
             }),
