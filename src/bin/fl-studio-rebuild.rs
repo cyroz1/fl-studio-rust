@@ -4397,6 +4397,40 @@ struct PendingMidiCcImport {
     pattern_id: u16,
     target_stream: (u8, u8),
     new_stream: bool,
+    batch_new_streams: bool,
+    selected_controllers: BTreeSet<u8>,
+    stream_mappings: BTreeMap<u8, (u8, u8)>,
+}
+
+struct MidiCcImportAction {
+    midi: MidiFile,
+    track_index: usize,
+    pattern_id: u16,
+    target_stream: (u8, u8),
+    controller_number: u8,
+    midi_channel: Option<u8>,
+    new_stream: bool,
+    batch_mappings: Option<Vec<(u8, u8, u8)>>,
+}
+
+fn next_unused_raw_controller_stream(
+    existing_streams: &BTreeSet<(u8, u8)>,
+    mappings: &BTreeMap<u8, (u8, u8)>,
+) -> Option<(u8, u8)> {
+    let occupied = existing_streams
+        .iter()
+        .copied()
+        .chain(mappings.values().copied())
+        .collect::<BTreeSet<_>>();
+    for flags in 0..=u8::MAX {
+        for channel in 0..=u8::MAX {
+            let candidate = (channel, flags);
+            if !occupied.contains(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 struct PendingMidiCcExport {
@@ -55912,6 +55946,7 @@ impl DawUi {
         let mut save_score_automation_requested = false;
         let mut open_midi_cc_import_requested = false;
         let mut open_midi_cc_new_stream_requested = false;
+        let mut open_midi_cc_batch_requested = false;
         let mut open_midi_cc_export_requested = false;
         let mut open_midi_song_cc_export_requested = false;
         ui.horizontal_wrapped(|ui| {
@@ -55995,6 +56030,9 @@ impl DawUi {
             }
             if ui.button("Import MIDI CC to new stream…").clicked() {
                 open_midi_cc_new_stream_requested = true;
+            }
+            if ui.button("Import multiple MIDI CCs…").clicked() {
+                open_midi_cc_batch_requested = true;
             }
             if ui
                 .add_enabled(
@@ -56174,6 +56212,7 @@ impl DawUi {
             &streams,
             open_midi_cc_import_requested,
             open_midi_cc_new_stream_requested,
+            open_midi_cc_batch_requested,
         );
         self.draw_pending_midi_cc_export_ui(
             ui,
@@ -56813,9 +56852,12 @@ impl DawUi {
         existing_streams: &BTreeSet<(u8, u8)>,
         open_existing_requested: bool,
         open_new_stream_requested: bool,
+        open_batch_requested: bool,
     ) {
-        if (open_existing_requested || open_new_stream_requested)
-            && let Some(target_stream) = if open_new_stream_requested {
+        if (open_existing_requested || open_new_stream_requested || open_batch_requested)
+            && let Some(target_stream) = if open_batch_requested {
+                Some((0, 0))
+            } else if open_new_stream_requested {
                 Some((
                     self.piano_roll_controller_new_channel,
                     self.piano_roll_controller_new_flags,
@@ -56831,10 +56873,18 @@ impl DawUi {
             match fs::read(&path) {
                 Ok(bytes) => match MidiFile::parse(&bytes) {
                     Ok(midi) if !midi.tracks().is_empty() => {
-                        let controller_number = midi.tracks()[0]
+                        let controller_numbers = midi.tracks()[0]
                             .control_changes()
-                            .first()
-                            .map_or(0, |change| change.controller());
+                            .iter()
+                            .map(|change| change.controller())
+                            .collect::<BTreeSet<_>>();
+                        let controller_number =
+                            controller_numbers.first().copied().unwrap_or_default();
+                        let selected_controllers = if open_batch_requested {
+                            controller_numbers.first().copied().into_iter().collect()
+                        } else {
+                            BTreeSet::new()
+                        };
                         self.pending_midi_cc_import = Some(PendingMidiCcImport {
                             path: path.clone(),
                             midi,
@@ -56843,7 +56893,10 @@ impl DawUi {
                             midi_channel: None,
                             pattern_id,
                             target_stream,
-                            new_stream: open_new_stream_requested,
+                            new_stream: open_new_stream_requested || open_batch_requested,
+                            batch_new_streams: open_batch_requested,
+                            selected_controllers,
+                            stream_mappings: BTreeMap::new(),
                         });
                         self.status =
                             format!("Loaded MIDI controller data from {}", path.display());
@@ -56867,7 +56920,12 @@ impl DawUi {
                     ui.strong("Import MIDI controller automation");
                     ui.weak(pending.path.display().to_string());
                 });
-                if pending.new_stream {
+                if pending.batch_new_streams {
+                    ui.label(format!(
+                        "Destination: multiple new raw streams in Pattern {}",
+                        pending.pattern_id
+                    ));
+                } else if pending.new_stream {
                     ui.label(format!(
                         "Destination: new raw stream in Pattern {}",
                         pending.pattern_id
@@ -56925,17 +56983,84 @@ impl DawUi {
                     .iter()
                     .map(|change| change.controller())
                     .collect::<BTreeSet<_>>();
-                if let Some(first_controller) = controller_numbers.first().copied()
-                    && !controller_numbers.contains(&pending.controller_number)
-                {
-                    pending.controller_number = first_controller;
-                }
-                let selected_controller_text = if controller_numbers.is_empty() {
-                    "No CC events".to_owned()
+                if pending.batch_new_streams {
+                    pending
+                        .selected_controllers
+                        .retain(|controller| controller_numbers.contains(controller));
+                    pending
+                        .stream_mappings
+                        .retain(|controller, _| controller_numbers.contains(controller));
+                    ui.label("Select CCs and assign a raw channel/flags pair to each stream.");
+                    egui::ScrollArea::vertical()
+                        .max_height(150.0)
+                        .show(ui, |ui| {
+                            for controller_number in &controller_numbers {
+                                ui.horizontal(|ui| {
+                                    let mut selected = pending
+                                        .selected_controllers
+                                        .contains(controller_number);
+                                    if ui
+                                        .checkbox(&mut selected, format!("CC {controller_number}"))
+                                        .changed()
+                                    {
+                                        if selected {
+                                            pending
+                                                .selected_controllers
+                                                .insert(*controller_number);
+                                            if !pending
+                                                .stream_mappings
+                                                .contains_key(controller_number)
+                                                && let Some(stream) =
+                                                    next_unused_raw_controller_stream(
+                                                        existing_streams,
+                                                        &pending.stream_mappings,
+                                                    )
+                                            {
+                                                pending
+                                                    .stream_mappings
+                                                    .insert(*controller_number, stream);
+                                            }
+                                        } else {
+                                            pending
+                                                .selected_controllers
+                                                .remove(controller_number);
+                                        }
+                                    }
+                                    if selected
+                                        && let Some((channel, flags)) = pending
+                                            .stream_mappings
+                                            .get_mut(controller_number)
+                                    {
+                                        ui.add(
+                                            egui::DragValue::new(channel)
+                                                .range(0..=u8::MAX)
+                                                .prefix("Channel "),
+                                        );
+                                        ui.add(
+                                            egui::DragValue::new(flags)
+                                                .range(0..=u8::MAX)
+                                                .hexadecimal(2, false, true)
+                                                .prefix("Flags 0x"),
+                                        );
+                                    }
+                                });
+                            }
+                        });
                 } else {
-                    format!("CC {}", pending.controller_number)
-                };
-                egui::ComboBox::from_id_salt(("piano-roll-midi-cc-number", pending.pattern_id))
+                    if let Some(first_controller) = controller_numbers.first().copied()
+                        && !controller_numbers.contains(&pending.controller_number)
+                    {
+                        pending.controller_number = first_controller;
+                    }
+                    let selected_controller_text = if controller_numbers.is_empty() {
+                        "No CC events".to_owned()
+                    } else {
+                        format!("CC {}", pending.controller_number)
+                    };
+                    egui::ComboBox::from_id_salt((
+                        "piano-roll-midi-cc-number",
+                        pending.pattern_id,
+                    ))
                     .selected_text(selected_controller_text)
                     .show_ui(ui, |ui| {
                         for controller_number in &controller_numbers {
@@ -56946,10 +57071,20 @@ impl DawUi {
                             );
                         }
                     });
+                }
 
                 let channels = changes
                     .iter()
-                    .filter(|change| change.controller() == pending.controller_number)
+                    .filter(|change| {
+                        if pending.batch_new_streams {
+                            pending.selected_controllers.is_empty()
+                                || pending
+                                    .selected_controllers
+                                    .contains(&change.controller())
+                        } else {
+                            change.controller() == pending.controller_number
+                        }
+                    })
                     .map(|change| change.channel())
                     .collect::<BTreeSet<_>>();
                 if pending
@@ -56974,32 +57109,62 @@ impl DawUi {
                             );
                         }
                     });
-                ui.weak("CC values map from 0–127 to 0.0–1.0. Source timing is preserved.");
+                ui.weak(if pending.batch_new_streams {
+                    "Raw stream bytes are uninterpreted; identifiers default to unused pairs and remain editable."
+                } else {
+                    "CC values map from 0–127 to 0.0–1.0. Source timing is preserved."
+                });
 
+                let can_import = if pending.batch_new_streams {
+                    let mut used_targets = BTreeSet::new();
+                    !pending.selected_controllers.is_empty()
+                        && pending.selected_controllers.iter().all(|controller| {
+                            pending.stream_mappings.get(controller).is_some_and(|stream| {
+                                !existing_streams.contains(stream) && used_targets.insert(*stream)
+                            })
+                        })
+                } else {
+                    !controller_numbers.is_empty()
+                        && (!pending.new_stream
+                            || !existing_streams.contains(&pending.target_stream))
+                };
+                let import_label = if pending.batch_new_streams {
+                    "Import selected CCs and create streams"
+                } else if pending.new_stream {
+                    "Import CC and create stream"
+                } else {
+                    "Import selected CC"
+                };
                 if ui
-                    .add_enabled(
-                        !controller_numbers.is_empty()
-                            && (!pending.new_stream
-                                || !existing_streams.contains(&pending.target_stream)),
-                        egui::Button::new(if pending.new_stream {
-                            "Import CC and create stream"
-                        } else {
-                            "Import selected CC"
-                        }),
-                    )
+                    .add_enabled(can_import, egui::Button::new(import_label))
                     .clicked()
                 {
-                    import_request = Some((
-                        pending.midi.clone(),
-                        pending.selected_track,
-                        pending.pattern_id,
-                        pending.target_stream,
-                        pending.controller_number,
-                        pending.midi_channel,
-                        pending.new_stream,
-                    ));
+                    let batch_mappings = pending.batch_new_streams.then(|| {
+                        pending
+                            .selected_controllers
+                            .iter()
+                            .filter_map(|controller| {
+                                pending.stream_mappings.get(controller).map(|(channel, flags)| {
+                                    (*controller, *channel, *flags)
+                                })
+                            })
+                            .collect()
+                    });
+                    import_request = Some(MidiCcImportAction {
+                        midi: pending.midi.clone(),
+                        track_index: pending.selected_track,
+                        pattern_id: pending.pattern_id,
+                        target_stream: pending.target_stream,
+                        controller_number: pending.controller_number,
+                        midi_channel: pending.midi_channel,
+                        new_stream: pending.new_stream,
+                        batch_mappings,
+                    });
                 }
-                if pending.new_stream && existing_streams.contains(&pending.target_stream) {
+                if pending.new_stream
+                    && !pending.batch_new_streams
+                    && existing_streams.contains(&pending.target_stream)
+                {
                     ui.weak(
                         "Choose a channel/flags pair that is not already used by this Pattern.",
                     );
@@ -57010,44 +57175,93 @@ impl DawUi {
         if cancel_requested {
             self.pending_midi_cc_import = None;
         }
-        if let Some((midi, track_index, target_pattern, target_stream, cc, channel, new_stream)) =
-            import_request
+        if let Some(MidiCcImportAction {
+            midi,
+            track_index,
+            pattern_id: target_pattern,
+            target_stream,
+            controller_number: cc,
+            midi_channel: channel,
+            new_stream,
+            batch_mappings,
+        }) = import_request
         {
             let result = self
                 .document
                 .as_mut()
                 .ok_or_else(|| "no project is open".to_owned())
                 .and_then(|document| {
-                    let result = if new_stream {
-                        document.import_midi_control_changes_to_new_stream(
-                            &midi,
-                            track_index,
-                            target_pattern,
-                            target_stream,
-                            cc,
-                            channel,
-                        )
+                    if let Some(mappings) = batch_mappings.as_ref() {
+                        document
+                            .import_midi_control_change_streams(
+                                &midi,
+                                track_index,
+                                target_pattern,
+                                mappings,
+                                channel,
+                            )
+                            .map_err(|error| error.to_string())
                     } else {
-                        document.import_midi_control_changes(
-                            &midi,
-                            track_index,
-                            target_pattern,
-                            target_stream,
-                            cc,
-                            channel,
-                        )
-                    };
-                    result.map_err(|error| error.to_string())
+                        let result = if new_stream {
+                            document.import_midi_control_changes_to_new_stream(
+                                &midi,
+                                track_index,
+                                target_pattern,
+                                target_stream,
+                                cc,
+                                channel,
+                            )
+                        } else {
+                            document.import_midi_control_changes(
+                                &midi,
+                                track_index,
+                                target_pattern,
+                                target_stream,
+                                cc,
+                                channel,
+                            )
+                        };
+                        result
+                            .map(|imported| vec![(cc, imported)])
+                            .map_err(|error| error.to_string())
+                    }
                 });
             match result {
-                Ok(imported) => {
+                Ok(imported_counts) => {
+                    let imported = imported_counts
+                        .iter()
+                        .fold(0usize, |total, (_, count)| total.saturating_add(*count));
                     self.dirty |= imported > 0;
                     if new_stream && imported > 0 {
-                        self.piano_roll_controller_stream = Some(target_stream);
+                        let imported_stream = batch_mappings
+                            .as_ref()
+                            .and_then(|mappings| {
+                                imported_counts
+                                    .iter()
+                                    .find(|(_, count)| *count > 0)
+                                    .and_then(|(controller, _)| {
+                                        mappings
+                                            .iter()
+                                            .find(|(mapped_controller, _, _)| {
+                                                mapped_controller == controller
+                                            })
+                                            .map(|(_, channel, flags)| (*channel, *flags))
+                                    })
+                            })
+                            .unwrap_or(target_stream);
+                        self.piano_roll_controller_stream = Some(imported_stream);
                     }
+                    let streams_with_events = imported_counts
+                        .iter()
+                        .filter(|(_, count)| *count > 0)
+                        .count();
                     self.status = if new_stream && imported == 0 {
                         format!(
-                            "No MIDI CC {cc} events matched in Pattern {target_pattern}; no raw stream was created"
+                            "No matching MIDI CC events were found in Pattern {target_pattern}; no raw stream was created"
+                        )
+                    } else if batch_mappings.is_some() {
+                        format!(
+                            "Imported {imported} MIDI CC events across {streams_with_events} new streams into Pattern {target_pattern}"
                         )
                     } else {
                         format!(
