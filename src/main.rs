@@ -44,6 +44,17 @@ struct MidiControlChangeImport<'a> {
     new_stream: bool,
 }
 
+struct MidiPitchBendImport<'a> {
+    input: &'a Path,
+    midi_path: &'a Path,
+    output: &'a Path,
+    track_index: usize,
+    pattern_id: u16,
+    target_stream: (u8, u8),
+    midi_channel: Option<u8>,
+    new_stream: bool,
+}
+
 fn main() -> ExitCode {
     match run(env::args().skip(1).collect()) {
         Ok(()) => ExitCode::SUCCESS,
@@ -3852,6 +3863,26 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 command == "import-midi-cc-streams",
             )
         }
+        [command, input, midi_path, output, track, pattern_id, stream_channel, stream_flags, midi_channel]
+            if command == "import-midi-pitch-bend"
+                || command == "import-midi-pitch-bend-new-stream" =>
+        {
+            import_midi_pitch_bends(
+                MidiPitchBendImport {
+                    input: Path::new(input),
+                    midi_path: Path::new(midi_path),
+                    output: Path::new(output),
+                    track_index: parse_usize(track, "MIDI track index")?,
+                    pattern_id: parse_u16(pattern_id, "pattern id")?,
+                    target_stream: (
+                        parse_raw_byte(stream_channel, "raw controller channel")?,
+                        parse_raw_byte(stream_flags, "raw controller flags")?,
+                    ),
+                    midi_channel: parse_midi_channel_filter(midi_channel)?,
+                    new_stream: command == "import-midi-pitch-bend-new-stream",
+                },
+            )
+        }
         [command, input, score_path, output, pattern_id, channel_id]
             if command == "import-score" =>
         {
@@ -4630,6 +4661,9 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "    Each mapping creates one raw Pattern stream; raw bytes are explicit, and CCs with no messages are skipped.\n",
             "  flp-rebuild import-midi-cc-into-streams <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <cc:raw-channel:raw-flags,...> <midi-channel-1..16|all>\n",
             "    Each mapping targets an existing raw Pattern stream; the full batch is applied atomically.\n",
+            "  flp-rebuild import-midi-pitch-bend <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <raw-channel> <raw-flags> <midi-channel-1..16|all>\n",
+            "  flp-rebuild import-midi-pitch-bend-new-stream <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <raw-channel> <raw-flags> <midi-channel-1..16|all>\n",
+            "    Pitch Bend's unsigned 14-bit values map linearly from 0–16383 to 0.0–1.0.\n",
             "  flp-rebuild import-midi-all <input.flp> <input.mid> <output.flp> <pattern-id|new> <channel-ids-comma-separated> [zero-velocity-note-ons:0|1] [realign-events:0|1] [midi-channels:all|none|1,2,...,16]\n",
             "  flp-rebuild import-midi-named-patterns <input.flp> <input.mid> <output.flp> <channel-id> [zero-velocity-note-ons:0|1] [realign-events:0|1] [midi-channels:all|none|1,2,...,16]\n",
             "  flp-rebuild import-midi-selected <input.flp> <input.mid> <output.flp> <pattern-id|new> <track-numbers:all|1,2,...> <selected-track-channel-ids-comma-separated> [zero-velocity-note-ons:0|1 realign-events:0|1 midi-channels:all|none|1,2,...,16]\n",
@@ -11033,6 +11067,63 @@ fn import_midi_control_changes(request: MidiControlChangeImport<'_>) -> Result<(
     };
     println!(
         "imported {imported} MIDI CC {controller_number} events from track {track_index} ({source_channel}) into pattern {pattern_id}, {stream_kind} {} / 0x{:02X} in {}",
+        target_stream.0,
+        target_stream.1,
+        output.display()
+    );
+    Ok(())
+}
+
+fn import_midi_pitch_bends(request: MidiPitchBendImport<'_>) -> Result<(), String> {
+    let MidiPitchBendImport {
+        input,
+        midi_path,
+        output,
+        track_index,
+        pattern_id,
+        target_stream,
+        midi_channel,
+        new_stream,
+    } = request;
+    let (_, mut document) = load_document(input)?;
+    let midi_bytes = fs::read(midi_path)
+        .map_err(|error| format!("could not read {}: {error}", midi_path.display()))?;
+    let midi = MidiFile::parse(&midi_bytes)
+        .map_err(|error| format!("could not parse {}: {error}", midi_path.display()))?;
+    let imported = if new_stream {
+        document.import_midi_pitch_bends_to_new_stream(
+            &midi,
+            track_index,
+            pattern_id,
+            target_stream,
+            midi_channel,
+        )
+    } else {
+        document.import_midi_pitch_bends(
+            &midi,
+            track_index,
+            pattern_id,
+            target_stream,
+            midi_channel,
+        )
+    }
+    .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    let source_channel = midi_channel.map_or_else(
+        || "all channels".to_owned(),
+        |channel| format!("MIDI channel {}", channel + 1),
+    );
+    let stream_kind = if new_stream {
+        "new raw stream"
+    } else {
+        "raw stream"
+    };
+    println!(
+        "imported {imported} MIDI Pitch Bend events from track {track_index} ({source_channel}) into pattern {pattern_id}, {stream_kind} {} / 0x{:02X} in {}",
         target_stream.0,
         target_stream.1,
         output.display()

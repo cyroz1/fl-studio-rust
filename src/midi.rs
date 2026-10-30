@@ -84,6 +84,31 @@ impl MidiControlChange {
     }
 }
 
+/// One MIDI Pitch Bend message with its source channel, 14-bit value, and tick.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MidiPitchBend {
+    channel: u8,
+    value: u16,
+    tick: u64,
+}
+
+impl MidiPitchBend {
+    /// Zero-based MIDI channel in the range 0–15.
+    pub fn channel(self) -> u8 {
+        self.channel
+    }
+
+    /// Unsigned 14-bit Pitch Bend value in the range 0–16383, with center at 8192.
+    pub fn value(self) -> u16 {
+        self.value
+    }
+
+    /// Absolute position in the source track's MIDI ticks.
+    pub fn tick(self) -> u64 {
+        self.tick
+    }
+}
+
 /// Options for interpreting MIDI notes and aligning imported events.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MidiImportOptions {
@@ -2078,6 +2103,26 @@ impl MidiTrack {
                     channel: status & 0x0F,
                     controller: data[0],
                     value: data[1],
+                    tick: event.absolute_tick,
+                })
+            })
+            .collect()
+    }
+
+    /// Returns valid MIDI Pitch Bend messages in file order.
+    pub fn pitch_bends(&self) -> Vec<MidiPitchBend> {
+        self.events
+            .iter()
+            .filter_map(|event| {
+                let MidiEventKind::ChannelVoice { status, data } = &event.kind else {
+                    return None;
+                };
+                if status & 0xF0 != 0xE0 || data.len() < 2 || data[0] > 127 || data[1] > 127 {
+                    return None;
+                }
+                Some(MidiPitchBend {
+                    channel: status & 0x0F,
+                    value: u16::from(data[0]) | (u16::from(data[1]) << 7),
                     tick: event.absolute_tick,
                 })
             })
