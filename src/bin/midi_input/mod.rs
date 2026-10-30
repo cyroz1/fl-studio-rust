@@ -660,6 +660,9 @@ fn queue_script_transport_actions(
             ScriptTransportAction::TogglePlayback => MidiTransportCommand::TogglePlayback,
             ScriptTransportAction::ToggleLoopMode => MidiTransportCommand::ToggleLoopMode,
             ScriptTransportAction::ToggleMetronome => MidiTransportCommand::ToggleMetronome,
+            ScriptTransportAction::ToggleRecordingPrecount => {
+                MidiTransportCommand::ToggleRecordingPrecount
+            }
             ScriptTransportAction::SetSongPosition(position) => {
                 MidiTransportCommand::SetSongPosition(position)
             }
@@ -870,6 +873,7 @@ pub enum MidiTransportCommand {
     TogglePlayback,
     ToggleLoopMode,
     ToggleMetronome,
+    ToggleRecordingPrecount,
     SetSongPosition(u32),
     SetSongPositionTicks(u64),
     SetSongPositionTimeUs(u64),
@@ -1672,6 +1676,9 @@ pub fn describe_event(event: MidiInputEvent) -> String {
             MidiTransportCommand::TogglePlayback => "MIDI script Play/Pause".to_owned(),
             MidiTransportCommand::ToggleLoopMode => "MIDI script Loop Mode".to_owned(),
             MidiTransportCommand::ToggleMetronome => "MIDI script Metronome".to_owned(),
+            MidiTransportCommand::ToggleRecordingPrecount => {
+                "MIDI script Recording Count-in".to_owned()
+            }
             MidiTransportCommand::SetSongPosition(_) => "MIDI script Song Position".to_owned(),
             MidiTransportCommand::SetSongPositionTicks(_) => "MIDI script Song Position".to_owned(),
             MidiTransportCommand::SetSongPositionTimeUs(_) => {

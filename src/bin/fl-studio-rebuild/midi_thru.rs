@@ -684,6 +684,7 @@ fn midi_input_thru_message(event: MidiInputEvent) -> Option<([u8; 3], usize)> {
             | MidiTransportCommand::TogglePlayback
             | MidiTransportCommand::ToggleLoopMode
             | MidiTransportCommand::ToggleMetronome
+            | MidiTransportCommand::ToggleRecordingPrecount
             | MidiTransportCommand::SetSongPosition(_)
             | MidiTransportCommand::SetSongPositionTicks(_)
             | MidiTransportCommand::SetSongPositionTimeUs(_)

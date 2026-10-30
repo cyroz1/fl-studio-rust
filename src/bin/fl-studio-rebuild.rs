@@ -61342,6 +61342,9 @@ impl DawUi {
             MidiTransportCommand::ToggleMetronome => {
                 self.toggle_metronome();
             }
+            MidiTransportCommand::ToggleRecordingPrecount => {
+                self.toggle_recording_precount();
+            }
             MidiTransportCommand::SetSongPosition(position) => {
                 self.set_midi_script_song_position(position);
             }

@@ -1884,6 +1884,10 @@ def _global_transport(command, value, pmeflags=2, flags=15):
         if value != 0:
             _request_transport_action("toggle_metronome")
         return 8
+    if command == 115:  # FPT_CountDown
+        if value != 0:
+            _request_transport_action("toggle_recording_precount")
+        return 8
     window_views = {
         64: 0,  # FPT_F5: Playlist
         65: 1,  # FPT_F6: Channel Rack

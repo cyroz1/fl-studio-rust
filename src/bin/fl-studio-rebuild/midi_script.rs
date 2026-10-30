@@ -69,6 +69,7 @@ pub enum ScriptTransportAction {
     TogglePlayback,
     ToggleLoopMode,
     ToggleMetronome,
+    ToggleRecordingPrecount,
     SetSongPosition(u32),
     SetSongPositionTicks(u64),
     SetSongPositionTimeUs(u64),
@@ -223,6 +224,7 @@ impl ScriptTransportAction {
             "toggle_playback" => Some(Self::TogglePlayback),
             "loop_mode" => Some(Self::ToggleLoopMode),
             "toggle_metronome" => Some(Self::ToggleMetronome),
+            "toggle_recording_precount" => Some(Self::ToggleRecordingPrecount),
             "select_next_empty_pattern_with_name_dialog" => {
                 Some(Self::SelectNextEmptyPatternWithNameDialog)
             }
