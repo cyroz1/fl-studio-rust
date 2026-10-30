@@ -8347,7 +8347,7 @@ fn stream_pattern_from_tick_with_vst3_to_device(
         meters: live_master_meters,
         latency_updates,
         metronome,
-        mut note_updates,
+        note_updates,
     } = controls;
     let mut metronome_route = metronome.as_ref().map(|metronome| {
         prepare_metronome_mixer_route(
@@ -8672,37 +8672,34 @@ fn stream_pattern_from_tick_with_vst3_to_device(
             if writer.is_cancelled() {
                 return Err("Sampler pattern playback was stopped".to_owned());
             }
-            if playback.repeat_pattern {
-                if let Some(receiver) = note_updates.as_ref() {
-                    let mut latest_notes = None;
-                    loop {
-                        match receiver.try_recv() {
-                            Ok(notes) => latest_notes = Some(notes),
-                            Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
-                        }
-                    }
-                    if let Some(notes) = latest_notes
-                        && let Ok(scheduled_notes) = schedule_live_sampler_pattern_notes(
-                            document,
-                            &notes,
-                            options,
-                            &render.sources_by_channel,
-                            live_vst3_volume_expression_channels.as_ref(),
-                            (!clap_pattern_channels.is_empty()).then_some(&clap_pattern_channels),
-                        )
-                    {
-                        engine.replace_unplayed_pattern_notes();
-                        let current_loop_start = block_start / loop_frames * loop_frames;
-                        engine.queue_live_notes_with_frame_offset(
-                            &scheduled_notes,
-                            current_loop_start,
-                            Some(block_start),
-                        )?;
-                        next_loop_start = current_loop_start
-                            .checked_add(loop_frames)
-                            .ok_or_else(|| "Sampler Pattern loop position overflow".to_owned())?;
-                        updated_pattern_notes = Some(scheduled_notes);
-                    }
+            if playback.repeat_pattern
+                && let Some(receiver) = note_updates.as_ref()
+            {
+                let mut latest_notes = None;
+                while let Ok(notes) = receiver.try_recv() {
+                    latest_notes = Some(notes);
+                }
+                if let Some(notes) = latest_notes
+                    && let Ok(scheduled_notes) = schedule_live_sampler_pattern_notes(
+                        document,
+                        &notes,
+                        options,
+                        &render.sources_by_channel,
+                        live_vst3_volume_expression_channels.as_ref(),
+                        (!clap_pattern_channels.is_empty()).then_some(&clap_pattern_channels),
+                    )
+                {
+                    engine.replace_unplayed_pattern_notes();
+                    let current_loop_start = block_start / loop_frames * loop_frames;
+                    engine.queue_live_notes_with_frame_offset(
+                        &scheduled_notes,
+                        current_loop_start,
+                        Some(block_start),
+                    )?;
+                    next_loop_start = current_loop_start
+                        .checked_add(loop_frames)
+                        .ok_or_else(|| "Sampler Pattern loop position overflow".to_owned())?;
+                    updated_pattern_notes = Some(scheduled_notes);
                 }
             }
             if let Some(latency_updates) = latency_updates.as_mut() {
