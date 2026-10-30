@@ -6493,6 +6493,19 @@ impl Vst3HostRuntime {
             }
         }
 
+        // Keep loaded, enabled Pattern channels available for live note edits even if the
+        // selected Pattern is silent on them when playback starts.
+        for channel_id in channel_instances.keys().copied() {
+            if plugin_channels.contains(&channel_id)
+                && channels_by_id.get(&channel_id).is_some_and(|channel| {
+                    channel.enabled() != Some(false)
+                        && mixer_route_audibility.allows_live_source_channel(channel.mixer_track())
+                })
+            {
+                notes_by_channel.entry(channel_id).or_default();
+            }
+        }
+
         let loop_output_frames = tempo_map
             .frame_at_tick(loop_length_ticks, output_sample_rate)?
             .max(1);
