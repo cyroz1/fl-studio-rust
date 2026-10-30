@@ -72699,12 +72699,12 @@ fn draw_sampler_envelope_lfo_editor(
     let mut enabled = record.enabled();
     let mut envelope_tempo_sync = record.tempo_sync_enabled();
     let mut lfo_tempo_sync = record.lfo_tempo_sync_enabled();
-    let mut lfo_phase_retrigger = record.lfo_phase_retrigger_enabled();
+    let mut lfo_global = !record.lfo_phase_retrigger_enabled();
     let enabled_changed = ui.checkbox(&mut enabled, "Enabled").changed();
     ui.horizontal_wrapped(|ui| {
         ui.checkbox(&mut envelope_tempo_sync, "Envelope tempo sync");
         ui.checkbox(&mut lfo_tempo_sync, "LFO tempo sync");
-        ui.checkbox(&mut lfo_phase_retrigger, "LFO phase retrigger");
+        ui.checkbox(&mut lfo_global, "Global");
     });
 
     macro_rules! edit_raw {
@@ -72800,12 +72800,12 @@ fn draw_sampler_envelope_lfo_editor(
 
     let tempo_sync_changed = envelope_tempo_sync != record.tempo_sync_enabled();
     let lfo_tempo_sync_changed = lfo_tempo_sync != record.lfo_tempo_sync_enabled();
-    let lfo_phase_retrigger_changed = lfo_phase_retrigger != record.lfo_phase_retrigger_enabled();
+    let lfo_phase_retrigger_changed = lfo_global != !record.lfo_phase_retrigger_enabled();
     let edit = SamplerEnvelopeLfoEdit {
         enabled: enabled_changed.then_some(enabled),
         tempo_sync: tempo_sync_changed.then_some(envelope_tempo_sync),
         lfo_tempo_sync: lfo_tempo_sync_changed.then_some(lfo_tempo_sync),
-        lfo_phase_retrigger: lfo_phase_retrigger_changed.then_some(lfo_phase_retrigger),
+        lfo_phase_retrigger: lfo_phase_retrigger_changed.then_some(!lfo_global),
         predelay_raw,
         attack_raw,
         hold_raw,
