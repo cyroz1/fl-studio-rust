@@ -7282,6 +7282,7 @@ impl DawUi {
         let channel_rack_mute_removed_steps = load_channel_rack_mute_removed_steps();
         let hide_collapsed_playlist_groups = load_hide_collapsed_playlist_groups();
         let playlist_zero_crossing_splits = load_playlist_zero_crossing_splits();
+        let playlist_show_fade_gain_previews = load_playlist_show_fade_gain_previews();
         let playlist_pattern_color_mode = load_playlist_pattern_color_mode();
         let playlist_edit_patterns_in = load_playlist_edit_patterns_in();
         let playlist_scroll_to_position = load_playlist_scroll_to_position();
@@ -7676,7 +7677,7 @@ impl DawUi {
             timeline_zoom: 0.10,
             playlist_track_zoom: 1.0,
             playlist_waveform_mode: PlaylistWaveformMode::Combined,
-            playlist_show_fade_gain_previews: true,
+            playlist_show_fade_gain_previews,
             playlist_zero_crossing_splits,
             plugin_candidates,
             audio_unit_probe_sender,
@@ -26996,11 +26997,23 @@ impl DawUi {
                         ui.selectable_value(&mut self.playlist_waveform_mode, mode, mode.label());
                     }
                 });
-            ui.checkbox(
-                &mut self.playlist_show_fade_gain_previews,
-                "Show fade/gain previews",
-            )
-            .on_hover_text("Hold Alt to show previews temporarily while this is off");
+            if ui
+                .checkbox(
+                    &mut self.playlist_show_fade_gain_previews,
+                    "Show fade/gain previews",
+                )
+                .on_hover_text(
+                    "This preference is saved for future sessions. Hold Alt to show previews temporarily while it is off.",
+                )
+                .changed()
+                && let Err(error) = save_playlist_show_fade_gain_previews(
+                    self.playlist_show_fade_gain_previews,
+                )
+            {
+                self.status = format!(
+                    "Could not save the Playlist waveform preview setting: {error}"
+                );
+            }
             let mut automatic_crossfades_enabled =
                 self.playlist_automatic_crossfades_enabled();
             if ui
@@ -77621,6 +77634,31 @@ fn save_hide_collapsed_playlist_groups(enabled: bool) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| "the Playlist view settings path has no parent folder".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    fs::write(&path, format!("{enabled}\n"))
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
+fn playlist_show_fade_gain_previews_settings_file() -> Option<PathBuf> {
+    browser_favorites_file()?
+        .parent()
+        .map(|directory| directory.join("playlist-show-fade-gain-previews.txt"))
+}
+
+fn load_playlist_show_fade_gain_previews() -> bool {
+    playlist_show_fade_gain_previews_settings_file()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|contents| contents.trim().parse::<bool>().ok())
+        .unwrap_or(true)
+}
+
+fn save_playlist_show_fade_gain_previews(enabled: bool) -> Result<(), String> {
+    let path = playlist_show_fade_gain_previews_settings_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the Playlist waveform settings path has no parent folder".to_owned())?;
     fs::create_dir_all(parent)
         .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
     fs::write(&path, format!("{enabled}\n"))
