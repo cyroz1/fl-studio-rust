@@ -40700,9 +40700,10 @@ impl DawUi {
                 .is_some_and(|channel| {
                     channel.data_event_index().is_some()
                         && !channel.points().is_empty()
-                        && channel.points().iter().all(|point| {
-                            point.value().is_finite() && (-0.001..=1.001).contains(&point.value())
-                        })
+                        && channel
+                            .points()
+                            .iter()
+                            .all(|point| normalized_automation_point_value(point.value()).is_some())
                 });
             if !has_blob {
                 ui.menu_button("Initialize from template", |ui| {
@@ -40760,8 +40761,7 @@ impl DawUi {
                         && points.iter().all(|point| {
                             point.position_beats().is_finite()
                                 && point.position_beats() >= 0.0
-                                && point.value().is_finite()
-                                && (-0.001..=1.001).contains(&point.value())
+                                && normalized_automation_point_value(point.value()).is_some()
                                 && point.tension().is_finite()
                         })
                         && points
