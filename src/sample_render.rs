@@ -12036,6 +12036,13 @@ fn prepare_sampler_arrangement(
                     processed_audio
                 }
             };
+            let processed_window = SampleBounds {
+                start: 0,
+                end: audio.frame_count(),
+            };
+            let loop_points = trim_sampler_loop_points(loop_points, processed_window);
+            let release_loop_points =
+                trim_sampler_loop_points(release_loop_points, processed_window);
             let prepared_stretch_source = prepare_sampler_stretch_source(
                 channel,
                 audio,
@@ -15123,6 +15130,13 @@ fn prepare_sampler_pattern_for_channel_internal(
                     processed_audio
                 }
             };
+            let processed_window = SampleBounds {
+                start: 0,
+                end: audio.frame_count(),
+            };
+            let loop_points = trim_sampler_loop_points(loop_points, processed_window);
+            let release_loop_points =
+                trim_sampler_loop_points(release_loop_points, processed_window);
             let prepared_stretch_source = prepare_sampler_stretch_source(
                 channel,
                 audio,
@@ -16888,6 +16902,7 @@ fn sampler_precomputed_fx(channel: &ChannelSummary) -> SamplerPrecomputedFx {
         remove_dc: channel.sample_remove_dc_enabled(),
         normalize: channel.sample_normalize_enabled(),
         reverse_polarity: channel.sample_reverse_polarity_enabled(),
+        trim_threshold_raw: channel.sample_trim_threshold_raw(),
         sample_start_raw: channel.sample_start_raw(),
         sample_length_raw: channel.sample_length_raw(),
     }
@@ -16981,6 +16996,39 @@ fn apply_sampler_sample_fx(audio: &mut DecodedAudio, fx: SamplerPrecomputedFx) {
                 let end = window.end.min(channel.len()).max(start);
                 *channel = channel[start..end].to_vec();
             }
+        }
+    }
+    if let Some(threshold_raw) = fx.trim_threshold_raw.filter(|raw| *raw <= 256) {
+        trim_sample_tail(audio, f64::from(threshold_raw) / 256.0);
+    }
+}
+
+/// Remove trailing frames below the documented linear Trim threshold. The raw-to-amplitude
+/// mapping and multi-channel frame comparison are candidates pending native render comparison.
+fn trim_sample_tail(audio: &mut DecodedAudio, threshold: f64) {
+    let frame_count = audio.frame_count();
+    if frame_count == 0 || audio.channels.is_empty() {
+        return;
+    }
+    let retained_frames = (0..frame_count)
+        .rev()
+        .find(|frame| {
+            audio.channels.iter().any(|channel| {
+                let Some(sample) = channel.get(*frame).copied() else {
+                    return false;
+                };
+                !sample.is_finite() || f64::from(sample).abs() > threshold
+            })
+        })
+        .map_or(0, |frame| frame + 1);
+    if retained_frames == 0 {
+        for channel in &mut audio.channels {
+            channel.clear();
+            channel.push(0.0);
+        }
+    } else {
+        for channel in &mut audio.channels {
+            channel.truncate(retained_frames);
         }
     }
 }
@@ -17223,6 +17271,7 @@ struct SamplerPrecomputedFx {
     remove_dc: bool,
     normalize: bool,
     reverse_polarity: bool,
+    trim_threshold_raw: Option<u32>,
     sample_start_raw: Option<[u16; 2]>,
     sample_length_raw: Option<[u16; 2]>,
 }
@@ -17251,6 +17300,7 @@ impl SamplerPrecomputedFx {
             || self.remove_dc
             || self.normalize
             || self.reverse_polarity
+            || self.trim_threshold_raw.is_some()
             || !self.sample_window_is_default()
     }
 }
@@ -22927,6 +22977,7 @@ mod tests {
                 remove_dc: false,
                 normalize: true,
                 reverse_polarity: true,
+                trim_threshold_raw: None,
                 sample_start_raw: None,
                 sample_length_raw: None,
             },
@@ -22951,6 +23002,7 @@ mod tests {
                 remove_dc: false,
                 normalize: true,
                 reverse_polarity: false,
+                trim_threshold_raw: None,
                 sample_start_raw: None,
                 sample_length_raw: None,
             },

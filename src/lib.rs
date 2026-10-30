@@ -719,6 +719,7 @@ pub struct ChannelSummary {
     sample_remove_dc: Option<bool>,
     sample_normalize: Option<bool>,
     sample_reverse_polarity: Option<bool>,
+    sample_trim_threshold_raw: Option<u32>,
     sample_start_raw: Option<[u16; 2]>,
     sample_length_raw: Option<[u16; 2]>,
     sampler_envelope_lfos: [Option<SamplerEnvelopeLfo>; 5],
@@ -801,6 +802,12 @@ pub struct ChannelSampleFxFlagsEdit {
 pub struct ChannelSampleWindowEdit {
     pub start_fraction: Option<f64>,
     pub length_fraction: Option<f64>,
+}
+
+/// Linear raw Trim threshold from the channel Parameters (`0xC7`) payload, in `0..=256`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ChannelSampleTrimEdit {
+    pub threshold_raw: Option<u32>,
 }
 
 /// Raw time-stretch settings from the channel Parameters (`0xC7`) payload.
@@ -1220,6 +1227,13 @@ impl ChannelSummary {
     /// Whether reverse polarity is enabled for this Sampler or Audio Clip source.
     pub fn sample_reverse_polarity_enabled(&self) -> bool {
         matches!(self.kind, Some(0 | 4)) && self.sample_reverse_polarity.unwrap_or(false)
+    }
+
+    /// Saved linear Trim threshold (`0..=256`) for this Sampler or Audio Clip source.
+    pub fn sample_trim_threshold_raw(&self) -> Option<u32> {
+        matches!(self.kind, Some(0 | 4))
+            .then_some(self.sample_trim_threshold_raw)
+            .flatten()
     }
 
     /// Whether the kind-0 Sampler's Volume envelope is enabled, when its saved `0xDA`
@@ -6378,6 +6392,14 @@ impl FlpDocument {
                         }
                         if event.payload.len() >= 82 && channel.sample_reverse_polarity.is_none() {
                             channel.sample_reverse_polarity = Some(event.payload[81] != 0);
+                        }
+                        if event.payload.len() >= 96 && channel.sample_trim_threshold_raw.is_none()
+                        {
+                            channel.sample_trim_threshold_raw = Some(u32::from_le_bytes(
+                                event.payload[92..96]
+                                    .try_into()
+                                    .expect("the sample Trim threshold field has four bytes"),
+                            ));
                         }
                     }
                     if event.payload.len() >= 112 && channel.stretch_settings.is_none() {
@@ -23664,6 +23686,72 @@ impl FlpDocument {
         if let Some(reverse_polarity) = edit.reverse_polarity {
             payload[81] = u8::from(reverse_polarity);
         }
+        candidate.events[parameters_index].replace_data_payload(payload)?;
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    /// Edits the documented linear Trim threshold in a unique existing Parameters event.
+    /// Other payload bytes and every unrelated event are preserved.
+    pub fn edit_channel_sample_trim_threshold(
+        &mut self,
+        channel_id: u16,
+        edit: ChannelSampleTrimEdit,
+    ) -> Result<(), FlpError> {
+        let Some(threshold_raw) = edit.threshold_raw else {
+            return Err(FlpError::UnsupportedEdit(
+                "a sample Trim threshold must be supplied",
+            ));
+        };
+        if threshold_raw > 256 {
+            return Err(FlpError::UnsupportedEdit(
+                "sample Trim threshold must be between 0 and 256",
+            ));
+        }
+
+        self.require_unique_channel(channel_id)?;
+        let channel = self
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id() == channel_id)
+            .expect("the unique channel was checked above");
+        if !matches!(channel.kind, Some(0 | 4)) {
+            return Err(FlpError::UnsupportedEdit(
+                "sample Trim threshold can only be edited on Sampler or Audio Clip channels",
+            ));
+        }
+
+        let c7_events = channel
+            .event_range()
+            .filter(|index| self.events[*index].opcode == 0xC7)
+            .collect::<Vec<_>>();
+        let mut parameter_events = c7_events.iter().copied().filter(|index| {
+            matches!(self.events[*index].encoding, PayloadEncoding::Data { .. })
+                && ascii_version(&self.events[*index].payload).is_none()
+        });
+        let parameters_index = parameter_events.next();
+        if parameter_events.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel has multiple Parameters (`0xC7`) events",
+            ));
+        }
+        let Some(parameters_index) = parameters_index else {
+            return Err(FlpError::UnsupportedEdit(if c7_events.is_empty() {
+                "the selected channel has no existing Parameters (`0xC7`) event"
+            } else {
+                "the selected channel's `0xC7` event is not a recognized Parameters payload"
+            }));
+        };
+        if self.events[parameters_index].payload.len() < 96 {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel's Parameters event does not contain the sample Trim threshold field",
+            ));
+        }
+
+        let mut candidate = self.clone();
+        let mut payload = candidate.events[parameters_index].payload.clone();
+        payload[92..96].copy_from_slice(&threshold_raw.to_le_bytes());
         candidate.events[parameters_index].replace_data_payload(payload)?;
         candidate.refresh_event_offsets()?;
         *self = candidate;

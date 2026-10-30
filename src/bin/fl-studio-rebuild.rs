@@ -99,21 +99,21 @@ use flp_rebuild::{
     ArpeggioScorePatternMode, ArpeggioScoreTimeMultiplier, ArpeggioSyncMode, Arrangement,
     ArticulateOptions, AutomationChannel, AutomationInterpolationMode, AutomationPoint,
     AutomationPointEdit, AutomationScaleLevelsOptions, ChannelGroupSummary, ChannelNoteRouter,
-    ChannelSampleEffectsEdit, ChannelSampleFxFlagsEdit, ChannelSampleWindowEdit, ChannelSortOrder,
-    ChannelStretchMode, ChannelStretchSettingsEdit, ChannelSummary, ChannelType,
-    ClawMachineOptions, FlamOptions, FlpDocument, FlpError, FscControllerStreamImportOptions,
-    FscScore, FstPreset, FstPresetKind, HumanizerOptions, LimitNoteOptions, LimitSnapDirection,
-    MixerInsertEdit, MixerInsertSummary, MixerParameterKind, MixerParameterRecord,
-    MixerSendSummary, PATTERN_NOTE_DEFAULT_FLAGS, PATTERN_NOTE_DEFAULT_RELEASE,
-    PATTERN_NOTE_SLIDE_FLAG, Pattern, PatternController, PatternControllerEdit, PatternNote,
-    PatternNoteEdit, PatternNoteRotation, PayloadEncoding, PlaylistClip, PlaylistClipEdit,
-    PlaylistClipSelectionClipboard, PlaylistClipTarget, PlaylistTrack, PlaylistTrackEdit,
-    PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit,
-    ProjectSettingsEdit, QuantizeNoteLevels, QuantizeNoteMode, QuantizeNoteOptions,
-    RandomNoteChordMap, RandomNoteGeneratorOptions, RandomizerOptions, RiffMachineOptions,
-    RiffMachineQuantizeMode, RiffMachineStage, SamplerEnvelopeLfo, SamplerEnvelopeLfoEdit,
-    SamplerEnvelopeLfoTarget, ScaleLevelsOptions, StrumOptions, TimeMarker, TimeMarkerEdit,
-    VstPluginStateMetadata,
+    ChannelSampleEffectsEdit, ChannelSampleFxFlagsEdit, ChannelSampleTrimEdit,
+    ChannelSampleWindowEdit, ChannelSortOrder, ChannelStretchMode, ChannelStretchSettingsEdit,
+    ChannelSummary, ChannelType, ClawMachineOptions, FlamOptions, FlpDocument, FlpError,
+    FscControllerStreamImportOptions, FscScore, FstPreset, FstPresetKind, HumanizerOptions,
+    LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerInsertSummary, MixerParameterKind,
+    MixerParameterRecord, MixerSendSummary, PATTERN_NOTE_DEFAULT_FLAGS,
+    PATTERN_NOTE_DEFAULT_RELEASE, PATTERN_NOTE_SLIDE_FLAG, Pattern, PatternController,
+    PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation, PayloadEncoding,
+    PlaylistClip, PlaylistClipEdit, PlaylistClipSelectionClipboard, PlaylistClipTarget,
+    PlaylistTrack, PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync,
+    ProjectInfoEdit, ProjectSettingsEdit, QuantizeNoteLevels, QuantizeNoteMode,
+    QuantizeNoteOptions, RandomNoteChordMap, RandomNoteGeneratorOptions, RandomizerOptions,
+    RiffMachineOptions, RiffMachineQuantizeMode, RiffMachineStage, SamplerEnvelopeLfo,
+    SamplerEnvelopeLfoEdit, SamplerEnvelopeLfoTarget, ScaleLevelsOptions, StrumOptions, TimeMarker,
+    TimeMarkerEdit, VstPluginStateMetadata,
 };
 use md5::{Digest, Md5};
 use vst3_host::midi::{MidiChannel as Vst3MidiChannel, MidiEvent as Vst3MidiEvent};
@@ -37015,6 +37015,7 @@ impl DawUi {
         let mut channel_sample_effect_edits = Vec::new();
         let mut channel_sample_fx_flag_edits = Vec::new();
         let mut channel_sample_window_edits = Vec::new();
+        let mut channel_sample_trim_edits = Vec::new();
         let mut channel_main_pitch_edits = Vec::new();
         let mut channel_add_to_key_edits = Vec::new();
         let mut channel_zipped_edits = Vec::new();
@@ -37724,6 +37725,25 @@ impl DawUi {
                                                 ChannelSampleWindowEdit {
                                                     length_fraction: Some(length),
                                                     ..ChannelSampleWindowEdit::default()
+                                                },
+                                            ));
+                                        }
+                                    });
+                                    ui.menu_button("Trim threshold", |ui| {
+                                        let mut threshold_raw = channel
+                                            .sample_trim_threshold_raw()
+                                            .unwrap_or(0);
+                                        if ui
+                                            .add(
+                                                egui::Slider::new(&mut threshold_raw, 0..=256)
+                                                    .text("Trim threshold"),
+                                            )
+                                            .changed()
+                                        {
+                                            channel_sample_trim_edits.push((
+                                                channel.id(),
+                                                ChannelSampleTrimEdit {
+                                                    threshold_raw: Some(threshold_raw),
                                                 },
                                             ));
                                         }
@@ -38913,6 +38933,27 @@ impl DawUi {
                 }
                 Some(Err(error)) => {
                     self.status = format!("Could not change sample window: {error}");
+                }
+                None => {}
+            }
+        }
+        for (channel_id, edit) in channel_sample_trim_edits {
+            let result = self
+                .document
+                .as_mut()
+                .map(|document| document.edit_channel_sample_trim_threshold(channel_id, edit));
+            match result {
+                Some(Ok(())) => {
+                    self.stop_project_playback();
+                    self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+                    self.status = format!(
+                        "Channel {channel_id} sample Trim threshold set to {:?}",
+                        edit.threshold_raw
+                    );
+                }
+                Some(Err(error)) => {
+                    self.status = format!("Could not change sample Trim threshold: {error}");
                 }
                 None => {}
             }
