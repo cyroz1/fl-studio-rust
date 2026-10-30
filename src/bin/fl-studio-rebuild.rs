@@ -48654,6 +48654,14 @@ impl DawUi {
             .map(Vst3PlaylistStreamProcessor::summary);
 
         self.initialize_live_master_mixer_targets(document);
+        let pattern_note_update_snapshot = loop_length_ticks.and_then(|_| {
+            document
+                .patterns()
+                .ok()?
+                .into_iter()
+                .find(|pattern| pattern.id == pattern_id)
+                .map(|pattern| pattern.notes)
+        });
 
         if staged_handoff.is_none() {
             self.stop_project_playback();
@@ -48716,14 +48724,6 @@ impl DawUi {
             self.midi_script_mixer_peak_holds.fill((0.0, 0.0));
             self.midi_script_mixer_peak_updated_at = Instant::now();
         }
-        let pattern_note_update_snapshot = loop_length_ticks.and_then(|_| {
-            document
-                .patterns()
-                .ok()?
-                .into_iter()
-                .find(|pattern| pattern.id == pattern_id)
-                .map(|pattern| pattern.notes)
-        });
         let (pattern_note_update_sender_for_ui, pattern_note_update_receiver) =
             if pattern_note_update_snapshot.is_some() {
                 let (updates, receiver) = mpsc::sync_channel(1);
