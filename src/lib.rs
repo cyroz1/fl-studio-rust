@@ -14151,6 +14151,23 @@ impl FlpDocument {
                     || matches!(event.opcode, 0x40 | 0x62 | 0x63)
             })
             .map_or(self.events.len(), |offset| region_start + offset);
+        let color_event_index = if pattern.color.is_some() {
+            Some(
+                self.events[region_start..region_end]
+                    .iter()
+                    .position(|event| {
+                        event.opcode == 0x96
+                            && event.encoding == PayloadEncoding::Dword
+                            && event.payload.len() == 4
+                    })
+                    .map(|offset| region_start + offset)
+                    .ok_or(FlpError::UnsupportedEdit(
+                        "a selected Pattern color has no recognized source event",
+                    ))?,
+            )
+        } else {
+            None
+        };
         let note_event_index = self
             .events
             .get(region_start)
@@ -14177,7 +14194,9 @@ impl FlpDocument {
         let mut length_event_count = 0usize;
 
         for event_index in region_start..region_end {
-            if time_marker_event_indices.contains(&event_index) {
+            if time_marker_event_indices.contains(&event_index)
+                || Some(event_index) == color_event_index
+            {
                 continue;
             }
             let event = &self.events[event_index];
@@ -14246,8 +14265,9 @@ impl FlpDocument {
     /// into that range and clipped at each source clip's endpoint. Raw Pattern controller
     /// points are repeated and carried into the merged pattern without interpreting their
     /// channel or flags. Recognized Pattern time markers are repeated with their raw flags and
-    /// meter/name events preserved. Original patterns remain unchanged. Unknown per-pattern
-    /// data and scaled clips are rejected because their score timing or payload is not modeled.
+    /// meter/name events preserved. The receiver Pattern's name and color are retained. Original
+    /// patterns remain unchanged. Unknown per-pattern data and scaled clips are rejected because
+    /// their score timing or payload is not modeled.
     pub fn merge_playlist_pattern_clips(
         &mut self,
         arrangement_id: u16,
@@ -14394,6 +14414,7 @@ impl FlpDocument {
             .as_deref()
             .unwrap_or("Merged")
             .to_owned();
+        let pattern_color = receiver_pattern.color;
         let mut merged_notes = Vec::<PatternNote>::new();
         let mut merged_controllers = Vec::<PatternController>::new();
         let mut merged_time_markers = Vec::<PlaylistPatternMergeMarker>::new();
@@ -14611,6 +14632,10 @@ impl FlpDocument {
             encode_project_string(&pattern_name, candidate.project_strings_use_utf16())?;
         let name_event = FlpEvent::new_data(0xC1, name_payload)?;
         let length_event = FlpEvent::new_dword(0xA4, merged_length_ticks);
+        let mut metadata_events = vec![name_event, length_event];
+        if let Some(color) = pattern_color {
+            metadata_events.push(FlpEvent::new_dword(0x96, u32::from_le_bytes(color)));
+        }
         let merged_marker_index = candidate
             .events
             .iter()
@@ -14628,7 +14653,7 @@ impl FlpDocument {
             .ok_or(FlpError::LengthOverflow)?;
         candidate.events.splice(
             metadata_insert_index..metadata_insert_index,
-            [name_event, length_event],
+            metadata_events,
         );
         candidate.refresh_event_offsets()?;
 
