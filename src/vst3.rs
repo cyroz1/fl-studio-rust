@@ -10019,19 +10019,19 @@ impl StereoStreamResampler {
             .source_frames
             .checked_add(frame_count as u64)
             .ok_or_else(|| "VST3 stream frame count overflow".to_owned())?;
-        for frame in 0..frame_count {
+        for (frame_index, _) in outputs[0].iter().take(frame_count).enumerate() {
             let mut left = 0.0_f64;
             let mut right = 0.0_f64;
             let mut channel_index = 0;
             for bus_channel_count in bus_channels {
                 if *bus_channel_count == 1 {
-                    let sample = f64::from(finite_sample(outputs[channel_index][frame]));
+                    let sample = f64::from(finite_sample(outputs[channel_index][frame_index]));
                     left += sample;
                     right += sample;
                     channel_index += 1;
                 } else {
-                    left += f64::from(finite_sample(outputs[channel_index][frame]));
-                    right += f64::from(finite_sample(outputs[channel_index + 1][frame]));
+                    left += f64::from(finite_sample(outputs[channel_index][frame_index]));
+                    right += f64::from(finite_sample(outputs[channel_index + 1][frame_index]));
                     channel_index += 2;
                 }
             }
