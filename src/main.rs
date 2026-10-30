@@ -7504,7 +7504,7 @@ fn list_automation_target_links(path: &Path) -> Result<(), String> {
         .map_err(|error| format!("could not decode candidate automation target links: {error}"))?;
     println!("candidate automation target links: {}", links.len());
     for link in links {
-        let source_id = u16::from(link.source_channel_id());
+        let source_id = link.source_channel_id();
         let source_channel = channels.iter().find(|channel| channel.id() == source_id);
         let source_name = source_channel.and_then(|channel| channel.display_name());
         let source_type = source_channel.and_then(|channel| channel.channel_type());

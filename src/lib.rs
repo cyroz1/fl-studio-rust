@@ -2339,7 +2339,7 @@ impl AutomationChannel {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AutomationTargetLink {
     event_index: usize,
-    source_channel_id: u8,
+    source_channel_id: u16,
     opaque_prefix: [u8; 8],
     parameter_raw: u16,
     destination_raw: i16,
@@ -2351,8 +2351,8 @@ impl AutomationTargetLink {
         self.event_index
     }
 
-    /// Candidate source Automation channel id from the observed record layout.
-    pub fn source_channel_id(&self) -> u8 {
+    /// Candidate 16-bit source Automation channel id from bytes 2–3 of the record.
+    pub fn source_channel_id(&self) -> u16 {
         self.source_channel_id
     }
 
@@ -2388,10 +2388,12 @@ impl AutomationTargetLink {
     }
 
     /// Candidate `(Mixer insert, slot)` from the observed packed destination field.
-    /// The insert index formula is provisional and remains subject to native comparison.
+    /// The insert uses bits 6–12 and the slot uses bits 0–5. This layout was
+    /// independently surveyed across a local producer corpus; native comparison
+    /// remains necessary before using the candidate for playback routing.
     pub fn candidate_mixer_effect_target(&self) -> Option<(u16, u16)> {
         let raw = self.destination_raw as u16;
-        (raw & 0x2000 != 0).then_some(((raw & 0x0ff0) >> 6, raw & 0x003f))
+        (raw & 0x2000 != 0).then_some(((raw >> 6) & 0x007f, raw & 0x003f))
     }
 
     /// Final eight record bytes, retained as opaque data.
@@ -7246,7 +7248,7 @@ impl FlpDocument {
             for record in records {
                 links.push(AutomationTargetLink {
                     event_index,
-                    source_channel_id: record[2],
+                    source_channel_id: u16::from_le_bytes([record[2], record[3]]),
                     opaque_prefix: record[..8]
                         .try_into()
                         .expect("an automation target record has an eight-byte prefix"),
