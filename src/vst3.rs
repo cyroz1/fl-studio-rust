@@ -33,7 +33,7 @@ use vst3_host::midi::{
     MidiChannel, MidiEvent, NoteExpressionInfo, NoteExpressionType, NoteId, PluginEvent,
     PluginEventData,
 };
-use vst3_host::{Plugin, PluginWindow, Vst3Host};
+use vst3_host::{Plugin, Vst3Host};
 
 use crate::PatternNote;
 
@@ -4145,7 +4145,7 @@ impl HostedPluginInfo {
 struct HostedPlugin {
     info: HostedPluginInfo,
     plugin: Arc<Mutex<Plugin>>,
-    editor: Option<PluginWindow>,
+    editor_open: bool,
 }
 
 fn read_32bit_x86_binary(path: &Path) -> bool {
@@ -4691,7 +4691,7 @@ impl Vst3HostRuntime {
         self.loaded.push(HostedPlugin {
             info: info.clone(),
             plugin: Arc::new(Mutex::new(plugin)),
-            editor: None,
+            editor_open: false,
         });
         Ok(info)
     }
@@ -5017,13 +5017,13 @@ impl Vst3HostRuntime {
                 loaded.info.name
             ));
         }
-        if loaded.editor.is_none() {
-            loaded.editor = Some(PluginWindow::new(loaded.plugin.clone()));
-        }
-        let editor = loaded.editor.as_mut().expect("editor was just created");
-        // `PluginWindow` does not expose a raise/focus operation. Reopening an existing
-        // native editor recreates its window and brings it above the main DAW window.
-        editor.open().map_err(|error| error.to_string())?;
+        loaded
+            .plugin
+            .lock()
+            .map_err(|_| "plug-in state lock was poisoned".to_owned())?
+            .open_isolated_editor()
+            .map_err(|error| error.to_string())?;
+        loaded.editor_open = true;
         Ok(())
     }
 
@@ -5033,16 +5033,25 @@ impl Vst3HostRuntime {
             .iter_mut()
             .find(|loaded| loaded.info.id == id)
             .ok_or_else(|| format!("no loaded VST3 instance with id {id}"))?;
-        if let Some(mut editor) = loaded.editor.take() {
-            editor.close();
+        if loaded.editor_open {
+            loaded
+                .plugin
+                .lock()
+                .map_err(|_| "plug-in state lock was poisoned".to_owned())?
+                .close_editor()
+                .map_err(|error| error.to_string())?;
+            loaded.editor_open = false;
         }
         Ok(())
     }
 
     pub fn close_all_editors(&mut self) {
         for loaded in &mut self.loaded {
-            if let Some(mut editor) = loaded.editor.take() {
-                editor.close();
+            if loaded.editor_open {
+                if let Ok(mut plugin) = loaded.plugin.lock() {
+                    let _ = plugin.close_editor();
+                }
+                loaded.editor_open = false;
             }
         }
     }
@@ -7587,11 +7596,6 @@ impl Vst3HostRuntime {
     pub fn service_editors(&mut self) -> Result<Vst3HostServiceChanges, String> {
         let mut changes = Vst3HostServiceChanges::default();
         for loaded in &mut self.loaded {
-            if let Some(editor) = loaded.editor.as_ref() {
-                editor
-                    .service_platform_events()
-                    .map_err(|error| error.to_string())?;
-            }
             let mut plugin = loaded
                 .plugin
                 .lock()

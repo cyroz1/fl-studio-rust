@@ -10,3 +10,12 @@ at `assets/licenses/LGPL-3.0.txt`, and the dependency versions are pinned in
 
 - [mp3lame-encoder source](https://crates.io/crates/mp3lame-encoder/0.2.5)
 - [mp3lame-sys source](https://crates.io/crates/mp3lame-sys/0.1.11)
+
+## VST3 hosting
+
+The VST3 hosting library is based on `vst3-host` 0.10.0 by Helge Sverre and is
+included under its MIT license. The license text is included at
+`vendor/vst3-host/LICENSE`; the dependency source and version are in
+`vendor/vst3-host` and `Cargo.lock`.
+
+- [vst3-host source](https://github.com/HelgeSverre/rust-vst3-host/tree/v0.10.0)
