@@ -8522,6 +8522,7 @@ fn stream_pattern_from_tick_with_vst3_to_device(
         render.resampling_quality,
         render.pan_law,
     );
+    engine.tempo_map = Some(&render.tempo_map);
     engine.mixer_transforms_by_channel = Some(&render.mixer_transforms_by_channel);
     engine.mixer_meter_transforms_by_channel = Some(&render.mixer_meter_transforms_by_channel);
     engine.mixer_effect_input_transforms_by_channel =
@@ -9163,6 +9164,7 @@ pub fn stream_sampler_midi_input_to_device(
         render.resampling_quality,
         render.pan_law,
     );
+    engine.tempo_map = Some(&render.tempo_map);
     engine.mixer_transforms_by_channel = Some(&render.mixer_transforms_by_channel);
 
     const LIVE_BLOCK_FRAMES: usize = 128;
@@ -9200,6 +9202,7 @@ pub fn stream_sampler_midi_input_to_device(
                         ));
                     }
                     current_tempo_bpm = tempo_bpm;
+                    engine.set_tempo_at_frame(block_start, tempo_bpm);
                     live_resample_fine_pitch_by_channel.clear();
                     for (target_channel_id, base_adjustment_cents) in
                         &base_resample_pitch_adjustment_by_channel
@@ -9447,6 +9450,7 @@ pub fn stream_mixed_layer_midi_input_to_device(
         sampler_render.resampling_quality,
         sampler_render.pan_law,
     );
+    sampler_engine.tempo_map = Some(&sampler_render.tempo_map);
     sampler_engine.mixer_transforms_by_channel = Some(&sampler_render.mixer_transforms_by_channel);
     sampler_engine.mixer_meter_transforms_by_channel =
         Some(&sampler_render.mixer_meter_transforms_by_channel);
@@ -9998,6 +10002,7 @@ fn stream_prepared_sampler_pattern_with_mixer_effects(
         render.resampling_quality,
         render.pan_law,
     );
+    engine.tempo_map = Some(&render.tempo_map);
     engine.mixer_transforms_by_channel = Some(&render.mixer_transforms_by_channel);
     if processor.is_some() {
         engine.mixer_meter_transforms_by_channel = Some(&render.mixer_meter_transforms_by_channel);
@@ -12102,16 +12107,19 @@ fn prepare_sampler_arrangement(
                     channel,
                     SamplerEnvelopeLfoTarget::Panning,
                     options.sample_rate,
+                    ppq,
                 ),
                 volume_lfo: sampler_lfo_config(
                     channel,
                     SamplerEnvelopeLfoTarget::Volume,
                     options.sample_rate,
+                    ppq,
                 ),
                 pitch_lfo: sampler_lfo_config(
                     channel,
                     SamplerEnvelopeLfoTarget::Pitch,
                     options.sample_rate,
+                    ppq,
                 ),
                 max_polyphony_raw: channel.sampler_max_polyphony_raw(),
                 mono_enabled: channel.sampler_mono_enabled().unwrap_or(false),
@@ -12368,6 +12376,7 @@ fn prepare_sampler_arrangement(
 
 struct PreparedSamplerPattern {
     summary: SamplerPatternRenderSummary,
+    tempo_map: PlaylistTempoMap,
     pan_law: PanLaw,
     notes: Vec<ScheduledSamplerNote>,
     sources_by_channel: HashMap<u16, SamplerVoiceSource>,
@@ -12421,31 +12430,88 @@ struct SamplerVolumeEnvelope {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct SamplerLfo {
-    predelay_frames: u64,
-    attack_frames: u64,
-    period_frames: u64,
+    timing: SamplerLfoTiming,
     amount: f32,
     shape: i32,
     phase_retrigger: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SamplerLfoTiming {
+    Frames {
+        predelay: u64,
+        attack: u64,
+        period: u64,
+    },
+    Ticks {
+        predelay: f64,
+        attack: f64,
+        period: f64,
+    },
+}
+
 impl SamplerLfo {
-    fn value_at_frame(self, started_frame: u64, frame: u64) -> f32 {
-        let elapsed = if self.phase_retrigger {
-            frame.saturating_sub(started_frame)
-        } else {
-            frame
+    fn needs_tempo_map(self) -> bool {
+        matches!(self.timing, SamplerLfoTiming::Ticks { .. })
+    }
+
+    fn value_at_frame(
+        self,
+        started_frame: u64,
+        frame: u64,
+        started_tick: Option<f64>,
+        current_tick: Option<f64>,
+    ) -> f32 {
+        let (elapsed, predelay, attack, period) = match self.timing {
+            SamplerLfoTiming::Frames {
+                predelay,
+                attack,
+                period,
+            } => {
+                let elapsed = if self.phase_retrigger {
+                    frame.saturating_sub(started_frame)
+                } else {
+                    frame
+                };
+                (
+                    elapsed as f64,
+                    predelay as f64,
+                    attack as f64,
+                    period.max(1) as f64,
+                )
+            }
+            SamplerLfoTiming::Ticks {
+                predelay,
+                attack,
+                period,
+            } => {
+                let Some(current_tick) = current_tick else {
+                    return 0.0;
+                };
+                let elapsed = if self.phase_retrigger {
+                    let Some(started_tick) = started_tick else {
+                        return 0.0;
+                    };
+                    current_tick - started_tick
+                } else {
+                    current_tick
+                };
+                if !elapsed.is_finite() || elapsed < 0.0 {
+                    return 0.0;
+                }
+                (elapsed, predelay, attack, period)
+            }
         };
-        if elapsed < self.predelay_frames {
+        if elapsed < predelay {
             return 0.0;
         }
-        let elapsed = elapsed - self.predelay_frames;
-        let attack = if self.attack_frames == 0 {
+        let elapsed = elapsed - predelay;
+        let attack = if attack <= 0.0 {
             1.0
         } else {
-            (elapsed as f64 / self.attack_frames as f64).clamp(0.0, 1.0) as f32
+            (elapsed / attack).clamp(0.0, 1.0) as f32
         };
-        let phase = (elapsed % self.period_frames.max(1)) as f32 / self.period_frames.max(1) as f32;
+        let phase = (elapsed.rem_euclid(period) / period) as f32;
         let wave = match self.shape {
             0 => (phase * std::f32::consts::TAU).sin(),
             1 => 1.0 - 4.0 * (phase - 0.5).abs(),
@@ -14975,6 +15041,7 @@ fn prepare_sampler_pattern_for_channel_internal(
     if !tempo_bpm.is_finite() || tempo_bpm <= 0.0 {
         return Err("project tempo must be finite and positive".to_owned());
     }
+    let tempo_map = PlaylistTempoMap::constant(ppq, tempo_bpm)?;
     let pattern = document
         .patterns()
         .map_err(|error| error.to_string())?
@@ -15071,6 +15138,7 @@ fn prepare_sampler_pattern_for_channel_internal(
                 notes_skipped_unresolved_sample: 0,
                 unresolved_sample_channels: Vec::new(),
             },
+            tempo_map,
             pan_law,
             notes: Vec::new(),
             sources_by_channel: HashMap::new(),
@@ -15257,16 +15325,19 @@ fn prepare_sampler_pattern_for_channel_internal(
                     channel,
                     SamplerEnvelopeLfoTarget::Panning,
                     options.sample_rate,
+                    ppq,
                 ),
                 volume_lfo: sampler_lfo_config(
                     channel,
                     SamplerEnvelopeLfoTarget::Volume,
                     options.sample_rate,
+                    ppq,
                 ),
                 pitch_lfo: sampler_lfo_config(
                     channel,
                     SamplerEnvelopeLfoTarget::Pitch,
                     options.sample_rate,
+                    ppq,
                 ),
                 max_polyphony_raw: channel.sampler_max_polyphony_raw(),
                 mono_enabled: channel.sampler_mono_enabled().unwrap_or(false),
@@ -15474,6 +15545,7 @@ fn prepare_sampler_pattern_for_channel_internal(
             notes_skipped_unresolved_sample: skipped_unresolved,
             unresolved_sample_channels: unresolved_sample_channels.into_iter().collect(),
         },
+        tempo_map,
         pan_law,
         notes,
         sources_by_channel,
@@ -15531,6 +15603,8 @@ struct SamplerVoiceEngine<'a> {
     sources_by_channel: HashMap<u16, SamplerVoiceSource>,
     notes: &'a [ScheduledSamplerNote],
     tempo_map: Option<&'a PlaylistTempoMap>,
+    tempo_override: Option<SamplerTempoAnchor>,
+    tempo_synced_lfos: bool,
     live_notes: Vec<ScheduledSamplerNote>,
     mixer_transforms_by_channel: Option<&'a HashMap<u16, MixerSourceRouteTransform>>,
     live_mixer_source_routes_by_channel: Option<&'a HashMap<u16, MixerLiveSourceRoutePlan>>,
@@ -15559,6 +15633,14 @@ struct SamplerVoiceEngine<'a> {
     live_midi_expression: [f32; 16],
     sustain_down: [bool; 16],
     sostenuto_down: [bool; 16],
+}
+
+#[derive(Clone, Copy)]
+struct SamplerTempoAnchor {
+    frame: u64,
+    tick: f64,
+    tempo_bpm: f64,
+    ppq: u16,
 }
 
 #[derive(Clone)]
@@ -15593,6 +15675,7 @@ struct SamplerVoice {
     release_ping_pong_loop: bool,
     stop_frame: Option<u64>,
     started_frame: u64,
+    started_tick: Option<f64>,
     base_gain: f32,
     velocity_gain: f32,
     gain: f32,
@@ -15715,10 +15798,17 @@ impl<'a> SamplerVoiceEngine<'a> {
         resampling_quality: ResamplingQuality,
         pan_law: PanLaw,
     ) -> Self {
+        let tempo_synced_lfos = sources_by_channel.values().any(|source| {
+            source.pan_lfo.is_some_and(SamplerLfo::needs_tempo_map)
+                || source.volume_lfo.is_some_and(SamplerLfo::needs_tempo_map)
+                || source.pitch_lfo.is_some_and(SamplerLfo::needs_tempo_map)
+        });
         Self {
             sources_by_channel: sources_by_channel.clone(),
             notes,
             tempo_map: None,
+            tempo_override: None,
+            tempo_synced_lfos,
             live_notes: Vec::new(),
             mixer_transforms_by_channel: None,
             live_mixer_source_routes_by_channel: None,
@@ -15749,8 +15839,33 @@ impl<'a> SamplerVoiceEngine<'a> {
     }
 
     fn tick_at_frame(&self, frame: u64) -> Option<f64> {
-        self.tempo_map?
-            .tick_at_frame(frame, self.output_sample_rate)
+        let tempo_map = self.tempo_map?;
+        if let Some(anchor) = self.tempo_override.filter(|anchor| frame >= anchor.frame) {
+            let elapsed_frames = frame.saturating_sub(anchor.frame) as f64;
+            let elapsed_ticks = elapsed_frames * anchor.tempo_bpm * f64::from(anchor.ppq)
+                / (60.0 * f64::from(self.output_sample_rate));
+            let tick = anchor.tick + elapsed_ticks;
+            return tick.is_finite().then_some(tick.max(0.0));
+        }
+        tempo_map.tick_at_frame(frame, self.output_sample_rate)
+    }
+
+    fn set_tempo_at_frame(&mut self, frame: u64, tempo_bpm: f64) {
+        let Some(ppq) = self.tempo_map.map(|tempo_map| tempo_map.ppq) else {
+            return;
+        };
+        if !tempo_bpm.is_finite() || tempo_bpm <= 0.0 {
+            return;
+        }
+        let Some(tick) = self.tick_at_frame(frame) else {
+            return;
+        };
+        self.tempo_override = Some(SamplerTempoAnchor {
+            frame,
+            tick,
+            tempo_bpm,
+            ppq,
+        });
     }
 
     fn slide_tick_bounds(&self, start_frame: u64, end_frame: u64) -> (Option<f64>, Option<f64>) {
@@ -15906,18 +16021,16 @@ impl<'a> SamplerVoiceEngine<'a> {
         let mut last_active_output_frame = None;
         for offset in 0..frame_count {
             let frame = block_start + offset as u64;
-            let current_tick = self
-                .voices
-                .iter()
-                .any(|voice| {
+            let current_tick = (self.tempo_synced_lfos
+                || self.voices.iter().any(|voice| {
                     voice.as_ref().is_some_and(|voice| {
                         voice
                             .note_slide
                             .is_some_and(|slide| slide.start_tick.is_some())
                     })
-                })
-                .then(|| self.tick_at_frame(frame))
-                .flatten();
+                }))
+            .then(|| self.tick_at_frame(frame))
+            .flatten();
             self.current_frame = frame;
             for voice in self.voices.iter_mut().filter_map(Option::as_mut) {
                 if voice.note_slide.is_some() {
@@ -15975,8 +16088,12 @@ impl<'a> SamplerVoiceEngine<'a> {
                 if let Some(pitch_lfo) = voice.pitch_lfo {
                     // Candidate depth pending a native render comparison: full raw amount spans
                     // one octave in either direction.
-                    voice.lfo_pitch_cents =
-                        f64::from(pitch_lfo.value_at_frame(voice.started_frame, frame)) * 1_200.0;
+                    voice.lfo_pitch_cents = f64::from(pitch_lfo.value_at_frame(
+                        voice.started_frame,
+                        frame,
+                        voice.started_tick,
+                        current_tick,
+                    )) * 1_200.0;
                     let pitch_bend = voice
                         .input_midi_channel
                         .map_or(0, |channel| pitch_bend_cents[usize::from(channel)]);
@@ -16012,7 +16129,12 @@ impl<'a> SamplerVoiceEngine<'a> {
                 if render_samples {
                     if let Some(pan_lfo) = voice.pan_lfo {
                         let pan = (sampler_note_pan_value(voice.channel_pan, voice.note_pan_value)
-                            + pan_lfo.value_at_frame(voice.started_frame, frame))
+                            + pan_lfo.value_at_frame(
+                                voice.started_frame,
+                                frame,
+                                voice.started_tick,
+                                current_tick,
+                            ))
                         .clamp(-1.0, 1.0);
                         (voice.left_gain, voice.right_gain) =
                             channel_pan_gains(pan, voice.source.channels.len() == 1, pan_law);
@@ -16035,7 +16157,13 @@ impl<'a> SamplerVoiceEngine<'a> {
                     };
                     let envelope_gain = sampler_voice_volume_envelope_gain(voice, frame);
                     let lfo_gain = voice.volume_lfo.map_or(1.0, |lfo| {
-                        (1.0 + lfo.value_at_frame(voice.started_frame, frame)).clamp(0.0, 2.0)
+                        (1.0 + lfo.value_at_frame(
+                            voice.started_frame,
+                            frame,
+                            voice.started_tick,
+                            current_tick,
+                        ))
+                        .clamp(0.0, 2.0)
                     });
                     let midi_gain = voice.input_midi_channel.map_or(1.0, |channel| {
                         live_midi_expression[usize::from(channel)]
@@ -16134,6 +16262,9 @@ impl<'a> SamplerVoiceEngine<'a> {
 
     fn start_voice(&mut self, note: ScheduledSamplerNote) -> Option<usize> {
         let source = self.sources_by_channel.get(&note.channel_id)?;
+        let started_tick = self
+            .tick_at_frame(note.start_frame)
+            .or(Some(note.start_tick as f64));
         if note.slide_note {
             self.apply_pitch_slide(note);
             return None;
@@ -16348,6 +16479,7 @@ impl<'a> SamplerVoiceEngine<'a> {
             release_ping_pong_loop: source.release_ping_pong_loop,
             stop_frame: note.stop_frame,
             started_frame: note.start_frame,
+            started_tick,
             base_gain,
             velocity_gain,
             gain: base_gain * velocity_gain,
@@ -18485,9 +18617,11 @@ fn sampler_lfo_config(
     channel: &ChannelSummary,
     target: SamplerEnvelopeLfoTarget,
     sample_rate: u32,
+    ppq: u16,
 ) -> Option<SamplerLfo> {
     let lfo = channel.sampler_envelope_lfo(target)?;
-    if lfo.lfo_tempo_sync_enabled() || sample_rate == 0 {
+    let tempo_sync = lfo.lfo_tempo_sync_enabled();
+    if sample_rate == 0 || (tempo_sync && ppq == 0) {
         return None;
     }
     let (Some(predelay), Some(attack), Some(amount), Some(speed), Some(shape)) = (
@@ -18518,10 +18652,24 @@ fn sampler_lfo_config(
     let period_frames = (f64::from(sample_rate) / frequency_hz)
         .round()
         .clamp(1.0, u64::MAX as f64) as u64;
+    let timing = if tempo_sync {
+        // Candidate interpretation: reuse the free-running timing at a reference tempo of
+        // 60 BPM, where one second spans `ppq` ticks, then let the project tempo map scale it.
+        let ticks_per_frame = f64::from(ppq) / f64::from(sample_rate);
+        SamplerLfoTiming::Ticks {
+            predelay: predelay_frames as f64 * ticks_per_frame,
+            attack: attack_frames as f64 * ticks_per_frame,
+            period: period_frames as f64 * ticks_per_frame,
+        }
+    } else {
+        SamplerLfoTiming::Frames {
+            predelay: predelay_frames,
+            attack: attack_frames,
+            period: period_frames,
+        }
+    };
     Some(SamplerLfo {
-        predelay_frames,
-        attack_frames,
-        period_frames,
+        timing,
         amount: amount as f32 / 128.0,
         shape,
         phase_retrigger: lfo.lfo_phase_retrigger_enabled(),
