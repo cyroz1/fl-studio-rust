@@ -40900,21 +40900,27 @@ impl DawUi {
             let mut minimum_raw = saved_minimum;
             let mut maximum_raw = saved_maximum;
             let mut apply = false;
-            ui.horizontal(|ui| {
-                ui.label("Min raw");
-                ui.add(egui::DragValue::new(&mut minimum_raw).speed(1));
-                ui.label("Max raw");
-                ui.add(egui::DragValue::new(&mut maximum_raw).speed(1));
-                let changed = minimum_raw != saved_minimum || maximum_raw != saved_maximum;
-                apply = ui
-                    .add_enabled(changed, egui::Button::new("Apply range"))
-                    .clicked();
+            let editable = document.can_edit_automation_range_raw(channel_id);
+            ui.add_enabled_ui(editable, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Min raw");
+                    ui.add(egui::DragValue::new(&mut minimum_raw).speed(1));
+                    ui.label("Max raw");
+                    ui.add(egui::DragValue::new(&mut maximum_raw).speed(1));
+                    let changed = minimum_raw != saved_minimum || maximum_raw != saved_maximum;
+                    apply = ui
+                        .add_enabled(changed, egui::Button::new("Apply range"))
+                        .clicked();
+                });
             });
             if apply {
                 action = Some(AutomationEditAction::SetRangeRaw {
                     minimum_raw,
                     maximum_raw,
                 });
+            }
+            if !editable {
+                ui.weak("Min/Max editing requires a unique channel ID and one valid 0xDB event");
             }
         } else {
             ui.weak("No saved 0xDB Automation Min/Max event to edit");

@@ -7388,6 +7388,12 @@ impl FlpDocument {
         Ok(())
     }
 
+    /// Returns whether the selected Automation channel has one valid, editable `0xDB` event.
+    /// Duplicate channel IDs, missing or multiple range events, and malformed events are rejected.
+    pub fn can_edit_automation_range_raw(&self, channel_id: u16) -> bool {
+        self.automation_range_raw_event_index(channel_id).is_ok()
+    }
+
     /// Sets the raw Min and Max words in a type-5 channel's modern `0xDB` event.
     /// Other fields and trailing event bytes are preserved exactly.
     pub fn set_automation_range_raw(
@@ -7396,6 +7402,19 @@ impl FlpDocument {
         minimum_raw: i32,
         maximum_raw: i32,
     ) -> Result<(), FlpError> {
+        let event_index = self.automation_range_raw_event_index(channel_id)?;
+
+        let mut candidate = self.clone();
+        let mut payload = candidate.events[event_index].payload.clone();
+        payload[..4].copy_from_slice(&minimum_raw.to_le_bytes());
+        payload[4..8].copy_from_slice(&maximum_raw.to_le_bytes());
+        candidate.events[event_index].replace_data_payload(payload)?;
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    fn automation_range_raw_event_index(&self, channel_id: u16) -> Result<usize, FlpError> {
         self.require_unique_channel(channel_id)?;
         let channel = self
             .channels()
@@ -7427,15 +7446,7 @@ impl FlpDocument {
                 "the selected Automation 0xDB Min/Max event is truncated or not length-prefixed",
             ));
         }
-
-        let mut candidate = self.clone();
-        let mut payload = candidate.events[event_index].payload.clone();
-        payload[..4].copy_from_slice(&minimum_raw.to_le_bytes());
-        payload[4..8].copy_from_slice(&maximum_raw.to_le_bytes());
-        candidate.events[event_index].replace_data_payload(payload)?;
-        candidate.refresh_event_offsets()?;
-        *self = candidate;
-        Ok(())
+        Ok(event_index)
     }
 
     /// Sets the raw bipolar LFO amount stored at offset 4 of a type-5 channel's `0xEA` event.
