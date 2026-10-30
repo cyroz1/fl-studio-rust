@@ -1359,6 +1359,17 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 i32::from(parse_i16(amount, "automation LFO amount")?),
             )
         }
+        [command, input, output, channel_id, minimum_raw, maximum_raw]
+            if command == "set-automation-range-raw" =>
+        {
+            set_automation_range_raw(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(channel_id, "Automation channel id")?,
+                parse_i32(minimum_raw, "Automation minimum raw value")?,
+                parse_i32(maximum_raw, "Automation maximum raw value")?,
+            )
+        }
         [command, input, output, channel_id] if command == "flip-automation-points" => {
             flip_automation_points(
                 Path::new(input),
@@ -4516,6 +4527,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild set-layer-fade <input.flp> <output.flp> <layer-channel-id> <fade:0..256>\n",
             "  flp-rebuild edit-automation-point <input.flp> <output.flp> <channel-id> <point-index> <position-beats> <value> <tension>\n",
             "  flp-rebuild set-automation-point-tail <input.flp> <output.flp> <channel-id> <point-index> <8-hex-digits>\n",
+            "  flp-rebuild set-automation-range-raw <input.flp> <output.flp> <channel-id> <minimum-i32> <maximum-i32>\n",
             "  flp-rebuild flip-automation-points <input.flp> <output.flp> <channel-id>\n",
             "  flp-rebuild normalize-automation-points <input.flp> <output.flp> <channel-id>\n",
             "  flp-rebuild scale-automation-levels <input.flp> <output.flp> <channel-id> <center:-100..100> <tension:-100..100> <multiply:-200..200> <offset:-100..100>\n",
@@ -8927,6 +8939,29 @@ fn set_automation_lfo_amount(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "set automation channel {channel_id} LFO amount to {amount} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn set_automation_range_raw(
+    input: &Path,
+    output: &Path,
+    channel_id: u16,
+    minimum_raw: i32,
+    maximum_raw: i32,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .set_automation_range_raw(channel_id, minimum_raw, maximum_raw)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "set Automation channel {channel_id} raw Min/Max to {minimum_raw}/{maximum_raw} in {}",
         output.display()
     );
     Ok(())

@@ -4301,6 +4301,10 @@ enum AutomationEditAction {
     SetLfoAmount {
         amount: i32,
     },
+    SetRangeRaw {
+        minimum_raw: i32,
+        maximum_raw: i32,
+    },
     Insert {
         slot: usize,
         position_beats: f64,
@@ -40888,6 +40892,29 @@ impl DawUi {
             empty_view(ui, "Select an automation channel");
             return;
         };
+        if let Some((saved_minimum, saved_maximum)) = channel.automation_range_raw() {
+            let mut minimum_raw = saved_minimum;
+            let mut maximum_raw = saved_maximum;
+            let mut apply = false;
+            ui.horizontal(|ui| {
+                ui.label("Min raw");
+                ui.add(egui::DragValue::new(&mut minimum_raw).speed(1));
+                ui.label("Max raw");
+                ui.add(egui::DragValue::new(&mut maximum_raw).speed(1));
+                let changed = minimum_raw != saved_minimum || maximum_raw != saved_maximum;
+                apply = ui
+                    .add_enabled(changed, egui::Button::new("Apply range"))
+                    .clicked();
+            });
+            if apply {
+                action = Some(AutomationEditAction::SetRangeRaw {
+                    minimum_raw,
+                    maximum_raw,
+                });
+            }
+        } else {
+            ui.weak("No saved 0xDB Automation Min/Max event to edit");
+        }
         if let Some(mut amount) = channel.lfo_amount() {
             if (-128..=128).contains(&amount) {
                 if ui
@@ -41238,6 +41265,7 @@ impl DawUi {
             let mut flipped_points = false;
             let mut normalized_points = false;
             let mut scaled_levels = false;
+            let mut automation_range_updated = false;
             let result = match action {
                 AutomationEditAction::InitializeFromTemplate {
                     template_channel_id,
@@ -41270,6 +41298,13 @@ impl DawUi {
                 }
                 AutomationEditAction::SetLfoAmount { amount } => {
                     document.set_automation_lfo_amount(channel_id, amount)
+                }
+                AutomationEditAction::SetRangeRaw {
+                    minimum_raw,
+                    maximum_raw,
+                } => {
+                    automation_range_updated = true;
+                    document.set_automation_range_raw(channel_id, minimum_raw, maximum_raw)
                 }
                 AutomationEditAction::Insert {
                     slot,
@@ -41394,6 +41429,8 @@ impl DawUi {
                         self.status = if initialized_template {
                             "Initialized an empty automation curve from the selected template"
                                 .to_owned()
+                        } else if automation_range_updated {
+                            format!("Updated Automation channel {channel_id} raw Min/Max range")
                         } else {
                             "Automation curve updated".to_owned()
                         };

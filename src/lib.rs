@@ -6759,23 +6759,21 @@ impl FlpDocument {
                 // Levels event. On type-5 channels, the same fields are the
                 // Automation channel's Min and Max controls.
                 0xDB if event.payload.len() >= 8 => {
-                    channel.levels_editable = true;
-                    if channel.kind == Some(ChannelType::Automation.raw()) {
-                        if channel.automation_min_raw.is_none()
-                            && channel.automation_max_raw.is_none()
-                        {
-                            channel.automation_min_raw = Some(i32::from_le_bytes(
-                                event.payload[0..4]
-                                    .try_into()
-                                    .expect("the 0xDB Automation minimum field has four bytes"),
-                            ));
-                            channel.automation_max_raw = Some(i32::from_le_bytes(
-                                event.payload[4..8]
-                                    .try_into()
-                                    .expect("the 0xDB Automation maximum field has four bytes"),
-                            ));
-                        }
-                    } else {
+                    if channel.automation_min_raw.is_none() && channel.automation_max_raw.is_none()
+                    {
+                        channel.automation_min_raw = Some(i32::from_le_bytes(
+                            event.payload[0..4]
+                                .try_into()
+                                .expect("the 0xDB minimum field has four bytes"),
+                        ));
+                        channel.automation_max_raw = Some(i32::from_le_bytes(
+                            event.payload[4..8]
+                                .try_into()
+                                .expect("the 0xDB maximum field has four bytes"),
+                        ));
+                    }
+                    if channel.kind != Some(ChannelType::Automation.raw()) {
+                        channel.levels_editable = true;
                         if channel.pan_priority < 3 {
                             channel.pan = Some(i32::from_le_bytes(
                                 event.payload[0..4]
@@ -6848,6 +6846,18 @@ impl FlpDocument {
         if let Some(mut channel) = current {
             channel.end_event_index = self.events.len();
             channels.push(channel);
+        }
+
+        // Automation channels use the two leading words of `0xDB` as Min/Max,
+        // not the volume/pan controls shown for other channel kinds. Apply this
+        // distinction after the whole channel is decoded so event ordering does
+        // not expose Automation ranges as ordinary channel levels.
+        for channel in &mut channels {
+            if channel.channel_type() == Some(ChannelType::Automation) {
+                channel.levels_editable = false;
+                channel.volume = None;
+                channel.pan = None;
+            }
         }
 
         // The meaning of `0xD5` depends on channel kind. Decode it only after the
@@ -7361,6 +7371,56 @@ impl FlpDocument {
         payload[record_start + 8..record_start + 10].copy_from_slice(&parameter_raw.to_le_bytes());
         payload[record_start + 10..record_start + 12]
             .copy_from_slice(&destination_raw.to_le_bytes());
+        candidate.events[event_index].replace_data_payload(payload)?;
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    /// Sets the raw Min and Max words in a type-5 channel's modern `0xDB` event.
+    /// Other fields and trailing event bytes are preserved exactly.
+    pub fn set_automation_range_raw(
+        &mut self,
+        channel_id: u16,
+        minimum_raw: i32,
+        maximum_raw: i32,
+    ) -> Result<(), FlpError> {
+        self.require_unique_channel(channel_id)?;
+        let channel = self
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id == channel_id)
+            .expect("the unique Automation channel was checked above");
+        if channel.channel_type() != Some(ChannelType::Automation) {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel is not a type-5 Automation channel",
+            ));
+        }
+
+        let mut levels_events = channel
+            .event_range()
+            .filter(|index| self.events[*index].opcode == 0xDB);
+        let Some(event_index) = levels_events.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected Automation channel has no existing 0xDB Min/Max event",
+            ));
+        };
+        if levels_events.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected Automation channel has multiple 0xDB Min/Max events",
+            ));
+        }
+        let event = &self.events[event_index];
+        if !matches!(event.encoding, PayloadEncoding::Data { .. }) || event.payload.len() < 8 {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected Automation 0xDB Min/Max event is truncated or not length-prefixed",
+            ));
+        }
+
+        let mut candidate = self.clone();
+        let mut payload = candidate.events[event_index].payload.clone();
+        payload[..4].copy_from_slice(&minimum_raw.to_le_bytes());
+        payload[4..8].copy_from_slice(&maximum_raw.to_le_bytes());
         candidate.events[event_index].replace_data_payload(payload)?;
         candidate.refresh_event_offsets()?;
         *self = candidate;
@@ -22310,6 +22370,11 @@ impl FlpDocument {
         };
         if matching.next().is_some() {
             return Err(FlpError::AmbiguousChannelId(channel_id));
+        }
+        if channel.channel_type() == Some(ChannelType::Automation) {
+            return Err(FlpError::UnsupportedEdit(
+                "Automation channel Min/Max values must be edited as an Automation range",
+            ));
         }
 
         let event_index = channel
