@@ -22594,7 +22594,7 @@ impl DawUi {
                 {
                     continue;
                 }
-                if !clip.has_default_scale() {
+                if !clip.has_default_automation_clip_scale(ChannelType::Automation) {
                     return Err(format!(
                         "CLAP channel automation cannot yet expand scaled Automation clips (clip at tick {})",
                         clip.position_ticks,
@@ -22702,7 +22702,7 @@ impl DawUi {
                 {
                     continue;
                 }
-                if !clip.has_default_scale() {
+                if !clip.has_default_automation_clip_scale(ChannelType::Automation) {
                     return Err(format!(
                         "CLAP parameter automation cannot yet expand scaled Automation clips (clip at tick {})",
                         clip.position_ticks,

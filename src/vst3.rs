@@ -24,7 +24,7 @@ use crate::sample_render::{
     schedule_playlist_pattern_notes_with_adjustments, swing_note_start_tick,
 };
 use crate::{
-    ChannelNoteRouter, ChannelPluginState, FlpDocument, MixerEffectSlotSummary,
+    ChannelNoteRouter, ChannelPluginState, ChannelType, FlpDocument, MixerEffectSlotSummary,
     MixerRouteAudibility, MixerSourceRouteTransform, PlaylistClipTarget,
     automation_segment_value_with_tension,
 };
@@ -7894,7 +7894,16 @@ fn expand_playlist_parameter_automation(
     let mut expanded_point_count = 0usize;
 
     for (clip_index, clip) in arrangement.clips.iter().enumerate() {
-        if clip_is_muted(clip) || !clip.has_default_scale() {
+        let clip_scale_is_default = match clip.target() {
+            PlaylistClipTarget::Pattern { .. } => clip.has_default_scale(),
+            PlaylistClipTarget::Channel { id } => {
+                clip.has_default_automation_clip_scale(ChannelType::Automation)
+                    && automation_clip_automation
+                        .keys()
+                        .any(|(automation_channel_id, _)| *automation_channel_id == id)
+            }
+        };
+        if clip_is_muted(clip) || !clip_scale_is_default {
             continue;
         }
         if clip.length_ticks == 0 {
@@ -8128,7 +8137,7 @@ fn expand_automation_clip_parameter_automation_for_clip(
     if ppq == 0 {
         return Err("project PPQ must be greater than zero".to_owned());
     }
-    if clip.length_ticks == 0 || !clip.has_default_scale() {
+    if clip.length_ticks == 0 || !clip.has_default_automation_clip_scale(ChannelType::Automation) {
         return Ok(BTreeMap::new());
     }
     let Some((source_start_tick, source_end_tick, explicit_source_window)) =
@@ -8190,7 +8199,7 @@ pub fn expand_automation_channel_curve_for_clip(
     if ppq == 0 {
         return Err("project PPQ must be greater than zero".to_owned());
     }
-    if clip.length_ticks == 0 || !clip.has_default_scale() {
+    if clip.length_ticks == 0 || !clip.has_default_automation_clip_scale(ChannelType::Automation) {
         return Ok(Vec::new());
     }
     let Some((source_start_tick, source_end_tick, explicit_source_window)) =
@@ -8432,7 +8441,16 @@ fn expand_playlist_mixer_effect_parameter_automation(
     let mut expanded_point_count = 0usize;
 
     for (clip_index, clip) in arrangement.clips.iter().enumerate() {
-        if clip_is_muted(clip) || clip.length_ticks == 0 || !clip.has_default_scale() {
+        let clip_scale_is_default = match clip.target() {
+            PlaylistClipTarget::Pattern { .. } => clip.has_default_scale(),
+            PlaylistClipTarget::Channel { id } => {
+                clip.has_default_automation_clip_scale(ChannelType::Automation)
+                    && automation_clip_automation
+                        .keys()
+                        .any(|(automation_channel_id, _, _)| *automation_channel_id == id)
+            }
+        };
+        if clip_is_muted(clip) || clip.length_ticks == 0 || !clip_scale_is_default {
             continue;
         }
         let clip_automation = match clip.target() {
@@ -8658,7 +8676,7 @@ fn expand_mixer_effect_automation_clip_parameter_automation_for_clip(
     if ppq == 0 {
         return Err("project PPQ must be greater than zero".to_owned());
     }
-    if clip.length_ticks == 0 || !clip.has_default_scale() {
+    if clip.length_ticks == 0 || !clip.has_default_automation_clip_scale(ChannelType::Automation) {
         return Ok(BTreeMap::new());
     }
     let Some((source_start_tick, source_end_tick, explicit_source_window)) =
@@ -11714,10 +11732,15 @@ mod tests {
             .expect("arrangements should decode")
             .into_iter()
             .find(|arrangement| arrangement.id == 3)
-            .and_then(|arrangement| arrangement.clips.first().cloned())
+            .and_then(|arrangement| arrangement.clips.last().cloned())
             .expect("fixture clip should exist");
         clip.length_ticks = 192;
-        clip.scale = None;
+        clip.record_size = 60;
+        clip.start_offset = -1.0;
+        clip.end_offset = -1.0;
+        clip.scale = Some(0.0);
+        assert!(!clip.has_default_scale());
+        assert!(clip.has_default_automation_clip_scale(ChannelType::Automation));
         let automation = BTreeMap::from([(
             (11, 4),
             vec![Vst3ParameterAutomation {

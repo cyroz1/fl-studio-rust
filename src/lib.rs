@@ -5722,6 +5722,21 @@ impl PlaylistClip {
                 && scale == 0.0)
     }
 
+    /// Whether an Automation Clip uses the default, unscaled timeline mapping.
+    ///
+    /// In the available FL24 project, 60-byte clips targeting type-5
+    /// Automation channels store zero in the candidate scale field while
+    /// retaining the full `-1/-1` source window. Callers must first resolve
+    /// the target as an Automation channel; zero remains unsupported for
+    /// sample-backed clips.
+    pub fn has_default_automation_clip_scale(&self, target_channel_type: ChannelType) -> bool {
+        self.has_default_scale()
+            || (self.record_size == 60
+                && target_channel_type == ChannelType::Automation
+                && matches!(self.target(), PlaylistClipTarget::Channel { .. })
+                && self.scale == Some(0.0))
+    }
+
     pub fn uses_full_source_window(&self) -> bool {
         if self.record_size == 88 {
             return match self.target() {
@@ -28098,10 +28113,20 @@ mod tests {
         let mut non_default_pattern_clip = pattern_clip;
         non_default_pattern_clip[52..56].copy_from_slice(&0.75f32.to_le_bytes());
 
+        let mut automation_clip = [0u8; 60];
+        automation_clip[4..6].copy_from_slice(&0x5000u16.to_le_bytes());
+        automation_clip[6..8].copy_from_slice(&18u16.to_le_bytes());
+        automation_clip[8..12].copy_from_slice(&960u32.to_le_bytes());
+        automation_clip[12..14].copy_from_slice(&499u16.to_le_bytes());
+        automation_clip[24..28].copy_from_slice(&(-1.0f32).to_le_bytes());
+        automation_clip[28..32].copy_from_slice(&(-1.0f32).to_le_bytes());
+        automation_clip[52..56].copy_from_slice(&0.0f32.to_le_bytes());
+
         let mut payload = Vec::new();
         payload.extend_from_slice(&pattern_clip);
         payload.extend_from_slice(&zero_scaled_audio_clip);
         payload.extend_from_slice(&non_default_pattern_clip);
+        payload.extend_from_slice(&automation_clip);
         let mut event_stream = Vec::new();
         append_data_event(&mut event_stream, 0xC7, b"24.2.2.4597\0");
         event_stream.extend_from_slice(&[0x63, 0, 0]);
@@ -28126,6 +28151,13 @@ mod tests {
             !clips[2].has_default_scale(),
             "non-unit Pattern Clip scale remains unsupported"
         );
+        assert!(!clips[3].has_default_scale());
+        assert!(clips[3].has_default_automation_clip_scale(super::ChannelType::Automation));
+        assert!(
+            !clips[1].has_default_automation_clip_scale(super::ChannelType::Sampler),
+            "a zero-scale sample clip remains unsupported"
+        );
+        assert!(clips[3].uses_full_source_window());
     }
 
     #[test]
