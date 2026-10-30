@@ -20431,7 +20431,7 @@ impl FlpDocument {
         &self,
         midi: &midi::MidiFile,
         track_index: usize,
-        pattern_id: u16,
+        pattern_id: Option<u16>,
         controller_number: u8,
         midi_channel: Option<u8>,
     ) -> Result<Vec<(u32, f32)>, FlpError> {
@@ -20445,10 +20445,11 @@ impl FlpDocument {
                 "MIDI channel must be from 0 through 15",
             ));
         }
-        if !self
-            .patterns()?
-            .iter()
-            .any(|pattern| pattern.id == pattern_id)
+        if let Some(pattern_id) = pattern_id
+            && !self
+                .patterns()?
+                .iter()
+                .any(|pattern| pattern.id == pattern_id)
         {
             return Err(FlpError::UnsupportedEdit(
                 "the requested Pattern does not exist",
@@ -20762,7 +20763,7 @@ impl FlpDocument {
         let points = self.midi_control_change_points(
             midi,
             track_index,
-            pattern_id,
+            Some(pattern_id),
             controller_number,
             midi_channel,
         )?;
@@ -20816,7 +20817,7 @@ impl FlpDocument {
         let points = self.midi_control_change_points(
             midi,
             track_index,
-            pattern_id,
+            Some(pattern_id),
             controller_number,
             midi_channel,
         )?;
@@ -20896,6 +20897,59 @@ impl FlpDocument {
         }
         *self = candidate;
         Ok(imported)
+    }
+
+    /// Replaces the points of one type-5 Automation channel with one MIDI Control Change
+    /// controller from a selected track. MIDI values remain normalized from 0.0 to 1.0; the
+    /// channel's saved Min/Max range continues to scale them when its parameter link is applied.
+    /// Source tempo timing is converted to project beats. The blob header and trailing payload
+    /// are retained; replaced points receive zeroed opaque tail bytes. If the selected track has
+    /// no matching messages, the existing curve is left unchanged.
+    pub fn replace_automation_channel_points_from_midi_control_change(
+        &mut self,
+        midi: &midi::MidiFile,
+        track_index: usize,
+        automation_channel_id: u16,
+        controller_number: u8,
+        midi_channel: Option<u8>,
+    ) -> Result<usize, FlpError> {
+        let automation_channels = self.automation_channels()?;
+        let mut matching_channels = automation_channels
+            .iter()
+            .filter(|channel| channel.channel_id() == automation_channel_id);
+        let Some(channel) = matching_channels.next() else {
+            return Err(FlpError::ChannelNotFound(automation_channel_id));
+        };
+        if matching_channels.next().is_some() {
+            return Err(FlpError::AmbiguousChannelId(automation_channel_id));
+        }
+        if channel.data_event_index().is_none() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested Automation channel has no existing point blob",
+            ));
+        }
+        let points = self.midi_control_change_points(
+            midi,
+            track_index,
+            None,
+            controller_number,
+            midi_channel,
+        )?;
+        if points.is_empty() {
+            return Ok(0);
+        }
+        let points_in_beats = points
+            .iter()
+            .map(|(position, value)| {
+                (
+                    f64::from(*position) / f64::from(self.header.ppq),
+                    f64::from(*value),
+                    0.0,
+                )
+            })
+            .collect::<Vec<_>>();
+        self.replace_automation_points(automation_channel_id, &points_in_beats)?;
+        Ok(points.len())
     }
 
     /// Imports MIDI Pitch Bend messages from one track into an existing raw Pattern controller
