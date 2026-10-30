@@ -4956,6 +4956,7 @@ struct DawUi {
     autosave_minutes: u8,
     autosave_before_risky: bool,
     backup_retention: usize,
+    backup_directory: Option<PathBuf>,
     autosave_deadline: Option<Instant>,
     pending_backup_write: Option<PendingBackupWrite>,
     last_autosave_path: Option<PathBuf>,
@@ -7379,6 +7380,7 @@ impl DawUi {
             autosave_minutes: DEFAULT_AUTOSAVE_MINUTES,
             autosave_before_risky: false,
             backup_retention: DEFAULT_BACKUP_RETENTION,
+            backup_directory: None,
             autosave_deadline: None,
             pending_backup_write: None,
             last_autosave_path: None,
@@ -8017,12 +8019,13 @@ impl DawUi {
             playlist_render_tail_mode: PlaylistTailMode::LeaveRemainder,
             playlist_render_include_plugin_tails: false,
         };
-        if let Some((autosave_minutes, autosave_before_risky, backup_retention)) =
+        if let Some((autosave_minutes, autosave_before_risky, backup_retention, backup_directory)) =
             load_autosave_settings()
         {
             app.autosave_minutes = autosave_minutes;
             app.autosave_before_risky = autosave_before_risky;
             app.backup_retention = backup_retention;
+            app.backup_directory = backup_directory;
         }
         app.refresh_browser_directory();
         if should_auto_connect_midi_input(
@@ -8041,7 +8044,7 @@ impl DawUi {
         }
         if let Some(path) = initial_project.as_deref() {
             app.open_project(path);
-        } else if let Some(prompt) = latest_recovery_prompt() {
+        } else if let Some(prompt) = latest_recovery_prompt(app.backup_directory.as_deref()) {
             app.last_autosave_path = Some(prompt.backup_path.clone());
             if prompt.is_untitled {
                 app.untitled_autosave_key = Some(prompt.source_path.clone());
@@ -9142,9 +9145,11 @@ impl DawUi {
                 let recent_project_save_error =
                     save_recent_projects(&self.browser_recent_projects).err();
                 self.dirty = false;
-                self.last_autosave_path = latest_project_autosave(target_path);
+                self.last_autosave_path =
+                    latest_project_autosave(target_path, self.backup_directory.as_deref());
                 if check_recovery {
-                    self.recovery_prompt = recovery_prompt_for_project(target_path);
+                    self.recovery_prompt =
+                        recovery_prompt_for_project(target_path, self.backup_directory.as_deref());
                 }
                 let plugin_summary = self
                     .load_project_vst3_plugins()
@@ -10706,15 +10711,30 @@ impl DawUi {
         });
     }
 
-    fn persist_autosave_settings(&mut self) {
+    fn persist_autosave_settings(&mut self) -> bool {
         self.autosave_deadline = None;
-        if let Err(error) = save_autosave_settings(
+        match save_autosave_settings(
             self.autosave_minutes,
             self.autosave_before_risky,
             self.backup_retention,
+            self.backup_directory.as_deref(),
         ) {
-            self.status = format!("Could not save autosave settings: {error}");
+            Ok(()) => true,
+            Err(error) => {
+                self.status = format!("Could not save autosave settings: {error}");
+                false
+            }
         }
+    }
+
+    fn refresh_last_autosave(&mut self) {
+        let project_path = self
+            .current_path
+            .clone()
+            .or_else(|| self.untitled_autosave_key.clone());
+        self.last_autosave_path = project_path
+            .as_deref()
+            .and_then(|path| latest_project_autosave(path, self.backup_directory.as_deref()));
     }
 
     fn backup_before_risky_operation(&mut self, operation: &str) {
@@ -10741,13 +10761,18 @@ impl DawUi {
             .map_err(|error| error.to_string())
             .and_then(|bytes| {
                 if is_untitled {
-                    write_untitled_backup_metadata(&source_path, template_path.as_deref())?;
+                    write_untitled_backup_metadata(
+                        &source_path,
+                        template_path.as_deref(),
+                        self.backup_directory.as_deref(),
+                    )?;
                 }
                 write_project_backup(
                     &source_path,
                     &bytes,
                     BackupPurpose::Autosave,
                     self.backup_retention,
+                    self.backup_directory.as_deref(),
                 )
             });
         match result {
@@ -10796,6 +10821,7 @@ impl DawUi {
             }
         };
         let retention = self.backup_retention;
+        let backup_directory = self.backup_directory.clone();
         let worker_source = source_path.clone();
         let worker_template_path = template_path.clone();
         let (sender, receiver) = mpsc::channel();
@@ -10803,12 +10829,28 @@ impl DawUi {
             .name("flp-autosave".to_owned())
             .spawn(move || {
                 let result = if is_untitled {
-                    write_untitled_backup_metadata(&worker_source, worker_template_path.as_deref())
-                        .and_then(|()| {
-                            write_project_backup(&worker_source, &bytes, purpose, retention)
-                        })
+                    write_untitled_backup_metadata(
+                        &worker_source,
+                        worker_template_path.as_deref(),
+                        backup_directory.as_deref(),
+                    )
+                    .and_then(|()| {
+                        write_project_backup(
+                            &worker_source,
+                            &bytes,
+                            purpose,
+                            retention,
+                            backup_directory.as_deref(),
+                        )
+                    })
                 } else {
-                    write_project_backup(&worker_source, &bytes, purpose, retention)
+                    write_project_backup(
+                        &worker_source,
+                        &bytes,
+                        purpose,
+                        retention,
+                        backup_directory.as_deref(),
+                    )
                 };
                 let _ = sender.send(result);
             }) {
@@ -10913,7 +10955,7 @@ impl DawUi {
         {
             let _ = pending.worker.join();
         }
-        remove_untitled_project_backup(&key);
+        remove_untitled_project_backup(&key, self.backup_directory.as_deref());
         self.last_autosave_path = None;
         self.autosave_deadline = None;
     }
@@ -12572,7 +12614,8 @@ impl DawUi {
                 self.saved_project_hash = Some(saved_hash);
                 self.dirty = false;
                 self.autosave_deadline = None;
-                self.last_autosave_path = latest_project_autosave(path);
+                self.last_autosave_path =
+                    latest_project_autosave(path, self.backup_directory.as_deref());
                 self.status = match backups {
                     Ok(paths) if !paths.is_empty() => {
                         format!("Saved {} · backup {}", path.display(), paths[0].display())
@@ -12647,6 +12690,7 @@ impl DawUi {
                 &bytes,
                 BackupPurpose::Manual,
                 self.backup_retention,
+                self.backup_directory.as_deref(),
             )?);
         }
         Ok(backups)
@@ -16071,6 +16115,42 @@ impl DawUi {
                             self.persist_autosave_settings();
                             ui.close();
                         }
+                    }
+                });
+                ui.menu_button("Backup location", |ui| {
+                    let current_directory = self
+                        .backup_directory
+                        .as_deref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| "Default user data folder".to_owned());
+                    ui.label(format!("Current: {current_directory}"));
+                    if ui.button("Choose folder…").clicked() {
+                        let mut dialog =
+                            rfd::FileDialog::new().set_title("Choose autosave backup folder");
+                        if let Some(directory) = self.backup_directory.as_deref() {
+                            dialog = dialog.set_directory(directory);
+                        }
+                        if let Some(directory) = dialog.pick_folder() {
+                            let previous_directory = self.backup_directory.clone();
+                            self.backup_directory = Some(directory);
+                            if self.persist_autosave_settings() {
+                                self.refresh_last_autosave();
+                            } else {
+                                self.backup_directory = previous_directory;
+                            }
+                        }
+                        ui.close();
+                    }
+                    if self.backup_directory.is_some() && ui.button("Use default folder").clicked()
+                    {
+                        let previous_directory = self.backup_directory.clone();
+                        self.backup_directory = None;
+                        if self.persist_autosave_settings() {
+                            self.refresh_last_autosave();
+                        } else {
+                            self.backup_directory = previous_directory;
+                        }
+                        ui.close();
                     }
                 });
                 ui.separator();
@@ -79202,7 +79282,7 @@ fn save_scale_setting(path: Option<PathBuf>, name: &str, scale: f32) -> Result<(
         .map_err(|error| format!("could not write {}: {error}", path.display()))
 }
 
-fn load_autosave_settings() -> Option<(u8, bool, usize)> {
+fn load_autosave_settings() -> Option<(u8, bool, usize, Option<PathBuf>)> {
     let contents = fs::read_to_string(autosave_settings_file()?).ok()?;
     let mut lines = contents.lines();
     let autosave_minutes = lines.next()?.parse::<u8>().ok()?;
@@ -79211,18 +79291,28 @@ fn load_autosave_settings() -> Option<(u8, bool, usize)> {
         .next()
         .and_then(|value| value.parse::<bool>().ok())
         .unwrap_or(false);
+    let backup_directory = lines
+        .next()
+        .and_then(decode_path_setting)
+        .filter(|path| path.is_absolute());
     if !AUTOSAVE_INTERVALS_MINUTES.contains(&autosave_minutes)
         || !BACKUP_RETENTION_OPTIONS.contains(&backup_retention)
     {
         return None;
     }
-    Some((autosave_minutes, autosave_before_risky, backup_retention))
+    Some((
+        autosave_minutes,
+        autosave_before_risky,
+        backup_retention,
+        backup_directory,
+    ))
 }
 
 fn save_autosave_settings(
     autosave_minutes: u8,
     autosave_before_risky: bool,
     backup_retention: usize,
+    backup_directory: Option<&Path>,
 ) -> Result<(), String> {
     let path = autosave_settings_file()
         .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
@@ -79231,11 +79321,53 @@ fn save_autosave_settings(
         .ok_or_else(|| "the autosave settings path has no parent folder".to_owned())?;
     fs::create_dir_all(parent)
         .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    let existing_contents = fs::read_to_string(&path).unwrap_or_default();
+    let mut existing_lines = existing_contents.lines();
+    let previous_backup_directory = existing_lines.nth(3).and_then(decode_path_setting);
+    let mut backup_directory_history = existing_lines
+        .filter_map(decode_path_setting)
+        .collect::<Vec<_>>();
+    if previous_backup_directory.as_deref() != backup_directory
+        && let Some(previous_backup_directory) = previous_backup_directory
+        && !backup_directory_history.contains(&previous_backup_directory)
+    {
+        backup_directory_history.push(previous_backup_directory);
+    }
+    let backup_directory_history = backup_directory_history
+        .iter()
+        .map(|path| format!("{}\n", encode_path_setting(path)))
+        .collect::<String>();
     fs::write(
         &path,
-        format!("{autosave_minutes}\n{backup_retention}\n{autosave_before_risky}\n"),
+        format!(
+            "{autosave_minutes}\n{backup_retention}\n{autosave_before_risky}\n{}\n{}",
+            backup_directory
+                .map(encode_path_setting)
+                .unwrap_or_default(),
+            backup_directory_history,
+        ),
     )
     .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
+fn encode_path_setting(path: &Path) -> String {
+    path.to_string_lossy()
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn decode_path_setting(encoded: &str) -> Option<PathBuf> {
+    if encoded.is_empty() || !encoded.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(encoded.len() / 2);
+    for pair in encoded.as_bytes().chunks_exact(2) {
+        let pair = std::str::from_utf8(pair).ok()?;
+        bytes.push(u8::from_str_radix(pair, 16).ok()?);
+    }
+    String::from_utf8(bytes).ok().map(PathBuf::from)
 }
 
 fn user_data_directory() -> Option<PathBuf> {
@@ -79271,19 +79403,59 @@ fn new_untitled_project_autosave_key() -> Option<PathBuf> {
     Some(directory.join(format!("untitled-{}-{nonce}.flp", std::process::id())))
 }
 
-fn project_backup_directory(project_path: &Path) -> Option<PathBuf> {
-    Some(
-        user_data_directory()?
-            .join("Backups")
-            .join(stable_project_id(project_path)),
-    )
+fn backup_roots(backup_directory: Option<&Path>) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(directory) = backup_directory {
+        roots.push(directory.to_path_buf());
+    }
+    if let Some(contents) = autosave_settings_file().and_then(|path| fs::read_to_string(path).ok())
+    {
+        for directory in contents
+            .lines()
+            .skip(3)
+            .filter_map(decode_path_setting)
+            .filter(|path| path.is_absolute())
+        {
+            if !roots.contains(&directory) {
+                roots.push(directory);
+            }
+        }
+    }
+    if let Some(directory) = user_data_directory().map(|root| root.join("Backups"))
+        && !roots.contains(&directory)
+    {
+        roots.push(directory);
+    }
+    roots
+}
+
+fn project_backup_directory(
+    project_path: &Path,
+    backup_directory: Option<&Path>,
+) -> Option<PathBuf> {
+    let root = backup_directory
+        .map(Path::to_path_buf)
+        .or_else(|| user_data_directory().map(|root| root.join("Backups")))?;
+    Some(root.join(stable_project_id(project_path)))
+}
+
+fn project_backup_directories(
+    project_path: &Path,
+    backup_directory: Option<&Path>,
+) -> Vec<PathBuf> {
+    let project_id = stable_project_id(project_path);
+    backup_roots(backup_directory)
+        .into_iter()
+        .map(|root| root.join(&project_id))
+        .collect()
 }
 
 fn write_untitled_backup_metadata(
     project_path: &Path,
     template_path: Option<&Path>,
+    backup_directory: Option<&Path>,
 ) -> Result<(), String> {
-    let directory = project_backup_directory(project_path)
+    let directory = project_backup_directory(project_path, backup_directory)
         .ok_or_else(|| "the user data folder is not available".to_owned())?;
     fs::create_dir_all(&directory)
         .map_err(|error| format!("could not create {}: {error}", directory.display()))?;
@@ -79302,8 +79474,8 @@ fn write_untitled_backup_metadata(
     Ok(())
 }
 
-fn remove_untitled_project_backup(project_path: &Path) {
-    if let Some(directory) = project_backup_directory(project_path) {
+fn remove_untitled_project_backup(project_path: &Path, backup_directory: Option<&Path>) {
+    for directory in project_backup_directories(project_path, backup_directory) {
         let _ = fs::remove_dir_all(directory);
     }
 }
@@ -79350,8 +79522,9 @@ fn write_project_backup(
     bytes: &[u8],
     purpose: BackupPurpose,
     retention: usize,
+    backup_directory: Option<&Path>,
 ) -> Result<PathBuf, String> {
-    let directory = project_backup_directory(project_path)
+    let directory = project_backup_directory(project_path, backup_directory)
         .ok_or_else(|| "the user data folder is not available".to_owned())?;
     fs::create_dir_all(&directory)
         .map_err(|error| format!("could not create {}: {error}", directory.display()))?;
@@ -79385,7 +79558,7 @@ fn write_project_backup(
     ));
     write_file_atomically(&path, bytes)
         .map_err(|error| format!("could not write {}: {error}", path.display()))?;
-    prune_global_project_backups(&directory, retention);
+    prune_global_project_backups(backup_directory, retention);
     Ok(path)
 }
 
@@ -79409,13 +79582,10 @@ fn write_file_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     }
 }
 
-fn prune_global_project_backups(project_directory: &Path, retention: usize) {
-    let Some(root) = project_directory.parent() else {
-        return;
-    };
-    let mut backups = fs::read_dir(root)
-        .ok()
+fn prune_global_project_backups(backup_directory: Option<&Path>, retention: usize) {
+    let mut backups = backup_roots(backup_directory)
         .into_iter()
+        .filter_map(|root| fs::read_dir(root).ok())
         .flatten()
         .filter_map(Result::ok)
         .filter_map(|entry| fs::read_dir(entry.path()).ok())
@@ -79442,10 +79612,94 @@ fn prune_global_project_backups(project_directory: &Path, retention: usize) {
     }
 }
 
-fn project_autosave_files(project_path: &Path) -> Vec<PathBuf> {
-    let Some(directory) = project_backup_directory(project_path) else {
-        return Vec::new();
-    };
+fn project_autosave_files(project_path: &Path, backup_directory: Option<&Path>) -> Vec<PathBuf> {
+    let mut paths = project_backup_directories(project_path, backup_directory)
+        .into_iter()
+        .filter_map(|directory| fs::read_dir(directory).ok())
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("flp"))
+                && path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("autosave-"))
+        })
+        .collect::<Vec<_>>();
+    paths.sort_by_key(|path| {
+        std::cmp::Reverse(
+            fs::metadata(path)
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(UNIX_EPOCH),
+        )
+    });
+    paths
+}
+
+fn latest_project_autosave(
+    project_path: &Path,
+    backup_directory: Option<&Path>,
+) -> Option<PathBuf> {
+    project_autosave_files(project_path, backup_directory)
+        .into_iter()
+        .find(|path| {
+            fs::read(path)
+                .ok()
+                .is_some_and(|bytes| FlpDocument::parse(&bytes).is_ok())
+        })
+}
+
+fn recovery_prompt_for_project(
+    project_path: &Path,
+    backup_directory: Option<&Path>,
+) -> Option<RecoveryPrompt> {
+    let source_modified = fs::metadata(project_path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok());
+    project_backup_directories(project_path, backup_directory)
+        .into_iter()
+        .filter_map(|directory| {
+            let recorded_path = fs::read_to_string(directory.join("project.path")).ok()?;
+            if !project_paths_equal(Path::new(recorded_path.trim()), project_path) {
+                return None;
+            }
+            let backup_path = project_autosave_files_in_directory(&directory)
+                .into_iter()
+                .find(|path| {
+                    fs::read(path)
+                        .ok()
+                        .is_some_and(|bytes| FlpDocument::parse(&bytes).is_ok())
+                })?;
+            let backup_modified = fs::metadata(&backup_path).ok()?.modified().ok()?;
+            if source_modified.is_some_and(|modified| backup_modified < modified) {
+                return None;
+            }
+            if fs::read(project_path).ok().is_some_and(|source_bytes| {
+                fs::read(&backup_path).is_ok_and(|backup| backup == source_bytes)
+            }) {
+                return None;
+            }
+            Some(RecoveryPrompt {
+                source_path: project_path.to_path_buf(),
+                backup_path,
+                is_revert: false,
+                is_untitled: directory.join("untitled.project").is_file(),
+                template_path: fs::read_to_string(directory.join("template.path"))
+                    .ok()
+                    .map(|path| path.trim().to_owned())
+                    .filter(|path| !path.is_empty())
+                    .map(PathBuf::from),
+            })
+        })
+        .max_by_key(|prompt| {
+            fs::metadata(&prompt.backup_path)
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(UNIX_EPOCH)
+        })
+}
+
+fn project_autosave_files_in_directory(directory: &Path) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(directory) else {
         return Vec::new();
     };
@@ -79470,57 +79724,16 @@ fn project_autosave_files(project_path: &Path) -> Vec<PathBuf> {
     paths
 }
 
-fn latest_project_autosave(project_path: &Path) -> Option<PathBuf> {
-    project_autosave_files(project_path)
+fn latest_recovery_prompt(backup_directory: Option<&Path>) -> Option<RecoveryPrompt> {
+    backup_roots(backup_directory)
         .into_iter()
-        .find(|path| {
-            fs::read(path)
-                .ok()
-                .is_some_and(|bytes| FlpDocument::parse(&bytes).is_ok())
-        })
-}
-
-fn recovery_prompt_for_project(project_path: &Path) -> Option<RecoveryPrompt> {
-    let directory = project_backup_directory(project_path)?;
-    let recorded_path = fs::read_to_string(directory.join("project.path")).ok()?;
-    if !project_paths_equal(Path::new(recorded_path.trim()), project_path) {
-        return None;
-    }
-    let backup_path = latest_project_autosave(project_path)?;
-    let backup_modified = fs::metadata(&backup_path).ok()?.modified().ok()?;
-    let source_modified = fs::metadata(project_path)
-        .ok()
-        .and_then(|metadata| metadata.modified().ok());
-    if source_modified.is_some_and(|modified| backup_modified < modified) {
-        return None;
-    }
-    if fs::read(project_path).ok().is_some_and(|source_bytes| {
-        fs::read(&backup_path).is_ok_and(|backup| backup == source_bytes)
-    }) {
-        return None;
-    }
-    Some(RecoveryPrompt {
-        source_path: project_path.to_path_buf(),
-        backup_path,
-        is_revert: false,
-        is_untitled: directory.join("untitled.project").is_file(),
-        template_path: fs::read_to_string(directory.join("template.path"))
-            .ok()
-            .map(|path| path.trim().to_owned())
-            .filter(|path| !path.is_empty())
-            .map(PathBuf::from),
-    })
-}
-
-fn latest_recovery_prompt() -> Option<RecoveryPrompt> {
-    let root = user_data_directory()?.join("Backups");
-    let directories = fs::read_dir(root).ok()?;
-    directories
+        .filter_map(|root| fs::read_dir(root).ok())
+        .flatten()
         .filter_map(Result::ok)
         .filter_map(|entry| {
             let directory = entry.path();
             let source_path = fs::read_to_string(directory.join("project.path")).ok()?;
-            recovery_prompt_for_project(Path::new(source_path.trim()))
+            recovery_prompt_for_project(Path::new(source_path.trim()), backup_directory)
         })
         .max_by_key(|prompt| {
             fs::metadata(&prompt.backup_path)
