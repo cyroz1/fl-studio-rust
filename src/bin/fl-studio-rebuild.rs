@@ -4888,11 +4888,25 @@ struct PatternLiveChannelSignature {
     enabled: Option<bool>,
     sample_path: Option<String>,
     plugin_identifier: Option<String>,
+    vst3_class_uid: Option<String>,
     layer_child_ids: Option<Vec<u16>>,
     mixer_track: Option<i8>,
 }
 
 fn pattern_live_channel_signature(document: &FlpDocument) -> Vec<PatternLiveChannelSignature> {
+    let vst3_class_uids_by_channel = document
+        .channel_plugin_states()
+        .into_iter()
+        .filter_map(|state| {
+            let metadata = state.vst_metadata()?;
+            if metadata.format_marker() != 12 || metadata.fourcc().is_some() {
+                return None;
+            }
+            metadata
+                .class_uid()
+                .map(|class_uid| (state.channel_id(), class_uid))
+        })
+        .collect::<BTreeMap<_, _>>();
     document
         .channels()
         .into_iter()
@@ -4902,6 +4916,7 @@ fn pattern_live_channel_signature(document: &FlpDocument) -> Vec<PatternLiveChan
             enabled: channel.enabled(),
             sample_path: channel.sample_path().map(str::to_owned),
             plugin_identifier: channel.plugin_identifier().map(str::to_owned),
+            vst3_class_uid: vst3_class_uids_by_channel.get(&channel.id()).cloned(),
             layer_child_ids: channel.layer_child_ids().map(<[u16]>::to_vec),
             mixer_track: channel.mixer_track(),
         })
@@ -5588,6 +5603,13 @@ enum PdcStreamHandoffReason {
     Vst3ChannelLoad,
     AutomaticPdc { enabled: bool },
     MixerRouting,
+}
+
+#[derive(Clone, Copy)]
+struct Vst3LoadOptions {
+    open_editor: bool,
+    make_backup: bool,
+    defer_pattern_handoff: bool,
 }
 
 struct PendingAudioClipExport {
@@ -17165,6 +17187,54 @@ impl DawUi {
         let notes_changed = self.pattern_note_update_snapshot.as_ref() != Some(&notes);
         let channels_changed =
             self.pattern_note_update_channel_snapshot.as_ref() != Some(&channel_snapshot);
+        let newly_added_vst3_channels = if channels_changed
+            && self.playing
+            && self.pattern_playback_mode
+            && !self.performance_mode_active
+        {
+            self.pattern_note_update_channel_snapshot
+                .as_ref()
+                .map(|previous_channels| {
+                    let changed_plugin_channel_ids = channel_snapshot
+                        .iter()
+                        .filter_map(|channel| {
+                            let previous = previous_channels
+                                .iter()
+                                .find(|previous| previous.channel_id == channel.channel_id);
+                            previous
+                                .is_none_or(|previous| {
+                                    previous.kind != channel.kind
+                                        || previous.plugin_identifier != channel.plugin_identifier
+                                        || previous.vst3_class_uid != channel.vst3_class_uid
+                                })
+                                .then_some(channel.channel_id)
+                        })
+                        .collect::<BTreeSet<_>>();
+                    document
+                        .channel_plugin_states()
+                        .into_iter()
+                        .filter_map(|state| {
+                            let channel_id = state.channel_id();
+                            if !changed_plugin_channel_ids.contains(&channel_id)
+                                || self.channel_vst3_instances.contains_key(&channel_id)
+                            {
+                                return None;
+                            }
+                            let metadata = state.vst_metadata()?;
+                            if metadata.format_marker() != 12 || metadata.fourcc().is_some() {
+                                return None;
+                            }
+                            let class_uid = metadata.class_uid()?;
+                            let candidate =
+                                matching_vst3_candidate(&self.plugin_candidates, metadata)?;
+                            Some((candidate.path.clone(), channel_id, class_uid))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         if !notes_changed && !channels_changed {
             self.pattern_note_update_revision = self.project_edit_revision;
             return;
@@ -17189,6 +17259,53 @@ impl DawUi {
                 self.pattern_note_update_snapshot = Some(notes);
                 self.pattern_note_update_channel_snapshot = Some(channel_snapshot);
                 self.pattern_note_update_revision = self.project_edit_revision;
+                if !newly_added_vst3_channels.is_empty() {
+                    let pattern_resume_tick = self
+                        .current_pattern_mode_playhead_tick()
+                        .map(|(_, tick)| tick)
+                        .filter(|tick| tick.is_finite() && *tick >= 0.0)
+                        .map(|tick| tick.round() as u64)
+                        .unwrap_or(self.pattern_seek_tick);
+                    let mut load_statuses = Vec::new();
+                    let mut load_failures = Vec::new();
+                    for (path, channel_id, class_uid) in newly_added_vst3_channels {
+                        self.load_installed_vst3(
+                            &path,
+                            Some(channel_id),
+                            Some(class_uid),
+                            Vst3LoadOptions {
+                                open_editor: false,
+                                make_backup: false,
+                                defer_pattern_handoff: true,
+                            },
+                        );
+                        let load_status = self.status.clone();
+                        if self.channel_vst3_instances.contains_key(&channel_id) {
+                            load_statuses.push(load_status);
+                        } else {
+                            load_failures.push(load_status);
+                        }
+                    }
+                    if !load_statuses.is_empty() {
+                        let mut loaded_status = if load_statuses.len() == 1 {
+                            load_statuses[0].clone()
+                        } else {
+                            format!(
+                                "Loaded {} new VST3 Pattern channels: {}",
+                                load_statuses.len(),
+                                load_statuses.join("; ")
+                            )
+                        };
+                        if !load_failures.is_empty() {
+                            loaded_status.push_str(&format!(
+                                "; {} channel(s) could not be loaded: {}",
+                                load_failures.len(),
+                                load_failures.join("; ")
+                            ));
+                        }
+                        self.finish_vst3_pattern_channel_load(pattern_resume_tick, loaded_status);
+                    }
+                }
             }
             Err(TrySendError::Full(_)) => {}
             Err(TrySendError::Disconnected(_)) => {
@@ -68869,9 +68986,27 @@ impl DawUi {
         }
 
         if let Some((path, channel_id, class_uid)) = restore_request {
-            self.load_installed_vst3(&path, Some(channel_id), class_uid);
+            self.load_installed_vst3(
+                &path,
+                Some(channel_id),
+                class_uid,
+                Vst3LoadOptions {
+                    open_editor: true,
+                    make_backup: true,
+                    defer_pattern_handoff: false,
+                },
+            );
         } else if let Some(path) = load_path {
-            self.load_installed_vst3(&path, None, None);
+            self.load_installed_vst3(
+                &path,
+                None,
+                None,
+                Vst3LoadOptions {
+                    open_editor: true,
+                    make_backup: true,
+                    defer_pattern_handoff: false,
+                },
+            );
         }
 
         if !loaded.is_empty() {
@@ -70088,6 +70223,7 @@ impl DawUi {
         path: &Path,
         restore_channel_id: Option<u16>,
         class_uid: Option<String>,
+        options: Vst3LoadOptions,
     ) {
         let pattern_playback_was_active =
             self.playing && self.pattern_playback_mode && !self.performance_mode_active;
@@ -70109,7 +70245,9 @@ impl DawUi {
             self.last_plugin_action = Some(self.status.clone());
             return;
         }
-        self.backup_before_risky_operation("loading a VST3 plug-in");
+        if options.make_backup {
+            self.backup_before_risky_operation("loading a VST3 plug-in");
+        }
         if self.vst3_host.is_none() {
             match Vst3HostRuntime::new(f64::from(self.audio_settings.sample_rate), 512) {
                 Ok(mut host) => {
@@ -70163,14 +70301,18 @@ impl DawUi {
                 } else {
                     String::new()
                 };
-                match host.open_editor(info.id) {
-                    Ok(()) => self.status = format!("Loaded {}{state_message}", info.name),
-                    Err(error) => {
-                        self.status = format!(
-                            "Loaded {}{state_message}, but its editor did not open: {error}",
-                            info.name
-                        );
+                if options.open_editor {
+                    match host.open_editor(info.id) {
+                        Ok(()) => self.status = format!("Loaded {}{state_message}", info.name),
+                        Err(error) => {
+                            self.status = format!(
+                                "Loaded {}{state_message}, but its editor did not open: {error}",
+                                info.name
+                            );
+                        }
                     }
+                } else {
+                    self.status = format!("Loaded {}{state_message}", info.name);
                 }
             }
             Err(error) => self.status = format!("Could not load VST3: {error}"),
@@ -70183,32 +70325,40 @@ impl DawUi {
             self.vst3_manual_latency_offset_labels
                 .insert(instance_id, offset_label);
         }
-        if pattern_playback_was_active && loaded_channel_was_added {
+        if pattern_playback_was_active && loaded_channel_was_added && !options.defer_pattern_handoff
+        {
             let loaded_status = self.status.clone();
-            if !self.stage_pattern_stream_rebuild(PdcStreamHandoffReason::Vst3ChannelLoad) {
-                if self.pending_sampler_stream.is_none() {
-                    self.stop_project_playback();
-                    self.pattern_seek_tick = pattern_resume_tick;
-                    self.start_pattern_mode_playback();
-                    let restart_status = self.status.clone();
-                    self.status = if self.playing
-                        || self.pending_sampler_stream.is_some()
-                        || self.pending_clap_pattern_playback.is_some()
-                    {
-                        format!(
-                            "{loaded_status}; Pattern playback restarted at tick {}",
-                            self.pattern_seek_tick
-                        )
-                    } else {
-                        format!(
-                            "{loaded_status}; could not restart Pattern playback: {restart_status}"
-                        )
-                    };
+            self.finish_vst3_pattern_channel_load(pattern_resume_tick, loaded_status);
+        }
+        self.last_plugin_action = Some(self.status.clone());
+    }
+
+    fn finish_vst3_pattern_channel_load(
+        &mut self,
+        pattern_resume_tick: u64,
+        loaded_status: String,
+    ) {
+        if !self.stage_pattern_stream_rebuild(PdcStreamHandoffReason::Vst3ChannelLoad) {
+            if self.pending_sampler_stream.is_none() {
+                self.stop_project_playback();
+                self.pattern_seek_tick = pattern_resume_tick;
+                self.start_pattern_mode_playback();
+                let restart_status = self.status.clone();
+                self.status = if self.playing
+                    || self.pending_sampler_stream.is_some()
+                    || self.pending_clap_pattern_playback.is_some()
+                {
+                    format!(
+                        "{loaded_status}; Pattern playback restarted at tick {}",
+                        self.pattern_seek_tick
+                    )
                 } else {
-                    self.status = format!(
-                        "{loaded_status}; the new VST3 channel will be used when Pattern playback restarts"
-                    );
-                }
+                    format!("{loaded_status}; could not restart Pattern playback: {restart_status}")
+                };
+            } else {
+                self.status = format!(
+                    "{loaded_status}; the new VST3 channel will be used when Pattern playback restarts"
+                );
             }
         }
         self.last_plugin_action = Some(self.status.clone());
