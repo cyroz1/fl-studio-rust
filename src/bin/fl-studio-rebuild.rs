@@ -4290,6 +4290,12 @@ struct StepGraphReset {
 }
 
 enum AutomationEditAction {
+    ImportMidiCc {
+        midi: MidiFile,
+        track_index: usize,
+        controller_number: u8,
+        midi_channel: Option<u8>,
+    },
     InitializeFromTemplate {
         template_channel_id: u16,
     },
@@ -4420,6 +4426,15 @@ struct MidiCcImportAction {
     midi_channel: Option<u8>,
     new_stream: bool,
     batch_mappings: Option<Vec<(u8, u8, u8)>>,
+}
+
+struct PendingAutomationMidiCcImport {
+    path: PathBuf,
+    midi: MidiFile,
+    selected_track: usize,
+    controller_number: u8,
+    midi_channel: Option<u8>,
+    automation_channel_id: u16,
 }
 
 fn next_unused_raw_controller_stream(
@@ -5318,6 +5333,7 @@ struct DawUi {
     piano_roll_slice_position_ticks: u32,
     pending_midi_import: Option<PendingMidiImport>,
     pending_midi_cc_import: Option<PendingMidiCcImport>,
+    pending_automation_midi_cc_import: Option<PendingAutomationMidiCcImport>,
     pending_midi_cc_export: Option<PendingMidiCcExport>,
     midi_channel_mapping: MidiChannelMapping,
     midi_export_file_format: MidiExportFileFormat,
@@ -7744,6 +7760,7 @@ impl DawUi {
             piano_roll_slice_position_ticks: 0,
             pending_midi_import: None,
             pending_midi_cc_import: None,
+            pending_automation_midi_cc_import: None,
             pending_midi_cc_export: None,
             midi_channel_mapping: MidiChannelMapping::PreserveNoteChannels,
             midi_export_file_format: MidiExportFileFormat::Format1,
@@ -40755,6 +40772,44 @@ impl DawUi {
                 .iter()
                 .find(|channel| channel.channel_id() == channel_id)
                 .is_some_and(|channel| channel.data_event_index().is_some());
+            if ui
+                .add_enabled(has_blob, egui::Button::new("Replace curve from MIDI CC…"))
+                .clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .set_title("Replace Automation curve from MIDI CC")
+                    .add_filter("MIDI files", &["mid", "midi"])
+                    .pick_file()
+            {
+                match fs::read(&path) {
+                    Ok(bytes) => match MidiFile::parse(&bytes) {
+                        Ok(midi) if !midi.tracks().is_empty() => {
+                            let controller_number = midi.tracks()[0]
+                                .control_changes()
+                                .first()
+                                .map(|change| change.controller())
+                                .unwrap_or_default();
+                            self.pending_automation_midi_cc_import =
+                                Some(PendingAutomationMidiCcImport {
+                                    path: path.clone(),
+                                    midi,
+                                    selected_track: 0,
+                                    controller_number,
+                                    midi_channel: None,
+                                    automation_channel_id: channel_id,
+                                });
+                            self.status =
+                                format!("Loaded MIDI automation source from {}", path.display());
+                        }
+                        Ok(_) => self.status = "The MIDI file contains no tracks".to_owned(),
+                        Err(error) => {
+                            self.status = format!("Could not parse MIDI file: {error}");
+                        }
+                    },
+                    Err(error) => {
+                        self.status = format!("Could not read {}: {error}", path.display());
+                    }
+                }
+            }
             let can_flip = automation_channels
                 .iter()
                 .find(|channel| channel.channel_id() == channel_id)
@@ -40939,6 +40994,13 @@ impl DawUi {
             self.automation_interpolate_mode = false;
             self.automation_interpolation_anchor = None;
             action = None;
+            if self
+                .pending_automation_midi_cc_import
+                .as_ref()
+                .is_some_and(|pending| pending.automation_channel_id != channel_id)
+            {
+                self.pending_automation_midi_cc_import = None;
+            }
         }
         self.selected_automation_channel = Some(channel_id);
 
@@ -40949,6 +41011,119 @@ impl DawUi {
             empty_view(ui, "Select an automation channel");
             return;
         };
+        let mut cancel_midi_import = false;
+        if let Some(pending) = self.pending_automation_midi_cc_import.as_mut()
+            && pending.automation_channel_id == channel_id
+        {
+            ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    ui.strong("Replace Automation curve from MIDI CC");
+                    ui.weak(pending.path.display().to_string());
+                });
+                let track_label = pending
+                    .midi
+                    .tracks()
+                    .get(pending.selected_track)
+                    .map(|track| {
+                        track
+                            .name()
+                            .filter(|name| !name.is_empty())
+                            .unwrap_or_else(|| format!("Track {}", pending.selected_track + 1))
+                    })
+                    .unwrap_or_else(|| "No track".to_owned());
+                egui::ComboBox::from_id_salt(("automation-midi-cc-track", channel_id))
+                    .selected_text(track_label)
+                    .show_ui(ui, |ui| {
+                        for (index, track) in pending.midi.tracks().iter().enumerate() {
+                            let label = track
+                                .name()
+                                .filter(|name| !name.is_empty())
+                                .unwrap_or_else(|| format!("Track {}", index + 1));
+                            ui.selectable_value(&mut pending.selected_track, index, label);
+                        }
+                    });
+                let changes = pending
+                    .midi
+                    .tracks()
+                    .get(pending.selected_track)
+                    .map(|track| track.control_changes())
+                    .unwrap_or_default();
+                let controller_numbers = changes
+                    .iter()
+                    .map(|change| change.controller())
+                    .collect::<BTreeSet<_>>();
+                if let Some(first_controller) = controller_numbers.first().copied()
+                    && !controller_numbers.contains(&pending.controller_number)
+                {
+                    pending.controller_number = first_controller;
+                }
+                let controller_text = if controller_numbers.is_empty() {
+                    "No CC events".to_owned()
+                } else {
+                    format!("CC {}", pending.controller_number)
+                };
+                egui::ComboBox::from_id_salt(("automation-midi-cc-number", channel_id))
+                    .selected_text(controller_text)
+                    .show_ui(ui, |ui| {
+                        for controller in &controller_numbers {
+                            ui.selectable_value(
+                                &mut pending.controller_number,
+                                *controller,
+                                format!("CC {controller}"),
+                            );
+                        }
+                    });
+                let channels = changes
+                    .iter()
+                    .filter(|change| change.controller() == pending.controller_number)
+                    .map(|change| change.channel())
+                    .collect::<BTreeSet<_>>();
+                if pending
+                    .midi_channel
+                    .is_some_and(|channel| !channels.contains(&channel))
+                {
+                    pending.midi_channel = None;
+                }
+                let channel_text = pending.midi_channel.map_or_else(
+                    || "All channels".to_owned(),
+                    |channel| format!("MIDI channel {}", channel + 1),
+                );
+                egui::ComboBox::from_id_salt(("automation-midi-cc-channel", channel_id))
+                    .selected_text(channel_text)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut pending.midi_channel, None, "All channels");
+                        for channel in &channels {
+                            ui.selectable_value(
+                                &mut pending.midi_channel,
+                                Some(*channel),
+                                format!("MIDI channel {}", channel + 1),
+                            );
+                        }
+                    });
+                ui.weak(
+                    "Replaces the current point curve. Saved Min/Max remains; new points use zeroed tail bytes.",
+                );
+                let import_clicked = ui
+                    .add_enabled(
+                        !controller_numbers.is_empty(),
+                        egui::Button::new("Replace curve from selected CC"),
+                    )
+                    .clicked();
+                if import_clicked {
+                    action = Some(AutomationEditAction::ImportMidiCc {
+                        midi: pending.midi.clone(),
+                        track_index: pending.selected_track,
+                        controller_number: pending.controller_number,
+                        midi_channel: pending.midi_channel,
+                    });
+                    cancel_midi_import = true;
+                }
+                cancel_midi_import |= ui.button("Cancel MIDI import").clicked();
+            });
+        }
+        if cancel_midi_import {
+            self.pending_automation_midi_cc_import = None;
+        }
         if let Some((saved_minimum, saved_maximum)) = channel.automation_range_raw() {
             let mut minimum_raw = saved_minimum;
             let mut maximum_raw = saved_maximum;
@@ -41401,7 +41576,29 @@ impl DawUi {
             let mut scaled_levels = false;
             let mut automation_range_updated = false;
             let mut native_target_record_updated = false;
+            let mut imported_midi_cc = None;
             let result = match action {
+                AutomationEditAction::ImportMidiCc {
+                    midi,
+                    track_index,
+                    controller_number,
+                    midi_channel,
+                } => {
+                    self.selected_automation_point = None;
+                    self.automation_add_mode = false;
+                    self.automation_interpolate_mode = false;
+                    self.automation_interpolation_anchor = None;
+                    imported_midi_cc = Some(controller_number);
+                    document
+                        .replace_automation_channel_points_from_midi_control_change(
+                            &midi,
+                            track_index,
+                            channel_id,
+                            controller_number,
+                            midi_channel,
+                        )
+                        .map(|count| changed_point_count = Some(count))
+                }
                 AutomationEditAction::InitializeFromTemplate {
                     template_channel_id,
                 } => {
@@ -41542,7 +41739,11 @@ impl DawUi {
                         );
                     } else if let Some(count) = changed_point_count {
                         if count == 0 {
-                            self.status = if flipped_points {
+                            self.status = if let Some(controller_number) = imported_midi_cc {
+                                format!(
+                                    "No matching MIDI CC {controller_number} events; Automation channel curve left unchanged"
+                                )
+                            } else if flipped_points {
                                 "There are no automation points to flip".to_owned()
                             } else if normalized_points {
                                 "The automation curve is flat; there is nothing to normalize"
@@ -41555,7 +41756,11 @@ impl DawUi {
                         } else {
                             self.dirty = true;
                             self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
-                            self.status = if flipped_points {
+                            self.status = if let Some(controller_number) = imported_midi_cc {
+                                format!(
+                                    "Replaced Automation channel {channel_id} with {count} MIDI CC {controller_number} points"
+                                )
+                            } else if flipped_points {
                                 format!("Vertically flipped {count} automation point values")
                             } else if normalized_points {
                                 format!("Normalized {count} automation point values to 0–1")
