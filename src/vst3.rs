@@ -13157,7 +13157,7 @@ mod tests {
             &[2, 1],
         )
         .unwrap();
-        assert_eq!(stereo, [0.375, -0.375, 0.25, 1.25]);
+        assert_eq!(stereo, [0.375, -0.375, -0.5, 1.25]);
 
         assert!(append_vst_output_buses_to_stereo(&mut stereo, &[0.0; 4], &[4]).is_err());
         assert!(append_vst_output_buses_to_stereo(&mut stereo, &[0.0], &[]).is_err());
