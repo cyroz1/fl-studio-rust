@@ -5664,6 +5664,7 @@ struct PendingSongRender {
     kind: PendingSongRenderKind,
     track_freeze: Option<PendingPlaylistTrackFreeze>,
     pattern_clip_placement: Option<PendingPlaylistPatternClipPlacement>,
+    clap_instrument_channels_rendered: usize,
 }
 
 struct PendingClapPlaylistOfflineRender {
@@ -23032,6 +23033,7 @@ impl DawUi {
             pending_song_render_kind,
             pattern_clip_placement,
         } = job;
+        let clap_instrument_channels_rendered = options.clap_audio_layers.len();
         let worker_output_path = output_path.clone();
         let rendering_time_selection = range.is_some();
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -23143,6 +23145,7 @@ impl DawUi {
                     }),
                     track_freeze,
                     pattern_clip_placement,
+                    clap_instrument_channels_rendered,
                 });
                 self.status = if let Some(freeze) = self
                     .pending_song_render
@@ -50947,6 +50950,7 @@ impl DawUi {
         output_path: &Path,
         summary: &PlaylistRenderSummary,
         placement: &PendingPlaylistPatternClipPlacement,
+        clap_instrument_channels_rendered: usize,
         history_snapshot_available: bool,
     ) {
         let operation = if placement.mute_source_clips {
@@ -50966,7 +50970,11 @@ impl DawUi {
             );
             return;
         }
-        if summary.sampler_notes_rendered + summary.vst3_notes_rendered == 0 {
+        if summary.sampler_notes_rendered
+            + summary.vst3_notes_rendered
+            + clap_instrument_channels_rendered
+            == 0
+        {
             self.status = format!(
                 "Rendered {}, but left {source_description} unchanged because no supported notes were rendered",
                 output_path.display(),
@@ -51985,6 +51993,7 @@ impl DawUi {
                     &pending.output_path,
                     &summary,
                     placement,
+                    pending.clap_instrument_channels_rendered,
                     history_snapshot_available,
                 ),
                 Err(error) => {
@@ -52056,7 +52065,7 @@ impl DawUi {
                             format!("{clip_count} selected Playlist Pattern Clips")
                         };
                         format!(
-                            "Rendered {clip_description} from {} to {} at {} Hz ({} Sampler notes, {} VST3 notes; {} unresolved sample notes, {} unloaded VST3 channels skipped). Supported Mixer effects and linked effect automation were included",
+                            "Rendered {clip_description} from {} to {} at {} Hz ({} Sampler notes, {} VST3 notes, {} CLAP instrument channels; {} unresolved sample notes, {} unloaded VST3 channels skipped). Supported Mixer effects and linked effect automation were included",
                             if start_from_song_start {
                                 "song start"
                             } else if clip_count > 1 {
@@ -52068,6 +52077,7 @@ impl DawUi {
                             summary.sample_rate,
                             summary.sampler_notes_rendered,
                             summary.vst3_notes_rendered,
+                            pending.clap_instrument_channels_rendered,
                             summary.notes_skipped_unresolved_sample,
                             summary.vst3_plugin_channels_unloaded,
                         )
