@@ -79359,11 +79359,12 @@ fn encode_path_setting(path: &Path) -> String {
 }
 
 fn decode_path_setting(encoded: &str) -> Option<PathBuf> {
-    if encoded.is_empty() || !encoded.len().is_multiple_of(2) {
+    let (pairs, remainder) = encoded.as_bytes().as_chunks::<2>();
+    if pairs.is_empty() || !remainder.is_empty() {
         return None;
     }
     let mut bytes = Vec::with_capacity(encoded.len() / 2);
-    for pair in encoded.as_bytes().chunks_exact(2) {
+    for pair in pairs {
         let pair = std::str::from_utf8(pair).ok()?;
         bytes.push(u8::from_str_radix(pair, 16).ok()?);
     }
