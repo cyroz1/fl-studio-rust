@@ -3,7 +3,8 @@ use std::fmt;
 
 use crate::{
     ChannelMidiOutSettings, FlpDocument, PatternNote, PlaylistClip, PlaylistClipTarget,
-    automation_segment_value_with_tension, normalized_automation_point_value,
+    automation_segment_value_with_tension, automation_value_for_target_range,
+    normalized_automation_point_value,
 };
 
 const MTHD: &[u8; 4] = b"MThd";
@@ -2497,9 +2498,15 @@ impl MidiTempoEvent {
 
 /// The native exporter emits tempo-control curves over FL's observed 60–180 BPM range.
 /// This mapping is inferred from the installed FL Studio reference project and needs
-/// more oracle coverage for other control ranges and non-linear point shapes.
-fn tempo_automation_bpm(value: f64) -> Result<f64, MidiError> {
+/// more oracle coverage for other control ranges and non-linear point shapes. The
+/// saved Automation Min/Max range is applied through the provisional 0–12,800 mapping
+/// used by other normalized Automation targets.
+fn tempo_automation_bpm(
+    value: f64,
+    automation_range_raw: Option<(i32, i32)>,
+) -> Result<f64, MidiError> {
     let value = normalized_automation_point_value(value).unwrap_or(value);
+    let value = automation_value_for_target_range(value, automation_range_raw);
     let bpm = 60.0 + value * 120.0;
     midi_tempo_microseconds_per_quarter(bpm)?;
     Ok(bpm)
@@ -2594,6 +2601,7 @@ pub(crate) fn song_tempo_events(
         if channel.points().is_empty() {
             continue;
         }
+        let automation_range_raw = channel.automation_range_raw();
 
         let (source_start_tick, source_end_tick, explicit_source_window) =
             match clip.source_window_ticks() {
@@ -2680,7 +2688,10 @@ pub(crate) fn song_tempo_events(
             .checked_add(points[0].0)
             .ok_or(MidiError::LengthOverflow)?;
         if first_point_tick < clip_end {
-            events.push((first_point_tick, tempo_automation_bpm(points[0].1)?));
+            events.push((
+                first_point_tick,
+                tempo_automation_bpm(points[0].1, automation_range_raw)?,
+            ));
         }
 
         let mut clip_event_count = 0usize;
@@ -2707,7 +2718,7 @@ pub(crate) fn song_tempo_events(
                 let elapsed = tick.saturating_add(1).saturating_sub(segment_start) as f64;
                 let fraction = (elapsed / span).clamp(0.0, 1.0);
                 let value = automation_segment_value_with_tension(from.1, to.1, fraction, to.2);
-                events.push((tick, tempo_automation_bpm(value)?));
+                events.push((tick, tempo_automation_bpm(value, automation_range_raw)?));
                 clip_event_count = clip_event_count.saturating_add(1);
                 if clip_event_count > MAX_EXPORTED_TEMPO_EVENTS {
                     return Err(MidiError::InvalidExport(

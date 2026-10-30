@@ -114,7 +114,8 @@ use flp_rebuild::{
     QuantizeNoteOptions, RandomNoteChordMap, RandomNoteGeneratorOptions, RandomizerOptions,
     RiffMachineOptions, RiffMachineQuantizeMode, RiffMachineStage, SamplerEnvelopeLfo,
     SamplerEnvelopeLfoEdit, SamplerEnvelopeLfoTarget, ScaleLevelsOptions, StrumOptions, TimeMarker,
-    TimeMarkerEdit, VstPluginStateMetadata, normalized_automation_point_value,
+    TimeMarkerEdit, VstPluginStateMetadata, automation_value_for_target_range,
+    normalized_automation_point_value,
 };
 use md5::{Digest, Md5};
 use vst3_host::midi::{MidiChannel as Vst3MidiChannel, MidiEvent as Vst3MidiEvent};
@@ -9420,11 +9421,7 @@ impl DawUi {
         automation_channel: &AutomationChannel,
         value: f64,
     ) -> f64 {
-        let Some((min_raw, max_raw)) = automation_channel.automation_range_raw() else {
-            return value;
-        };
-        let raw_value = f64::from(min_raw) + (f64::from(max_raw) - f64::from(min_raw)) * value;
-        (raw_value / 12_800.0).clamp(0.0, 1.0)
+        automation_value_for_target_range(value, automation_channel.automation_range_raw())
     }
 
     fn vst3_playlist_automation_sources(

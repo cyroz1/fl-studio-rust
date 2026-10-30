@@ -2242,6 +2242,17 @@ pub fn normalized_automation_point_value(value: f64) -> Option<f64> {
         .then(|| value.clamp(0.0, 1.0))
 }
 
+/// Maps a normalized Automation point through the channel's saved raw Min/Max range.
+/// Without a saved range, the normalized value is returned unchanged.
+pub fn automation_value_for_target_range(value: f64, raw_range: Option<(i32, i32)>) -> f64 {
+    let Some((minimum_raw, maximum_raw)) = raw_range else {
+        return value;
+    };
+    let raw_value =
+        f64::from(minimum_raw) + (f64::from(maximum_raw) - f64::from(minimum_raw)) * value;
+    (raw_value / 12_800.0).clamp(0.0, 1.0)
+}
+
 /// One point from the `0xEA` payload of a kind-5 automation channel.
 ///
 /// Positions are cumulative beats from the start of the automation clip. The
