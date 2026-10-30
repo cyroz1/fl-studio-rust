@@ -697,6 +697,7 @@ struct MidiPatternLoopSchedule {
     output: ConnectedMidiOutput,
     messages: Vec<ScheduledMidiFrameMessage>,
     loop_frames: u64,
+    phase_offset_frames: u64,
     playback_clock: ProjectPlaybackClock,
     stop_receiver: Receiver<()>,
     error_sender: Sender<String>,
@@ -709,6 +710,24 @@ impl MidiPatternLoopScheduler {
         output: ConnectedMidiOutput,
         messages: Vec<ScheduledMidiFrameMessage>,
         loop_frames: u64,
+        playback_clock: ProjectPlaybackClock,
+        script_output: Option<MidiScriptOutputHandle>,
+    ) -> Result<Self, String> {
+        Self::start_with_phase_offset(
+            output,
+            messages,
+            loop_frames,
+            0,
+            playback_clock,
+            script_output,
+        )
+    }
+
+    pub fn start_with_phase_offset(
+        output: ConnectedMidiOutput,
+        messages: Vec<ScheduledMidiFrameMessage>,
+        loop_frames: u64,
+        phase_offset_frames: u64,
         playback_clock: ProjectPlaybackClock,
         script_output: Option<MidiScriptOutputHandle>,
     ) -> Result<Self, String> {
@@ -733,6 +752,7 @@ impl MidiPatternLoopScheduler {
                     output,
                     messages,
                     loop_frames,
+                    phase_offset_frames: phase_offset_frames % loop_frames,
                     playback_clock,
                     stop_receiver,
                     error_sender,
@@ -1127,6 +1147,7 @@ fn schedule_midi_pattern_loop(schedule: MidiPatternLoopSchedule) {
         mut output,
         messages,
         loop_frames,
+        phase_offset_frames,
         playback_clock,
         stop_receiver,
         error_sender,
@@ -1156,8 +1177,8 @@ fn schedule_midi_pattern_loop(schedule: MidiPatternLoopSchedule) {
             }
 
             let current_frame = playback_clock.position_frames();
-            let cycle = current_frame / loop_frames;
-            let phase_frame = current_frame % loop_frames;
+            let (cycle, phase_frame) =
+                midi_pattern_loop_phase_at_frame(current_frame, loop_frames, phase_offset_frames);
             if !was_active || last_cycle != Some(cycle) || current_frame < last_frame {
                 if let Err(error) = output.send_all_notes_off() {
                     break Err(error);
@@ -1208,6 +1229,22 @@ fn schedule_midi_pattern_loop(schedule: MidiPatternLoopSchedule) {
         let _ = error_sender.send(errors.join("; "));
     }
     let _ = completion_sender.send(());
+}
+
+fn midi_pattern_loop_phase_at_frame(
+    frame: u64,
+    loop_frames: u64,
+    phase_offset_frames: u64,
+) -> (u64, u64) {
+    let cycle = frame / loop_frames;
+    let phase_frame = frame % loop_frames;
+    let phase_offset_frames = phase_offset_frames % loop_frames;
+    let until_wrap = loop_frames - phase_frame;
+    if phase_offset_frames >= until_wrap {
+        (cycle.saturating_add(1), phase_offset_frames - until_wrap)
+    } else {
+        (cycle, phase_frame + phase_offset_frames)
+    }
 }
 
 fn midi_pattern_active_note_ons(

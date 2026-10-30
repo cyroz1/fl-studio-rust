@@ -2156,6 +2156,7 @@ impl MetronomeTimeline {
 pub struct MetronomeStreamPlayback {
     playback: Arc<PlaybackState>,
     mixer_track: i8,
+    frame_offset: u64,
 }
 
 impl MetronomeStreamPlayback {
@@ -2180,7 +2181,9 @@ impl MetronomeStreamPlayback {
         let click_samples = click_samples_snapshot.as_deref();
         let playback_speed = f32::from_bits(self.playback.playback_speed.load(Ordering::Acquire));
         for frame_index in 0..frame_count {
-            let project_frame = start_frame.saturating_add(frame_index as u64);
+            let project_frame = start_frame
+                .saturating_add(frame_index as u64)
+                .saturating_add(self.frame_offset);
             let click = timeline.click_sample(project_frame, playback_speed, click_samples);
             mix_sample(frame_index, click);
         }
@@ -4067,6 +4070,14 @@ impl AudioEngine {
 
     /// Return a live metronome handle for project stream renderers.
     pub fn metronome_stream_playback(&self) -> MetronomeStreamPlayback {
+        self.metronome_stream_playback_with_frame_offset(0)
+    }
+
+    /// Return a live metronome handle whose phase is shifted within its timeline loop.
+    pub fn metronome_stream_playback_with_frame_offset(
+        &self,
+        frame_offset: u64,
+    ) -> MetronomeStreamPlayback {
         MetronomeStreamPlayback {
             playback: Arc::clone(&self.playback),
             mixer_track: i8::try_from(
@@ -4076,6 +4087,7 @@ impl AudioEngine {
                     .clamp(0, i32::from(i8::MAX)),
             )
             .unwrap_or_default(),
+            frame_offset,
         }
     }
 

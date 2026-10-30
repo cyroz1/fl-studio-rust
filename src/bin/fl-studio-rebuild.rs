@@ -4974,6 +4974,7 @@ struct DawUi {
     pattern_playback_mode: bool,
     pattern_mode_playback_source: Option<(u16, u64)>,
     pattern_seek_tick: u64,
+    pattern_playback_phase_offset_frames: u64,
     performance_mode_active: bool,
     performance_midi_channel: u8,
     held_performance_clips: Vec<(u16, u32, usize)>,
@@ -5597,12 +5598,13 @@ struct PendingAudioRender {
     staged_handoff_reason: Option<PdcStreamHandoffReason>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum PdcStreamHandoffReason {
     Vst3Latency,
     Vst3ChannelLoad,
     AutomaticPdc { enabled: bool },
     MixerRouting,
+    PatternSeek,
 }
 
 #[derive(Clone, Copy)]
@@ -7390,6 +7392,7 @@ impl DawUi {
             pattern_playback_mode: false,
             pattern_mode_playback_source: None,
             pattern_seek_tick: 0,
+            pattern_playback_phase_offset_frames: 0,
             performance_mode_active: false,
             performance_midi_channel,
             held_performance_clips: Vec::new(),
@@ -14203,6 +14206,14 @@ impl DawUi {
     }
 
     fn stage_pattern_stream_rebuild(&mut self, reason: PdcStreamHandoffReason) -> bool {
+        self.stage_pattern_stream_rebuild_from_tick(reason, None)
+    }
+
+    fn stage_pattern_stream_rebuild_from_tick(
+        &mut self,
+        reason: PdcStreamHandoffReason,
+        requested_tick: Option<u64>,
+    ) -> bool {
         if !self.playing || !self.pattern_playback_mode || self.performance_mode_active {
             return false;
         }
@@ -14212,6 +14223,9 @@ impl DawUi {
         let Some((pattern_id, loop_length_ticks)) = self.pattern_mode_playback_source else {
             return false;
         };
+        if loop_length_ticks == 0 {
+            return false;
+        }
         if self.selected_pattern != Some(pattern_id) {
             return false;
         }
@@ -14242,15 +14256,37 @@ impl DawUi {
             return false;
         };
         let start_frame = engine.project_playback_position_frames();
-        let Some(loop_start_tick) = pattern_loop_handoff_tick_at_frame(
-            start_frame,
-            engine.sample_rate(),
-            document.header().ppq(),
-            document.metadata().tempo_bpm().unwrap_or(140.0),
-            loop_length_ticks,
-        ) else {
-            return false;
+        let sample_rate = engine.sample_rate();
+        let ppq = document.header().ppq();
+        let tempo_bpm = document.metadata().tempo_bpm().unwrap_or(140.0);
+        let loop_start_tick = if let Some(tick) = requested_tick {
+            tick % loop_length_ticks
+        } else {
+            let Some(tick) = pattern_loop_tick_at_frame_with_phase_offset(
+                start_frame,
+                self.pattern_playback_phase_offset_frames,
+                sample_rate,
+                ppq,
+                tempo_bpm,
+                loop_length_ticks,
+            ) else {
+                return false;
+            };
+            tick.round() as u64 % loop_length_ticks
         };
+        if requested_tick.is_some() {
+            let Some(phase_offset_frames) = pattern_loop_phase_offset_frames(
+                loop_start_tick,
+                start_frame,
+                sample_rate,
+                ppq,
+                tempo_bpm,
+                loop_length_ticks,
+            ) else {
+                return false;
+            };
+            self.pattern_playback_phase_offset_frames = phase_offset_frames;
+        }
         self.pattern_seek_tick = loop_start_tick;
         self.stream_selected_sampler_pattern_handoff(
             loop_length_ticks,
@@ -14261,6 +14297,13 @@ impl DawUi {
         self.pending_sampler_stream
             .as_ref()
             .is_some_and(|pending| pending.staged_streaming.is_some())
+    }
+
+    fn stage_pattern_stream_seek(&mut self, requested_tick: u64) -> bool {
+        self.stage_pattern_stream_rebuild_from_tick(
+            PdcStreamHandoffReason::PatternSeek,
+            Some(requested_tick),
+        )
     }
 
     fn initialize_live_mixer_insert_fader_targets(&self, document: &FlpDocument) {
@@ -14349,6 +14392,7 @@ impl DawUi {
         loop_start_tick: u64,
         audio_layers: Vec<PatternAudioLayer>,
     ) {
+        self.pattern_playback_phase_offset_frames = 0;
         self.active_clap_pattern_audio_layers = audio_layers.clone();
         let clap_audio_channel_ids = self
             .clap_pattern_playback_instruments
@@ -14468,6 +14512,17 @@ impl DawUi {
             }
         };
         let seek_tick = u64::from(requested_tick) % loop_length_ticks;
+        if self.playing
+            && self
+                .pattern_mode_playback_source
+                .is_some_and(|(active_pattern_id, _)| active_pattern_id == pattern_id)
+            && self.stage_pattern_stream_seek(seek_tick)
+        {
+            self.status = format!(
+                "Seeking Pattern {pattern_id} to tick {seek_tick} while current audio continues…"
+            );
+            return;
+        }
         let restart_playback = self.playing;
         let playback_loaded = self.project_playback_loaded
             || self.pending_audio_render.is_some()
@@ -15007,6 +15062,9 @@ impl DawUi {
                 Some(PdcStreamHandoffReason::Vst3ChannelLoad) => format!(
                     "Loaded VST3 channel applied through a live Playlist handoff{tick_suffix}"
                 ),
+                Some(PdcStreamHandoffReason::PatternSeek) => {
+                    format!("Pattern seek stream staged{tick_suffix}")
+                }
                 Some(PdcStreamHandoffReason::Vst3Latency) | None => {
                     format!("VST3 latency update applied through a live PDC handoff{tick_suffix}")
                 }
@@ -15106,6 +15164,9 @@ impl DawUi {
             None
         };
         if staged_handoff_committed {
+            if staged_handoff_reason == Some(PdcStreamHandoffReason::PatternSeek) && self.playing {
+                self.start_midi_pattern_transport_for_active_pattern();
+            }
             let tick = self
                 .current_pattern_mode_playhead_tick()
                 .map(|(_, tick)| tick)
@@ -15123,6 +15184,9 @@ impl DawUi {
                 Some(PdcStreamHandoffReason::Vst3ChannelLoad) => format!(
                     "Loaded VST3 channel applied through a live Pattern handoff{tick_suffix}"
                 ),
+                Some(PdcStreamHandoffReason::PatternSeek) => {
+                    format!("Pattern seek applied through a live audio handoff{tick_suffix}")
+                }
                 Some(PdcStreamHandoffReason::Vst3Latency) | None => format!(
                     "VST3 latency update applied through a live Pattern PDC handoff{tick_suffix}"
                 ),
@@ -15776,6 +15840,7 @@ impl DawUi {
         self.stop_midi_playlist_playback();
         self.stop_midi_pattern_transport();
         self.pattern_mode_playback_source = None;
+        self.pattern_playback_phase_offset_frames = 0;
         self.stop_midi_clock();
         self.stop_midi_pattern_preview();
         self.stop_live_sampler_input();
@@ -19479,8 +19544,9 @@ impl DawUi {
         let (pattern_id, loop_length_ticks) = self.pattern_mode_playback_source?;
         let document = self.document.as_ref()?;
         let engine = self.audio_engine.as_ref()?;
-        let tick = pattern_loop_tick_at_frame(
+        let tick = pattern_loop_tick_at_frame_with_phase_offset(
             engine.project_playback_position_frames(),
+            self.pattern_playback_phase_offset_frames,
             engine.sample_rate(),
             document.header().ppq(),
             document.metadata().tempo_bpm().unwrap_or(140.0),
@@ -48886,10 +48952,11 @@ impl DawUi {
             }
         };
         writer.set_metronome_mixer_routed(true);
-        let worker_metronome = self
-            .audio_engine
-            .as_ref()
-            .map(AudioEngine::metronome_stream_playback);
+        let worker_metronome = self.audio_engine.as_ref().map(|engine| {
+            engine.metronome_stream_playback_with_frame_offset(
+                self.pattern_playback_phase_offset_frames,
+            )
+        });
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
         let read_sample_root_note = self.read_sample_root_note;
@@ -49083,6 +49150,9 @@ impl DawUi {
                         Some((_, PdcStreamHandoffReason::Vst3ChannelLoad)) => {
                             "Preparing the loaded VST3 Pattern channel while current audio continues…"
                                 .to_owned()
+                        }
+                        Some((_, PdcStreamHandoffReason::PatternSeek)) => {
+                            "Preparing the Pattern seek while current audio continues…".to_owned()
                         }
                         _ => "Preparing updated Pattern PDC while current audio continues…"
                             .to_owned(),
@@ -60317,10 +60387,11 @@ impl DawUi {
             .midi_input_connection
             .as_ref()
             .and_then(ConnectedMidiInput::midi_script_output_handle);
-        match MidiPatternLoopScheduler::start(
+        match MidiPatternLoopScheduler::start_with_phase_offset(
             output,
             messages,
             loop_frames,
+            self.pattern_playback_phase_offset_frames,
             playback_clock,
             script_output,
         ) {
@@ -82630,6 +82701,61 @@ fn pattern_loop_tick_at_frame(
         .ok()?
         .max(1);
     tempo_map.tick_at_frame(frame % loop_length_frames, sample_rate)
+}
+
+fn pattern_loop_tick_at_frame_with_phase_offset(
+    frame: u64,
+    phase_offset_frames: u64,
+    sample_rate: u32,
+    ppq: u16,
+    tempo_bpm: f64,
+    loop_length_ticks: u64,
+) -> Option<f64> {
+    if loop_length_ticks == 0 {
+        return None;
+    }
+    let tempo_map = PlaylistTempoMap::constant(ppq, tempo_bpm).ok()?;
+    let loop_length_frames = tempo_map
+        .frame_at_tick(loop_length_ticks, sample_rate)
+        .ok()?
+        .max(1);
+    let frame_phase = frame % loop_length_frames;
+    let offset_phase = phase_offset_frames % loop_length_frames;
+    let until_wrap = loop_length_frames - frame_phase;
+    let phase_frame = if offset_phase >= until_wrap {
+        offset_phase - until_wrap
+    } else {
+        frame_phase + offset_phase
+    };
+    tempo_map.tick_at_frame(phase_frame, sample_rate)
+}
+
+fn pattern_loop_phase_offset_frames(
+    target_tick: u64,
+    start_frame: u64,
+    sample_rate: u32,
+    ppq: u16,
+    tempo_bpm: f64,
+    loop_length_ticks: u64,
+) -> Option<u64> {
+    if loop_length_ticks == 0 {
+        return None;
+    }
+    let tempo_map = PlaylistTempoMap::constant(ppq, tempo_bpm).ok()?;
+    let loop_length_frames = tempo_map
+        .frame_at_tick(loop_length_ticks, sample_rate)
+        .ok()?
+        .max(1);
+    let target_phase = tempo_map
+        .frame_at_tick(target_tick % loop_length_ticks, sample_rate)
+        .ok()?
+        % loop_length_frames;
+    let current_phase = start_frame % loop_length_frames;
+    Some(if target_phase >= current_phase {
+        target_phase - current_phase
+    } else {
+        loop_length_frames - (current_phase - target_phase)
+    })
 }
 
 fn pattern_loop_handoff_tick_at_frame(
