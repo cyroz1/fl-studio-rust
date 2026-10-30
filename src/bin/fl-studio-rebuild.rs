@@ -60387,14 +60387,26 @@ impl DawUi {
             .midi_input_connection
             .as_ref()
             .and_then(ConnectedMidiInput::midi_script_output_handle);
-        match MidiPatternLoopScheduler::start_with_phase_offset(
-            output,
-            messages,
-            loop_frames,
-            self.pattern_playback_phase_offset_frames,
-            playback_clock,
-            script_output,
-        ) {
+        let phase_offset_frames = self.pattern_playback_phase_offset_frames;
+        let scheduler_result = if phase_offset_frames == 0 {
+            MidiPatternLoopScheduler::start(
+                output,
+                messages,
+                loop_frames,
+                playback_clock,
+                script_output,
+            )
+        } else {
+            MidiPatternLoopScheduler::start_with_phase_offset(
+                output,
+                messages,
+                loop_frames,
+                phase_offset_frames,
+                playback_clock,
+                script_output,
+            )
+        };
+        match scheduler_result {
             Ok(scheduler) => {
                 self.midi_pattern_transport = Some(ActiveMidiPatternTransport {
                     pattern_id,
@@ -82685,6 +82697,7 @@ fn playlist_song_length_bst_components(
     (bars.saturating_sub(1), steps.saturating_sub(1), ticks)
 }
 
+#[cfg(test)]
 fn pattern_loop_tick_at_frame(
     frame: u64,
     sample_rate: u32,
@@ -82758,6 +82771,7 @@ fn pattern_loop_phase_offset_frames(
     })
 }
 
+#[cfg(test)]
 fn pattern_loop_handoff_tick_at_frame(
     frame: u64,
     sample_rate: u32,
