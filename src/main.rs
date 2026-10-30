@@ -21,7 +21,7 @@ use flp_rebuild::{
     ChannelLevelAdjustmentsEdit, ChannelMidiOutSettingsEdit, ChannelSampleCrossfadeEdit,
     ChannelSampleEffectsEdit, ChannelSampleFxFlagsEdit, ChannelSampleTrimEdit,
     ChannelSampleWindowEdit, ChannelSamplerFilterEdit, ChannelSortOrder,
-    ChannelStretchSettingsEdit, ClawMachineOptions, FlamOptions, FlpDocument,
+    ChannelStretchSettingsEdit, ChannelType, ClawMachineOptions, FlamOptions, FlpDocument,
     FscControllerStreamImportOptions, FscScore, FstPreset, HumanizerOptions, LimitNoteOptions,
     LimitSnapDirection, MixerInsertEdit, MixerParameterKind, PatternControllerEdit, PatternNote,
     PatternNoteEdit, PatternNoteRotation, PlaylistClipEdit, PlaylistTrackEdit, PlaylistTrackMotion,
@@ -7502,23 +7502,38 @@ fn list_automation_target_links(path: &Path) -> Result<(), String> {
     let links = document
         .automation_target_links()
         .map_err(|error| format!("could not decode candidate automation target links: {error}"))?;
-    println!("candidate automation target links: {}", links.len());
+    println!("candidate 0xE3 records: {}", links.len());
     for link in links {
         let source_id = link.source_channel_id();
         let source_channel = channels.iter().find(|channel| channel.id() == source_id);
         let source_name = source_channel.and_then(|channel| channel.display_name());
         let source_type = source_channel.and_then(|channel| channel.channel_type());
         let source_range = source_channel.and_then(|channel| channel.automation_range_raw());
-        let mixer_target = link.candidate_mixer_effect_target();
-        let target = if let Some(channel_id) = link.candidate_channel_target_id() {
+        let source_class = match source_type {
+            Some(ChannelType::Automation) => "automation",
+            Some(_) => "other-channel",
+            None => "unresolved",
+        };
+        // Project-level 0xE3 records also describe non-Automation remote-control mappings.
+        // Keep those records visible as raw data, but only interpret their parameter and
+        // destination fields as Automation links when the source resolves to a type-5 channel.
+        let automation_source = source_class == "automation";
+        let channel_target_id = automation_source
+            .then(|| link.candidate_channel_target_id())
+            .flatten();
+        let mixer_target = automation_source
+            .then(|| link.candidate_mixer_effect_target())
+            .flatten();
+        let target = if let Some(channel_id) = channel_target_id {
             format!("channel:{channel_id}")
         } else if let Some((insert, slot)) = mixer_target {
             format!("mixer-insert:{insert}/slot:{slot}")
-        } else {
+        } else if automation_source {
             "unclassified".to_owned()
+        } else {
+            "not-interpreted".to_owned()
         };
-        let target_channel = link
-            .candidate_channel_target_id()
+        let target_channel = channel_target_id
             .and_then(|channel_id| channels.iter().find(|channel| channel.id() == channel_id));
         let target_name = target_channel.and_then(|channel| channel.display_name());
         let target_type = target_channel.and_then(|channel| channel.channel_type());
@@ -7536,16 +7551,27 @@ fn list_automation_target_links(path: &Path) -> Result<(), String> {
         });
         let target_effect_name =
             target_effect.and_then(|effect| effect.display_name().or(effect.plugin_identifier()));
+        let candidate_parameter = if automation_source {
+            link.candidate_parameter_index().to_string()
+        } else {
+            "not-interpreted".to_owned()
+        };
+        let candidate_vst_parameter = if automation_source {
+            link.candidate_vst_parameter().to_string()
+        } else {
+            "not-interpreted".to_owned()
+        };
         println!(
-            "event={} source_channel={} source_name={:?} source_type={:?} source_automation_range_raw={:?} candidate_parameter={} parameter_raw=0x{:04X} candidate_vst_parameter={} destination_raw={} candidate_target={} candidate_target_name={:?} candidate_target_type={:?} candidate_target_insert_name={:?} candidate_target_effect_name={:?} prefix={:02X?} suffix={:02X?}",
+            "event={} source_channel={} source_name={:?} source_class={} source_type={:?} source_automation_range_raw={:?} candidate_parameter={} parameter_raw=0x{:04X} candidate_vst_parameter={} destination_raw={} candidate_target={} candidate_target_name={:?} candidate_target_type={:?} candidate_target_insert_name={:?} candidate_target_effect_name={:?} prefix={:02X?} suffix={:02X?}",
             link.event_index(),
             source_id,
             source_name,
+            source_class,
             source_type,
             source_range,
-            link.candidate_parameter_index(),
+            candidate_parameter,
             link.parameter_raw(),
-            link.candidate_vst_parameter(),
+            candidate_vst_parameter,
             link.destination_raw(),
             target,
             target_name,
