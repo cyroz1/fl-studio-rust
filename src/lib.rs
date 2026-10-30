@@ -746,6 +746,8 @@ pub struct ChannelSummary {
     group_number: Option<i32>,
     volume: Option<u32>,
     pan: Option<i32>,
+    automation_min_raw: Option<i32>,
+    automation_max_raw: Option<i32>,
     levels_editable: bool,
     volume_priority: u8,
     pan_priority: u8,
@@ -1519,6 +1521,14 @@ impl ChannelSummary {
     /// Raw FL channel pan value, in the project's 0..=12800 control range.
     pub fn pan(&self) -> Option<i32> {
         self.pan
+    }
+
+    /// Raw minimum and maximum controls from a type-5 channel's `0xDB` Levels event.
+    pub fn automation_range_raw(&self) -> Option<(i32, i32)> {
+        if self.channel_type() != Some(ChannelType::Automation) {
+            return None;
+        }
+        Some((self.automation_min_raw?, self.automation_max_raw?))
     }
 
     /// Raw fields from each recognized 20-byte core in a Layer channel's
@@ -6701,24 +6711,42 @@ impl FlpDocument {
                     ));
                 }
                 // FL 25+ stores channel pan and volume at the start of the 0xDB
-                // Levels data event. Keep legacy byte/word values as fallbacks.
+                // Levels event. On type-5 channels, the same fields are the
+                // Automation channel's Min and Max controls.
                 0xDB if event.payload.len() >= 8 => {
                     channel.levels_editable = true;
-                    if channel.pan_priority < 3 {
-                        channel.pan = Some(i32::from_le_bytes(
-                            event.payload[0..4]
-                                .try_into()
-                                .expect("the 0xDB pan field has four bytes"),
-                        ));
-                        channel.pan_priority = 3;
-                    }
-                    if channel.volume_priority < 3 {
-                        channel.volume = Some(u32::from_le_bytes(
-                            event.payload[4..8]
-                                .try_into()
-                                .expect("the 0xDB volume field has four bytes"),
-                        ));
-                        channel.volume_priority = 3;
+                    if channel.kind == Some(ChannelType::Automation.raw()) {
+                        if channel.automation_min_raw.is_none()
+                            && channel.automation_max_raw.is_none()
+                        {
+                            channel.automation_min_raw = Some(i32::from_le_bytes(
+                                event.payload[0..4]
+                                    .try_into()
+                                    .expect("the 0xDB Automation minimum field has four bytes"),
+                            ));
+                            channel.automation_max_raw = Some(i32::from_le_bytes(
+                                event.payload[4..8]
+                                    .try_into()
+                                    .expect("the 0xDB Automation maximum field has four bytes"),
+                            ));
+                        }
+                    } else {
+                        if channel.pan_priority < 3 {
+                            channel.pan = Some(i32::from_le_bytes(
+                                event.payload[0..4]
+                                    .try_into()
+                                    .expect("the 0xDB pan field has four bytes"),
+                            ));
+                            channel.pan_priority = 3;
+                        }
+                        if channel.volume_priority < 3 {
+                            channel.volume = Some(u32::from_le_bytes(
+                                event.payload[4..8]
+                                    .try_into()
+                                    .expect("the 0xDB volume field has four bytes"),
+                            ));
+                            channel.volume_priority = 3;
+                        }
                     }
                 }
                 0x48 if event.payload.len() == 2 && channel.volume_priority < 2 => {

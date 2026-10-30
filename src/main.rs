@@ -6727,7 +6727,7 @@ fn list_channels(path: &Path) -> Result<(), String> {
     println!("channels: {}", channels.len());
     for channel in channels {
         println!(
-            "id={} kind={} type={:?} enabled={} zipped={} main_pitch={} add_to_key={} fine_tune_raw={:?} key_region={:?} stretch_settings={:?} sampler_fade_out_raw={:?} sampler_fade_in_raw={:?} sampler_filter_cutoff_raw={:?} sampler_filter_resonance_raw={:?} sampler_filter_type_raw={:?} sample_fade_stereo={} sample_swap_stereo={} sample_remove_dc={} sample_normalize={} sample_reverse_polarity={} sample_start_fraction={:?} sample_length_fraction={:?} sample_trim_threshold_raw={:?} sample_crossfade_raw={:?} sampler_portamento={:?} sampler_polyphony_slide_raw={:?} sampler_volume_envelope={:?} sampler_envelopes={:?} color={:?} volume={:?} pan={:?} level_adjusts_raw={:?} midi_out_settings={:?} swing_mix_raw={:?} layer_children={:?} layer_flags={:?} plugin={} name={} sample_path={:?} events={:?}",
+            "id={} kind={} type={:?} enabled={} zipped={} main_pitch={} add_to_key={} fine_tune_raw={:?} key_region={:?} stretch_settings={:?} sampler_fade_out_raw={:?} sampler_fade_in_raw={:?} sampler_filter_cutoff_raw={:?} sampler_filter_resonance_raw={:?} sampler_filter_type_raw={:?} sample_fade_stereo={} sample_swap_stereo={} sample_remove_dc={} sample_normalize={} sample_reverse_polarity={} sample_start_fraction={:?} sample_length_fraction={:?} sample_trim_threshold_raw={:?} sample_crossfade_raw={:?} sampler_portamento={:?} sampler_polyphony_slide_raw={:?} sampler_volume_envelope={:?} sampler_envelopes={:?} color={:?} volume={:?} pan={:?} automation_range_raw={:?} level_adjusts_raw={:?} midi_out_settings={:?} swing_mix_raw={:?} layer_children={:?} layer_flags={:?} plugin={} name={} sample_path={:?} events={:?}",
             channel.id(),
             channel
                 .kind()
@@ -6763,6 +6763,7 @@ fn list_channels(path: &Path) -> Result<(), String> {
             channel.color(),
             channel.volume(),
             channel.pan(),
+            channel.automation_range_raw(),
             channel.level_adjustments(),
             channel.midi_out_settings(),
             channel.swing_mix_raw(),
@@ -7505,6 +7506,7 @@ fn list_automation_target_links(path: &Path) -> Result<(), String> {
         let source_channel = channels.iter().find(|channel| channel.id() == source_id);
         let source_name = source_channel.and_then(|channel| channel.display_name());
         let source_type = source_channel.and_then(|channel| channel.channel_type());
+        let source_range = source_channel.and_then(|channel| channel.automation_range_raw());
         let target = if let Some(channel_id) = link.candidate_channel_target_id() {
             format!("channel:{channel_id}")
         } else if let Some((insert, slot)) = link.candidate_mixer_effect_target() {
@@ -7518,11 +7520,12 @@ fn list_automation_target_links(path: &Path) -> Result<(), String> {
         let target_name = target_channel.and_then(|channel| channel.display_name());
         let target_type = target_channel.and_then(|channel| channel.channel_type());
         println!(
-            "event={} source_channel={} source_name={:?} source_type={:?} candidate_parameter={} parameter_raw=0x{:04X} candidate_vst_parameter={} destination_raw={} candidate_target={} candidate_target_name={:?} candidate_target_type={:?} prefix={:02X?} suffix={:02X?}",
+            "event={} source_channel={} source_name={:?} source_type={:?} source_automation_range_raw={:?} candidate_parameter={} parameter_raw=0x{:04X} candidate_vst_parameter={} destination_raw={} candidate_target={} candidate_target_name={:?} candidate_target_type={:?} prefix={:02X?} suffix={:02X?}",
             link.event_index(),
             source_id,
             source_name,
             source_type,
+            source_range,
             link.candidate_parameter_index(),
             link.parameter_raw(),
             link.candidate_vst_parameter(),
