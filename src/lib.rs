@@ -26432,7 +26432,7 @@ fn decode_automation_points(event: &FlpEvent) -> Result<Vec<AutomationPoint>, Fl
 }
 
 fn validate_automation_point_value(value: f64) -> Result<(), FlpError> {
-    if !value.is_finite() || !(-0.001..=1.001).contains(&value) {
+    if normalized_automation_point_value(value).is_none() {
         return Err(FlpError::UnsupportedEdit(
             "automation point values must be finite and between -0.001 and 1.001",
         ));
