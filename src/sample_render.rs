@@ -796,6 +796,12 @@ impl PartialEq for PlaylistAudioLayer {
 
 impl Eq for PlaylistAudioLayer {}
 
+/// Latest live Pattern notes and an optional project snapshot for channel-source changes.
+pub struct PatternLiveUpdate {
+    pub notes: Vec<PatternNote>,
+    pub project_bytes: Option<Vec<u8>>,
+}
+
 /// Live Sampler Pattern loop inputs, meters, and block-boundary Mixer updates.
 pub struct SamplerPatternLoopStreamControls<'a> {
     pub playback: SamplerPatternLoopPlayback,
@@ -803,7 +809,7 @@ pub struct SamplerPatternLoopStreamControls<'a> {
     pub latency_updates: Option<Vst3LatencyUpdateControls>,
     pub metronome: Option<MetronomeStreamPlayback>,
     /// Updated Pattern notes; applied to unplayed Sampler events at block boundaries.
-    pub note_updates: Option<Receiver<Vec<PatternNote>>>,
+    pub note_updates: Option<Receiver<PatternLiveUpdate>>,
     /// Assigned CLAP destinations, including channels with zero crossfade gain.
     pub clap_audio_channel_ids: BTreeSet<u16>,
     pub pattern_audio_layers: Vec<PatternAudioLayer>,
@@ -830,7 +836,7 @@ pub struct Vst3PatternLoopStreamControls<'a> {
     pub latency_updates: Option<Vst3LatencyUpdateControls>,
     pub metronome: Option<MetronomeStreamPlayback>,
     /// Updated Pattern notes; applied to unplayed events at block boundaries for prepared sources.
-    pub note_updates: Option<Receiver<Vec<PatternNote>>>,
+    pub note_updates: Option<Receiver<PatternLiveUpdate>>,
     /// Assigned CLAP destinations, including channels with zero crossfade gain.
     pub clap_audio_channel_ids: BTreeSet<u16>,
     pub pattern_audio_layers: Vec<PatternAudioLayer>,
@@ -8191,7 +8197,7 @@ struct PatternLiveStreamControls<'a> {
     meters: Option<&'a crate::audio::MixerTrackPeakMeters>,
     latency_updates: Option<Vst3LatencyUpdateControls>,
     metronome: Option<MetronomeStreamPlayback>,
-    note_updates: Option<Receiver<Vec<PatternNote>>>,
+    note_updates: Option<Receiver<PatternLiveUpdate>>,
 }
 
 struct SamplerPatternChannelOptions<'a> {
@@ -8420,6 +8426,7 @@ fn stream_pattern_from_tick_with_vst3_to_device(
             project_path.as_ref(),
             options,
             Some(cancelled),
+            None,
             SamplerPatternChannelOptions {
                 channel_filter: Some(&included_channels),
                 allow_empty: true,
@@ -8664,6 +8671,7 @@ fn stream_pattern_from_tick_with_vst3_to_device(
         }
         let mut next_loop_start = loop_frames;
         let mut updated_pattern_notes = None;
+        let mut updated_project_document = None;
         loop {
             if finite_output_frames.is_some_and(|frames| block_start >= frames) {
                 break Ok(());
@@ -8676,23 +8684,66 @@ fn stream_pattern_from_tick_with_vst3_to_device(
                 && let Some(receiver) = note_updates.as_ref()
             {
                 let mut latest_notes = None;
-                while let Ok(notes) = receiver.try_recv() {
-                    latest_notes = Some(notes);
+                let mut latest_project_bytes = None;
+                while let Ok(update) = receiver.try_recv() {
+                    latest_notes = Some(update.notes);
+                    if update.project_bytes.is_some() {
+                        latest_project_bytes = update.project_bytes;
+                    }
+                }
+                if let Some(project_bytes) = latest_project_bytes
+                    && let Ok(project_document) = FlpDocument::parse(&project_bytes)
+                {
+                    updated_project_document = Some(project_document);
                 }
                 if let Some(notes) = latest_notes {
+                    let live_document = updated_project_document.as_ref().unwrap_or(document);
+                    let new_sampler_channels = live_document
+                        .channels()
+                        .into_iter()
+                        .filter(|channel| {
+                            channel.kind() == Some(0)
+                                && channel.enabled() != Some(false)
+                                && !engine.sources_by_channel.contains_key(&channel.id())
+                        })
+                        .map(|channel| channel.id())
+                        .collect::<BTreeSet<_>>();
+                    if !new_sampler_channels.is_empty()
+                        && let Ok(prepared_sources) = prepare_sampler_pattern_for_channel_internal(
+                            live_document,
+                            project_path.as_ref(),
+                            options,
+                            Some(cancelled),
+                            Some(&notes),
+                            SamplerPatternChannelOptions {
+                                channel_filter: Some(&new_sampler_channels),
+                                allow_empty: true,
+                                include_muted_mixer_sources: live_master_meters.is_some(),
+                                vst3_volume_expression_channels:
+                                    live_vst3_volume_expression_channels.as_ref(),
+                                clap_audio_channels: (!clap_pattern_channels.is_empty())
+                                    .then_some(&clap_pattern_channels),
+                            },
+                        )
+                    {
+                        engine
+                            .sources_by_channel
+                            .extend(prepared_sources.sources_by_channel);
+                        engine.update_live_mixer_routing(live_document, live_master_meters);
+                    }
                     if let Some(processor) = playback.vst3_processor.as_mut() {
                         let _ = processor.update_live_pattern_notes(
-                            document,
+                            live_document,
                             &notes,
                             &clap_pattern_channels,
                             block_start,
                         );
                     }
                     if let Ok(scheduled_notes) = schedule_live_sampler_pattern_notes(
-                        document,
+                        live_document,
                         &notes,
                         options,
-                        &render.sources_by_channel,
+                        &engine.sources_by_channel,
                         live_vst3_volume_expression_channels.as_ref(),
                         (!clap_pattern_channels.is_empty()).then_some(&clap_pattern_channels),
                     ) {
@@ -14723,6 +14774,7 @@ fn prepare_sampler_pattern(
             project_path,
             options,
             cancelled,
+            None,
             SamplerPatternChannelOptions {
                 channel_filter: None,
                 allow_empty: false,
@@ -14748,6 +14800,7 @@ fn prepare_sampler_pattern_for_channel(
         project_path,
         options,
         cancelled,
+        None,
         SamplerPatternChannelOptions {
             channel_filter,
             allow_empty: false,
@@ -14771,6 +14824,7 @@ fn prepare_sampler_pattern_allow_empty(
         project_path,
         options,
         cancelled,
+        None,
         SamplerPatternChannelOptions {
             channel_filter: None,
             allow_empty: true,
@@ -14786,6 +14840,7 @@ fn prepare_sampler_pattern_for_channel_internal(
     project_path: &Path,
     options: SamplerPatternRenderOptions,
     cancelled: Option<&AtomicBool>,
+    pattern_notes_override: Option<&[PatternNote]>,
     channel_options: SamplerPatternChannelOptions<'_>,
 ) -> Result<PreparedSamplerPattern, String> {
     let SamplerPatternChannelOptions {
@@ -14818,6 +14873,7 @@ fn prepare_sampler_pattern_for_channel_internal(
         .into_iter()
         .find(|pattern| pattern.id == options.pattern_id)
         .ok_or_else(|| format!("pattern {} was not found", options.pattern_id))?;
+    let pattern_notes = pattern_notes_override.unwrap_or(&pattern.notes);
     let pan_law = project_pan_law(document);
     let fast_declick_for_cut_groups = document
         .project_settings()
@@ -14830,8 +14886,7 @@ fn prepare_sampler_pattern_for_channel_internal(
         .map(|channel| (channel.id(), channel))
         .collect();
     let channel_router = ChannelNoteRouter::new(channels.clone());
-    let sampler_notes = pattern
-        .notes
+    let sampler_notes = pattern_notes
         .iter()
         .enumerate()
         .filter(|(_, note)| !note.is_muted())
@@ -15329,7 +15384,7 @@ fn refresh_prepared_clip_mixer_routes(
 }
 
 struct SamplerVoiceEngine<'a> {
-    sources_by_channel: &'a HashMap<u16, SamplerVoiceSource>,
+    sources_by_channel: HashMap<u16, SamplerVoiceSource>,
     notes: &'a [ScheduledSamplerNote],
     tempo_map: Option<&'a PlaylistTempoMap>,
     live_notes: Vec<ScheduledSamplerNote>,
@@ -15513,7 +15568,7 @@ impl<'a> SamplerVoiceEngine<'a> {
         pan_law: PanLaw,
     ) -> Self {
         Self {
-            sources_by_channel,
+            sources_by_channel: sources_by_channel.clone(),
             notes,
             tempo_map: None,
             live_notes: Vec::new(),
@@ -15921,7 +15976,7 @@ impl<'a> SamplerVoiceEngine<'a> {
             .map(|(cut_group, _)| cut_group)
             .filter(|cut_group| *cut_group != 0)
         {
-            let sources_by_channel = self.sources_by_channel;
+            let sources_by_channel = &self.sources_by_channel;
             let voices_to_cut = self
                 .voices
                 .iter()
@@ -16381,7 +16436,7 @@ impl<'a> SamplerVoiceEngine<'a> {
         let channel = channel & 0x0F;
         let pan = pan.clamp(0.0, 127.0);
         self.live_midi_pan[usize::from(channel)] = pan;
-        let sources_by_channel = self.sources_by_channel;
+        let sources_by_channel = &self.sources_by_channel;
         let pan_law = self.pan_law;
         for voice in self.voices.iter_mut().filter_map(Option::as_mut) {
             if voice.input_midi_channel == Some(channel)

@@ -51,21 +51,21 @@ use flp_rebuild::sample_render::{
     AudioClipRenderOptions, AudioClipRenderSummary, AudioFileRenderOptions, AudioRecordingSummary,
     AudioRenderEncodingOptions, AudioRenderOutput, LayerLiveInputConfig, LayerLiveInputEvent,
     LayerLiveInputSender, MP3_BITRATES_KBPS, MixerStemRenderOptions,
-    PLAYLIST_AUDIO_CLIP_GAIN_MINUS_INFINITY, PatternAudioLayer, PlaylistAudioClipEnvelope,
-    PlaylistAudioClipFadeCurve, PlaylistAudioLayer, PlaylistChannelAutomationPoint,
-    PlaylistLiveStreamControls, PlaylistPatternScheduleOptions, PlaylistPerformanceClapLayer,
-    PlaylistPerformanceCommand, PlaylistPerformanceLaunch, PlaylistPerformanceLiveStatus,
-    PlaylistPerformanceStream, PlaylistPlaybackLoopRange, PlaylistRenderOptions,
-    PlaylistRenderRange, PlaylistRenderSummary, PlaylistStreamMonitor, PlaylistTailMode,
-    PlaylistTempoMap, PlaylistTrackFilter, ResamplingQuality, SamplerLiveInputRouting,
-    SamplerLiveNoteEvent, SamplerLiveNoteSender, SamplerPatternLoopPlayback,
-    SamplerPatternLoopStreamControls, SamplerPatternRenderOptions, SamplerPatternRenderSummary,
-    SamplerPatternStreamControls, Vst3LatencyUpdateControls, Vst3LiveInputEvent,
-    Vst3LiveInputSender, Vst3PatternLoopPlayback, Vst3PatternLoopStreamControls,
-    Vst3PatternPlayback, Vst3PatternStreamControls, WavChannelMode, WavDitherMode, WavSampleFormat,
-    layer_live_input_queue, nearest_playlist_audio_clip_zero_crossing_tick,
-    playlist_audio_clip_fade_gain, playlist_performance_clap_clip_indices,
-    playlist_performance_clip_indices_with_vst3_and_clap,
+    PLAYLIST_AUDIO_CLIP_GAIN_MINUS_INFINITY, PatternAudioLayer, PatternLiveUpdate,
+    PlaylistAudioClipEnvelope, PlaylistAudioClipFadeCurve, PlaylistAudioLayer,
+    PlaylistChannelAutomationPoint, PlaylistLiveStreamControls, PlaylistPatternScheduleOptions,
+    PlaylistPerformanceClapLayer, PlaylistPerformanceCommand, PlaylistPerformanceLaunch,
+    PlaylistPerformanceLiveStatus, PlaylistPerformanceStream, PlaylistPlaybackLoopRange,
+    PlaylistRenderOptions, PlaylistRenderRange, PlaylistRenderSummary, PlaylistStreamMonitor,
+    PlaylistTailMode, PlaylistTempoMap, PlaylistTrackFilter, ResamplingQuality,
+    SamplerLiveInputRouting, SamplerLiveNoteEvent, SamplerLiveNoteSender,
+    SamplerPatternLoopPlayback, SamplerPatternLoopStreamControls, SamplerPatternRenderOptions,
+    SamplerPatternRenderSummary, SamplerPatternStreamControls, Vst3LatencyUpdateControls,
+    Vst3LiveInputEvent, Vst3LiveInputSender, Vst3PatternLoopPlayback,
+    Vst3PatternLoopStreamControls, Vst3PatternPlayback, Vst3PatternStreamControls, WavChannelMode,
+    WavDitherMode, WavSampleFormat, layer_live_input_queue,
+    nearest_playlist_audio_clip_zero_crossing_tick, playlist_audio_clip_fade_gain,
+    playlist_performance_clap_clip_indices, playlist_performance_clip_indices_with_vst3_and_clap,
     playlist_performance_static_document_with_vst3_and_clap, playlist_performance_vst3_channel_ids,
     playlist_performance_vst3_clip_indices_with_clap, process_recording_precount_through_mixer,
     project_channel_stereo_output_gains_with_layer_adjustments, render_audio_clips_to_file,
@@ -4881,6 +4881,33 @@ struct MidiHeldPerformanceClip {
 
 type MidiPerformanceHoldMap = BTreeMap<(u8, u8), Vec<MidiHeldPerformanceClip>>;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PatternLiveChannelSignature {
+    channel_id: u16,
+    kind: Option<u8>,
+    enabled: Option<bool>,
+    sample_path: Option<String>,
+    plugin_identifier: Option<String>,
+    layer_child_ids: Option<Vec<u16>>,
+    mixer_track: Option<i8>,
+}
+
+fn pattern_live_channel_signature(document: &FlpDocument) -> Vec<PatternLiveChannelSignature> {
+    document
+        .channels()
+        .into_iter()
+        .map(|channel| PatternLiveChannelSignature {
+            channel_id: channel.id(),
+            kind: channel.kind(),
+            enabled: channel.enabled(),
+            sample_path: channel.sample_path().map(str::to_owned),
+            plugin_identifier: channel.plugin_identifier().map(str::to_owned),
+            layer_child_ids: channel.layer_child_ids().map(<[u16]>::to_vec),
+            mixer_track: channel.mixer_track(),
+        })
+        .collect()
+}
+
 #[derive(Clone, Copy)]
 struct MidiScriptTransportMove {
     speed_millionths: i32,
@@ -4947,9 +4974,10 @@ struct DawUi {
     performance_mixer_routing_sender: Option<Sender<FlpDocument>>,
     performance_latency_update_sender: Option<Sender<BTreeSet<u64>>>,
     performance_latency_report_receiver: Option<Receiver<Vst3LatencyReport>>,
-    pattern_note_update_sender: Option<SyncSender<Vec<PatternNote>>>,
+    pattern_note_update_sender: Option<SyncSender<PatternLiveUpdate>>,
     pattern_note_update_pattern_id: Option<u16>,
     pattern_note_update_snapshot: Option<Vec<PatternNote>>,
+    pattern_note_update_channel_snapshot: Option<Vec<PatternLiveChannelSignature>>,
     pattern_note_update_revision: u64,
     pattern_latency_update_sender: Option<Sender<BTreeSet<u64>>>,
     pattern_latency_report_receiver: Option<Receiver<Vst3LatencyReport>>,
@@ -7359,6 +7387,7 @@ impl DawUi {
             pattern_note_update_sender: None,
             pattern_note_update_pattern_id: None,
             pattern_note_update_snapshot: None,
+            pattern_note_update_channel_snapshot: None,
             pattern_note_update_revision: 0,
             pattern_latency_update_sender: None,
             pattern_latency_report_receiver: None,
@@ -15703,6 +15732,7 @@ impl DawUi {
         self.pattern_note_update_sender = None;
         self.pattern_note_update_pattern_id = None;
         self.pattern_note_update_snapshot = None;
+        self.pattern_note_update_channel_snapshot = None;
         self.pattern_note_update_revision = 0;
         self.pattern_latency_update_sender = None;
         self.pattern_latency_report_receiver = None;
@@ -17105,26 +17135,48 @@ impl DawUi {
         let Some(pattern_id) = self.pattern_note_update_pattern_id else {
             return;
         };
-        let Some(notes) = self
-            .document
-            .as_ref()
-            .and_then(|document| document.patterns().ok())
+        let Some(document) = self.document.as_ref() else {
+            return;
+        };
+        let Some(notes) = document
+            .patterns()
+            .ok()
             .and_then(|patterns| {
                 patterns
                     .into_iter()
                     .find(|pattern| pattern.id == pattern_id)
-                    .map(|pattern| pattern.notes)
             })
+            .map(|pattern| pattern.notes)
         else {
             return;
         };
-        if self.pattern_note_update_snapshot.as_ref() == Some(&notes) {
+        let channel_snapshot = pattern_live_channel_signature(document);
+        let notes_changed = self.pattern_note_update_snapshot.as_ref() != Some(&notes);
+        let channels_changed =
+            self.pattern_note_update_channel_snapshot.as_ref() != Some(&channel_snapshot);
+        if !notes_changed && !channels_changed {
             self.pattern_note_update_revision = self.project_edit_revision;
             return;
         }
-        match sender.try_send(notes.clone()) {
+        let project_bytes = if channels_changed {
+            match document.encode_lossless() {
+                Ok(bytes) => Some(bytes),
+                Err(error) => {
+                    self.status = format!("Could not prepare live Pattern channel update: {error}");
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let update = PatternLiveUpdate {
+            notes: notes.clone(),
+            project_bytes,
+        };
+        match sender.try_send(update) {
             Ok(()) => {
                 self.pattern_note_update_snapshot = Some(notes);
+                self.pattern_note_update_channel_snapshot = Some(channel_snapshot);
                 self.pattern_note_update_revision = self.project_edit_revision;
             }
             Err(TrySendError::Full(_)) => {}
@@ -17132,6 +17184,7 @@ impl DawUi {
                 self.pattern_note_update_sender = None;
                 self.pattern_note_update_pattern_id = None;
                 self.pattern_note_update_snapshot = None;
+                self.pattern_note_update_channel_snapshot = None;
                 self.pattern_note_update_revision = self.project_edit_revision;
             }
         }
@@ -48662,6 +48715,9 @@ impl DawUi {
                 .find(|pattern| pattern.id == pattern_id)
                 .map(|pattern| pattern.notes)
         });
+        let pattern_note_update_channel_snapshot = pattern_note_update_snapshot
+            .as_ref()
+            .map(|_| pattern_live_channel_signature(document));
 
         if staged_handoff.is_none() {
             self.stop_project_playback();
@@ -48881,6 +48937,7 @@ impl DawUi {
                 self.pattern_note_update_pattern_id =
                     pattern_note_update_snapshot.as_ref().map(|_| pattern_id);
                 self.pattern_note_update_snapshot = pattern_note_update_snapshot;
+                self.pattern_note_update_channel_snapshot = pattern_note_update_channel_snapshot;
                 self.pattern_note_update_revision = self.project_edit_revision;
                 self.pattern_latency_update_sender = pattern_latency_update_sender_for_ui;
                 self.pattern_latency_report_receiver = if has_vst3_processor {
