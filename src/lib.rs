@@ -2304,6 +2304,12 @@ pub struct PatternController {
 struct PlaylistPatternMergeScore {
     notes: Vec<PatternNote>,
     controllers: Vec<PatternController>,
+    time_markers: Vec<TimeMarker>,
+}
+
+struct PlaylistPatternMergeMarker {
+    position: u32,
+    events: Vec<FlpEvent>,
 }
 
 impl PatternController {
@@ -14117,8 +14123,9 @@ impl FlpDocument {
 
     fn pattern_score_for_playlist_merge(
         &self,
-        pattern_id: u16,
+        pattern: &Pattern,
     ) -> Result<PlaylistPatternMergeScore, FlpError> {
+        let pattern_id = pattern.id;
         let mut matching_markers = self.events.iter().enumerate().filter(|(_, event)| {
             event.opcode == 0x41
                 && event.encoding == PayloadEncoding::Word
@@ -14149,10 +14156,30 @@ impl FlpDocument {
             .get(region_start)
             .filter(|event| Self::is_pattern_note_event(event))
             .map(|_| region_start);
-        let mut score = PlaylistPatternMergeScore::default();
+        let time_marker_event_indices = pattern
+            .time_markers
+            .iter()
+            .flat_map(|marker| {
+                [
+                    marker.source_events.position,
+                    marker.source_events.numerator,
+                    marker.source_events.denominator,
+                    marker.source_events.name,
+                ]
+                .into_iter()
+                .flatten()
+            })
+            .collect::<HashSet<_>>();
+        let mut score = PlaylistPatternMergeScore {
+            time_markers: pattern.time_markers.clone(),
+            ..PlaylistPatternMergeScore::default()
+        };
         let mut length_event_count = 0usize;
 
         for event_index in region_start..region_end {
+            if time_marker_event_indices.contains(&event_index) {
+                continue;
+            }
             let event = &self.events[event_index];
             if Some(event_index) == note_event_index {
                 if !matches!(event.encoding, PayloadEncoding::Data { .. })
@@ -14218,8 +14245,9 @@ impl FlpDocument {
     /// The output clip spans the selected timeline range; repeated source scores are expanded
     /// into that range and clipped at each source clip's endpoint. Raw Pattern controller
     /// points are repeated and carried into the merged pattern without interpreting their
-    /// channel or flags. Original patterns remain unchanged. Unknown per-pattern data and
-    /// scaled clips are rejected because their score timing or payload is not yet modeled.
+    /// channel or flags. Recognized Pattern time markers are repeated with their raw flags and
+    /// meter/name events preserved. Original patterns remain unchanged. Unknown per-pattern
+    /// data and scaled clips are rejected because their score timing or payload is not modeled.
     pub fn merge_playlist_pattern_clips(
         &mut self,
         arrangement_id: u16,
@@ -14347,7 +14375,11 @@ impl FlpDocument {
                 ));
             }
             if let std::collections::hash_map::Entry::Vacant(entry) = scores_by_pattern.entry(id) {
-                entry.insert(self.pattern_score_for_playlist_merge(id)?);
+                let source_pattern = patterns
+                    .iter()
+                    .find(|pattern| pattern.id == id)
+                    .expect("a selected source Pattern was checked above");
+                entry.insert(self.pattern_score_for_playlist_merge(source_pattern)?);
             }
         }
 
@@ -14364,6 +14396,7 @@ impl FlpDocument {
             .to_owned();
         let mut merged_notes = Vec::<PatternNote>::new();
         let mut merged_controllers = Vec::<PatternController>::new();
+        let mut merged_time_markers = Vec::<PlaylistPatternMergeMarker>::new();
 
         for (_, clip) in &selected_clips {
             let PlaylistClipTarget::Pattern { id } = clip.target() else {
@@ -14378,6 +14411,7 @@ impl FlpDocument {
                 .expect("selected pattern score was decoded above");
             let source_notes = &score.notes;
             let source_controllers = &score.controllers;
+            let source_time_markers = &score.time_markers;
             let clip_length = u64::from(clip.length_ticks);
             let inferred_length = source_notes
                 .iter()
@@ -14463,6 +14497,72 @@ impl FlpDocument {
                     merged_controllers.push(merged_controller);
                 }
             }
+
+            for marker in source_time_markers {
+                let marker_tick = u64::from(marker.position_ticks());
+                if marker_tick >= clip_length {
+                    continue;
+                }
+                for repetition in 0..repetitions {
+                    let source_position = repetition
+                        .checked_mul(repeat_length)
+                        .and_then(|start| start.checked_add(marker_tick))
+                        .ok_or(FlpError::LengthOverflow)?;
+                    if source_position >= clip_length {
+                        continue;
+                    }
+                    if merged_time_markers.len() >= MAX_MERGED_PATTERN_NOTES {
+                        return Err(FlpError::UnsupportedEdit(
+                            "merging would expand beyond 2,000,000 Pattern time markers",
+                        ));
+                    }
+                    let merged_position = clip_offset
+                        .checked_add(source_position)
+                        .ok_or(FlpError::LengthOverflow)?;
+                    if merged_position > u64::from(TIME_MARKER_TICK_MASK) {
+                        return Err(FlpError::UnsupportedEdit(
+                            "a merged Pattern time marker exceeds the supported position range",
+                        ));
+                    }
+                    let raw_position = (marker.raw_position() & !TIME_MARKER_TICK_MASK)
+                        | u32::try_from(merged_position).map_err(|_| FlpError::LengthOverflow)?;
+                    let position_event_index =
+                        marker
+                            .source_events
+                            .position
+                            .ok_or(FlpError::UnsupportedEdit(
+                                "a Pattern time marker has no source position event",
+                            ))?;
+                    let mut source_event_indices = [
+                        Some(position_event_index),
+                        marker.source_events.numerator,
+                        marker.source_events.denominator,
+                        marker.source_events.name,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>();
+                    source_event_indices.sort_unstable();
+                    source_event_indices.dedup();
+                    let mut marker_events = Vec::with_capacity(source_event_indices.len());
+                    for event_index in source_event_indices {
+                        let mut event = self.events.get(event_index).cloned().ok_or(
+                            FlpError::UnsupportedEdit(
+                                "a Pattern time marker references a missing source event",
+                            ),
+                        )?;
+                        if event_index == position_event_index {
+                            event.replace_dword_payload(raw_position)?;
+                        }
+                        marker_events.push(event);
+                    }
+                    merged_time_markers.push(PlaylistPatternMergeMarker {
+                        position: u32::try_from(merged_position)
+                            .map_err(|_| FlpError::LengthOverflow)?,
+                        events: marker_events,
+                    });
+                }
+            }
         }
 
         let receiver_pattern_base = receiver_clip.pattern_base;
@@ -14475,6 +14575,38 @@ impl FlpDocument {
         candidate.add_pattern_notes(merged_pattern_id, &merged_notes)?;
         merged_controllers.sort_by_key(|controller| controller.position);
         candidate.append_pattern_controller_records(merged_pattern_id, &merged_controllers)?;
+        merged_time_markers.sort_by_key(|marker| marker.position);
+        if !merged_time_markers.is_empty() {
+            let new_pattern_marker_index = candidate
+                .events
+                .iter()
+                .position(|event| {
+                    event.opcode == 0x41
+                        && event.encoding == PayloadEncoding::Word
+                        && event.payload.as_slice() == merged_pattern_id.to_le_bytes()
+                })
+                .ok_or(FlpError::UnsupportedEdit(
+                    "the merged Pattern marker could not be found",
+                ))?;
+            let pattern_region_start = new_pattern_marker_index + 1;
+            let pattern_region_end = candidate.events[pattern_region_start..]
+                .iter()
+                .position(|event| {
+                    (event.opcode == 0x41 && event.payload.len() == 2)
+                        || matches!(event.opcode, 0x40 | 0x62 | 0x63)
+                })
+                .map_or(candidate.events.len(), |offset| {
+                    pattern_region_start + offset
+                });
+            let marker_events = merged_time_markers
+                .into_iter()
+                .flat_map(|marker| marker.events)
+                .collect::<Vec<_>>();
+            candidate
+                .events
+                .splice(pattern_region_end..pattern_region_end, marker_events);
+            candidate.refresh_event_offsets()?;
+        }
         let name_payload =
             encode_project_string(&pattern_name, candidate.project_strings_use_utf16())?;
         let name_event = FlpEvent::new_data(0xC1, name_payload)?;
