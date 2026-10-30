@@ -9189,7 +9189,9 @@ fn flp_vst3_output_mixer_offsets(payload: &[u8]) -> Option<Vec<i32>> {
     }
 
     output_data
-        .chunks_exact(12)
+        .as_chunks::<12>()
+        .0
+        .iter()
         .map(|record| Some(i32::from_le_bytes(record[4..8].try_into().ok()?)))
         .collect()
 }
