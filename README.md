@@ -290,7 +290,7 @@ The Piano roll key and scale selectors highlight C through B in major, natural m
 
 When a note is selected, the inspector names a recognized chord made from notes at the same onset in the target channel. It detects common triads, suspended chords, seventh chords, and power chords; inversions and more complex voicings appear as a note count.
 
-The Piano roll's **Ghost channels** toggle shows every channel in the current pattern in muted blue-gray while keeping the target channel green. Ghost notes remain editable through the same note controls.
+The Piano roll's **Ghost channels** toggle (Alt/Option+V) shows every channel in the current pattern in muted blue-gray while keeping the target channel green. Ghost notes remain editable through the same note controls.
 
 Enable **Color by MIDI channel** to assign each note's stored low four MIDI-channel bits a distinct display color. Native color groups and color-based selection remain undecoded.
 

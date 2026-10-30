@@ -43555,7 +43555,10 @@ impl DawUi {
                             ui.selectable_value(&mut self.piano_roll_scale, scale, scale.label());
                         }
                     });
-                ui.checkbox(&mut self.piano_roll_ghost_channels, "Ghost channels");
+                ui.checkbox(
+                    &mut self.piano_roll_ghost_channels,
+                    "Ghost channels (Alt/Option+V)",
+                );
                 ui.checkbox(
                     &mut self.piano_roll_editable_ghost_channels,
                     "Editable ghosts (Ctrl/Cmd+Alt+V)",
@@ -70047,6 +70050,19 @@ impl eframe::App for DawUi {
         });
         self.history_snapshot_available_this_frame =
             !history_navigation_requested && self.pending_history_snapshot.is_some();
+        let piano_roll_shortcuts_available =
+            self.view == MainView::PianoRoll || self.piano_roll_window_detached;
+        let toggle_ghost_channels_requested = piano_roll_shortcuts_available
+            && !ui.ctx().egui_wants_keyboard_input()
+            && ui.input_mut(|input| input.consume_key(egui::Modifiers::ALT, egui::Key::V));
+        if toggle_ghost_channels_requested {
+            self.piano_roll_ghost_channels = !self.piano_roll_ghost_channels;
+            self.status = if self.piano_roll_ghost_channels {
+                "Piano roll ghost channels shown".to_owned()
+            } else {
+                "Piano roll ghost channels hidden".to_owned()
+            };
+        }
         let toggle_editable_ghosts_requested = (self.view == MainView::PianoRoll
             || self.piano_roll_window_detached)
             && ui.input_mut(|input| {
