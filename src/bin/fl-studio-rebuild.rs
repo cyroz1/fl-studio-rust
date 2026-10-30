@@ -10384,6 +10384,11 @@ impl DawUi {
             let channel_id = state.channel_id();
             match host.load(&candidate.path, Some(&class_uid)) {
                 Ok(info) => {
+                    if let Err(error) = host.activate_all_audio_output_buses(info.id) {
+                        unresolved.push(format!(
+                            "channel {channel_id} secondary VST3 outputs could not be activated: {error}"
+                        ));
+                    }
                     let offset_key = channel_vst3_latency_offset_key(channel_id, &info.uid);
                     if let Some(offset_samples) =
                         self.vst3_project_manual_latency_offsets.get(&offset_key)

@@ -28,7 +28,7 @@ use crate::{
     MixerRouteAudibility, MixerSourceRouteTransform, PlaylistClipTarget,
     automation_segment_value_with_tension,
 };
-use vst3_host::audio::{AudioBuffers, AudioBusLayout, BusAudioBuffers};
+use vst3_host::audio::{AudioBuffers, AudioBusLayout, BusAudioBuffers, BusDirection, MediaType};
 use vst3_host::midi::{
     MidiChannel, MidiEvent, NoteExpressionInfo, NoteExpressionType, NoteId, PluginEvent,
     PluginEventData,
@@ -158,6 +158,7 @@ struct PreparedPatternRender {
     sample_rate: f64,
     sample_rate_u32: u32,
     output_channels: usize,
+    output_bus_channels: Vec<usize>,
     block_size: usize,
     total_frames: u64,
 }
@@ -3706,10 +3707,10 @@ impl PlaylistPluginStream {
                             self.channel_id
                         ));
                     }
-                    self.resampler.push_outputs(
+                    self.resampler.push_outputs_with_bus_channels(
                         &buffers.outputs,
                         source_count,
-                        self.render.output_channels,
+                        &self.render.output_bus_channels,
                     )?
                 };
                 self.push_interleaved(&output_block)?;
@@ -4725,6 +4726,52 @@ impl Vst3HostRuntime {
             .map_err(|error| error.to_string())
     }
 
+    /// Activate every advertised audio output bus on a loaded instrument before processing.
+    ///
+    /// VST3 secondary outputs commonly begin inactive, so output counts and block buffers omit
+    /// them until the host activates them. Mixer effects retain their saved bus activation and
+    /// should not use this instrument-specific helper.
+    pub fn activate_all_audio_output_buses(&self, id: u64) -> Result<usize, String> {
+        let plugin = self.plugin(id)?;
+        let mut plugin = plugin
+            .lock()
+            .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
+        if plugin.is_processing() {
+            return Err("VST3 output buses cannot be activated during processing".to_owned());
+        }
+        let layout = plugin
+            .audio_bus_layout()
+            .map_err(|error| error.to_string())?;
+        let inactive_bus_indices = layout
+            .outputs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, bus)| (!bus.active).then_some(index))
+            .collect::<Vec<_>>();
+        let mut activated = Vec::with_capacity(inactive_bus_indices.len());
+        for bus_index in inactive_bus_indices {
+            let bus_index_i32 = i32::try_from(bus_index)
+                .map_err(|_| "VST3 output bus index exceeds the host range".to_owned())?;
+            if let Err(error) =
+                plugin.set_bus_active(MediaType::Audio, BusDirection::Output, bus_index_i32, true)
+            {
+                for activated_bus_index in activated.into_iter().rev() {
+                    let _ = plugin.set_bus_active(
+                        MediaType::Audio,
+                        BusDirection::Output,
+                        activated_bus_index,
+                        false,
+                    );
+                }
+                return Err(format!(
+                    "could not activate VST3 audio output bus {bus_index}: {error}"
+                ));
+            }
+            activated.push(bus_index_i32);
+        }
+        Ok(activated.len())
+    }
+
     /// Allocate reusable buffers for every configured audio bus.
     pub fn create_audio_bus_buffers(
         &self,
@@ -5153,13 +5200,9 @@ impl Vst3HostRuntime {
         })
     }
 
-    /// Render a pattern channel with the selected audio file encoding and explicit VST3 automation.
-    ///
-    /// WAV, FLAC, Ogg Vorbis, and MP3 are streamed to a temporary output before the final file is
-    /// replaced. The shared channel mode and WAV depth/dither settings apply to the encoded output.
-    /// VST3 output buses must be mono or stereo; mono is duplicated to stereo before channel-mode
-    /// encoding. This does not restore FLP plug-in state, apply Mixer routing/effects, or expand
-    /// Playlist clips.
+    /// Render a pattern channel as raw 32-bit float WAV with every active output channel retained
+    /// in bus/channel order. This does not restore FLP plug-in state, apply Mixer routing/effects,
+    /// or expand Playlist clips.
     pub fn render_pattern_channel_to_file(
         &self,
         id: u64,
@@ -5179,6 +5222,8 @@ impl Vst3HostRuntime {
     }
 
     /// Render a pattern channel with explicit VST3 parameter automation into an encoded audio file.
+    /// Active mono/stereo output buses are summed to stereo before applying the selected channel
+    /// mode and encoding. Separate per-bus Mixer connections are not applied here.
     pub fn render_pattern_channel_to_file_with_automation(
         &self,
         id: u64,
@@ -5194,13 +5239,6 @@ impl Vst3HostRuntime {
             .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
         let render =
             prepare_pattern_render_with_automation(&plugin, notes, options, parameter_automation)?;
-        if !(1..=2).contains(&render.output_channels) {
-            return Err(format!(
-                "VST3 file rendering supports mono or stereo output buses; this instrument has {} channels",
-                render.output_channels
-            ));
-        }
-
         render_stereo_audio_to_file(
             path.as_ref(),
             render.total_frames,
@@ -5210,15 +5248,13 @@ impl Vst3HostRuntime {
             |write_block| {
                 let mut stereo_block = Vec::with_capacity(render.block_size * 2);
                 process_pattern_render(&mut plugin, &render, |interleaved| {
-                    if render.output_channels == 1 {
-                        stereo_block.clear();
-                        for sample in interleaved {
-                            stereo_block.extend_from_slice(&[*sample, *sample]);
-                        }
-                        write_block(&stereo_block)
-                    } else {
-                        write_block(interleaved)
-                    }
+                    stereo_block.clear();
+                    append_vst_output_buses_to_stereo(
+                        &mut stereo_block,
+                        interleaved,
+                        &render.output_bus_channels,
+                    )?;
+                    write_block(&stereo_block)
                 })?;
                 Ok(Vst3RenderSummary {
                     frames: render.total_frames,
@@ -5491,12 +5527,6 @@ impl Vst3HostRuntime {
             parameter_automation,
             layer_adjustments,
         )?;
-        if !(1..=2).contains(&render.output_channels) {
-            return Err(format!(
-                "VST3 preview supports mono or stereo output buses; this instrument has {} channels",
-                render.output_channels
-            ));
-        }
         let sample_count = usize::try_from(render.total_frames)
             .ok()
             .and_then(|frames| frames.checked_mul(2))
@@ -5512,7 +5542,7 @@ impl Vst3HostRuntime {
             })?;
         let mut stereo = Vec::with_capacity(buffer_bytes / std::mem::size_of::<f32>());
         process_pattern_render(&mut plugin, &render, |interleaved| {
-            append_vst_output_block_to_stereo(&mut stereo, interleaved, render.output_channels)
+            append_vst_output_buses_to_stereo(&mut stereo, interleaved, &render.output_bus_channels)
         })?;
 
         Ok((
@@ -5990,15 +6020,12 @@ impl Vst3HostRuntime {
             return Err("VST3 note pitch offset must be between -12 and 12 semitones".to_owned());
         }
         let plugin = self.plugin(id)?.clone();
-        let (sample_rate, block_size, output_channels) = {
+        let (sample_rate, block_size) = {
             let plugin = plugin
                 .lock()
                 .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
-            (
-                plugin.sample_rate(),
-                plugin.block_size(),
-                plugin.output_channel_count(),
-            )
+            plugin_output_bus_channel_counts(&plugin)?;
+            (plugin.sample_rate(), plugin.block_size())
         };
         if !sample_rate.is_finite() || !(8_000.0..=384_000.0).contains(&sample_rate) {
             return Err("VST3 host sample rate is invalid".to_owned());
@@ -6006,12 +6033,6 @@ impl Vst3HostRuntime {
         if block_size == 0 || block_size > 65_536 {
             return Err("VST3 host block size is not renderable".to_owned());
         }
-        if !(1..=2).contains(&output_channels) {
-            return Err(format!(
-                "VST3 live audition supports mono or stereo output buses; this instrument has {output_channels} channels"
-            ));
-        }
-
         let (sender, receiver) = mpsc::sync_channel(256);
         let (result_sender, result_receiver) = mpsc::sync_channel(1);
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -6070,12 +6091,6 @@ impl Vst3HostRuntime {
                 parameter_automation,
             )?
         };
-        if !(1..=2).contains(&render.output_channels) {
-            return Err(format!(
-                "VST3 streaming supports mono or stereo output buses; this instrument has {} channels",
-                render.output_channels
-            ));
-        }
         Ok(Vst3PatternStream { plugin, render })
     }
 
@@ -6608,7 +6623,7 @@ impl Vst3HostRuntime {
                 (render, latency_frames, loop_frames)
             };
             let (left_pan_gain, right_pan_gain) =
-                channel_pan_gains(pan, render.output_channels == 1, pan_law);
+                channel_pan_gains(pan, render.output_bus_channels.as_slice() == [1], pan_law);
             let resampler = StereoStreamResampler::new(render.sample_rate_u32, output_sample_rate)?;
             notes_scheduled = notes_scheduled.saturating_add(render.note_count);
             let template_events = render.events.clone();
@@ -7490,7 +7505,7 @@ impl Vst3HostRuntime {
                 render.parameter_automation = prepared;
             }
             let (left_pan_gain, right_pan_gain) =
-                channel_pan_gains(pan, render.output_channels == 1, pan_law);
+                channel_pan_gains(pan, render.output_bus_channels.as_slice() == [1], pan_law);
             let resampler = StereoStreamResampler::new(render.sample_rate_u32, output_sample_rate)?;
             notes_scheduled += render.note_count;
             let (live_midi_sender, live_midi_receiver) =
@@ -8692,12 +8707,8 @@ fn prepare_playlist_pattern_render(
     if block_size == 0 || block_size > 65_536 {
         return Err("VST3 host block size is not renderable".to_owned());
     }
-    let output_channels = plugin.output_channel_count();
-    if !(1..=2).contains(&output_channels) {
-        return Err(format!(
-            "VST3 Playlist supports mono or stereo output buses; the instrument has {output_channels} channels"
-        ));
-    }
+    let output_bus_channels = plugin_output_bus_channel_counts(plugin)?;
+    let output_channels = output_bus_channels.iter().sum();
     if !(-12..=12).contains(&note_pitch_offset_semitones) {
         return Err("VST3 note pitch offset must be between -12 and 12 semitones".to_owned());
     }
@@ -8719,6 +8730,7 @@ fn prepare_playlist_pattern_render(
         sample_rate,
         sample_rate_u32,
         output_channels,
+        output_bus_channels,
         block_size,
         total_frames: total_frames.max(last_event_frame.saturating_add(1)),
     })
@@ -8886,10 +8898,8 @@ fn prepare_pattern_render_with_layer_adjustments(
     if block_size == 0 || block_size > 65_536 {
         return Err("VST3 host block size is not renderable".to_owned());
     }
-    let output_channels = plugin.output_channel_count();
-    if output_channels == 0 || output_channels > 64 {
-        return Err("VST3 instrument has no supported audio output buses".to_owned());
-    }
+    let output_bus_channels = plugin_output_bus_channel_counts(plugin)?;
+    let output_channels = output_bus_channels.iter().sum();
     let parameter_automation =
         prepare_parameter_automation(parameter_automation, sample_rate, tempo_bpm)?;
 
@@ -8939,6 +8949,7 @@ fn prepare_pattern_render_with_layer_adjustments(
         sample_rate,
         sample_rate_u32,
         output_channels,
+        output_bus_channels,
         block_size,
         total_frames,
     })
@@ -8956,6 +8967,46 @@ fn plugin_note_expression_support(
         note_expressions_support_brightness(&expressions),
         note_expressions_support_mod_y(&expressions),
     )
+}
+
+fn plugin_output_bus_channel_counts(plugin: &Plugin) -> Result<Vec<usize>, String> {
+    let output_channels = plugin.output_channel_count();
+    if output_channels == 0 || output_channels > 64 {
+        return Err(format!(
+            "VST3 instrument reports {output_channels} active output channels; supported range is 1..=64"
+        ));
+    }
+
+    let layout = plugin
+        .audio_bus_layout()
+        .map_err(|error| format!("could not read VST3 output bus layout: {error}"))?;
+    let bus_channels = layout
+        .outputs
+        .iter()
+        .filter(|bus| bus.active)
+        .map(|bus| bus.channel_count)
+        .collect::<Vec<_>>();
+    let layout_channels = bus_channels.iter().try_fold(0usize, |total, channels| {
+        total
+            .checked_add(*channels)
+            .ok_or_else(|| "VST3 output bus channel count overflow".to_owned())
+    })?;
+    if bus_channels.is_empty() || layout_channels != output_channels {
+        return Err(format!(
+            "VST3 output layout reports {layout_channels} active channels across {} buses, but the host reports {output_channels} channels",
+            bus_channels.len()
+        ));
+    }
+    if bus_channels
+        .iter()
+        .any(|channels| !matches!(channels, 1 | 2))
+    {
+        return Err(format!(
+            "VST3 stereo playback supports active mono or stereo output buses; the layout is {:?}",
+            bus_channels
+        ));
+    }
+    Ok(bus_channels)
 }
 
 fn note_expressions_support_pan(expressions: &[NoteExpressionInfo]) -> bool {
@@ -9556,14 +9607,14 @@ fn stream_live_midi_input(
     cancelled: Arc<AtomicBool>,
 ) -> Result<(), String> {
     crate::audio::enable_denormal_protection();
-    let (sample_rate, block_size, output_channels) = {
+    let (sample_rate, block_size, output_bus_channels) = {
         let plugin = plugin
             .lock()
             .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
         (
             plugin.sample_rate(),
             plugin.block_size(),
-            plugin.output_channel_count(),
+            plugin_output_bus_channel_counts(&plugin)?,
         )
     };
     if !sample_rate.is_finite() || !(8_000.0..=384_000.0).contains(&sample_rate) {
@@ -9573,9 +9624,7 @@ fn stream_live_midi_input(
     if block_size == 0 || block_size > 65_536 {
         return Err("VST3 host block size is not renderable".to_owned());
     }
-    if !(1..=2).contains(&output_channels) {
-        return Err("VST3 live audition supports mono or stereo output buses".to_owned());
-    }
+    let output_channels = output_bus_channels.iter().sum();
     let mut resampler = StereoStreamResampler::new(sample_rate_u32, output_sample_rate)?;
     {
         let mut plugin = plugin
@@ -9721,7 +9770,11 @@ fn stream_live_midi_input(
                 {
                     return Err("VST3 returned audio buffers with an unexpected shape".to_owned());
                 }
-                resampler.push_outputs(&buffers.outputs, block_size, output_channels)?
+                resampler.push_outputs_with_bus_channels(
+                    &buffers.outputs,
+                    block_size,
+                    &output_bus_channels,
+                )?
             };
             if let Err(error) = writer.write_stereo_samples(&output) {
                 if cancelled.load(Ordering::Acquire) || writer.is_cancelled() {
@@ -9876,7 +9929,11 @@ fn stream_pattern_render(
                 {
                     return Err("VST3 returned audio buffers with an unexpected shape".to_owned());
                 }
-                resampler.push_outputs(&buffers.outputs, frame_count, render.output_channels)?
+                resampler.push_outputs_with_bus_channels(
+                    &buffers.outputs,
+                    frame_count,
+                    &render.output_bus_channels,
+                )?
             };
             writer.write_stereo_samples(&output)?;
             rendered_frames = block_end;
@@ -9926,32 +9983,60 @@ impl StereoStreamResampler {
         })
     }
 
+    #[cfg(test)]
     fn push_outputs(
         &mut self,
         outputs: &[Vec<f32>],
         frame_count: usize,
         output_channels: usize,
     ) -> Result<Vec<f32>, String> {
-        if !(1..=2).contains(&output_channels)
+        self.push_outputs_with_bus_channels(outputs, frame_count, &[output_channels])
+    }
+
+    fn push_outputs_with_bus_channels(
+        &mut self,
+        outputs: &[Vec<f32>],
+        frame_count: usize,
+        bus_channels: &[usize],
+    ) -> Result<Vec<f32>, String> {
+        let output_channels = bus_channels.iter().try_fold(0usize, |total, channels| {
+            total
+                .checked_add(*channels)
+                .ok_or_else(|| "VST3 output channel count overflow".to_owned())
+        })?;
+        if bus_channels.is_empty()
+            || bus_channels
+                .iter()
+                .any(|channels| !matches!(channels, 1 | 2))
             || outputs.len() != output_channels
             || outputs.iter().any(|channel| channel.len() < frame_count)
         {
-            return Err("VST3 output block is not mono or stereo".to_owned());
+            return Err(format!(
+                "VST3 output block with bus layout {bus_channels:?} cannot be mixed to stereo"
+            ));
         }
         self.source_frames = self
             .source_frames
             .checked_add(frame_count as u64)
             .ok_or_else(|| "VST3 stream frame count overflow".to_owned())?;
-        if output_channels == 1 {
-            for &sample in outputs[0].iter().take(frame_count) {
-                let sample = finite_sample(sample);
-                self.buffer.push_back([sample, sample]);
+        for frame in 0..frame_count {
+            let mut left = 0.0_f64;
+            let mut right = 0.0_f64;
+            let mut channel_index = 0;
+            for bus_channel_count in bus_channels {
+                if *bus_channel_count == 1 {
+                    let sample = f64::from(finite_sample(outputs[channel_index][frame]));
+                    left += sample;
+                    right += sample;
+                    channel_index += 1;
+                } else {
+                    left += f64::from(finite_sample(outputs[channel_index][frame]));
+                    right += f64::from(finite_sample(outputs[channel_index + 1][frame]));
+                    channel_index += 2;
+                }
             }
-        } else {
-            for (&left, &right) in outputs[0].iter().zip(&outputs[1]).take(frame_count) {
-                self.buffer
-                    .push_back([finite_sample(left), finite_sample(right)]);
-            }
+            self.buffer
+                .push_back([finite_mixed_sample(left), finite_mixed_sample(right)]);
         }
         self.emit_ready(false)
     }
@@ -10033,6 +10118,14 @@ impl StereoStreamResampler {
 
 fn finite_sample(sample: f32) -> f32 {
     if sample.is_finite() { sample } else { 0.0 }
+}
+
+fn finite_mixed_sample(sample: f64) -> f32 {
+    if !sample.is_finite() {
+        0.0
+    } else {
+        sample.clamp(-f64::from(f32::MAX), f64::from(f32::MAX)) as f32
+    }
 }
 
 fn plugin_event_with_pitch_offset(
@@ -10211,6 +10304,7 @@ fn add_channel_fine_tune_cents(
     master_pitch_offset_cents.saturating_add(fine_tune_cents)
 }
 
+#[cfg(test)]
 fn append_vst_output_block_to_stereo(
     stereo: &mut Vec<f32>,
     interleaved: &[f32],
@@ -10230,6 +10324,49 @@ fn append_vst_output_block_to_stereo(
         }
     } else {
         stereo.extend_from_slice(interleaved);
+    }
+    Ok(())
+}
+
+fn append_vst_output_buses_to_stereo(
+    stereo: &mut Vec<f32>,
+    interleaved: &[f32],
+    bus_channels: &[usize],
+) -> Result<(), String> {
+    let output_channels = bus_channels.iter().try_fold(0usize, |total, channels| {
+        total
+            .checked_add(*channels)
+            .ok_or_else(|| "VST3 output channel count overflow".to_owned())
+    })?;
+    if bus_channels.is_empty()
+        || bus_channels
+            .iter()
+            .any(|channels| !matches!(channels, 1 | 2))
+        || !interleaved.len().is_multiple_of(output_channels)
+    {
+        return Err(format!(
+            "VST3 output block with bus layout {bus_channels:?} cannot be mixed to stereo"
+        ));
+    }
+
+    for frame in interleaved.chunks_exact(output_channels) {
+        let mut left = 0.0_f64;
+        let mut right = 0.0_f64;
+        let mut channel_index = 0;
+        for bus_channel_count in bus_channels {
+            if *bus_channel_count == 1 {
+                let sample = f64::from(finite_sample(frame[channel_index]));
+                left += sample;
+                right += sample;
+                channel_index += 1;
+            } else {
+                left += f64::from(finite_sample(frame[channel_index]));
+                right += f64::from(finite_sample(frame[channel_index + 1]));
+                channel_index += 2;
+            }
+        }
+        stereo.push(finite_mixed_sample(left));
+        stereo.push(finite_mixed_sample(right));
     }
     Ok(())
 }
@@ -13012,6 +13149,21 @@ mod tests {
     }
 
     #[test]
+    fn preview_mixes_active_mono_and_stereo_output_buses_in_order() {
+        let mut stereo = Vec::new();
+        append_vst_output_buses_to_stereo(
+            &mut stereo,
+            &[0.25, -0.5, 0.125, -0.75, 1.0, 0.25],
+            &[2, 1],
+        )
+        .unwrap();
+        assert_eq!(stereo, [0.375, -0.375, 0.25, 1.25]);
+
+        assert!(append_vst_output_buses_to_stereo(&mut stereo, &[0.0; 4], &[4]).is_err());
+        assert!(append_vst_output_buses_to_stereo(&mut stereo, &[0.0], &[]).is_err());
+    }
+
+    #[test]
     fn pattern_render_mix_sums_stereo_buffers_and_pads_short_channels() {
         let mut mixed = Vec::new();
         let mut frames = 0;
@@ -13063,6 +13215,19 @@ mod tests {
             [0.5, 1.5]
         );
         assert_eq!(resampler.finish().unwrap(), [1.0, 2.0]);
+    }
+
+    #[test]
+    fn streaming_resampler_sums_active_mono_and_stereo_buses() {
+        let mut resampler = StereoStreamResampler::new(2, 2).unwrap();
+        let outputs = [vec![0.25, 0.5], vec![-0.5, -0.25], vec![0.125, 0.25]];
+        assert_eq!(
+            resampler
+                .push_outputs_with_bus_channels(&outputs, 2, &[2, 1])
+                .unwrap(),
+            [0.375, -0.375]
+        );
+        assert_eq!(resampler.finish().unwrap(), [0.75, 0.0]);
     }
 
     #[test]
