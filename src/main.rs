@@ -18,8 +18,8 @@ use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, ArpeggioRangePattern, ArpeggioScoreOptions,
     ArpeggioScorePatternMode, ArpeggioScoreTimeMultiplier, ArpeggioSyncMode, ArticulateOptions,
     AutomationInterpolationMode, AutomationPointEdit, AutomationScaleLevelsOptions,
-    ChannelLevelAdjustmentsEdit, ChannelSampleEffectsEdit, ChannelSortOrder,
-    ChannelStretchSettingsEdit, ClawMachineOptions, FlamOptions, FlpDocument,
+    ChannelLevelAdjustmentsEdit, ChannelSampleEffectsEdit, ChannelSampleFxFlagsEdit,
+    ChannelSortOrder, ChannelStretchSettingsEdit, ClawMachineOptions, FlamOptions, FlpDocument,
     FscControllerStreamImportOptions, FscScore, FstPreset, HumanizerOptions, LimitNoteOptions,
     LimitSnapDirection, MixerInsertEdit, MixerParameterKind, PatternControllerEdit, PatternNote,
     PatternNoteEdit, PatternNoteRotation, PlaylistClipEdit, PlaylistTrackEdit, PlaylistTrackMotion,
@@ -866,6 +866,19 @@ fn run(args: Vec<String>) -> Result<(), String> {
                         "sample Reverse Polarity setting",
                     )?,
                     remove_dc: parse_optional_bool(remove_dc, "sample Remove DC setting")?,
+                },
+            )
+        }
+        [command, input, output, channel_id, fade_stereo, swap_stereo]
+            if command == "edit-channel-sample-fx-flags" =>
+        {
+            edit_channel_sample_fx_flags(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(channel_id, "sample-bearing channel id")?,
+                ChannelSampleFxFlagsEdit {
+                    fade_stereo: parse_optional_bool(fade_stereo, "sample Fade Stereo setting")?,
+                    swap_stereo: parse_optional_bool(swap_stereo, "sample Swap Stereo setting")?,
                 },
             )
         }
@@ -4383,6 +4396,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild set-channel-sample-path <input.flp> <output.flp> <channel-id> <sample-path>\n",
             "  flp-rebuild set-channel-sample-reversed <input.flp> <output.flp> <channel-id> <0|1>\n",
             "  flp-rebuild edit-channel-sample-effects <input.flp> <output.flp> <channel-id> <normalize:0|1|-> <reverse-polarity:0|1|-> [remove-dc:0|1|->]\n",
+            "  flp-rebuild edit-channel-sample-fx-flags <input.flp> <output.flp> <channel-id> <fade-stereo:0|1|-> <swap-stereo:0|1|->\n",
             "  flp-rebuild set-channel-zipped <input.flp> <output.flp> <channel-id> <0|1>\n",
             "  flp-rebuild set-channel-main-pitch <input.flp> <output.flp> <channel-id> <0|1>\n",
             "  flp-rebuild set-channel-key-region <input.flp> <output.flp> <channel-id> <low-key:0..127> <high-key:0..127>\n",
@@ -6622,7 +6636,7 @@ fn list_channels(path: &Path) -> Result<(), String> {
     println!("channels: {}", channels.len());
     for channel in channels {
         println!(
-            "id={} kind={} type={:?} enabled={} zipped={} main_pitch={} add_to_key={} fine_tune_raw={:?} key_region={:?} stretch_settings={:?} sampler_fade_out_raw={:?} sampler_fade_in_raw={:?} sample_remove_dc={} sample_normalize={} sample_reverse_polarity={} sampler_portamento={:?} sampler_polyphony_slide_raw={:?} sampler_volume_envelope={:?} sampler_envelopes={:?} color={:?} volume={:?} pan={:?} level_adjusts_raw={:?} swing_mix_raw={:?} layer_children={:?} layer_flags={:?} plugin={} name={} sample_path={:?} events={:?}",
+            "id={} kind={} type={:?} enabled={} zipped={} main_pitch={} add_to_key={} fine_tune_raw={:?} key_region={:?} stretch_settings={:?} sampler_fade_out_raw={:?} sampler_fade_in_raw={:?} sample_fade_stereo={} sample_swap_stereo={} sample_remove_dc={} sample_normalize={} sample_reverse_polarity={} sampler_portamento={:?} sampler_polyphony_slide_raw={:?} sampler_volume_envelope={:?} sampler_envelopes={:?} color={:?} volume={:?} pan={:?} level_adjusts_raw={:?} swing_mix_raw={:?} layer_children={:?} layer_flags={:?} plugin={} name={} sample_path={:?} events={:?}",
             channel.id(),
             channel
                 .kind()
@@ -6639,6 +6653,8 @@ fn list_channels(path: &Path) -> Result<(), String> {
             channel.stretch_settings(),
             channel.sampler_fade_out_raw(),
             channel.sampler_fade_in_raw(),
+            channel.sample_fade_stereo_enabled(),
+            channel.sample_swap_stereo_enabled(),
             channel.sample_remove_dc_enabled(),
             channel.sample_normalize_enabled(),
             channel.sample_reverse_polarity_enabled(),
@@ -8056,6 +8072,28 @@ fn edit_channel_sample_effects(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "edited sample effect flags on channel {channel_id} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn edit_channel_sample_fx_flags(
+    input: &Path,
+    output: &Path,
+    channel_id: u16,
+    edit: ChannelSampleFxFlagsEdit,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .edit_channel_sample_fx_flags(channel_id, edit)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "edited sample FX flags on channel {channel_id} in {}",
         output.display()
     );
     Ok(())

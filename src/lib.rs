@@ -787,6 +787,13 @@ pub struct ChannelSampleEffectsEdit {
     pub reverse_polarity: Option<bool>,
 }
 
+/// Saved whole-sample stereo processing switches in the channel `0x46` FX flags word.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ChannelSampleFxFlagsEdit {
+    pub fade_stereo: Option<bool>,
+    pub swap_stereo: Option<bool>,
+}
+
 /// Raw time-stretch settings from the channel Parameters (`0xC7`) payload.
 ///
 /// The four values are retained in FL Studio's stored units. Their field offsets and
@@ -1125,6 +1132,22 @@ impl ChannelSummary {
             && self
                 .sampler_fx_flags
                 .is_some_and(|flags| flags & (1 << 1) != 0)
+    }
+
+    /// Whether the sample is faded from the left channel to the right over its duration.
+    pub fn sample_fade_stereo_enabled(&self) -> bool {
+        matches!(self.kind, Some(0 | 4))
+            && self
+                .sampler_fx_flags
+                .is_some_and(|flags| flags & (1 << 0) != 0)
+    }
+
+    /// Whether the sample's left and right channels are swapped.
+    pub fn sample_swap_stereo_enabled(&self) -> bool {
+        matches!(self.kind, Some(0 | 4))
+            && self
+                .sampler_fx_flags
+                .is_some_and(|flags| flags & (1 << 8) != 0)
     }
 
     /// Saved raw Sampler precomputed Fade Out value (`0x4B`), when present.
@@ -23420,6 +23443,100 @@ impl FlpDocument {
                 .insert(kind_index + 1, FlpEvent::new_word(0x46, 1 << 1));
         } else {
             return Ok(());
+        }
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    /// Edits Fade Stereo and Swap Stereo in a sample-bearing channel's `0x46` FX flags word.
+    /// Unknown flag bits and every unrelated event are preserved.
+    pub fn edit_channel_sample_fx_flags(
+        &mut self,
+        channel_id: u16,
+        edit: ChannelSampleFxFlagsEdit,
+    ) -> Result<(), FlpError> {
+        if edit.fade_stereo.is_none() && edit.swap_stereo.is_none() {
+            return Err(FlpError::UnsupportedEdit(
+                "at least one sample FX flag must be supplied",
+            ));
+        }
+
+        let channels = self.channels();
+        let mut matching = channels.iter().filter(|channel| channel.id == channel_id);
+        let Some(channel) = matching.next() else {
+            return Err(FlpError::ChannelNotFound(channel_id));
+        };
+        if matching.next().is_some() {
+            return Err(FlpError::AmbiguousChannelId(channel_id));
+        }
+        if !matches!(channel.kind, Some(0 | 4)) {
+            return Err(FlpError::UnsupportedEdit(
+                "sample FX flags can only be edited on Sampler or Audio Clip channels",
+            ));
+        }
+
+        let mut fx_events = channel
+            .event_range()
+            .filter(|index| self.events[*index].opcode == 0x46);
+        let existing_event = fx_events.next();
+        if fx_events.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel has multiple 0x46 FX flags events",
+            ));
+        }
+
+        let old_flags = if let Some(event_index) = existing_event {
+            let event = &self.events[event_index];
+            if event.encoding != PayloadEncoding::Word || event.payload.len() != 2 {
+                return Err(FlpError::UnsupportedEdit(
+                    "the selected channel's 0x46 FX flags event is not a word event",
+                ));
+            }
+            u16::from_le_bytes([event.payload[0], event.payload[1]])
+        } else {
+            0
+        };
+        let mut flags = old_flags;
+        for (value, mask) in [(edit.fade_stereo, 1_u16), (edit.swap_stereo, 1_u16 << 8)] {
+            if let Some(value) = value {
+                if value {
+                    flags |= mask;
+                } else {
+                    flags &= !mask;
+                }
+            }
+        }
+        if flags == old_flags {
+            return Ok(());
+        }
+
+        let mut candidate = self.clone();
+        if let Some(event_index) = existing_event {
+            candidate.events[event_index].replace_word_payload(flags)?;
+        } else {
+            let mut kind_events = channel
+                .event_range()
+                .filter(|index| self.events[*index].opcode == 0x15);
+            let Some(kind_index) = kind_events.next() else {
+                return Err(FlpError::UnsupportedEdit(
+                    "the selected channel has no recognized 0x15 kind event",
+                ));
+            };
+            if kind_events.next().is_some() {
+                return Err(FlpError::UnsupportedEdit(
+                    "the selected channel has multiple 0x15 kind events",
+                ));
+            }
+            let kind_event = &candidate.events[kind_index];
+            if kind_event.encoding != PayloadEncoding::Byte || kind_event.payload.len() != 1 {
+                return Err(FlpError::UnsupportedEdit(
+                    "the selected channel's 0x15 kind event is not a one-byte event",
+                ));
+            }
+            candidate
+                .events
+                .insert(kind_index + 1, FlpEvent::new_word(0x46, flags));
         }
         candidate.refresh_event_offsets()?;
         *self = candidate;

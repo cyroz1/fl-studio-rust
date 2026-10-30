@@ -16877,6 +16877,8 @@ fn supported_sampler_fade_raw(raw_value: Option<u16>) -> Option<u16> {
 
 fn sampler_precomputed_fx(channel: &ChannelSummary) -> SamplerPrecomputedFx {
     SamplerPrecomputedFx {
+        fade_stereo: channel.sample_fade_stereo_enabled(),
+        swap_stereo: channel.sample_swap_stereo_enabled(),
         remove_dc: channel.sample_remove_dc_enabled(),
         normalize: channel.sample_normalize_enabled(),
         reverse_polarity: channel.sample_reverse_polarity_enabled(),
@@ -16940,6 +16942,23 @@ fn apply_sampler_sample_fx(audio: &mut DecodedAudio, fx: SamplerPrecomputedFx) {
                 *sample = -*sample;
             }
         }
+    }
+
+    if fx.fade_stereo && audio.channels.len() == 2 {
+        let (left, right) = audio.channels.split_at_mut(1);
+        let frame_count = left[0].len().min(right[0].len());
+        for frame in 0..frame_count {
+            let progress = if frame_count <= 1 {
+                0.0
+            } else {
+                frame as f64 / (frame_count - 1) as f64
+            };
+            left[0][frame] *= (1.0 - progress) as f32;
+            right[0][frame] *= progress as f32;
+        }
+    }
+    if fx.swap_stereo && audio.channels.len() == 2 {
+        audio.channels.swap(0, 1);
     }
 }
 
@@ -17154,6 +17173,8 @@ struct ProcessedAudioCacheKey {
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 struct SamplerPrecomputedFx {
+    fade_stereo: bool,
+    swap_stereo: bool,
     remove_dc: bool,
     normalize: bool,
     reverse_polarity: bool,
@@ -17161,7 +17182,11 @@ struct SamplerPrecomputedFx {
 
 impl SamplerPrecomputedFx {
     const fn any(self) -> bool {
-        self.remove_dc || self.normalize || self.reverse_polarity
+        self.fade_stereo
+            || self.swap_stereo
+            || self.remove_dc
+            || self.normalize
+            || self.reverse_polarity
     }
 }
 
@@ -22832,6 +22857,8 @@ mod tests {
         let processed = sampler_precompute_sample_fx(
             &source,
             SamplerPrecomputedFx {
+                fade_stereo: false,
+                swap_stereo: false,
                 remove_dc: false,
                 normalize: true,
                 reverse_polarity: true,
@@ -22852,6 +22879,8 @@ mod tests {
         apply_sampler_sample_fx(
             &mut silence,
             SamplerPrecomputedFx {
+                fade_stereo: false,
+                swap_stereo: false,
                 remove_dc: false,
                 normalize: true,
                 reverse_polarity: false,

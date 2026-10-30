@@ -99,11 +99,11 @@ use flp_rebuild::{
     ArpeggioScorePatternMode, ArpeggioScoreTimeMultiplier, ArpeggioSyncMode, Arrangement,
     ArticulateOptions, AutomationChannel, AutomationInterpolationMode, AutomationPoint,
     AutomationPointEdit, AutomationScaleLevelsOptions, ChannelGroupSummary, ChannelNoteRouter,
-    ChannelSampleEffectsEdit, ChannelSortOrder, ChannelStretchMode, ChannelStretchSettingsEdit,
-    ChannelSummary, ChannelType, ClawMachineOptions, FlamOptions, FlpDocument, FlpError,
-    FscControllerStreamImportOptions, FscScore, FstPreset, FstPresetKind, HumanizerOptions,
-    LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerInsertSummary, MixerParameterKind,
-    MixerParameterRecord, MixerSendSummary, PATTERN_NOTE_DEFAULT_FLAGS,
+    ChannelSampleEffectsEdit, ChannelSampleFxFlagsEdit, ChannelSortOrder, ChannelStretchMode,
+    ChannelStretchSettingsEdit, ChannelSummary, ChannelType, ClawMachineOptions, FlamOptions,
+    FlpDocument, FlpError, FscControllerStreamImportOptions, FscScore, FstPreset, FstPresetKind,
+    HumanizerOptions, LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerInsertSummary,
+    MixerParameterKind, MixerParameterRecord, MixerSendSummary, PATTERN_NOTE_DEFAULT_FLAGS,
     PATTERN_NOTE_DEFAULT_RELEASE, PATTERN_NOTE_SLIDE_FLAG, Pattern, PatternController,
     PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation, PayloadEncoding,
     PlaylistClip, PlaylistClipEdit, PlaylistClipSelectionClipboard, PlaylistClipTarget,
@@ -37012,6 +37012,7 @@ impl DawUi {
         let mut channel_enabled_edits = Vec::new();
         let mut channel_sample_reverse_edits = Vec::new();
         let mut channel_sample_effect_edits = Vec::new();
+        let mut channel_sample_fx_flag_edits = Vec::new();
         let mut channel_main_pitch_edits = Vec::new();
         let mut channel_add_to_key_edits = Vec::new();
         let mut channel_zipped_edits = Vec::new();
@@ -37703,6 +37704,40 @@ impl DawUi {
                                     {
                                         channel_sample_reverse_edits
                                             .push((channel.id(), !reversed));
+                                        ui.close();
+                                    }
+                                    let fade_stereo = channel.sample_fade_stereo_enabled();
+                                    if ui
+                                        .selectable_label(fade_stereo, "Fade stereo")
+                                        .on_hover_text(
+                                            "Fade the sample from the left channel to the right over its duration.",
+                                        )
+                                        .clicked()
+                                    {
+                                        channel_sample_fx_flag_edits.push((
+                                            channel.id(),
+                                            ChannelSampleFxFlagsEdit {
+                                                fade_stereo: Some(!fade_stereo),
+                                                ..ChannelSampleFxFlagsEdit::default()
+                                            },
+                                        ));
+                                        ui.close();
+                                    }
+                                    let swap_stereo = channel.sample_swap_stereo_enabled();
+                                    if ui
+                                        .selectable_label(swap_stereo, "Swap stereo channels")
+                                        .on_hover_text(
+                                            "Swap the sample's left and right channels.",
+                                        )
+                                        .clicked()
+                                    {
+                                        channel_sample_fx_flag_edits.push((
+                                            channel.id(),
+                                            ChannelSampleFxFlagsEdit {
+                                                swap_stereo: Some(!swap_stereo),
+                                                ..ChannelSampleFxFlagsEdit::default()
+                                            },
+                                        ));
                                         ui.close();
                                     }
                                     let remove_dc = channel.sample_remove_dc_enabled();
@@ -38798,6 +38833,27 @@ impl DawUi {
                 }
                 Some(Err(error)) => {
                     self.status = format!("Could not change sample effect flags: {error}");
+                }
+                None => {}
+            }
+        }
+        for (channel_id, edit) in channel_sample_fx_flag_edits {
+            let result = self
+                .document
+                .as_mut()
+                .map(|document| document.edit_channel_sample_fx_flags(channel_id, edit));
+            match result {
+                Some(Ok(())) => {
+                    self.stop_project_playback();
+                    self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+                    self.status = format!(
+                        "Channel {channel_id} sample FX updated: Fade Stereo {:?}, Swap Stereo {:?}",
+                        edit.fade_stereo, edit.swap_stereo
+                    );
+                }
+                Some(Err(error)) => {
+                    self.status = format!("Could not change sample FX flags: {error}");
                 }
                 None => {}
             }
