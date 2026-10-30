@@ -1902,7 +1902,11 @@ fn playlist_performance_clap_clip_candidates(
             let notes = pattern
                 .notes
                 .iter()
-                .filter(|note| !note.is_muted() && note.velocity > 0 && note.length > 0)
+                .filter(|note| {
+                    !note.is_muted()
+                        && (note.velocity > 0 || note.is_slide_note())
+                        && note.length > 0
+                })
                 .collect::<Vec<_>>();
             (clip.position_ticks < performance_zone_end_tick
                 && clip.length_ticks > 0

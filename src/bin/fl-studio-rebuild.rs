@@ -21932,7 +21932,7 @@ impl DawUi {
                 note.channel_id == channel_id
                     && !note.is_muted()
                     && note.length > 0
-                    && note.velocity > 0
+                    && (note.velocity > 0 || note.is_slide_note())
             })
             .map(|note| ClapPatternNote {
                 position_ticks: note.position,
@@ -21944,6 +21944,7 @@ impl DawUi {
                 pan: note.pan.min(128),
                 release: note.release.min(128),
                 mod_x: note.mod_x,
+                slide_note: note.is_slide_note(),
             })
             .collect::<Vec<_>>();
         if notes.is_empty() {
@@ -21991,7 +21992,8 @@ impl DawUi {
         let channel_router = ChannelNoteRouter::new(document.channels());
         let mut notes_by_layer_route = BTreeMap::<(u16, u32, i32), Vec<ClapPatternNote>>::new();
         for (note_index, note) in pattern.notes.iter().enumerate() {
-            if note.is_muted() || note.length == 0 || note.velocity == 0 {
+            if note.is_muted() || note.length == 0 || (note.velocity == 0 && !note.is_slide_note())
+            {
                 continue;
             }
             for (channel_id, target_gain, target_pan_raw) in channel_router
@@ -22022,6 +22024,7 @@ impl DawUi {
                         pan: note.pan.min(128),
                         release: note.release.min(128),
                         mod_x: note.mod_x,
+                        slide_note: note.is_slide_note(),
                     });
             }
         }
@@ -22122,7 +22125,7 @@ impl DawUi {
                 pattern.notes.iter().enumerate().any(|(note_index, note)| {
                     !note.is_muted()
                         && note.length > 0
-                        && note.velocity > 0
+                        && (note.velocity > 0 || note.is_slide_note())
                         && channel_router
                             .targets_for_note_with_clap_and_mixed_crossfade(
                                 note.channel_id,
@@ -22193,7 +22196,7 @@ impl DawUi {
         let mut parameter_point_counts_by_layer_route = BTreeMap::<(u16, u32, i32), usize>::new();
         let mut expanded_automation_routes = BTreeSet::new();
         for placed in schedule.notes {
-            if placed.note.velocity == 0 {
+            if placed.note.velocity == 0 && !placed.note.is_slide_note() {
                 continue;
             }
             let Some(stop_tick) = placed.stop_tick.filter(|stop| *stop > placed.start_tick) else {
@@ -22279,6 +22282,7 @@ impl DawUi {
                     pan: placed.note.pan.min(128),
                     release: placed.note.release.min(128),
                     mod_x: placed.note.mod_x,
+                    slide_note: placed.note.is_slide_note(),
                 });
         }
 
@@ -22486,7 +22490,7 @@ impl DawUi {
             BTreeMap::<(usize, u16, u16, u32, i32), Vec<ClapPatternNote>>::new();
         for placed in schedule.notes {
             if !clip_indices.contains(&placed.clip_index)
-                || placed.note.velocity == 0
+                || (placed.note.velocity == 0 && !placed.note.is_slide_note())
                 || !placed.target_gain.is_finite()
                 || placed.target_gain <= 0.0
             {
@@ -22529,6 +22533,7 @@ impl DawUi {
                 pan: placed.note.pan.min(128),
                 release: placed.note.release.min(128),
                 mod_x: placed.note.mod_x,
+                slide_note: placed.note.is_slide_note(),
             };
             notes_by_route
                 .entry((

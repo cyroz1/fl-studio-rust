@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::{CString, OsString};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -59,6 +59,7 @@ const MAX_CLAP_MIXER_EFFECT_BLOCK_FRAMES: u32 = 512;
 const MAX_PATTERN_PREVIEW_NOTES: usize = 16_384;
 const MAX_CLAP_PREVIEW_PARAMETER_CHANGES: usize = 512;
 const MAX_CLAP_MIXER_EFFECT_PARAMETER_CHANGES: usize = 2_048;
+const MAX_CLAP_SLIDE_EXPRESSION_EVENTS: usize = 1_000_000;
 const NOTE_PREVIEW_BLOCK_FRAMES: u32 = 512;
 const CLAP_MIXER_EFFECT_PROCESS_TIMEOUT: Duration = Duration::from_secs(10);
 const NOTE_PREVIEW_DURATION_MILLISECONDS: u32 = 1500;
@@ -299,6 +300,7 @@ pub struct ClapPatternNote {
     pub pan: u8,
     pub release: u8,
     pub mod_x: u8,
+    pub slide_note: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -343,6 +345,7 @@ pub struct ClapPlaylistNote {
     pub pan: u8,
     pub release: u8,
     pub mod_x: u8,
+    pub slide_note: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1983,7 +1986,7 @@ impl ClapPreviewProcess {
             for note in &playlist.notes {
                 writeln!(
                     self.stdin,
-                    "NOTE {} {} {} {} {} {} {} {} {}",
+                    "NOTE {} {} {} {} {} {} {} {} {} {}",
                     note.start_tick,
                     note.stop_tick,
                     note.key,
@@ -1993,6 +1996,7 @@ impl ClapPreviewProcess {
                     note.pan,
                     note.release,
                     note.mod_x,
+                    u8::from(note.slide_note),
                 )
                 .map_err(|error| format!("could not send a CLAP Playlist note: {error}"))?;
             }
@@ -2012,7 +2016,7 @@ impl ClapPreviewProcess {
             for note in &settings.notes {
                 writeln!(
                     self.stdin,
-                    "NOTE {} {} {} {} {} {} {} {} {}",
+                    "NOTE {} {} {} {} {} {} {} {} {} {}",
                     note.position_ticks,
                     note.length_ticks,
                     note.key,
@@ -2022,6 +2026,7 @@ impl ClapPreviewProcess {
                     note.pan,
                     note.release,
                     note.mod_x,
+                    u8::from(note.slide_note),
                 )
                 .map_err(|error| format!("could not send a CLAP Pattern note: {error}"))?;
             }
@@ -4102,6 +4107,7 @@ fn parse_playlist_note(line: &str) -> Result<ClapPlaylistNote, String> {
         Some(pan),
         Some(release),
         Some(mod_x),
+        Some(slide_note),
         None,
     ) = (
         fields.next(),
@@ -4115,10 +4121,16 @@ fn parse_playlist_note(line: &str) -> Result<ClapPlaylistNote, String> {
         fields.next().and_then(|field| field.parse::<u8>().ok()),
         fields.next().and_then(|field| field.parse::<u8>().ok()),
         fields.next(),
+        fields.next(),
     )
     else {
         return Err("invalid CLAP Playlist note".to_owned());
     };
+    let slide_note = slide_note
+        .parse::<u8>()
+        .ok()
+        .filter(|value| *value <= 1)
+        .ok_or_else(|| "invalid CLAP Playlist slide-note flag".to_owned())?;
     Ok(ClapPlaylistNote {
         start_tick,
         stop_tick,
@@ -4129,6 +4141,7 @@ fn parse_playlist_note(line: &str) -> Result<ClapPlaylistNote, String> {
         pan,
         release,
         mod_x,
+        slide_note: slide_note != 0,
     })
 }
 
@@ -4145,6 +4158,7 @@ fn parse_pattern_preview_note(line: &str) -> Result<ClapPatternNote, String> {
         Some(pan),
         Some(release),
         Some(mod_x),
+        Some(slide_note),
         None,
     ) = (
         fields.next(),
@@ -4158,10 +4172,16 @@ fn parse_pattern_preview_note(line: &str) -> Result<ClapPatternNote, String> {
         fields.next().and_then(|field| field.parse::<u8>().ok()),
         fields.next().and_then(|field| field.parse::<u8>().ok()),
         fields.next(),
+        fields.next(),
     )
     else {
         return Err("invalid CLAP Pattern note".to_owned());
     };
+    let slide_note = slide_note
+        .parse::<u8>()
+        .ok()
+        .filter(|value| *value <= 1)
+        .ok_or_else(|| "invalid CLAP Pattern slide-note flag".to_owned())?;
     Ok(ClapPatternNote {
         position_ticks,
         length_ticks,
@@ -4172,6 +4192,7 @@ fn parse_pattern_preview_note(line: &str) -> Result<ClapPatternNote, String> {
         pan,
         release,
         mod_x,
+        slide_note: slide_note != 0,
     })
 }
 
@@ -4589,7 +4610,7 @@ fn write_preview_server_error(output: &mut impl Write, error: &str) -> std::io::
     writeln!(output, "ERR {message}")
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 enum PreviewNoteDialect {
     Clap,
     Midi,
@@ -5452,6 +5473,8 @@ impl ClapNotePreviewInstance {
                 release: 0,
                 mod_x: 128,
                 is_note_on: true,
+                is_slide_note: false,
+                expression: None,
             },
             ScheduledClapNoteEvent {
                 frame: u64::from(note_off_frame),
@@ -5465,6 +5488,8 @@ impl ClapNotePreviewInstance {
                 release: 0,
                 mod_x: 128,
                 is_note_on: false,
+                is_slide_note: false,
+                expression: None,
             },
         ];
         let total_frames = self.sample_rate * NOTE_PREVIEW_DURATION_MILLISECONDS / 1000;
@@ -5648,7 +5673,13 @@ impl ClapNotePreviewInstance {
             {
                 scheduled_block_events.push((
                     event.frame,
-                    if event.is_note_on { 2 } else { 0 },
+                    if event.expression.is_some() {
+                        3
+                    } else if event.is_note_on {
+                        2
+                    } else {
+                        0
+                    },
                     event_index,
                     false,
                 ));
@@ -5707,6 +5738,27 @@ impl ClapNotePreviewInstance {
                     u16::from(event.key),
                     event.note_id,
                 );
+                if let Some(expression) = event.expression {
+                    if self.dialect == PreviewNoteDialect::Clap {
+                        let (kind, value) = match expression {
+                            ScheduledClapExpression::TuningCents(cents) => {
+                                (NoteExpressionType::Tuning, f64::from(cents) / 100.0)
+                            }
+                            ScheduledClapExpression::PanRaw(value) => {
+                                (NoteExpressionType::Pan, f64::from(value) / 128.0)
+                            }
+                            ScheduledClapExpression::VolumeMillionths(value) => {
+                                (NoteExpressionType::Volume, f64::from(value) / 1_000_000.0)
+                            }
+                        };
+                        input_event_buffer
+                            .push(&NoteExpressionEvent::new(event_time, pckn, kind, value));
+                    }
+                    continue;
+                }
+                if event.is_slide_note && self.dialect == PreviewNoteDialect::Clap {
+                    continue;
+                }
                 match (self.dialect, event.is_note_on) {
                     (PreviewNoteDialect::Clap, true) => {
                         input_event_buffer.push(&NoteOnEvent::new(
@@ -5903,6 +5955,13 @@ impl ClapNotePreviewInstance {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScheduledClapExpression {
+    TuningCents(i32),
+    PanRaw(u8),
+    VolumeMillionths(u32),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ScheduledClapNoteEvent {
     frame: u64,
     priority: u8,
@@ -5915,6 +5974,228 @@ struct ScheduledClapNoteEvent {
     release: u8,
     mod_x: u8,
     is_note_on: bool,
+    is_slide_note: bool,
+    expression: Option<ScheduledClapExpression>,
+}
+
+#[derive(Clone, Copy)]
+struct ClapScheduledNoteSpan {
+    start_frame: u64,
+    stop_frame: u64,
+    note_on: ScheduledClapNoteEvent,
+}
+
+#[derive(Clone, Copy)]
+struct ClapSlideCurve {
+    note_on: ScheduledClapNoteEvent,
+    note_stop_frame: u64,
+    start_frame: u64,
+    end_frame: u64,
+    start_tuning_cents: i32,
+    end_tuning_cents: i32,
+    start_pan_raw: u8,
+    end_pan_raw: u8,
+    start_gain: f64,
+    end_gain: f64,
+}
+
+fn clap_slide_curve_values(curve: ClapSlideCurve, frame: u64) -> (i32, u8, f64) {
+    if frame >= curve.end_frame {
+        return (curve.end_tuning_cents, curve.end_pan_raw, curve.end_gain);
+    }
+    let duration = curve.end_frame.saturating_sub(curve.start_frame).max(1);
+    let progress = frame.saturating_sub(curve.start_frame).min(duration) as f64 / duration as f64;
+    let tuning_delta = curve.end_tuning_cents - curve.start_tuning_cents;
+    let pan_delta = i32::from(curve.end_pan_raw) - i32::from(curve.start_pan_raw);
+    (
+        curve.start_tuning_cents + (f64::from(tuning_delta) * progress).round() as i32,
+        (i32::from(curve.start_pan_raw) + (f64::from(pan_delta) * progress).round() as i32)
+            .clamp(0, 128) as u8,
+        curve.start_gain + (curve.end_gain - curve.start_gain) * progress,
+    )
+}
+
+fn clap_note_slide_values(
+    curves: Option<&[ClapSlideCurve]>,
+    note: ClapScheduledNoteSpan,
+    frame: u64,
+) -> (i32, u8, f64) {
+    curves
+        .and_then(|curves| {
+            curves
+                .iter()
+                .rev()
+                .find(|curve| curve.start_frame <= frame)
+                .copied()
+        })
+        .map(|curve| clap_slide_curve_values(curve, frame))
+        .unwrap_or((
+            i32::from(note.note_on.fine_pitch_cents),
+            note.note_on.pan,
+            f64::from(note.note_on.velocity) / 127.0,
+        ))
+}
+
+fn clap_note_expression_event(
+    mut note: ScheduledClapNoteEvent,
+    frame: u64,
+    expression: ScheduledClapExpression,
+) -> ScheduledClapNoteEvent {
+    note.frame = frame;
+    note.priority = 2;
+    note.velocity = 0;
+    note.is_note_on = false;
+    note.is_slide_note = false;
+    note.expression = Some(expression);
+    note
+}
+
+fn clap_expression_sort_order(expression: Option<ScheduledClapExpression>) -> u8 {
+    match expression {
+        Some(ScheduledClapExpression::TuningCents(_)) => 0,
+        Some(ScheduledClapExpression::PanRaw(_)) => 1,
+        Some(ScheduledClapExpression::VolumeMillionths(_)) => 2,
+        None => 3,
+    }
+}
+
+fn append_clap_slide_expressions(
+    events: &mut Vec<ScheduledClapNoteEvent>,
+    note_spans: &[ClapScheduledNoteSpan],
+    sample_rate: u32,
+) -> Result<u64, String> {
+    let mut slides = note_spans
+        .iter()
+        .copied()
+        .filter(|span| span.note_on.is_slide_note)
+        .collect::<Vec<_>>();
+    slides.sort_by_key(|span| (span.start_frame, span.note_on.note_id));
+    let mut curves_by_note = HashMap::<u32, Vec<ClapSlideCurve>>::new();
+
+    for slide in slides {
+        let active_notes = note_spans
+            .iter()
+            .copied()
+            .filter(|span| {
+                !span.note_on.is_slide_note
+                    && span.note_on.midi_channel == slide.note_on.midi_channel
+                    && span.start_frame <= slide.start_frame
+                    && span.stop_frame > slide.start_frame
+            })
+            .map(|span| {
+                let values = clap_note_slide_values(
+                    curves_by_note.get(&span.note_on.note_id).map(Vec::as_slice),
+                    span,
+                    slide.start_frame,
+                );
+                (span, values)
+            })
+            .collect::<Vec<_>>();
+        let Some(reference_pitch_cents) = active_notes
+            .iter()
+            .map(|(span, (tuning_cents, _, _))| i32::from(span.note_on.key) * 100 + *tuning_cents)
+            .max()
+        else {
+            continue;
+        };
+
+        let target_pitch_cents =
+            i32::from(slide.note_on.key) * 100 + i32::from(slide.note_on.fine_pitch_cents);
+        let pitch_delta_cents = target_pitch_cents - reference_pitch_cents;
+        let target_pan_raw = slide.note_on.pan;
+        let target_gain = f64::from(slide.note_on.velocity) / 127.0;
+        for (note_span, (start_tuning_cents, start_pan_raw, start_gain)) in active_notes {
+            let end_frame = slide.stop_frame.min(note_span.stop_frame);
+            if end_frame <= slide.start_frame {
+                continue;
+            }
+            let end_tuning_cents = start_tuning_cents + pitch_delta_cents;
+            if !(-12_000..=12_000).contains(&start_tuning_cents)
+                || !(-12_000..=12_000).contains(&end_tuning_cents)
+            {
+                return Err(
+                    "CLAP note slide exceeds the per-note tuning range of −120…120 semitones"
+                        .into(),
+                );
+            }
+
+            let curves = curves_by_note.entry(note_span.note_on.note_id).or_default();
+            let mut retained = Vec::with_capacity(curves.len().saturating_add(1));
+            for mut curve in curves.drain(..) {
+                if curve.start_frame >= slide.start_frame {
+                    continue;
+                }
+                if curve.end_frame > slide.start_frame {
+                    curve.end_frame = slide.start_frame;
+                    curve.end_tuning_cents = start_tuning_cents;
+                    curve.end_pan_raw = start_pan_raw;
+                    curve.end_gain = start_gain;
+                }
+                retained.push(curve);
+            }
+            retained.push(ClapSlideCurve {
+                note_on: note_span.note_on,
+                note_stop_frame: note_span.stop_frame,
+                start_frame: slide.start_frame,
+                end_frame,
+                start_tuning_cents,
+                end_tuning_cents,
+                start_pan_raw,
+                end_pan_raw: target_pan_raw,
+                start_gain,
+                end_gain: target_gain,
+            });
+            *curves = retained;
+        }
+    }
+
+    let update_interval = (u64::from(sample_rate) / 200).max(1);
+    let mut expression_count = 0usize;
+    let mut last_expression_frame = 0u64;
+    for curves in curves_by_note.values() {
+        for curve in curves {
+            let base_velocity = f64::from(curve.note_on.velocity) / 127.0;
+            if base_velocity <= 0.0 {
+                continue;
+            }
+            let mut frame = curve.start_frame;
+            loop {
+                if frame >= curve.note_stop_frame {
+                    break;
+                }
+                let (tuning_cents, pan_raw, gain) = clap_slide_curve_values(*curve, frame);
+                let volume_ratio = (gain / base_velocity).clamp(0.000_001, 4.0);
+                let volume_millionths = (volume_ratio * 1_000_000.0).round() as u32;
+                events.push(clap_note_expression_event(
+                    curve.note_on,
+                    frame,
+                    ScheduledClapExpression::TuningCents(tuning_cents),
+                ));
+                events.push(clap_note_expression_event(
+                    curve.note_on,
+                    frame,
+                    ScheduledClapExpression::PanRaw(pan_raw),
+                ));
+                events.push(clap_note_expression_event(
+                    curve.note_on,
+                    frame,
+                    ScheduledClapExpression::VolumeMillionths(volume_millionths),
+                ));
+                expression_count = expression_count.saturating_add(3);
+                if expression_count > MAX_CLAP_SLIDE_EXPRESSION_EVENTS {
+                    return Err(format!(
+                        "CLAP note slides exceed {MAX_CLAP_SLIDE_EXPRESSION_EVENTS} scheduled expression events"
+                    ));
+                }
+                last_expression_frame = last_expression_frame.max(frame);
+                if frame >= curve.end_frame {
+                    break;
+                }
+                frame = frame.saturating_add(update_interval).min(curve.end_frame);
+            }
+        }
+    }
+    Ok(last_expression_frame)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -6077,6 +6358,7 @@ fn schedule_playlist_preview_events(
     let tempo_map =
         PlaylistTempoMap::from_tempo_events(settings.ppq, settings.tempo_bpm, &tempo_events)?;
     let mut events = Vec::with_capacity(playlist.notes.len().saturating_mul(2));
+    let mut note_spans = Vec::with_capacity(playlist.notes.len());
     let mut last_event_frame = 0u64;
     for (index, note) in playlist.notes.iter().enumerate() {
         if note.stop_tick <= note.start_tick {
@@ -6088,7 +6370,7 @@ fn schedule_playlist_preview_events(
                 note.key
             ));
         }
-        if !(1..=127).contains(&note.velocity) {
+        if note.velocity > 127 || (!note.slide_note && note.velocity == 0) {
             return Err(format!(
                 "CLAP Playlist velocity {} is outside 1–127",
                 note.velocity
@@ -6121,7 +6403,7 @@ fn schedule_playlist_preview_events(
             .max(start_frame.saturating_add(1));
         let note_id =
             u32::try_from(index + 1).map_err(|_| "CLAP Playlist note ID overflowed".to_owned())?;
-        events.push(ScheduledClapNoteEvent {
+        let note_on = ScheduledClapNoteEvent {
             frame: start_frame,
             priority: 1,
             key: note.key as u8,
@@ -6133,7 +6415,10 @@ fn schedule_playlist_preview_events(
             release: note.release,
             mod_x: note.mod_x,
             is_note_on: true,
-        });
+            is_slide_note: note.slide_note,
+            expression: None,
+        };
+        events.push(note_on);
         events.push(ScheduledClapNoteEvent {
             frame: stop_frame,
             priority: 0,
@@ -6146,10 +6431,29 @@ fn schedule_playlist_preview_events(
             release: note.release,
             mod_x: note.mod_x,
             is_note_on: false,
+            is_slide_note: note.slide_note,
+            expression: None,
+        });
+        note_spans.push(ClapScheduledNoteSpan {
+            start_frame,
+            stop_frame,
+            note_on,
         });
         last_event_frame = last_event_frame.max(stop_frame);
     }
-    events.sort_by_key(|event| (event.frame, event.priority));
+    last_event_frame = last_event_frame.max(append_clap_slide_expressions(
+        &mut events,
+        &note_spans,
+        sample_rate,
+    )?);
+    events.sort_by_key(|event| {
+        (
+            event.frame,
+            event.priority,
+            event.note_id,
+            clap_expression_sort_order(event.expression),
+        )
+    });
     if let Some(last_parameter_event) =
         schedule_parameter_events(&playlist.parameter_automation, |tick| {
             tempo_map.frame_at_tick(tick, sample_rate)
@@ -6252,6 +6556,7 @@ fn schedule_pattern_preview_events(
         pattern_preview_frame_at_tick(tick, settings.ppq, settings.tempo_bpm, sample_rate)
     };
     let mut events = Vec::with_capacity(settings.notes.len().saturating_mul(2));
+    let mut note_spans = Vec::with_capacity(settings.notes.len());
     let mut last_event_frame = frame_at_tick(settings.loop_length_ticks)?;
     for (index, note) in settings.notes.iter().enumerate() {
         if note.length_ticks == 0 {
@@ -6263,7 +6568,7 @@ fn schedule_pattern_preview_events(
                 note.key
             ));
         }
-        if !(1..=127).contains(&note.velocity) {
+        if note.velocity > 127 || (!note.slide_note && note.velocity == 0) {
             return Err(format!(
                 "CLAP Pattern preview velocity {} is outside 1–127",
                 note.velocity
@@ -6300,7 +6605,7 @@ fn schedule_pattern_preview_events(
         let end_frame = frame_at_tick(end_tick)?.max(start_frame.saturating_add(1));
         let note_id = u32::try_from(index + 1)
             .map_err(|_| "CLAP Pattern preview note ID overflowed".to_owned())?;
-        events.push(ScheduledClapNoteEvent {
+        let note_on = ScheduledClapNoteEvent {
             frame: start_frame,
             priority: 1,
             key: note.key as u8,
@@ -6312,7 +6617,10 @@ fn schedule_pattern_preview_events(
             release: note.release,
             mod_x: note.mod_x,
             is_note_on: true,
-        });
+            is_slide_note: note.slide_note,
+            expression: None,
+        };
+        events.push(note_on);
         events.push(ScheduledClapNoteEvent {
             frame: end_frame,
             priority: 0,
@@ -6325,10 +6633,29 @@ fn schedule_pattern_preview_events(
             release: note.release,
             mod_x: note.mod_x,
             is_note_on: false,
+            is_slide_note: note.slide_note,
+            expression: None,
+        });
+        note_spans.push(ClapScheduledNoteSpan {
+            start_frame,
+            stop_frame: end_frame,
+            note_on,
         });
         last_event_frame = last_event_frame.max(end_frame);
     }
-    events.sort_by_key(|event| (event.frame, event.priority));
+    last_event_frame = last_event_frame.max(append_clap_slide_expressions(
+        &mut events,
+        &note_spans,
+        sample_rate,
+    )?);
+    events.sort_by_key(|event| {
+        (
+            event.frame,
+            event.priority,
+            event.note_id,
+            clap_expression_sort_order(event.expression),
+        )
+    });
 
     let release_tail_frames =
         u64::from(sample_rate) * u64::from(NOTE_PREVIEW_DURATION_MILLISECONDS) / 1000;
@@ -7073,6 +7400,7 @@ mod tests {
                     pan: 48,
                     release: 32,
                     mod_x: 100,
+                    slide_note: false,
                 },
                 ClapPatternNote {
                     position_ticks: 96,
@@ -7084,6 +7412,7 @@ mod tests {
                     pan: 64,
                     release: 64,
                     mod_x: 128,
+                    slide_note: false,
                 },
             ],
         }
@@ -7140,6 +7469,7 @@ mod tests {
                     pan: 48,
                     release: 32,
                     mod_x: 100,
+                    slide_note: false,
                 }],
                 parameter_automation: Vec::new(),
             }),
@@ -7166,7 +7496,7 @@ mod tests {
         let base_tempo = 123.5_f64;
         let header = format!("96 {:016x} 2 1 0", base_tempo.to_bits());
         let mut input = Cursor::new(
-            b"TEMPO 0 405e000000000000\nTEMPO 96 404e000000000000\nNOTE 0 192 60 100 0 -35 48 32 100\nEND\n".as_slice(),
+            b"TEMPO 0 405e000000000000\nTEMPO 96 404e000000000000\nNOTE 0 192 60 100 0 -35 48 32 100 0\nEND\n".as_slice(),
         );
 
         let parsed = parse_playlist_preview_request(&header, &mut input, 48_000)
@@ -7199,7 +7529,8 @@ mod tests {
         let tempo_bpm = 123.5_f64;
         let header = format!("96 {:016x} 192 2 0", tempo_bpm.to_bits());
         let mut input = Cursor::new(
-            b"NOTE 0 96 60 100 0 -35 48 32 100\nNOTE 96 96 64 80 2 0 64 64 128\nEND\n".as_slice(),
+            b"NOTE 0 96 60 100 0 -35 48 32 100 0\nNOTE 96 96 64 80 2 0 64 64 128 0\nEND\n"
+                .as_slice(),
         );
 
         let parsed = parse_pattern_preview_request(&header, &mut input, 48_000)
