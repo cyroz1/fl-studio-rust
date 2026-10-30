@@ -5680,6 +5680,7 @@ struct PlaylistOfflineRenderJob {
     vst3_processor: Option<Vst3PlaylistStreamProcessor>,
     range: Option<PlaylistRenderRange>,
     kind: PlaylistOfflineRenderKind,
+    track_freeze: Option<PendingPlaylistTrackFreeze>,
 }
 
 #[derive(Clone, Copy)]
@@ -13931,6 +13932,7 @@ impl DawUi {
                     arrangement_id,
                     &playlist_tempo_map,
                     &vst3_volume_expression_channels,
+                    self.soloed_playlist_track_range,
                 )
             });
             match schedule_result {
@@ -21982,6 +21984,7 @@ impl DawUi {
         arrangement_id: u16,
         tempo_map: &PlaylistTempoMap,
         vst3_volume_expression_channels: &BTreeSet<u16>,
+        soloed_playlist_track_range: Option<(u32, u32)>,
     ) -> Result<Vec<ClapPlaylistPreviewRequest>, String> {
         let assigned_channel_ids = self
             .clap_pattern_playback_instruments
@@ -22010,7 +22013,7 @@ impl DawUi {
             .map(|track| track.id)
             .collect::<BTreeSet<_>>();
         let track_filter =
-            PlaylistTrackFilter::new(&disabled_track_ids, self.soloed_playlist_track_range);
+            PlaylistTrackFilter::new(&disabled_track_ids, soloed_playlist_track_range);
         let channels = document.channels();
         let channels_by_id = channels
             .iter()
@@ -22939,6 +22942,7 @@ impl DawUi {
             job.options.arrangement_id,
             &tempo_map,
             &vst3_volume_expression_channels,
+            job.options.soloed_playlist_track_range,
         ) {
             Ok(requests) => requests,
             Err(error) => {
@@ -23021,6 +23025,7 @@ impl DawUi {
             vst3_processor,
             range,
             kind,
+            track_freeze,
         } = job;
         let worker_output_path = output_path.clone();
         let rendering_time_selection = range.is_some();
@@ -23131,31 +23136,47 @@ impl DawUi {
                             PendingSongRenderKind::MixerStems
                         }
                     },
-                    track_freeze: None,
+                    track_freeze,
                     pattern_clip_placement: None,
                 });
-                self.status = match kind {
-                    PlaylistOfflineRenderKind::Mix { .. } if rendering_time_selection => {
-                        format!(
-                            "Rendering Playlist time selection to {}…",
-                            output_path.display()
-                        )
-                    }
-                    PlaylistOfflineRenderKind::Mix { .. } => {
-                        format!("Rendering Playlist mix to {}…", output_path.display())
-                    }
-                    PlaylistOfflineRenderKind::MixerStems { .. } => {
-                        format!("Rendering Mixer stems into {}…", output_path.display())
+                self.status = if let Some(freeze) = self
+                    .pending_song_render
+                    .as_ref()
+                    .and_then(|pending| pending.track_freeze.as_ref())
+                {
+                    format!(
+                        "Freezing Playlist track {} from song start to {}…",
+                        freeze.track_id,
+                        output_path.display()
+                    )
+                } else {
+                    match kind {
+                        PlaylistOfflineRenderKind::Mix { .. } if rendering_time_selection => {
+                            format!(
+                                "Rendering Playlist time selection to {}…",
+                                output_path.display()
+                            )
+                        }
+                        PlaylistOfflineRenderKind::Mix { .. } => {
+                            format!("Rendering Playlist mix to {}…", output_path.display())
+                        }
+                        PlaylistOfflineRenderKind::MixerStems { .. } => {
+                            format!("Rendering Mixer stems into {}…", output_path.display())
+                        }
                     }
                 };
             }
             Err(error) => {
-                self.status = match kind {
-                    PlaylistOfflineRenderKind::Mix { .. } => {
-                        format!("Could not start Playlist render worker: {error}")
-                    }
-                    PlaylistOfflineRenderKind::MixerStems { .. } => {
-                        format!("Could not start Mixer stem render worker: {error}")
+                self.status = if track_freeze.is_some() {
+                    format!("Could not start Playlist track freeze worker: {error}")
+                } else {
+                    match kind {
+                        PlaylistOfflineRenderKind::Mix { .. } => {
+                            format!("Could not start Playlist render worker: {error}")
+                        }
+                        PlaylistOfflineRenderKind::MixerStems { .. } => {
+                            format!("Could not start Mixer stem render worker: {error}")
+                        }
                     }
                 };
             }
@@ -51501,11 +51522,12 @@ impl DawUi {
                 return;
             }
         };
-        let loaded_vst3_channels = self
+        let mut loaded_instrument_ids = self
             .channel_vst3_instances
             .keys()
             .copied()
             .collect::<BTreeSet<_>>();
+        loaded_instrument_ids.extend(self.clap_pattern_playback_instruments.keys().copied());
         for clip in &active_source_clips {
             match clip.target() {
                 PlaylistClipTarget::Channel { id } => {
@@ -51532,7 +51554,7 @@ impl DawUi {
                     if let Err(reason) = playlist_freeze_pattern_sources_supported(
                         pattern,
                         &channels,
-                        &loaded_vst3_channels,
+                        &loaded_instrument_ids,
                     ) {
                         self.status =
                             format!("Playlist track {track_id} cannot be frozen safely: {reason}");
@@ -51586,6 +51608,12 @@ impl DawUi {
             soloed_playlist_track_range: Some((track_id, track_id)),
             read_sample_root_note: self.read_sample_root_note,
             clip_envelopes: self.playlist_audio_clip_envelopes_for_current_project(arrangement_id),
+            clap_audio_channel_ids: Arc::new(
+                self.clap_pattern_playback_instruments
+                    .keys()
+                    .copied()
+                    .collect(),
+            ),
             wav_sample_format: self.playlist_render_format,
             wav_dither_mode: self.playlist_render_dither_mode,
             wav_save_playlist_markers: false,
@@ -51618,88 +51646,30 @@ impl DawUi {
                 return;
             }
         };
-        let flac_bits_per_sample = self.playlist_render_flac_bits_per_sample;
-        let ogg_bitrate_kbps = self.playlist_render_ogg_bitrate_kbps;
-        let mp3_bitrate_kbps = self.playlist_render_mp3_bitrate_kbps;
-        let document = document.clone();
-        let output_path_for_worker = output_path.clone();
-        let worker_project_path = project_path.clone();
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let worker_cancelled = Arc::clone(&cancelled);
-        let (sender, receiver) = mpsc::sync_channel(1);
-        let worker_options = options.clone();
-        let worker = thread::Builder::new()
-            .name("playlist-track-freeze-render".to_owned())
-            .spawn(move || {
-                let result = match output_format {
-                    PlaylistSongOutputFormat::Wav => render_playlist_with_vst3_to_wav_cancellable(
-                        &document,
-                        &worker_project_path,
-                        worker_options,
-                        &output_path_for_worker,
-                        vst3_processor,
-                        &worker_cancelled,
-                    ),
-                    PlaylistSongOutputFormat::Flac => {
-                        render_playlist_with_vst3_to_flac_cancellable(
-                            &document,
-                            &worker_project_path,
-                            options,
-                            &output_path_for_worker,
-                            flac_bits_per_sample,
-                            vst3_processor,
-                            &worker_cancelled,
-                        )
-                    }
-                    PlaylistSongOutputFormat::Ogg => render_playlist_with_vst3_to_ogg_cancellable(
-                        &document,
-                        &worker_project_path,
-                        options,
-                        &output_path_for_worker,
-                        ogg_bitrate_kbps,
-                        vst3_processor,
-                        &worker_cancelled,
-                    ),
-                    PlaylistSongOutputFormat::Mp3 => render_playlist_with_vst3_to_mp3_cancellable(
-                        &document,
-                        &worker_project_path,
-                        options,
-                        &output_path_for_worker,
-                        mp3_bitrate_kbps,
-                        vst3_processor,
-                        &worker_cancelled,
-                    ),
-                };
-                let _ = sender.send(result);
-            });
-        match worker {
-            Ok(worker) => {
-                self.pending_song_render = Some(PendingSongRender {
-                    receiver,
-                    cancelled,
-                    worker,
-                    output_path: output_path.clone(),
-                    kind: PendingSongRenderKind::Mix,
-                    track_freeze: Some(PendingPlaylistTrackFreeze {
-                        arrangement_id,
-                        track_id,
-                        track_index,
-                        expected_audio_clip_count,
-                        project_generation: self.project_generation,
-                        project_path,
-                        project_fingerprint,
-                    }),
-                    pattern_clip_placement: None,
-                });
-                self.status = format!(
-                    "Freezing Playlist track {track_id} from song start to {}…",
-                    output_path.display()
-                );
-            }
-            Err(error) => {
-                self.status = format!("Could not start Playlist track freeze worker: {error}");
-            }
-        }
+        let job = PlaylistOfflineRenderJob {
+            document: document.clone(),
+            project_path: project_path.clone(),
+            output_path,
+            options,
+            vst3_processor,
+            range: None,
+            kind: PlaylistOfflineRenderKind::Mix {
+                output_format,
+                flac_bits_per_sample: self.playlist_render_flac_bits_per_sample,
+                ogg_bitrate_kbps: self.playlist_render_ogg_bitrate_kbps,
+                mp3_bitrate_kbps: self.playlist_render_mp3_bitrate_kbps,
+            },
+            track_freeze: Some(PendingPlaylistTrackFreeze {
+                arrangement_id,
+                track_id,
+                track_index,
+                expected_audio_clip_count,
+                project_generation: self.project_generation,
+                project_path,
+                project_fingerprint,
+            }),
+        };
+        self.prepare_clap_playlist_offline_render(job);
     }
 
     fn playlist_render_is_pending(&self) -> bool {
@@ -51866,6 +51836,7 @@ impl DawUi {
                 ogg_bitrate_kbps,
                 mp3_bitrate_kbps,
             },
+            track_freeze: None,
         };
         self.prepare_clap_playlist_offline_render(job);
     }
@@ -51964,6 +51935,7 @@ impl DawUi {
             kind: PlaylistOfflineRenderKind::MixerStems {
                 options: stem_options,
             },
+            track_freeze: None,
         };
         self.prepare_clap_playlist_offline_render(job);
     }
@@ -81897,7 +81869,7 @@ fn project_has_audio_clip_template(document: &FlpDocument) -> bool {
 fn playlist_freeze_pattern_sources_supported(
     pattern: &Pattern,
     channels: &[ChannelSummary],
-    loaded_vst3_channels: &BTreeSet<u16>,
+    loaded_instrument_ids: &BTreeSet<u16>,
 ) -> Result<(), String> {
     if !pattern.controllers.is_empty() {
         return Err(format!(
@@ -81914,7 +81886,7 @@ fn playlist_freeze_pattern_sources_supported(
         key: u16,
         layer_id: u16,
         channels_by_id: &BTreeMap<u16, &ChannelSummary>,
-        loaded_vst3_channels: &BTreeSet<u16>,
+        loaded_instrument_ids: &BTreeSet<u16>,
         active_layers: &mut BTreeSet<u16>,
     ) -> Result<(), String> {
         if !active_layers.insert(layer_id) {
@@ -81953,11 +81925,11 @@ fn playlist_freeze_pattern_sources_supported(
                     key,
                     child_id,
                     channels_by_id,
-                    loaded_vst3_channels,
+                    loaded_instrument_ids,
                     active_layers,
                 )?,
                 Some(ChannelType::Sampler) => {}
-                Some(ChannelType::Instrument) if loaded_vst3_channels.contains(&child_id) => {}
+                Some(ChannelType::Instrument) if loaded_instrument_ids.contains(&child_id) => {}
                 Some(ChannelType::Instrument) => {
                     return Err(format!(
                         "Pattern {pattern_id} uses an unloaded instrument channel"
@@ -81989,7 +81961,7 @@ fn playlist_freeze_pattern_sources_supported(
         }
         match source.channel_type() {
             Some(ChannelType::Sampler) => {}
-            Some(ChannelType::Instrument) if loaded_vst3_channels.contains(&source.id()) => {}
+            Some(ChannelType::Instrument) if loaded_instrument_ids.contains(&source.id()) => {}
             Some(ChannelType::Instrument) => {
                 return Err(format!(
                     "Pattern {} uses an unloaded instrument channel",
@@ -82002,7 +81974,7 @@ fn playlist_freeze_pattern_sources_supported(
                     note.key,
                     source.id(),
                     &channels_by_id,
-                    loaded_vst3_channels,
+                    loaded_instrument_ids,
                     &mut BTreeSet::new(),
                 )?;
             }
