@@ -7497,6 +7497,8 @@ fn diff_playlist_clip_records(
 fn list_automation_target_links(path: &Path) -> Result<(), String> {
     let (_, document) = load_document(path)?;
     let channels = document.channels();
+    let mixer_inserts = document.mixer_inserts();
+    let mixer_effect_slots = document.mixer_effect_slots();
     let links = document
         .automation_target_links()
         .map_err(|error| format!("could not decode candidate automation target links: {error}"))?;
@@ -7507,9 +7509,10 @@ fn list_automation_target_links(path: &Path) -> Result<(), String> {
         let source_name = source_channel.and_then(|channel| channel.display_name());
         let source_type = source_channel.and_then(|channel| channel.channel_type());
         let source_range = source_channel.and_then(|channel| channel.automation_range_raw());
+        let mixer_target = link.candidate_mixer_effect_target();
         let target = if let Some(channel_id) = link.candidate_channel_target_id() {
             format!("channel:{channel_id}")
-        } else if let Some((insert, slot)) = link.candidate_mixer_effect_target() {
+        } else if let Some((insert, slot)) = mixer_target {
             format!("mixer-insert:{insert}/slot:{slot}")
         } else {
             "unclassified".to_owned()
@@ -7519,8 +7522,22 @@ fn list_automation_target_links(path: &Path) -> Result<(), String> {
             .and_then(|channel_id| channels.iter().find(|channel| channel.id() == channel_id));
         let target_name = target_channel.and_then(|channel| channel.display_name());
         let target_type = target_channel.and_then(|channel| channel.channel_type());
+        let target_insert_name = mixer_target
+            .and_then(|(insert, _)| {
+                mixer_inserts
+                    .iter()
+                    .find(|item| item.ordinal() == usize::from(insert))
+            })
+            .and_then(|insert| insert.name());
+        let target_effect = mixer_target.and_then(|(insert, slot)| {
+            mixer_effect_slots.iter().find(|item| {
+                item.insert_ordinal() == usize::from(insert) && item.slot_index() == slot
+            })
+        });
+        let target_effect_name =
+            target_effect.and_then(|effect| effect.display_name().or(effect.plugin_identifier()));
         println!(
-            "event={} source_channel={} source_name={:?} source_type={:?} source_automation_range_raw={:?} candidate_parameter={} parameter_raw=0x{:04X} candidate_vst_parameter={} destination_raw={} candidate_target={} candidate_target_name={:?} candidate_target_type={:?} prefix={:02X?} suffix={:02X?}",
+            "event={} source_channel={} source_name={:?} source_type={:?} source_automation_range_raw={:?} candidate_parameter={} parameter_raw=0x{:04X} candidate_vst_parameter={} destination_raw={} candidate_target={} candidate_target_name={:?} candidate_target_type={:?} candidate_target_insert_name={:?} candidate_target_effect_name={:?} prefix={:02X?} suffix={:02X?}",
             link.event_index(),
             source_id,
             source_name,
@@ -7533,6 +7550,8 @@ fn list_automation_target_links(path: &Path) -> Result<(), String> {
             target,
             target_name,
             target_type,
+            target_insert_name,
+            target_effect_name,
             link.opaque_prefix(),
             link.opaque_suffix()
         );
