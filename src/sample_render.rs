@@ -2742,6 +2742,238 @@ pub fn write_input_recording_to_wav(
     Ok(summary)
 }
 
+/// Process prepared recording count-in audio through a selected Mixer route and its loaded effects.
+pub fn process_recording_precount_through_mixer(
+    document: &FlpDocument,
+    mixer_track: i8,
+    sample_rate: u32,
+    samples: &mut [f32],
+    mixer_meters: &MixerTrackPeakMeters,
+    mut vst3_processor: Option<Vst3PlaylistStreamProcessor>,
+    cancelled: &AtomicBool,
+) -> Result<(), String> {
+    if sample_rate == 0 {
+        return Err("Recording count-in Mixer processing requires a positive sample rate".into());
+    }
+    if !samples.len().is_multiple_of(2) {
+        return Err("Recording count-in audio must contain stereo sample frames".into());
+    }
+    if mixer_track < 0 {
+        return Err("Recording count-in routing requires Master or a recognized insert".into());
+    }
+
+    let track = (mixer_track > 0).then_some(mixer_track).filter(|track| {
+        usize::try_from(*track).ok().is_some_and(|track| {
+            document
+                .mixer_inserts()
+                .iter()
+                .any(|insert| insert.ordinal() == track)
+        })
+    });
+    let routing = MixerRouteAudibility::from_document(document);
+    let route_plan = routing.source_route_plan_for_channel(track);
+    let live_source_control = routing
+        .live_source_route_plan_for_channel(track)
+        .map(|route_plan| LiveMixerSourceControl::new(route_plan, sample_rate));
+    let live_source_targets = live_source_control
+        .as_ref()
+        .and_then(|control| control.targets(mixer_meters));
+    let live_route_controls_active = live_source_control.is_some() && live_source_targets.is_some();
+    let route_is_audible =
+        track.is_none() || live_route_controls_active || routing.allows_channel(track);
+    let master_output = MixerMasterOutput::from_document(document)
+        .with_live_master_targets(mixer_meters, sample_rate);
+    let mixer_effect_buses_required = vst3_processor
+        .as_ref()
+        .is_some_and(Vst3PlaylistStreamProcessor::needs_mixer_insert_buses);
+    let mixer_meter_buses_required = !route_plan.insert_meter_transforms.is_empty()
+        || live_source_control
+            .as_ref()
+            .is_some_and(|control| !control.insert_meter_transforms().is_empty());
+    let mixer_buses_required = mixer_meter_buses_required || mixer_effect_buses_required;
+    let mixer_bus_planes = 1 + usize::from(mixer_effect_buses_required);
+    const BLOCK_FRAMES: usize = 128;
+    let block_samples = BLOCK_FRAMES * 2;
+    let mut source_block = vec![0.0_f32; block_samples];
+    let mut mixer_buses = mixer_buses_required
+        .then(|| vec![0.0_f32; MIXER_TRACK_METER_COUNT * block_samples * mixer_bus_planes]);
+    let mut post_effect_buses =
+        mixer_effect_buses_required.then(|| vec![0.0_f32; MIXER_TRACK_METER_COUNT * block_samples]);
+
+    if let Some(processor) = vst3_processor.as_mut() {
+        processor.set_live_mixer_source_targets(mixer_meters);
+        processor.start_processing()?;
+    }
+    let processing_result = (|| {
+        for block in samples.chunks_mut(block_samples) {
+            if cancelled.load(Ordering::Acquire) {
+                return Err("Recording count-in Mixer processing was canceled".to_owned());
+            }
+            let sample_count = block.len();
+            let frame_count = sample_count / 2;
+            source_block[..sample_count].copy_from_slice(block);
+            block.fill(0.0);
+            let active_bus_samples = MIXER_TRACK_METER_COUNT * sample_count * mixer_bus_planes;
+            let mut buses = mixer_buses
+                .as_deref_mut()
+                .map(|buses| &mut buses[..active_bus_samples]);
+            if let Some(buses) = buses.as_deref_mut() {
+                buses.fill(0.0);
+            }
+            if let Some(post_effect_buses) = post_effect_buses.as_deref_mut() {
+                post_effect_buses[..MIXER_TRACK_METER_COUNT * sample_count].fill(0.0);
+            }
+
+            if route_is_audible {
+                let meter_transforms = live_source_control
+                    .as_ref()
+                    .map_or(route_plan.insert_meter_transforms.as_slice(), |control| {
+                        control.insert_meter_transforms()
+                    });
+                let effect_input_transforms = live_source_control.as_ref().map_or(
+                    route_plan.insert_effect_input_transforms.as_slice(),
+                    |control| control.insert_effect_input_transforms(),
+                );
+                if meter_transforms
+                    .iter()
+                    .any(|(track, _)| *track >= MIXER_TRACK_METER_COUNT)
+                    || effect_input_transforms
+                        .iter()
+                        .any(|(track, _)| *track >= MIXER_TRACK_METER_COUNT)
+                {
+                    return Err(
+                        "Recording count-in Mixer route exceeds the supported track range"
+                            .to_owned(),
+                    );
+                }
+                for frame_index in 0..frame_count {
+                    let source_frame = [
+                        source_block[frame_index * 2],
+                        source_block[frame_index * 2 + 1],
+                    ];
+                    let live_controls = live_source_control
+                        .as_ref()
+                        .zip(live_source_targets.as_ref())
+                        .map(|(control, targets)| control.next_frame_controls(targets));
+                    let mut routed_frame = source_frame;
+                    if let (Some(control), Some(controls)) =
+                        (live_source_control.as_ref(), live_controls)
+                    {
+                        control.apply_output_frame(controls, &mut routed_frame);
+                    } else {
+                        route_plan.output_transform.apply_frame(&mut routed_frame);
+                    }
+                    block[frame_index * 2] = routed_frame[0];
+                    block[frame_index * 2 + 1] = routed_frame[1];
+
+                    if let Some(buses) = buses.as_deref_mut() {
+                        for (track, transform) in meter_transforms {
+                            let mut meter_frame = source_frame;
+                            if let (Some(control), Some(controls)) =
+                                (live_source_control.as_ref(), live_controls)
+                            {
+                                control.apply_meter_frame(
+                                    controls,
+                                    *track,
+                                    *transform,
+                                    &mut meter_frame,
+                                );
+                            } else {
+                                transform.apply_frame(&mut meter_frame);
+                            }
+                            let offset = *track * sample_count + frame_index * 2;
+                            buses[offset] += meter_frame[0];
+                            buses[offset + 1] += meter_frame[1];
+                        }
+                        if mixer_effect_buses_required {
+                            let meter_bus_samples = MIXER_TRACK_METER_COUNT * sample_count;
+                            let effect_input_buses = &mut buses[meter_bus_samples..];
+                            for (track, transform) in effect_input_transforms {
+                                let mut effect_frame = source_frame;
+                                if let (Some(control), Some(controls)) =
+                                    (live_source_control.as_ref(), live_controls)
+                                {
+                                    control.apply_effect_input_frame(
+                                        controls,
+                                        *track,
+                                        *transform,
+                                        &mut effect_frame,
+                                    );
+                                } else {
+                                    transform.apply_frame(&mut effect_frame);
+                                }
+                                let offset = *track * sample_count + frame_index * 2;
+                                effect_input_buses[offset] += effect_frame[0];
+                                effect_input_buses[offset + 1] += effect_frame[1];
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(processor) = vst3_processor.as_mut() {
+                if let Some(buses) = buses.as_deref_mut() {
+                    if let Some(post_effect_buses) = post_effect_buses.as_deref_mut() {
+                        processor.mix_next_block_with_post_effect_buses(
+                            block,
+                            buses,
+                            &mut post_effect_buses[..MIXER_TRACK_METER_COUNT * sample_count],
+                        )?;
+                    } else {
+                        processor.mix_next_block_with_meter_buses(block, buses)?;
+                    }
+                } else {
+                    processor.mix_next_block(block)?;
+                }
+            }
+
+            if let Some(buses) = buses.as_deref() {
+                for (track, track_samples) in buses[..MIXER_TRACK_METER_COUNT * sample_count]
+                    .chunks_exact(sample_count)
+                    .enumerate()
+                    .skip(1)
+                {
+                    let (frames, _) = track_samples.as_chunks::<2>();
+                    let (left_peak, right_peak) =
+                        frames
+                            .iter()
+                            .fold((0.0_f32, 0.0_f32), |(left_peak, right_peak), frame| {
+                                (
+                                    left_peak.max(frame[0].abs()),
+                                    right_peak.max(frame[1].abs()),
+                                )
+                            });
+                    mixer_meters.publish_stereo_peak(track, left_peak, right_peak);
+                    let post_effect_samples =
+                        post_effect_buses
+                            .as_deref()
+                            .map_or(track_samples, |post_effect_buses| {
+                                let offset = track * sample_count;
+                                &post_effect_buses[offset..offset + sample_count]
+                            });
+                    let (frames, _) = post_effect_samples.as_chunks::<2>();
+                    let (left_peak, right_peak) =
+                        frames
+                            .iter()
+                            .fold((0.0_f32, 0.0_f32), |(left_peak, right_peak), frame| {
+                                (
+                                    left_peak.max(frame[0].abs()),
+                                    right_peak.max(frame[1].abs()),
+                                )
+                            });
+                    mixer_meters.publish_post_effect_stereo_peak(track, left_peak, right_peak);
+                }
+            }
+            master_output.apply(block);
+        }
+        Ok::<_, String>(())
+    })();
+    let stop_result = vst3_processor
+        .as_mut()
+        .map_or(Ok(()), Vst3PlaylistStreamProcessor::stop_processing);
+    processing_result.and(stop_result)
+}
+
 /// Process live input through a selected Mixer route and loaded VST3 effects for monitoring.
 pub fn stream_input_monitor_through_mixer(
     document: &FlpDocument,

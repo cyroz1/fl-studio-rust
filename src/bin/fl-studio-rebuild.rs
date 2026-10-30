@@ -67,7 +67,7 @@ use flp_rebuild::sample_render::{
     playlist_audio_clip_fade_gain, playlist_performance_clap_clip_indices,
     playlist_performance_clip_indices_with_vst3_and_clap,
     playlist_performance_static_document_with_vst3_and_clap, playlist_performance_vst3_channel_ids,
-    playlist_performance_vst3_clip_indices_with_clap,
+    playlist_performance_vst3_clip_indices_with_clap, process_recording_precount_through_mixer,
     project_channel_stereo_output_gains_with_layer_adjustments, render_audio_clips_to_file,
     render_playlist_mixer_stems_with_vst3_cancellable,
     render_playlist_with_vst3_to_file_from_frame_cancellable,
@@ -5978,7 +5978,12 @@ struct AudioRecordingSession {
 }
 
 struct PendingRecordingPrecount {
-    timeout_at: Instant,
+    receiver: Receiver<Result<Vec<f32>, String>>,
+    worker: Option<thread::JoinHandle<()>>,
+    cancelled: Arc<AtomicBool>,
+    timeout_at: Option<Instant>,
+    sample_rate: u32,
+    resume_audio_monitor: bool,
     start_tick: u32,
     project_generation: u64,
     bars: u8,
@@ -15343,7 +15348,7 @@ impl DawUi {
             .map_or(96, |document| document.header().ppq());
         let bars = self.recording_precount_bars;
         let click_samples = self.metronome_click_samples();
-        let samples = render_recording_precount_samples(
+        let mut samples = render_recording_precount_samples(
             sample_rate,
             ppq,
             &tempo_map,
@@ -15352,54 +15357,218 @@ impl DawUi {
             bars,
             click_samples.as_deref(),
         )?;
-        let duration =
-            Duration::from_secs_f64((samples.len() / 2) as f64 / f64::from(sample_rate.max(1)));
-        engine.set_recording_precount(samples)?;
+        let document = self
+            .document
+            .as_ref()
+            .ok_or_else(|| "Open a project before recording".to_owned())?;
+        let project_bytes = document.encode_lossless().map_err(|error| {
+            format!("Could not prepare recording count-in Mixer route: {error}")
+        })?;
+        self.initialize_live_master_mixer_targets(document);
+        let worker_mixer_meters = Arc::clone(&self.mixer_track_peak_meters);
+        let mixer_track = self.metronome_mixer_track;
+        let arrangements = document.arrangements().map_err(|error| {
+            format!("Could not prepare recording count-in Mixer route: {error}")
+        })?;
+        let arrangement_id = self
+            .selected_arrangement
+            .filter(|selected| {
+                arrangements
+                    .iter()
+                    .any(|arrangement| arrangement.id == *selected)
+            })
+            .or_else(|| arrangements.first().map(|arrangement| arrangement.id))
+            .unwrap_or(0);
+        let options = PlaylistRenderOptions {
+            arrangement_id,
+            sample_rate,
+            ..PlaylistRenderOptions::default()
+        };
+        let processor = self
+            .vst3_host
+            .as_ref()
+            .map(|host| {
+                host.prepare_live_playlist_stream_with_mixer_effects_and_automation_sources(
+                    document,
+                    options,
+                    &BTreeMap::new(),
+                    &self.mixer_effect_vst3_instances,
+                    false,
+                    &Vst3PlaylistAutomationSources::default(),
+                )
+            })
+            .transpose()
+            .map_err(|error| {
+                format!("Could not prepare recording count-in Mixer effects: {error}")
+            })?;
+        let resume_audio_monitor = self.audio_monitor_input && self.audio_monitor_session.is_some();
+        if resume_audio_monitor {
+            self.stop_audio_input_monitor();
+        }
+        let worker_cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::clone(&worker_cancelled);
+        let (sender, receiver) = mpsc::channel();
+        let worker_result = thread::Builder::new()
+            .name("recording-precount-mixer".to_owned())
+            .spawn(move || {
+                let result = FlpDocument::parse(&project_bytes)
+                    .map_err(|error| error.to_string())
+                    .and_then(|document| {
+                        process_recording_precount_through_mixer(
+                            &document,
+                            mixer_track,
+                            sample_rate,
+                            &mut samples,
+                            &worker_mixer_meters,
+                            processor,
+                            &cancelled,
+                        )
+                    })
+                    .map(|()| samples);
+                let _ = sender.send(result);
+            });
+        let worker = match worker_result {
+            Ok(worker) => worker,
+            Err(error) => {
+                if resume_audio_monitor {
+                    let _ = self.start_audio_input_monitor(false);
+                }
+                return Err(format!(
+                    "Could not start recording count-in Mixer processing: {error}"
+                ));
+            }
+        };
         self.pending_recording_precount = Some(PendingRecordingPrecount {
-            timeout_at: Instant::now() + duration + Duration::from_secs(3),
+            receiver,
+            worker: Some(worker),
+            cancelled: worker_cancelled,
+            timeout_at: None,
+            sample_rate,
+            resume_audio_monitor,
             start_tick,
             project_generation: self.project_generation,
             bars,
             midi,
             audio_path,
         });
-        self.status = format!("Recording count-in · {bars} bar(s)");
+        self.status = format!("Preparing recording count-in · {bars} bar(s)");
         Ok(true)
     }
 
     fn cancel_recording_precount(&mut self) -> bool {
-        if self.pending_recording_precount.take().is_none() {
+        let Some(mut precount) = self.pending_recording_precount.take() else {
             return false;
+        };
+        precount.cancelled.store(true, Ordering::Release);
+        if let Some(worker) = precount.worker.take() {
+            let _ = worker.join();
         }
         if let Some(engine) = self.audio_engine.as_ref() {
             engine.stop_recording_precount();
+        }
+        if precount.resume_audio_monitor && precount.project_generation == self.project_generation {
+            let _ = self.start_audio_input_monitor(false);
         }
         self.status = "Recording count-in canceled".to_owned();
         true
     }
 
     fn poll_recording_precount(&mut self) {
-        let Some(precount) = self.pending_recording_precount.as_ref() else {
+        let Some(mut precount) = self.pending_recording_precount.take() else {
             return;
         };
-        let timed_out = Instant::now() >= precount.timeout_at;
+        if precount.timeout_at.is_none() {
+            match precount.receiver.try_recv() {
+                Ok(Ok(samples)) => {
+                    if precount
+                        .worker
+                        .take()
+                        .is_some_and(|worker| worker.join().is_err())
+                    {
+                        precount.cancelled.store(true, Ordering::Release);
+                        if precount.resume_audio_monitor
+                            && precount.project_generation == self.project_generation
+                        {
+                            let _ = self.start_audio_input_monitor(false);
+                        }
+                        self.status = "Recording count-in Mixer processing worker panicked".into();
+                        return;
+                    }
+                    let duration = Duration::from_secs_f64(
+                        (samples.len() / 2) as f64 / f64::from(precount.sample_rate.max(1)),
+                    );
+                    let result = self
+                        .audio_engine
+                        .as_ref()
+                        .ok_or_else(|| "Audio output is not available".to_owned())
+                        .and_then(|engine| engine.set_recording_precount(samples));
+                    if let Err(error) = result {
+                        precount.cancelled.store(true, Ordering::Release);
+                        if precount.resume_audio_monitor
+                            && precount.project_generation == self.project_generation
+                        {
+                            let _ = self.start_audio_input_monitor(false);
+                        }
+                        self.status = format!("Could not start recording count-in: {error}");
+                        return;
+                    }
+                    precount.timeout_at = Some(Instant::now() + duration + Duration::from_secs(3));
+                    self.status = format!("Recording count-in · {} bar(s)", precount.bars);
+                }
+                Ok(Err(error)) => {
+                    if let Some(worker) = precount.worker.take() {
+                        let _ = worker.join();
+                    }
+                    precount.cancelled.store(true, Ordering::Release);
+                    if precount.resume_audio_monitor
+                        && precount.project_generation == self.project_generation
+                    {
+                        let _ = self.start_audio_input_monitor(false);
+                    }
+                    self.status = format!("Could not prepare recording count-in: {error}");
+                    return;
+                }
+                Err(TryRecvError::Empty) => {
+                    self.pending_recording_precount = Some(precount);
+                    return;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    if let Some(worker) = precount.worker.take() {
+                        let _ = worker.join();
+                    }
+                    precount.cancelled.store(true, Ordering::Release);
+                    if precount.resume_audio_monitor
+                        && precount.project_generation == self.project_generation
+                    {
+                        let _ = self.start_audio_input_monitor(false);
+                    }
+                    self.status = "Recording count-in Mixer processing stopped unexpectedly".into();
+                    return;
+                }
+            }
+        }
+        let timed_out = precount
+            .timeout_at
+            .is_some_and(|timeout_at| Instant::now() >= timeout_at);
         let finished = self
             .audio_engine
             .as_ref()
             .is_none_or(|engine| !engine.recording_precount_active())
             || timed_out;
         if !finished {
+            self.pending_recording_precount = Some(precount);
             return;
         }
-        let Some(precount) = self.pending_recording_precount.take() else {
-            return;
-        };
+        precount.cancelled.store(true, Ordering::Release);
         if let Some(engine) = self.audio_engine.as_ref() {
             engine.stop_recording_precount();
         }
         if precount.project_generation != self.project_generation {
             self.status = "Recording count-in canceled because the project changed".to_owned();
             return;
+        }
+        if precount.resume_audio_monitor && !self.audio_monitor_input {
+            let _ = self.start_audio_input_monitor(false);
         }
 
         let mut audio_started = false;
@@ -19316,7 +19485,7 @@ impl DawUi {
             let metronome_response = ui
                 .selectable_label(self.metronome_enabled, "MET")
                 .on_hover_text(
-                    "Metronome: click each beat and accent each bar (Ctrl/Cmd+M; right-click for samples and Mixer route)",
+                    "Metronome: click each beat and accent each bar (Ctrl/Cmd+M; right-click for samples and Mixer route, also used by PRE)",
                 );
             let metronome_mixer_tracks = self.document.as_ref().map_or_else(
                 || vec![(0_i8, "Master".to_owned())],
@@ -19413,7 +19582,7 @@ impl DawUi {
             let precount_response = ui
                 .selectable_label(self.recording_precount_enabled, "PRE")
                 .on_hover_text(
-                    "Recording count-in: play clicks before starting a stopped recording (Ctrl/Cmd+P; right-click for bar count)",
+                    "Recording count-in: play clicks through the MET Mixer route before a stopped recording (Ctrl/Cmd+P; right-click for bar count)",
                 );
             let _ = precount_response.context_menu(|ui| {
                 apply_local_ui_scale(ui, self.popup_menu_scale);
