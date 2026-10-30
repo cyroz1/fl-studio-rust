@@ -2296,6 +2296,7 @@ pub struct AutomationChannel {
     channel_id: u16,
     display_name: Option<String>,
     points: Vec<AutomationPoint>,
+    automation_range_raw: Option<(i32, i32)>,
     lfo_amount: Option<i32>,
     data_event_index: Option<usize>,
 }
@@ -2311,6 +2312,11 @@ impl AutomationChannel {
 
     pub fn points(&self) -> &[AutomationPoint] {
         &self.points
+    }
+
+    /// Raw Min and Max controls from this Automation channel's `0xDB` Levels event.
+    pub fn automation_range_raw(&self) -> Option<(i32, i32)> {
+        self.automation_range_raw
     }
 
     /// Saved raw LFO amount from the automation event, when the channel has a valid `0xEA` blob.
@@ -7200,10 +7206,12 @@ impl FlpDocument {
                             .expect("a decoded automation event has a four-byte LFO amount"),
                     )
                 });
+                let automation_range_raw = channel.automation_range_raw();
                 Ok(AutomationChannel {
                     channel_id: channel.id,
                     display_name: channel.display_name,
                     points,
+                    automation_range_raw,
                     lfo_amount,
                     data_event_index: event_index,
                 })

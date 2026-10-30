@@ -9405,6 +9405,17 @@ impl DawUi {
         playlist_automation
     }
 
+    fn automation_value_for_normalized_target(
+        automation_channel: &AutomationChannel,
+        value: f64,
+    ) -> f64 {
+        let Some((min_raw, max_raw)) = automation_channel.automation_range_raw() else {
+            return value;
+        };
+        let raw_value = f64::from(min_raw) + (f64::from(max_raw) - f64::from(min_raw)) * value;
+        (raw_value / 12_800.0).clamp(0.0, 1.0)
+    }
+
     fn vst3_playlist_automation_sources(
         &self,
         document: &FlpDocument,
@@ -9462,7 +9473,10 @@ impl DawUi {
                 })
                 .map(|point| Vst3AutomationPoint {
                     position_beats: point.position_beats(),
-                    value: point.value(),
+                    value: Self::automation_value_for_normalized_target(
+                        automation_channel,
+                        point.value(),
+                    ),
                     tension: point.tension(),
                 })
                 .collect::<Vec<_>>();
@@ -9512,7 +9526,10 @@ impl DawUi {
                 })
                 .map(|point| Vst3AutomationPoint {
                     position_beats: point.position_beats(),
-                    value: point.value(),
+                    value: Self::automation_value_for_normalized_target(
+                        automation_channel,
+                        point.value(),
+                    ),
                     tension: point.tension(),
                 })
                 .collect::<Vec<_>>();
@@ -22722,7 +22739,10 @@ impl DawUi {
                         point_index,
                         PlaylistChannelAutomationPoint {
                             tick,
-                            value: point.value,
+                            value: Self::automation_value_for_normalized_target(
+                                automation_channel,
+                                point.value,
+                            ),
                             tension: point.tension,
                         },
                     ));
@@ -22831,7 +22851,15 @@ impl DawUi {
                     points_by_parameter
                         .entry(link.parameter_id)
                         .or_default()
-                        .push((tick, clip_index, point_index, point.value));
+                        .push((
+                            tick,
+                            clip_index,
+                            point_index,
+                            Self::automation_value_for_normalized_target(
+                                automation_channel,
+                                point.value,
+                            ),
+                        ));
                 }
             }
         }
