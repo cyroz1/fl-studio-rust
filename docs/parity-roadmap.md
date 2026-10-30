@@ -367,10 +367,12 @@ are applied where the Mixer rows below describe. Full export surface:
   menu can render one selected, unmuted, default-scale Pattern Clip or mix multiple selected
   Pattern Clips into one file, from the earliest selected clip start or song start through
   the latest selected endpoint and configured tail. Group renders preserve relative song
-  positions and use the shared output formats and settings. Supported Sampler and loaded VST3
-  note sources render with tempo automation, supported linked Automation Clip and Pattern
-  Event/LFO effect automation, loaded Mixer insert and Master effects, reported tails, and
-  automatic PDC. File > Export can also render and insert one or more selected Pattern Clips as
+  positions and use the shared output formats and settings. Supported Sampler, loaded VST3, and
+  assigned CLAP instrument sources render with tempo automation, supported linked Automation
+  Clip and Pattern Event/LFO effect automation, loaded Mixer insert and Master effects, reported
+  tails, and automatic PDC. Pattern Clips must use the default scale; CLAP clips also require the
+  full Pattern source range. Raw Pattern controller points and unavailable sources remain
+  unsupported. File > Export can also render and insert one or more selected Pattern Clips as
   one unmuted Audio Clip at the earliest source position or song start, on the earliest source
   clip's track, leaving the Pattern Clips unchanged. The context menu can consolidate one
   Pattern Clip or multiple selected Pattern Clips across Playlist tracks into one Audio Clip

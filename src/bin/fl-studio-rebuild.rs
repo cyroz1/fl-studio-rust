@@ -5681,6 +5681,8 @@ struct PlaylistOfflineRenderJob {
     range: Option<PlaylistRenderRange>,
     kind: PlaylistOfflineRenderKind,
     track_freeze: Option<PendingPlaylistTrackFreeze>,
+    pending_song_render_kind: Option<PendingSongRenderKind>,
+    pattern_clip_placement: Option<PendingPlaylistPatternClipPlacement>,
 }
 
 #[derive(Clone, Copy)]
@@ -5711,6 +5713,7 @@ struct PendingPlaylistPatternClipPlacement {
     source_clips: Vec<PendingPlaylistPatternClipSource>,
     source_position_ticks: u32,
     source_track_index: u16,
+    start_from_song_start: bool,
     mute_source_clips: bool,
     project_generation: u64,
     project_path: PathBuf,
@@ -23026,6 +23029,8 @@ impl DawUi {
             range,
             kind,
             track_freeze,
+            pending_song_render_kind,
+            pattern_clip_placement,
         } = job;
         let worker_output_path = output_path.clone();
         let rendering_time_selection = range.is_some();
@@ -23130,14 +23135,14 @@ impl DawUi {
                     cancelled,
                     worker,
                     output_path: output_path.clone(),
-                    kind: match kind {
+                    kind: pending_song_render_kind.unwrap_or(match kind {
                         PlaylistOfflineRenderKind::Mix { .. } => PendingSongRenderKind::Mix,
                         PlaylistOfflineRenderKind::MixerStems { .. } => {
                             PendingSongRenderKind::MixerStems
                         }
-                    },
+                    }),
                     track_freeze,
-                    pattern_clip_placement: None,
+                    pattern_clip_placement,
                 });
                 self.status = if let Some(freeze) = self
                     .pending_song_render
@@ -23147,6 +23152,60 @@ impl DawUi {
                     format!(
                         "Freezing Playlist track {} from song start to {}…",
                         freeze.track_id,
+                        output_path.display()
+                    )
+                } else if let Some(placement) = self
+                    .pending_song_render
+                    .as_ref()
+                    .and_then(|pending| pending.pattern_clip_placement.as_ref())
+                {
+                    let clip_count = placement.source_clips.len();
+                    let description = if clip_count == 1 {
+                        format!(
+                            "Playlist Pattern Clip {}",
+                            placement.source_clips[0].clip_index + 1
+                        )
+                    } else {
+                        format!("{clip_count} selected Playlist Pattern Clips")
+                    };
+                    if placement.mute_source_clips {
+                        format!("Consolidating {description} to {}…", output_path.display())
+                    } else {
+                        let start_label = if placement.start_from_song_start {
+                            "song start"
+                        } else if clip_count > 1 {
+                            "earliest selected clip start"
+                        } else {
+                            "clip start"
+                        };
+                        format!(
+                            "Rendering and inserting {description} from {start_label} to {}…",
+                            output_path.display()
+                        )
+                    }
+                } else if let Some(PendingSongRenderKind::PatternClips {
+                    clip_count,
+                    first_clip_index,
+                    start_from_song_start,
+                }) = self
+                    .pending_song_render
+                    .as_ref()
+                    .map(|pending| pending.kind)
+                {
+                    let description = if clip_count == 1 {
+                        format!("Playlist Pattern Clip {}", first_clip_index + 1)
+                    } else {
+                        format!("{clip_count} selected Playlist Pattern Clips")
+                    };
+                    let start_label = if start_from_song_start {
+                        "song start"
+                    } else if clip_count > 1 {
+                        "earliest selected clip start"
+                    } else {
+                        "clip start"
+                    };
+                    format!(
+                        "Rendering {description} from {start_label} to {}…",
                         output_path.display()
                     )
                 } else {
@@ -23169,6 +23228,17 @@ impl DawUi {
             Err(error) => {
                 self.status = if track_freeze.is_some() {
                     format!("Could not start Playlist track freeze worker: {error}")
+                } else if let Some(placement) = pattern_clip_placement.as_ref() {
+                    if placement.mute_source_clips {
+                        format!("Could not start Pattern Clip consolidation worker: {error}")
+                    } else {
+                        format!("Could not start Pattern Clip render-and-insert worker: {error}")
+                    }
+                } else if matches!(
+                    pending_song_render_kind,
+                    Some(PendingSongRenderKind::PatternClips { .. })
+                ) {
+                    format!("Could not start Pattern Clip render worker: {error}")
                 } else {
                     match kind {
                         PlaylistOfflineRenderKind::Mix { .. } => {
@@ -50445,11 +50515,12 @@ impl DawUi {
             }
         };
         let channels = document.channels();
-        let loaded_vst3_channels = self
+        let mut loaded_instrument_ids = self
             .channel_vst3_instances
             .keys()
             .copied()
             .collect::<BTreeSet<_>>();
+        loaded_instrument_ids.extend(self.clap_pattern_playback_instruments.keys().copied());
         let playlist_tracks = document.playlist_tracks();
         let mut source_start_tick = u32::MAX;
         let mut clip_end_tick = 0_u64;
@@ -50536,9 +50607,11 @@ impl DawUi {
                 );
                 return;
             };
-            if let Err(reason) =
-                playlist_freeze_pattern_sources_supported(pattern, &channels, &loaded_vst3_channels)
-            {
+            if let Err(reason) = playlist_freeze_pattern_sources_supported(
+                pattern,
+                &channels,
+                &loaded_instrument_ids,
+            ) {
                 self.status = format!(
                     "Pattern Clip {} cannot be {rendered_or_consolidated} safely: {reason}",
                     selected_index + 1
@@ -50749,6 +50822,12 @@ impl DawUi {
             soloed_playlist_track_range: None,
             read_sample_root_note: self.read_sample_root_note,
             clip_envelopes: self.playlist_audio_clip_envelopes_for_current_project(arrangement_id),
+            clap_audio_channel_ids: Arc::new(
+                self.clap_pattern_playback_instruments
+                    .keys()
+                    .copied()
+                    .collect(),
+            ),
             wav_sample_format: self.playlist_render_format,
             wav_dither_mode: self.playlist_render_dither_mode,
             wav_save_playlist_markers: false,
@@ -50789,7 +50868,7 @@ impl DawUi {
                 return;
             }
         };
-        let output_format = match output_format {
+        let audio_output_format = match output_format {
             PlaylistSongOutputFormat::Wav => AudioRenderOutput::Wav,
             PlaylistSongOutputFormat::Flac => AudioRenderOutput::Flac {
                 bits_per_sample: self.playlist_render_flac_bits_per_sample,
@@ -50813,6 +50892,12 @@ impl DawUi {
                     source_clips: consolidation_sources,
                     source_position_ticks,
                     source_track_index: track_index,
+                    start_from_song_start: matches!(
+                        action,
+                        PlaylistPatternClipRenderAction::Insert {
+                            start_from_song_start: true
+                        }
+                    ),
                     mute_source_clips: action == PlaylistPatternClipRenderAction::Consolidate,
                     project_generation: self.project_generation,
                     project_path: project_path.clone(),
@@ -50821,129 +50906,40 @@ impl DawUi {
             }
             PlaylistPatternClipRenderAction::Export { .. } => None,
         };
-        let document = render_document;
-        let output_path_for_worker = output_path.clone();
-        let worker_project_path = project_path.clone();
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let worker_cancelled = Arc::clone(&cancelled);
-        let (sender, receiver) = mpsc::sync_channel(1);
-        let worker_options = options.clone();
-        let worker = thread::Builder::new()
-            .name("playlist-pattern-clip-render".to_owned())
-            .spawn(move || {
-                let result = render_playlist_with_vst3_to_file_from_frame_cancellable(
-                    &document,
-                    &worker_project_path,
-                    worker_options,
-                    &output_path_for_worker,
-                    PlaylistRenderRange {
-                        output_format,
-                        output_start_frame,
-                        output_end_frame: None,
-                        minimum_content_frames,
-                    },
-                    vst3_processor,
-                    &worker_cancelled,
-                );
-                let _ = sender.send(result);
-            });
-        match worker {
-            Ok(worker) => {
-                self.pending_song_render = Some(PendingSongRender {
-                    receiver,
-                    cancelled,
-                    worker,
-                    output_path: output_path.clone(),
-                    kind: match action {
-                        PlaylistPatternClipRenderAction::Export {
-                            start_from_song_start,
-                        } => PendingSongRenderKind::PatternClips {
-                            clip_count: selected_clip_indices.len(),
-                            first_clip_index: clip_index,
-                            start_from_song_start,
-                        },
-                        PlaylistPatternClipRenderAction::Insert { .. } => {
-                            PendingSongRenderKind::Mix
-                        }
-                        PlaylistPatternClipRenderAction::Consolidate => PendingSongRenderKind::Mix,
-                    },
-                    track_freeze: None,
-                    pattern_clip_placement,
-                });
-                self.status = match action {
-                    PlaylistPatternClipRenderAction::Export {
-                        start_from_song_start,
-                    } => {
-                        let clip_description = if selected_clip_indices.len() == 1 {
-                            format!("Playlist Pattern Clip {}", clip_index + 1)
-                        } else {
-                            format!(
-                                "{} selected Playlist Pattern Clips",
-                                selected_clip_indices.len()
-                            )
-                        };
-                        format!(
-                            "Rendering {clip_description} from {} to {}…",
-                            if start_from_song_start {
-                                "song start"
-                            } else if selected_clip_indices.len() > 1 {
-                                "earliest selected clip start"
-                            } else {
-                                "clip start"
-                            },
-                            output_path.display()
-                        )
-                    }
-                    PlaylistPatternClipRenderAction::Insert {
-                        start_from_song_start,
-                    } => {
-                        let clip_description = if selected_clip_indices.len() == 1 {
-                            format!("Playlist Pattern Clip {}", clip_index + 1)
-                        } else {
-                            format!(
-                                "{} selected Playlist Pattern Clips",
-                                selected_clip_indices.len()
-                            )
-                        };
-                        format!(
-                            "Rendering and inserting {clip_description} from {} to {}…",
-                            if start_from_song_start {
-                                "song start"
-                            } else if selected_clip_indices.len() > 1 {
-                                "earliest selected clip start"
-                            } else {
-                                "clip start"
-                            },
-                            output_path.display()
-                        )
-                    }
-                    PlaylistPatternClipRenderAction::Consolidate => {
-                        let description = if selected_clip_indices.len() == 1 {
-                            format!("Playlist Pattern Clip {}", clip_index + 1)
-                        } else {
-                            format!(
-                                "{} selected Playlist Pattern Clips",
-                                selected_clip_indices.len()
-                            )
-                        };
-                        format!("Consolidating {description} to {}…", output_path.display())
-                    }
-                };
-            }
-            Err(error) => {
-                self.status = match action {
-                    PlaylistPatternClipRenderAction::Export { .. } => {
-                        format!("Could not start Pattern Clip render: {error}")
-                    }
-                    PlaylistPatternClipRenderAction::Insert { .. } => {
-                        format!("Could not start Pattern Clip render-and-insert: {error}")
-                    }
-                    PlaylistPatternClipRenderAction::Consolidate => {
-                        format!("Could not start Pattern Clip consolidation: {error}")
-                    }
-                };
-            }
-        }
+        let pending_song_render_kind = match action {
+            PlaylistPatternClipRenderAction::Export {
+                start_from_song_start,
+            } => PendingSongRenderKind::PatternClips {
+                clip_count: selected_clip_indices.len(),
+                first_clip_index: clip_index,
+                start_from_song_start,
+            },
+            PlaylistPatternClipRenderAction::Insert { .. }
+            | PlaylistPatternClipRenderAction::Consolidate => PendingSongRenderKind::Mix,
+        };
+        let job = PlaylistOfflineRenderJob {
+            document: render_document,
+            project_path: project_path.clone(),
+            output_path,
+            options,
+            vst3_processor,
+            range: Some(PlaylistRenderRange {
+                output_format: audio_output_format,
+                output_start_frame,
+                output_end_frame: None,
+                minimum_content_frames,
+            }),
+            kind: PlaylistOfflineRenderKind::Mix {
+                output_format,
+                flac_bits_per_sample: self.playlist_render_flac_bits_per_sample,
+                ogg_bitrate_kbps: self.playlist_render_ogg_bitrate_kbps,
+                mp3_bitrate_kbps: self.playlist_render_mp3_bitrate_kbps,
+            },
+            track_freeze: None,
+            pending_song_render_kind: Some(pending_song_render_kind),
+            pattern_clip_placement,
+        };
+        self.prepare_clap_playlist_offline_render(job);
     }
 
     fn finish_playlist_pattern_clip_placement(
@@ -51668,6 +51664,8 @@ impl DawUi {
                 project_path,
                 project_fingerprint,
             }),
+            pending_song_render_kind: None,
+            pattern_clip_placement: None,
         };
         self.prepare_clap_playlist_offline_render(job);
     }
@@ -51837,6 +51835,8 @@ impl DawUi {
                 mp3_bitrate_kbps,
             },
             track_freeze: None,
+            pending_song_render_kind: None,
+            pattern_clip_placement: None,
         };
         self.prepare_clap_playlist_offline_render(job);
     }
@@ -51936,6 +51936,8 @@ impl DawUi {
                 options: stem_options,
             },
             track_freeze: None,
+            pending_song_render_kind: None,
+            pattern_clip_placement: None,
         };
         self.prepare_clap_playlist_offline_render(job);
     }
