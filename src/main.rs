@@ -4788,8 +4788,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "    Polyphonic Key Pressure imports the selected key; 7-bit values map linearly from 0–127 to 0.0–1.0.\n",
             "  flp-rebuild replace-automation-from-midi-cc <input.flp> <input.mid> <output.flp> <track-index> <automation-channel-id> <cc-0..127> <midi-channel-1..16|all>\n",
             "    Replaces the selected Automation channel's curve points; its saved Min/Max range is retained.\n",
-            "  flp-rebuild replace-automation-from-midi-source <input.flp> <input.mid> <output.flp> <track-index> <automation-channel-id> <cc:N|pitch-bend|channel-pressure|poly-pressure:KEY> <midi-channel-1..16|all>\n",
-            "    Replaces the curve from one selected MIDI channel-voice source; poly-pressure requires a note key.\n",
+            "  flp-rebuild replace-automation-from-midi-source <input.flp> <input.mid> <output.flp> <track-index> <automation-channel-id> <cc:N|cc14:N|pitch-bend|channel-pressure|poly-pressure:KEY> <midi-channel-1..16|all>\n",
+            "    Replaces the curve from one selected MIDI channel-voice source; cc14 uses CC N and N+32, while poly-pressure requires a note key.\n",
             "  flp-rebuild import-midi-all <input.flp> <input.mid> <output.flp> <pattern-id|new> <channel-ids-comma-separated> [zero-velocity-note-ons:0|1] [realign-events:0|1] [midi-channels:all|none|1,2,...,16]\n",
             "  flp-rebuild import-midi-named-patterns <input.flp> <input.mid> <output.flp> <channel-id> [zero-velocity-note-ons:0|1] [realign-events:0|1] [midi-channels:all|none|1,2,...,16]\n",
             "  flp-rebuild import-midi-selected <input.flp> <input.mid> <output.flp> <pattern-id|new> <track-numbers:all|1,2,...> <selected-track-channel-ids-comma-separated> [zero-velocity-note-ons:0|1 realign-events:0|1 midi-channels:all|none|1,2,...,16]\n",
@@ -5181,6 +5181,15 @@ fn parse_midi_automation_source(value: &str) -> Result<MidiAutomationSource, Str
             }
             Ok(MidiAutomationSource::ControlChange(controller))
         }
+        ["cc14", controller] => {
+            let controller = parse_u8(controller, "14-bit MIDI Control Change base number")?;
+            if controller > 31 {
+                return Err(
+                    "14-bit MIDI Control Change base number must be from 0 through 31".to_owned(),
+                );
+            }
+            Ok(MidiAutomationSource::ControlChange14(controller))
+        }
         ["pitch-bend"] => Ok(MidiAutomationSource::PitchBend),
         ["channel-pressure"] => Ok(MidiAutomationSource::ChannelPressure),
         ["poly-pressure", key] => {
@@ -5191,7 +5200,7 @@ fn parse_midi_automation_source(value: &str) -> Result<MidiAutomationSource, Str
             Ok(MidiAutomationSource::PolyphonicKeyPressure(key))
         }
         _ => Err(
-            "MIDI Automation source must be cc:<0..127>, pitch-bend, channel-pressure, or poly-pressure:<0..127>"
+            "MIDI Automation source must be cc:<0..127>, cc14:<0..31>, pitch-bend, channel-pressure, or poly-pressure:<0..127>"
                 .to_owned(),
         ),
     }

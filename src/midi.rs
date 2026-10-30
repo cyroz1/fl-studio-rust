@@ -148,6 +148,8 @@ pub struct MidiPolyphonicKeyPressure {
 pub enum MidiAutomationSource {
     /// One MIDI Control Change number in the range 0–127.
     ControlChange(u8),
+    /// One paired 14-bit Control Change source, using CC `base` and CC `base + 32`.
+    ControlChange14(u8),
     /// MIDI Pitch Bend, mapped from its unsigned 14-bit value.
     PitchBend,
     /// MIDI Channel Pressure, mapped from its seven-bit value.

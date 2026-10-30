@@ -20900,11 +20900,13 @@ impl FlpDocument {
     }
 
     /// Replaces one type-5 Automation channel's points with a selected MIDI channel-voice source.
-    /// Seven-bit sources map 0–127 linearly to 0.0–1.0; Pitch Bend maps its unsigned 14-bit
-    /// value from 0–16383. The channel's saved Min/Max range remains available for parameter
-    /// scaling. Source tempo timing is converted to project beats. The blob header and trailing
-    /// payload are retained; replaced points receive zeroed opaque tail bytes. If the track has
-    /// no matching messages, the existing curve is left unchanged.
+    /// Seven-bit sources map 0–127 linearly to 0.0–1.0; Pitch Bend and paired 14-bit Control
+    /// Change map 0–16383. A paired CC source uses base CC 0–31 and its LSB at base + 32, with
+    /// each byte held until the next update and both values starting at zero. The channel's
+    /// saved Min/Max range remains available for parameter scaling. Source tempo timing is
+    /// converted to project beats. The blob header and trailing payload are retained; replaced
+    /// points receive zeroed opaque tail bytes. If the track has no matching messages, the
+    /// existing curve is left unchanged.
     pub fn replace_automation_channel_points_from_midi_source(
         &mut self,
         midi: &midi::MidiFile,
@@ -20919,6 +20921,13 @@ impl FlpDocument {
             {
                 return Err(FlpError::UnsupportedEdit(
                     "MIDI Control Change number must be from 0 through 127",
+                ));
+            }
+            midi::MidiAutomationSource::ControlChange14(base_controller)
+                if base_controller > 31 =>
+            {
+                return Err(FlpError::UnsupportedEdit(
+                    "14-bit MIDI Control Change base number must be from 0 through 31",
                 ));
             }
             midi::MidiAutomationSource::PolyphonicKeyPressure(key) if key > 127 => {
@@ -20987,6 +20996,28 @@ impl FlpDocument {
                     )
                 })
                 .collect::<Vec<_>>(),
+            midi::MidiAutomationSource::ControlChange14(base_controller) => {
+                let lsb_controller = base_controller + 32;
+                let mut most_significant = [0u8; 16];
+                let mut least_significant = [0u8; 16];
+                track
+                    .control_changes()
+                    .into_iter()
+                    .filter_map(|event| {
+                        let channel = usize::from(event.channel());
+                        if event.controller() == base_controller {
+                            most_significant[channel] = event.value();
+                        } else if event.controller() == lsb_controller {
+                            least_significant[channel] = event.value();
+                        } else {
+                            return None;
+                        }
+                        let value = u16::from(most_significant[channel]) * 128
+                            + u16::from(least_significant[channel]);
+                        Some((event.channel(), event.tick(), f64::from(value) / 16_383.0))
+                    })
+                    .collect::<Vec<_>>()
+            }
             midi::MidiAutomationSource::PitchBend => track
                 .pitch_bends()
                 .into_iter()

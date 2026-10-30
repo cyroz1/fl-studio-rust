@@ -4444,6 +4444,7 @@ struct PendingAutomationMidiCcImport {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MidiAutomationSourceKind {
     ControlChange,
+    ControlChange14,
     PitchBend,
     ChannelPressure,
     PolyphonicKeyPressure,
@@ -41064,6 +41065,9 @@ impl DawUi {
                 egui::ComboBox::from_id_salt(("automation-midi-source", channel_id))
                     .selected_text(match pending.source_kind {
                         MidiAutomationSourceKind::ControlChange => "Control Change",
+                        MidiAutomationSourceKind::ControlChange14 => {
+                            "14-bit Control Change"
+                        }
                         MidiAutomationSourceKind::PitchBend => "Pitch Bend",
                         MidiAutomationSourceKind::ChannelPressure => "Channel Pressure",
                         MidiAutomationSourceKind::PolyphonicKeyPressure => {
@@ -41075,6 +41079,11 @@ impl DawUi {
                             &mut pending.source_kind,
                             MidiAutomationSourceKind::ControlChange,
                             "Control Change",
+                        );
+                        ui.selectable_value(
+                            &mut pending.source_kind,
+                            MidiAutomationSourceKind::ControlChange14,
+                            "14-bit Control Change",
                         );
                         ui.selectable_value(
                             &mut pending.source_kind,
@@ -41120,6 +41129,14 @@ impl DawUi {
                     .iter()
                     .map(|change| change.controller())
                     .collect::<BTreeSet<_>>();
+                let controller_14_bases = controller_numbers
+                    .iter()
+                    .filter_map(|controller| match *controller {
+                        0..=31 => Some(*controller),
+                        32..=63 => Some(*controller - 32),
+                        _ => None,
+                    })
+                    .collect::<BTreeSet<_>>();
                 let pressure_keys = polyphonic_pressures
                     .iter()
                     .map(|pressure| pressure.key())
@@ -41142,6 +41159,31 @@ impl DawUi {
                                     &mut pending.controller_number,
                                     *controller,
                                     format!("CC {controller}"),
+                                );
+                            }
+                        });
+                } else if pending.source_kind == MidiAutomationSourceKind::ControlChange14 {
+                    if let Some(first_controller) = controller_14_bases.first().copied()
+                        && !controller_14_bases.contains(&pending.controller_number)
+                    {
+                        pending.controller_number = first_controller;
+                    }
+                    egui::ComboBox::from_id_salt(("automation-midi-cc14-number", channel_id))
+                        .selected_text(if controller_14_bases.is_empty() {
+                            "No paired CC events".to_owned()
+                        } else {
+                            format!(
+                                "CC {} + CC {} (14-bit)",
+                                pending.controller_number,
+                                pending.controller_number + 32
+                            )
+                        })
+                        .show_ui(ui, |ui| {
+                            for controller in &controller_14_bases {
+                                ui.selectable_value(
+                                    &mut pending.controller_number,
+                                    *controller,
+                                    format!("CC {controller} + CC {} (14-bit)", controller + 32),
                                 );
                             }
                         });
@@ -41173,6 +41215,14 @@ impl DawUi {
                     MidiAutomationSourceKind::ControlChange => changes
                         .iter()
                         .filter(|change| change.controller() == pending.controller_number)
+                        .map(|change| change.channel())
+                        .collect::<BTreeSet<_>>(),
+                    MidiAutomationSourceKind::ControlChange14 => changes
+                        .iter()
+                        .filter(|change| {
+                            change.controller() == pending.controller_number
+                                || change.controller() == pending.controller_number + 32
+                        })
                         .map(|change| change.channel())
                         .collect::<BTreeSet<_>>(),
                     MidiAutomationSourceKind::PitchBend => pitch_bends
@@ -41218,6 +41268,9 @@ impl DawUi {
                     MidiAutomationSourceKind::ControlChange => {
                         MidiAutomationSource::ControlChange(pending.controller_number)
                     }
+                    MidiAutomationSourceKind::ControlChange14 => {
+                        MidiAutomationSource::ControlChange14(pending.controller_number)
+                    }
                     MidiAutomationSourceKind::PitchBend => MidiAutomationSource::PitchBend,
                     MidiAutomationSourceKind::ChannelPressure => {
                         MidiAutomationSource::ChannelPressure
@@ -41230,6 +41283,11 @@ impl DawUi {
                     MidiAutomationSourceKind::ControlChange => {
                         format!("CC {}", pending.controller_number)
                     }
+                    MidiAutomationSourceKind::ControlChange14 => format!(
+                        "14-bit CC {} + CC {}",
+                        pending.controller_number,
+                        pending.controller_number + 32
+                    ),
                     MidiAutomationSourceKind::PitchBend => "Pitch Bend".to_owned(),
                     MidiAutomationSourceKind::ChannelPressure => {
                         "Channel Pressure".to_owned()
