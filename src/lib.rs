@@ -20587,6 +20587,55 @@ impl FlpDocument {
         Ok(points.len())
     }
 
+    /// Imports several MIDI Control Change numbers into new raw Pattern controller streams.
+    /// Each mapping is `(controller_number, target_channel, target_flags)`; the raw FL stream
+    /// bytes remain uninterpreted. Mappings and edits are applied atomically, and controllers
+    /// with no matching messages do not create streams.
+    pub fn import_midi_control_change_streams(
+        &mut self,
+        midi: &midi::MidiFile,
+        track_index: usize,
+        pattern_id: u16,
+        mappings: &[(u8, u8, u8)],
+        midi_channel: Option<u8>,
+    ) -> Result<Vec<(u8, usize)>, FlpError> {
+        if mappings.is_empty() {
+            return Err(FlpError::UnsupportedEdit(
+                "select at least one MIDI Control Change mapping",
+            ));
+        }
+        let mut controller_numbers = HashSet::with_capacity(mappings.len());
+        let mut target_streams = HashSet::with_capacity(mappings.len());
+        for &(controller_number, channel, flags) in mappings {
+            if !controller_numbers.insert(controller_number) {
+                return Err(FlpError::UnsupportedEdit(
+                    "a MIDI Control Change number cannot be mapped more than once",
+                ));
+            }
+            if !target_streams.insert((channel, flags)) {
+                return Err(FlpError::UnsupportedEdit(
+                    "each MIDI Control Change mapping requires a distinct raw Pattern stream",
+                ));
+            }
+        }
+
+        let mut candidate = self.clone();
+        let mut imported = Vec::with_capacity(mappings.len());
+        for &(controller_number, channel, flags) in mappings {
+            let point_count = candidate.import_midi_control_changes_to_new_stream(
+                midi,
+                track_index,
+                pattern_id,
+                (channel, flags),
+                controller_number,
+                midi_channel,
+            )?;
+            imported.push((controller_number, point_count));
+        }
+        *self = candidate;
+        Ok(imported)
+    }
+
     /// Imports the note events from one Standard MIDI File track into an existing FLP
     /// pattern and channel. Note times are converted through the MIDI tempo map or
     /// SMPTE clock, then expressed against the existing FLP tempo. MIDI CC 10 pan

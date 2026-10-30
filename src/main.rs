@@ -3837,6 +3837,19 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 },
             )
         }
+        [command, input, midi_path, output, track, pattern_id, mappings, midi_channel]
+            if command == "import-midi-cc-streams" =>
+        {
+            import_midi_control_change_streams(
+                Path::new(input),
+                Path::new(midi_path),
+                Path::new(output),
+                parse_usize(track, "MIDI track index")?,
+                parse_u16(pattern_id, "pattern id")?,
+                mappings,
+                parse_midi_channel_filter(midi_channel)?,
+            )
+        }
         [command, input, score_path, output, pattern_id, channel_id]
             if command == "import-score" =>
         {
@@ -4611,6 +4624,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild export-score-automation <input.flp> <output.fsc> <pattern-id> <stream-channel-0..255> <stream-flags-0..255>\n",
             "  flp-rebuild import-midi-cc <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <raw-channel> <raw-flags> <cc-0..127> <midi-channel-1..16|all>\n",
             "  flp-rebuild import-midi-cc-new-stream <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <raw-channel> <raw-flags> <cc-0..127> <midi-channel-1..16|all>\n",
+            "  flp-rebuild import-midi-cc-streams <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <cc:raw-channel:raw-flags,...> <midi-channel-1..16|all>\n",
+            "    Each mapping creates one raw Pattern stream; raw bytes are explicit, and CCs with no messages are skipped.\n",
             "  flp-rebuild import-midi-all <input.flp> <input.mid> <output.flp> <pattern-id|new> <channel-ids-comma-separated> [zero-velocity-note-ons:0|1] [realign-events:0|1] [midi-channels:all|none|1,2,...,16]\n",
             "  flp-rebuild import-midi-named-patterns <input.flp> <input.mid> <output.flp> <channel-id> [zero-velocity-note-ons:0|1] [realign-events:0|1] [midi-channels:all|none|1,2,...,16]\n",
             "  flp-rebuild import-midi-selected <input.flp> <input.mid> <output.flp> <pattern-id|new> <track-numbers:all|1,2,...> <selected-track-channel-ids-comma-separated> [zero-velocity-note-ons:0|1 realign-events:0|1 midi-channels:all|none|1,2,...,16]\n",
@@ -5051,6 +5066,39 @@ fn parse_raw_byte(value: &str, description: &str) -> Result<u8, String> {
     } else {
         parse_u8(value, description)
     }
+}
+
+fn parse_midi_cc_stream_mappings(value: &str) -> Result<Vec<(u8, u8, u8)>, String> {
+    if value.trim().is_empty() {
+        return Err("provide at least one MIDI CC stream mapping".to_owned());
+    }
+    value
+        .split(',')
+        .map(|mapping| {
+            let mut fields = mapping.split(':');
+            let controller = fields
+                .next()
+                .ok_or_else(|| "each MIDI CC mapping needs controller:channel:flags".to_owned())?;
+            let channel = fields
+                .next()
+                .ok_or_else(|| "each MIDI CC mapping needs controller:channel:flags".to_owned())?;
+            let flags = fields
+                .next()
+                .ok_or_else(|| "each MIDI CC mapping needs controller:channel:flags".to_owned())?;
+            if fields.next().is_some() {
+                return Err("each MIDI CC mapping needs controller:channel:flags".to_owned());
+            }
+            let controller = parse_u8(controller.trim(), "MIDI Control Change number")?;
+            if controller > 127 {
+                return Err("MIDI Control Change number must be from 0 through 127".to_owned());
+            }
+            Ok((
+                controller,
+                parse_raw_byte(channel.trim(), "raw controller channel")?,
+                parse_raw_byte(flags.trim(), "raw controller flags")?,
+            ))
+        })
+        .collect()
 }
 
 fn parse_automation_point_tail(value: &str) -> Result<[u8; 4], String> {
@@ -10980,6 +11028,44 @@ fn import_midi_control_changes(request: MidiControlChangeImport<'_>) -> Result<(
         "imported {imported} MIDI CC {controller_number} events from track {track_index} ({source_channel}) into pattern {pattern_id}, {stream_kind} {} / 0x{:02X} in {}",
         target_stream.0,
         target_stream.1,
+        output.display()
+    );
+    Ok(())
+}
+
+fn import_midi_control_change_streams(
+    input: &Path,
+    midi_path: &Path,
+    output: &Path,
+    track_index: usize,
+    pattern_id: u16,
+    mappings: &str,
+    midi_channel: Option<u8>,
+) -> Result<(), String> {
+    let mappings = parse_midi_cc_stream_mappings(mappings)?;
+    let (_, mut document) = load_document(input)?;
+    let midi_bytes = fs::read(midi_path)
+        .map_err(|error| format!("could not read {}: {error}", midi_path.display()))?;
+    let midi = MidiFile::parse(&midi_bytes)
+        .map_err(|error| format!("could not parse {}: {error}", midi_path.display()))?;
+    let imported = document
+        .import_midi_control_change_streams(&midi, track_index, pattern_id, &mappings, midi_channel)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    let source_channel = midi_channel.map_or_else(
+        || "all channels".to_owned(),
+        |channel| format!("MIDI channel {}", channel + 1),
+    );
+    let total_points = imported
+        .iter()
+        .fold(0usize, |total, (_, count)| total.saturating_add(*count));
+    let created_streams = imported.iter().filter(|(_, count)| *count > 0).count();
+    println!(
+        "imported {total_points} MIDI CC events from track {track_index} ({source_channel}) into pattern {pattern_id} across {created_streams} new raw streams in {}",
         output.display()
     );
     Ok(())
