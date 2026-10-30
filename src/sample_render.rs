@@ -829,7 +829,7 @@ pub struct Vst3PatternLoopStreamControls<'a> {
     pub meters: &'a crate::audio::MixerTrackPeakMeters,
     pub latency_updates: Option<Vst3LatencyUpdateControls>,
     pub metronome: Option<MetronomeStreamPlayback>,
-    /// Updated Pattern notes; currently applied to Sampler events at block boundaries.
+    /// Updated Pattern notes; applied to unplayed events at block boundaries for prepared sources.
     pub note_updates: Option<Receiver<Vec<PatternNote>>>,
     /// Assigned CLAP destinations, including channels with zero crossfade gain.
     pub clap_audio_channel_ids: BTreeSet<u16>,
@@ -8679,27 +8679,35 @@ fn stream_pattern_from_tick_with_vst3_to_device(
                 while let Ok(notes) = receiver.try_recv() {
                     latest_notes = Some(notes);
                 }
-                if let Some(notes) = latest_notes
-                    && let Ok(scheduled_notes) = schedule_live_sampler_pattern_notes(
+                if let Some(notes) = latest_notes {
+                    if let Some(processor) = playback.vst3_processor.as_mut() {
+                        let _ = processor.update_live_pattern_notes(
+                            document,
+                            &notes,
+                            &clap_pattern_channels,
+                            block_start,
+                        );
+                    }
+                    if let Ok(scheduled_notes) = schedule_live_sampler_pattern_notes(
                         document,
                         &notes,
                         options,
                         &render.sources_by_channel,
                         live_vst3_volume_expression_channels.as_ref(),
                         (!clap_pattern_channels.is_empty()).then_some(&clap_pattern_channels),
-                    )
-                {
-                    engine.replace_unplayed_pattern_notes();
-                    let current_loop_start = block_start / loop_frames * loop_frames;
-                    engine.queue_live_notes_with_frame_offset(
-                        &scheduled_notes,
-                        current_loop_start,
-                        Some(block_start),
-                    )?;
-                    next_loop_start = current_loop_start
-                        .checked_add(loop_frames)
-                        .ok_or_else(|| "Sampler Pattern loop position overflow".to_owned())?;
-                    updated_pattern_notes = Some(scheduled_notes);
+                    ) {
+                        engine.replace_unplayed_pattern_notes();
+                        let current_loop_start = block_start / loop_frames * loop_frames;
+                        engine.queue_live_notes_with_frame_offset(
+                            &scheduled_notes,
+                            current_loop_start,
+                            Some(block_start),
+                        )?;
+                        next_loop_start = current_loop_start
+                            .checked_add(loop_frames)
+                            .ok_or_else(|| "Sampler Pattern loop position overflow".to_owned())?;
+                        updated_pattern_notes = Some(scheduled_notes);
+                    }
                 }
             }
             if let Some(latency_updates) = latency_updates.as_mut() {

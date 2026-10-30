@@ -390,6 +390,7 @@ struct PlaylistPluginStream {
     live_mixer_source: Option<PlaylistLiveMixerSource>,
     live_performance: bool,
     active_performance_notes: HashMap<i32, ScheduledMidiEvent>,
+    active_pattern_note_ids: BTreeSet<i32>,
     note_pitch_offset_semitones: i16,
     pattern_loop: Option<PatternLoopEventQueue>,
 }
@@ -624,6 +625,26 @@ impl PatternLoopEventQueue {
             self.repeated_events.push(event);
         }
         Ok(())
+    }
+
+    fn replace_template_events(
+        &mut self,
+        template_events: Vec<ScheduledMidiEvent>,
+        next_cycle: u64,
+    ) {
+        self.first_event_frame = template_events
+            .iter()
+            .map(|event| event.frame)
+            .min()
+            .unwrap_or(self.loop_start_frame);
+        self.note_ids.clear();
+        self.note_ids.reserve(template_events.len());
+        for event in &template_events {
+            self.note_ids.entry(event.note_id).or_insert(0);
+        }
+        self.repeated_events.clear();
+        self.template_events = template_events;
+        self.next_cycle = next_cycle;
     }
 }
 
@@ -902,6 +923,184 @@ impl Vst3PlaylistStreamProcessor {
 
     pub fn live_midi_input_senders(&self) -> BTreeMap<u16, Vst3PlaylistLiveInputSender> {
         self.live_input_senders.clone()
+    }
+
+    pub(crate) fn update_live_pattern_notes(
+        &mut self,
+        document: &FlpDocument,
+        pattern_notes: &[PatternNote],
+        clap_audio_channels: &BTreeSet<u16>,
+        output_frame: u64,
+    ) -> Result<(), String> {
+        let prepared_channels = self
+            .streams
+            .iter()
+            .filter(|stream| stream.pattern_loop.is_some())
+            .map(|stream| stream.channel_id)
+            .collect::<BTreeSet<_>>();
+        if prepared_channels.is_empty() {
+            return Ok(());
+        }
+        let ppq = document.header().ppq();
+        if ppq == 0 {
+            return Err("project PPQ must be greater than zero".to_owned());
+        }
+        let global_swing_mix_raw = document.metadata().global_swing_mix();
+        let channels = document.channels();
+        let channels_by_id = channels
+            .iter()
+            .map(|channel| (channel.id(), channel))
+            .collect::<BTreeMap<_, _>>();
+        let router = ChannelNoteRouter::new(channels.clone());
+        let mixer_route_audibility = MixerRouteAudibility::from_document(document);
+        let mut notes_by_channel = BTreeMap::<u16, Vec<PlaylistMidiNote>>::new();
+
+        for (note_index, note) in pattern_notes.iter().enumerate() {
+            if note.is_muted() {
+                continue;
+            }
+            let nominal_start_tick = u64::from(note.position);
+            let source_swing_mix = channels_by_id
+                .get(&note.channel_id)
+                .map_or(128, |channel| channel.swing_mix());
+            let start_tick = swing_note_start_tick(
+                nominal_start_tick,
+                ppq,
+                global_swing_mix_raw,
+                source_swing_mix,
+            )?;
+            let swing_offset = start_tick.saturating_sub(nominal_start_tick);
+            let stop_tick = nominal_start_tick
+                .checked_add(u64::from(note.length.max(1)))
+                .and_then(|tick| tick.checked_add(swing_offset))
+                .ok_or_else(|| "Pattern VST3 note end position overflow".to_owned())?;
+            for (target_channel_id, layer_gain, layer_pan_raw) in router
+                .targets_for_note_with_clap_and_mixed_crossfade(
+                    note.channel_id,
+                    note_index as u64,
+                    note.key,
+                    &self.volume_expression_channel_ids,
+                    clap_audio_channels,
+                )
+            {
+                if !prepared_channels.contains(&target_channel_id)
+                    || !channels_by_id
+                        .get(&target_channel_id)
+                        .is_some_and(|channel| {
+                            channel.enabled() != Some(false)
+                                && mixer_route_audibility
+                                    .allows_live_source_channel(channel.mixer_track())
+                        })
+                {
+                    continue;
+                }
+                notes_by_channel
+                    .entry(target_channel_id)
+                    .or_default()
+                    .push(PlaylistMidiNote {
+                        mod_y: note.mod_y,
+                        start_tick,
+                        stop_tick,
+                        key: note.key,
+                        velocity: note.velocity,
+                        midi_channel: note.midi_channel,
+                        fine_pitch_offset_cents: note.fine_pitch_offset_cents(),
+                        pan: note.pan,
+                        mod_x: note.mod_x,
+                        release: note.release,
+                        layer_gain,
+                        layer_pan_raw,
+                    });
+            }
+        }
+
+        let mut replacement_events_by_channel = BTreeMap::new();
+        let mut notes_scheduled = 0usize;
+        for stream in &self.streams {
+            if stream.pattern_loop.is_none() {
+                continue;
+            }
+            let notes = notes_by_channel
+                .get(&stream.channel_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let (mut events, note_count) = scheduled_playlist_midi_events_with_tempo_map(
+                notes,
+                &self.tempo_map,
+                stream.render.sample_rate,
+            )?;
+            transpose_scheduled_note_events(&mut events, stream.note_pitch_offset_semitones);
+            notes_scheduled = notes_scheduled.saturating_add(note_count);
+            replacement_events_by_channel.insert(stream.channel_id, events);
+        }
+
+        for stream in &mut self.streams {
+            let Some(queue) = stream.pattern_loop.as_mut() else {
+                continue;
+            };
+            let Some(template_events) = replacement_events_by_channel.remove(&stream.channel_id)
+            else {
+                continue;
+            };
+            let current_frame = playlist_output_frame_to_plugin_frame(
+                output_frame,
+                stream.render.sample_rate,
+                self.output_sample_rate,
+            )?
+            .max(stream.source_frame);
+            let loop_frames = queue.loop_frames;
+            if loop_frames == 0 {
+                continue;
+            }
+            let cycle_offset =
+                current_frame.saturating_sub(queue.loop_start_frame) / loop_frames * loop_frames;
+            let current_loop_start = queue
+                .loop_start_frame
+                .checked_add(cycle_offset)
+                .ok_or_else(|| "VST3 Pattern loop position overflow".to_owned())?;
+            let note_on_ids = template_events
+                .iter()
+                .filter(|event| {
+                    event.frame >= current_frame.saturating_sub(current_loop_start)
+                        && matches!(event.event, MidiEvent::NoteOn { velocity, .. } if velocity > 0)
+                })
+                .map(|event| event.note_id)
+                .collect::<BTreeSet<_>>();
+            let current_events = template_events
+                .iter()
+                .filter(|event| note_on_ids.contains(&event.note_id))
+                .map(|event| {
+                    let mut event = *event;
+                    event.frame = event
+                        .frame
+                        .checked_add(current_loop_start)
+                        .ok_or_else(|| "VST3 Pattern event position overflow".to_owned())?;
+                    Ok(event)
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+
+            let pending_non_note_on_events = stream
+                .render
+                .events
+                .drain(stream.next_event..)
+                .filter(|event| match event.event {
+                    MidiEvent::NoteOn { .. } => false,
+                    MidiEvent::NoteOff { .. } => {
+                        stream.active_pattern_note_ids.contains(&event.note_id)
+                    }
+                    _ => true,
+                })
+                .collect::<Vec<_>>();
+            stream.render.events.extend(pending_non_note_on_events);
+            stream.render.events.extend(current_events);
+            stream.render.events[stream.next_event..]
+                .sort_unstable_by_key(|event| (event.frame, event.priority));
+            let current_cycle = cycle_offset / loop_frames;
+            queue.replace_template_events(template_events, current_cycle.saturating_add(1));
+            stream.render.note_count = notes_by_channel.get(&stream.channel_id).map_or(0, Vec::len);
+        }
+        self.notes_scheduled = notes_scheduled;
+        Ok(())
     }
 
     pub(crate) fn set_playlist_loop_range(
@@ -3475,6 +3674,15 @@ impl PlaylistPluginStream {
                                 }
                                 _ => {}
                             }
+                        }
+                        match event.event {
+                            MidiEvent::NoteOn { velocity, .. } if velocity > 0 => {
+                                self.active_pattern_note_ids.insert(event.note_id);
+                            }
+                            MidiEvent::NoteOn { .. } | MidiEvent::NoteOff { .. } => {
+                                self.active_pattern_note_ids.remove(&event.note_id);
+                            }
+                            _ => {}
                         }
                         self.next_event += 1;
                     }
@@ -6419,6 +6627,7 @@ impl Vst3HostRuntime {
                 live_mixer_source,
                 live_performance: true,
                 active_performance_notes: HashMap::new(),
+                active_pattern_note_ids: BTreeSet::new(),
                 note_pitch_offset_semitones,
                 pattern_loop: Some(PatternLoopEventQueue::new(0, loop_frames, template_events)),
             });
@@ -7299,6 +7508,7 @@ impl Vst3HostRuntime {
                 live_mixer_source,
                 live_performance: live_performance_channels.contains(&channel_id),
                 active_performance_notes: HashMap::new(),
+                active_pattern_note_ids: BTreeSet::new(),
                 note_pitch_offset_semitones,
                 pattern_loop: None,
             });
