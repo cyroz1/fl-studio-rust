@@ -7505,9 +7505,13 @@ fn list_automation_target_links(path: &Path) -> Result<(), String> {
     println!("candidate 0xE3 records: {}", links.len());
     for link in links {
         let source_id = link.source_channel_id();
-        let source_channel = channels.iter().find(|channel| channel.id() == source_id);
+        let mut source_matches = channels.iter().filter(|channel| channel.id() == source_id);
+        let source_channel = match (source_matches.next(), source_matches.next()) {
+            (Some(channel), None) => Some(channel),
+            _ => None,
+        };
         let source_name = source_channel.and_then(|channel| channel.display_name());
-        let source_type = source_channel.and_then(|channel| channel.channel_type());
+        let source_type = link.source_channel_type();
         let source_range = source_channel.and_then(|channel| channel.automation_range_raw());
         let source_class = match source_type {
             Some(ChannelType::Automation) => "automation",
@@ -7551,16 +7555,12 @@ fn list_automation_target_links(path: &Path) -> Result<(), String> {
         });
         let target_effect_name =
             target_effect.and_then(|effect| effect.display_name().or(effect.plugin_identifier()));
-        let candidate_parameter = if automation_source {
-            link.candidate_parameter_index().to_string()
-        } else {
-            "not-interpreted".to_owned()
-        };
-        let candidate_vst_parameter = if automation_source {
-            link.candidate_vst_parameter().to_string()
-        } else {
-            "not-interpreted".to_owned()
-        };
+        let candidate_parameter = link
+            .candidate_parameter_index()
+            .map_or_else(|| "not-interpreted".to_owned(), |value| value.to_string());
+        let candidate_vst_parameter = link
+            .candidate_vst_parameter()
+            .map_or_else(|| "not-interpreted".to_owned(), |value| value.to_string());
         println!(
             "event={} source_channel={} source_name={:?} source_class={} source_type={:?} source_automation_range_raw={:?} candidate_parameter={} parameter_raw=0x{:04X} candidate_vst_parameter={} destination_raw={} candidate_target={} candidate_target_name={:?} candidate_target_type={:?} candidate_target_insert_name={:?} candidate_target_effect_name={:?} prefix={:02X?} suffix={:02X?}",
             link.event_index(),

@@ -2331,15 +2331,18 @@ impl AutomationChannel {
     }
 }
 
-/// A candidate native target link from a type-5 Automation channel's `0xE3` record.
+/// One observed 20-byte `0xE3` RemoteController record.
 ///
-/// The 20-byte record layout is observed in FLP files. Its parameter and destination
-/// fields are exposed with candidate interpretations only; native save/playback
-/// comparison is still needed before using them to drive plug-in parameters.
+/// The parameter and destination fields receive candidate Automation-link interpretations
+/// only when the source id uniquely resolves to a type-5 Automation channel. Other records
+/// may represent project-level remote-control mappings and remain available as raw fields.
+/// Native save/playback comparison is still needed before candidate links drive plug-in
+/// parameters.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AutomationTargetLink {
     event_index: usize,
     source_channel_id: u16,
+    source_channel_type: Option<ChannelType>,
     opaque_prefix: [u8; 8],
     parameter_raw: u16,
     destination_raw: i16,
@@ -2356,24 +2359,35 @@ impl AutomationTargetLink {
         self.source_channel_id
     }
 
+    /// Type of the uniquely resolved source channel, if its id exists exactly once.
+    /// Only type-5 Automation sources receive candidate parameter and destination
+    /// interpretations; other `0xE3` records may be remote-control mappings.
+    pub fn source_channel_type(&self) -> Option<ChannelType> {
+        self.source_channel_type
+    }
+
     /// First eight record bytes, including the source id, preserved as raw data.
     pub fn opaque_prefix(&self) -> [u8; 8] {
         self.opaque_prefix
     }
 
-    /// Candidate parameter field before masking its high flag bit.
+    /// Raw 16-bit parameter field before any candidate interpretation.
     pub fn parameter_raw(&self) -> u16 {
         self.parameter_raw
     }
 
-    /// Candidate parameter index from the low 15 bits of `parameter_raw`.
-    pub fn candidate_parameter_index(&self) -> u16 {
-        self.parameter_raw & 0x7fff
+    /// Candidate parameter index from the low 15 bits of `parameter_raw`, when
+    /// the source id uniquely resolves to a type-5 Automation channel.
+    pub fn candidate_parameter_index(&self) -> Option<u16> {
+        (self.source_channel_type == Some(ChannelType::Automation))
+            .then_some(self.parameter_raw & 0x7fff)
     }
 
-    /// Candidate VST-parameter marker from the high bit of `parameter_raw`.
-    pub fn candidate_vst_parameter(&self) -> bool {
-        self.parameter_raw & 0x8000 != 0
+    /// Candidate plug-in-parameter marker from `parameter_raw`, when the source
+    /// id uniquely resolves to a type-5 Automation channel.
+    pub fn candidate_vst_parameter(&self) -> Option<bool> {
+        (self.source_channel_type == Some(ChannelType::Automation))
+            .then_some(self.parameter_raw & 0x8000 != 0)
     }
 
     /// Candidate destination field, retained as a signed 16-bit value.
@@ -2383,6 +2397,9 @@ impl AutomationTargetLink {
 
     /// Candidate channel destination when the observed Mixer-target flag is clear.
     pub fn candidate_channel_target_id(&self) -> Option<u16> {
+        if self.source_channel_type != Some(ChannelType::Automation) {
+            return None;
+        }
         let raw = self.destination_raw as u16;
         (raw & 0x2000 == 0 && self.destination_raw >= 0).then_some(self.destination_raw as u16)
     }
@@ -2392,6 +2409,9 @@ impl AutomationTargetLink {
     /// independently surveyed across a local producer corpus; native comparison
     /// remains necessary before using the candidate for playback routing.
     pub fn candidate_mixer_effect_target(&self) -> Option<(u16, u16)> {
+        if self.source_channel_type != Some(ChannelType::Automation) {
+            return None;
+        }
         let raw = self.destination_raw as u16;
         (raw & 0x2000 != 0).then_some(((raw >> 6) & 0x007f, raw & 0x003f))
     }
@@ -7221,13 +7241,16 @@ impl FlpDocument {
             .collect()
     }
 
-    /// Reads candidate native Automation target links from observed 20-byte `0xE3` records.
+    /// Reads observed 20-byte `0xE3` records and associates their source channel when unique.
     ///
     /// The event and record boundaries are decoded, while the first and final eight bytes
-    /// remain available as opaque fields. Parameter and destination accessors on each result
-    /// are explicitly provisional and do not imply playback support.
+    /// remain available as opaque fields. Candidate parameter and destination accessors are
+    /// exposed only when the source id resolves to exactly one type-5 Automation channel;
+    /// other records may represent project-level remote-control mappings. Candidate fields
+    /// remain provisional and do not imply playback support.
     pub fn automation_target_links(&self) -> Result<Vec<AutomationTargetLink>, FlpError> {
         let mut links = Vec::new();
+        let channels = self.channels();
         for (event_index, event) in self.events.iter().enumerate() {
             if event.opcode != 0xE3 {
                 continue;
@@ -7246,9 +7269,18 @@ impl FlpDocument {
             }
             let (records, _) = event.payload.as_chunks::<20>();
             for record in records {
+                let source_channel_id = u16::from_le_bytes([record[2], record[3]]);
+                let mut source_matches = channels
+                    .iter()
+                    .filter(|channel| channel.id() == source_channel_id);
+                let source_channel_type = match (source_matches.next(), source_matches.next()) {
+                    (Some(channel), None) => channel.channel_type(),
+                    _ => None,
+                };
                 links.push(AutomationTargetLink {
                     event_index,
-                    source_channel_id: u16::from_le_bytes([record[2], record[3]]),
+                    source_channel_id,
+                    source_channel_type,
                     opaque_prefix: record[..8]
                         .try_into()
                         .expect("an automation target record has an eight-byte prefix"),
