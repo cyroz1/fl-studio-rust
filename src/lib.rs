@@ -20551,6 +20551,29 @@ impl FlpDocument {
         Ok(points.len())
     }
 
+    fn validate_midi_cc_stream_mappings(mappings: &[(u8, u8, u8)]) -> Result<(), FlpError> {
+        if mappings.is_empty() {
+            return Err(FlpError::UnsupportedEdit(
+                "select at least one MIDI Control Change mapping",
+            ));
+        }
+        let mut controller_numbers = HashSet::with_capacity(mappings.len());
+        let mut target_streams = HashSet::with_capacity(mappings.len());
+        for &(controller_number, channel, flags) in mappings {
+            if !controller_numbers.insert(controller_number) {
+                return Err(FlpError::UnsupportedEdit(
+                    "a MIDI Control Change number cannot be mapped more than once",
+                ));
+            }
+            if !target_streams.insert((channel, flags)) {
+                return Err(FlpError::UnsupportedEdit(
+                    "each MIDI Control Change mapping requires a distinct raw Pattern stream",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Imports one MIDI Control Change number into a newly created raw Pattern controller
     /// stream. The requested channel/flags bytes are stored verbatim, and the stream starts at
     /// the first imported point. If no matching MIDI messages exist, no stream is created.
@@ -20599,30 +20622,42 @@ impl FlpDocument {
         mappings: &[(u8, u8, u8)],
         midi_channel: Option<u8>,
     ) -> Result<Vec<(u8, usize)>, FlpError> {
-        if mappings.is_empty() {
-            return Err(FlpError::UnsupportedEdit(
-                "select at least one MIDI Control Change mapping",
-            ));
-        }
-        let mut controller_numbers = HashSet::with_capacity(mappings.len());
-        let mut target_streams = HashSet::with_capacity(mappings.len());
-        for &(controller_number, channel, flags) in mappings {
-            if !controller_numbers.insert(controller_number) {
-                return Err(FlpError::UnsupportedEdit(
-                    "a MIDI Control Change number cannot be mapped more than once",
-                ));
-            }
-            if !target_streams.insert((channel, flags)) {
-                return Err(FlpError::UnsupportedEdit(
-                    "each MIDI Control Change mapping requires a distinct raw Pattern stream",
-                ));
-            }
-        }
+        Self::validate_midi_cc_stream_mappings(mappings)?;
 
         let mut candidate = self.clone();
         let mut imported = Vec::with_capacity(mappings.len());
         for &(controller_number, channel, flags) in mappings {
             let point_count = candidate.import_midi_control_changes_to_new_stream(
+                midi,
+                track_index,
+                pattern_id,
+                (channel, flags),
+                controller_number,
+                midi_channel,
+            )?;
+            imported.push((controller_number, point_count));
+        }
+        *self = candidate;
+        Ok(imported)
+    }
+
+    /// Imports several MIDI Control Change numbers into existing raw Pattern controller streams.
+    /// Each mapping is `(controller_number, target_channel, target_flags)`; the raw FL stream
+    /// bytes remain uninterpreted. Mappings and edits are applied atomically.
+    pub fn import_midi_control_changes_to_streams(
+        &mut self,
+        midi: &midi::MidiFile,
+        track_index: usize,
+        pattern_id: u16,
+        mappings: &[(u8, u8, u8)],
+        midi_channel: Option<u8>,
+    ) -> Result<Vec<(u8, usize)>, FlpError> {
+        Self::validate_midi_cc_stream_mappings(mappings)?;
+
+        let mut candidate = self.clone();
+        let mut imported = Vec::with_capacity(mappings.len());
+        for &(controller_number, channel, flags) in mappings {
+            let point_count = candidate.import_midi_control_changes(
                 midi,
                 track_index,
                 pattern_id,
