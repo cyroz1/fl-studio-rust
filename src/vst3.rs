@@ -298,6 +298,18 @@ pub struct Vst3AutomationPoint {
     pub tension: f32,
 }
 
+/// Normalize a stored Automation Clip value for plug-in playback.
+///
+/// FL-authored projects can contain small floating-point overshoots around the
+/// normalized range. Accept values within the same 0.001 slack used by the
+/// Automation editor, then clamp them for normalized plug-in parameters. The
+/// serialized point value remains unchanged.
+pub fn normalized_automation_point_value(value: f64) -> Option<f64> {
+    const VALUE_SLACK: f64 = 0.001;
+    (value.is_finite() && (-VALUE_SLACK..=1.0 + VALUE_SLACK).contains(&value))
+        .then(|| value.clamp(0.0, 1.0))
+}
+
 /// Explicit VST3 parameter automation for a pattern render.
 ///
 /// `parameter_id` must be an ID reported by the loaded VST3, and point positions are
@@ -8207,19 +8219,21 @@ pub fn expand_automation_channel_curve_for_clip(
     else {
         return Ok(Vec::new());
     };
-    let points = automation_points
-        .iter()
-        .map(|point| Vst3AutomationPoint {
-            position_beats: point.position_beats(),
-            value: point.value(),
-            tension: point.tension(),
-        })
-        .collect::<Vec<_>>();
-    if points.len() > MAX_VST3_AUTOMATION_POINTS {
+    if automation_points.len() > MAX_VST3_AUTOMATION_POINTS {
         return Err(format!(
             "Playlist automation exceeds {MAX_VST3_AUTOMATION_POINTS} points"
         ));
     }
+    let points = automation_points
+        .iter()
+        .filter_map(|point| {
+            Some(Vst3AutomationPoint {
+                position_beats: point.position_beats(),
+                value: normalized_automation_point_value(point.value())?,
+                tension: point.tension(),
+            })
+        })
+        .collect::<Vec<_>>();
     Ok(playlist_automation_points_in_source_window(
         &points,
         ppq,

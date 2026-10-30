@@ -93,6 +93,7 @@ use flp_rebuild::vst3::{
     Vst3PatternStreamHandle, Vst3PlaylistAutomationPoint, Vst3PlaylistAutomationSources,
     Vst3PlaylistLiveInputSender, Vst3PlaylistLiveInputSession, Vst3PlaylistParameterAutomation,
     Vst3PlaylistStreamProcessor, expand_automation_channel_curve_for_clip,
+    normalized_automation_point_value,
 };
 use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, ArpeggioRangePattern, ArpeggioScoreOptions,
@@ -9443,19 +9444,19 @@ impl DawUi {
             automation_channel
                 .points()
                 .iter()
-                .filter(|point| {
-                    point.position_beats().is_finite()
-                        && point.position_beats() >= 0.0
-                        && point.value().is_finite()
-                        && (0.0..=1.0).contains(&point.value())
-                })
-                .map(|point| Vst3AutomationPoint {
-                    position_beats: point.position_beats(),
-                    value: Self::automation_value_for_normalized_target(
-                        automation_channel,
-                        point.value(),
-                    ),
-                    tension: point.tension(),
+                .filter_map(|point| {
+                    if !point.position_beats().is_finite() || point.position_beats() < 0.0 {
+                        return None;
+                    }
+                    let value = normalized_automation_point_value(point.value())?;
+                    Some(Vst3AutomationPoint {
+                        position_beats: point.position_beats(),
+                        value: Self::automation_value_for_normalized_target(
+                            automation_channel,
+                            value,
+                        ),
+                        tension: point.tension(),
+                    })
                 })
                 .collect::<Vec<_>>()
         };
