@@ -573,8 +573,58 @@ impl Drop for Vst3PlaylistLiveInputSession {
 struct PatternLoopEventQueue {
     loop_start_frame: u64,
     loop_frames: u64,
+    first_event_frame: u64,
     template_events: Vec<ScheduledMidiEvent>,
+    note_ids: HashMap<i32, i32>,
+    repeated_events: Vec<ScheduledMidiEvent>,
     next_cycle: u64,
+}
+
+impl PatternLoopEventQueue {
+    fn new(
+        loop_start_frame: u64,
+        loop_frames: u64,
+        template_events: Vec<ScheduledMidiEvent>,
+    ) -> Self {
+        let first_event_frame = template_events
+            .iter()
+            .map(|event| event.frame)
+            .min()
+            .unwrap_or(loop_start_frame);
+        let mut note_ids = HashMap::with_capacity(template_events.len());
+        for event in &template_events {
+            note_ids.entry(event.note_id).or_insert(0);
+        }
+        Self {
+            loop_start_frame,
+            loop_frames,
+            first_event_frame,
+            repeated_events: Vec::with_capacity(template_events.len()),
+            template_events,
+            note_ids,
+            next_cycle: 1,
+        }
+    }
+
+    fn repeat_cycle(&mut self, cycle_offset: u64) -> Result<(), String> {
+        self.repeated_events.clear();
+        for note_id in self.note_ids.values_mut() {
+            *note_id = next_vst3_note_expression_id();
+        }
+        for template_event in &self.template_events {
+            let mut event = *template_event;
+            event.frame = event
+                .frame
+                .checked_add(cycle_offset)
+                .ok_or_else(|| "VST3 Pattern event position overflow".to_owned())?;
+            event.note_id = *self
+                .note_ids
+                .get(&template_event.note_id)
+                .ok_or_else(|| "VST3 Pattern event note ID was not indexed".to_owned())?;
+            self.repeated_events.push(event);
+        }
+        Ok(())
+    }
 }
 
 /// One prepared Mixer VST3 effect slot.
@@ -897,12 +947,11 @@ impl Vst3PlaylistStreamProcessor {
             let (initial_events, template_events) =
                 playlist_loop_midi_events(&stream.render.events, source_start, source_end);
             stream.render.events = initial_events;
-            stream.pattern_loop = Some(PatternLoopEventQueue {
-                loop_start_frame: source_start,
-                loop_frames: source_end - source_start,
+            stream.pattern_loop = Some(PatternLoopEventQueue::new(
+                source_start,
+                source_end - source_start,
                 template_events,
-                next_cycle: 1,
-            });
+            ));
             stream.live_performance = true;
         }
         for effect in &mut self.mixer_effects {
@@ -3697,12 +3746,6 @@ impl PlaylistPluginStream {
         if queue.loop_frames == 0 || queue.template_events.is_empty() {
             return Ok(());
         }
-        let first_event_frame = queue
-            .template_events
-            .iter()
-            .map(|event| event.frame)
-            .min()
-            .unwrap_or(0);
         loop {
             let cycle_start = queue
                 .loop_frames
@@ -3715,7 +3758,11 @@ impl PlaylistPluginStream {
                 })
                 .ok_or_else(|| "VST3 Playlist loop position overflow".to_owned())?;
             let first_frame = cycle_start
-                .checked_add(first_event_frame.saturating_sub(queue.loop_start_frame))
+                .checked_add(
+                    queue
+                        .first_event_frame
+                        .saturating_sub(queue.loop_start_frame),
+                )
                 .ok_or_else(|| "VST3 Playlist loop event position overflow".to_owned())?;
             if first_frame >= block_end {
                 break;
@@ -3723,8 +3770,10 @@ impl PlaylistPluginStream {
             let cycle_offset = cycle_start
                 .checked_sub(queue.loop_start_frame)
                 .ok_or_else(|| "VST3 Playlist loop offset underflow".to_owned())?;
-            let repeated = repeat_pattern_loop_events(&queue.template_events, cycle_offset)?;
-            self.render.events.extend(repeated);
+            queue.repeat_cycle(cycle_offset)?;
+            self.render
+                .events
+                .extend(queue.repeated_events.iter().copied());
             self.render.events[self.next_event..]
                 .sort_unstable_by_key(|event| (event.frame, event.priority));
             queue.next_cycle = queue
@@ -3748,27 +3797,6 @@ impl PlaylistPluginStream {
         );
         Ok(())
     }
-}
-
-fn repeat_pattern_loop_events(
-    template_events: &[ScheduledMidiEvent],
-    cycle_start: u64,
-) -> Result<Vec<ScheduledMidiEvent>, String> {
-    let mut note_ids = HashMap::new();
-    template_events
-        .iter()
-        .map(|template_event| {
-            let mut event = *template_event;
-            event.frame = event
-                .frame
-                .checked_add(cycle_start)
-                .ok_or_else(|| "VST3 Pattern event position overflow".to_owned())?;
-            event.note_id = *note_ids
-                .entry(event.note_id)
-                .or_insert_with(next_vst3_note_expression_id);
-            Ok(event)
-        })
-        .collect()
 }
 
 fn playlist_output_frame_to_plugin_frame(
@@ -6392,12 +6420,7 @@ impl Vst3HostRuntime {
                 live_performance: true,
                 active_performance_notes: HashMap::new(),
                 note_pitch_offset_semitones,
-                pattern_loop: Some(PatternLoopEventQueue {
-                    loop_start_frame: 0,
-                    loop_frames,
-                    template_events,
-                    next_cycle: 1,
-                }),
+                pattern_loop: Some(PatternLoopEventQueue::new(0, loop_frames, template_events)),
             });
         }
 
@@ -10884,14 +10907,19 @@ mod tests {
             },
         ];
 
-        let repeated = repeat_pattern_loop_events(&template, 384)
+        let mut queue = PatternLoopEventQueue::new(0, 384, template.to_vec());
+        queue
+            .repeat_cycle(384)
             .expect("the next Pattern iteration should schedule");
-        assert_eq!(repeated.len(), 2);
-        assert_eq!(repeated[0].frame, 396);
-        assert_eq!(repeated[1].frame, 424);
-        assert_ne!(repeated[0].note_id, template[0].note_id);
-        assert_eq!(repeated[0].note_id, repeated[1].note_id);
-        assert!(repeat_pattern_loop_events(&template, u64::MAX).is_err());
+        assert_eq!(queue.repeated_events.len(), 2);
+        assert_eq!(queue.repeated_events[0].frame, 396);
+        assert_eq!(queue.repeated_events[1].frame, 424);
+        assert_ne!(queue.repeated_events[0].note_id, template[0].note_id);
+        assert_eq!(
+            queue.repeated_events[0].note_id,
+            queue.repeated_events[1].note_id
+        );
+        assert!(queue.repeat_cycle(u64::MAX).is_err());
     }
 
     #[test]
