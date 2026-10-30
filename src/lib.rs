@@ -20578,6 +20578,77 @@ impl FlpDocument {
         Ok(points)
     }
 
+    fn midi_channel_pressure_points(
+        &self,
+        midi: &midi::MidiFile,
+        track_index: usize,
+        pattern_id: u16,
+        midi_channel: Option<u8>,
+    ) -> Result<Vec<(u32, f32)>, FlpError> {
+        if midi_channel.is_some_and(|channel| channel > 15) {
+            return Err(FlpError::UnsupportedEdit(
+                "MIDI channel must be from 0 through 15",
+            ));
+        }
+        if !self
+            .patterns()?
+            .iter()
+            .any(|pattern| pattern.id == pattern_id)
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested Pattern does not exist",
+            ));
+        }
+        if self.header.ppq == 0 {
+            return Err(FlpError::UnsupportedEdit(
+                "MIDI import requires a non-zero project PPQ value",
+            ));
+        }
+        let project_tempo_milli_bpm = self.metadata.tempo_milli_bpm.unwrap_or(140_000);
+        if project_tempo_milli_bpm == 0 {
+            return Err(FlpError::UnsupportedEdit(
+                "MIDI import requires a positive project tempo",
+            ));
+        }
+        let track = midi
+            .tracks()
+            .get(track_index)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested MIDI track does not exist",
+            ))?;
+        let default_microseconds_per_quarter =
+            60_000_000_000.0 / f64::from(project_tempo_milli_bpm);
+        midi.elapsed_microseconds_at_tick(0, track_index, default_microseconds_per_quarter)
+            .map_err(|_| {
+                FlpError::UnsupportedEdit(
+                    "MIDI import requires a supported time division and valid tempo map",
+                )
+            })?;
+
+        let pressures = track
+            .channel_pressures()
+            .into_iter()
+            .filter(|pressure| midi_channel.is_none_or(|channel| pressure.channel() == channel))
+            .collect::<Vec<_>>();
+        let mut points = Vec::with_capacity(pressures.len());
+        for pressure in &pressures {
+            let elapsed_microseconds = midi
+                .elapsed_microseconds_at_tick(
+                    pressure.tick(),
+                    track_index,
+                    default_microseconds_per_quarter,
+                )
+                .map_err(|_| FlpError::UnsupportedEdit("could not convert MIDI event time"))?;
+            let position = scale_midi_microseconds_to_project_ticks(
+                elapsed_microseconds,
+                project_tempo_milli_bpm,
+                self.header.ppq,
+            )?;
+            points.push((position, f32::from(pressure.value()) / 127.0));
+        }
+        Ok(points)
+    }
+
     /// Imports one MIDI Control Change number from a track into an existing raw Pattern
     /// controller stream. Source MIDI timing and tempo changes are preserved; CC values map
     /// linearly from 0–127 to 0.0–1.0. `midi_channel` is zero-based, or `None` to include all
@@ -20794,6 +20865,72 @@ impl FlpDocument {
         midi_channel: Option<u8>,
     ) -> Result<usize, FlpError> {
         let points = self.midi_pitch_bend_points(midi, track_index, pattern_id, midi_channel)?;
+        let Some((first_position, first_value)) = points.first().copied() else {
+            return Ok(0);
+        };
+
+        let mut candidate = self.clone();
+        candidate.create_pattern_controller_stream(
+            pattern_id,
+            target_stream.0,
+            target_stream.1,
+            first_position,
+            first_value,
+        )?;
+        candidate.draw_pattern_controller_points(pattern_id, target_stream, &points)?;
+        *self = candidate;
+        Ok(points.len())
+    }
+
+    /// Imports MIDI Channel Pressure messages from one track into an existing raw Pattern
+    /// controller stream. Source timing and tempo changes are preserved; seven-bit values map
+    /// linearly from 0–127 to 0.0–1.0. `midi_channel` is zero-based, or `None` to include every
+    /// channel. The raw stream channel and flags remain caller-specified.
+    pub fn import_midi_channel_pressure(
+        &mut self,
+        midi: &midi::MidiFile,
+        track_index: usize,
+        pattern_id: u16,
+        target_stream: (u8, u8),
+        midi_channel: Option<u8>,
+    ) -> Result<usize, FlpError> {
+        let pattern = self
+            .patterns()?
+            .into_iter()
+            .find(|pattern| pattern.id == pattern_id)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested Pattern does not exist",
+            ))?;
+        if !pattern
+            .controllers
+            .iter()
+            .any(|point| (point.channel, point.flags) == target_stream)
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested raw Pattern controller stream does not exist",
+            ));
+        }
+        let points =
+            self.midi_channel_pressure_points(midi, track_index, pattern_id, midi_channel)?;
+        if !points.is_empty() {
+            self.draw_pattern_controller_points(pattern_id, target_stream, &points)?;
+        }
+        Ok(points.len())
+    }
+
+    /// Imports MIDI Channel Pressure messages into a new raw Pattern controller stream with the
+    /// requested channel/flags bytes. The stream begins at the first imported point; no stream is
+    /// created when no matching messages exist.
+    pub fn import_midi_channel_pressure_to_new_stream(
+        &mut self,
+        midi: &midi::MidiFile,
+        track_index: usize,
+        pattern_id: u16,
+        target_stream: (u8, u8),
+        midi_channel: Option<u8>,
+    ) -> Result<usize, FlpError> {
+        let points =
+            self.midi_channel_pressure_points(midi, track_index, pattern_id, midi_channel)?;
         let Some((first_position, first_value)) = points.first().copied() else {
             return Ok(0);
         };

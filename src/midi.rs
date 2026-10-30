@@ -109,6 +109,31 @@ impl MidiPitchBend {
     }
 }
 
+/// One MIDI Channel Pressure message with its source channel, value, and tick.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MidiChannelPressure {
+    channel: u8,
+    value: u8,
+    tick: u64,
+}
+
+impl MidiChannelPressure {
+    /// Zero-based MIDI channel in the range 0–15.
+    pub fn channel(self) -> u8 {
+        self.channel
+    }
+
+    /// Seven-bit pressure value in the range 0–127.
+    pub fn value(self) -> u8 {
+        self.value
+    }
+
+    /// Absolute position in the source track's MIDI ticks.
+    pub fn tick(self) -> u64 {
+        self.tick
+    }
+}
+
 /// Options for interpreting MIDI notes and aligning imported events.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MidiImportOptions {
@@ -2123,6 +2148,26 @@ impl MidiTrack {
                 Some(MidiPitchBend {
                     channel: status & 0x0F,
                     value: u16::from(data[0]) | (u16::from(data[1]) << 7),
+                    tick: event.absolute_tick,
+                })
+            })
+            .collect()
+    }
+
+    /// Returns valid MIDI Channel Pressure messages in file order.
+    pub fn channel_pressures(&self) -> Vec<MidiChannelPressure> {
+        self.events
+            .iter()
+            .filter_map(|event| {
+                let MidiEventKind::ChannelVoice { status, data } = &event.kind else {
+                    return None;
+                };
+                if status & 0xF0 != 0xD0 || data.is_empty() || data[0] > 127 {
+                    return None;
+                }
+                Some(MidiChannelPressure {
+                    channel: status & 0x0F,
+                    value: data[0],
                     tick: event.absolute_tick,
                 })
             })
