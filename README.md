@@ -54,6 +54,7 @@ flp-rebuild rename-mixer-insert <input.flp> <output.flp> <insert-ordinal> <name>
 flp-rebuild set-mixer-insert-flag <input.flp> <output.flp> <insert-ordinal> <enabled|soloed|polarity-reversed|swap-left-right|effects-enabled> <0|1>
 flp-rebuild set-mixer-routing-flag <input.flp> <output.flp> <event-index> <flag-byte-index> <0|1>
 flp-rebuild automation <file.flp>
+flp-rebuild automation-targets <file.flp>
 flp-rebuild time-markers <file.flp>
 flp-rebuild patterns <file.flp>
 flp-rebuild pattern-controllers <file.flp> <pattern-id>
@@ -340,7 +341,9 @@ The Mixer inspector also shows unique, unscoped three-band EQ gain, frequency, a
 
 `automation <file.flp>` lists type-5 channel points, including their four raw tail bytes. `edit-automation-point` changes a point's position, value, and tension; `set-automation-point-tail <input.flp> <output.flp> <channel-id> <point-index> <8-hex-digits>` replaces the selected point's four raw bytes without interpreting them as a curve mode. Insert, delete, interpolation, flip, normalization, and Scale Levels operations preserve unmodified point data, the blob header, and its era trailer. New points use a zeroed opaque tail. The API and CLI can initialize a zero-point blob from another type-5 channel in the same project, and copy complete Automation state between channels.
 
-The desktop Automation view edits point position, value, and tension, shows the selected point's raw tail as hexadecimal, and supports insertion, deletion, interpolation, flip, normalization, Scale Levels, LFO amount edits, and template-based initialization. Its preview, supported linked VST3 playback/renders, and `TEMPO` export use a bounded single-curve tension approximation. FL Studio's Hold, Stairs, Double/Alt curves, exact tension semantics, and native parameter-link encoding remain incomplete. App-local VST3 parameter links and linked type-5 Automation Clips are supported when their saved templates and channels are present; native project-stored target links and legacy Event automation remain undecoded.
+`automation-targets <file.flp>` lists observed 20-byte `0xE3` records with their raw bytes and candidate source, parameter, and destination fields. The parameter and Mixer insert/slot interpretations are provisional; native save and playback comparison is still needed before they can drive plug-in automation.
+
+The desktop Automation view edits point position, value, and tension, shows the selected point's raw tail as hexadecimal, and supports insertion, deletion, interpolation, flip, normalization, Scale Levels, LFO amount edits, and template-based initialization. Its preview, supported linked VST3 playback/renders, and `TEMPO` export use a bounded single-curve tension approximation. FL Studio's Hold, Stairs, Double/Alt curves, exact tension semantics, and native parameter-link execution remain incomplete. App-local VST3 parameter links and linked type-5 Automation Clips are supported when their saved templates and channels are present; candidate native project target records are now available read-only through the API and CLI, while native target mapping and legacy Event automation remain incomplete.
 
 ## Automated checks and installers
 

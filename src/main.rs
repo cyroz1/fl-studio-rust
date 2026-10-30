@@ -76,6 +76,9 @@ fn run(args: Vec<String>) -> Result<(), String> {
             )
         }
         [command, path] if command == "automation" => list_automation(Path::new(path)),
+        [command, path] if command == "automation-targets" => {
+            list_automation_target_links(Path::new(path))
+        }
         [command, path] if command == "time-markers" => list_time_markers(Path::new(path)),
         [command, path] if command == "sample-paths" => list_sample_paths(Path::new(path)),
         [command, path] if command == "audio-info" => inspect_audio_file(Path::new(path)),
@@ -7486,6 +7489,36 @@ fn diff_playlist_clip_records(
         println!("no raw record differences");
     } else {
         println!("changed bytes: {changed_bytes}");
+    }
+    Ok(())
+}
+
+fn list_automation_target_links(path: &Path) -> Result<(), String> {
+    let (_, document) = load_document(path)?;
+    let links = document
+        .automation_target_links()
+        .map_err(|error| format!("could not decode candidate automation target links: {error}"))?;
+    println!("candidate automation target links: {}", links.len());
+    for link in links {
+        let target = if let Some(channel_id) = link.candidate_channel_target_id() {
+            format!("channel:{channel_id}")
+        } else if let Some((insert, slot)) = link.candidate_mixer_effect_target() {
+            format!("mixer-insert:{insert}/slot:{slot}")
+        } else {
+            "unclassified".to_owned()
+        };
+        println!(
+            "event={} source_channel={} candidate_parameter={} parameter_raw=0x{:04X} candidate_vst_parameter={} destination_raw={} candidate_target={} prefix={:02X?} suffix={:02X?}",
+            link.event_index(),
+            link.source_channel_id(),
+            link.candidate_parameter_index(),
+            link.parameter_raw(),
+            link.candidate_vst_parameter(),
+            link.destination_raw(),
+            target,
+            link.opaque_prefix(),
+            link.opaque_suffix()
+        );
     }
     Ok(())
 }

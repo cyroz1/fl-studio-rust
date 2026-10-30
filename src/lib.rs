@@ -2315,6 +2315,75 @@ impl AutomationChannel {
     }
 }
 
+/// A candidate native target link from a type-5 Automation channel's `0xE3` record.
+///
+/// The 20-byte record layout is observed in FLP files. Its parameter and destination
+/// fields are exposed with candidate interpretations only; native save/playback
+/// comparison is still needed before using them to drive plug-in parameters.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AutomationTargetLink {
+    event_index: usize,
+    source_channel_id: u8,
+    opaque_prefix: [u8; 8],
+    parameter_raw: u16,
+    destination_raw: i16,
+    opaque_suffix: [u8; 8],
+}
+
+impl AutomationTargetLink {
+    pub fn event_index(&self) -> usize {
+        self.event_index
+    }
+
+    /// Candidate source Automation channel id from the observed record layout.
+    pub fn source_channel_id(&self) -> u8 {
+        self.source_channel_id
+    }
+
+    /// First eight record bytes, including the source id, preserved as raw data.
+    pub fn opaque_prefix(&self) -> [u8; 8] {
+        self.opaque_prefix
+    }
+
+    /// Candidate parameter field before masking its high flag bit.
+    pub fn parameter_raw(&self) -> u16 {
+        self.parameter_raw
+    }
+
+    /// Candidate parameter index from the low 15 bits of `parameter_raw`.
+    pub fn candidate_parameter_index(&self) -> u16 {
+        self.parameter_raw & 0x7fff
+    }
+
+    /// Candidate VST-parameter marker from the high bit of `parameter_raw`.
+    pub fn candidate_vst_parameter(&self) -> bool {
+        self.parameter_raw & 0x8000 != 0
+    }
+
+    /// Candidate destination field, retained as a signed 16-bit value.
+    pub fn destination_raw(&self) -> i16 {
+        self.destination_raw
+    }
+
+    /// Candidate channel destination when the observed Mixer-target flag is clear.
+    pub fn candidate_channel_target_id(&self) -> Option<u16> {
+        let raw = self.destination_raw as u16;
+        (raw & 0x2000 == 0 && self.destination_raw >= 0).then_some(self.destination_raw as u16)
+    }
+
+    /// Candidate `(Mixer insert, slot)` from the observed packed destination field.
+    /// The insert index formula is provisional and remains subject to native comparison.
+    pub fn candidate_mixer_effect_target(&self) -> Option<(u16, u16)> {
+        let raw = self.destination_raw as u16;
+        (raw & 0x2000 != 0).then_some(((raw & 0x0ff0) >> 6, raw & 0x003f))
+    }
+
+    /// Final eight record bytes, retained as opaque data.
+    pub fn opaque_suffix(&self) -> [u8; 8] {
+        self.opaque_suffix
+    }
+}
+
 /// Fields that can be changed on an existing automation point.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct AutomationPointEdit {
@@ -7112,6 +7181,47 @@ impl FlpDocument {
                 })
             })
             .collect()
+    }
+
+    /// Reads candidate native Automation target links from observed 20-byte `0xE3` records.
+    ///
+    /// The event and record boundaries are decoded, while the first and final eight bytes
+    /// remain available as opaque fields. Parameter and destination accessors on each result
+    /// are explicitly provisional and do not imply playback support.
+    pub fn automation_target_links(&self) -> Result<Vec<AutomationTargetLink>, FlpError> {
+        let mut links = Vec::new();
+        for (event_index, event) in self.events.iter().enumerate() {
+            if event.opcode != 0xE3 {
+                continue;
+            }
+            if !matches!(event.encoding, PayloadEncoding::Data { .. }) {
+                return Err(FlpError::InvalidEvent {
+                    offset: event.file_offset,
+                    detail: "automation target link event is not a length-prefixed data event",
+                });
+            }
+            if event.payload.len() % 20 != 0 {
+                return Err(FlpError::InvalidEvent {
+                    offset: event.file_offset,
+                    detail: "automation target link payload is not a multiple of 20 bytes",
+                });
+            }
+            for record in event.payload.chunks_exact(20) {
+                links.push(AutomationTargetLink {
+                    event_index,
+                    source_channel_id: record[2],
+                    opaque_prefix: record[..8]
+                        .try_into()
+                        .expect("an automation target record has an eight-byte prefix"),
+                    parameter_raw: u16::from_le_bytes([record[8], record[9]]),
+                    destination_raw: i16::from_le_bytes([record[10], record[11]]),
+                    opaque_suffix: record[12..]
+                        .try_into()
+                        .expect("an automation target record has an eight-byte suffix"),
+                });
+            }
+        }
+        Ok(links)
     }
 
     /// Sets the raw bipolar LFO amount stored at offset 4 of a type-5 channel's `0xEA` event.
