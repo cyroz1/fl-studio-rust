@@ -10,7 +10,7 @@ use flp_rebuild::midi::{
     MidiChannelMapping, MidiEventKind, MidiFile, fl_note_release_to_midi_velocity,
 };
 use flp_rebuild::sample_render::PlaylistTempoMap;
-use flp_rebuild::{FlpDocument, Pattern};
+use flp_rebuild::{FlpDocument, Pattern, PatternNote};
 use midir::{MidiOutput, MidiOutputConnection as MidirOutputConnection};
 
 const MAX_PATTERN_PREVIEW_NOTES: usize = 100_000;
@@ -119,11 +119,28 @@ fn pattern_preview_messages(
     pattern_preview_messages_excluding_channels(pattern, ppq, tempo_bpm, &BTreeSet::new())
 }
 
+#[cfg(test)]
 pub fn pattern_preview_messages_excluding_channels(
     pattern: &Pattern,
     ppq: u16,
     tempo_bpm: f64,
     excluded_project_channels: &BTreeSet<u16>,
+) -> Result<Vec<ScheduledMidiMessage>, String> {
+    pattern_preview_messages_excluding_channels_with_midi_out_overrides(
+        pattern,
+        ppq,
+        tempo_bpm,
+        excluded_project_channels,
+        &BTreeMap::new(),
+    )
+}
+
+pub fn pattern_preview_messages_excluding_channels_with_midi_out_overrides(
+    pattern: &Pattern,
+    ppq: u16,
+    tempo_bpm: f64,
+    excluded_project_channels: &BTreeSet<u16>,
+    midi_out_channel_overrides: &BTreeMap<u16, u8>,
 ) -> Result<Vec<ScheduledMidiMessage>, String> {
     if ppq == 0 || !tempo_bpm.is_finite() || tempo_bpm <= 0.0 {
         return Err("project timing must have a positive PPQ and tempo".to_owned());
@@ -143,10 +160,10 @@ pub fn pattern_preview_messages_excluding_channels(
         let Some(key) = u8::try_from(note.key).ok().filter(|key| *key <= 127) else {
             continue;
         };
-        if note.midi_channel > 15 || note.velocity > 127 || note.velocity == 0 {
+        let channel = pattern_note_midi_output_channel(note, midi_out_channel_overrides);
+        if channel > 15 || note.velocity > 127 || note.velocity == 0 {
             continue;
         }
-        let channel = note.midi_channel;
         let start_tick = u64::from(note.position);
         let end_tick = start_tick.saturating_add(u64::from(note.length.max(1)));
         ordered.push(OrderedMidiMessage {
@@ -202,6 +219,7 @@ fn pattern_loop_frame_messages(
     )
 }
 
+#[cfg(test)]
 pub fn pattern_loop_frame_messages_excluding_channels(
     pattern: &Pattern,
     ppq: u16,
@@ -209,6 +227,26 @@ pub fn pattern_loop_frame_messages_excluding_channels(
     sample_rate: u32,
     loop_length_ticks: u64,
     excluded_project_channels: &BTreeSet<u16>,
+) -> Result<(Vec<ScheduledMidiFrameMessage>, u64), String> {
+    pattern_loop_frame_messages_excluding_channels_with_midi_out_overrides(
+        pattern,
+        ppq,
+        tempo_bpm,
+        sample_rate,
+        loop_length_ticks,
+        excluded_project_channels,
+        &BTreeMap::new(),
+    )
+}
+
+pub fn pattern_loop_frame_messages_excluding_channels_with_midi_out_overrides(
+    pattern: &Pattern,
+    ppq: u16,
+    tempo_bpm: f64,
+    sample_rate: u32,
+    loop_length_ticks: u64,
+    excluded_project_channels: &BTreeSet<u16>,
+    midi_out_channel_overrides: &BTreeMap<u16, u8>,
 ) -> Result<(Vec<ScheduledMidiFrameMessage>, u64), String> {
     if loop_length_ticks == 0 {
         return Err("Pattern MIDI loop length must be greater than zero".to_owned());
@@ -233,10 +271,10 @@ pub fn pattern_loop_frame_messages_excluding_channels(
         let Some(key) = u8::try_from(note.key).ok().filter(|key| *key <= 127) else {
             continue;
         };
-        if note.midi_channel > 15 || note.velocity > 127 || note.velocity == 0 {
+        let channel = pattern_note_midi_output_channel(note, midi_out_channel_overrides);
+        if channel > 15 || note.velocity > 127 || note.velocity == 0 {
             continue;
         }
-        let channel = note.midi_channel;
         let start_tick = u64::from(note.position);
         let end_tick = start_tick.saturating_add(u64::from(note.length.max(1)));
         let start_frame = tempo_map.frame_at_tick(start_tick, sample_rate)?;
@@ -390,6 +428,30 @@ pub(super) fn disabled_project_channel_ids(document: &FlpDocument) -> BTreeSet<u
         .filter(|channel| channel.enabled() == Some(false))
         .map(|channel| channel.id())
         .collect()
+}
+
+pub(super) fn midi_out_channel_overrides(document: &FlpDocument) -> BTreeMap<u16, u8> {
+    document
+        .channels()
+        .into_iter()
+        .filter_map(|channel| {
+            let settings = channel.midi_out_settings()?;
+            if settings.use_note_color_channel() {
+                return None;
+            }
+            Some((channel.id(), settings.midi_channel().checked_sub(1)?))
+        })
+        .collect()
+}
+
+fn pattern_note_midi_output_channel(
+    note: &PatternNote,
+    midi_out_channel_overrides: &BTreeMap<u16, u8>,
+) -> u8 {
+    midi_out_channel_overrides
+        .get(&note.channel_id)
+        .copied()
+        .unwrap_or(note.midi_channel)
 }
 
 fn midi_tick_messages(

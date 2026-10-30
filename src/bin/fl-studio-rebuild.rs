@@ -140,8 +140,9 @@ use midi_output::{
     MidiOutputDevice, MidiPatternLoopScheduler, MidiPlaylistScheduler, PlaylistLoopMidiMessages,
     PlaylistMidiLoopSelection, ScheduledMidiFrameMessage, ScheduledMidiMessage,
     ScheduledMidiTickMessage, connect_output_device_with_routes, disabled_project_channel_ids,
-    enumerate_output_devices, midi_patch_setup_messages,
-    pattern_loop_frame_messages_excluding_channels, pattern_preview_messages_excluding_channels,
+    enumerate_output_devices, midi_out_channel_overrides, midi_patch_setup_messages,
+    pattern_loop_frame_messages_excluding_channels_with_midi_out_overrides,
+    pattern_preview_messages_excluding_channels_with_midi_out_overrides,
     playlist_loop_frame_messages, playlist_playback_messages,
 };
 use midi_script::{
@@ -60870,21 +60871,24 @@ impl DawUi {
             return;
         };
         let excluded_project_channels = disabled_project_channel_ids(document);
-        let (messages, loop_frames) = match pattern_loop_frame_messages_excluding_channels(
-            &pattern,
-            ppq,
-            tempo_bpm,
-            sample_rate,
-            loop_length_ticks,
-            &excluded_project_channels,
-        ) {
-            Ok(schedule) => schedule,
-            Err(error) => {
-                self.midi_output_error = Some(error.clone());
-                self.status = format!("Could not prepare Pattern MIDI output: {error}");
-                return;
-            }
-        };
+        let midi_out_channel_overrides = midi_out_channel_overrides(document);
+        let (messages, loop_frames) =
+            match pattern_loop_frame_messages_excluding_channels_with_midi_out_overrides(
+                &pattern,
+                ppq,
+                tempo_bpm,
+                sample_rate,
+                loop_length_ticks,
+                &excluded_project_channels,
+                &midi_out_channel_overrides,
+            ) {
+                Ok(schedule) => schedule,
+                Err(error) => {
+                    self.midi_output_error = Some(error.clone());
+                    self.status = format!("Could not prepare Pattern MIDI output: {error}");
+                    return;
+                }
+            };
         if messages.is_empty() {
             self.midi_output_error = None;
             return;
@@ -61016,11 +61020,13 @@ impl DawUi {
             return;
         };
         let excluded_project_channels = disabled_project_channel_ids(document);
-        let messages = match pattern_preview_messages_excluding_channels(
+        let midi_out_channel_overrides = midi_out_channel_overrides(document);
+        let messages = match pattern_preview_messages_excluding_channels_with_midi_out_overrides(
             &pattern,
             ppq,
             self.tempo_bpm,
             &excluded_project_channels,
+            &midi_out_channel_overrides,
         ) {
             Ok(messages) => messages,
             Err(error) => {
