@@ -2300,6 +2300,12 @@ pub struct PatternController {
     pub value_bits: u32,
 }
 
+#[derive(Default)]
+struct PlaylistPatternMergeScore {
+    notes: Vec<PatternNote>,
+    controllers: Vec<PatternController>,
+}
+
 impl PatternController {
     /// Decodes the stored float value while leaving its original bits available in `value_bits`.
     pub fn value(&self) -> f32 {
@@ -14112,7 +14118,7 @@ impl FlpDocument {
     fn pattern_score_for_playlist_merge(
         &self,
         pattern_id: u16,
-    ) -> Result<(Vec<PatternNote>, Option<u8>), FlpError> {
+    ) -> Result<PlaylistPatternMergeScore, FlpError> {
         let mut matching_markers = self.events.iter().enumerate().filter(|(_, event)| {
             event.opcode == 0x41
                 && event.encoding == PayloadEncoding::Word
@@ -14143,8 +14149,7 @@ impl FlpDocument {
             .get(region_start)
             .filter(|event| Self::is_pattern_note_event(event))
             .map(|_| region_start);
-        let mut notes = Vec::new();
-        let mut note_opcode = None;
+        let mut score = PlaylistPatternMergeScore::default();
         let mut length_event_count = 0usize;
 
         for event_index in region_start..region_end {
@@ -14157,8 +14162,7 @@ impl FlpDocument {
                         "a selected pattern has an unsupported score event layout",
                     ));
                 }
-                note_opcode = Some(event.opcode);
-                notes.extend(
+                score.notes.extend(
                     event
                         .payload
                         .as_chunks::<FLP_NOTE_RECORD_SIZE>()
@@ -14171,12 +14175,31 @@ impl FlpDocument {
 
             match event.opcode {
                 0xC1 if matches!(event.encoding, PayloadEncoding::Data { .. }) => {}
+                0xDF if matches!(event.encoding, PayloadEncoding::Data { .. }) => {
+                    if !event
+                        .payload
+                        .len()
+                        .is_multiple_of(FLP_PATTERN_CONTROLLER_RECORD_SIZE)
+                    {
+                        return Err(FlpError::UnsupportedEdit(
+                            "a selected pattern has an unsupported controller-point layout",
+                        ));
+                    }
+                    score.controllers.extend(
+                        event
+                            .payload
+                            .as_chunks::<FLP_PATTERN_CONTROLLER_RECORD_SIZE>()
+                            .0
+                            .iter()
+                            .map(PatternController::decode),
+                    );
+                }
                 0xA4 if event.encoding == PayloadEncoding::Dword && event.payload.len() == 4 => {
                     length_event_count += 1;
                 }
                 _ => {
                     return Err(FlpError::UnsupportedEdit(
-                        "selected patterns containing event automation or unknown pattern data cannot be merged",
+                        "selected patterns containing unmodeled automation or unknown pattern data cannot be merged",
                     ));
                 }
             }
@@ -14188,14 +14211,15 @@ impl FlpDocument {
             ));
         }
 
-        Ok((notes, note_opcode))
+        Ok(score)
     }
 
     /// Merges selected Pattern Clip scores into a new pattern assigned to the uppermost clip.
     /// The output clip spans the selected timeline range; repeated source scores are expanded
-    /// into that range and clipped at each source clip's endpoint. Original patterns remain
-    /// unchanged. Pattern event automation, unknown per-pattern data, and scaled clips are
-    /// rejected because their score timing or payload is not yet modeled.
+    /// into that range and clipped at each source clip's endpoint. Raw Pattern controller
+    /// points are repeated and carried into the merged pattern without interpreting their
+    /// channel or flags. Original patterns remain unchanged. Unknown per-pattern data and
+    /// scaled clips are rejected because their score timing or payload is not yet modeled.
     pub fn merge_playlist_pattern_clips(
         &mut self,
         arrangement_id: u16,
@@ -14312,7 +14336,7 @@ impl FlpDocument {
         };
 
         let patterns = self.patterns()?;
-        let mut scores_by_pattern = HashMap::<u16, (Vec<PatternNote>, Option<u8>)>::new();
+        let mut scores_by_pattern = HashMap::<u16, PlaylistPatternMergeScore>::new();
         for (_, clip) in &selected_clips {
             let PlaylistClipTarget::Pattern { id } = clip.target() else {
                 unreachable!("all selected clips were checked as Pattern Clips");
@@ -14339,6 +14363,7 @@ impl FlpDocument {
             .unwrap_or("Merged")
             .to_owned();
         let mut merged_notes = Vec::<PatternNote>::new();
+        let mut merged_controllers = Vec::<PatternController>::new();
 
         for (_, clip) in &selected_clips {
             let PlaylistClipTarget::Pattern { id } = clip.target() else {
@@ -14348,9 +14373,11 @@ impl FlpDocument {
                 .iter()
                 .find(|pattern| pattern.id == id)
                 .expect("selected pattern ids were checked above");
-            let (source_notes, _) = scores_by_pattern
+            let score = scores_by_pattern
                 .get(&id)
                 .expect("selected pattern score was decoded above");
+            let source_notes = &score.notes;
+            let source_controllers = &score.controllers;
             let clip_length = u64::from(clip.length_ticks);
             let inferred_length = source_notes
                 .iter()
@@ -14408,6 +14435,34 @@ impl FlpDocument {
                     merged_notes.push(merged_note);
                 }
             }
+
+            for controller in source_controllers {
+                if u64::from(controller.position) >= clip_length {
+                    continue;
+                }
+                for repetition in 0..repetitions {
+                    let source_position = repetition
+                        .checked_mul(repeat_length)
+                        .and_then(|start| start.checked_add(u64::from(controller.position)))
+                        .ok_or(FlpError::LengthOverflow)?;
+                    if source_position >= clip_length {
+                        continue;
+                    }
+                    if merged_controllers.len() >= MAX_MERGED_PATTERN_NOTES {
+                        return Err(FlpError::UnsupportedEdit(
+                            "merging would expand beyond 2,000,000 Pattern controller points",
+                        ));
+                    }
+                    let mut merged_controller = *controller;
+                    merged_controller.position = u32::try_from(
+                        clip_offset
+                            .checked_add(source_position)
+                            .ok_or(FlpError::LengthOverflow)?,
+                    )
+                    .map_err(|_| FlpError::LengthOverflow)?;
+                    merged_controllers.push(merged_controller);
+                }
+            }
         }
 
         let receiver_pattern_base = receiver_clip.pattern_base;
@@ -14418,6 +14473,8 @@ impl FlpDocument {
             .checked_add(merged_pattern_id)
             .ok_or(FlpError::LengthOverflow)?;
         candidate.add_pattern_notes(merged_pattern_id, &merged_notes)?;
+        merged_controllers.sort_by_key(|controller| controller.position);
+        candidate.append_pattern_controller_records(merged_pattern_id, &merged_controllers)?;
         let name_payload =
             encode_project_string(&pattern_name, candidate.project_strings_use_utf16())?;
         let name_event = FlpEvent::new_data(0xC1, name_payload)?;
