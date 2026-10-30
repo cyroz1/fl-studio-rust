@@ -99,12 +99,12 @@ use flp_rebuild::{
     ArpeggioScorePatternMode, ArpeggioScoreTimeMultiplier, ArpeggioSyncMode, Arrangement,
     ArticulateOptions, AutomationChannel, AutomationInterpolationMode, AutomationPoint,
     AutomationPointEdit, AutomationScaleLevelsOptions, ChannelGroupSummary, ChannelNoteRouter,
-    ChannelSampleEffectsEdit, ChannelSampleFxFlagsEdit, ChannelSampleTrimEdit,
-    ChannelSampleWindowEdit, ChannelSortOrder, ChannelStretchMode, ChannelStretchSettingsEdit,
-    ChannelSummary, ChannelType, ClawMachineOptions, FlamOptions, FlpDocument, FlpError,
-    FscControllerStreamImportOptions, FscScore, FstPreset, FstPresetKind, HumanizerOptions,
-    LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerInsertSummary, MixerParameterKind,
-    MixerParameterRecord, MixerSendSummary, PATTERN_NOTE_DEFAULT_FLAGS,
+    ChannelSampleCrossfadeEdit, ChannelSampleEffectsEdit, ChannelSampleFxFlagsEdit,
+    ChannelSampleTrimEdit, ChannelSampleWindowEdit, ChannelSortOrder, ChannelStretchMode,
+    ChannelStretchSettingsEdit, ChannelSummary, ChannelType, ClawMachineOptions, FlamOptions,
+    FlpDocument, FlpError, FscControllerStreamImportOptions, FscScore, FstPreset, FstPresetKind,
+    HumanizerOptions, LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerInsertSummary,
+    MixerParameterKind, MixerParameterRecord, MixerSendSummary, PATTERN_NOTE_DEFAULT_FLAGS,
     PATTERN_NOTE_DEFAULT_RELEASE, PATTERN_NOTE_SLIDE_FLAG, Pattern, PatternController,
     PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation, PayloadEncoding,
     PlaylistClip, PlaylistClipEdit, PlaylistClipSelectionClipboard, PlaylistClipTarget,
@@ -37016,6 +37016,7 @@ impl DawUi {
         let mut channel_sample_fx_flag_edits = Vec::new();
         let mut channel_sample_window_edits = Vec::new();
         let mut channel_sample_trim_edits = Vec::new();
+        let mut channel_sample_crossfade_edits = Vec::new();
         let mut channel_main_pitch_edits = Vec::new();
         let mut channel_add_to_key_edits = Vec::new();
         let mut channel_zipped_edits = Vec::new();
@@ -37744,6 +37745,24 @@ impl DawUi {
                                                 channel.id(),
                                                 ChannelSampleTrimEdit {
                                                     threshold_raw: Some(threshold_raw),
+                                                },
+                                            ));
+                                        }
+                                    });
+                                    ui.menu_button("Sample loop crossfade", |ui| {
+                                        let mut amount_raw =
+                                            channel.sample_crossfade_raw().unwrap_or(0);
+                                        if ui
+                                            .add(
+                                                egui::Slider::new(&mut amount_raw, 0..=256)
+                                                    .text("Crossfade"),
+                                            )
+                                            .changed()
+                                        {
+                                            channel_sample_crossfade_edits.push((
+                                                channel.id(),
+                                                ChannelSampleCrossfadeEdit {
+                                                    amount_raw: Some(amount_raw),
                                                 },
                                             ));
                                         }
@@ -38954,6 +38973,27 @@ impl DawUi {
                 }
                 Some(Err(error)) => {
                     self.status = format!("Could not change sample Trim threshold: {error}");
+                }
+                None => {}
+            }
+        }
+        for (channel_id, edit) in channel_sample_crossfade_edits {
+            let result = self
+                .document
+                .as_mut()
+                .map(|document| document.edit_channel_sample_crossfade(channel_id, edit));
+            match result {
+                Some(Ok(())) => {
+                    self.stop_project_playback();
+                    self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+                    self.status = format!(
+                        "Channel {channel_id} sample Crossfade set to {:?}",
+                        edit.amount_raw
+                    );
+                }
+                Some(Err(error)) => {
+                    self.status = format!("Could not change sample Crossfade: {error}");
                 }
                 None => {}
             }

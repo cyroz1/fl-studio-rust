@@ -719,6 +719,7 @@ pub struct ChannelSummary {
     sample_remove_dc: Option<bool>,
     sample_normalize: Option<bool>,
     sample_reverse_polarity: Option<bool>,
+    sample_crossfade_raw: Option<u32>,
     sample_trim_threshold_raw: Option<u32>,
     sample_start_raw: Option<[u16; 2]>,
     sample_length_raw: Option<[u16; 2]>,
@@ -808,6 +809,12 @@ pub struct ChannelSampleWindowEdit {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ChannelSampleTrimEdit {
     pub threshold_raw: Option<u32>,
+}
+
+/// Linear raw sample loop Crossfade amount from the channel Parameters (`0xC7`) payload.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ChannelSampleCrossfadeEdit {
+    pub amount_raw: Option<u32>,
 }
 
 /// Raw time-stretch settings from the channel Parameters (`0xC7`) payload.
@@ -1233,6 +1240,13 @@ impl ChannelSummary {
     pub fn sample_trim_threshold_raw(&self) -> Option<u32> {
         matches!(self.kind, Some(0 | 4))
             .then_some(self.sample_trim_threshold_raw)
+            .flatten()
+    }
+
+    /// Saved linear sample loop Crossfade amount (`0..=256`) for this sample-bearing channel.
+    pub fn sample_crossfade_raw(&self) -> Option<u32> {
+        matches!(self.kind, Some(0 | 4))
+            .then_some(self.sample_crossfade_raw)
             .flatten()
     }
 
@@ -6399,6 +6413,13 @@ impl FlpDocument {
                                 event.payload[92..96]
                                     .try_into()
                                     .expect("the sample Trim threshold field has four bytes"),
+                            ));
+                        }
+                        if event.payload.len() >= 92 && channel.sample_crossfade_raw.is_none() {
+                            channel.sample_crossfade_raw = Some(u32::from_le_bytes(
+                                event.payload[88..92]
+                                    .try_into()
+                                    .expect("the sample Crossfade field has four bytes"),
                             ));
                         }
                     }
@@ -23752,6 +23773,72 @@ impl FlpDocument {
         let mut candidate = self.clone();
         let mut payload = candidate.events[parameters_index].payload.clone();
         payload[92..96].copy_from_slice(&threshold_raw.to_le_bytes());
+        candidate.events[parameters_index].replace_data_payload(payload)?;
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    /// Edits the documented sample loop Crossfade amount in a unique existing Parameters event.
+    /// Other payload bytes and every unrelated event are preserved.
+    pub fn edit_channel_sample_crossfade(
+        &mut self,
+        channel_id: u16,
+        edit: ChannelSampleCrossfadeEdit,
+    ) -> Result<(), FlpError> {
+        let Some(amount_raw) = edit.amount_raw else {
+            return Err(FlpError::UnsupportedEdit(
+                "a sample Crossfade amount must be supplied",
+            ));
+        };
+        if amount_raw > 256 {
+            return Err(FlpError::UnsupportedEdit(
+                "sample Crossfade amount must be between 0 and 256",
+            ));
+        }
+
+        self.require_unique_channel(channel_id)?;
+        let channel = self
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id() == channel_id)
+            .expect("the unique channel was checked above");
+        if !matches!(channel.kind, Some(0 | 4)) {
+            return Err(FlpError::UnsupportedEdit(
+                "sample Crossfade can only be edited on Sampler or Audio Clip channels",
+            ));
+        }
+
+        let c7_events = channel
+            .event_range()
+            .filter(|index| self.events[*index].opcode == 0xC7)
+            .collect::<Vec<_>>();
+        let mut parameter_events = c7_events.iter().copied().filter(|index| {
+            matches!(self.events[*index].encoding, PayloadEncoding::Data { .. })
+                && ascii_version(&self.events[*index].payload).is_none()
+        });
+        let parameters_index = parameter_events.next();
+        if parameter_events.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel has multiple Parameters (`0xC7`) events",
+            ));
+        }
+        let Some(parameters_index) = parameters_index else {
+            return Err(FlpError::UnsupportedEdit(if c7_events.is_empty() {
+                "the selected channel has no existing Parameters (`0xC7`) event"
+            } else {
+                "the selected channel's `0xC7` event is not a recognized Parameters payload"
+            }));
+        };
+        if self.events[parameters_index].payload.len() < 92 {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel's Parameters event does not contain the sample Crossfade field",
+            ));
+        }
+
+        let mut candidate = self.clone();
+        let mut payload = candidate.events[parameters_index].payload.clone();
+        payload[88..92].copy_from_slice(&amount_raw.to_le_bytes());
         candidate.events[parameters_index].replace_data_payload(payload)?;
         candidate.refresh_event_offsets()?;
         *self = candidate;

@@ -18,16 +18,17 @@ use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, ArpeggioRangePattern, ArpeggioScoreOptions,
     ArpeggioScorePatternMode, ArpeggioScoreTimeMultiplier, ArpeggioSyncMode, ArticulateOptions,
     AutomationInterpolationMode, AutomationPointEdit, AutomationScaleLevelsOptions,
-    ChannelLevelAdjustmentsEdit, ChannelSampleEffectsEdit, ChannelSampleFxFlagsEdit,
-    ChannelSampleTrimEdit, ChannelSampleWindowEdit, ChannelSortOrder, ChannelStretchSettingsEdit,
-    ClawMachineOptions, FlamOptions, FlpDocument, FscControllerStreamImportOptions, FscScore,
-    FstPreset, HumanizerOptions, LimitNoteOptions, LimitSnapDirection, MixerInsertEdit,
-    MixerParameterKind, PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation,
-    PlaylistClipEdit, PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress,
-    PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit, QuantizeNoteLevels, QuantizeNoteMode,
-    QuantizeNoteOptions, RandomNoteChordMap, RandomNoteGeneratorOptions, RandomizerOptions,
-    RiffMachineOptions, RiffMachineQuantizeMode, SamplerEnvelopeLfoEdit, SamplerEnvelopeLfoTarget,
-    SamplerVolumeEnvelopeEdit, ScaleLevelsOptions, StrumOptions, TimeMarkerEdit,
+    ChannelLevelAdjustmentsEdit, ChannelSampleCrossfadeEdit, ChannelSampleEffectsEdit,
+    ChannelSampleFxFlagsEdit, ChannelSampleTrimEdit, ChannelSampleWindowEdit, ChannelSortOrder,
+    ChannelStretchSettingsEdit, ClawMachineOptions, FlamOptions, FlpDocument,
+    FscControllerStreamImportOptions, FscScore, FstPreset, HumanizerOptions, LimitNoteOptions,
+    LimitSnapDirection, MixerInsertEdit, MixerParameterKind, PatternControllerEdit, PatternNote,
+    PatternNoteEdit, PatternNoteRotation, PlaylistClipEdit, PlaylistTrackEdit, PlaylistTrackMotion,
+    PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit,
+    QuantizeNoteLevels, QuantizeNoteMode, QuantizeNoteOptions, RandomNoteChordMap,
+    RandomNoteGeneratorOptions, RandomizerOptions, RiffMachineOptions, RiffMachineQuantizeMode,
+    SamplerEnvelopeLfoEdit, SamplerEnvelopeLfoTarget, SamplerVolumeEnvelopeEdit,
+    ScaleLevelsOptions, StrumOptions, TimeMarkerEdit,
 };
 
 struct MidiControlChangeImport<'a> {
@@ -910,6 +911,18 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u16(channel_id, "sample-bearing channel id")?,
                 ChannelSampleTrimEdit {
                     threshold_raw: Some(parse_u32(threshold_raw, "sample Trim threshold")?),
+                },
+            )
+        }
+        [command, input, output, channel_id, amount_raw]
+            if command == "edit-channel-sample-crossfade" =>
+        {
+            edit_channel_sample_crossfade(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(channel_id, "sample-bearing channel id")?,
+                ChannelSampleCrossfadeEdit {
+                    amount_raw: Some(parse_u32(amount_raw, "sample Crossfade amount")?),
                 },
             )
         }
@@ -4430,6 +4443,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild edit-channel-sample-fx-flags <input.flp> <output.flp> <channel-id> <fade-stereo:0|1|-> <swap-stereo:0|1|->\n",
             "  flp-rebuild edit-channel-sample-window <input.flp> <output.flp> <channel-id> <start:0..1|-> <length:0..1|->\n",
             "  flp-rebuild edit-channel-sample-trim <input.flp> <output.flp> <channel-id> <threshold-0..256>\n",
+            "  flp-rebuild edit-channel-sample-crossfade <input.flp> <output.flp> <channel-id> <amount-0..256>\n",
             "  flp-rebuild set-channel-zipped <input.flp> <output.flp> <channel-id> <0|1>\n",
             "  flp-rebuild set-channel-main-pitch <input.flp> <output.flp> <channel-id> <0|1>\n",
             "  flp-rebuild set-channel-key-region <input.flp> <output.flp> <channel-id> <low-key:0..127> <high-key:0..127>\n",
@@ -6669,7 +6683,7 @@ fn list_channels(path: &Path) -> Result<(), String> {
     println!("channels: {}", channels.len());
     for channel in channels {
         println!(
-            "id={} kind={} type={:?} enabled={} zipped={} main_pitch={} add_to_key={} fine_tune_raw={:?} key_region={:?} stretch_settings={:?} sampler_fade_out_raw={:?} sampler_fade_in_raw={:?} sample_fade_stereo={} sample_swap_stereo={} sample_remove_dc={} sample_normalize={} sample_reverse_polarity={} sample_start_fraction={:?} sample_length_fraction={:?} sample_trim_threshold_raw={:?} sampler_portamento={:?} sampler_polyphony_slide_raw={:?} sampler_volume_envelope={:?} sampler_envelopes={:?} color={:?} volume={:?} pan={:?} level_adjusts_raw={:?} swing_mix_raw={:?} layer_children={:?} layer_flags={:?} plugin={} name={} sample_path={:?} events={:?}",
+            "id={} kind={} type={:?} enabled={} zipped={} main_pitch={} add_to_key={} fine_tune_raw={:?} key_region={:?} stretch_settings={:?} sampler_fade_out_raw={:?} sampler_fade_in_raw={:?} sample_fade_stereo={} sample_swap_stereo={} sample_remove_dc={} sample_normalize={} sample_reverse_polarity={} sample_start_fraction={:?} sample_length_fraction={:?} sample_trim_threshold_raw={:?} sample_crossfade_raw={:?} sampler_portamento={:?} sampler_polyphony_slide_raw={:?} sampler_volume_envelope={:?} sampler_envelopes={:?} color={:?} volume={:?} pan={:?} level_adjusts_raw={:?} swing_mix_raw={:?} layer_children={:?} layer_flags={:?} plugin={} name={} sample_path={:?} events={:?}",
             channel.id(),
             channel
                 .kind()
@@ -6694,6 +6708,7 @@ fn list_channels(path: &Path) -> Result<(), String> {
             channel.sample_start_fraction(),
             channel.sample_length_fraction(),
             channel.sample_trim_threshold_raw(),
+            channel.sample_crossfade_raw(),
             channel.sampler_portamento_enabled(),
             channel.sampler_polyphony_slide_raw(),
             channel.sampler_volume_envelope(),
@@ -8174,6 +8189,28 @@ fn edit_channel_sample_trim(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "set sample Trim threshold on channel {channel_id} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn edit_channel_sample_crossfade(
+    input: &Path,
+    output: &Path,
+    channel_id: u16,
+    edit: ChannelSampleCrossfadeEdit,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .edit_channel_sample_crossfade(channel_id, edit)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "set sample Crossfade amount on channel {channel_id} in {}",
         output.display()
     );
     Ok(())
