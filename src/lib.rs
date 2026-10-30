@@ -20557,6 +20557,11 @@ impl FlpDocument {
                 "select at least one MIDI Control Change mapping",
             ));
         }
+        if mappings.len() > 128 {
+            return Err(FlpError::UnsupportedEdit(
+                "at most 128 MIDI Control Change mappings can be imported",
+            ));
+        }
         let mut controller_numbers = HashSet::with_capacity(mappings.len());
         let mut target_streams = HashSet::with_capacity(mappings.len());
         for &(controller_number, channel, flags) in mappings {

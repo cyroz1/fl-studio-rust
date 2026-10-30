@@ -5076,6 +5076,9 @@ fn parse_midi_cc_stream_mappings(value: &str) -> Result<Vec<(u8, u8, u8)>, Strin
     if value.trim().is_empty() {
         return Err("provide at least one MIDI CC stream mapping".to_owned());
     }
+    if value.split(',').count() > 128 {
+        return Err("at most 128 MIDI CC stream mappings can be provided".to_owned());
+    }
     value
         .split(',')
         .map(|mapping| {
