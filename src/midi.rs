@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
 use crate::{
-    FlpDocument, PatternNote, PlaylistClip, PlaylistClipTarget,
+    ChannelMidiOutSettings, FlpDocument, PatternNote, PlaylistClip, PlaylistClipTarget,
     automation_segment_value_with_tension,
 };
 
@@ -175,7 +175,8 @@ impl MidiSmpteTimeBase {
 /// Selects how FL Studio channels are assigned to MIDI channels during export.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum MidiChannelMapping {
-    /// Preserve the low four bits of each note's stored MIDI channel.
+    /// Preserve each note's stored MIDI channel. A recognized MIDI Out setting overrides it
+    /// when that channel does not route MIDI by note color.
     #[default]
     PreserveNoteChannels,
     /// Assign each distinct FL Studio channel its own MIDI channel, wrapping after 16.
@@ -1137,6 +1138,7 @@ impl MidiFile {
             .iter()
             .map(|pattern| (pattern.id, pattern))
             .collect();
+        let midi_out_settings = channel_midi_out_settings(document);
         let mut notes_by_channel = BTreeMap::<u16, Vec<MidiExportNote>>::new();
         let mut song_end_tick = 0u64;
         let mut exported_note_count = 0usize;
@@ -1272,7 +1274,12 @@ impl MidiFile {
                     notes_by_channel
                         .entry(note.channel_id)
                         .or_default()
-                        .push(export_note(note, start_tick, stop_tick));
+                        .push(export_note(
+                            note,
+                            start_tick,
+                            stop_tick,
+                            midi_out_settings.get(&note.channel_id).copied(),
+                        ));
                 }
             }
         }
@@ -2888,6 +2895,7 @@ fn tracks_for_notes(
             "the pattern contains more than one million MIDI notes",
         ));
     }
+    let midi_out_settings = channel_midi_out_settings(document);
     let mut grouped = BTreeMap::<u16, Vec<MidiExportNote>>::new();
     for note in notes {
         if note.is_muted() {
@@ -2900,9 +2908,27 @@ fn tracks_for_notes(
             ));
         }
         let end_tick = u64::from(note.position) + u64::from(note.length);
-        track_notes.push(export_note(note, u64::from(note.position), end_tick));
+        track_notes.push(export_note(
+            note,
+            u64::from(note.position),
+            end_tick,
+            midi_out_settings.get(&note.channel_id).copied(),
+        ));
     }
     tracks_for_grouped_notes(document, grouped)
+}
+
+fn channel_midi_out_settings(document: &FlpDocument) -> BTreeMap<u16, ChannelMidiOutSettings> {
+    document
+        .channels()
+        .into_iter()
+        .filter_map(|channel| {
+            channel
+                .midi_out_settings()
+                .copied()
+                .map(|settings| (channel.id(), settings))
+        })
+        .collect()
 }
 
 fn tracks_for_grouped_notes(
@@ -2930,9 +2956,19 @@ fn tracks_for_grouped_notes(
         .collect())
 }
 
-fn export_note(note: &PatternNote, start_tick: u64, end_tick: u64) -> MidiExportNote {
+fn export_note(
+    note: &PatternNote,
+    start_tick: u64,
+    end_tick: u64,
+    midi_out_settings: Option<ChannelMidiOutSettings>,
+) -> MidiExportNote {
     MidiExportNote {
-        channel: note.midi_channel_index(),
+        channel: midi_out_settings
+            .filter(|settings| !settings.use_note_color_channel())
+            .map_or_else(
+                || note.midi_channel_index(),
+                |settings| settings.midi_channel() - 1,
+            ),
         key: u8::try_from(note.key).unwrap_or(u8::MAX),
         velocity: note.velocity,
         release_velocity: fl_note_release_to_midi_velocity(note.release),
