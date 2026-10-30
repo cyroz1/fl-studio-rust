@@ -60,6 +60,7 @@ const SAMPLER_ROOT_KEY: u16 = 60;
 const SAMPLER_POLYPHONY_SLIDE_DEFAULT_RAW: u32 = 820;
 const SAMPLER_POLYPHONY_SLIDE_MAX_RAW: u32 = 1_660;
 const SAMPLER_BLOCK_FRAMES: usize = 1_024;
+const PERFORMANCE_DUE_COMMANDS_INITIAL_CAPACITY: usize = 128;
 const FLAC_BLOCK_FRAMES: usize = 4_096;
 const FLAC_MAX_SAMPLE_FRAMES: u64 = (1_u64 << 36) - 1;
 const OGG_MIN_BITRATE_KBPS: u16 = 64;
@@ -12331,6 +12332,7 @@ struct PlaylistPerformanceRuntime {
     live_status: Arc<Mutex<PlaylistPerformanceLiveStatus>>,
     current_document: FlpDocument,
     pending_commands: Vec<PlaylistPerformanceCommand>,
+    due_commands: Vec<PlaylistPerformanceCommand>,
     queued_by_track: BTreeMap<u32, VecDeque<PlaylistPerformanceLaunch>>,
     motion_by_track: HashMap<u32, Option<PlaylistTrackMotion>>,
     motion_clip_order_by_track: HashMap<u32, Vec<usize>>,
@@ -12901,6 +12903,7 @@ impl PlaylistPerformanceRuntime {
             live_status: controls.live_status,
             current_document: document.clone(),
             pending_commands: Vec::new(),
+            due_commands: Vec::with_capacity(PERFORMANCE_DUE_COMMANDS_INITIAL_CAPACITY),
             queued_by_track: BTreeMap::new(),
             motion_by_track,
             motion_clip_order_by_track,
@@ -13057,12 +13060,12 @@ impl PlaylistPerformanceRuntime {
         let due_command_count = self
             .pending_commands
             .partition_point(|command| command.start_frame() <= block_end);
-        let due_commands = self
-            .pending_commands
-            .drain(..due_command_count)
-            .collect::<Vec<_>>();
+        self.due_commands.clear();
+        self.due_commands
+            .extend(self.pending_commands.drain(..due_command_count));
         let mut stopped_tracks_in_block = BTreeMap::new();
-        for command in due_commands {
+        for command_index in 0..self.due_commands.len() {
+            let command = self.due_commands[command_index];
             match command {
                 PlaylistPerformanceCommand::Launch(launch) => {
                     self.validate_launch(launch)?;
@@ -13237,6 +13240,7 @@ impl PlaylistPerformanceRuntime {
                 }
             }
         }
+        self.due_commands.clear();
 
         let horizon_frame = block_start
             .saturating_add(frame_count as u64)
@@ -19766,6 +19770,7 @@ mod tests {
             live_status: Arc::new(Mutex::new(PlaylistPerformanceLiveStatus::default())),
             current_document: performance_audio_clip_fixture(80, None),
             pending_commands: Vec::new(),
+            due_commands: Vec::with_capacity(super::PERFORMANCE_DUE_COMMANDS_INITIAL_CAPACITY),
             queued_by_track: BTreeMap::new(),
             motion_by_track: HashMap::new(),
             motion_clip_order_by_track: HashMap::new(),
