@@ -99,20 +99,20 @@ use flp_rebuild::{
     ArpeggioScorePatternMode, ArpeggioScoreTimeMultiplier, ArpeggioSyncMode, Arrangement,
     ArticulateOptions, AutomationChannel, AutomationInterpolationMode, AutomationPoint,
     AutomationPointEdit, AutomationScaleLevelsOptions, ChannelGroupSummary, ChannelNoteRouter,
-    ChannelSortOrder, ChannelStretchMode, ChannelStretchSettingsEdit, ChannelSummary, ChannelType,
-    ClawMachineOptions, FlamOptions, FlpDocument, FlpError, FscControllerStreamImportOptions,
-    FscScore, FstPreset, FstPresetKind, HumanizerOptions, LimitNoteOptions, LimitSnapDirection,
-    MixerInsertEdit, MixerInsertSummary, MixerParameterKind, MixerParameterRecord,
-    MixerSendSummary, PATTERN_NOTE_DEFAULT_FLAGS, PATTERN_NOTE_DEFAULT_RELEASE,
-    PATTERN_NOTE_SLIDE_FLAG, Pattern, PatternController, PatternControllerEdit, PatternNote,
-    PatternNoteEdit, PatternNoteRotation, PayloadEncoding, PlaylistClip, PlaylistClipEdit,
-    PlaylistClipSelectionClipboard, PlaylistClipTarget, PlaylistTrack, PlaylistTrackEdit,
-    PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit,
-    ProjectSettingsEdit, QuantizeNoteLevels, QuantizeNoteMode, QuantizeNoteOptions,
-    RandomNoteChordMap, RandomNoteGeneratorOptions, RandomizerOptions, RiffMachineOptions,
-    RiffMachineQuantizeMode, RiffMachineStage, SamplerEnvelopeLfo, SamplerEnvelopeLfoEdit,
-    SamplerEnvelopeLfoTarget, ScaleLevelsOptions, StrumOptions, TimeMarker, TimeMarkerEdit,
-    VstPluginStateMetadata,
+    ChannelSampleEffectsEdit, ChannelSortOrder, ChannelStretchMode, ChannelStretchSettingsEdit,
+    ChannelSummary, ChannelType, ClawMachineOptions, FlamOptions, FlpDocument, FlpError,
+    FscControllerStreamImportOptions, FscScore, FstPreset, FstPresetKind, HumanizerOptions,
+    LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerInsertSummary, MixerParameterKind,
+    MixerParameterRecord, MixerSendSummary, PATTERN_NOTE_DEFAULT_FLAGS,
+    PATTERN_NOTE_DEFAULT_RELEASE, PATTERN_NOTE_SLIDE_FLAG, Pattern, PatternController,
+    PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation, PayloadEncoding,
+    PlaylistClip, PlaylistClipEdit, PlaylistClipSelectionClipboard, PlaylistClipTarget,
+    PlaylistTrack, PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync,
+    ProjectInfoEdit, ProjectSettingsEdit, QuantizeNoteLevels, QuantizeNoteMode,
+    QuantizeNoteOptions, RandomNoteChordMap, RandomNoteGeneratorOptions, RandomizerOptions,
+    RiffMachineOptions, RiffMachineQuantizeMode, RiffMachineStage, SamplerEnvelopeLfo,
+    SamplerEnvelopeLfoEdit, SamplerEnvelopeLfoTarget, ScaleLevelsOptions, StrumOptions, TimeMarker,
+    TimeMarkerEdit, VstPluginStateMetadata,
 };
 use md5::{Digest, Md5};
 use vst3_host::midi::{MidiChannel as Vst3MidiChannel, MidiEvent as Vst3MidiEvent};
@@ -37011,6 +37011,7 @@ impl DawUi {
         let mut duplicate_channel_request = None;
         let mut channel_enabled_edits = Vec::new();
         let mut channel_sample_reverse_edits = Vec::new();
+        let mut channel_sample_effect_edits = Vec::new();
         let mut channel_main_pitch_edits = Vec::new();
         let mut channel_add_to_key_edits = Vec::new();
         let mut channel_zipped_edits = Vec::new();
@@ -37702,6 +37703,44 @@ impl DawUi {
                                     {
                                         channel_sample_reverse_edits
                                             .push((channel.id(), !reversed));
+                                        ui.close();
+                                    }
+                                    let normalize = channel.sample_normalize_enabled();
+                                    if ui
+                                        .selectable_label(normalize, "Normalize sample")
+                                        .on_hover_text(
+                                            "Peak-normalize this sample source without clipping.",
+                                        )
+                                        .clicked()
+                                    {
+                                        channel_sample_effect_edits.push((
+                                            channel.id(),
+                                            ChannelSampleEffectsEdit {
+                                                normalize: Some(!normalize),
+                                                ..ChannelSampleEffectsEdit::default()
+                                            },
+                                        ));
+                                        ui.close();
+                                    }
+                                    let reverse_polarity =
+                                        channel.sample_reverse_polarity_enabled();
+                                    if ui
+                                        .selectable_label(
+                                            reverse_polarity,
+                                            "Reverse sample polarity",
+                                        )
+                                        .on_hover_text(
+                                            "Invert waveform amplitude without reversing its playback direction.",
+                                        )
+                                        .clicked()
+                                    {
+                                        channel_sample_effect_edits.push((
+                                            channel.id(),
+                                            ChannelSampleEffectsEdit {
+                                                reverse_polarity: Some(!reverse_polarity),
+                                                ..ChannelSampleEffectsEdit::default()
+                                            },
+                                        ));
                                         ui.close();
                                     }
                                 }
@@ -38721,6 +38760,27 @@ impl DawUi {
                 }
                 Some(Err(error)) => {
                     self.status = format!("Could not change sample Reverse setting: {error}");
+                }
+                None => {}
+            }
+        }
+        for (channel_id, edit) in channel_sample_effect_edits {
+            let result = self
+                .document
+                .as_mut()
+                .map(|document| document.edit_channel_sample_effects(channel_id, edit));
+            match result {
+                Some(Ok(())) => {
+                    self.stop_project_playback();
+                    self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+                    self.status = format!(
+                        "Channel {channel_id} sample effects updated: Normalize {:?}, Reverse Polarity {:?}",
+                        edit.normalize, edit.reverse_polarity
+                    );
+                }
+                Some(Err(error)) => {
+                    self.status = format!("Could not change sample effect flags: {error}");
                 }
                 None => {}
             }

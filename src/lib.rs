@@ -716,6 +716,8 @@ pub struct ChannelSummary {
     sampler_fx_flags: Option<u16>,
     sampler_fade_out_raw: Option<u16>,
     sampler_fade_in_raw: Option<u16>,
+    sample_normalize: Option<bool>,
+    sample_reverse_polarity: Option<bool>,
     sampler_envelope_lfos: [Option<SamplerEnvelopeLfo>; 5],
     sampler_max_polyphony_raw: Option<u32>,
     sampler_polyphony_slide_raw: Option<u32>,
@@ -773,6 +775,14 @@ pub struct ChannelLevelAdjustmentsEdit {
     pub volume_raw: Option<u32>,
     pub mod_x_raw: Option<i32>,
     pub mod_y_raw: Option<i32>,
+}
+
+/// Saved precomputed sample processing switches from the channel Parameters (`0xC7`) payload.
+/// These apply to Sampler and sample-backed Audio Clip channels.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ChannelSampleEffectsEdit {
+    pub normalize: Option<bool>,
+    pub reverse_polarity: Option<bool>,
 }
 
 /// Raw time-stretch settings from the channel Parameters (`0xC7`) payload.
@@ -1131,6 +1141,16 @@ impl ChannelSummary {
         (self.kind == Some(0))
             .then_some(self.sampler_fade_in_raw)
             .flatten()
+    }
+
+    /// Whether peak normalization is enabled for this Sampler or Audio Clip source.
+    pub fn sample_normalize_enabled(&self) -> bool {
+        matches!(self.kind, Some(0 | 4)) && self.sample_normalize.unwrap_or(false)
+    }
+
+    /// Whether reverse polarity is enabled for this Sampler or Audio Clip source.
+    pub fn sample_reverse_polarity_enabled(&self) -> bool {
+        matches!(self.kind, Some(0 | 4)) && self.sample_reverse_polarity.unwrap_or(false)
     }
 
     /// Whether the kind-0 Sampler's Volume envelope is enabled, when its saved `0xDA`
@@ -6268,6 +6288,14 @@ impl FlpDocument {
                 0xC7 if matches!(event.encoding, PayloadEncoding::Data { .. })
                     && ascii_version(&event.payload).is_none() =>
                 {
+                    if matches!(channel.kind, Some(0 | 4)) {
+                        if event.payload.len() >= 81 && channel.sample_normalize.is_none() {
+                            channel.sample_normalize = Some(event.payload[80] != 0);
+                        }
+                        if event.payload.len() >= 82 && channel.sample_reverse_polarity.is_none() {
+                            channel.sample_reverse_polarity = Some(event.payload[81] != 0);
+                        }
+                    }
                     if event.payload.len() >= 112 && channel.stretch_settings.is_none() {
                         channel.stretch_settings = Some(ChannelStretchSettings {
                             time_raw: u32::from_le_bytes(
@@ -23388,6 +23416,77 @@ impl FlpDocument {
         Ok(())
     }
 
+    /// Edits the saved Normalize and Reverse Polarity flags in a sample-bearing channel's
+    /// Parameters (`0xC7`) payload. Unknown bytes and every unrelated event are preserved.
+    pub fn edit_channel_sample_effects(
+        &mut self,
+        channel_id: u16,
+        edit: ChannelSampleEffectsEdit,
+    ) -> Result<(), FlpError> {
+        if edit.normalize.is_none() && edit.reverse_polarity.is_none() {
+            return Err(FlpError::UnsupportedEdit(
+                "at least one sample effect setting must be supplied",
+            ));
+        }
+
+        self.require_unique_channel(channel_id)?;
+        let channel = self
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id() == channel_id)
+            .expect("the unique channel was checked above");
+        if !matches!(channel.kind, Some(0 | 4)) {
+            return Err(FlpError::UnsupportedEdit(
+                "sample effects can only be edited on Sampler or Audio Clip channels",
+            ));
+        }
+
+        let c7_events = channel
+            .event_range()
+            .filter(|index| self.events[*index].opcode == 0xC7)
+            .collect::<Vec<_>>();
+        let mut parameter_events = c7_events.iter().copied().filter(|index| {
+            matches!(self.events[*index].encoding, PayloadEncoding::Data { .. })
+                && ascii_version(&self.events[*index].payload).is_none()
+        });
+        let parameters_index = parameter_events.next();
+        if parameter_events.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel has multiple Parameters (`0xC7`) events",
+            ));
+        }
+        let Some(parameters_index) = parameters_index else {
+            return Err(FlpError::UnsupportedEdit(if c7_events.is_empty() {
+                "the selected channel has no existing Parameters (`0xC7`) event"
+            } else {
+                "the selected channel's `0xC7` event is not a recognized Parameters payload"
+            }));
+        };
+        let required_payload_len = if edit.reverse_polarity.is_some() {
+            82
+        } else {
+            81
+        };
+        if self.events[parameters_index].payload.len() < required_payload_len {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel's Parameters event does not contain the requested sample effect field",
+            ));
+        }
+
+        let mut candidate = self.clone();
+        let mut payload = candidate.events[parameters_index].payload.clone();
+        if let Some(normalize) = edit.normalize {
+            payload[80] = u8::from(normalize);
+        }
+        if let Some(reverse_polarity) = edit.reverse_polarity {
+            payload[81] = u8::from(reverse_polarity);
+        }
+        candidate.events[parameters_index].replace_data_payload(payload)?;
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
     /// Sets a channel's enabled state, which controls whether the Channel Rack row is muted.
     /// Existing `0x00` events are edited in place; channels without one get a byte event after
     /// their recognized `0x15` kind event. Other channel events are retained.
@@ -26101,8 +26200,8 @@ mod tests {
     use super::{
         ArpeggioOptions, ArpeggioRangePattern, ArpeggioSyncMode, ArticulateOptions,
         AutomationInterpolationMode, AutomationScaleLevelsOptions, ChannelGroupSummary,
-        ChannelLevelAdjustmentsEdit, ChannelNoteRouter, ChannelSortOrder, ChannelStretchMode,
-        ChannelStretchSettingsEdit, ChannelSummary, ClawMachineOptions,
+        ChannelLevelAdjustmentsEdit, ChannelNoteRouter, ChannelSampleEffectsEdit, ChannelSortOrder,
+        ChannelStretchMode, ChannelStretchSettingsEdit, ChannelSummary, ClawMachineOptions,
         FLP_AUTOMATION_COUNT_OFFSET, FLP_AUTOMATION_LFO_AMOUNT_OFFSET, FLP_AUTOMATION_POINT_SIZE,
         FLP_AUTOMATION_POINTS_OFFSET, FlpDocument, FlpError, FlpEvent, FstPreset, FstPresetKind,
         LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerInsertSummary,
@@ -32920,6 +33019,117 @@ mod tests {
             assert_eq!(document.channels()[0].sample_reversed(), expected);
             assert_eq!(document.encode_lossless().unwrap(), input);
         }
+    }
+
+    #[test]
+    fn decodes_and_edits_sample_normalize_and_reverse_polarity_losslessly() {
+        for kind in [0, 4] {
+            let mut parameters = vec![0xA5; 82];
+            parameters[80] = 1;
+            parameters[81] = 1;
+            let mut event_stream = vec![0x40, 7, 0, 0x15, kind];
+            append_data_event(&mut event_stream, 0xC7, &parameters);
+            event_stream.extend_from_slice(&[0x62, 0, 0]);
+            let input = flp_fixture(&event_stream, &[], &[]);
+            let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+            let channel = &document.channels()[0];
+            assert!(channel.sample_normalize_enabled());
+            assert!(channel.sample_reverse_polarity_enabled());
+            assert_eq!(document.encode_lossless().unwrap(), input);
+
+            document
+                .edit_channel_sample_effects(
+                    7,
+                    ChannelSampleEffectsEdit {
+                        normalize: Some(false),
+                        reverse_polarity: Some(false),
+                    },
+                )
+                .expect("sample effect flags should be editable");
+            let expected_payload = {
+                let mut expected = parameters.clone();
+                expected[80] = 0;
+                expected[81] = 0;
+                expected
+            };
+            let edited_event = document
+                .events()
+                .iter()
+                .find(|event| event.opcode() == 0xC7)
+                .expect("Parameters event should remain present");
+            assert_eq!(edited_event.payload(), expected_payload);
+            assert!(!document.channels()[0].sample_normalize_enabled());
+            assert!(!document.channels()[0].sample_reverse_polarity_enabled());
+            let encoded = document
+                .encode_lossless()
+                .expect("updated project should encode");
+            let reopened = FlpDocument::parse(&encoded).expect("updated project should reopen");
+            assert_eq!(reopened.channels(), document.channels());
+        }
+
+        let mut native_instrument = vec![0x40, 7, 0, 0x15, 2];
+        let mut parameters = vec![0; 82];
+        parameters[80] = 1;
+        parameters[81] = 1;
+        append_data_event(&mut native_instrument, 0xC7, &parameters);
+        native_instrument.extend_from_slice(&[0x62, 0, 0]);
+        let document = FlpDocument::parse(&flp_fixture(&native_instrument, &[], &[]))
+            .expect("native instrument fixture should parse");
+        assert!(!document.channels()[0].sample_normalize_enabled());
+        assert!(!document.channels()[0].sample_reverse_polarity_enabled());
+    }
+
+    #[test]
+    fn sample_effect_editor_rejects_missing_short_and_ambiguous_parameters() {
+        let edit = ChannelSampleEffectsEdit {
+            normalize: Some(true),
+            ..ChannelSampleEffectsEdit::default()
+        };
+
+        let missing_bytes = flp_fixture(&[0x40, 7, 0, 0x15, 0, 0x62, 0, 0], &[], &[]);
+        let mut missing = FlpDocument::parse(&missing_bytes).expect("fixture should parse");
+        assert!(matches!(
+            missing.edit_channel_sample_effects(7, edit),
+            Err(FlpError::UnsupportedEdit(_))
+        ));
+
+        let mut short_stream = vec![0x40, 7, 0, 0x15, 0];
+        append_data_event(&mut short_stream, 0xC7, &[0; 81]);
+        short_stream.extend_from_slice(&[0x62, 0, 0]);
+        let mut short = FlpDocument::parse(&flp_fixture(&short_stream, &[], &[]))
+            .expect("short Parameters fixture should parse");
+        assert!(matches!(
+            short.edit_channel_sample_effects(
+                7,
+                ChannelSampleEffectsEdit {
+                    reverse_polarity: Some(true),
+                    ..ChannelSampleEffectsEdit::default()
+                }
+            ),
+            Err(FlpError::UnsupportedEdit(_))
+        ));
+
+        short
+            .edit_channel_sample_effects(7, edit)
+            .expect("Normalize only needs payload byte 80");
+        let short_parameters = short
+            .events()
+            .iter()
+            .find(|event| event.opcode() == 0xC7)
+            .expect("short Parameters event should remain present");
+        assert_eq!(short_parameters.payload()[80], 1);
+        assert_eq!(short_parameters.payload().len(), 81);
+
+        let mut duplicate_stream = vec![0x40, 7, 0, 0x15, 0];
+        append_data_event(&mut duplicate_stream, 0xC7, &[0; 82]);
+        append_data_event(&mut duplicate_stream, 0xC7, &[0; 82]);
+        duplicate_stream.extend_from_slice(&[0x62, 0, 0]);
+        let mut duplicate = FlpDocument::parse(&flp_fixture(&duplicate_stream, &[], &[]))
+            .expect("duplicate Parameters fixture should parse");
+        assert!(matches!(
+            duplicate.edit_channel_sample_effects(7, edit),
+            Err(FlpError::UnsupportedEdit(_))
+        ));
     }
 
     #[test]

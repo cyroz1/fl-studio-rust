@@ -10883,6 +10883,7 @@ fn prepare_audio_clip_render(
         u16,
         PathBuf,
         bool,
+        SamplerPrecomputedFx,
         f32,
         f32,
         f64,
@@ -10966,6 +10967,7 @@ fn prepare_audio_clip_render(
             id,
             resolved_path,
             channel.audio_clip_reversed(),
+            sampler_precomputed_fx(channel),
             gain,
             pan,
             f64::from(channel.master_pitch_offset_cents(master_pitch_cents))
@@ -10998,7 +11000,7 @@ fn prepare_audio_clip_render(
     let mut source_paths = BTreeSet::new();
     let mut audio_sources = Vec::<DecodedAudio>::new();
     let mut cached_source_bytes = 0usize;
-    for (_, _, _, path, _, _, _, _, _, _, _) in &candidate_clips {
+    for (_, _, _, path, _, _, _, _, _, _, _, _) in &candidate_clips {
         check_cancelled(cancelled)?;
         if source_id_by_path.contains_key(path) {
             continue;
@@ -11020,6 +11022,7 @@ fn prepare_audio_clip_render(
     }
 
     let mut processed_source_ids = HashMap::<ProcessedAudioCacheKey, usize>::new();
+    let mut sample_fx_source_ids = HashMap::<(PathBuf, SamplerPrecomputedFx), usize>::new();
     let mut clips = Vec::with_capacity(candidate_clips.len());
     let mut output_frames = timeline_frames;
     let mut live_source_routes_by_track = HashMap::new();
@@ -11029,6 +11032,7 @@ fn prepare_audio_clip_render(
         channel_id,
         path,
         reverse,
+        sample_fx,
         gain,
         pan,
         pitch_offset_cents,
@@ -11041,7 +11045,31 @@ fn prepare_audio_clip_render(
         let raw_source_id = *source_id_by_path
             .get(path)
             .expect("all candidate source files were decoded");
-        let audio = &audio_sources[raw_source_id];
+        let mut source_id = raw_source_id;
+        if sample_fx.any() {
+            let cache_key = (path.clone(), *sample_fx);
+            source_id = if let Some(source_id) = sample_fx_source_ids.get(&cache_key) {
+                *source_id
+            } else {
+                let mut processed_audio = audio_sources[raw_source_id].clone();
+                apply_sampler_sample_fx(&mut processed_audio, *sample_fx);
+                let bytes = decoded_audio_bytes(&processed_audio)?;
+                cached_source_bytes = cached_source_bytes
+                    .checked_add(bytes)
+                    .filter(|total| *total <= MAX_SOURCE_CACHE_BYTES)
+                    .ok_or_else(|| {
+                        format!(
+                            "audio sources and sample effects exceed the {} MiB render cache limit",
+                            MAX_SOURCE_CACHE_BYTES / (1024 * 1024)
+                        )
+                    })?;
+                let source_id = audio_sources.len();
+                audio_sources.push(processed_audio);
+                sample_fx_source_ids.insert(cache_key, source_id);
+                source_id
+            };
+        }
+        let audio = &audio_sources[source_id];
         if audio.channels.is_empty() || audio.channels.len() > 2 {
             return Err(format!(
                 "audio channel {channel_id} source has {} channels; only mono and stereo are supported by this renderer",
@@ -11115,7 +11143,6 @@ fn prepare_audio_clip_render(
                 *clip_index,
             )?
         };
-        let mut source_id = raw_source_id;
         let instance_pitch_offset_cents =
             *pitch_offset_cents + f64::from(clip_envelope.stretch_pitch_cents);
         let mut effective_pitch_ratio = audio_clip_pitch_ratio(instance_pitch_offset_cents);
@@ -11140,6 +11167,7 @@ fn prepare_audio_clip_render(
                     target_duration_frames,
                     pitch_raw: duration_preserving_pitch_raw,
                     mode_raw,
+                    sample_fx: *sample_fx,
                 };
                 source_id = if let Some(source_id) = processed_source_ids.get(&cache_key) {
                     *source_id
@@ -11148,7 +11176,7 @@ fn prepare_audio_clip_render(
                     let source_frames = source_bounds.end - source_bounds.start;
                     let stretch_ratio = target_duration_frames as f32 / source_frames as f32;
                     let processed_audio = process_audio_range_for_playback(
-                        &audio_sources[raw_source_id],
+                        &audio_sources[source_id],
                         source_bounds.start..source_bounds.end,
                         duration_preserving_pitch_raw as f32 / 100.0,
                         stretch_ratio,
@@ -11891,8 +11919,10 @@ fn prepare_sampler_arrangement(
 
     let resolver = SamplePathResolver::new(project_path);
     let mut decoded_by_path = HashMap::<PathBuf, Arc<DecodedAudio>>::new();
-    let mut faded_audio_by_settings =
-        HashMap::<(PathBuf, Option<u16>, Option<u16>), Arc<DecodedAudio>>::new();
+    let mut faded_audio_by_settings = HashMap::<
+        (PathBuf, Option<u16>, Option<u16>, SamplerPrecomputedFx),
+        Arc<DecodedAudio>,
+    >::new();
     let mut sources_by_channel = HashMap::<u16, SamplerVoiceSource>::new();
     // Store each channel's tick-zero Resample rate, then offset scheduled notes from it to
     // match the tempo at their own start ticks.
@@ -11979,10 +12009,11 @@ fn prepare_sampler_arrangement(
             };
             let fade_in_raw = supported_sampler_fade_raw(channel.sampler_fade_in_raw());
             let fade_out_raw = supported_sampler_fade_raw(channel.sampler_fade_out_raw());
-            let audio = if fade_in_raw.is_none() && fade_out_raw.is_none() {
+            let sample_fx = sampler_precomputed_fx(channel);
+            let audio = if fade_in_raw.is_none() && fade_out_raw.is_none() && !sample_fx.any() {
                 audio
             } else {
-                let key = (resolved_path.clone(), fade_in_raw, fade_out_raw);
+                let key = (resolved_path.clone(), fade_in_raw, fade_out_raw, sample_fx);
                 if let Some(audio) = faded_audio_by_settings.get(&key) {
                     Arc::clone(audio)
                 } else {
@@ -11996,9 +12027,10 @@ fn prepare_sampler_arrangement(
                                 MAX_SOURCE_CACHE_BYTES / (1024 * 1024)
                             )
                         })?;
-                    let faded_audio = sampler_precompute_fades(&audio, fade_in_raw, fade_out_raw);
-                    faded_audio_by_settings.insert(key, Arc::clone(&faded_audio));
-                    faded_audio
+                    let processed_audio =
+                        sampler_precompute_sample_fx(&audio, sample_fx, fade_in_raw, fade_out_raw);
+                    faded_audio_by_settings.insert(key, Arc::clone(&processed_audio));
+                    processed_audio
                 }
             };
             let prepared_stretch_source = prepare_sampler_stretch_source(
@@ -14975,8 +15007,10 @@ fn prepare_sampler_pattern_for_channel_internal(
 
     let resolver = SamplePathResolver::new(project_path);
     let mut decoded_by_path = HashMap::<PathBuf, Arc<DecodedAudio>>::new();
-    let mut faded_audio_by_settings =
-        HashMap::<(PathBuf, Option<u16>, Option<u16>), Arc<DecodedAudio>>::new();
+    let mut faded_audio_by_settings = HashMap::<
+        (PathBuf, Option<u16>, Option<u16>, SamplerPrecomputedFx),
+        Arc<DecodedAudio>,
+    >::new();
     let mut sources_by_channel = HashMap::<u16, SamplerVoiceSource>::new();
     let mut mixer_transforms_by_channel = HashMap::<u16, MixerSourceRouteTransform>::new();
     let mut mixer_meter_transforms_by_channel =
@@ -15059,10 +15093,11 @@ fn prepare_sampler_pattern_for_channel_internal(
             };
             let fade_in_raw = supported_sampler_fade_raw(channel.sampler_fade_in_raw());
             let fade_out_raw = supported_sampler_fade_raw(channel.sampler_fade_out_raw());
-            let audio = if fade_in_raw.is_none() && fade_out_raw.is_none() {
+            let sample_fx = sampler_precomputed_fx(channel);
+            let audio = if fade_in_raw.is_none() && fade_out_raw.is_none() && !sample_fx.any() {
                 audio
             } else {
-                let key = (resolved_path.clone(), fade_in_raw, fade_out_raw);
+                let key = (resolved_path.clone(), fade_in_raw, fade_out_raw, sample_fx);
                 if let Some(audio) = faded_audio_by_settings.get(&key) {
                     Arc::clone(audio)
                 } else {
@@ -15076,9 +15111,10 @@ fn prepare_sampler_pattern_for_channel_internal(
                                 MAX_SOURCE_CACHE_BYTES / (1024 * 1024)
                             )
                         })?;
-                    let faded_audio = sampler_precompute_fades(&audio, fade_in_raw, fade_out_raw);
-                    faded_audio_by_settings.insert(key, Arc::clone(&faded_audio));
-                    faded_audio
+                    let processed_audio =
+                        sampler_precompute_sample_fx(&audio, sample_fx, fade_in_raw, fade_out_raw);
+                    faded_audio_by_settings.insert(key, Arc::clone(&processed_audio));
+                    processed_audio
                 }
             };
             let prepared_stretch_source = prepare_sampler_stretch_source(
@@ -16839,18 +16875,65 @@ fn supported_sampler_fade_raw(raw_value: Option<u16>) -> Option<u16> {
     raw_value.filter(|value| (1..=1024).contains(value))
 }
 
-fn sampler_precompute_fades(
+fn sampler_precomputed_fx(channel: &ChannelSummary) -> SamplerPrecomputedFx {
+    SamplerPrecomputedFx {
+        normalize: channel.sample_normalize_enabled(),
+        reverse_polarity: channel.sample_reverse_polarity_enabled(),
+    }
+}
+
+/// Applies the saved whole-source sample processing before note/clip playback.
+/// Normalization uses the peak across all channels so stereo balance is preserved.
+fn apply_sampler_sample_fx(audio: &mut DecodedAudio, fx: SamplerPrecomputedFx) {
+    if !fx.any() {
+        return;
+    }
+
+    let peak = if fx.normalize {
+        audio
+            .channels
+            .iter()
+            .flatten()
+            .filter(|sample| sample.is_finite())
+            .map(|sample| f64::from(*sample).abs())
+            .fold(0.0_f64, f64::max)
+    } else {
+        1.0
+    };
+    let normalization_gain = if fx.normalize && peak > 0.0 {
+        1.0 / peak
+    } else {
+        1.0
+    };
+
+    for sample in audio.channels.iter_mut().flatten() {
+        if sample.is_finite() {
+            let value = f64::from(*sample) * normalization_gain;
+            *sample = if fx.reverse_polarity {
+                (-value) as f32
+            } else {
+                value as f32
+            };
+        } else if fx.reverse_polarity {
+            *sample = -*sample;
+        }
+    }
+}
+
+fn sampler_precompute_sample_fx(
     source: &Arc<DecodedAudio>,
+    fx: SamplerPrecomputedFx,
     fade_in_raw: Option<u16>,
     fade_out_raw: Option<u16>,
 ) -> Arc<DecodedAudio> {
     let fade_in_raw = supported_sampler_fade_raw(fade_in_raw);
     let fade_out_raw = supported_sampler_fade_raw(fade_out_raw);
-    if fade_in_raw.is_none() && fade_out_raw.is_none() {
+    if !fx.any() && fade_in_raw.is_none() && fade_out_raw.is_none() {
         return Arc::clone(source);
     }
 
     let mut processed = (**source).clone();
+    apply_sampler_sample_fx(&mut processed, fx);
     let source_frame_count = processed.frame_count();
     for channel in &mut processed.channels {
         for (frame, sample) in channel.iter_mut().enumerate() {
@@ -17043,6 +17126,19 @@ struct ProcessedAudioCacheKey {
     target_duration_frames: u64,
     pitch_raw: i32,
     mode_raw: i32,
+    sample_fx: SamplerPrecomputedFx,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+struct SamplerPrecomputedFx {
+    normalize: bool,
+    reverse_polarity: bool,
+}
+
+impl SamplerPrecomputedFx {
+    const fn any(self) -> bool {
+        self.normalize || self.reverse_polarity
+    }
 }
 
 #[derive(Debug)]
@@ -22682,15 +22778,60 @@ mod tests {
             sample_rate: 5,
             channels: vec![vec![1.0; 5], vec![-1.0; 5]],
         });
-        let faded = sampler_precompute_fades(&source, Some(1024), None);
+        let faded = sampler_precompute_sample_fx(
+            &source,
+            SamplerPrecomputedFx::default(),
+            Some(1024),
+            None,
+        );
 
         assert_eq!(faded.channels[0], [0.0, 0.25, 0.5, 0.75, 1.0]);
         assert_eq!(faded.channels[1], [0.0, -0.25, -0.5, -0.75, -1.0]);
         assert_eq!(source.channels[0], [1.0; 5]);
         assert!(Arc::ptr_eq(
             &source,
-            &sampler_precompute_fades(&source, Some(0), Some(1025))
+            &sampler_precompute_sample_fx(
+                &source,
+                SamplerPrecomputedFx::default(),
+                Some(0),
+                Some(1025),
+            )
         ));
+    }
+
+    #[test]
+    fn sampler_normalization_and_reverse_polarity_process_the_whole_sample() {
+        let source = Arc::new(DecodedAudio {
+            sample_rate: 4,
+            channels: vec![vec![0.25, -0.5], vec![-0.125, 0.25]],
+        });
+        let processed = sampler_precompute_sample_fx(
+            &source,
+            SamplerPrecomputedFx {
+                normalize: true,
+                reverse_polarity: true,
+            },
+            None,
+            None,
+        );
+
+        assert_eq!(processed.channels[0], [-0.5, 1.0]);
+        assert_eq!(processed.channels[1], [0.25, -0.5]);
+        assert_eq!(source.channels[0], [0.25, -0.5]);
+        assert_eq!(source.channels[1], [-0.125, 0.25]);
+
+        let mut silence = DecodedAudio {
+            sample_rate: 4,
+            channels: vec![vec![0.0; 3], vec![0.0; 3]],
+        };
+        apply_sampler_sample_fx(
+            &mut silence,
+            SamplerPrecomputedFx {
+                normalize: true,
+                reverse_polarity: false,
+            },
+        );
+        assert_eq!(silence.channels, vec![vec![0.0; 3], vec![0.0; 3]]);
     }
 
     #[test]

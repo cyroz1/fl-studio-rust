@@ -18,15 +18,16 @@ use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, ArpeggioRangePattern, ArpeggioScoreOptions,
     ArpeggioScorePatternMode, ArpeggioScoreTimeMultiplier, ArpeggioSyncMode, ArticulateOptions,
     AutomationInterpolationMode, AutomationPointEdit, AutomationScaleLevelsOptions,
-    ChannelLevelAdjustmentsEdit, ChannelSortOrder, ChannelStretchSettingsEdit, ClawMachineOptions,
-    FlamOptions, FlpDocument, FscControllerStreamImportOptions, FscScore, FstPreset,
-    HumanizerOptions, LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerParameterKind,
-    PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation, PlaylistClipEdit,
-    PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit,
-    ProjectSettingsEdit, QuantizeNoteLevels, QuantizeNoteMode, QuantizeNoteOptions,
-    RandomNoteChordMap, RandomNoteGeneratorOptions, RandomizerOptions, RiffMachineOptions,
-    RiffMachineQuantizeMode, SamplerEnvelopeLfoEdit, SamplerEnvelopeLfoTarget,
-    SamplerVolumeEnvelopeEdit, ScaleLevelsOptions, StrumOptions, TimeMarkerEdit,
+    ChannelLevelAdjustmentsEdit, ChannelSampleEffectsEdit, ChannelSortOrder,
+    ChannelStretchSettingsEdit, ClawMachineOptions, FlamOptions, FlpDocument,
+    FscControllerStreamImportOptions, FscScore, FstPreset, HumanizerOptions, LimitNoteOptions,
+    LimitSnapDirection, MixerInsertEdit, MixerParameterKind, PatternControllerEdit, PatternNote,
+    PatternNoteEdit, PatternNoteRotation, PlaylistClipEdit, PlaylistTrackEdit, PlaylistTrackMotion,
+    PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit,
+    QuantizeNoteLevels, QuantizeNoteMode, QuantizeNoteOptions, RandomNoteChordMap,
+    RandomNoteGeneratorOptions, RandomizerOptions, RiffMachineOptions, RiffMachineQuantizeMode,
+    SamplerEnvelopeLfoEdit, SamplerEnvelopeLfoTarget, SamplerVolumeEnvelopeEdit,
+    ScaleLevelsOptions, StrumOptions, TimeMarkerEdit,
 };
 
 struct MidiControlChangeImport<'a> {
@@ -832,6 +833,22 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 Path::new(output),
                 parse_u16(channel_id, "channel id")?,
                 parse_bool(reversed, "sample Reverse setting")?,
+            )
+        }
+        [command, input, output, channel_id, normalize, reverse_polarity]
+            if command == "edit-channel-sample-effects" =>
+        {
+            edit_channel_sample_effects(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(channel_id, "sample-bearing channel id")?,
+                ChannelSampleEffectsEdit {
+                    normalize: parse_optional_bool(normalize, "sample Normalize setting")?,
+                    reverse_polarity: parse_optional_bool(
+                        reverse_polarity,
+                        "sample Reverse Polarity setting",
+                    )?,
+                },
             )
         }
         [command, input, output, event_index, record_index, value]
@@ -4347,6 +4364,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild set-channel-enabled <input.flp> <output.flp> <channel-id> <0|1>\n",
             "  flp-rebuild set-channel-sample-path <input.flp> <output.flp> <channel-id> <sample-path>\n",
             "  flp-rebuild set-channel-sample-reversed <input.flp> <output.flp> <channel-id> <0|1>\n",
+            "  flp-rebuild edit-channel-sample-effects <input.flp> <output.flp> <channel-id> <normalize:0|1|-> <reverse-polarity:0|1|->\n",
             "  flp-rebuild set-channel-zipped <input.flp> <output.flp> <channel-id> <0|1>\n",
             "  flp-rebuild set-channel-main-pitch <input.flp> <output.flp> <channel-id> <0|1>\n",
             "  flp-rebuild set-channel-key-region <input.flp> <output.flp> <channel-id> <low-key:0..127> <high-key:0..127>\n",
@@ -6586,7 +6604,7 @@ fn list_channels(path: &Path) -> Result<(), String> {
     println!("channels: {}", channels.len());
     for channel in channels {
         println!(
-            "id={} kind={} type={:?} enabled={} zipped={} main_pitch={} add_to_key={} fine_tune_raw={:?} key_region={:?} stretch_settings={:?} sampler_fade_out_raw={:?} sampler_fade_in_raw={:?} sampler_portamento={:?} sampler_polyphony_slide_raw={:?} sampler_volume_envelope={:?} sampler_envelopes={:?} color={:?} volume={:?} pan={:?} level_adjusts_raw={:?} swing_mix_raw={:?} layer_children={:?} layer_flags={:?} plugin={} name={} sample_path={:?} events={:?}",
+            "id={} kind={} type={:?} enabled={} zipped={} main_pitch={} add_to_key={} fine_tune_raw={:?} key_region={:?} stretch_settings={:?} sampler_fade_out_raw={:?} sampler_fade_in_raw={:?} sample_normalize={} sample_reverse_polarity={} sampler_portamento={:?} sampler_polyphony_slide_raw={:?} sampler_volume_envelope={:?} sampler_envelopes={:?} color={:?} volume={:?} pan={:?} level_adjusts_raw={:?} swing_mix_raw={:?} layer_children={:?} layer_flags={:?} plugin={} name={} sample_path={:?} events={:?}",
             channel.id(),
             channel
                 .kind()
@@ -6603,6 +6621,8 @@ fn list_channels(path: &Path) -> Result<(), String> {
             channel.stretch_settings(),
             channel.sampler_fade_out_raw(),
             channel.sampler_fade_in_raw(),
+            channel.sample_normalize_enabled(),
+            channel.sample_reverse_polarity_enabled(),
             channel.sampler_portamento_enabled(),
             channel.sampler_polyphony_slide_raw(),
             channel.sampler_volume_envelope(),
@@ -7995,6 +8015,28 @@ fn set_channel_sample_reversed(
     println!(
         "{} sample source on channel {channel_id} in {}",
         if reversed { "reversed" } else { "restored" },
+        output.display()
+    );
+    Ok(())
+}
+
+fn edit_channel_sample_effects(
+    input: &Path,
+    output: &Path,
+    channel_id: u16,
+    edit: ChannelSampleEffectsEdit,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .edit_channel_sample_effects(channel_id, edit)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "edited sample effect flags on channel {channel_id} in {}",
         output.display()
     );
     Ok(())
