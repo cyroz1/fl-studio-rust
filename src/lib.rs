@@ -989,6 +989,16 @@ impl ChannelPluginState {
         self.data_payload.get(range.clone())
     }
 
+    /// Per-output-bus Mixer route offsets from a recognized marker-12 VST3 state envelope.
+    /// The offsets are relative to the channel's saved Mixer track assignment.
+    pub fn vst3_output_mixer_offsets(&self) -> Option<Vec<i32>> {
+        let metadata = self.vst_metadata.as_ref()?;
+        if metadata.format_marker() != 12 || metadata.fourcc().is_some() {
+            return None;
+        }
+        parse_vst3_output_mixer_offset_records(&self.data_payload).map(|(_, offsets)| offsets)
+    }
+
     pub fn data_event_index(&self) -> usize {
         self.data_event_index
     }
@@ -6905,6 +6915,100 @@ impl FlpDocument {
             nested_state,
         )?;
         candidate.events[*data_event_index].replace_data_payload(replacement_payload)?;
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    /// Routes one saved VST3 instrument output bus to a Mixer track while preserving
+    /// the wrapper envelope and all other output-bus record bytes.
+    ///
+    /// Mixer track `-1` means Current, `0` means Master, and positive values select inserts.
+    /// The route is stored as an offset from the channel's `0x16` Mixer assignment, matching
+    /// the candidate mapping used by project rendering. Only an existing marker-12 output-route
+    /// table is edited; no route records are synthesized.
+    pub fn set_vst3_channel_output_mixer_track(
+        &mut self,
+        channel_id: u16,
+        output_bus_index: usize,
+        mixer_track: i8,
+    ) -> Result<(), FlpError> {
+        if mixer_track < -1 {
+            return Err(FlpError::UnsupportedEdit(
+                "VST3 output Mixer tracks must be Current (-1), Master (0), or insert 1 through 127",
+            ));
+        }
+        self.require_unique_channel(channel_id)?;
+        let channel = self
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id() == channel_id)
+            .expect("the unique channel was checked above");
+        if channel.kind() != Some(2) {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel is not a Native VST3 instrument",
+            ));
+        }
+        let data_events = channel
+            .event_range()
+            .filter(|index| self.events[*index].opcode == 0xD5)
+            .collect::<Vec<_>>();
+        let [data_event_index] = data_events.as_slice() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel must contain exactly one VST3 plug-in data event",
+            ));
+        };
+        let payload = &self.events[*data_event_index].payload;
+        let Some(metadata) = parse_vst_plugin_state_metadata(payload) else {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel has an unsupported VST plug-in state envelope",
+            ));
+        };
+        if metadata.format_marker() != 12 || metadata.fourcc().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "output routing edits require a marker-12 VST3 envelope",
+            ));
+        }
+        let Some((output_data_range, offsets)) = parse_vst3_output_mixer_offset_records(payload)
+        else {
+            return Err(FlpError::UnsupportedEdit(
+                "the VST3 state has no unambiguous output-bus Mixer route table",
+            ));
+        };
+        let Some(current_offset) = offsets.get(output_bus_index).copied() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected VST3 output bus does not exist in the saved route table",
+            ));
+        };
+        let base_track = i32::from(channel.mixer_track().unwrap_or(0));
+        let offset = i32::from(mixer_track) - base_track;
+        if !(-1..=127).contains(&(base_track + offset)) {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected VST3 output Mixer track is outside the supported route range",
+            ));
+        }
+        if current_offset == offset {
+            return Ok(());
+        }
+
+        let record_offset = output_bus_index
+            .checked_mul(12)
+            .and_then(|offset| offset.checked_add(4))
+            .and_then(|offset| output_data_range.start.checked_add(offset))
+            .ok_or(FlpError::LengthOverflow)?;
+        let record_end = record_offset
+            .checked_add(4)
+            .ok_or(FlpError::LengthOverflow)?;
+        if record_end > output_data_range.end {
+            return Err(FlpError::UnsupportedEdit(
+                "the VST3 output-bus route table is truncated",
+            ));
+        }
+
+        let mut candidate = self.clone();
+        let mut replacement = payload.clone();
+        replacement[record_offset..record_end].copy_from_slice(&offset.to_le_bytes());
+        candidate.events[*data_event_index].replace_data_payload(replacement)?;
         candidate.refresh_event_offsets()?;
         *self = candidate;
         Ok(())
@@ -25825,6 +25929,56 @@ fn parse_vst_plugin_state_metadata(payload: &[u8]) -> Option<VstPluginStateMetad
     (field_count > 0).then_some(metadata)
 }
 
+pub(crate) fn parse_vst3_output_mixer_offset_records(
+    payload: &[u8],
+) -> Option<(std::ops::Range<usize>, Vec<i32>)> {
+    if u32::from_le_bytes(payload.get(..4)?.try_into().ok()?) != 12 {
+        return None;
+    }
+
+    let mut cursor = 4usize;
+    let mut io_data = None;
+    let mut output_data_range = None;
+    while cursor < payload.len() {
+        let id_end = cursor.checked_add(4)?;
+        let data_start = cursor.checked_add(12)?;
+        let id = u32::from_le_bytes(payload.get(cursor..id_end)?.try_into().ok()?);
+        let length = usize::try_from(u64::from_le_bytes(
+            payload.get(id_end..data_start)?.try_into().ok()?,
+        ))
+        .ok()?;
+        let data_end = data_start.checked_add(length)?;
+        let data = payload.get(data_start..data_end)?;
+        match id {
+            30 if io_data.is_none() => io_data = Some(data),
+            30 => return None,
+            32 if output_data_range.is_none() => output_data_range = Some(data_start..data_end),
+            32 => return None,
+            _ => {}
+        }
+        cursor = data_end;
+    }
+
+    let io_data = io_data?;
+    let output_data_range = output_data_range?;
+    let output_count =
+        usize::try_from(u32::from_le_bytes(io_data.get(4..8)?.try_into().ok()?)).ok()?;
+    let output_data = payload.get(output_data_range.clone())?;
+    if output_count > 64 || output_data.len() != output_count.checked_mul(12)? {
+        return None;
+    }
+
+    let (records, remainder) = output_data.as_chunks::<12>();
+    if !remainder.is_empty() {
+        return None;
+    }
+    let offsets = records
+        .iter()
+        .map(|record| Some(i32::from_le_bytes(record[4..8].try_into().ok()?)))
+        .collect::<Option<Vec<_>>>()?;
+    Some((output_data_range, offsets))
+}
+
 fn replace_vst_state_field(
     payload: &[u8],
     state_data_range: Option<&std::ops::Range<usize>>,
@@ -25923,7 +26077,8 @@ mod tests {
         SamplerEnvelopeLfoTarget, SamplerVolumeEnvelopeEdit, ScaleLevelsOptions, TimeMarkerEdit,
         apply_mixer_pan, apply_mixer_stereo_separation, midi::MidiChannelMapping,
         midi::MidiEventKind, midi::MidiFile, midi::MidiImportOptions, note_pitch_in_scale,
-        parse_vst_plugin_state_metadata, riff_machine_groove_note_timing,
+        parse_vst_plugin_state_metadata, parse_vst3_output_mixer_offset_records,
+        riff_machine_groove_note_timing,
     };
 
     fn articulate_options(
@@ -32049,6 +32204,30 @@ mod tests {
         flp_fixture(&event_stream, &[], &[0xD1, 0xD2])
     }
 
+    fn marker_12_vst3_output_routes_fixture() -> Vec<u8> {
+        let mut payload = 12u32.to_le_bytes().to_vec();
+        append_vst_field(&mut payload, 52, &[0x10; 16]);
+        let mut io_data = Vec::new();
+        io_data.extend_from_slice(&0u32.to_le_bytes());
+        io_data.extend_from_slice(&2u32.to_le_bytes());
+        append_vst_field(&mut payload, 30, &io_data);
+        let mut output_data = Vec::new();
+        for (record_prefix, offset, record_suffix) in [
+            (0xAABB_CCDD_u32, 1_i32, 0x1122_3344_u32),
+            (0x5566_7788, -2, 0x99AA_BBCC),
+        ] {
+            output_data.extend_from_slice(&record_prefix.to_le_bytes());
+            output_data.extend_from_slice(&offset.to_le_bytes());
+            output_data.extend_from_slice(&record_suffix.to_le_bytes());
+        }
+        append_vst_field(&mut payload, 32, &output_data);
+        append_vst_field(&mut payload, 53, &[1, 2, 3]);
+
+        let mut event_stream = vec![0x40, 7, 0, 0x15, 2, 0x16, 4];
+        append_data_event(&mut event_stream, 0xD5, &payload);
+        flp_fixture(&event_stream, &[], &[])
+    }
+
     #[test]
     fn channel_preset_matches_only_the_same_marker_12_vst3_class() {
         let project_bytes = marker_12_vst3_state_fixture();
@@ -32111,6 +32290,46 @@ mod tests {
                 .matching_vst3_channel_state(&target_state)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn edits_one_vst3_output_route_and_preserves_other_wrapper_bytes() {
+        let input = marker_12_vst3_output_routes_fixture();
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+        let state = document.channel_plugin_states().remove(0);
+        assert_eq!(state.vst3_output_mixer_offsets(), Some(vec![1, -2]));
+        let (output_data_range, _) = parse_vst3_output_mixer_offset_records(state.data_payload())
+            .expect("fixture should expose output routes");
+        let mut expected_payload = state.data_payload().to_vec();
+        expected_payload[output_data_range.start + 16..output_data_range.start + 20]
+            .copy_from_slice(&2_i32.to_le_bytes());
+
+        document
+            .set_vst3_channel_output_mixer_track(7, 1, 6)
+            .expect("bus one should route to Mixer track six");
+        let routed_state = document.channel_plugin_states().remove(0);
+        assert_eq!(routed_state.vst3_output_mixer_offsets(), Some(vec![1, 2]));
+        assert_eq!(routed_state.data_payload(), expected_payload);
+
+        let encoded = document
+            .encode_lossless()
+            .expect("edited FLP should encode");
+        let reparsed = FlpDocument::parse(&encoded).expect("edited FLP should parse");
+        assert_eq!(
+            reparsed.channel_plugin_states()[0].vst3_output_mixer_offsets(),
+            Some(vec![1, 2])
+        );
+    }
+
+    #[test]
+    fn vst3_output_route_edit_rejects_missing_bus_without_mutating_document() {
+        let input = marker_12_vst3_output_routes_fixture();
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+        assert!(matches!(
+            document.set_vst3_channel_output_mixer_track(7, 2, 4),
+            Err(FlpError::UnsupportedEdit(_))
+        ));
+        assert_eq!(document.encode_lossless().unwrap(), input);
     }
 
     #[test]

@@ -9153,47 +9153,7 @@ fn plugin_output_bus_channel_counts(plugin: &Plugin) -> Result<Vec<usize>, Strin
 /// signed Mixer offset in the middle word. Unknown record words and unsupported lengths
 /// are left uninterpreted so callers can retain the existing single-route behavior.
 fn flp_vst3_output_mixer_offsets(payload: &[u8]) -> Option<Vec<i32>> {
-    if u32::from_le_bytes(payload.get(..4)?.try_into().ok()?) != 12 {
-        return None;
-    }
-
-    let mut cursor = 4usize;
-    let mut io_data = None;
-    let mut output_data = None;
-    while cursor < payload.len() {
-        let id_end = cursor.checked_add(4)?;
-        let length_end = cursor.checked_add(12)?;
-        let id = u32::from_le_bytes(payload.get(cursor..id_end)?.try_into().ok()?);
-        let length = usize::try_from(u64::from_le_bytes(
-            payload.get(id_end..length_end)?.try_into().ok()?,
-        ))
-        .ok()?;
-        let end = length_end.checked_add(length)?;
-        let data = payload.get(length_end..end)?;
-        match id {
-            30 if io_data.is_none() => io_data = Some(data),
-            30 => return None,
-            32 if output_data.is_none() => output_data = Some(data),
-            32 => return None,
-            _ => {}
-        }
-        cursor = end;
-    }
-
-    let io_data = io_data?;
-    let output_data = output_data?;
-    let output_count =
-        usize::try_from(u32::from_le_bytes(io_data.get(4..8)?.try_into().ok()?)).ok()?;
-    if output_count > 64 || output_data.len() != output_count.checked_mul(12)? {
-        return None;
-    }
-
-    output_data
-        .as_chunks::<12>()
-        .0
-        .iter()
-        .map(|record| Some(i32::from_le_bytes(record[4..8].try_into().ok()?)))
-        .collect()
+    crate::parse_vst3_output_mixer_offset_records(payload).map(|(_, offsets)| offsets)
 }
 
 fn flp_vst3_output_mixer_offsets_by_channel(document: &FlpDocument) -> HashMap<u16, Vec<i32>> {

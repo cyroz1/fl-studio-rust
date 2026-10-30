@@ -972,6 +972,17 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_mixer_track(mixer_track)?,
             )
         }
+        [command, input, output, channel_id, output_bus_index, mixer_track]
+            if command == "set-vst3-output-route" =>
+        {
+            set_vst3_output_route(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(channel_id, "channel id")?,
+                parse_usize(output_bus_index, "zero-based VST3 output bus index")?,
+                parse_mixer_track(mixer_track)?,
+            )
+        }
         [command, input, output, channel_id, time_raw, pitch_raw, multiplier_raw, mode_raw]
             if command == "edit-channel-stretch-settings" =>
         {
@@ -4341,6 +4352,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild set-channel-key-region <input.flp> <output.flp> <channel-id> <low-key:0..127> <high-key:0..127>\n",
             "  flp-rebuild set-channel-add-to-key <input.flp> <output.flp> <channel-id> <0|1>\n",
             "  flp-rebuild set-channel-mixer-track <input.flp> <output.flp> <channel-id> <mixer-track:-1=Current|0=Master|1..127=insert>\n",
+            "  flp-rebuild set-vst3-output-route <input.flp> <output.flp> <channel-id> <output-bus-index:0-based> <mixer-track:-1=Current|0=Master|1..127=insert>\n",
             "  flp-rebuild edit-channel-stretch-settings <input.flp> <output.flp> <channel-id> <time-raw|-> <pitch-raw|-> <multiplier-raw|-> <mode:-1..9|->\n",
             "  flp-rebuild edit-channel-level-adjustments <input.flp> <output.flp> <channel-id> <event-index> <pan-raw|-> <volume-raw|-> <mod-x-raw|-> <mod-y-raw|->\n",
             "  flp-rebuild set-channel-swing <input.flp> <output.flp> <channel-id> <percent-0..100>\n",
@@ -8189,6 +8201,29 @@ fn set_channel_mixer_track(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "routed channel {channel_id} to Mixer track {mixer_track} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn set_vst3_output_route(
+    input: &Path,
+    output: &Path,
+    channel_id: u16,
+    output_bus_index: usize,
+    mixer_track: i8,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .set_vst3_channel_output_mixer_track(channel_id, output_bus_index, mixer_track)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "routed channel {channel_id} VST3 output bus {output_bus_index} to Mixer track {mixer_track} in {}",
         output.display()
     );
     Ok(())

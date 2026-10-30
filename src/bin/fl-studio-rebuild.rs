@@ -36958,6 +36958,14 @@ impl DawUi {
         }
         let channel_ids = channels.iter().map(ChannelSummary::id).collect::<Vec<_>>();
         let plugin_states = document.channel_plugin_states();
+        let vst3_output_routes_by_channel = plugin_states
+            .iter()
+            .filter_map(|state| {
+                state
+                    .vst3_output_mixer_offsets()
+                    .map(|offsets| (state.channel_id(), offsets))
+            })
+            .collect::<BTreeMap<_, _>>();
         let patterns = document.patterns().unwrap_or_default();
         let global_swing_raw = document.metadata().global_swing_mix();
         let global_swing_percent = (u32::from(global_swing_raw.min(128)) * 100 + 64) / 128;
@@ -37072,6 +37080,7 @@ impl DawUi {
         let mut layer_flag_edits = Vec::new();
         let mut layer_fade_edits = Vec::new();
         let mut channel_mixer_track_edits = Vec::<(Vec<u16>, i8)>::new();
+        let mut vst3_output_route_edits = Vec::<(u16, usize, i8)>::new();
         let mut channel_stretch_edits = Vec::new();
         let mut channel_key_region_edits = Vec::new();
         let mut step_toggles = Vec::<(u16, Vec<usize>, u32, StepToggleOperation)>::new();
@@ -37749,6 +37758,96 @@ impl DawUi {
                                         });
                                     }
                                 });
+                                if channel.kind() == Some(2)
+                                    && let Some(output_offsets) =
+                                        vst3_output_routes_by_channel.get(&channel.id())
+                                {
+                                    let base_track = channel.mixer_track().unwrap_or(0);
+                                    let channel_route_label = match base_track {
+                                        -1 => "Channel route (Current)".to_owned(),
+                                        0 => "Channel route (Master)".to_owned(),
+                                        track => format!("Channel route (Insert {track})"),
+                                    };
+                                    ui.menu_button("VST3 output buses", |ui| {
+                                        for (bus_index, offset) in
+                                            output_offsets.iter().copied().enumerate()
+                                        {
+                                            let current_track =
+                                                i32::from(base_track).saturating_add(offset);
+                                            let current_label = match current_track {
+                                                -1 => "Current".to_owned(),
+                                                0 => "Master".to_owned(),
+                                                1..=127 => format!("Insert {current_track}"),
+                                                _ => format!("Unsupported route {current_track}"),
+                                            };
+                                            ui.menu_button(
+                                                format!("Bus {} · {current_label}", bus_index + 1),
+                                                |ui| {
+                                                    if ui
+                                                        .selectable_label(
+                                                            current_track
+                                                                == i32::from(base_track),
+                                                            &channel_route_label,
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        vst3_output_route_edits.push((
+                                                            channel.id(),
+                                                            bus_index,
+                                                            base_track,
+                                                        ));
+                                                        ui.close();
+                                                    }
+                                                    if base_track != 0
+                                                        && ui
+                                                            .selectable_label(
+                                                                current_track == 0,
+                                                                "Master (0)",
+                                                            )
+                                                            .clicked()
+                                                    {
+                                                        vst3_output_route_edits.push((
+                                                            channel.id(),
+                                                            bus_index,
+                                                            0,
+                                                        ));
+                                                        ui.close();
+                                                    }
+                                                    for start in (1i8..=127).step_by(16) {
+                                                        let end = start.saturating_add(15);
+                                                        ui.menu_button(
+                                                            format!("Inserts {start}–{end}"),
+                                                            |ui| {
+                                                                for track in start..=end {
+                                                                    if ui
+                                                                        .selectable_label(
+                                                                            current_track
+                                                                                == i32::from(
+                                                                                    track,
+                                                                                ),
+                                                                            format!(
+                                                                                "Insert {track}"
+                                                                            ),
+                                                                        )
+                                                                        .clicked()
+                                                                    {
+                                                                        vst3_output_route_edits
+                                                                            .push((
+                                                                                channel.id(),
+                                                                                bus_index,
+                                                                                track,
+                                                                            ));
+                                                                        ui.close();
+                                                                    }
+                                                                }
+                                                            },
+                                                        );
+                                                    }
+                                                },
+                                            );
+                                        }
+                                    });
+                                }
                                 if matches!(channel.kind(), Some(0 | 2 | 4)) {
                                     let mut main_pitch_enabled =
                                         channel.keyboard_main_pitch_enabled();
@@ -38653,6 +38752,35 @@ impl DawUi {
                 }
                 Some(Err(error)) => {
                     self.status = format!("Could not update Mixer track assignments: {error}");
+                }
+                None => {}
+            }
+        }
+        for (channel_id, output_bus_index, mixer_track) in vst3_output_route_edits {
+            let result = self.document.as_mut().map(|document| {
+                document.set_vst3_channel_output_mixer_track(
+                    channel_id,
+                    output_bus_index,
+                    mixer_track,
+                )
+            });
+            match result {
+                Some(Ok(())) => {
+                    self.stop_project_playback();
+                    self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+                    let track_name = match mixer_track {
+                        -1 => "Current".to_owned(),
+                        0 => "Master".to_owned(),
+                        track => format!("Insert {track}"),
+                    };
+                    self.status = format!(
+                        "Routed channel {channel_id} VST3 output bus {} to {track_name}",
+                        output_bus_index + 1
+                    );
+                }
+                Some(Err(error)) => {
+                    self.status = format!("Could not update VST3 output route: {error}");
                 }
                 None => {}
             }
