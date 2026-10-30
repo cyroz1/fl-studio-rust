@@ -659,6 +659,7 @@ fn queue_script_transport_actions(
             ScriptTransportAction::RecordToggle => MidiTransportCommand::RecordToggle,
             ScriptTransportAction::TogglePlayback => MidiTransportCommand::TogglePlayback,
             ScriptTransportAction::ToggleLoopMode => MidiTransportCommand::ToggleLoopMode,
+            ScriptTransportAction::ToggleMetronome => MidiTransportCommand::ToggleMetronome,
             ScriptTransportAction::SetSongPosition(position) => {
                 MidiTransportCommand::SetSongPosition(position)
             }
@@ -868,6 +869,7 @@ pub enum MidiTransportCommand {
     RecordToggle,
     TogglePlayback,
     ToggleLoopMode,
+    ToggleMetronome,
     SetSongPosition(u32),
     SetSongPositionTicks(u64),
     SetSongPositionTimeUs(u64),
@@ -1669,6 +1671,7 @@ pub fn describe_event(event: MidiInputEvent) -> String {
             MidiTransportCommand::RecordToggle => "MIDI script Record".to_owned(),
             MidiTransportCommand::TogglePlayback => "MIDI script Play/Pause".to_owned(),
             MidiTransportCommand::ToggleLoopMode => "MIDI script Loop Mode".to_owned(),
+            MidiTransportCommand::ToggleMetronome => "MIDI script Metronome".to_owned(),
             MidiTransportCommand::SetSongPosition(_) => "MIDI script Song Position".to_owned(),
             MidiTransportCommand::SetSongPositionTicks(_) => "MIDI script Song Position".to_owned(),
             MidiTransportCommand::SetSongPositionTimeUs(_) => {

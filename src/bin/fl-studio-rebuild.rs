@@ -61339,6 +61339,9 @@ impl DawUi {
             MidiTransportCommand::ToggleLoopMode => {
                 self.set_pattern_playback_mode(!self.pattern_playback_mode);
             }
+            MidiTransportCommand::ToggleMetronome => {
+                self.toggle_metronome();
+            }
             MidiTransportCommand::SetSongPosition(position) => {
                 self.set_midi_script_song_position(position);
             }
