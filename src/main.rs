@@ -79,6 +79,19 @@ fn run(args: Vec<String>) -> Result<(), String> {
         [command, path] if command == "automation-targets" => {
             list_automation_target_links(Path::new(path))
         }
+        [command, input, output, event_index, record_index, source_id_raw, parameter_raw, destination_raw]
+            if command == "set-e3-record-raw-fields" =>
+        {
+            set_e3_record_raw_fields(
+                Path::new(input),
+                Path::new(output),
+                parse_usize(event_index, "0xE3 event index")?,
+                parse_usize(record_index, "0xE3 record index")?,
+                parse_u16(source_id_raw, "0xE3 source ID raw value")?,
+                parse_u16(parameter_raw, "0xE3 parameter raw value")?,
+                parse_i16(destination_raw, "0xE3 destination raw value")?,
+            )
+        }
         [command, path] if command == "time-markers" => list_time_markers(Path::new(path)),
         [command, path] if command == "sample-paths" => list_sample_paths(Path::new(path)),
         [command, path] if command == "audio-info" => inspect_audio_file(Path::new(path)),
@@ -4420,6 +4433,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild set-mixer-insert-flag <input.flp> <output.flp> <insert-ordinal> <enabled|soloed|polarity-reversed|swap-left-right|effects-enabled|mute-locked> <0|1>\n",
             "  flp-rebuild set-mixer-routing-flag <input.flp> <output.flp> <event-index> <flag-byte-index> <0|1>\n",
             "  flp-rebuild automation <file.flp>\n",
+            "  flp-rebuild set-e3-record-raw-fields <input.flp> <output.flp> <event-index> <record-index> <source-id-raw> <parameter-raw> <destination-raw-signed>\n",
             "  flp-rebuild time-markers <file.flp>\n",
             "  flp-rebuild sample-paths <file.flp>\n",
             "  flp-rebuild audio-info <audio-file>\n",
@@ -7562,8 +7576,9 @@ fn list_automation_target_links(path: &Path) -> Result<(), String> {
             .candidate_vst_parameter()
             .map_or_else(|| "not-interpreted".to_owned(), |value| value.to_string());
         println!(
-            "event={} source_channel={} source_name={:?} source_class={} source_type={:?} source_automation_range_raw={:?} candidate_parameter={} parameter_raw=0x{:04X} candidate_vst_parameter={} destination_raw={} candidate_target={} candidate_target_name={:?} candidate_target_type={:?} candidate_target_insert_name={:?} candidate_target_effect_name={:?} prefix={:02X?} suffix={:02X?}",
+            "event={} record={} source_channel={} source_name={:?} source_class={} source_type={:?} source_automation_range_raw={:?} candidate_parameter={} parameter_raw=0x{:04X} candidate_vst_parameter={} destination_raw={} candidate_target={} candidate_target_name={:?} candidate_target_type={:?} candidate_target_insert_name={:?} candidate_target_effect_name={:?} prefix={:02X?} suffix={:02X?}",
             link.event_index(),
+            link.record_index(),
             source_id,
             source_name,
             source_class,
@@ -8912,6 +8927,37 @@ fn set_automation_lfo_amount(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "set automation channel {channel_id} LFO amount to {amount} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn set_e3_record_raw_fields(
+    input: &Path,
+    output: &Path,
+    event_index: usize,
+    record_index: usize,
+    source_id_raw: u16,
+    parameter_raw: u16,
+    destination_raw: i16,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .set_e3_record_raw_fields(
+            event_index,
+            record_index,
+            source_id_raw,
+            parameter_raw,
+            destination_raw,
+        )
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "updated raw 0xE3 record fields at event {event_index}, record {record_index} in {}",
         output.display()
     );
     Ok(())

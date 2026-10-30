@@ -2351,6 +2351,7 @@ impl AutomationChannel {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AutomationTargetLink {
     event_index: usize,
+    record_index: usize,
     source_channel_id: u16,
     source_channel_type: Option<ChannelType>,
     opaque_prefix: [u8; 8],
@@ -2362,6 +2363,11 @@ pub struct AutomationTargetLink {
 impl AutomationTargetLink {
     pub fn event_index(&self) -> usize {
         self.event_index
+    }
+
+    /// Record index within the length-prefixed `0xE3` event.
+    pub fn record_index(&self) -> usize {
+        self.record_index
     }
 
     /// Candidate 16-bit source Automation channel id from bytes 2–3 of the record.
@@ -7279,7 +7285,7 @@ impl FlpDocument {
                 });
             }
             let (records, _) = event.payload.as_chunks::<20>();
-            for record in records {
+            for (record_index, record) in records.iter().enumerate() {
                 let source_channel_id = u16::from_le_bytes([record[2], record[3]]);
                 let mut source_matches = channels
                     .iter()
@@ -7290,6 +7296,7 @@ impl FlpDocument {
                 };
                 links.push(AutomationTargetLink {
                     event_index,
+                    record_index,
                     source_channel_id,
                     source_channel_type,
                     opaque_prefix: record[..8]
@@ -7304,6 +7311,60 @@ impl FlpDocument {
             }
         }
         Ok(links)
+    }
+
+    /// Edits the three observed 16-bit fields in one `0xE3` record.
+    ///
+    /// The other 14 bytes in the record, including fields whose meaning is not
+    /// established, are preserved byte-for-byte.
+    pub fn set_e3_record_raw_fields(
+        &mut self,
+        event_index: usize,
+        record_index: usize,
+        source_id_raw: u16,
+        parameter_raw: u16,
+        destination_raw: i16,
+    ) -> Result<(), FlpError> {
+        let event = self
+            .events
+            .get(event_index)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested 0xE3 event does not exist",
+            ))?;
+        if event.opcode != 0xE3 {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested event is not a 0xE3 record event",
+            ));
+        }
+        if !matches!(event.encoding, PayloadEncoding::Data { .. }) {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested 0xE3 event is not a length-prefixed data event",
+            ));
+        }
+        if event.payload.len() % 20 != 0 {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested 0xE3 payload is not a multiple of 20 bytes",
+            ));
+        }
+        let record_start = record_index
+            .checked_mul(20)
+            .ok_or(FlpError::LengthOverflow)?;
+        if record_start >= event.payload.len() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested 0xE3 record index does not exist",
+            ));
+        }
+
+        let mut candidate = self.clone();
+        let mut payload = candidate.events[event_index].payload.clone();
+        payload[record_start + 2..record_start + 4].copy_from_slice(&source_id_raw.to_le_bytes());
+        payload[record_start + 8..record_start + 10].copy_from_slice(&parameter_raw.to_le_bytes());
+        payload[record_start + 10..record_start + 12]
+            .copy_from_slice(&destination_raw.to_le_bytes());
+        candidate.events[event_index].replace_data_payload(payload)?;
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
     }
 
     /// Sets the raw bipolar LFO amount stored at offset 4 of a type-5 channel's `0xEA` event.
