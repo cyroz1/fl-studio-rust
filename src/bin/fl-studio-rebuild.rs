@@ -4305,6 +4305,13 @@ enum AutomationEditAction {
         minimum_raw: i32,
         maximum_raw: i32,
     },
+    SetE3RecordRawFields {
+        event_index: usize,
+        record_index: usize,
+        source_id_raw: u16,
+        parameter_raw: u16,
+        destination_raw: i16,
+    },
     Insert {
         slot: usize,
         position_beats: f64,
@@ -40915,6 +40922,61 @@ impl DawUi {
         } else {
             ui.weak("No saved 0xDB Automation Min/Max event to edit");
         }
+        match document.automation_target_links() {
+            Ok(links) => {
+                let mut matching_links = 0usize;
+                ui.group(|ui| {
+                    ui.label("Native 0xE3 target records (raw)");
+                    for link in links.iter().filter(|link| {
+                        link.source_channel_id() == channel_id
+                            && link.source_channel_type() == Some(ChannelType::Automation)
+                    }) {
+                        matching_links += 1;
+                        let mut source_id_raw = link.source_channel_id();
+                        let mut parameter_raw = link.parameter_raw();
+                        let mut destination_raw = link.destination_raw();
+                        let mut apply = false;
+                        ui.horizontal(|ui| {
+                            ui.label(format!(
+                                "Event {} record {}",
+                                link.event_index(),
+                                link.record_index()
+                            ));
+                            ui.label("Source");
+                            ui.add(egui::DragValue::new(&mut source_id_raw).speed(1));
+                            ui.label("Parameter");
+                            ui.add(egui::DragValue::new(&mut parameter_raw).speed(1));
+                            ui.label("Destination");
+                            ui.add(egui::DragValue::new(&mut destination_raw).speed(1));
+                            let changed = source_id_raw != link.source_channel_id()
+                                || parameter_raw != link.parameter_raw()
+                                || destination_raw != link.destination_raw();
+                            apply = ui
+                                .add_enabled(changed, egui::Button::new("Apply raw fields"))
+                                .clicked();
+                        });
+                        if apply {
+                            action = Some(AutomationEditAction::SetE3RecordRawFields {
+                                event_index: link.event_index(),
+                                record_index: link.record_index(),
+                                source_id_raw,
+                                parameter_raw,
+                                destination_raw,
+                            });
+                        }
+                    }
+                    if matching_links == 0 {
+                        ui.weak("No uniquely resolved native target records for this channel");
+                    }
+                });
+            }
+            Err(error) => {
+                ui.colored_label(
+                    ORANGE,
+                    format!("Could not decode native target records: {error}"),
+                );
+            }
+        }
         if let Some(mut amount) = channel.lfo_amount() {
             if (-128..=128).contains(&amount) {
                 if ui
@@ -41266,6 +41328,7 @@ impl DawUi {
             let mut normalized_points = false;
             let mut scaled_levels = false;
             let mut automation_range_updated = false;
+            let mut native_target_record_updated = false;
             let result = match action {
                 AutomationEditAction::InitializeFromTemplate {
                     template_channel_id,
@@ -41305,6 +41368,22 @@ impl DawUi {
                 } => {
                     automation_range_updated = true;
                     document.set_automation_range_raw(channel_id, minimum_raw, maximum_raw)
+                }
+                AutomationEditAction::SetE3RecordRawFields {
+                    event_index,
+                    record_index,
+                    source_id_raw,
+                    parameter_raw,
+                    destination_raw,
+                } => {
+                    native_target_record_updated = true;
+                    document.set_e3_record_raw_fields(
+                        event_index,
+                        record_index,
+                        source_id_raw,
+                        parameter_raw,
+                        destination_raw,
+                    )
                 }
                 AutomationEditAction::Insert {
                     slot,
@@ -41431,6 +41510,8 @@ impl DawUi {
                                 .to_owned()
                         } else if automation_range_updated {
                             format!("Updated Automation channel {channel_id} raw Min/Max range")
+                        } else if native_target_record_updated {
+                            "Updated raw native Automation target fields".to_owned()
                         } else {
                             "Automation curve updated".to_owned()
                         };
