@@ -42,6 +42,7 @@ struct MidiControlChangeImport<'a> {
     pattern_id: u16,
     target_stream: (u8, u8),
     controller_number: u8,
+    high_resolution: bool,
     midi_channel: Option<u8>,
     new_stream: bool,
 }
@@ -98,6 +99,17 @@ struct MidiAutomationSourceImport<'a> {
     automation_channel_id: u16,
     source: MidiAutomationSource,
     midi_channel: Option<u8>,
+}
+
+struct MidiControlChangeStreamImport<'a> {
+    input: &'a Path,
+    midi_path: &'a Path,
+    output: &'a Path,
+    track_index: usize,
+    pattern_id: u16,
+    mappings: &'a str,
+    midi_channel: Option<u8>,
+    create_new_streams: bool,
 }
 
 fn main() -> ExitCode {
@@ -3874,7 +3886,10 @@ fn run(args: Vec<String>) -> Result<(), String> {
             )
         }
         [command, input, midi_path, output, track, pattern_id, stream_channel, stream_flags, controller_number, midi_channel]
-            if command == "import-midi-cc" || command == "import-midi-cc-new-stream" =>
+            if command == "import-midi-cc"
+                || command == "import-midi-cc-new-stream"
+                || command == "import-midi-cc14"
+                || command == "import-midi-cc14-new-stream" =>
         {
             import_midi_control_changes(
                 MidiControlChangeImport {
@@ -3888,8 +3903,9 @@ fn run(args: Vec<String>) -> Result<(), String> {
                     parse_raw_byte(stream_flags, "raw controller flags")?,
                     ),
                     controller_number: parse_u8(controller_number, "MIDI Control Change number")?,
+                    high_resolution: command.contains("cc14"),
                     midi_channel: parse_midi_channel_filter(midi_channel)?,
-                    new_stream: command == "import-midi-cc-new-stream",
+                    new_stream: command.ends_with("new-stream"),
                 },
             )
         }
@@ -3898,14 +3914,16 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 || command == "import-midi-cc-into-streams" =>
         {
             import_midi_control_change_streams(
-                Path::new(input),
-                Path::new(midi_path),
-                Path::new(output),
-                parse_usize(track, "MIDI track index")?,
-                parse_u16(pattern_id, "pattern id")?,
-                mappings,
-                parse_midi_channel_filter(midi_channel)?,
-                command == "import-midi-cc-streams",
+                MidiControlChangeStreamImport {
+                    input: Path::new(input),
+                    midi_path: Path::new(midi_path),
+                    output: Path::new(output),
+                    track_index: parse_usize(track, "MIDI track index")?,
+                    pattern_id: parse_u16(pattern_id, "pattern id")?,
+                    mappings,
+                    midi_channel: parse_midi_channel_filter(midi_channel)?,
+                    create_new_streams: command == "import-midi-cc-streams",
+                },
             )
         }
         [command, input, midi_path, output, track, pattern_id, stream_channel, stream_flags, midi_channel]
@@ -4773,6 +4791,9 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild export-score-automation <input.flp> <output.fsc> <pattern-id> <stream-channel-0..255> <stream-flags-0..255>\n",
             "  flp-rebuild import-midi-cc <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <raw-channel> <raw-flags> <cc-0..127> <midi-channel-1..16|all>\n",
             "  flp-rebuild import-midi-cc-new-stream <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <raw-channel> <raw-flags> <cc-0..127> <midi-channel-1..16|all>\n",
+            "  flp-rebuild import-midi-cc14 <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <raw-channel> <raw-flags> <base-cc-0..31> <midi-channel-1..16|all>\n",
+            "  flp-rebuild import-midi-cc14-new-stream <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <raw-channel> <raw-flags> <base-cc-0..31> <midi-channel-1..16|all>\n",
+            "    CC14 combines base CC N with CC N+32, retaining each byte per MIDI channel; values map from 0–16383 to 0.0–1.0.\n",
             "  flp-rebuild import-midi-cc-streams <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <cc:raw-channel:raw-flags,...> <midi-channel-1..16|all>\n",
             "    Each mapping creates one raw Pattern stream; raw bytes are explicit, and CCs with no messages are skipped.\n",
             "  flp-rebuild import-midi-cc-into-streams <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <cc:raw-channel:raw-flags,...> <midi-channel-1..16|all>\n",
@@ -11183,6 +11204,7 @@ fn import_midi_control_changes(request: MidiControlChangeImport<'_>) -> Result<(
         pattern_id,
         target_stream,
         controller_number,
+        high_resolution,
         midi_channel,
         new_stream,
     } = request;
@@ -11191,7 +11213,27 @@ fn import_midi_control_changes(request: MidiControlChangeImport<'_>) -> Result<(
         .map_err(|error| format!("could not read {}: {error}", midi_path.display()))?;
     let midi = MidiFile::parse(&midi_bytes)
         .map_err(|error| format!("could not parse {}: {error}", midi_path.display()))?;
-    let imported = if new_stream {
+    let imported = if high_resolution {
+        if new_stream {
+            document.import_midi_14bit_control_changes_to_new_stream(
+                &midi,
+                track_index,
+                pattern_id,
+                target_stream,
+                controller_number,
+                midi_channel,
+            )
+        } else {
+            document.import_midi_14bit_control_changes(
+                &midi,
+                track_index,
+                pattern_id,
+                target_stream,
+                controller_number,
+                midi_channel,
+            )
+        }
+    } else if new_stream {
         document.import_midi_control_changes_to_new_stream(
             &midi,
             track_index,
@@ -11225,8 +11267,16 @@ fn import_midi_control_changes(request: MidiControlChangeImport<'_>) -> Result<(
     } else {
         "raw stream"
     };
+    let controller_source = if high_resolution {
+        format!(
+            "14-bit CC {controller_number} + CC {}",
+            controller_number + 32
+        )
+    } else {
+        format!("CC {controller_number}")
+    };
     println!(
-        "imported {imported} MIDI CC {controller_number} events from track {track_index} ({source_channel}) into pattern {pattern_id}, {stream_kind} {} / 0x{:02X} in {}",
+        "imported {imported} MIDI {controller_source} events from track {track_index} ({source_channel}) into pattern {pattern_id}, {stream_kind} {} / 0x{:02X} in {}",
         target_stream.0,
         target_stream.1,
         output.display()
@@ -11493,15 +11543,18 @@ fn replace_automation_from_midi_source(
 }
 
 fn import_midi_control_change_streams(
-    input: &Path,
-    midi_path: &Path,
-    output: &Path,
-    track_index: usize,
-    pattern_id: u16,
-    mappings: &str,
-    midi_channel: Option<u8>,
-    create_new_streams: bool,
+    request: MidiControlChangeStreamImport<'_>,
 ) -> Result<(), String> {
+    let MidiControlChangeStreamImport {
+        input,
+        midi_path,
+        output,
+        track_index,
+        pattern_id,
+        mappings,
+        midi_channel,
+        create_new_streams,
+    } = request;
     let mappings = parse_midi_cc_stream_mappings(mappings)?;
     let (_, mut document) = load_document(input)?;
     let midi_bytes = fs::read(midi_path)

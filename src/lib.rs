@@ -20508,6 +20508,85 @@ impl FlpDocument {
         Ok(points)
     }
 
+    fn midi_control_change_14_points(
+        &self,
+        midi: &midi::MidiFile,
+        track_index: usize,
+        pattern_id: Option<u16>,
+        base_controller: u8,
+        midi_channel: Option<u8>,
+    ) -> Result<Vec<(u32, f32)>, FlpError> {
+        if base_controller > 31 {
+            return Err(FlpError::UnsupportedEdit(
+                "14-bit MIDI Control Change base number must be from 0 through 31",
+            ));
+        }
+        if midi_channel.is_some_and(|channel| channel > 15) {
+            return Err(FlpError::UnsupportedEdit(
+                "MIDI channel must be from 0 through 15",
+            ));
+        }
+        if let Some(pattern_id) = pattern_id
+            && !self
+                .patterns()?
+                .iter()
+                .any(|pattern| pattern.id == pattern_id)
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested Pattern does not exist",
+            ));
+        }
+        if self.header.ppq == 0 {
+            return Err(FlpError::UnsupportedEdit(
+                "MIDI import requires a non-zero project PPQ value",
+            ));
+        }
+        let project_tempo_milli_bpm = self.metadata.tempo_milli_bpm.unwrap_or(140_000);
+        if project_tempo_milli_bpm == 0 {
+            return Err(FlpError::UnsupportedEdit(
+                "MIDI import requires a positive project tempo",
+            ));
+        }
+        let track = midi
+            .tracks()
+            .get(track_index)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested MIDI track does not exist",
+            ))?;
+        let default_microseconds_per_quarter =
+            60_000_000_000.0 / f64::from(project_tempo_milli_bpm);
+        midi.elapsed_microseconds_at_tick(0, track_index, default_microseconds_per_quarter)
+            .map_err(|_| {
+                FlpError::UnsupportedEdit(
+                    "MIDI import requires a supported time division and valid tempo map",
+                )
+            })?;
+
+        let changes = track
+            .control_changes_14(base_controller)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|change| midi_channel.is_none_or(|channel| change.channel() == channel))
+            .collect::<Vec<_>>();
+        let mut points = Vec::with_capacity(changes.len());
+        for change in changes {
+            let elapsed_microseconds = midi
+                .elapsed_microseconds_at_tick(
+                    change.tick(),
+                    track_index,
+                    default_microseconds_per_quarter,
+                )
+                .map_err(|_| FlpError::UnsupportedEdit("could not convert MIDI event time"))?;
+            let position = scale_midi_microseconds_to_project_ticks(
+                elapsed_microseconds,
+                project_tempo_milli_bpm,
+                self.header.ppq,
+            )?;
+            points.push((position, f32::from(change.value()) / 16_383.0));
+        }
+        Ok(points)
+    }
+
     fn midi_pitch_bend_points(
         &self,
         midi: &midi::MidiFile,
@@ -20774,6 +20853,48 @@ impl FlpDocument {
         Ok(points.len())
     }
 
+    /// Imports one paired 14-bit MIDI Control Change source into an existing raw Pattern stream.
+    /// `base_controller` is 0–31 and its LSB is read from CC `base_controller + 32`; byte state
+    /// starts at zero per MIDI channel and updates on each message. Combined values map from
+    /// 0–16383 to 0.0–1.0, preserving source tempo timing.
+    pub fn import_midi_14bit_control_changes(
+        &mut self,
+        midi: &midi::MidiFile,
+        track_index: usize,
+        pattern_id: u16,
+        target_stream: (u8, u8),
+        base_controller: u8,
+        midi_channel: Option<u8>,
+    ) -> Result<usize, FlpError> {
+        let pattern = self
+            .patterns()?
+            .into_iter()
+            .find(|pattern| pattern.id == pattern_id)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested Pattern does not exist",
+            ))?;
+        if !pattern
+            .controllers
+            .iter()
+            .any(|point| (point.channel, point.flags) == target_stream)
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested raw Pattern controller stream does not exist",
+            ));
+        }
+        let points = self.midi_control_change_14_points(
+            midi,
+            track_index,
+            Some(pattern_id),
+            base_controller,
+            midi_channel,
+        )?;
+        if !points.is_empty() {
+            self.draw_pattern_controller_points(pattern_id, target_stream, &points)?;
+        }
+        Ok(points.len())
+    }
+
     fn validate_midi_cc_stream_mappings(mappings: &[(u8, u8, u8)]) -> Result<(), FlpError> {
         if mappings.is_empty() {
             return Err(FlpError::UnsupportedEdit(
@@ -20819,6 +20940,42 @@ impl FlpDocument {
             track_index,
             Some(pattern_id),
             controller_number,
+            midi_channel,
+        )?;
+        let Some((first_position, first_value)) = points.first().copied() else {
+            return Ok(0);
+        };
+
+        let mut candidate = self.clone();
+        candidate.create_pattern_controller_stream(
+            pattern_id,
+            target_stream.0,
+            target_stream.1,
+            first_position,
+            first_value,
+        )?;
+        candidate.draw_pattern_controller_points(pattern_id, target_stream, &points)?;
+        *self = candidate;
+        Ok(points.len())
+    }
+
+    /// Imports one paired 14-bit MIDI Control Change source into a new raw Pattern stream.
+    /// `base_controller` is 0–31 and its LSB is read from CC `base_controller + 32`; byte state
+    /// starts at zero per MIDI channel. The stream is created only when matching messages exist.
+    pub fn import_midi_14bit_control_changes_to_new_stream(
+        &mut self,
+        midi: &midi::MidiFile,
+        track_index: usize,
+        pattern_id: u16,
+        target_stream: (u8, u8),
+        base_controller: u8,
+        midi_channel: Option<u8>,
+    ) -> Result<usize, FlpError> {
+        let points = self.midi_control_change_14_points(
+            midi,
+            track_index,
+            Some(pattern_id),
+            base_controller,
             midi_channel,
         )?;
         let Some((first_position, first_value)) = points.first().copied() else {
@@ -20996,28 +21153,18 @@ impl FlpDocument {
                     )
                 })
                 .collect::<Vec<_>>(),
-            midi::MidiAutomationSource::ControlChange14(base_controller) => {
-                let lsb_controller = base_controller + 32;
-                let mut most_significant = [0u8; 16];
-                let mut least_significant = [0u8; 16];
-                track
-                    .control_changes()
-                    .into_iter()
-                    .filter_map(|event| {
-                        let channel = usize::from(event.channel());
-                        if event.controller() == base_controller {
-                            most_significant[channel] = event.value();
-                        } else if event.controller() == lsb_controller {
-                            least_significant[channel] = event.value();
-                        } else {
-                            return None;
-                        }
-                        let value = u16::from(most_significant[channel]) * 128
-                            + u16::from(least_significant[channel]);
-                        Some((event.channel(), event.tick(), f64::from(value) / 16_383.0))
-                    })
-                    .collect::<Vec<_>>()
-            }
+            midi::MidiAutomationSource::ControlChange14(base_controller) => track
+                .control_changes_14(base_controller)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|event| {
+                    (
+                        event.channel(),
+                        event.tick(),
+                        f64::from(event.value()) / 16_383.0,
+                    )
+                })
+                .collect::<Vec<_>>(),
             midi::MidiAutomationSource::PitchBend => track
                 .pitch_bends()
                 .into_iter()

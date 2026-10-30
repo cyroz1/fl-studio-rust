@@ -84,6 +84,37 @@ impl MidiControlChange {
     }
 }
 
+/// One paired 14-bit MIDI Control Change value after combining a base CC with its CC+32 LSB.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MidiControlChange14 {
+    channel: u8,
+    base_controller: u8,
+    value: u16,
+    tick: u64,
+}
+
+impl MidiControlChange14 {
+    /// Zero-based MIDI channel in the range 0–15.
+    pub fn channel(self) -> u8 {
+        self.channel
+    }
+
+    /// Base MIDI Control Change number in the range 0–31.
+    pub fn base_controller(self) -> u8 {
+        self.base_controller
+    }
+
+    /// Combined unsigned 14-bit value in the range 0–16383.
+    pub fn value(self) -> u16 {
+        self.value
+    }
+
+    /// Absolute position in the source track's MIDI ticks.
+    pub fn tick(self) -> u64 {
+        self.tick
+    }
+}
+
 /// One MIDI Pitch Bend message with its source channel, 14-bit value, and tick.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MidiPitchBend {
@@ -2178,6 +2209,47 @@ impl MidiTrack {
                 })
             })
             .collect()
+    }
+
+    /// Returns one paired 14-bit CC stream in file order, or `None` when the base is outside
+    /// 0–31. CC `base` supplies the MSB and CC `base + 32` supplies the LSB; each byte retains
+    /// its previous value until updated, and both bytes start at zero for each MIDI channel.
+    pub fn control_changes_14(&self, base_controller: u8) -> Option<Vec<MidiControlChange14>> {
+        if base_controller > 31 {
+            return None;
+        }
+        let lsb_controller = base_controller + 32;
+        let mut most_significant = [0u8; 16];
+        let mut least_significant = [0u8; 16];
+        Some(
+            self.events
+                .iter()
+                .filter_map(|event| {
+                    let MidiEventKind::ChannelVoice { status, data } = &event.kind else {
+                        return None;
+                    };
+                    if status & 0xF0 != 0xB0 || data.len() < 2 || data[0] > 127 || data[1] > 127 {
+                        return None;
+                    }
+                    let channel = status & 0x0F;
+                    let channel_index = usize::from(channel);
+                    if data[0] == base_controller {
+                        most_significant[channel_index] = data[1];
+                    } else if data[0] == lsb_controller {
+                        least_significant[channel_index] = data[1];
+                    } else {
+                        return None;
+                    }
+                    Some(MidiControlChange14 {
+                        channel,
+                        base_controller,
+                        value: u16::from(most_significant[channel_index]) * 128
+                            + u16::from(least_significant[channel_index]),
+                        tick: event.absolute_tick,
+                    })
+                })
+                .collect(),
+        )
     }
 
     /// Returns valid MIDI Pitch Bend messages in file order.
