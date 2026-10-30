@@ -752,11 +752,12 @@ pub struct ChannelSummary {
     layer_children: Vec<u16>,
     layer_flags: Option<u32>,
     level_adjustments: Vec<ChannelLevelAdjustments>,
+    midi_out_settings: Option<ChannelMidiOutSettings>,
     first_event_index: usize,
     end_event_index: usize,
 }
 
-/// Raw fields decoded from one FLP `0xD5` channel Level Adjusts event.
+/// Raw fields decoded from one Layer channel's FLP `0xD5` Level Adjusts event.
 ///
 /// The fields remain raw values and the complete payload stays available through
 /// [`FlpDocument::events`]. Supported Sampler routes apply only a unique, in-range
@@ -769,6 +770,46 @@ pub struct ChannelLevelAdjustments {
     unknown: u32,
     mod_x: i32,
     mod_y: i32,
+}
+
+/// Candidate MIDI Out settings decoded from its `0xD5` state payload.
+///
+/// The byte positions are based on a public FLP parser and a stock channel preset;
+/// the mapping still needs confirmation against a controlled FL Studio project save.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChannelMidiOutSettings {
+    midi_channel: u8,
+    use_note_color_channel: bool,
+}
+
+impl ChannelMidiOutSettings {
+    fn decode(payload: &[u8]) -> Option<Self> {
+        if payload.len() < 30 || payload[4] > 15 || payload[29] > 1 {
+            return None;
+        }
+        Some(Self {
+            midi_channel: payload[4] + 1,
+            use_note_color_channel: payload[29] != 0,
+        })
+    }
+
+    /// MIDI channel number, in FL Studio's user-facing 1–16 range.
+    pub fn midi_channel(&self) -> u8 {
+        self.midi_channel
+    }
+
+    /// Whether note colors select the outgoing MIDI channel.
+    pub fn use_note_color_channel(&self) -> bool {
+        self.use_note_color_channel
+    }
+}
+
+/// Fields that can be changed in a recognized MIDI Out channel state payload.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ChannelMidiOutSettingsEdit {
+    /// MIDI channel number in FL Studio's user-facing 1–16 range.
+    pub midi_channel: Option<u8>,
+    pub use_note_color_channel: Option<bool>,
 }
 
 /// Raw fields that can be changed on one existing channel `0xD5` Level Adjusts event.
@@ -1445,11 +1486,18 @@ impl ChannelSummary {
         self.pan
     }
 
-    /// Raw fields from each recognized 20-byte core in a channel `0xD5`
-    /// Level Adjusts data event. A channel can contain multiple matching
+    /// Raw fields from each recognized 20-byte core in a Layer channel's
+    /// `0xD5` Level Adjusts data events. A Layer can contain multiple matching
     /// events, so callers should not assume there is exactly one.
     pub fn level_adjustments(&self) -> &[ChannelLevelAdjustments] {
         &self.level_adjustments
+    }
+
+    /// Candidate MIDI Out settings decoded from a unique recognized `0xD5` state event.
+    pub fn midi_out_settings(&self) -> Option<&ChannelMidiOutSettings> {
+        (self.channel_type() == Some(ChannelType::MidiOut))
+            .then_some(self.midi_out_settings.as_ref())
+            .flatten()
     }
 
     /// Raw per-channel swing mix from the `0x61` word event.
@@ -6489,12 +6537,6 @@ impl FlpDocument {
                         channel.keyboard_add_root = Some(event.payload[63] != 0);
                     }
                 }
-                0xD5 if matches!(event.encoding, PayloadEncoding::Data { .. }) => {
-                    if let Some(level_adjustments) = ChannelLevelAdjustments::decode(&event.payload)
-                    {
-                        channel.level_adjustments.push(level_adjustments);
-                    }
-                }
                 0x16 if event.encoding == PayloadEncoding::Byte && event.payload.len() == 1 => {
                     channel.mixer_track = Some(event.payload[0] as i8);
                 }
@@ -6603,6 +6645,41 @@ impl FlpDocument {
         if let Some(mut channel) = current {
             channel.end_event_index = self.events.len();
             channels.push(channel);
+        }
+
+        // The meaning of `0xD5` depends on channel kind. Decode it only after the
+        // full record establishes whether it is Layer Level Adjusts or MIDI Out state.
+        for channel in &mut channels {
+            match channel.channel_type() {
+                Some(ChannelType::Layer) => {
+                    for event in self.events[channel.event_range()].iter().filter(|event| {
+                        event.opcode == 0xD5
+                            && matches!(event.encoding, PayloadEncoding::Data { .. })
+                    }) {
+                        if let Some(level_adjustments) =
+                            ChannelLevelAdjustments::decode(&event.payload)
+                        {
+                            channel.level_adjustments.push(level_adjustments);
+                        }
+                    }
+                }
+                Some(ChannelType::MidiOut) => {
+                    let mut state_events = channel
+                        .event_range()
+                        .filter(|index| self.events[*index].opcode == 0xD5);
+                    let Some(event_index) = state_events.next() else {
+                        continue;
+                    };
+                    if state_events.next().is_some() {
+                        continue;
+                    }
+                    let event = &self.events[event_index];
+                    if matches!(event.encoding, PayloadEncoding::Data { .. }) {
+                        channel.midi_out_settings = ChannelMidiOutSettings::decode(&event.payload);
+                    }
+                }
+                _ => {}
+            }
         }
         channels
     }
@@ -22413,7 +22490,7 @@ impl FlpDocument {
         Ok(())
     }
 
-    /// Edits established raw fields in one channel's existing `0xD5` Level Adjusts event.
+    /// Edits established raw fields in one Layer channel's existing `0xD5` Level Adjusts event.
     ///
     /// `event_index` is the global FLP event index, available from `channel-events` and
     /// `events`. The channel ID must be unique and the selected event must belong to that
@@ -22433,6 +22510,11 @@ impl FlpDocument {
         if !channel.event_range().contains(&event_index) {
             return Err(FlpError::UnsupportedEdit(
                 "the requested Level Adjusts event does not belong to the selected channel",
+            ));
+        }
+        if channel.channel_type() != Some(ChannelType::Layer) {
+            return Err(FlpError::UnsupportedEdit(
+                "Level Adjusts fields are only recognized on Layer channels",
             ));
         }
         if edit.pan_raw.is_none()
@@ -22484,6 +22566,82 @@ impl FlpDocument {
         }
         if let Some(mod_y) = edit.mod_y_raw {
             payload[16..20].copy_from_slice(&mod_y.to_le_bytes());
+        }
+
+        let mut candidate = self.clone();
+        candidate.events[event_index].replace_data_payload(payload)?;
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    /// Edits candidate MIDI Out settings in the channel's unique `0xD5` state payload.
+    ///
+    /// The channel and note-color byte mappings are provisional and still need
+    /// confirmation against a controlled FL Studio save.
+    pub fn edit_channel_midi_out_settings(
+        &mut self,
+        channel_id: u16,
+        edit: ChannelMidiOutSettingsEdit,
+    ) -> Result<(), FlpError> {
+        self.require_unique_channel(channel_id)?;
+        let channel = self
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id() == channel_id)
+            .expect("the unique channel was checked above");
+        if channel.channel_type() != Some(ChannelType::MidiOut) {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel is not a MIDI Out channel",
+            ));
+        }
+        if edit.midi_channel.is_none() && edit.use_note_color_channel.is_none() {
+            return Err(FlpError::UnsupportedEdit(
+                "at least one MIDI Out setting must be provided",
+            ));
+        }
+        if edit
+            .midi_channel
+            .is_some_and(|channel| !(1..=16).contains(&channel))
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "the MIDI Out channel must be between 1 and 16",
+            ));
+        }
+
+        let mut state_events = channel
+            .event_range()
+            .filter(|index| self.events[*index].opcode == 0xD5);
+        let Some(event_index) = state_events.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the MIDI Out channel has no recognized state event",
+            ));
+        };
+        if state_events.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the MIDI Out channel has multiple state events",
+            ));
+        }
+        let event = self
+            .events
+            .get(event_index)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the MIDI Out state event does not exist",
+            ))?;
+        if !matches!(event.encoding, PayloadEncoding::Data { .. })
+            || ChannelMidiOutSettings::decode(&event.payload).is_none()
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "the MIDI Out state event does not match the recognized settings layout",
+            ));
+        }
+
+        let mut payload = event.payload.clone();
+        if let Some(midi_channel) = edit.midi_channel {
+            payload[4] = midi_channel - 1;
+        }
+        if let Some(use_note_color_channel) = edit.use_note_color_channel {
+            payload[29] = u8::from(use_note_color_channel);
         }
 
         let mut candidate = self.clone();

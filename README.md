@@ -105,6 +105,7 @@ flp-rebuild set-channel-main-pitch <input.flp> <output.flp> <channel-id> <0|1>
 flp-rebuild set-channel-key-region <input.flp> <output.flp> <channel-id> <low-key:0..127> <high-key:0..127>
 flp-rebuild set-channel-add-to-key <input.flp> <output.flp> <channel-id> <0|1>
 flp-rebuild edit-channel-level-adjustments <input.flp> <output.flp> <channel-id> <event-index> <pan-raw|-> <volume-raw|-> <mod-x-raw|-> <mod-y-raw|->
+flp-rebuild set-channel-midi-out-settings <input.flp> <output.flp> <channel-id> <midi-channel:1..16|-> <use-note-color-channel:0|1|->
 flp-rebuild set-channel-swing <input.flp> <output.flp> <channel-id> <percent-0..100>
 flp-rebuild set-layer-children <input.flp> <output.flp> <layer-channel-id> <child-ids-comma-separated|->
 flp-rebuild set-layer-flags <input.flp> <output.flp> <layer-channel-id> <random:0|1|-> <crossfade:0|1|->

@@ -18,17 +18,17 @@ use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, ArpeggioRangePattern, ArpeggioScoreOptions,
     ArpeggioScorePatternMode, ArpeggioScoreTimeMultiplier, ArpeggioSyncMode, ArticulateOptions,
     AutomationInterpolationMode, AutomationPointEdit, AutomationScaleLevelsOptions,
-    ChannelLevelAdjustmentsEdit, ChannelSampleCrossfadeEdit, ChannelSampleEffectsEdit,
-    ChannelSampleFxFlagsEdit, ChannelSampleTrimEdit, ChannelSampleWindowEdit, ChannelSortOrder,
-    ChannelStretchSettingsEdit, ClawMachineOptions, FlamOptions, FlpDocument,
-    FscControllerStreamImportOptions, FscScore, FstPreset, HumanizerOptions, LimitNoteOptions,
-    LimitSnapDirection, MixerInsertEdit, MixerParameterKind, PatternControllerEdit, PatternNote,
-    PatternNoteEdit, PatternNoteRotation, PlaylistClipEdit, PlaylistTrackEdit, PlaylistTrackMotion,
-    PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit,
-    QuantizeNoteLevels, QuantizeNoteMode, QuantizeNoteOptions, RandomNoteChordMap,
-    RandomNoteGeneratorOptions, RandomizerOptions, RiffMachineOptions, RiffMachineQuantizeMode,
-    SamplerEnvelopeLfoEdit, SamplerEnvelopeLfoTarget, SamplerVolumeEnvelopeEdit,
-    ScaleLevelsOptions, StrumOptions, TimeMarkerEdit,
+    ChannelLevelAdjustmentsEdit, ChannelMidiOutSettingsEdit, ChannelSampleCrossfadeEdit,
+    ChannelSampleEffectsEdit, ChannelSampleFxFlagsEdit, ChannelSampleTrimEdit,
+    ChannelSampleWindowEdit, ChannelSortOrder, ChannelStretchSettingsEdit, ClawMachineOptions,
+    FlamOptions, FlpDocument, FscControllerStreamImportOptions, FscScore, FstPreset,
+    HumanizerOptions, LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerParameterKind,
+    PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation, PlaylistClipEdit,
+    PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit,
+    ProjectSettingsEdit, QuantizeNoteLevels, QuantizeNoteMode, QuantizeNoteOptions,
+    RandomNoteChordMap, RandomNoteGeneratorOptions, RandomizerOptions, RiffMachineOptions,
+    RiffMachineQuantizeMode, SamplerEnvelopeLfoEdit, SamplerEnvelopeLfoTarget,
+    SamplerVolumeEnvelopeEdit, ScaleLevelsOptions, StrumOptions, TimeMarkerEdit,
 };
 
 struct MidiControlChangeImport<'a> {
@@ -1062,6 +1062,27 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 Path::new(output),
                 parse_u16(channel_id, "channel id")?,
                 parse_mixer_track(mixer_track)?,
+            )
+        }
+        [command, input, output, channel_id, midi_channel, note_color_channel]
+            if command == "set-channel-midi-out-settings" =>
+        {
+            let midi_channel = if midi_channel == "-" {
+                None
+            } else {
+                Some(parse_u8(midi_channel, "MIDI Out channel number")?)
+            };
+            set_channel_midi_out_settings(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(channel_id, "channel id")?,
+                ChannelMidiOutSettingsEdit {
+                    midi_channel,
+                    use_note_color_channel: parse_optional_bool(
+                        note_color_channel,
+                        "MIDI Out note-color channel setting",
+                    )?,
+                },
             )
         }
         [command, input, output, channel_id, output_bus_index, mixer_track]
@@ -4449,6 +4470,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild set-channel-key-region <input.flp> <output.flp> <channel-id> <low-key:0..127> <high-key:0..127>\n",
             "  flp-rebuild set-channel-add-to-key <input.flp> <output.flp> <channel-id> <0|1>\n",
             "  flp-rebuild set-channel-mixer-track <input.flp> <output.flp> <channel-id> <mixer-track:-1=Current|0=Master|1..127=insert>\n",
+            "  flp-rebuild set-channel-midi-out-settings <input.flp> <output.flp> <channel-id> <midi-channel:1..16|-> <use-note-color-channel:0|1|->\n",
             "  flp-rebuild set-vst3-output-route <input.flp> <output.flp> <channel-id> <output-bus-index:0-based> <mixer-track:-1=Current|0=Master|1..127=insert>\n",
             "  flp-rebuild edit-channel-stretch-settings <input.flp> <output.flp> <channel-id> <time-raw|-> <pitch-raw|-> <multiplier-raw|-> <mode:-1..9|->\n",
             "  flp-rebuild edit-channel-level-adjustments <input.flp> <output.flp> <channel-id> <event-index> <pan-raw|-> <volume-raw|-> <mod-x-raw|-> <mod-y-raw|->\n",
@@ -6683,7 +6705,7 @@ fn list_channels(path: &Path) -> Result<(), String> {
     println!("channels: {}", channels.len());
     for channel in channels {
         println!(
-            "id={} kind={} type={:?} enabled={} zipped={} main_pitch={} add_to_key={} fine_tune_raw={:?} key_region={:?} stretch_settings={:?} sampler_fade_out_raw={:?} sampler_fade_in_raw={:?} sample_fade_stereo={} sample_swap_stereo={} sample_remove_dc={} sample_normalize={} sample_reverse_polarity={} sample_start_fraction={:?} sample_length_fraction={:?} sample_trim_threshold_raw={:?} sample_crossfade_raw={:?} sampler_portamento={:?} sampler_polyphony_slide_raw={:?} sampler_volume_envelope={:?} sampler_envelopes={:?} color={:?} volume={:?} pan={:?} level_adjusts_raw={:?} swing_mix_raw={:?} layer_children={:?} layer_flags={:?} plugin={} name={} sample_path={:?} events={:?}",
+            "id={} kind={} type={:?} enabled={} zipped={} main_pitch={} add_to_key={} fine_tune_raw={:?} key_region={:?} stretch_settings={:?} sampler_fade_out_raw={:?} sampler_fade_in_raw={:?} sample_fade_stereo={} sample_swap_stereo={} sample_remove_dc={} sample_normalize={} sample_reverse_polarity={} sample_start_fraction={:?} sample_length_fraction={:?} sample_trim_threshold_raw={:?} sample_crossfade_raw={:?} sampler_portamento={:?} sampler_polyphony_slide_raw={:?} sampler_volume_envelope={:?} sampler_envelopes={:?} color={:?} volume={:?} pan={:?} level_adjusts_raw={:?} midi_out_settings={:?} swing_mix_raw={:?} layer_children={:?} layer_flags={:?} plugin={} name={} sample_path={:?} events={:?}",
             channel.id(),
             channel
                 .kind()
@@ -6717,6 +6739,7 @@ fn list_channels(path: &Path) -> Result<(), String> {
             channel.volume(),
             channel.pan(),
             channel.level_adjustments(),
+            channel.midi_out_settings(),
             channel.swing_mix_raw(),
             channel.layer_child_ids(),
             channel.layer_flags(),
@@ -8424,6 +8447,28 @@ fn set_channel_mixer_track(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "routed channel {channel_id} to Mixer track {mixer_track} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn set_channel_midi_out_settings(
+    input: &Path,
+    output: &Path,
+    channel_id: u16,
+    edit: ChannelMidiOutSettingsEdit,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .edit_channel_midi_out_settings(channel_id, edit)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "edited candidate MIDI Out settings for channel {channel_id} in {}",
         output.display()
     );
     Ok(())
