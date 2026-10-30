@@ -99,20 +99,21 @@ use flp_rebuild::{
     ArpeggioScorePatternMode, ArpeggioScoreTimeMultiplier, ArpeggioSyncMode, Arrangement,
     ArticulateOptions, AutomationChannel, AutomationInterpolationMode, AutomationPoint,
     AutomationPointEdit, AutomationScaleLevelsOptions, ChannelGroupSummary, ChannelNoteRouter,
-    ChannelSampleEffectsEdit, ChannelSampleFxFlagsEdit, ChannelSortOrder, ChannelStretchMode,
-    ChannelStretchSettingsEdit, ChannelSummary, ChannelType, ClawMachineOptions, FlamOptions,
-    FlpDocument, FlpError, FscControllerStreamImportOptions, FscScore, FstPreset, FstPresetKind,
-    HumanizerOptions, LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerInsertSummary,
-    MixerParameterKind, MixerParameterRecord, MixerSendSummary, PATTERN_NOTE_DEFAULT_FLAGS,
-    PATTERN_NOTE_DEFAULT_RELEASE, PATTERN_NOTE_SLIDE_FLAG, Pattern, PatternController,
-    PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation, PayloadEncoding,
-    PlaylistClip, PlaylistClipEdit, PlaylistClipSelectionClipboard, PlaylistClipTarget,
-    PlaylistTrack, PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync,
-    ProjectInfoEdit, ProjectSettingsEdit, QuantizeNoteLevels, QuantizeNoteMode,
-    QuantizeNoteOptions, RandomNoteChordMap, RandomNoteGeneratorOptions, RandomizerOptions,
-    RiffMachineOptions, RiffMachineQuantizeMode, RiffMachineStage, SamplerEnvelopeLfo,
-    SamplerEnvelopeLfoEdit, SamplerEnvelopeLfoTarget, ScaleLevelsOptions, StrumOptions, TimeMarker,
-    TimeMarkerEdit, VstPluginStateMetadata,
+    ChannelSampleEffectsEdit, ChannelSampleFxFlagsEdit, ChannelSampleWindowEdit, ChannelSortOrder,
+    ChannelStretchMode, ChannelStretchSettingsEdit, ChannelSummary, ChannelType,
+    ClawMachineOptions, FlamOptions, FlpDocument, FlpError, FscControllerStreamImportOptions,
+    FscScore, FstPreset, FstPresetKind, HumanizerOptions, LimitNoteOptions, LimitSnapDirection,
+    MixerInsertEdit, MixerInsertSummary, MixerParameterKind, MixerParameterRecord,
+    MixerSendSummary, PATTERN_NOTE_DEFAULT_FLAGS, PATTERN_NOTE_DEFAULT_RELEASE,
+    PATTERN_NOTE_SLIDE_FLAG, Pattern, PatternController, PatternControllerEdit, PatternNote,
+    PatternNoteEdit, PatternNoteRotation, PayloadEncoding, PlaylistClip, PlaylistClipEdit,
+    PlaylistClipSelectionClipboard, PlaylistClipTarget, PlaylistTrack, PlaylistTrackEdit,
+    PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit,
+    ProjectSettingsEdit, QuantizeNoteLevels, QuantizeNoteMode, QuantizeNoteOptions,
+    RandomNoteChordMap, RandomNoteGeneratorOptions, RandomizerOptions, RiffMachineOptions,
+    RiffMachineQuantizeMode, RiffMachineStage, SamplerEnvelopeLfo, SamplerEnvelopeLfoEdit,
+    SamplerEnvelopeLfoTarget, ScaleLevelsOptions, StrumOptions, TimeMarker, TimeMarkerEdit,
+    VstPluginStateMetadata,
 };
 use md5::{Digest, Md5};
 use vst3_host::midi::{MidiChannel as Vst3MidiChannel, MidiEvent as Vst3MidiEvent};
@@ -37013,6 +37014,7 @@ impl DawUi {
         let mut channel_sample_reverse_edits = Vec::new();
         let mut channel_sample_effect_edits = Vec::new();
         let mut channel_sample_fx_flag_edits = Vec::new();
+        let mut channel_sample_window_edits = Vec::new();
         let mut channel_main_pitch_edits = Vec::new();
         let mut channel_add_to_key_edits = Vec::new();
         let mut channel_zipped_edits = Vec::new();
@@ -37690,6 +37692,42 @@ impl DawUi {
                                     ui.close();
                                 }
                                 if matches!(channel.kind(), Some(0 | 4)) {
+                                    ui.menu_button("Sample window", |ui| {
+                                        let mut start =
+                                            channel.sample_start_fraction().unwrap_or(0.0);
+                                        if ui
+                                            .add(
+                                                egui::Slider::new(&mut start, 0.0..=1.0)
+                                                    .text("Sample start"),
+                                            )
+                                            .changed()
+                                        {
+                                            channel_sample_window_edits.push((
+                                                channel.id(),
+                                                ChannelSampleWindowEdit {
+                                                    start_fraction: Some(start),
+                                                    ..ChannelSampleWindowEdit::default()
+                                                },
+                                            ));
+                                        }
+                                        let mut length =
+                                            channel.sample_length_fraction().unwrap_or(1.0);
+                                        if ui
+                                            .add(
+                                                egui::Slider::new(&mut length, 0.0..=1.0)
+                                                    .text("Sample length"),
+                                            )
+                                            .changed()
+                                        {
+                                            channel_sample_window_edits.push((
+                                                channel.id(),
+                                                ChannelSampleWindowEdit {
+                                                    length_fraction: Some(length),
+                                                    ..ChannelSampleWindowEdit::default()
+                                                },
+                                            ));
+                                        }
+                                    });
                                     let reversed = if channel.kind() == Some(4) {
                                         channel.audio_clip_reversed()
                                     } else {
@@ -38854,6 +38892,27 @@ impl DawUi {
                 }
                 Some(Err(error)) => {
                     self.status = format!("Could not change sample FX flags: {error}");
+                }
+                None => {}
+            }
+        }
+        for (channel_id, edit) in channel_sample_window_edits {
+            let result = self
+                .document
+                .as_mut()
+                .map(|document| document.edit_channel_sample_window(channel_id, edit));
+            match result {
+                Some(Ok(())) => {
+                    self.stop_project_playback();
+                    self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+                    self.status = format!(
+                        "Channel {channel_id} sample window updated: start {:?}, length {:?}",
+                        edit.start_fraction, edit.length_fraction
+                    );
+                }
+                Some(Err(error)) => {
+                    self.status = format!("Could not change sample window: {error}");
                 }
                 None => {}
             }

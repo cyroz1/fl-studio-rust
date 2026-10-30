@@ -719,6 +719,8 @@ pub struct ChannelSummary {
     sample_remove_dc: Option<bool>,
     sample_normalize: Option<bool>,
     sample_reverse_polarity: Option<bool>,
+    sample_start_raw: Option<[u16; 2]>,
+    sample_length_raw: Option<[u16; 2]>,
     sampler_envelope_lfos: [Option<SamplerEnvelopeLfo>; 5],
     sampler_max_polyphony_raw: Option<u32>,
     sampler_polyphony_slide_raw: Option<u32>,
@@ -792,6 +794,13 @@ pub struct ChannelSampleEffectsEdit {
 pub struct ChannelSampleFxFlagsEdit {
     pub fade_stereo: Option<bool>,
     pub swap_stereo: Option<bool>,
+}
+
+/// Sample-window controls decoded from a channel Parameters (`0xC7`) payload.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ChannelSampleWindowEdit {
+    pub start_fraction: Option<f64>,
+    pub length_fraction: Option<f64>,
 }
 
 /// Raw time-stretch settings from the channel Parameters (`0xC7`) payload.
@@ -1148,6 +1157,36 @@ impl ChannelSummary {
             && self
                 .sampler_fx_flags
                 .is_some_and(|flags| flags & (1 << 8) != 0)
+    }
+
+    /// Normalized start of the saved precomputed sample window, when its LogNormal field is valid.
+    pub fn sample_start_fraction(&self) -> Option<f64> {
+        (matches!(self.kind, Some(0 | 4)))
+            .then_some(self.sample_start_raw)
+            .flatten()
+            .and_then(decode_sample_fraction)
+    }
+
+    /// Raw two-word LogNormal sample-start field from the Parameters event.
+    pub fn sample_start_raw(&self) -> Option<[u16; 2]> {
+        matches!(self.kind, Some(0 | 4))
+            .then_some(self.sample_start_raw)
+            .flatten()
+    }
+
+    /// Normalized length of the saved precomputed sample window, when its LogNormal field is valid.
+    pub fn sample_length_fraction(&self) -> Option<f64> {
+        (matches!(self.kind, Some(0 | 4)))
+            .then_some(self.sample_length_raw)
+            .flatten()
+            .and_then(decode_sample_fraction)
+    }
+
+    /// Raw two-word LogNormal sample-length field from the Parameters event.
+    pub fn sample_length_raw(&self) -> Option<[u16; 2]> {
+        matches!(self.kind, Some(0 | 4))
+            .then_some(self.sample_length_raw)
+            .flatten()
     }
 
     /// Saved raw Sampler precomputed Fade Out value (`0x4B`), when present.
@@ -6319,6 +6358,18 @@ impl FlpDocument {
                     && ascii_version(&event.payload).is_none() =>
                 {
                     if matches!(channel.kind, Some(0 | 4)) {
+                        if event.payload.len() >= 137 && channel.sample_start_raw.is_none() {
+                            channel.sample_start_raw = Some([
+                                u16::from_le_bytes([event.payload[133], event.payload[134]]),
+                                u16::from_le_bytes([event.payload[135], event.payload[136]]),
+                            ]);
+                        }
+                        if event.payload.len() >= 145 && channel.sample_length_raw.is_none() {
+                            channel.sample_length_raw = Some([
+                                u16::from_le_bytes([event.payload[141], event.payload[142]]),
+                                u16::from_le_bytes([event.payload[143], event.payload[144]]),
+                            ]);
+                        }
                         if event.payload.len() >= 11 && channel.sample_remove_dc.is_none() {
                             channel.sample_remove_dc = Some(event.payload[10] != 0);
                         }
@@ -23619,6 +23670,87 @@ impl FlpDocument {
         Ok(())
     }
 
+    /// Edits the normalized sample start and/or length in a unique existing Parameters event.
+    /// Other payload bytes, including reserved bytes between the two fields, are preserved.
+    pub fn edit_channel_sample_window(
+        &mut self,
+        channel_id: u16,
+        edit: ChannelSampleWindowEdit,
+    ) -> Result<(), FlpError> {
+        if edit.start_fraction.is_none() && edit.length_fraction.is_none() {
+            return Err(FlpError::UnsupportedEdit(
+                "at least one sample-window value must be supplied",
+            ));
+        }
+        for value in [edit.start_fraction, edit.length_fraction]
+            .into_iter()
+            .flatten()
+        {
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                return Err(FlpError::UnsupportedEdit(
+                    "sample-window values must be between 0 and 1",
+                ));
+            }
+        }
+
+        self.require_unique_channel(channel_id)?;
+        let channel = self
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id() == channel_id)
+            .expect("the unique channel was checked above");
+        if !matches!(channel.kind, Some(0 | 4)) {
+            return Err(FlpError::UnsupportedEdit(
+                "sample windows can only be edited on Sampler or Audio Clip channels",
+            ));
+        }
+
+        let c7_events = channel
+            .event_range()
+            .filter(|index| self.events[*index].opcode == 0xC7)
+            .collect::<Vec<_>>();
+        let mut parameter_events = c7_events.iter().copied().filter(|index| {
+            matches!(self.events[*index].encoding, PayloadEncoding::Data { .. })
+                && ascii_version(&self.events[*index].payload).is_none()
+        });
+        let parameters_index = parameter_events.next();
+        if parameter_events.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel has multiple Parameters (`0xC7`) events",
+            ));
+        }
+        let Some(parameters_index) = parameters_index else {
+            return Err(FlpError::UnsupportedEdit(if c7_events.is_empty() {
+                "the selected channel has no existing Parameters (`0xC7`) event"
+            } else {
+                "the selected channel's `0xC7` event is not a recognized Parameters payload"
+            }));
+        };
+        let required_payload_len = if edit.length_fraction.is_some() {
+            145
+        } else {
+            137
+        };
+        if self.events[parameters_index].payload.len() < required_payload_len {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected channel's Parameters event does not contain the requested sample-window field",
+            ));
+        }
+
+        let mut candidate = self.clone();
+        let mut payload = candidate.events[parameters_index].payload.clone();
+        if let Some(start_fraction) = edit.start_fraction {
+            payload[133..137].copy_from_slice(&encode_sample_fraction(start_fraction));
+        }
+        if let Some(length_fraction) = edit.length_fraction {
+            payload[141..145].copy_from_slice(&encode_sample_fraction(length_fraction));
+        }
+        candidate.events[parameters_index].replace_data_payload(payload)?;
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
     /// Sets a channel's enabled state, which controls whether the Channel Rack row is muted.
     /// Existing `0x00` events are edited in place; channels without one get a byte event after
     /// their recognized `0x15` kind event. Other channel events are retained.
@@ -25663,6 +25795,32 @@ fn ascii_version(payload: &[u8]) -> Option<String> {
             .next()
             .is_some_and(|byte| byte.is_ascii_digit());
     valid.then(|| text.to_owned())
+}
+
+fn decode_sample_fraction(raw: [u16; 2]) -> Option<f64> {
+    if raw[0] > 61_440 {
+        return None;
+    }
+    if raw[0] == 0 {
+        return Some(0.0);
+    }
+    if raw[1] != 63 {
+        return None;
+    }
+    Some((2.0_f64.powf(f64::from(raw[0]) / 4_096.0) / 32_768.0).clamp(0.0, 1.0))
+}
+
+fn encode_sample_fraction(value: f64) -> [u8; 4] {
+    if value == 0.0 {
+        return [0; 4];
+    }
+    let raw_value = (4_096.0 * (value.log2() + 15.0))
+        .floor()
+        .clamp(0.0, 61_440.0) as u16;
+    let mut bytes = [0; 4];
+    bytes[..2].copy_from_slice(&raw_value.to_le_bytes());
+    bytes[2..].copy_from_slice(&63_u16.to_le_bytes());
+    bytes
 }
 
 fn decode_utf16_z(payload: &[u8]) -> Option<String> {

@@ -12010,6 +12010,9 @@ fn prepare_sampler_arrangement(
             let fade_in_raw = supported_sampler_fade_raw(channel.sampler_fade_in_raw());
             let fade_out_raw = supported_sampler_fade_raw(channel.sampler_fade_out_raw());
             let sample_fx = sampler_precomputed_fx(channel);
+            let sample_window = sampler_sample_window_bounds(audio.frame_count(), sample_fx);
+            let loop_points = trim_sampler_loop_points(loop_points, sample_window);
+            let release_loop_points = trim_sampler_loop_points(release_loop_points, sample_window);
             let audio = if fade_in_raw.is_none() && fade_out_raw.is_none() && !sample_fx.any() {
                 audio
             } else {
@@ -15094,6 +15097,9 @@ fn prepare_sampler_pattern_for_channel_internal(
             let fade_in_raw = supported_sampler_fade_raw(channel.sampler_fade_in_raw());
             let fade_out_raw = supported_sampler_fade_raw(channel.sampler_fade_out_raw());
             let sample_fx = sampler_precomputed_fx(channel);
+            let sample_window = sampler_sample_window_bounds(audio.frame_count(), sample_fx);
+            let loop_points = trim_sampler_loop_points(loop_points, sample_window);
+            let release_loop_points = trim_sampler_loop_points(release_loop_points, sample_window);
             let audio = if fade_in_raw.is_none() && fade_out_raw.is_none() && !sample_fx.any() {
                 audio
             } else {
@@ -16882,6 +16888,8 @@ fn sampler_precomputed_fx(channel: &ChannelSummary) -> SamplerPrecomputedFx {
         remove_dc: channel.sample_remove_dc_enabled(),
         normalize: channel.sample_normalize_enabled(),
         reverse_polarity: channel.sample_reverse_polarity_enabled(),
+        sample_start_raw: channel.sample_start_raw(),
+        sample_length_raw: channel.sample_length_raw(),
     }
 }
 
@@ -16960,6 +16968,43 @@ fn apply_sampler_sample_fx(audio: &mut DecodedAudio, fx: SamplerPrecomputedFx) {
     if fx.swap_stereo && audio.channels.len() == 2 {
         audio.channels.swap(0, 1);
     }
+    if !fx.sample_window_is_default() {
+        let window = sampler_sample_window_bounds(audio.frame_count(), fx);
+        if window.start == window.end && audio.frame_count() > 0 {
+            for channel in &mut audio.channels {
+                channel.clear();
+                channel.push(0.0);
+            }
+        } else {
+            for channel in &mut audio.channels {
+                let start = window.start.min(channel.len());
+                let end = window.end.min(channel.len()).max(start);
+                *channel = channel[start..end].to_vec();
+            }
+        }
+    }
+}
+
+fn sampler_sample_window_bounds(frame_count: usize, fx: SamplerPrecomputedFx) -> SampleBounds {
+    let (start_fraction, length_fraction) = fx.sample_window_fractions();
+    let start = (frame_count as f64 * start_fraction).round() as usize;
+    let length = (frame_count as f64 * length_fraction).round() as usize;
+    let start = start.min(frame_count);
+    let end = start.saturating_add(length).min(frame_count);
+    SampleBounds { start, end }
+}
+
+fn trim_sampler_loop_points(
+    loop_points: Option<(usize, usize)>,
+    sample_window: SampleBounds,
+) -> Option<(usize, usize)> {
+    let (start, end) = loop_points?;
+    let clipped_start = start.max(sample_window.start).min(sample_window.end);
+    let clipped_end = end.min(sample_window.end).max(clipped_start);
+    (clipped_start < clipped_end).then_some((
+        clipped_start - sample_window.start,
+        clipped_end - sample_window.start,
+    ))
 }
 
 fn sampler_precompute_sample_fx(
@@ -17178,15 +17223,35 @@ struct SamplerPrecomputedFx {
     remove_dc: bool,
     normalize: bool,
     reverse_polarity: bool,
+    sample_start_raw: Option<[u16; 2]>,
+    sample_length_raw: Option<[u16; 2]>,
 }
 
 impl SamplerPrecomputedFx {
-    const fn any(self) -> bool {
+    fn sample_window_fractions(self) -> (f64, f64) {
+        let start = self
+            .sample_start_raw
+            .and_then(crate::decode_sample_fraction)
+            .unwrap_or(0.0);
+        let length = self
+            .sample_length_raw
+            .and_then(crate::decode_sample_fraction)
+            .unwrap_or(1.0);
+        (start, length)
+    }
+
+    fn sample_window_is_default(self) -> bool {
+        let (start, length) = self.sample_window_fractions();
+        start == 0.0 && length == 1.0
+    }
+
+    fn any(self) -> bool {
         self.fade_stereo
             || self.swap_stereo
             || self.remove_dc
             || self.normalize
             || self.reverse_polarity
+            || !self.sample_window_is_default()
     }
 }
 
@@ -22862,6 +22927,8 @@ mod tests {
                 remove_dc: false,
                 normalize: true,
                 reverse_polarity: true,
+                sample_start_raw: None,
+                sample_length_raw: None,
             },
             None,
             None,
@@ -22884,6 +22951,8 @@ mod tests {
                 remove_dc: false,
                 normalize: true,
                 reverse_polarity: false,
+                sample_start_raw: None,
+                sample_length_raw: None,
             },
         );
         assert_eq!(silence.channels, vec![vec![0.0; 3], vec![0.0; 3]]);

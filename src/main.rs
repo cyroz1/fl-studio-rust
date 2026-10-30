@@ -19,15 +19,15 @@ use flp_rebuild::{
     ArpeggioScorePatternMode, ArpeggioScoreTimeMultiplier, ArpeggioSyncMode, ArticulateOptions,
     AutomationInterpolationMode, AutomationPointEdit, AutomationScaleLevelsOptions,
     ChannelLevelAdjustmentsEdit, ChannelSampleEffectsEdit, ChannelSampleFxFlagsEdit,
-    ChannelSortOrder, ChannelStretchSettingsEdit, ClawMachineOptions, FlamOptions, FlpDocument,
-    FscControllerStreamImportOptions, FscScore, FstPreset, HumanizerOptions, LimitNoteOptions,
-    LimitSnapDirection, MixerInsertEdit, MixerParameterKind, PatternControllerEdit, PatternNote,
-    PatternNoteEdit, PatternNoteRotation, PlaylistClipEdit, PlaylistTrackEdit, PlaylistTrackMotion,
-    PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit,
-    QuantizeNoteLevels, QuantizeNoteMode, QuantizeNoteOptions, RandomNoteChordMap,
-    RandomNoteGeneratorOptions, RandomizerOptions, RiffMachineOptions, RiffMachineQuantizeMode,
-    SamplerEnvelopeLfoEdit, SamplerEnvelopeLfoTarget, SamplerVolumeEnvelopeEdit,
-    ScaleLevelsOptions, StrumOptions, TimeMarkerEdit,
+    ChannelSampleWindowEdit, ChannelSortOrder, ChannelStretchSettingsEdit, ClawMachineOptions,
+    FlamOptions, FlpDocument, FscControllerStreamImportOptions, FscScore, FstPreset,
+    HumanizerOptions, LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerParameterKind,
+    PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation, PlaylistClipEdit,
+    PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit,
+    ProjectSettingsEdit, QuantizeNoteLevels, QuantizeNoteMode, QuantizeNoteOptions,
+    RandomNoteChordMap, RandomNoteGeneratorOptions, RandomizerOptions, RiffMachineOptions,
+    RiffMachineQuantizeMode, SamplerEnvelopeLfoEdit, SamplerEnvelopeLfoTarget,
+    SamplerVolumeEnvelopeEdit, ScaleLevelsOptions, StrumOptions, TimeMarkerEdit,
 };
 
 struct MidiControlChangeImport<'a> {
@@ -879,6 +879,25 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 ChannelSampleFxFlagsEdit {
                     fade_stereo: parse_optional_bool(fade_stereo, "sample Fade Stereo setting")?,
                     swap_stereo: parse_optional_bool(swap_stereo, "sample Swap Stereo setting")?,
+                },
+            )
+        }
+        [command, input, output, channel_id, start_fraction, length_fraction]
+            if command == "edit-channel-sample-window" =>
+        {
+            edit_channel_sample_window(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(channel_id, "sample-bearing channel id")?,
+                ChannelSampleWindowEdit {
+                    start_fraction: parse_optional_f64(
+                        start_fraction,
+                        "sample start fraction",
+                    )?,
+                    length_fraction: parse_optional_f64(
+                        length_fraction,
+                        "sample length fraction",
+                    )?,
                 },
             )
         }
@@ -4397,6 +4416,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild set-channel-sample-reversed <input.flp> <output.flp> <channel-id> <0|1>\n",
             "  flp-rebuild edit-channel-sample-effects <input.flp> <output.flp> <channel-id> <normalize:0|1|-> <reverse-polarity:0|1|-> [remove-dc:0|1|->]\n",
             "  flp-rebuild edit-channel-sample-fx-flags <input.flp> <output.flp> <channel-id> <fade-stereo:0|1|-> <swap-stereo:0|1|->\n",
+            "  flp-rebuild edit-channel-sample-window <input.flp> <output.flp> <channel-id> <start:0..1|-> <length:0..1|->\n",
             "  flp-rebuild set-channel-zipped <input.flp> <output.flp> <channel-id> <0|1>\n",
             "  flp-rebuild set-channel-main-pitch <input.flp> <output.flp> <channel-id> <0|1>\n",
             "  flp-rebuild set-channel-key-region <input.flp> <output.flp> <channel-id> <low-key:0..127> <high-key:0..127>\n",
@@ -6636,7 +6656,7 @@ fn list_channels(path: &Path) -> Result<(), String> {
     println!("channels: {}", channels.len());
     for channel in channels {
         println!(
-            "id={} kind={} type={:?} enabled={} zipped={} main_pitch={} add_to_key={} fine_tune_raw={:?} key_region={:?} stretch_settings={:?} sampler_fade_out_raw={:?} sampler_fade_in_raw={:?} sample_fade_stereo={} sample_swap_stereo={} sample_remove_dc={} sample_normalize={} sample_reverse_polarity={} sampler_portamento={:?} sampler_polyphony_slide_raw={:?} sampler_volume_envelope={:?} sampler_envelopes={:?} color={:?} volume={:?} pan={:?} level_adjusts_raw={:?} swing_mix_raw={:?} layer_children={:?} layer_flags={:?} plugin={} name={} sample_path={:?} events={:?}",
+            "id={} kind={} type={:?} enabled={} zipped={} main_pitch={} add_to_key={} fine_tune_raw={:?} key_region={:?} stretch_settings={:?} sampler_fade_out_raw={:?} sampler_fade_in_raw={:?} sample_fade_stereo={} sample_swap_stereo={} sample_remove_dc={} sample_normalize={} sample_reverse_polarity={} sample_start_fraction={:?} sample_length_fraction={:?} sampler_portamento={:?} sampler_polyphony_slide_raw={:?} sampler_volume_envelope={:?} sampler_envelopes={:?} color={:?} volume={:?} pan={:?} level_adjusts_raw={:?} swing_mix_raw={:?} layer_children={:?} layer_flags={:?} plugin={} name={} sample_path={:?} events={:?}",
             channel.id(),
             channel
                 .kind()
@@ -6658,6 +6678,8 @@ fn list_channels(path: &Path) -> Result<(), String> {
             channel.sample_remove_dc_enabled(),
             channel.sample_normalize_enabled(),
             channel.sample_reverse_polarity_enabled(),
+            channel.sample_start_fraction(),
+            channel.sample_length_fraction(),
             channel.sampler_portamento_enabled(),
             channel.sampler_polyphony_slide_raw(),
             channel.sampler_volume_envelope(),
@@ -8094,6 +8116,28 @@ fn edit_channel_sample_fx_flags(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "edited sample FX flags on channel {channel_id} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn edit_channel_sample_window(
+    input: &Path,
+    output: &Path,
+    channel_id: u16,
+    edit: ChannelSampleWindowEdit,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .edit_channel_sample_window(channel_id, edit)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "edited sample window on channel {channel_id} in {}",
         output.display()
     );
     Ok(())
