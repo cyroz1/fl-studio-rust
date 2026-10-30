@@ -134,6 +134,37 @@ impl MidiChannelPressure {
     }
 }
 
+/// One MIDI Polyphonic Key Pressure message with its source channel, key, value, and tick.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MidiPolyphonicKeyPressure {
+    channel: u8,
+    key: u8,
+    value: u8,
+    tick: u64,
+}
+
+impl MidiPolyphonicKeyPressure {
+    /// Zero-based MIDI channel in the range 0–15.
+    pub fn channel(self) -> u8 {
+        self.channel
+    }
+
+    /// MIDI key number in the range 0–127.
+    pub fn key(self) -> u8 {
+        self.key
+    }
+
+    /// Seven-bit pressure value in the range 0–127.
+    pub fn value(self) -> u8 {
+        self.value
+    }
+
+    /// Absolute position in the source track's MIDI ticks.
+    pub fn tick(self) -> u64 {
+        self.tick
+    }
+}
+
 /// Options for interpreting MIDI notes and aligning imported events.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MidiImportOptions {
@@ -2168,6 +2199,27 @@ impl MidiTrack {
                 Some(MidiChannelPressure {
                     channel: status & 0x0F,
                     value: data[0],
+                    tick: event.absolute_tick,
+                })
+            })
+            .collect()
+    }
+
+    /// Returns valid MIDI Polyphonic Key Pressure messages in file order.
+    pub fn polyphonic_key_pressures(&self) -> Vec<MidiPolyphonicKeyPressure> {
+        self.events
+            .iter()
+            .filter_map(|event| {
+                let MidiEventKind::ChannelVoice { status, data } = &event.kind else {
+                    return None;
+                };
+                if status & 0xF0 != 0xA0 || data.len() < 2 || data[0] > 127 || data[1] > 127 {
+                    return None;
+                }
+                Some(MidiPolyphonicKeyPressure {
+                    channel: status & 0x0F,
+                    key: data[0],
+                    value: data[1],
                     tick: event.absolute_tick,
                 })
             })

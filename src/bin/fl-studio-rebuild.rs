@@ -4393,6 +4393,8 @@ struct PendingMidiCcImport {
     midi: MidiFile,
     pitch_bend: bool,
     channel_pressure: bool,
+    polyphonic_pressure: bool,
+    pressure_key: u8,
     selected_track: usize,
     controller_number: u8,
     midi_channel: Option<u8>,
@@ -4409,6 +4411,8 @@ struct MidiCcImportAction {
     midi: MidiFile,
     pitch_bend: bool,
     channel_pressure: bool,
+    polyphonic_pressure: bool,
+    pressure_key: u8,
     track_index: usize,
     pattern_id: u16,
     target_stream: (u8, u8),
@@ -55965,6 +55969,8 @@ impl DawUi {
         let mut open_midi_pitch_bend_new_stream_requested = false;
         let mut open_midi_channel_pressure_import_requested = false;
         let mut open_midi_channel_pressure_new_stream_requested = false;
+        let mut open_midi_poly_pressure_import_requested = false;
+        let mut open_midi_poly_pressure_new_stream_requested = false;
         let mut open_midi_cc_batch_requested = false;
         let mut open_midi_cc_batch_existing_requested = false;
         let mut open_midi_cc_export_requested = false;
@@ -56077,6 +56083,21 @@ impl DawUi {
                 .clicked()
             {
                 open_midi_channel_pressure_new_stream_requested = true;
+            }
+            if ui
+                .add_enabled(
+                    self.piano_roll_controller_stream.is_some(),
+                    egui::Button::new("Import MIDI Polyphonic Pressure…"),
+                )
+                .clicked()
+            {
+                open_midi_poly_pressure_import_requested = true;
+            }
+            if ui
+                .button("Import MIDI Polyphonic Pressure to new stream…")
+                .clicked()
+            {
+                open_midi_poly_pressure_new_stream_requested = true;
             }
             if ui.button("Import multiple MIDI CCs…").clicked() {
                 open_midi_cc_batch_requested = true;
@@ -56272,6 +56293,8 @@ impl DawUi {
             open_midi_pitch_bend_new_stream_requested,
             open_midi_channel_pressure_import_requested,
             open_midi_channel_pressure_new_stream_requested,
+            open_midi_poly_pressure_import_requested,
+            open_midi_poly_pressure_new_stream_requested,
             open_midi_cc_batch_requested,
             open_midi_cc_batch_existing_requested,
         );
@@ -56917,6 +56940,8 @@ impl DawUi {
         open_pitch_bend_new_stream_requested: bool,
         open_channel_pressure_existing_requested: bool,
         open_channel_pressure_new_stream_requested: bool,
+        open_poly_pressure_existing_requested: bool,
+        open_poly_pressure_new_stream_requested: bool,
         open_batch_requested: bool,
         open_batch_existing_requested: bool,
     ) {
@@ -56926,6 +56951,8 @@ impl DawUi {
             || open_pitch_bend_new_stream_requested
             || open_channel_pressure_existing_requested
             || open_channel_pressure_new_stream_requested
+            || open_poly_pressure_existing_requested
+            || open_poly_pressure_new_stream_requested
             || open_batch_requested
             || open_batch_existing_requested)
             && let Some(target_stream) = if open_batch_requested {
@@ -56947,6 +56974,11 @@ impl DawUi {
                     self.piano_roll_controller_new_channel,
                     self.piano_roll_controller_new_flags,
                 ))
+            } else if open_poly_pressure_new_stream_requested {
+                Some((
+                    self.piano_roll_controller_new_channel,
+                    self.piano_roll_controller_new_flags,
+                ))
             } else {
                 selected_stream
             }
@@ -56958,6 +56990,10 @@ impl DawUi {
                         || open_channel_pressure_new_stream_requested
                     {
                         "Import MIDI Channel Pressure automation"
+                    } else if open_poly_pressure_existing_requested
+                        || open_poly_pressure_new_stream_requested
+                    {
+                        "Import MIDI Polyphonic Key Pressure automation"
                     } else {
                         "Import MIDI controller automation"
                     },
@@ -56981,6 +57017,11 @@ impl DawUi {
                             } else {
                                 BTreeSet::new()
                             };
+                        let pressure_key = midi.tracks()[0]
+                            .polyphonic_key_pressures()
+                            .first()
+                            .map(|pressure| pressure.key())
+                            .unwrap_or(60);
                         self.pending_midi_cc_import = Some(PendingMidiCcImport {
                             path: path.clone(),
                             midi,
@@ -56988,6 +57029,9 @@ impl DawUi {
                                 || open_pitch_bend_new_stream_requested,
                             channel_pressure: open_channel_pressure_existing_requested
                                 || open_channel_pressure_new_stream_requested,
+                            polyphonic_pressure: open_poly_pressure_existing_requested
+                                || open_poly_pressure_new_stream_requested,
+                            pressure_key,
                             selected_track: 0,
                             controller_number,
                             midi_channel: None,
@@ -56996,6 +57040,7 @@ impl DawUi {
                             new_stream: open_new_stream_requested
                                 || open_pitch_bend_new_stream_requested
                                 || open_channel_pressure_new_stream_requested
+                                || open_poly_pressure_new_stream_requested
                                 || open_batch_requested,
                             batch_new_streams: open_batch_requested,
                             batch_existing_streams: open_batch_existing_requested,
@@ -57012,6 +57057,10 @@ impl DawUi {
                                 || open_channel_pressure_new_stream_requested
                             {
                                 "Channel Pressure"
+                            } else if open_poly_pressure_existing_requested
+                                || open_poly_pressure_new_stream_requested
+                            {
+                                "Polyphonic Key Pressure"
                             } else {
                                 "controller"
                             },
@@ -57038,6 +57087,8 @@ impl DawUi {
                         "Import MIDI Pitch Bend automation"
                     } else if pending.channel_pressure {
                         "Import MIDI Channel Pressure automation"
+                    } else if pending.polyphonic_pressure {
+                        "Import MIDI Polyphonic Key Pressure automation"
                     } else {
                         "Import MIDI controller automation"
                     });
@@ -57119,10 +57170,20 @@ impl DawUi {
                     .get(pending.selected_track)
                     .map(|track| track.channel_pressures())
                     .unwrap_or_default();
+                let polyphonic_pressures = pending
+                    .midi
+                    .tracks()
+                    .get(pending.selected_track)
+                    .map(|track| track.polyphonic_key_pressures())
+                    .unwrap_or_default();
                 let controller_numbers = changes
                     .iter()
                     .map(|change| change.controller())
-                    .filter(|_| !pending.pitch_bend && !pending.channel_pressure)
+                    .filter(|_| {
+                        !pending.pitch_bend
+                            && !pending.channel_pressure
+                            && !pending.polyphonic_pressure
+                    })
                     .collect::<BTreeSet<_>>();
                 if pending.batch_new_streams || pending.batch_existing_streams {
                     pending
@@ -57271,6 +57332,35 @@ impl DawUi {
                     ui.label(
                         "Channel Pressure events from the selected MIDI track will be imported.",
                     );
+                } else if pending.polyphonic_pressure {
+                    let pressure_keys = polyphonic_pressures
+                        .iter()
+                        .map(|pressure| pressure.key())
+                        .collect::<BTreeSet<_>>();
+                    if !pressure_keys.contains(&pending.pressure_key)
+                        && let Some(first_key) = pressure_keys.first().copied()
+                    {
+                        pending.pressure_key = first_key;
+                    }
+                    let key_text = if pressure_keys.is_empty() {
+                        "No key pressure events".to_owned()
+                    } else {
+                        format!("MIDI key {}", pending.pressure_key)
+                    };
+                    egui::ComboBox::from_id_salt((
+                        "piano-roll-midi-poly-pressure-key",
+                        pending.pattern_id,
+                    ))
+                    .selected_text(key_text)
+                    .show_ui(ui, |ui| {
+                        for key in &pressure_keys {
+                            ui.selectable_value(
+                                &mut pending.pressure_key,
+                                *key,
+                                format!("MIDI key {key}"),
+                            );
+                        }
+                    });
                 } else {
                     if let Some(first_controller) = controller_numbers.first().copied()
                         && !controller_numbers.contains(&pending.controller_number)
@@ -57306,6 +57396,12 @@ impl DawUi {
                 } else if pending.channel_pressure {
                     channel_pressures
                         .iter()
+                        .map(|pressure| pressure.channel())
+                        .collect::<BTreeSet<_>>()
+                } else if pending.polyphonic_pressure {
+                    polyphonic_pressures
+                        .iter()
+                        .filter(|pressure| pressure.key() == pending.pressure_key)
                         .map(|pressure| pressure.channel())
                         .collect::<BTreeSet<_>>()
                 } else {
@@ -57350,6 +57446,8 @@ impl DawUi {
                     "Pitch Bend values map linearly from 0–16383 to 0.0–1.0. Source timing is preserved."
                 } else if pending.channel_pressure {
                     "Channel Pressure values map linearly from 0–127 to 0.0–1.0. Source timing is preserved."
+                } else if pending.polyphonic_pressure {
+                    "Imports the selected key only. Values map from 0–127 to 0.0–1.0; source timing is preserved."
                 } else if pending.batch_new_streams {
                     "Raw stream bytes are uninterpreted; identifiers default to unused pairs and remain editable."
                 } else if pending.batch_existing_streams {
@@ -57376,6 +57474,10 @@ impl DawUi {
                         !pitch_bends.is_empty()
                     } else if pending.channel_pressure {
                         !channel_pressures.is_empty()
+                    } else if pending.polyphonic_pressure {
+                        polyphonic_pressures
+                            .iter()
+                            .any(|pressure| pressure.key() == pending.pressure_key)
                     } else {
                         !controller_numbers.is_empty()
                     };
@@ -57401,6 +57503,10 @@ impl DawUi {
                     "Import Channel Pressure and create stream"
                 } else if pending.channel_pressure {
                     "Import Channel Pressure"
+                } else if pending.polyphonic_pressure && pending.new_stream {
+                    "Import Key Pressure and create stream"
+                } else if pending.polyphonic_pressure {
+                    "Import Key Pressure"
                 } else if pending.batch_new_streams {
                     "Import selected CCs and create streams"
                 } else if pending.batch_existing_streams {
@@ -57431,6 +57537,8 @@ impl DawUi {
                         midi: pending.midi.clone(),
                         pitch_bend: pending.pitch_bend,
                         channel_pressure: pending.channel_pressure,
+                        polyphonic_pressure: pending.polyphonic_pressure,
+                        pressure_key: pending.pressure_key,
                         track_index: pending.selected_track,
                         pattern_id: pending.pattern_id,
                         target_stream: pending.target_stream,
@@ -57458,6 +57566,8 @@ impl DawUi {
             midi,
             pitch_bend,
             channel_pressure,
+            polyphonic_pressure,
+            pressure_key,
             track_index,
             pattern_id: target_pattern,
             target_stream,
@@ -57533,6 +57643,29 @@ impl DawUi {
                         result
                             .map(|imported| vec![(cc, imported)])
                             .map_err(|error| error.to_string())
+                    } else if polyphonic_pressure {
+                        let result = if new_stream {
+                            document.import_midi_polyphonic_pressure_to_new_stream(
+                                &midi,
+                                track_index,
+                                target_pattern,
+                                target_stream,
+                                pressure_key,
+                                channel,
+                            )
+                        } else {
+                            document.import_midi_polyphonic_pressure(
+                                &midi,
+                                track_index,
+                                target_pattern,
+                                target_stream,
+                                pressure_key,
+                                channel,
+                            )
+                        };
+                        result
+                            .map(|imported| vec![(cc, imported)])
+                            .map_err(|error| error.to_string())
                     } else {
                         let result = if new_stream {
                             document.import_midi_control_changes_to_new_stream(
@@ -57595,6 +57728,10 @@ impl DawUi {
                         format!(
                             "No matching MIDI Channel Pressure events were found in Pattern {target_pattern}; no raw stream was created"
                         )
+                    } else if polyphonic_pressure && new_stream && imported == 0 {
+                        format!(
+                            "No matching MIDI Polyphonic Key Pressure events for key {pressure_key} were found in Pattern {target_pattern}; no raw stream was created"
+                        )
                     } else if new_stream && imported == 0 {
                         format!(
                             "No matching MIDI CC events were found in Pattern {target_pattern}; no raw stream was created"
@@ -57611,6 +57748,15 @@ impl DawUi {
                     } else if channel_pressure {
                         format!(
                             "Imported {imported} MIDI Channel Pressure events into Pattern {target_pattern}{}",
+                            if new_stream {
+                                " and created a raw stream"
+                            } else {
+                                ""
+                            }
+                        )
+                    } else if polyphonic_pressure {
+                        format!(
+                            "Imported {imported} MIDI Polyphonic Key Pressure events for key {pressure_key} into Pattern {target_pattern}{}",
                             if new_stream {
                                 " and created a raw stream"
                             } else {
@@ -57641,6 +57787,8 @@ impl DawUi {
                             "Pitch Bend"
                         } else if channel_pressure {
                             "Channel Pressure"
+                        } else if polyphonic_pressure {
+                            "Polyphonic Key Pressure"
                         } else {
                             "controller"
                         }
