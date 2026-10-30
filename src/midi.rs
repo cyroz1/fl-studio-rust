@@ -356,6 +356,22 @@ struct TimedMidiBytes {
     bytes: Vec<u8>,
 }
 
+fn midi_14bit_control_change_messages(
+    normalized_value: f64,
+    base_controller: u8,
+    midi_channel: u8,
+) -> ([u8; 3], [u8; 3]) {
+    let value = (normalized_value.clamp(0.0, 1.0) * 16_383.0).round() as u16;
+    (
+        [0xB0 | midi_channel, base_controller, (value >> 7) as u8],
+        [
+            0xB0 | midi_channel,
+            base_controller + 32,
+            (value & 0x7F) as u8,
+        ],
+    )
+}
+
 struct MidiExportMarker {
     tick: u64,
     name: String,
@@ -732,7 +748,73 @@ impl MidiFile {
         midi_channel: u8,
         file_format: MidiExportFileFormat,
     ) -> Result<Vec<u8>, MidiError> {
-        if midi_controller > 127 {
+        Self::encode_project_pattern_controller_stream_with_format_and_resolution(
+            document,
+            pattern_id,
+            raw_stream,
+            midi_controller,
+            midi_channel,
+            file_format,
+            false,
+        )
+    }
+
+    /// Exports one raw Pattern controller stream as a paired 14-bit MIDI Control Change track.
+    /// The normalized raw stream value maps linearly to 0–16383, with the MSB sent on the
+    /// selected base CC (0–31) and the LSB sent on CC `base + 32`.
+    pub fn encode_project_pattern_controller_stream_14bit(
+        document: &FlpDocument,
+        pattern_id: u16,
+        raw_stream: (u8, u8),
+        base_controller: u8,
+        midi_channel: u8,
+    ) -> Result<Vec<u8>, MidiError> {
+        Self::encode_project_pattern_controller_stream_14bit_with_format(
+            document,
+            pattern_id,
+            raw_stream,
+            base_controller,
+            midi_channel,
+            MidiExportFileFormat::Format1,
+        )
+    }
+
+    /// Exports one raw Pattern controller stream as a paired 14-bit MIDI Control Change track
+    /// using the requested MIDI file layout.
+    pub fn encode_project_pattern_controller_stream_14bit_with_format(
+        document: &FlpDocument,
+        pattern_id: u16,
+        raw_stream: (u8, u8),
+        base_controller: u8,
+        midi_channel: u8,
+        file_format: MidiExportFileFormat,
+    ) -> Result<Vec<u8>, MidiError> {
+        Self::encode_project_pattern_controller_stream_with_format_and_resolution(
+            document,
+            pattern_id,
+            raw_stream,
+            base_controller,
+            midi_channel,
+            file_format,
+            true,
+        )
+    }
+
+    fn encode_project_pattern_controller_stream_with_format_and_resolution(
+        document: &FlpDocument,
+        pattern_id: u16,
+        raw_stream: (u8, u8),
+        midi_controller: u8,
+        midi_channel: u8,
+        file_format: MidiExportFileFormat,
+        high_resolution: bool,
+    ) -> Result<Vec<u8>, MidiError> {
+        if high_resolution && midi_controller > 31 {
+            return Err(MidiError::InvalidExport(
+                "14-bit MIDI Control Change base number must be from 0 through 31",
+            ));
+        }
+        if !high_resolution && midi_controller > 127 {
             return Err(MidiError::InvalidExport(
                 "MIDI Control Change number must be from 0 through 127",
             ));
@@ -835,20 +917,48 @@ impl MidiFile {
                     MidiExportFileFormat::Format0 => 0x01,
                     MidiExportFileFormat::Format1 => 0x03,
                 },
-                format!(
-                    "Pattern {pattern_id} controller {} / 0x{:02X}",
-                    raw_stream.0, raw_stream.1
-                )
+                if high_resolution {
+                    format!(
+                        "Pattern {pattern_id} controller {} / 0x{:02X} as CC {midi_controller} + CC {}",
+                        raw_stream.0,
+                        raw_stream.1,
+                        midi_controller + 32,
+                    )
+                } else {
+                    format!(
+                        "Pattern {pattern_id} controller {} / 0x{:02X}",
+                        raw_stream.0, raw_stream.1
+                    )
+                }
                 .as_bytes(),
             )?,
         }];
         for point in controller_points {
-            let value = (point.value().clamp(0.0, 1.0) * 127.0).round() as u8;
-            controller_events.push(TimedMidiBytes {
-                tick: u64::from(point.position),
-                order: 4,
-                bytes: vec![0xB0 | midi_channel, midi_controller, value],
-            });
+            let tick = u64::from(point.position);
+            if high_resolution {
+                let (msb, lsb) = midi_14bit_control_change_messages(
+                    f64::from(point.value()),
+                    midi_controller,
+                    midi_channel,
+                );
+                controller_events.push(TimedMidiBytes {
+                    tick,
+                    order: 4,
+                    bytes: msb.to_vec(),
+                });
+                controller_events.push(TimedMidiBytes {
+                    tick,
+                    order: 4,
+                    bytes: lsb.to_vec(),
+                });
+            } else {
+                let value = (point.value().clamp(0.0, 1.0) * 127.0).round() as u8;
+                controller_events.push(TimedMidiBytes {
+                    tick,
+                    order: 4,
+                    bytes: vec![0xB0 | midi_channel, midi_controller, value],
+                });
+            }
         }
         match file_format {
             MidiExportFileFormat::Format0 => {
@@ -926,7 +1036,72 @@ impl MidiFile {
         midi_channel: u8,
         file_format: MidiExportFileFormat,
     ) -> Result<Vec<u8>, MidiError> {
-        if midi_controller > 127 {
+        Self::encode_project_song_controller_stream_with_format_and_resolution(
+            document,
+            arrangement_id,
+            raw_stream,
+            midi_controller,
+            midi_channel,
+            file_format,
+            false,
+        )
+    }
+
+    /// Exports one raw Pattern controller stream across an arrangement as paired 14-bit MIDI
+    /// Control Change events at every matching Playlist Pattern Clip.
+    pub fn encode_project_song_controller_stream_14bit(
+        document: &FlpDocument,
+        arrangement_id: u16,
+        raw_stream: (u8, u8),
+        base_controller: u8,
+        midi_channel: u8,
+    ) -> Result<Vec<u8>, MidiError> {
+        Self::encode_project_song_controller_stream_14bit_with_format(
+            document,
+            arrangement_id,
+            raw_stream,
+            base_controller,
+            midi_channel,
+            MidiExportFileFormat::Format1,
+        )
+    }
+
+    /// Exports one raw Pattern controller stream across an arrangement as paired 14-bit MIDI
+    /// Control Change events using the requested MIDI file layout.
+    pub fn encode_project_song_controller_stream_14bit_with_format(
+        document: &FlpDocument,
+        arrangement_id: u16,
+        raw_stream: (u8, u8),
+        base_controller: u8,
+        midi_channel: u8,
+        file_format: MidiExportFileFormat,
+    ) -> Result<Vec<u8>, MidiError> {
+        Self::encode_project_song_controller_stream_with_format_and_resolution(
+            document,
+            arrangement_id,
+            raw_stream,
+            base_controller,
+            midi_channel,
+            file_format,
+            true,
+        )
+    }
+
+    fn encode_project_song_controller_stream_with_format_and_resolution(
+        document: &FlpDocument,
+        arrangement_id: u16,
+        raw_stream: (u8, u8),
+        midi_controller: u8,
+        midi_channel: u8,
+        file_format: MidiExportFileFormat,
+        high_resolution: bool,
+    ) -> Result<Vec<u8>, MidiError> {
+        if high_resolution && midi_controller > 31 {
+            return Err(MidiError::InvalidExport(
+                "14-bit MIDI Control Change base number must be from 0 through 31",
+            ));
+        }
+        if !high_resolution && midi_controller > 127 {
             return Err(MidiError::InvalidExport(
                 "MIDI Control Change number must be from 0 through 127",
             ));
@@ -1076,17 +1251,36 @@ impl MidiFile {
                             "the arrangement expands to more than one million controller points",
                         ));
                     }
-                    controller_events.push(TimedMidiBytes {
-                        tick: clip_start
-                            .checked_add(source_tick - source_start_tick)
-                            .ok_or(MidiError::LengthOverflow)?,
-                        order: 4,
-                        bytes: vec![
-                            0xB0 | midi_channel,
+                    let tick = clip_start
+                        .checked_add(source_tick - source_start_tick)
+                        .ok_or(MidiError::LengthOverflow)?;
+                    if high_resolution {
+                        let (msb, lsb) = midi_14bit_control_change_messages(
+                            f64::from(point.value()),
                             midi_controller,
-                            (point.value().clamp(0.0, 1.0) * 127.0).round() as u8,
-                        ],
-                    });
+                            midi_channel,
+                        );
+                        controller_events.push(TimedMidiBytes {
+                            tick,
+                            order: 4,
+                            bytes: msb.to_vec(),
+                        });
+                        controller_events.push(TimedMidiBytes {
+                            tick,
+                            order: 4,
+                            bytes: lsb.to_vec(),
+                        });
+                    } else {
+                        controller_events.push(TimedMidiBytes {
+                            tick,
+                            order: 4,
+                            bytes: vec![
+                                0xB0 | midi_channel,
+                                midi_controller,
+                                (point.value().clamp(0.0, 1.0) * 127.0).round() as u8,
+                            ],
+                        });
+                    }
                 }
             }
             if source_start_tick > 0
@@ -1098,15 +1292,33 @@ impl MidiFile {
                         "the arrangement expands to more than one million controller points",
                     ));
                 }
-                controller_events.push(TimedMidiBytes {
-                    tick: clip_start,
-                    order: 3,
-                    bytes: vec![
-                        0xB0 | midi_channel,
+                if high_resolution {
+                    let (msb, lsb) = midi_14bit_control_change_messages(
+                        normalized_value,
                         midi_controller,
-                        (normalized_value.clamp(0.0, 1.0) * 127.0).round() as u8,
-                    ],
-                });
+                        midi_channel,
+                    );
+                    controller_events.push(TimedMidiBytes {
+                        tick: clip_start,
+                        order: 3,
+                        bytes: msb.to_vec(),
+                    });
+                    controller_events.push(TimedMidiBytes {
+                        tick: clip_start,
+                        order: 3,
+                        bytes: lsb.to_vec(),
+                    });
+                } else {
+                    controller_events.push(TimedMidiBytes {
+                        tick: clip_start,
+                        order: 3,
+                        bytes: vec![
+                            0xB0 | midi_channel,
+                            midi_controller,
+                            (normalized_value.clamp(0.0, 1.0) * 127.0).round() as u8,
+                        ],
+                    });
+                }
             }
         }
 
@@ -1117,12 +1329,22 @@ impl MidiFile {
         }
 
         let auxiliary_track = MidiExportAuxiliaryTrack {
-            name: format!(
-                "Arrangement {arrangement_id} raw controller {} / 0x{:02X} as CC {midi_controller} channel {}",
-                raw_stream.0,
-                raw_stream.1,
-                midi_channel + 1
-            ),
+            name: if high_resolution {
+                format!(
+                    "Arrangement {arrangement_id} raw controller {} / 0x{:02X} as CC {midi_controller} + CC {} channel {}",
+                    raw_stream.0,
+                    raw_stream.1,
+                    midi_controller + 32,
+                    midi_channel + 1
+                )
+            } else {
+                format!(
+                    "Arrangement {arrangement_id} raw controller {} / 0x{:02X} as CC {midi_controller} channel {}",
+                    raw_stream.0,
+                    raw_stream.1,
+                    midi_channel + 1
+                )
+            },
             end_tick: song_end_tick,
             events: controller_events,
         };

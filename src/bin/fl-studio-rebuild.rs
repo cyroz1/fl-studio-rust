@@ -4503,6 +4503,7 @@ struct PendingMidiCcExport {
     target_stream: (u8, u8),
     controller_number: u8,
     midi_channel: u8,
+    high_resolution: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -58365,6 +58366,7 @@ impl DawUi {
                 target_stream,
                 controller_number: 1,
                 midi_channel: 1,
+                high_resolution: false,
             });
         }
         let song_arrangement_id = if open_song_requested {
@@ -58395,6 +58397,7 @@ impl DawUi {
                 target_stream,
                 controller_number: 1,
                 midi_channel: 1,
+                high_resolution: false,
             });
         }
 
@@ -58436,10 +58439,18 @@ impl DawUi {
                     pending.target_stream.0, pending.target_stream.1
                 ));
                 ui.horizontal(|ui| {
+                    ui.selectable_value(&mut pending.high_resolution, false, "7-bit CC");
+                    ui.selectable_value(&mut pending.high_resolution, true, "14-bit CC pair");
+                    let maximum_controller = if pending.high_resolution { 31 } else { 127 };
+                    pending.controller_number = pending.controller_number.min(maximum_controller);
                     ui.add(
                         egui::DragValue::new(&mut pending.controller_number)
-                            .range(0..=127)
-                            .prefix("CC "),
+                            .range(0..=maximum_controller)
+                            .prefix(if pending.high_resolution {
+                                "Base CC "
+                            } else {
+                                "CC "
+                            }),
                     );
                     ui.add(
                         egui::DragValue::new(&mut pending.midi_channel)
@@ -58447,7 +58458,11 @@ impl DawUi {
                             .prefix("MIDI channel "),
                     );
                 });
-                ui.weak(help_text);
+                ui.weak(if pending.high_resolution {
+                    "Values map to 0–16383; CC N carries the MSB and CC N+32 carries the LSB."
+                } else {
+                    help_text
+                });
                 if ui.button(export_button_label).clicked() {
                     export_request = Some((
                         pending.path.clone(),
@@ -58456,6 +58471,7 @@ impl DawUi {
                         pending.controller_number,
                         pending.midi_channel - 1,
                         file_format,
+                        pending.high_resolution,
                     ));
                 }
                 cancel_requested = ui.button("Cancel").clicked();
@@ -58464,17 +58480,39 @@ impl DawUi {
         if cancel_requested {
             self.pending_midi_cc_export = None;
         }
-        if let Some((path, target, target_stream, cc, channel, file_format)) = export_request {
+        if let Some((path, target, target_stream, cc, channel, file_format, high_resolution)) =
+            export_request
+        {
             let result = self
                 .document
                 .as_ref()
                 .ok_or_else(|| "no project is open".to_owned())
                 .and_then(|document| {
                     let encoded = match target {
+                        PendingMidiCcExportTarget::Pattern(pattern_id) if high_resolution => {
+                            MidiFile::encode_project_pattern_controller_stream_14bit_with_format(
+                                document,
+                                pattern_id,
+                                target_stream,
+                                cc,
+                                channel,
+                                file_format,
+                            )
+                        }
                         PendingMidiCcExportTarget::Pattern(pattern_id) => {
                             MidiFile::encode_project_pattern_controller_stream_with_format(
                                 document,
                                 pattern_id,
+                                target_stream,
+                                cc,
+                                channel,
+                                file_format,
+                            )
+                        }
+                        PendingMidiCcExportTarget::Song(arrangement_id) if high_resolution => {
+                            MidiFile::encode_project_song_controller_stream_14bit_with_format(
+                                document,
+                                arrangement_id,
                                 target_stream,
                                 cc,
                                 channel,
@@ -58510,9 +58548,14 @@ impl DawUi {
                         }
                     };
                     self.status = format!(
-                        "Exported {scope} raw stream {} / 0x{:02X} as MIDI CC {cc} on channel {} to {} ({byte_count} bytes)",
+                        "Exported {scope} raw stream {} / 0x{:02X} as {} on channel {} to {} ({byte_count} bytes)",
                         target_stream.0,
                         target_stream.1,
+                        if high_resolution {
+                            format!("MIDI 14-bit CC {cc} + CC {}", cc + 32)
+                        } else {
+                            format!("MIDI CC {cc}")
+                        },
                         channel + 1,
                         path.display()
                     );
