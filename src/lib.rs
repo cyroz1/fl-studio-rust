@@ -1523,7 +1523,7 @@ impl ChannelSummary {
         self.pan
     }
 
-    /// Raw minimum and maximum controls from a type-5 channel's `0xDB` Levels event.
+    /// Raw minimum and maximum controls from a unique, valid type-5 `0xDB` Levels event.
     pub fn automation_range_raw(&self) -> Option<(i32, i32)> {
         if self.channel_type() != Some(ChannelType::Automation) {
             return None;
@@ -2335,7 +2335,7 @@ impl AutomationChannel {
         &self.points
     }
 
-    /// Raw Min and Max controls from this Automation channel's `0xDB` Levels event.
+    /// Raw Min and Max controls from a unique, valid `0xDB` Levels event.
     pub fn automation_range_raw(&self) -> Option<(i32, i32)> {
         self.automation_range_raw
     }
@@ -6868,6 +6868,33 @@ impl FlpDocument {
                 channel.levels_editable = false;
                 channel.volume = None;
                 channel.pan = None;
+                let mut range_events = channel
+                    .event_range()
+                    .filter(|index| self.events[*index].opcode == 0xDB);
+                let automation_range = match (range_events.next(), range_events.next()) {
+                    (Some(event_index), None) => {
+                        let event = &self.events[event_index];
+                        (matches!(event.encoding, PayloadEncoding::Data { .. })
+                            && event.payload.len() >= 8)
+                            .then(|| {
+                                (
+                                    i32::from_le_bytes(
+                                        event.payload[..4]
+                                            .try_into()
+                                            .expect("the 0xDB minimum field has four bytes"),
+                                    ),
+                                    i32::from_le_bytes(
+                                        event.payload[4..8]
+                                            .try_into()
+                                            .expect("the 0xDB maximum field has four bytes"),
+                                    ),
+                                )
+                            })
+                    }
+                    _ => None,
+                };
+                channel.automation_min_raw = automation_range.map(|(minimum, _)| minimum);
+                channel.automation_max_raw = automation_range.map(|(_, maximum)| maximum);
             }
         }
 

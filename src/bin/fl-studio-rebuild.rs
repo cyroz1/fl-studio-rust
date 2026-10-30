@@ -40923,7 +40923,23 @@ impl DawUi {
                 ui.weak("Min/Max editing requires a unique channel ID and one valid 0xDB event");
             }
         } else {
-            ui.weak("No saved 0xDB Automation Min/Max event to edit");
+            let has_range_event = document
+                .channels()
+                .into_iter()
+                .filter(|candidate| {
+                    candidate.id() == channel_id
+                        && candidate.channel_type() == Some(ChannelType::Automation)
+                })
+                .any(|candidate| {
+                    candidate
+                        .event_range()
+                        .any(|index| document.events()[index].opcode() == 0xDB)
+                });
+            if has_range_event {
+                ui.weak("Saved 0xDB range is ambiguous or malformed and cannot be edited");
+            } else {
+                ui.weak("No saved 0xDB Automation Min/Max event to edit");
+            }
         }
         match document.automation_target_links() {
             Ok(links) => {
