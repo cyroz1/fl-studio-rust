@@ -3,7 +3,7 @@ use std::fs;
 use std::hash::{BuildHasher, Hash, Hasher, RandomState};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -4947,6 +4947,10 @@ struct DawUi {
     performance_mixer_routing_sender: Option<Sender<FlpDocument>>,
     performance_latency_update_sender: Option<Sender<BTreeSet<u64>>>,
     performance_latency_report_receiver: Option<Receiver<Vst3LatencyReport>>,
+    pattern_note_update_sender: Option<SyncSender<Vec<PatternNote>>>,
+    pattern_note_update_pattern_id: Option<u16>,
+    pattern_note_update_snapshot: Option<Vec<PatternNote>>,
+    pattern_note_update_revision: u64,
     pattern_latency_update_sender: Option<Sender<BTreeSet<u64>>>,
     pattern_latency_report_receiver: Option<Receiver<Vst3LatencyReport>>,
     pattern_pdc_update_sender: Option<Sender<FlpDocument>>,
@@ -7352,6 +7356,10 @@ impl DawUi {
             performance_mixer_routing_sender: None,
             performance_latency_update_sender: None,
             performance_latency_report_receiver: None,
+            pattern_note_update_sender: None,
+            pattern_note_update_pattern_id: None,
+            pattern_note_update_snapshot: None,
+            pattern_note_update_revision: 0,
             pattern_latency_update_sender: None,
             pattern_latency_report_receiver: None,
             pattern_pdc_update_sender: None,
@@ -15692,6 +15700,10 @@ impl DawUi {
         self.performance_mixer_routing_sender = None;
         self.performance_latency_update_sender = None;
         self.performance_latency_report_receiver = None;
+        self.pattern_note_update_sender = None;
+        self.pattern_note_update_pattern_id = None;
+        self.pattern_note_update_snapshot = None;
+        self.pattern_note_update_revision = 0;
         self.pattern_latency_update_sender = None;
         self.pattern_latency_report_receiver = None;
         self.pattern_pdc_update_sender = None;
@@ -17081,6 +17093,48 @@ impl DawUi {
         let engine = self.audio_engine.as_ref()?;
         let frames = engine.project_playback_position_frames();
         tempo_map.tick_at_frame(frames, engine.sample_rate())
+    }
+
+    fn publish_live_pattern_note_updates(&mut self) {
+        if self.pattern_note_update_revision == self.project_edit_revision {
+            return;
+        }
+        let Some(sender) = self.pattern_note_update_sender.clone() else {
+            return;
+        };
+        let Some(pattern_id) = self.pattern_note_update_pattern_id else {
+            return;
+        };
+        let Some(notes) = self
+            .document
+            .as_ref()
+            .and_then(|document| document.patterns().ok())
+            .and_then(|patterns| {
+                patterns
+                    .into_iter()
+                    .find(|pattern| pattern.id == pattern_id)
+                    .map(|pattern| pattern.notes)
+            })
+        else {
+            return;
+        };
+        if self.pattern_note_update_snapshot.as_ref() == Some(&notes) {
+            self.pattern_note_update_revision = self.project_edit_revision;
+            return;
+        }
+        match sender.try_send(notes.clone()) {
+            Ok(()) => {
+                self.pattern_note_update_snapshot = Some(notes);
+                self.pattern_note_update_revision = self.project_edit_revision;
+            }
+            Err(TrySendError::Full(_)) => {}
+            Err(TrySendError::Disconnected(_)) => {
+                self.pattern_note_update_sender = None;
+                self.pattern_note_update_pattern_id = None;
+                self.pattern_note_update_snapshot = None;
+                self.pattern_note_update_revision = self.project_edit_revision;
+            }
+        }
     }
 
     fn publish_midi_script_transport_state(&mut self) {
@@ -48662,6 +48716,21 @@ impl DawUi {
             self.midi_script_mixer_peak_holds.fill((0.0, 0.0));
             self.midi_script_mixer_peak_updated_at = Instant::now();
         }
+        let pattern_note_update_snapshot = loop_length_ticks.and_then(|_| {
+            document
+                .patterns()
+                .ok()?
+                .into_iter()
+                .find(|pattern| pattern.id == pattern_id)
+                .map(|pattern| pattern.notes)
+        });
+        let (pattern_note_update_sender_for_ui, pattern_note_update_receiver) =
+            if pattern_note_update_snapshot.is_some() {
+                let (updates, receiver) = mpsc::sync_channel(1);
+                (Some(updates), Some(receiver))
+            } else {
+                (None, None)
+            };
         let (sender, receiver) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
             .name(if loop_length_ticks.is_some() {
@@ -48703,6 +48772,7 @@ impl DawUi {
                                                     pdc_updates: pattern_pdc_update_receiver,
                                                 }
                                             }),
+                                        note_updates: pattern_note_update_receiver,
                                         clap_audio_channel_ids: worker_clap_pattern_channels.clone(),
                                         pattern_audio_layers: worker_pattern_audio_layers,
                                     },
@@ -48753,6 +48823,7 @@ impl DawUi {
                                             reports,
                                             pdc_updates: pattern_pdc_update_receiver,
                                         }),
+                                    note_updates: pattern_note_update_receiver,
                                     clap_audio_channel_ids: worker_clap_pattern_channels.clone(),
                                     pattern_audio_layers: worker_pattern_audio_layers,
                                 },
@@ -48806,6 +48877,11 @@ impl DawUi {
                 });
                 self.playing = true;
                 self.project_playback_loaded = true;
+                self.pattern_note_update_sender = pattern_note_update_sender_for_ui;
+                self.pattern_note_update_pattern_id =
+                    pattern_note_update_snapshot.as_ref().map(|_| pattern_id);
+                self.pattern_note_update_snapshot = pattern_note_update_snapshot;
+                self.pattern_note_update_revision = self.project_edit_revision;
                 self.pattern_latency_update_sender = pattern_latency_update_sender_for_ui;
                 self.pattern_latency_report_receiver = if has_vst3_processor {
                     pattern_latency_report_receiver
@@ -70037,6 +70113,7 @@ impl eframe::App for DawUi {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.publish_live_pattern_note_updates();
         self.publish_midi_script_transport_state();
         // Reassert the app theme before building child Uis. Some native
         // window backends report a system appearance after startup.

@@ -802,6 +802,8 @@ pub struct SamplerPatternLoopStreamControls<'a> {
     pub meters: &'a crate::audio::MixerTrackPeakMeters,
     pub latency_updates: Option<Vst3LatencyUpdateControls>,
     pub metronome: Option<MetronomeStreamPlayback>,
+    /// Updated Pattern notes; applied to unplayed Sampler events at block boundaries.
+    pub note_updates: Option<Receiver<Vec<PatternNote>>>,
     /// Assigned CLAP destinations, including channels with zero crossfade gain.
     pub clap_audio_channel_ids: BTreeSet<u16>,
     pub pattern_audio_layers: Vec<PatternAudioLayer>,
@@ -827,6 +829,8 @@ pub struct Vst3PatternLoopStreamControls<'a> {
     pub meters: &'a crate::audio::MixerTrackPeakMeters,
     pub latency_updates: Option<Vst3LatencyUpdateControls>,
     pub metronome: Option<MetronomeStreamPlayback>,
+    /// Updated Pattern notes; currently applied to Sampler events at block boundaries.
+    pub note_updates: Option<Receiver<Vec<PatternNote>>>,
     /// Assigned CLAP destinations, including channels with zero crossfade gain.
     pub clap_audio_channel_ids: BTreeSet<u16>,
     pub pattern_audio_layers: Vec<PatternAudioLayer>,
@@ -7480,6 +7484,7 @@ pub fn stream_sampler_pattern_to_device_with_live_controls(
             meters: Some(controls.meters),
             latency_updates: controls.latency_updates,
             metronome: controls.metronome,
+            note_updates: None,
         },
         writer,
         cancelled,
@@ -7537,6 +7542,7 @@ pub fn stream_sampler_pattern_loop_from_tick_to_device(
             meters: None,
             latency_updates: None,
             metronome: None,
+            note_updates: None,
         },
         writer,
         cancelled,
@@ -7562,6 +7568,7 @@ pub fn stream_sampler_pattern_loop_from_tick_to_device_with_live_master_controls
             meters,
             latency_updates: None,
             metronome: None,
+            note_updates: None,
             clap_audio_channel_ids: BTreeSet::new(),
             pattern_audio_layers: Vec::new(),
         },
@@ -7598,6 +7605,7 @@ pub fn stream_sampler_pattern_loop_from_tick_to_device_with_live_controls(
             meters: Some(controls.meters),
             latency_updates: controls.latency_updates,
             metronome: controls.metronome,
+            note_updates: controls.note_updates,
         },
         writer,
         cancelled,
@@ -7631,6 +7639,7 @@ pub fn stream_pattern_loop_with_vst3_from_tick_to_device(
             meters: None,
             latency_updates: None,
             metronome: None,
+            note_updates: None,
         },
         writer,
         cancelled,
@@ -7665,6 +7674,7 @@ pub fn stream_pattern_loop_with_vst3_from_tick_to_device_with_live_master_contro
             meters: Some(meters),
             latency_updates: None,
             metronome: None,
+            note_updates: None,
         },
         writer,
         cancelled,
@@ -7698,6 +7708,7 @@ pub fn stream_pattern_loop_with_vst3_from_tick_to_device_with_live_controls(
             meters: Some(controls.meters),
             latency_updates: controls.latency_updates,
             metronome: controls.metronome,
+            note_updates: controls.note_updates,
         },
         writer,
         cancelled,
@@ -7756,6 +7767,7 @@ pub fn stream_pattern_with_vst3_to_device_with_live_controls(
             meters: Some(controls.meters),
             latency_updates: controls.latency_updates,
             metronome: controls.metronome,
+            note_updates: None,
         },
         writer,
         cancelled,
@@ -8179,6 +8191,7 @@ struct PatternLiveStreamControls<'a> {
     meters: Option<&'a crate::audio::MixerTrackPeakMeters>,
     latency_updates: Option<Vst3LatencyUpdateControls>,
     metronome: Option<MetronomeStreamPlayback>,
+    note_updates: Option<Receiver<Vec<PatternNote>>>,
 }
 
 struct SamplerPatternChannelOptions<'a> {
@@ -8187,6 +8200,138 @@ struct SamplerPatternChannelOptions<'a> {
     include_muted_mixer_sources: bool,
     vst3_volume_expression_channels: Option<&'a BTreeSet<u16>>,
     clap_audio_channels: Option<&'a BTreeSet<u16>>,
+}
+
+fn schedule_live_sampler_pattern_notes(
+    document: &FlpDocument,
+    pattern_notes: &[PatternNote],
+    options: SamplerPatternRenderOptions,
+    sources_by_channel: &HashMap<u16, SamplerVoiceSource>,
+    vst3_volume_expression_channels: Option<&BTreeSet<u16>>,
+    clap_audio_channels: Option<&BTreeSet<u16>>,
+) -> Result<Vec<ScheduledSamplerNote>, String> {
+    let ppq = document.header().ppq();
+    if ppq == 0 {
+        return Err("project PPQ must be greater than zero".to_owned());
+    }
+    let tempo_bpm = document.metadata().tempo_bpm().unwrap_or(140.0);
+    if !tempo_bpm.is_finite() || tempo_bpm <= 0.0 {
+        return Err("project tempo must be finite and positive".to_owned());
+    }
+    let global_swing_mix_raw = document.metadata().global_swing_mix();
+    let channels = document.channels();
+    let channels_by_id = channels
+        .iter()
+        .map(|channel| (channel.id(), channel))
+        .collect::<HashMap<_, _>>();
+    let channel_router = ChannelNoteRouter::new(channels.clone());
+    let mut scheduled_notes = Vec::new();
+
+    for (note_index, note) in pattern_notes.iter().enumerate() {
+        if note.is_muted() {
+            continue;
+        }
+        let routes = match (vst3_volume_expression_channels, clap_audio_channels) {
+            (Some(vst3_channels), Some(clap_channels)) => channel_router
+                .targets_for_note_with_clap_and_mixed_crossfade(
+                    note.channel_id,
+                    note_index as u64,
+                    note.key,
+                    vst3_channels,
+                    clap_channels,
+                ),
+            (Some(vst3_channels), None) => channel_router.targets_for_note_with_mixed_crossfade(
+                note.channel_id,
+                note_index as u64,
+                note.key,
+                vst3_channels,
+            ),
+            (None, Some(clap_channels)) => channel_router.targets_for_note_with_clap_audio_layers(
+                note.channel_id,
+                note_index as u64,
+                note.key,
+                clap_channels,
+            ),
+            (None, None) => channel_router.targets_for_note_with_layer_adjustments(
+                note.channel_id,
+                note_index as u64,
+                note.key,
+            ),
+        };
+        for (target_channel_id, layer_gain, layer_pan_raw) in routes {
+            let Some(source) = sources_by_channel.get(&target_channel_id) else {
+                continue;
+            };
+            let Some(channel) = channels_by_id.get(&target_channel_id) else {
+                continue;
+            };
+            if channel.kind() != Some(0) || channel.enabled() == Some(false) {
+                continue;
+            }
+            let note_key = transpose_sampler_note_key(
+                note.key,
+                sampler_note_pitch_offset_semitones(
+                    channel,
+                    source.root_key,
+                    document.metadata().master_pitch_cents(),
+                ),
+            );
+            if !note.is_slide_note() && !source.accepts_note(note_key, note.velocity) {
+                continue;
+            }
+            let channel_swing_mix_raw = channels_by_id
+                .get(&note.channel_id)
+                .map_or(128, |channel| channel.swing_mix());
+            let nominal_start_tick = u64::from(note.position);
+            let swung_start_tick = swing_note_start_tick(
+                nominal_start_tick,
+                ppq,
+                global_swing_mix_raw,
+                channel_swing_mix_raw,
+            )?;
+            let swing_offset = swung_start_tick.saturating_sub(nominal_start_tick);
+            let start_frame =
+                ticks_to_frames(swung_start_tick, ppq, tempo_bpm, options.sample_rate)?;
+            let stop_frame = if note.length == 0 {
+                None
+            } else {
+                let end_tick = nominal_start_tick
+                    .checked_add(u64::from(note.length))
+                    .and_then(|tick| tick.checked_add(swing_offset))
+                    .ok_or_else(|| "Sampler note end position overflow".to_owned())?;
+                Some(
+                    ticks_to_frames(end_tick, ppq, tempo_bpm, options.sample_rate)?
+                        .max(start_frame.saturating_add(1)),
+                )
+            };
+            scheduled_notes.push(ScheduledSamplerNote {
+                clip_index: 0,
+                playlist_track_id: None,
+                start_tick: 0,
+                stop_tick: None,
+                start_frame,
+                stop_frame,
+                channel_id: target_channel_id,
+                key: note_key,
+                midi_channel: note.midi_channel,
+                slide_note: note.is_slide_note(),
+                slide_duration_frames: sampler_polyphony_slide_frames(
+                    channel.sampler_polyphony_slide_raw(),
+                    ppq,
+                    tempo_bpm,
+                    options.sample_rate,
+                ),
+                velocity: note.velocity,
+                pan: note.pan,
+                fine_pitch_offset_cents: note.fine_pitch_offset_cents(),
+                layer_gain,
+                layer_pan_raw,
+            });
+        }
+    }
+    scheduled_notes
+        .sort_by_key(|note| (note.start_frame, note.slide_note, note.channel_id, note.key));
+    Ok(scheduled_notes)
 }
 
 fn stream_pattern_from_tick_with_vst3_to_device(
@@ -8202,6 +8347,7 @@ fn stream_pattern_from_tick_with_vst3_to_device(
         meters: live_master_meters,
         latency_updates,
         metronome,
+        mut note_updates,
     } = controls;
     let mut metronome_route = metronome.as_ref().map(|metronome| {
         prepare_metronome_mixer_route(
@@ -8248,10 +8394,12 @@ fn stream_pattern_from_tick_with_vst3_to_device(
     if start_frame >= loop_frames {
         return Err("Pattern seek position rounds outside its audio loop".to_owned());
     }
-    let vst3_volume_expression_channels = playback
+    let live_vst3_volume_expression_channels = playback
         .vst3_processor
         .as_ref()
-        .map(|processor| processor.volume_expression_channel_ids().clone())
+        .map(|processor| processor.volume_expression_channel_ids().clone());
+    let vst3_volume_expression_channels = live_vst3_volume_expression_channels
+        .clone()
         .unwrap_or_default();
     let mut clap_pattern_channels = playback.clap_audio_channel_ids;
     clap_pattern_channels.extend(
@@ -8515,6 +8663,7 @@ fn stream_pattern_from_tick_with_vst3_to_device(
             block_start += frame_count as u64;
         }
         let mut next_loop_start = loop_frames;
+        let mut updated_pattern_notes = None;
         loop {
             if finite_output_frames.is_some_and(|frames| block_start >= frames) {
                 break Ok(());
@@ -8522,6 +8671,39 @@ fn stream_pattern_from_tick_with_vst3_to_device(
             check_cancelled(Some(cancelled))?;
             if writer.is_cancelled() {
                 return Err("Sampler pattern playback was stopped".to_owned());
+            }
+            if playback.repeat_pattern {
+                if let Some(receiver) = note_updates.as_ref() {
+                    let mut latest_notes = None;
+                    loop {
+                        match receiver.try_recv() {
+                            Ok(notes) => latest_notes = Some(notes),
+                            Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+                        }
+                    }
+                    if let Some(notes) = latest_notes
+                        && let Ok(scheduled_notes) = schedule_live_sampler_pattern_notes(
+                            document,
+                            &notes,
+                            options,
+                            &render.sources_by_channel,
+                            live_vst3_volume_expression_channels.as_ref(),
+                            (!clap_pattern_channels.is_empty()).then_some(&clap_pattern_channels),
+                        )
+                    {
+                        engine.replace_unplayed_pattern_notes();
+                        let current_loop_start = block_start / loop_frames * loop_frames;
+                        engine.queue_live_notes_with_frame_offset(
+                            &scheduled_notes,
+                            current_loop_start,
+                            Some(block_start),
+                        )?;
+                        next_loop_start = current_loop_start
+                            .checked_add(loop_frames)
+                            .ok_or_else(|| "Sampler Pattern loop position overflow".to_owned())?;
+                        updated_pattern_notes = Some(scheduled_notes);
+                    }
+                }
             }
             if let Some(latency_updates) = latency_updates.as_mut() {
                 apply_live_pdc_updates(
@@ -8555,8 +8737,9 @@ fn stream_pattern_from_tick_with_vst3_to_device(
             }
             let block_end = block_start.saturating_add(SAMPLER_BLOCK_FRAMES as u64);
             if playback.repeat_pattern {
+                let loop_notes = updated_pattern_notes.as_deref().unwrap_or(&render.notes);
                 while next_loop_start <= block_end {
-                    engine.queue_live_notes_with_frame_offset(&render.notes, next_loop_start)?;
+                    engine.queue_live_notes_with_frame_offset(loop_notes, next_loop_start, None)?;
                     next_loop_start = next_loop_start
                         .checked_add(loop_frames)
                         .ok_or_else(|| "Sampler Pattern loop position overflow".to_owned())?;
@@ -16076,6 +16259,7 @@ impl<'a> SamplerVoiceEngine<'a> {
         &mut self,
         notes: &[ScheduledSamplerNote],
         frame_offset: u64,
+        not_before_frame: Option<u64>,
     ) -> Result<(), String> {
         debug_assert!(
             notes
@@ -16097,12 +16281,19 @@ impl<'a> SamplerVoiceEngine<'a> {
 
         self.discard_consumed_live_notes();
         self.live_notes.reserve(notes.len());
-        self.live_notes
-            .extend(notes.iter().copied().map(|mut note| {
-                note.start_frame += frame_offset;
-                note.stop_frame = note.stop_frame.map(|stop_frame| stop_frame + frame_offset);
-                note
-            }));
+        self.live_notes.extend(
+            notes
+                .iter()
+                .copied()
+                .map(|mut note| {
+                    note.start_frame += frame_offset;
+                    note.stop_frame = note.stop_frame.map(|stop_frame| stop_frame + frame_offset);
+                    note
+                })
+                .filter(|note| {
+                    not_before_frame.is_none_or(|not_before| note.start_frame >= not_before)
+                }),
+        );
         self.live_notes.sort_by_key(|note| {
             (
                 note.start_frame,
@@ -16114,6 +16305,12 @@ impl<'a> SamplerVoiceEngine<'a> {
             )
         });
         Ok(())
+    }
+
+    fn replace_unplayed_pattern_notes(&mut self) {
+        self.next_note = self.notes.len();
+        self.live_notes.clear();
+        self.next_live_note = 0;
     }
 
     fn remove_queued_track_notes_from(&mut self, track_id: u32, start_frame: u64) {
