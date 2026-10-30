@@ -719,6 +719,9 @@ pub struct ChannelSummary {
     sample_remove_dc: Option<bool>,
     sample_normalize: Option<bool>,
     sample_reverse_polarity: Option<bool>,
+    sampler_filter_cutoff_raw: Option<u32>,
+    sampler_filter_resonance_raw: Option<u32>,
+    sampler_filter_type_raw: Option<u32>,
     sample_crossfade_raw: Option<u32>,
     sample_trim_threshold_raw: Option<u32>,
     sample_start_raw: Option<[u16; 2]>,
@@ -856,6 +859,14 @@ pub struct ChannelSampleTrimEdit {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ChannelSampleCrossfadeEdit {
     pub amount_raw: Option<u32>,
+}
+
+/// Candidate raw Sampler filter controls from the channel Parameters (`0xC7`) payload.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ChannelSamplerFilterEdit {
+    pub cutoff_raw: Option<u32>,
+    pub resonance_raw: Option<u32>,
+    pub filter_type_raw: Option<u32>,
 }
 
 /// Raw time-stretch settings from the channel Parameters (`0xC7`) payload.
@@ -1259,6 +1270,30 @@ impl ChannelSummary {
     pub fn sampler_fade_in_raw(&self) -> Option<u16> {
         (self.kind == Some(0))
             .then_some(self.sampler_fade_in_raw)
+            .flatten()
+    }
+
+    /// Candidate raw Sampler filter cutoff (`0..=256`) from the channel Parameters payload.
+    /// The layout follows PyFLP and still needs controlled FL Studio save comparison.
+    pub fn sampler_filter_cutoff_raw(&self) -> Option<u32> {
+        (self.kind == Some(0))
+            .then_some(self.sampler_filter_cutoff_raw)
+            .flatten()
+    }
+
+    /// Candidate raw Sampler filter resonance (`0..=256`) from the channel Parameters payload.
+    /// The layout follows PyFLP and still needs controlled FL Studio save comparison.
+    pub fn sampler_filter_resonance_raw(&self) -> Option<u32> {
+        (self.kind == Some(0))
+            .then_some(self.sampler_filter_resonance_raw)
+            .flatten()
+    }
+
+    /// Candidate raw Sampler filter type (`0..=7`) from the channel Parameters payload.
+    /// The layout follows PyFLP and still needs controlled FL Studio save comparison.
+    pub fn sampler_filter_type_raw(&self) -> Option<u32> {
+        (self.kind == Some(0))
+            .then_some(self.sampler_filter_type_raw)
             .flatten()
     }
 
@@ -6480,6 +6515,32 @@ impl FlpDocument {
                                 event.payload[88..92]
                                     .try_into()
                                     .expect("the sample Crossfade field has four bytes"),
+                            ));
+                        }
+                    }
+                    if channel.kind == Some(ChannelType::Sampler.raw()) && event.payload.len() >= 28
+                    {
+                        // PyFLP's Levels event layout places the Sampler filter cutoff,
+                        // resonance, and type at bytes 16, 20, and 24 respectively.
+                        if channel.sampler_filter_cutoff_raw.is_none() {
+                            channel.sampler_filter_cutoff_raw = Some(u32::from_le_bytes(
+                                event.payload[16..20]
+                                    .try_into()
+                                    .expect("the Sampler filter cutoff field has four bytes"),
+                            ));
+                        }
+                        if channel.sampler_filter_resonance_raw.is_none() {
+                            channel.sampler_filter_resonance_raw = Some(u32::from_le_bytes(
+                                event.payload[20..24]
+                                    .try_into()
+                                    .expect("the Sampler filter resonance field has four bytes"),
+                            ));
+                        }
+                        if channel.sampler_filter_type_raw.is_none() {
+                            channel.sampler_filter_type_raw = Some(u32::from_le_bytes(
+                                event.payload[24..28]
+                                    .try_into()
+                                    .expect("the Sampler filter type field has four bytes"),
                             ));
                         }
                     }
@@ -24211,6 +24272,85 @@ impl FlpDocument {
         let mut candidate = self.clone();
         let mut payload = candidate.events[parameters_index].payload.clone();
         payload[88..92].copy_from_slice(&amount_raw.to_le_bytes());
+        candidate.events[parameters_index].replace_data_payload(payload)?;
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    /// Edits the saved Sampler filter controls in a unique existing Parameters event.
+    /// The field offsets follow the PyFLP Levels layout; all other payload bytes are preserved.
+    pub fn edit_channel_sampler_filter(
+        &mut self,
+        channel_id: u16,
+        edit: ChannelSamplerFilterEdit,
+    ) -> Result<(), FlpError> {
+        if edit.cutoff_raw.is_none()
+            && edit.resonance_raw.is_none()
+            && edit.filter_type_raw.is_none()
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "at least one Sampler filter value must be supplied",
+            ));
+        }
+        if edit.cutoff_raw.is_some_and(|value| value > 256)
+            || edit.resonance_raw.is_some_and(|value| value > 256)
+            || edit.filter_type_raw.is_some_and(|value| value > 7)
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "Sampler filter cutoff and resonance must be 0..=256, and filter type must be 0..=7",
+            ));
+        }
+
+        self.require_unique_channel(channel_id)?;
+        let channel = self
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id() == channel_id)
+            .expect("the unique channel was checked above");
+        if channel.kind != Some(ChannelType::Sampler.raw()) {
+            return Err(FlpError::UnsupportedEdit(
+                "Sampler filter controls can only be edited on Sampler channels",
+            ));
+        }
+
+        let c7_events = channel
+            .event_range()
+            .filter(|index| self.events[*index].opcode == 0xC7)
+            .collect::<Vec<_>>();
+        let mut parameter_events = c7_events.iter().copied().filter(|index| {
+            matches!(self.events[*index].encoding, PayloadEncoding::Data { .. })
+                && ascii_version(&self.events[*index].payload).is_none()
+        });
+        let Some(parameters_index) = parameter_events.next() else {
+            return Err(FlpError::UnsupportedEdit(if c7_events.is_empty() {
+                "the selected Sampler has no existing Parameters (`0xC7`) event"
+            } else {
+                "the selected Sampler's `0xC7` event is not a recognized Parameters payload"
+            }));
+        };
+        if parameter_events.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected Sampler has multiple Parameters (`0xC7`) events",
+            ));
+        }
+        if self.events[parameters_index].payload.len() < 28 {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected Sampler's Parameters event does not contain all filter fields",
+            ));
+        }
+
+        let mut candidate = self.clone();
+        let mut payload = candidate.events[parameters_index].payload.clone();
+        if let Some(value) = edit.cutoff_raw {
+            payload[16..20].copy_from_slice(&value.to_le_bytes());
+        }
+        if let Some(value) = edit.resonance_raw {
+            payload[20..24].copy_from_slice(&value.to_le_bytes());
+        }
+        if let Some(value) = edit.filter_type_raw {
+            payload[24..28].copy_from_slice(&value.to_le_bytes());
+        }
         candidate.events[parameters_index].replace_data_payload(payload)?;
         candidate.refresh_event_offsets()?;
         *self = candidate;

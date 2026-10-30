@@ -101,11 +101,11 @@ use flp_rebuild::{
     AutomationPointEdit, AutomationScaleLevelsOptions, ChannelGroupSummary,
     ChannelMidiOutSettingsEdit, ChannelNoteRouter, ChannelSampleCrossfadeEdit,
     ChannelSampleEffectsEdit, ChannelSampleFxFlagsEdit, ChannelSampleTrimEdit,
-    ChannelSampleWindowEdit, ChannelSortOrder, ChannelStretchMode, ChannelStretchSettingsEdit,
-    ChannelSummary, ChannelType, ClawMachineOptions, FlamOptions, FlpDocument, FlpError,
-    FscControllerStreamImportOptions, FscScore, FstPreset, FstPresetKind, HumanizerOptions,
-    LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerInsertSummary, MixerParameterKind,
-    MixerParameterRecord, MixerSendSummary, PATTERN_NOTE_DEFAULT_FLAGS,
+    ChannelSampleWindowEdit, ChannelSamplerFilterEdit, ChannelSortOrder, ChannelStretchMode,
+    ChannelStretchSettingsEdit, ChannelSummary, ChannelType, ClawMachineOptions, FlamOptions,
+    FlpDocument, FlpError, FscControllerStreamImportOptions, FscScore, FstPreset, FstPresetKind,
+    HumanizerOptions, LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerInsertSummary,
+    MixerParameterKind, MixerParameterRecord, MixerSendSummary, PATTERN_NOTE_DEFAULT_FLAGS,
     PATTERN_NOTE_DEFAULT_RELEASE, PATTERN_NOTE_SLIDE_FLAG, Pattern, PatternController,
     PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation, PayloadEncoding,
     PlaylistClip, PlaylistClipEdit, PlaylistClipSelectionClipboard, PlaylistClipTarget,
@@ -37198,6 +37198,7 @@ impl DawUi {
         let mut channel_sample_window_edits = Vec::new();
         let mut channel_sample_trim_edits = Vec::new();
         let mut channel_sample_crossfade_edits = Vec::new();
+        let mut channel_sampler_filter_edits = Vec::new();
         let mut channel_main_pitch_edits = Vec::new();
         let mut channel_add_to_key_edits = Vec::new();
         let mut channel_zipped_edits = Vec::new();
@@ -37949,6 +37950,100 @@ impl DawUi {
                                             ));
                                         }
                                     });
+                                    if channel.kind() == Some(ChannelType::Sampler.raw()) {
+                                        ui.menu_button("Sampler filter", |ui| {
+                                            let (
+                                                Some(mut cutoff_raw),
+                                                Some(mut resonance_raw),
+                                                Some(mut filter_type_raw),
+                                            ) = (
+                                                channel.sampler_filter_cutoff_raw(),
+                                                channel.sampler_filter_resonance_raw(),
+                                                channel.sampler_filter_type_raw(),
+                                            )
+                                            else {
+                                                ui.small("No complete saved filter fields");
+                                                return;
+                                            };
+                                            let cutoff_changed = ui
+                                                .add(
+                                                    egui::Slider::new(&mut cutoff_raw, 0..=256)
+                                                        .text("Cutoff raw"),
+                                                )
+                                                .changed();
+                                            if cutoff_changed {
+                                                channel_sampler_filter_edits.push((
+                                                    channel.id(),
+                                                    ChannelSamplerFilterEdit {
+                                                        cutoff_raw: Some(cutoff_raw),
+                                                        ..ChannelSamplerFilterEdit::default()
+                                                    },
+                                                ));
+                                            }
+                                            let resonance_changed = ui
+                                                .add(
+                                                    egui::Slider::new(
+                                                        &mut resonance_raw,
+                                                        0..=256,
+                                                    )
+                                                    .text("Resonance raw"),
+                                                )
+                                                .changed();
+                                            if resonance_changed {
+                                                channel_sampler_filter_edits.push((
+                                                    channel.id(),
+                                                    ChannelSamplerFilterEdit {
+                                                        resonance_raw: Some(resonance_raw),
+                                                        ..ChannelSamplerFilterEdit::default()
+                                                    },
+                                                ));
+                                            }
+                                            const FILTER_TYPES: [&str; 8] = [
+                                                "Fast LP",
+                                                "LP",
+                                                "BP",
+                                                "HP",
+                                                "BS",
+                                                "LPx2",
+                                                "SVF LP",
+                                                "SVF LPx2",
+                                            ];
+                                            let original_filter_type = filter_type_raw;
+                                            let selected_filter_name = usize::try_from(filter_type_raw)
+                                                .ok()
+                                                .and_then(|index| FILTER_TYPES.get(index))
+                                                .copied()
+                                                .unwrap_or("Unknown");
+                                            egui::ComboBox::from_id_salt((
+                                                "sampler-filter-type",
+                                                channel.id(),
+                                            ))
+                                            .selected_text(selected_filter_name)
+                                            .show_ui(ui, |ui| {
+                                                for (raw, label) in
+                                                    FILTER_TYPES.iter().enumerate()
+                                                {
+                                                    ui.selectable_value(
+                                                        &mut filter_type_raw,
+                                                        raw as u32,
+                                                        *label,
+                                                    );
+                                                }
+                                            });
+                                            if filter_type_raw != original_filter_type {
+                                                channel_sampler_filter_edits.push((
+                                                    channel.id(),
+                                                    ChannelSamplerFilterEdit {
+                                                        filter_type_raw: Some(filter_type_raw),
+                                                        ..ChannelSamplerFilterEdit::default()
+                                                    },
+                                                ));
+                                            }
+                                            ui.small(
+                                                "Changes are saved to the project; playback does not apply the filter yet.",
+                                            );
+                                        });
+                                    }
                                     let reversed = if channel.kind() == Some(4) {
                                         channel.audio_clip_reversed()
                                     } else {
@@ -39210,6 +39305,25 @@ impl DawUi {
                 }
                 Some(Err(error)) => {
                     self.status = format!("Could not change sample Crossfade: {error}");
+                }
+                None => {}
+            }
+        }
+        for (channel_id, edit) in channel_sampler_filter_edits {
+            let result = self
+                .document
+                .as_mut()
+                .map(|document| document.edit_channel_sampler_filter(channel_id, edit));
+            match result {
+                Some(Ok(())) => {
+                    self.stop_project_playback();
+                    self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+                    self.status =
+                        format!("Updated Sampler filter settings for channel {channel_id}");
+                }
+                Some(Err(error)) => {
+                    self.status = format!("Could not change Sampler filter settings: {error}");
                 }
                 None => {}
             }
