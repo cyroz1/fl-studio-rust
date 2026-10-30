@@ -1638,6 +1638,15 @@ jobs:
           xvfb-run --auto-servernum --server-args="-screen 0 1600x900x24 +extension GLX" \
             bash "$RUNNER_TEMP/capture-ui.sh"
 
+      - name: Upload Piano roll shortcut preview
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v6
+        with:
+          name: gui-preview-${{ matrix.platform }}
+          path: dist/gui-preview/piano-roll-ghost-channels-toggle.png
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Launch Linux AppImage on a virtual display
         if: runner.os == 'Linux'
         shell: bash
