@@ -6278,6 +6278,7 @@ struct ActiveMidiRecording {
 struct MidiAutomationRecording {
     source: MidiAutomationRecordSource,
     stream: (u8, u8),
+    control_change_14: [[u8; 2]; 16],
     points: Vec<(u32, f32)>,
     overflowed: bool,
 }
@@ -6285,6 +6286,7 @@ struct MidiAutomationRecording {
 #[derive(Clone, Copy)]
 enum MidiAutomationRecordSource {
     ControlChange(u8),
+    ControlChange14(u8),
     ProgramChange,
     PitchBend,
     ChannelPressure,
@@ -6294,6 +6296,7 @@ enum MidiAutomationRecordSource {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MidiAutomationSourceChoice {
     ControlChange,
+    ControlChange14,
     ProgramChange,
     PitchBend,
     ChannelPressure,
@@ -6301,8 +6304,9 @@ enum MidiAutomationSourceChoice {
 }
 
 impl MidiAutomationSourceChoice {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::ControlChange,
+        Self::ControlChange14,
         Self::ProgramChange,
         Self::PitchBend,
         Self::ChannelPressure,
@@ -6312,6 +6316,7 @@ impl MidiAutomationSourceChoice {
     fn label(self) -> &'static str {
         match self {
             Self::ControlChange => "Control Change",
+            Self::ControlChange14 => "14-bit Control Change",
             Self::ProgramChange => "Program Change",
             Self::PitchBend => "Pitch Bend",
             Self::ChannelPressure => "Channel Pressure",
@@ -6322,6 +6327,7 @@ impl MidiAutomationSourceChoice {
     fn setting(self) -> &'static str {
         match self {
             Self::ControlChange => "cc",
+            Self::ControlChange14 => "cc14",
             Self::ProgramChange => "program-change",
             Self::PitchBend => "pitch-bend",
             Self::ChannelPressure => "channel-pressure",
@@ -6332,6 +6338,7 @@ impl MidiAutomationSourceChoice {
     fn from_setting(value: &str) -> Option<Self> {
         Some(match value {
             "cc" => Self::ControlChange,
+            "cc14" => Self::ControlChange14,
             "program-change" => Self::ProgramChange,
             "pitch-bend" => Self::PitchBend,
             "channel-pressure" => Self::ChannelPressure,
@@ -6343,6 +6350,9 @@ impl MidiAutomationSourceChoice {
     fn recording_source(self, controller: u8, key: u8) -> MidiAutomationRecordSource {
         match self {
             Self::ControlChange => MidiAutomationRecordSource::ControlChange(controller.min(127)),
+            Self::ControlChange14 => {
+                MidiAutomationRecordSource::ControlChange14(controller.min(31))
+            }
             Self::ProgramChange => MidiAutomationRecordSource::ProgramChange,
             Self::PitchBend => MidiAutomationRecordSource::PitchBend,
             Self::ChannelPressure => MidiAutomationRecordSource::ChannelPressure,
@@ -6357,37 +6367,15 @@ impl MidiAutomationRecordSource {
     fn label(self) -> String {
         match self {
             Self::ControlChange(controller) => format!("MIDI CC {controller}"),
+            Self::ControlChange14(controller) => {
+                format!("MIDI 14-bit CC {controller}")
+            }
             Self::ProgramChange => "MIDI Program Change".to_owned(),
             Self::PitchBend => "MIDI Pitch Bend".to_owned(),
             Self::ChannelPressure => "MIDI Channel Pressure".to_owned(),
             Self::PolyphonicPressure(key) => {
                 format!("MIDI Polyphonic Pressure for key {key}")
             }
-        }
-    }
-
-    fn value_from(self, event: &MidiInputEvent) -> Option<f32> {
-        match (self, event) {
-            (
-                Self::ControlChange(selected),
-                MidiInputEvent::ControlChange {
-                    controller, value, ..
-                },
-            ) if selected == *controller => Some(f32::from((*value).min(127)) / 127.0),
-            (Self::ProgramChange, MidiInputEvent::ProgramChange { program, .. }) => {
-                Some(f32::from((*program).min(127)) / 127.0)
-            }
-            (Self::PitchBend, MidiInputEvent::PitchBend { value, .. }) => {
-                Some((f32::from(*value).clamp(-8192.0, 8191.0) + 8192.0) / 16_383.0)
-            }
-            (Self::ChannelPressure, MidiInputEvent::ChannelPressure { pressure, .. }) => {
-                Some(f32::from((*pressure).min(127)) / 127.0)
-            }
-            (
-                Self::PolyphonicPressure(selected_key),
-                MidiInputEvent::PolyphonicPressure { key, pressure, .. },
-            ) if selected_key == *key => Some(f32::from((*pressure).min(127)) / 127.0),
-            _ => None,
         }
     }
 }
@@ -6397,8 +6385,53 @@ impl MidiAutomationRecording {
         Self {
             source,
             stream,
+            control_change_14: [[0; 2]; 16],
             points: Vec::new(),
             overflowed: false,
+        }
+    }
+
+    fn value_from(&mut self, event: &MidiInputEvent) -> Option<f32> {
+        match (self.source, event) {
+            (
+                MidiAutomationRecordSource::ControlChange(selected),
+                MidiInputEvent::ControlChange {
+                    controller, value, ..
+                },
+            ) if selected == *controller => Some(f32::from((*value).min(127)) / 127.0),
+            (
+                MidiAutomationRecordSource::ControlChange14(base_controller),
+                MidiInputEvent::ControlChange {
+                    channel,
+                    controller,
+                    value,
+                },
+            ) if *controller == base_controller || *controller == base_controller + 32 => {
+                let channel_values = self.control_change_14.get_mut(usize::from(*channel))?;
+                if *controller == base_controller {
+                    channel_values[0] = (*value).min(127);
+                } else {
+                    channel_values[1] = (*value).min(127);
+                }
+                let combined = u16::from(channel_values[0]) * 128 + u16::from(channel_values[1]);
+                Some(f32::from(combined) / 16_383.0)
+            }
+            (
+                MidiAutomationRecordSource::ProgramChange,
+                MidiInputEvent::ProgramChange { program, .. },
+            ) => Some(f32::from((*program).min(127)) / 127.0),
+            (MidiAutomationRecordSource::PitchBend, MidiInputEvent::PitchBend { value, .. }) => {
+                Some((f32::from(*value).clamp(-8192.0, 8191.0) + 8192.0) / 16_383.0)
+            }
+            (
+                MidiAutomationRecordSource::ChannelPressure,
+                MidiInputEvent::ChannelPressure { pressure, .. },
+            ) => Some(f32::from((*pressure).min(127)) / 127.0),
+            (
+                MidiAutomationRecordSource::PolyphonicPressure(selected_key),
+                MidiInputEvent::PolyphonicPressure { key, pressure, .. },
+            ) if selected_key == *key => Some(f32::from((*pressure).min(127)) / 127.0),
+            _ => None,
         }
     }
 
@@ -7248,7 +7281,7 @@ impl ActiveMidiRecording {
                 self.recorder.position_for_message(&message)
             };
             if let Some(position) = position
-                && let Some(value) = automation.source.value_from(&message.event)
+                && let Some(value) = automation.value_from(&message.event)
             {
                 automation.record_normalized(position, value);
             }
@@ -20203,6 +20236,7 @@ impl DawUi {
                             )
                             .changed();
                         ui.horizontal(|ui| {
+                            let previous_source = self.midi_record_automation_source;
                             egui::ComboBox::from_id_salt("midi_record_automation_source")
                                 .selected_text(self.midi_record_automation_source.label())
                                 .show_ui(ui, |ui| {
@@ -20216,6 +20250,13 @@ impl DawUi {
                                             .changed();
                                     }
                                 });
+                            if previous_source != self.midi_record_automation_source
+                                && self.midi_record_automation_source
+                                    == MidiAutomationSourceChoice::ControlChange14
+                            {
+                                self.midi_record_automation_controller =
+                                    self.midi_record_automation_controller.min(31);
+                            }
                             match self.midi_record_automation_source {
                                 MidiAutomationSourceChoice::ControlChange => {
                                     ui.label("CC");
@@ -20223,6 +20264,14 @@ impl DawUi {
                                         .add(egui::DragValue::new(
                                             &mut self.midi_record_automation_controller,
                                         ).range(0..=127))
+                                        .changed();
+                                }
+                                MidiAutomationSourceChoice::ControlChange14 => {
+                                    ui.label("Base CC");
+                                    record_filters_changed |= ui
+                                        .add(egui::DragValue::new(
+                                            &mut self.midi_record_automation_controller,
+                                        ).range(0..=31))
                                         .changed();
                                 }
                                 MidiAutomationSourceChoice::PolyphonicPressure => {
@@ -80491,7 +80540,13 @@ fn encode_midi_device_selections(selections: &MidiDeviceSelections) -> String {
         u8::from(selections.record_automation),
         u8::from(selections.record_automation_to_playlist),
         selections.record_automation_source.setting(),
-        selections.record_automation_controller.min(127),
+        selections.record_automation_controller.min(
+            if selections.record_automation_source == MidiAutomationSourceChoice::ControlChange14 {
+                31
+            } else {
+                127
+            },
+        ),
         selections.record_automation_key.min(127),
         selections.record_automation_channel,
         selections.record_automation_flags
@@ -80591,6 +80646,9 @@ fn parse_midi_device_selections(contents: &str) -> MidiDeviceSelections {
     }
     if selections.input_script_auto_detect {
         selections.input_script = None;
+    }
+    if selections.record_automation_source == MidiAutomationSourceChoice::ControlChange14 {
+        selections.record_automation_controller = selections.record_automation_controller.min(31);
     }
     selections
 }
