@@ -403,6 +403,7 @@ pub struct ClapPlaylistPreviewSettings {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ClapPatternPreviewPurpose {
     Audition,
+    Render,
     Transport,
     Playlist,
     SetParameters,
@@ -802,6 +803,11 @@ pub fn start_pattern_preview_worker(
                         ClapPatternPreviewPurpose::Audition => process
                             .render_pattern(settings.as_ref().ok_or_else(|| {
                                 "CLAP Pattern audition is missing its settings".to_owned()
+                            })?)
+                            .map(ClapPatternPreviewOutput::Audio),
+                        ClapPatternPreviewPurpose::Render => process
+                            .render_pattern(settings.as_ref().ok_or_else(|| {
+                                "CLAP Pattern render is missing its settings".to_owned()
                             })?)
                             .map(ClapPatternPreviewOutput::Audio),
                         ClapPatternPreviewPurpose::Transport => process

@@ -90,6 +90,7 @@ use flp_rebuild::sample_render::{
     stream_sampler_pattern_loop_from_tick_to_device_with_live_controls,
     stream_sampler_pattern_to_device, stream_sampler_pattern_to_device_with_live_controls,
     stream_vst3_midi_input_to_device, vst3_live_input_queue, write_input_recording_to_wav,
+    write_stereo_audio_buffer_to_file,
 };
 use flp_rebuild::vst3::{
     MAX_REPORTED_TAIL_SECONDS, Vst3AutomationPoint, Vst3HostRuntime, Vst3LatencyReport,
@@ -5510,6 +5511,7 @@ struct DawUi {
     pending_clap_performance_playback: Option<PendingClapPerformancePlayback>,
     active_clap_performance_cache_key: Option<ClapPerformanceCacheKey>,
     active_clap_performance_audio_layers: Arc<Vec<PlaylistPerformanceClapLayer>>,
+    pending_clap_pattern_render: Option<PendingClapPatternRender>,
     pending_clap_state_capture: Option<PendingClapStateCapture>,
     pending_clap_mixer_effect_state_capture: Option<PendingClapMixerEffectStateCapture>,
     active_clap_pattern_audio_layers: Vec<PatternAudioLayer>,
@@ -5821,6 +5823,25 @@ struct PendingClapPlaylistOfflineRender {
     request_routes: BTreeMap<u64, ClapPlaylistAudioRoute>,
     audio_layers: Vec<PlaylistAudioLayer>,
     job: PlaylistOfflineRenderJob,
+}
+
+struct PendingClapPatternRenderLayer {
+    left_gain: f32,
+    right_gain: f32,
+    samples: Vec<f32>,
+}
+
+struct PendingClapPatternRender {
+    request_routes: BTreeMap<u64, PendingClapPatternAudioRoute>,
+    audio_layers: Vec<PendingClapPatternRenderLayer>,
+    pattern_id: u16,
+    output_path: PathBuf,
+    sample_rate: u32,
+    output_format: AudioRenderOutput,
+    encoding: AudioRenderEncodingOptions,
+    insert_placement: Option<PendingPatternRenderPlacement>,
+    write_receiver: Option<Receiver<Result<u64, String>>>,
+    write_worker: Option<thread::JoinHandle<()>>,
 }
 
 struct PlaylistOfflineRenderJob {
@@ -8267,6 +8288,7 @@ impl DawUi {
             pending_clap_performance_playback: None,
             active_clap_performance_cache_key: None,
             active_clap_performance_audio_layers: Arc::new(Vec::new()),
+            pending_clap_pattern_render: None,
             pending_clap_state_capture: None,
             pending_clap_mixer_effect_state_capture: None,
             active_clap_pattern_audio_layers: Vec::new(),
@@ -24347,6 +24369,10 @@ impl DawUi {
         while let Ok((path, plugin_id, plugin_name, settings, purpose, request_id, result)) =
             self.clap_pattern_preview_receiver.try_recv()
         {
+            if purpose == ClapPatternPreviewPurpose::Render {
+                self.handle_clap_pattern_render_response(settings, plugin_name, request_id, result);
+                continue;
+            }
             if purpose == ClapPatternPreviewPurpose::SetParameters {
                 self.handle_clap_parameter_update_response(
                     path,
@@ -43781,6 +43807,19 @@ impl DawUi {
                 !self.channel_vst3_instances.is_empty()
                     && pattern.notes.iter().any(|note| !note.is_muted())
             });
+        let has_assigned_clap_pattern_notes = self.selected_pattern.is_some_and(|pattern_id| {
+            !self.clap_pattern_playback_instruments.is_empty()
+                && patterns
+                    .iter()
+                    .find(|pattern| pattern.id == pattern_id)
+                    .is_some_and(|pattern| {
+                        pattern.notes.iter().any(|note| {
+                            !note.is_muted()
+                                && note.length > 0
+                                && (note.velocity > 0 || note.is_slide_note())
+                        })
+                    })
+        });
         let mut add_note_requested = false;
         let mut open_midi_requested = !ui.ctx().egui_wants_keyboard_input()
             && ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::M));
@@ -43792,6 +43831,8 @@ impl DawUi {
         let mut render_insert_requested = false;
         let mut render_all_vst3_requested = false;
         let mut render_insert_all_vst3_requested = false;
+        let mut render_clap_pattern_requested = false;
+        let mut render_insert_clap_pattern_requested = false;
         let mut preview_requested = false;
         let mut chord_preview_requested = false;
         let mut sampler_preview_requested = false;
@@ -46196,6 +46237,39 @@ impl DawUi {
                 }
                 if ui
                     .add_enabled(
+                        has_assigned_clap_pattern_notes
+                            && self.pending_clap_pattern_render.is_none(),
+                        egui::Button::new("Render assigned CLAP Pattern channels…"),
+                    )
+                    .on_hover_text(
+                        "Render Pattern notes routed to assigned CLAP instruments into one audio file",
+                    )
+                    .clicked()
+                {
+                    render_clap_pattern_requested = true;
+                    ui.close();
+                }
+                let can_insert_clap_pattern = has_assigned_clap_pattern_notes
+                    && self.pending_clap_pattern_render.is_none()
+                    && self.document.as_ref().is_some_and(|document| {
+                        project_has_audio_clip_template(document)
+                            && self.pattern_render_insert_placement(document).is_some()
+                    });
+                if ui
+                    .add_enabled(
+                        can_insert_clap_pattern,
+                        egui::Button::new("Render and insert assigned CLAP Pattern channels…"),
+                    )
+                    .on_hover_text(
+                        "Render the assigned CLAP Pattern channels and place the result as an Audio Clip",
+                    )
+                    .clicked()
+                {
+                    render_insert_clap_pattern_requested = true;
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
                         has_loaded_instrument && self.selected_pattern.is_some(),
                         egui::Button::new("Preview VST3"),
                     )
@@ -47337,6 +47411,12 @@ impl DawUi {
         }
         if render_insert_all_vst3_requested {
             self.render_all_loaded_vst3_pattern_channels(true);
+        }
+        if render_clap_pattern_requested {
+            self.render_assigned_clap_pattern_dialog(false);
+        }
+        if render_insert_clap_pattern_requested {
+            self.render_assigned_clap_pattern_dialog(true);
         }
         if discard_note_lengths_requested
             && let Some(pattern_id) = self.selected_pattern
@@ -49843,6 +49923,380 @@ impl DawUi {
                 }
             }
             Err(error) => self.status = format!("Could not render VST3 Pattern mix: {error}"),
+        }
+    }
+
+    fn render_assigned_clap_pattern_dialog(&mut self, insert_into_playlist: bool) {
+        if self.pending_clap_pattern_render.is_some() {
+            self.status = "A CLAP Pattern render is already running".to_owned();
+            return;
+        }
+        let Some(pattern_id) = self.selected_pattern else {
+            self.status = "Select a Pattern before rendering CLAP channels".to_owned();
+            return;
+        };
+        if self.clap_pattern_playback_instruments.is_empty() {
+            self.status = "Assign a CLAP instrument before rendering Pattern channels".to_owned();
+            return;
+        }
+        let Some(document) = self.document.clone() else {
+            self.status = "Open a project before rendering CLAP Pattern channels".to_owned();
+            return;
+        };
+        let insert_placement = if insert_into_playlist {
+            if !project_has_audio_clip_template(&document) {
+                self.status =
+                    "Add an Audio Clip to the project before inserting the rendered Pattern"
+                        .to_owned();
+                return;
+            }
+            let Some(placement) = self.pattern_render_insert_placement(&document) else {
+                self.status = "Select a Playlist arrangement before inserting the rendered Pattern"
+                    .to_owned();
+                return;
+            };
+            Some(placement)
+        } else {
+            None
+        };
+        let sample_rate = self.audio_settings.sample_rate;
+        if !(8_000..=192_000).contains(&sample_rate) {
+            self.status = format!("Unsupported CLAP render sample rate: {sample_rate} Hz");
+            return;
+        }
+        let loop_length_ticks = match self.selected_pattern_loop_length_ticks(pattern_id) {
+            Ok(length_ticks) => length_ticks,
+            Err(error) => {
+                self.status = format!("Could not determine the Pattern loop length: {error}");
+                return;
+            }
+        };
+        let assigned_channel_ids = self
+            .clap_pattern_playback_instruments
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let vst3_volume_expression_channels = self
+            .vst3_host
+            .as_ref()
+            .map(|host| host.volume_expression_channels(&self.channel_vst3_instances))
+            .unwrap_or_default();
+        let mut render_settings = match self.clap_pattern_transport_preview_settings(
+            pattern_id,
+            loop_length_ticks,
+            &assigned_channel_ids,
+            &vst3_volume_expression_channels,
+        ) {
+            Ok(settings) => settings,
+            Err(error) => {
+                self.status = format!("Could not prepare CLAP Pattern render: {error}");
+                return;
+            }
+        };
+        if render_settings.is_empty() {
+            self.status =
+                format!("Pattern {pattern_id} has no notes routed to assigned CLAP instruments");
+            return;
+        }
+        for (settings, _, _) in &mut render_settings {
+            settings.plugin_tail_seconds = Some(2);
+        }
+
+        let output_format = self.audio_render_output();
+        let output_name = if insert_into_playlist {
+            format!("Pattern_{pattern_id}_CLAP_Channels_Audio_Clip")
+        } else {
+            format!("Pattern_{pattern_id}_CLAP_Channels")
+        };
+        let Some(output_path) = add_audio_render_file_filter(
+            rfd::FileDialog::new()
+                .set_title(if insert_into_playlist {
+                    "Render and insert assigned CLAP Pattern channels"
+                } else {
+                    "Render assigned CLAP Pattern channels"
+                })
+                .set_file_name(format!("{output_name}.{}", output_format.extension())),
+            self.playlist_song_output_format,
+        )
+        .save_file() else {
+            return;
+        };
+        let encoding = AudioRenderEncodingOptions {
+            wav_sample_format: self.playlist_render_format,
+            wav_dither_mode: self.playlist_render_dither_mode,
+            wav_channel_mode: self.playlist_render_channel_mode,
+        };
+        let mut pending = PendingClapPatternRender {
+            request_routes: BTreeMap::new(),
+            audio_layers: Vec::new(),
+            pattern_id,
+            output_path,
+            sample_rate,
+            output_format,
+            encoding,
+            insert_placement,
+            write_receiver: None,
+            write_worker: None,
+        };
+        let mut requests = Vec::with_capacity(render_settings.len());
+        for (settings, left_gain, right_gain) in render_settings {
+            let Some(instrument) = self
+                .clap_pattern_playback_instruments
+                .get(&settings.channel_id)
+                .cloned()
+            else {
+                self.status = format!(
+                    "CLAP Pattern Channel {} lost its instrument assignment",
+                    settings.channel_id
+                );
+                return;
+            };
+            self.clap_pattern_preview_request_id =
+                self.clap_pattern_preview_request_id.wrapping_add(1).max(1);
+            let request_id = self.clap_pattern_preview_request_id;
+            pending.request_routes.insert(
+                request_id,
+                PendingClapPatternAudioRoute {
+                    channel_id: settings.channel_id,
+                    left_gain,
+                    right_gain,
+                },
+            );
+            let parameter_values = self.clap_parameter_overrides_for(
+                settings.channel_id,
+                &instrument.path,
+                &instrument.plugin_id,
+            );
+            requests.push((instrument, settings, parameter_values, request_id));
+        }
+        self.pending_clap_pattern_render = Some(pending);
+        for (instrument, settings, parameter_values, request_id) in requests {
+            if self
+                .clap_pattern_preview_sender
+                .send((
+                    instrument.path,
+                    instrument.plugin_id,
+                    instrument.plugin_name,
+                    sample_rate,
+                    settings.channel_id,
+                    Some(settings),
+                    instrument.state,
+                    parameter_values,
+                    ClapPatternPreviewPurpose::Render,
+                    request_id,
+                ))
+                .is_err()
+            {
+                self.pending_clap_pattern_render = None;
+                self.status = "CLAP Pattern render worker is unavailable".to_owned();
+                return;
+            }
+        }
+        self.status = format!("Rendering assigned CLAP instruments in Pattern {pattern_id}…");
+    }
+
+    fn handle_clap_pattern_render_response(
+        &mut self,
+        settings: Option<ClapPatternPreviewSettings>,
+        plugin_name: String,
+        request_id: u64,
+        result: Result<ClapPatternPreviewOutput, String>,
+    ) {
+        let Some(pending) = self.pending_clap_pattern_render.as_mut() else {
+            return;
+        };
+        let Some(route) = pending.request_routes.remove(&request_id) else {
+            return;
+        };
+        let Some(settings) = settings else {
+            self.pending_clap_pattern_render = None;
+            self.status = "CLAP Pattern render response was missing its source settings".into();
+            return;
+        };
+        if settings.channel_id != route.channel_id {
+            self.pending_clap_pattern_render = None;
+            self.status = "CLAP Pattern render returned a mismatched source".into();
+            return;
+        }
+        match result {
+            Ok(ClapPatternPreviewOutput::Audio(audio))
+                if !audio.samples.is_empty() && audio.samples.len().is_multiple_of(2) =>
+            {
+                let current_bytes = pending
+                    .audio_layers
+                    .iter()
+                    .map(|layer| {
+                        layer
+                            .samples
+                            .len()
+                            .saturating_mul(std::mem::size_of::<f32>())
+                    })
+                    .fold(0_usize, usize::saturating_add);
+                let new_bytes = audio
+                    .samples
+                    .len()
+                    .saturating_mul(std::mem::size_of::<f32>());
+                if current_bytes.saturating_add(new_bytes) > 512 * 1024 * 1024 {
+                    self.pending_clap_pattern_render = None;
+                    self.status = "Prepared CLAP Pattern audio exceeds the 512 MiB limit".into();
+                    return;
+                }
+                pending.audio_layers.push(PendingClapPatternRenderLayer {
+                    left_gain: route.left_gain,
+                    right_gain: route.right_gain,
+                    samples: audio.samples,
+                });
+            }
+            Ok(ClapPatternPreviewOutput::Audio(_)) => {
+                self.pending_clap_pattern_render = None;
+                self.status = format!(
+                    "CLAP Pattern render for Channel {} returned invalid stereo audio",
+                    route.channel_id
+                );
+                return;
+            }
+            Ok(ClapPatternPreviewOutput::SavedState(_)) => {
+                self.pending_clap_pattern_render = None;
+                self.status = format!(
+                    "CLAP Pattern render for Channel {} returned plug-in state instead of audio",
+                    route.channel_id
+                );
+                return;
+            }
+            Ok(ClapPatternPreviewOutput::ParametersSet) => {
+                self.pending_clap_pattern_render = None;
+                self.status = format!(
+                    "CLAP Pattern render for Channel {} returned a parameter acknowledgement instead of audio",
+                    route.channel_id
+                );
+                return;
+            }
+            Err(error) => {
+                self.pending_clap_pattern_render = None;
+                self.status = format!(
+                    "Could not render Pattern Channel {} through {plugin_name}: {error}",
+                    route.channel_id
+                );
+                return;
+            }
+        }
+        if !pending.request_routes.is_empty() {
+            return;
+        }
+
+        let Some(mut pending) = self.pending_clap_pattern_render.take() else {
+            return;
+        };
+        let frames = pending
+            .audio_layers
+            .iter()
+            .map(|layer| layer.samples.len() / 2)
+            .max()
+            .unwrap_or(0);
+        let sample_count = match frames.checked_mul(2) {
+            Some(sample_count) if sample_count <= (512 * 1024 * 1024) / 4 => sample_count,
+            _ => {
+                self.status = "Mixed CLAP Pattern render exceeds the 512 MiB limit".into();
+                return;
+            }
+        };
+        if sample_count == 0 {
+            self.status = "CLAP Pattern render returned no audio frames".into();
+            return;
+        }
+        let mut mixed = vec![0.0_f32; sample_count];
+        for layer in &pending.audio_layers {
+            for (frame, stereo) in layer.samples.chunks_exact(2).enumerate() {
+                let sample_index = frame * 2;
+                let left = stereo[0] * layer.left_gain;
+                let right = stereo[1] * layer.right_gain;
+                mixed[sample_index] += if left.is_finite() { left } else { 0.0 };
+                mixed[sample_index + 1] += if right.is_finite() { right } else { 0.0 };
+            }
+        }
+        for sample in &mut mixed {
+            if !sample.is_finite() {
+                *sample = 0.0;
+            }
+        }
+
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let output_path = pending.output_path.clone();
+        let sample_rate = pending.sample_rate;
+        let output_format = pending.output_format;
+        let encoding = pending.encoding;
+        let worker = thread::Builder::new()
+            .name("clap-pattern-file-render".to_owned())
+            .spawn(move || {
+                let result = u64::try_from(mixed.len() / 2)
+                    .map_err(|_| "CLAP Pattern frame count exceeds this platform".to_owned())
+                    .and_then(|frames| {
+                        write_stereo_audio_buffer_to_file(
+                            &output_path,
+                            &mixed,
+                            sample_rate,
+                            encoding,
+                            output_format,
+                        )
+                        .map(|()| frames)
+                    });
+                let _ = sender.send(result);
+            });
+        match worker {
+            Ok(worker) => {
+                pending.write_receiver = Some(receiver);
+                pending.write_worker = Some(worker);
+                self.pending_clap_pattern_render = Some(pending);
+                self.status = "Writing rendered CLAP Pattern audio…".into();
+            }
+            Err(error) => {
+                self.status = format!("Could not start CLAP Pattern file render: {error}");
+            }
+        }
+    }
+
+    fn poll_clap_pattern_render(&mut self, ctx: &egui::Context) {
+        let result = self
+            .pending_clap_pattern_render
+            .as_mut()
+            .and_then(|pending| pending.write_receiver.as_ref())
+            .and_then(|receiver| match receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Disconnected) => Some(Err(
+                    "CLAP Pattern file render worker stopped unexpectedly".to_owned(),
+                )),
+                Err(TryRecvError::Empty) => None,
+            });
+        if let Some(result) = result {
+            let Some(mut pending) = self.pending_clap_pattern_render.take() else {
+                return;
+            };
+            if let Some(worker) = pending.write_worker.take() {
+                let _ = worker.join();
+            }
+            match result {
+                Ok(frames) => {
+                    self.status = format!(
+                        "Rendered Pattern {} with assigned CLAP instruments to {} ({:.2}s)",
+                        pending.pattern_id,
+                        pending.output_path.display(),
+                        frames as f64 / f64::from(pending.sample_rate),
+                    );
+                    if let Some(placement) = pending.insert_placement {
+                        self.queue_rendered_pattern_audio_clip(
+                            pending.pattern_id,
+                            &pending.output_path,
+                            placement,
+                        );
+                    }
+                }
+                Err(error) => {
+                    self.status = format!("Could not write CLAP Pattern render: {error}");
+                }
+            }
+        }
+        if self.pending_clap_pattern_render.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(40));
         }
     }
 
@@ -74263,6 +74717,7 @@ impl eframe::App for DawUi {
         self.poll_browser_preview(ui.ctx());
         self.poll_sample_editor_preview(ui.ctx());
         self.poll_clap_note_preview(ui.ctx());
+        self.poll_clap_pattern_render(ui.ctx());
         self.poll_clap_pattern_preview(ui.ctx());
         self.poll_clap_plugin_editors(ui.ctx());
         self.poll_clap_instrument_editors(ui.ctx());

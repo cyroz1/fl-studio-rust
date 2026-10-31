@@ -19518,6 +19518,34 @@ fn write_audio_buffer_to_file(
     )
 }
 
+/// Write an interleaved stereo audio buffer using the shared audio-file encoders.
+pub fn write_stereo_audio_buffer_to_file(
+    output_path: &Path,
+    samples: &[f32],
+    sample_rate: u32,
+    encoding: AudioRenderEncodingOptions,
+    output_format: AudioRenderOutput,
+) -> Result<(), String> {
+    if !samples.len().is_multiple_of(2) {
+        return Err("rendered audio buffer must contain interleaved stereo frames".to_owned());
+    }
+    let frames = u64::try_from(samples.len() / 2)
+        .map_err(|_| "render frame count exceeds this platform".to_owned())?;
+    render_stereo_audio_to_file(
+        output_path,
+        frames,
+        sample_rate,
+        encoding,
+        output_format,
+        |write_block| {
+            for block in samples.chunks(STREAM_BLOCK_FRAMES * 2) {
+                write_block(block)?;
+            }
+            Ok(())
+        },
+    )
+}
+
 pub(crate) fn render_stereo_audio_to_file<T>(
     output_path: &Path,
     expected_frames: u64,
