@@ -747,6 +747,9 @@ def _mixer_get_track_peaks(index, mode):
     if mode not in (0, 1, 2):
         raise ValueError("Mixer peak mode must be PEAK_L, PEAK_R, or PEAK_LR")
     peaks = _active_transport_state.get("mixer_track_peaks", [])
+    current_track_index = _mixer_track_count() - 1
+    if index == current_track_index:
+        index = int(_active_transport_state.get("mixer_selected_track", 0))
     if index >= len(peaks):
         return 0.0
     try:
