@@ -50206,7 +50206,7 @@ impl DawUi {
         }
         let mut mixed = vec![0.0_f32; sample_count];
         for layer in &pending.audio_layers {
-            for (frame, stereo) in layer.samples.chunks_exact(2).enumerate() {
+            for (frame, stereo) in layer.samples.as_chunks::<2>().0.iter().enumerate() {
                 let sample_index = frame * 2;
                 let left = stereo[0] * layer.left_gain;
                 let right = stereo[1] * layer.right_gain;
