@@ -6037,18 +6037,19 @@ impl ClapNotePreviewInstance {
         if let Some(error) = render_error {
             return Err(error);
         }
-        if latency_samples > 0 {
-            let first_output_sample = latency_samples as usize * 2;
-            let output_sample_count = total_frames as usize * 2;
-            let output_sample_end = first_output_sample
-                .checked_add(output_sample_count)
-                .ok_or_else(|| "CLAP latency-compensated sample range overflowed".to_owned())?;
-            if output_sample_end > samples.len() {
-                return Err("CLAP latency-compensated output ended early".to_owned());
-            }
-            samples.copy_within(first_output_sample..output_sample_end, 0);
-            samples.truncate(output_sample_count);
+        let first_output_sample = latency_samples as usize * 2;
+        let output_frame_count = render_frames
+            .checked_sub(latency_samples)
+            .ok_or_else(|| "CLAP latency exceeded the rendered frame count".to_owned())?;
+        let output_sample_count = output_frame_count as usize * 2;
+        let output_sample_end = first_output_sample
+            .checked_add(output_sample_count)
+            .ok_or_else(|| "CLAP latency-compensated sample range overflowed".to_owned())?;
+        if output_sample_end > samples.len() {
+            return Err("CLAP latency-compensated output ended early".to_owned());
         }
+        samples.copy_within(first_output_sample..output_sample_end, 0);
+        samples.truncate(output_sample_count);
         self.next_steady_time = render_start_time.saturating_add(u64::from(render_frames));
         Ok(samples)
     }

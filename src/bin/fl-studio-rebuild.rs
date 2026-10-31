@@ -12631,7 +12631,7 @@ impl DawUi {
                         });
                 });
                 if self.playlist_render_mixer_stems {
-                    ui.label("Mixer stem renders use the fixed tail length.");
+                    ui.label("Mixer stems use the selected base tail; reported instrument and effect tails can extend the render.");
                 } else if self.playlist_render_tail_mode == PlaylistTailMode::LeaveRemainder {
                     ui.label("Continues the render until the mix stays quiet for two seconds, up to 60 seconds after the minimum tail.");
                 } else if self.playlist_render_tail_mode == PlaylistTailMode::WrapRemainder {
@@ -12644,7 +12644,7 @@ impl DawUi {
                         &mut self.playlist_render_include_master_stem,
                         "Include Master stem",
                     );
-                    ui.label("Master uses the final supported mix; insert and Current stems are pre-effect.");
+                    ui.label("Master uses the final supported mix; insert stems are post-effect; Current is pre-effect.");
                     ui.add_enabled_ui(!current_track_options.is_empty(), |ui| {
                         ui.checkbox(
                             &mut self.playlist_render_include_current_stem,
@@ -12678,7 +12678,7 @@ impl DawUi {
                                 });
                         });
                     }
-                    ui.label("Mixer effects, automation, and route PDC are not included.");
+                    ui.label("Loaded VST3 and assigned CLAP effects, supported parameter automation, and route PDC are included.");
                 }
                 ui.checkbox(
                     &mut self.playlist_render_include_plugin_tails,
