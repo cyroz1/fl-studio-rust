@@ -110,6 +110,7 @@ struct MidiControlChangeStreamImport<'a> {
     mappings: &'a str,
     midi_channel: Option<u8>,
     create_new_streams: bool,
+    high_resolution: bool,
 }
 
 fn main() -> ExitCode {
@@ -3973,7 +3974,9 @@ fn run(args: Vec<String>) -> Result<(), String> {
         }
         [command, input, midi_path, output, track, pattern_id, mappings, midi_channel]
             if command == "import-midi-cc-streams"
-                || command == "import-midi-cc-into-streams" =>
+                || command == "import-midi-cc-into-streams"
+                || command == "import-midi-cc14-streams"
+                || command == "import-midi-cc14-into-streams" =>
         {
             import_midi_control_change_streams(
                 MidiControlChangeStreamImport {
@@ -3984,7 +3987,9 @@ fn run(args: Vec<String>) -> Result<(), String> {
                     pattern_id: parse_u16(pattern_id, "pattern id")?,
                     mappings,
                     midi_channel: parse_midi_channel_filter(midi_channel)?,
-                    create_new_streams: command == "import-midi-cc-streams",
+                    create_new_streams: command == "import-midi-cc-streams"
+                        || command == "import-midi-cc14-streams",
+                    high_resolution: command.contains("cc14"),
                 },
             )
         }
@@ -4862,6 +4867,9 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "    Each mapping creates one raw Pattern stream; raw bytes are explicit, and CCs with no messages are skipped.\n",
             "  flp-rebuild import-midi-cc-into-streams <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <cc:raw-channel:raw-flags,...> <midi-channel-1..16|all>\n",
             "    Each mapping targets an existing raw Pattern stream; the full batch is applied atomically.\n",
+            "  flp-rebuild import-midi-cc14-streams <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <base-cc:raw-channel:raw-flags,...> <midi-channel-1..16|all>\n",
+            "  flp-rebuild import-midi-cc14-into-streams <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <base-cc:raw-channel:raw-flags,...> <midi-channel-1..16|all>\n",
+            "    Each base CC 0–31 pairs with CC N+32; values map to 0.0–1.0 and mappings apply atomically.\n",
             "  flp-rebuild import-midi-pitch-bend <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <raw-channel> <raw-flags> <midi-channel-1..16|all>\n",
             "  flp-rebuild import-midi-pitch-bend-new-stream <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <raw-channel> <raw-flags> <midi-channel-1..16|all>\n",
             "    Pitch Bend's unsigned 14-bit values map linearly from 0–16383 to 0.0–1.0.\n",
@@ -5351,12 +5359,24 @@ fn parse_raw_byte(value: &str, description: &str) -> Result<u8, String> {
     }
 }
 
-fn parse_midi_cc_stream_mappings(value: &str) -> Result<Vec<(u8, u8, u8)>, String> {
+fn parse_midi_cc_stream_mappings(
+    value: &str,
+    high_resolution: bool,
+) -> Result<Vec<(u8, u8, u8)>, String> {
     if value.trim().is_empty() {
-        return Err("provide at least one MIDI CC stream mapping".to_owned());
+        return Err(if high_resolution {
+            "provide at least one paired 14-bit MIDI CC stream mapping".to_owned()
+        } else {
+            "provide at least one MIDI CC stream mapping".to_owned()
+        });
     }
-    if value.split(',').count() > 128 {
-        return Err("at most 128 MIDI CC stream mappings can be provided".to_owned());
+    let maximum_mappings = if high_resolution { 32 } else { 128 };
+    if value.split(',').count() > maximum_mappings {
+        return Err(if high_resolution {
+            "at most 32 paired 14-bit MIDI CC stream mappings can be provided".to_owned()
+        } else {
+            "at most 128 MIDI CC stream mappings can be provided".to_owned()
+        });
     }
     value
         .split(',')
@@ -5375,7 +5395,12 @@ fn parse_midi_cc_stream_mappings(value: &str) -> Result<Vec<(u8, u8, u8)>, Strin
                 return Err("each MIDI CC mapping needs controller:channel:flags".to_owned());
             }
             let controller = parse_u8(controller.trim(), "MIDI Control Change number")?;
-            if controller > 127 {
+            if high_resolution && controller > 31 {
+                return Err(
+                    "14-bit MIDI Control Change base number must be from 0 through 31".to_owned(),
+                );
+            }
+            if !high_resolution && controller > 127 {
                 return Err("MIDI Control Change number must be from 0 through 127".to_owned());
             }
             Ok((
@@ -11684,14 +11709,31 @@ fn import_midi_control_change_streams(
         mappings,
         midi_channel,
         create_new_streams,
+        high_resolution,
     } = request;
-    let mappings = parse_midi_cc_stream_mappings(mappings)?;
+    let mappings = parse_midi_cc_stream_mappings(mappings, high_resolution)?;
     let (_, mut document) = load_document(input)?;
     let midi_bytes = fs::read(midi_path)
         .map_err(|error| format!("could not read {}: {error}", midi_path.display()))?;
     let midi = MidiFile::parse(&midi_bytes)
         .map_err(|error| format!("could not parse {}: {error}", midi_path.display()))?;
-    let imported = if create_new_streams {
+    let imported = if high_resolution && create_new_streams {
+        document.import_midi_14bit_control_change_streams(
+            &midi,
+            track_index,
+            pattern_id,
+            &mappings,
+            midi_channel,
+        )
+    } else if high_resolution {
+        document.import_midi_14bit_control_changes_to_streams(
+            &midi,
+            track_index,
+            pattern_id,
+            &mappings,
+            midi_channel,
+        )
+    } else if create_new_streams {
         document.import_midi_control_change_streams(
             &midi,
             track_index,
@@ -11727,10 +11769,17 @@ fn import_midi_control_change_streams(
     } else {
         "existing raw streams"
     };
-    println!(
-        "imported {total_points} MIDI CC events from track {track_index} ({source_channel}) into pattern {pattern_id} across {streams_with_events} {stream_kind} with imported events in {}",
-        output.display()
-    );
+    if high_resolution {
+        println!(
+            "imported {total_points} paired 14-bit MIDI CC points from track {track_index} ({source_channel}) into pattern {pattern_id} across {streams_with_events} {stream_kind} with imported events in {}",
+            output.display()
+        );
+    } else {
+        println!(
+            "imported {total_points} MIDI CC events from track {track_index} ({source_channel}) into pattern {pattern_id} across {streams_with_events} {stream_kind} with imported events in {}",
+            output.display()
+        );
+    }
     Ok(())
 }
 

@@ -20923,6 +20923,39 @@ impl FlpDocument {
         Ok(())
     }
 
+    fn validate_midi_cc14_stream_mappings(mappings: &[(u8, u8, u8)]) -> Result<(), FlpError> {
+        if mappings.is_empty() {
+            return Err(FlpError::UnsupportedEdit(
+                "select at least one paired 14-bit MIDI Control Change mapping",
+            ));
+        }
+        if mappings.len() > 32 {
+            return Err(FlpError::UnsupportedEdit(
+                "at most 32 paired 14-bit MIDI Control Change mappings can be imported",
+            ));
+        }
+        let mut base_controllers = HashSet::with_capacity(mappings.len());
+        let mut target_streams = HashSet::with_capacity(mappings.len());
+        for &(base_controller, channel, flags) in mappings {
+            if base_controller > 31 {
+                return Err(FlpError::UnsupportedEdit(
+                    "14-bit MIDI Control Change base number must be from 0 through 31",
+                ));
+            }
+            if !base_controllers.insert(base_controller) {
+                return Err(FlpError::UnsupportedEdit(
+                    "a paired 14-bit MIDI Control Change source cannot be mapped more than once",
+                ));
+            }
+            if !target_streams.insert((channel, flags)) {
+                return Err(FlpError::UnsupportedEdit(
+                    "each MIDI Control Change mapping requires a distinct raw Pattern stream",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Imports one MIDI Control Change number into a newly created raw Pattern controller
     /// stream. The requested channel/flags bytes are stored verbatim, and the stream starts at
     /// the first imported point. If no matching MIDI messages exist, no stream is created.
@@ -21051,6 +21084,67 @@ impl FlpDocument {
                 midi_channel,
             )?;
             imported.push((controller_number, point_count));
+        }
+        *self = candidate;
+        Ok(imported)
+    }
+
+    /// Imports several paired 14-bit MIDI Control Change sources into new raw Pattern streams.
+    /// Each mapping is `(base_controller, target_channel, target_flags)`; the base CC (0–31)
+    /// supplies the MSB and its CC+32 LSB updates the same value. Imports are atomic, and
+    /// sources without matching messages do not create streams.
+    pub fn import_midi_14bit_control_change_streams(
+        &mut self,
+        midi: &midi::MidiFile,
+        track_index: usize,
+        pattern_id: u16,
+        mappings: &[(u8, u8, u8)],
+        midi_channel: Option<u8>,
+    ) -> Result<Vec<(u8, usize)>, FlpError> {
+        Self::validate_midi_cc14_stream_mappings(mappings)?;
+
+        let mut candidate = self.clone();
+        let mut imported = Vec::with_capacity(mappings.len());
+        for &(base_controller, channel, flags) in mappings {
+            let point_count = candidate.import_midi_14bit_control_changes_to_new_stream(
+                midi,
+                track_index,
+                pattern_id,
+                (channel, flags),
+                base_controller,
+                midi_channel,
+            )?;
+            imported.push((base_controller, point_count));
+        }
+        *self = candidate;
+        Ok(imported)
+    }
+
+    /// Imports several paired 14-bit MIDI Control Change sources into existing raw Pattern
+    /// streams. Each mapping is `(base_controller, target_channel, target_flags)`; each base CC
+    /// and its CC+32 LSB update one 14-bit value. Imports are atomic.
+    pub fn import_midi_14bit_control_changes_to_streams(
+        &mut self,
+        midi: &midi::MidiFile,
+        track_index: usize,
+        pattern_id: u16,
+        mappings: &[(u8, u8, u8)],
+        midi_channel: Option<u8>,
+    ) -> Result<Vec<(u8, usize)>, FlpError> {
+        Self::validate_midi_cc14_stream_mappings(mappings)?;
+
+        let mut candidate = self.clone();
+        let mut imported = Vec::with_capacity(mappings.len());
+        for &(base_controller, channel, flags) in mappings {
+            let point_count = candidate.import_midi_14bit_control_changes(
+                midi,
+                track_index,
+                pattern_id,
+                (channel, flags),
+                base_controller,
+                midi_channel,
+            )?;
+            imported.push((base_controller, point_count));
         }
         *self = candidate;
         Ok(imported)

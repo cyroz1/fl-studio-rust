@@ -4429,6 +4429,8 @@ struct MidiCcImportOpenRequests {
     open_poly_pressure_new_stream_requested: bool,
     open_batch_requested: bool,
     open_batch_existing_requested: bool,
+    open_cc14_batch_requested: bool,
+    open_cc14_batch_existing_requested: bool,
 }
 
 struct MidiCcImportAction {
@@ -56391,6 +56393,8 @@ impl DawUi {
         let mut open_midi_poly_pressure_new_stream_requested = false;
         let mut open_midi_cc_batch_requested = false;
         let mut open_midi_cc_batch_existing_requested = false;
+        let mut open_midi_cc14_batch_requested = false;
+        let mut open_midi_cc14_batch_existing_requested = false;
         let mut open_midi_cc_export_requested = false;
         let mut open_midi_song_cc_export_requested = false;
         ui.horizontal_wrapped(|ui| {
@@ -56541,6 +56545,18 @@ impl DawUi {
                 .clicked()
             {
                 open_midi_cc_batch_existing_requested = true;
+            }
+            if ui.button("Import multiple MIDI 14-bit CCs…").clicked() {
+                open_midi_cc14_batch_requested = true;
+            }
+            if ui
+                .add_enabled(
+                    !streams.is_empty(),
+                    egui::Button::new("Import multiple MIDI 14-bit CCs into streams…"),
+                )
+                .clicked()
+            {
+                open_midi_cc14_batch_existing_requested = true;
             }
             if ui
                 .add_enabled(
@@ -56734,6 +56750,8 @@ impl DawUi {
                     open_midi_poly_pressure_new_stream_requested,
                 open_batch_requested: open_midi_cc_batch_requested,
                 open_batch_existing_requested: open_midi_cc_batch_existing_requested,
+                open_cc14_batch_requested: open_midi_cc14_batch_requested,
+                open_cc14_batch_existing_requested: open_midi_cc14_batch_existing_requested,
             },
         );
         self.draw_pending_midi_cc_export_ui(
@@ -57387,6 +57405,8 @@ impl DawUi {
             open_poly_pressure_new_stream_requested,
             open_batch_requested,
             open_batch_existing_requested,
+            open_cc14_batch_requested,
+            open_cc14_batch_existing_requested,
         } = requests;
         if (open_existing_requested
             || open_new_stream_requested
@@ -57399,10 +57419,12 @@ impl DawUi {
             || open_poly_pressure_existing_requested
             || open_poly_pressure_new_stream_requested
             || open_batch_requested
-            || open_batch_existing_requested)
-            && let Some(target_stream) = if open_batch_requested {
+            || open_batch_existing_requested
+            || open_cc14_batch_requested
+            || open_cc14_batch_existing_requested)
+            && let Some(target_stream) = if open_batch_requested || open_cc14_batch_requested {
                 Some((0, 0))
-            } else if open_batch_existing_requested {
+            } else if open_batch_existing_requested || open_cc14_batch_existing_requested {
                 selected_stream.or_else(|| existing_streams.first().copied())
             } else if open_new_stream_requested
                 || open_cc14_new_stream_requested
@@ -57419,7 +57441,11 @@ impl DawUi {
             }
             && let Some(path) = rfd::FileDialog::new()
                 .set_title(
-                    if open_cc14_existing_requested || open_cc14_new_stream_requested {
+                    if open_cc14_existing_requested
+                        || open_cc14_new_stream_requested
+                        || open_cc14_batch_requested
+                        || open_cc14_batch_existing_requested
+                    {
                         "Import MIDI 14-bit Control Change automation"
                     } else if open_pitch_bend_existing_requested
                         || open_pitch_bend_new_stream_requested
@@ -57448,14 +57474,34 @@ impl DawUi {
                             .iter()
                             .map(|change| change.controller())
                             .collect::<BTreeSet<_>>();
-                        let controller_number =
-                            controller_numbers.first().copied().unwrap_or_default();
-                        let selected_controllers =
-                            if open_batch_requested || open_batch_existing_requested {
-                                controller_numbers.first().copied().into_iter().collect()
-                            } else {
-                                BTreeSet::new()
-                            };
+                        let controller_14_bases = midi.tracks()[0]
+                            .control_changes()
+                            .iter()
+                            .filter_map(|change| match change.controller() {
+                                0..=31 => Some(change.controller()),
+                                32..=63 => Some(change.controller() - 32),
+                                _ => None,
+                            })
+                            .collect::<BTreeSet<_>>();
+                        let control_change_14 = open_cc14_existing_requested
+                            || open_cc14_new_stream_requested
+                            || open_cc14_batch_requested
+                            || open_cc14_batch_existing_requested;
+                        let any_batch_requested = open_batch_requested
+                            || open_batch_existing_requested
+                            || open_cc14_batch_requested
+                            || open_cc14_batch_existing_requested;
+                        let first_controller = if control_change_14 {
+                            controller_14_bases.first().copied()
+                        } else {
+                            controller_numbers.first().copied()
+                        };
+                        let controller_number = first_controller.unwrap_or_default();
+                        let selected_controllers = if any_batch_requested {
+                            first_controller.into_iter().collect()
+                        } else {
+                            BTreeSet::new()
+                        };
                         let pressure_key = midi.tracks()[0]
                             .polyphonic_key_pressures()
                             .first()
@@ -57464,8 +57510,7 @@ impl DawUi {
                         self.pending_midi_cc_import = Some(PendingMidiCcImport {
                             path: path.clone(),
                             midi,
-                            control_change_14: open_cc14_existing_requested
-                                || open_cc14_new_stream_requested,
+                            control_change_14,
                             pitch_bend: open_pitch_bend_existing_requested
                                 || open_pitch_bend_new_stream_requested,
                             channel_pressure: open_channel_pressure_existing_requested
@@ -57483,15 +57528,17 @@ impl DawUi {
                                 || open_pitch_bend_new_stream_requested
                                 || open_channel_pressure_new_stream_requested
                                 || open_poly_pressure_new_stream_requested
-                                || open_batch_requested,
-                            batch_new_streams: open_batch_requested,
-                            batch_existing_streams: open_batch_existing_requested,
+                                || open_batch_requested
+                                || open_cc14_batch_requested,
+                            batch_new_streams: open_batch_requested || open_cc14_batch_requested,
+                            batch_existing_streams: open_batch_existing_requested
+                                || open_cc14_batch_existing_requested,
                             selected_controllers,
                             stream_mappings: BTreeMap::new(),
                         });
                         self.status = format!(
                             "Loaded MIDI {} data from {}",
-                            if open_cc14_existing_requested || open_cc14_new_stream_requested {
+                            if control_change_14 {
                                 "14-bit controller"
                             } else if open_pitch_bend_existing_requested
                                 || open_pitch_bend_new_stream_requested
@@ -57640,12 +57687,17 @@ impl DawUi {
                         _ => None,
                     })
                     .collect::<BTreeSet<_>>();
+                let batch_controller_numbers = if pending.control_change_14 {
+                    &controller_14_bases
+                } else {
+                    &controller_numbers
+                };
                 if pending.batch_new_streams || pending.batch_existing_streams {
                     pending
                         .selected_controllers
-                        .retain(|controller| controller_numbers.contains(controller));
+                        .retain(|controller| batch_controller_numbers.contains(controller));
                     pending.stream_mappings.retain(|controller, stream| {
-                        controller_numbers.contains(controller)
+                        batch_controller_numbers.contains(controller)
                             && (!pending.batch_existing_streams
                                 || existing_streams.contains(stream))
                     });
@@ -57671,7 +57723,11 @@ impl DawUi {
                             pending.stream_mappings.insert(controller, stream);
                         }
                     }
-                    ui.label(if pending.batch_new_streams {
+                    ui.label(if pending.control_change_14 && pending.batch_new_streams {
+                        "Select 14-bit CC pairs and assign a raw channel/flags pair to each new stream."
+                    } else if pending.control_change_14 {
+                        "Select 14-bit CC pairs and choose a different existing raw stream for each."
+                    } else if pending.batch_new_streams {
                         "Select CCs and assign a raw channel/flags pair to each new stream."
                     } else {
                         "Select CCs and choose a different existing raw stream for each."
@@ -57679,13 +57735,20 @@ impl DawUi {
                     egui::ScrollArea::vertical()
                         .max_height(150.0)
                         .show(ui, |ui| {
-                            for controller_number in &controller_numbers {
+                            for controller_number in batch_controller_numbers {
                                 ui.horizontal(|ui| {
                                     let mut selected = pending
                                         .selected_controllers
                                         .contains(controller_number);
-                                    if ui
-                                        .checkbox(&mut selected, format!("CC {controller_number}"))
+                                    let controller_label = if pending.control_change_14 {
+                                        format!(
+                                            "CC {controller_number} + CC {} (14-bit)",
+                                            controller_number + 32
+                                        )
+                                    } else {
+                                        format!("CC {controller_number}")
+                                    };
+                                    if ui.checkbox(&mut selected, controller_label)
                                         .changed()
                                     {
                                         if selected {
@@ -57875,6 +57938,7 @@ impl DawUi {
                     });
                 }
 
+                let is_batch_import = pending.batch_new_streams || pending.batch_existing_streams;
                 let channels = if pending.pitch_bend {
                     pitch_bends
                         .iter()
@@ -57895,8 +57959,18 @@ impl DawUi {
                     changes
                         .iter()
                         .filter(|change| {
-                            change.controller() == pending.controller_number
-                                || change.controller() == pending.controller_number + 32
+                            let base_controller = match change.controller() {
+                                0..=31 => Some(change.controller()),
+                                32..=63 => Some(change.controller() - 32),
+                                _ => None,
+                            };
+                            base_controller.is_some_and(|base_controller| {
+                                if is_batch_import {
+                                    pending.selected_controllers.contains(&base_controller)
+                                } else {
+                                    base_controller == pending.controller_number
+                                }
+                            })
                         })
                         .map(|change| change.channel())
                         .collect::<BTreeSet<_>>()
@@ -57904,7 +57978,7 @@ impl DawUi {
                     changes
                         .iter()
                         .filter(|change| {
-                            if pending.batch_new_streams || pending.batch_existing_streams {
+                            if is_batch_import {
                                 pending.selected_controllers.is_empty()
                                     || pending
                                         .selected_controllers
@@ -57940,6 +58014,8 @@ impl DawUi {
                     });
                 ui.weak(if pending.pitch_bend {
                     "Pitch Bend values map linearly from 0–16383 to 0.0–1.0. Source timing is preserved."
+                } else if pending.control_change_14 && is_batch_import {
+                    "Each selected CC pair is combined per MIDI channel; 14-bit values map from 0–16383 to 0.0–1.0."
                 } else if pending.control_change_14 {
                     "CC N and CC N+32 update one 14-bit value per MIDI channel; values map from 0–16383 to 0.0–1.0."
                 } else if pending.channel_pressure {
@@ -57995,7 +58071,15 @@ impl DawUi {
                         "Choose a different existing raw stream for each selected CC."
                     });
                 }
-                let import_label = if pending.control_change_14 && pending.new_stream {
+                let import_label = if pending.control_change_14 && pending.batch_new_streams {
+                    "Import selected 14-bit CC pairs and create streams"
+                } else if pending.control_change_14 && pending.batch_existing_streams {
+                    "Import selected 14-bit CC pairs into streams"
+                } else if pending.batch_new_streams {
+                    "Import selected CCs and create streams"
+                } else if pending.batch_existing_streams {
+                    "Import selected CCs into streams"
+                } else if pending.control_change_14 && pending.new_stream {
                     "Import 14-bit CC and create stream"
                 } else if pending.control_change_14 {
                     "Import 14-bit CC"
@@ -58011,10 +58095,6 @@ impl DawUi {
                     "Import Key Pressure and create stream"
                 } else if pending.polyphonic_pressure {
                     "Import Key Pressure"
-                } else if pending.batch_new_streams {
-                    "Import selected CCs and create streams"
-                } else if pending.batch_existing_streams {
-                    "Import selected CCs into streams"
                 } else if pending.new_stream {
                     "Import CC and create stream"
                 } else {
@@ -58089,7 +58169,23 @@ impl DawUi {
                 .ok_or_else(|| "no project is open".to_owned())
                 .and_then(|document| {
                     if let Some(mappings) = batch_mappings.as_ref() {
-                        let result = if new_stream {
+                        let result = if control_change_14 && new_stream {
+                            document.import_midi_14bit_control_change_streams(
+                                &midi,
+                                track_index,
+                                target_pattern,
+                                mappings,
+                                channel,
+                            )
+                        } else if control_change_14 {
+                            document.import_midi_14bit_control_changes_to_streams(
+                                &midi,
+                                track_index,
+                                target_pattern,
+                                mappings,
+                                channel,
+                            )
+                        } else if new_stream {
                             document.import_midi_control_change_streams(
                                 &midi,
                                 track_index,
@@ -58249,7 +58345,24 @@ impl DawUi {
                         .iter()
                         .filter(|(_, count)| *count > 0)
                         .count();
-                    self.status = if pitch_bend && new_stream && imported == 0 {
+                    self.status = if control_change_14
+                        && batch_mappings.is_some()
+                        && new_stream
+                        && imported == 0
+                    {
+                        format!(
+                            "No matching 14-bit MIDI CC pairs were found in Pattern {target_pattern}; no raw streams were created"
+                        )
+                    } else if control_change_14
+                        && batch_mappings.is_none()
+                        && new_stream
+                        && imported == 0
+                    {
+                        format!(
+                            "No matching MIDI 14-bit CC {cc} and CC {} events were found in Pattern {target_pattern}; no raw stream was created",
+                            cc + 32
+                        )
+                    } else if pitch_bend && new_stream && imported == 0 {
                         format!(
                             "No matching MIDI Pitch Bend events were found in Pattern {target_pattern}; no raw stream was created"
                         )
@@ -58260,11 +58373,6 @@ impl DawUi {
                     } else if polyphonic_pressure && new_stream && imported == 0 {
                         format!(
                             "No matching MIDI Polyphonic Key Pressure events for key {pressure_key} were found in Pattern {target_pattern}; no raw stream was created"
-                        )
-                    } else if control_change_14 && new_stream && imported == 0 {
-                        format!(
-                            "No matching MIDI 14-bit CC {cc} and CC {} events were found in Pattern {target_pattern}; no raw stream was created",
-                            cc + 32
                         )
                     } else if new_stream && imported == 0 {
                         format!(
@@ -58297,7 +58405,7 @@ impl DawUi {
                                 ""
                             }
                         )
-                    } else if control_change_14 {
+                    } else if control_change_14 && batch_mappings.is_none() {
                         format!(
                             "Imported {imported} MIDI 14-bit CC {cc} + CC {} events into Pattern {target_pattern}{}",
                             cc + 32,
@@ -58308,10 +58416,17 @@ impl DawUi {
                             }
                         )
                     } else if batch_mappings.is_some() {
-                        format!(
-                            "Imported {imported} MIDI CC events across {streams_with_events} {} streams into Pattern {target_pattern}",
-                            if new_stream { "new" } else { "existing" }
-                        )
+                        if control_change_14 {
+                            format!(
+                                "Imported {imported} paired 14-bit MIDI CC points across {streams_with_events} {} streams into Pattern {target_pattern}",
+                                if new_stream { "new" } else { "existing" }
+                            )
+                        } else {
+                            format!(
+                                "Imported {imported} MIDI CC events across {streams_with_events} {} streams into Pattern {target_pattern}",
+                                if new_stream { "new" } else { "existing" }
+                            )
+                        }
                     } else {
                         format!(
                             "Imported {imported} MIDI CC {cc} events into Pattern {target_pattern}{}",
