@@ -20808,6 +20808,77 @@ impl FlpDocument {
         Ok(points)
     }
 
+    fn midi_program_change_points(
+        &self,
+        midi: &midi::MidiFile,
+        track_index: usize,
+        pattern_id: u16,
+        midi_channel: Option<u8>,
+    ) -> Result<Vec<(u32, f32)>, FlpError> {
+        if midi_channel.is_some_and(|channel| channel > 15) {
+            return Err(FlpError::UnsupportedEdit(
+                "MIDI channel must be from 0 through 15",
+            ));
+        }
+        if !self
+            .patterns()?
+            .iter()
+            .any(|pattern| pattern.id == pattern_id)
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested Pattern does not exist",
+            ));
+        }
+        if self.header.ppq == 0 {
+            return Err(FlpError::UnsupportedEdit(
+                "MIDI import requires a non-zero project PPQ value",
+            ));
+        }
+        let project_tempo_milli_bpm = self.metadata.tempo_milli_bpm.unwrap_or(140_000);
+        if project_tempo_milli_bpm == 0 {
+            return Err(FlpError::UnsupportedEdit(
+                "MIDI import requires a positive project tempo",
+            ));
+        }
+        let track = midi
+            .tracks()
+            .get(track_index)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested MIDI track does not exist",
+            ))?;
+        let default_microseconds_per_quarter =
+            60_000_000_000.0 / f64::from(project_tempo_milli_bpm);
+        midi.elapsed_microseconds_at_tick(0, track_index, default_microseconds_per_quarter)
+            .map_err(|_| {
+                FlpError::UnsupportedEdit(
+                    "MIDI import requires a supported time division and valid tempo map",
+                )
+            })?;
+
+        let changes = track
+            .program_changes()
+            .into_iter()
+            .filter(|change| midi_channel.is_none_or(|channel| change.channel() == channel))
+            .collect::<Vec<_>>();
+        let mut points = Vec::with_capacity(changes.len());
+        for change in &changes {
+            let elapsed_microseconds = midi
+                .elapsed_microseconds_at_tick(
+                    change.tick(),
+                    track_index,
+                    default_microseconds_per_quarter,
+                )
+                .map_err(|_| FlpError::UnsupportedEdit("could not convert MIDI event time"))?;
+            let position = scale_midi_microseconds_to_project_ticks(
+                elapsed_microseconds,
+                project_tempo_milli_bpm,
+                self.header.ppq,
+            )?;
+            points.push((position, f32::from(change.program()) / 127.0));
+        }
+        Ok(points)
+    }
+
     fn midi_polyphonic_pressure_points(
         &self,
         midi: &midi::MidiFile,
@@ -21644,6 +21715,70 @@ impl FlpDocument {
     ) -> Result<usize, FlpError> {
         let points =
             self.midi_channel_pressure_points(midi, track_index, pattern_id, midi_channel)?;
+        let Some((first_position, first_value)) = points.first().copied() else {
+            return Ok(0);
+        };
+
+        let mut candidate = self.clone();
+        candidate.create_pattern_controller_stream(
+            pattern_id,
+            target_stream.0,
+            target_stream.1,
+            first_position,
+            first_value,
+        )?;
+        candidate.draw_pattern_controller_points(pattern_id, target_stream, &points)?;
+        *self = candidate;
+        Ok(points.len())
+    }
+
+    /// Imports MIDI Program Change messages from one track into an existing raw Pattern
+    /// controller stream. Source timing is preserved; zero-based programs 0–127 map linearly to
+    /// 0.0–1.0. `midi_channel` is zero-based, or `None` to include every channel.
+    pub fn import_midi_program_changes(
+        &mut self,
+        midi: &midi::MidiFile,
+        track_index: usize,
+        pattern_id: u16,
+        target_stream: (u8, u8),
+        midi_channel: Option<u8>,
+    ) -> Result<usize, FlpError> {
+        let pattern = self
+            .patterns()?
+            .into_iter()
+            .find(|pattern| pattern.id == pattern_id)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the requested Pattern does not exist",
+            ))?;
+        if !pattern
+            .controllers
+            .iter()
+            .any(|point| (point.channel, point.flags) == target_stream)
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested raw Pattern controller stream does not exist",
+            ));
+        }
+        let points =
+            self.midi_program_change_points(midi, track_index, pattern_id, midi_channel)?;
+        if !points.is_empty() {
+            self.draw_pattern_controller_points(pattern_id, target_stream, &points)?;
+        }
+        Ok(points.len())
+    }
+
+    /// Imports MIDI Program Change messages into a new raw Pattern controller stream with the
+    /// requested channel/flags bytes. No stream is created when no matching messages exist.
+    pub fn import_midi_program_changes_to_new_stream(
+        &mut self,
+        midi: &midi::MidiFile,
+        track_index: usize,
+        pattern_id: u16,
+        target_stream: (u8, u8),
+        midi_channel: Option<u8>,
+    ) -> Result<usize, FlpError> {
+        let points =
+            self.midi_program_change_points(midi, track_index, pattern_id, midi_channel)?;
         let Some((first_position, first_value)) = points.first().copied() else {
             return Ok(0);
         };

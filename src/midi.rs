@@ -230,6 +230,14 @@ pub struct MidiChannelPressure {
     tick: u64,
 }
 
+/// One MIDI Program Change message with its source channel, program number, and tick.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MidiProgramChange {
+    channel: u8,
+    program: u8,
+    tick: u64,
+}
+
 impl MidiChannelPressure {
     /// Zero-based MIDI channel in the range 0–15.
     pub fn channel(self) -> u8 {
@@ -239,6 +247,23 @@ impl MidiChannelPressure {
     /// Seven-bit pressure value in the range 0–127.
     pub fn value(self) -> u8 {
         self.value
+    }
+
+    /// Absolute position in the source track's MIDI ticks.
+    pub fn tick(self) -> u64 {
+        self.tick
+    }
+}
+
+impl MidiProgramChange {
+    /// Zero-based MIDI channel in the range 0–15.
+    pub fn channel(self) -> u8 {
+        self.channel
+    }
+
+    /// Zero-based MIDI program number in the range 0–127.
+    pub fn program(self) -> u8 {
+        self.program
     }
 
     /// Absolute position in the source track's MIDI ticks.
@@ -455,6 +480,8 @@ pub enum MidiControllerExportSource {
     PitchBend,
     /// One 7-bit MIDI Channel Pressure message.
     ChannelPressure,
+    /// One 7-bit MIDI Program Change message.
+    ProgramChange,
     /// One 7-bit MIDI Polyphonic Key Pressure message for a key in 0–127.
     PolyphonicKeyPressure(u8),
 }
@@ -492,6 +519,7 @@ impl MidiControllerExportSource {
             }
             Self::PitchBend => "Pitch Bend".to_owned(),
             Self::ChannelPressure => "Channel Pressure".to_owned(),
+            Self::ProgramChange => "Program Change".to_owned(),
             Self::PolyphonicKeyPressure(key) => {
                 format!("Polyphonic Key Pressure key {key}")
             }
@@ -551,6 +579,10 @@ impl MidiControllerExportSource {
             }
             Self::ChannelPressure => push(vec![
                 0xD0 | midi_channel,
+                (normalized_value.clamp(0.0, 1.0) * 127.0).round() as u8,
+            ]),
+            Self::ProgramChange => push(vec![
+                0xC0 | midi_channel,
                 (normalized_value.clamp(0.0, 1.0) * 127.0).round() as u8,
             ]),
             Self::PolyphonicKeyPressure(key) => push(vec![
@@ -2750,6 +2782,26 @@ impl MidiTrack {
                 Some(MidiChannelPressure {
                     channel: status & 0x0F,
                     value: data[0],
+                    tick: event.absolute_tick,
+                })
+            })
+            .collect()
+    }
+
+    /// Returns valid MIDI Program Change messages in file order.
+    pub fn program_changes(&self) -> Vec<MidiProgramChange> {
+        self.events
+            .iter()
+            .filter_map(|event| {
+                let MidiEventKind::ChannelVoice { status, data } = &event.kind else {
+                    return None;
+                };
+                if status & 0xF0 != 0xC0 || data.is_empty() || data[0] > 127 {
+                    return None;
+                }
+                Some(MidiProgramChange {
+                    channel: status & 0x0F,
+                    program: data[0],
                     tick: event.absolute_tick,
                 })
             })

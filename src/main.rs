@@ -84,6 +84,17 @@ struct MidiChannelPressureImport<'a> {
     new_stream: bool,
 }
 
+struct MidiProgramChangeImport<'a> {
+    input: &'a Path,
+    midi_path: &'a Path,
+    output: &'a Path,
+    track_index: usize,
+    pattern_id: u16,
+    target_stream: (u8, u8),
+    midi_channel: Option<u8>,
+    new_stream: bool,
+}
+
 struct MidiPolyphonicPressureImport<'a> {
     input: &'a Path,
     midi_path: &'a Path,
@@ -591,8 +602,10 @@ fn run(args: Vec<String>) -> Result<(), String> {
         [command, project, output, target_id, raw_channel, raw_flags, midi_channel]
             if command == "export-midi-pitch-bend"
                 || command == "export-midi-channel-pressure"
+                || command == "export-midi-program-change"
                 || command == "export-midi-song-pitch-bend"
-                || command == "export-midi-song-channel-pressure" =>
+                || command == "export-midi-song-channel-pressure"
+                || command == "export-midi-song-program-change" =>
         {
             export_midi_controller_source_stream(MidiControllerStreamExportRequest {
                 project: Path::new(project),
@@ -605,6 +618,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 ),
                 source: if command.contains("pitch-bend") {
                     MidiControllerExportSource::PitchBend
+                } else if command.contains("program-change") {
+                    MidiControllerExportSource::ProgramChange
                 } else {
                     MidiControllerExportSource::ChannelPressure
                 },
@@ -615,8 +630,10 @@ fn run(args: Vec<String>) -> Result<(), String> {
         [command, project, output, target_id, raw_channel, raw_flags, midi_channel, file_format]
             if command == "export-midi-pitch-bend"
                 || command == "export-midi-channel-pressure"
+                || command == "export-midi-program-change"
                 || command == "export-midi-song-pitch-bend"
-                || command == "export-midi-song-channel-pressure" =>
+                || command == "export-midi-song-channel-pressure"
+                || command == "export-midi-song-program-change" =>
         {
             export_midi_controller_source_stream(MidiControllerStreamExportRequest {
                 project: Path::new(project),
@@ -629,6 +646,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 ),
                 source: if command.contains("pitch-bend") {
                     MidiControllerExportSource::PitchBend
+                } else if command.contains("program-change") {
+                    MidiControllerExportSource::ProgramChange
                 } else {
                     MidiControllerExportSource::ChannelPressure
                 },
@@ -4212,6 +4231,26 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 },
             )
         }
+        [command, input, midi_path, output, track, pattern_id, stream_channel, stream_flags, midi_channel]
+            if command == "import-midi-program-change"
+                || command == "import-midi-program-change-new-stream" =>
+        {
+            import_midi_program_changes(
+                MidiProgramChangeImport {
+                    input: Path::new(input),
+                    midi_path: Path::new(midi_path),
+                    output: Path::new(output),
+                    track_index: parse_usize(track, "MIDI track index")?,
+                    pattern_id: parse_u16(pattern_id, "pattern id")?,
+                    target_stream: (
+                        parse_raw_byte(stream_channel, "raw controller channel")?,
+                        parse_raw_byte(stream_flags, "raw controller flags")?,
+                    ),
+                    midi_channel: parse_midi_channel_filter(midi_channel)?,
+                    new_stream: command == "import-midi-program-change-new-stream",
+                },
+            )
+        }
         [command, input, midi_path, output, track, pattern_id, stream_channel, stream_flags, key, midi_channel]
             if command == "import-midi-poly-pressure"
                 || command == "import-midi-poly-pressure-new-stream" =>
@@ -4853,6 +4892,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild export-midi-nrpn <project.flp> <output.mid> <pattern-id> <raw-channel> <raw-flags> <parameter-0..16382> <midi-channel-1..16> [format0|format1]\n",
             "  flp-rebuild export-midi-pitch-bend <project.flp> <output.mid> <pattern-id> <raw-channel> <raw-flags> <midi-channel-1..16> [format0|format1]\n",
             "  flp-rebuild export-midi-channel-pressure <project.flp> <output.mid> <pattern-id> <raw-channel> <raw-flags> <midi-channel-1..16> [format0|format1]\n",
+            "  flp-rebuild export-midi-program-change <project.flp> <output.mid> <pattern-id> <raw-channel> <raw-flags> <midi-channel-1..16> [format0|format1]\n",
             "  flp-rebuild export-midi-poly-pressure <project.flp> <output.mid> <pattern-id> <raw-channel> <raw-flags> <key-0..127> <midi-channel-1..16> [format0|format1]\n",
             "  flp-rebuild export-midi-song <project.flp> <output.mid> <arrangement-id> [stored|channels] [format0|format1]\n",
             "  flp-rebuild export-midi-song-cc <project.flp> <output.mid> <arrangement-id> <raw-channel> <raw-flags> <cc-0..127> <midi-channel-1..16> [format0|format1]\n",
@@ -4861,8 +4901,9 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild export-midi-song-nrpn <project.flp> <output.mid> <arrangement-id> <raw-channel> <raw-flags> <parameter-0..16382> <midi-channel-1..16> [format0|format1]\n",
             "  flp-rebuild export-midi-song-pitch-bend <project.flp> <output.mid> <arrangement-id> <raw-channel> <raw-flags> <midi-channel-1..16> [format0|format1]\n",
             "  flp-rebuild export-midi-song-channel-pressure <project.flp> <output.mid> <arrangement-id> <raw-channel> <raw-flags> <midi-channel-1..16> [format0|format1]\n",
+            "  flp-rebuild export-midi-song-program-change <project.flp> <output.mid> <arrangement-id> <raw-channel> <raw-flags> <midi-channel-1..16> [format0|format1]\n",
             "  flp-rebuild export-midi-song-poly-pressure <project.flp> <output.mid> <arrangement-id> <raw-channel> <raw-flags> <key-0..127> <midi-channel-1..16> [format0|format1]\n",
-            "    RPN/NRPN output writes selector MSB/LSB and Data Entry MSB/LSB per point; 16383 is reserved for null selection. Pitch Bend uses 14-bit values; pressure messages use 7-bit values.\n",
+            "    RPN/NRPN output writes selector MSB/LSB and Data Entry MSB/LSB per point; 16383 is reserved for null selection. Pitch Bend uses 14-bit values; pressure and Program Change messages use 7-bit values.\n",
             "  flp-rebuild midi-events <file.mid> <track> [start] [count]\n",
             "  flp-rebuild scan <directory>\n",
             "  flp-rebuild plugin-scan\n",
@@ -5071,6 +5112,9 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild import-midi-channel-pressure <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <raw-channel> <raw-flags> <midi-channel-1..16|all>\n",
             "  flp-rebuild import-midi-channel-pressure-new-stream <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <raw-channel> <raw-flags> <midi-channel-1..16|all>\n",
             "    Channel Pressure's 7-bit values map linearly from 0–127 to 0.0–1.0.\n",
+            "  flp-rebuild import-midi-program-change <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <raw-channel> <raw-flags> <midi-channel-1..16|all>\n",
+            "  flp-rebuild import-midi-program-change-new-stream <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <raw-channel> <raw-flags> <midi-channel-1..16|all>\n",
+            "    Zero-based Program Change values 0–127 map linearly to 0.0–1.0.\n",
             "  flp-rebuild import-midi-poly-pressure <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <raw-channel> <raw-flags> <note-key-0..127> <midi-channel-1..16|all>\n",
             "  flp-rebuild import-midi-poly-pressure-new-stream <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <raw-channel> <raw-flags> <note-key-0..127> <midi-channel-1..16|all>\n",
             "    Polyphonic Key Pressure imports the selected key; 7-bit values map linearly from 0–127 to 0.0–1.0.\n",
@@ -11886,6 +11930,63 @@ fn import_midi_channel_pressure(request: MidiChannelPressureImport<'_>) -> Resul
     };
     println!(
         "imported {imported} MIDI Channel Pressure events from track {track_index} ({source_channel}) into pattern {pattern_id}, {stream_kind} {} / 0x{:02X} in {}",
+        target_stream.0,
+        target_stream.1,
+        output.display()
+    );
+    Ok(())
+}
+
+fn import_midi_program_changes(request: MidiProgramChangeImport<'_>) -> Result<(), String> {
+    let MidiProgramChangeImport {
+        input,
+        midi_path,
+        output,
+        track_index,
+        pattern_id,
+        target_stream,
+        midi_channel,
+        new_stream,
+    } = request;
+    let (_, mut document) = load_document(input)?;
+    let midi_bytes = fs::read(midi_path)
+        .map_err(|error| format!("could not read {}: {error}", midi_path.display()))?;
+    let midi = MidiFile::parse(&midi_bytes)
+        .map_err(|error| format!("could not parse {}: {error}", midi_path.display()))?;
+    let imported = if new_stream {
+        document.import_midi_program_changes_to_new_stream(
+            &midi,
+            track_index,
+            pattern_id,
+            target_stream,
+            midi_channel,
+        )
+    } else {
+        document.import_midi_program_changes(
+            &midi,
+            track_index,
+            pattern_id,
+            target_stream,
+            midi_channel,
+        )
+    }
+    .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    let source_channel = midi_channel.map_or_else(
+        || "all channels".to_owned(),
+        |channel| format!("MIDI channel {}", channel + 1),
+    );
+    let stream_kind = if new_stream {
+        "new raw stream"
+    } else {
+        "raw stream"
+    };
+    println!(
+        "imported {imported} MIDI Program Change events from track {track_index} ({source_channel}) into pattern {pattern_id}, {stream_kind} {} / 0x{:02X} in {}",
         target_stream.0,
         target_stream.1,
         output.display()

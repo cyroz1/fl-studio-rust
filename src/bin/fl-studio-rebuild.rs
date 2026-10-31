@@ -4404,6 +4404,7 @@ struct PendingMidiCcImport {
     control_change_14: bool,
     pitch_bend: bool,
     channel_pressure: bool,
+    program_change: bool,
     polyphonic_pressure: bool,
     parameter_kind: Option<MidiParameterKind>,
     parameter_number: u16,
@@ -4429,6 +4430,8 @@ struct MidiCcImportOpenRequests {
     open_pitch_bend_new_stream_requested: bool,
     open_channel_pressure_existing_requested: bool,
     open_channel_pressure_new_stream_requested: bool,
+    open_program_change_existing_requested: bool,
+    open_program_change_new_stream_requested: bool,
     open_poly_pressure_existing_requested: bool,
     open_poly_pressure_new_stream_requested: bool,
     open_parameter_existing_requested: bool,
@@ -4444,6 +4447,7 @@ struct MidiCcImportAction {
     control_change_14: bool,
     pitch_bend: bool,
     channel_pressure: bool,
+    program_change: bool,
     polyphonic_pressure: bool,
     parameter_kind: Option<MidiParameterKind>,
     parameter_number: u16,
@@ -4529,6 +4533,7 @@ enum PendingMidiCcExportSource {
     NonRegisteredParameter,
     PitchBend,
     ChannelPressure,
+    ProgramChange,
     PolyphonicKeyPressure,
 }
 
@@ -56510,6 +56515,8 @@ impl DawUi {
         let mut open_midi_pitch_bend_new_stream_requested = false;
         let mut open_midi_channel_pressure_import_requested = false;
         let mut open_midi_channel_pressure_new_stream_requested = false;
+        let mut open_midi_program_change_import_requested = false;
+        let mut open_midi_program_change_new_stream_requested = false;
         let mut open_midi_poly_pressure_import_requested = false;
         let mut open_midi_poly_pressure_new_stream_requested = false;
         let mut open_midi_parameter_import_requested = false;
@@ -56653,6 +56660,24 @@ impl DawUi {
                 .clicked()
             {
                 open_midi_channel_pressure_new_stream_requested = true;
+            }
+            if ui
+                .add_enabled(
+                    self.piano_roll_controller_stream.is_some(),
+                    egui::Button::new("Import MIDI Program Change…"),
+                )
+                .on_hover_text(
+                    "Import program selections from the MIDI track into the selected raw stream",
+                )
+                .clicked()
+            {
+                open_midi_program_change_import_requested = true;
+            }
+            if ui
+                .button("Import MIDI Program Change to new stream…")
+                .clicked()
+            {
+                open_midi_program_change_new_stream_requested = true;
             }
             if ui
                 .add_enabled(
@@ -56880,6 +56905,9 @@ impl DawUi {
                     open_midi_channel_pressure_import_requested,
                 open_channel_pressure_new_stream_requested:
                     open_midi_channel_pressure_new_stream_requested,
+                open_program_change_existing_requested: open_midi_program_change_import_requested,
+                open_program_change_new_stream_requested:
+                    open_midi_program_change_new_stream_requested,
                 open_poly_pressure_existing_requested: open_midi_poly_pressure_import_requested,
                 open_poly_pressure_new_stream_requested:
                     open_midi_poly_pressure_new_stream_requested,
@@ -57538,6 +57566,8 @@ impl DawUi {
             open_pitch_bend_new_stream_requested,
             open_channel_pressure_existing_requested,
             open_channel_pressure_new_stream_requested,
+            open_program_change_existing_requested,
+            open_program_change_new_stream_requested,
             open_poly_pressure_existing_requested,
             open_poly_pressure_new_stream_requested,
             open_parameter_existing_requested,
@@ -57555,6 +57585,8 @@ impl DawUi {
             || open_pitch_bend_new_stream_requested
             || open_channel_pressure_existing_requested
             || open_channel_pressure_new_stream_requested
+            || open_program_change_existing_requested
+            || open_program_change_new_stream_requested
             || open_poly_pressure_existing_requested
             || open_poly_pressure_new_stream_requested
             || open_parameter_existing_requested
@@ -57571,6 +57603,7 @@ impl DawUi {
                 || open_cc14_new_stream_requested
                 || open_pitch_bend_new_stream_requested
                 || open_channel_pressure_new_stream_requested
+                || open_program_change_new_stream_requested
                 || open_poly_pressure_new_stream_requested
                 || open_parameter_new_stream_requested
             {
@@ -57597,6 +57630,10 @@ impl DawUi {
                         || open_channel_pressure_new_stream_requested
                     {
                         "Import MIDI Channel Pressure automation"
+                    } else if open_program_change_existing_requested
+                        || open_program_change_new_stream_requested
+                    {
+                        "Import MIDI Program Change automation"
                     } else if open_poly_pressure_existing_requested
                         || open_poly_pressure_new_stream_requested
                     {
@@ -57633,6 +57670,8 @@ impl DawUi {
                             || open_cc14_new_stream_requested
                             || open_cc14_batch_requested
                             || open_cc14_batch_existing_requested;
+                        let program_change = open_program_change_existing_requested
+                            || open_program_change_new_stream_requested;
                         let any_batch_requested = open_batch_requested
                             || open_batch_existing_requested
                             || open_cc14_batch_requested
@@ -57672,6 +57711,7 @@ impl DawUi {
                                 || open_pitch_bend_new_stream_requested,
                             channel_pressure: open_channel_pressure_existing_requested
                                 || open_channel_pressure_new_stream_requested,
+                            program_change,
                             polyphonic_pressure: open_poly_pressure_existing_requested
                                 || open_poly_pressure_new_stream_requested,
                             parameter_kind,
@@ -57686,6 +57726,7 @@ impl DawUi {
                                 || open_cc14_new_stream_requested
                                 || open_pitch_bend_new_stream_requested
                                 || open_channel_pressure_new_stream_requested
+                                || open_program_change_new_stream_requested
                                 || open_poly_pressure_new_stream_requested
                                 || open_parameter_new_stream_requested
                                 || open_batch_requested
@@ -57708,6 +57749,10 @@ impl DawUi {
                                 || open_channel_pressure_new_stream_requested
                             {
                                 "Channel Pressure"
+                            } else if open_program_change_existing_requested
+                                || open_program_change_new_stream_requested
+                            {
+                                "Program Change"
                             } else if open_poly_pressure_existing_requested
                                 || open_poly_pressure_new_stream_requested
                             {
@@ -57746,6 +57791,8 @@ impl DawUi {
                         "Import MIDI 14-bit Control Change automation"
                     } else if pending.channel_pressure {
                         "Import MIDI Channel Pressure automation"
+                    } else if pending.program_change {
+                        "Import MIDI Program Change automation"
                     } else if pending.polyphonic_pressure {
                         "Import MIDI Polyphonic Key Pressure automation"
                     } else {
@@ -57829,6 +57876,12 @@ impl DawUi {
                     .get(pending.selected_track)
                     .map(|track| track.channel_pressures())
                     .unwrap_or_default();
+                let program_changes = pending
+                    .midi
+                    .tracks()
+                    .get(pending.selected_track)
+                    .map(|track| track.program_changes())
+                    .unwrap_or_default();
                 let polyphonic_pressures = pending
                     .midi
                     .tracks()
@@ -57842,6 +57895,7 @@ impl DawUi {
                         !pending.control_change_14
                             && !pending.pitch_bend
                             && !pending.channel_pressure
+                            && !pending.program_change
                             && !pending.polyphonic_pressure
                             && pending.parameter_kind.is_none()
                     })
@@ -58033,6 +58087,8 @@ impl DawUi {
                     ui.label(
                         "Channel Pressure events from the selected MIDI track will be imported.",
                     );
+                } else if pending.program_change {
+                    ui.label("Program Change events from the selected MIDI track will be imported.");
                 } else if pending.polyphonic_pressure {
                     let pressure_keys = polyphonic_pressures
                         .iter()
@@ -58179,6 +58235,11 @@ impl DawUi {
                         .iter()
                         .map(|pressure| pressure.channel())
                         .collect::<BTreeSet<_>>()
+                } else if pending.program_change {
+                    program_changes
+                        .iter()
+                        .map(|change| change.channel())
+                        .collect::<BTreeSet<_>>()
                 } else if pending.polyphonic_pressure {
                     polyphonic_pressures
                         .iter()
@@ -58264,6 +58325,8 @@ impl DawUi {
                     "CC N and CC N+32 update one 14-bit value per MIDI channel; values map from 0–16383 to 0.0–1.0."
                 } else if pending.channel_pressure {
                     "Channel Pressure values map linearly from 0–127 to 0.0–1.0. Source timing is preserved."
+                } else if pending.program_change {
+                    "Zero-based Program Change values map linearly from 0–127 to 0.0–1.0. Source timing is preserved."
                 } else if pending.polyphonic_pressure {
                     "Imports the selected key only. Values map from 0–127 to 0.0–1.0; source timing is preserved."
                 } else if pending.parameter_kind.is_some() {
@@ -58296,6 +58359,8 @@ impl DawUi {
                         !controller_14_bases.is_empty()
                     } else if pending.channel_pressure {
                         !channel_pressures.is_empty()
+                    } else if pending.program_change {
+                        !program_changes.is_empty()
                     } else if pending.polyphonic_pressure {
                         polyphonic_pressures
                             .iter()
@@ -58347,6 +58412,10 @@ impl DawUi {
                     "Import Channel Pressure and create stream"
                 } else if pending.channel_pressure {
                     "Import Channel Pressure"
+                } else if pending.program_change && pending.new_stream {
+                    "Import Program Change and create stream"
+                } else if pending.program_change {
+                    "Import Program Change"
                 } else if pending.polyphonic_pressure && pending.new_stream {
                     "Import Key Pressure and create stream"
                 } else if pending.polyphonic_pressure {
@@ -58382,6 +58451,7 @@ impl DawUi {
                         control_change_14: pending.control_change_14,
                         pitch_bend: pending.pitch_bend,
                         channel_pressure: pending.channel_pressure,
+                        program_change: pending.program_change,
                         polyphonic_pressure: pending.polyphonic_pressure,
                         parameter_kind: pending.parameter_kind,
                         parameter_number: pending.parameter_number,
@@ -58414,6 +58484,7 @@ impl DawUi {
             control_change_14,
             pitch_bend,
             channel_pressure,
+            program_change,
             polyphonic_pressure,
             parameter_kind,
             parameter_number,
@@ -58555,6 +58626,27 @@ impl DawUi {
                         result
                             .map(|imported| vec![(cc, imported)])
                             .map_err(|error| error.to_string())
+                    } else if program_change {
+                        let result = if new_stream {
+                            document.import_midi_program_changes_to_new_stream(
+                                &midi,
+                                track_index,
+                                target_pattern,
+                                target_stream,
+                                channel,
+                            )
+                        } else {
+                            document.import_midi_program_changes(
+                                &midi,
+                                track_index,
+                                target_pattern,
+                                target_stream,
+                                channel,
+                            )
+                        };
+                        result
+                            .map(|imported| vec![(cc, imported)])
+                            .map_err(|error| error.to_string())
                     } else if polyphonic_pressure {
                         let result = if new_stream {
                             document.import_midi_polyphonic_pressure_to_new_stream(
@@ -58657,6 +58749,10 @@ impl DawUi {
                         format!(
                             "No matching MIDI Channel Pressure events were found in Pattern {target_pattern}; no raw stream was created"
                         )
+                    } else if program_change && new_stream && imported == 0 {
+                        format!(
+                            "No matching MIDI Program Change events were found in Pattern {target_pattern}; no raw stream was created"
+                        )
                     } else if polyphonic_pressure && new_stream && imported == 0 {
                         format!(
                             "No matching MIDI Polyphonic Key Pressure events for key {pressure_key} were found in Pattern {target_pattern}; no raw stream was created"
@@ -58681,6 +58777,15 @@ impl DawUi {
                     } else if channel_pressure {
                         format!(
                             "Imported {imported} MIDI Channel Pressure events into Pattern {target_pattern}{}",
+                            if new_stream {
+                                " and created a raw stream"
+                            } else {
+                                ""
+                            }
+                        )
+                    } else if program_change {
+                        format!(
+                            "Imported {imported} MIDI Program Change events into Pattern {target_pattern}{}",
                             if new_stream {
                                 " and created a raw stream"
                             } else {
@@ -58752,6 +58857,8 @@ impl DawUi {
                             "14-bit Control Change"
                         } else if channel_pressure {
                             "Channel Pressure"
+                        } else if program_change {
+                            "Program Change"
                         } else if polyphonic_pressure {
                             "Polyphonic Key Pressure"
                         } else if parameter_kind.is_some() {
@@ -58875,6 +58982,7 @@ impl DawUi {
                         PendingMidiCcExportSource::NonRegisteredParameter => "NRPN",
                         PendingMidiCcExportSource::PitchBend => "Pitch Bend",
                         PendingMidiCcExportSource::ChannelPressure => "Channel Pressure",
+                        PendingMidiCcExportSource::ProgramChange => "Program Change",
                         PendingMidiCcExportSource::PolyphonicKeyPressure => "Polyphonic Pressure",
                     })
                     .show_ui(ui, |ui| {
@@ -58907,6 +59015,11 @@ impl DawUi {
                             &mut pending.source_kind,
                             PendingMidiCcExportSource::ChannelPressure,
                             "Channel Pressure",
+                        );
+                        ui.selectable_value(
+                            &mut pending.source_kind,
+                            PendingMidiCcExportSource::ProgramChange,
+                            "Program Change",
                         );
                         ui.selectable_value(
                             &mut pending.source_kind,
@@ -58952,7 +59065,8 @@ impl DawUi {
                             );
                         }
                         PendingMidiCcExportSource::PitchBend
-                        | PendingMidiCcExportSource::ChannelPressure => {}
+                        | PendingMidiCcExportSource::ChannelPressure
+                        | PendingMidiCcExportSource::ProgramChange => {}
                     }
                     ui.add(
                         egui::DragValue::new(&mut pending.midi_channel)
@@ -58974,6 +59088,9 @@ impl DawUi {
                     }
                     PendingMidiCcExportSource::ChannelPressure => {
                         "Values map linearly to the 7-bit MIDI Channel Pressure range 0–127."
+                    }
+                    PendingMidiCcExportSource::ProgramChange => {
+                        "Values map linearly to zero-based MIDI programs 0–127."
                     }
                     PendingMidiCcExportSource::PolyphonicKeyPressure => {
                         "Values map linearly to 0–127 for the selected MIDI key."
@@ -59032,6 +59149,9 @@ impl DawUi {
                 PendingMidiCcExportSource::PitchBend => MidiControllerExportSource::PitchBend,
                 PendingMidiCcExportSource::ChannelPressure => {
                     MidiControllerExportSource::ChannelPressure
+                }
+                PendingMidiCcExportSource::ProgramChange => {
+                    MidiControllerExportSource::ProgramChange
                 }
                 PendingMidiCcExportSource::PolyphonicKeyPressure => {
                     MidiControllerExportSource::PolyphonicKeyPressure(poly_pressure_key)
