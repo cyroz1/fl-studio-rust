@@ -5606,8 +5606,9 @@ struct DawUi {
     record_notes_enabled: bool,
     record_automation_enabled: bool,
     record_automation_to_playlist: bool,
-    midi_record_automation_program_change: bool,
+    midi_record_automation_source: MidiAutomationSourceChoice,
     midi_record_automation_controller: u8,
+    midi_record_automation_key: u8,
     midi_record_automation_channel: u8,
     midi_record_automation_flags: u8,
     midi_record_toggle_requested: bool,
@@ -6285,6 +6286,71 @@ struct MidiAutomationRecording {
 enum MidiAutomationRecordSource {
     ControlChange(u8),
     ProgramChange,
+    PitchBend,
+    ChannelPressure,
+    PolyphonicPressure(u8),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MidiAutomationSourceChoice {
+    ControlChange,
+    ProgramChange,
+    PitchBend,
+    ChannelPressure,
+    PolyphonicPressure,
+}
+
+impl MidiAutomationSourceChoice {
+    const ALL: [Self; 5] = [
+        Self::ControlChange,
+        Self::ProgramChange,
+        Self::PitchBend,
+        Self::ChannelPressure,
+        Self::PolyphonicPressure,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::ControlChange => "Control Change",
+            Self::ProgramChange => "Program Change",
+            Self::PitchBend => "Pitch Bend",
+            Self::ChannelPressure => "Channel Pressure",
+            Self::PolyphonicPressure => "Polyphonic Pressure",
+        }
+    }
+
+    fn setting(self) -> &'static str {
+        match self {
+            Self::ControlChange => "cc",
+            Self::ProgramChange => "program-change",
+            Self::PitchBend => "pitch-bend",
+            Self::ChannelPressure => "channel-pressure",
+            Self::PolyphonicPressure => "polyphonic-pressure",
+        }
+    }
+
+    fn from_setting(value: &str) -> Option<Self> {
+        Some(match value {
+            "cc" => Self::ControlChange,
+            "program-change" => Self::ProgramChange,
+            "pitch-bend" => Self::PitchBend,
+            "channel-pressure" => Self::ChannelPressure,
+            "polyphonic-pressure" => Self::PolyphonicPressure,
+            _ => return None,
+        })
+    }
+
+    fn recording_source(self, controller: u8, key: u8) -> MidiAutomationRecordSource {
+        match self {
+            Self::ControlChange => MidiAutomationRecordSource::ControlChange(controller.min(127)),
+            Self::ProgramChange => MidiAutomationRecordSource::ProgramChange,
+            Self::PitchBend => MidiAutomationRecordSource::PitchBend,
+            Self::ChannelPressure => MidiAutomationRecordSource::ChannelPressure,
+            Self::PolyphonicPressure => {
+                MidiAutomationRecordSource::PolyphonicPressure(key.min(127))
+            }
+        }
+    }
 }
 
 impl MidiAutomationRecordSource {
@@ -6292,18 +6358,35 @@ impl MidiAutomationRecordSource {
         match self {
             Self::ControlChange(controller) => format!("MIDI CC {controller}"),
             Self::ProgramChange => "MIDI Program Change".to_owned(),
+            Self::PitchBend => "MIDI Pitch Bend".to_owned(),
+            Self::ChannelPressure => "MIDI Channel Pressure".to_owned(),
+            Self::PolyphonicPressure(key) => {
+                format!("MIDI Polyphonic Pressure for key {key}")
+            }
         }
     }
 
-    fn value_from(self, event: &MidiInputEvent) -> Option<u8> {
+    fn value_from(self, event: &MidiInputEvent) -> Option<f32> {
         match (self, event) {
             (
                 Self::ControlChange(selected),
                 MidiInputEvent::ControlChange {
                     controller, value, ..
                 },
-            ) if selected == *controller => Some(*value),
-            (Self::ProgramChange, MidiInputEvent::ProgramChange { program, .. }) => Some(*program),
+            ) if selected == *controller => Some(f32::from((*value).min(127)) / 127.0),
+            (Self::ProgramChange, MidiInputEvent::ProgramChange { program, .. }) => {
+                Some(f32::from((*program).min(127)) / 127.0)
+            }
+            (Self::PitchBend, MidiInputEvent::PitchBend { value, .. }) => {
+                Some((f32::from(*value).clamp(-8192.0, 8191.0) + 8192.0) / 16_383.0)
+            }
+            (Self::ChannelPressure, MidiInputEvent::ChannelPressure { pressure, .. }) => {
+                Some(f32::from((*pressure).min(127)) / 127.0)
+            }
+            (
+                Self::PolyphonicPressure(selected_key),
+                MidiInputEvent::PolyphonicPressure { key, pressure, .. },
+            ) if selected_key == *key => Some(f32::from((*pressure).min(127)) / 127.0),
             _ => None,
         }
     }
@@ -6319,8 +6402,16 @@ impl MidiAutomationRecording {
         }
     }
 
+    #[cfg(test)]
     fn record(&mut self, position: u32, value: u8) {
-        let point = (position, f32::from(value.min(127)) / 127.0);
+        self.record_normalized(position, f32::from(value.min(127)) / 127.0);
+    }
+
+    fn record_normalized(&mut self, position: u32, value: f32) {
+        if !value.is_finite() {
+            return;
+        }
+        let point = (position, value.clamp(0.0, 1.0));
         if let Some(last) = self.points.last_mut() {
             if last.0 == position {
                 *last = point;
@@ -7159,7 +7250,7 @@ impl ActiveMidiRecording {
             if let Some(position) = position
                 && let Some(value) = automation.source.value_from(&message.event)
             {
-                automation.record(position, value);
+                automation.record_normalized(position, value);
             }
         }
         if self.record_notes {
@@ -7445,8 +7536,9 @@ impl DawUi {
             record_notes: record_notes_enabled,
             record_automation: record_automation_enabled,
             record_automation_to_playlist,
-            midi_record_automation_program_change,
+            record_automation_source: midi_record_automation_source,
             record_automation_controller: midi_record_automation_controller,
+            record_automation_key: midi_record_automation_key,
             record_automation_channel: midi_record_automation_channel,
             record_automation_flags: midi_record_automation_flags,
         } = load_midi_device_selections();
@@ -8055,8 +8147,9 @@ impl DawUi {
             record_notes_enabled,
             record_automation_enabled,
             record_automation_to_playlist,
-            midi_record_automation_program_change,
+            midi_record_automation_source,
             midi_record_automation_controller,
+            midi_record_automation_key,
             midi_record_automation_channel,
             midi_record_automation_flags,
             midi_record_toggle_requested: false,
@@ -20096,7 +20189,7 @@ impl DawUi {
                     record_filters_changed |= ui
                         .checkbox(&mut self.record_automation_enabled, "MIDI automation")
                         .on_hover_text(
-                            "Record the selected MIDI CC or Program Change into a Pattern Event stream by default. You can also record a new Playlist Automation Clip while the Playlist is playing.",
+                            "Record a selected MIDI CC, Program Change, Pitch Bend, Channel Pressure, or Polyphonic Pressure source into a Pattern Event stream by default. You can also record a new Playlist Automation Clip while the Playlist is playing.",
                         )
                         .changed();
                     ui.add_enabled_ui(self.record_automation_enabled, |ui| {
@@ -20110,21 +20203,37 @@ impl DawUi {
                             )
                             .changed();
                         ui.horizontal(|ui| {
-                            record_filters_changed |= ui
-                                .checkbox(
-                                    &mut self.midi_record_automation_program_change,
-                                    "Program Change",
-                                )
-                                .changed();
-                            if self.midi_record_automation_program_change {
-                                ui.label("zero-based program 0–127");
-                            } else {
-                                ui.label("CC");
-                                record_filters_changed |= ui
-                                    .add(egui::DragValue::new(
-                                        &mut self.midi_record_automation_controller,
-                                    ).range(0..=127))
-                                    .changed();
+                            egui::ComboBox::from_id_salt("midi_record_automation_source")
+                                .selected_text(self.midi_record_automation_source.label())
+                                .show_ui(ui, |ui| {
+                                    for source in MidiAutomationSourceChoice::ALL {
+                                        record_filters_changed |= ui
+                                            .selectable_value(
+                                                &mut self.midi_record_automation_source,
+                                                source,
+                                                source.label(),
+                                            )
+                                            .changed();
+                                    }
+                                });
+                            match self.midi_record_automation_source {
+                                MidiAutomationSourceChoice::ControlChange => {
+                                    ui.label("CC");
+                                    record_filters_changed |= ui
+                                        .add(egui::DragValue::new(
+                                            &mut self.midi_record_automation_controller,
+                                        ).range(0..=127))
+                                        .changed();
+                                }
+                                MidiAutomationSourceChoice::PolyphonicPressure => {
+                                    ui.label("Key");
+                                    record_filters_changed |= ui
+                                        .add(egui::DragValue::new(
+                                            &mut self.midi_record_automation_key,
+                                        ).range(0..=127))
+                                        .changed();
+                                }
+                                _ => {}
                             }
                             ui.label("Raw stream");
                             record_filters_changed |= ui
@@ -62615,8 +62724,9 @@ impl DawUi {
             record_notes: self.record_notes_enabled,
             record_automation: self.record_automation_enabled,
             record_automation_to_playlist: self.record_automation_to_playlist,
-            midi_record_automation_program_change: self.midi_record_automation_program_change,
+            record_automation_source: self.midi_record_automation_source,
             record_automation_controller: self.midi_record_automation_controller,
+            record_automation_key: self.midi_record_automation_key,
             record_automation_channel: self.midi_record_automation_channel,
             record_automation_flags: self.midi_record_automation_flags,
         };
@@ -63637,11 +63747,10 @@ impl DawUi {
     fn start_midi_recording_at(&mut self, start_tick_override: Option<u32>) {
         let record_notes = self.record_notes_enabled;
         let record_automation = self.record_automation_enabled;
-        let automation_source = if self.midi_record_automation_program_change {
-            MidiAutomationRecordSource::ProgramChange
-        } else {
-            MidiAutomationRecordSource::ControlChange(self.midi_record_automation_controller)
-        };
+        let automation_source = self.midi_record_automation_source.recording_source(
+            self.midi_record_automation_controller,
+            self.midi_record_automation_key,
+        );
         let automation_source_label = automation_source.label();
         if !record_notes && !record_automation {
             self.status = "Enable Notes or MIDI automation in the Record filter first".to_owned();
@@ -80243,8 +80352,9 @@ struct MidiDeviceSelections {
     record_notes: bool,
     record_automation: bool,
     record_automation_to_playlist: bool,
-    midi_record_automation_program_change: bool,
+    record_automation_source: MidiAutomationSourceChoice,
     record_automation_controller: u8,
+    record_automation_key: u8,
     record_automation_channel: u8,
     record_automation_flags: u8,
 }
@@ -80273,8 +80383,9 @@ impl Default for MidiDeviceSelections {
             record_notes: true,
             record_automation: false,
             record_automation_to_playlist: false,
-            midi_record_automation_program_change: false,
+            record_automation_source: MidiAutomationSourceChoice::ControlChange,
             record_automation_controller: 1,
+            record_automation_key: 60,
             record_automation_channel: 0,
             record_automation_flags: 0,
         }
@@ -80354,7 +80465,7 @@ fn parse_midi_thru_preferences(contents: &str) -> (bool, Option<u8>) {
 
 fn encode_midi_device_selections(selections: &MidiDeviceSelections) -> String {
     format!(
-        "input={}\ninput_script={}\ninput_script_auto_detect={}\nconnect_input_on_startup={}\nmidi_pickup_enabled={}\nfirst_connect_device_ids={}\noutput={}\nconnect_output_on_startup={}\noutput_routes={}\nbank_msb={}\nbank_lsb={}\nprograms={}\nclock={}\nplaylist_notes={}\npattern_notes={}\nfixed_velocity={}\nperformance_channel={}\nrecord_audio={}\nrecord_notes={}\nrecord_automation={}\nrecord_automation_to_playlist={}\nrecord_automation_program_change={}\nrecord_automation_controller={}\nrecord_automation_channel={}\nrecord_automation_flags={}\n",
+        "input={}\ninput_script={}\ninput_script_auto_detect={}\nconnect_input_on_startup={}\nmidi_pickup_enabled={}\nfirst_connect_device_ids={}\noutput={}\nconnect_output_on_startup={}\noutput_routes={}\nbank_msb={}\nbank_lsb={}\nprograms={}\nclock={}\nplaylist_notes={}\npattern_notes={}\nfixed_velocity={}\nperformance_channel={}\nrecord_audio={}\nrecord_notes={}\nrecord_automation={}\nrecord_automation_to_playlist={}\nrecord_automation_source={}\nrecord_automation_controller={}\nrecord_automation_key={}\nrecord_automation_channel={}\nrecord_automation_flags={}\n",
         encode_midi_device_id(selections.input_id.as_deref().unwrap_or_default()),
         selections.input_script.as_ref().map_or_else(
             || "-".to_owned(),
@@ -80379,8 +80490,9 @@ fn encode_midi_device_selections(selections: &MidiDeviceSelections) -> String {
         u8::from(selections.record_notes),
         u8::from(selections.record_automation),
         u8::from(selections.record_automation_to_playlist),
-        u8::from(selections.midi_record_automation_program_change),
+        selections.record_automation_source.setting(),
         selections.record_automation_controller.min(127),
+        selections.record_automation_key.min(127),
         selections.record_automation_channel,
         selections.record_automation_flags
     )
@@ -80446,13 +80558,26 @@ fn parse_midi_device_selections(contents: &str) -> MidiDeviceSelections {
             selections.record_automation = enabled == "1";
         } else if let Some(enabled) = line.strip_prefix("record_automation_to_playlist=") {
             selections.record_automation_to_playlist = enabled == "1";
+        } else if let Some(source) = line.strip_prefix("record_automation_source=") {
+            if let Some(source) = MidiAutomationSourceChoice::from_setting(source) {
+                selections.record_automation_source = source;
+            }
         } else if let Some(enabled) = line.strip_prefix("record_automation_program_change=") {
-            selections.midi_record_automation_program_change = enabled == "1";
+            // Read the boolean setting written by the preceding version.
+            if enabled == "1" {
+                selections.record_automation_source = MidiAutomationSourceChoice::ProgramChange;
+            }
         } else if let Some(controller) = line.strip_prefix("record_automation_controller=") {
             if let Ok(controller) = controller.parse::<u8>()
                 && controller <= 127
             {
                 selections.record_automation_controller = controller;
+            }
+        } else if let Some(key) = line.strip_prefix("record_automation_key=") {
+            if let Ok(key) = key.parse::<u8>()
+                && key <= 127
+            {
+                selections.record_automation_key = key;
             }
         } else if let Some(channel) = line.strip_prefix("record_automation_channel=") {
             if let Ok(channel) = channel.parse::<u8>() {
@@ -87101,9 +87226,9 @@ mod tests {
         DetachedWindowKind, DetachedWindowPlacement, DetachedWindowPlacements,
         DetectedPianoRollScale, FlpDocument, InternalLfoParameterLink, InternalLfoWaveform,
         MAX_INTERNAL_LFO_AUTOMATION_POINTS, MainView, MidiAutomationRecordSource,
-        MidiAutomationRecording, MidiControlChangeMapping, MidiControllerCcBinding,
-        MidiControllerTemplate, MidiDeviceSelections, MidiInputDevice, MidiInputEvent,
-        MidiMixerControlMapping, MidiMixerControlTarget, MidiOutputDevice,
+        MidiAutomationRecording, MidiAutomationSourceChoice, MidiControlChangeMapping,
+        MidiControllerCcBinding, MidiControllerTemplate, MidiDeviceSelections, MidiInputDevice,
+        MidiInputEvent, MidiMixerControlMapping, MidiMixerControlTarget, MidiOutputDevice,
         MidiVst3MixerEffectParameterTarget, MidiVst3ParameterMapping,
         MidiVst3ParameterMappingTarget, MidiVst3ParameterTarget, PIANO_ROLL_RULER_HEIGHT,
         PLAYLIST_AUDIO_CLIP_GAIN_MINUS_INFINITY, Pattern, PatternController, PatternNote,
@@ -88857,8 +88982,9 @@ mod tests {
             record_notes: true,
             record_automation: true,
             record_automation_to_playlist: true,
-            midi_record_automation_program_change: false,
+            record_automation_source: MidiAutomationSourceChoice::ProgramChange,
             record_automation_controller: 74,
+            record_automation_key: 42,
             record_automation_channel: 240,
             record_automation_flags: 129,
         };
