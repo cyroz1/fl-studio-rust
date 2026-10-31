@@ -2798,11 +2798,16 @@ mod tests {
         let script_path = temporary.path().join("device_test.py");
         fs::write(
             &script_path,
-            "# name=Test Script\nimport device\nimport midi\nimport mixer\nimport transport\ndef OnInit():\n    device.setHasMeters()\ndef OnUpdateMeters():\n    if mixer.getTrackPeaks(1, midi.PEAK_R) >= 0.75:\n        transport.stop()\n",
+            "# name=Test Script\nimport device\nimport midi\nimport mixer\nimport transport\ndef OnInit():\n    device.setHasMeters()\ndef OnUpdateMeters():\n    if mixer.getTrackPeaks(mixer.trackCount() - 1, midi.PEAK_R) >= 0.75:\n        transport.stop()\n",
         )
         .unwrap();
         let script = MidiControllerScript::parse(script_path).unwrap();
         let transport_state = Arc::new(MidiScriptTransportState::default());
+        *transport_state.mixer_track_names.lock().unwrap() =
+            vec!["Master".to_owned(), "Insert 1".to_owned()];
+        transport_state
+            .mixer_selected_track
+            .store(1, Ordering::Relaxed);
         *transport_state.mixer_track_peaks.lock().unwrap() = vec![(0.0, 0.0), (0.25, 0.75)];
         let mut runtime = MidiScriptRuntime::start_for_device_with_transport_state(
             &script,
