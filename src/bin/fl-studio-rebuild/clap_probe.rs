@@ -61,6 +61,7 @@ const MAX_CLAP_PREVIEW_PARAMETER_CHANGES: usize = 512;
 const MAX_CLAP_MIXER_EFFECT_PARAMETER_CHANGES: usize = 2_048;
 const MAX_CLAP_SLIDE_EXPRESSION_EVENTS: usize = 1_000_000;
 const MAX_CLAP_INSTRUMENT_LATENCY_SECONDS: u64 = 60;
+const MAX_CLAP_INSTRUMENT_TAIL_SECONDS: u64 = 60;
 const NOTE_PREVIEW_BLOCK_FRAMES: u32 = 512;
 const CLAP_MIXER_EFFECT_PROCESS_TIMEOUT: Duration = Duration::from_secs(10);
 const NOTE_PREVIEW_DURATION_MILLISECONDS: u32 = 1500;
@@ -327,6 +328,8 @@ pub struct ClapPatternPreviewSettings {
     /// Normalized CLAP parameter lanes in Pattern-relative ticks.
     pub parameter_automation: Vec<ClapParameterAutomation>,
     pub playlist: Option<ClapPlaylistPreviewSettings>,
+    /// Selected tail duration when offline Playlist rendering includes plug-in tail reports.
+    pub plugin_tail_seconds: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1967,12 +1970,15 @@ impl ClapPreviewProcess {
             validate_playlist_preview_settings(settings, self.sample_rate)?;
             writeln!(
                 self.stdin,
-                "PLAYLIST {} {:016x} {} {} {}",
+                "PLAYLIST {} {:016x} {} {} {} {}",
                 settings.ppq,
                 settings.tempo_bpm.to_bits(),
                 playlist.tempo_points.len(),
                 playlist.notes.len(),
                 parameter_automation_point_count(&playlist.parameter_automation),
+                settings
+                    .plugin_tail_seconds
+                    .map_or(-1_i32, |seconds| seconds as i32),
             )
             .map_err(|error| format!("could not send a CLAP Playlist request: {error}"))?;
             for point in &playlist.tempo_points {
@@ -3922,6 +3928,7 @@ fn parse_pattern_preview_request(
         notes,
         parameter_automation,
         playlist: None,
+        plugin_tail_seconds: None,
     };
     validate_pattern_preview_settings(&settings, sample_rate)?;
     Ok(settings)
@@ -3939,6 +3946,7 @@ fn parse_playlist_preview_request(
         Some(tempo_count),
         Some(note_count),
         Some(parameter_count),
+        Some(plugin_tail_seconds),
         None,
     ) = (
         fields.next().and_then(|field| field.parse::<u16>().ok()),
@@ -3946,11 +3954,15 @@ fn parse_playlist_preview_request(
         fields.next().and_then(|field| field.parse::<usize>().ok()),
         fields.next().and_then(|field| field.parse::<usize>().ok()),
         fields.next().and_then(|field| field.parse::<usize>().ok()),
+        fields.next().and_then(|field| field.parse::<i32>().ok()),
         fields.next(),
     )
     else {
         return Err("invalid CLAP Playlist preview header".to_owned());
     };
+    if !(-1..=60).contains(&plugin_tail_seconds) {
+        return Err("CLAP Playlist tail duration must be between 0 and 60 seconds".to_owned());
+    }
     let tempo_bpm = u64::from_str_radix(tempo_bits, 16)
         .map(f64::from_bits)
         .map_err(|_| "invalid CLAP Playlist base tempo".to_owned())?;
@@ -3994,6 +4006,7 @@ fn parse_playlist_preview_request(
             notes,
             parameter_automation,
         }),
+        plugin_tail_seconds: (plugin_tail_seconds >= 0).then_some(plugin_tail_seconds as u32),
     };
     validate_playlist_preview_settings(&settings, sample_rate)?;
     Ok(settings)
@@ -5494,7 +5507,7 @@ impl ClapNotePreviewInstance {
             },
         ];
         let total_frames = self.sample_rate * NOTE_PREVIEW_DURATION_MILLISECONDS / 1000;
-        self.render_scheduled_events(&events, &[], total_frames, None)
+        self.render_scheduled_events(&events, &[], total_frames, None, None)
     }
 
     fn render_pattern(
@@ -5503,7 +5516,7 @@ impl ClapNotePreviewInstance {
     ) -> Result<Vec<f32>, String> {
         let (events, total_frames) = schedule_pattern_preview_events(settings, self.sample_rate)?;
         let parameter_events = schedule_pattern_parameter_events(settings, self.sample_rate)?;
-        self.render_scheduled_events(&events, &parameter_events, total_frames, None)
+        self.render_scheduled_events(&events, &parameter_events, total_frames, None, None)
     }
 
     fn render_pattern_loop(
@@ -5569,7 +5582,7 @@ impl ClapNotePreviewInstance {
         let total_frames = u32::try_from(total_frames)
             .map_err(|_| "CLAP Pattern loop render exceeds the supported range".to_owned())?;
         let rendered =
-            self.render_scheduled_events(&events, &parameter_events, total_frames, None)?;
+            self.render_scheduled_events(&events, &parameter_events, total_frames, None, None)?;
         second_pattern_loop_audio(&rendered, loop_frames)
     }
 
@@ -5585,6 +5598,7 @@ impl ClapNotePreviewInstance {
             &parameter_events,
             total_frames,
             Some((&transport_points, settings.ppq)),
+            settings.plugin_tail_seconds,
         )
     }
 
@@ -5594,6 +5608,7 @@ impl ClapNotePreviewInstance {
         parameter_events: &[ScheduledClapParameterEvent],
         total_frames: u32,
         transport: Option<(&[ClapTransportPoint], u16)>,
+        plugin_tail_seconds: Option<u32>,
     ) -> Result<Vec<f32>, String> {
         if total_frames == 0 {
             return Err("CLAP preview has no audio frames to render".to_owned());
@@ -5613,6 +5628,9 @@ impl ClapNotePreviewInstance {
         let latency_samples = plugin
             .get_extension::<PluginLatency>()
             .map_or(0, |latency| latency.get(&plugin));
+        let selected_tail_samples = plugin_tail_seconds
+            .map(|seconds| u64::from(seconds) * u64::from(self.sample_rate))
+            .unwrap_or(0);
         let maximum_latency_samples =
             u64::from(self.sample_rate) * MAX_CLAP_INSTRUMENT_LATENCY_SECONDS;
         if u64::from(latency_samples) > maximum_latency_samples {
@@ -5621,8 +5639,42 @@ impl ClapNotePreviewInstance {
                 "CLAP instrument reports {latency_samples} samples of latency, exceeding the {MAX_CLAP_INSTRUMENT_LATENCY_SECONDS}-second processing limit"
             ));
         }
+        let mut audio_processor = match stopped_processor.start_processing() {
+            Ok(processor) => processor,
+            Err(error) => {
+                let stopped_processor = error.into_stopped_processor();
+                self.instance.deactivate(stopped_processor);
+                return Err("CLAP instrument could not start audio processing".to_owned());
+            }
+        };
+        let maximum_tail_samples = u64::from(self.sample_rate) * MAX_CLAP_INSTRUMENT_TAIL_SECONDS;
+        let reported_tail_samples = plugin_tail_seconds
+            .and_then(|_| {
+                let plugin = audio_processor.plugin_handle();
+                plugin
+                    .get_extension::<PluginTail>()
+                    .map(|tail| match tail.get(&plugin) {
+                        TailLength::Finite(samples) => u64::from(samples),
+                        TailLength::Infinite => selected_tail_samples,
+                    })
+            })
+            .map(|samples| samples.min(maximum_tail_samples))
+            .unwrap_or(0);
         let render_frames = (|| {
-            let render_frames = u64::from(total_frames)
+            let last_scheduled_frame = events
+                .iter()
+                .map(|event| event.frame)
+                .chain(parameter_events.iter().map(|event| event.frame))
+                .max()
+                .unwrap_or(0);
+            let scheduled_tail_frames =
+                u64::from(total_frames).saturating_sub(last_scheduled_frame);
+            let tail_frames = scheduled_tail_frames
+                .max(selected_tail_samples)
+                .max(reported_tail_samples);
+            let render_frames = last_scheduled_frame
+                .checked_add(tail_frames)
+                .ok_or_else(|| "CLAP tail-compensated render length overflowed".to_owned())?
                 .checked_add(u64::from(latency_samples))
                 .ok_or_else(|| "CLAP latency-compensated render length overflowed".to_owned())?;
             let render_bytes = render_frames
@@ -5641,16 +5693,8 @@ impl ClapNotePreviewInstance {
         let render_frames = match render_frames {
             Ok(frames) => frames,
             Err(error) => {
-                self.instance.deactivate(stopped_processor);
+                self.instance.deactivate(audio_processor.stop_processing());
                 return Err(error);
-            }
-        };
-        let mut audio_processor = match stopped_processor.start_processing() {
-            Ok(processor) => processor,
-            Err(error) => {
-                let stopped_processor = error.into_stopped_processor();
-                self.instance.deactivate(stopped_processor);
-                return Err("CLAP instrument could not start audio processing".to_owned());
             }
         };
 
@@ -7445,6 +7489,7 @@ mod tests {
             loop_length_ticks: 192,
             parameter_automation: Vec::new(),
             playlist: None,
+            plugin_tail_seconds: None,
             notes: vec![
                 ClapPatternNote {
                     position_ticks: 0,
@@ -7504,6 +7549,7 @@ mod tests {
             loop_length_ticks: 192,
             notes: Vec::new(),
             parameter_automation: Vec::new(),
+            plugin_tail_seconds: None,
             playlist: Some(ClapPlaylistPreviewSettings {
                 tempo_points: vec![
                     ClapPlaylistTempoPoint {
@@ -7550,7 +7596,7 @@ mod tests {
     #[test]
     fn playlist_preview_parser_reads_tempo_and_note_records() {
         let base_tempo = 123.5_f64;
-        let header = format!("96 {:016x} 2 1 0", base_tempo.to_bits());
+        let header = format!("96 {:016x} 2 1 0 -1", base_tempo.to_bits());
         let mut input = Cursor::new(
             b"TEMPO 0 405e000000000000\nTEMPO 96 404e000000000000\nNOTE 0 192 60 100 0 -35 48 32 100 0\nEND\n".as_slice(),
         );

@@ -12682,10 +12682,10 @@ impl DawUi {
                 }
                 ui.checkbox(
                     &mut self.playlist_render_include_plugin_tails,
-                    "Use VST3 instrument tail reports",
+                    "Use VST3 and CLAP instrument tail reports",
                 )
                 .on_hover_text(format!(
-                    "Extends to the longest finite VST3 instrument tail, up to {:.0} seconds. Infinite reports use the selected tail length.",
+                    "Extends to the longest finite VST3 or CLAP instrument tail, up to {:.0} seconds. Infinite reports use the selected tail length.",
                     MAX_REPORTED_TAIL_SECONDS
                 ));
                 ui.horizontal(|ui| {
@@ -22631,6 +22631,7 @@ impl DawUi {
             notes,
             parameter_automation: Vec::new(),
             playlist: None,
+            plugin_tail_seconds: None,
         }))
     }
 
@@ -22723,6 +22724,7 @@ impl DawUi {
                                 channel_id,
                             ),
                         playlist: None,
+                        plugin_tail_seconds: None,
                     },
                     left_gain,
                     right_gain,
@@ -23056,6 +23058,7 @@ impl DawUi {
                         loop_length_ticks,
                         notes: Vec::new(),
                         parameter_automation: Vec::new(),
+                        plugin_tail_seconds: None,
                         playlist: Some(ClapPlaylistPreviewSettings {
                             tempo_points: tempo_points.clone(),
                             notes,
@@ -23292,6 +23295,7 @@ impl DawUi {
                         notes,
                         parameter_automation,
                         playlist: None,
+                        plugin_tail_seconds: None,
                     };
                     let (volume_automation, pan_automation) = self
                         .clap_playlist_control_automation_for_channel(
@@ -23703,7 +23707,7 @@ impl DawUi {
             .as_ref()
             .map(|processor| processor.volume_expression_channel_ids().clone())
             .unwrap_or_default();
-        let requests = match self.clap_playlist_preview_settings_for_arrangement(
+        let mut requests = match self.clap_playlist_preview_settings_for_arrangement(
             &job.document,
             job.options.arrangement_id,
             &tempo_map,
@@ -23716,6 +23720,11 @@ impl DawUi {
                 return;
             }
         };
+        if self.playlist_render_include_plugin_tails {
+            for request in &mut requests {
+                request.settings.plugin_tail_seconds = Some(u32::from(job.options.tail_seconds));
+            }
+        }
         let requests = requests
             .into_iter()
             .filter_map(|request| {
