@@ -5606,6 +5606,7 @@ struct DawUi {
     record_notes_enabled: bool,
     record_automation_enabled: bool,
     record_automation_to_playlist: bool,
+    midi_record_automation_program_change: bool,
     midi_record_automation_controller: u8,
     midi_record_automation_channel: u8,
     midi_record_automation_flags: u8,
@@ -6274,16 +6275,44 @@ struct ActiveMidiRecording {
 }
 
 struct MidiAutomationRecording {
-    controller: u8,
+    source: MidiAutomationRecordSource,
     stream: (u8, u8),
     points: Vec<(u32, f32)>,
     overflowed: bool,
 }
 
+#[derive(Clone, Copy)]
+enum MidiAutomationRecordSource {
+    ControlChange(u8),
+    ProgramChange,
+}
+
+impl MidiAutomationRecordSource {
+    fn label(self) -> String {
+        match self {
+            Self::ControlChange(controller) => format!("MIDI CC {controller}"),
+            Self::ProgramChange => "MIDI Program Change".to_owned(),
+        }
+    }
+
+    fn value_from(self, event: &MidiInputEvent) -> Option<u8> {
+        match (self, event) {
+            (
+                Self::ControlChange(selected),
+                MidiInputEvent::ControlChange {
+                    controller, value, ..
+                },
+            ) if selected == *controller => Some(*value),
+            (Self::ProgramChange, MidiInputEvent::ProgramChange { program, .. }) => Some(*program),
+            _ => None,
+        }
+    }
+}
+
 impl MidiAutomationRecording {
-    fn new(controller: u8, stream: (u8, u8)) -> Self {
+    fn new(source: MidiAutomationRecordSource, stream: (u8, u8)) -> Self {
         Self {
-            controller: controller.min(127),
+            source,
             stream,
             points: Vec::new(),
             overflowed: false,
@@ -6359,7 +6388,7 @@ fn record_pattern_controller_points(
 }
 
 struct MidiPlaylistAutomationTake<'a> {
-    controller: u8,
+    source_label: &'a str,
     elapsed_ticks: u32,
     ppq: u16,
     points: &'a [(u32, f32)],
@@ -6374,13 +6403,13 @@ fn record_playlist_automation_clip(
     take: MidiPlaylistAutomationTake<'_>,
 ) -> Result<(u16, usize, u32, bool, bool), String> {
     let MidiPlaylistAutomationTake {
-        controller,
+        source_label,
         elapsed_ticks,
         ppq,
         points,
     } = take;
     if points.is_empty() {
-        return Err("the take contains no selected CC changes".to_owned());
+        return Err("the take contains no selected automation source changes".to_owned());
     }
     if ppq == 0 {
         return Err("Playlist Automation recording requires a non-zero PPQ value".to_owned());
@@ -6390,10 +6419,7 @@ fn record_playlist_automation_clip(
     let mut candidate_links = links.clone();
     let mut candidate_mixer_effect_links = mixer_effect_links.clone();
     let channel_id = candidate
-        .duplicate_automation_channel(
-            target.template_channel_id,
-            &format!("MIDI CC {controller} Take"),
-        )
+        .duplicate_automation_channel(target.template_channel_id, &format!("{source_label} Take"))
         .map_err(|error| error.to_string())?;
     let automation_points = points
         .iter()
@@ -7130,15 +7156,10 @@ impl ActiveMidiRecording {
             } else {
                 self.recorder.position_for_message(&message)
             };
-            if let (
-                Some(position),
-                MidiInputEvent::ControlChange {
-                    controller, value, ..
-                },
-            ) = (position, &message.event)
-                && *controller == automation.controller
+            if let Some(position) = position
+                && let Some(value) = automation.source.value_from(&message.event)
             {
-                automation.record(position, *value);
+                automation.record(position, value);
             }
         }
         if self.record_notes {
@@ -7424,6 +7445,7 @@ impl DawUi {
             record_notes: record_notes_enabled,
             record_automation: record_automation_enabled,
             record_automation_to_playlist,
+            midi_record_automation_program_change,
             record_automation_controller: midi_record_automation_controller,
             record_automation_channel: midi_record_automation_channel,
             record_automation_flags: midi_record_automation_flags,
@@ -8033,6 +8055,7 @@ impl DawUi {
             record_notes_enabled,
             record_automation_enabled,
             record_automation_to_playlist,
+            midi_record_automation_program_change,
             midi_record_automation_controller,
             midi_record_automation_channel,
             midi_record_automation_flags,
@@ -20046,9 +20069,9 @@ impl DawUi {
                             .as_ref()
                             .is_some_and(|recording| recording.record_notes)
                         {
-                            "Finish MIDI notes and CC automation recording"
+                            "Finish MIDI notes and MIDI automation recording"
                         } else {
-                            "Finish MIDI CC automation recording"
+                            "Finish MIDI automation recording"
                         }
                     } else if recording_midi {
                         "Finish MIDI note recording"
@@ -20071,9 +20094,9 @@ impl DawUi {
                         .checkbox(&mut self.record_notes_enabled, "Notes")
                         .changed();
                     record_filters_changed |= ui
-                        .checkbox(&mut self.record_automation_enabled, "CC automation")
+                        .checkbox(&mut self.record_automation_enabled, "MIDI automation")
                         .on_hover_text(
-                            "Record the selected CC into a Pattern Event stream by default. You can also record a new Playlist Automation Clip while the Playlist is playing.",
+                            "Record the selected MIDI CC or Program Change into a Pattern Event stream by default. You can also record a new Playlist Automation Clip while the Playlist is playing.",
                         )
                         .changed();
                     ui.add_enabled_ui(self.record_automation_enabled, |ui| {
@@ -20087,12 +20110,22 @@ impl DawUi {
                             )
                             .changed();
                         ui.horizontal(|ui| {
-                            ui.label("CC");
                             record_filters_changed |= ui
-                                .add(egui::DragValue::new(
-                                    &mut self.midi_record_automation_controller,
-                                ).range(0..=127))
+                                .checkbox(
+                                    &mut self.midi_record_automation_program_change,
+                                    "Program Change",
+                                )
                                 .changed();
+                            if self.midi_record_automation_program_change {
+                                ui.label("zero-based program 0–127");
+                            } else {
+                                ui.label("CC");
+                                record_filters_changed |= ui
+                                    .add(egui::DragValue::new(
+                                        &mut self.midi_record_automation_controller,
+                                    ).range(0..=127))
+                                    .changed();
+                            }
                             ui.label("Raw stream");
                             record_filters_changed |= ui
                                 .add(egui::DragValue::new(
@@ -20108,7 +20141,7 @@ impl DawUi {
                     });
                 });
                 ui.separator();
-                ui.label("Audio, Notes, and CC automation can be recorded together.");
+                ui.label("Audio, Notes, and MIDI automation can be recorded together.");
             });
             if record_filters_changed {
                 self.persist_midi_device_selections();
@@ -62582,6 +62615,7 @@ impl DawUi {
             record_notes: self.record_notes_enabled,
             record_automation: self.record_automation_enabled,
             record_automation_to_playlist: self.record_automation_to_playlist,
+            midi_record_automation_program_change: self.midi_record_automation_program_change,
             record_automation_controller: self.midi_record_automation_controller,
             record_automation_channel: self.midi_record_automation_channel,
             record_automation_flags: self.midi_record_automation_flags,
@@ -63603,8 +63637,14 @@ impl DawUi {
     fn start_midi_recording_at(&mut self, start_tick_override: Option<u32>) {
         let record_notes = self.record_notes_enabled;
         let record_automation = self.record_automation_enabled;
+        let automation_source = if self.midi_record_automation_program_change {
+            MidiAutomationRecordSource::ProgramChange
+        } else {
+            MidiAutomationRecordSource::ControlChange(self.midi_record_automation_controller)
+        };
+        let automation_source_label = automation_source.label();
         if !record_notes && !record_automation {
-            self.status = "Enable Notes or CC automation in the Record filter first".to_owned();
+            self.status = "Enable Notes or MIDI automation in the Record filter first".to_owned();
             return;
         }
         if self.midi_input_connection.is_none() {
@@ -63902,7 +63942,7 @@ impl DawUi {
                     record_notes,
                     automation: record_automation.then(|| {
                         MidiAutomationRecording::new(
-                            self.midi_record_automation_controller,
+                            automation_source,
                             (
                                 self.midi_record_automation_channel,
                                 self.midi_record_automation_flags,
@@ -63925,17 +63965,14 @@ impl DawUi {
                 if record_automation {
                     if let Some(target) = playlist_automation_target {
                         recording_targets.push(format!(
-                            "CC{} to a new Playlist Automation Clip on track {} at tick {}",
-                            self.midi_record_automation_controller,
+                            "{automation_source_label} to a new Playlist Automation Clip on track {} at tick {}",
                             target.track_index + 1,
                             target.position_ticks
                         ));
                     } else {
                         recording_targets.push(format!(
-                            "CC{} to raw stream ({}, {})",
-                            self.midi_record_automation_controller,
-                            self.midi_record_automation_channel,
-                            self.midi_record_automation_flags
+                            "{automation_source_label} to raw stream ({}, {})",
+                            self.midi_record_automation_channel, self.midi_record_automation_flags
                         ));
                     }
                 }
@@ -63999,7 +64036,7 @@ impl DawUi {
         }
         let automation_info = automation.map(|automation| {
             (
-                automation.controller,
+                automation.source.label(),
                 automation.stream,
                 automation.overflowed,
                 automation.normalized_points(),
@@ -64016,13 +64053,14 @@ impl DawUi {
                 "MIDI recording reached a capture limit before any event could be committed"
                     .to_owned()
             } else {
-                "MIDI recording ended without captured notes or selected CC changes".to_owned()
+                "MIDI recording ended without captured notes or selected automation changes"
+                    .to_owned()
             };
             return;
         }
         if self.current_path != result.project_path {
             self.status = format!(
-                "Discarded {} MIDI note(s) and {} CC point(s) because the active project changed during recording",
+                "Discarded {} MIDI note(s) and {} automation point(s) because the active project changed during recording",
                 notes.len(),
                 automation_points.len()
             );
@@ -64060,7 +64098,7 @@ impl DawUi {
                 &automation_points,
             )
         {
-            self.status = format!("Could not save recorded MIDI CC automation: {error}");
+            self.status = format!("Could not save recorded MIDI automation: {error}");
             return;
         }
         let mut updated_playlist_vst3_parameter_links = self.playlist_vst3_parameter_links.clone();
@@ -64068,7 +64106,7 @@ impl DawUi {
             self.playlist_vst3_mixer_effect_parameter_links.clone();
         let playlist_automation_result =
             match (playlist_automation_target, automation_info.as_ref()) {
-                (Some(target), Some((controller, _, _, _))) if !automation_points.is_empty() => {
+                (Some(target), Some((source_label, _, _, _))) if !automation_points.is_empty() => {
                     Some(record_playlist_automation_clip(
                         &mut updated,
                         &mut updated_playlist_vst3_parameter_links,
@@ -64076,7 +64114,7 @@ impl DawUi {
                         result.project_path.as_deref(),
                         target,
                         MidiPlaylistAutomationTake {
-                            controller: *controller,
+                            source_label,
                             elapsed_ticks: recorded_elapsed_ticks,
                             ppq: document.header().ppq(),
                             points: &automation_points,
@@ -64090,7 +64128,7 @@ impl DawUi {
             && let Some(Err(error)) = playlist_automation_result.as_ref()
         {
             self.status = format!(
-                "Could not save the Playlist Automation take; captured CC points were discarded: {error}"
+                "Could not save the Playlist Automation take; captured automation points were discarded: {error}"
             );
             return;
         }
@@ -64185,11 +64223,11 @@ impl DawUi {
                 ));
             }
         }
-        if let Some((controller, (channel, flags), overflowed, _)) = automation_info.as_ref()
+        if let Some((source_label, (channel, flags), overflowed, _)) = automation_info.as_ref()
             && !automation_points.is_empty()
         {
             let suffix = if *overflowed {
-                "; later CC changes were ignored after the point limit"
+                "; later automation changes were ignored after the point limit"
             } else {
                 ""
             };
@@ -64199,12 +64237,12 @@ impl DawUi {
                     .is_some_and(|recording_result| recording_result.is_ok())
             {
                 status_parts.push(format!(
-                    "Recorded {} CC{controller} point(s) into a new Playlist Automation Clip{suffix}",
+                    "Recorded {} {source_label} point(s) into a new Playlist Automation Clip{suffix}",
                     automation_points.len()
                 ));
             } else if playlist_automation_target.is_none() {
                 status_parts.push(format!(
-                    "Recorded {} CC{controller} point(s) into raw Pattern stream ({channel}, {flags}){suffix}; no parameter link was created",
+                    "Recorded {} {source_label} point(s) into raw Pattern stream ({channel}, {flags}){suffix}; no parameter link was created",
                     automation_points.len()
                 ));
             }
@@ -64292,7 +64330,7 @@ impl DawUi {
                     }
                 }
                 Err(error) => status.push_str(&format!(
-                    " · Playlist Automation Clip not added; captured CC points were discarded: {error}"
+                    " · Playlist Automation Clip not added; captured automation points were discarded: {error}"
                 )),
             }
         }
@@ -80205,6 +80243,7 @@ struct MidiDeviceSelections {
     record_notes: bool,
     record_automation: bool,
     record_automation_to_playlist: bool,
+    midi_record_automation_program_change: bool,
     record_automation_controller: u8,
     record_automation_channel: u8,
     record_automation_flags: u8,
@@ -80234,6 +80273,7 @@ impl Default for MidiDeviceSelections {
             record_notes: true,
             record_automation: false,
             record_automation_to_playlist: false,
+            midi_record_automation_program_change: false,
             record_automation_controller: 1,
             record_automation_channel: 0,
             record_automation_flags: 0,
@@ -80314,7 +80354,7 @@ fn parse_midi_thru_preferences(contents: &str) -> (bool, Option<u8>) {
 
 fn encode_midi_device_selections(selections: &MidiDeviceSelections) -> String {
     format!(
-        "input={}\ninput_script={}\ninput_script_auto_detect={}\nconnect_input_on_startup={}\nmidi_pickup_enabled={}\nfirst_connect_device_ids={}\noutput={}\nconnect_output_on_startup={}\noutput_routes={}\nbank_msb={}\nbank_lsb={}\nprograms={}\nclock={}\nplaylist_notes={}\npattern_notes={}\nfixed_velocity={}\nperformance_channel={}\nrecord_audio={}\nrecord_notes={}\nrecord_automation={}\nrecord_automation_to_playlist={}\nrecord_automation_controller={}\nrecord_automation_channel={}\nrecord_automation_flags={}\n",
+        "input={}\ninput_script={}\ninput_script_auto_detect={}\nconnect_input_on_startup={}\nmidi_pickup_enabled={}\nfirst_connect_device_ids={}\noutput={}\nconnect_output_on_startup={}\noutput_routes={}\nbank_msb={}\nbank_lsb={}\nprograms={}\nclock={}\nplaylist_notes={}\npattern_notes={}\nfixed_velocity={}\nperformance_channel={}\nrecord_audio={}\nrecord_notes={}\nrecord_automation={}\nrecord_automation_to_playlist={}\nrecord_automation_program_change={}\nrecord_automation_controller={}\nrecord_automation_channel={}\nrecord_automation_flags={}\n",
         encode_midi_device_id(selections.input_id.as_deref().unwrap_or_default()),
         selections.input_script.as_ref().map_or_else(
             || "-".to_owned(),
@@ -80339,6 +80379,7 @@ fn encode_midi_device_selections(selections: &MidiDeviceSelections) -> String {
         u8::from(selections.record_notes),
         u8::from(selections.record_automation),
         u8::from(selections.record_automation_to_playlist),
+        u8::from(selections.midi_record_automation_program_change),
         selections.record_automation_controller.min(127),
         selections.record_automation_channel,
         selections.record_automation_flags
@@ -80405,6 +80446,8 @@ fn parse_midi_device_selections(contents: &str) -> MidiDeviceSelections {
             selections.record_automation = enabled == "1";
         } else if let Some(enabled) = line.strip_prefix("record_automation_to_playlist=") {
             selections.record_automation_to_playlist = enabled == "1";
+        } else if let Some(enabled) = line.strip_prefix("record_automation_program_change=") {
+            selections.midi_record_automation_program_change = enabled == "1";
         } else if let Some(controller) = line.strip_prefix("record_automation_controller=") {
             if let Ok(controller) = controller.parse::<u8>()
                 && controller <= 127
@@ -87057,21 +87100,22 @@ mod tests {
         ActivePlaylistClipDrag, Arrangement, ChannelDisplayFilter, ChannelNoteRouter,
         DetachedWindowKind, DetachedWindowPlacement, DetachedWindowPlacements,
         DetectedPianoRollScale, FlpDocument, InternalLfoParameterLink, InternalLfoWaveform,
-        MAX_INTERNAL_LFO_AUTOMATION_POINTS, MainView, MidiAutomationRecording,
-        MidiControlChangeMapping, MidiControllerCcBinding, MidiControllerTemplate,
-        MidiDeviceSelections, MidiInputDevice, MidiInputEvent, MidiMixerControlMapping,
-        MidiMixerControlTarget, MidiOutputDevice, MidiVst3MixerEffectParameterTarget,
-        MidiVst3ParameterMapping, MidiVst3ParameterMappingTarget, MidiVst3ParameterTarget,
-        PIANO_ROLL_RULER_HEIGHT, PLAYLIST_AUDIO_CLIP_GAIN_MINUS_INFINITY, Pattern,
-        PatternController, PatternNote, PatternVst3AutomationSources,
-        PatternVst3MixerEffectParameterLink, PatternVst3ParameterLink, PianoRollChordStamp,
-        PianoRollGrid, PianoRollScale, PianoRollSnap, PlaylistAudioClipEnvelope,
-        PlaylistAudioClipFadeCurve, PlaylistClip, PlaylistClipDragKind, PlaylistClipEdit,
-        PlaylistClipResizeEdge, PlaylistPerformanceLiveStatus, PlaylistTempoMap, PlaylistTrack,
-        PlaylistTrackMotion, PlaylistTrackPerformanceParameter, PlaylistTrackPress,
-        PlaylistTrackSync, PlaylistVst3MixerEffectParameterLink, PlaylistVst3ParameterLink,
-        PluginCandidate, PluginFormat, ProjectPlaylistAudioClipEnvelope, TimeSelectionShift,
-        TouchGesture, TouchTapTracker, TouchZoomConfig, Vst3PlaylistAutomationPoint,
+        MAX_INTERNAL_LFO_AUTOMATION_POINTS, MainView, MidiAutomationRecordSource,
+        MidiAutomationRecording, MidiControlChangeMapping, MidiControllerCcBinding,
+        MidiControllerTemplate, MidiDeviceSelections, MidiInputDevice, MidiInputEvent,
+        MidiMixerControlMapping, MidiMixerControlTarget, MidiOutputDevice,
+        MidiVst3MixerEffectParameterTarget, MidiVst3ParameterMapping,
+        MidiVst3ParameterMappingTarget, MidiVst3ParameterTarget, PIANO_ROLL_RULER_HEIGHT,
+        PLAYLIST_AUDIO_CLIP_GAIN_MINUS_INFINITY, Pattern, PatternController, PatternNote,
+        PatternVst3AutomationSources, PatternVst3MixerEffectParameterLink,
+        PatternVst3ParameterLink, PianoRollChordStamp, PianoRollGrid, PianoRollScale,
+        PianoRollSnap, PlaylistAudioClipEnvelope, PlaylistAudioClipFadeCurve, PlaylistClip,
+        PlaylistClipDragKind, PlaylistClipEdit, PlaylistClipResizeEdge,
+        PlaylistPerformanceLiveStatus, PlaylistTempoMap, PlaylistTrack, PlaylistTrackMotion,
+        PlaylistTrackPerformanceParameter, PlaylistTrackPress, PlaylistTrackSync,
+        PlaylistVst3MixerEffectParameterLink, PlaylistVst3ParameterLink, PluginCandidate,
+        PluginFormat, ProjectPlaylistAudioClipEnvelope, TimeSelectionShift, TouchGesture,
+        TouchTapTracker, TouchZoomConfig, Vst3PlaylistAutomationPoint,
         Vst3PlaylistParameterAutomation, WINDOW_LAYOUT_PRESETS_HEADER, WindowLayoutPreset,
         audio_recording_start_tick_with_offset, built_in_midi_controller_templates,
         candidate_live_mixer_send_key, candidate_matches_vst_identity, candidate_mixer_controls,
@@ -88813,6 +88857,7 @@ mod tests {
             record_notes: true,
             record_automation: true,
             record_automation_to_playlist: true,
+            midi_record_automation_program_change: false,
             record_automation_controller: 74,
             record_automation_channel: 240,
             record_automation_flags: 129,
@@ -90631,7 +90676,8 @@ mod tests {
 
     #[test]
     fn midi_automation_recording_normalizes_and_coalesces_cc_values() {
-        let mut recording = MidiAutomationRecording::new(74, (3, 0x91));
+        let mut recording =
+            MidiAutomationRecording::new(MidiAutomationRecordSource::ControlChange(74), (3, 0x91));
         recording.record(0, 0);
         recording.record(96, 64);
         recording.record(96, 127);
@@ -90647,7 +90693,8 @@ mod tests {
 
     #[test]
     fn midi_automation_recording_sorts_out_of_order_timestamps() {
-        let mut recording = MidiAutomationRecording::new(1, (0, 0));
+        let mut recording =
+            MidiAutomationRecording::new(MidiAutomationRecordSource::ControlChange(1), (0, 0));
         recording.record(288, 127);
         recording.record(0, 0);
         recording.record(96, 64);
