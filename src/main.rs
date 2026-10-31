@@ -6,8 +6,9 @@ use std::process::ExitCode;
 
 use flp_rebuild::media::{SamplePathResolver, decode_audio_file};
 use flp_rebuild::midi::{
-    MAX_MIDI_PARAMETER_NUMBER, MidiAutomationSource, MidiChannelMapping, MidiExportFileFormat,
-    MidiFile, MidiImportOptions, MidiParameterKind,
+    MAX_MIDI_PARAMETER_NUMBER, MidiAutomationSource, MidiChannelMapping,
+    MidiControllerExportSource, MidiExportFileFormat, MidiFile, MidiImportOptions,
+    MidiParameterKind,
 };
 use flp_rebuild::plugin_settings::load_vst3_manual_latency_offsets;
 use flp_rebuild::plugins::scan_installed_plugins;
@@ -545,7 +546,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 || command == "export-midi-song-rpn"
                 || command == "export-midi-song-nrpn" =>
         {
-            export_midi_parameter_stream(MidiParameterExportRequest {
+            export_midi_controller_source_stream(MidiControllerStreamExportRequest {
                 project: Path::new(project),
                 output: Path::new(output),
                 target_id: parse_u16(target_id, "Pattern or arrangement id")?,
@@ -554,12 +555,11 @@ fn run(args: Vec<String>) -> Result<(), String> {
                     parse_u8(raw_channel, "raw controller stream channel")?,
                     parse_u8(raw_flags, "raw controller stream flags")?,
                 ),
-                kind: if command.contains("nrpn") {
+                source: MidiControllerExportSource::Parameter(if command.contains("nrpn") {
                     MidiParameterKind::NonRegistered
                 } else {
                     MidiParameterKind::Registered
-                },
-                parameter_number: parse_u16(parameter_number, "MIDI parameter number")?,
+                }, parse_u16(parameter_number, "MIDI parameter number")?),
                 midi_channel: parse_midi_channel_number(midi_channel)?,
                 file_format: MidiExportFileFormat::Format1,
             })
@@ -570,7 +570,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 || command == "export-midi-song-rpn"
                 || command == "export-midi-song-nrpn" =>
         {
-            export_midi_parameter_stream(MidiParameterExportRequest {
+            export_midi_controller_source_stream(MidiControllerStreamExportRequest {
                 project: Path::new(project),
                 output: Path::new(output),
                 target_id: parse_u16(target_id, "Pattern or arrangement id")?,
@@ -579,12 +579,99 @@ fn run(args: Vec<String>) -> Result<(), String> {
                     parse_u8(raw_channel, "raw controller stream channel")?,
                     parse_u8(raw_flags, "raw controller stream flags")?,
                 ),
-                kind: if command.contains("nrpn") {
+                source: MidiControllerExportSource::Parameter(if command.contains("nrpn") {
                     MidiParameterKind::NonRegistered
                 } else {
                     MidiParameterKind::Registered
+                }, parse_u16(parameter_number, "MIDI parameter number")?),
+                midi_channel: parse_midi_channel_number(midi_channel)?,
+                file_format: parse_midi_export_file_format(file_format)?,
+            })
+        }
+        [command, project, output, target_id, raw_channel, raw_flags, midi_channel]
+            if command == "export-midi-pitch-bend"
+                || command == "export-midi-channel-pressure"
+                || command == "export-midi-song-pitch-bend"
+                || command == "export-midi-song-channel-pressure" =>
+        {
+            export_midi_controller_source_stream(MidiControllerStreamExportRequest {
+                project: Path::new(project),
+                output: Path::new(output),
+                target_id: parse_u16(target_id, "Pattern or arrangement id")?,
+                is_song: command.contains("song"),
+                raw_stream: (
+                    parse_u8(raw_channel, "raw controller stream channel")?,
+                    parse_u8(raw_flags, "raw controller stream flags")?,
+                ),
+                source: if command.contains("pitch-bend") {
+                    MidiControllerExportSource::PitchBend
+                } else {
+                    MidiControllerExportSource::ChannelPressure
                 },
-                parameter_number: parse_u16(parameter_number, "MIDI parameter number")?,
+                midi_channel: parse_midi_channel_number(midi_channel)?,
+                file_format: MidiExportFileFormat::Format1,
+            })
+        }
+        [command, project, output, target_id, raw_channel, raw_flags, midi_channel, file_format]
+            if command == "export-midi-pitch-bend"
+                || command == "export-midi-channel-pressure"
+                || command == "export-midi-song-pitch-bend"
+                || command == "export-midi-song-channel-pressure" =>
+        {
+            export_midi_controller_source_stream(MidiControllerStreamExportRequest {
+                project: Path::new(project),
+                output: Path::new(output),
+                target_id: parse_u16(target_id, "Pattern or arrangement id")?,
+                is_song: command.contains("song"),
+                raw_stream: (
+                    parse_u8(raw_channel, "raw controller stream channel")?,
+                    parse_u8(raw_flags, "raw controller stream flags")?,
+                ),
+                source: if command.contains("pitch-bend") {
+                    MidiControllerExportSource::PitchBend
+                } else {
+                    MidiControllerExportSource::ChannelPressure
+                },
+                midi_channel: parse_midi_channel_number(midi_channel)?,
+                file_format: parse_midi_export_file_format(file_format)?,
+            })
+        }
+        [command, project, output, target_id, raw_channel, raw_flags, key, midi_channel]
+            if command == "export-midi-poly-pressure"
+                || command == "export-midi-song-poly-pressure" =>
+        {
+            export_midi_controller_source_stream(MidiControllerStreamExportRequest {
+                project: Path::new(project),
+                output: Path::new(output),
+                target_id: parse_u16(target_id, "Pattern or arrangement id")?,
+                is_song: command.contains("song"),
+                raw_stream: (
+                    parse_u8(raw_channel, "raw controller stream channel")?,
+                    parse_u8(raw_flags, "raw controller stream flags")?,
+                ),
+                source: MidiControllerExportSource::PolyphonicKeyPressure(
+                    parse_u8(key, "MIDI key")?,
+                ),
+                midi_channel: parse_midi_channel_number(midi_channel)?,
+                file_format: MidiExportFileFormat::Format1,
+            })
+        }
+        [command, project, output, target_id, raw_channel, raw_flags, key, midi_channel, file_format]
+            if command == "export-midi-poly-pressure"
+                || command == "export-midi-song-poly-pressure" =>
+        {
+            export_midi_controller_source_stream(MidiControllerStreamExportRequest {
+                project: Path::new(project),
+                output: Path::new(output),
+                target_id: parse_u16(target_id, "Pattern or arrangement id")?,
+                is_song: command.contains("song"),
+                raw_stream: (
+                    parse_u8(raw_channel, "raw controller stream channel")?,
+                    parse_u8(raw_flags, "raw controller stream flags")?,
+                ),
+                source: MidiControllerExportSource::PolyphonicKeyPressure(
+                    parse_u8(key, "MIDI key")?,
+                ),
                 midi_channel: parse_midi_channel_number(midi_channel)?,
                 file_format: parse_midi_export_file_format(file_format)?,
             })
@@ -4764,12 +4851,18 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild export-midi-cc14 <project.flp> <output.mid> <pattern-id> <raw-channel> <raw-flags> <base-cc-0..31> <midi-channel-1..16> [format0|format1]\n",
             "  flp-rebuild export-midi-rpn <project.flp> <output.mid> <pattern-id> <raw-channel> <raw-flags> <parameter-0..16382> <midi-channel-1..16> [format0|format1]\n",
             "  flp-rebuild export-midi-nrpn <project.flp> <output.mid> <pattern-id> <raw-channel> <raw-flags> <parameter-0..16382> <midi-channel-1..16> [format0|format1]\n",
+            "  flp-rebuild export-midi-pitch-bend <project.flp> <output.mid> <pattern-id> <raw-channel> <raw-flags> <midi-channel-1..16> [format0|format1]\n",
+            "  flp-rebuild export-midi-channel-pressure <project.flp> <output.mid> <pattern-id> <raw-channel> <raw-flags> <midi-channel-1..16> [format0|format1]\n",
+            "  flp-rebuild export-midi-poly-pressure <project.flp> <output.mid> <pattern-id> <raw-channel> <raw-flags> <key-0..127> <midi-channel-1..16> [format0|format1]\n",
             "  flp-rebuild export-midi-song <project.flp> <output.mid> <arrangement-id> [stored|channels] [format0|format1]\n",
             "  flp-rebuild export-midi-song-cc <project.flp> <output.mid> <arrangement-id> <raw-channel> <raw-flags> <cc-0..127> <midi-channel-1..16> [format0|format1]\n",
             "  flp-rebuild export-midi-song-cc14 <project.flp> <output.mid> <arrangement-id> <raw-channel> <raw-flags> <base-cc-0..31> <midi-channel-1..16> [format0|format1]\n",
             "  flp-rebuild export-midi-song-rpn <project.flp> <output.mid> <arrangement-id> <raw-channel> <raw-flags> <parameter-0..16382> <midi-channel-1..16> [format0|format1]\n",
             "  flp-rebuild export-midi-song-nrpn <project.flp> <output.mid> <arrangement-id> <raw-channel> <raw-flags> <parameter-0..16382> <midi-channel-1..16> [format0|format1]\n",
-            "    RPN/NRPN output writes selector MSB/LSB and Data Entry MSB/LSB per point; 16383 is reserved as the null selection.\n",
+            "  flp-rebuild export-midi-song-pitch-bend <project.flp> <output.mid> <arrangement-id> <raw-channel> <raw-flags> <midi-channel-1..16> [format0|format1]\n",
+            "  flp-rebuild export-midi-song-channel-pressure <project.flp> <output.mid> <arrangement-id> <raw-channel> <raw-flags> <midi-channel-1..16> [format0|format1]\n",
+            "  flp-rebuild export-midi-song-poly-pressure <project.flp> <output.mid> <arrangement-id> <raw-channel> <raw-flags> <key-0..127> <midi-channel-1..16> [format0|format1]\n",
+            "    RPN/NRPN output writes selector MSB/LSB and Data Entry MSB/LSB per point; 16383 is reserved for null selection. Pitch Bend uses 14-bit values; pressure messages use 7-bit values.\n",
             "  flp-rebuild midi-events <file.mid> <track> [start] [count]\n",
             "  flp-rebuild scan <directory>\n",
             "  flp-rebuild plugin-scan\n",
@@ -6977,48 +7070,46 @@ fn export_midi_controller_stream_14bit(
     Ok(())
 }
 
-struct MidiParameterExportRequest<'a> {
+struct MidiControllerStreamExportRequest<'a> {
     project: &'a Path,
     output: &'a Path,
     target_id: u16,
     is_song: bool,
     raw_stream: (u8, u8),
-    kind: MidiParameterKind,
-    parameter_number: u16,
+    source: MidiControllerExportSource,
     midi_channel: u8,
     file_format: MidiExportFileFormat,
 }
 
-fn export_midi_parameter_stream(request: MidiParameterExportRequest<'_>) -> Result<(), String> {
-    let MidiParameterExportRequest {
+fn export_midi_controller_source_stream(
+    request: MidiControllerStreamExportRequest<'_>,
+) -> Result<(), String> {
+    let MidiControllerStreamExportRequest {
         project,
         output,
         target_id,
         is_song,
         raw_stream,
-        kind,
-        parameter_number,
+        source,
         midi_channel,
         file_format,
     } = request;
     let (_, document) = load_document(project)?;
     let bytes = if is_song {
-        MidiFile::encode_project_song_parameter_stream_with_format(
+        MidiFile::encode_project_song_controller_stream_with_format_and_source(
             &document,
             target_id,
             raw_stream,
-            kind,
-            parameter_number,
+            source,
             midi_channel,
             file_format,
         )
     } else {
-        MidiFile::encode_project_pattern_parameter_stream_with_format(
+        MidiFile::encode_project_pattern_controller_stream_with_format_and_source(
             &document,
             target_id,
             raw_stream,
-            kind,
-            parameter_number,
+            source,
             midi_channel,
             file_format,
         )
@@ -7026,17 +7117,14 @@ fn export_midi_parameter_stream(request: MidiParameterExportRequest<'_>) -> Resu
     .map_err(|error| error.to_string())?;
     fs::write(output, &bytes)
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
-    let source = match kind {
-        MidiParameterKind::Registered => "RPN",
-        MidiParameterKind::NonRegistered => "NRPN",
-    };
+    let source_description = source.description();
     let target_name = if is_song {
         format!("arrangement {target_id}")
     } else {
         format!("Pattern {target_id}")
     };
     println!(
-        "exported {target_name} raw controller stream {} / 0x{:02X} as MIDI {source} {parameter_number} on channel {} to {} ({} bytes)",
+        "exported {target_name} raw controller stream {} / 0x{:02X} as MIDI {source_description} on channel {} to {} ({} bytes)",
         raw_stream.0,
         raw_stream.1,
         midi_channel + 1,

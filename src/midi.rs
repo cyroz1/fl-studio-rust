@@ -442,14 +442,24 @@ struct TimedMidiBytes {
     bytes: Vec<u8>,
 }
 
-#[derive(Clone, Copy)]
-enum MidiControllerExportResolution {
+/// Describes the MIDI channel-voice message used to export one raw Pattern stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MidiControllerExportSource {
+    /// One MIDI Control Change number in the range 0–127.
     SevenBit(u8),
+    /// One paired 14-bit Control Change source with base number 0–31.
     FourteenBit(u8),
+    /// One selected RPN or NRPN number and selector kind.
     Parameter(MidiParameterKind, u16),
+    /// One 14-bit MIDI Pitch Bend message.
+    PitchBend,
+    /// One 7-bit MIDI Channel Pressure message.
+    ChannelPressure,
+    /// One 7-bit MIDI Polyphonic Key Pressure message for a key in 0–127.
+    PolyphonicKeyPressure(u8),
 }
 
-impl MidiControllerExportResolution {
+impl MidiControllerExportSource {
     fn validate(self) -> Result<(), MidiError> {
         match self {
             Self::SevenBit(controller) if controller > 127 => Err(MidiError::InvalidExport(
@@ -463,11 +473,14 @@ impl MidiControllerExportResolution {
                     "MIDI RPN or NRPN number must be from 0 through 16382; 16383 is the null selection",
                 ))
             }
+            Self::PolyphonicKeyPressure(key) if key > 127 => Err(MidiError::InvalidExport(
+                "MIDI Polyphonic Key Pressure key must be from 0 through 127",
+            )),
             _ => Ok(()),
         }
     }
 
-    fn description(self) -> String {
+    pub fn description(self) -> String {
         match self {
             Self::SevenBit(controller) => format!("CC {controller}"),
             Self::FourteenBit(controller) => {
@@ -476,6 +489,11 @@ impl MidiControllerExportResolution {
             Self::Parameter(MidiParameterKind::Registered, number) => format!("RPN {number}"),
             Self::Parameter(MidiParameterKind::NonRegistered, number) => {
                 format!("NRPN {number}")
+            }
+            Self::PitchBend => "Pitch Bend".to_owned(),
+            Self::ChannelPressure => "Channel Pressure".to_owned(),
+            Self::PolyphonicKeyPressure(key) => {
+                format!("Polyphonic Key Pressure key {key}")
             }
         }
     }
@@ -488,25 +506,29 @@ impl MidiControllerExportResolution {
         order: u8,
         events: &mut Vec<TimedMidiBytes>,
     ) {
-        let status = 0xB0 | midi_channel;
-        let mut push = |controller, value| {
-            events.push(TimedMidiBytes {
-                tick,
-                order,
-                bytes: vec![status, controller, value],
-            });
+        let mut push = |bytes| {
+            events.push(TimedMidiBytes { tick, order, bytes });
         };
         match self {
             Self::SevenBit(controller) => {
-                push(
+                push(vec![
+                    0xB0 | midi_channel,
                     controller,
                     (normalized_value.clamp(0.0, 1.0) * 127.0).round() as u8,
-                );
+                ]);
             }
             Self::FourteenBit(base_controller) => {
                 let value = (normalized_value.clamp(0.0, 1.0) * 16_383.0).round() as u16;
-                push(base_controller, (value >> 7) as u8);
-                push(base_controller + 32, (value & 0x7f) as u8);
+                push(vec![
+                    0xB0 | midi_channel,
+                    base_controller,
+                    (value >> 7) as u8,
+                ]);
+                push(vec![
+                    0xB0 | midi_channel,
+                    base_controller + 32,
+                    (value & 0x7f) as u8,
+                ]);
             }
             Self::Parameter(kind, number) => {
                 let selector = match kind {
@@ -514,11 +536,28 @@ impl MidiControllerExportResolution {
                     MidiParameterKind::NonRegistered => (99, 98),
                 };
                 let value = (normalized_value.clamp(0.0, 1.0) * 16_383.0).round() as u16;
-                push(selector.0, (number >> 7) as u8);
-                push(selector.1, (number & 0x7f) as u8);
-                push(6, (value >> 7) as u8);
-                push(38, (value & 0x7f) as u8);
+                push(vec![0xB0 | midi_channel, selector.0, (number >> 7) as u8]);
+                push(vec![0xB0 | midi_channel, selector.1, (number & 0x7f) as u8]);
+                push(vec![0xB0 | midi_channel, 6, (value >> 7) as u8]);
+                push(vec![0xB0 | midi_channel, 38, (value & 0x7f) as u8]);
             }
+            Self::PitchBend => {
+                let value = (normalized_value.clamp(0.0, 1.0) * 16_383.0).round() as u16;
+                push(vec![
+                    0xE0 | midi_channel,
+                    (value & 0x7f) as u8,
+                    (value >> 7) as u8,
+                ]);
+            }
+            Self::ChannelPressure => push(vec![
+                0xD0 | midi_channel,
+                (normalized_value.clamp(0.0, 1.0) * 127.0).round() as u8,
+            ]),
+            Self::PolyphonicKeyPressure(key) => push(vec![
+                0xA0 | midi_channel,
+                key,
+                (normalized_value.clamp(0.0, 1.0) * 127.0).round() as u8,
+            ]),
         }
     }
 }
@@ -899,11 +938,11 @@ impl MidiFile {
         midi_channel: u8,
         file_format: MidiExportFileFormat,
     ) -> Result<Vec<u8>, MidiError> {
-        Self::encode_project_pattern_controller_stream_with_format_and_resolution(
+        Self::encode_project_pattern_controller_stream_with_format_and_source(
             document,
             pattern_id,
             raw_stream,
-            MidiControllerExportResolution::SevenBit(midi_controller),
+            MidiControllerExportSource::SevenBit(midi_controller),
             midi_channel,
             file_format,
         )
@@ -939,11 +978,11 @@ impl MidiFile {
         midi_channel: u8,
         file_format: MidiExportFileFormat,
     ) -> Result<Vec<u8>, MidiError> {
-        Self::encode_project_pattern_controller_stream_with_format_and_resolution(
+        Self::encode_project_pattern_controller_stream_with_format_and_source(
             document,
             pattern_id,
             raw_stream,
-            MidiControllerExportResolution::FourteenBit(base_controller),
+            MidiControllerExportSource::FourteenBit(base_controller),
             midi_channel,
             file_format,
         )
@@ -961,21 +1000,23 @@ impl MidiFile {
         midi_channel: u8,
         file_format: MidiExportFileFormat,
     ) -> Result<Vec<u8>, MidiError> {
-        Self::encode_project_pattern_controller_stream_with_format_and_resolution(
+        Self::encode_project_pattern_controller_stream_with_format_and_source(
             document,
             pattern_id,
             raw_stream,
-            MidiControllerExportResolution::Parameter(kind, parameter_number),
+            MidiControllerExportSource::Parameter(kind, parameter_number),
             midi_channel,
             file_format,
         )
     }
 
-    fn encode_project_pattern_controller_stream_with_format_and_resolution(
+    /// Exports one raw Pattern controller stream using an explicit MIDI channel-voice message
+    /// source and the requested MIDI file layout.
+    pub fn encode_project_pattern_controller_stream_with_format_and_source(
         document: &FlpDocument,
         pattern_id: u16,
         raw_stream: (u8, u8),
-        resolution: MidiControllerExportResolution,
+        resolution: MidiControllerExportSource,
         midi_channel: u8,
         file_format: MidiExportFileFormat,
     ) -> Result<Vec<u8>, MidiError> {
@@ -1173,11 +1214,11 @@ impl MidiFile {
         midi_channel: u8,
         file_format: MidiExportFileFormat,
     ) -> Result<Vec<u8>, MidiError> {
-        Self::encode_project_song_controller_stream_with_format_and_resolution(
+        Self::encode_project_song_controller_stream_with_format_and_source(
             document,
             arrangement_id,
             raw_stream,
-            MidiControllerExportResolution::SevenBit(midi_controller),
+            MidiControllerExportSource::SevenBit(midi_controller),
             midi_channel,
             file_format,
         )
@@ -1212,11 +1253,11 @@ impl MidiFile {
         midi_channel: u8,
         file_format: MidiExportFileFormat,
     ) -> Result<Vec<u8>, MidiError> {
-        Self::encode_project_song_controller_stream_with_format_and_resolution(
+        Self::encode_project_song_controller_stream_with_format_and_source(
             document,
             arrangement_id,
             raw_stream,
-            MidiControllerExportResolution::FourteenBit(base_controller),
+            MidiControllerExportSource::FourteenBit(base_controller),
             midi_channel,
             file_format,
         )
@@ -1233,21 +1274,23 @@ impl MidiFile {
         midi_channel: u8,
         file_format: MidiExportFileFormat,
     ) -> Result<Vec<u8>, MidiError> {
-        Self::encode_project_song_controller_stream_with_format_and_resolution(
+        Self::encode_project_song_controller_stream_with_format_and_source(
             document,
             arrangement_id,
             raw_stream,
-            MidiControllerExportResolution::Parameter(kind, parameter_number),
+            MidiControllerExportSource::Parameter(kind, parameter_number),
             midi_channel,
             file_format,
         )
     }
 
-    fn encode_project_song_controller_stream_with_format_and_resolution(
+    /// Exports one raw Pattern controller stream across an arrangement using an explicit MIDI
+    /// channel-voice message source and the requested MIDI file layout.
+    pub fn encode_project_song_controller_stream_with_format_and_source(
         document: &FlpDocument,
         arrangement_id: u16,
         raw_stream: (u8, u8),
-        resolution: MidiControllerExportResolution,
+        resolution: MidiControllerExportSource,
         midi_channel: u8,
         file_format: MidiExportFileFormat,
     ) -> Result<Vec<u8>, MidiError> {
