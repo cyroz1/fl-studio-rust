@@ -753,6 +753,8 @@ pub struct PlaylistAudioLayer {
     pub layer_pan_raw: i32,
     pub volume_automation: Arc<Vec<PlaylistChannelAutomationPoint>>,
     pub pan_automation: Arc<Vec<PlaylistChannelAutomationPoint>>,
+    /// Absolute frame of the last scheduled note or parameter event, before the tail.
+    pub content_frames: u64,
     pub samples: Vec<f32>,
 }
 
@@ -786,6 +788,7 @@ impl PartialEq for PlaylistAudioLayer {
             && self.layer_pan_raw == other.layer_pan_raw
             && self.volume_automation == other.volume_automation
             && self.pan_automation == other.pan_automation
+            && self.content_frames == other.content_frames
             && self.samples.len() == other.samples.len()
             && self
                 .samples
@@ -3413,6 +3416,7 @@ pub fn stream_playlist_performance_with_vst3_to_device(
             layer_pan_raw: layer.layer_pan_raw,
             volume_automation: Arc::clone(&layer.volume_automation),
             pan_automation: Arc::clone(&layer.pan_automation),
+            content_frames: 0,
             samples: Vec::new(),
         }
     }));
@@ -4098,6 +4102,7 @@ fn render_playlist_with_vst3_cancellable(
     )?;
     if audio.clips.is_empty()
         && sampler.notes.is_empty()
+        && options.clap_audio_layers.is_empty()
         && vst3_processor
             .as_ref()
             .is_none_or(|processor| processor.summary().plugin_channels_rendered == 0)
@@ -4116,16 +4121,23 @@ fn render_playlist_with_vst3_cancellable(
             }
         }
         return Err(
-            "arrangement contains no supported audio clips, Sampler notes, or loaded VST3 notes in Pattern Clips"
+            "arrangement contains no supported audio clips, Sampler notes, CLAP audio, or loaded VST3 notes in Pattern Clips"
                 .to_owned(),
         );
     }
 
+    let clap_content_frames = options
+        .clap_audio_layers
+        .iter()
+        .map(|layer| layer.content_frames)
+        .max()
+        .unwrap_or(0);
     let mut content_frames = audio
         .summary
         .frames
         .max(sampler.summary.frames)
-        .max(minimum_content_frames);
+        .max(minimum_content_frames)
+        .max(clap_content_frames);
     if let Some(processor) = vst3_processor.as_mut() {
         content_frames = content_frames.max(processor.content_frames());
     }
@@ -4166,8 +4178,12 @@ fn render_playlist_with_vst3_cancellable(
             true
         });
     }
-    let minimum_tail_end_frame =
-        add_render_tail_frames(content_frames, options.sample_rate, options.tail_seconds)?;
+    let minimum_tail_end_frame = playlist_minimum_tail_end_frame(
+        content_frames,
+        options.sample_rate,
+        options.tail_seconds,
+        &options.clap_audio_layers,
+    )?;
     let mut frames = match options.tail_mode {
         PlaylistTailMode::LeaveRemainder | PlaylistTailMode::WrapRemainder => {
             add_render_tail_frames(
@@ -7917,6 +7933,27 @@ fn playlist_clap_audio_frames(layers: &[PlaylistAudioLayer]) -> u64 {
         .map(|layer| (layer.samples.len() / 2) as u64)
         .max()
         .unwrap_or(0)
+}
+
+fn playlist_clap_content_frames(layers: &[PlaylistAudioLayer]) -> u64 {
+    layers
+        .iter()
+        .map(|layer| layer.content_frames)
+        .max()
+        .unwrap_or(0)
+}
+
+fn playlist_minimum_tail_end_frame(
+    content_frames: u64,
+    sample_rate: u32,
+    tail_seconds: u8,
+    clap_audio_layers: &[PlaylistAudioLayer],
+) -> Result<u64, String> {
+    let content_frames = content_frames.max(playlist_clap_content_frames(clap_audio_layers));
+    Ok(
+        add_render_tail_frames(content_frames, sample_rate, tail_seconds)?
+            .max(playlist_clap_audio_frames(clap_audio_layers)),
+    )
 }
 
 struct PreparedClapMixerRoute {
@@ -19641,6 +19678,7 @@ mod tests {
             layer_pan_raw: 0,
             volume_automation: Arc::new(Vec::new()),
             pan_automation: Arc::new(Vec::new()),
+            content_frames: 0,
             samples: vec![1.0, 10.0, 2.0, 20.0, 3.0, 30.0],
         };
         let mut output = vec![0.0; 6];
@@ -19664,6 +19702,30 @@ mod tests {
         .expect("Playlist CLAP audio should mix without routing");
 
         assert_eq!(output, [2.0, 20.0, 3.0, 30.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn playlist_tail_bound_covers_clap_report_without_adding_the_selected_tail_twice() {
+        let make_layer = |frames| PlaylistAudioLayer {
+            channel_id: 9,
+            left_gain: 1.0,
+            right_gain: 1.0,
+            layer_gain: 1.0,
+            layer_pan_raw: 0,
+            volume_automation: Arc::new(Vec::new()),
+            pan_automation: Arc::new(Vec::new()),
+            content_frames: 100,
+            samples: vec![0.0; frames * 2],
+        };
+
+        assert_eq!(
+            playlist_minimum_tail_end_frame(100, 10, 5, &[make_layer(200)]).unwrap(),
+            200,
+        );
+        assert_eq!(
+            playlist_minimum_tail_end_frame(100, 10, 5, &[make_layer(120)]).unwrap(),
+            150,
+        );
     }
 
     fn performance_audio_clip_fixture(record_size: usize, scale: Option<f64>) -> FlpDocument {

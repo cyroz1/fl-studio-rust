@@ -410,8 +410,15 @@ pub enum ClapPatternPreviewPurpose {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct ClapRenderedAudio {
+    pub samples: Vec<f32>,
+    /// Absolute frame of the last scheduled note or parameter event, before its tail.
+    pub content_frames: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum ClapPatternPreviewOutput {
-    Audio(Vec<f32>),
+    Audio(ClapRenderedAudio),
     ParametersSet,
     SavedState(Vec<u8>),
 }
@@ -1096,7 +1103,7 @@ pub fn inspect_instance_in_subprocess(
 
 enum ClapPreviewProcessResponse {
     Ready,
-    Audio(Vec<f32>),
+    Audio(ClapRenderedAudio),
     State(Vec<u8>),
     Error(String),
 }
@@ -1965,7 +1972,7 @@ impl ClapPreviewProcess {
         .and_then(|_| self.stdin.flush())
         .map_err(|error| format!("could not send a CLAP preview request: {error}"))?;
         match self.receive_response()? {
-            ClapPreviewProcessResponse::Audio(samples) => Ok(samples),
+            ClapPreviewProcessResponse::Audio(audio) => Ok(audio.samples),
             ClapPreviewProcessResponse::Error(error) => Err(error),
             ClapPreviewProcessResponse::Ready => {
                 Err("CLAP preview helper restarted unexpectedly".to_owned())
@@ -1979,21 +1986,21 @@ impl ClapPreviewProcess {
     fn render_pattern(
         &mut self,
         settings: &ClapPatternPreviewSettings,
-    ) -> Result<Vec<f32>, String> {
+    ) -> Result<ClapRenderedAudio, String> {
         self.render_pattern_request("PATTERN", settings)
     }
 
     fn render_pattern_loop(
         &mut self,
         settings: &ClapPatternPreviewSettings,
-    ) -> Result<Vec<f32>, String> {
+    ) -> Result<ClapRenderedAudio, String> {
         self.render_pattern_request("PATTERN_LOOP", settings)
     }
 
     fn render_playlist(
         &mut self,
         settings: &ClapPatternPreviewSettings,
-    ) -> Result<Vec<f32>, String> {
+    ) -> Result<ClapRenderedAudio, String> {
         self.render_pattern_request("PLAYLIST", settings)
     }
 
@@ -2001,7 +2008,7 @@ impl ClapPreviewProcess {
         &mut self,
         command: &str,
         settings: &ClapPatternPreviewSettings,
-    ) -> Result<Vec<f32>, String> {
+    ) -> Result<ClapRenderedAudio, String> {
         if command == "PLAYLIST" {
             let playlist = settings
                 .playlist
@@ -2084,7 +2091,7 @@ impl ClapPreviewProcess {
             .and_then(|_| self.stdin.flush())
             .map_err(|error| format!("could not finish a CLAP Pattern preview request: {error}"))?;
         match self.receive_response()? {
-            ClapPreviewProcessResponse::Audio(samples) => Ok(samples),
+            ClapPreviewProcessResponse::Audio(audio) => Ok(audio),
             ClapPreviewProcessResponse::Error(error) => Err(error),
             ClapPreviewProcessResponse::Ready => {
                 Err("CLAP preview helper restarted unexpectedly".to_owned())
@@ -2226,10 +2233,15 @@ fn read_preview_process_responses(
             }
             continue;
         }
-        if let Some(byte_count) = header.strip_prefix("OK ") {
-            let Ok(byte_count) = byte_count.parse::<usize>() else {
+        if let Some(audio_header) = header.strip_prefix("OK ") {
+            let mut fields = audio_header.split_whitespace();
+            let (Some(byte_count), Some(content_frames), None) = (
+                fields.next().and_then(|field| field.parse::<usize>().ok()),
+                fields.next().and_then(|field| field.parse::<u64>().ok()),
+                fields.next(),
+            ) else {
                 let _ = response_sender.send(ClapPreviewProcessResponse::Error(
-                    "CLAP preview helper sent an invalid audio length".to_owned(),
+                    "CLAP preview helper sent invalid audio metadata".to_owned(),
                 ));
                 return;
             };
@@ -2239,6 +2251,12 @@ fn read_preview_process_responses(
             {
                 let _ = response_sender.send(ClapPreviewProcessResponse::Error(
                     "CLAP preview helper sent an invalid stereo audio length".to_owned(),
+                ));
+                return;
+            }
+            if content_frames > (byte_count / 8) as u64 {
+                let _ = response_sender.send(ClapPreviewProcessResponse::Error(
+                    "CLAP preview helper reported content beyond its audio".to_owned(),
                 ));
                 return;
             }
@@ -2262,7 +2280,10 @@ fn read_preview_process_responses(
                 remaining_bytes -= chunk_length;
             }
             if response_sender
-                .send(ClapPreviewProcessResponse::Audio(samples))
+                .send(ClapPreviewProcessResponse::Audio(ClapRenderedAudio {
+                    samples,
+                    content_frames,
+                }))
                 .is_err()
             {
                 return;
@@ -4250,8 +4271,18 @@ fn parse_pattern_preview_note(line: &str) -> Result<ClapPatternNote, String> {
     })
 }
 
-fn write_preview_server_audio(output: &mut impl Write, samples: &[f32]) -> std::io::Result<()> {
-    let byte_count = samples
+fn write_preview_server_audio(
+    output: &mut impl Write,
+    audio: &ClapRenderedAudio,
+) -> std::io::Result<()> {
+    if audio.content_frames > (audio.samples.len() / 2) as u64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "CLAP preview content endpoint exceeds the rendered audio",
+        ));
+    }
+    let byte_count = audio
+        .samples
         .len()
         .checked_mul(std::mem::size_of::<f32>())
         .filter(|byte_count| {
@@ -4265,8 +4296,8 @@ fn write_preview_server_audio(output: &mut impl Write, samples: &[f32]) -> std::
                 "CLAP preview audio length is invalid",
             )
         })?;
-    writeln!(output, "OK {byte_count}")?;
-    for sample in samples {
+    writeln!(output, "OK {byte_count} {}", audio.content_frames)?;
+    for sample in &audio.samples {
         output.write_all(&sample.to_le_bytes())?;
     }
     output.flush()
@@ -4680,7 +4711,9 @@ fn render_note_preview(
     note_duration_milliseconds: u32,
 ) -> Result<Vec<f32>, String> {
     let mut instance = ClapNotePreviewInstance::new(path, plugin_id, sample_rate)?;
-    instance.render(note_key, velocity, note_duration_milliseconds)
+    instance
+        .render(note_key, velocity, note_duration_milliseconds)
+        .map(|audio| audio.samples)
 }
 
 struct ClapNotePreviewInstance {
@@ -5543,7 +5576,7 @@ impl ClapNotePreviewInstance {
         note_key: u8,
         velocity: u8,
         note_duration_milliseconds: u32,
-    ) -> Result<Vec<f32>, String> {
+    ) -> Result<ClapRenderedAudio, String> {
         if note_key > 127 {
             return Err("CLAP preview MIDI note must be between 0 and 127".to_owned());
         }
@@ -5592,7 +5625,7 @@ impl ClapNotePreviewInstance {
     fn render_pattern(
         &mut self,
         settings: &ClapPatternPreviewSettings,
-    ) -> Result<Vec<f32>, String> {
+    ) -> Result<ClapRenderedAudio, String> {
         let (events, total_frames) = schedule_pattern_preview_events(settings, self.sample_rate)?;
         let parameter_events = schedule_pattern_parameter_events(settings, self.sample_rate)?;
         self.render_scheduled_events(&events, &parameter_events, total_frames, None, None)
@@ -5601,7 +5634,7 @@ impl ClapNotePreviewInstance {
     fn render_pattern_loop(
         &mut self,
         settings: &ClapPatternPreviewSettings,
-    ) -> Result<Vec<f32>, String> {
+    ) -> Result<ClapRenderedAudio, String> {
         let (one_loop_events, _) = schedule_pattern_preview_events(settings, self.sample_rate)?;
         let one_loop_parameter_events =
             schedule_pattern_parameter_events(settings, self.sample_rate)?;
@@ -5662,13 +5695,16 @@ impl ClapNotePreviewInstance {
             .map_err(|_| "CLAP Pattern loop render exceeds the supported range".to_owned())?;
         let rendered =
             self.render_scheduled_events(&events, &parameter_events, total_frames, None, None)?;
-        second_pattern_loop_audio(&rendered, loop_frames)
+        Ok(ClapRenderedAudio {
+            samples: second_pattern_loop_audio(&rendered.samples, loop_frames)?,
+            content_frames: loop_frames,
+        })
     }
 
     fn render_playlist(
         &mut self,
         settings: &ClapPatternPreviewSettings,
-    ) -> Result<Vec<f32>, String> {
+    ) -> Result<ClapRenderedAudio, String> {
         let (events, total_frames, transport_points) =
             schedule_playlist_preview_events(settings, self.sample_rate)?;
         let parameter_events = schedule_playlist_parameter_events(settings, self.sample_rate)?;
@@ -5688,7 +5724,7 @@ impl ClapNotePreviewInstance {
         total_frames: u32,
         transport: Option<(&[ClapTransportPoint], u16)>,
         plugin_tail_seconds: Option<u32>,
-    ) -> Result<Vec<f32>, String> {
+    ) -> Result<ClapRenderedAudio, String> {
         if total_frames == 0 {
             return Err("CLAP preview has no audio frames to render".to_owned());
         }
@@ -6151,7 +6187,10 @@ impl ClapNotePreviewInstance {
         samples.copy_within(first_output_sample..output_sample_end, 0);
         samples.truncate(output_sample_count);
         self.next_steady_time = render_start_time.saturating_add(u64::from(frame_offset));
-        Ok(samples)
+        Ok(ClapRenderedAudio {
+            samples,
+            content_frames: last_scheduled_frame,
+        })
     }
 }
 

@@ -15513,6 +15513,7 @@ impl DawUi {
                     layer_pan_raw: layer.layer_pan_raw,
                     volume_automation: Arc::clone(&layer.volume_automation),
                     pan_automation: Arc::clone(&layer.pan_automation),
+                    content_frames: 0,
                     samples: Vec::new(),
                 })
                 .collect(),
@@ -24425,7 +24426,7 @@ impl DawUi {
             }
 
             let result = result.and_then(|output| {
-                let ClapPatternPreviewOutput::Audio(samples) = output else {
+                let ClapPatternPreviewOutput::Audio(audio) = output else {
                     return Err(
                         "CLAP Pattern preview returned plug-in state instead of audio".to_owned(),
                     );
@@ -24439,7 +24440,7 @@ impl DawUi {
                 }
                 engine.set_browser_preview_gain(self.browser_preview_volume);
                 engine.set_browser_preview_looping(false);
-                engine.set_browser_preview(samples)
+                engine.set_browser_preview(audio.samples)
             });
             match result {
                 Ok(()) => {
@@ -25180,7 +25181,7 @@ impl DawUi {
             return;
         }
         match result {
-            Ok(ClapPatternPreviewOutput::Audio(samples)) => {
+            Ok(ClapPatternPreviewOutput::Audio(audio)) => {
                 let current_bytes = pending
                     .audio_layers
                     .iter()
@@ -25191,7 +25192,10 @@ impl DawUi {
                             .saturating_mul(std::mem::size_of::<f32>())
                     })
                     .sum::<usize>();
-                let new_bytes = samples.len().saturating_mul(std::mem::size_of::<f32>());
+                let new_bytes = audio
+                    .samples
+                    .len()
+                    .saturating_mul(std::mem::size_of::<f32>());
                 if current_bytes.saturating_add(new_bytes) > 512 * 1024 * 1024 {
                     self.pending_clap_pattern_playback = None;
                     self.status = "Prepared CLAP Pattern audio exceeds the 512 MiB limit".into();
@@ -25201,7 +25205,7 @@ impl DawUi {
                     channel_id,
                     left_gain: route.left_gain,
                     right_gain: route.right_gain,
-                    samples,
+                    samples: audio.samples,
                 })
             }
             Ok(ClapPatternPreviewOutput::SavedState(_)) => {
@@ -25272,8 +25276,8 @@ impl DawUi {
             return;
         }
         match result {
-            Ok(ClapPatternPreviewOutput::Audio(samples))
-                if !samples.is_empty() && samples.len().is_multiple_of(2) =>
+            Ok(ClapPatternPreviewOutput::Audio(audio))
+                if !audio.samples.is_empty() && audio.samples.len().is_multiple_of(2) =>
             {
                 let current_bytes = pending
                     .audio_layers
@@ -25285,7 +25289,10 @@ impl DawUi {
                             .saturating_mul(std::mem::size_of::<f32>())
                     })
                     .sum::<usize>();
-                let new_bytes = samples.len().saturating_mul(std::mem::size_of::<f32>());
+                let new_bytes = audio
+                    .samples
+                    .len()
+                    .saturating_mul(std::mem::size_of::<f32>());
                 if current_bytes.saturating_add(new_bytes) > 512 * 1024 * 1024 {
                     self.pending_clap_performance_playback = None;
                     self.status =
@@ -25300,7 +25307,7 @@ impl DawUi {
                     layer_pan_raw: route.layer_pan_raw,
                     volume_automation: route.volume_automation,
                     pan_automation: route.pan_automation,
-                    samples,
+                    samples: audio.samples,
                 });
             }
             Ok(ClapPatternPreviewOutput::Audio(_)) => {
@@ -25398,8 +25405,8 @@ impl DawUi {
             return;
         }
         match result {
-            Ok(ClapPatternPreviewOutput::Audio(samples))
-                if !samples.is_empty() && samples.len().is_multiple_of(2) =>
+            Ok(ClapPatternPreviewOutput::Audio(audio))
+                if !audio.samples.is_empty() && audio.samples.len().is_multiple_of(2) =>
             {
                 let current_bytes = pending
                     .audio_layers
@@ -25411,7 +25418,10 @@ impl DawUi {
                             .saturating_mul(std::mem::size_of::<f32>())
                     })
                     .sum::<usize>();
-                let new_bytes = samples.len().saturating_mul(std::mem::size_of::<f32>());
+                let new_bytes = audio
+                    .samples
+                    .len()
+                    .saturating_mul(std::mem::size_of::<f32>());
                 if current_bytes.saturating_add(new_bytes) > 512 * 1024 * 1024 {
                     self.pending_clap_playlist_playback = None;
                     self.status = "Prepared CLAP Playlist audio exceeds the 512 MiB limit".into();
@@ -25425,7 +25435,8 @@ impl DawUi {
                     layer_pan_raw: route.layer_pan_raw,
                     volume_automation: route.volume_automation,
                     pan_automation: route.pan_automation,
-                    samples,
+                    content_frames: audio.content_frames,
+                    samples: audio.samples,
                 });
             }
             Ok(ClapPatternPreviewOutput::Audio(_)) => {
@@ -25517,8 +25528,8 @@ impl DawUi {
             return;
         }
         match result {
-            Ok(ClapPatternPreviewOutput::Audio(samples))
-                if !samples.is_empty() && samples.len().is_multiple_of(2) =>
+            Ok(ClapPatternPreviewOutput::Audio(audio))
+                if !audio.samples.is_empty() && audio.samples.len().is_multiple_of(2) =>
             {
                 let current_bytes = pending
                     .audio_layers
@@ -25530,7 +25541,10 @@ impl DawUi {
                             .saturating_mul(std::mem::size_of::<f32>())
                     })
                     .sum::<usize>();
-                let new_bytes = samples.len().saturating_mul(std::mem::size_of::<f32>());
+                let new_bytes = audio
+                    .samples
+                    .len()
+                    .saturating_mul(std::mem::size_of::<f32>());
                 if current_bytes.saturating_add(new_bytes) > 512 * 1024 * 1024 {
                     self.pending_clap_playlist_offline_render = None;
                     self.status =
@@ -25545,7 +25559,8 @@ impl DawUi {
                     layer_pan_raw: route.layer_pan_raw,
                     volume_automation: route.volume_automation,
                     pan_automation: route.pan_automation,
-                    samples,
+                    content_frames: audio.content_frames,
+                    samples: audio.samples,
                 });
             }
             Ok(ClapPatternPreviewOutput::Audio(_)) => {
