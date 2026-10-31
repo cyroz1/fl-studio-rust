@@ -442,20 +442,85 @@ struct TimedMidiBytes {
     bytes: Vec<u8>,
 }
 
-fn midi_14bit_control_change_messages(
-    normalized_value: f64,
-    base_controller: u8,
-    midi_channel: u8,
-) -> ([u8; 3], [u8; 3]) {
-    let value = (normalized_value.clamp(0.0, 1.0) * 16_383.0).round() as u16;
-    (
-        [0xB0 | midi_channel, base_controller, (value >> 7) as u8],
-        [
-            0xB0 | midi_channel,
-            base_controller + 32,
-            (value & 0x7F) as u8,
-        ],
-    )
+#[derive(Clone, Copy)]
+enum MidiControllerExportResolution {
+    SevenBit(u8),
+    FourteenBit(u8),
+    Parameter(MidiParameterKind, u16),
+}
+
+impl MidiControllerExportResolution {
+    fn validate(self) -> Result<(), MidiError> {
+        match self {
+            Self::SevenBit(controller) if controller > 127 => Err(MidiError::InvalidExport(
+                "MIDI Control Change number must be from 0 through 127",
+            )),
+            Self::FourteenBit(controller) if controller > 31 => Err(MidiError::InvalidExport(
+                "14-bit MIDI Control Change base number must be from 0 through 31",
+            )),
+            Self::Parameter(_, number) if number > MAX_MIDI_PARAMETER_NUMBER => {
+                Err(MidiError::InvalidExport(
+                    "MIDI RPN or NRPN number must be from 0 through 16382; 16383 is the null selection",
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn description(self) -> String {
+        match self {
+            Self::SevenBit(controller) => format!("CC {controller}"),
+            Self::FourteenBit(controller) => {
+                format!("14-bit CC {controller} + CC {}", controller + 32)
+            }
+            Self::Parameter(MidiParameterKind::Registered, number) => format!("RPN {number}"),
+            Self::Parameter(MidiParameterKind::NonRegistered, number) => {
+                format!("NRPN {number}")
+            }
+        }
+    }
+
+    fn append_point_events(
+        self,
+        normalized_value: f64,
+        midi_channel: u8,
+        tick: u64,
+        order: u8,
+        events: &mut Vec<TimedMidiBytes>,
+    ) {
+        let status = 0xB0 | midi_channel;
+        let mut push = |controller, value| {
+            events.push(TimedMidiBytes {
+                tick,
+                order,
+                bytes: vec![status, controller, value],
+            });
+        };
+        match self {
+            Self::SevenBit(controller) => {
+                push(
+                    controller,
+                    (normalized_value.clamp(0.0, 1.0) * 127.0).round() as u8,
+                );
+            }
+            Self::FourteenBit(base_controller) => {
+                let value = (normalized_value.clamp(0.0, 1.0) * 16_383.0).round() as u16;
+                push(base_controller, (value >> 7) as u8);
+                push(base_controller + 32, (value & 0x7f) as u8);
+            }
+            Self::Parameter(kind, number) => {
+                let selector = match kind {
+                    MidiParameterKind::Registered => (101, 100),
+                    MidiParameterKind::NonRegistered => (99, 98),
+                };
+                let value = (normalized_value.clamp(0.0, 1.0) * 16_383.0).round() as u16;
+                push(selector.0, (number >> 7) as u8);
+                push(selector.1, (number & 0x7f) as u8);
+                push(6, (value >> 7) as u8);
+                push(38, (value & 0x7f) as u8);
+            }
+        }
+    }
 }
 
 struct MidiExportMarker {
@@ -838,10 +903,9 @@ impl MidiFile {
             document,
             pattern_id,
             raw_stream,
-            midi_controller,
+            MidiControllerExportResolution::SevenBit(midi_controller),
             midi_channel,
             file_format,
-            false,
         )
     }
 
@@ -879,10 +943,31 @@ impl MidiFile {
             document,
             pattern_id,
             raw_stream,
-            base_controller,
+            MidiControllerExportResolution::FourteenBit(base_controller),
             midi_channel,
             file_format,
-            true,
+        )
+    }
+
+    /// Exports one raw Pattern controller stream as an RPN or NRPN data-entry track.
+    /// The selected parameter and MIDI channel are explicit; normalized stream values map to
+    /// 0–16383 and each point writes selector MSB/LSB followed by Data Entry MSB/LSB.
+    pub fn encode_project_pattern_parameter_stream_with_format(
+        document: &FlpDocument,
+        pattern_id: u16,
+        raw_stream: (u8, u8),
+        kind: MidiParameterKind,
+        parameter_number: u16,
+        midi_channel: u8,
+        file_format: MidiExportFileFormat,
+    ) -> Result<Vec<u8>, MidiError> {
+        Self::encode_project_pattern_controller_stream_with_format_and_resolution(
+            document,
+            pattern_id,
+            raw_stream,
+            MidiControllerExportResolution::Parameter(kind, parameter_number),
+            midi_channel,
+            file_format,
         )
     }
 
@@ -890,21 +975,11 @@ impl MidiFile {
         document: &FlpDocument,
         pattern_id: u16,
         raw_stream: (u8, u8),
-        midi_controller: u8,
+        resolution: MidiControllerExportResolution,
         midi_channel: u8,
         file_format: MidiExportFileFormat,
-        high_resolution: bool,
     ) -> Result<Vec<u8>, MidiError> {
-        if high_resolution && midi_controller > 31 {
-            return Err(MidiError::InvalidExport(
-                "14-bit MIDI Control Change base number must be from 0 through 31",
-            ));
-        }
-        if !high_resolution && midi_controller > 127 {
-            return Err(MidiError::InvalidExport(
-                "MIDI Control Change number must be from 0 through 127",
-            ));
-        }
+        resolution.validate()?;
         if midi_channel > 15 {
             return Err(MidiError::InvalidExport(
                 "MIDI channel must be from 0 through 15",
@@ -1003,48 +1078,24 @@ impl MidiFile {
                     MidiExportFileFormat::Format0 => 0x01,
                     MidiExportFileFormat::Format1 => 0x03,
                 },
-                if high_resolution {
-                    format!(
-                        "Pattern {pattern_id} controller {} / 0x{:02X} as CC {midi_controller} + CC {}",
-                        raw_stream.0,
-                        raw_stream.1,
-                        midi_controller + 32,
-                    )
-                } else {
-                    format!(
-                        "Pattern {pattern_id} controller {} / 0x{:02X}",
-                        raw_stream.0, raw_stream.1
-                    )
-                }
+                format!(
+                    "Pattern {pattern_id} controller {} / 0x{:02X} as {}",
+                    raw_stream.0,
+                    raw_stream.1,
+                    resolution.description(),
+                )
                 .as_bytes(),
             )?,
         }];
         for point in controller_points {
             let tick = u64::from(point.position);
-            if high_resolution {
-                let (msb, lsb) = midi_14bit_control_change_messages(
-                    f64::from(point.value()),
-                    midi_controller,
-                    midi_channel,
-                );
-                controller_events.push(TimedMidiBytes {
-                    tick,
-                    order: 4,
-                    bytes: msb.to_vec(),
-                });
-                controller_events.push(TimedMidiBytes {
-                    tick,
-                    order: 4,
-                    bytes: lsb.to_vec(),
-                });
-            } else {
-                let value = (point.value().clamp(0.0, 1.0) * 127.0).round() as u8;
-                controller_events.push(TimedMidiBytes {
-                    tick,
-                    order: 4,
-                    bytes: vec![0xB0 | midi_channel, midi_controller, value],
-                });
-            }
+            resolution.append_point_events(
+                f64::from(point.value()),
+                midi_channel,
+                tick,
+                4,
+                &mut controller_events,
+            );
         }
         match file_format {
             MidiExportFileFormat::Format0 => {
@@ -1126,10 +1177,9 @@ impl MidiFile {
             document,
             arrangement_id,
             raw_stream,
-            midi_controller,
+            MidiControllerExportResolution::SevenBit(midi_controller),
             midi_channel,
             file_format,
-            false,
         )
     }
 
@@ -1166,10 +1216,30 @@ impl MidiFile {
             document,
             arrangement_id,
             raw_stream,
-            base_controller,
+            MidiControllerExportResolution::FourteenBit(base_controller),
             midi_channel,
             file_format,
-            true,
+        )
+    }
+
+    /// Exports one raw Pattern controller stream across an arrangement as RPN or NRPN data entry.
+    /// Each point writes selector MSB/LSB followed by Data Entry MSB/LSB on the selected channel.
+    pub fn encode_project_song_parameter_stream_with_format(
+        document: &FlpDocument,
+        arrangement_id: u16,
+        raw_stream: (u8, u8),
+        kind: MidiParameterKind,
+        parameter_number: u16,
+        midi_channel: u8,
+        file_format: MidiExportFileFormat,
+    ) -> Result<Vec<u8>, MidiError> {
+        Self::encode_project_song_controller_stream_with_format_and_resolution(
+            document,
+            arrangement_id,
+            raw_stream,
+            MidiControllerExportResolution::Parameter(kind, parameter_number),
+            midi_channel,
+            file_format,
         )
     }
 
@@ -1177,21 +1247,11 @@ impl MidiFile {
         document: &FlpDocument,
         arrangement_id: u16,
         raw_stream: (u8, u8),
-        midi_controller: u8,
+        resolution: MidiControllerExportResolution,
         midi_channel: u8,
         file_format: MidiExportFileFormat,
-        high_resolution: bool,
     ) -> Result<Vec<u8>, MidiError> {
-        if high_resolution && midi_controller > 31 {
-            return Err(MidiError::InvalidExport(
-                "14-bit MIDI Control Change base number must be from 0 through 31",
-            ));
-        }
-        if !high_resolution && midi_controller > 127 {
-            return Err(MidiError::InvalidExport(
-                "MIDI Control Change number must be from 0 through 127",
-            ));
-        }
+        resolution.validate()?;
         if midi_channel > 15 {
             return Err(MidiError::InvalidExport(
                 "MIDI channel must be from 0 through 15",
@@ -1340,33 +1400,13 @@ impl MidiFile {
                     let tick = clip_start
                         .checked_add(source_tick - source_start_tick)
                         .ok_or(MidiError::LengthOverflow)?;
-                    if high_resolution {
-                        let (msb, lsb) = midi_14bit_control_change_messages(
-                            f64::from(point.value()),
-                            midi_controller,
-                            midi_channel,
-                        );
-                        controller_events.push(TimedMidiBytes {
-                            tick,
-                            order: 4,
-                            bytes: msb.to_vec(),
-                        });
-                        controller_events.push(TimedMidiBytes {
-                            tick,
-                            order: 4,
-                            bytes: lsb.to_vec(),
-                        });
-                    } else {
-                        controller_events.push(TimedMidiBytes {
-                            tick,
-                            order: 4,
-                            bytes: vec![
-                                0xB0 | midi_channel,
-                                midi_controller,
-                                (point.value().clamp(0.0, 1.0) * 127.0).round() as u8,
-                            ],
-                        });
-                    }
+                    resolution.append_point_events(
+                        f64::from(point.value()),
+                        midi_channel,
+                        tick,
+                        4,
+                        &mut controller_events,
+                    );
                 }
             }
             if source_start_tick > 0
@@ -1378,33 +1418,13 @@ impl MidiFile {
                         "the arrangement expands to more than one million controller points",
                     ));
                 }
-                if high_resolution {
-                    let (msb, lsb) = midi_14bit_control_change_messages(
-                        normalized_value,
-                        midi_controller,
-                        midi_channel,
-                    );
-                    controller_events.push(TimedMidiBytes {
-                        tick: clip_start,
-                        order: 3,
-                        bytes: msb.to_vec(),
-                    });
-                    controller_events.push(TimedMidiBytes {
-                        tick: clip_start,
-                        order: 3,
-                        bytes: lsb.to_vec(),
-                    });
-                } else {
-                    controller_events.push(TimedMidiBytes {
-                        tick: clip_start,
-                        order: 3,
-                        bytes: vec![
-                            0xB0 | midi_channel,
-                            midi_controller,
-                            (normalized_value.clamp(0.0, 1.0) * 127.0).round() as u8,
-                        ],
-                    });
-                }
+                resolution.append_point_events(
+                    normalized_value,
+                    midi_channel,
+                    clip_start,
+                    3,
+                    &mut controller_events,
+                );
             }
         }
 
@@ -1415,22 +1435,13 @@ impl MidiFile {
         }
 
         let auxiliary_track = MidiExportAuxiliaryTrack {
-            name: if high_resolution {
-                format!(
-                    "Arrangement {arrangement_id} raw controller {} / 0x{:02X} as CC {midi_controller} + CC {} channel {}",
-                    raw_stream.0,
-                    raw_stream.1,
-                    midi_controller + 32,
-                    midi_channel + 1
-                )
-            } else {
-                format!(
-                    "Arrangement {arrangement_id} raw controller {} / 0x{:02X} as CC {midi_controller} channel {}",
-                    raw_stream.0,
-                    raw_stream.1,
-                    midi_channel + 1
-                )
-            },
+            name: format!(
+                "Arrangement {arrangement_id} raw controller {} / 0x{:02X} as {} on channel {}",
+                raw_stream.0,
+                raw_stream.1,
+                resolution.description(),
+                midi_channel + 1
+            ),
             end_tick: song_end_tick,
             events: controller_events,
         };

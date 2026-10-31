@@ -37,8 +37,8 @@ use flp_rebuild::media::{
     summarize_audio_waveform, write_audio_range_to_wav_with_options,
 };
 use flp_rebuild::midi::{
-    MidiAutomationSource, MidiChannelMapping, MidiExportFileFormat, MidiFile, MidiImportOptions,
-    MidiParameterKind,
+    MAX_MIDI_PARAMETER_NUMBER, MidiAutomationSource, MidiChannelMapping, MidiExportFileFormat,
+    MidiFile, MidiImportOptions, MidiParameterKind,
 };
 use flp_rebuild::plugin_settings::{
     ClapProjectInstrumentAssignment as ClapPatternPlaybackInstrument,
@@ -4514,8 +4514,17 @@ struct PendingMidiCcExport {
     target: PendingMidiCcExportTarget,
     target_stream: (u8, u8),
     controller_number: u8,
+    parameter_number: u16,
     midi_channel: u8,
-    high_resolution: bool,
+    source_kind: PendingMidiCcExportSource,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingMidiCcExportSource {
+    ControlChange,
+    ControlChange14,
+    RegisteredParameter,
+    NonRegisteredParameter,
 }
 
 #[derive(Clone, Copy)]
@@ -58772,8 +58781,9 @@ impl DawUi {
                 target: PendingMidiCcExportTarget::Pattern(pattern_id),
                 target_stream,
                 controller_number: 1,
+                parameter_number: 0,
                 midi_channel: 1,
-                high_resolution: false,
+                source_kind: PendingMidiCcExportSource::ControlChange,
             });
         }
         let song_arrangement_id = if open_song_requested {
@@ -58803,8 +58813,9 @@ impl DawUi {
                 target: PendingMidiCcExportTarget::Song(arrangement_id),
                 target_stream,
                 controller_number: 1,
+                parameter_number: 0,
                 midi_channel: 1,
-                high_resolution: false,
+                source_kind: PendingMidiCcExportSource::ControlChange,
             });
         }
 
@@ -58838,7 +58849,7 @@ impl DawUi {
             };
             ui.group(|ui| {
                 ui.horizontal(|ui| {
-                    ui.strong("Export raw controller stream as MIDI CC");
+                    ui.strong("Export raw controller stream as MIDI");
                     ui.weak(pending.path.display().to_string());
                 });
                 ui.label(format!(
@@ -58846,29 +58857,84 @@ impl DawUi {
                     pending.target_stream.0, pending.target_stream.1
                 ));
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut pending.high_resolution, false, "7-bit CC");
-                    ui.selectable_value(&mut pending.high_resolution, true, "14-bit CC pair");
-                    let maximum_controller = if pending.high_resolution { 31 } else { 127 };
-                    pending.controller_number = pending.controller_number.min(maximum_controller);
-                    ui.add(
-                        egui::DragValue::new(&mut pending.controller_number)
-                            .range(0..=maximum_controller)
-                            .prefix(if pending.high_resolution {
-                                "Base CC "
-                            } else {
-                                "CC "
-                            }),
-                    );
+                    egui::ComboBox::from_id_salt((
+                        "piano-roll-midi-controller-export-source",
+                        pending.target_stream,
+                    ))
+                    .selected_text(match pending.source_kind {
+                        PendingMidiCcExportSource::ControlChange => "7-bit CC",
+                        PendingMidiCcExportSource::ControlChange14 => "14-bit CC pair",
+                        PendingMidiCcExportSource::RegisteredParameter => "RPN",
+                        PendingMidiCcExportSource::NonRegisteredParameter => "NRPN",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut pending.source_kind,
+                            PendingMidiCcExportSource::ControlChange,
+                            "7-bit CC",
+                        );
+                        ui.selectable_value(
+                            &mut pending.source_kind,
+                            PendingMidiCcExportSource::ControlChange14,
+                            "14-bit CC pair",
+                        );
+                        ui.selectable_value(
+                            &mut pending.source_kind,
+                            PendingMidiCcExportSource::RegisteredParameter,
+                            "RPN",
+                        );
+                        ui.selectable_value(
+                            &mut pending.source_kind,
+                            PendingMidiCcExportSource::NonRegisteredParameter,
+                            "NRPN",
+                        );
+                    });
+                    match pending.source_kind {
+                        PendingMidiCcExportSource::ControlChange => {
+                            ui.add(
+                                egui::DragValue::new(&mut pending.controller_number)
+                                    .range(0..=127)
+                                    .prefix("CC "),
+                            );
+                        }
+                        PendingMidiCcExportSource::ControlChange14 => {
+                            pending.controller_number = pending.controller_number.min(31);
+                            ui.add(
+                                egui::DragValue::new(&mut pending.controller_number)
+                                    .range(0..=31)
+                                    .prefix("Base CC "),
+                            );
+                        }
+                        PendingMidiCcExportSource::RegisteredParameter
+                        | PendingMidiCcExportSource::NonRegisteredParameter => {
+                            ui.add(
+                                egui::DragValue::new(&mut pending.parameter_number)
+                                    .range(0..=MAX_MIDI_PARAMETER_NUMBER)
+                                    .prefix(if pending.source_kind
+                                        == PendingMidiCcExportSource::RegisteredParameter
+                                    {
+                                        "RPN "
+                                    } else {
+                                        "NRPN "
+                                    }),
+                            );
+                        }
+                    }
                     ui.add(
                         egui::DragValue::new(&mut pending.midi_channel)
                             .range(1..=16)
                             .prefix("MIDI channel "),
                     );
                 });
-                ui.weak(if pending.high_resolution {
-                    "Values map to 0–16383; CC N carries the MSB and CC N+32 carries the LSB."
-                } else {
-                    help_text
+                ui.weak(match pending.source_kind {
+                    PendingMidiCcExportSource::ControlChange14 => {
+                        "Values map to 0–16383; CC N carries the MSB and CC N+32 carries the LSB."
+                    }
+                    PendingMidiCcExportSource::RegisteredParameter
+                    | PendingMidiCcExportSource::NonRegisteredParameter => {
+                        "Each point writes the selected parameter followed by Data Entry MSB and LSB; 16383 is reserved for the null selection."
+                    }
+                    PendingMidiCcExportSource::ControlChange => help_text,
                 });
                 if ui.button(export_button_label).clicked() {
                     export_request = Some((
@@ -58876,9 +58942,10 @@ impl DawUi {
                         pending.target,
                         pending.target_stream,
                         pending.controller_number,
+                        pending.parameter_number,
+                        pending.source_kind,
                         pending.midi_channel - 1,
                         file_format,
-                        pending.high_resolution,
                     ));
                 }
                 cancel_requested = ui.button("Cancel").clicked();
@@ -58887,55 +58954,115 @@ impl DawUi {
         if cancel_requested {
             self.pending_midi_cc_export = None;
         }
-        if let Some((path, target, target_stream, cc, channel, file_format, high_resolution)) =
-            export_request
+        if let Some((
+            path,
+            target,
+            target_stream,
+            cc,
+            parameter_number,
+            source_kind,
+            channel,
+            file_format,
+        )) = export_request
         {
             let result = self
                 .document
                 .as_ref()
                 .ok_or_else(|| "no project is open".to_owned())
                 .and_then(|document| {
-                    let encoded = match target {
-                        PendingMidiCcExportTarget::Pattern(pattern_id) if high_resolution => {
-                            MidiFile::encode_project_pattern_controller_stream_14bit_with_format(
-                                document,
-                                pattern_id,
-                                target_stream,
-                                cc,
-                                channel,
-                                file_format,
-                            )
-                        }
-                        PendingMidiCcExportTarget::Pattern(pattern_id) => {
-                            MidiFile::encode_project_pattern_controller_stream_with_format(
-                                document,
-                                pattern_id,
-                                target_stream,
-                                cc,
-                                channel,
-                                file_format,
-                            )
-                        }
-                        PendingMidiCcExportTarget::Song(arrangement_id) if high_resolution => {
-                            MidiFile::encode_project_song_controller_stream_14bit_with_format(
-                                document,
-                                arrangement_id,
-                                target_stream,
-                                cc,
-                                channel,
-                                file_format,
-                            )
-                        }
-                        PendingMidiCcExportTarget::Song(arrangement_id) => {
-                            MidiFile::encode_project_song_controller_stream_with_format(
-                                document,
-                                arrangement_id,
-                                target_stream,
-                                cc,
-                                channel,
-                                file_format,
-                            )
-                        }
+                    let encoded = match (target, source_kind) {
+                        (
+                            PendingMidiCcExportTarget::Pattern(pattern_id),
+                            PendingMidiCcExportSource::ControlChange,
+                        ) => MidiFile::encode_project_pattern_controller_stream_with_format(
+                            document,
+                            pattern_id,
+                            target_stream,
+                            cc,
+                            channel,
+                            file_format,
+                        ),
+                        (
+                            PendingMidiCcExportTarget::Pattern(pattern_id),
+                            PendingMidiCcExportSource::ControlChange14,
+                        ) => MidiFile::encode_project_pattern_controller_stream_14bit_with_format(
+                            document,
+                            pattern_id,
+                            target_stream,
+                            cc,
+                            channel,
+                            file_format,
+                        ),
+                        (
+                            PendingMidiCcExportTarget::Pattern(pattern_id),
+                            PendingMidiCcExportSource::RegisteredParameter,
+                        ) => MidiFile::encode_project_pattern_parameter_stream_with_format(
+                            document,
+                            pattern_id,
+                            target_stream,
+                            MidiParameterKind::Registered,
+                            parameter_number,
+                            channel,
+                            file_format,
+                        ),
+                        (
+                            PendingMidiCcExportTarget::Pattern(pattern_id),
+                            PendingMidiCcExportSource::NonRegisteredParameter,
+                        ) => MidiFile::encode_project_pattern_parameter_stream_with_format(
+                            document,
+                            pattern_id,
+                            target_stream,
+                            MidiParameterKind::NonRegistered,
+                            parameter_number,
+                            channel,
+                            file_format,
+                        ),
+                        (
+                            PendingMidiCcExportTarget::Song(arrangement_id),
+                            PendingMidiCcExportSource::ControlChange,
+                        ) => MidiFile::encode_project_song_controller_stream_with_format(
+                            document,
+                            arrangement_id,
+                            target_stream,
+                            cc,
+                            channel,
+                            file_format,
+                        ),
+                        (
+                            PendingMidiCcExportTarget::Song(arrangement_id),
+                            PendingMidiCcExportSource::ControlChange14,
+                        ) => MidiFile::encode_project_song_controller_stream_14bit_with_format(
+                            document,
+                            arrangement_id,
+                            target_stream,
+                            cc,
+                            channel,
+                            file_format,
+                        ),
+                        (
+                            PendingMidiCcExportTarget::Song(arrangement_id),
+                            PendingMidiCcExportSource::RegisteredParameter,
+                        ) => MidiFile::encode_project_song_parameter_stream_with_format(
+                            document,
+                            arrangement_id,
+                            target_stream,
+                            MidiParameterKind::Registered,
+                            parameter_number,
+                            channel,
+                            file_format,
+                        ),
+                        (
+                            PendingMidiCcExportTarget::Song(arrangement_id),
+                            PendingMidiCcExportSource::NonRegisteredParameter,
+                        ) => MidiFile::encode_project_song_parameter_stream_with_format(
+                            document,
+                            arrangement_id,
+                            target_stream,
+                            MidiParameterKind::NonRegistered,
+                            parameter_number,
+                            channel,
+                            file_format,
+                        ),
                     };
                     encoded.map_err(|error| error.to_string())
                 })
@@ -58958,10 +59085,17 @@ impl DawUi {
                         "Exported {scope} raw stream {} / 0x{:02X} as {} on channel {} to {} ({byte_count} bytes)",
                         target_stream.0,
                         target_stream.1,
-                        if high_resolution {
-                            format!("MIDI 14-bit CC {cc} + CC {}", cc + 32)
-                        } else {
-                            format!("MIDI CC {cc}")
+                        match source_kind {
+                            PendingMidiCcExportSource::ControlChange => format!("MIDI CC {cc}"),
+                            PendingMidiCcExportSource::ControlChange14 => {
+                                format!("MIDI 14-bit CC {cc} + CC {}", cc + 32)
+                            }
+                            PendingMidiCcExportSource::RegisteredParameter => {
+                                format!("MIDI RPN {parameter_number}")
+                            }
+                            PendingMidiCcExportSource::NonRegisteredParameter => {
+                                format!("MIDI NRPN {parameter_number}")
+                            }
                         },
                         channel + 1,
                         path.display()
