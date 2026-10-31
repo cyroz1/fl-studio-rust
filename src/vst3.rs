@@ -5911,6 +5911,46 @@ impl Vst3HostRuntime {
         Ok(processor)
     }
 
+    /// Prepare a one-shot Pattern stream with loaded VST3 channels and offline Mixer effects.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_pattern_render_stream_with_mixer_effects_and_automation_and_clap_audio_channels(
+        &self,
+        document: &FlpDocument,
+        pattern_id: u16,
+        loop_length_ticks: u64,
+        output_sample_rate: u32,
+        channel_instances: &BTreeMap<u16, u64>,
+        mixer_effect_instances: &BTreeMap<(usize, u16), u64>,
+        parameter_automation: &BTreeMap<u16, Vec<Vst3ParameterAutomation>>,
+        mixer_effect_parameter_automation: &BTreeMap<
+            (usize, u16),
+            Vec<Vst3PlaylistParameterAutomation>,
+        >,
+        clap_audio_channels: &BTreeSet<u16>,
+    ) -> Result<Vst3PlaylistStreamProcessor, String> {
+        let mut processor = self
+            .prepare_pattern_loop_stream_with_automation_and_clap_audio_channels(
+                document,
+                pattern_id,
+                loop_length_ticks,
+                output_sample_rate,
+                channel_instances,
+                parameter_automation,
+                clap_audio_channels,
+            )?;
+        processor.stop_pattern_repetition_after_first_pass();
+        self.attach_mixer_effects(
+            document,
+            mixer_effect_instances,
+            &mut processor,
+            true,
+            false,
+            mixer_effect_parameter_automation,
+            None,
+        )?;
+        Ok(processor)
+    }
+
     /// Prepare loaded Mixer effects for an offline Audio Clip render.
     ///
     /// Audio Clip callers render the source into the processor's Mixer buses, then the processor

@@ -1164,6 +1164,17 @@ pub struct SamplerPatternRenderSummary {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PatternMixRenderSummary {
+    pub frames: u64,
+    pub sample_rate: u32,
+    pub sampler_notes_rendered: usize,
+    pub sampler_channels_rendered: usize,
+    pub vst3_plugin_channels_rendered: usize,
+    pub vst3_notes_rendered: usize,
+    pub clap_plugin_channels_rendered: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AudioClipRenderSummary {
     pub frames: u64,
     pub sample_rate: u32,
@@ -7424,6 +7435,275 @@ pub fn render_sampler_pattern_to_file_with_mixer_effects(
     Ok(summary)
 }
 
+/// Render Sampler, loaded VST3, and pre-rendered CLAP sources for one Pattern through the saved
+/// Mixer routing and loaded Mixer effects.
+#[allow(clippy::too_many_arguments)]
+pub fn render_pattern_mix_to_file(
+    document: &FlpDocument,
+    project_path: impl AsRef<Path>,
+    options: SamplerPatternRenderOptions,
+    output_path: impl AsRef<Path>,
+    output_format: AudioRenderOutput,
+    mut processor: Option<Vst3PlaylistStreamProcessor>,
+    clap_audio_layers: &[PlaylistAudioLayer],
+    clap_audio_channels: &BTreeSet<u16>,
+    vst3_volume_expression_channels: &BTreeSet<u16>,
+) -> Result<PatternMixRenderSummary, String> {
+    let project_path = project_path.as_ref();
+    let output_path = output_path.as_ref();
+    validate_output_path_with_extension(project_path, output_path, output_format.extension())?;
+    if clap_audio_layers.iter().any(|layer| {
+        !layer.samples.len().is_multiple_of(2)
+            || layer.samples.iter().any(|sample| !sample.is_finite())
+    }) {
+        return Err("CLAP Pattern sources must contain finite interleaved stereo audio".to_owned());
+    }
+
+    let render = prepare_sampler_pattern_for_channel_internal(
+        document,
+        project_path,
+        options,
+        None,
+        None,
+        SamplerPatternChannelOptions {
+            channel_filter: None,
+            allow_empty: true,
+            include_muted_mixer_sources: false,
+            vst3_volume_expression_channels: Some(vst3_volume_expression_channels),
+            clap_audio_channels: Some(clap_audio_channels),
+        },
+    )?;
+    let mut render_frames = render
+        .summary
+        .frames
+        .max(playlist_clap_audio_frames(clap_audio_layers));
+    if let Some(processor) = processor.as_mut() {
+        processor.stop_pattern_repetition_after_first_pass();
+        let processor_content_frames = processor.content_frames();
+        let vst3_output_end = if processor.summary().notes_scheduled > 0 {
+            processor_content_frames
+                .checked_add(u64::from(options.sample_rate).saturating_mul(2))
+                .ok_or_else(|| "VST3 Pattern instrument tail length overflow".to_owned())?
+        } else {
+            processor_content_frames
+        };
+        render_frames = render_frames.max(vst3_output_end);
+        processor.extend_to_output_frames(render_frames)?;
+        render_frames = processor.summary().frames;
+        if processor.summary().sample_rate != options.sample_rate {
+            return Err("Pattern sources and Mixer effect sample rates do not match".to_owned());
+        }
+    }
+    if render.summary.notes_rendered == 0
+        && processor
+            .as_ref()
+            .is_none_or(|processor| processor.summary().notes_scheduled == 0)
+        && clap_audio_layers.is_empty()
+    {
+        return Err(format!(
+            "Pattern {} has no supported Sampler, VST3, or CLAP notes",
+            options.pattern_id
+        ));
+    }
+    if render_frames == 0 {
+        return Err(format!(
+            "Pattern {} has no supported Sampler, VST3, or CLAP audio",
+            options.pattern_id
+        ));
+    }
+
+    let processor_summary = processor.as_ref().map(Vst3PlaylistStreamProcessor::summary);
+    let trim_frames = processor.as_ref().map_or(0, |processor| {
+        processor
+            .pdc_render_start_trim_frames()
+            .min(processor.summary().frames)
+    });
+    let clap_routes = prepare_pattern_clap_mixer_routes_for_channels(
+        clap_audio_layers.iter().map(|layer| layer.channel_id),
+        document,
+        None,
+        options.sample_rate,
+    );
+    let summary = PatternMixRenderSummary {
+        frames: render_frames.saturating_sub(trim_frames),
+        sample_rate: options.sample_rate,
+        sampler_notes_rendered: render.summary.notes_rendered,
+        sampler_channels_rendered: render.summary.sampler_channels_rendered,
+        vst3_plugin_channels_rendered: processor_summary
+            .as_ref()
+            .map_or(0, |summary| summary.plugin_channels_rendered),
+        vst3_notes_rendered: processor_summary
+            .as_ref()
+            .map_or(0, |summary| summary.notes_scheduled),
+        clap_plugin_channels_rendered: clap_audio_layers
+            .iter()
+            .map(|layer| layer.channel_id)
+            .collect::<BTreeSet<_>>()
+            .len(),
+    };
+
+    if let Some(processor) = processor.as_mut() {
+        processor.start_processing()?;
+    }
+    let render_result = render_stereo_audio_to_file(
+        output_path,
+        summary.frames,
+        summary.sample_rate,
+        AudioRenderEncodingOptions {
+            wav_sample_format: options.wav_sample_format,
+            wav_dither_mode: options.wav_dither_mode,
+            wav_channel_mode: options.wav_channel_mode,
+        },
+        output_format,
+        |write_block| {
+            stream_prepared_pattern_mix(
+                &render,
+                processor.as_mut(),
+                render_frames,
+                trim_frames,
+                clap_audio_layers,
+                &clap_routes,
+                None,
+                || false,
+                write_block,
+            )
+        },
+    );
+    let stop_result = processor
+        .as_mut()
+        .map_or(Ok(()), Vst3PlaylistStreamProcessor::stop_processing);
+    render_result?;
+    stop_result?;
+    Ok(summary)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stream_prepared_pattern_mix(
+    render: &PreparedSamplerPattern,
+    mut processor: Option<&mut Vst3PlaylistStreamProcessor>,
+    render_frames: u64,
+    trim_frames: u64,
+    clap_audio_layers: &[PlaylistAudioLayer],
+    clap_routes: &HashMap<u16, PreparedClapMixerRoute>,
+    cancelled: Option<&AtomicBool>,
+    mut stream_cancelled: impl FnMut() -> bool,
+    mut write_block: impl FnMut(&[f32]) -> Result<(), String>,
+) -> Result<(), String> {
+    crate::audio::enable_denormal_protection();
+    let release_frames = (f64::from(render.summary.sample_rate) * SAMPLER_RELEASE_SECONDS)
+        .round()
+        .max(1.0) as usize;
+    let mut engine = SamplerVoiceEngine::with_resampling_quality_and_pan_law(
+        &render.sources_by_channel,
+        &render.notes,
+        render.voice_limit,
+        release_frames,
+        render.summary.sample_rate,
+        render.resampling_quality,
+        render.pan_law,
+    );
+    engine.tempo_map = Some(&render.tempo_map);
+    engine.mixer_transforms_by_channel = Some(&render.mixer_transforms_by_channel);
+    if processor.is_some() {
+        engine.mixer_meter_transforms_by_channel = Some(&render.mixer_meter_transforms_by_channel);
+        engine.mixer_effect_input_transforms_by_channel =
+            Some(&render.mixer_effect_input_transforms_by_channel);
+    }
+
+    let empty_levels = HashMap::new();
+    let empty_automation = HashMap::new();
+    let channel_controls = PreparedClapChannelMixControls {
+        levels_by_channel: &empty_levels,
+        automation_by_channel: &empty_automation,
+        pan_law: render.pan_law,
+    };
+    let mut block = vec![0.0f32; SAMPLER_BLOCK_FRAMES * 2];
+    let mixer_bus_planes = processor.as_ref().map_or(0, |processor| {
+        1 + usize::from(processor.needs_mixer_insert_buses())
+    });
+    let mixer_bus_len = MIXER_TRACK_METER_COUNT
+        .checked_mul(SAMPLER_BLOCK_FRAMES)
+        .and_then(|frames| frames.checked_mul(2))
+        .and_then(|samples| samples.checked_mul(mixer_bus_planes))
+        .ok_or_else(|| "Pattern Mixer bus size overflow".to_owned())?;
+    let mut mixer_buses = vec![0.0f32; mixer_bus_len];
+    let direct_source_delay_frames = processor
+        .as_ref()
+        .map_or(0, |processor| processor.pdc_direct_source_delay_frames());
+    let mut direct_source_delay = crate::audio::StereoFrameDelay::new(direct_source_delay_frames)?;
+    let mixer_bus_delay_count = MIXER_TRACK_METER_COUNT * mixer_bus_planes;
+    let mut mixer_bus_delays = (0..mixer_bus_delay_count)
+        .map(|_| crate::audio::StereoFrameDelay::new(direct_source_delay_frames))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut block_start = 0u64;
+    while block_start < render_frames {
+        check_cancelled(cancelled)?;
+        if stream_cancelled() {
+            return Err("Pattern mix render was stopped".to_owned());
+        }
+        let frame_count = (render_frames - block_start).min(SAMPLER_BLOCK_FRAMES as u64) as usize;
+        let sample_count = frame_count
+            .checked_mul(2)
+            .ok_or_else(|| "Pattern mix block size overflow".to_owned())?;
+        let block_samples = &mut block[..sample_count];
+        let active_buses =
+            &mut mixer_buses[..MIXER_TRACK_METER_COUNT * sample_count * mixer_bus_planes];
+        if processor.is_some() {
+            active_buses.fill(0.0);
+            engine.render_block_with_meters(
+                block_start,
+                frame_count,
+                block_samples,
+                Some(active_buses),
+                sample_count,
+            );
+        } else {
+            engine.render_block(block_start, frame_count, block_samples);
+        }
+        mix_playlist_clap_audio_layers(
+            block_samples,
+            block_start,
+            frame_count,
+            clap_audio_layers,
+            clap_routes,
+            channel_controls,
+            processor.as_ref().map(|_| active_buses as &mut [f32]),
+        )?;
+
+        if processor.is_some() {
+            for (track, delay) in mixer_bus_delays.iter_mut().enumerate() {
+                let bus_start = track * sample_count;
+                delay
+                    .process_interleaved(&mut active_buses[bus_start..bus_start + sample_count])?;
+            }
+            direct_source_delay.process_interleaved(block_samples)?;
+            processor
+                .as_deref_mut()
+                .expect("processor presence was checked above")
+                .mix_next_block_with_meter_buses(block_samples, active_buses)?;
+        }
+        for sample in block_samples.iter_mut() {
+            if !sample.is_finite() {
+                *sample = 0.0;
+            }
+        }
+        render.master_output.apply(block_samples);
+        let skipped_frames = trim_frames
+            .saturating_sub(block_start)
+            .min(frame_count as u64);
+        if skipped_frames < frame_count as u64 {
+            let skip_samples = usize::try_from(skipped_frames)
+                .ok()
+                .and_then(|frames| frames.checked_mul(2))
+                .ok_or_else(|| "Pattern mix PDC trim overflow".to_owned())?;
+            write_block(&block_samples[skip_samples..])?;
+        }
+        block_start += frame_count as u64;
+    }
+    Ok(())
+}
+
 /// Render all enabled kind-0 Sampler notes in one pattern into an interleaved stereo buffer.
 pub fn render_sampler_pattern_to_stereo_buffer(
     document: &FlpDocument,
@@ -7976,17 +8256,31 @@ fn prepare_pattern_clap_mixer_routes(
     meters: Option<&MixerTrackPeakMeters>,
     sample_rate: u32,
 ) -> HashMap<u16, PreparedClapMixerRoute> {
+    prepare_pattern_clap_mixer_routes_for_channels(
+        layers.iter().map(|layer| layer.channel_id),
+        document,
+        meters,
+        sample_rate,
+    )
+}
+
+fn prepare_pattern_clap_mixer_routes_for_channels(
+    channel_ids: impl IntoIterator<Item = u16>,
+    document: &FlpDocument,
+    meters: Option<&MixerTrackPeakMeters>,
+    sample_rate: u32,
+) -> HashMap<u16, PreparedClapMixerRoute> {
     let routing = MixerRouteAudibility::from_document(document);
     let channels_by_id = document
         .channels()
         .into_iter()
         .map(|channel| (channel.id(), channel))
         .collect::<HashMap<_, _>>();
-    layers
-        .iter()
-        .map(|layer| {
+    channel_ids
+        .into_iter()
+        .map(|channel_id| {
             let mixer_track = channels_by_id
-                .get(&layer.channel_id)
+                .get(&channel_id)
                 .and_then(|channel| channel.mixer_track());
             let statically_audible = routing.allows_channel(mixer_track);
             let route_plan = routing.source_route_plan_for_channel(mixer_track);
@@ -8001,7 +8295,7 @@ fn prepare_pattern_clap_mixer_routes(
                     })
             });
             (
-                layer.channel_id,
+                channel_id,
                 PreparedClapMixerRoute {
                     mixer_transform: if statically_audible {
                         route_plan.output_transform
@@ -15680,6 +15974,31 @@ fn prepare_sampler_pattern_for_channel_internal(
     }
 
     if notes.is_empty() {
+        if allow_empty {
+            return Ok(PreparedSamplerPattern {
+                summary: SamplerPatternRenderSummary {
+                    frames: 0,
+                    sample_rate: options.sample_rate,
+                    notes_rendered: 0,
+                    voices_stolen: 0,
+                    sampler_channels_rendered: sources_by_channel.len(),
+                    source_files: decoded_by_path.len(),
+                    notes_skipped_unresolved_sample: skipped_unresolved,
+                    unresolved_sample_channels: unresolved_sample_channels.into_iter().collect(),
+                },
+                tempo_map,
+                pan_law,
+                notes,
+                sources_by_channel,
+                mixer_transforms_by_channel,
+                mixer_meter_transforms_by_channel,
+                mixer_effect_input_transforms_by_channel,
+                live_mixer_source_routes_by_channel,
+                master_output: MixerMasterOutput::from_document(document),
+                voice_limit: options.voice_limit,
+                resampling_quality: options.resampling_quality,
+            });
+        }
         let missing = unresolved_sample_channels
             .iter()
             .map(u16::to_string)

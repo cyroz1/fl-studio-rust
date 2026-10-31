@@ -74,7 +74,7 @@ use flp_rebuild::sample_render::{
     playlist_performance_static_document_with_vst3_and_clap, playlist_performance_vst3_channel_ids,
     playlist_performance_vst3_clip_indices_with_clap, process_recording_precount_through_mixer,
     project_channel_stereo_output_gains_with_layer_adjustments, render_audio_clips_to_file,
-    render_playlist_mixer_stems_with_vst3_cancellable,
+    render_pattern_mix_to_file, render_playlist_mixer_stems_with_vst3_cancellable,
     render_playlist_with_vst3_to_file_from_frame_cancellable,
     render_playlist_with_vst3_to_flac_cancellable, render_playlist_with_vst3_to_mp3_cancellable,
     render_playlist_with_vst3_to_ogg_cancellable, render_playlist_with_vst3_to_wav_cancellable,
@@ -5826,9 +5826,20 @@ struct PendingClapPlaylistOfflineRender {
 }
 
 struct PendingClapPatternRenderLayer {
+    channel_id: u16,
     left_gain: f32,
     right_gain: f32,
+    content_frames: u64,
     samples: Vec<f32>,
+}
+
+struct PendingFullPatternMix {
+    document: FlpDocument,
+    project_path: PathBuf,
+    options: SamplerPatternRenderOptions,
+    processor: Option<Vst3PlaylistStreamProcessor>,
+    clap_audio_channels: BTreeSet<u16>,
+    vst3_volume_expression_channels: BTreeSet<u16>,
 }
 
 struct PendingClapPatternRender {
@@ -5840,6 +5851,8 @@ struct PendingClapPatternRender {
     output_format: AudioRenderOutput,
     encoding: AudioRenderEncodingOptions,
     insert_placement: Option<PendingPatternRenderPlacement>,
+    full_mix: Option<PendingFullPatternMix>,
+    is_full_mix: bool,
     write_receiver: Option<Receiver<Result<u64, String>>>,
     write_worker: Option<thread::JoinHandle<()>>,
 }
@@ -43833,6 +43846,8 @@ impl DawUi {
         let mut render_insert_all_vst3_requested = false;
         let mut render_clap_pattern_requested = false;
         let mut render_insert_clap_pattern_requested = false;
+        let mut render_full_pattern_mix_requested = false;
+        let mut render_insert_full_pattern_mix_requested = false;
         let mut preview_requested = false;
         let mut chord_preview_requested = false;
         let mut sampler_preview_requested = false;
@@ -46268,6 +46283,43 @@ impl DawUi {
                     render_insert_clap_pattern_requested = true;
                     ui.close();
                 }
+                let can_render_full_pattern_mix = self.selected_pattern.is_some()
+                    && self.pending_clap_pattern_render.is_none()
+                    && self.sample_project_path().is_some()
+                    && (has_sampler_notes
+                        || has_loaded_vst3_pattern_notes
+                        || has_assigned_clap_pattern_notes);
+                if ui
+                    .add_enabled(
+                        can_render_full_pattern_mix,
+                        egui::Button::new("Render full Pattern mix…"),
+                    )
+                    .on_hover_text(
+                        "Render Sampler, loaded VST3, and assigned CLAP Pattern sources through Mixer routing and loaded effects",
+                    )
+                    .clicked()
+                {
+                    render_full_pattern_mix_requested = true;
+                    ui.close();
+                }
+                let can_insert_full_pattern_mix = can_render_full_pattern_mix
+                    && self.document.as_ref().is_some_and(|document| {
+                        project_has_audio_clip_template(document)
+                            && self.pattern_render_insert_placement(document).is_some()
+                    });
+                if ui
+                    .add_enabled(
+                        can_insert_full_pattern_mix,
+                        egui::Button::new("Render and insert full Pattern mix…"),
+                    )
+                    .on_hover_text(
+                        "Render the complete Pattern mix and place it as an Audio Clip",
+                    )
+                    .clicked()
+                {
+                    render_insert_full_pattern_mix_requested = true;
+                    ui.close();
+                }
                 if ui
                     .add_enabled(
                         has_loaded_instrument && self.selected_pattern.is_some(),
@@ -47417,6 +47469,12 @@ impl DawUi {
         }
         if render_insert_clap_pattern_requested {
             self.render_assigned_clap_pattern_dialog(true);
+        }
+        if render_full_pattern_mix_requested {
+            self.render_full_pattern_mix_dialog(false);
+        }
+        if render_insert_full_pattern_mix_requested {
+            self.render_full_pattern_mix_dialog(true);
         }
         if discard_note_lengths_requested
             && let Some(pattern_id) = self.selected_pattern
@@ -49927,21 +49985,38 @@ impl DawUi {
     }
 
     fn render_assigned_clap_pattern_dialog(&mut self, insert_into_playlist: bool) {
+        self.render_pattern_mix_dialog(insert_into_playlist, false);
+    }
+
+    fn render_full_pattern_mix_dialog(&mut self, insert_into_playlist: bool) {
+        self.render_pattern_mix_dialog(insert_into_playlist, true);
+    }
+
+    fn render_pattern_mix_dialog(&mut self, insert_into_playlist: bool, full_mix: bool) {
         if self.pending_clap_pattern_render.is_some() {
-            self.status = "A CLAP Pattern render is already running".to_owned();
+            self.status = "A Pattern render is already running".to_owned();
             return;
         }
         let Some(pattern_id) = self.selected_pattern else {
-            self.status = "Select a Pattern before rendering CLAP channels".to_owned();
+            self.status = "Select a Pattern before rendering audio".to_owned();
             return;
         };
-        if self.clap_pattern_playback_instruments.is_empty() {
+        if self.clap_pattern_playback_instruments.is_empty() && !full_mix {
             self.status = "Assign a CLAP instrument before rendering Pattern channels".to_owned();
             return;
         }
         let Some(document) = self.document.clone() else {
-            self.status = "Open a project before rendering CLAP Pattern channels".to_owned();
+            self.status = "Open a project before rendering Pattern audio".to_owned();
             return;
+        };
+        let project_path = if full_mix {
+            let Some(project_path) = self.sample_project_path() else {
+                self.status = "Save the project before rendering its full Pattern mix".to_owned();
+                return;
+            };
+            Some(project_path)
+        } else {
+            None
         };
         let insert_placement = if insert_into_playlist {
             if !project_has_audio_clip_template(&document) {
@@ -49993,7 +50068,7 @@ impl DawUi {
                 return;
             }
         };
-        if render_settings.is_empty() {
+        if render_settings.is_empty() && !full_mix {
             self.status =
                 format!("Pattern {pattern_id} has no notes routed to assigned CLAP instruments");
             return;
@@ -50003,14 +50078,22 @@ impl DawUi {
         }
 
         let output_format = self.audio_render_output();
-        let output_name = if insert_into_playlist {
+        let output_name = if full_mix && insert_into_playlist {
+            format!("Pattern_{pattern_id}_Full_Mix_Audio_Clip")
+        } else if full_mix {
+            format!("Pattern_{pattern_id}_Full_Mix")
+        } else if insert_into_playlist {
             format!("Pattern_{pattern_id}_CLAP_Channels_Audio_Clip")
         } else {
             format!("Pattern_{pattern_id}_CLAP_Channels")
         };
         let Some(output_path) = add_audio_render_file_filter(
             rfd::FileDialog::new()
-                .set_title(if insert_into_playlist {
+                .set_title(if full_mix && insert_into_playlist {
+                    "Render and insert full Pattern mix"
+                } else if full_mix {
+                    "Render full Pattern mix"
+                } else if insert_into_playlist {
                     "Render and insert assigned CLAP Pattern channels"
                 } else {
                     "Render assigned CLAP Pattern channels"
@@ -50026,6 +50109,95 @@ impl DawUi {
             wav_dither_mode: self.playlist_render_dither_mode,
             wav_channel_mode: self.playlist_render_channel_mode,
         };
+        let full_mix_job = if full_mix {
+            let project_path = project_path.expect("full Pattern renders capture a project path");
+            let pattern = match document.patterns() {
+                Ok(patterns) => match patterns
+                    .into_iter()
+                    .find(|pattern| pattern.id == pattern_id)
+                {
+                    Some(pattern) => pattern,
+                    None => {
+                        self.status = format!("Pattern {pattern_id} was not found");
+                        return;
+                    }
+                },
+                Err(error) => {
+                    self.status = format!("Could not decode Pattern notes: {error}");
+                    return;
+                }
+            };
+            let ppq = document.header().ppq();
+            let channel_instances = self
+                .channel_vst3_instances
+                .iter()
+                .filter(|(channel_id, _)| !assigned_channel_ids.contains(channel_id))
+                .map(|(channel_id, instance_id)| (*channel_id, *instance_id))
+                .collect::<BTreeMap<_, _>>();
+            let vst3_volume_expression_channels = self
+                .vst3_host
+                .as_ref()
+                .map(|host| host.volume_expression_channels(&channel_instances))
+                .unwrap_or_default();
+            let parameter_automation = self.pattern_vst3_parameter_automations_for_pattern(
+                &pattern,
+                ppq,
+                loop_length_ticks,
+            );
+            let mixer_effect_automation = self
+                .pattern_vst3_mixer_effect_parameter_automations_for_pattern(
+                    &pattern,
+                    ppq,
+                    loop_length_ticks,
+                );
+            let mixer_effect_instances = self.mixer_effect_vst3_instances.clone();
+            let processor = if !channel_instances.is_empty() || !mixer_effect_instances.is_empty() {
+                let Some(host) = self.vst3_host.as_ref() else {
+                    self.status = "VST3 host is not initialized".to_owned();
+                    return;
+                };
+                match host
+                    .prepare_pattern_render_stream_with_mixer_effects_and_automation_and_clap_audio_channels(
+                        &document,
+                        pattern_id,
+                        loop_length_ticks,
+                        sample_rate,
+                        &channel_instances,
+                        &mixer_effect_instances,
+                        &parameter_automation,
+                        &mixer_effect_automation,
+                        &assigned_channel_ids,
+                    )
+                {
+                    Ok(processor) => Some(processor),
+                    Err(error) => {
+                        self.status = format!("Could not prepare the full Pattern VST3 mix: {error}");
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            Some(PendingFullPatternMix {
+                document: document.clone(),
+                project_path,
+                options: SamplerPatternRenderOptions {
+                    pattern_id,
+                    sample_rate,
+                    resampling_quality: self.playlist_render_quality,
+                    read_sample_root_note: self.read_sample_root_note,
+                    wav_sample_format: self.playlist_render_format,
+                    wav_dither_mode: self.playlist_render_dither_mode,
+                    wav_channel_mode: self.playlist_render_channel_mode,
+                    ..SamplerPatternRenderOptions::default()
+                },
+                processor,
+                clap_audio_channels: assigned_channel_ids.clone(),
+                vst3_volume_expression_channels,
+            })
+        } else {
+            None
+        };
         let mut pending = PendingClapPatternRender {
             request_routes: BTreeMap::new(),
             audio_layers: Vec::new(),
@@ -50035,6 +50207,8 @@ impl DawUi {
             output_format,
             encoding,
             insert_placement,
+            full_mix: full_mix_job,
+            is_full_mix: full_mix,
             write_receiver: None,
             write_worker: None,
         };
@@ -50070,6 +50244,10 @@ impl DawUi {
             requests.push((instrument, settings, parameter_values, request_id));
         }
         self.pending_clap_pattern_render = Some(pending);
+        if requests.is_empty() {
+            self.finish_clap_pattern_render();
+            return;
+        }
         for (instrument, settings, parameter_values, request_id) in requests {
             if self
                 .clap_pattern_preview_sender
@@ -50142,8 +50320,10 @@ impl DawUi {
                     return;
                 }
                 pending.audio_layers.push(PendingClapPatternRenderLayer {
+                    channel_id: route.channel_id,
                     left_gain: route.left_gain,
                     right_gain: route.right_gain,
+                    content_frames: audio.content_frames,
                     samples: audio.samples,
                 });
             }
@@ -50183,10 +50363,65 @@ impl DawUi {
         if !pending.request_routes.is_empty() {
             return;
         }
+        self.finish_clap_pattern_render();
+    }
 
+    fn finish_clap_pattern_render(&mut self) {
         let Some(mut pending) = self.pending_clap_pattern_render.take() else {
             return;
         };
+        if let Some(full_mix) = pending.full_mix.take() {
+            let audio_layers = pending
+                .audio_layers
+                .drain(..)
+                .map(|layer| PlaylistAudioLayer {
+                    channel_id: layer.channel_id,
+                    left_gain: layer.left_gain,
+                    right_gain: layer.right_gain,
+                    layer_gain: 1.0,
+                    layer_pan_raw: 0,
+                    volume_automation: Arc::new(Vec::new()),
+                    pan_automation: Arc::new(Vec::new()),
+                    content_frames: layer.content_frames,
+                    samples: layer.samples,
+                })
+                .collect::<Vec<_>>();
+            let (sender, receiver) = mpsc::sync_channel(1);
+            let output_path = pending.output_path.clone();
+            let output_format = pending.output_format;
+            let options = full_mix.options;
+            let package_workspace = self.package_workspace.clone();
+            let worker = thread::Builder::new()
+                .name("full-pattern-mix-render".to_owned())
+                .spawn(move || {
+                    let _package_workspace = package_workspace;
+                    let result = render_pattern_mix_to_file(
+                        &full_mix.document,
+                        &full_mix.project_path,
+                        options,
+                        &output_path,
+                        output_format,
+                        full_mix.processor,
+                        &audio_layers,
+                        &full_mix.clap_audio_channels,
+                        &full_mix.vst3_volume_expression_channels,
+                    )
+                    .map(|summary| summary.frames);
+                    let _ = sender.send(result);
+                });
+            match worker {
+                Ok(worker) => {
+                    pending.write_receiver = Some(receiver);
+                    pending.write_worker = Some(worker);
+                    self.pending_clap_pattern_render = Some(pending);
+                    self.status = "Rendering the full Pattern mix…".into();
+                }
+                Err(error) => {
+                    self.status = format!("Could not start full Pattern render: {error}");
+                }
+            }
+            return;
+        }
         let frames = pending
             .audio_layers
             .iter()
@@ -50276,12 +50511,21 @@ impl DawUi {
             }
             match result {
                 Ok(frames) => {
-                    self.status = format!(
-                        "Rendered Pattern {} with assigned CLAP instruments to {} ({:.2}s)",
-                        pending.pattern_id,
-                        pending.output_path.display(),
-                        frames as f64 / f64::from(pending.sample_rate),
-                    );
+                    self.status = if pending.is_full_mix {
+                        format!(
+                            "Rendered the full Pattern {} mix to {} ({:.2}s)",
+                            pending.pattern_id,
+                            pending.output_path.display(),
+                            frames as f64 / f64::from(pending.sample_rate),
+                        )
+                    } else {
+                        format!(
+                            "Rendered Pattern {} with assigned CLAP instruments to {} ({:.2}s)",
+                            pending.pattern_id,
+                            pending.output_path.display(),
+                            frames as f64 / f64::from(pending.sample_rate),
+                        )
+                    };
                     if let Some(placement) = pending.insert_placement {
                         self.queue_rendered_pattern_audio_clip(
                             pending.pattern_id,
@@ -50291,7 +50535,11 @@ impl DawUi {
                     }
                 }
                 Err(error) => {
-                    self.status = format!("Could not write CLAP Pattern render: {error}");
+                    self.status = if pending.is_full_mix {
+                        format!("Could not render full Pattern mix: {error}")
+                    } else {
+                        format!("Could not write CLAP Pattern render: {error}")
+                    };
                 }
             }
         }
