@@ -12433,6 +12433,9 @@ struct SamplerVolumeEnvelope {
     timing: SamplerEnvelopeTiming,
     sustain_level: f32,
     amount: f32,
+    attack_tension: i32,
+    decay_tension: i32,
+    release_tension: i32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -12586,8 +12589,10 @@ impl SamplerVolumeEnvelope {
 
     fn release_progress_at_tick(self, start_tick: f64, current_tick: f64) -> Option<f32> {
         let release_ticks = self.tick_times()?.release;
-        (release_ticks > 0.0 && start_tick.is_finite() && current_tick.is_finite())
-            .then(|| ((current_tick - start_tick) / release_ticks).clamp(0.0, 1.0) as f32)
+        (release_ticks > 0.0 && start_tick.is_finite() && current_tick.is_finite()).then(|| {
+            let progress = ((current_tick - start_tick) / release_ticks).clamp(0.0, 1.0) as f32;
+            sampler_envelope_tension_curve(progress, self.release_tension)
+        })
     }
 
     fn release_finished_at_tick(self, start_tick: f64, current_tick: f64) -> bool {
@@ -12638,7 +12643,7 @@ impl SamplerVolumeEnvelope {
         }
         let elapsed = elapsed - predelay;
         if attack > 0.0 && elapsed < attack {
-            return (elapsed / attack) as f32;
+            return sampler_envelope_tension_curve((elapsed / attack) as f32, self.attack_tension);
         }
         let elapsed = (elapsed - attack).max(0.0);
         if elapsed < hold {
@@ -12646,7 +12651,8 @@ impl SamplerVolumeEnvelope {
         }
         let elapsed = (elapsed - hold).max(0.0);
         if decay > 0.0 && elapsed < decay {
-            let progress = (elapsed / decay) as f32;
+            let progress =
+                sampler_envelope_tension_curve((elapsed / decay) as f32, self.decay_tension);
             return 1.0 + (self.sustain_level - 1.0) * progress;
         }
         self.sustain_level
@@ -17154,11 +17160,12 @@ fn sampler_voice_volume_envelope_gain(
                 })
                 .max(1);
             let elapsed = frame.saturating_sub(start_frame);
-            if total_frames <= 1 {
+            let linear_progress = if total_frames <= 1 {
                 1.0
             } else {
                 (elapsed as f32 / (total_frames - 1) as f32).clamp(0.0, 1.0)
-            }
+            };
+            sampler_envelope_tension_curve(linear_progress, envelope.release_tension)
         });
         voice.envelope_release_start_gain * (1.0 - progress)
     } else {
@@ -17208,6 +17215,19 @@ fn sampler_envelope_release_frames(
         .filter(|frames| *frames > 0)
         .unwrap_or(default_release_frames)
         .max(1)
+}
+
+fn sampler_envelope_tension_curve(progress: f32, tension: i32) -> f32 {
+    let progress = if progress.is_finite() {
+        progress.clamp(0.0, 1.0)
+    } else {
+        return 0.0;
+    };
+    if tension == 0 {
+        return progress;
+    }
+    let exponent = 2.0_f32.powf(tension.clamp(-128, 128) as f32 / 64.0);
+    progress.powf(exponent)
 }
 
 fn sampler_envelope_release_tail_frames(
@@ -18847,8 +18867,14 @@ fn sampler_volume_envelope_config(
     else {
         return None;
     };
+    let attack_tension = envelope.attack_tension_raw().unwrap_or(0);
+    let decay_tension = envelope.decay_tension_raw().unwrap_or(0);
+    let release_tension = envelope.release_tension_raw().unwrap_or(0);
     if !(0..=128).contains(&sustain)
         || !(-128..=128).contains(&amount)
+        || !(-128..=128).contains(&attack_tension)
+        || !(-128..=128).contains(&decay_tension)
+        || !(-128..=128).contains(&release_tension)
         || [predelay, attack, hold, decay, release]
             .into_iter()
             .any(|raw| !(100..=65_536).contains(&raw))
@@ -18884,6 +18910,9 @@ fn sampler_volume_envelope_config(
         timing,
         sustain_level: sustain as f32 / 128.0,
         amount: amount as f32 / 128.0,
+        attack_tension,
+        decay_tension,
+        release_tension,
     })
 }
 
@@ -23272,6 +23301,9 @@ mod tests {
             }),
             sustain_level: 0.25,
             amount: 0.5,
+            attack_tension: 0,
+            decay_tension: 0,
+            release_tension: 0,
         };
         let gain = |frame| envelope.gain_at_frame(5, frame, None, None);
 
@@ -23306,6 +23338,9 @@ mod tests {
                 }),
                 sustain_level: 1.0,
                 amount: 1.0,
+                attack_tension: 0,
+                decay_tension: 0,
+                release_tension: 0,
             }),
             max_polyphony_raw: None,
             mono_enabled: false,
