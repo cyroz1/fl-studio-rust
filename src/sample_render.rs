@@ -19706,7 +19706,7 @@ mod tests {
 
     #[test]
     fn playlist_tail_bound_covers_clap_report_without_adding_the_selected_tail_twice() {
-        let make_layer = |frames| PlaylistAudioLayer {
+        let make_layer = |frames: usize| PlaylistAudioLayer {
             channel_id: 9,
             left_gain: 1.0,
             right_gain: 1.0,
