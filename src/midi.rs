@@ -296,6 +296,8 @@ pub enum MidiAutomationSource {
     PitchBend,
     /// MIDI Channel Pressure, mapped from its seven-bit value.
     ChannelPressure,
+    /// MIDI Program Change, mapped from its seven-bit program number.
+    ProgramChange,
     /// MIDI Polyphonic Key Pressure for one key in the range 0–127.
     PolyphonicKeyPressure(u8),
 }

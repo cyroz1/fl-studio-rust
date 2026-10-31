@@ -21381,8 +21381,9 @@ impl FlpDocument {
     }
 
     /// Replaces one type-5 Automation channel's points with a selected MIDI channel-voice source.
-    /// Seven-bit sources map 0–127 linearly to 0.0–1.0; Pitch Bend, paired 14-bit Control Change,
-    /// RPN, and NRPN values map 0–16383. A paired CC source uses a base CC from 0–31 and the CC
+    /// Seven-bit sources map 0–127 linearly to 0.0–1.0; Program Change numbers are zero-based.
+    /// Pitch Bend, paired 14-bit Control Change, RPN, and NRPN values map 0–16383. A paired CC
+    /// source uses a base CC from 0–31 and the CC
     /// number 32 higher for its LSB; each byte is held until its next update and both start at
     /// zero. RPN/NRPN selectors are tracked per channel. CC 6 and CC 38 update the selected
     /// parameter, while CC 96 and CC 97 increment or decrement it. Parameter data bytes start at
@@ -21544,6 +21545,17 @@ impl FlpDocument {
                         event.channel(),
                         event.tick(),
                         f64::from(event.value()) / 127.0,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            midi::MidiAutomationSource::ProgramChange => track
+                .program_changes()
+                .into_iter()
+                .map(|event| {
+                    (
+                        event.channel(),
+                        event.tick(),
+                        f64::from(event.program()) / 127.0,
                     )
                 })
                 .collect::<Vec<_>>(),

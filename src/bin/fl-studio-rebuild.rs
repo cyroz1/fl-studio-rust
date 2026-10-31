@@ -4481,6 +4481,7 @@ enum MidiAutomationSourceKind {
     NonRegisteredParameter,
     PitchBend,
     ChannelPressure,
+    ProgramChange,
     PolyphonicKeyPressure,
 }
 
@@ -41122,6 +41123,7 @@ impl DawUi {
                         MidiAutomationSourceKind::NonRegisteredParameter => "NRPN",
                         MidiAutomationSourceKind::PitchBend => "Pitch Bend",
                         MidiAutomationSourceKind::ChannelPressure => "Channel Pressure",
+                        MidiAutomationSourceKind::ProgramChange => "Program Change",
                         MidiAutomationSourceKind::PolyphonicKeyPressure => {
                             "Polyphonic Key Pressure"
                         }
@@ -41159,6 +41161,11 @@ impl DawUi {
                         );
                         ui.selectable_value(
                             &mut pending.source_kind,
+                            MidiAutomationSourceKind::ProgramChange,
+                            "Program Change",
+                        );
+                        ui.selectable_value(
+                            &mut pending.source_kind,
                             MidiAutomationSourceKind::PolyphonicKeyPressure,
                             "Polyphonic Key Pressure",
                         );
@@ -41180,6 +41187,12 @@ impl DawUi {
                     .tracks()
                     .get(pending.selected_track)
                     .map(|track| track.channel_pressures())
+                    .unwrap_or_default();
+                let program_changes = pending
+                    .midi
+                    .tracks()
+                    .get(pending.selected_track)
+                    .map(|track| track.program_changes())
                     .unwrap_or_default();
                 let polyphonic_pressures = pending
                     .midi
@@ -41367,6 +41380,10 @@ impl DawUi {
                         .iter()
                         .map(|pressure| pressure.channel())
                         .collect::<BTreeSet<_>>(),
+                    MidiAutomationSourceKind::ProgramChange => program_changes
+                        .iter()
+                        .map(|change| change.channel())
+                        .collect::<BTreeSet<_>>(),
                     MidiAutomationSourceKind::PolyphonicKeyPressure => polyphonic_pressures
                         .iter()
                         .filter(|pressure| pressure.key() == pending.pressure_key)
@@ -41398,6 +41415,11 @@ impl DawUi {
                 ui.weak(
                     "Replaces the current point curve. Saved Min/Max remains; new points use zeroed tail bytes.",
                 );
+                if pending.source_kind == MidiAutomationSourceKind::ProgramChange {
+                    ui.weak(
+                        "Zero-based Program Change values map from 0–127 to 0.0–1.0.",
+                    );
+                }
                 let source = match pending.source_kind {
                     MidiAutomationSourceKind::ControlChange => {
                         MidiAutomationSource::ControlChange(pending.controller_number)
@@ -41415,6 +41437,7 @@ impl DawUi {
                     MidiAutomationSourceKind::ChannelPressure => {
                         MidiAutomationSource::ChannelPressure
                     }
+                    MidiAutomationSourceKind::ProgramChange => MidiAutomationSource::ProgramChange,
                     MidiAutomationSourceKind::PolyphonicKeyPressure => {
                         MidiAutomationSource::PolyphonicKeyPressure(pending.pressure_key)
                     }
@@ -41438,6 +41461,7 @@ impl DawUi {
                     MidiAutomationSourceKind::ChannelPressure => {
                         "Channel Pressure".to_owned()
                     }
+                    MidiAutomationSourceKind::ProgramChange => "Program Change".to_owned(),
                     MidiAutomationSourceKind::PolyphonicKeyPressure => {
                         format!("Key Pressure for MIDI key {}", pending.pressure_key)
                     }
