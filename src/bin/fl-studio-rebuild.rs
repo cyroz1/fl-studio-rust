@@ -46295,7 +46295,7 @@ impl DawUi {
                         egui::Button::new("Render full Pattern mix…"),
                     )
                     .on_hover_text(
-                        "Render Sampler, loaded VST3, and assigned CLAP Pattern sources through Mixer routing and loaded effects",
+                        "Render Sampler, loaded VST3, and assigned CLAP Pattern sources through Mixer routing and assigned Mixer effects",
                     )
                     .clicked()
                 {
@@ -50151,7 +50151,11 @@ impl DawUi {
                     loop_length_ticks,
                 );
             let mixer_effect_instances = self.mixer_effect_vst3_instances.clone();
-            let processor = if !channel_instances.is_empty() || !mixer_effect_instances.is_empty() {
+            let has_clap_mixer_effects = !self.clap_mixer_effect_assignments.is_empty();
+            let processor = if !channel_instances.is_empty()
+                || !mixer_effect_instances.is_empty()
+                || has_clap_mixer_effects
+            {
                 let Some(host) = self.vst3_host.as_ref() else {
                     self.status = "VST3 host is not initialized".to_owned();
                     return;
@@ -50171,7 +50175,7 @@ impl DawUi {
                 {
                     Ok(processor) => Some(processor),
                     Err(error) => {
-                        self.status = format!("Could not prepare the full Pattern VST3 mix: {error}");
+                        self.status = format!("Could not prepare full Pattern Mixer effects: {error}");
                         return;
                     }
                 }
