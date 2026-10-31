@@ -60,6 +60,7 @@ const MAX_PATTERN_PREVIEW_NOTES: usize = 16_384;
 const MAX_CLAP_PREVIEW_PARAMETER_CHANGES: usize = 512;
 const MAX_CLAP_MIXER_EFFECT_PARAMETER_CHANGES: usize = 2_048;
 const MAX_CLAP_SLIDE_EXPRESSION_EVENTS: usize = 1_000_000;
+const MAX_CLAP_INSTRUMENT_LATENCY_SECONDS: u64 = 60;
 const NOTE_PREVIEW_BLOCK_FRAMES: u32 = 512;
 const CLAP_MIXER_EFFECT_PROCESS_TIMEOUT: Duration = Duration::from_secs(10);
 const NOTE_PREVIEW_DURATION_MILLISECONDS: u32 = 1500;
@@ -5608,6 +5609,42 @@ impl ClapNotePreviewInstance {
             .instance
             .activate(|_, _| (), audio_configuration)
             .map_err(|error| format!("could not activate CLAP instrument: {error}"))?;
+        let plugin = self.instance.plugin_handle();
+        let latency_samples = plugin
+            .get_extension::<PluginLatency>()
+            .map_or(0, |latency| latency.get(&plugin));
+        let maximum_latency_samples =
+            u64::from(self.sample_rate) * MAX_CLAP_INSTRUMENT_LATENCY_SECONDS;
+        if u64::from(latency_samples) > maximum_latency_samples {
+            self.instance.deactivate(stopped_processor);
+            return Err(format!(
+                "CLAP instrument reports {latency_samples} samples of latency, exceeding the {MAX_CLAP_INSTRUMENT_LATENCY_SECONDS}-second processing limit"
+            ));
+        }
+        let render_frames = (|| {
+            let render_frames = u64::from(total_frames)
+                .checked_add(u64::from(latency_samples))
+                .ok_or_else(|| "CLAP latency-compensated render length overflowed".to_owned())?;
+            let render_bytes = render_frames
+                .checked_mul(8)
+                .ok_or_else(|| "CLAP latency-compensated audio size overflowed".to_owned())?;
+            if render_bytes > MAX_NOTE_PREVIEW_OUTPUT_BYTES as u64 {
+                return Err(format!(
+                    "CLAP latency-compensated render exceeds the {} MiB audio limit at this sample rate",
+                    MAX_NOTE_PREVIEW_OUTPUT_BYTES / (1024 * 1024)
+                ));
+            }
+            u32::try_from(render_frames).map_err(|_| {
+                "CLAP latency-compensated render exceeds the supported range".to_owned()
+            })
+        })();
+        let render_frames = match render_frames {
+            Ok(frames) => frames,
+            Err(error) => {
+                self.instance.deactivate(stopped_processor);
+                return Err(error);
+            }
+        };
         let mut audio_processor = match stopped_processor.start_processing() {
             Ok(processor) => processor,
             Err(error) => {
@@ -5618,7 +5655,7 @@ impl ClapNotePreviewInstance {
         };
 
         let main_output_channels = self.output_port_channels[self.main_output_index];
-        let mut samples = Vec::with_capacity(total_frames as usize * 2);
+        let mut samples = Vec::with_capacity(render_frames as usize * 2);
         let mut input_audio_ports = AudioPorts::with_capacity(
             self.input_port_channels.iter().sum::<u32>() as usize,
             self.input_port_channels.len(),
@@ -5634,16 +5671,22 @@ impl ClapNotePreviewInstance {
         let mut transport_index = 0usize;
         let mut render_error = None;
 
-        while frame_offset < total_frames {
-            let mut frame_count = (total_frames - frame_offset).min(NOTE_PREVIEW_BLOCK_FRAMES);
+        while frame_offset < render_frames {
+            let mut frame_count = (render_frames - frame_offset).min(NOTE_PREVIEW_BLOCK_FRAMES);
             if let Some((points, _)) = transport {
                 while transport_index + 1 < points.len()
-                    && points[transport_index + 1].frame <= u64::from(frame_offset)
+                    && points[transport_index + 1]
+                        .frame
+                        .saturating_add(u64::from(latency_samples))
+                        <= u64::from(frame_offset)
                 {
                     transport_index += 1;
                 }
                 if let Some(next_point) = points.get(transport_index + 1) {
-                    let frames_to_change = next_point.frame.saturating_sub(u64::from(frame_offset));
+                    let next_change_frame =
+                        next_point.frame.saturating_add(u64::from(latency_samples));
+                    let frames_to_change =
+                        next_change_frame.saturating_sub(u64::from(frame_offset));
                     if frames_to_change > 0 {
                         frame_count = u32::try_from(frames_to_change.min(u64::from(frame_count)))
                             .expect("the block limit fits in u32");
@@ -5856,9 +5899,10 @@ impl ClapNotePreviewInstance {
             let steady_time = render_start_time.saturating_add(u64::from(frame_offset));
             let transport_event = transport.map(|(points, ppq)| {
                 let point = points[transport_index];
-                let elapsed_frames = u64::from(frame_offset).saturating_sub(point.frame);
+                let timeline_frame = f64::from(frame_offset) - f64::from(latency_samples);
+                let elapsed_frames = timeline_frame - point.frame as f64;
                 let current_tick = point.tick as f64
-                    + elapsed_frames as f64 * point.tempo_bpm * f64::from(ppq)
+                    + elapsed_frames * point.tempo_bpm * f64::from(ppq)
                         / (60.0 * f64::from(self.sample_rate));
                 TransportEvent {
                     header: EventHeader::<TransportEvent>::new_core(0, EventFlags::empty()),
@@ -5868,7 +5912,7 @@ impl ClapNotePreviewInstance {
                         | TransportFlags::IS_PLAYING,
                     song_pos_beats: BeatTime::from_float(current_tick / f64::from(ppq)),
                     song_pos_seconds: SecondsTime::from_float(
-                        f64::from(frame_offset) / f64::from(self.sample_rate),
+                        timeline_frame / f64::from(self.sample_rate),
                     ),
                     tempo: point.tempo_bpm,
                     tempo_inc: 0.0,
@@ -5949,7 +5993,19 @@ impl ClapNotePreviewInstance {
         if let Some(error) = render_error {
             return Err(error);
         }
-        self.next_steady_time = render_start_time.saturating_add(u64::from(total_frames));
+        if latency_samples > 0 {
+            let first_output_sample = latency_samples as usize * 2;
+            let output_sample_count = total_frames as usize * 2;
+            let output_sample_end = first_output_sample
+                .checked_add(output_sample_count)
+                .ok_or_else(|| "CLAP latency-compensated sample range overflowed".to_owned())?;
+            if output_sample_end > samples.len() {
+                return Err("CLAP latency-compensated output ended early".to_owned());
+            }
+            samples.copy_within(first_output_sample..output_sample_end, 0);
+            samples.truncate(output_sample_count);
+        }
+        self.next_steady_time = render_start_time.saturating_add(u64::from(render_frames));
         Ok(samples)
     }
 }
