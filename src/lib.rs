@@ -20596,9 +20596,9 @@ impl FlpDocument {
         parameter_number: u16,
         midi_channel: Option<u8>,
     ) -> Result<Vec<(u32, f32)>, FlpError> {
-        if parameter_number > 16_383 {
+        if parameter_number > midi::MAX_MIDI_PARAMETER_NUMBER {
             return Err(FlpError::UnsupportedEdit(
-                "MIDI RPN or NRPN number must be from 0 through 16383",
+                "MIDI RPN or NRPN number must be from 0 through 16382; 16383 is the null selection",
             ));
         }
         if midi_channel.is_some_and(|channel| channel > 15) {
@@ -21346,10 +21346,10 @@ impl FlpDocument {
             }
             midi::MidiAutomationSource::RegisteredParameter(parameter_number)
             | midi::MidiAutomationSource::NonRegisteredParameter(parameter_number)
-                if parameter_number > 16_383 =>
+                if parameter_number > midi::MAX_MIDI_PARAMETER_NUMBER =>
             {
                 return Err(FlpError::UnsupportedEdit(
-                    "MIDI RPN or NRPN number must be from 0 through 16383",
+                    "MIDI RPN or NRPN number must be from 0 through 16382; 16383 is the null selection",
                 ));
             }
             midi::MidiAutomationSource::PolyphonicKeyPressure(key) if key > 127 => {

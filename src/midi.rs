@@ -14,6 +14,8 @@ const MAX_EXPORTED_NOTES: usize = 1_000_000;
 const MAX_EXPORTED_CONTROLLER_POINTS: usize = 1_000_000;
 const MAX_EXPORTED_TEMPO_EVENTS: usize = 1_000_000;
 const MAX_EXPORTED_MARKERS: usize = 1_000_000;
+/// Highest selectable MIDI 1.0 RPN or NRPN number; 16383 encodes the null selection.
+pub const MAX_MIDI_PARAMETER_NUMBER: u16 = 16_382;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MidiFile {
@@ -139,7 +141,7 @@ impl MidiParameterChange {
         self.channel
     }
 
-    /// Selected 14-bit RPN or NRPN number in the range 0–16383.
+    /// Selected 14-bit RPN or NRPN number in the range 0–16382; 16383 is the null selection.
     pub fn parameter_number(self) -> u16 {
         self.parameter_number
     }
@@ -2572,7 +2574,7 @@ impl MidiTrack {
     }
 
     /// Returns 14-bit data updates for one RPN or NRPN parameter, or `None` when the
-    /// requested parameter number is outside 0–16383. CC 6 and 38 update the selected
+    /// requested parameter number is outside 0–16382. CC 6 and 38 update the selected
     /// parameter's MSB and LSB; CC 96 and 97 increment or decrement its current value.
     /// Parameter bytes start at zero per MIDI channel and remain stored when another
     /// parameter is selected. CC 121 clears the active selection but retains values.
@@ -2581,7 +2583,7 @@ impl MidiTrack {
         kind: MidiParameterKind,
         parameter_number: u16,
     ) -> Option<Vec<MidiParameterChange>> {
-        if parameter_number > 16_383 {
+        if parameter_number > MAX_MIDI_PARAMETER_NUMBER {
             return None;
         }
         Some(self.control_parameter_changes(kind, Some(parameter_number)))

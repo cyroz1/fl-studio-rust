@@ -6,8 +6,8 @@ use std::process::ExitCode;
 
 use flp_rebuild::media::{SamplePathResolver, decode_audio_file};
 use flp_rebuild::midi::{
-    MidiAutomationSource, MidiChannelMapping, MidiExportFileFormat, MidiFile, MidiImportOptions,
-    MidiParameterKind,
+    MAX_MIDI_PARAMETER_NUMBER, MidiAutomationSource, MidiChannelMapping, MidiExportFileFormat,
+    MidiFile, MidiImportOptions, MidiParameterKind,
 };
 use flp_rebuild::plugin_settings::load_vst3_manual_latency_offsets;
 use flp_rebuild::plugins::scan_installed_plugins;
@@ -4905,10 +4905,10 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild import-midi-cc14 <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <raw-channel> <raw-flags> <base-cc-0..31> <midi-channel-1..16|all>\n",
             "  flp-rebuild import-midi-cc14-new-stream <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <raw-channel> <raw-flags> <base-cc-0..31> <midi-channel-1..16|all>\n",
             "    CC14 combines base CC N with CC N+32, retaining each byte per MIDI channel; values map from 0–16383 to 0.0–1.0.\n",
-            "  flp-rebuild import-midi-rpn <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <raw-channel> <raw-flags> <rpn-0..16383> <midi-channel-1..16|all>\n",
-            "  flp-rebuild import-midi-rpn-new-stream <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <raw-channel> <raw-flags> <rpn-0..16383> <midi-channel-1..16|all>\n",
-            "  flp-rebuild import-midi-nrpn <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <raw-channel> <raw-flags> <nrpn-0..16383> <midi-channel-1..16|all>\n",
-            "  flp-rebuild import-midi-nrpn-new-stream <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <raw-channel> <raw-flags> <nrpn-0..16383> <midi-channel-1..16|all>\n",
+            "  flp-rebuild import-midi-rpn <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <raw-channel> <raw-flags> <rpn-0..16382> <midi-channel-1..16|all>\n",
+            "  flp-rebuild import-midi-rpn-new-stream <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <raw-channel> <raw-flags> <rpn-0..16382> <midi-channel-1..16|all>\n",
+            "  flp-rebuild import-midi-nrpn <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <raw-channel> <raw-flags> <nrpn-0..16382> <midi-channel-1..16|all>\n",
+            "  flp-rebuild import-midi-nrpn-new-stream <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <raw-channel> <raw-flags> <nrpn-0..16382> <midi-channel-1..16|all>\n",
             "    RPN/NRPN data combines CC 6/38 and applies CC 96/97 increments; values map from 0–16383 to 0.0–1.0.\n",
             "  flp-rebuild import-midi-cc-streams <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <cc:raw-channel:raw-flags,...> <midi-channel-1..16|all>\n",
             "    Each mapping creates one raw Pattern stream; raw bytes are explicit, and CCs with no messages are skipped.\n",
@@ -5332,15 +5332,15 @@ fn parse_midi_automation_source(value: &str) -> Result<MidiAutomationSource, Str
         }
         ["rpn", parameter_number] => {
             let parameter_number = parse_u16(parameter_number, "MIDI RPN number")?;
-            if parameter_number > 16_383 {
-                return Err("MIDI RPN number must be from 0 through 16383".to_owned());
+            if parameter_number > MAX_MIDI_PARAMETER_NUMBER {
+                return Err("MIDI RPN number must be from 0 through 16382; 16383 is the null selection".to_owned());
             }
             Ok(MidiAutomationSource::RegisteredParameter(parameter_number))
         }
         ["nrpn", parameter_number] => {
             let parameter_number = parse_u16(parameter_number, "MIDI NRPN number")?;
-            if parameter_number > 16_383 {
-                return Err("MIDI NRPN number must be from 0 through 16383".to_owned());
+            if parameter_number > MAX_MIDI_PARAMETER_NUMBER {
+                return Err("MIDI NRPN number must be from 0 through 16382; 16383 is the null selection".to_owned());
             }
             Ok(MidiAutomationSource::NonRegisteredParameter(
                 parameter_number,
@@ -5356,7 +5356,7 @@ fn parse_midi_automation_source(value: &str) -> Result<MidiAutomationSource, Str
             Ok(MidiAutomationSource::PolyphonicKeyPressure(key))
         }
         _ => Err(
-            "MIDI Automation source must be cc:<0..127>, cc14:<0..31>, rpn:<0..16383>, nrpn:<0..16383>, pitch-bend, channel-pressure, or poly-pressure:<0..127>"
+            "MIDI Automation source must be cc:<0..127>, cc14:<0..31>, rpn:<0..16382>, nrpn:<0..16382>, pitch-bend, channel-pressure, or poly-pressure:<0..127>"
                 .to_owned(),
         ),
     }
