@@ -73,6 +73,46 @@ const INSTANCE_PROBE_HEADER: &str = "FL_STUDIO_REBUILD_CLAP_INSTANCE_V1";
 
 struct ClapMixerEffectHost;
 
+struct ClapNotePreviewHost;
+
+struct ClapNotePreviewHostShared {
+    tail_changed: Arc<AtomicBool>,
+}
+
+struct ClapNotePreviewHostMainThread;
+
+struct ClapNotePreviewHostAudioProcessor<'a> {
+    tail_changed: &'a AtomicBool,
+}
+
+impl<'a> SharedHandler<'a> for ClapNotePreviewHostShared {
+    fn request_restart(&self) {}
+
+    fn request_process(&self) {}
+
+    fn request_callback(&self) {}
+}
+
+impl<'a> MainThreadHandler<'a> for ClapNotePreviewHostMainThread {}
+
+impl<'a> AudioProcessorHandler<'a> for ClapNotePreviewHostAudioProcessor<'a> {}
+
+impl HostTailImpl for ClapNotePreviewHostAudioProcessor<'_> {
+    fn changed(&mut self) {
+        self.tail_changed.store(true, Ordering::Release);
+    }
+}
+
+impl HostHandlers for ClapNotePreviewHost {
+    type Shared<'a> = ClapNotePreviewHostShared;
+    type MainThread<'a> = ClapNotePreviewHostMainThread;
+    type AudioProcessor<'a> = ClapNotePreviewHostAudioProcessor<'a>;
+
+    fn declare_extensions(builder: &mut HostExtensions<Self>, _shared: &Self::Shared<'_>) {
+        builder.register::<HostTail>();
+    }
+}
+
 struct ClapMixerEffectHostShared {
     restart_requested: Arc<AtomicBool>,
     callback_requested: Arc<AtomicBool>,
@@ -4644,7 +4684,7 @@ fn render_note_preview(
 }
 
 struct ClapNotePreviewInstance {
-    instance: PluginInstance<()>,
+    instance: PluginInstance<ClapNotePreviewHost>,
     sample_rate: u32,
     input_port_channels: Vec<u32>,
     output_port_channels: Vec<u32>,
@@ -4652,6 +4692,7 @@ struct ClapNotePreviewInstance {
     note_port_index: u16,
     dialect: PreviewNoteDialect,
     next_steady_time: u64,
+    tail_changed: Arc<AtomicBool>,
 }
 
 struct LimitedClapStateWriter {
@@ -5250,6 +5291,34 @@ fn run_plugin_editor_ui(
         .ok_or_else(|| "CLAP editor closed without saving its state".to_owned())?
 }
 
+fn clap_instrument_render_frame_count(
+    last_scheduled_frame: u64,
+    scheduled_tail_frames: u64,
+    selected_tail_samples: u64,
+    reported_tail_samples: u64,
+    latency_samples: u32,
+) -> Result<u32, String> {
+    let tail_frames = scheduled_tail_frames
+        .max(selected_tail_samples)
+        .max(reported_tail_samples);
+    let render_frames = last_scheduled_frame
+        .checked_add(tail_frames)
+        .ok_or_else(|| "CLAP tail-compensated render length overflowed".to_owned())?
+        .checked_add(u64::from(latency_samples))
+        .ok_or_else(|| "CLAP latency-compensated render length overflowed".to_owned())?;
+    let render_bytes = render_frames
+        .checked_mul(8)
+        .ok_or_else(|| "CLAP latency-compensated audio size overflowed".to_owned())?;
+    if render_bytes > MAX_NOTE_PREVIEW_OUTPUT_BYTES as u64 {
+        return Err(format!(
+            "CLAP latency-compensated render exceeds the {} MiB audio limit at this sample rate",
+            MAX_NOTE_PREVIEW_OUTPUT_BYTES / (1024 * 1024)
+        ));
+    }
+    u32::try_from(render_frames)
+        .map_err(|_| "CLAP latency-compensated render exceeds the supported range".to_owned())
+}
+
 impl ClapNotePreviewInstance {
     fn new(path: &Path, plugin_id: &str, sample_rate: u32) -> Result<Self, String> {
         if !(8_000..=192_000).contains(&sample_rate) {
@@ -5269,9 +5338,18 @@ impl ClapNotePreviewInstance {
             env!("CARGO_PKG_VERSION"),
         )
         .map_err(|error| format!("could not describe the host to the CLAP plug-in: {error}"))?;
-        let mut instance =
-            PluginInstance::<()>::new(|_| (), |_| (), &entry, &plugin_id, &host_info)
-                .map_err(|error| format!("could not initialize CLAP plug-in instance: {error}"))?;
+        let tail_changed = Arc::new(AtomicBool::new(false));
+        let shared_tail_changed = Arc::clone(&tail_changed);
+        let mut instance = PluginInstance::<ClapNotePreviewHost>::new(
+            move |_| ClapNotePreviewHostShared {
+                tail_changed: Arc::clone(&shared_tail_changed),
+            },
+            |_| ClapNotePreviewHostMainThread,
+            &entry,
+            &plugin_id,
+            &host_info,
+        )
+        .map_err(|error| format!("could not initialize CLAP plug-in instance: {error}"))?;
 
         let (
             input_port_channels,
@@ -5317,6 +5395,7 @@ impl ClapNotePreviewInstance {
             note_port_index,
             dialect,
             next_steady_time: 0,
+            tail_changed,
         })
     }
 
@@ -5622,7 +5701,12 @@ impl ClapNotePreviewInstance {
         };
         let stopped_processor = self
             .instance
-            .activate(|_, _| (), audio_configuration)
+            .activate(
+                |shared, _| ClapNotePreviewHostAudioProcessor {
+                    tail_changed: shared.tail_changed.as_ref(),
+                },
+                audio_configuration,
+            )
             .map_err(|error| format!("could not activate CLAP instrument: {error}"))?;
         let plugin = self.instance.plugin_handle();
         let latency_samples = plugin
@@ -5647,56 +5731,43 @@ impl ClapNotePreviewInstance {
                 return Err("CLAP instrument could not start audio processing".to_owned());
             }
         };
+        self.tail_changed.store(false, Ordering::Release);
         let maximum_tail_samples = u64::from(self.sample_rate) * MAX_CLAP_INSTRUMENT_TAIL_SECONDS;
-        let reported_tail_samples = plugin_tail_seconds
-            .and_then(|_| {
-                let plugin = audio_processor.plugin_handle();
-                plugin
-                    .get_extension::<PluginTail>()
-                    .map(|tail| match tail.get(&plugin) {
-                        TailLength::Finite(samples) => u64::from(samples),
-                        TailLength::Infinite => selected_tail_samples,
-                    })
-            })
-            .map(|samples| samples.min(maximum_tail_samples))
+        let reported_tail_samples = if plugin_tail_seconds.is_some() {
+            let plugin = audio_processor.plugin_handle();
+            plugin
+                .get_extension::<PluginTail>()
+                .map(|tail| match tail.get(&plugin) {
+                    TailLength::Finite(samples) => u64::from(samples),
+                    TailLength::Infinite => selected_tail_samples,
+                })
+                .map(|samples| samples.min(maximum_tail_samples))
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let last_scheduled_frame = events
+            .iter()
+            .map(|event| event.frame)
+            .chain(parameter_events.iter().map(|event| event.frame))
+            .max()
             .unwrap_or(0);
-        let render_frames = (|| {
-            let last_scheduled_frame = events
-                .iter()
-                .map(|event| event.frame)
-                .chain(parameter_events.iter().map(|event| event.frame))
-                .max()
-                .unwrap_or(0);
-            let scheduled_tail_frames =
-                u64::from(total_frames).saturating_sub(last_scheduled_frame);
-            let tail_frames = scheduled_tail_frames
-                .max(selected_tail_samples)
-                .max(reported_tail_samples);
-            let render_frames = last_scheduled_frame
-                .checked_add(tail_frames)
-                .ok_or_else(|| "CLAP tail-compensated render length overflowed".to_owned())?
-                .checked_add(u64::from(latency_samples))
-                .ok_or_else(|| "CLAP latency-compensated render length overflowed".to_owned())?;
-            let render_bytes = render_frames
-                .checked_mul(8)
-                .ok_or_else(|| "CLAP latency-compensated audio size overflowed".to_owned())?;
-            if render_bytes > MAX_NOTE_PREVIEW_OUTPUT_BYTES as u64 {
-                return Err(format!(
-                    "CLAP latency-compensated render exceeds the {} MiB audio limit at this sample rate",
-                    MAX_NOTE_PREVIEW_OUTPUT_BYTES / (1024 * 1024)
-                ));
-            }
-            u32::try_from(render_frames).map_err(|_| {
-                "CLAP latency-compensated render exceeds the supported range".to_owned()
-            })
-        })();
-        let render_frames = match render_frames {
+        let scheduled_tail_frames = u64::from(total_frames).saturating_sub(last_scheduled_frame);
+        let render_frames = clap_instrument_render_frame_count(
+            last_scheduled_frame,
+            scheduled_tail_frames,
+            selected_tail_samples,
+            reported_tail_samples,
+            latency_samples,
+        );
+        let mut render_frames = match render_frames {
             Ok(frames) => frames,
             Err(error) => {
                 self.instance.deactivate(audio_processor.stop_processing());
                 return Err(error);
             }
         };
+        let mut final_render_frames = render_frames;
 
         let main_output_channels = self.output_port_channels[self.main_output_index];
         let mut samples = Vec::with_capacity(render_frames as usize * 2);
@@ -6029,6 +6100,35 @@ impl ClapNotePreviewInstance {
                 samples.push(if left.is_finite() { left } else { 0.0 });
                 samples.push(if right.is_finite() { right } else { 0.0 });
             }
+            if self.tail_changed.swap(false, Ordering::AcqRel) && plugin_tail_seconds.is_some() {
+                let reported_tail_samples = {
+                    let plugin = audio_processor.plugin_handle();
+                    plugin
+                        .get_extension::<PluginTail>()
+                        .map(|tail| match tail.get(&plugin) {
+                            TailLength::Finite(samples) => u64::from(samples),
+                            TailLength::Infinite => selected_tail_samples,
+                        })
+                        .map(|samples| samples.min(maximum_tail_samples))
+                        .unwrap_or(0)
+                };
+                match clap_instrument_render_frame_count(
+                    last_scheduled_frame,
+                    scheduled_tail_frames,
+                    selected_tail_samples,
+                    reported_tail_samples,
+                    latency_samples,
+                ) {
+                    Ok(updated_render_frames) => {
+                        final_render_frames = updated_render_frames;
+                        render_frames = updated_render_frames.max(frame_end);
+                    }
+                    Err(error) => {
+                        render_error = Some(error);
+                        break;
+                    }
+                }
+            }
             frame_offset = frame_end;
         }
 
@@ -6038,7 +6138,7 @@ impl ClapNotePreviewInstance {
             return Err(error);
         }
         let first_output_sample = latency_samples as usize * 2;
-        let output_frame_count = render_frames
+        let output_frame_count = final_render_frames
             .checked_sub(latency_samples)
             .ok_or_else(|| "CLAP latency exceeded the rendered frame count".to_owned())?;
         let output_sample_count = output_frame_count as usize * 2;
@@ -6050,7 +6150,7 @@ impl ClapNotePreviewInstance {
         }
         samples.copy_within(first_output_sample..output_sample_end, 0);
         samples.truncate(output_sample_count);
-        self.next_steady_time = render_start_time.saturating_add(u64::from(render_frames));
+        self.next_steady_time = render_start_time.saturating_add(u64::from(frame_offset));
         Ok(samples)
     }
 }
