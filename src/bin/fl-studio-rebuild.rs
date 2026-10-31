@@ -38,6 +38,7 @@ use flp_rebuild::media::{
 };
 use flp_rebuild::midi::{
     MidiAutomationSource, MidiChannelMapping, MidiExportFileFormat, MidiFile, MidiImportOptions,
+    MidiParameterKind,
 };
 use flp_rebuild::plugin_settings::{
     ClapProjectInstrumentAssignment as ClapPatternPlaybackInstrument,
@@ -4455,6 +4456,7 @@ struct PendingAutomationMidiCcImport {
     selected_track: usize,
     source_kind: MidiAutomationSourceKind,
     controller_number: u8,
+    parameter_number: u16,
     pressure_key: u8,
     midi_channel: Option<u8>,
     automation_channel_id: u16,
@@ -4464,6 +4466,8 @@ struct PendingAutomationMidiCcImport {
 enum MidiAutomationSourceKind {
     ControlChange,
     ControlChange14,
+    RegisteredParameter,
+    NonRegisteredParameter,
     PitchBend,
     ChannelPressure,
     PolyphonicKeyPressure,
@@ -40833,6 +40837,7 @@ impl DawUi {
                                     selected_track: 0,
                                     source_kind: MidiAutomationSourceKind::ControlChange,
                                     controller_number,
+                                    parameter_number: 0,
                                     pressure_key,
                                     midi_channel: None,
                                     automation_channel_id: channel_id,
@@ -41088,6 +41093,8 @@ impl DawUi {
                         MidiAutomationSourceKind::ControlChange14 => {
                             "14-bit Control Change"
                         }
+                        MidiAutomationSourceKind::RegisteredParameter => "RPN",
+                        MidiAutomationSourceKind::NonRegisteredParameter => "NRPN",
                         MidiAutomationSourceKind::PitchBend => "Pitch Bend",
                         MidiAutomationSourceKind::ChannelPressure => "Channel Pressure",
                         MidiAutomationSourceKind::PolyphonicKeyPressure => {
@@ -41104,6 +41111,16 @@ impl DawUi {
                             &mut pending.source_kind,
                             MidiAutomationSourceKind::ControlChange14,
                             "14-bit Control Change",
+                        );
+                        ui.selectable_value(
+                            &mut pending.source_kind,
+                            MidiAutomationSourceKind::RegisteredParameter,
+                            "Registered Parameter (RPN)",
+                        );
+                        ui.selectable_value(
+                            &mut pending.source_kind,
+                            MidiAutomationSourceKind::NonRegisteredParameter,
+                            "Non-Registered Parameter (NRPN)",
                         );
                         ui.selectable_value(
                             &mut pending.source_kind,
@@ -41157,6 +41174,25 @@ impl DawUi {
                         _ => None,
                     })
                     .collect::<BTreeSet<_>>();
+                let parameter_numbers = pending
+                    .midi
+                    .tracks()
+                    .get(pending.selected_track)
+                    .map(|track| {
+                        let kind = match pending.source_kind {
+                            MidiAutomationSourceKind::RegisteredParameter => {
+                                Some(MidiParameterKind::Registered)
+                            }
+                            MidiAutomationSourceKind::NonRegisteredParameter => {
+                                Some(MidiParameterKind::NonRegistered)
+                            }
+                            _ => None,
+                        };
+                        kind.map_or_else(Vec::new, |kind| {
+                            track.control_parameter_numbers(kind)
+                        })
+                    })
+                    .unwrap_or_default();
                 let pressure_keys = polyphonic_pressures
                     .iter()
                     .map(|pressure| pressure.key())
@@ -41207,6 +41243,38 @@ impl DawUi {
                                 );
                             }
                         });
+                } else if matches!(
+                    pending.source_kind,
+                    MidiAutomationSourceKind::RegisteredParameter
+                        | MidiAutomationSourceKind::NonRegisteredParameter
+                ) {
+                    if let Some(first_parameter) = parameter_numbers.first().copied()
+                        && !parameter_numbers.contains(&pending.parameter_number)
+                    {
+                        pending.parameter_number = first_parameter;
+                    }
+                    let prefix = if pending.source_kind
+                        == MidiAutomationSourceKind::RegisteredParameter
+                    {
+                        "RPN"
+                    } else {
+                        "NRPN"
+                    };
+                    egui::ComboBox::from_id_salt(("automation-midi-parameter-number", channel_id))
+                        .selected_text(if parameter_numbers.is_empty() {
+                            format!("No {prefix} data events")
+                        } else {
+                            format!("{prefix} {}", pending.parameter_number)
+                        })
+                        .show_ui(ui, |ui| {
+                            for parameter in &parameter_numbers {
+                                ui.selectable_value(
+                                    &mut pending.parameter_number,
+                                    *parameter,
+                                    format!("{prefix} {parameter}"),
+                                );
+                            }
+                        });
                 } else if pending.source_kind
                     == MidiAutomationSourceKind::PolyphonicKeyPressure
                 {
@@ -41245,6 +41313,27 @@ impl DawUi {
                         })
                         .map(|change| change.channel())
                         .collect::<BTreeSet<_>>(),
+                    MidiAutomationSourceKind::RegisteredParameter
+                    | MidiAutomationSourceKind::NonRegisteredParameter => pending
+                        .midi
+                        .tracks()
+                        .get(pending.selected_track)
+                        .map(|track| {
+                            let kind = if pending.source_kind
+                                == MidiAutomationSourceKind::RegisteredParameter
+                            {
+                                MidiParameterKind::Registered
+                            } else {
+                                MidiParameterKind::NonRegistered
+                            };
+                            track
+                                .control_parameter_values(kind, pending.parameter_number)
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|change| change.channel())
+                                .collect::<BTreeSet<_>>()
+                        })
+                        .unwrap_or_default(),
                     MidiAutomationSourceKind::PitchBend => pitch_bends
                         .iter()
                         .map(|bend| bend.channel())
@@ -41291,6 +41380,12 @@ impl DawUi {
                     MidiAutomationSourceKind::ControlChange14 => {
                         MidiAutomationSource::ControlChange14(pending.controller_number)
                     }
+                    MidiAutomationSourceKind::RegisteredParameter => {
+                        MidiAutomationSource::RegisteredParameter(pending.parameter_number)
+                    }
+                    MidiAutomationSourceKind::NonRegisteredParameter => {
+                        MidiAutomationSource::NonRegisteredParameter(pending.parameter_number)
+                    }
                     MidiAutomationSourceKind::PitchBend => MidiAutomationSource::PitchBend,
                     MidiAutomationSourceKind::ChannelPressure => {
                         MidiAutomationSource::ChannelPressure
@@ -41308,6 +41403,12 @@ impl DawUi {
                         pending.controller_number,
                         pending.controller_number + 32
                     ),
+                    MidiAutomationSourceKind::RegisteredParameter => {
+                        format!("RPN {}", pending.parameter_number)
+                    }
+                    MidiAutomationSourceKind::NonRegisteredParameter => {
+                        format!("NRPN {}", pending.parameter_number)
+                    }
                     MidiAutomationSourceKind::PitchBend => "Pitch Bend".to_owned(),
                     MidiAutomationSourceKind::ChannelPressure => {
                         "Channel Pressure".to_owned()

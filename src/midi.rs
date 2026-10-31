@@ -115,6 +115,86 @@ impl MidiControlChange14 {
     }
 }
 
+/// Selects the MIDI 1.0 parameter number space addressed by RPN or NRPN messages.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MidiParameterKind {
+    /// Registered Parameter Number selected by CC 101 and CC 100.
+    Registered,
+    /// Non-Registered Parameter Number selected by CC 99 and CC 98.
+    NonRegistered,
+}
+
+/// One 14-bit RPN or NRPN data update with its source channel, parameter number, and tick.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MidiParameterChange {
+    channel: u8,
+    parameter_number: u16,
+    value: u16,
+    tick: u64,
+}
+
+impl MidiParameterChange {
+    /// Zero-based MIDI channel in the range 0–15.
+    pub fn channel(self) -> u8 {
+        self.channel
+    }
+
+    /// Selected 14-bit RPN or NRPN number in the range 0–16383.
+    pub fn parameter_number(self) -> u16 {
+        self.parameter_number
+    }
+
+    /// Combined unsigned 14-bit data value in the range 0–16383.
+    pub fn value(self) -> u16 {
+        self.value
+    }
+
+    /// Absolute position in the source track's MIDI ticks.
+    pub fn tick(self) -> u64 {
+        self.tick
+    }
+}
+
+#[derive(Clone, Copy)]
+struct MidiParameterSelection {
+    rpn: [u8; 2],
+    nrpn: [u8; 2],
+    active: Option<MidiParameterKind>,
+}
+
+impl Default for MidiParameterSelection {
+    fn default() -> Self {
+        Self {
+            rpn: [127, 127],
+            nrpn: [127, 127],
+            active: None,
+        }
+    }
+}
+
+impl MidiParameterSelection {
+    fn select(&mut self, kind: MidiParameterKind, most_significant: bool, value: u8) {
+        let selection = match kind {
+            MidiParameterKind::Registered => &mut self.rpn,
+            MidiParameterKind::NonRegistered => &mut self.nrpn,
+        };
+        selection[if most_significant { 0 } else { 1 }] = value;
+        self.active = if selection == &[127, 127] {
+            None
+        } else {
+            Some(kind)
+        };
+    }
+
+    fn parameter_number(self) -> Option<u16> {
+        let selection = match self.active? {
+            MidiParameterKind::Registered => self.rpn,
+            MidiParameterKind::NonRegistered => self.nrpn,
+        };
+        Some(u16::from(selection[0]) * 128 + u16::from(selection[1]))
+    }
+}
+
 /// One MIDI Pitch Bend message with its source channel, 14-bit value, and tick.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MidiPitchBend {
@@ -181,6 +261,10 @@ pub enum MidiAutomationSource {
     ControlChange(u8),
     /// One paired 14-bit Control Change source, using CC `base` and CC `base + 32`.
     ControlChange14(u8),
+    /// One registered parameter selected by its 14-bit RPN number.
+    RegisteredParameter(u16),
+    /// One non-registered parameter selected by its 14-bit NRPN number.
+    NonRegisteredParameter(u16),
     /// MIDI Pitch Bend, mapped from its unsigned 14-bit value.
     PitchBend,
     /// MIDI Channel Pressure, mapped from its seven-bit value.
@@ -2472,6 +2556,107 @@ impl MidiTrack {
                 })
                 .collect(),
         )
+    }
+
+    /// Returns the selected parameter numbers that receive RPN or NRPN data updates.
+    /// The list follows first-use order in the track.
+    pub fn control_parameter_numbers(&self, kind: MidiParameterKind) -> Vec<u16> {
+        let mut numbers = Vec::new();
+        for change in self.control_parameter_changes(kind, None) {
+            if !numbers.contains(&change.parameter_number) {
+                numbers.push(change.parameter_number);
+            }
+        }
+        numbers
+    }
+
+    /// Returns 14-bit data updates for one RPN or NRPN parameter, or `None` when the
+    /// requested parameter number is outside 0–16383. CC 6 and 38 update the selected
+    /// parameter's MSB and LSB; CC 96 and 97 increment or decrement its current value.
+    /// Parameter bytes start at zero per MIDI channel and remain stored when another
+    /// parameter is selected. CC 121 clears the active selection but retains values.
+    pub fn control_parameter_values(
+        &self,
+        kind: MidiParameterKind,
+        parameter_number: u16,
+    ) -> Option<Vec<MidiParameterChange>> {
+        if parameter_number > 16_383 {
+            return None;
+        }
+        Some(self.control_parameter_changes(kind, Some(parameter_number)))
+    }
+
+    fn control_parameter_changes(
+        &self,
+        kind: MidiParameterKind,
+        parameter_number: Option<u16>,
+    ) -> Vec<MidiParameterChange> {
+        let mut selection = [MidiParameterSelection::default(); 16];
+        let mut values = [[0u8; 2]; 16];
+        let mut changes = Vec::new();
+
+        for event in &self.events {
+            let MidiEventKind::ChannelVoice { status, data } = &event.kind else {
+                continue;
+            };
+            if status & 0xF0 != 0xB0 || data.len() < 2 || data[0] > 127 || data[1] > 127 {
+                continue;
+            }
+
+            let channel = status & 0x0F;
+            let channel_index = usize::from(channel);
+            let controller = data[0];
+            let value = data[1];
+            match controller {
+                101 => selection[channel_index].select(MidiParameterKind::Registered, true, value),
+                100 => selection[channel_index].select(MidiParameterKind::Registered, false, value),
+                99 => {
+                    selection[channel_index].select(MidiParameterKind::NonRegistered, true, value)
+                }
+                98 => {
+                    selection[channel_index].select(MidiParameterKind::NonRegistered, false, value)
+                }
+                121 => selection[channel_index] = MidiParameterSelection::default(),
+                6 | 38 | 96 | 97 => {
+                    let state = selection[channel_index];
+                    let Some(selected_number) = state.parameter_number() else {
+                        continue;
+                    };
+                    if state.active != Some(kind)
+                        || parameter_number.is_some_and(|number| number != selected_number)
+                    {
+                        continue;
+                    }
+
+                    let data_value = &mut values[channel_index];
+                    match controller {
+                        6 => data_value[0] = value,
+                        38 => data_value[1] = value,
+                        96 | 97 => {
+                            let current = u16::from(data_value[0]) * 128 + u16::from(data_value[1]);
+                            let updated = if controller == 96 {
+                                current.saturating_add(1).min(16_383)
+                            } else {
+                                current.saturating_sub(1)
+                            };
+                            data_value[0] = (updated >> 7) as u8;
+                            data_value[1] = (updated & 0x7f) as u8;
+                        }
+                        _ => unreachable!(),
+                    }
+
+                    changes.push(MidiParameterChange {
+                        channel,
+                        parameter_number: selected_number,
+                        value: u16::from(data_value[0]) * 128 + u16::from(data_value[1]),
+                        tick: event.absolute_tick,
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        changes
     }
 
     /// Returns valid MIDI Pitch Bend messages in file order.

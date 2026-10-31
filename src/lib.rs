@@ -21151,13 +21151,17 @@ impl FlpDocument {
     }
 
     /// Replaces one type-5 Automation channel's points with a selected MIDI channel-voice source.
-    /// Seven-bit sources map 0–127 linearly to 0.0–1.0; Pitch Bend and paired 14-bit Control
-    /// Change map 0–16383. A paired CC source uses base CC 0–31 and its LSB at base + 32, with
-    /// each byte held until the next update and both values starting at zero. The channel's
-    /// saved Min/Max range remains available for parameter scaling. Source tempo timing is
-    /// converted to project beats. The blob header and trailing payload are retained; replaced
-    /// points receive zeroed opaque tail bytes. If the track has no matching messages, the
-    /// existing curve is left unchanged.
+    /// Seven-bit sources map 0–127 linearly to 0.0–1.0; Pitch Bend, paired 14-bit Control Change,
+    /// RPN, and NRPN values map 0–16383. A paired CC source uses a base CC from 0–31 and the CC
+    /// number 32 higher for its LSB; each byte is held until its next update and both start at
+    /// zero. RPN/NRPN selectors are tracked per channel. CC 6 and CC 38 update the selected
+    /// parameter, while CC 96 and CC 97 increment or decrement it. Parameter data bytes start at
+    /// zero per channel, and CC 121
+    /// clears selection while retaining the imported parameter value. The channel's saved Min/Max
+    /// range remains available for parameter scaling. Source tempo timing is converted to project
+    /// beats. The blob header and trailing payload are retained; replaced points receive zeroed
+    /// opaque tail bytes. If the track has no matching messages, the existing curve is left
+    /// unchanged.
     pub fn replace_automation_channel_points_from_midi_source(
         &mut self,
         midi: &midi::MidiFile,
@@ -21179,6 +21183,14 @@ impl FlpDocument {
             {
                 return Err(FlpError::UnsupportedEdit(
                     "14-bit MIDI Control Change base number must be from 0 through 31",
+                ));
+            }
+            midi::MidiAutomationSource::RegisteredParameter(parameter_number)
+            | midi::MidiAutomationSource::NonRegisteredParameter(parameter_number)
+                if parameter_number > 16_383 =>
+            {
+                return Err(FlpError::UnsupportedEdit(
+                    "MIDI RPN or NRPN number must be from 0 through 16383",
                 ));
             }
             midi::MidiAutomationSource::PolyphonicKeyPressure(key) if key > 127 => {
@@ -21249,6 +21261,30 @@ impl FlpDocument {
                 .collect::<Vec<_>>(),
             midi::MidiAutomationSource::ControlChange14(base_controller) => track
                 .control_changes_14(base_controller)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|event| {
+                    (
+                        event.channel(),
+                        event.tick(),
+                        f64::from(event.value()) / 16_383.0,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            midi::MidiAutomationSource::RegisteredParameter(parameter_number) => track
+                .control_parameter_values(midi::MidiParameterKind::Registered, parameter_number)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|event| {
+                    (
+                        event.channel(),
+                        event.tick(),
+                        f64::from(event.value()) / 16_383.0,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            midi::MidiAutomationSource::NonRegisteredParameter(parameter_number) => track
+                .control_parameter_values(midi::MidiParameterKind::NonRegistered, parameter_number)
                 .unwrap_or_default()
                 .into_iter()
                 .map(|event| {

@@ -4881,8 +4881,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "    Polyphonic Key Pressure imports the selected key; 7-bit values map linearly from 0–127 to 0.0–1.0.\n",
             "  flp-rebuild replace-automation-from-midi-cc <input.flp> <input.mid> <output.flp> <track-index> <automation-channel-id> <cc-0..127> <midi-channel-1..16|all>\n",
             "    Replaces the selected Automation channel's curve points; its saved Min/Max range is retained.\n",
-            "  flp-rebuild replace-automation-from-midi-source <input.flp> <input.mid> <output.flp> <track-index> <automation-channel-id> <cc:N|cc14:N|pitch-bend|channel-pressure|poly-pressure:KEY> <midi-channel-1..16|all>\n",
-            "    Replaces the curve from one selected MIDI channel-voice source; cc14 uses CC N and N+32, while poly-pressure requires a note key.\n",
+            "  flp-rebuild replace-automation-from-midi-source <input.flp> <input.mid> <output.flp> <track-index> <automation-channel-id> <cc:N|cc14:N|rpn:N|nrpn:N|pitch-bend|channel-pressure|poly-pressure:KEY> <midi-channel-1..16|all>\n",
+            "    Replaces the curve from one selected MIDI channel-voice source; cc14 uses CC N and N+32, rpn/nrpn use a 14-bit parameter number, and poly-pressure requires a note key.\n",
             "  flp-rebuild import-midi-all <input.flp> <input.mid> <output.flp> <pattern-id|new> <channel-ids-comma-separated> [zero-velocity-note-ons:0|1] [realign-events:0|1] [midi-channels:all|none|1,2,...,16]\n",
             "  flp-rebuild import-midi-named-patterns <input.flp> <input.mid> <output.flp> <channel-id> [zero-velocity-note-ons:0|1] [realign-events:0|1] [midi-channels:all|none|1,2,...,16]\n",
             "  flp-rebuild import-midi-selected <input.flp> <input.mid> <output.flp> <pattern-id|new> <track-numbers:all|1,2,...> <selected-track-channel-ids-comma-separated> [zero-velocity-note-ons:0|1 realign-events:0|1 midi-channels:all|none|1,2,...,16]\n",
@@ -5283,6 +5283,22 @@ fn parse_midi_automation_source(value: &str) -> Result<MidiAutomationSource, Str
             }
             Ok(MidiAutomationSource::ControlChange14(controller))
         }
+        ["rpn", parameter_number] => {
+            let parameter_number = parse_u16(parameter_number, "MIDI RPN number")?;
+            if parameter_number > 16_383 {
+                return Err("MIDI RPN number must be from 0 through 16383".to_owned());
+            }
+            Ok(MidiAutomationSource::RegisteredParameter(parameter_number))
+        }
+        ["nrpn", parameter_number] => {
+            let parameter_number = parse_u16(parameter_number, "MIDI NRPN number")?;
+            if parameter_number > 16_383 {
+                return Err("MIDI NRPN number must be from 0 through 16383".to_owned());
+            }
+            Ok(MidiAutomationSource::NonRegisteredParameter(
+                parameter_number,
+            ))
+        }
         ["pitch-bend"] => Ok(MidiAutomationSource::PitchBend),
         ["channel-pressure"] => Ok(MidiAutomationSource::ChannelPressure),
         ["poly-pressure", key] => {
@@ -5293,7 +5309,7 @@ fn parse_midi_automation_source(value: &str) -> Result<MidiAutomationSource, Str
             Ok(MidiAutomationSource::PolyphonicKeyPressure(key))
         }
         _ => Err(
-            "MIDI Automation source must be cc:<0..127>, cc14:<0..31>, pitch-bend, channel-pressure, or poly-pressure:<0..127>"
+            "MIDI Automation source must be cc:<0..127>, cc14:<0..31>, rpn:<0..16383>, nrpn:<0..16383>, pitch-bend, channel-pressure, or poly-pressure:<0..127>"
                 .to_owned(),
         ),
     }
