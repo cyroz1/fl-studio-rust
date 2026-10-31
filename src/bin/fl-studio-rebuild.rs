@@ -4404,6 +4404,8 @@ struct PendingMidiCcImport {
     pitch_bend: bool,
     channel_pressure: bool,
     polyphonic_pressure: bool,
+    parameter_kind: Option<MidiParameterKind>,
+    parameter_number: u16,
     pressure_key: u8,
     selected_track: usize,
     controller_number: u8,
@@ -4428,6 +4430,8 @@ struct MidiCcImportOpenRequests {
     open_channel_pressure_new_stream_requested: bool,
     open_poly_pressure_existing_requested: bool,
     open_poly_pressure_new_stream_requested: bool,
+    open_parameter_existing_requested: bool,
+    open_parameter_new_stream_requested: bool,
     open_batch_requested: bool,
     open_batch_existing_requested: bool,
     open_cc14_batch_requested: bool,
@@ -4440,6 +4444,8 @@ struct MidiCcImportAction {
     pitch_bend: bool,
     channel_pressure: bool,
     polyphonic_pressure: bool,
+    parameter_kind: Option<MidiParameterKind>,
+    parameter_number: u16,
     pressure_key: u8,
     track_index: usize,
     pattern_id: u16,
@@ -56492,6 +56498,8 @@ impl DawUi {
         let mut open_midi_channel_pressure_new_stream_requested = false;
         let mut open_midi_poly_pressure_import_requested = false;
         let mut open_midi_poly_pressure_new_stream_requested = false;
+        let mut open_midi_parameter_import_requested = false;
+        let mut open_midi_parameter_new_stream_requested = false;
         let mut open_midi_cc_batch_requested = false;
         let mut open_midi_cc_batch_existing_requested = false;
         let mut open_midi_cc14_batch_requested = false;
@@ -56592,6 +56600,18 @@ impl DawUi {
             }
             if ui.button("Import MIDI 14-bit CC to new stream…").clicked() {
                 open_midi_cc14_new_stream_requested = true;
+            }
+            if ui
+                .add_enabled(
+                    self.piano_roll_controller_stream.is_some(),
+                    egui::Button::new("Import MIDI RPN/NRPN…"),
+                )
+                .clicked()
+            {
+                open_midi_parameter_import_requested = true;
+            }
+            if ui.button("Import MIDI RPN/NRPN to new stream…").clicked() {
+                open_midi_parameter_new_stream_requested = true;
             }
             if ui
                 .add_enabled(
@@ -56849,6 +56869,8 @@ impl DawUi {
                 open_poly_pressure_existing_requested: open_midi_poly_pressure_import_requested,
                 open_poly_pressure_new_stream_requested:
                     open_midi_poly_pressure_new_stream_requested,
+                open_parameter_existing_requested: open_midi_parameter_import_requested,
+                open_parameter_new_stream_requested: open_midi_parameter_new_stream_requested,
                 open_batch_requested: open_midi_cc_batch_requested,
                 open_batch_existing_requested: open_midi_cc_batch_existing_requested,
                 open_cc14_batch_requested: open_midi_cc14_batch_requested,
@@ -57504,6 +57526,8 @@ impl DawUi {
             open_channel_pressure_new_stream_requested,
             open_poly_pressure_existing_requested,
             open_poly_pressure_new_stream_requested,
+            open_parameter_existing_requested,
+            open_parameter_new_stream_requested,
             open_batch_requested,
             open_batch_existing_requested,
             open_cc14_batch_requested,
@@ -57519,6 +57543,8 @@ impl DawUi {
             || open_channel_pressure_new_stream_requested
             || open_poly_pressure_existing_requested
             || open_poly_pressure_new_stream_requested
+            || open_parameter_existing_requested
+            || open_parameter_new_stream_requested
             || open_batch_requested
             || open_batch_existing_requested
             || open_cc14_batch_requested
@@ -57532,6 +57558,7 @@ impl DawUi {
                 || open_pitch_bend_new_stream_requested
                 || open_channel_pressure_new_stream_requested
                 || open_poly_pressure_new_stream_requested
+                || open_parameter_new_stream_requested
             {
                 Some((
                     self.piano_roll_controller_new_channel,
@@ -57560,6 +57587,10 @@ impl DawUi {
                         || open_poly_pressure_new_stream_requested
                     {
                         "Import MIDI Polyphonic Key Pressure automation"
+                    } else if open_parameter_existing_requested
+                        || open_parameter_new_stream_requested
+                    {
+                        "Import MIDI RPN/NRPN automation"
                     } else {
                         "Import MIDI controller automation"
                     },
@@ -57608,6 +57639,17 @@ impl DawUi {
                             .first()
                             .map(|pressure| pressure.key())
                             .unwrap_or(60);
+                        let parameter_kind = (open_parameter_existing_requested
+                            || open_parameter_new_stream_requested)
+                            .then_some(MidiParameterKind::Registered);
+                        let parameter_number = parameter_kind
+                            .and_then(|kind| {
+                                midi.tracks()[0]
+                                    .control_parameter_numbers(kind)
+                                    .first()
+                                    .copied()
+                            })
+                            .unwrap_or_default();
                         self.pending_midi_cc_import = Some(PendingMidiCcImport {
                             path: path.clone(),
                             midi,
@@ -57618,6 +57660,8 @@ impl DawUi {
                                 || open_channel_pressure_new_stream_requested,
                             polyphonic_pressure: open_poly_pressure_existing_requested
                                 || open_poly_pressure_new_stream_requested,
+                            parameter_kind,
+                            parameter_number,
                             pressure_key,
                             selected_track: 0,
                             controller_number,
@@ -57629,6 +57673,7 @@ impl DawUi {
                                 || open_pitch_bend_new_stream_requested
                                 || open_channel_pressure_new_stream_requested
                                 || open_poly_pressure_new_stream_requested
+                                || open_parameter_new_stream_requested
                                 || open_batch_requested
                                 || open_cc14_batch_requested,
                             batch_new_streams: open_batch_requested || open_cc14_batch_requested,
@@ -57653,6 +57698,10 @@ impl DawUi {
                                 || open_poly_pressure_new_stream_requested
                             {
                                 "Polyphonic Key Pressure"
+                            } else if open_parameter_existing_requested
+                                || open_parameter_new_stream_requested
+                            {
+                                "RPN/NRPN"
                             } else {
                                 "controller"
                             },
@@ -57677,6 +57726,8 @@ impl DawUi {
                 ui.horizontal(|ui| {
                     ui.strong(if pending.pitch_bend {
                         "Import MIDI Pitch Bend automation"
+                    } else if pending.parameter_kind.is_some() {
+                        "Import MIDI RPN/NRPN automation"
                     } else if pending.control_change_14 {
                         "Import MIDI 14-bit Control Change automation"
                     } else if pending.channel_pressure {
@@ -57778,6 +57829,7 @@ impl DawUi {
                             && !pending.pitch_bend
                             && !pending.channel_pressure
                             && !pending.polyphonic_pressure
+                            && pending.parameter_kind.is_none()
                     })
                     .collect::<BTreeSet<_>>();
                 let controller_14_bases = changes
@@ -57788,6 +57840,22 @@ impl DawUi {
                         _ => None,
                     })
                     .collect::<BTreeSet<_>>();
+                let registered_parameter_numbers = pending
+                    .midi
+                    .tracks()
+                    .get(pending.selected_track)
+                    .map(|track| {
+                        track.control_parameter_numbers(MidiParameterKind::Registered)
+                    })
+                    .unwrap_or_default();
+                let non_registered_parameter_numbers = pending
+                    .midi
+                    .tracks()
+                    .get(pending.selected_track)
+                    .map(|track| {
+                        track.control_parameter_numbers(MidiParameterKind::NonRegistered)
+                    })
+                    .unwrap_or_default();
                 let batch_controller_numbers = if pending.control_change_14 {
                     &controller_14_bases
                 } else {
@@ -57980,6 +58048,53 @@ impl DawUi {
                             );
                         }
                     });
+                } else if let Some(mut parameter_kind) = pending.parameter_kind {
+                    egui::ComboBox::from_id_salt(("piano-roll-midi-parameter-kind", pending.pattern_id))
+                        .selected_text(match parameter_kind {
+                            MidiParameterKind::Registered => "RPN",
+                            MidiParameterKind::NonRegistered => "NRPN",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut parameter_kind,
+                                MidiParameterKind::Registered,
+                                "RPN",
+                            );
+                            ui.selectable_value(
+                                &mut parameter_kind,
+                                MidiParameterKind::NonRegistered,
+                                "NRPN",
+                            );
+                        });
+                    pending.parameter_kind = Some(parameter_kind);
+                    let parameter_numbers = match parameter_kind {
+                        MidiParameterKind::Registered => &registered_parameter_numbers,
+                        MidiParameterKind::NonRegistered => &non_registered_parameter_numbers,
+                    };
+                    if let Some(first_parameter) = parameter_numbers.first().copied()
+                        && !parameter_numbers.contains(&pending.parameter_number)
+                    {
+                        pending.parameter_number = first_parameter;
+                    }
+                    let prefix = match parameter_kind {
+                        MidiParameterKind::Registered => "RPN",
+                        MidiParameterKind::NonRegistered => "NRPN",
+                    };
+                    egui::ComboBox::from_id_salt(("piano-roll-midi-parameter-number", pending.pattern_id))
+                        .selected_text(if parameter_numbers.is_empty() {
+                            format!("No {prefix} data events")
+                        } else {
+                            format!("{prefix} {}", pending.parameter_number)
+                        })
+                        .show_ui(ui, |ui| {
+                            for parameter in parameter_numbers {
+                                ui.selectable_value(
+                                    &mut pending.parameter_number,
+                                    *parameter,
+                                    format!("{prefix} {parameter}"),
+                                );
+                            }
+                        });
                 } else if pending.control_change_14 {
                     if let Some(first_controller) = controller_14_bases.first().copied()
                         && !controller_14_bases.contains(&pending.controller_number)
@@ -58056,6 +58171,20 @@ impl DawUi {
                         .filter(|pressure| pressure.key() == pending.pressure_key)
                         .map(|pressure| pressure.channel())
                         .collect::<BTreeSet<_>>()
+                } else if let Some(kind) = pending.parameter_kind {
+                    pending
+                        .midi
+                        .tracks()
+                        .get(pending.selected_track)
+                        .map(|track| {
+                            track
+                                .control_parameter_values(kind, pending.parameter_number)
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|change| change.channel())
+                                .collect::<BTreeSet<_>>()
+                        })
+                        .unwrap_or_default()
                 } else if pending.control_change_14 {
                     changes
                         .iter()
@@ -58123,6 +58252,8 @@ impl DawUi {
                     "Channel Pressure values map linearly from 0–127 to 0.0–1.0. Source timing is preserved."
                 } else if pending.polyphonic_pressure {
                     "Imports the selected key only. Values map from 0–127 to 0.0–1.0; source timing is preserved."
+                } else if pending.parameter_kind.is_some() {
+                    "Data Entry and Increment/Decrement messages update the selected parameter. Values map from 0–16383 to 0.0–1.0."
                 } else if pending.batch_new_streams {
                     "Raw stream bytes are uninterpreted; identifiers default to unused pairs and remain editable."
                 } else if pending.batch_existing_streams {
@@ -58155,6 +58286,16 @@ impl DawUi {
                         polyphonic_pressures
                             .iter()
                             .any(|pressure| pressure.key() == pending.pressure_key)
+                    } else if let Some(kind) = pending.parameter_kind {
+                        pending
+                            .midi
+                            .tracks()
+                            .get(pending.selected_track)
+                            .is_some_and(|track| {
+                                track
+                                    .control_parameter_values(kind, pending.parameter_number)
+                                    .is_some_and(|changes| !changes.is_empty())
+                            })
                     } else {
                         !controller_numbers.is_empty()
                     };
@@ -58196,6 +58337,10 @@ impl DawUi {
                     "Import Key Pressure and create stream"
                 } else if pending.polyphonic_pressure {
                     "Import Key Pressure"
+                } else if pending.parameter_kind.is_some() && pending.new_stream {
+                    "Import RPN/NRPN and create stream"
+                } else if pending.parameter_kind.is_some() {
+                    "Import RPN/NRPN"
                 } else if pending.new_stream {
                     "Import CC and create stream"
                 } else {
@@ -58224,6 +58369,8 @@ impl DawUi {
                         pitch_bend: pending.pitch_bend,
                         channel_pressure: pending.channel_pressure,
                         polyphonic_pressure: pending.polyphonic_pressure,
+                        parameter_kind: pending.parameter_kind,
+                        parameter_number: pending.parameter_number,
                         pressure_key: pending.pressure_key,
                         track_index: pending.selected_track,
                         pattern_id: pending.pattern_id,
@@ -58254,6 +58401,8 @@ impl DawUi {
             pitch_bend,
             channel_pressure,
             polyphonic_pressure,
+            parameter_kind,
+            parameter_number,
             pressure_key,
             track_index,
             pattern_id: target_pattern,
@@ -58304,6 +58453,29 @@ impl DawUi {
                             )
                         };
                         result.map_err(|error| error.to_string())
+                    } else if let Some(kind) = parameter_kind {
+                        let result = if new_stream {
+                            document.import_midi_control_parameter_to_new_stream(
+                                &midi,
+                                track_index,
+                                target_pattern,
+                                target_stream,
+                                (kind, parameter_number),
+                                channel,
+                            )
+                        } else {
+                            document.import_midi_control_parameter(
+                                &midi,
+                                track_index,
+                                target_pattern,
+                                target_stream,
+                                (kind, parameter_number),
+                                channel,
+                            )
+                        };
+                        result
+                            .map(|imported| vec![(cc, imported)])
+                            .map_err(|error| error.to_string())
                     } else if control_change_14 {
                         let result = if new_stream {
                             document.import_midi_14bit_control_changes_to_new_stream(
@@ -58475,6 +58647,10 @@ impl DawUi {
                         format!(
                             "No matching MIDI Polyphonic Key Pressure events for key {pressure_key} were found in Pattern {target_pattern}; no raw stream was created"
                         )
+                    } else if parameter_kind.is_some() && new_stream && imported == 0 {
+                        format!(
+                            "No matching MIDI RPN/NRPN {parameter_number} data events were found in Pattern {target_pattern}; no raw stream was created"
+                        )
                     } else if new_stream && imported == 0 {
                         format!(
                             "No matching MIDI CC events were found in Pattern {target_pattern}; no raw stream was created"
@@ -58500,6 +58676,19 @@ impl DawUi {
                     } else if polyphonic_pressure {
                         format!(
                             "Imported {imported} MIDI Polyphonic Key Pressure events for key {pressure_key} into Pattern {target_pattern}{}",
+                            if new_stream {
+                                " and created a raw stream"
+                            } else {
+                                ""
+                            }
+                        )
+                    } else if let Some(kind) = parameter_kind {
+                        format!(
+                            "Imported {imported} MIDI {} {parameter_number} data updates into Pattern {target_pattern}{}",
+                            match kind {
+                                MidiParameterKind::Registered => "RPN",
+                                MidiParameterKind::NonRegistered => "NRPN",
+                            },
                             if new_stream {
                                 " and created a raw stream"
                             } else {
@@ -58551,6 +58740,8 @@ impl DawUi {
                             "Channel Pressure"
                         } else if polyphonic_pressure {
                             "Polyphonic Key Pressure"
+                        } else if parameter_kind.is_some() {
+                            "RPN/NRPN"
                         } else {
                             "controller"
                         }

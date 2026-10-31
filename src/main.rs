@@ -7,6 +7,7 @@ use std::process::ExitCode;
 use flp_rebuild::media::{SamplePathResolver, decode_audio_file};
 use flp_rebuild::midi::{
     MidiAutomationSource, MidiChannelMapping, MidiExportFileFormat, MidiFile, MidiImportOptions,
+    MidiParameterKind,
 };
 use flp_rebuild::plugin_settings::load_vst3_manual_latency_offsets;
 use flp_rebuild::plugins::scan_installed_plugins;
@@ -43,6 +44,19 @@ struct MidiControlChangeImport<'a> {
     target_stream: (u8, u8),
     controller_number: u8,
     high_resolution: bool,
+    midi_channel: Option<u8>,
+    new_stream: bool,
+}
+
+struct MidiControlParameterImport<'a> {
+    input: &'a Path,
+    midi_path: &'a Path,
+    output: &'a Path,
+    track_index: usize,
+    pattern_id: u16,
+    target_stream: (u8, u8),
+    kind: MidiParameterKind,
+    parameter_number: u16,
     midi_channel: Option<u8>,
     new_stream: bool,
 }
@@ -3972,6 +3986,34 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 },
             )
         }
+        [command, input, midi_path, output, track, pattern_id, stream_channel, stream_flags, parameter_number, midi_channel]
+            if command == "import-midi-rpn"
+                || command == "import-midi-rpn-new-stream"
+                || command == "import-midi-nrpn"
+                || command == "import-midi-nrpn-new-stream" =>
+        {
+            import_midi_control_parameter(
+                MidiControlParameterImport {
+                    input: Path::new(input),
+                    midi_path: Path::new(midi_path),
+                    output: Path::new(output),
+                    track_index: parse_usize(track, "MIDI track index")?,
+                    pattern_id: parse_u16(pattern_id, "pattern id")?,
+                    target_stream: (
+                        parse_raw_byte(stream_channel, "raw controller channel")?,
+                        parse_raw_byte(stream_flags, "raw controller flags")?,
+                    ),
+                    kind: if command.contains("nrpn") {
+                        MidiParameterKind::NonRegistered
+                    } else {
+                        MidiParameterKind::Registered
+                    },
+                    parameter_number: parse_u16(parameter_number, "MIDI parameter number")?,
+                    midi_channel: parse_midi_channel_filter(midi_channel)?,
+                    new_stream: command.ends_with("new-stream"),
+                },
+            )
+        }
         [command, input, midi_path, output, track, pattern_id, mappings, midi_channel]
             if command == "import-midi-cc-streams"
                 || command == "import-midi-cc-into-streams"
@@ -4863,6 +4905,11 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild import-midi-cc14 <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <raw-channel> <raw-flags> <base-cc-0..31> <midi-channel-1..16|all>\n",
             "  flp-rebuild import-midi-cc14-new-stream <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <raw-channel> <raw-flags> <base-cc-0..31> <midi-channel-1..16|all>\n",
             "    CC14 combines base CC N with CC N+32, retaining each byte per MIDI channel; values map from 0–16383 to 0.0–1.0.\n",
+            "  flp-rebuild import-midi-rpn <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <raw-channel> <raw-flags> <rpn-0..16383> <midi-channel-1..16|all>\n",
+            "  flp-rebuild import-midi-rpn-new-stream <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <raw-channel> <raw-flags> <rpn-0..16383> <midi-channel-1..16|all>\n",
+            "  flp-rebuild import-midi-nrpn <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <raw-channel> <raw-flags> <nrpn-0..16383> <midi-channel-1..16|all>\n",
+            "  flp-rebuild import-midi-nrpn-new-stream <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <raw-channel> <raw-flags> <nrpn-0..16383> <midi-channel-1..16|all>\n",
+            "    RPN/NRPN data combines CC 6/38 and applies CC 96/97 increments; values map from 0–16383 to 0.0–1.0.\n",
             "  flp-rebuild import-midi-cc-streams <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <cc:raw-channel:raw-flags,...> <midi-channel-1..16|all>\n",
             "    Each mapping creates one raw Pattern stream; raw bytes are explicit, and CCs with no messages are skipped.\n",
             "  flp-rebuild import-midi-cc-into-streams <input.flp> <input.mid> <output.flp> <track-index> <pattern-id> <cc:raw-channel:raw-flags,...> <midi-channel-1..16|all>\n",
@@ -11448,6 +11495,71 @@ fn import_midi_control_changes(request: MidiControlChangeImport<'_>) -> Result<(
     };
     println!(
         "imported {imported} MIDI {controller_source} events from track {track_index} ({source_channel}) into pattern {pattern_id}, {stream_kind} {} / 0x{:02X} in {}",
+        target_stream.0,
+        target_stream.1,
+        output.display()
+    );
+    Ok(())
+}
+
+fn import_midi_control_parameter(request: MidiControlParameterImport<'_>) -> Result<(), String> {
+    let MidiControlParameterImport {
+        input,
+        midi_path,
+        output,
+        track_index,
+        pattern_id,
+        target_stream,
+        kind,
+        parameter_number,
+        midi_channel,
+        new_stream,
+    } = request;
+    let (_, mut document) = load_document(input)?;
+    let midi_bytes = fs::read(midi_path)
+        .map_err(|error| format!("could not read {}: {error}", midi_path.display()))?;
+    let midi = MidiFile::parse(&midi_bytes)
+        .map_err(|error| format!("could not parse {}: {error}", midi_path.display()))?;
+    let imported = if new_stream {
+        document.import_midi_control_parameter_to_new_stream(
+            &midi,
+            track_index,
+            pattern_id,
+            target_stream,
+            (kind, parameter_number),
+            midi_channel,
+        )
+    } else {
+        document.import_midi_control_parameter(
+            &midi,
+            track_index,
+            pattern_id,
+            target_stream,
+            (kind, parameter_number),
+            midi_channel,
+        )
+    }
+    .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    let source_channel = midi_channel.map_or_else(
+        || "all channels".to_owned(),
+        |channel| format!("MIDI channel {}", channel + 1),
+    );
+    let source_name = match kind {
+        MidiParameterKind::Registered => "RPN",
+        MidiParameterKind::NonRegistered => "NRPN",
+    };
+    let stream_kind = if new_stream {
+        "new raw stream"
+    } else {
+        "raw stream"
+    };
+    println!(
+        "imported {imported} MIDI {source_name} {parameter_number} events from track {track_index} ({source_channel}) into pattern {pattern_id}, {stream_kind} {} / 0x{:02X} in {}",
         target_stream.0,
         target_stream.1,
         output.display()

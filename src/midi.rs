@@ -2561,9 +2561,10 @@ impl MidiTrack {
     /// Returns the selected parameter numbers that receive RPN or NRPN data updates.
     /// The list follows first-use order in the track.
     pub fn control_parameter_numbers(&self, kind: MidiParameterKind) -> Vec<u16> {
+        let mut seen = BTreeSet::new();
         let mut numbers = Vec::new();
         for change in self.control_parameter_changes(kind, None) {
-            if !numbers.contains(&change.parameter_number) {
+            if seen.insert(change.parameter_number) {
                 numbers.push(change.parameter_number);
             }
         }
