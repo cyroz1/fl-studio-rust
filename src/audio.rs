@@ -5331,7 +5331,7 @@ impl AudioEngine {
         self.error.count.load(Ordering::Relaxed)
     }
 
-    /// Number of device buffer underruns or overruns reported by CPAL.
+    /// Number of device buffer underruns or discontinuities reported by audio backends.
     pub fn reported_device_xrun_count(&self) -> u64 {
         self.error.xrun_count.load(Ordering::Relaxed)
     }
@@ -6836,6 +6836,21 @@ fn wasapi_render_block_latency(
 }
 
 #[cfg(windows)]
+fn wasapi_clock_position_frames(
+    device_position: u64,
+    clock_frequency: u64,
+    sample_rate: u32,
+) -> Option<u64> {
+    if clock_frequency == 0 || sample_rate == 0 {
+        return None;
+    }
+    let frames = u128::from(device_position)
+        .checked_mul(u128::from(sample_rate))?
+        .checked_div(u128::from(clock_frequency))?;
+    u64::try_from(frames).ok()
+}
+
+#[cfg(windows)]
 struct WasapiWorkerState {
     source: Arc<AtomicU8>,
     playback: Arc<PlaybackState>,
@@ -7528,6 +7543,9 @@ fn wasapi_exclusive_output_worker(
         let buffer_frames = client
             .get_buffer_size()
             .map_err(|error| error.to_string())? as usize;
+        let buffer_duration =
+            Duration::from_secs_f64(buffer_frames as f64 / f64::from(format_spec.sample_rate));
+        let delayed_event_threshold = buffer_duration.saturating_mul(2);
         let initial_frames = client
             .get_available_space_in_frames()
             .map_err(|error| error.to_string())? as usize;
@@ -7563,9 +7581,40 @@ fn wasapi_exclusive_output_worker(
             .map_err(|error| format_exclusive_error("output", error.to_string()))?;
         started = true;
         let _ = ready.send(Ok(()));
+        let mut last_render_event = std::time::Instant::now();
 
         while !stop.load(Ordering::Acquire) {
-            match event.wait_for_event(100) {
+            let event_result = event.wait_for_event(100);
+            if stop.load(Ordering::Acquire) {
+                break;
+            }
+            let event_time = std::time::Instant::now();
+            let event_gap = event_time.saturating_duration_since(last_render_event);
+            if event_gap >= delayed_event_threshold {
+                set_xrun_error(
+                    &error,
+                    format!(
+                        "WASAPI exclusive output underrun: render event gap was {:.1} ms for a {:.1} ms buffer; the available buffer is being refilled",
+                        event_gap.as_secs_f64() * 1_000.0,
+                        buffer_duration.as_secs_f64() * 1_000.0,
+                    ),
+                );
+                if let (Some(clock), Some(clock_frequency)) =
+                    (output_clock.as_ref(), output_clock_frequency)
+                    && let Ok((device_position, _)) = clock.get_position()
+                    && let Some(device_frames) = wasapi_clock_position_frames(
+                        device_position,
+                        clock_frequency,
+                        format_spec.sample_rate,
+                    )
+                {
+                    submitted_frames = submitted_frames.max(device_frames);
+                }
+                last_render_event = event_time;
+            } else if event_result.is_ok() {
+                last_render_event = event_time;
+            }
+            match event_result {
                 Ok(()) => {
                     let callback_time_100ns = query_performance_time_100ns(qpc_frequency);
                     let frames = client
@@ -7706,6 +7755,7 @@ fn wasapi_exclusive_input_worker(
         let qpc_frequency = query_performance_frequency();
         started = true;
         let _ = ready.send(Ok(()));
+        let mut capture_packet_seen = false;
 
         while !stop.load(Ordering::Acquire) {
             match event.wait_for_event(100) {
@@ -7714,6 +7764,16 @@ fn wasapi_exclusive_input_worker(
                     let (frames, buffer_info) = capture
                         .read_from_device(&mut bytes)
                         .map_err(|error| error.to_string())?;
+                    if frames > 0 {
+                        if buffer_info.flags.data_discontinuity && capture_packet_seen {
+                            set_xrun_error(
+                                &error,
+                                "WASAPI exclusive input reported a capture data discontinuity"
+                                    .to_owned(),
+                            );
+                        }
+                        capture_packet_seen = true;
+                    }
                     if frames > 0
                         && !buffer_info.flags.timestamp_error
                         && let Some(latency_100ns) = capture_event_time
@@ -7741,12 +7801,17 @@ fn wasapi_exclusive_input_worker(
                         input_channel_pair.load(Ordering::Acquire),
                     )
                     .unwrap_or((fallback_left_channel, fallback_right_channel));
+                    let silent_packet = buffer_info.flags.silent;
                     for frame in bytes[..active_bytes].chunks_exact(format_spec.frame_bytes) {
                         let mut stereo = [0.0_f32; 2];
                         for (channel, sample_bytes) in
                             frame.chunks_exact(format_spec.sample_bytes).enumerate()
                         {
-                            let sample = format_spec.decode(sample_bytes)?;
+                            let sample = if silent_packet {
+                                0.0
+                            } else {
+                                format_spec.decode(sample_bytes)?
+                            };
                             if channel == left_channel {
                                 stereo[0] = sample;
                             }
