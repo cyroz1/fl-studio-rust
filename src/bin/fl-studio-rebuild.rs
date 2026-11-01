@@ -63586,6 +63586,7 @@ impl DawUi {
                         if let Some((insert_ordinal, slot_index)) =
                             mixer_effect_enabled_locations.get(&(event_index, record_index))
                         {
+                            mixer_refresh_flags |= SCRIPT_HW_DIRTY_CONTROL_VALUES;
                             applied_live_mixer_effect_enabled.push((
                                 *insert_ordinal,
                                 *slot_index,
@@ -63971,8 +63972,10 @@ impl DawUi {
             match document.move_mixer_effect_slot(insert_ordinal, from_slot, to_slot) {
                 Ok(()) => {
                     dirty_mixer_tracks.insert(i32::try_from(insert_ordinal).unwrap_or(-1));
-                    mixer_refresh_flags |=
-                        SCRIPT_HW_DIRTY_MIXER_DISPLAY | SCRIPT_HW_DIRTY_MIXER_CONTROLS;
+                    mixer_refresh_flags |= SCRIPT_HW_DIRTY_MIXER_DISPLAY
+                        | SCRIPT_HW_DIRTY_MIXER_CONTROLS
+                        | SCRIPT_HW_DIRTY_CONTROL_VALUES
+                        | SCRIPT_HW_DIRTY_NAMES;
                     remap_mixer_effect_instances_after_move(
                         &mut self.mixer_effect_vst3_instances,
                         insert_ordinal,
