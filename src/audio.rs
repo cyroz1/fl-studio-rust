@@ -6673,6 +6673,11 @@ fn set_error(error: &AudioErrorState, message: String) {
     error.report(message, false);
 }
 
+#[cfg(windows)]
+fn set_xrun_error(error: &AudioErrorState, message: String) {
+    error.report(message, true);
+}
+
 fn set_cpal_stream_error(error: &AudioErrorState, stream_error: cpal::Error) {
     let is_xrun = stream_error.kind() == cpal::ErrorKind::Xrun;
     error.report(stream_error.to_string(), is_xrun);
@@ -7225,6 +7230,8 @@ fn directsound_shared_input_worker(
             .buffer_frames
             .max(settings.sample_rate / 10)
             .max(256);
+        let buffer_duration =
+            Duration::from_secs_f64(f64::from(buffer_frames) / f64::from(settings.sample_rate));
         let buffer_bytes = buffer_frames
             .checked_mul(u32::from(block_align))
             .ok_or_else(|| "DirectSound capture buffer size overflowed".to_owned())?;
@@ -7260,6 +7267,7 @@ fn directsound_shared_input_worker(
         }
         let mut next_read_offset =
             (read_cursor as usize % buffer_byte_count) / frame_bytes * frame_bytes;
+        let mut last_capture_poll = std::time::Instant::now();
         ready_sent = ready.send(Ok(())).is_ok();
 
         while !stop.load(Ordering::Acquire) {
@@ -7274,6 +7282,23 @@ fn directsound_shared_input_worker(
                 (capture_cursor as usize % buffer_byte_count) / frame_bytes * frame_bytes;
             let read_cursor =
                 (read_cursor as usize % buffer_byte_count) / frame_bytes * frame_bytes;
+            let poll_completed_at = std::time::Instant::now();
+            let poll_gap = poll_completed_at.saturating_duration_since(last_capture_poll);
+            last_capture_poll = poll_completed_at;
+            if poll_gap >= buffer_duration {
+                set_xrun_error(
+                    &error,
+                    format!(
+                        "DirectSound capture overrun: worker was not scheduled for {:.1} ms, longer than the {:.1} ms capture buffer; buffered input was dropped",
+                        poll_gap.as_secs_f64() * 1_000.0,
+                        buffer_duration.as_secs_f64() * 1_000.0,
+                    ),
+                );
+                input_callback_frames.store(0, Ordering::Release);
+                peak.store(0.0_f32.to_bits(), Ordering::Release);
+                next_read_offset = read_cursor;
+                continue;
+            }
             let readable_bytes =
                 directsound_circular_distance(next_read_offset, read_cursor, buffer_byte_count);
             let readable_bytes = readable_bytes / frame_bytes * frame_bytes;
