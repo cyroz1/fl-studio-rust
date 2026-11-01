@@ -13221,7 +13221,8 @@ impl DawUi {
                 | SCRIPT_HW_DIRTY_MIXER_DISPLAY
                 | SCRIPT_HW_DIRTY_COLORS
                 | SCRIPT_HW_DIRTY_NAMES
-                | SCRIPT_HW_DIRTY_CHANNEL_RACK_GROUP,
+                | SCRIPT_HW_DIRTY_CHANNEL_RACK_GROUP
+                | SCRIPT_HW_CHANNEL_EVENT,
         ) {
             self.status
                 .push_str(" · MIDI script Mixer refresh callback queue is full");
@@ -40624,20 +40625,41 @@ impl DawUi {
                 None => {}
             }
         }
+        let mut channel_rack_order_changed = false;
         for (channel_id, target_index) in channel_order_edits {
+            let previous_order = self.document.as_ref().map(|document| {
+                document
+                    .channels()
+                    .iter()
+                    .map(ChannelSummary::id)
+                    .collect::<Vec<_>>()
+            });
             let result = self
                 .document
                 .as_mut()
                 .map(|document| document.move_channel(channel_id, target_index));
             match result {
                 Some(Ok(())) => {
-                    self.stop_project_playback();
-                    self.dirty = true;
-                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
-                    self.status = format!(
-                        "Moved channel {channel_id} to position {}",
-                        target_index + 1
-                    );
+                    let changed = self.document.as_ref().is_some_and(|document| {
+                        previous_order.as_ref().is_some_and(|previous| {
+                            previous
+                                != &document
+                                    .channels()
+                                    .iter()
+                                    .map(ChannelSummary::id)
+                                    .collect::<Vec<_>>()
+                        })
+                    });
+                    if changed {
+                        channel_rack_order_changed = true;
+                        self.stop_project_playback();
+                        self.dirty = true;
+                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+                        self.status = format!(
+                            "Moved channel {channel_id} to position {}",
+                            target_index + 1
+                        );
+                    }
                 }
                 Some(Err(error)) => {
                     self.status = format!("Could not reorder Channel Rack row: {error}");
@@ -40676,6 +40698,7 @@ impl DawUi {
                         ChannelSortOrder::Type => "type",
                     };
                     if changed {
+                        channel_rack_order_changed = true;
                         self.stop_project_playback();
                         self.dirty = true;
                         self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
@@ -40689,6 +40712,12 @@ impl DawUi {
                 }
                 None => {}
             }
+        }
+        if channel_rack_order_changed
+            && !self.notify_midi_script_channel_events_changed(&[], SCRIPT_HW_CHANNEL_EVENT)
+        {
+            self.status
+                .push_str(" · MIDI script Channel Rack refresh callback queue is full");
         }
         if let Some(pattern_id) = self.selected_pattern
             && !step_toggles.is_empty()
