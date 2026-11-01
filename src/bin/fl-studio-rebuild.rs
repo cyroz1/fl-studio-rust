@@ -67521,6 +67521,15 @@ impl DawUi {
         host.set_parameter(instance_id, parameter_id, f64::from(value) / 127.0)?;
         self.dirty = true;
         self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+        if let MidiVst3ParameterMappingTarget::MixerEffect(target) = &mapping.target
+            && !self.notify_midi_script_mixer_tracks_changed(
+                &[i32::try_from(target.insert_ordinal).unwrap_or(-1)],
+                SCRIPT_HW_DIRTY_CONTROL_VALUES,
+            )
+        {
+            self.status
+                .push_str(" · MIDI script Mixer refresh callback queue is full");
+        }
         Ok(true)
     }
 
@@ -75200,15 +75209,35 @@ impl DawUi {
         }
         if let Some(host) = &self.vst3_host {
             let mut parameter_changed = false;
+            let mut dirty_mixer_tracks = BTreeSet::new();
             for (id, parameter_id, value) in parameter_edits {
                 match host.set_parameter(id, parameter_id, value) {
-                    Ok(()) => parameter_changed = true,
+                    Ok(()) => {
+                        parameter_changed = true;
+                        if let Some(insert_ordinal) = self
+                            .mixer_effect_vst3_instances
+                            .iter()
+                            .find(|(_, instance_id)| **instance_id == id)
+                            .map(|((insert_ordinal, _), _)| *insert_ordinal)
+                        {
+                            dirty_mixer_tracks.insert(i32::try_from(insert_ordinal).unwrap_or(-1));
+                        }
+                    }
                     Err(error) => {
                         self.status = format!("Could not update VST3 parameter: {error}");
                     }
                 }
             }
             self.dirty |= parameter_changed;
+            if !dirty_mixer_tracks.is_empty()
+                && !self.notify_midi_script_mixer_tracks_changed(
+                    &dirty_mixer_tracks.into_iter().collect::<Vec<_>>(),
+                    SCRIPT_HW_DIRTY_CONTROL_VALUES,
+                )
+            {
+                self.status
+                    .push_str(" · MIDI script Mixer refresh callback queue is full");
+            }
         }
     }
 
