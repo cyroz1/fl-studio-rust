@@ -9064,6 +9064,8 @@ fn schedule_live_sampler_pattern_notes(
                     options.sample_rate,
                 ),
                 velocity: note.velocity,
+                mod_x: note.mod_x,
+                mod_y: note.mod_y,
                 pan: note.pan,
                 fine_pitch_offset_cents: note.fine_pitch_offset_cents(),
                 layer_gain,
@@ -10027,6 +10029,8 @@ pub fn stream_sampler_midi_input_to_device(
                                     )
                                 }),
                             velocity,
+                            mod_x: 128,
+                            mod_y: 128,
                             pan: engine.live_midi_pan(midi_channel),
                             fine_pitch_offset_cents: live_resample_fine_pitch_by_channel
                                 .get(&target_channel_id)
@@ -10282,6 +10286,8 @@ pub fn stream_mixed_layer_midi_input_to_device(
                                                 )
                                             }),
                                         velocity,
+                                        mod_x: 128,
+                                        mod_y: 128,
                                         pan: sampler_engine.live_midi_pan(channel),
                                         fine_pitch_offset_cents: 0,
                                         layer_gain,
@@ -13021,6 +13027,8 @@ fn prepare_sampler_arrangement(
                 slide_note: true,
                 slide_duration_frames,
                 velocity: note.velocity,
+                mod_x: note.mod_x,
+                mod_y: note.mod_y,
                 pan: note.pan,
                 fine_pitch_offset_cents,
                 layer_gain: placed.target_gain,
@@ -13084,6 +13092,8 @@ fn prepare_sampler_arrangement(
             slide_note: false,
             slide_duration_frames,
             velocity: note.velocity,
+            mod_x: note.mod_x,
+            mod_y: note.mod_y,
             pan: note.pan,
             fine_pitch_offset_cents,
             layer_gain: placed.target_gain,
@@ -13231,10 +13241,7 @@ fn sampler_filter_config(channel: &ChannelSummary) -> Option<SamplerFilterConfig
         resonance_raw: channel.sampler_filter_resonance_raw()?,
         filter_type_raw: channel.sampler_filter_type_raw()?,
     };
-    (config.cutoff_raw <= 256
-        && config.resonance_raw <= 256
-        && config.filter_type_raw <= 7
-        && (config.cutoff_raw < 256 || config.resonance_raw > 0))
+    (config.cutoff_raw <= 256 && config.resonance_raw <= 256 && config.filter_type_raw <= 7)
         .then_some(config)
 }
 
@@ -13278,10 +13285,17 @@ struct SamplerFilterState {
 }
 
 impl SamplerFilterState {
-    fn new(config: SamplerFilterConfig, sample_rate: u32) -> Option<Self> {
+    fn new_for_note(
+        mut config: SamplerFilterConfig,
+        sample_rate: u32,
+        mod_x: u8,
+        mod_y: u8,
+    ) -> Option<Self> {
         if config.cutoff_raw > 256 || config.resonance_raw > 256 || config.filter_type_raw > 7 {
             return None;
         }
+        config.cutoff_raw = sampler_filter_modulated_raw(config.cutoff_raw, mod_x);
+        config.resonance_raw = sampler_filter_modulated_raw(config.resonance_raw, mod_y);
         if config.cutoff_raw == 256 && config.resonance_raw == 0 {
             return None;
         }
@@ -13389,6 +13403,19 @@ fn sampler_filter_cutoff_hz(raw: u32, sample_rate: f64) -> f64 {
 fn sampler_filter_resonance_q(raw: u32) -> f64 {
     let normalized = f64::from(raw.min(256)) / 256.0;
     std::f64::consts::FRAC_1_SQRT_2 * 10.0_f64.powf(normalized)
+}
+
+/// Applies note Mod X/Mod Y around the FLP neutral value (128). The destination scaling is a
+/// candidate because Image-Line documents the control destinations but not the saved raw curve.
+fn sampler_filter_modulated_raw(base_raw: u32, note_value: u8) -> u32 {
+    let base_raw = base_raw.min(256);
+    let note_value = u32::from(note_value);
+    if note_value < 128 {
+        ((base_raw * note_value + 64) / 128).min(256)
+    } else {
+        let remaining = 256 - base_raw;
+        (base_raw + (remaining * (note_value - 128) + 63) / 127).min(256)
+    }
 }
 
 fn sampler_filter_biquad(
@@ -13712,6 +13739,8 @@ struct ScheduledSamplerNote {
     slide_note: bool,
     slide_duration_frames: u64,
     velocity: u8,
+    mod_x: u8,
+    mod_y: u8,
     pan: u8,
     fine_pitch_offset_cents: i16,
     layer_gain: f32,
@@ -16908,6 +16937,8 @@ fn prepare_sampler_pattern_for_channel_internal(
                 slide_note: true,
                 slide_duration_frames,
                 velocity: note.velocity,
+                mod_x: note.mod_x,
+                mod_y: note.mod_y,
                 pan: note.pan,
                 fine_pitch_offset_cents: note.fine_pitch_offset_cents(),
                 layer_gain,
@@ -16970,6 +17001,8 @@ fn prepare_sampler_pattern_for_channel_internal(
             slide_note: false,
             slide_duration_frames,
             velocity: note.velocity,
+            mod_x: note.mod_x,
+            mod_y: note.mod_y,
             pan: note.pan,
             fine_pitch_offset_cents: note.fine_pitch_offset_cents(),
             layer_gain,
@@ -18040,9 +18073,14 @@ impl<'a> SamplerVoiceEngine<'a> {
             pan_lfo: source.pan_lfo,
             volume_lfo: source.volume_lfo,
             pitch_lfo: source.pitch_lfo,
-            sampler_filter: source
-                .sampler_filter
-                .and_then(|config| SamplerFilterState::new(config, self.output_sample_rate)),
+            sampler_filter: source.sampler_filter.and_then(|config| {
+                SamplerFilterState::new_for_note(
+                    config,
+                    self.output_sample_rate,
+                    note.mod_x,
+                    note.mod_y,
+                )
+            }),
             lfo_pitch_cents: 0.0,
             envelope_release_start_frame: None,
             envelope_release_start_tick: None,
@@ -23598,6 +23636,8 @@ mod tests {
                 slide_note: false,
                 slide_duration_frames: 0,
                 velocity: 127,
+                mod_x: 128,
+                mod_y: 128,
                 pan: 64,
                 fine_pitch_offset_cents: 0,
                 layer_gain: 1.0,
@@ -24759,13 +24799,15 @@ mod tests {
 
     fn sampler_filter_sine_rms(filter_type_raw: u32, frequency_hz: f64) -> f64 {
         let sample_rate = 48_000.0_f64;
-        let mut filter = SamplerFilterState::new(
+        let mut filter = SamplerFilterState::new_for_note(
             SamplerFilterConfig {
                 cutoff_raw: 128,
                 resonance_raw: 0,
                 filter_type_raw,
             },
             sample_rate as u32,
+            128,
+            128,
         )
         .expect("the selected filter should be enabled");
         let samples = 12_000;
@@ -24785,13 +24827,15 @@ mod tests {
     #[test]
     fn sampler_filter_bypass_and_cutoff_modes_behave_as_expected() {
         assert!(
-            SamplerFilterState::new(
+            SamplerFilterState::new_for_note(
                 SamplerFilterConfig {
                     cutoff_raw: 256,
                     resonance_raw: 0,
                     filter_type_raw: 1,
                 },
                 48_000,
+                128,
+                128,
             )
             .is_none()
         );
@@ -24806,15 +24850,34 @@ mod tests {
     }
 
     #[test]
+    fn sampler_filter_note_modulation_keeps_128_neutral_and_uses_saved_extents() {
+        assert_eq!(sampler_filter_modulated_raw(64, 0), 0);
+        assert_eq!(sampler_filter_modulated_raw(64, 128), 64);
+        assert_eq!(sampler_filter_modulated_raw(64, 255), 256);
+        assert_eq!(sampler_filter_modulated_raw(0, 255), 256);
+        assert_eq!(sampler_filter_modulated_raw(256, 0), 0);
+
+        let default_filter = SamplerFilterConfig {
+            cutoff_raw: 256,
+            resonance_raw: 0,
+            filter_type_raw: 1,
+        };
+        assert!(SamplerFilterState::new_for_note(default_filter, 48_000, 128, 128).is_none());
+        assert!(SamplerFilterState::new_for_note(default_filter, 48_000, 0, 128).is_some());
+    }
+
+    #[test]
     fn sampler_filter_modes_keep_impulse_output_finite() {
         for filter_type_raw in 0..=7 {
-            let mut filter = SamplerFilterState::new(
+            let mut filter = SamplerFilterState::new_for_note(
                 SamplerFilterConfig {
                     cutoff_raw: 192,
                     resonance_raw: 224,
                     filter_type_raw,
                 },
                 44_100,
+                128,
+                128,
             )
             .expect("known filter types should construct");
             for frame in 0..2_048 {
@@ -24945,6 +25008,8 @@ mod tests {
             slide_note: false,
             slide_duration_frames: 0,
             velocity: 127,
+            mod_x: 128,
+            mod_y: 128,
             pan: 64,
             fine_pitch_offset_cents: 0,
             layer_gain: 1.0,
@@ -25102,6 +25167,8 @@ mod tests {
             slide_note: false,
             slide_duration_frames: 0,
             velocity: 127,
+            mod_x: 128,
+            mod_y: 128,
             pan: 64,
             fine_pitch_offset_cents: 0,
             layer_gain: 1.0,
@@ -25172,6 +25239,8 @@ mod tests {
             slide_note: false,
             slide_duration_frames: 0,
             velocity: 127,
+            mod_x: 128,
+            mod_y: 128,
             pan: 64,
             fine_pitch_offset_cents: 0,
             layer_gain: 1.0,
@@ -25238,6 +25307,8 @@ mod tests {
             slide_note: false,
             slide_duration_frames: 0,
             velocity: 127,
+            mod_x: 128,
+            mod_y: 128,
             pan: 64,
             fine_pitch_offset_cents: 0,
             layer_gain: 1.0,
@@ -25376,6 +25447,8 @@ mod tests {
             slide_note: false,
             slide_duration_frames: 0,
             velocity: 127,
+            mod_x: 128,
+            mod_y: 128,
             pan: 64,
             fine_pitch_offset_cents: 0,
             layer_gain: 1.0,
@@ -25444,6 +25517,8 @@ mod tests {
                 slide_note: false,
                 slide_duration_frames: 0,
                 velocity: 127,
+                mod_x: 128,
+                mod_y: 128,
                 pan: 96,
                 fine_pitch_offset_cents: 0,
                 layer_gain: 1.0,
@@ -25462,6 +25537,8 @@ mod tests {
                 slide_note: false,
                 slide_duration_frames: 0,
                 velocity: 127,
+                mod_x: 128,
+                mod_y: 128,
                 pan: 32,
                 fine_pitch_offset_cents: 0,
                 layer_gain: 1.0,
@@ -25535,6 +25612,8 @@ mod tests {
                 slide_note: false,
                 slide_duration_frames: 0,
                 velocity: 127,
+                mod_x: 128,
+                mod_y: 128,
                 pan: 64,
                 fine_pitch_offset_cents: 0,
                 layer_gain: 1.0,
@@ -25606,6 +25685,8 @@ mod tests {
                 slide_note: false,
                 slide_duration_frames: 0,
                 velocity: 127,
+                mod_x: 128,
+                mod_y: 128,
                 pan: engine.live_midi_pan(2),
                 fine_pitch_offset_cents: 0,
                 layer_gain: 1.0,
@@ -25675,6 +25756,8 @@ mod tests {
             slide_note: false,
             slide_duration_frames: 0,
             velocity: 127,
+            mod_x: 128,
+            mod_y: 128,
             pan: 64,
             fine_pitch_offset_cents: 0,
             layer_gain: 1.0,
@@ -25769,6 +25852,8 @@ mod tests {
             slide_note: false,
             slide_duration_frames: 0,
             velocity: 127,
+            mod_x: 128,
+            mod_y: 128,
             pan: 64,
             fine_pitch_offset_cents: 0,
             layer_gain: 1.0,
@@ -25831,6 +25916,8 @@ mod tests {
             slide_note: false,
             slide_duration_frames: 0,
             velocity: 127,
+            mod_x: 128,
+            mod_y: 128,
             pan: 64,
             fine_pitch_offset_cents: 0,
             layer_gain: 0.5,
@@ -25892,6 +25979,8 @@ mod tests {
             slide_note: false,
             slide_duration_frames: 0,
             velocity: 127,
+            mod_x: 128,
+            mod_y: 128,
             pan: 64,
             fine_pitch_offset_cents: 0,
             layer_gain: 0.5,
@@ -25956,6 +26045,8 @@ mod tests {
             slide_note: false,
             slide_duration_frames: 0,
             velocity: 127,
+            mod_x: 128,
+            mod_y: 128,
             pan: 64,
             fine_pitch_offset_cents: 0,
             layer_gain: 1.0,
@@ -26016,6 +26107,8 @@ mod tests {
             slide_note: false,
             slide_duration_frames: 0,
             velocity: 127,
+            mod_x: 128,
+            mod_y: 128,
             pan: 64,
             fine_pitch_offset_cents: 0,
             layer_gain: 1.0,
@@ -26082,6 +26175,8 @@ mod tests {
             slide_note: false,
             slide_duration_frames: 0,
             velocity: 127,
+            mod_x: 128,
+            mod_y: 128,
             pan: 64,
             fine_pitch_offset_cents: 0,
             layer_gain: 1.0,
@@ -26148,6 +26243,8 @@ mod tests {
             slide_note: false,
             slide_duration_frames: 0,
             velocity: 127,
+            mod_x: 128,
+            mod_y: 128,
             pan: 64,
             fine_pitch_offset_cents: 0,
             layer_gain: 1.0,
@@ -26214,6 +26311,8 @@ mod tests {
             slide_note: false,
             slide_duration_frames: 0,
             velocity: 127,
+            mod_x: 128,
+            mod_y: 128,
             pan: 64,
             fine_pitch_offset_cents: 0,
             layer_gain: 1.0,
@@ -26295,6 +26394,8 @@ mod tests {
             slide_note: false,
             slide_duration_frames: 0,
             velocity: 127,
+            mod_x: 128,
+            mod_y: 128,
             pan: 64,
             fine_pitch_offset_cents: 0,
             layer_gain: 1.0,
@@ -26357,6 +26458,8 @@ mod tests {
             slide_note: false,
             slide_duration_frames: 0,
             velocity: 127,
+            mod_x: 128,
+            mod_y: 128,
             pan: 64,
             fine_pitch_offset_cents: 0,
             layer_gain: 1.0,
@@ -26507,6 +26610,8 @@ mod tests {
             slide_note: false,
             slide_duration_frames: 0,
             velocity: 127,
+            mod_x: 128,
+            mod_y: 128,
             pan: 64,
             fine_pitch_offset_cents: 50,
             layer_gain: 1.0,
@@ -26588,6 +26693,8 @@ mod tests {
             slide_note: false,
             slide_duration_frames: 0,
             velocity: 127,
+            mod_x: 128,
+            mod_y: 128,
             pan: 64,
             fine_pitch_offset_cents: 0,
             layer_gain: 1.0,
@@ -26690,6 +26797,8 @@ mod tests {
                 slide_note: false,
                 slide_duration_frames: 0,
                 velocity: 127,
+                mod_x: 128,
+                mod_y: 128,
                 pan: 64,
                 fine_pitch_offset_cents: 0,
                 layer_gain: 1.0,
@@ -26708,6 +26817,8 @@ mod tests {
                 slide_note: false,
                 slide_duration_frames: 0,
                 velocity: 127,
+                mod_x: 128,
+                mod_y: 128,
                 pan: 64,
                 fine_pitch_offset_cents: 0,
                 layer_gain: 1.0,
@@ -26808,6 +26919,8 @@ mod tests {
                 slide_note: false,
                 slide_duration_frames: 0,
                 velocity: 127,
+                mod_x: 128,
+                mod_y: 128,
                 pan: 64,
                 fine_pitch_offset_cents: 0,
                 layer_gain: 1.0,
@@ -26826,6 +26939,8 @@ mod tests {
                 slide_note: false,
                 slide_duration_frames: 0,
                 velocity: 127,
+                mod_x: 128,
+                mod_y: 128,
                 pan: 64,
                 fine_pitch_offset_cents: 0,
                 layer_gain: 1.0,
@@ -26844,6 +26959,8 @@ mod tests {
                 slide_note: false,
                 slide_duration_frames: 0,
                 velocity: 127,
+                mod_x: 128,
+                mod_y: 128,
                 pan: 64,
                 fine_pitch_offset_cents: 0,
                 layer_gain: 1.0,
@@ -26926,6 +27043,8 @@ mod tests {
                 slide_note: false,
                 slide_duration_frames: 0,
                 velocity: 127,
+                mod_x: 128,
+                mod_y: 128,
                 pan: 64,
                 fine_pitch_offset_cents: 0,
                 layer_gain: 1.0,
@@ -26944,6 +27063,8 @@ mod tests {
                 slide_note: false,
                 slide_duration_frames: 0,
                 velocity: 127,
+                mod_x: 128,
+                mod_y: 128,
                 pan: 64,
                 fine_pitch_offset_cents: 0,
                 layer_gain: 1.0,
@@ -27024,6 +27145,8 @@ mod tests {
             slide_note: false,
             slide_duration_frames: 0,
             velocity: 127,
+            mod_x: 128,
+            mod_y: 128,
             pan: 64,
             fine_pitch_offset_cents: 0,
             layer_gain: 1.0,
@@ -27107,6 +27230,8 @@ mod tests {
             slide_note: false,
             slide_duration_frames: 0,
             velocity: 127,
+            mod_x: 128,
+            mod_y: 128,
             pan: 64,
             fine_pitch_offset_cents: 0,
             layer_gain: 1.0,
@@ -27189,6 +27314,8 @@ mod tests {
                     slide_note,
                     slide_duration_frames: 0,
                     velocity: 127,
+                    mod_x: 128,
+                    mod_y: 128,
                     pan: 64,
                     fine_pitch_offset_cents,
                     layer_gain: 1.0,
@@ -27285,6 +27412,8 @@ mod tests {
             slide_note,
             slide_duration_frames: 0,
             velocity: 127,
+            mod_x: 128,
+            mod_y: 128,
             pan: 64,
             fine_pitch_offset_cents: 0,
             layer_gain: 1.0,
@@ -27354,6 +27483,8 @@ mod tests {
             slide_note,
             slide_duration_frames: 0,
             velocity,
+            mod_x: 128,
+            mod_y: 128,
             pan,
             fine_pitch_offset_cents: 0,
             layer_gain: 1.0,
@@ -27434,6 +27565,8 @@ mod tests {
                 slide_note: false,
                 slide_duration_frames: 0,
                 velocity: 127,
+                mod_x: 128,
+                mod_y: 128,
                 pan: 64,
                 fine_pitch_offset_cents: 0,
                 layer_gain: 1.0,
@@ -27452,6 +27585,8 @@ mod tests {
                 slide_note: true,
                 slide_duration_frames: 0,
                 velocity: 127,
+                mod_x: 128,
+                mod_y: 128,
                 pan: 64,
                 fine_pitch_offset_cents: 0,
                 layer_gain: 1.0,
@@ -27524,6 +27659,8 @@ mod tests {
             slide_note: true,
             slide_duration_frames: 0,
             velocity: 127,
+            mod_x: 128,
+            mod_y: 128,
             pan: 64,
             fine_pitch_offset_cents: 0,
             layer_gain: 1.0,

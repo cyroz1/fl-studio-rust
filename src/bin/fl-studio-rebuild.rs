@@ -40271,7 +40271,7 @@ impl DawUi {
                                                 ));
                                             }
                                             ui.small(
-                                                "Saved cutoff, resonance, and filter type affect Sampler playback; note Mod X/Mod Y and their envelope/LFO modulation remain unsupported.",
+                                                "Saved filter settings and Pattern/Playlist note Mod X/Mod Y affect Sampler playback with provisional scaling; Mod X/Mod Y envelopes, LFOs, and live MIDI CC remain unsupported.",
                                             );
                                         });
                                     }
