@@ -10748,6 +10748,30 @@ impl DawUi {
         automation_value_for_target_range(value, automation_channel.automation_range_raw())
     }
 
+    fn clap_parameter_is_automatable(
+        &self,
+        plugin_path: &Path,
+        plugin_id: &str,
+        parameter_id: u32,
+    ) -> bool {
+        let Some(ClapInstanceInspectionState::Inspected(info)) = self
+            .clap_instance_inspection_states
+            .get(&(plugin_path.to_path_buf(), plugin_id.to_owned()))
+        else {
+            return false;
+        };
+        info.parameters
+            .iter()
+            .find(|parameter| parameter.id == parameter_id)
+            .is_some_and(|parameter| {
+                parameter.flags & ParamInfoFlags::IS_AUTOMATABLE.bits() != 0
+                    && parameter.flags & ParamInfoFlags::IS_READONLY.bits() == 0
+                    && parameter.min_value.is_finite()
+                    && parameter.max_value.is_finite()
+                    && parameter.min_value < parameter.max_value
+            })
+    }
+
     fn vst3_playlist_automation_sources(
         &self,
         document: &FlpDocument,
@@ -10970,6 +10994,61 @@ impl DawUi {
             if let Some(existing) = lanes
                 .iter_mut()
                 .find(|existing| existing.parameter_id == link.target.parameter_id)
+            {
+                *existing = lane;
+            } else {
+                lanes.push(lane);
+            }
+        }
+        for link in document
+            .automation_target_links()
+            .unwrap_or_default()
+            .into_iter()
+        {
+            let destination_raw = link.destination_raw() as u16;
+            if destination_raw & 0xc000 != 0 || link.candidate_vst_parameter() != Some(true) {
+                continue;
+            }
+            let Some(parameter_id) = link.candidate_parameter_index().map(u32::from) else {
+                continue;
+            };
+            let Some((insert, slot)) = link.candidate_mixer_effect_target() else {
+                continue;
+            };
+            if !(1..=127).contains(&insert) || slot >= 10 {
+                continue;
+            }
+            let effect_target = (usize::from(insert), slot);
+            let Some(assignment) = self.clap_mixer_effect_assignments.get(&effect_target) else {
+                continue;
+            };
+            if !self.clap_parameter_is_automatable(
+                &assignment.path,
+                &assignment.plugin_id,
+                parameter_id,
+            ) {
+                continue;
+            }
+            let Some(automation_channel) =
+                automation_channels.get(&link.source_channel_id()).copied()
+            else {
+                continue;
+            };
+            let points = points_for_channel(automation_channel);
+            if points.is_empty() {
+                continue;
+            }
+            let lanes = sources
+                .mixer_effect_automation_clips
+                .entry((link.source_channel_id(), effect_target.0, effect_target.1))
+                .or_default();
+            let lane = Vst3ParameterAutomation {
+                parameter_id,
+                points,
+            };
+            if let Some(existing) = lanes
+                .iter_mut()
+                .find(|existing| existing.parameter_id == parameter_id)
             {
                 *existing = lane;
             } else {
@@ -24697,9 +24776,6 @@ impl DawUi {
                     && link.plugin_id == plugin_id
             })
             .collect::<Vec<_>>();
-        if links.is_empty() {
-            return Ok(BTreeMap::new());
-        }
         let automation_channels = document
             .automation_channels()
             .map_err(|error| error.to_string())?
@@ -24707,16 +24783,50 @@ impl DawUi {
             .map(|channel| (channel.channel_id(), channel))
             .collect::<HashMap<_, _>>();
 
+        let mut automation_sources = links
+            .iter()
+            .map(|link| (link.automation_channel_id, link.parameter_id))
+            .collect::<BTreeSet<_>>();
+        let assigned_target_matches = self
+            .clap_pattern_playback_instruments
+            .get(&channel_id)
+            .is_some_and(|assignment| {
+                assignment.path == plugin_path && assignment.plugin_id == plugin_id
+            });
+        if assigned_target_matches {
+            for link in document
+                .automation_target_links()
+                .unwrap_or_default()
+                .into_iter()
+            {
+                let destination_raw = link.destination_raw() as u16;
+                if destination_raw & 0xc000 != 0
+                    || link.candidate_vst_parameter() != Some(true)
+                    || link.candidate_channel_target_id() != Some(channel_id)
+                {
+                    continue;
+                }
+                let Some(parameter_id) = link.candidate_parameter_index().map(u32::from) else {
+                    continue;
+                };
+                if self.clap_parameter_is_automatable(plugin_path, plugin_id, parameter_id) {
+                    automation_sources.insert((link.source_channel_id(), parameter_id));
+                }
+            }
+        }
+        if automation_sources.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+
         let mut points_by_parameter = BTreeMap::<u32, Vec<(u64, usize, usize, f64)>>::new();
         let mut expanded_point_count = 0usize;
-        for link in links {
-            let Some(automation_channel) = automation_channels.get(&link.automation_channel_id)
-            else {
+        for (automation_channel_id, parameter_id) in automation_sources {
+            let Some(automation_channel) = automation_channels.get(&automation_channel_id) else {
                 continue;
             };
             for (clip_index, clip) in arrangement.clips.iter().enumerate() {
                 if track_filter.clip_is_muted(clip)
-                    || !matches!(clip.target(), PlaylistClipTarget::Channel { id } if id == link.automation_channel_id)
+                    || !matches!(clip.target(), PlaylistClipTarget::Channel { id } if id == automation_channel_id)
                     || clip.length_ticks == 0
                 {
                     continue;
@@ -24791,10 +24901,12 @@ impl DawUi {
                     let tick = u64::from(clip.position_ticks)
                         .checked_add(relative_tick)
                         .ok_or_else(|| "CLAP Playlist automation position overflow".to_owned())?;
-                    points_by_parameter
-                        .entry(link.parameter_id)
-                        .or_default()
-                        .push((tick, clip_index, point_index, value));
+                    points_by_parameter.entry(parameter_id).or_default().push((
+                        tick,
+                        clip_index,
+                        point_index,
+                        value,
+                    ));
                 }
             }
         }
