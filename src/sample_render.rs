@@ -1736,7 +1736,8 @@ fn playlist_performance_note_source_route_kinds(
     source_channel_id: u16,
     channels: &HashMap<u16, ChannelSummary>,
     loaded_vst3_channels: &BTreeSet<u16>,
-) -> Option<(bool, bool)> {
+    assigned_clap_channels: &BTreeSet<u16>,
+) -> Option<(bool, bool, bool)> {
     let source = channels.get(&source_channel_id)?;
     if source.enabled() == Some(false) {
         return None;
@@ -1746,27 +1747,33 @@ fn playlist_performance_note_source_route_kinds(
         if leaf_ids.is_empty() {
             return None;
         }
-        let (mut has_sampler, mut has_vst3) = (false, false);
+        let (mut has_sampler, mut has_vst3, mut has_clap) = (false, false, false);
         for child_id in leaf_ids {
             let child = channels.get(&child_id)?;
             if child.kind() == Some(0) {
                 has_sampler = true;
+            } else if assigned_clap_channels.contains(&child_id) {
+                has_clap = true;
             } else if loaded_vst3_channels.contains(&child_id)
                 && child.plugin_identifier().is_some()
+                && child.kind() != Some(3)
             {
                 has_vst3 = true;
             } else {
                 return None;
             }
         }
-        return Some((has_sampler, has_vst3));
+        return Some((has_sampler, has_vst3, has_clap));
     }
     if source.kind() == Some(0) {
-        Some((true, false))
+        Some((true, false, false))
+    } else if assigned_clap_channels.contains(&source_channel_id) {
+        Some((false, false, true))
     } else if loaded_vst3_channels.contains(&source_channel_id)
         && source.plugin_identifier().is_some()
+        && source.kind() != Some(3)
     {
-        Some((false, true))
+        Some((false, true, false))
     } else {
         None
     }
@@ -1840,37 +1847,11 @@ fn playlist_performance_vst3_clip_candidates(
         .collect())
 }
 
-fn playlist_performance_clap_note_source_supported(
-    source_channel_id: u16,
-    channels: &HashMap<u16, ChannelSummary>,
-    assigned_clap_channels: &BTreeSet<u16>,
-) -> bool {
-    let Some(source) = channels.get(&source_channel_id) else {
-        return false;
-    };
-    if source.enabled() == Some(false) {
-        return false;
-    }
-    if source.layer_child_ids().is_some() {
-        return performance_layer_leaf_channel_ids(source_channel_id, channels).is_some_and(
-            |leaf_ids| {
-                !leaf_ids.is_empty()
-                    && leaf_ids.iter().all(|channel_id| {
-                        assigned_clap_channels.contains(channel_id)
-                            && channels
-                                .get(channel_id)
-                                .is_some_and(|child| child.enabled() != Some(false))
-                    })
-            },
-        );
-    }
-    assigned_clap_channels.contains(&source_channel_id)
-}
-
 fn playlist_performance_clap_clip_candidates(
     document: &FlpDocument,
     arrangement_id: u16,
     performance_zone_end_tick: u32,
+    loaded_vst3_channels: &BTreeSet<u16>,
     assigned_clap_channels: &BTreeSet<u16>,
 ) -> Result<BTreeSet<usize>, String> {
     if assigned_clap_channels.is_empty() {
@@ -1922,6 +1903,25 @@ fn playlist_performance_clap_clip_candidates(
                         && note.length > 0
                 })
                 .collect::<Vec<_>>();
+            let source_notes = pattern
+                .notes
+                .iter()
+                .filter(|note| !note.is_muted())
+                .collect::<Vec<_>>();
+            let mut has_active_clap = false;
+            let sources_supported = source_notes.iter().all(|note| {
+                let Some((_, _, note_has_clap)) = playlist_performance_note_source_route_kinds(
+                    note.channel_id,
+                    &channels,
+                    loaded_vst3_channels,
+                    assigned_clap_channels,
+                ) else {
+                    return false;
+                };
+                has_active_clap |=
+                    note_has_clap && (note.velocity > 0 || note.is_slide_note()) && note.length > 0;
+                true
+            });
             (clip.position_ticks < performance_zone_end_tick
                 && clip.length_ticks > 0
                 && !clip.is_muted()
@@ -1929,18 +1929,20 @@ fn playlist_performance_clap_clip_candidates(
                 && clip
                     .scale
                     .is_none_or(|scale| scale.is_finite() && (scale - 1.0).abs() <= 1e-9)
+                && pattern.controllers.is_empty()
                 && clip.recognized_pattern_source_window_ticks().is_some()
                 && !notes.is_empty()
-                && notes.iter().all(|note| {
-                    playlist_performance_clap_note_source_supported(
-                        note.channel_id,
-                        &channels,
-                        assigned_clap_channels,
-                    )
-                }))
-            .then_some(index)
+                && sources_supported
+                && has_active_clap)
+                .then_some(index)
         })
         .collect())
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum PlaylistPerformanceDestination {
+    Sampler,
+    Vst3,
 }
 
 fn playlist_performance_mixed_source_clip_candidates(
@@ -1948,8 +1950,10 @@ fn playlist_performance_mixed_source_clip_candidates(
     arrangement_id: u16,
     performance_zone_end_tick: u32,
     loaded_vst3_channels: &BTreeSet<u16>,
+    assigned_clap_channels: &BTreeSet<u16>,
+    destination: Option<PlaylistPerformanceDestination>,
 ) -> Result<BTreeSet<usize>, String> {
-    if loaded_vst3_channels.is_empty() {
+    if loaded_vst3_channels.is_empty() && assigned_clap_channels.is_empty() {
         return Ok(BTreeSet::new());
     }
     let arrangement = document
@@ -1975,6 +1979,11 @@ fn playlist_performance_mixed_source_clip_candidates(
         .filter(|track| track.enabled == Some(false))
         .map(|track| track.id)
         .collect::<BTreeSet<_>>();
+    let constant_tempo = !assigned_clap_channels.is_empty()
+        && PlaylistTempoMap::for_arrangement(document, arrangement_id)?
+            .tempo_segments()
+            .count()
+            == 1;
     Ok(arrangement
         .clips
         .iter()
@@ -1990,19 +1999,21 @@ fn playlist_performance_mixed_source_clip_candidates(
                 .iter()
                 .filter(|note| !note.is_muted())
                 .collect::<Vec<_>>();
-            let (mut has_sampler, mut has_vst3) = (false, false);
+            let (mut has_sampler, mut has_vst3, mut has_clap) = (false, false, false);
             let sources_supported = notes.iter().all(|note| {
-                let Some((note_has_sampler, note_has_vst3)) =
+                let Some((note_has_sampler, note_has_vst3, note_has_clap)) =
                     playlist_performance_note_source_route_kinds(
                         note.channel_id,
                         &channels,
                         loaded_vst3_channels,
+                        assigned_clap_channels,
                     )
                 else {
                     return false;
                 };
                 has_sampler |= note_has_sampler;
                 has_vst3 |= note_has_vst3;
+                has_clap |= note_has_clap;
                 true
             });
             (clip.position_ticks < performance_zone_end_tick
@@ -2015,9 +2026,12 @@ fn playlist_performance_mixed_source_clip_candidates(
                 && pattern.controllers.is_empty()
                 && !notes.is_empty()
                 && sources_supported
-                && has_sampler
-                && has_vst3)
-                .then_some(index)
+                && usize::from(has_sampler) + usize::from(has_vst3) + usize::from(has_clap) >= 2
+                && (destination != Some(PlaylistPerformanceDestination::Sampler) || has_sampler)
+                && (destination != Some(PlaylistPerformanceDestination::Vst3) || has_vst3)
+                && (!has_clap
+                    || (constant_tempo && clip.recognized_pattern_source_window_ticks().is_some())))
+            .then_some(index)
         })
         .collect())
 }
@@ -2036,8 +2050,7 @@ pub fn playlist_performance_clip_indices(
     )
 }
 
-/// Return supported Performance Mode clips, including Pattern Clips that combine enabled Sampler
-/// and loaded VST3 destinations.
+/// Return supported Performance Mode clips, including Pattern Clips that mix Sampler and loaded VST3 destinations.
 pub fn playlist_performance_clip_indices_with_vst3(
     document: &FlpDocument,
     arrangement_id: u16,
@@ -2053,7 +2066,7 @@ pub fn playlist_performance_clip_indices_with_vst3(
     )
 }
 
-/// Return supported Performance Mode clips, including clips rendered from assigned CLAP channels.
+/// Return supported Performance Mode clips, including mixed Sampler, VST3, and assigned CLAP destinations.
 pub fn playlist_performance_clip_indices_with_vst3_and_clap(
     document: &FlpDocument,
     arrangement_id: u16,
@@ -2082,11 +2095,14 @@ pub fn playlist_performance_clip_indices_with_vst3_and_clap(
         arrangement_id,
         performance_zone_end_tick,
         loaded_vst3_channels,
+        assigned_clap_channels,
+        None,
     )?);
     clip_indices.extend(playlist_performance_clap_clip_candidates(
         document,
         arrangement_id,
         performance_zone_end_tick,
+        loaded_vst3_channels,
         assigned_clap_channels,
     )?);
     let arrangement = document
@@ -2123,8 +2139,7 @@ pub fn playlist_performance_clip_indices_with_vst3_and_clap(
     Ok(clip_indices)
 }
 
-/// Return VST3 and mixed Sampler/VST3 Pattern Clips on tracks whose Performance Zone media is fully
-/// supported.
+/// Return VST3 and mixed-source Pattern Clips on tracks whose Performance Zone media is fully supported.
 pub fn playlist_performance_vst3_clip_indices(
     document: &FlpDocument,
     arrangement_id: u16,
@@ -2140,7 +2155,7 @@ pub fn playlist_performance_vst3_clip_indices(
     )
 }
 
-/// Return loaded VST3 Pattern Clips whose tracks can also contain assigned CLAP Pattern Clips.
+/// Return loaded VST3 Pattern Clips, including supported mixed-source clips.
 pub fn playlist_performance_vst3_clip_indices_with_clap(
     document: &FlpDocument,
     arrangement_id: u16,
@@ -2159,6 +2174,8 @@ pub fn playlist_performance_vst3_clip_indices_with_clap(
         arrangement_id,
         performance_zone_end_tick,
         loaded_vst3_channels,
+        assigned_clap_channels,
+        Some(PlaylistPerformanceDestination::Vst3),
     )?);
     let supported = playlist_performance_clip_indices_with_vst3_and_clap(
         document,
@@ -2170,7 +2187,7 @@ pub fn playlist_performance_vst3_clip_indices_with_clap(
     Ok(candidates.intersection(&supported).copied().collect())
 }
 
-/// Return assigned CLAP-only Pattern Clips that can be pre-rendered for Performance Mode.
+/// Return assigned CLAP-backed Pattern Clips that can be pre-rendered for Performance Mode.
 pub fn playlist_performance_clap_clip_indices(
     document: &FlpDocument,
     arrangement_id: u16,
@@ -2182,6 +2199,7 @@ pub fn playlist_performance_clap_clip_indices(
         document,
         arrangement_id,
         performance_zone_end_tick,
+        loaded_vst3_channels,
         assigned_clap_channels,
     )?;
     let supported = playlist_performance_clip_indices_with_vst3_and_clap(
@@ -3400,9 +3418,8 @@ pub fn stream_playlist_with_vst3_to_device_with_monitor_and_latency_updates(
 /// Stream arrangement audio while accepting quantized Audio and Sampler Clip launches.
 ///
 /// The arrangement must contain supported clips before the named Start marker. Launches replace
-/// content from the same Playlist track and repeat at the clip's tick length. Loaded VST3 Pattern
-/// Clips and constant-tempo assigned CLAP-only Pattern Clips can launch alongside Sampler and
-/// Audio Clips.
+/// content from the same Playlist track and repeat at the clip's tick length. Loaded VST3 Pattern Clips can follow Playlist tempo, and assigned CLAP-backed Pattern Clips
+/// can launch in constant-tempo arrangements alongside Sampler and Audio Clips.
 pub fn stream_playlist_performance_with_vst3_to_device(
     document: &FlpDocument,
     project_path: impl AsRef<Path>,
@@ -3477,6 +3494,8 @@ pub fn stream_playlist_performance_with_vst3_to_device(
         options.arrangement_id,
         performance.performance_zone_end_tick,
         &loaded_vst3_channels,
+        &assigned_clap_channels,
+        Some(PlaylistPerformanceDestination::Sampler),
     )?);
     let mut performance_audio_clip_indices = playlist_performance_audio_clip_indices(
         document,
@@ -3489,6 +3508,7 @@ pub fn stream_playlist_performance_with_vst3_to_device(
         document,
         options.arrangement_id,
         performance.performance_zone_end_tick,
+        &loaded_vst3_channels,
         &assigned_clap_channels,
     )?;
     performance_clap_clip_indices.retain(|index| performance_clip_indices.contains(index));
@@ -3503,6 +3523,8 @@ pub fn stream_playlist_performance_with_vst3_to_device(
         options.arrangement_id,
         performance.performance_zone_end_tick,
         &loaded_vst3_channels,
+        &assigned_clap_channels,
+        Some(PlaylistPerformanceDestination::Vst3),
     )?);
     performance_vst3_clip_indices.retain(|index| performance_clip_indices.contains(index));
     let mut audio = prepare_audio_clip_render(
