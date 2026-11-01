@@ -918,6 +918,16 @@ pub enum SamplerLiveNoteEvent {
         channel: u8,
         value: u16,
     },
+    /// Updated 7-bit Sampler Mod X value (MIDI CC 74) for an input channel.
+    ModX {
+        channel: u8,
+        value: u8,
+    },
+    /// Updated 7-bit Sampler Mod Y value (MIDI CC 71) for an input channel.
+    ModY {
+        channel: u8,
+        value: u8,
+    },
     AllNotesOff {
         channel: u8,
     },
@@ -932,6 +942,8 @@ pub enum SamplerLiveNoteEvent {
         channel: u8,
         down: bool,
     },
+    /// Reset Sampler sustain, channel-volume, expression, pan, Mod X/Mod Y, and pitch-bend
+    /// state for an input MIDI channel.
     ResetControllers {
         channel: u8,
         pan: u8,
@@ -1018,8 +1030,8 @@ pub enum LayerLiveInputEvent {
     SamplerChannelVolume14Bit { channel: u8, value: u16 },
     /// Updated 14-bit Sampler Expression for an input MIDI channel.
     SamplerExpression14Bit { channel: u8, value: u16 },
-    /// Reset Sampler sustain, channel-volume, expression, pan, and pitch-bend state
-    /// for an input MIDI channel.
+    /// Reset Sampler sustain, channel-volume, expression, pan, Mod X/Mod Y, and pitch-bend
+    /// state for an input MIDI channel.
     SamplerResetControllers {
         channel: u8,
         pan: u8,
@@ -10029,8 +10041,8 @@ pub fn stream_sampler_midi_input_to_device(
                                     )
                                 }),
                             velocity,
-                            mod_x: 128,
-                            mod_y: 128,
+                            mod_x: engine.live_midi_mod_x_value(midi_channel),
+                            mod_y: engine.live_midi_mod_y_value(midi_channel),
                             pan: engine.live_midi_pan(midi_channel),
                             fine_pitch_offset_cents: live_resample_fine_pitch_by_channel
                                 .get(&target_channel_id)
@@ -10087,6 +10099,12 @@ pub fn stream_sampler_midi_input_to_device(
                 Ok(SamplerLiveNoteEvent::Expression14Bit { channel, value }) => {
                     engine.apply_live_expression_14bit(channel, value);
                 }
+                Ok(SamplerLiveNoteEvent::ModX { channel, value }) => {
+                    engine.apply_live_mod_x(channel, value);
+                }
+                Ok(SamplerLiveNoteEvent::ModY { channel, value }) => {
+                    engine.apply_live_mod_y(channel, value);
+                }
                 Ok(SamplerLiveNoteEvent::AllNotesOff { channel }) => {
                     note_targets.retain(|(midi_channel, _), _| *midi_channel != (channel & 0x0F));
                     engine.release_live_notes(channel);
@@ -10111,6 +10129,8 @@ pub fn stream_sampler_midi_input_to_device(
                     engine.apply_live_pan(channel, pan);
                     engine.apply_live_channel_volume(channel, 127);
                     engine.apply_live_expression(channel, 127);
+                    engine.apply_live_mod_x(channel, 64);
+                    engine.apply_live_mod_y(channel, 64);
                     engine.apply_live_pitch_bend(channel, pitch_bend_cents);
                 }
                 Err(TryRecvError::Empty) => break,
@@ -10286,8 +10306,8 @@ pub fn stream_mixed_layer_midi_input_to_device(
                                                 )
                                             }),
                                         velocity,
-                                        mod_x: 128,
-                                        mod_y: 128,
+                                        mod_x: sampler_engine.live_midi_mod_x_value(channel),
+                                        mod_y: sampler_engine.live_midi_mod_y_value(channel),
                                         pan: sampler_engine.live_midi_pan(channel),
                                         fine_pitch_offset_cents: 0,
                                         layer_gain,
@@ -10493,8 +10513,14 @@ fn apply_live_layer_sampler_controller(
         10 => engine.apply_live_pan(channel, value),
         7 => engine.apply_live_channel_volume(channel, value),
         11 => engine.apply_live_expression(channel, value),
+        74 => engine.apply_live_mod_x(channel, value),
+        71 => engine.apply_live_mod_y(channel, value),
         64 => engine.set_live_sustain(channel, value >= 64),
         66 => engine.set_live_sostenuto(channel, value >= 64),
+        121 => {
+            engine.apply_live_mod_x(channel, 64);
+            engine.apply_live_mod_y(channel, 64);
+        }
         _ => {}
     }
 }
@@ -10510,6 +10536,8 @@ fn reset_live_layer_sampler_controllers(
     engine.apply_live_pan(channel, pan);
     engine.apply_live_channel_volume(channel, 127);
     engine.apply_live_expression(channel, 127);
+    engine.apply_live_mod_x(channel, 64);
+    engine.apply_live_mod_y(channel, 64);
     engine.apply_live_pitch_bend(channel, pitch_bend_cents);
 }
 
@@ -17407,6 +17435,8 @@ struct SamplerVoiceEngine<'a> {
     live_midi_pan: [f32; 16],
     live_midi_channel_volume: [f32; 16],
     live_midi_expression: [f32; 16],
+    live_midi_mod_x: [u8; 16],
+    live_midi_mod_y: [u8; 16],
     sustain_down: [bool; 16],
     sostenuto_down: [bool; 16],
 }
@@ -17617,6 +17647,8 @@ impl<'a> SamplerVoiceEngine<'a> {
             live_midi_pan: [64.0; 16],
             live_midi_channel_volume: [1.0; 16],
             live_midi_expression: [1.0; 16],
+            live_midi_mod_x: [128; 16],
+            live_midi_mod_y: [128; 16],
             sustain_down: [false; 16],
             sostenuto_down: [false; 16],
         }
@@ -18596,6 +18628,40 @@ impl<'a> SamplerVoiceEngine<'a> {
 
     fn live_midi_pan(&self, channel: u8) -> u8 {
         self.live_midi_pan[usize::from(channel & 0x0F)].round() as u8
+    }
+
+    fn live_midi_mod_x_value(&self, channel: u8) -> u8 {
+        self.live_midi_mod_x[usize::from(channel & 0x0F)]
+    }
+
+    fn live_midi_mod_y_value(&self, channel: u8) -> u8 {
+        self.live_midi_mod_y[usize::from(channel & 0x0F)]
+    }
+
+    fn apply_live_mod_x(&mut self, channel: u8, value: u8) {
+        let channel = channel & 0x0F;
+        let mod_x = crate::midi::midi_modulation_to_fl_note_value(value);
+        self.live_midi_mod_x[usize::from(channel)] = mod_x;
+        for voice in self.voices.iter_mut().filter_map(Option::as_mut) {
+            if voice.input_midi_channel == Some(channel)
+                && let Some(filter) = voice.sampler_filter.as_mut()
+            {
+                filter.note_mod_x = mod_x;
+            }
+        }
+    }
+
+    fn apply_live_mod_y(&mut self, channel: u8, value: u8) {
+        let channel = channel & 0x0F;
+        let mod_y = crate::midi::midi_modulation_to_fl_note_value(value);
+        self.live_midi_mod_y[usize::from(channel)] = mod_y;
+        for voice in self.voices.iter_mut().filter_map(Option::as_mut) {
+            if voice.input_midi_channel == Some(channel)
+                && let Some(filter) = voice.sampler_filter.as_mut()
+            {
+                filter.note_mod_y = mod_y;
+            }
+        }
     }
 
     fn apply_live_pan(&mut self, channel: u8, value: u8) {
@@ -26039,11 +26105,18 @@ mod tests {
         assert!((output[2] - combined_gain).abs() < 1e-6);
         assert!((output[3] - combined_gain).abs() < 1e-6);
 
+        apply_live_layer_sampler_controller(&mut engine, 2, 74, 127);
+        apply_live_layer_sampler_controller(&mut engine, 2, 71, 0);
+        assert_eq!(engine.live_midi_mod_x_value(2), 255);
+        assert_eq!(engine.live_midi_mod_y_value(2), 0);
+
         apply_live_layer_sampler_controller(&mut engine, 2, 7, 0);
         engine.render_block(2, 1, &mut output[4..6]);
         assert_eq!(&output[4..6], &[0.0, 0.0]);
 
         reset_live_layer_sampler_controllers(&mut engine, 2, 64, 0);
+        assert_eq!(engine.live_midi_mod_x_value(2), 128);
+        assert_eq!(engine.live_midi_mod_y_value(2), 128);
         engine.render_block(3, 1, &mut output[6..]);
         assert!((output[6] - full_pan_gain).abs() < 1e-6);
         assert!((output[7] - full_pan_gain).abs() < 1e-6);
@@ -26074,6 +26147,8 @@ mod tests {
             controller_gain * angle.sin()
         );
 
+        apply_live_layer_sampler_controller(&mut engine, 2, 74, 127);
+        apply_live_layer_sampler_controller(&mut engine, 2, 71, 0);
         let new_slot_index = engine
             .start_voice(ScheduledSamplerNote {
                 clip_index: 0,
@@ -26088,8 +26163,8 @@ mod tests {
                 slide_note: false,
                 slide_duration_frames: 0,
                 velocity: 127,
-                mod_x: 128,
-                mod_y: 128,
+                mod_x: engine.live_midi_mod_x_value(2),
+                mod_y: engine.live_midi_mod_y_value(2),
                 pan: engine.live_midi_pan(2),
                 fine_pitch_offset_cents: 0,
                 layer_gain: 1.0,
@@ -26098,6 +26173,50 @@ mod tests {
             .expect("second live voice should start");
         engine.set_voice_input_midi_channel(new_slot_index, 2);
         engine.refresh_live_pan_for_channel(2);
+        let live_mod_x = engine.live_midi_mod_x_value(2);
+        let live_mod_y = engine.live_midi_mod_y_value(2);
+        // The test source has no filter configured, so seed it with the live note values.
+        {
+            let voice = engine.voices[new_slot_index]
+                .as_mut()
+                .expect("second live voice should remain active");
+            voice.sampler_filter = SamplerFilterState::new_for_note(
+                SamplerFilterConfig {
+                    cutoff_raw: 64,
+                    resonance_raw: 64,
+                    filter_type_raw: 1,
+                    mod_x_envelope: None,
+                    mod_y_envelope: None,
+                    mod_x_lfo: None,
+                    mod_y_lfo: None,
+                },
+                48_000,
+                live_mod_x,
+                live_mod_y,
+                6,
+                None,
+            );
+            let filter = voice
+                .sampler_filter
+                .as_mut()
+                .expect("test filter should be enabled");
+            assert_eq!(filter.note_mod_x, 255);
+            assert_eq!(filter.note_mod_y, 0);
+            assert_eq!(filter.current_modulated_raw, Some((256, 0)));
+        }
+        apply_live_layer_sampler_controller(&mut engine, 2, 74, 0);
+        apply_live_layer_sampler_controller(&mut engine, 2, 71, 127);
+        let voice = engine.voices[new_slot_index]
+            .as_mut()
+            .expect("second live voice should remain active");
+        let filter = voice
+            .sampler_filter
+            .as_mut()
+            .expect("test filter should remain enabled");
+        filter.update_modulation(6, 7, None, None, None, None);
+        assert_eq!(filter.note_mod_x, 0);
+        assert_eq!(filter.note_mod_y, 255);
+        assert_eq!(filter.current_modulated_raw, Some((0, 256)));
         let expected_pan = 8_193.0 / 128.0;
         assert!(
             (engine.voices[new_slot_index]

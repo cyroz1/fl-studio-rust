@@ -70010,6 +70010,14 @@ impl DawUi {
                 }
                 for (channel, state) in initial_channel_state.iter().copied().enumerate() {
                     let channel = channel as u8;
+                    let _ = event_sender.send(SamplerLiveNoteEvent::ModX {
+                        channel,
+                        value: state.raw_mod_x(),
+                    });
+                    let _ = event_sender.send(SamplerLiveNoteEvent::ModY {
+                        channel,
+                        value: state.raw_mod_y(),
+                    });
                     if state.pan_lsb_received() {
                         let _ = event_sender.send(SamplerLiveNoteEvent::Pan14Bit {
                             channel,
@@ -70448,6 +70456,28 @@ impl DawUi {
                 };
                 (event, None)
             }
+            MidiInputEvent::ControlChange {
+                channel,
+                controller: 74,
+                ..
+            } => (
+                SamplerLiveNoteEvent::ModX {
+                    channel,
+                    value: self.midi_input_channel_state[usize::from(channel & 0x0F)].raw_mod_x(),
+                },
+                None,
+            ),
+            MidiInputEvent::ControlChange {
+                channel,
+                controller: 71,
+                ..
+            } => (
+                SamplerLiveNoteEvent::ModY {
+                    channel,
+                    value: self.midi_input_channel_state[usize::from(channel & 0x0F)].raw_mod_y(),
+                },
+                None,
+            ),
             MidiInputEvent::ControlChange {
                 channel,
                 controller: 7 | 39,
