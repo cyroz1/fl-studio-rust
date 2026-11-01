@@ -1271,17 +1271,27 @@ impl Vst3PlaylistStreamProcessor {
                 bus.mixer_transform = route_plan.output_transform;
                 bus.mixer_meter_transforms = route_plan.insert_meter_transforms;
                 bus.mixer_effect_input_transforms = route_plan.insert_effect_input_transforms;
-                bus.live_mixer_source = routing
-                    .live_source_route_plan_for_channel(mixer_route)
-                    .map(|route_plan| {
-                        LiveMixerSourceControl::try_new(route_plan, self.output_sample_rate).map(
-                            |control| PlaylistLiveMixerSource {
-                                control,
-                                targets: None,
-                            },
-                        )
-                    })
-                    .transpose()?;
+                let live_route_plan = routing.live_source_route_plan_for_channel(mixer_route);
+                let mut live_source = bus.live_mixer_source.take();
+                let preserved = match (live_source.as_mut(), live_route_plan.as_ref()) {
+                    (Some(source), Some(route_plan)) => source
+                        .control
+                        .try_update_manual_pdc_offsets(route_plan, self.output_sample_rate)?,
+                    _ => false,
+                };
+                bus.live_mixer_source = if preserved {
+                    live_source
+                } else {
+                    live_route_plan
+                        .map(|route_plan| {
+                            LiveMixerSourceControl::try_new(route_plan, self.output_sample_rate)
+                                .map(|control| PlaylistLiveMixerSource {
+                                    control,
+                                    targets: None,
+                                })
+                        })
+                        .transpose()?
+                };
             }
         }
         for effect in &mut self.mixer_effects {
@@ -1310,17 +1320,25 @@ impl Vst3PlaylistStreamProcessor {
                 .map_or_else(MixerSourceRouteTransform::default, |(_, transform)| {
                     *transform
                 });
-            chain.live_source = routing
-                .live_source_route_plan_for_channel(Some(track))
-                .map(|route_plan| {
-                    LiveMixerSourceControl::try_new(route_plan, self.output_sample_rate).map(
-                        |control| PlaylistMixerEffectLiveSource {
-                            control,
-                            targets: None,
-                        },
-                    )
-                })
-                .transpose()?;
+            let live_route_plan = routing.live_source_route_plan_for_channel(Some(track));
+            let preserved = match (chain.live_source.as_mut(), live_route_plan.as_ref()) {
+                (Some(source), Some(route_plan)) => source
+                    .control
+                    .try_update_manual_pdc_offsets(route_plan, self.output_sample_rate)?,
+                _ => false,
+            };
+            if !preserved {
+                chain.live_source = live_route_plan
+                    .map(|route_plan| {
+                        LiveMixerSourceControl::try_new(route_plan, self.output_sample_rate).map(
+                            |control| PlaylistMixerEffectLiveSource {
+                                control,
+                                targets: None,
+                            },
+                        )
+                    })
+                    .transpose()?;
+            }
             chain.route_plan = route_plan;
         }
         let instrument_delay_frames = if self.automatic_pdc_enabled {

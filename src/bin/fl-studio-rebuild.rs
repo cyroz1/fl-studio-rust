@@ -62205,7 +62205,7 @@ impl DawUi {
                             });
                             ui.small(
                                 egui::RichText::new(
-                                    "Positive values add delay to this track; negative values delay the other Mixer tracks. The offset is saved in the FLP; playback and render timing support is still in progress.",
+                                    "Positive values add delay to this track; negative values delay the other Mixer tracks. Changes are saved in the FLP and apply to supported playback and render routes.",
                                 )
                                 .color(MUTED),
                             );
@@ -63741,7 +63741,80 @@ impl DawUi {
                 mixer_refresh_flags |= SCRIPT_HW_DIRTY_MIXER_CONTROLS;
                 self.dirty = true;
                 self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
-                self.status = "Saved Mixer track PDC offset in the FLP".to_owned();
+                let playback_was_active = self.playing;
+                let song_live_pdc_update = playback_was_active
+                    && self.playlist_playback_loaded
+                    && !self.pattern_playback_mode
+                    && !self.performance_mode_active
+                    && self
+                        .document
+                        .as_ref()
+                        .zip(self.playlist_pdc_update_sender.as_ref())
+                        .is_some_and(|(document, sender)| sender.send(document.clone()).is_ok());
+                let pattern_live_pdc_update = playback_was_active
+                    && self.pending_sampler_stream.is_some()
+                    && !self.performance_mode_active
+                    && self
+                        .document
+                        .as_ref()
+                        .zip(self.pattern_pdc_update_sender.as_ref())
+                        .is_some_and(|(document, sender)| sender.send(document.clone()).is_ok());
+                let performance_live_update = playback_was_active
+                    && self.performance_mode_active
+                    && self
+                        .document
+                        .as_ref()
+                        .zip(self.performance_mixer_routing_sender.as_ref())
+                        .is_some_and(|(document, sender)| sender.send(document.clone()).is_ok());
+                let staged_song_handoff = playback_was_active
+                    && self.playlist_playback_loaded
+                    && !self.pattern_playback_mode
+                    && !self.performance_mode_active
+                    && !song_live_pdc_update
+                    && self.stage_playlist_stream_rebuild(PdcStreamHandoffReason::MixerRouting);
+                let staged_pattern_handoff = playback_was_active
+                    && !staged_song_handoff
+                    && self.pattern_playback_mode
+                    && self.pattern_mode_playback_source.is_some()
+                    && !self.performance_mode_active
+                    && !pattern_live_pdc_update
+                    && self.stage_pattern_stream_rebuild(PdcStreamHandoffReason::MixerRouting);
+                if playback_was_active
+                    && !staged_song_handoff
+                    && !staged_pattern_handoff
+                    && !song_live_pdc_update
+                    && !pattern_live_pdc_update
+                    && !performance_live_update
+                {
+                    self.stop_project_playback();
+                }
+                self.status = if song_live_pdc_update || pattern_live_pdc_update {
+                    format!(
+                        "Saved Mixer track PDC offset; applying at the next {} audio-block boundary",
+                        if pattern_live_pdc_update {
+                            "Pattern"
+                        } else {
+                            "Song"
+                        }
+                    )
+                } else if staged_song_handoff || staged_pattern_handoff {
+                    format!(
+                        "Saved Mixer track PDC offset; preparing a live {} handoff…",
+                        if staged_pattern_handoff {
+                            "Pattern"
+                        } else {
+                            "Song"
+                        }
+                    )
+                } else if performance_live_update {
+                    "Saved Mixer track PDC offset; applying at the next Performance audio block"
+                        .to_owned()
+                } else if playback_was_active {
+                    "Saved Mixer track PDC offset; playback stopped. Start again to apply it."
+                        .to_owned()
+                } else {
+                    "Saved Mixer track PDC offset in the FLP".to_owned()
+                };
             }
         }
         if !effect_slot_color_edits.is_empty()

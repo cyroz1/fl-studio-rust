@@ -631,6 +631,13 @@ struct LiveMixerSourceDelayLines {
     effect_input: Vec<StereoFrameDelay>,
 }
 
+#[derive(Default)]
+struct LiveMixerSourceDelayFrames {
+    output: Vec<u64>,
+    meter: Vec<u64>,
+    effect_input: Vec<u64>,
+}
+
 const MAX_LIVE_MIXER_PDC_DELAY_BYTES: u64 = 128 * 1024 * 1024;
 
 impl Clone for LiveMixerSourceControl {
@@ -889,6 +896,116 @@ impl LiveMixerSourceControl {
             smoothing_alpha: output_gain_smoothing_alpha(sample_rate as f32),
             route_plan,
         })
+    }
+
+    /// Updates a live source's saved offsets without discarding audio already queued for PDC.
+    /// Returns `false` when other route controls or path topology also changed.
+    pub(crate) fn try_update_manual_pdc_offsets(
+        &mut self,
+        route_plan: &crate::MixerLiveSourceRoutePlan,
+        sample_rate: u32,
+    ) -> Result<bool, String> {
+        if route_plan == &self.route_plan {
+            return Ok(true);
+        }
+        let mut comparable = route_plan.clone();
+        comparable.manual_pdc_offsets_ms_by_track =
+            self.route_plan.manual_pdc_offsets_ms_by_track.clone();
+
+        if comparable.ordered_output_paths.len() != self.route_plan.ordered_output_paths.len()
+            || comparable.ordered_insert_meter_paths.len()
+                != self.route_plan.ordered_insert_meter_paths.len()
+            || comparable.ordered_insert_effect_input_paths.len()
+                != self.route_plan.ordered_insert_effect_input_paths.len()
+        {
+            return Ok(false);
+        }
+        for (next, previous) in comparable
+            .ordered_output_paths
+            .iter_mut()
+            .zip(&self.route_plan.ordered_output_paths)
+        {
+            next.manual_pdc_offsets_ms = previous.manual_pdc_offsets_ms.clone();
+        }
+        for (next, previous) in comparable
+            .ordered_insert_meter_paths
+            .iter_mut()
+            .zip(&self.route_plan.ordered_insert_meter_paths)
+        {
+            next.manual_pdc_offsets_ms = previous.manual_pdc_offsets_ms.clone();
+        }
+        for (next, previous) in comparable
+            .ordered_insert_effect_input_paths
+            .iter_mut()
+            .zip(&self.route_plan.ordered_insert_effect_input_paths)
+        {
+            next.manual_pdc_offsets_ms = previous.manual_pdc_offsets_ms.clone();
+        }
+
+        match (
+            &mut comparable.live_send_output_paths,
+            &self.route_plan.live_send_output_paths,
+        ) {
+            (Some(next_paths), Some(previous_paths))
+                if next_paths.len() == previous_paths.len() =>
+            {
+                for (next, previous) in next_paths.iter_mut().zip(previous_paths) {
+                    next.manual_pdc_offsets_ms = previous.manual_pdc_offsets_ms.clone();
+                }
+            }
+            (None, None) => {}
+            _ => return Ok(false),
+        }
+        if comparable.live_send_meter_paths.len() != self.route_plan.live_send_meter_paths.len()
+            || comparable.live_send_effect_input_paths.len()
+                != self.route_plan.live_send_effect_input_paths.len()
+        {
+            return Ok(false);
+        }
+        for (next, previous) in comparable
+            .live_send_meter_paths
+            .iter_mut()
+            .zip(&self.route_plan.live_send_meter_paths)
+        {
+            next.manual_pdc_offsets_ms = previous.manual_pdc_offsets_ms.clone();
+        }
+        for (next, previous) in comparable
+            .live_send_effect_input_paths
+            .iter_mut()
+            .zip(&self.route_plan.live_send_effect_input_paths)
+        {
+            next.manual_pdc_offsets_ms = previous.manual_pdc_offsets_ms.clone();
+        }
+        if comparable != self.route_plan {
+            return Ok(false);
+        }
+
+        let delay_frames = live_mixer_source_delay_frames(route_plan, sample_rate)?;
+        let previous_delays = self
+            .delay_lines
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if previous_delays.output.len() != delay_frames.output.len()
+            || previous_delays.meter.len() != delay_frames.meter.len()
+            || previous_delays.effect_input.len() != delay_frames.effect_input.len()
+        {
+            return Ok(false);
+        }
+        for (delay, frames) in previous_delays.output.iter_mut().zip(delay_frames.output) {
+            delay.set_delay_frames(frames)?;
+        }
+        for (delay, frames) in previous_delays.meter.iter_mut().zip(delay_frames.meter) {
+            delay.set_delay_frames(frames)?;
+        }
+        for (delay, frames) in previous_delays
+            .effect_input
+            .iter_mut()
+            .zip(delay_frames.effect_input)
+        {
+            delay.set_delay_frames(frames)?;
+        }
+        self.route_plan = route_plan.clone();
+        Ok(true)
     }
 
     pub(crate) fn targets(&self, meters: &MixerTrackPeakMeters) -> Option<LiveMixerSourceTargets> {
@@ -1587,12 +1704,27 @@ impl StereoFrameDelay {
             return Ok(());
         }
 
-        let retained_frames = capacity.min(self.frames.len());
+        *self = self.copied_with_delay_frames(delay_frames)?;
+        Ok(())
+    }
+
+    fn copied_with_delay_frames(&self, delay_frames: u64) -> Result<Self, String> {
+        let capacity = usize::try_from(delay_frames)
+            .map_err(|_| "PDC delay is too large for this platform".to_owned())?;
         let mut frames = Vec::new();
         frames
             .try_reserve_exact(capacity)
             .map_err(|error| format!("could not allocate PDC delay line: {error}"))?;
+        if capacity == self.frames.len() {
+            frames.extend_from_slice(&self.frames);
+            return Ok(Self {
+                frames,
+                cursor: self.cursor,
+            });
+        }
+
         frames.resize(capacity, [0.0; 2]);
+        let retained_frames = capacity.min(self.frames.len());
         if retained_frames > 0 {
             let source_start =
                 (self.cursor + self.frames.len() - retained_frames) % self.frames.len();
@@ -1602,9 +1734,7 @@ impl StereoFrameDelay {
                     self.frames[(source_start + offset) % self.frames.len()];
             }
         }
-        self.frames = frames;
-        self.cursor = 0;
-        Ok(())
+        Ok(Self { frames, cursor: 0 })
     }
 
     pub(crate) fn process_interleaved(&mut self, samples: &mut [f32]) -> Result<(), String> {
@@ -1638,13 +1768,39 @@ fn live_mixer_source_delay_lines(
     route_plan: &crate::MixerLiveSourceRoutePlan,
     sample_rate: u32,
 ) -> Result<LiveMixerSourceDelayLines, String> {
+    let planned = live_mixer_source_delay_frames(route_plan, sample_rate)?;
+    let output = create_delay_lines(planned.output, "output")?;
+    let meter = create_delay_lines(planned.meter, "meter")?;
+    let effect_input = create_delay_lines(planned.effect_input, "effect-input")?;
+    Ok(LiveMixerSourceDelayLines {
+        output,
+        meter,
+        effect_input,
+    })
+}
+
+fn create_delay_lines(frames: Vec<u64>, path_kind: &str) -> Result<Vec<StereoFrameDelay>, String> {
+    let mut delays = Vec::new();
+    delays
+        .try_reserve_exact(frames.len())
+        .map_err(|error| format!("could not allocate Mixer {path_kind} delay plans: {error}"))?;
+    for delay_frames in frames {
+        delays.push(StereoFrameDelay::new(delay_frames)?);
+    }
+    Ok(delays)
+}
+
+fn live_mixer_source_delay_frames(
+    route_plan: &crate::MixerLiveSourceRoutePlan,
+    sample_rate: u32,
+) -> Result<LiveMixerSourceDelayFrames, String> {
     let mut total_delay_bytes = 0_u64;
     let mut output = Vec::new();
     output
         .try_reserve_exact(route_plan.ordered_output_paths.len())
         .map_err(|error| format!("could not allocate Mixer output delay plans: {error}"))?;
     for path in &route_plan.ordered_output_paths {
-        output.push(new_route_delay_line(
+        output.push(route_delay_frames(
             &path.track_path,
             None,
             &route_plan.manual_pdc_offsets_ms_by_track,
@@ -1658,7 +1814,7 @@ fn live_mixer_source_delay_lines(
         .try_reserve_exact(route_plan.ordered_insert_meter_paths.len())
         .map_err(|error| format!("could not allocate Mixer meter delay plans: {error}"))?;
     for path in &route_plan.ordered_insert_meter_paths {
-        meter.push(new_route_delay_line(
+        meter.push(route_delay_frames(
             &path.track_path,
             None,
             &route_plan.manual_pdc_offsets_ms_by_track,
@@ -1672,7 +1828,7 @@ fn live_mixer_source_delay_lines(
         .try_reserve_exact(route_plan.ordered_insert_effect_input_paths.len())
         .map_err(|error| format!("could not allocate Mixer effect-input delay plans: {error}"))?;
     for path in &route_plan.ordered_insert_effect_input_paths {
-        effect_input.push(new_route_delay_line(
+        effect_input.push(route_delay_frames(
             &path.track_path,
             Some(path.track),
             &route_plan.manual_pdc_offsets_ms_by_track,
@@ -1680,21 +1836,20 @@ fn live_mixer_source_delay_lines(
             &mut total_delay_bytes,
         )?);
     }
-
-    Ok(LiveMixerSourceDelayLines {
+    Ok(LiveMixerSourceDelayFrames {
         output,
         meter,
         effect_input,
     })
 }
 
-fn new_route_delay_line(
+fn route_delay_frames(
     track_path: &[usize],
     effect_input_track: Option<usize>,
     manual_offsets_ms: &[(usize, f32)],
     sample_rate: u32,
     total_delay_bytes: &mut u64,
-) -> Result<StereoFrameDelay, String> {
+) -> Result<u64, String> {
     let path_delay_ms = manual_offsets_ms
         .iter()
         .fold(0.0_f64, |delay_ms, (track, offset_ms)| {
@@ -1711,7 +1866,7 @@ fn new_route_delay_line(
             }
         });
     if path_delay_ms == 0.0 {
-        return Ok(StereoFrameDelay::default());
+        return Ok(0);
     }
     if sample_rate == 0 {
         return Err("Mixer manual PDC requires a positive sample rate".to_owned());
@@ -1733,7 +1888,7 @@ fn new_route_delay_line(
                 MAX_LIVE_MIXER_PDC_DELAY_BYTES / (1024 * 1024)
             )
         })?;
-    StereoFrameDelay::new(frames)
+    Ok(frames)
 }
 
 /// Enable flush-to-zero for floating-point work on the current audio/render thread.

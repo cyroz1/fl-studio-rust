@@ -16471,10 +16471,24 @@ fn refresh_prepared_clip_mixer_routes(
 ) -> Result<(), String> {
     for clip in clips {
         let route_plan = routing.source_route_plan_for_channel(clip.mixer_track);
-        let live_mixer_source_control = routing
-            .live_source_route_plan_for_channel(clip.mixer_track)
-            .map(|route_plan| LiveMixerSourceControl::try_new(route_plan, sample_rate))
-            .transpose()?;
+        let live_route_plan = routing.live_source_route_plan_for_channel(clip.mixer_track);
+        let previous_route = clip.mixer_route_override.load_full();
+        let mut previous_control = previous_route
+            .as_deref()
+            .and_then(|route| route.live_mixer_source_control.clone());
+        let preserved = match (previous_control.as_mut(), live_route_plan.as_ref()) {
+            (Some(control), Some(next_plan)) => {
+                control.try_update_manual_pdc_offsets(next_plan, sample_rate)?
+            }
+            _ => false,
+        };
+        let live_mixer_source_control = if preserved {
+            previous_control
+        } else {
+            live_route_plan
+                .map(|route_plan| LiveMixerSourceControl::try_new(route_plan, sample_rate))
+                .transpose()?
+        };
         clip.mixer_route_override
             .store(Some(Arc::new(PreparedClipMixerRouteOverride {
                 mixer_transform: route_plan.output_transform,
@@ -16804,10 +16818,24 @@ impl<'a> SamplerVoiceEngine<'a> {
             voice.mixer_transform = route.mixer_transform;
             voice.mixer_meter_transforms = route.mixer_meter_transforms.clone();
             voice.mixer_effect_input_transforms = route.mixer_effect_input_transforms.clone();
-            voice.live_mixer_source_control = if let Some(plan) = route.live_source_route.clone() {
-                let control = LiveMixerSourceControl::try_new(plan, self.output_sample_rate)?;
-                let targets = meters.and_then(|meters| control.targets(meters));
-                Some((control, targets))
+            let previous_control = voice.live_mixer_source_control.take();
+            voice.live_mixer_source_control = if let Some(plan) = route.live_source_route.as_ref() {
+                if let Some((mut control, _)) = previous_control {
+                    if control.try_update_manual_pdc_offsets(plan, self.output_sample_rate)? {
+                        let targets = meters.and_then(|meters| control.targets(meters));
+                        Some((control, targets))
+                    } else {
+                        let control =
+                            LiveMixerSourceControl::try_new(plan.clone(), self.output_sample_rate)?;
+                        let targets = meters.and_then(|meters| control.targets(meters));
+                        Some((control, targets))
+                    }
+                } else {
+                    let control =
+                        LiveMixerSourceControl::try_new(plan.clone(), self.output_sample_rate)?;
+                    let targets = meters.and_then(|meters| control.targets(meters));
+                    Some((control, targets))
+                }
             } else {
                 None
             };
