@@ -2608,6 +2608,9 @@ pub const PATTERN_NOTE_MUTED_FLAG: u16 = 1 << 0;
 /// documents clip muting but not its binary representation.
 pub const PLAYLIST_CLIP_MUTED_FLAG: u16 = 0x2000;
 
+/// Maximum manual Mixer track PDC offset accepted by the host, in milliseconds.
+pub const MAX_MIXER_TRACK_MANUAL_PDC_MS: f32 = 60_000.0;
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PatternNoteEdit {
     pub position: Option<u32>,
@@ -10418,6 +10421,67 @@ impl FlpDocument {
         candidate.refresh_event_offsets()?;
         *self = candidate;
         Ok(())
+    }
+
+    /// Reads the saved manual PDC offset for one recognized Mixer insert, in milliseconds.
+    /// The first float in its unique 12-byte `0xEC` track-state event stores this value.
+    /// Malformed, missing, or ambiguous records remain uninterpreted.
+    pub fn mixer_insert_manual_pdc_ms(&self, insert_ordinal: usize) -> Option<f32> {
+        let event_index = self.mixer_insert_manual_pdc_event_index(insert_ordinal)?;
+        let event = self.events.get(event_index)?;
+        let value = f32::from_le_bytes(event.payload[..4].try_into().ok()?);
+        value.is_finite().then_some(value)
+    }
+
+    /// Edits an existing Mixer insert's saved manual PDC offset, in milliseconds.
+    /// Only the first four bytes of its unique 12-byte `0xEC` track-state event are changed;
+    /// flags, input latency, and all unrelated project bytes are retained.
+    pub fn set_mixer_insert_manual_pdc_ms(
+        &mut self,
+        insert_ordinal: usize,
+        offset_ms: f32,
+    ) -> Result<(), FlpError> {
+        if !offset_ms.is_finite() || offset_ms.abs() > MAX_MIXER_TRACK_MANUAL_PDC_MS {
+            return Err(FlpError::UnsupportedEdit(
+                "manual Mixer PDC offset must be finite and within ±60000 ms",
+            ));
+        }
+        let event_index = self
+            .mixer_insert_manual_pdc_event_index(insert_ordinal)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the Mixer insert has no unique recognized 12-byte 0xEC track-state event",
+            ))?;
+
+        let mut candidate = self.clone();
+        let event = candidate
+            .events
+            .get_mut(event_index)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the Mixer insert PDC event is outside the project event stream",
+            ))?;
+        let mut payload = event.payload.clone();
+        payload[..4].copy_from_slice(&offset_ms.to_le_bytes());
+        event.replace_data_payload(payload)?;
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    fn mixer_insert_manual_pdc_event_index(&self, insert_ordinal: usize) -> Option<usize> {
+        let insert = self
+            .mixer_inserts()
+            .into_iter()
+            .find(|insert| insert.ordinal() == insert_ordinal)?;
+        let range = insert.event_range();
+        let mut candidates = range.filter(|&event_index| {
+            self.events.get(event_index).is_some_and(|event| {
+                event.opcode == 0xEC
+                    && event.payload.len() == 12
+                    && matches!(event.encoding, PayloadEncoding::Data { .. })
+            })
+        });
+        let event_index = candidates.next()?;
+        candidates.next().is_none().then_some(event_index)
     }
 
     fn candidate_mixer_automatic_pdc_event(&self) -> Option<(usize, bool)> {

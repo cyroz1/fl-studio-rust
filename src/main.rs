@@ -170,6 +170,19 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_bool(enabled, "Automatic PDC setting")?,
             )
         }
+        [command, input, output, insert_ordinal, offset_ms]
+            if command == "set-mixer-insert-manual-pdc" =>
+        {
+            let offset_ms = offset_ms
+                .parse::<f32>()
+                .map_err(|_| "manual Mixer PDC offset must be a finite number of milliseconds".to_owned())?;
+            set_mixer_insert_manual_pdc(
+                Path::new(input),
+                Path::new(output),
+                parse_usize(insert_ordinal, "Mixer insert ordinal")?,
+                offset_ms,
+            )
+        }
         [command, path] if command == "automation" => list_automation(Path::new(path)),
         [command, path] if command == "automation-targets" => {
             list_automation_target_links(Path::new(path))
@@ -4921,6 +4934,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild duplicate-channel <input.flp> <output.flp> <channel-id> <name>\n",
             "  flp-rebuild mixer <file.flp>\n",
             "  flp-rebuild set-mixer-automatic-pdc <input.flp> <output.flp> <0|1>\n",
+            "  flp-rebuild set-mixer-insert-manual-pdc <input.flp> <output.flp> <insert-ordinal> <offset-ms>\n",
             "  flp-rebuild set-mixer-parameter-record-value <input.flp> <output.flp> <event-index> <record-index> <signed-value>\n",
             "  flp-rebuild set-mixer-eq-parameter-raw <input.flp> <output.flp> <insert-ordinal> <low-gain|mid-gain|high-gain|low-frequency|mid-frequency|high-frequency|low-q|mid-q|high-q> <raw-value>\n",
             "  flp-rebuild set-mixer-effect-slot-enabled <input.flp> <output.flp> <insert-ordinal> <slot-index> <0|1>\n",
@@ -7701,7 +7715,7 @@ fn list_mixer(path: &Path) -> Result<(), String> {
     println!("recognized insert records: {}", inserts.len());
     for insert in inserts {
         println!(
-            "ordinal={} name={} enabled={:?} soloed={:?} polarity_reversed={:?} swap_left_right={:?} effects_enabled={:?} mute_locked={:?} flags={:?} input_raw={} output_raw={} color_raw=0x{:08X} icon_raw={:?} events={:?}",
+            "ordinal={} name={} enabled={:?} soloed={:?} polarity_reversed={:?} swap_left_right={:?} effects_enabled={:?} mute_locked={:?} manual_pdc_ms={:?} flags={:?} input_raw={} output_raw={} color_raw=0x{:08X} icon_raw={:?} events={:?}",
             insert.ordinal(),
             insert.name().unwrap_or("(unnamed)"),
             insert.enabled(),
@@ -7710,6 +7724,7 @@ fn list_mixer(path: &Path) -> Result<(), String> {
             insert.swap_left_right(),
             insert.effects_enabled(),
             insert.mute_locked(),
+            document.mixer_insert_manual_pdc_ms(insert.ordinal()),
             insert.flags(),
             insert.input_raw(),
             insert.output_raw(),
@@ -7819,6 +7834,28 @@ fn set_mixer_automatic_pdc(input: &Path, output: &Path, enabled: bool) -> Result
     println!(
         "set Mixer Automatic PDC to {} in {}",
         u8::from(enabled),
+        output.display()
+    );
+    Ok(())
+}
+
+fn set_mixer_insert_manual_pdc(
+    input: &Path,
+    output: &Path,
+    insert_ordinal: usize,
+    offset_ms: f32,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .set_mixer_insert_manual_pdc_ms(insert_ordinal, offset_ms)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "set Mixer insert {insert_ordinal} manual PDC offset to {offset_ms} ms in {}",
         output.display()
     );
     Ok(())

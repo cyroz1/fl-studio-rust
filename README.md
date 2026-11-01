@@ -1,12 +1,12 @@
 # Rust DAW compatibility rebuild
 
-## Parity progress — 2026-10-23
+## Parity progress — 2026-11-01
 
 **Early prototype; not yet suitable as a full FL Studio replacement.** The [parity roadmap](docs/parity-roadmap.md) is an unweighted checklist: partial items cover only their stated subsets, and a completed small item does not count as the same amount of work as a complete subsystem.
 
-- **Working foundations:** lossless FLP parsing and round-trip writing, selected project and note edits, MIDI import and partial export, and cross-platform CI packaging.
+- **Working foundations:** lossless FLP parsing and round-trip writing, selected project and note edits, read/edit support for saved manual Mixer track PDC offsets, MIDI import and partial export, and cross-platform CI packaging.
 - **Partial runtime and editing:** early Playlist, Channel Rack, Piano roll, Mixer, plug-in, and audio views; the Piano roll includes a saved Grouping switch and repeatable Magic Lasso selection; Windows shared and exclusive audio; playback and a first combined WAV render for supported audio clips, Sampler notes, and mapped installed VST3 instruments. Loaded VST3 instances support a machine-local manual PDC offset per class UID, added to reported latency. Supported Mixer direct and complete send paths include live fader, pan, stereo-width, phase, and channel-swap smoothing. Direct-to-Master sources smooth live mute changes, and direct plus complete send-routed paths smooth live solo changes; route and parameter mappings remain provisional.
-- **Major parity gaps:** native-verified Mixer mappings (see the [render comparison procedure](docs/native-render-comparison.md)), manual per-track PDC offsets, sidechain audio, broad automation parity, VST compatibility and state write-back, full FL Studio window/control behavior, and verified compatibility across FL Studio versions.
+- **Major parity gaps:** native-verified Mixer mappings (see the [render comparison procedure](docs/native-render-comparison.md)), applying manual per-track PDC offsets through the complete live and offline Mixer graph, sidechain audio, broad automation parity, VST compatibility and state write-back, full FL Studio window/control behavior, and verified compatibility across FL Studio versions.
 
 See the roadmap for subsystem-level status and evidence.
 
@@ -46,6 +46,7 @@ flp-rebuild channels <file.flp>
 flp-rebuild plugin-states <file.flp>
 flp-rebuild channel-events <file.flp> <channel-id>
 flp-rebuild mixer <file.flp>
+flp-rebuild set-mixer-insert-manual-pdc <input.flp> <output.flp> <insert-ordinal> <offset-ms>
 flp-rebuild set-mixer-parameter-record-value <input.flp> <output.flp> <event-index> <record-index> <signed-value>
 flp-rebuild set-mixer-eq-parameter-raw <input.flp> <output.flp> <insert-ordinal> <low-gain|mid-gain|high-gain|low-frequency|mid-frequency|high-frequency|low-q|mid-q|high-q> <raw-value>
 flp-rebuild set-mixer-effect-slot-enabled <input.flp> <output.flp> <insert-ordinal> <slot-index> <0|1>

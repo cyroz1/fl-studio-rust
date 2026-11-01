@@ -61378,6 +61378,7 @@ impl DawUi {
         let mut rename_edits = Vec::new();
         let mut flag_edits = Vec::new();
         let mut parameter_edits = Vec::new();
+        let mut manual_pdc_edits = Vec::new();
         let mut effect_slot_color_edits = Vec::new();
         let mixer_effect_mix_locations = effect_slots
             .iter()
@@ -62184,6 +62185,30 @@ impl DawUi {
                         }
                         if name_response.changed() {
                             rename_edits.push((insert.ordinal(), name));
+                        }
+                        if let Some(mut offset_ms) =
+                            document.mixer_insert_manual_pdc_ms(insert.ordinal())
+                        {
+                            ui.horizontal(|ui| {
+                                ui.label("Manual track PDC");
+                                if ui
+                                    .add(
+                                        egui::DragValue::new(&mut offset_ms)
+                                            .speed(0.1)
+                                            .range(-60_000.0..=60_000.0)
+                                            .suffix(" ms"),
+                                    )
+                                    .changed()
+                                {
+                                    manual_pdc_edits.push((insert.ordinal(), offset_ms));
+                                }
+                            });
+                            ui.small(
+                                egui::RichText::new(
+                                    "Positive values add delay to this track; negative values delay the other Mixer tracks. The offset is saved in the FLP; playback and render timing support is still in progress.",
+                                )
+                                .color(MUTED),
+                            );
                         }
                         let insert_slots = effect_slots
                             .iter()
@@ -63695,6 +63720,28 @@ impl DawUi {
                         self.status = format!("Could not rename Mixer insert: {error}");
                     }
                 }
+            }
+        }
+        if !manual_pdc_edits.is_empty()
+            && let Some(document) = self.document.as_mut()
+        {
+            let mut updated_tracks = Vec::new();
+            for (insert_ordinal, offset_ms) in manual_pdc_edits {
+                match document.set_mixer_insert_manual_pdc_ms(insert_ordinal, offset_ms) {
+                    Ok(()) => updated_tracks.push(insert_ordinal),
+                    Err(error) => {
+                        self.status = format!("Could not set Mixer track PDC offset: {error}");
+                    }
+                }
+            }
+            if !updated_tracks.is_empty() {
+                for insert_ordinal in updated_tracks {
+                    dirty_mixer_tracks.insert(i32::try_from(insert_ordinal).unwrap_or(-1));
+                }
+                mixer_refresh_flags |= SCRIPT_HW_DIRTY_MIXER_CONTROLS;
+                self.dirty = true;
+                self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+                self.status = "Saved Mixer track PDC offset in the FLP".to_owned();
             }
         }
         if !effect_slot_color_edits.is_empty()
