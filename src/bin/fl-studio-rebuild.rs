@@ -157,13 +157,13 @@ use midi_script::{
     MixerTrackParameter, PlaylistTrackPerformanceParameter, SCRIPT_BEAT_INDICATOR_BAR,
     SCRIPT_BEAT_INDICATOR_BEAT, SCRIPT_BEAT_INDICATOR_OFF, SCRIPT_CHANNEL_EVENT_NEW,
     SCRIPT_CHANNEL_EVENT_RENAME, SCRIPT_CHANNEL_EVENT_REPLACE, SCRIPT_CHANNEL_EVENT_SELECT,
-    SCRIPT_HW_CHANNEL_EVENT, SCRIPT_HW_DIRTY_COLORS, SCRIPT_HW_DIRTY_FOCUSED_WINDOW,
-    SCRIPT_HW_DIRTY_MIXER_CONTROLS, SCRIPT_HW_DIRTY_MIXER_DISPLAY, SCRIPT_HW_DIRTY_MIXER_SEL,
-    SCRIPT_HW_DIRTY_NAMES, SCRIPT_HW_DIRTY_UNDO, SCRIPT_MIXER_SCROLL_TO_MAKE_VISIBLE,
-    SCRIPT_PROJECT_LOAD_ERROR, SCRIPT_PROJECT_LOAD_OK, SCRIPT_PROJECT_LOAD_START,
-    SCRIPT_TRANSPORT_PATTERN_MODE, SCRIPT_TRANSPORT_PLAYING, SCRIPT_TRANSPORT_RECORDING,
-    absolute_song_position_ticks, discover_midi_scripts, find_script_for_device,
-    normalized_song_position, song_position_ticks,
+    SCRIPT_HW_CHANNEL_EVENT, SCRIPT_HW_DIRTY_CHANNEL_RACK_GROUP, SCRIPT_HW_DIRTY_COLORS,
+    SCRIPT_HW_DIRTY_FOCUSED_WINDOW, SCRIPT_HW_DIRTY_MIXER_CONTROLS, SCRIPT_HW_DIRTY_MIXER_DISPLAY,
+    SCRIPT_HW_DIRTY_MIXER_SEL, SCRIPT_HW_DIRTY_NAMES, SCRIPT_HW_DIRTY_UNDO,
+    SCRIPT_MIXER_SCROLL_TO_MAKE_VISIBLE, SCRIPT_PROJECT_LOAD_ERROR, SCRIPT_PROJECT_LOAD_OK,
+    SCRIPT_PROJECT_LOAD_START, SCRIPT_TRANSPORT_PATTERN_MODE, SCRIPT_TRANSPORT_PLAYING,
+    SCRIPT_TRANSPORT_RECORDING, absolute_song_position_ticks, discover_midi_scripts,
+    find_script_for_device, normalized_song_position, song_position_ticks,
 };
 use midi_thru::{MidiThruSettings, MidiThruWorker};
 
@@ -9100,6 +9100,10 @@ impl DawUi {
                             format!("Renamed display group to {}", dialog.name)
                         }
                     };
+                    if !self.notify_midi_script_channel_rack_group_changed() {
+                        self.status
+                            .push_str(" · MIDI script Channel Rack refresh callback queue is full");
+                    }
                 } else {
                     self.status = match &dialog.action {
                         ChannelGroupDialogAction::AssignSelected(_) => {
@@ -9157,6 +9161,10 @@ impl DawUi {
                     }
                     filter => filter,
                 };
+                if !self.notify_midi_script_channel_rack_group_changed() {
+                    self.status
+                        .push_str(" · MIDI script Channel Rack refresh callback queue is full");
+                }
             }
             Some(Err(error)) => {
                 self.status = format!("Could not delete display group: {error}");
@@ -9517,6 +9525,10 @@ impl DawUi {
             &[(channel_index, flag)],
             SCRIPT_HW_CHANNEL_EVENT,
         )
+    }
+
+    fn notify_midi_script_channel_rack_group_changed(&self) -> bool {
+        self.notify_midi_script_channel_events_changed(&[], SCRIPT_HW_DIRTY_CHANNEL_RACK_GROUP)
     }
 
     fn notify_midi_script_channel_selection_changes(
@@ -13208,7 +13220,8 @@ impl DawUi {
                 | SCRIPT_HW_DIRTY_MIXER_CONTROLS
                 | SCRIPT_HW_DIRTY_MIXER_DISPLAY
                 | SCRIPT_HW_DIRTY_COLORS
-                | SCRIPT_HW_DIRTY_NAMES,
+                | SCRIPT_HW_DIRTY_NAMES
+                | SCRIPT_HW_DIRTY_CHANNEL_RACK_GROUP,
         ) {
             self.status
                 .push_str(" · MIDI script Mixer refresh callback queue is full");
