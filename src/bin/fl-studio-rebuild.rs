@@ -61657,6 +61657,8 @@ impl DawUi {
         let mut clap_effect_manual_latency_offset_edits = Vec::new();
         let mut clap_effect_parameter_override_apply = Vec::new();
         let mut clap_effect_parameter_override_clear = Vec::new();
+        let mut pattern_clap_mixer_effect_lfo_upserts = Vec::new();
+        let mut pattern_clap_mixer_effect_lfo_unlinks = Vec::new();
         let mut clap_effect_assignment_edit = None;
         let mut clap_effect_assignment_remove = None;
         let mut capture_clap_mixer_effect_state = None;
@@ -64624,6 +64626,49 @@ impl DawUi {
             } else {
                 self.status = "Save the project before editing CLAP parameters".to_owned();
             }
+        }
+        for link in pattern_clap_mixer_effect_lfo_upserts {
+            upsert_pattern_clap_mixer_effect_lfo_parameter_link(
+                &mut self.pattern_clap_mixer_effect_lfo_parameter_links,
+                link.clone(),
+            );
+            self.invalidate_clap_playlist_audio();
+            self.status = save_pattern_clap_mixer_effect_lfo_parameter_links(
+                &self.pattern_clap_mixer_effect_lfo_parameter_links,
+            )
+            .err()
+            .map_or_else(
+                || {
+                    format!(
+                        "Linked {} to a CLAP Mixer Pattern LFO on this machine",
+                        link.parameter_name
+                    )
+                },
+                |error| {
+                    format!(
+                        "Updated the CLAP Mixer Pattern LFO for this session; could not save it: {error}"
+                    )
+                },
+            );
+        }
+        for link in pattern_clap_mixer_effect_lfo_unlinks {
+            remove_pattern_clap_mixer_effect_lfo_parameter_link(
+                &mut self.pattern_clap_mixer_effect_lfo_parameter_links,
+                &link,
+            );
+            self.invalidate_clap_playlist_audio();
+            self.status = save_pattern_clap_mixer_effect_lfo_parameter_links(
+                &self.pattern_clap_mixer_effect_lfo_parameter_links,
+            )
+            .err()
+            .map_or_else(
+                || format!("Cleared CLAP Mixer Pattern LFO for {}", link.parameter_name),
+                |error| {
+                    format!(
+                        "Cleared the CLAP Mixer Pattern LFO for this session; could not save it: {error}"
+                    )
+                },
+            );
         }
         if let Some((insert_ordinal, slot_index)) = capture_clap_mixer_effect_state {
             self.request_clap_mixer_effect_state_capture(insert_ordinal, slot_index);
@@ -72901,8 +72946,6 @@ impl DawUi {
         let mut pattern_clap_unlink_request: Option<PatternClapParameterLink> = None;
         let mut pattern_clap_lfo_upserts = Vec::new();
         let mut pattern_clap_lfo_unlinks = Vec::new();
-        let mut pattern_clap_mixer_effect_lfo_upserts = Vec::new();
-        let mut pattern_clap_mixer_effect_lfo_unlinks = Vec::new();
         let mut pattern_vst3_link_request: Option<(String, u16, u8, u8, MidiVst3ParameterTarget)> =
             None;
         let mut pattern_vst3_unlink_request: Option<(PathBuf, u16, MidiVst3ParameterTarget)> = None;
@@ -75108,49 +75151,6 @@ impl DawUi {
                 |error| {
                     format!(
                         "Cleared CLAP Pattern LFO link for this session; could not save it: {error}"
-                    )
-                },
-            );
-        }
-        for link in pattern_clap_mixer_effect_lfo_upserts {
-            upsert_pattern_clap_mixer_effect_lfo_parameter_link(
-                &mut self.pattern_clap_mixer_effect_lfo_parameter_links,
-                link.clone(),
-            );
-            self.invalidate_clap_playlist_audio();
-            self.status = save_pattern_clap_mixer_effect_lfo_parameter_links(
-                &self.pattern_clap_mixer_effect_lfo_parameter_links,
-            )
-            .err()
-            .map_or_else(
-                || {
-                    format!(
-                        "Linked {} to a CLAP Mixer Pattern LFO on this machine",
-                        link.parameter_name
-                    )
-                },
-                |error| {
-                    format!(
-                        "Updated the CLAP Mixer Pattern LFO for this session; could not save it: {error}"
-                    )
-                },
-            );
-        }
-        for link in pattern_clap_mixer_effect_lfo_unlinks {
-            remove_pattern_clap_mixer_effect_lfo_parameter_link(
-                &mut self.pattern_clap_mixer_effect_lfo_parameter_links,
-                &link,
-            );
-            self.invalidate_clap_playlist_audio();
-            self.status = save_pattern_clap_mixer_effect_lfo_parameter_links(
-                &self.pattern_clap_mixer_effect_lfo_parameter_links,
-            )
-            .err()
-            .map_or_else(
-                || format!("Cleared CLAP Mixer Pattern LFO for {}", link.parameter_name),
-                |error| {
-                    format!(
-                        "Cleared the CLAP Mixer Pattern LFO for this session; could not save it: {error}"
                     )
                 },
             );
