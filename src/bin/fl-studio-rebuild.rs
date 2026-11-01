@@ -157,12 +157,13 @@ use midi_script::{
     MixerTrackParameter, PlaylistTrackPerformanceParameter, SCRIPT_BEAT_INDICATOR_BAR,
     SCRIPT_BEAT_INDICATOR_BEAT, SCRIPT_BEAT_INDICATOR_OFF, SCRIPT_CHANNEL_EVENT_NEW,
     SCRIPT_CHANNEL_EVENT_RENAME, SCRIPT_CHANNEL_EVENT_REPLACE, SCRIPT_CHANNEL_EVENT_SELECT,
-    SCRIPT_HW_CHANNEL_EVENT, SCRIPT_HW_DIRTY_COLORS, SCRIPT_HW_DIRTY_MIXER_CONTROLS,
-    SCRIPT_HW_DIRTY_MIXER_DISPLAY, SCRIPT_HW_DIRTY_MIXER_SEL, SCRIPT_HW_DIRTY_NAMES,
-    SCRIPT_MIXER_SCROLL_TO_MAKE_VISIBLE, SCRIPT_PROJECT_LOAD_ERROR, SCRIPT_PROJECT_LOAD_OK,
-    SCRIPT_PROJECT_LOAD_START, SCRIPT_TRANSPORT_PATTERN_MODE, SCRIPT_TRANSPORT_PLAYING,
-    SCRIPT_TRANSPORT_RECORDING, absolute_song_position_ticks, discover_midi_scripts,
-    find_script_for_device, normalized_song_position, song_position_ticks,
+    SCRIPT_HW_CHANNEL_EVENT, SCRIPT_HW_DIRTY_COLORS, SCRIPT_HW_DIRTY_FOCUSED_WINDOW,
+    SCRIPT_HW_DIRTY_MIXER_CONTROLS, SCRIPT_HW_DIRTY_MIXER_DISPLAY, SCRIPT_HW_DIRTY_MIXER_SEL,
+    SCRIPT_HW_DIRTY_NAMES, SCRIPT_HW_DIRTY_UNDO, SCRIPT_MIXER_SCROLL_TO_MAKE_VISIBLE,
+    SCRIPT_PROJECT_LOAD_ERROR, SCRIPT_PROJECT_LOAD_OK, SCRIPT_PROJECT_LOAD_START,
+    SCRIPT_TRANSPORT_PATTERN_MODE, SCRIPT_TRANSPORT_PLAYING, SCRIPT_TRANSPORT_RECORDING,
+    absolute_song_position_ticks, discover_midi_scripts, find_script_for_device,
+    normalized_song_position, song_position_ticks,
 };
 use midi_thru::{MidiThruSettings, MidiThruWorker};
 
@@ -9485,12 +9486,15 @@ impl DawUi {
             .unwrap_or(true)
     }
 
-    fn notify_midi_script_channel_events_changed(&self, channel_events: &[(i32, i32)]) -> bool {
+    fn notify_midi_script_channel_events_changed(
+        &self,
+        channel_events: &[(i32, i32)],
+        refresh_flags: i32,
+    ) -> bool {
         self.midi_input_connection
             .as_ref()
             .and_then(|connection| {
-                connection
-                    .notify_script_channel_events_changed(channel_events, SCRIPT_HW_CHANNEL_EVENT)
+                connection.notify_script_channel_events_changed(channel_events, refresh_flags)
             })
             .unwrap_or(true)
     }
@@ -9509,19 +9513,24 @@ impl DawUi {
         else {
             return true;
         };
-        self.notify_midi_script_channel_events_changed(&[(channel_index, flag)])
+        self.notify_midi_script_channel_events_changed(
+            &[(channel_index, flag)],
+            SCRIPT_HW_CHANNEL_EVENT,
+        )
     }
 
     fn notify_midi_script_channel_selection_changes(
         &self,
         previous: &BTreeSet<u16>,
         current: &BTreeSet<u16>,
+        previous_focus: Option<u16>,
+        current_focus: Option<u16>,
     ) -> bool {
         let Some(document) = self.document.as_ref() else {
             return true;
         };
         let channels = document.channels();
-        let channel_events = previous
+        let mut channel_events = previous
             .symmetric_difference(current)
             .filter_map(|channel_id| {
                 channels
@@ -9530,11 +9539,24 @@ impl DawUi {
                     .and_then(|index| i32::try_from(index).ok())
                     .map(|index| (index, SCRIPT_CHANNEL_EVENT_SELECT))
             })
-            .collect::<Vec<_>>();
-        if channel_events.is_empty() {
+            .collect::<BTreeSet<_>>();
+        if previous == current && previous_focus == current_focus {
             true
         } else {
-            self.notify_midi_script_channel_events_changed(&channel_events)
+            if previous_focus != current_focus
+                && let Some(channel_id) = current_focus
+                && let Some(channel_index) = channels
+                    .iter()
+                    .position(|channel| channel.id() == channel_id)
+                    .and_then(|index| i32::try_from(index).ok())
+            {
+                channel_events.insert((channel_index, SCRIPT_CHANNEL_EVENT_SELECT));
+            }
+            let channel_events = channel_events.into_iter().collect::<Vec<_>>();
+            self.notify_midi_script_channel_events_changed(
+                &channel_events,
+                SCRIPT_HW_CHANNEL_EVENT | SCRIPT_HW_DIRTY_FOCUSED_WINDOW,
+            )
         }
     }
 
@@ -13179,6 +13201,17 @@ impl DawUi {
                 " · VST3 state restore issue: {}",
                 plugin_restore_warnings.join("; ")
             ));
+        }
+        if !self.notify_midi_script_mixer_tracks_changed(
+            &[-1],
+            SCRIPT_HW_DIRTY_UNDO
+                | SCRIPT_HW_DIRTY_MIXER_CONTROLS
+                | SCRIPT_HW_DIRTY_MIXER_DISPLAY
+                | SCRIPT_HW_DIRTY_COLORS
+                | SCRIPT_HW_DIRTY_NAMES,
+        ) {
+            self.status
+                .push_str(" · MIDI script Mixer refresh callback queue is full");
         }
     }
 
@@ -38063,6 +38096,7 @@ impl DawUi {
             self.selected_rack_channels.insert(channel_id);
         }
         let initial_selected_rack_channels = self.selected_rack_channels.clone();
+        let initial_selected_graph_channel = self.selected_graph_channel;
         if self
             .rack_selection_anchor
             .is_none_or(|id| !channels.iter().any(|channel| channel.id() == id))
@@ -40948,7 +40982,10 @@ impl DawUi {
                 })
                 .collect::<Vec<_>>();
             if !changed_channel_events.is_empty() {
-                let _ = self.notify_midi_script_channel_events_changed(&changed_channel_events);
+                let _ = self.notify_midi_script_channel_events_changed(
+                    &changed_channel_events,
+                    SCRIPT_HW_CHANNEL_EVENT,
+                );
             }
         }
         if let Some(instance_id) = open_editor
@@ -40974,6 +41011,8 @@ impl DawUi {
         let _ = self.notify_midi_script_channel_selection_changes(
             &initial_selected_rack_channels,
             &self.selected_rack_channels,
+            initial_selected_graph_channel,
+            self.selected_graph_channel,
         );
     }
 
@@ -63940,6 +63979,7 @@ impl DawUi {
                 .transpose()
             {
                 Ok(Some(())) => {
+                    dirty_mixer_tracks.insert(-1);
                     mixer_refresh_flags |= SCRIPT_HW_DIRTY_MIXER_CONTROLS;
                     let playback_was_active = self.playing;
                     let song_live_pdc_update = playback_was_active
