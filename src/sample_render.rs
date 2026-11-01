@@ -27367,6 +27367,89 @@ mod tests {
     }
 
     #[test]
+    fn sampler_voice_applies_pan_and_pitch_envelopes_to_rendered_audio() {
+        let envelope = SamplerVolumeEnvelope {
+            timing: SamplerEnvelopeTiming::Frames(SamplerEnvelopeFrameTimes {
+                predelay: 0,
+                attack: 2,
+                hold: 0,
+                decay: 0,
+                release: 2,
+            }),
+            sustain_level: 1.0,
+            amount: 1.0,
+            attack_tension: 0,
+            decay_tension: 0,
+            release_tension: 0,
+        };
+        let sources = HashMap::from([(
+            7,
+            SamplerVoiceSource {
+                sampler_filter: None,
+                audio: Arc::new(DecodedAudio {
+                    sample_rate: 4,
+                    channels: vec![vec![1.0; 8]],
+                }),
+                gain: 1.0,
+                pan: 0.0,
+                reverse: false,
+                volume_envelope_enabled: false,
+                volume_envelope: None,
+                pan_envelope: Some(envelope),
+                pitch_envelope: Some(envelope),
+                pan_lfo: None,
+                volume_lfo: None,
+                pitch_lfo: None,
+                max_polyphony_raw: None,
+                mono_enabled: false,
+                portamento_enabled: false,
+                polyphony_slide_raw: None,
+                channel_cut_groups: None,
+                fast_declick_for_cut_groups: false,
+                key_range: None,
+                velocity_range: None,
+                root_key: SAMPLER_ROOT_KEY,
+                fine_tune_cents: 0.0,
+                loop_bounds: None,
+                ping_pong_loop: false,
+                backward_loop: false,
+                release_loop_bounds: None,
+                release_ping_pong_loop: false,
+            },
+        )]);
+        let notes = [ScheduledSamplerNote {
+            clip_index: 0,
+            playlist_track_id: None,
+            start_tick: 0,
+            stop_tick: None,
+            start_frame: 0,
+            stop_frame: None,
+            channel_id: 7,
+            key: SAMPLER_ROOT_KEY,
+            midi_channel: 0,
+            slide_note: false,
+            slide_duration_frames: 0,
+            velocity: 127,
+            mod_x: 128,
+            mod_y: 128,
+            pan: 64,
+            fine_pitch_offset_cents: 0,
+            layer_gain: 1.0,
+            layer_pan_raw: 0,
+        }];
+        let mut engine = SamplerVoiceEngine::new(&sources, &notes, 1, 4, 4);
+        let mut output = [0.0; 2];
+
+        engine.render_block(0, 1, &mut output);
+
+        assert_eq!(output, [1.0, 0.0]);
+        let voice = engine.voices[0]
+            .as_ref()
+            .expect("the note should remain active");
+        assert!((voice.source_step - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
     fn zero_length_sampler_note_plays_the_sample_to_its_end() {
         let source = Arc::new(DecodedAudio {
             sample_rate: 4,
