@@ -4093,7 +4093,7 @@ fn enumerate_directsound_outputs_on_mta() -> Result<(Vec<AudioDeviceInfo>, Vec<S
         .ok()
         .map_err(|error| format!("Could not initialize DirectSound discovery COM: {error}"))?;
     let _com = WasapiComGuard;
-    let mut descriptors = Vec::new();
+    let mut descriptors: Vec<DirectSoundDeviceDescriptor> = Vec::new();
     unsafe {
         DirectSoundEnumerateW(
             Some(directsound_enumeration_callback),
