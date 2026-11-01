@@ -18669,12 +18669,12 @@ impl DawUi {
         if let Ok(mut value) = self.midi_script_transport_state.project_genre.lock() {
             *value = project_genre;
         }
-        let (
-            playlist_track_ids,
-            playlist_track_names,
-            playlist_track_muted,
-            playlist_track_group_ranges,
-        ) = self.midi_script_playlist_track_snapshot();
+        let MidiScriptPlaylistTrackSnapshot {
+            track_ids: playlist_track_ids,
+            track_names: playlist_track_names,
+            track_muted: playlist_track_muted,
+            track_group_ranges: playlist_track_group_ranges,
+        } = self.midi_script_playlist_track_snapshot();
         let supported_playlist_track_ids =
             playlist_track_ids.iter().copied().collect::<BTreeSet<_>>();
         self.midi_script_transport_state
@@ -35585,11 +35585,9 @@ impl DawUi {
         };
     }
 
-    fn midi_script_playlist_track_snapshot(
-        &self,
-    ) -> (Vec<u32>, Vec<String>, Vec<bool>, Vec<Option<(u32, u32)>>) {
+    fn midi_script_playlist_track_snapshot(&self) -> MidiScriptPlaylistTrackSnapshot {
         let Some(document) = self.document.as_ref() else {
-            return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            return MidiScriptPlaylistTrackSnapshot::default();
         };
         let arrangements = document.arrangements().unwrap_or_default();
         let Some(arrangement) = arrangements
@@ -35597,18 +35595,23 @@ impl DawUi {
             .find(|arrangement| Some(arrangement.id) == self.selected_arrangement)
             .or_else(|| arrangements.first())
         else {
-            return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            return MidiScriptPlaylistTrackSnapshot::default();
         };
         let tracks = document.playlist_tracks_in_arrangement(arrangement.id);
         let track_ids = midi_script_playlist_track_ids(arrangement, &tracks);
         let track_names = midi_script_playlist_track_names(&track_ids, &tracks);
         let track_muted = midi_script_playlist_track_mute_states(&track_ids, &tracks);
         let track_group_ranges = midi_script_playlist_track_group_ranges(&track_ids, &tracks);
-        (track_ids, track_names, track_muted, track_group_ranges)
+        MidiScriptPlaylistTrackSnapshot {
+            track_ids,
+            track_names,
+            track_muted,
+            track_group_ranges,
+        }
     }
 
     fn midi_script_playlist_track_ids(&self) -> Vec<u32> {
-        self.midi_script_playlist_track_snapshot().0
+        self.midi_script_playlist_track_snapshot().track_ids
     }
 
     fn set_midi_script_playlist_track_selection(&mut self, track_ids: Vec<u32>) {
@@ -35671,8 +35674,12 @@ impl DawUi {
             self.status = "Open a project to mute Playlist tracks".to_owned();
             return;
         }
-        let (track_ids, _, track_muted, track_group_ranges) =
-            self.midi_script_playlist_track_snapshot();
+        let MidiScriptPlaylistTrackSnapshot {
+            track_ids,
+            track_muted,
+            track_group_ranges,
+            ..
+        } = self.midi_script_playlist_track_snapshot();
         let Some(track_index) = track_ids
             .iter()
             .position(|candidate| *candidate == track_id)
@@ -35776,7 +35783,7 @@ impl DawUi {
             self.status = "Open a project to solo Playlist tracks".to_owned();
             return;
         }
-        let (track_ids, _, _, _) = self.midi_script_playlist_track_snapshot();
+        let track_ids = self.midi_script_playlist_track_snapshot().track_ids;
         if !track_ids.contains(&track_id) {
             self.status = format!(
                 "Could not change Playlist track {track_id} solo state: track is outside the supported rows"
@@ -87446,6 +87453,14 @@ fn midi_script_arrangement_time_ticks(current_time: f64, ppq: u16) -> (u64, u64)
         .unwrap_or(0)
         .saturating_mul(snap_ticks);
     (current_time, snapped_time)
+}
+
+#[derive(Default)]
+struct MidiScriptPlaylistTrackSnapshot {
+    track_ids: Vec<u32>,
+    track_names: Vec<String>,
+    track_muted: Vec<bool>,
+    track_group_ranges: Vec<Option<(u32, u32)>>,
 }
 
 fn midi_script_playlist_track_ids(arrangement: &Arrangement, tracks: &[PlaylistTrack]) -> Vec<u32> {
