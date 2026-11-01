@@ -3980,6 +3980,27 @@ def OnMidiIn(event):
     }
 
     #[test]
+    fn python_ui_snap_mode_queues_snap_selection_and_returns_global_handling() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport midi\nimport ui\ndef OnMidiIn(event):\n    result = ui.snapMode(-2)\n    event.data1 = int(result == midi.GT_Global)\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let mut runtime = MidiScriptRuntime::start_for_device(&script, "Test Input").unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
+
+        assert_eq!(result.bytes, [0xB0, 1, 1]);
+        assert_eq!(
+            result.actions,
+            [ScriptTransportAction::PianoRollSnapJog(-2)]
+        );
+    }
+
+    #[test]
     fn python_global_transport_rewind_and_fast_forward_are_hold_commands() {
         let temporary = TestDirectory::new();
         let script_path = temporary.path().join("device_test.py");

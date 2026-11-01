@@ -173,6 +173,17 @@ def _set_hint_msg(message):
     _request_transport_action({"action": "set_hint_message", "message": message})
 
 
+def _ui_snap_mode(value):
+    try:
+        increment = int(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("ui.snapMode() value must be an integer") from error
+    _request_transport_action(
+        {"action": "piano_roll_snap_jog", "increment": increment}
+    )
+    return 8
+
+
 def _playlist_track_count():
     try:
         return max(0, int(_active_transport_state.get("playlist_track_count", 0)))
@@ -2214,6 +2225,7 @@ def _install_modules(script_name, device_name):
     ui.getHintMsg = _get_hint_msg
     ui.setHintMsg = _set_hint_msg
     ui.getHintValue = lambda value, max: f"{value / max:.0%}"
+    ui.snapMode = _ui_snap_mode
 
     playlist = _module("playlist")
     playlist.trackCount = _playlist_track_count
