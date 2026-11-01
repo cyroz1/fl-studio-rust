@@ -1847,12 +1847,6 @@ fn playlist_performance_vst3_clip_candidates(
         .collect())
 }
 
-fn playlist_tempo_is_constant_from_tick(tempo_map: &PlaylistTempoMap, start_tick: u64) -> bool {
-    tempo_map
-        .tempo_segments()
-        .all(|(segment_tick, _)| segment_tick <= start_tick)
-}
-
 fn playlist_performance_clap_clip_candidates(
     document: &FlpDocument,
     arrangement_id: u16,
@@ -1861,10 +1855,6 @@ fn playlist_performance_clap_clip_candidates(
     assigned_clap_channels: &BTreeSet<u16>,
 ) -> Result<BTreeSet<usize>, String> {
     if assigned_clap_channels.is_empty() {
-        return Ok(BTreeSet::new());
-    }
-    let tempo_map = PlaylistTempoMap::for_arrangement(document, arrangement_id)?;
-    if !playlist_tempo_is_constant_from_tick(&tempo_map, u64::from(performance_zone_end_tick)) {
         return Ok(BTreeSet::new());
     }
     let arrangement = document
@@ -1985,11 +1975,6 @@ fn playlist_performance_mixed_source_clip_candidates(
         .filter(|track| track.enabled == Some(false))
         .map(|track| track.id)
         .collect::<BTreeSet<_>>();
-    let constant_tempo = !assigned_clap_channels.is_empty()
-        && playlist_tempo_is_constant_from_tick(
-            &PlaylistTempoMap::for_arrangement(document, arrangement_id)?,
-            u64::from(performance_zone_end_tick),
-        );
     Ok(arrangement
         .clips
         .iter()
@@ -2035,8 +2020,7 @@ fn playlist_performance_mixed_source_clip_candidates(
                 && usize::from(has_sampler) + usize::from(has_vst3) + usize::from(has_clap) >= 2
                 && (destination != Some(PlaylistPerformanceDestination::Sampler) || has_sampler)
                 && (destination != Some(PlaylistPerformanceDestination::Vst3) || has_vst3)
-                && (!has_clap
-                    || (constant_tempo && clip.recognized_pattern_source_window_ticks().is_some())))
+                && (!has_clap || clip.recognized_pattern_source_window_ticks().is_some()))
             .then_some(index)
         })
         .collect())
@@ -3425,8 +3409,9 @@ pub fn stream_playlist_with_vst3_to_device_with_monitor_and_latency_updates(
 ///
 /// The arrangement must contain supported clips before the named Start marker. Launches replace
 /// content from the same Playlist track and repeat at the clip's tick length. Loaded VST3 Pattern
-/// Clips follow Playlist tempo. Assigned CLAP-backed Pattern Clips can launch when tempo stays
-/// constant from Start, using the tempo active there, alongside Sampler and Audio Clips.
+/// Clips follow Playlist tempo. Assigned CLAP-backed Pattern Clips render at the tempo active at
+/// Start and use piecewise pitch-preserving time stretch to follow later Playlist tempo changes,
+/// alongside Sampler and Audio Clips.
 pub fn stream_playlist_performance_with_vst3_to_device(
     document: &FlpDocument,
     project_path: impl AsRef<Path>,
@@ -10835,13 +10820,14 @@ fn stream_prepared_audio_clip_render(
         block.resize(frame_count * 2, 0.0);
         block.fill(0.0);
         for clip in &render.clips {
-            let audio = render.audio_sources.get(clip.source_id).ok_or_else(|| {
-                format!(
-                    "prepared audio clip {} from {} has no decoded source",
-                    clip.clip_index,
-                    clip.path.display()
-                )
-            })?;
+            let audio =
+                prepared_clip_audio_source(clip, &render.audio_sources).ok_or_else(|| {
+                    format!(
+                        "prepared audio clip {} from {} has no decoded source",
+                        clip.clip_index,
+                        clip.path.display()
+                    )
+                })?;
             mix_clip_window_into_stereo_with_quality(
                 &mut block,
                 block_start,
@@ -10968,7 +10954,7 @@ fn render_audio_clips_to_stereo_buffer_inner(
 
     for clip in &render.clips {
         check_cancelled(cancelled)?;
-        let audio = render.audio_sources.get(clip.source_id).ok_or_else(|| {
+        let audio = prepared_clip_audio_source(clip, &render.audio_sources).ok_or_else(|| {
             format!(
                 "prepared audio clip {} from {} has no decoded source",
                 clip.clip_index,
@@ -12048,6 +12034,7 @@ fn prepare_audio_clip_render(
             live_mixer_source_control,
             mixer_meter_transforms: mixer_route_plan.insert_meter_transforms.clone(),
             mixer_effect_input_transforms: mixer_route_plan.insert_effect_input_transforms.clone(),
+            audio_override: None,
             mixer_route_override: Arc::new(ArcSwapOption::empty()),
         });
     }
@@ -13515,6 +13502,15 @@ struct PerformanceAudioClip {
     additional_templates: Vec<PreparedClip>,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct PerformanceClapTempoWarpKey {
+    clip_index: usize,
+    channel_id: u16,
+    source_start_tick: u64,
+    length_ticks: u64,
+    tempo_profile: Vec<(u64, u64)>,
+}
+
 #[derive(Clone)]
 struct PerformanceVst3Clip {
     track_id: u32,
@@ -13559,6 +13555,250 @@ struct ActivePerformanceVst3Clip {
     first_loop_end_tick: u64,
     loop_period_ticks: u64,
     first_pass_scheduled: bool,
+}
+
+const PERFORMANCE_CLAP_MIN_STRETCH_SEGMENT_FRAMES: usize = 2_048;
+const PERFORMANCE_CLAP_MAX_STRETCH_SAMPLES: usize = 16 * 1024 * 1024;
+
+fn performance_clap_tempo_warp_key(
+    clip_index: usize,
+    channel_id: u16,
+    source_start_tick: u64,
+    timeline_start_tick: u64,
+    length_ticks: u64,
+    tempo_map: &PlaylistTempoMap,
+) -> Result<PerformanceClapTempoWarpKey, String> {
+    let timeline_end_tick = timeline_start_tick
+        .checked_add(length_ticks)
+        .ok_or_else(|| "Performance CLAP tempo-warp tick overflow".to_owned())?;
+    let mut last_tempo_bits = tempo_map.tempo_bpm_at_tick(timeline_start_tick).to_bits();
+    let mut tempo_profile = vec![(0, last_tempo_bits)];
+    for (tick, tempo_bpm) in tempo_map
+        .tempo_segments()
+        .filter(|(tick, _)| *tick > timeline_start_tick && *tick < timeline_end_tick)
+    {
+        let tempo_bits = tempo_bpm.to_bits();
+        if tempo_bits != last_tempo_bits {
+            tempo_profile.push((tick - timeline_start_tick, tempo_bits));
+            last_tempo_bits = tempo_bits;
+        }
+    }
+    Ok(PerformanceClapTempoWarpKey {
+        clip_index,
+        channel_id,
+        source_start_tick,
+        length_ticks,
+        tempo_profile,
+    })
+}
+
+fn stretch_performance_clap_audio_range_to_frames(
+    source: &DecodedAudio,
+    source_range: std::ops::Range<usize>,
+    target_frames: usize,
+) -> Result<DecodedAudio, String> {
+    if source.channels.is_empty()
+        || source
+            .channels
+            .iter()
+            .any(|channel| channel.len() != source.frame_count())
+        || source_range.start >= source_range.end
+        || source_range.end > source.frame_count()
+        || target_frames == 0
+    {
+        return Err("Performance CLAP tempo stretch received an invalid audio range".to_owned());
+    }
+    if target_frames
+        .checked_mul(source.channels.len())
+        .is_none_or(|count| count > PERFORMANCE_CLAP_MAX_STRETCH_SAMPLES)
+    {
+        return Err("Performance CLAP tempo-stretched loop exceeds its sample limit".to_owned());
+    }
+
+    let mut current = DecodedAudio {
+        sample_rate: source.sample_rate,
+        channels: source
+            .channels
+            .iter()
+            .map(|channel| channel[source_range.clone()].to_vec())
+            .collect(),
+    };
+    let mut current_frames = current.frame_count();
+    while (target_frames as f64 / current_frames as f64) > 2.0
+        || (target_frames as f64 / current_frames as f64) < 0.5
+    {
+        let ratio = target_frames as f64 / current_frames as f64;
+        let next_frames = if ratio > 2.0 {
+            current_frames
+                .checked_mul(2)
+                .ok_or_else(|| "Performance CLAP tempo-stretch size overflow".to_owned())?
+        } else {
+            current_frames.div_ceil(2)
+        };
+        if next_frames == 0 || next_frames == current_frames {
+            return Err("Performance CLAP tempo stretch exceeds the supported range".to_owned());
+        }
+        current = process_audio_range_for_playback(
+            &current,
+            0..current_frames,
+            0.0,
+            (next_frames as f64 / current_frames as f64) as f32,
+        )?;
+        current_frames = current.frame_count();
+    }
+
+    if current_frames != target_frames {
+        current = process_audio_range_for_playback(
+            &current,
+            0..current_frames,
+            0.0,
+            (target_frames as f64 / current_frames as f64) as f32,
+        )?;
+    }
+    for channel in &mut current.channels {
+        let last_sample = channel.last().copied().unwrap_or_default();
+        channel.resize(target_frames, last_sample);
+    }
+    Ok(current)
+}
+
+fn tempo_warp_performance_clap_audio(
+    source: &DecodedAudio,
+    tempo_map: &PlaylistTempoMap,
+    source_loop_length_ticks: u64,
+    source_start_tick: u64,
+    timeline_start_tick: u64,
+    timeline_length_ticks: u64,
+) -> Result<DecodedAudio, String> {
+    let source_end_tick = source_start_tick
+        .checked_add(timeline_length_ticks)
+        .ok_or_else(|| "Performance CLAP source-window tick overflow".to_owned())?;
+    let timeline_end_tick = timeline_start_tick
+        .checked_add(timeline_length_ticks)
+        .ok_or_else(|| "Performance CLAP timeline tick overflow".to_owned())?;
+    if source_loop_length_ticks == 0
+        || timeline_length_ticks == 0
+        || source_end_tick > source_loop_length_ticks
+        || source.frame_count() == 0
+    {
+        return Err("Performance CLAP tempo stretch received an invalid loop window".to_owned());
+    }
+    let source_frames = source.frame_count();
+    let source_frame_at_tick = |tick: u64| -> usize {
+        ((source_frames as u128 * u128::from(tick) + u128::from(source_loop_length_ticks / 2))
+            / u128::from(source_loop_length_ticks))
+        .min(source_frames as u128) as usize
+    };
+    let target_start_frame = tempo_map.frame_at_tick(timeline_start_tick, source.sample_rate)?;
+    let target_end_frame = tempo_map.frame_at_tick(timeline_end_tick, source.sample_rate)?;
+    let target_frames = usize::try_from(target_end_frame.saturating_sub(target_start_frame))
+        .map_err(|_| "Performance CLAP tempo-stretched loop is too long".to_owned())?;
+    if target_frames == 0 {
+        return Ok(DecodedAudio {
+            sample_rate: source.sample_rate,
+            channels: source.channels.iter().map(|_| Vec::new()).collect(),
+        });
+    }
+    if target_frames
+        .checked_mul(source.channels.len())
+        .is_none_or(|count| count > PERFORMANCE_CLAP_MAX_STRETCH_SAMPLES)
+    {
+        return Err("Performance CLAP tempo-stretched loop exceeds its sample limit".to_owned());
+    }
+
+    let mut split_offsets = vec![0_u64];
+    let mut last_tempo_bits = tempo_map.tempo_bpm_at_tick(timeline_start_tick).to_bits();
+    for (tick, tempo_bpm) in tempo_map
+        .tempo_segments()
+        .filter(|(tick, _)| *tick > timeline_start_tick && *tick < timeline_end_tick)
+    {
+        let tempo_bits = tempo_bpm.to_bits();
+        if tempo_bits != last_tempo_bits {
+            split_offsets.push(tick - timeline_start_tick);
+            last_tempo_bits = tempo_bits;
+        }
+    }
+    split_offsets.push(timeline_length_ticks);
+    split_offsets.sort_unstable();
+    split_offsets.dedup();
+
+    let target_frame_at_offset = |offset: u64| -> Result<u64, String> {
+        tempo_map.frame_at_tick(
+            timeline_start_tick
+                .checked_add(offset)
+                .ok_or_else(|| "Performance CLAP tempo-warp tick overflow".to_owned())?,
+            source.sample_rate,
+        )
+    };
+    let mut chunk_offsets = Vec::new();
+    let mut chunk_start = 0_u64;
+    for &offset in split_offsets.iter().skip(1) {
+        let source_start = source_frame_at_tick(source_start_tick + chunk_start);
+        let source_end = source_frame_at_tick(source_start_tick + offset);
+        let output_start = target_frame_at_offset(chunk_start)?;
+        let output_end = target_frame_at_offset(offset)?;
+        let source_chunk_frames = source_end.saturating_sub(source_start);
+        let output_chunk_frames = output_end.saturating_sub(output_start);
+        if (source_chunk_frames >= PERFORMANCE_CLAP_MIN_STRETCH_SEGMENT_FRAMES
+            && output_chunk_frames >= PERFORMANCE_CLAP_MIN_STRETCH_SEGMENT_FRAMES as u64)
+            || offset == timeline_length_ticks
+        {
+            chunk_offsets.push(offset);
+            chunk_start = offset;
+        }
+    }
+    if chunk_offsets.last().copied() != Some(timeline_length_ticks) {
+        chunk_offsets.push(timeline_length_ticks);
+    }
+    if chunk_offsets.len() > 1 {
+        let last_start = chunk_offsets[chunk_offsets.len() - 2];
+        let source_start = source_frame_at_tick(source_start_tick + last_start);
+        let source_end = source_frame_at_tick(source_end_tick);
+        let output_start = target_frame_at_offset(last_start)?;
+        let output_end = target_frame_at_offset(timeline_length_ticks)?;
+        if source_end.saturating_sub(source_start) < PERFORMANCE_CLAP_MIN_STRETCH_SEGMENT_FRAMES
+            || output_end.saturating_sub(output_start)
+                < PERFORMANCE_CLAP_MIN_STRETCH_SEGMENT_FRAMES as u64
+        {
+            chunk_offsets.remove(chunk_offsets.len() - 2);
+        }
+    }
+
+    let mut output = DecodedAudio {
+        sample_rate: source.sample_rate,
+        channels: source
+            .channels
+            .iter()
+            .map(|_| Vec::with_capacity(target_frames))
+            .collect(),
+    };
+    chunk_start = 0;
+    for offset in chunk_offsets {
+        let source_start = source_frame_at_tick(source_start_tick + chunk_start);
+        let source_end = source_frame_at_tick(source_start_tick + offset);
+        let output_start = target_frame_at_offset(chunk_start)?;
+        let output_end = target_frame_at_offset(offset)?;
+        let output_chunk_frames = usize::try_from(output_end.saturating_sub(output_start))
+            .map_err(|_| "Performance CLAP tempo-stretched segment is too long".to_owned())?;
+        if source_end > source_start && output_chunk_frames > 0 {
+            let stretched = stretch_performance_clap_audio_range_to_frames(
+                source,
+                source_start..source_end,
+                output_chunk_frames,
+            )?;
+            for (output_channel, input_channel) in
+                output.channels.iter_mut().zip(stretched.channels)
+            {
+                output_channel.extend(input_channel);
+            }
+        }
+        chunk_start = offset;
+    }
+    for channel in &mut output.channels {
+        let last_sample = channel.last().copied().unwrap_or_default();
+        channel.resize(target_frames, last_sample);
+    }
+    Ok(output)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -13616,6 +13856,8 @@ struct PlaylistPerformanceRuntime {
     active_audio_by_track: BTreeMap<u32, ActivePerformanceAudioClip>,
     active_vst3_by_track: BTreeMap<u32, ActivePerformanceVst3Clip>,
     active_audio_playbacks: Vec<PreparedClip>,
+    performance_clap_tempo_warp_cache: HashMap<PerformanceClapTempoWarpKey, Arc<DecodedAudio>>,
+    performance_clap_tempo_warp_cache_bytes: usize,
 }
 
 struct PlaylistPerformanceControls {
@@ -13881,6 +14123,7 @@ impl PlaylistPerformanceRuntime {
                     .get(&layer.channel_id)
                     .cloned()
                     .unwrap_or_default(),
+                audio_override: None,
                 mixer_route_override: Arc::new(ArcSwapOption::empty()),
             };
             clap_templates_by_clip
@@ -14190,6 +14433,8 @@ impl PlaylistPerformanceRuntime {
             active_audio_by_track: BTreeMap::new(),
             active_vst3_by_track: BTreeMap::new(),
             active_audio_playbacks: Vec::new(),
+            performance_clap_tempo_warp_cache: HashMap::new(),
+            performance_clap_tempo_warp_cache_bytes: 0,
         })
     }
 
@@ -14684,35 +14929,114 @@ impl PlaylistPerformanceRuntime {
                     .tempo_map
                     .frame_at_tick(loop_end_tick, self.sample_rate)?;
                 let timeline_duration_frames = loop_end_frame.saturating_sub(loop_frame);
-                let source_offset_output_frames = (u128::from(clip.source_duration_frames)
-                    * u128::from(loop_offset_ticks)
-                    / u128::from(clip.length_ticks))
-                .min(u128::from(u64::MAX)) as u64;
-                let duration_frames = clip
-                    .source_duration_frames
-                    .saturating_sub(source_offset_output_frames)
-                    .min(timeline_duration_frames);
-                if duration_frames > 0 {
+                if timeline_duration_frames > 0 {
                     for template in
                         std::iter::once(&clip.template).chain(clip.additional_templates.iter())
                     {
                         let mut playback = template.clone();
                         playback.start_frame = loop_frame;
-                        playback.duration_frames = duration_frames;
-                        if loop_offset_ticks > 0 {
-                            let source_frames = playback
-                                .source_bounds
-                                .end
-                                .saturating_sub(playback.source_bounds.start);
-                            let source_offset_frames =
-                                (source_frames as u128 * u128::from(loop_offset_ticks)
+                        let tempo_warp_key = if template.performance_clap_mix_controls.is_some() {
+                            Some(performance_clap_tempo_warp_key(
+                                active.clip_index,
+                                template.channel_id,
+                                loop_offset_ticks,
+                                loop_start_tick,
+                                loop_length_ticks,
+                                &self.tempo_map,
+                            )?)
+                        } else {
+                            None
+                        };
+                        let rendered_tempo_bpm = self
+                            .tempo_map
+                            .tempo_bpm_at_tick(u64::from(self.performance_zone_end_tick));
+                        let needs_tempo_warp = tempo_warp_key.as_ref().is_some_and(|key| {
+                            key.tempo_profile.iter().any(|(_, tempo_bits)| {
+                                f64::from_bits(*tempo_bits) != rendered_tempo_bpm
+                            })
+                        });
+                        if needs_tempo_warp {
+                            let key = tempo_warp_key.ok_or_else(|| {
+                                "Performance CLAP tempo-warp key is missing".to_owned()
+                            })?;
+                            let warped_audio = if let Some(audio) =
+                                self.performance_clap_tempo_warp_cache.get(&key)
+                            {
+                                Arc::clone(audio)
+                            } else {
+                                let source = prepared_clip_audio_source(
+                                    template,
+                                    audio_context.audio_sources,
+                                )
+                                .ok_or_else(|| {
+                                    format!(
+                                        "Performance CLAP Pattern Clip {} has no decoded instrument audio",
+                                        active.clip_index + 1
+                                    )
+                                })?;
+                                let audio = Arc::new(tempo_warp_performance_clap_audio(
+                                    source,
+                                    &self.tempo_map,
+                                    clip.length_ticks,
+                                    loop_offset_ticks,
+                                    loop_start_tick,
+                                    loop_length_ticks,
+                                )?);
+                                let bytes = decoded_audio_bytes(&audio)?;
+                                if self
+                                    .performance_clap_tempo_warp_cache_bytes
+                                    .saturating_add(bytes)
+                                    <= MAX_SOURCE_CACHE_BYTES
+                                {
+                                    self.performance_clap_tempo_warp_cache_bytes = self
+                                        .performance_clap_tempo_warp_cache_bytes
+                                        .saturating_add(bytes);
+                                    self.performance_clap_tempo_warp_cache
+                                        .insert(key, Arc::clone(&audio));
+                                }
+                                audio
+                            };
+                            let warped_frames = warped_audio.frame_count();
+                            if warped_frames == 0 {
+                                continue;
+                            }
+                            playback.audio_override = Some(warped_audio);
+                            playback.source_bounds = SampleBounds {
+                                start: 0,
+                                end: warped_frames,
+                            };
+                            playback.pitch_ratio = 1.0;
+                            playback.duration_frames = warped_frames as u64;
+                        } else {
+                            let source_offset_output_frames =
+                                (u128::from(clip.source_duration_frames)
+                                    * u128::from(loop_offset_ticks)
                                     / u128::from(clip.length_ticks))
-                                .min(usize::MAX as u128) as usize;
-                            playback.source_bounds.start = playback
-                                .source_bounds
-                                .start
-                                .saturating_add(source_offset_frames)
-                                .min(playback.source_bounds.end.saturating_sub(1));
+                                .min(u128::from(u64::MAX)) as u64;
+                            let duration_frames = clip
+                                .source_duration_frames
+                                .saturating_sub(source_offset_output_frames)
+                                .min(timeline_duration_frames);
+                            if duration_frames == 0 {
+                                continue;
+                            }
+                            playback.duration_frames = duration_frames;
+                            if loop_offset_ticks > 0 {
+                                let source_frames = playback
+                                    .source_bounds
+                                    .end
+                                    .saturating_sub(playback.source_bounds.start);
+                                let source_offset_frames = (source_frames as u128
+                                    * u128::from(loop_offset_ticks)
+                                    / u128::from(clip.length_ticks))
+                                .min(usize::MAX as u128)
+                                    as usize;
+                                playback.source_bounds.start = playback
+                                    .source_bounds
+                                    .start
+                                    .saturating_add(source_offset_frames)
+                                    .min(playback.source_bounds.end.saturating_sub(1));
+                            }
                         }
                         self.active_audio_playbacks.push(playback);
                     }
@@ -18773,6 +19097,7 @@ struct PreparedClip {
     mixer_track: Option<i8>,
     path: PathBuf,
     source_id: usize,
+    audio_override: Option<Arc<DecodedAudio>>,
     start_frame: u64,
     source_bounds: SampleBounds,
     reverse: bool,
@@ -18794,6 +19119,15 @@ struct PreparedClip {
     mixer_meter_transforms: Vec<(usize, MixerSourceRouteTransform)>,
     mixer_effect_input_transforms: Vec<(usize, MixerSourceRouteTransform)>,
     mixer_route_override: Arc<ArcSwapOption<PreparedClipMixerRouteOverride>>,
+}
+
+fn prepared_clip_audio_source<'a>(
+    clip: &'a PreparedClip,
+    audio_sources: &'a [DecodedAudio],
+) -> Option<&'a DecodedAudio> {
+    clip.audio_override
+        .as_deref()
+        .or_else(|| audio_sources.get(clip.source_id))
 }
 
 #[derive(Clone, Debug)]
@@ -19145,7 +19479,7 @@ fn audio_clip_mix_worker(task: AudioClipMixWorkerTask<'_>) {
                 None
             };
             for clip in &clips {
-                let source = audio_sources.get(clip.source_id).ok_or_else(|| {
+                let source = prepared_clip_audio_source(clip, audio_sources).ok_or_else(|| {
                     format!(
                         "prepared audio clip {} from {} has no decoded source",
                         clip.clip_index,
@@ -19203,7 +19537,7 @@ fn mix_prepared_audio_clip_block(
     let mut meter_buses = meter_buses;
     let meter_stride_samples = stereo.len();
     for clip in context.clips {
-        let source = context.audio_sources.get(clip.source_id).ok_or_else(|| {
+        let source = prepared_clip_audio_source(clip, context.audio_sources).ok_or_else(|| {
             format!(
                 "prepared audio clip {} from {} has no decoded source",
                 clip.clip_index,
@@ -21689,6 +22023,7 @@ mod tests {
                 (2, MixerSourceRouteTransform::default().scaled(0.75)),
             ],
             mixer_effect_input_transforms: Vec::new(),
+            audio_override: None,
             mixer_route_override: Arc::new(ArcSwapOption::empty()),
         };
         let meters = MixerTrackPeakMeters::default();
@@ -21780,6 +22115,7 @@ mod tests {
             )),
             mixer_meter_transforms: meter_transforms,
             mixer_effect_input_transforms: Vec::new(),
+            audio_override: None,
             mixer_route_override: Arc::new(ArcSwapOption::empty()),
         };
         let meters = MixerTrackPeakMeters::default();
@@ -21890,6 +22226,7 @@ mod tests {
             )),
             mixer_meter_transforms: meter_transforms,
             mixer_effect_input_transforms: Vec::new(),
+            audio_override: None,
             mixer_route_override: Arc::new(ArcSwapOption::empty()),
         };
         let (launches, receiver) = std::sync::mpsc::channel();
@@ -21936,6 +22273,8 @@ mod tests {
             active_audio_by_track: BTreeMap::new(),
             active_vst3_by_track: BTreeMap::new(),
             active_audio_playbacks: Vec::new(),
+            performance_clap_tempo_warp_cache: HashMap::new(),
+            performance_clap_tempo_warp_cache_bytes: 0,
         };
         launches
             .send(PlaylistPerformanceCommand::Launch(
@@ -22959,6 +23298,7 @@ mod tests {
                     ),
                 ],
                 mixer_effect_input_transforms: Vec::new(),
+                audio_override: None,
                 mixer_route_override: Arc::new(ArcSwapOption::empty()),
             }],
         };
@@ -23349,6 +23689,7 @@ mod tests {
                 live_mixer_source_control: None,
                 mixer_meter_transforms: vec![(usize::try_from(mixer_track).unwrap(), transform)],
                 mixer_effect_input_transforms: Vec::new(),
+                audio_override: None,
                 mixer_route_override: Arc::new(ArcSwapOption::empty()),
             }
         })
@@ -23435,6 +23776,7 @@ mod tests {
             live_mixer_source_control: None,
             mixer_meter_transforms: Vec::new(),
             mixer_effect_input_transforms: Vec::new(),
+            audio_override: None,
             mixer_route_override: Arc::new(ArcSwapOption::empty()),
         };
         let mut mix = vec![0.0; 8];
@@ -23488,6 +23830,7 @@ mod tests {
             live_mixer_source_control: None,
             mixer_meter_transforms: Vec::new(),
             mixer_effect_input_transforms: Vec::new(),
+            audio_override: None,
             mixer_route_override: Arc::new(ArcSwapOption::empty()),
         };
         let mut mix = vec![0.0; 8];
@@ -23597,6 +23940,7 @@ mod tests {
             live_mixer_source_control: None,
             mixer_meter_transforms: Vec::new(),
             mixer_effect_input_transforms: Vec::new(),
+            audio_override: None,
             mixer_route_override: Arc::new(ArcSwapOption::empty()),
         };
         let mut mix = vec![0.0; 4];
@@ -24046,6 +24390,7 @@ mod tests {
             live_mixer_source_control: None,
             mixer_meter_transforms: Vec::new(),
             mixer_effect_input_transforms: Vec::new(),
+            audio_override: None,
             mixer_route_override: Arc::new(ArcSwapOption::empty()),
         };
         let mut mix = vec![0.0; 2];
@@ -24092,6 +24437,7 @@ mod tests {
             live_mixer_source_control: None,
             mixer_meter_transforms: Vec::new(),
             mixer_effect_input_transforms: Vec::new(),
+            audio_override: None,
             mixer_route_override: Arc::new(ArcSwapOption::empty()),
         };
         let render = PreparedAudioClipRender {
