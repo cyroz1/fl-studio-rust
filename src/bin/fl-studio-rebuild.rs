@@ -22717,6 +22717,33 @@ impl DawUi {
         }
     }
 
+    fn apply_fst_preset_to_midi_out_channel(
+        &mut self,
+        preset: &FstPreset,
+        target_channel_id: u16,
+        preset_name: &str,
+    ) -> bool {
+        let Some(mut document) = self.document.clone() else {
+            self.status = "Open a project before applying a channel preset".to_owned();
+            return false;
+        };
+        match document.apply_midi_out_channel_state_preset(target_channel_id, preset) {
+            Ok(event_count) => {
+                self.document = Some(document);
+                self.dirty = true;
+                self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+                self.status = format!(
+                    "Applied {preset_name} to MIDI Out Channel {target_channel_id} ({event_count} channel-state events)"
+                );
+                true
+            }
+            Err(error) => {
+                self.status = format!("Could not apply MIDI Out preset: {error}");
+                false
+            }
+        }
+    }
+
     fn selected_sample_channel(&self) -> Option<(u16, String)> {
         let channel_id = self.selected_graph_channel?;
         let channel = self
@@ -22852,7 +22879,20 @@ impl DawUi {
             && preset_channels.len() == 1
             && preset_channels[0].channel_type() == Some(ChannelType::Sampler);
         let apply_sampler_available = sampler_target_available && sampler_preset_available;
-        let apply_available = apply_vst3_available || apply_sampler_available;
+        let midi_out_target_available = target_channel_id.is_some_and(|channel_id| {
+            self.document.as_ref().is_some_and(|document| {
+                document.channels().into_iter().any(|channel| {
+                    channel.id() == channel_id
+                        && channel.channel_type() == Some(ChannelType::MidiOut)
+                })
+            })
+        });
+        let midi_out_preset_available = details.preset.kind() == FstPresetKind::ChannelState
+            && preset_channels.len() == 1
+            && preset_channels[0].channel_type() == Some(ChannelType::MidiOut);
+        let apply_midi_out_available = midi_out_target_available && midi_out_preset_available;
+        let apply_available =
+            apply_vst3_available || apply_sampler_available || apply_midi_out_available;
         let mut open = true;
         let mut close = false;
         let mut apply_requested = false;
@@ -22933,7 +22973,7 @@ impl DawUi {
                             egui::Button::new("Apply to selected Channel"),
                         )
                         .on_hover_text(
-                            "Applies a compatible Sampler or matching marker-12 VST3 preset to the selected Channel",
+                            "Applies a compatible Sampler or MIDI Out preset, or matching marker-12 VST3 preset, to the selected Channel",
                         )
                         .clicked()
                     {
@@ -22942,7 +22982,7 @@ impl DawUi {
                     if !apply_available {
                         ui.label(
                             egui::RichText::new(
-                                "Select a compatible Sampler or loaded VST3 Channel.",
+                                "Select a compatible Sampler, MIDI Out, or loaded VST3 Channel.",
                             )
                             .color(MUTED),
                         );
@@ -22960,6 +23000,8 @@ impl DawUi {
                 .unwrap_or("VST3 preset");
             close = if apply_sampler_available {
                 self.apply_fst_preset_to_sampler_channel(&details.preset, channel_id, preset_name)
+            } else if apply_midi_out_available {
+                self.apply_fst_preset_to_midi_out_channel(&details.preset, channel_id, preset_name)
             } else {
                 self.apply_fst_preset_to_vst3_channel(&details.preset, channel_id, preset_name)
             };
