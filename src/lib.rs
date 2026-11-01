@@ -27740,6 +27740,54 @@ impl FlpDocument {
         self.create_sample_channel(path, name, 4)
     }
 
+    /// Adds a sample-backed Audio Clip channel configured for pitch-preserving tempo sync.
+    /// The channel receives a minimal Parameters (`0xC7`) record with the saved target duration,
+    /// neutral pitch and multiplier, and Elastique 3 Generic mode.
+    pub fn create_tempo_synced_audio_channel(
+        &mut self,
+        path: &str,
+        name: &str,
+        time_raw: u32,
+    ) -> Result<u16, FlpError> {
+        if time_raw == 0 {
+            return Err(FlpError::UnsupportedEdit(
+                "a tempo-synced Audio Clip requires a non-zero target duration",
+            ));
+        }
+
+        let mut candidate = self.clone();
+        let channel_id = candidate.create_audio_channel(path, name)?;
+        let channel = candidate
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id() == channel_id)
+            .ok_or(FlpError::ChannelNotFound(channel_id))?;
+        let mut kind_events = channel
+            .event_range()
+            .filter(|index| candidate.events[*index].opcode == 0x15);
+        let Some(kind_index) = kind_events.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the new Audio Clip channel has no recognized `0x15` kind event",
+            ));
+        };
+        if kind_events.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the new Audio Clip channel has multiple `0x15` kind events",
+            ));
+        }
+        let mut parameters = vec![0; 112];
+        parameters[96..100].copy_from_slice(&time_raw.to_le_bytes());
+        parameters[100..104].copy_from_slice(&0_i32.to_le_bytes());
+        parameters[104..108].copy_from_slice(&0_i32.to_le_bytes());
+        parameters[108..112].copy_from_slice(&1_i32.to_le_bytes());
+        candidate
+            .events
+            .insert(kind_index + 1, FlpEvent::new_data(0xC7, parameters)?);
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(channel_id)
+    }
+
     fn create_sample_channel(&mut self, path: &str, name: &str, kind: u8) -> Result<u16, FlpError> {
         if path.is_empty() || path.contains('\0') {
             return Err(FlpError::UnsupportedEdit(
@@ -40160,6 +40208,59 @@ mod tests {
             round_trip.channels()[1].sample_path(),
             Some("/samples/take.wav")
         );
+    }
+
+    #[test]
+    fn creates_tempo_synced_audio_clip_channel_with_stretch_settings() {
+        let mut event_stream = vec![0x40, 7, 0, 0x15, 0];
+        append_data_event(
+            &mut event_stream,
+            0xC4,
+            &utf16_project_string("/samples/kick.wav"),
+        );
+        append_project_info_string(&mut event_stream, 0xCB, "Kick");
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+        let mut input = flp_fixture(&event_stream, &[], &[]);
+        input[10..12].copy_from_slice(&1u16.to_le_bytes());
+
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+        let channel_id = document
+            .create_tempo_synced_audio_channel("/samples/loop.wav", "Loop", 320)
+            .expect("tempo-synced Audio Clip should be created");
+        let channel = document
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id() == channel_id)
+            .expect("new Audio Clip channel should be present");
+        let settings = channel
+            .stretch_settings()
+            .expect("new Audio Clip should contain stretch settings");
+        assert_eq!(settings.time_raw(), 320);
+        assert_eq!(settings.pitch_raw(), 0);
+        assert_eq!(settings.multiplier_raw(), 0);
+        assert_eq!(settings.mode(), ChannelStretchMode::Elastique3Generic);
+
+        let encoded = document
+            .encode_lossless()
+            .expect("tempo-synced project should encode");
+        let reopened = FlpDocument::parse(&encoded).expect("tempo-synced project should reopen");
+        let reopened_channel = reopened
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id() == channel_id)
+            .expect("new Audio Clip channel should survive round-trip");
+        assert_eq!(
+            reopened_channel.stretch_settings().unwrap().mode(),
+            ChannelStretchMode::Elastique3Generic
+        );
+
+        let before = document.clone();
+        assert!(
+            document
+                .create_tempo_synced_audio_channel("/samples/loop.wav", "Loop", 0)
+                .is_err()
+        );
+        assert_eq!(document, before);
     }
 
     #[test]

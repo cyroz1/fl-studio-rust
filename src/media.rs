@@ -894,6 +894,12 @@ pub(crate) fn wav_sampler_metadata(path: &Path) -> Option<SamplerFileMetadata> {
     .then_some(metadata)
 }
 
+/// Return a valid WAVE ACID loop tempo for Browser preview and Playlist placement.
+/// One-shots and files without supported loop tempo metadata return `None`.
+pub fn wave_acid_loop_tempo_bpm(path: impl AsRef<Path>) -> Option<f64> {
+    wav_sampler_metadata(path.as_ref()).and_then(|metadata| metadata.acid_loop_tempo_bpm)
+}
+
 /// Read sampler metadata from a standard AIFF or AIFF-C `INST` and `MARK` chunk.
 ///
 /// Both loops use half-open frame bounds. Invalid or absent sampler metadata is ignored, leaving

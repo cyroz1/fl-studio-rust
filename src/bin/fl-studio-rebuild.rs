@@ -35,7 +35,7 @@ use flp_rebuild::media::{
     decode_audio_file, decode_audio_preview, decode_audio_preview_from_position,
     decode_audio_preview_from_position_with_tempo, decode_audio_preview_with_tempo,
     decode_audio_waveform, find_empty_project_template, process_audio_range_to_stereo_preview,
-    summarize_audio_waveform, write_audio_range_to_wav_with_options,
+    summarize_audio_waveform, wave_acid_loop_tempo_bpm, write_audio_range_to_wav_with_options,
 };
 use flp_rebuild::midi::{
     MAX_MIDI_PARAMETER_NUMBER, MidiAutomationSource, MidiChannelMapping,
@@ -6275,6 +6275,7 @@ struct PendingPlaylistAudioDrop {
     position_ticks: u32,
     track_index: u16,
     project_generation: u64,
+    read_sample_tempo_information: bool,
 }
 
 struct AudioRecordingSession {
@@ -11691,6 +11692,7 @@ impl DawUi {
                 position_ticks,
                 track_index,
                 project_generation: self.project_generation,
+                read_sample_tempo_information: self.read_sample_tempo_information,
             });
         self.request_audio_waveform(&path);
         self.status = format!("Preparing {} for the Playlist…", path.display());
@@ -11785,25 +11787,61 @@ impl DawUi {
                 return;
             }
         };
-        let length_ticks = match tempo_map
-            .ticks_for_audio_frames(
-                u64::from(pending.position_ticks),
-                waveform.frame_count,
-                waveform.sample_rate,
+        let source_tempo_bpm = pending
+            .read_sample_tempo_information
+            .then(|| wave_acid_loop_tempo_bpm(&pending.path))
+            .flatten();
+        let tempo_sync = source_tempo_bpm.map(|source_tempo_bpm| {
+            browser_audio_drop_tempo_sync(
+                waveform,
+                source_tempo_bpm,
+                document.header().ppq(),
+                &tempo_map,
+                pending.position_ticks,
             )
-            .and_then(|ticks| {
-                u32::try_from(ticks)
-                    .map_err(|_| "audio source is too long for this Playlist".to_owned())
-            }) {
-            Ok(length_ticks) => length_ticks,
-            Err(error) => {
-                self.status = format!(
-                    "Could not determine the Playlist length for {}: {error}",
-                    pending.path.display()
-                );
-                return;
-            }
+        });
+        let regular_length_ticks = || {
+            tempo_map
+                .ticks_for_audio_frames(
+                    u64::from(pending.position_ticks),
+                    waveform.frame_count,
+                    waveform.sample_rate,
+                )
+                .and_then(|ticks| {
+                    u32::try_from(ticks)
+                        .map_err(|_| "audio source is too long for this Playlist".to_owned())
+                })
         };
+        let (length_ticks, stretch_time_raw, tempo_sync_warning) = match tempo_sync {
+            Some(Ok((length_ticks, time_raw))) => (length_ticks, Some(time_raw), None),
+            Some(Err(error)) => match regular_length_ticks() {
+                Ok(length_ticks) => (length_ticks, None, Some(error)),
+                Err(length_error) => {
+                    self.status = format!(
+                        "Could not determine the Playlist length for {}: {length_error}",
+                        pending.path.display()
+                    );
+                    return;
+                }
+            },
+            None => match regular_length_ticks() {
+                Ok(length_ticks) => (length_ticks, None, None),
+                Err(error) => {
+                    self.status = format!(
+                        "Could not determine the Playlist length for {}: {error}",
+                        pending.path.display()
+                    );
+                    return;
+                }
+            },
+        };
+        if length_ticks == 0 {
+            self.status = format!(
+                "Could not add {} because its Playlist duration is shorter than one tick",
+                pending.path.display()
+            );
+            return;
+        }
         if pending.position_ticks.checked_add(length_ticks).is_none() {
             self.status = format!(
                 "{} is too long to fit at this Playlist position",
@@ -11824,7 +11862,13 @@ impl DawUi {
             .map(|stem| stem.to_string_lossy().into_owned())
             .filter(|name| !name.trim().is_empty())
             .unwrap_or_else(|| "Audio Clip".to_owned());
-        let channel_id = match updated.create_audio_channel(&sample_path, &channel_name) {
+        let channel_result = match stretch_time_raw {
+            Some(time_raw) => {
+                updated.create_tempo_synced_audio_channel(&sample_path, &channel_name, time_raw)
+            }
+            None => updated.create_audio_channel(&sample_path, &channel_name),
+        };
+        let channel_id = match channel_result {
             Ok(channel_id) => channel_id,
             Err(error) => {
                 self.status = format!(
@@ -11865,11 +11909,23 @@ impl DawUi {
         self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
         self.view = MainView::Playlist;
         self.refresh_audio_waveform_paths();
-        self.status = format!(
-            "Added {} to Playlist track {}",
-            pending.path.display(),
-            pending.track_index + 1
-        );
+        self.status = match (stretch_time_raw, source_tempo_bpm, tempo_sync_warning) {
+            (Some(_), Some(source_tempo), _) => format!(
+                "Added {} to Playlist track {} with tempo sync from {source_tempo:.2} BPM metadata",
+                pending.path.display(),
+                pending.track_index + 1
+            ),
+            (_, Some(_), Some(reason)) => format!(
+                "Added {} to Playlist track {} without tempo sync: {reason}",
+                pending.path.display(),
+                pending.track_index + 1
+            ),
+            _ => format!(
+                "Added {} to Playlist track {}",
+                pending.path.display(),
+                pending.track_index + 1
+            ),
+        };
         ctx.request_repaint();
     }
 
@@ -56927,6 +56983,7 @@ impl DawUi {
                 position_ticks: placement.position_ticks,
                 track_index: placement.track_index,
                 project_generation: placement.project_generation,
+                read_sample_tempo_information: false,
             });
         self.audio_waveforms.remove(output_path);
         self.waveform_errors.remove(output_path);
@@ -89616,6 +89673,58 @@ fn playlist_audio_drop_position_ticks(
     snap_note_tick(relative_tick, snap_ticks, 0)
 }
 
+fn browser_audio_drop_tempo_sync(
+    waveform: &AudioWaveform,
+    source_tempo_bpm: f64,
+    ppq: u16,
+    tempo_map: &PlaylistTempoMap,
+    start_tick: u32,
+) -> Result<(u32, u32), String> {
+    if waveform.frame_count == 0 || waveform.sample_rate == 0 {
+        return Err("sample tempo sync requires a non-empty audio source".to_owned());
+    }
+    if ppq == 0 {
+        return Err("project PPQ must be greater than zero".to_owned());
+    }
+    if !source_tempo_bpm.is_finite() || !(1.0..=1_000.0).contains(&source_tempo_bpm) {
+        return Err("sample loop tempo metadata is outside the supported range".to_owned());
+    }
+
+    let target_ticks_f64 = waveform.frame_count as f64 * source_tempo_bpm * f64::from(ppq)
+        / (f64::from(waveform.sample_rate) * 60.0);
+    if !target_ticks_f64.is_finite() || target_ticks_f64 < 0.5 || target_ticks_f64 > u32::MAX as f64
+    {
+        return Err("sample tempo sync duration is outside the Playlist range".to_owned());
+    }
+    let target_ticks = target_ticks_f64.round() as u32;
+    start_tick
+        .checked_add(target_ticks)
+        .ok_or_else(|| "sample tempo sync duration exceeds the Playlist range".to_owned())?;
+    let target_end_tick = f64::from(start_tick) + target_ticks_f64;
+    if tempo_map
+        .tempo_segments()
+        .any(|(tick, _)| tick > u64::from(start_tick) && (tick as f64) < target_end_tick)
+    {
+        return Err("sample tempo sync across Playlist tempo automation is unsupported".to_owned());
+    }
+
+    let start_frame = tempo_map.frame_at_tick(u64::from(start_tick), waveform.sample_rate)?;
+    let end_frame = tempo_map.frame_at_fractional_tick(target_end_tick, waveform.sample_rate)?;
+    let target_frames = end_frame.saturating_sub(start_frame);
+    let stretch_ratio = target_frames as f64 / waveform.frame_count as f64;
+    if !stretch_ratio.is_finite() || !(0.5..=2.0).contains(&stretch_ratio) {
+        return Err(format!(
+            "sample tempo sync needs a stretch ratio outside the supported 0.5x to 2x range ({stretch_ratio:.3}x)"
+        ));
+    }
+
+    let time_raw_f64 = f64::from(target_ticks) * 192.0 / f64::from(ppq);
+    if !time_raw_f64.is_finite() || time_raw_f64 < 0.5 || time_raw_f64 > u32::MAX as f64 {
+        return Err("sample tempo sync target is outside the channel settings range".to_owned());
+    }
+    Ok((target_ticks, (time_raw_f64.round() as u32).max(1)))
+}
+
 fn playlist_track_sync_label(sync: PlaylistTrackSync) -> &'static str {
     match sync {
         PlaylistTrackSync::Off => "Off",
@@ -92048,8 +92157,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        ActivePlaylistClipDrag, Arrangement, ChannelDisplayFilter, ChannelNoteRouter,
-        DetachedWindowKind, DetachedWindowPlacement, DetachedWindowPlacements,
+        ActivePlaylistClipDrag, Arrangement, AudioWaveform, ChannelDisplayFilter,
+        ChannelNoteRouter, DetachedWindowKind, DetachedWindowPlacement, DetachedWindowPlacements,
         DetectedPianoRollScale, FlpDocument, InternalLfoParameterLink, InternalLfoWaveform,
         MAX_INTERNAL_LFO_AUTOMATION_POINTS, MainView, MidiAutomationRecordSource,
         MidiAutomationRecording, MidiAutomationSourceChoice, MidiControlChangeMapping,
@@ -92068,8 +92177,9 @@ mod tests {
         PluginFormat, ProjectPlaylistAudioClipEnvelope, TimeSelectionShift, TouchGesture,
         TouchTapTracker, TouchZoomConfig, Vst3PlaylistAutomationPoint,
         Vst3PlaylistParameterAutomation, WINDOW_LAYOUT_PRESETS_HEADER, WindowLayoutPreset,
-        audio_recording_start_tick_with_offset, built_in_midi_controller_templates,
-        candidate_live_mixer_send_key, candidate_matches_vst_identity, candidate_mixer_controls,
+        audio_recording_start_tick_with_offset, browser_audio_drop_tempo_sync,
+        built_in_midi_controller_templates, candidate_live_mixer_send_key,
+        candidate_matches_vst_identity, candidate_mixer_controls,
         candidate_mixer_stereo_separation, detect_chord_name, detect_piano_roll_channel_scale,
         detect_piano_roll_scale, encode_midi_device_id, encode_midi_device_selections,
         encode_midi_output_routes, first_available_playlist_track,
@@ -95733,6 +95843,39 @@ mod tests {
         assert_eq!(
             playlist_audio_drop_position_ticks(8.0, 10.0, 0.1, 96, false),
             0
+        );
+    }
+
+    #[test]
+    fn browser_audio_drop_tempo_sync_uses_loop_beats_and_rejects_unsupported_ranges() {
+        let waveform = AudioWaveform {
+            sample_rate: 8_000,
+            frame_count: 8_000,
+            peaks: Vec::new(),
+            channel_peaks: Vec::new(),
+            spectral_bands: Vec::new(),
+        };
+        let tempo_map = PlaylistTempoMap::constant(96, 200.0)
+            .expect("constant Playlist tempo map should be valid");
+        assert_eq!(
+            browser_audio_drop_tempo_sync(&waveform, 100.0, 96, &tempo_map, 0),
+            Ok((160, 320))
+        );
+
+        let automated_tempo_map = PlaylistTempoMap::from_tempo_events(96, 200.0, &[(96, 180.0)])
+            .expect("automated Playlist tempo map should be valid");
+        assert!(
+            browser_audio_drop_tempo_sync(&waveform, 100.0, 96, &automated_tempo_map, 0,)
+                .unwrap_err()
+                .contains("tempo automation")
+        );
+
+        let out_of_range_map = PlaylistTempoMap::constant(96, 40.0)
+            .expect("constant Playlist tempo map should be valid");
+        assert!(
+            browser_audio_drop_tempo_sync(&waveform, 100.0, 96, &out_of_range_map, 0,)
+                .unwrap_err()
+                .contains("0.5x to 2x")
         );
     }
 
