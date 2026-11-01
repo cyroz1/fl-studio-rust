@@ -28297,6 +28297,89 @@ impl FlpDocument {
         Ok(replacement_count)
     }
 
+    /// Applies one format-48 native plug-in state event to a matching Native Channel Rack plug-in.
+    /// The target channel's ID, name, wrapper, and all unrelated events remain unchanged.
+    pub fn apply_native_channel_plugin_state_preset(
+        &mut self,
+        target_channel_id: u16,
+        preset: &FstPreset,
+    ) -> Result<usize, FlpError> {
+        if preset.kind() != FstPresetKind::NativePluginState {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected preset is not a native plug-in state",
+            ));
+        }
+        let source_plugin_identifier =
+            preset
+                .native_plugin_identifier()
+                .ok_or(FlpError::UnsupportedEdit(
+                    "native plug-in state import requires one recognized plug-in identifier",
+                ))?;
+        if preset.native_plugin_state_bytes().is_none() {
+            return Err(FlpError::UnsupportedEdit(
+                "native plug-in state import requires one data-encoded state event",
+            ));
+        }
+        let source_state_event = preset
+            .document
+            .events
+            .iter()
+            .find(|event| event.opcode == 0xD5)
+            .ok_or(FlpError::UnsupportedEdit(
+                "native plug-in state preset has no state event",
+            ))?;
+
+        let matching_channels = self
+            .channels()
+            .into_iter()
+            .filter(|channel| channel.id() == target_channel_id)
+            .collect::<Vec<_>>();
+        let [target_channel] = matching_channels.as_slice() else {
+            return Err(FlpError::UnsupportedEdit(
+                "native plug-in state import requires one unique target channel",
+            ));
+        };
+        if target_channel.channel_type() != Some(ChannelType::Native) {
+            return Err(FlpError::UnsupportedEdit(
+                "native plug-in state import requires a Native Channel Rack target",
+            ));
+        }
+        let channel_range = target_channel.event_range();
+        let plugin_identifier_count = channel_range
+            .clone()
+            .filter(|&event_index| self.events[event_index].opcode == 0xC9)
+            .count();
+        if plugin_identifier_count != 1
+            || target_channel.plugin_identifier() != Some(source_plugin_identifier.as_str())
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "native plug-in state preset does not match one unique target plug-in identifier",
+            ));
+        }
+        let target_state_events = channel_range
+            .filter(|&event_index| self.events[event_index].opcode == 0xD5)
+            .collect::<Vec<_>>();
+        let [target_state_index] = target_state_events.as_slice() else {
+            return Err(FlpError::UnsupportedEdit(
+                "native plug-in state import requires exactly one target state event",
+            ));
+        };
+        if !matches!(
+            self.events[*target_state_index].encoding,
+            PayloadEncoding::Data { .. }
+        ) {
+            return Err(FlpError::UnsupportedEdit(
+                "native plug-in state import requires one data-encoded target state event",
+            ));
+        }
+
+        let mut updated = self.clone();
+        updated.events[*target_state_index] = source_state_event.clone();
+        updated.refresh_event_offsets()?;
+        *self = updated;
+        Ok(1)
+    }
+
     /// Applies one format-48 native plug-in state event to an existing Mixer effect slot with
     /// the same recognized plug-in identifier. The target slot's wrapper, name, color, enabled
     /// state, mix, and surrounding Mixer events remain unchanged.
@@ -30960,6 +31043,144 @@ mod tests {
             Err(FlpError::UnsupportedEdit(_))
         ));
         assert_eq!(mismatched, mismatched_before);
+    }
+
+    #[test]
+    fn applies_format48_native_plugin_state_to_the_matching_channel() {
+        let preset_bytes = native_effect_state_preset_fixture("BooBass", &[1, 2, 3, 4]);
+        let preset = FstPreset::parse(&preset_bytes).expect("native generator preset should parse");
+        let source_state_wire = preset
+            .document()
+            .events()
+            .iter()
+            .find(|event| event.opcode() == 0xD5)
+            .expect("the preset should contain one state event")
+            .wire_bytes()
+            .to_vec();
+
+        let mut target_events = Vec::new();
+        append_data_event(&mut target_events, 0xC7, b"26.0.0\0");
+        append_project_info_string(&mut target_events, 0xC2, "Project title");
+        target_events.extend_from_slice(&[0x40, 5, 0, 0x15, 2]);
+        append_project_info_string(&mut target_events, 0xC9, "BooBass");
+        append_data_event(&mut target_events, 0xD4, &[0xB4; 12]);
+        append_data_event(&mut target_events, 0xD5, &[9, 8]);
+        append_project_info_string(&mut target_events, 0xCB, "Destination");
+        target_events.extend_from_slice(&[0x62, 0, 0]);
+        let mut target = FlpDocument::parse(&flp_fixture(&target_events, &[], &[]))
+            .expect("target project should parse");
+        let target_state_index = target.channels()[0]
+            .event_range()
+            .find(|&index| target.events()[index].opcode() == 0xD5)
+            .expect("the target should contain one state event");
+        let before = target.clone();
+        let wrapper_wire = before
+            .channel_plugin_states()
+            .into_iter()
+            .find(|state| state.channel_id() == 5)
+            .and_then(|state| state.wrapper_payload().map(<[u8]>::to_vec))
+            .expect("the target should have wrapper metadata");
+
+        assert_eq!(
+            target.apply_native_channel_plugin_state_preset(5, &preset),
+            Ok(1)
+        );
+        assert_eq!(target.events().len(), before.events().len());
+        assert_eq!(target.header(), before.header());
+        assert_eq!(
+            target.events()[1].wire_bytes(),
+            before.events()[1].wire_bytes()
+        );
+        let target_state = target
+            .channel_plugin_states()
+            .into_iter()
+            .find(|state| state.channel_id() == 5)
+            .expect("the target Native channel should retain plug-in state");
+        assert_eq!(target_state.plugin_identifier(), Some("BooBass"));
+        assert_eq!(target_state.display_name(), Some("Destination"));
+        assert_eq!(
+            target_state.wrapper_payload(),
+            Some(wrapper_wire.as_slice())
+        );
+        assert_eq!(target_state.data_payload(), &[1, 2, 3, 4]);
+        let target_range = target.channels()[0].event_range();
+        assert_eq!(
+            target.events()[target_range]
+                .iter()
+                .find(|event| event.opcode() == 0xD5)
+                .expect("the target should retain one state event")
+                .wire_bytes(),
+            source_state_wire
+        );
+        for (index, (before_event, after_event)) in
+            before.events().iter().zip(target.events()).enumerate()
+        {
+            if index != target_state_index {
+                assert_eq!(
+                    after_event.wire_bytes(),
+                    before_event.wire_bytes(),
+                    "unrelated event {index} should remain byte-exact"
+                );
+            }
+        }
+        let encoded = target
+            .encode_lossless()
+            .expect("updated project should encode");
+        let reparsed = FlpDocument::parse(&encoded).expect("updated project should reparse");
+        assert_eq!(
+            reparsed.channel_plugin_states()[0].data_payload(),
+            &[1, 2, 3, 4]
+        );
+    }
+
+    #[test]
+    fn format48_native_plugin_state_rejects_mismatched_channel_identity_atomically() {
+        let preset = FstPreset::parse(&native_effect_state_preset_fixture("BooBass", &[1, 2]))
+            .expect("native generator preset should parse");
+        let target_bytes =
+            native_generator_channel_state_fixture(5, "Fruity Reeverb 2", "Destination", &[0xAA]);
+        let mut target = FlpDocument::parse(&target_bytes).expect("target project should parse");
+        let before = target.clone();
+        assert!(matches!(
+            target.apply_native_channel_plugin_state_preset(5, &preset),
+            Err(FlpError::UnsupportedEdit(_))
+        ));
+        assert_eq!(target, before);
+
+        let mut duplicate_ids = Vec::new();
+        append_data_event(&mut duplicate_ids, 0xC7, b"26.0.0\0");
+        duplicate_ids.extend_from_slice(&[0x40, 5, 0, 0x15, 2]);
+        append_project_info_string(&mut duplicate_ids, 0xC9, "BooBass");
+        append_project_info_string(&mut duplicate_ids, 0xC9, "BooBass");
+        append_data_event(&mut duplicate_ids, 0xD5, &[0xAA]);
+        append_project_info_string(&mut duplicate_ids, 0xCB, "Destination");
+        duplicate_ids.extend_from_slice(&[0x62, 0, 0]);
+        let mut duplicate_target = FlpDocument::parse(&flp_fixture(&duplicate_ids, &[], &[]))
+            .expect("target with duplicate plug-in IDs should parse losslessly");
+        let duplicate_before = duplicate_target.clone();
+        assert!(matches!(
+            duplicate_target.apply_native_channel_plugin_state_preset(5, &preset),
+            Err(FlpError::UnsupportedEdit(_))
+        ));
+        assert_eq!(duplicate_target, duplicate_before);
+
+        let mut duplicate_states = Vec::new();
+        append_data_event(&mut duplicate_states, 0xC7, b"26.0.0\0");
+        duplicate_states.extend_from_slice(&[0x40, 5, 0, 0x15, 2]);
+        append_project_info_string(&mut duplicate_states, 0xC9, "BooBass");
+        append_data_event(&mut duplicate_states, 0xD5, &[0xAA]);
+        append_data_event(&mut duplicate_states, 0xD5, &[0xBB]);
+        append_project_info_string(&mut duplicate_states, 0xCB, "Destination");
+        duplicate_states.extend_from_slice(&[0x62, 0, 0]);
+        let mut duplicate_state_target =
+            FlpDocument::parse(&flp_fixture(&duplicate_states, &[], &[]))
+                .expect("target with duplicate state events should parse losslessly");
+        let duplicate_state_before = duplicate_state_target.clone();
+        assert!(matches!(
+            duplicate_state_target.apply_native_channel_plugin_state_preset(5, &preset),
+            Err(FlpError::UnsupportedEdit(_))
+        ));
+        assert_eq!(duplicate_state_target, duplicate_state_before);
     }
 
     #[test]

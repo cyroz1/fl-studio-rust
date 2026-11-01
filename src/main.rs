@@ -1077,6 +1077,16 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 Path::new(preset),
             )
         }
+        [command, input, output, channel_id, preset]
+            if command == "apply-native-channel-plugin-state-preset" =>
+        {
+            apply_native_channel_plugin_state_preset(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(channel_id, "native channel id")?,
+                Path::new(preset),
+            )
+        }
         [command, input, output, channel_id, preset] if command == "apply-layer-state-preset" => {
             apply_layer_state_preset(
                 Path::new(input),
@@ -5002,6 +5012,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild apply-audio-clip-state-preset <input.flp> <output.flp> <audio-clip-channel-id> <preset.fst>\n",
             "  flp-rebuild apply-automation-state-preset <input.flp> <output.flp> <automation-channel-id> <preset.fst>\n",
             "  flp-rebuild apply-native-state-preset <input.flp> <output.flp> <native-channel-id> <preset.fst>\n",
+            "  flp-rebuild apply-native-channel-plugin-state-preset <input.flp> <output.flp> <native-channel-id> <preset.fst>\n",
             "  flp-rebuild apply-layer-state-preset <input.flp> <output.flp> <layer-channel-id> <preset.fst>\n",
             "  flp-rebuild apply-native-mixer-effect-state-preset <input.flp> <output.flp> <insert-ordinal> <slot-index> <preset.fst>\n",
             "  flp-rebuild mixer <file.flp>\n",
@@ -8822,6 +8833,37 @@ fn apply_native_state_preset(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "applied {event_count} native generator state events from {} to channel {channel_id} in {}",
+        preset_path.display(),
+        output.display()
+    );
+    Ok(())
+}
+
+fn apply_native_channel_plugin_state_preset(
+    input: &Path,
+    output: &Path,
+    channel_id: u16,
+    preset_path: &Path,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let preset_bytes = fs::read(preset_path)
+        .map_err(|error| format!("could not read {}: {error}", preset_path.display()))?;
+    let preset = FstPreset::parse(&preset_bytes).map_err(|error| {
+        format!(
+            "could not parse native Channel plug-in state preset {}: {error}",
+            preset_path.display()
+        )
+    })?;
+    let event_count = document
+        .apply_native_channel_plugin_state_preset(channel_id, &preset)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "applied {event_count} native plug-in state event from {} to Channel {channel_id} in {}",
         preset_path.display(),
         output.display()
     );

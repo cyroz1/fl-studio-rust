@@ -22827,6 +22827,33 @@ impl DawUi {
         }
     }
 
+    fn apply_fst_preset_to_native_channel_plugin_state(
+        &mut self,
+        preset: &FstPreset,
+        target_channel_id: u16,
+        preset_name: &str,
+    ) -> bool {
+        let Some(mut document) = self.document.clone() else {
+            self.status = "Open a project before applying a native plug-in state preset".to_owned();
+            return false;
+        };
+        match document.apply_native_channel_plugin_state_preset(target_channel_id, preset) {
+            Ok(_) => {
+                self.document = Some(document);
+                self.dirty = true;
+                self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+                self.status = format!(
+                    "Applied {preset_name} native plug-in state to Channel {target_channel_id}"
+                );
+                true
+            }
+            Err(error) => {
+                self.status = format!("Could not apply native Channel plug-in state: {error}");
+                false
+            }
+        }
+    }
+
     fn apply_fst_preset_to_layer_channel(
         &mut self,
         preset: &FstPreset,
@@ -23148,6 +23175,36 @@ impl DawUi {
                 })
             })
         });
+        let apply_native_channel_plugin_state_available = native_plugin_state_bytes.is_some()
+            && native_plugin_identifier.as_deref().is_some_and(|plugin_id| {
+                target_channel_id.is_some_and(|channel_id| {
+                    self.document.as_ref().is_some_and(|document| {
+                        let Some(channel) = document
+                            .channels()
+                            .into_iter()
+                            .find(|channel| channel.id() == channel_id)
+                        else {
+                            return false;
+                        };
+                        if channel.channel_type() != Some(ChannelType::Native)
+                            || channel.plugin_identifier() != Some(plugin_id)
+                        {
+                            return false;
+                        }
+                        let channel_events = channel.event_range();
+                        let plugin_identifier_count = channel_events
+                            .clone()
+                            .filter(|&index| document.events()[index].opcode() == 0xC9)
+                            .count();
+                        let state_events = channel_events
+                            .filter(|&index| document.events()[index].opcode() == 0xD5)
+                            .collect::<Vec<_>>();
+                        plugin_identifier_count == 1
+                            && matches!(state_events.as_slice(), [index]
+                                if matches!(document.events()[*index].encoding(), PayloadEncoding::Data { .. }))
+                    })
+                })
+            });
         let apply_native_available = details.preset.kind() == FstPresetKind::ChannelState
             && native_generator_target_available
             && native_plugin_identity_matches;
@@ -23178,6 +23235,7 @@ impl DawUi {
         let mut open = true;
         let mut close = false;
         let mut apply_requested = false;
+        let mut apply_native_channel_plugin_state_requested = false;
         let mut apply_mixer_effect_requested = false;
         egui::Window::new("FST preset details")
             .id(Id::new("browser-fst-details-dialog"))
@@ -23285,6 +23343,26 @@ impl DawUi {
                     });
                 }
                 if details.kind == FstPresetKind::NativePluginState {
+                    if ui
+                        .add_enabled(
+                            apply_native_channel_plugin_state_available,
+                            egui::Button::new("Apply to selected native Channel"),
+                        )
+                        .on_hover_text(
+                            "Copies the native state event into a Channel Rack plug-in with the same unique plug-in identifier, preserving its channel wrapper and name",
+                        )
+                        .clicked()
+                    {
+                        apply_native_channel_plugin_state_requested = true;
+                    }
+                    if !apply_native_channel_plugin_state_available {
+                        ui.label(
+                            egui::RichText::new(
+                                "Select a Native Channel Rack plug-in with the same unique plug-in identifier and one state event.",
+                            )
+                            .color(MUTED),
+                        );
+                    }
                     ui.horizontal(|ui| {
                         let selected_text = native_effect_target
                             .and_then(|target| {
@@ -23369,6 +23447,18 @@ impl DawUi {
             } else {
                 self.apply_fst_preset_to_vst3_channel(&details.preset, channel_id, preset_name)
             };
+        }
+        if apply_native_channel_plugin_state_requested && let Some(channel_id) = target_channel_id {
+            let preset_name = details
+                .path
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .unwrap_or("native plug-in preset");
+            close = self.apply_fst_preset_to_native_channel_plugin_state(
+                &details.preset,
+                channel_id,
+                preset_name,
+            );
         }
         if apply_mixer_effect_requested
             && let Some((insert_ordinal, slot_index)) = native_effect_target
