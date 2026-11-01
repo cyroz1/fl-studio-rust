@@ -279,6 +279,11 @@ def _playlist_get_track_activity_level(index):
     return float(levels[index - 1]) if index <= len(levels) else 0.0
 
 
+def _playlist_get_track_activity_level_vis(index):
+    level = _playlist_get_track_activity_level(index)
+    return max(0.0, min(1.0, level))
+
+
 def _playlist_track_performance_value(index, value_index):
     index = _playlist_track_index(index)
     modes = _active_transport_state.get("playlist_track_performance_modes", [])
@@ -2181,6 +2186,7 @@ def _install_modules(script_name, device_name):
     playlist.isTrackSolo = _playlist_is_track_solo
     playlist.soloTrack = _playlist_solo_track
     playlist.getTrackActivityLevel = _playlist_get_track_activity_level
+    playlist.getTrackActivityLevelVis = _playlist_get_track_activity_level_vis
     playlist.getLiveLoopMode = _playlist_get_live_loop_mode
     playlist.getLiveTriggerMode = _playlist_get_live_trigger_mode
     playlist.getLivePosSnap = _playlist_get_live_pos_snap
