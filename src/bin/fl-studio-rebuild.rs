@@ -20484,6 +20484,148 @@ impl DawUi {
         );
     }
 
+    fn move_midi_script_items(&mut self, increment: i32) {
+        if increment == 0 {
+            return;
+        }
+        match self.view {
+            MainView::PianoRoll => self.move_midi_script_piano_roll_notes(increment),
+            MainView::Playlist => self.move_midi_script_playlist_clips(increment),
+            _ => {
+                self.status =
+                    "MIDI script move jog is supported in the Playlist and Piano roll views"
+                        .to_owned();
+            }
+        }
+    }
+
+    fn move_midi_script_piano_roll_notes(&mut self, increment: i32) {
+        let Some(pattern_id) = self.selected_pattern else {
+            self.status =
+                "Open a Pattern and select Piano roll notes before moving them".to_owned();
+            return;
+        };
+        let Some((pattern, ppq, project_signature)) = self.document.as_ref().and_then(|document| {
+            let pattern = document
+                .patterns()
+                .ok()?
+                .into_iter()
+                .find(|pattern| pattern.id == pattern_id)?;
+            Some((
+                pattern,
+                document.header().ppq(),
+                document.metadata().time_signature(),
+            ))
+        }) else {
+            self.status = "Open a project before moving Piano roll notes".to_owned();
+            return;
+        };
+        let time_signature = pattern
+            .time_markers
+            .iter()
+            .rfind(|marker| marker.is_signature() && marker.position_ticks() == 0)
+            .and_then(|marker| marker.numerator().zip(marker.denominator()))
+            .or(project_signature);
+        let snap_ticks = self.piano_roll_snap.ticks(ppq, time_signature).max(1);
+        let tick_delta = i64::from(increment).saturating_mul(i64::from(snap_ticks));
+        self.nudge_piano_roll_selection(&pattern, pattern_id, tick_delta, 0);
+    }
+
+    fn move_midi_script_playlist_clips(&mut self, increment: i32) {
+        let Some(document) = self.document.as_ref() else {
+            self.status = "Open a project before moving Playlist clips".to_owned();
+            return;
+        };
+        let Ok(arrangements) = document.arrangements() else {
+            self.status = "Could not read the active Playlist arrangement".to_owned();
+            return;
+        };
+        let arrangement = self
+            .selected_arrangement
+            .and_then(|arrangement_id| {
+                arrangements
+                    .iter()
+                    .find(|arrangement| arrangement.id == arrangement_id)
+            })
+            .or_else(|| {
+                self.selected_arrangement
+                    .is_none()
+                    .then(|| arrangements.first())
+                    .flatten()
+            });
+        let Some(arrangement) = arrangement else {
+            self.status = "No Playlist arrangement is available to move clips".to_owned();
+            return;
+        };
+        let clip_indices = if self.selected_arrangement == Some(arrangement.id) {
+            if self.selected_playlist_clips.is_empty() {
+                self.selected_clip.into_iter().collect::<Vec<_>>()
+            } else {
+                self.selected_playlist_clips
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>()
+            }
+        } else {
+            Vec::new()
+        };
+        let clip_indices = clip_indices
+            .into_iter()
+            .filter(|index| *index < arrangement.clips.len())
+            .collect::<Vec<_>>();
+        if clip_indices.is_empty() {
+            self.status = "Select Playlist clips before moving them".to_owned();
+            return;
+        }
+
+        let snap_ticks = (u32::from(document.header().ppq()) / 4).max(1);
+        let tick_delta = i64::from(increment).saturating_mul(i64::from(snap_ticks));
+        let arrangement_id = arrangement.id;
+        let positions = clip_indices
+            .iter()
+            .map(|index| (*index, arrangement.clips[*index].position_ticks))
+            .collect::<Vec<_>>();
+        let mut updated = document.clone();
+        for (clip_index, position_ticks) in &positions {
+            let moved_position = i64::from(*position_ticks) + tick_delta;
+            let Ok(position_ticks) = u32::try_from(moved_position) else {
+                self.status = if moved_position < 0 {
+                    "Selected Playlist clips cannot move before tick zero".to_owned()
+                } else {
+                    "Selected Playlist clips cannot move past the supported timeline".to_owned()
+                };
+                return;
+            };
+            if let Err(error) = updated.edit_playlist_clip(
+                arrangement_id,
+                *clip_index,
+                PlaylistClipEdit {
+                    position_ticks: Some(position_ticks),
+                    ..PlaylistClipEdit::default()
+                },
+            ) {
+                self.status = format!("Could not move Playlist clips: {error}");
+                return;
+            }
+        }
+        self.document = Some(updated);
+        self.stop_project_playback();
+        self.dirty = true;
+        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+        let direction = if increment < 0 { "left" } else { "right" };
+        self.status = format!(
+            "Moved {} selected Playlist clip{} {direction} by {} sixteenth-note step{}",
+            positions.len(),
+            if positions.len() == 1 { "" } else { "s" },
+            increment.unsigned_abs(),
+            if increment.unsigned_abs() == 1 {
+                ""
+            } else {
+                "s"
+            }
+        );
+    }
+
     fn set_midi_script_channel_selection(&mut self, channel_id: u16) {
         let channel_exists = self.document.as_ref().is_some_and(|document| {
             document
@@ -67590,6 +67732,9 @@ impl DawUi {
             }
             MidiTransportCommand::PianoRollSnapJog(increment) => {
                 self.jog_midi_script_piano_roll_snap(increment);
+            }
+            MidiTransportCommand::MoveJog(increment) => {
+                self.move_midi_script_items(increment);
             }
             MidiTransportCommand::PatternJog(increment) => {
                 self.jog_midi_script_pattern(increment);

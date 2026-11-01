@@ -1007,6 +1007,7 @@ fn queue_script_transport_actions(
             ScriptTransportAction::PianoRollSnapJog(increment) => {
                 MidiTransportCommand::PianoRollSnapJog(increment)
             }
+            ScriptTransportAction::MoveJog(increment) => MidiTransportCommand::MoveJog(increment),
             ScriptTransportAction::PatternJog(increment) => {
                 MidiTransportCommand::PatternJog(increment)
             }
@@ -1159,6 +1160,7 @@ pub enum MidiTransportCommand {
     UndoHistoryJog(i32),
     TogglePianoRollSnap,
     PianoRollSnapJog(i32),
+    MoveJog(i32),
     PatternJog(i32),
     TempoJog(i32),
     MarkerJumpJog(i32),
@@ -1951,6 +1953,7 @@ pub fn describe_event(event: MidiInputEvent) -> String {
             MidiTransportCommand::PianoRollSnapJog(_) => {
                 "MIDI script Piano roll Snap Mode".to_owned()
             }
+            MidiTransportCommand::MoveJog(_) => "MIDI script Move Jog".to_owned(),
             MidiTransportCommand::PatternJog(_) => "MIDI script Pattern Selection".to_owned(),
             MidiTransportCommand::TempoJog(_) => "MIDI script Tempo".to_owned(),
             MidiTransportCommand::MarkerJumpJog(_) => "MIDI script Marker Jump".to_owned(),

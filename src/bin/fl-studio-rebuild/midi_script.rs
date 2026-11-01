@@ -178,6 +178,7 @@ pub enum ScriptTransportAction {
     UndoHistoryJog(i32),
     TogglePianoRollSnap,
     PianoRollSnapJog(i32),
+    MoveJog(i32),
     PatternJog(i32),
     TempoJog(i32),
     MarkerJumpJog(i32),
@@ -1497,6 +1498,13 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
             .and_then(|increment| i32::try_from(increment).ok())
             .ok_or_else(|| "MIDI script returned an invalid snap-mode increment".to_owned())?;
         return Ok(ScriptTransportAction::PianoRollSnapJog(increment));
+    }
+    if name == Some("move_jog") {
+        let increment = action["increment"]
+            .as_i64()
+            .and_then(|increment| i32::try_from(increment).ok())
+            .ok_or_else(|| "MIDI script returned an invalid move-jog increment".to_owned())?;
+        return Ok(ScriptTransportAction::MoveJog(increment));
     }
     if name == Some("set_global_swing_mix") {
         let value_raw = action["value_raw"]
@@ -3909,12 +3917,12 @@ def OnMidiIn(event):
     }
 
     #[test]
-    fn python_global_transport_leaves_unsupported_or_non_global_commands_unhandled() {
+    fn python_move_jog_commands_queue_contextual_moves_and_respect_global_scope() {
         let temporary = TestDirectory::new();
         let script_path = temporary.path().join("device_test.py");
         fs::write(
             &script_path,
-            "# name=Test Script\nimport midi\nimport transport\ndef OnMidiIn(event):\n    unsupported = transport.globalTransport(midi.FPT_MoveJog, 1, event.pmeflags)\n    focused = transport.globalTransport(midi.FPT_Play, 1, event.pmeflags, midi.GT_Form)\n    event.data1 = int(unsupported == midi.GT_Cannot and focused == midi.GT_Cannot)\n",
+            "# name=Test Script\nimport midi\nimport transport\nimport ui\ndef OnMidiIn(event):\n    moved = transport.globalTransport(midi.FPT_MoveJog, 1, event.pmeflags)\n    direct = ui.moveJog(-2)\n    focused = transport.globalTransport(midi.FPT_Play, 1, event.pmeflags, midi.GT_Form)\n    event.data1 = int(moved == midi.GT_Global and focused == midi.GT_Cannot)\n    event.data2 = int(direct == midi.GT_Global)\n",
         )
         .unwrap();
         let script = MidiControllerScript::parse(script_path).unwrap();
@@ -3923,7 +3931,13 @@ def OnMidiIn(event):
         let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
 
         assert_eq!(result.bytes, [0xB0, 1, 1]);
-        assert!(result.actions.is_empty());
+        assert_eq!(
+            result.actions,
+            [
+                ScriptTransportAction::MoveJog(1),
+                ScriptTransportAction::MoveJog(-2)
+            ]
+        );
     }
 
     #[test]

@@ -1804,6 +1804,18 @@ def _set_playback_speed(speed_multiplier):
     )
 
 
+def _move_jog(value):
+    try:
+        increment = int(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("move jog increment must be an integer") from error
+    if not -(2**31) <= increment < 2**31:
+        raise ValueError("move jog increment is outside the supported range")
+    if increment:
+        _request_transport_action({"action": "move_jog", "increment": increment})
+    return 8
+
+
 def _global_transport(command, value, pmeflags=2, flags=15):
     command = int(command)
     value = int(value)
@@ -1846,6 +1858,8 @@ def _global_transport(command, value, pmeflags=2, flags=15):
                 {"action": "piano_roll_snap_jog", "increment": value}
             )
         return 8
+    if command == 8:  # FPT_MoveJog
+        return _move_jog(value)
     if command == 122:  # FPT_ShuffleJog
         current = min(
             128,
@@ -2176,6 +2190,9 @@ def _install_modules(script_name, device_name):
     device.repeatMidiEvent = _repeat_midi_event
     device.stopRepeatMidiEvent = _stop_repeat_midi_event
     device.setHasMeters = _set_has_meters
+
+    ui = _module("ui")
+    ui.moveJog = _move_jog
 
     playlist = _module("playlist")
     playlist.trackCount = _playlist_track_count
