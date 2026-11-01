@@ -158,12 +158,12 @@ use midi_script::{
     SCRIPT_BEAT_INDICATOR_BEAT, SCRIPT_BEAT_INDICATOR_OFF, SCRIPT_CHANNEL_EVENT_NEW,
     SCRIPT_CHANNEL_EVENT_RENAME, SCRIPT_CHANNEL_EVENT_REPLACE, SCRIPT_CHANNEL_EVENT_SELECT,
     SCRIPT_HW_CHANNEL_EVENT, SCRIPT_HW_DIRTY_CHANNEL_RACK_GROUP, SCRIPT_HW_DIRTY_COLORS,
-    SCRIPT_HW_DIRTY_FOCUSED_WINDOW, SCRIPT_HW_DIRTY_MIXER_CONTROLS, SCRIPT_HW_DIRTY_MIXER_DISPLAY,
-    SCRIPT_HW_DIRTY_MIXER_SEL, SCRIPT_HW_DIRTY_NAMES, SCRIPT_HW_DIRTY_UNDO,
-    SCRIPT_MIXER_SCROLL_TO_MAKE_VISIBLE, SCRIPT_PROJECT_LOAD_ERROR, SCRIPT_PROJECT_LOAD_OK,
-    SCRIPT_PROJECT_LOAD_START, SCRIPT_TRANSPORT_PATTERN_MODE, SCRIPT_TRANSPORT_PLAYING,
-    SCRIPT_TRANSPORT_RECORDING, absolute_song_position_ticks, discover_midi_scripts,
-    find_script_for_device, normalized_song_position, song_position_ticks,
+    SCRIPT_HW_DIRTY_CONTROL_VALUES, SCRIPT_HW_DIRTY_FOCUSED_WINDOW, SCRIPT_HW_DIRTY_MIXER_CONTROLS,
+    SCRIPT_HW_DIRTY_MIXER_DISPLAY, SCRIPT_HW_DIRTY_MIXER_SEL, SCRIPT_HW_DIRTY_NAMES,
+    SCRIPT_HW_DIRTY_UNDO, SCRIPT_MIXER_SCROLL_TO_MAKE_VISIBLE, SCRIPT_PROJECT_LOAD_ERROR,
+    SCRIPT_PROJECT_LOAD_OK, SCRIPT_PROJECT_LOAD_START, SCRIPT_TRANSPORT_PATTERN_MODE,
+    SCRIPT_TRANSPORT_PLAYING, SCRIPT_TRANSPORT_RECORDING, absolute_song_position_ticks,
+    discover_midi_scripts, find_script_for_device, normalized_song_position, song_position_ticks,
 };
 use midi_thru::{MidiThruSettings, MidiThruWorker};
 
@@ -11380,6 +11380,17 @@ impl DawUi {
                     "Loaded {event_count} Mixer effect-state events into insert {insert_ordinal} from {}{plugin_summary}{capture_warning}",
                     path.display(),
                 );
+                if !self.notify_midi_script_mixer_tracks_changed(
+                    &[i32::try_from(insert_ordinal).unwrap_or(-1)],
+                    SCRIPT_HW_DIRTY_MIXER_DISPLAY
+                        | SCRIPT_HW_DIRTY_MIXER_CONTROLS
+                        | SCRIPT_HW_DIRTY_CONTROL_VALUES
+                        | SCRIPT_HW_DIRTY_COLORS
+                        | SCRIPT_HW_DIRTY_NAMES,
+                ) {
+                    self.status
+                        .push_str(" · MIDI script Mixer refresh callback queue is full");
+                }
             }
             Err(error) => {
                 self.status = format!("Could not load Mixer state preset: {error}");
