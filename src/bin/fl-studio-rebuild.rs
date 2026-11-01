@@ -15551,6 +15551,7 @@ impl DawUi {
             tail_seconds: 2,
             soloed_playlist_track_range: self.soloed_playlist_track_range,
             read_sample_root_note: self.read_sample_root_note,
+            read_sample_tempo_information: self.read_sample_tempo_information,
             clip_envelopes: self.playlist_audio_clip_envelopes_for_current_project(
                 self.selected_arrangement.unwrap_or(0),
             ),
@@ -16489,6 +16490,7 @@ impl DawUi {
             tail_seconds: 2,
             soloed_playlist_track_range: self.soloed_playlist_track_range,
             read_sample_root_note: self.read_sample_root_note,
+            read_sample_tempo_information: self.read_sample_tempo_information,
             clap_audio_channel_ids: Arc::new(assigned_clap_channel_ids.clone()),
             clip_envelopes: self.playlist_audio_clip_envelopes_for_current_project(arrangement_id),
             ..PlaylistRenderOptions::default()
@@ -17268,6 +17270,7 @@ impl DawUi {
         let options = PlaylistRenderOptions {
             arrangement_id,
             sample_rate,
+            read_sample_tempo_information: self.read_sample_tempo_information,
             ..PlaylistRenderOptions::default()
         };
         let processor = self
@@ -52457,6 +52460,7 @@ impl DawUi {
                     sample_rate,
                     resampling_quality: self.playlist_render_quality,
                     read_sample_root_note: self.read_sample_root_note,
+                    read_sample_tempo_information: self.read_sample_tempo_information,
                     wav_sample_format: self.playlist_render_format,
                     wav_dither_mode: self.playlist_render_dither_mode,
                     wav_channel_mode: self.playlist_render_channel_mode,
@@ -53187,6 +53191,7 @@ impl DawUi {
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
         let read_sample_root_note = self.read_sample_root_note;
+        let read_sample_tempo_information = self.read_sample_tempo_information;
         let resampling_quality = self.live_resampling_quality;
         let (sender, receiver) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
@@ -53203,6 +53208,7 @@ impl DawUi {
                                 sample_rate: device_rate,
                                 resampling_quality,
                                 read_sample_root_note,
+                                read_sample_tempo_information,
                                 ..SamplerPatternRenderOptions::default()
                             },
                             &writer,
@@ -53474,6 +53480,7 @@ impl DawUi {
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
         let read_sample_root_note = self.read_sample_root_note;
+        let read_sample_tempo_information = self.read_sample_tempo_information;
         let resampling_quality = self.live_resampling_quality;
         let (sender, receiver) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
@@ -53490,6 +53497,7 @@ impl DawUi {
                                 sample_rate: device_rate,
                                 resampling_quality,
                                 read_sample_root_note,
+                                read_sample_tempo_information,
                                 ..SamplerPatternRenderOptions::default()
                             },
                             &writer,
@@ -54034,6 +54042,7 @@ impl DawUi {
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
         let read_sample_root_note = self.read_sample_root_note;
+        let read_sample_tempo_information = self.read_sample_tempo_information;
         let resampling_quality = self.live_resampling_quality;
         let worker_mixer_meters = Arc::clone(&self.mixer_track_peak_meters);
         let clap_pattern_channel_count = pattern_audio_layers
@@ -54072,6 +54081,7 @@ impl DawUi {
                             sample_rate: device_rate,
                             resampling_quality,
                             read_sample_root_note,
+                            read_sample_tempo_information,
                             ..SamplerPatternRenderOptions::default()
                         };
                         if let Some(vst3_processor) = vst3_processor {
@@ -54319,6 +54329,7 @@ impl DawUi {
             wav_channel_mode: self.playlist_render_channel_mode,
             resampling_quality: self.playlist_render_quality,
             soloed_playlist_track_range: self.soloed_playlist_track_range,
+            read_sample_tempo_information: self.read_sample_tempo_information,
             clip_envelopes: self.playlist_audio_clip_envelopes_for_current_project(
                 self.selected_arrangement.unwrap_or_default(),
             ),
@@ -54430,6 +54441,7 @@ impl DawUi {
             start_from_song_start,
             soloed_playlist_track_range: self.soloed_playlist_track_range,
             clip_envelopes: self.playlist_audio_clip_envelopes_for_current_project(arrangement_id),
+            read_sample_tempo_information: self.read_sample_tempo_information,
         };
         let output = self.audio_render_output();
         self.start_audio_clip_export(options, output_path, output, action, source);
@@ -73655,7 +73667,7 @@ impl DawUi {
                 "Read sample tempo information",
             )
             .on_hover_text(
-                "Tempo-sync Browser previews of WAVE loops marked for stretching with valid ACID metadata to the project tempo. One-shots are unchanged.",
+                "Use valid WAVE ACID loop tempo metadata for Browser previews and target durations in supported channel-level Sampler and Playlist stretch modes. Explicit Audio Clip fits keep their visible duration; one-shots and channels without stretch settings are unchanged.",
             )
             .changed();
         if sample_tempo_preference_changed
