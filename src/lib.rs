@@ -27893,98 +27893,7 @@ impl FlpDocument {
         target_channel_id: u16,
         preset: &FstPreset,
     ) -> Result<usize, FlpError> {
-        if preset.kind() != FstPresetKind::ChannelState {
-            return Err(FlpError::UnsupportedEdit(
-                "the selected preset is not a channel state",
-            ));
-        }
-
-        let source_channels = preset.document().channels();
-        if source_channels.len() != 1
-            || source_channels[0].channel_type() != Some(ChannelType::Sampler)
-        {
-            return Err(FlpError::UnsupportedEdit(
-                "Sampler state import requires exactly one kind-0 Sampler channel",
-            ));
-        }
-        let source_channel = &source_channels[0];
-
-        let mut matching_targets = self
-            .channels()
-            .into_iter()
-            .filter(|channel| channel.id() == target_channel_id);
-        let target_channel = matching_targets
-            .next()
-            .ok_or(FlpError::ChannelNotFound(target_channel_id))?;
-        if matching_targets.next().is_some() {
-            return Err(FlpError::AmbiguousChannelId(target_channel_id));
-        }
-        if target_channel.channel_type() != Some(ChannelType::Sampler) {
-            return Err(FlpError::UnsupportedEdit(
-                "Sampler state import requires a kind-0 Sampler target channel",
-            ));
-        }
-
-        if preset.document().project_string_encoding().is_none()
-            || self.project_string_encoding().is_none()
-            || preset.document().project_string_encoding() != self.project_string_encoding()
-        {
-            return Err(FlpError::UnsupportedEdit(
-                "Sampler state import requires matching, recognized project string encodings",
-            ));
-        }
-
-        let source_range = source_channel.event_range();
-        let target_range = target_channel.event_range();
-        let channel_block_is_supported = |events: &[FlpEvent], range: &std::ops::Range<usize>| {
-            let markers = range
-                .clone()
-                .filter(|&index| events[index].opcode == 0x40)
-                .collect::<Vec<_>>();
-            let names = range
-                .clone()
-                .filter(|&index| events[index].opcode == 0xCB)
-                .collect::<Vec<_>>();
-            markers.len() == 1
-                && events[markers[0]].encoding == PayloadEncoding::Word
-                && events[markers[0]].payload.len() == 2
-                && names.len() == 1
-                && matches!(events[names[0]].encoding, PayloadEncoding::Data { .. })
-                && !range.clone().any(|index| {
-                    matches!(events[index].opcode, 0x41 | 0x63)
-                        || Self::is_pattern_note_event(&events[index])
-                })
-        };
-        if !channel_block_is_supported(&preset.document().events, &source_range)
-            || !channel_block_is_supported(&self.events, &target_range)
-        {
-            return Err(FlpError::UnsupportedEdit(
-                "Sampler state import requires one well-formed channel marker and name, without note or Playlist events",
-            ));
-        }
-
-        let target_name_event = target_range
-            .clone()
-            .find(|&index| self.events[index].opcode == 0xCB)
-            .expect("a supported channel block has one name event");
-        let mut replacement = preset.document().events[source_range.clone()].to_vec();
-        let source_marker_offset = source_range
-            .clone()
-            .position(|index| preset.document().events[index].opcode == 0x40)
-            .expect("a supported channel block has one marker");
-        let source_name_offset = source_range
-            .clone()
-            .position(|index| preset.document().events[index].opcode == 0xCB)
-            .expect("a supported channel block has one name event");
-        replacement[source_marker_offset].replace_word_payload(target_channel_id)?;
-        replacement[source_name_offset] = self.events[target_name_event].clone();
-
-        let replacement_count = replacement.len();
-        let mut updated = self.clone();
-        updated.events.splice(target_range, replacement);
-        updated.refresh_event_offsets()?;
-        *self = updated;
-        Ok(replacement_count)
+        self.apply_channel_state_preset_for_type(target_channel_id, preset, ChannelType::Sampler)
     }
 
     /// Applies one kind-1 MIDI Out channel block from a format-32 preset to an existing MIDI Out channel.
@@ -27996,6 +27905,62 @@ impl FlpDocument {
         target_channel_id: u16,
         preset: &FstPreset,
     ) -> Result<usize, FlpError> {
+        self.apply_channel_state_preset_for_type(target_channel_id, preset, ChannelType::MidiOut)
+    }
+
+    /// Applies one kind-4 Audio Clip channel block from a format-32 preset to an existing Audio Clip.
+    ///
+    /// The target channel ID and display-name event are retained. Source and target project
+    /// string encodings must be known and match because the copied block may contain a sample
+    /// path. Note and Playlist events are excluded from this channel-state operation.
+    pub fn apply_audio_clip_channel_state_preset(
+        &mut self,
+        target_channel_id: u16,
+        preset: &FstPreset,
+    ) -> Result<usize, FlpError> {
+        self.apply_channel_state_preset_for_type(target_channel_id, preset, ChannelType::Instrument)
+    }
+
+    fn apply_channel_state_preset_for_type(
+        &mut self,
+        target_channel_id: u16,
+        preset: &FstPreset,
+        channel_type: ChannelType,
+    ) -> Result<usize, FlpError> {
+        let (
+            source_channel_error,
+            target_channel_error,
+            require_string_encodings,
+            string_encoding_error,
+            channel_block_error,
+        ) = match channel_type {
+            ChannelType::Sampler => (
+                "Sampler state import requires exactly one kind-0 Sampler channel",
+                "Sampler state import requires a kind-0 Sampler target channel",
+                true,
+                "Sampler state import requires matching, recognized project string encodings",
+                "Sampler state import requires one well-formed channel marker and name, without note or Playlist events",
+            ),
+            ChannelType::MidiOut => (
+                "MIDI Out state import requires exactly one kind-1 MIDI Out channel",
+                "MIDI Out state import requires a kind-1 MIDI Out target channel",
+                false,
+                "",
+                "MIDI Out state import requires one well-formed channel marker and name, without note or Playlist events",
+            ),
+            ChannelType::Instrument => (
+                "Audio Clip state import requires exactly one kind-4 Audio Clip channel",
+                "Audio Clip state import requires a kind-4 Audio Clip target channel",
+                true,
+                "Audio Clip state import requires matching, recognized project string encodings",
+                "Audio Clip state import requires one well-formed channel marker and name, without note or Playlist events",
+            ),
+            _ => {
+                return Err(FlpError::UnsupportedEdit(
+                    "state-preset import is not supported for this channel type",
+                ));
+            }
+        };
         if preset.kind() != FstPresetKind::ChannelState {
             return Err(FlpError::UnsupportedEdit(
                 "the selected preset is not a channel state",
@@ -28003,12 +27968,8 @@ impl FlpDocument {
         }
 
         let source_channels = preset.document().channels();
-        if source_channels.len() != 1
-            || source_channels[0].channel_type() != Some(ChannelType::MidiOut)
-        {
-            return Err(FlpError::UnsupportedEdit(
-                "MIDI Out state import requires exactly one kind-1 MIDI Out channel",
-            ));
+        if source_channels.len() != 1 || source_channels[0].channel_type() != Some(channel_type) {
+            return Err(FlpError::UnsupportedEdit(source_channel_error));
         }
         let source_channel = &source_channels[0];
 
@@ -28022,10 +27983,16 @@ impl FlpDocument {
         if matching_targets.next().is_some() {
             return Err(FlpError::AmbiguousChannelId(target_channel_id));
         }
-        if target_channel.channel_type() != Some(ChannelType::MidiOut) {
-            return Err(FlpError::UnsupportedEdit(
-                "MIDI Out state import requires a kind-1 MIDI Out target channel",
-            ));
+        if target_channel.channel_type() != Some(channel_type) {
+            return Err(FlpError::UnsupportedEdit(target_channel_error));
+        }
+
+        if require_string_encodings
+            && (preset.document().project_string_encoding().is_none()
+                || self.project_string_encoding().is_none()
+                || preset.document().project_string_encoding() != self.project_string_encoding())
+        {
+            return Err(FlpError::UnsupportedEdit(string_encoding_error));
         }
 
         let source_range = source_channel.event_range();
@@ -28052,9 +28019,7 @@ impl FlpDocument {
         if !channel_block_is_supported(&preset.document().events, &source_range)
             || !channel_block_is_supported(&self.events, &target_range)
         {
-            return Err(FlpError::UnsupportedEdit(
-                "MIDI Out state import requires one well-formed channel marker and name, without note or Playlist events",
-            ));
+            return Err(FlpError::UnsupportedEdit(channel_block_error));
         }
 
         let target_name_event = target_range
@@ -29687,6 +29652,27 @@ mod tests {
         bytes
     }
 
+    fn audio_clip_channel_state_fixture(
+        format: u16,
+        channel_id: u16,
+        name: &str,
+        sample_path: &str,
+        clip_state: &[u8],
+    ) -> Vec<u8> {
+        let mut event_stream = Vec::new();
+        append_data_event(&mut event_stream, 0xC7, b"26.0.0\0");
+        append_data_event(&mut event_stream, 0xC2, b"Project title\0");
+        event_stream.extend_from_slice(&[0x40]);
+        event_stream.extend_from_slice(&channel_id.to_le_bytes());
+        event_stream.extend_from_slice(&[0x15, 4]);
+        append_data_event(&mut event_stream, 0xD4, clip_state);
+        append_data_event(&mut event_stream, 0xC4, &utf16_project_string(sample_path));
+        append_project_info_string(&mut event_stream, 0xCB, name);
+        let mut bytes = flp_fixture(&event_stream, &[], &[]);
+        bytes[8..10].copy_from_slice(&format.to_le_bytes());
+        bytes
+    }
+
     #[test]
     fn applies_sampler_channel_state_while_preserving_target_identity_and_project_events() {
         let source_bytes =
@@ -29953,6 +29939,122 @@ mod tests {
             .expect("MIDI Out preset with a Playlist event should parse");
         assert!(matches!(
             target.apply_midi_out_channel_state_preset(5, &blocked_preset),
+            Err(FlpError::UnsupportedEdit(_))
+        ));
+        assert_eq!(target, before);
+    }
+
+    #[test]
+    fn applies_audio_clip_channel_state_while_preserving_target_identity_and_project_data() {
+        let source = FlpDocument::parse(&audio_clip_channel_state_fixture(
+            0,
+            8,
+            "Preset Audio",
+            "preset.wav",
+            &[0x11, 0x22, 0x33],
+        ))
+        .expect("source Audio Clip project should parse");
+        let preset = FstPreset::parse(
+            &source
+                .encode_channel_state_preset(8)
+                .expect("Audio Clip state should export as format 32"),
+        )
+        .expect("exported Audio Clip preset should parse");
+
+        let mut target_stream = Vec::new();
+        append_data_event(&mut target_stream, 0xC7, b"26.0.0\0");
+        append_data_event(&mut target_stream, 0xC2, b"Project title\0");
+        target_stream.extend_from_slice(&[0x40, 5, 0, 0x15, 4]);
+        append_data_event(&mut target_stream, 0xD4, &[0xAA]);
+        append_data_event(
+            &mut target_stream,
+            0xC4,
+            &utf16_project_string("target.wav"),
+        );
+        append_project_info_string(&mut target_stream, 0xCB, "Destination");
+        target_stream.extend_from_slice(&[0x40, 6, 0, 0x15, 0]);
+        append_project_info_string(&mut target_stream, 0xCB, "Sibling");
+        let mut target = FlpDocument::parse(&flp_fixture(&target_stream, &[], &[]))
+            .expect("target project should parse");
+        let target_name_bytes = target.events()[target.channels()[0].event_range()]
+            .iter()
+            .find(|event| event.opcode() == 0xCB)
+            .expect("target Audio Clip should have a name")
+            .wire_bytes()
+            .to_vec();
+        let original_project_title = target.events()[1].wire_bytes().to_vec();
+        let original_sibling = target.events()[target.channels()[1].event_range()]
+            .iter()
+            .map(|event| event.wire_bytes().to_vec())
+            .collect::<Vec<_>>();
+
+        let replaced = target
+            .apply_audio_clip_channel_state_preset(5, &preset)
+            .expect("compatible Audio Clip state should apply");
+
+        assert_eq!(replaced, 5);
+        assert_eq!(target.channels()[0].id(), 5);
+        assert_eq!(target.channels()[0].kind(), Some(4));
+        assert_eq!(target.channels()[0].display_name(), Some("Destination"));
+        let target_range = target.channels()[0].event_range();
+        let channel_events = &target.events()[target_range.clone()];
+        assert_eq!(
+            channel_events
+                .iter()
+                .find(|event| event.opcode() == 0xCB)
+                .expect("target Audio Clip should retain its name event")
+                .wire_bytes(),
+            target_name_bytes
+        );
+        assert!(
+            channel_events
+                .iter()
+                .any(|event| { event.opcode() == 0xD4 && event.payload() == [0x11, 0x22, 0x33] })
+        );
+        assert!(channel_events.iter().any(|event| {
+            event.opcode() == 0xC4 && event.payload() == utf16_project_string("preset.wav")
+        }));
+        assert_eq!(target.events()[1].wire_bytes(), original_project_title);
+        assert_eq!(
+            target.events()[target.channels()[1].event_range()]
+                .iter()
+                .map(|event| event.wire_bytes().to_vec())
+                .collect::<Vec<_>>(),
+            original_sibling
+        );
+        assert_eq!(
+            target.events()[target_range.start].payload(),
+            &5_u16.to_le_bytes()
+        );
+    }
+
+    #[test]
+    fn audio_clip_channel_state_import_rejects_mismatched_project_string_encodings_atomically() {
+        let source = FlpDocument::parse(&audio_clip_channel_state_fixture(
+            0,
+            8,
+            "Preset Audio",
+            "preset.wav",
+            &[0x11, 0x22],
+        ))
+        .expect("source Audio Clip project should parse");
+        let preset = FstPreset::parse(
+            &source
+                .encode_channel_state_preset(8)
+                .expect("Audio Clip state should export as format 32"),
+        )
+        .expect("exported Audio Clip preset should parse");
+
+        let mut target_stream = Vec::new();
+        target_stream.extend_from_slice(&[0x40, 5, 0, 0x15, 4]);
+        append_data_event(&mut target_stream, 0xC4, b"target.wav\0");
+        append_data_event(&mut target_stream, 0xCB, b"Destination\0");
+        let mut target = FlpDocument::parse(&flp_fixture(&target_stream, &[], &[]))
+            .expect("legacy target project should parse");
+        let before = target.clone();
+
+        assert!(matches!(
+            target.apply_audio_clip_channel_state_preset(5, &preset),
             Err(FlpError::UnsupportedEdit(_))
         ));
         assert_eq!(target, before);
