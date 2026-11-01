@@ -156,13 +156,13 @@ use midi_script::{
     MidiControllerScript, MidiScriptTransportState, MixerSendRouteSnapshot, MixerTrackFlag,
     MixerTrackParameter, PlaylistTrackPerformanceParameter, SCRIPT_BEAT_INDICATOR_BAR,
     SCRIPT_BEAT_INDICATOR_BEAT, SCRIPT_BEAT_INDICATOR_OFF, SCRIPT_CHANNEL_EVENT_NEW,
-    SCRIPT_CHANNEL_EVENT_REPLACE, SCRIPT_CHANNEL_EVENT_SELECT, SCRIPT_HW_CHANNEL_EVENT,
-    SCRIPT_HW_DIRTY_COLORS, SCRIPT_HW_DIRTY_MIXER_CONTROLS, SCRIPT_HW_DIRTY_MIXER_DISPLAY,
-    SCRIPT_HW_DIRTY_MIXER_SEL, SCRIPT_HW_DIRTY_NAMES, SCRIPT_MIXER_SCROLL_TO_MAKE_VISIBLE,
-    SCRIPT_PROJECT_LOAD_ERROR, SCRIPT_PROJECT_LOAD_OK, SCRIPT_PROJECT_LOAD_START,
-    SCRIPT_TRANSPORT_PATTERN_MODE, SCRIPT_TRANSPORT_PLAYING, SCRIPT_TRANSPORT_RECORDING,
-    absolute_song_position_ticks, discover_midi_scripts, find_script_for_device,
-    normalized_song_position, song_position_ticks,
+    SCRIPT_CHANNEL_EVENT_RENAME, SCRIPT_CHANNEL_EVENT_REPLACE, SCRIPT_CHANNEL_EVENT_SELECT,
+    SCRIPT_HW_CHANNEL_EVENT, SCRIPT_HW_DIRTY_COLORS, SCRIPT_HW_DIRTY_MIXER_CONTROLS,
+    SCRIPT_HW_DIRTY_MIXER_DISPLAY, SCRIPT_HW_DIRTY_MIXER_SEL, SCRIPT_HW_DIRTY_NAMES,
+    SCRIPT_MIXER_SCROLL_TO_MAKE_VISIBLE, SCRIPT_PROJECT_LOAD_ERROR, SCRIPT_PROJECT_LOAD_OK,
+    SCRIPT_PROJECT_LOAD_START, SCRIPT_TRANSPORT_PATTERN_MODE, SCRIPT_TRANSPORT_PLAYING,
+    SCRIPT_TRANSPORT_RECORDING, absolute_song_position_ticks, discover_midi_scripts,
+    find_script_for_device, normalized_song_position, song_position_ticks,
 };
 use midi_thru::{MidiThruSettings, MidiThruWorker};
 
@@ -40069,6 +40069,70 @@ impl DawUi {
                 None => {}
             }
         }
+        let mut channel_event_candidate_ids = BTreeSet::new();
+        channel_event_candidate_ids.extend(channel_enabled_edits.iter().map(|(id, _)| *id));
+        channel_event_candidate_ids.extend(channel_sample_reverse_edits.iter().map(|(id, _)| *id));
+        channel_event_candidate_ids.extend(channel_sample_effect_edits.iter().map(|(id, _)| *id));
+        channel_event_candidate_ids.extend(channel_sample_fx_flag_edits.iter().map(|(id, _)| *id));
+        channel_event_candidate_ids.extend(channel_sample_window_edits.iter().map(|(id, _)| *id));
+        channel_event_candidate_ids.extend(channel_sample_trim_edits.iter().map(|(id, _)| *id));
+        channel_event_candidate_ids
+            .extend(channel_sample_crossfade_edits.iter().map(|(id, _)| *id));
+        channel_event_candidate_ids.extend(channel_sampler_filter_edits.iter().map(|(id, _)| *id));
+        channel_event_candidate_ids.extend(
+            channel_mixer_track_edits
+                .iter()
+                .flat_map(|(ids, _)| ids.iter().copied()),
+        );
+        channel_event_candidate_ids.extend(vst3_output_route_edits.iter().map(|(id, _, _)| *id));
+        channel_event_candidate_ids.extend(channel_main_pitch_edits.iter().map(|(id, _)| *id));
+        channel_event_candidate_ids.extend(channel_add_to_key_edits.iter().map(|(id, _)| *id));
+        channel_event_candidate_ids.extend(channel_zipped_edits.iter().map(|(id, _)| *id));
+        channel_event_candidate_ids.extend(channel_swing_edits.iter().map(|(id, _)| *id));
+        channel_event_candidate_ids.extend(sampler_fade_edits.iter().map(|(id, _, _)| *id));
+        channel_event_candidate_ids.extend(sampler_portamento_edits.iter().map(|(id, _, _)| *id));
+        channel_event_candidate_ids.extend(sampler_envelope_lfo_edits.iter().map(|(id, _, _)| *id));
+        channel_event_candidate_ids.extend(channel_fine_tune_edits.iter().map(|(id, _)| *id));
+        channel_event_candidate_ids.extend(midi_out_settings_edits.iter().map(|(id, _)| *id));
+        channel_event_candidate_ids.extend(
+            channel_color_edits
+                .iter()
+                .flat_map(|(ids, _)| ids.iter().copied()),
+        );
+        channel_event_candidate_ids.extend(
+            channel_color_gradient_edits
+                .iter()
+                .flat_map(|(ids, _, _)| ids.iter().copied()),
+        );
+        channel_event_candidate_ids.extend(channel_order_edits.iter().map(|(id, _)| *id));
+        channel_event_candidate_ids.extend(level_edits.iter().map(|(id, _, _)| *id));
+        channel_event_candidate_ids.extend(layer_edits.iter().map(|(id, _)| *id));
+        channel_event_candidate_ids.extend(channel_stretch_edits.iter().map(|(id, _)| *id));
+        channel_event_candidate_ids.extend(channel_key_region_edits.iter().map(|(id, _, _)| *id));
+        channel_event_candidate_ids.extend(layer_flag_edits.iter().map(|(id, _, _)| *id));
+        channel_event_candidate_ids.extend(layer_fade_edits.iter().map(|(id, _)| *id));
+        let initial_channel_event_blocks = self
+            .document
+            .as_ref()
+            .map(|document| {
+                let channels = document.channels();
+                channel_event_candidate_ids
+                    .iter()
+                    .filter_map(|channel_id| {
+                        let channel = channels
+                            .iter()
+                            .find(|channel| channel.id() == *channel_id)?;
+                        Some((
+                            *channel_id,
+                            (
+                                channel.display_name().map(str::to_owned),
+                                document.events()[channel.event_range()].to_vec(),
+                            ),
+                        ))
+                    })
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .unwrap_or_default();
         for (channel_id, enabled) in channel_enabled_edits {
             let result = self
                 .document
@@ -40856,6 +40920,35 @@ impl DawUi {
                             format!("Could not update Layer channel {channel_id} Fade: {error}");
                     }
                 }
+            }
+        }
+        if !initial_channel_event_blocks.is_empty()
+            && let Some(document) = self.document.as_ref()
+        {
+            let current_channels = document.channels();
+            let changed_channel_events = initial_channel_event_blocks
+                .iter()
+                .filter_map(|(channel_id, (previous_name, previous_events))| {
+                    let (channel_index, channel) = current_channels
+                        .iter()
+                        .enumerate()
+                        .find(|(_, channel)| channel.id() == *channel_id)?;
+                    let current_events = document.events().get(channel.event_range())?;
+                    if current_events == previous_events.as_slice() {
+                        return None;
+                    }
+                    let flag = if channel.display_name() != previous_name.as_deref() {
+                        SCRIPT_CHANNEL_EVENT_RENAME
+                    } else {
+                        SCRIPT_CHANNEL_EVENT_REPLACE
+                    };
+                    i32::try_from(channel_index)
+                        .ok()
+                        .map(|channel_index| (channel_index, flag))
+                })
+                .collect::<Vec<_>>();
+            if !changed_channel_events.is_empty() {
+                let _ = self.notify_midi_script_channel_events_changed(&changed_channel_events);
             }
         }
         if let Some(instance_id) = open_editor
