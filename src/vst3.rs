@@ -11496,12 +11496,16 @@ mod tests {
                         saved_enabled: true,
                     }],
                     insert_enabled_gains: Vec::new(),
+                    track_path: vec![1],
+                    manual_pdc_offsets_ms: vec![0.0],
                 }]),
                 live_send_meter_paths: vec![crate::MixerLiveSendMeterPath {
                     track: 1,
                     transform: MixerSourceRouteTransform::default(),
                     send_gains: Vec::new(),
                     insert_enabled_gains: Vec::new(),
+                    track_path: vec![1],
+                    manual_pdc_offsets_ms: vec![0.0],
                 }],
                 ..MixerLiveSourceRoutePlan::default()
             },

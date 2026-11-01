@@ -21254,6 +21254,8 @@ mod tests {
                         target_index: Some(0),
                         saved_enabled: true,
                     }],
+                    track_path: vec![1, 2],
+                    manual_pdc_offsets_ms: vec![0.0, 0.0],
                 }]),
                 live_send_meter_paths: vec![
                     crate::MixerLiveSendMeterPath {
@@ -21261,6 +21263,8 @@ mod tests {
                         transform: MixerSourceRouteTransform::default(),
                         send_gains: Vec::new(),
                         insert_enabled_gains: Vec::new(),
+                        track_path: vec![1],
+                        manual_pdc_offsets_ms: vec![0.0],
                     },
                     crate::MixerLiveSendMeterPath {
                         track: 2,
@@ -21275,6 +21279,8 @@ mod tests {
                             target_index: Some(0),
                             saved_enabled: true,
                         }],
+                        track_path: vec![1, 2],
+                        manual_pdc_offsets_ms: vec![0.0, 0.0],
                     },
                 ],
                 live_send_effect_input_paths: Vec::new(),

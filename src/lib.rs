@@ -4367,7 +4367,7 @@ impl MixerInsertSummary {
 
 /// Conservative direct-route Mixer state for mute, solo, and candidate fader values.
 /// Unknown and context-dependent routes are left untouched.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct MixerRouteAudibility {
     known_tracks: HashSet<i8>,
     disabled_tracks: HashSet<i8>,
@@ -4377,6 +4377,7 @@ pub(crate) struct MixerRouteAudibility {
     source_fader_volume_raw: HashMap<i8, i32>,
     source_signal_flags: HashMap<i8, (bool, bool)>,
     source_enabled: HashMap<i8, bool>,
+    source_manual_pdc_ms: HashMap<i8, f32>,
     send_routes_by_source: HashMap<i8, Vec<MixerSendRouteEdge>>,
     complete_send_sources: HashSet<i8>,
     master_fader_raw: Option<i32>,
@@ -4438,6 +4439,8 @@ pub(crate) struct MixerLiveSendOutputPath {
     pub(crate) transform: MixerSourceRouteTransform,
     pub(crate) send_gains: Vec<MixerLiveSendGain>,
     pub(crate) insert_enabled_gains: Vec<MixerLiveInsertEnabledGain>,
+    pub(crate) track_path: Vec<usize>,
+    pub(crate) manual_pdc_offsets_ms: Vec<f32>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -4446,13 +4449,37 @@ pub(crate) struct MixerLiveSendMeterPath {
     pub(crate) transform: MixerSourceRouteTransform,
     pub(crate) send_gains: Vec<MixerLiveSendGain>,
     pub(crate) insert_enabled_gains: Vec<MixerLiveInsertEnabledGain>,
+    pub(crate) track_path: Vec<usize>,
+    pub(crate) manual_pdc_offsets_ms: Vec<f32>,
+}
+
+/// One ordered route from a source insert to the Master input.
+///
+/// The raw per-insert manual offsets stay alongside the path so runtime delay planning can
+/// preserve branch timing instead of trying to reconstruct it from a summed matrix transform.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct MixerSourceRoutePath {
+    pub(crate) transform: MixerSourceRouteTransform,
+    pub(crate) track_path: Vec<usize>,
+    pub(crate) manual_pdc_offsets_ms: Vec<f32>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct MixerSourceInsertRoutePath {
+    pub(crate) track: usize,
+    pub(crate) transform: MixerSourceRouteTransform,
+    pub(crate) track_path: Vec<usize>,
+    pub(crate) manual_pdc_offsets_ms: Vec<f32>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct MixerSourceRoutePlan {
     pub(crate) output_transform: MixerSourceRouteTransform,
+    pub(crate) ordered_output_paths: Vec<MixerSourceRoutePath>,
     pub(crate) insert_meter_transforms: Vec<(usize, MixerSourceRouteTransform)>,
     pub(crate) insert_effect_input_transforms: Vec<(usize, MixerSourceRouteTransform)>,
+    pub(crate) ordered_insert_meter_paths: Vec<MixerSourceInsertRoutePath>,
+    pub(crate) ordered_insert_effect_input_paths: Vec<MixerSourceInsertRoutePath>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -4624,13 +4651,37 @@ impl MixerInsertSignalTransform {
 impl MixerRouteAudibility {
     pub(crate) fn from_document(document: &FlpDocument) -> Self {
         let parameters = document.mixer_parameter_records().unwrap_or_default();
+        let inserts = document.mixer_inserts();
         let mut routing = Self::from_inserts_with_parameters(
-            document.mixer_inserts(),
+            inserts.iter().cloned(),
             &parameters,
             document.metadata().pan_law_raw(),
         );
         routing.add_send_summaries(document.mixer_send_summaries().unwrap_or_default());
+        for insert in &inserts {
+            let Ok(track) = i8::try_from(insert.ordinal()) else {
+                continue;
+            };
+            if track <= 0 {
+                continue;
+            }
+            if let Some(offset_ms) = document.mixer_insert_manual_pdc_ms_for_insert(insert) {
+                routing.source_manual_pdc_ms.insert(track, offset_ms);
+            }
+        }
         routing
+    }
+
+    fn manual_pdc_offsets_for_path(&self, track_path: &[usize]) -> Vec<f32> {
+        track_path
+            .iter()
+            .map(|track| {
+                i8::try_from(*track)
+                    .ok()
+                    .and_then(|track| self.source_manual_pdc_ms.get(&track).copied())
+                    .unwrap_or_default()
+            })
+            .collect()
     }
 
     /// Returns Mixer tracks that remain audible for current solo and mute-lock flags and
@@ -5130,13 +5181,54 @@ impl MixerRouteAudibility {
                         * saved_meter_solo_gains[index],
                 ));
         }
+        let ordered_output_paths = output_paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| MixerSourceRoutePath {
+                transform: path.transform.scaled(
+                    saved_live_route_path_gain(&path.send_gains, &path.insert_enabled_gains)
+                        * saved_output_solo_gains[index],
+                ),
+                track_path: path.track_path.clone(),
+                manual_pdc_offsets_ms: path.manual_pdc_offsets_ms.clone(),
+            })
+            .collect();
+        let ordered_insert_meter_paths = meter_paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| MixerSourceInsertRoutePath {
+                track: path.track,
+                transform: path.transform.scaled(
+                    saved_live_route_path_gain(&path.send_gains, &path.insert_enabled_gains)
+                        * saved_meter_solo_gains[index],
+                ),
+                track_path: path.track_path.clone(),
+                manual_pdc_offsets_ms: path.manual_pdc_offsets_ms.clone(),
+            })
+            .collect();
+        let ordered_insert_effect_input_paths = effect_input_paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| MixerSourceInsertRoutePath {
+                track: path.track,
+                transform: path.transform.scaled(
+                    saved_live_route_path_gain(&path.send_gains, &path.insert_enabled_gains)
+                        * saved_meter_solo_gains[index],
+                ),
+                track_path: path.track_path.clone(),
+                manual_pdc_offsets_ms: path.manual_pdc_offsets_ms.clone(),
+            })
+            .collect();
         MixerLiveSourceRouteData {
             route_plan: MixerSourceRoutePlan {
                 output_transform,
+                ordered_output_paths,
                 insert_meter_transforms: insert_meter_transforms.into_iter().collect(),
                 insert_effect_input_transforms: insert_effect_input_transforms
                     .into_iter()
                     .collect(),
+                ordered_insert_meter_paths,
+                ordered_insert_effect_input_paths,
             },
             output_paths: Some(output_paths),
             meter_paths,
@@ -5183,6 +5275,8 @@ impl MixerRouteAudibility {
                 transform: path,
                 send_gains: send_gains.clone(),
                 insert_enabled_gains: insert_enabled_gains.clone(),
+                track_path: solo_tracks.clone(),
+                manual_pdc_offsets_ms: self.manual_pdc_offsets_for_path(&solo_tracks),
             });
             saved_output_solo_gains.push(self.saved_solo_gain_for_path(&solo_tracks));
             output_solo_tracks.push(solo_tracks);
@@ -5225,6 +5319,8 @@ impl MixerRouteAudibility {
             transform: path,
             send_gains: send_gains.clone(),
             insert_enabled_gains: insert_enabled_gains.clone(),
+            track_path: solo_path_tracks.clone(),
+            manual_pdc_offsets_ms: self.manual_pdc_offsets_for_path(solo_path_tracks),
         });
         let path = path.then(MixerSourceRouteTransform::from_insert_transform(
             track_transform,
@@ -5234,6 +5330,8 @@ impl MixerRouteAudibility {
             transform: path,
             send_gains: send_gains.clone(),
             insert_enabled_gains: insert_enabled_gains.clone(),
+            track_path: solo_path_tracks.clone(),
+            manual_pdc_offsets_ms: self.manual_pdc_offsets_for_path(solo_path_tracks),
         });
 
         if self.complete_send_sources.contains(&track) {
@@ -5296,6 +5394,8 @@ impl MixerRouteAudibility {
                 transform: path,
                 send_gains: send_gains.clone(),
                 insert_enabled_gains: insert_enabled_gains.clone(),
+                track_path: solo_tracks.clone(),
+                manual_pdc_offsets_ms: self.manual_pdc_offsets_for_path(&solo_tracks),
             });
             saved_output_solo_gains.push(self.saved_solo_gain_for_path(&solo_tracks));
             output_solo_tracks.push(solo_tracks);
@@ -5355,8 +5455,11 @@ impl MixerRouteAudibility {
         else {
             return MixerSourceRoutePlan {
                 output_transform: MixerSourceRouteTransform::default(),
+                ordered_output_paths: Vec::new(),
                 insert_meter_transforms: Vec::new(),
                 insert_effect_input_transforms: Vec::new(),
+                ordered_insert_meter_paths: Vec::new(),
+                ordered_insert_effect_input_paths: Vec::new(),
             };
         };
         if !self.complete_send_sources.contains(&track) {
@@ -5365,30 +5468,57 @@ impl MixerRouteAudibility {
             );
             return MixerSourceRoutePlan {
                 output_transform: transform,
+                ordered_output_paths: vec![MixerSourceRoutePath {
+                    transform,
+                    track_path: vec![track as usize],
+                    manual_pdc_offsets_ms: self.manual_pdc_offsets_for_path(&[track as usize]),
+                }],
                 insert_meter_transforms: vec![(track as usize, transform)],
                 insert_effect_input_transforms: vec![(
                     track as usize,
                     MixerSourceRouteTransform::default(),
                 )],
+                ordered_insert_meter_paths: vec![MixerSourceInsertRoutePath {
+                    track: track as usize,
+                    transform,
+                    track_path: vec![track as usize],
+                    manual_pdc_offsets_ms: self.manual_pdc_offsets_for_path(&[track as usize]),
+                }],
+                ordered_insert_effect_input_paths: vec![MixerSourceInsertRoutePath {
+                    track: track as usize,
+                    transform: MixerSourceRouteTransform::default(),
+                    track_path: vec![track as usize],
+                    manual_pdc_offsets_ms: self.manual_pdc_offsets_for_path(&[track as usize]),
+                }],
             };
         }
 
         let mut output = MixerSourceRouteTransform::zero();
+        let mut ordered_output_paths = Vec::new();
         let mut insert_meter_transforms = BTreeMap::new();
         let mut insert_effect_input_transforms = BTreeMap::new();
+        let mut ordered_insert_meter_paths = Vec::new();
+        let mut ordered_insert_effect_input_paths = Vec::new();
         self.accumulate_send_paths(
             track,
             MixerSourceRouteTransform::default(),
             &mut HashSet::new(),
+            &mut Vec::new(),
             false,
             &mut output,
+            &mut ordered_output_paths,
             &mut insert_meter_transforms,
             &mut insert_effect_input_transforms,
+            &mut ordered_insert_meter_paths,
+            &mut ordered_insert_effect_input_paths,
         );
         MixerSourceRoutePlan {
             output_transform: output,
+            ordered_output_paths,
             insert_meter_transforms: insert_meter_transforms.into_iter().collect(),
             insert_effect_input_transforms: insert_effect_input_transforms.into_iter().collect(),
+            ordered_insert_meter_paths,
+            ordered_insert_effect_input_paths,
         }
     }
 
@@ -5589,20 +5719,30 @@ impl MixerRouteAudibility {
         track: i8,
         path: MixerSourceRouteTransform,
         visited: &mut HashSet<i8>,
+        track_path: &mut Vec<usize>,
         reached_solo: bool,
         output: &mut MixerSourceRouteTransform,
+        ordered_output_paths: &mut Vec<MixerSourceRoutePath>,
         insert_meter_transforms: &mut BTreeMap<usize, MixerSourceRouteTransform>,
         insert_effect_input_transforms: &mut BTreeMap<usize, MixerSourceRouteTransform>,
+        ordered_insert_meter_paths: &mut Vec<MixerSourceInsertRoutePath>,
+        ordered_insert_effect_input_paths: &mut Vec<MixerSourceInsertRoutePath>,
     ) {
         if track == 0 {
             if self.soloed_insert_tracks.is_empty() || reached_solo {
                 output.add(path);
+                ordered_output_paths.push(MixerSourceRoutePath {
+                    transform: path,
+                    track_path: track_path.clone(),
+                    manual_pdc_offsets_ms: self.manual_pdc_offsets_for_path(track_path),
+                });
             }
             return;
         }
         if self.disabled_tracks.contains(&track) || !visited.insert(track) {
             return;
         }
+        track_path.push(track as usize);
 
         let reached_solo = reached_solo || self.soloed_insert_tracks.contains(&track);
         if self.soloed_insert_tracks.is_empty()
@@ -5613,6 +5753,12 @@ impl MixerRouteAudibility {
                 .entry(track as usize)
                 .or_insert_with(MixerSourceRouteTransform::zero)
                 .add(path);
+            ordered_insert_effect_input_paths.push(MixerSourceInsertRoutePath {
+                track: track as usize,
+                transform: path,
+                track_path: track_path.clone(),
+                manual_pdc_offsets_ms: self.manual_pdc_offsets_for_path(track_path),
+            });
         }
         let track_transform = self
             .source_transforms
@@ -5630,6 +5776,12 @@ impl MixerRouteAudibility {
                 .entry(track as usize)
                 .or_insert_with(MixerSourceRouteTransform::zero)
                 .add(path);
+            ordered_insert_meter_paths.push(MixerSourceInsertRoutePath {
+                track: track as usize,
+                transform: path,
+                track_path: track_path.clone(),
+                manual_pdc_offsets_ms: self.manual_pdc_offsets_for_path(track_path),
+            });
         }
         if self.complete_send_sources.contains(&track) {
             if let Some(routes) = self.send_routes_by_source.get(&track) {
@@ -5642,17 +5794,27 @@ impl MixerRouteAudibility {
                         route.destination_track,
                         path.scaled(gain),
                         visited,
+                        track_path,
                         reached_solo,
                         output,
+                        ordered_output_paths,
                         insert_meter_transforms,
                         insert_effect_input_transforms,
+                        ordered_insert_meter_paths,
+                        ordered_insert_effect_input_paths,
                     );
                 }
             }
         } else if self.soloed_insert_tracks.is_empty() || reached_solo {
             // Rows without a complete routing map retain FL Studio's default Master path.
             output.add(path);
+            ordered_output_paths.push(MixerSourceRoutePath {
+                transform: path,
+                track_path: track_path.clone(),
+                manual_pdc_offsets_ms: self.manual_pdc_offsets_for_path(track_path),
+            });
         }
+        track_path.pop();
         visited.remove(&track);
     }
 
@@ -10427,7 +10589,15 @@ impl FlpDocument {
     /// The first float in its unique 12-byte `0xEC` track-state event stores this value.
     /// Malformed, missing, or ambiguous records remain uninterpreted.
     pub fn mixer_insert_manual_pdc_ms(&self, insert_ordinal: usize) -> Option<f32> {
-        let event_index = self.mixer_insert_manual_pdc_event_index(insert_ordinal)?;
+        let insert = self
+            .mixer_inserts()
+            .into_iter()
+            .find(|insert| insert.ordinal() == insert_ordinal)?;
+        self.mixer_insert_manual_pdc_ms_for_insert(&insert)
+    }
+
+    fn mixer_insert_manual_pdc_ms_for_insert(&self, insert: &MixerInsertSummary) -> Option<f32> {
+        let event_index = self.mixer_insert_manual_pdc_event_index_for_insert(insert)?;
         let event = self.events.get(event_index)?;
         let value = f32::from_le_bytes(event.payload[..4].try_into().ok()?);
         value.is_finite().then_some(value)
@@ -10472,6 +10642,13 @@ impl FlpDocument {
             .mixer_inserts()
             .into_iter()
             .find(|insert| insert.ordinal() == insert_ordinal)?;
+        self.mixer_insert_manual_pdc_event_index_for_insert(&insert)
+    }
+
+    fn mixer_insert_manual_pdc_event_index_for_insert(
+        &self,
+        insert: &MixerInsertSummary,
+    ) -> Option<usize> {
         let range = insert.event_range();
         let mut candidates = range.filter(|&event_index| {
             self.events.get(event_index).is_some_and(|event| {
@@ -34349,6 +34526,8 @@ mod tests {
                     target_index: Some(0),
                     saved_enabled: true,
                 }],
+                track_path: vec![1, 2],
+                manual_pdc_offsets_ms: vec![0.0, 0.0],
             }])
         );
     }
