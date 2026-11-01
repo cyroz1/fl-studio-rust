@@ -262,6 +262,10 @@ pub const SCRIPT_HW_DIRTY_MIXER_DISPLAY: i32 = 2;
 pub const SCRIPT_HW_DIRTY_MIXER_CONTROLS: i32 = 4;
 pub const SCRIPT_HW_DIRTY_COLORS: i32 = 8192;
 pub const SCRIPT_HW_DIRTY_NAMES: i32 = 16384;
+pub const SCRIPT_HW_CHANNEL_EVENT: i32 = 65536;
+pub const SCRIPT_CHANNEL_EVENT_NEW: i32 = 0;
+pub const SCRIPT_CHANNEL_EVENT_REPLACE: i32 = 2;
+pub const SCRIPT_CHANNEL_EVENT_SELECT: i32 = 4;
 pub const SCRIPT_MIXER_SCROLL_TO_MAKE_VISIBLE: u32 = 1 << 0;
 
 pub struct MidiScriptTransportState {
@@ -803,6 +807,22 @@ impl MidiScriptRuntime {
     ) -> Result<ScriptMidiResult, String> {
         let response = self.exchange(&json!({
             "dirty_mixer_tracks": track_indices,
+            "refresh_flags": refresh_flags,
+        }))?;
+        Ok(ScriptMidiResult {
+            handled: false,
+            bytes: Vec::new(),
+            actions: parse_transport_actions(&response)?,
+        })
+    }
+
+    pub fn process_channel_events_changed(
+        &mut self,
+        channel_events: &[(i32, i32)],
+        refresh_flags: i32,
+    ) -> Result<ScriptMidiResult, String> {
+        let response = self.exchange(&json!({
+            "dirty_channels": channel_events,
             "refresh_flags": refresh_flags,
         }))?;
         Ok(ScriptMidiResult {

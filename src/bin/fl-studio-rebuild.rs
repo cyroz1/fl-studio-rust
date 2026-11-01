@@ -155,12 +155,14 @@ use midi_output::{
 use midi_script::{
     MidiControllerScript, MidiScriptTransportState, MixerSendRouteSnapshot, MixerTrackFlag,
     MixerTrackParameter, PlaylistTrackPerformanceParameter, SCRIPT_BEAT_INDICATOR_BAR,
-    SCRIPT_BEAT_INDICATOR_BEAT, SCRIPT_BEAT_INDICATOR_OFF, SCRIPT_HW_DIRTY_COLORS,
-    SCRIPT_HW_DIRTY_MIXER_CONTROLS, SCRIPT_HW_DIRTY_MIXER_DISPLAY, SCRIPT_HW_DIRTY_MIXER_SEL,
-    SCRIPT_HW_DIRTY_NAMES, SCRIPT_MIXER_SCROLL_TO_MAKE_VISIBLE, SCRIPT_PROJECT_LOAD_ERROR,
-    SCRIPT_PROJECT_LOAD_OK, SCRIPT_PROJECT_LOAD_START, SCRIPT_TRANSPORT_PATTERN_MODE,
-    SCRIPT_TRANSPORT_PLAYING, SCRIPT_TRANSPORT_RECORDING, absolute_song_position_ticks,
-    discover_midi_scripts, find_script_for_device, normalized_song_position, song_position_ticks,
+    SCRIPT_BEAT_INDICATOR_BEAT, SCRIPT_BEAT_INDICATOR_OFF, SCRIPT_CHANNEL_EVENT_NEW,
+    SCRIPT_CHANNEL_EVENT_REPLACE, SCRIPT_CHANNEL_EVENT_SELECT, SCRIPT_HW_CHANNEL_EVENT,
+    SCRIPT_HW_DIRTY_COLORS, SCRIPT_HW_DIRTY_MIXER_CONTROLS, SCRIPT_HW_DIRTY_MIXER_DISPLAY,
+    SCRIPT_HW_DIRTY_MIXER_SEL, SCRIPT_HW_DIRTY_NAMES, SCRIPT_MIXER_SCROLL_TO_MAKE_VISIBLE,
+    SCRIPT_PROJECT_LOAD_ERROR, SCRIPT_PROJECT_LOAD_OK, SCRIPT_PROJECT_LOAD_START,
+    SCRIPT_TRANSPORT_PATTERN_MODE, SCRIPT_TRANSPORT_PLAYING, SCRIPT_TRANSPORT_RECORDING,
+    absolute_song_position_ticks, discover_midi_scripts, find_script_for_device,
+    normalized_song_position, song_position_ticks,
 };
 use midi_thru::{MidiThruSettings, MidiThruWorker};
 
@@ -9481,6 +9483,59 @@ impl DawUi {
                 connection.notify_script_mixer_tracks_changed(track_indices, refresh_flags)
             })
             .unwrap_or(true)
+    }
+
+    fn notify_midi_script_channel_events_changed(&self, channel_events: &[(i32, i32)]) -> bool {
+        self.midi_input_connection
+            .as_ref()
+            .and_then(|connection| {
+                connection
+                    .notify_script_channel_events_changed(channel_events, SCRIPT_HW_CHANNEL_EVENT)
+            })
+            .unwrap_or(true)
+    }
+
+    fn notify_midi_script_channel_event(&self, channel_id: u16, flag: i32) -> bool {
+        let Some(channel_index) = self
+            .document
+            .as_ref()
+            .and_then(|document| {
+                document
+                    .channels()
+                    .iter()
+                    .position(|channel| channel.id() == channel_id)
+            })
+            .and_then(|index| i32::try_from(index).ok())
+        else {
+            return true;
+        };
+        self.notify_midi_script_channel_events_changed(&[(channel_index, flag)])
+    }
+
+    fn notify_midi_script_channel_selection_changes(
+        &self,
+        previous: &BTreeSet<u16>,
+        current: &BTreeSet<u16>,
+    ) -> bool {
+        let Some(document) = self.document.as_ref() else {
+            return true;
+        };
+        let channels = document.channels();
+        let channel_events = previous
+            .symmetric_difference(current)
+            .filter_map(|channel_id| {
+                channels
+                    .iter()
+                    .position(|channel| channel.id() == *channel_id)
+                    .and_then(|index| i32::try_from(index).ok())
+                    .map(|index| (index, SCRIPT_CHANNEL_EVENT_SELECT))
+            })
+            .collect::<Vec<_>>();
+        if channel_events.is_empty() {
+            true
+        } else {
+            self.notify_midi_script_channel_events_changed(&channel_events)
+        }
     }
 
     fn notify_midi_script_display_zone_if_changed(&mut self) {
@@ -21541,6 +21596,8 @@ impl DawUi {
                 self.stop_project_playback();
                 self.dirty = true;
                 self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+                let _ =
+                    self.notify_midi_script_channel_event(channel_id, SCRIPT_CHANNEL_EVENT_REPLACE);
                 let channel_name = self
                     .document
                     .as_ref()
@@ -21584,6 +21641,7 @@ impl DawUi {
                 self.stop_project_playback();
                 self.dirty = true;
                 self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+                let _ = self.notify_midi_script_channel_event(channel_id, SCRIPT_CHANNEL_EVENT_NEW);
                 self.selected_graph_channel = Some(channel_id);
                 self.selected_note_channel = Some(channel_id);
                 self.status = format!("Created Sampler channel {name} from {}", path.display());
@@ -38004,6 +38062,7 @@ impl DawUi {
         {
             self.selected_rack_channels.insert(channel_id);
         }
+        let initial_selected_rack_channels = self.selected_rack_channels.clone();
         if self
             .rack_selection_anchor
             .is_none_or(|id| !channels.iter().any(|channel| channel.id() == id))
@@ -39989,6 +40048,8 @@ impl DawUi {
             match result {
                 Some(Ok(new_channel_id)) => {
                     self.stop_project_playback();
+                    let _ = self
+                        .notify_midi_script_channel_event(new_channel_id, SCRIPT_CHANNEL_EVENT_NEW);
                     self.selected_rack_channels.clear();
                     self.selected_rack_channels.insert(new_channel_id);
                     self.rack_selection_anchor = Some(new_channel_id);
@@ -40817,6 +40878,10 @@ impl DawUi {
         if let Some(group_index) = delete_group {
             self.delete_channel_group_from_ui(group_index);
         }
+        let _ = self.notify_midi_script_channel_selection_changes(
+            &initial_selected_rack_channels,
+            &self.selected_rack_channels,
+        );
     }
 
     fn step_graph_editor(
