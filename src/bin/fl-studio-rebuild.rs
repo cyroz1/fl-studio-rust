@@ -80154,6 +80154,7 @@ fn remove_pattern_clap_mixer_effect_lfo_parameter_link(
     links.retain(|link| !same_pattern_clap_mixer_effect_lfo_parameter_link_target(link, target));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn pattern_clap_mixer_effect_lfo_parameter_link_for_target<'a>(
     links: &'a [PatternClapMixerEffectLfoParameterLink],
     project_path: &Path,
