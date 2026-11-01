@@ -4063,7 +4063,7 @@ unsafe extern "system" fn directsound_enumeration_callback(
     };
     let id = guid.map_or_else(
         || "dsound:default".to_owned(),
-        |guid| format!("dsound:{guid:?}"),
+        |guid| format!("dsound:{}", directsound_guid_text(guid)),
     );
     let name = if description.is_null() {
         "DirectSound output".to_owned()
@@ -4072,6 +4072,24 @@ unsafe extern "system" fn directsound_enumeration_callback(
     };
     devices.push(DirectSoundDeviceDescriptor { id, name, guid });
     windows::core::BOOL(1)
+}
+
+#[cfg(windows)]
+fn directsound_guid_text(guid: windows::core::GUID) -> String {
+    format!(
+        "{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+        guid.data1,
+        guid.data2,
+        guid.data3,
+        guid.data4[0],
+        guid.data4[1],
+        guid.data4[2],
+        guid.data4[3],
+        guid.data4[4],
+        guid.data4[5],
+        guid.data4[6],
+        guid.data4[7],
+    )
 }
 
 #[cfg(windows)]
