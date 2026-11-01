@@ -20491,9 +20491,10 @@ impl DawUi {
         match self.view {
             MainView::PianoRoll => self.move_midi_script_piano_roll_notes(increment),
             MainView::Playlist => self.move_midi_script_playlist_clips(increment),
+            MainView::ChannelRack => self.move_midi_script_channel_rack_rows(increment),
             _ => {
                 self.status =
-                    "MIDI script move jog is supported in the Playlist and Piano roll views"
+                    "MIDI script move jog is supported in the Playlist, Channel Rack, and Piano roll views"
                         .to_owned();
             }
         }
@@ -20623,6 +20624,84 @@ impl DawUi {
             } else {
                 "s"
             }
+        );
+    }
+
+    fn move_midi_script_channel_rack_rows(&mut self, increment: i32) {
+        let Some(document) = self.document.as_ref() else {
+            self.status = "Open a project before moving Channel Rack rows".to_owned();
+            return;
+        };
+        let channel_ids = document
+            .channels()
+            .iter()
+            .map(ChannelSummary::id)
+            .collect::<Vec<_>>();
+        if channel_ids.is_empty() {
+            self.status = "The Channel Rack has no rows to move".to_owned();
+            return;
+        }
+        let mut selected = channel_ids
+            .iter()
+            .map(|channel_id| self.selected_rack_channels.contains(channel_id))
+            .collect::<Vec<_>>();
+        if !selected.iter().any(|is_selected| *is_selected) {
+            self.status = "Select Channel Rack rows before moving them".to_owned();
+            return;
+        }
+        let selected_count = selected.iter().filter(|is_selected| **is_selected).count();
+        let mut reordered_ids = channel_ids.clone();
+
+        let requested_steps = (increment.unsigned_abs() as usize).min(channel_ids.len());
+        let mut moved_steps = 0;
+        for _ in 0..requested_steps {
+            let mut changed = false;
+            if increment > 0 {
+                for index in (0..selected.len().saturating_sub(1)).rev() {
+                    if selected[index] && !selected[index + 1] {
+                        selected.swap(index, index + 1);
+                        reordered_ids.swap(index, index + 1);
+                        changed = true;
+                    }
+                }
+            } else {
+                for index in 1..selected.len() {
+                    if selected[index] && !selected[index - 1] {
+                        selected.swap(index, index - 1);
+                        reordered_ids.swap(index, index - 1);
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+            moved_steps += 1;
+        }
+        if moved_steps == 0 {
+            self.status = if increment > 0 {
+                "Selected Channel Rack rows are already at the bottom".to_owned()
+            } else {
+                "Selected Channel Rack rows are already at the top".to_owned()
+            };
+            return;
+        }
+
+        let mut updated = document.clone();
+        if let Err(error) = updated.reorder_channels(&reordered_ids) {
+            self.status = format!("Could not move Channel Rack rows: {error}");
+            return;
+        }
+        self.document = Some(updated);
+        self.stop_project_playback();
+        self.dirty = true;
+        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+        let direction = if increment > 0 { "down" } else { "up" };
+        self.status = format!(
+            "Moved {} selected Channel Rack row{} {direction} by {moved_steps} step{}",
+            selected_count,
+            if selected_count == 1 { "" } else { "s" },
+            if moved_steps == 1 { "" } else { "s" }
         );
     }
 
