@@ -31252,6 +31252,7 @@ mod tests {
             if slot_index == target_slot {
                 append_project_info_string(event_stream, 0xC9, plugin_identifier);
                 append_data_event(event_stream, 0xD4, &[0xB4; 52]);
+                append_project_info_string(event_stream, 0xCB, plugin_identifier);
                 event_stream.push(0x9B);
                 event_stream.extend_from_slice(&0_u32.to_le_bytes());
                 event_stream.push(0x80);
@@ -31267,7 +31268,9 @@ mod tests {
     fn exports_a_native_mixer_effect_slot_as_a_format48_state_preset() {
         let mut target_events = Vec::new();
         append_data_event(&mut target_events, 0xC7, b"26.0.0\0");
-        target_events.extend_from_slice(&[0x1C, 3]);
+        target_events.push(0x9F);
+        target_events.extend_from_slice(&0x0000_0012_u32.to_le_bytes());
+        target_events.extend_from_slice(&[0x1C, 3, 0x25, 7]);
         append_complete_mixer_insert_with_native_effect(
             &mut target_events,
             4,
@@ -31295,8 +31298,14 @@ mod tests {
                 .iter()
                 .map(|event| event.opcode())
                 .collect::<Vec<_>>(),
-            [0xC7, 0x1C, 0xC9, 0xD4, 0x9B, 0x80, 0xD5]
+            [0xC7, 0x9F, 0x1C, 0x25, 0xC9, 0xD4, 0xCB, 0x9B, 0x80, 0xD5]
         );
+        let mut roundtrip = target.clone();
+        assert_eq!(
+            roundtrip.apply_native_mixer_effect_state_preset(0, 4, &preset),
+            Ok(1)
+        );
+        assert_eq!(roundtrip, target);
     }
 
     #[test]
