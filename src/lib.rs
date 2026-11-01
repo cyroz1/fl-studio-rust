@@ -4136,8 +4136,8 @@ pub struct PlaylistTrackEdit {
     pub tolerant: Option<bool>,
 }
 
-/// Mixer insert fields recognized from the observed `0x9A`, `0x93`, `0x95`
-/// sequence. The source events remain byte-exact in [`FlpDocument::events`].
+/// Mixer insert fields recognized from the `0x9A`, `0x93` input/output pair and optional
+/// `0x95` color event. The source events remain byte-exact in [`FlpDocument::events`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MixerInsertSummary {
     ordinal: usize,
@@ -4308,8 +4308,10 @@ impl MixerInsertSummary {
         self.output_raw
     }
 
-    /// Raw four-byte value carried by the insert's `0x95` event.
+    /// Raw four-byte value carried by the insert's `0x95` event, or FL Studio's default
+    /// Mixer color when that optional event is absent.
     pub fn color_raw(&self) -> u32 {
+        // FL Studio's default Mixer color when a project omits the optional color event.
         self.color_raw
     }
 
@@ -10302,31 +10304,23 @@ impl FlpDocument {
         Ok(())
     }
 
-    /// Returns Mixer insert summaries for the observed adjacent `0x9A`, `0x93`, `0x95`
-    /// record signature. This is intentionally read-only; the unparsed insert and effect data
-    /// remains available byte-for-byte through `events()`.
+    /// Returns Mixer insert summaries for adjacent `0x9A`/`0x93` input/output records, with an
+    /// optional `0x95` color event. Recent projects can omit the color event entirely. This is
+    /// intentionally read-only; the unparsed insert and effect data remains byte-exact through
+    /// `events()`.
     pub fn mixer_inserts(&self) -> Vec<MixerInsertSummary> {
-        let flag_opcodes: &[u8] = match self
-            .project_version
-            .as_deref()
-            .and_then(|version| version.split('.').next())
-            .and_then(|major| major.parse::<u32>().ok())
-        {
-            Some(major) if major >= 25 => &[0xEC],
-            Some(_) => &[0xDC],
-            None => &[0xEC, 0xDC],
-        };
+        // Both layouts occur across FL Studio generations; some 24.x projects already use
+        // the 12-byte `0xEC` state that also stores the manual PDC value.
+        let flag_opcodes: &[u8] = &[0xEC, 0xDC];
         let starts = self
             .events
-            .windows(3)
+            .windows(2)
             .enumerate()
             .filter_map(|(index, window)| {
                 (window[0].opcode == 0x9A
                     && window[0].payload.len() == 4
                     && window[1].opcode == 0x93
-                    && window[1].payload.len() == 4
-                    && window[2].opcode == 0x95
-                    && window[2].payload.len() == 4)
+                    && window[1].payload.len() == 4)
                     .then_some(index)
             })
             .collect::<Vec<_>>();
@@ -10347,11 +10341,17 @@ impl FlpDocument {
                             .expect("the Mixer record signature checked four-byte fields"),
                     )
                 };
-                let color_raw = u32::from_le_bytes(
-                    self.events[start + 2].payload[..4]
-                        .try_into()
-                        .expect("the Mixer record signature checked four-byte fields"),
-                );
+                let color_raw = insert_events
+                    .iter()
+                    .find(|event| event.opcode == 0x95 && event.payload.len() == 4)
+                    .map(|event| {
+                        u32::from_le_bytes(
+                            event.payload[..4]
+                                .try_into()
+                                .expect("a Mixer color event has four bytes"),
+                        )
+                    })
+                    .unwrap_or(0x0071_6C63);
                 let icon_raw = insert_events
                     .iter()
                     .find(|event| event.opcode == 0x5F && event.payload.len() == 2)
@@ -11075,7 +11075,7 @@ impl FlpDocument {
         Ok(())
     }
 
-    /// Sets the RGB portion of a recognized Mixer insert's `0x95` color value.
+    /// Sets the RGB portion of a recognized Mixer insert's existing `0x95` color event.
     /// The upper saved byte and every unrelated event remain unchanged.
     pub fn set_mixer_insert_color(
         &mut self,
@@ -11089,7 +11089,21 @@ impl FlpDocument {
             .ok_or(FlpError::UnsupportedEdit(
                 "the requested Mixer insert does not exist",
             ))?;
-        let event_index = insert.first_event_index + 2;
+        let mut color_events = insert.event_range().filter(|&event_index| {
+            self.events.get(event_index).is_some_and(|event| {
+                event.opcode == 0x95
+                    && event.encoding == PayloadEncoding::Dword
+                    && event.payload.len() == 4
+            })
+        });
+        let event_index = color_events.next().ok_or(FlpError::UnsupportedEdit(
+            "the requested Mixer insert color event does not exist",
+        ))?;
+        if color_events.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested Mixer insert has multiple color events",
+            ));
+        }
         let event = self
             .events
             .get(event_index)
