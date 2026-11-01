@@ -715,6 +715,8 @@ pub(crate) struct SamplerFileMetadata {
     pub(crate) release_ping_pong_loop: Option<bool>,
     /// ACID loop tempo when a WAVE `acid` chunk marks a stretch-enabled loop rather than a one-shot.
     pub(crate) acid_loop_tempo_bpm: Option<f64>,
+    /// ACID loop beat count paired with `acid_loop_tempo_bpm` for valid stretch-enabled loops.
+    pub(crate) acid_loop_beat_count: Option<u32>,
 }
 
 /// Read standard sampler metadata from a RIFF/WAVE file.
@@ -750,6 +752,7 @@ pub(crate) fn wav_sampler_metadata(path: &Path) -> Option<SamplerFileMetadata> {
     let mut ping_pong_loop = None;
     let mut backward_loop = None;
     let mut acid_loop_tempo_bpm = None;
+    let mut acid_loop_beat_count = None;
     while cursor.checked_add(8)? <= riff_end {
         file.seek(SeekFrom::Start(cursor)).ok()?;
         let mut chunk_header = [0; 8];
@@ -776,6 +779,7 @@ pub(crate) fn wav_sampler_metadata(path: &Path) -> Option<SamplerFileMetadata> {
                     && (1.0..=1_000.0).contains(&tempo_bpm)
                 {
                     acid_loop_tempo_bpm = Some(f64::from(tempo_bpm));
+                    acid_loop_beat_count = Some(beat_count);
                 }
             }
             b"inst" if chunk_size >= 7 && inst_root_key.is_none() => {
@@ -884,6 +888,7 @@ pub(crate) fn wav_sampler_metadata(path: &Path) -> Option<SamplerFileMetadata> {
         release_loop_points: None,
         release_ping_pong_loop: None,
         acid_loop_tempo_bpm,
+        acid_loop_beat_count,
     };
     (metadata.root_key.is_some()
         || metadata.gain_db.is_some()
@@ -894,10 +899,20 @@ pub(crate) fn wav_sampler_metadata(path: &Path) -> Option<SamplerFileMetadata> {
     .then_some(metadata)
 }
 
+/// Return valid WAVE ACID loop beat count and tempo for Browser preview and Playlist placement.
+/// One-shots and files without supported loop tempo metadata return `None`.
+pub fn wave_acid_loop_tempo_metadata(path: impl AsRef<Path>) -> Option<(u32, f64)> {
+    let metadata = wav_sampler_metadata(path.as_ref())?;
+    Some((
+        metadata.acid_loop_beat_count?,
+        metadata.acid_loop_tempo_bpm?,
+    ))
+}
+
 /// Return a valid WAVE ACID loop tempo for Browser preview and Playlist placement.
 /// One-shots and files without supported loop tempo metadata return `None`.
 pub fn wave_acid_loop_tempo_bpm(path: impl AsRef<Path>) -> Option<f64> {
-    wav_sampler_metadata(path.as_ref()).and_then(|metadata| metadata.acid_loop_tempo_bpm)
+    wave_acid_loop_tempo_metadata(path).map(|(_, tempo_bpm)| tempo_bpm)
 }
 
 /// Read sampler metadata from a standard AIFF or AIFF-C `INST` and `MARK` chunk.
@@ -1017,6 +1032,7 @@ pub(crate) fn aiff_sampler_metadata(path: &Path) -> Option<SamplerFileMetadata> 
         release_loop_points,
         release_ping_pong_loop,
         acid_loop_tempo_bpm: None,
+        acid_loop_beat_count: None,
     };
     (metadata.root_key.is_some()
         || metadata.gain_db.is_some()
@@ -2897,8 +2913,8 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let path = root.join("acid-loop.wav");
 
-        let cases: [(u32, u32, f32, Option<f64>); 5] = [
-            (4, 4, 120.0, Some(120.0)),
+        let cases: [(u32, u32, f32, Option<(u32, f64)>); 5] = [
+            (4, 4, 120.0, Some((4, 120.0))),
             (5, 4, 120.0, None),
             (0, 4, 120.0, None),
             (0, 0, 120.0, None),
@@ -2911,7 +2927,12 @@ mod tests {
             )
             .unwrap();
             assert_eq!(
-                wav_sampler_metadata(&path).and_then(|metadata| metadata.acid_loop_tempo_bpm),
+                wav_sampler_metadata(&path).and_then(|metadata| {
+                    Some((
+                        metadata.acid_loop_beat_count?,
+                        metadata.acid_loop_tempo_bpm?,
+                    ))
+                }),
                 expected
             );
         }
@@ -2924,10 +2945,10 @@ mod tests {
         let root = fixture_root();
         fs::create_dir_all(&root).unwrap();
         let path = root.join("acid-loop.wav");
-        fs::write(&path, pcm16_wav_with_acid_fixture(4, 4, 100.0, 8_000)).unwrap();
+        fs::write(&path, pcm16_wav_with_acid_fixture(4, 4, 100.0, 19_200)).unwrap();
 
         let synced = decode_audio_preview_with_tempo(&path, 8_000, None, 200.0).unwrap();
-        assert_eq!(synced.len(), 4_000 * 2);
+        assert_eq!(synced.len(), 9_600 * 2);
 
         let from_position =
             decode_audio_preview_from_position_with_tempo(&path, 8_000, Some(0.25), 0.25, 200.0)

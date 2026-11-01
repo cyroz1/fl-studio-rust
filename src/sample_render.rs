@@ -9881,12 +9881,16 @@ pub fn stream_sampler_midi_input_to_device(
             .iter()
             .filter_map(|channel_id| {
                 let channel = channels_by_id.get(channel_id)?;
-                let source_tempo_bpm = channel
+                let source_tempo_metadata = channel
                     .sample_path()
                     .and_then(|path| resolver.resolve(path).ok())
                     .and_then(|path| sample_sampler_metadata(&path))
-                    .and_then(|metadata| metadata.acid_loop_tempo_bpm);
-                Some((*channel_id, source_tempo_bpm))
+                    .and_then(|metadata| {
+                        metadata
+                            .acid_loop_beat_count
+                            .zip(metadata.acid_loop_tempo_bpm)
+                    });
+                Some((*channel_id, source_tempo_metadata))
             })
             .collect::<HashMap<_, _>>()
     } else {
@@ -11110,20 +11114,16 @@ struct AudioSourceDimensions {
 }
 
 fn sample_tempo_stretch_target_ticks(
-    source_frames: usize,
-    source_sample_rate: u32,
     ppq: u16,
     time_raw: u32,
     multiplier: f64,
-    source_tempo_bpm: Option<f64>,
+    source_tempo_metadata: Option<(u32, f64)>,
 ) -> f64 {
-    source_tempo_bpm
-        .filter(|bpm| bpm.is_finite() && (1.0..=1_000.0).contains(bpm))
-        .map(|source_tempo_bpm| {
-            source_frames as f64 / f64::from(source_sample_rate) * source_tempo_bpm * f64::from(ppq)
-                / 60.0
-                * multiplier
+    source_tempo_metadata
+        .filter(|(beat_count, tempo_bpm)| {
+            *beat_count > 0 && tempo_bpm.is_finite() && (1.0..=1_000.0).contains(tempo_bpm)
         })
+        .map(|(beat_count, _)| f64::from(beat_count) * f64::from(ppq) * multiplier)
         .unwrap_or_else(|| f64::from(time_raw) * f64::from(ppq) / 192.0 * multiplier)
 }
 
@@ -11133,7 +11133,7 @@ fn channel_audio_clip_stretch_plan(
     ppq: u16,
     clip_start_tick: u32,
     source: AudioSourceDimensions,
-    source_tempo_bpm: Option<f64>,
+    source_tempo_metadata: Option<(u32, f64)>,
     clip_index: usize,
 ) -> Result<Option<AudioClipStretchPlan>, String> {
     let AudioSourceDimensions {
@@ -11172,14 +11172,8 @@ fn channel_audio_clip_stretch_plan(
     }
 
     let start_tick = f64::from(clip_start_tick);
-    let target_ticks = sample_tempo_stretch_target_ticks(
-        source_frames,
-        sample_rate,
-        ppq,
-        time_raw,
-        multiplier,
-        source_tempo_bpm,
-    );
+    let target_ticks =
+        sample_tempo_stretch_target_ticks(ppq, time_raw, multiplier, source_tempo_metadata);
     let end_tick = start_tick + target_ticks;
     if !end_tick.is_finite() || end_tick <= start_tick {
         return Err(format!(
@@ -11321,7 +11315,7 @@ fn sampler_resample_stretch_pitch_adjustment(
     source_sample_rate: u32,
     ppq: u16,
     tempo_bpm: f64,
-    source_tempo_bpm: Option<f64>,
+    source_tempo_metadata: Option<(u32, f64)>,
 ) -> Result<Option<(f64, f64)>, String> {
     let Some(settings) = channel.stretch_settings().filter(|settings| {
         settings.time_raw() > 0 && settings.mode() == ChannelStretchMode::Resample
@@ -11357,12 +11351,10 @@ fn sampler_resample_stretch_pitch_adjustment(
 
     let source_seconds = source_frames as f64 / f64::from(source_sample_rate);
     let target_ticks = sample_tempo_stretch_target_ticks(
-        source_frames,
-        source_sample_rate,
         ppq,
         settings.time_raw(),
         multiplier,
-        source_tempo_bpm,
+        source_tempo_metadata,
     );
     let target_seconds = target_ticks * 60.0 / (f64::from(ppq) * tempo_bpm);
     if !target_ticks.is_finite()
@@ -11415,7 +11407,7 @@ struct SamplerDurationPreservingStretchSettings {
 struct SamplerStretchTempo {
     ppq: u16,
     tempo_bpm: f64,
-    source_tempo_bpm: Option<f64>,
+    source_tempo_metadata: Option<(u32, f64)>,
 }
 
 fn sampler_duration_preserving_stretch_plan(
@@ -11457,7 +11449,7 @@ fn sampler_duration_preserving_stretch_plan_from_settings(
     let SamplerStretchTempo {
         ppq,
         tempo_bpm,
-        source_tempo_bpm,
+        source_tempo_metadata,
     } = stretch_tempo;
     match ChannelStretchMode::from_raw(settings.mode_raw) {
         ChannelStretchMode::Resample => return Ok(None),
@@ -11503,12 +11495,10 @@ fn sampler_duration_preserving_stretch_plan_from_settings(
     }
 
     let target_ticks = sample_tempo_stretch_target_ticks(
-        source_frames,
-        source_sample_rate,
         ppq,
         settings.time_raw,
         multiplier,
-        source_tempo_bpm,
+        source_tempo_metadata,
     );
     let target_seconds = target_ticks * 60.0 / (f64::from(ppq) * tempo_bpm);
     let target_frames_f64 = target_seconds * f64::from(source_sample_rate);
@@ -11896,7 +11886,7 @@ fn prepare_audio_clip_render(
 
     let mut processed_source_ids = HashMap::<ProcessedAudioCacheKey, usize>::new();
     let mut sample_fx_source_ids = HashMap::<(PathBuf, SamplerPrecomputedFx), usize>::new();
-    let mut sample_tempo_by_path = HashMap::<PathBuf, Option<f64>>::new();
+    let mut sample_tempo_by_path = HashMap::<PathBuf, Option<(u32, f64)>>::new();
     let mut clips = Vec::with_capacity(candidate_clips.len());
     let mut output_frames = timeline_frames;
     let mut live_source_routes_by_track = HashMap::new();
@@ -11944,14 +11934,19 @@ fn prepare_audio_clip_render(
             };
         }
         let audio = &audio_sources[source_id];
-        let source_tempo_bpm = *sample_tempo_by_path.entry(path.clone()).or_insert_with(|| {
-            options
-                .read_sample_tempo_information
-                .then(|| {
-                    sample_sampler_metadata(path).and_then(|metadata| metadata.acid_loop_tempo_bpm)
-                })
-                .flatten()
-        });
+        let source_tempo_metadata =
+            *sample_tempo_by_path.entry(path.clone()).or_insert_with(|| {
+                options
+                    .read_sample_tempo_information
+                    .then(|| {
+                        sample_sampler_metadata(path).and_then(|metadata| {
+                            metadata
+                                .acid_loop_beat_count
+                                .zip(metadata.acid_loop_tempo_bpm)
+                        })
+                    })
+                    .flatten()
+            });
         if audio.channels.is_empty() || audio.channels.len() > 2 {
             return Err(format!(
                 "audio channel {channel_id} source has {} channels; only mono and stereo are supported by this renderer",
@@ -12022,7 +12017,7 @@ fn prepare_audio_clip_render(
                 ppq,
                 clip.position_ticks,
                 source_dimensions,
-                source_tempo_bpm,
+                source_tempo_metadata,
                 *clip_index,
             )?
         };
@@ -12816,7 +12811,7 @@ fn prepare_sampler_arrangement(
     // Store each channel's tick-zero Resample rate, then offset scheduled notes from it to
     // match the tempo at their own start ticks.
     let mut resample_pitch_adjustment_by_channel = HashMap::<u16, f64>::new();
-    let mut sample_tempo_by_channel = HashMap::<u16, Option<f64>>::new();
+    let mut sample_tempo_by_channel = HashMap::<u16, Option<(u32, f64)>>::new();
     let mut duration_stretch_plan_by_channel =
         HashMap::<u16, SamplerDurationPreservingStretchPlan>::new();
     let mut unresolved_sample_channels = std::collections::BTreeSet::new();
@@ -12858,11 +12853,15 @@ fn prepare_sampler_arrangement(
                 }
             };
             let sample_metadata = sample_sampler_metadata(&resolved_path).unwrap_or_default();
-            let source_tempo_bpm = options
+            let source_tempo_metadata = options
                 .read_sample_tempo_information
-                .then_some(sample_metadata.acid_loop_tempo_bpm)
+                .then_some(
+                    sample_metadata
+                        .acid_loop_beat_count
+                        .zip(sample_metadata.acid_loop_tempo_bpm),
+                )
                 .flatten();
-            sample_tempo_by_channel.insert(placed.target_channel_id, source_tempo_bpm);
+            sample_tempo_by_channel.insert(placed.target_channel_id, source_tempo_metadata);
             let loop_points = channel
                 .sampler_uses_loop_points()
                 .then_some(sample_metadata.loop_points)
@@ -12953,7 +12952,7 @@ fn prepare_sampler_arrangement(
                 SamplerStretchTempo {
                     ppq,
                     tempo_bpm: tempo_map.tempo_bpm_at_tick(placed.start_tick),
-                    source_tempo_bpm,
+                    source_tempo_metadata,
                 },
                 &mut cached_source_bytes,
             )?;
@@ -12975,7 +12974,7 @@ fn prepare_sampler_arrangement(
                 audio.sample_rate,
                 ppq,
                 tempo_map.tempo_bpm_at_tick(0),
-                source_tempo_bpm,
+                source_tempo_metadata,
             )?;
             if let Some((_, pitch_adjustment_cents)) = sampler_stretch {
                 resample_pitch_adjustment_by_channel
@@ -17099,9 +17098,13 @@ fn prepare_sampler_pattern_for_channel_internal(
                 }
             };
             let sample_metadata = sample_sampler_metadata(&resolved_path).unwrap_or_default();
-            let source_tempo_bpm = options
+            let source_tempo_metadata = options
                 .read_sample_tempo_information
-                .then_some(sample_metadata.acid_loop_tempo_bpm)
+                .then_some(
+                    sample_metadata
+                        .acid_loop_beat_count
+                        .zip(sample_metadata.acid_loop_tempo_bpm),
+                )
                 .flatten();
             let loop_points = channel
                 .sampler_uses_loop_points()
@@ -17193,7 +17196,7 @@ fn prepare_sampler_pattern_for_channel_internal(
                 SamplerStretchTempo {
                     ppq,
                     tempo_bpm,
-                    source_tempo_bpm,
+                    source_tempo_metadata,
                 },
                 &mut cached_source_bytes,
             )?;
@@ -17212,7 +17215,7 @@ fn prepare_sampler_pattern_for_channel_internal(
                 audio.sample_rate,
                 ppq,
                 tempo_bpm,
-                source_tempo_bpm,
+                source_tempo_metadata,
             )?;
             let (gain, pan) = channel_gain_pan(channel.volume(), channel.pan());
             let volume_envelope = sampler_volume_envelope_config(channel, options.sample_rate, ppq);
@@ -24940,14 +24943,14 @@ mod tests {
                 channels: 1,
                 sample_rate: 8_000,
             },
-            Some(60.0),
+            Some((2, 60.0)),
             4,
         )
         .unwrap();
         assert!(matches!(
             metadata_tempo_stretch,
             Some(AudioClipStretchPlan::DurationPreserving {
-                target_duration_frames: 4_000,
+                target_duration_frames: 8_000,
                 mode_raw: 1,
                 ..
             })
@@ -25149,7 +25152,7 @@ mod tests {
                 SamplerStretchTempo {
                     ppq: 96,
                     tempo_bpm: 120.0,
-                    source_tempo_bpm: None,
+                    source_tempo_metadata: None,
                 },
             )
             .unwrap()
@@ -25176,7 +25179,7 @@ mod tests {
                 SamplerStretchTempo {
                     ppq: 96,
                     tempo_bpm: 120.0,
-                    source_tempo_bpm: None,
+                    source_tempo_metadata: None,
                 },
             )
             .unwrap()
@@ -25197,7 +25200,7 @@ mod tests {
                 SamplerStretchTempo {
                     ppq: 96,
                     tempo_bpm: 120.0,
-                    source_tempo_bpm: None,
+                    source_tempo_metadata: None,
                 },
             )
             .unwrap_err()
@@ -25218,7 +25221,7 @@ mod tests {
                 SamplerStretchTempo {
                     ppq: 96,
                     tempo_bpm: 120.0,
-                    source_tempo_bpm: None,
+                    source_tempo_metadata: None,
                 },
             )
             .unwrap_err()
@@ -25239,13 +25242,13 @@ mod tests {
             SamplerStretchTempo {
                 ppq: 96,
                 tempo_bpm: 120.0,
-                source_tempo_bpm: Some(60.0),
+                source_tempo_metadata: Some((2, 60.0)),
             },
         )
         .unwrap()
         .expect("source tempo metadata should define the stretched duration");
-        assert!((metadata_tempo_plan.target_ticks - 96.0).abs() < 1e-12);
-        assert_eq!(metadata_tempo_plan.target_frames, 4_000);
+        assert!((metadata_tempo_plan.target_ticks - 192.0).abs() < 1e-12);
+        assert_eq!(metadata_tempo_plan.target_frames, 8_000);
         let stored_time_plan = sampler_duration_preserving_stretch_plan_from_settings(
             7,
             SamplerDurationPreservingStretchSettings {
@@ -25260,7 +25263,7 @@ mod tests {
             SamplerStretchTempo {
                 ppq: 96,
                 tempo_bpm: 120.0,
-                source_tempo_bpm: None,
+                source_tempo_metadata: None,
             },
         )
         .unwrap()

@@ -35,7 +35,7 @@ use flp_rebuild::media::{
     decode_audio_file, decode_audio_preview, decode_audio_preview_from_position,
     decode_audio_preview_from_position_with_tempo, decode_audio_preview_with_tempo,
     decode_audio_waveform, find_empty_project_template, process_audio_range_to_stereo_preview,
-    summarize_audio_waveform, wave_acid_loop_tempo_bpm, write_audio_range_to_wav_with_options,
+    summarize_audio_waveform, wave_acid_loop_tempo_metadata, write_audio_range_to_wav_with_options,
 };
 use flp_rebuild::midi::{
     MAX_MIDI_PARAMETER_NUMBER, MidiAutomationSource, MidiChannelMapping,
@@ -11787,13 +11787,14 @@ impl DawUi {
                 return;
             }
         };
-        let source_tempo_bpm = pending
+        let acid_loop_tempo = pending
             .read_sample_tempo_information
-            .then(|| wave_acid_loop_tempo_bpm(&pending.path))
+            .then(|| wave_acid_loop_tempo_metadata(&pending.path))
             .flatten();
-        let tempo_sync = source_tempo_bpm.map(|source_tempo_bpm| {
+        let tempo_sync = acid_loop_tempo.map(|(beat_count, source_tempo_bpm)| {
             browser_audio_drop_tempo_sync(
                 waveform,
+                beat_count,
                 source_tempo_bpm,
                 document.header().ppq(),
                 &tempo_map,
@@ -11909,8 +11910,8 @@ impl DawUi {
         self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
         self.view = MainView::Playlist;
         self.refresh_audio_waveform_paths();
-        self.status = match (stretch_time_raw, source_tempo_bpm, tempo_sync_warning) {
-            (Some(_), Some(source_tempo), _) => format!(
+        self.status = match (stretch_time_raw, acid_loop_tempo, tempo_sync_warning) {
+            (Some(_), Some((_, source_tempo)), _) => format!(
                 "Added {} to Playlist track {} with tempo sync from {source_tempo:.2} BPM metadata",
                 pending.path.display(),
                 pending.track_index + 1
@@ -89675,6 +89676,7 @@ fn playlist_audio_drop_position_ticks(
 
 fn browser_audio_drop_tempo_sync(
     waveform: &AudioWaveform,
+    beat_count: u32,
     source_tempo_bpm: f64,
     ppq: u16,
     tempo_map: &PlaylistTempoMap,
@@ -89686,12 +89688,14 @@ fn browser_audio_drop_tempo_sync(
     if ppq == 0 {
         return Err("project PPQ must be greater than zero".to_owned());
     }
+    if beat_count == 0 {
+        return Err("sample loop beat-count metadata must be greater than zero".to_owned());
+    }
     if !source_tempo_bpm.is_finite() || !(1.0..=1_000.0).contains(&source_tempo_bpm) {
         return Err("sample loop tempo metadata is outside the supported range".to_owned());
     }
 
-    let target_ticks_f64 = waveform.frame_count as f64 * source_tempo_bpm * f64::from(ppq)
-        / (f64::from(waveform.sample_rate) * 60.0);
+    let target_ticks_f64 = f64::from(beat_count) * f64::from(ppq);
     if !target_ticks_f64.is_finite() || target_ticks_f64 < 0.5 || target_ticks_f64 > u32::MAX as f64
     {
         return Err("sample tempo sync duration is outside the Playlist range".to_owned());
@@ -95858,14 +95862,14 @@ mod tests {
         let tempo_map = PlaylistTempoMap::constant(96, 200.0)
             .expect("constant Playlist tempo map should be valid");
         assert_eq!(
-            browser_audio_drop_tempo_sync(&waveform, 100.0, 96, &tempo_map, 0),
-            Ok((160, 320))
+            browser_audio_drop_tempo_sync(&waveform, 4, 100.0, 96, &tempo_map, 0),
+            Ok((384, 768))
         );
 
         let automated_tempo_map = PlaylistTempoMap::from_tempo_events(96, 200.0, &[(96, 180.0)])
             .expect("automated Playlist tempo map should be valid");
         assert!(
-            browser_audio_drop_tempo_sync(&waveform, 100.0, 96, &automated_tempo_map, 0,)
+            browser_audio_drop_tempo_sync(&waveform, 4, 100.0, 96, &automated_tempo_map, 0,)
                 .unwrap_err()
                 .contains("tempo automation")
         );
@@ -95873,7 +95877,7 @@ mod tests {
         let out_of_range_map = PlaylistTempoMap::constant(96, 40.0)
             .expect("constant Playlist tempo map should be valid");
         assert!(
-            browser_audio_drop_tempo_sync(&waveform, 100.0, 96, &out_of_range_map, 0,)
+            browser_audio_drop_tempo_sync(&waveform, 4, 100.0, 96, &out_of_range_map, 0,)
                 .unwrap_err()
                 .contains("0.5x to 2x")
         );
