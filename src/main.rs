@@ -1679,6 +1679,16 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 cents,
             )
         }
+        [command, input, output, channel_id, root_key]
+            if command == "set-channel-sampler-root-key" =>
+        {
+            set_channel_sampler_root_key(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(channel_id, "channel id")?,
+                parse_u16(root_key, "Sampler root MIDI key")?,
+            )
+        }
         [command, input, output, channel_id, event_index, pan, volume, mod_x, mod_y]
             if command == "edit-channel-level-adjustments" =>
         {
@@ -5109,6 +5119,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild edit-sampler-volume-envelope <input.flp> <output.flp> <sampler-channel-id> <enabled:0|1|-> <tempo-sync:0|1|-> <predelay-raw|-> <attack-raw|-> <hold-raw|-> <decay-raw|-> <sustain-raw|-> <release-raw|-> <amount-raw|-> <attack-tension-raw|-> <decay-tension-raw|-> <release-tension-raw|->\n",
             "  flp-rebuild edit-sampler-envelope-lfo <input.flp> <output.flp> <sampler-channel-id> <target:panning|volume|mod-x|mod-y|pitch> <enabled:0|1|-> <envelope-tempo-sync:0|1|-> <lfo-tempo-sync:0|1|-> <lfo-phase-retrigger:0|1|-> <predelay-raw|-> <attack-raw|-> <hold-raw|-> <decay-raw|-> <sustain-raw|-> <release-raw|-> <amount-raw|-> <attack-tension-raw|-> <decay-tension-raw|-> <release-tension-raw|-> <lfo-predelay-raw|-> <lfo-attack-raw|-> <lfo-amount-raw|-> <lfo-speed-raw|-> <lfo-shape:0|1|2|->\n",
             "  flp-rebuild set-channel-fine-tune <input.flp> <output.flp> <channel-id> <-100..100-cents>\n",
+            "  flp-rebuild set-channel-sampler-root-key <input.flp> <output.flp> <sampler-channel-id> <root-midi-key:0..127>\n",
             "  flp-rebuild set-channel-enabled <input.flp> <output.flp> <channel-id> <0|1>\n",
             "  flp-rebuild set-channel-sample-path <input.flp> <output.flp> <channel-id> <sample-path>\n",
             "  flp-rebuild set-channel-sample-reversed <input.flp> <output.flp> <channel-id> <0|1>\n",
@@ -9999,6 +10010,28 @@ fn set_channel_fine_tune(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "set channel {channel_id} Fine Tune to {cents} cents in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn set_channel_sampler_root_key(
+    input: &Path,
+    output: &Path,
+    channel_id: u16,
+    root_key: u16,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    document
+        .set_channel_sampler_root_key(channel_id, root_key)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "set Sampler channel {channel_id} root key to MIDI note {root_key} in {}",
         output.display()
     );
     Ok(())

@@ -34,8 +34,8 @@ use flp_rebuild::media::{
     AudioExportOptions, AudioWaveform, BrowserPreviewPitch, DecodedAudio, SampleKeyMetadata,
     SamplePathResolver, WaveformPeak, decode_audio_file, decode_audio_preview,
     decode_audio_waveform, decode_browser_preview, find_empty_project_template,
-    process_audio_range_to_stereo_preview, summarize_audio_waveform, wave_acid_loop_tempo_metadata,
-    write_audio_range_to_wav_with_options,
+    process_audio_range_to_stereo_preview, sample_key_metadata, summarize_audio_waveform,
+    wave_acid_loop_tempo_metadata, write_audio_range_to_wav_with_options,
 };
 use flp_rebuild::midi::{
     MAX_MIDI_PARAMETER_NUMBER, MidiAutomationSource, MidiChannelMapping,
@@ -4916,6 +4916,20 @@ impl BrowserPreviewPreferences {
             self.semitone_offset,
         )
     }
+}
+
+fn browser_sampler_root_key_for_preview(
+    enabled: bool,
+    target_key: Option<u8>,
+    semitone_offset: i8,
+    sample_metadata: Option<SampleKeyMetadata>,
+) -> Option<u16> {
+    if !enabled {
+        return None;
+    }
+    let (sample_root_key, _) = sample_metadata?;
+    let selected_key = target_key.unwrap_or(sample_root_key);
+    Some((i16::from(selected_key) + i16::from(semitone_offset)).clamp(0, 127) as u16)
 }
 
 struct PendingBrowserPreview {
@@ -23150,19 +23164,48 @@ impl DawUi {
         ))
     }
 
+    fn browser_preview_target_sampler_root_key(&self, path: &Path) -> Option<u16> {
+        browser_sampler_root_key_for_preview(
+            self.browser_preview_key_enabled,
+            self.browser_preview_target_key,
+            self.browser_preview_semitone_offset,
+            sample_key_metadata(path),
+        )
+    }
+
     fn load_browser_sample_into_channel(&mut self, channel_id: u16, path: &Path) {
         let path_string = path.to_string_lossy().into_owned();
-        let result = self
-            .document
-            .as_mut()
-            .ok_or_else(|| "no project is open".to_owned())
-            .and_then(|document| {
-                document
-                    .set_channel_sample_path(channel_id, &path_string)
-                    .map_err(|error| error.to_string())
-            });
+        let requested_root_key = self.browser_preview_target_sampler_root_key(path);
+        let result = (|| {
+            let mut document = self
+                .document
+                .clone()
+                .ok_or_else(|| "no project is open".to_owned())?;
+            let is_sampler = document
+                .channels()
+                .into_iter()
+                .find(|channel| channel.id() == channel_id)
+                .is_some_and(|channel| channel.kind() == Some(0));
+            document
+                .set_channel_sample_path(channel_id, &path_string)
+                .map_err(|error| error.to_string())?;
+            let applied_root_key = if is_sampler {
+                if let Some(root_key) = requested_root_key {
+                    document
+                        .set_channel_sampler_root_key(channel_id, root_key)
+                        .map_err(|error| error.to_string())?;
+                    Some(root_key)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            Ok::<_, String>((document, applied_root_key))
+        })();
         match result {
-            Ok(()) => {
+            Ok((document, applied_root_key)) => {
+                self.document = Some(document);
                 self.stop_project_playback();
                 self.dirty = true;
                 self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
@@ -23183,7 +23226,14 @@ impl DawUi {
                     .file_name()
                     .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_else(|| path.display().to_string());
-                self.status = format!("Loaded sample {file_name} into {channel_name}");
+                self.status = if let Some(root_key) = applied_root_key {
+                    format!(
+                        "Loaded sample {file_name} into {channel_name} · Sampler root set to {}",
+                        note_name(root_key)
+                    )
+                } else {
+                    format!("Loaded sample {file_name} into {channel_name}")
+                };
                 self.refresh_audio_waveform_paths();
             }
             Err(error) => self.status = format!("Could not load sample into channel: {error}"),
@@ -23192,29 +23242,45 @@ impl DawUi {
 
     fn create_browser_sampler_channel(&mut self, path: &Path) {
         let path_string = path.to_string_lossy().into_owned();
+        let root_key = self.browser_preview_target_sampler_root_key(path);
         let name = path
             .file_stem()
             .map(|name| name.to_string_lossy().into_owned())
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| "Sampler".to_owned());
-        let result = self
-            .document
-            .as_mut()
-            .ok_or_else(|| "no project is open".to_owned())
-            .and_then(|document| {
+        let result = (|| {
+            let mut document = self
+                .document
+                .clone()
+                .ok_or_else(|| "no project is open".to_owned())?;
+            let channel_id = document
+                .create_sampler_channel(&path_string, &name)
+                .map_err(|error| error.to_string())?;
+            if let Some(root_key) = root_key {
                 document
-                    .create_sampler_channel(&path_string, &name)
-                    .map_err(|error| error.to_string())
-            });
+                    .set_channel_sampler_root_key(channel_id, root_key)
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok::<_, String>((document, channel_id))
+        })();
         match result {
-            Ok(channel_id) => {
+            Ok((document, channel_id)) => {
+                self.document = Some(document);
                 self.stop_project_playback();
                 self.dirty = true;
                 self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                 let _ = self.notify_midi_script_channel_event(channel_id, SCRIPT_CHANNEL_EVENT_NEW);
                 self.selected_graph_channel = Some(channel_id);
                 self.selected_note_channel = Some(channel_id);
-                self.status = format!("Created Sampler channel {name} from {}", path.display());
+                self.status = if let Some(root_key) = root_key {
+                    format!(
+                        "Created Sampler channel {name} from {} · root set to {}",
+                        path.display(),
+                        note_name(root_key)
+                    )
+                } else {
+                    format!("Created Sampler channel {name} from {}", path.display())
+                };
                 self.refresh_audio_waveform_paths();
             }
             Err(error) => self.status = format!("Could not create Sampler channel: {error}"),
@@ -28336,7 +28402,7 @@ impl DawUi {
                     key_pitch_changed = ui
                         .checkbox(&mut self.browser_preview_key_enabled, "Key")
                         .on_hover_text(
-                            "Use the sample's WAVE/AIFF root key to preview another key",
+                            "Preview the WAVE/AIFF sample at another key. Sending or dropping it onto a Sampler also sets that Sampler's root note to the selected key.",
                         )
                         .changed();
                     if self.browser_preview_key_enabled {
@@ -92392,7 +92458,6 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::PathBuf;
 
-    use super::BrowserPreviewPreferences;
     use super::{
         ActivePlaylistClipDrag, Arrangement, AudioWaveform, ChannelDisplayFilter,
         ChannelNoteRouter, DetachedWindowKind, DetachedWindowPlacement, DetachedWindowPlacements,
@@ -92495,6 +92560,7 @@ mod tests {
         upsert_playlist_vst3_mixer_effect_parameter_link, upsert_playlist_vst3_parameter_link,
         zoom_to_fit,
     };
+    use super::{BrowserPreviewPreferences, browser_sampler_root_key_for_preview};
 
     #[test]
     fn browser_preview_preferences_round_trip_and_reject_invalid_values() {
@@ -92519,6 +92585,34 @@ mod tests {
                 key_enabled: true,
                 ..BrowserPreviewPreferences::default()
             }
+        );
+    }
+
+    #[test]
+    fn browser_key_selection_maps_to_sampler_root_only_when_enabled_and_clamps_to_midi_range() {
+        assert_eq!(
+            browser_sampler_root_key_for_preview(true, None, 4, Some((60, -23.0))),
+            Some(64)
+        );
+        assert_eq!(
+            browser_sampler_root_key_for_preview(true, Some(72), -5, Some((60, 0.0))),
+            Some(67)
+        );
+        assert_eq!(
+            browser_sampler_root_key_for_preview(true, Some(0), -24, Some((60, 0.0))),
+            Some(0)
+        );
+        assert_eq!(
+            browser_sampler_root_key_for_preview(true, Some(127), 24, Some((60, 0.0))),
+            Some(127)
+        );
+        assert_eq!(
+            browser_sampler_root_key_for_preview(false, Some(72), 0, Some((60, 0.0))),
+            None
+        );
+        assert_eq!(
+            browser_sampler_root_key_for_preview(true, Some(72), 0, None),
+            None
         );
     }
 

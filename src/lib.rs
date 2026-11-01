@@ -24567,6 +24567,88 @@ impl FlpDocument {
         Ok(())
     }
 
+    /// Sets a Sampler channel's saved root note (`0x87`) to a MIDI key number.
+    ///
+    /// Existing root-note dword events are edited in place. If the event is absent, it is
+    /// inserted with the other channel keyboard dwords; unrelated channel bytes are retained.
+    pub fn set_channel_sampler_root_key(
+        &mut self,
+        channel_id: u16,
+        root_key: u16,
+    ) -> Result<(), FlpError> {
+        if root_key > 127 {
+            return Err(FlpError::UnsupportedEdit(
+                "Sampler root key must be between 0 and 127",
+            ));
+        }
+
+        self.require_unique_channel(channel_id)?;
+        let channel = self
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id == channel_id)
+            .expect("the unique channel was checked above");
+        if channel.kind != Some(ChannelType::Sampler.raw()) {
+            return Err(FlpError::UnsupportedEdit(
+                "Sampler root key applies only to Sampler channels",
+            ));
+        }
+
+        let matching_events = channel
+            .event_range()
+            .filter(|index| self.events[*index].opcode == 0x87)
+            .collect::<Vec<_>>();
+        if matching_events.len() > 1 {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected Sampler has duplicate root-note events",
+            ));
+        }
+        if let Some(index) = matching_events.first() {
+            let event = &self.events[*index];
+            if event.encoding != PayloadEncoding::Dword || event.payload.len() != 4 {
+                return Err(FlpError::UnsupportedEdit(
+                    "the selected Sampler has an unrecognized root-note event",
+                ));
+            }
+            self.events[*index].replace_dword_payload(u32::from(root_key))?;
+            self.refresh_event_offsets()?;
+            return Ok(());
+        }
+
+        let mut candidate = self.clone();
+        let channel = candidate
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id == channel_id)
+            .expect("the unique channel remains present");
+        let insertion_index = channel
+            .event_range()
+            .find(|index| {
+                let opcode = candidate.events[*index].opcode;
+                (0x80..=0xBF).contains(&opcode) && opcode > 0x87
+            })
+            .or_else(|| {
+                channel
+                    .event_range()
+                    .rfind(|index| (0x80..=0xBF).contains(&candidate.events[*index].opcode))
+                    .map(|index| index + 1)
+            })
+            .or_else(|| {
+                channel
+                    .event_range()
+                    .find(|index| candidate.events[*index].opcode == 0x15)
+                    .map(|index| index + 1)
+            })
+            .unwrap_or(channel.end_event_index);
+        candidate.events.insert(
+            insertion_index,
+            FlpEvent::new_dword(0x87, u32::from(root_key)),
+        );
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
     /// Edits established raw fields in one Layer channel's existing `0xD5` Level Adjusts event.
     ///
     /// `event_index` is the global FLP event index, available from `channel-events` and
@@ -38535,6 +38617,63 @@ mod tests {
             assert_eq!(document.channels()[0].sampler_root_key(), expected_root_key);
             assert_eq!(document.encode_lossless().unwrap(), input);
         }
+    }
+
+    #[test]
+    fn edits_sampler_root_note_in_place_or_inserts_before_fine_tune() {
+        let mut event_stream = vec![0x40, 7, 0, 0x15, 0, 0x87];
+        event_stream.extend_from_slice(&60_u32.to_le_bytes());
+        event_stream.extend_from_slice(&[0x8E]);
+        event_stream.extend_from_slice(&(-20_i32).to_le_bytes());
+        event_stream.extend_from_slice(&[0x8F]);
+        event_stream.extend_from_slice(&0xA5_u32.to_le_bytes());
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+        let input = flp_fixture(&event_stream, &[], &[]);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+        let fine_tune_event = document.events()[3].wire_bytes().to_vec();
+        let sampler_flags_event = document.events()[4].wire_bytes().to_vec();
+
+        document
+            .set_channel_sampler_root_key(7, 73)
+            .expect("existing root note should update");
+        assert_eq!(document.channels()[0].sampler_root_key(), Some(73));
+        assert_eq!(document.events()[3].wire_bytes(), fine_tune_event);
+        assert_eq!(document.events()[4].wire_bytes(), sampler_flags_event);
+
+        let mut missing_stream = vec![0x40, 7, 0, 0x15, 0, 0x8E];
+        missing_stream.extend_from_slice(&(-20_i32).to_le_bytes());
+        missing_stream.extend_from_slice(&[0x62, 0, 0]);
+        let missing = flp_fixture(&missing_stream, &[], &[]);
+        let mut missing = FlpDocument::parse(&missing).expect("fixture should parse");
+        missing
+            .set_channel_sampler_root_key(7, 64)
+            .expect("missing root note should be inserted");
+        let reparsed = FlpDocument::parse(&missing.encode_lossless().unwrap())
+            .expect("edited fixture should parse");
+        let channel = &reparsed.channels()[0];
+        assert_eq!(channel.sampler_root_key(), Some(64));
+        let root_event = channel
+            .event_range()
+            .find(|index| reparsed.events()[*index].opcode() == 0x87)
+            .expect("root note event should exist");
+        let fine_tune_event = channel
+            .event_range()
+            .find(|index| reparsed.events()[*index].opcode() == 0x8E)
+            .expect("Fine Tune event should remain");
+        assert!(root_event < fine_tune_event);
+    }
+
+    #[test]
+    fn sampler_root_note_edit_rejects_invalid_keys_and_non_sampler_channels() {
+        let mut event_stream = vec![0x40, 7, 0, 0x15, 0, 0x62, 0, 0];
+        let input = flp_fixture(&event_stream, &[], &[]);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+        assert!(document.set_channel_sampler_root_key(7, 128).is_err());
+
+        event_stream[4] = 2;
+        let input = flp_fixture(&event_stream, &[], &[]);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+        assert!(document.set_channel_sampler_root_key(7, 60).is_err());
     }
 
     #[test]
