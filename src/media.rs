@@ -1221,9 +1221,7 @@ fn decode_audio_preview_with_tempo_from_position(
     project_tempo_bpm: f64,
 ) -> Result<Vec<f32>, String> {
     let path = path.as_ref();
-    let Some(source_tempo_bpm) =
-        wav_sampler_metadata(path).and_then(|metadata| metadata.acid_loop_tempo_bpm)
-    else {
+    let Some((beat_count, source_tempo_bpm)) = wave_acid_loop_tempo_metadata(path) else {
         return decode_audio_preview_without_tempo_sync(
             path,
             output_sample_rate,
@@ -1246,24 +1244,33 @@ fn decode_audio_preview_with_tempo_from_position(
         return Err("Browser preview start position must be between 0 and 1".into());
     }
 
-    let stretch_ratio = source_tempo_bpm / project_tempo_bpm;
-    if (stretch_ratio - 1.0).abs() <= 0.000_001 {
-        return decode_audio_preview_without_tempo_sync(
-            path,
-            output_sample_rate,
-            maximum_seconds,
-            start_fraction,
-        );
-    }
-    let maximum_source_seconds = maximum_seconds.map(|seconds| seconds / stretch_ratio);
+    let estimated_stretch_ratio = source_tempo_bpm / project_tempo_bpm;
+    let estimated_maximum_source_seconds =
+        maximum_seconds.map(|seconds| seconds / estimated_stretch_ratio);
     let audio = decode_audio_file_for_preview(
         path,
         if start_fraction.is_some() {
             None
         } else {
-            maximum_source_seconds
+            estimated_maximum_source_seconds
         },
     )?;
+    let source_duration_seconds = audio.frame_count() as f64 / f64::from(audio.sample_rate);
+    if !source_duration_seconds.is_finite() || source_duration_seconds <= 0.0 {
+        return Err(format!("sample {} has no audio frames", path.display()));
+    }
+    let decoded_full_source = start_fraction.is_some()
+        || estimated_maximum_source_seconds
+            .is_none_or(|maximum| source_duration_seconds + f64::EPSILON < maximum);
+    let stretch_ratio = if decoded_full_source {
+        (f64::from(beat_count) * 60.0 / project_tempo_bpm) / source_duration_seconds
+    } else {
+        estimated_stretch_ratio
+    };
+    if !stretch_ratio.is_finite() || stretch_ratio <= 0.0 {
+        return Err("tempo-synced Browser preview has an invalid stretch ratio".to_owned());
+    }
+    let maximum_source_seconds = maximum_seconds.map(|seconds| seconds / stretch_ratio);
     let source_frames = audio.frame_count();
     let start_frame = start_fraction
         .map(|fraction| ((source_frames.saturating_sub(1)) as f64 * fraction).round() as usize)
@@ -1280,7 +1287,11 @@ fn decode_audio_preview_with_tempo_from_position(
             path.display()
         )
     })?;
-    stretch_browser_preview_to_tempo(&source_preview, output_sample_rate, stretch_ratio)
+    if (stretch_ratio - 1.0).abs() <= 0.000_001 {
+        Ok(source_preview)
+    } else {
+        stretch_browser_preview_to_tempo(&source_preview, output_sample_rate, stretch_ratio)
+    }
 }
 
 fn decode_audio_preview_without_tempo_sync(
@@ -2955,6 +2966,14 @@ mod tests {
             decode_audio_preview_from_position_with_tempo(&path, 8_000, Some(0.25), 0.25, 200.0)
                 .unwrap();
         assert_eq!(from_position.len(), 2_000 * 2);
+
+        fs::write(&path, pcm16_wav_with_acid_fixture(4, 4, 100.0, 8_000)).unwrap();
+        let metadata_sized = decode_audio_preview_with_tempo(&path, 8_000, None, 200.0).unwrap();
+        assert_eq!(metadata_sized.len(), 9_600 * 2);
+        let metadata_sized_from_position =
+            decode_audio_preview_from_position_with_tempo(&path, 8_000, Some(0.25), 0.25, 200.0)
+                .unwrap();
+        assert_eq!(metadata_sized_from_position.len(), 2_000 * 2);
 
         fs::write(&path, pcm16_wav_with_acid_fixture(5, 4, 100.0, 8_000)).unwrap();
         let one_shot = decode_audio_preview_with_tempo(&path, 8_000, None, 200.0).unwrap();
