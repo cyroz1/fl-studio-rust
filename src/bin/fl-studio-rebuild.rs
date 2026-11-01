@@ -31,11 +31,11 @@ use flp_rebuild::audio::{
     MetronomeTimeline, MixerTrackPeakMeters, StagedStreamingPlayback, enumerate_devices,
 };
 use flp_rebuild::media::{
-    AudioExportOptions, AudioWaveform, DecodedAudio, SamplePathResolver, WaveformPeak,
-    decode_audio_file, decode_audio_preview, decode_audio_preview_from_position,
-    decode_audio_preview_from_position_with_tempo, decode_audio_preview_with_tempo,
-    decode_audio_waveform, find_empty_project_template, process_audio_range_to_stereo_preview,
-    summarize_audio_waveform, wave_acid_loop_tempo_metadata, write_audio_range_to_wav_with_options,
+    AudioExportOptions, AudioWaveform, BrowserPreviewPitch, DecodedAudio, SampleKeyMetadata,
+    SamplePathResolver, WaveformPeak, decode_audio_file, decode_audio_preview,
+    decode_audio_waveform, decode_browser_preview, find_empty_project_template,
+    process_audio_range_to_stereo_preview, summarize_audio_waveform, wave_acid_loop_tempo_metadata,
+    write_audio_range_to_wav_with_options,
 };
 use flp_rebuild::midi::{
     MAX_MIDI_PARAMETER_NUMBER, MidiAutomationSource, MidiChannelMapping,
@@ -4839,10 +4839,13 @@ struct PendingBrowserIndex {
     worker: thread::JoinHandle<()>,
 }
 
+type BrowserPreviewResult = Result<(Vec<f32>, Option<SampleKeyMetadata>), String>;
+
 struct PendingBrowserPreview {
     path: PathBuf,
+    full_sample: bool,
     start_fraction: Option<f64>,
-    receiver: Receiver<Result<Vec<f32>, String>>,
+    receiver: Receiver<BrowserPreviewResult>,
     worker: thread::JoinHandle<()>,
 }
 
@@ -5703,6 +5706,12 @@ struct DawUi {
     browser_full_sample: bool,
     browser_preview_looping: bool,
     browser_preview_volume: f32,
+    browser_preview_key_enabled: bool,
+    browser_preview_target_key: Option<u8>,
+    browser_preview_semitone_offset: i8,
+    browser_preview_key_metadata: Option<(PathBuf, Option<SampleKeyMetadata>)>,
+    browser_preview_loaded_full_sample: bool,
+    browser_preview_loaded_start_fraction: Option<f64>,
     browser_preview_pending: Option<PendingBrowserPreview>,
     browser_preview_queued: Option<(PathBuf, bool, Option<f64>)>,
     browser_preview_cancelled: bool,
@@ -8877,6 +8886,12 @@ impl DawUi {
             browser_full_sample: false,
             browser_preview_looping: false,
             browser_preview_volume: 1.0,
+            browser_preview_key_enabled: false,
+            browser_preview_target_key: None,
+            browser_preview_semitone_offset: 0,
+            browser_preview_key_metadata: None,
+            browser_preview_loaded_full_sample: false,
+            browser_preview_loaded_start_fraction: None,
             browser_preview_pending: None,
             browser_preview_queued: None,
             browser_preview_cancelled: false,
@@ -27824,44 +27839,24 @@ impl DawUi {
         }
         let output_sample_rate = engine.sample_rate();
         let maximum_seconds = (!full_sample).then_some(5.0);
-        let read_sample_tempo_information = self.read_sample_tempo_information;
-        let project_tempo_bpm = self.tempo_bpm;
+        let project_tempo_bpm = self.read_sample_tempo_information.then_some(self.tempo_bpm);
+        let pitch = BrowserPreviewPitch {
+            enabled: self.browser_preview_key_enabled,
+            target_note: self.browser_preview_target_key,
+            semitone_offset: self.browser_preview_semitone_offset,
+        };
         let worker_path = path.clone();
         let (sender, receiver) = mpsc::channel();
         let worker = match thread::Builder::new()
             .name("browser-sample-preview".to_owned())
             .spawn(move || {
-                let result = start_fraction.map_or_else(
-                    || {
-                        if read_sample_tempo_information {
-                            decode_audio_preview_with_tempo(
-                                &worker_path,
-                                output_sample_rate,
-                                maximum_seconds,
-                                project_tempo_bpm,
-                            )
-                        } else {
-                            decode_audio_preview(&worker_path, output_sample_rate, maximum_seconds)
-                        }
-                    },
-                    |fraction| {
-                        if read_sample_tempo_information {
-                            decode_audio_preview_from_position_with_tempo(
-                                &worker_path,
-                                output_sample_rate,
-                                maximum_seconds,
-                                fraction,
-                                project_tempo_bpm,
-                            )
-                        } else {
-                            decode_audio_preview_from_position(
-                                &worker_path,
-                                output_sample_rate,
-                                maximum_seconds,
-                                fraction,
-                            )
-                        }
-                    },
+                let result = decode_browser_preview(
+                    &worker_path,
+                    output_sample_rate,
+                    maximum_seconds,
+                    start_fraction,
+                    project_tempo_bpm,
+                    pitch,
                 );
                 let _ = sender.send(result);
             }) {
@@ -27874,6 +27869,7 @@ impl DawUi {
         };
         self.browser_preview_pending = Some(PendingBrowserPreview {
             path,
+            full_sample,
             start_fraction,
             receiver,
             worker,
@@ -27919,7 +27915,10 @@ impl DawUi {
                 return;
             }
             match result {
-                Ok(samples) => {
+                Ok((samples, key_metadata)) => {
+                    self.browser_preview_key_metadata = Some((pending.path.clone(), key_metadata));
+                    self.browser_preview_loaded_full_sample = pending.full_sample;
+                    self.browser_preview_loaded_start_fraction = pending.start_fraction;
                     let start_result = if let Some(engine) = self.audio_engine.as_ref() {
                         engine.set_browser_preview_gain(self.browser_preview_volume);
                         engine.set_browser_preview_looping(self.browser_preview_looping);
@@ -28173,11 +28172,21 @@ impl DawUi {
         } else {
             name
         };
+        let key_metadata_loaded = self
+            .browser_preview_key_metadata
+            .as_ref()
+            .is_some_and(|(metadata_path, _)| metadata_path == &path);
+        let key_metadata = self
+            .browser_preview_key_metadata
+            .as_ref()
+            .filter(|(metadata_path, _)| metadata_path == &path)
+            .and_then(|(_, metadata)| *metadata);
         let mut play_to_end = false;
         let mut stop_preview = false;
         let mut edit_sample = false;
         let mut volume_changed = false;
         let mut looping_changed = false;
+        let mut key_pitch_changed = false;
         let mut seek_frame = None;
         ui.group(|ui| {
             ui.horizontal(|ui| {
@@ -28235,6 +28244,74 @@ impl DawUi {
                     .on_hover_text("Preview volume")
                     .changed();
             });
+            ui.horizontal_wrapped(|ui| {
+                if let Some((root_key, fine_tune_cents)) = key_metadata {
+                    key_pitch_changed = ui
+                        .checkbox(&mut self.browser_preview_key_enabled, "Key")
+                        .on_hover_text(
+                            "Use the sample's WAVE/AIFF root key to preview another key",
+                        )
+                        .changed();
+                    if self.browser_preview_key_enabled {
+                        let selected_key = self
+                            .browser_preview_target_key
+                            .map_or_else(
+                                || format!("Original ({})", note_name(u16::from(root_key))),
+                                |key| note_name(u16::from(key)),
+                            );
+                        egui::ComboBox::from_id_salt("browser-preview-target-key")
+                            .selected_text(selected_key)
+                            .show_ui(ui, |ui| {
+                                key_pitch_changed |= ui
+                                    .selectable_value(
+                                        &mut self.browser_preview_target_key,
+                                        None,
+                                        format!("Original ({})", note_name(u16::from(root_key))),
+                                    )
+                                    .changed();
+                                for key in 0..=127 {
+                                    key_pitch_changed |= ui
+                                        .selectable_value(
+                                            &mut self.browser_preview_target_key,
+                                            Some(key),
+                                            note_name(u16::from(key)),
+                                        )
+                                        .changed();
+                                }
+                            });
+                        ui.small("Semitone");
+                        key_pitch_changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut self.browser_preview_semitone_offset)
+                                    .range(-24..=24)
+                                    .suffix(" st"),
+                            )
+                            .changed();
+                        if ui.small_button("Original key").clicked() {
+                            self.browser_preview_target_key = None;
+                            self.browser_preview_semitone_offset = 0;
+                            key_pitch_changed = true;
+                        }
+                    }
+                    ui.small(format!(
+                        "Root {}{:+.0}¢",
+                        note_name(u16::from(root_key)),
+                        fine_tune_cents
+                    ));
+                } else if key_metadata_loaded {
+                    ui.add_enabled(false, egui::Checkbox::new(
+                        &mut self.browser_preview_key_enabled,
+                        "Key",
+                    ));
+                    ui.small("This sample has no WAVE/AIFF root-key metadata");
+                } else {
+                    ui.add_enabled(false, egui::Checkbox::new(
+                        &mut self.browser_preview_key_enabled,
+                        "Key",
+                    ));
+                    ui.small("Key controls are available for samples with root-key metadata");
+                }
+            });
             if let Some(error) = &self.browser_preview_error {
                 ui.label(egui::RichText::new(error).color(ORANGE).small());
             } else if self.browser_preview_pending.is_some() && !self.browser_preview_cancelled {
@@ -28254,6 +28331,13 @@ impl DawUi {
         }
         if looping_changed && let Some(engine) = self.audio_engine.as_ref() {
             engine.set_browser_preview_looping(self.browser_preview_looping);
+        }
+        if key_pitch_changed {
+            self.request_browser_preview(
+                path.clone(),
+                self.browser_preview_loaded_full_sample,
+                self.browser_preview_loaded_start_fraction,
+            );
         }
         if let Some(frame) = seek_frame
             && let Some(engine) = self.audio_engine.as_ref()

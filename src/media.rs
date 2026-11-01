@@ -721,6 +721,18 @@ pub(crate) struct SamplerFileMetadata {
     pub(crate) wave_source_duration_seconds: Option<f64>,
 }
 
+/// Key controls for a Browser sample preview. A missing target note keeps the source's original
+/// key; a selected target note transposes from the file's sampler root-key metadata.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BrowserPreviewPitch {
+    pub enabled: bool,
+    pub target_note: Option<u8>,
+    pub semitone_offset: i8,
+}
+
+/// Key and fine-tuning metadata used by Browser preview controls.
+pub type SampleKeyMetadata = (u8, f64);
+
 /// Read standard sampler metadata from a RIFF/WAVE file.
 ///
 /// The `inst` root key takes precedence over the `smpl` MIDI unity note. WAVE stores loop ends
@@ -1173,6 +1185,15 @@ pub(crate) fn sample_sampler_metadata(path: &Path) -> Option<SamplerFileMetadata
     wav_sampler_metadata(path).or_else(|| aiff_sampler_metadata(path))
 }
 
+/// Return the source note and fine tuning from supported WAVE or AIFF sampler metadata.
+pub fn sample_key_metadata(path: impl AsRef<Path>) -> Option<SampleKeyMetadata> {
+    let metadata = sample_sampler_metadata(path.as_ref())?;
+    Some((
+        u8::try_from(metadata.root_key?).ok()?,
+        metadata.fine_tune_cents.unwrap_or(0.0),
+    ))
+}
+
 /// Decode an audio file for the Browser and return interleaved stereo samples at the output rate.
 /// A duration limit keeps the default short preview bounded; `None` returns the full sample.
 pub fn decode_audio_preview(
@@ -1260,6 +1281,101 @@ pub fn decode_audio_preview_from_position_with_tempo(
         Some(start_fraction),
         project_tempo_bpm,
     )
+}
+
+/// Decode a Browser preview with optional ACID tempo sync and source-key-aware pitch controls.
+/// The returned metadata is available to the UI even when key shifting is disabled.
+pub fn decode_browser_preview(
+    path: impl AsRef<Path>,
+    output_sample_rate: u32,
+    maximum_seconds: Option<f64>,
+    start_fraction: Option<f64>,
+    project_tempo_bpm: Option<f64>,
+    pitch: BrowserPreviewPitch,
+) -> Result<(Vec<f32>, Option<SampleKeyMetadata>), String> {
+    if !(-24..=24).contains(&pitch.semitone_offset) {
+        return Err("Browser preview semitone offset must be between -24 and +24".to_owned());
+    }
+    let path = path.as_ref();
+    let key_metadata = sample_key_metadata(path);
+    let samples = match (start_fraction, project_tempo_bpm) {
+        (Some(fraction), Some(tempo)) => decode_audio_preview_from_position_with_tempo(
+            path,
+            output_sample_rate,
+            maximum_seconds,
+            fraction,
+            tempo,
+        )?,
+        (None, Some(tempo)) => {
+            decode_audio_preview_with_tempo(path, output_sample_rate, maximum_seconds, tempo)?
+        }
+        (Some(fraction), None) => {
+            decode_audio_preview_from_position(path, output_sample_rate, maximum_seconds, fraction)?
+        }
+        (None, None) => decode_audio_preview(path, output_sample_rate, maximum_seconds)?,
+    };
+    let semitones = browser_preview_pitch_shift_semitones(pitch, key_metadata)?;
+    let samples = pitch_shift_browser_preview(samples, output_sample_rate, semitones)?;
+    Ok((samples, key_metadata))
+}
+
+fn browser_preview_pitch_shift_semitones(
+    pitch: BrowserPreviewPitch,
+    key_metadata: Option<SampleKeyMetadata>,
+) -> Result<f32, String> {
+    if !(-24..=24).contains(&pitch.semitone_offset) {
+        return Err("Browser preview semitone offset must be between -24 and +24".to_owned());
+    }
+    if pitch.target_note.is_some_and(|note| note > 127) {
+        return Err("Browser preview target note must be between 0 and 127".to_owned());
+    }
+    if !pitch.enabled {
+        return Ok(0.0);
+    }
+    Ok(key_metadata.map_or(0.0, |(root_note, fine_tune_cents)| {
+        let target_note = pitch.target_note.unwrap_or(root_note);
+        f32::from(target_note) - f32::from(root_note) - fine_tune_cents as f32 / 100.0
+            + f32::from(pitch.semitone_offset)
+    }))
+}
+
+fn pitch_shift_browser_preview(
+    samples: Vec<f32>,
+    sample_rate: u32,
+    semitones: f32,
+) -> Result<Vec<f32>, String> {
+    const CHANNEL_COUNT: usize = 2;
+    if !semitones.is_finite() || !(-152.0..=152.0).contains(&semitones) {
+        return Err("Browser preview pitch shift is outside the supported range".to_owned());
+    }
+    if !(8_000..=384_000).contains(&sample_rate)
+        || samples.is_empty()
+        || !samples.len().is_multiple_of(CHANNEL_COUNT)
+    {
+        return Err("Browser preview pitch shift received invalid audio".to_owned());
+    }
+    if semitones == 0.0 {
+        return Ok(samples);
+    }
+    let pitch_factor = 2.0_f64.powf(f64::from(semitones) / 12.0);
+    let intermediate_samples = (samples.len() as f64 * pitch_factor.max(1.0 / pitch_factor)).ceil();
+    if !intermediate_samples.is_finite()
+        || intermediate_samples > MAX_BROWSER_TEMPO_SYNC_SAMPLE_COUNT as f64
+    {
+        return Err("key-shifted Browser preview exceeds its processing limit".to_owned());
+    }
+    let parameters = StretchParams::new(1.0)
+        .with_sample_rate(sample_rate)
+        .with_channels(CHANNEL_COUNT as u32);
+    let mut shifted = pitch_shift(&samples, &parameters, pitch_factor)
+        .map_err(|error| format!("could not key-shift Browser preview: {error}"))?;
+    if shifted.len() != samples.len() {
+        return Err("pitch-shift engine changed the Browser preview duration".to_owned());
+    }
+    for sample in &mut shifted {
+        *sample = finite_sample(*sample);
+    }
+    Ok(shifted)
 }
 
 fn decode_audio_preview_with_tempo_from_position(
@@ -2538,6 +2654,135 @@ mod tests {
     }
 
     #[test]
+    fn browser_preview_pitch_shift_uses_root_key_and_preserves_duration() {
+        let metadata = Some((72, -23.0));
+        assert_eq!(
+            browser_preview_pitch_shift_semitones(
+                BrowserPreviewPitch {
+                    enabled: true,
+                    target_note: None,
+                    semitone_offset: 0,
+                },
+                metadata,
+            )
+            .unwrap(),
+            0.23
+        );
+        assert_eq!(
+            browser_preview_pitch_shift_semitones(
+                BrowserPreviewPitch {
+                    enabled: true,
+                    target_note: Some(76),
+                    semitone_offset: -2,
+                },
+                metadata,
+            )
+            .unwrap(),
+            2.23
+        );
+        assert_eq!(
+            browser_preview_pitch_shift_semitones(
+                BrowserPreviewPitch {
+                    enabled: false,
+                    target_note: Some(84),
+                    semitone_offset: 12,
+                },
+                metadata,
+            )
+            .unwrap(),
+            0.0
+        );
+        assert!(
+            browser_preview_pitch_shift_semitones(
+                BrowserPreviewPitch {
+                    enabled: true,
+                    target_note: Some(128),
+                    semitone_offset: 0,
+                },
+                metadata,
+            )
+            .is_err()
+        );
+
+        let sample_rate = 44_100_u32;
+        let samples: Vec<_> = (0..sample_rate as usize)
+            .flat_map(|frame| {
+                let sample =
+                    (std::f32::consts::TAU * 440.0 * frame as f32 / sample_rate as f32).sin() * 0.5;
+                [sample, sample]
+            })
+            .collect();
+        let shifted = pitch_shift_browser_preview(samples, sample_rate, 12.0)
+            .expect("one-octave Browser preview shift should succeed");
+        assert_eq!(shifted.len(), sample_rate as usize * 2);
+        let middle = &shifted[4_410 * 2..39_690 * 2];
+        let positive_crossings = middle
+            .chunks_exact(2)
+            .map(|frame| frame[0])
+            .collect::<Vec<_>>()
+            .windows(2)
+            .filter(|pair| pair[0] <= 0.0 && pair[1] > 0.0)
+            .count();
+        let estimated_frequency =
+            positive_crossings as f32 * sample_rate as f32 / (middle.len() as f32 / 2.0);
+        assert!((850.0..=910.0).contains(&estimated_frequency));
+    }
+
+    #[test]
+    fn browser_preview_transposes_to_target_note_from_wave_key_metadata() {
+        let root = fixture_root();
+        fs::create_dir_all(&root).expect("fixture directory should be created");
+        let path = root.join("keyed-tone.wav");
+        let sample_rate = 8_000_u32;
+        let mut format = Vec::new();
+        format.extend_from_slice(&1u16.to_le_bytes());
+        format.extend_from_slice(&1u16.to_le_bytes());
+        format.extend_from_slice(&sample_rate.to_le_bytes());
+        format.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+        format.extend_from_slice(&2u16.to_le_bytes());
+        format.extend_from_slice(&16u16.to_le_bytes());
+        let instrument = [69, 0, 0, 0, 127, 1, 127];
+        let mut data = Vec::new();
+        for frame in 0..sample_rate {
+            let sample = (std::f32::consts::TAU * 440.0 * frame as f32 / sample_rate as f32).sin();
+            data.extend_from_slice(&((sample * 16_000.0) as i16).to_le_bytes());
+        }
+        fs::write(
+            &path,
+            wave_with_sampler_chunks(&[("fmt ", &format), ("inst", &instrument), ("data", &data)]),
+        )
+        .expect("keyed WAVE should be written");
+
+        let (preview, metadata) = decode_browser_preview(
+            &path,
+            sample_rate,
+            None,
+            None,
+            None,
+            BrowserPreviewPitch {
+                enabled: true,
+                target_note: Some(81),
+                semitone_offset: 0,
+            },
+        )
+        .expect("keyed WAVE should preview at its selected target note");
+        assert_eq!(metadata, Some((69, 0.0)));
+        assert_eq!(preview.len(), sample_rate as usize * 2);
+        let middle = &preview[1_000 * 2..7_000 * 2];
+        let positive_crossings = middle
+            .chunks_exact(2)
+            .map(|frame| frame[0])
+            .collect::<Vec<_>>()
+            .windows(2)
+            .filter(|pair| pair[0] <= 0.0 && pair[1] > 0.0)
+            .count();
+        let estimated_frequency =
+            positive_crossings as f32 * sample_rate as f32 / (middle.len() as f32 / 2.0);
+        assert!((850.0..=910.0).contains(&estimated_frequency));
+        fs::remove_dir_all(root).expect("fixture directory should be removed");
+    }
+
+    #[test]
     fn sample_editor_audio_processing_rejects_unsupported_or_invalid_inputs() {
         let stereo = DecodedAudio {
             sample_rate: 44_100,
@@ -3147,6 +3392,7 @@ mod tests {
             let metadata = wav_sampler_metadata(&path).expect("WAVE root metadata should parse");
             assert_eq!(metadata.root_key, Some(72));
             assert_eq!(metadata.fine_tune_cents, Some(-23.0));
+            assert_eq!(sample_key_metadata(&path), Some((72, -23.0)));
             assert_eq!(metadata.gain_db, Some(-6));
             assert_eq!(metadata.key_range, Some((0, 127)));
             assert_eq!(metadata.velocity_range, Some((1, 127)));
