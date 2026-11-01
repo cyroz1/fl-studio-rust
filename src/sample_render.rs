@@ -12844,7 +12844,7 @@ fn prepare_sampler_arrangement(
             let (gain, pan) = channel_gain_pan(channel.volume(), channel.pan());
             let volume_envelope = sampler_volume_envelope_config(channel, options.sample_rate, ppq);
             source_entry.insert(SamplerVoiceSource {
-                sampler_filter: sampler_filter_config(channel),
+                sampler_filter: sampler_filter_config(channel, options.sample_rate, ppq),
                 audio,
                 gain: gain
                     * sampler_metadata_gain(sample_metadata.gain_db)
@@ -13228,18 +13228,33 @@ struct SamplerLfo {
     phase_retrigger: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct SamplerFilterConfig {
     cutoff_raw: u32,
     resonance_raw: u32,
     filter_type_raw: u32,
+    mod_x_lfo: Option<SamplerLfo>,
+    mod_y_lfo: Option<SamplerLfo>,
 }
 
-fn sampler_filter_config(channel: &ChannelSummary) -> Option<SamplerFilterConfig> {
+impl SamplerFilterConfig {
+    fn needs_tempo_map(self) -> bool {
+        self.mod_x_lfo.is_some_and(SamplerLfo::needs_tempo_map)
+            || self.mod_y_lfo.is_some_and(SamplerLfo::needs_tempo_map)
+    }
+}
+
+fn sampler_filter_config(
+    channel: &ChannelSummary,
+    sample_rate: u32,
+    ppq: u16,
+) -> Option<SamplerFilterConfig> {
     let config = SamplerFilterConfig {
         cutoff_raw: channel.sampler_filter_cutoff_raw()?,
         resonance_raw: channel.sampler_filter_resonance_raw()?,
         filter_type_raw: channel.sampler_filter_type_raw()?,
+        mod_x_lfo: sampler_lfo_config(channel, SamplerEnvelopeLfoTarget::ModX, sample_rate, ppq),
+        mod_y_lfo: sampler_lfo_config(channel, SamplerEnvelopeLfoTarget::ModY, sample_rate, ppq),
     };
     (config.cutoff_raw <= 256 && config.resonance_raw <= 256 && config.filter_type_raw <= 7)
         .then_some(config)
@@ -13276,6 +13291,12 @@ struct SamplerFilterStageState {
 
 #[derive(Clone)]
 struct SamplerFilterState {
+    config: SamplerFilterConfig,
+    sample_rate: f64,
+    note_mod_x: u8,
+    note_mod_y: u8,
+    current_modulated_raw: Option<(u32, u32)>,
+    active: bool,
     first_coefficients: SamplerFilterStageCoefficients,
     second_coefficients: Option<SamplerFilterStageCoefficients>,
     left_first: SamplerFilterStageState,
@@ -13286,88 +13307,93 @@ struct SamplerFilterState {
 
 impl SamplerFilterState {
     fn new_for_note(
-        mut config: SamplerFilterConfig,
+        config: SamplerFilterConfig,
         sample_rate: u32,
         mod_x: u8,
         mod_y: u8,
+        started_frame: u64,
+        started_tick: Option<f64>,
     ) -> Option<Self> {
         if config.cutoff_raw > 256 || config.resonance_raw > 256 || config.filter_type_raw > 7 {
             return None;
         }
-        config.cutoff_raw = sampler_filter_modulated_raw(config.cutoff_raw, mod_x);
-        config.resonance_raw = sampler_filter_modulated_raw(config.resonance_raw, mod_y);
-        if config.cutoff_raw == 256 && config.resonance_raw == 0 {
-            return None;
-        }
-
-        let sample_rate = f64::from(sample_rate.max(1));
-        let cutoff_hz = sampler_filter_cutoff_hz(config.cutoff_raw, sample_rate);
-        let resonance_q = sampler_filter_resonance_q(config.resonance_raw);
-        let filter_type = config.filter_type_raw;
-        let first_coefficients = match filter_type {
-            0 => SamplerFilterStageCoefficients::OnePole {
-                alpha: (1.0 - (-std::f64::consts::TAU * cutoff_hz / sample_rate).exp()) as f32,
-            },
-            1 => sampler_filter_biquad(
-                cutoff_hz,
-                sample_rate,
-                resonance_q,
-                SamplerBiquadMode::LowPass,
-            ),
-            2 => sampler_filter_biquad(
-                cutoff_hz,
-                sample_rate,
-                resonance_q,
-                SamplerBiquadMode::BandPass,
-            ),
-            3 => sampler_filter_biquad(
-                cutoff_hz,
-                sample_rate,
-                resonance_q,
-                SamplerBiquadMode::HighPass,
-            ),
-            4 => sampler_filter_biquad(
-                cutoff_hz,
-                sample_rate,
-                resonance_q,
-                SamplerBiquadMode::BandStop,
-            ),
-            5 => sampler_filter_biquad(
-                cutoff_hz,
-                sample_rate,
-                resonance_q,
-                SamplerBiquadMode::LowPass,
-            ),
-            6 => sampler_filter_state_variable(cutoff_hz, sample_rate, resonance_q),
-            7 => sampler_filter_state_variable(cutoff_hz, sample_rate, resonance_q),
-            _ => return None,
-        };
-        let second_coefficients = match filter_type {
-            5 => Some(sampler_filter_biquad(
-                cutoff_hz,
-                sample_rate,
-                resonance_q,
-                SamplerBiquadMode::LowPass,
-            )),
-            7 => Some(sampler_filter_state_variable(
-                cutoff_hz,
-                sample_rate,
-                resonance_q,
-            )),
-            _ => None,
-        };
-
-        Some(Self {
-            first_coefficients,
-            second_coefficients,
+        let mut state = Self {
+            config,
+            sample_rate: f64::from(sample_rate.max(1)),
+            note_mod_x: mod_x,
+            note_mod_y: mod_y,
+            current_modulated_raw: None,
+            active: false,
+            // Replaced by the first parameter refresh before processing samples.
+            first_coefficients: SamplerFilterStageCoefficients::OnePole { alpha: 1.0 },
+            second_coefficients: None,
             left_first: SamplerFilterStageState::default(),
             right_first: SamplerFilterStageState::default(),
             left_second: SamplerFilterStageState::default(),
             right_second: SamplerFilterStageState::default(),
-        })
+        };
+        state.update_modulation(started_frame, started_frame, started_tick, started_tick);
+        if !state.active && config.mod_x_lfo.is_none() && config.mod_y_lfo.is_none() {
+            None
+        } else {
+            Some(state)
+        }
+    }
+
+    fn update_modulation(
+        &mut self,
+        started_frame: u64,
+        frame: u64,
+        started_tick: Option<f64>,
+        current_tick: Option<f64>,
+    ) {
+        let mod_x = sampler_filter_lfo_modulation(
+            self.note_mod_x,
+            self.config.mod_x_lfo,
+            started_frame,
+            frame,
+            started_tick,
+            current_tick,
+        );
+        let mod_y = sampler_filter_lfo_modulation(
+            self.note_mod_y,
+            self.config.mod_y_lfo,
+            started_frame,
+            frame,
+            started_tick,
+            current_tick,
+        );
+        let cutoff_raw = sampler_filter_modulated_raw(self.config.cutoff_raw, mod_x);
+        let resonance_raw = sampler_filter_modulated_raw(self.config.resonance_raw, mod_y);
+        if self.current_modulated_raw == Some((cutoff_raw, resonance_raw)) {
+            return;
+        }
+        self.current_modulated_raw = Some((cutoff_raw, resonance_raw));
+        let was_active = self.active;
+        self.active = cutoff_raw != 256 || resonance_raw != 0;
+        if self.active != was_active {
+            self.left_first = SamplerFilterStageState::default();
+            self.right_first = SamplerFilterStageState::default();
+            self.left_second = SamplerFilterStageState::default();
+            self.right_second = SamplerFilterStageState::default();
+        }
+        let Some((first_coefficients, second_coefficients)) = sampler_filter_coefficients(
+            self.config.filter_type_raw,
+            cutoff_raw,
+            resonance_raw,
+            self.sample_rate,
+        ) else {
+            self.active = false;
+            return;
+        };
+        self.first_coefficients = first_coefficients;
+        self.second_coefficients = second_coefficients;
     }
 
     fn process_left(&mut self, sample: f32) -> f32 {
+        if !self.active {
+            return sample;
+        }
         let output =
             sampler_filter_process_stage(sample, self.first_coefficients, &mut self.left_first);
         self.second_coefficients.map_or(output, |coefficients| {
@@ -13376,12 +13402,98 @@ impl SamplerFilterState {
     }
 
     fn process_right(&mut self, sample: f32) -> f32 {
+        if !self.active {
+            return sample;
+        }
         let output =
             sampler_filter_process_stage(sample, self.first_coefficients, &mut self.right_first);
         self.second_coefficients.map_or(output, |coefficients| {
             sampler_filter_process_stage(output, coefficients, &mut self.right_second)
         })
     }
+}
+
+fn sampler_filter_coefficients(
+    filter_type: u32,
+    cutoff_raw: u32,
+    resonance_raw: u32,
+    sample_rate: f64,
+) -> Option<(
+    SamplerFilterStageCoefficients,
+    Option<SamplerFilterStageCoefficients>,
+)> {
+    let cutoff_hz = sampler_filter_cutoff_hz(cutoff_raw, sample_rate);
+    let resonance_q = sampler_filter_resonance_q(resonance_raw);
+    let first = match filter_type {
+        0 => SamplerFilterStageCoefficients::OnePole {
+            alpha: (1.0 - (-std::f64::consts::TAU * cutoff_hz / sample_rate).exp()) as f32,
+        },
+        1 => sampler_filter_biquad(
+            cutoff_hz,
+            sample_rate,
+            resonance_q,
+            SamplerBiquadMode::LowPass,
+        ),
+        2 => sampler_filter_biquad(
+            cutoff_hz,
+            sample_rate,
+            resonance_q,
+            SamplerBiquadMode::BandPass,
+        ),
+        3 => sampler_filter_biquad(
+            cutoff_hz,
+            sample_rate,
+            resonance_q,
+            SamplerBiquadMode::HighPass,
+        ),
+        4 => sampler_filter_biquad(
+            cutoff_hz,
+            sample_rate,
+            resonance_q,
+            SamplerBiquadMode::BandStop,
+        ),
+        5 => sampler_filter_biquad(
+            cutoff_hz,
+            sample_rate,
+            resonance_q,
+            SamplerBiquadMode::LowPass,
+        ),
+        6 | 7 => sampler_filter_state_variable(cutoff_hz, sample_rate, resonance_q),
+        _ => return None,
+    };
+    let second = match filter_type {
+        5 => Some(sampler_filter_biquad(
+            cutoff_hz,
+            sample_rate,
+            resonance_q,
+            SamplerBiquadMode::LowPass,
+        )),
+        7 => Some(sampler_filter_state_variable(
+            cutoff_hz,
+            sample_rate,
+            resonance_q,
+        )),
+        _ => None,
+    };
+    Some((first, second))
+}
+
+fn sampler_filter_lfo_modulation(
+    note_value: u8,
+    lfo: Option<SamplerLfo>,
+    started_frame: u64,
+    frame: u64,
+    started_tick: Option<f64>,
+    current_tick: Option<f64>,
+) -> u8 {
+    let Some(lfo) = lfo else {
+        return note_value;
+    };
+    // Candidate interpretation: the bipolar LFO amount shifts Mod X/Y around raw neutral 128.
+    (f32::from(note_value)
+        + lfo.value_at_frame(started_frame, frame, started_tick, current_tick) * 128.0)
+        .round()
+        .clamp(0.0, 255.0) as u8
 }
 
 #[derive(Clone, Copy)]
@@ -16791,7 +16903,7 @@ fn prepare_sampler_pattern_for_channel_internal(
             let (gain, pan) = channel_gain_pan(channel.volume(), channel.pan());
             let volume_envelope = sampler_volume_envelope_config(channel, options.sample_rate, ppq);
             source_entry.insert(SamplerVoiceSource {
-                sampler_filter: sampler_filter_config(channel),
+                sampler_filter: sampler_filter_config(channel, options.sample_rate, ppq),
                 audio,
                 gain: gain
                     * sampler_metadata_gain(sample_metadata.gain_db)
@@ -17346,6 +17458,9 @@ impl<'a> SamplerVoiceEngine<'a> {
                 || source.pan_lfo.is_some_and(SamplerLfo::needs_tempo_map)
                 || source.volume_lfo.is_some_and(SamplerLfo::needs_tempo_map)
                 || source.pitch_lfo.is_some_and(SamplerLfo::needs_tempo_map)
+                || source
+                    .sampler_filter
+                    .is_some_and(SamplerFilterConfig::needs_tempo_map)
         });
         Self {
             sources_by_channel: sources_by_channel.clone(),
@@ -17706,6 +17821,45 @@ impl<'a> SamplerVoiceEngine<'a> {
                     continue;
                 }
                 last_active_output_frame = Some(frame.saturating_add(1));
+                let mono_source = voice.source.channels.len() == 1;
+                let filtered_samples = if render_samples || voice.sampler_filter.is_some() {
+                    let left = resample_sample(
+                        &voice.source.channels[0],
+                        voice.source_position,
+                        voice.source_step,
+                        self.resampling_quality,
+                    );
+                    let right = if mono_source {
+                        left
+                    } else {
+                        resample_sample(
+                            &voice.source.channels[1],
+                            voice.source_position,
+                            voice.source_step,
+                            self.resampling_quality,
+                        )
+                    };
+                    let (left, right) = if let Some(filter) = voice.sampler_filter.as_mut() {
+                        filter.update_modulation(
+                            voice.started_frame,
+                            frame,
+                            voice.started_tick,
+                            current_tick,
+                        );
+                        let left = filter.process_left(left);
+                        let right = if mono_source {
+                            left
+                        } else {
+                            filter.process_right(right)
+                        };
+                        (left, right)
+                    } else {
+                        (left, right)
+                    };
+                    Some((left, right))
+                } else {
+                    None
+                };
                 if render_samples {
                     if let Some(pan_lfo) = voice.pan_lfo {
                         let pan = (sampler_note_pan_value(voice.channel_pan, voice.note_pan_value)
@@ -17719,34 +17873,8 @@ impl<'a> SamplerVoiceEngine<'a> {
                         (voice.left_gain, voice.right_gain) =
                             channel_pan_gains(pan, voice.source.channels.len() == 1, pan_law);
                     }
-                    let left = resample_sample(
-                        &voice.source.channels[0],
-                        voice.source_position,
-                        voice.source_step,
-                        self.resampling_quality,
-                    );
-                    let mono_source = voice.source.channels.len() == 1;
-                    let right = if mono_source {
-                        left
-                    } else {
-                        resample_sample(
-                            &voice.source.channels[1],
-                            voice.source_position,
-                            voice.source_step,
-                            self.resampling_quality,
-                        )
-                    };
-                    let (left, right) = if let Some(filter) = voice.sampler_filter.as_mut() {
-                        let left = filter.process_left(left);
-                        let right = if mono_source {
-                            left
-                        } else {
-                            filter.process_right(right)
-                        };
-                        (left, right)
-                    } else {
-                        (left, right)
-                    };
+                    let (left, right) = filtered_samples
+                        .expect("rendering sampler samples computes a source frame");
                     let envelope_gain =
                         sampler_voice_volume_envelope_gain(voice, frame, current_tick);
                     let lfo_gain = voice.volume_lfo.map_or(1.0, |lfo| {
@@ -18079,6 +18207,8 @@ impl<'a> SamplerVoiceEngine<'a> {
                     self.output_sample_rate,
                     note.mod_x,
                     note.mod_y,
+                    note.start_frame,
+                    started_tick,
                 )
             }),
             lfo_pitch_cents: 0.0,
@@ -24804,10 +24934,14 @@ mod tests {
                 cutoff_raw: 128,
                 resonance_raw: 0,
                 filter_type_raw,
+                mod_x_lfo: None,
+                mod_y_lfo: None,
             },
             sample_rate as u32,
             128,
             128,
+            0,
+            None,
         )
         .expect("the selected filter should be enabled");
         let samples = 12_000;
@@ -24832,10 +24966,14 @@ mod tests {
                     cutoff_raw: 256,
                     resonance_raw: 0,
                     filter_type_raw: 1,
+                    mod_x_lfo: None,
+                    mod_y_lfo: None,
                 },
                 48_000,
                 128,
                 128,
+                0,
+                None,
             )
             .is_none()
         );
@@ -24861,9 +24999,51 @@ mod tests {
             cutoff_raw: 256,
             resonance_raw: 0,
             filter_type_raw: 1,
+            mod_x_lfo: None,
+            mod_y_lfo: None,
         };
-        assert!(SamplerFilterState::new_for_note(default_filter, 48_000, 128, 128).is_none());
-        assert!(SamplerFilterState::new_for_note(default_filter, 48_000, 0, 128).is_some());
+        assert!(
+            SamplerFilterState::new_for_note(default_filter, 48_000, 128, 128, 0, None).is_none()
+        );
+        assert!(
+            SamplerFilterState::new_for_note(default_filter, 48_000, 0, 128, 0, None).is_some()
+        );
+    }
+
+    #[test]
+    fn sampler_filter_mod_x_y_lfos_move_cutoff_and_resonance_during_a_note() {
+        let lfo = SamplerLfo {
+            timing: SamplerLfoTiming::Frames {
+                predelay: 0,
+                attack: 0,
+                period: 4,
+            },
+            amount: 1.0,
+            shape: 0,
+            phase_retrigger: true,
+        };
+        let mut filter = SamplerFilterState::new_for_note(
+            SamplerFilterConfig {
+                cutoff_raw: 128,
+                resonance_raw: 64,
+                filter_type_raw: 1,
+                mod_x_lfo: Some(lfo),
+                mod_y_lfo: Some(lfo),
+            },
+            48_000,
+            128,
+            128,
+            0,
+            None,
+        )
+        .expect("the active Mod X LFO should keep the filter state present");
+
+        assert_eq!(filter.current_modulated_raw, Some((128, 64)));
+        filter.update_modulation(0, 1, None, None);
+        assert_eq!(filter.current_modulated_raw, Some((256, 256)));
+        filter.update_modulation(0, 3, None, None);
+        assert_eq!(filter.current_modulated_raw, Some((0, 0)));
+        assert!(filter.process_left(1.0).is_finite());
     }
 
     #[test]
@@ -24874,10 +25054,14 @@ mod tests {
                     cutoff_raw: 192,
                     resonance_raw: 224,
                     filter_type_raw,
+                    mod_x_lfo: None,
+                    mod_y_lfo: None,
                 },
                 44_100,
                 128,
                 128,
+                0,
+                None,
             )
             .expect("known filter types should construct");
             for frame in 0..2_048 {
