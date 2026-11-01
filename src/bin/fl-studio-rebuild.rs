@@ -33,6 +33,7 @@ use flp_rebuild::audio::{
 use flp_rebuild::media::{
     AudioExportOptions, AudioWaveform, DecodedAudio, SamplePathResolver, WaveformPeak,
     decode_audio_file, decode_audio_preview, decode_audio_preview_from_position,
+    decode_audio_preview_from_position_with_tempo, decode_audio_preview_with_tempo,
     decode_audio_waveform, find_empty_project_template, process_audio_range_to_stereo_preview,
     summarize_audio_waveform, write_audio_range_to_wav_with_options,
 };
@@ -5539,6 +5540,7 @@ struct DawUi {
     audio_settings: AudioSettings,
     live_resampling_quality: ResamplingQuality,
     read_sample_root_note: bool,
+    read_sample_tempo_information: bool,
     audio_engine: Option<AudioEngine>,
     audio_recording: Option<AudioRecordingSession>,
     audio_monitor_session: Option<AudioInputMonitorSession>,
@@ -8224,6 +8226,7 @@ impl DawUi {
         let detached_window_placements = load_detached_window_placements();
         let window_layout_presets = load_window_layout_presets();
         let read_sample_root_note = load_read_sample_root_note();
+        let read_sample_tempo_information = load_read_sample_tempo_information();
         let metronome_enabled = load_metronome_enabled();
         let metronome_mixer_track = load_metronome_mixer_track();
         let (metronome_accent_sample_path, metronome_beat_sample_path) =
@@ -8710,6 +8713,7 @@ impl DawUi {
             audio_settings,
             live_resampling_quality,
             read_sample_root_note,
+            read_sample_tempo_information,
             audio_engine: None,
             audio_recording: None,
             audio_monitor_session: None,
@@ -27760,20 +27764,43 @@ impl DawUi {
         }
         let output_sample_rate = engine.sample_rate();
         let maximum_seconds = (!full_sample).then_some(5.0);
+        let read_sample_tempo_information = self.read_sample_tempo_information;
+        let project_tempo_bpm = self.tempo_bpm;
         let worker_path = path.clone();
         let (sender, receiver) = mpsc::channel();
         let worker = match thread::Builder::new()
             .name("browser-sample-preview".to_owned())
             .spawn(move || {
                 let result = start_fraction.map_or_else(
-                    || decode_audio_preview(&worker_path, output_sample_rate, maximum_seconds),
+                    || {
+                        if read_sample_tempo_information {
+                            decode_audio_preview_with_tempo(
+                                &worker_path,
+                                output_sample_rate,
+                                maximum_seconds,
+                                project_tempo_bpm,
+                            )
+                        } else {
+                            decode_audio_preview(&worker_path, output_sample_rate, maximum_seconds)
+                        }
+                    },
                     |fraction| {
-                        decode_audio_preview_from_position(
-                            &worker_path,
-                            output_sample_rate,
-                            maximum_seconds,
-                            fraction,
-                        )
+                        if read_sample_tempo_information {
+                            decode_audio_preview_from_position_with_tempo(
+                                &worker_path,
+                                output_sample_rate,
+                                maximum_seconds,
+                                fraction,
+                                project_tempo_bpm,
+                            )
+                        } else {
+                            decode_audio_preview_from_position(
+                                &worker_path,
+                                output_sample_rate,
+                                maximum_seconds,
+                                fraction,
+                            )
+                        }
                     },
                 );
                 let _ = sender.send(result);
@@ -73622,6 +73649,21 @@ impl DawUi {
         {
             self.status = format!("Could not save sample root-note preference: {error}");
         }
+        let sample_tempo_preference_changed = ui
+            .checkbox(
+                &mut self.read_sample_tempo_information,
+                "Read sample tempo information",
+            )
+            .on_hover_text(
+                "Tempo-sync Browser previews of WAVE loops marked for stretching with valid ACID metadata to the project tempo. One-shots are unchanged.",
+            )
+            .changed();
+        if sample_tempo_preference_changed
+            && let Err(error) =
+                save_read_sample_tempo_information(self.read_sample_tempo_information)
+        {
+            self.status = format!("Could not save sample tempo preference: {error}");
+        }
 
         let default_input_id = if self.audio_settings.access == AudioAccess::Exclusive {
             self.audio_catalog.default_exclusive_input_id.as_ref()
@@ -86046,6 +86088,12 @@ fn read_sample_root_note_settings_file() -> Option<PathBuf> {
         .map(|directory| directory.join("read-sample-root-note.txt"))
 }
 
+fn read_sample_tempo_information_settings_file() -> Option<PathBuf> {
+    browser_favorites_file()?
+        .parent()
+        .map(|directory| directory.join("read-sample-tempo-information.txt"))
+}
+
 fn metronome_settings_file() -> Option<PathBuf> {
     browser_favorites_file()?
         .parent()
@@ -86354,6 +86402,25 @@ fn save_read_sample_root_note(enabled: bool) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| "the sample root-note preference path has no parent folder".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    fs::write(&path, format!("{enabled}\n"))
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
+fn load_read_sample_tempo_information() -> bool {
+    read_sample_tempo_information_settings_file()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|contents| contents.trim().parse::<bool>().ok())
+        .unwrap_or(true)
+}
+
+fn save_read_sample_tempo_information(enabled: bool) -> Result<(), String> {
+    let path = read_sample_tempo_information_settings_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the sample tempo preference path has no parent folder".to_owned())?;
     fs::create_dir_all(parent)
         .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
     fs::write(&path, format!("{enabled}\n"))

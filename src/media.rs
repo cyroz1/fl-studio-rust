@@ -18,6 +18,7 @@ use timestretch::{StretchParams, pitch_shift, stretch};
 const FACTORY_DATA_MACRO: &str = "%FLStudioFactoryData%";
 const MAX_DECODED_SAMPLE_BYTES: usize = 512 * 1024 * 1024;
 const MAX_SAMPLE_EDITOR_PROCESSING_SAMPLES: usize = 16 * 1024 * 1024;
+const MAX_BROWSER_TEMPO_SYNC_SAMPLE_COUNT: usize = 32 * 1024 * 1024;
 const WAVEFORM_SPECTRUM_WINDOW: usize = 256;
 const WAVEFORM_SPECTRUM_COLUMNS: usize = 128;
 const WAVEFORM_SPECTRUM_BANDS: usize = 32;
@@ -712,6 +713,8 @@ pub(crate) struct SamplerFileMetadata {
     pub(crate) release_loop_points: Option<(usize, usize)>,
     /// AIFF `INST` loop mode when its release markers resolve to valid frame bounds.
     pub(crate) release_ping_pong_loop: Option<bool>,
+    /// ACID loop tempo when a WAVE `acid` chunk marks a stretch-enabled loop rather than a one-shot.
+    pub(crate) acid_loop_tempo_bpm: Option<f64>,
 }
 
 /// Read standard sampler metadata from a RIFF/WAVE file.
@@ -746,6 +749,7 @@ pub(crate) fn wav_sampler_metadata(path: &Path) -> Option<SamplerFileMetadata> {
     let mut loop_points = None;
     let mut ping_pong_loop = None;
     let mut backward_loop = None;
+    let mut acid_loop_tempo_bpm = None;
     while cursor.checked_add(8)? <= riff_end {
         file.seek(SeekFrom::Start(cursor)).ok()?;
         let mut chunk_header = [0; 8];
@@ -758,6 +762,22 @@ pub(crate) fn wav_sampler_metadata(path: &Path) -> Option<SamplerFileMetadata> {
         }
 
         match &chunk_header[..4] {
+            b"acid" if chunk_size >= 24 && acid_loop_tempo_bpm.is_none() => {
+                file.seek(SeekFrom::Start(body_start)).ok()?;
+                let mut acid = [0; 24];
+                file.read_exact(&mut acid).ok()?;
+                let flags = u32::from_le_bytes(acid[..4].try_into().ok()?);
+                let beat_count = u32::from_le_bytes(acid[12..16].try_into().ok()?);
+                let tempo_bpm = f32::from_le_bytes(acid[20..24].try_into().ok()?);
+                if flags & 1 == 0
+                    && flags & 4 != 0
+                    && beat_count > 0
+                    && tempo_bpm.is_finite()
+                    && (1.0..=1_000.0).contains(&tempo_bpm)
+                {
+                    acid_loop_tempo_bpm = Some(f64::from(tempo_bpm));
+                }
+            }
             b"inst" if chunk_size >= 7 && inst_root_key.is_none() => {
                 file.seek(SeekFrom::Start(body_start)).ok()?;
                 let mut instrument = [0; 7];
@@ -863,12 +883,14 @@ pub(crate) fn wav_sampler_metadata(path: &Path) -> Option<SamplerFileMetadata> {
         backward_loop,
         release_loop_points: None,
         release_ping_pong_loop: None,
+        acid_loop_tempo_bpm,
     };
     (metadata.root_key.is_some()
         || metadata.gain_db.is_some()
         || metadata.key_range.is_some()
         || metadata.velocity_range.is_some()
-        || metadata.loop_points.is_some())
+        || metadata.loop_points.is_some()
+        || metadata.acid_loop_tempo_bpm.is_some())
     .then_some(metadata)
 }
 
@@ -988,6 +1010,7 @@ pub(crate) fn aiff_sampler_metadata(path: &Path) -> Option<SamplerFileMetadata> 
         backward_loop: None,
         release_loop_points,
         release_ping_pong_loop,
+        acid_loop_tempo_bpm: None,
     };
     (metadata.root_key.is_some()
         || metadata.gain_db.is_some()
@@ -1132,6 +1155,168 @@ pub fn decode_audio_preview_from_position(
                 path.display()
             )
         })
+}
+
+/// Decode a Browser preview and match valid WAVE ACID loop metadata to the project tempo.
+/// One-shot samples and files without usable tempo metadata retain their original timing.
+pub fn decode_audio_preview_with_tempo(
+    path: impl AsRef<Path>,
+    output_sample_rate: u32,
+    maximum_seconds: Option<f64>,
+    project_tempo_bpm: f64,
+) -> Result<Vec<f32>, String> {
+    decode_audio_preview_with_tempo_from_position(
+        path,
+        output_sample_rate,
+        maximum_seconds,
+        None,
+        project_tempo_bpm,
+    )
+}
+
+/// Decode a tempo-matched Browser preview from a normalized position in the full source sample.
+pub fn decode_audio_preview_from_position_with_tempo(
+    path: impl AsRef<Path>,
+    output_sample_rate: u32,
+    maximum_seconds: Option<f64>,
+    start_fraction: f64,
+    project_tempo_bpm: f64,
+) -> Result<Vec<f32>, String> {
+    decode_audio_preview_with_tempo_from_position(
+        path,
+        output_sample_rate,
+        maximum_seconds,
+        Some(start_fraction),
+        project_tempo_bpm,
+    )
+}
+
+fn decode_audio_preview_with_tempo_from_position(
+    path: impl AsRef<Path>,
+    output_sample_rate: u32,
+    maximum_seconds: Option<f64>,
+    start_fraction: Option<f64>,
+    project_tempo_bpm: f64,
+) -> Result<Vec<f32>, String> {
+    let path = path.as_ref();
+    let Some(source_tempo_bpm) =
+        wav_sampler_metadata(path).and_then(|metadata| metadata.acid_loop_tempo_bpm)
+    else {
+        return decode_audio_preview_without_tempo_sync(
+            path,
+            output_sample_rate,
+            maximum_seconds,
+            start_fraction,
+        );
+    };
+    if !project_tempo_bpm.is_finite() || !(1.0..=1_000.0).contains(&project_tempo_bpm) {
+        return Err("Browser preview project tempo must be between 1 and 1000 BPM".to_owned());
+    }
+    if !(8_000..=384_000).contains(&output_sample_rate) {
+        return Err("Browser preview output rate must be between 8 kHz and 384 kHz".into());
+    }
+    if maximum_seconds.is_some_and(|seconds| !seconds.is_finite() || seconds <= 0.0) {
+        return Err("Browser preview duration must be finite and greater than zero".into());
+    }
+    if start_fraction
+        .is_some_and(|fraction| !fraction.is_finite() || !(0.0..=1.0).contains(&fraction))
+    {
+        return Err("Browser preview start position must be between 0 and 1".into());
+    }
+
+    let stretch_ratio = source_tempo_bpm / project_tempo_bpm;
+    if (stretch_ratio - 1.0).abs() <= 0.000_001 {
+        return decode_audio_preview_without_tempo_sync(
+            path,
+            output_sample_rate,
+            maximum_seconds,
+            start_fraction,
+        );
+    }
+    let maximum_source_seconds = maximum_seconds.map(|seconds| seconds / stretch_ratio);
+    let audio = decode_audio_file_for_preview(
+        path,
+        if start_fraction.is_some() {
+            None
+        } else {
+            maximum_source_seconds
+        },
+    )?;
+    let source_frames = audio.frame_count();
+    let start_frame = start_fraction
+        .map(|fraction| ((source_frames.saturating_sub(1)) as f64 * fraction).round() as usize)
+        .unwrap_or(0);
+    let source_preview = decoded_audio_to_stereo_samples_from(
+        &audio,
+        output_sample_rate,
+        maximum_source_seconds,
+        start_frame,
+    )
+    .map_err(|error| {
+        format!(
+            "could not prepare tempo-synced sample preview {}: {error}",
+            path.display()
+        )
+    })?;
+    stretch_browser_preview_to_tempo(&source_preview, output_sample_rate, stretch_ratio)
+}
+
+fn decode_audio_preview_without_tempo_sync(
+    path: &Path,
+    output_sample_rate: u32,
+    maximum_seconds: Option<f64>,
+    start_fraction: Option<f64>,
+) -> Result<Vec<f32>, String> {
+    match start_fraction {
+        Some(fraction) => {
+            decode_audio_preview_from_position(path, output_sample_rate, maximum_seconds, fraction)
+        }
+        None => decode_audio_preview(path, output_sample_rate, maximum_seconds),
+    }
+}
+
+fn stretch_browser_preview_to_tempo(
+    interleaved: &[f32],
+    sample_rate: u32,
+    stretch_ratio: f64,
+) -> Result<Vec<f32>, String> {
+    const CHANNEL_COUNT: usize = 2;
+    if !(8_000..=384_000).contains(&sample_rate)
+        || interleaved.is_empty()
+        || !interleaved.len().is_multiple_of(CHANNEL_COUNT)
+        || !stretch_ratio.is_finite()
+        || stretch_ratio <= 0.0
+    {
+        return Err("tempo-synced Browser preview has invalid audio or tempo metadata".to_owned());
+    }
+    let input_sample_count = interleaved.len();
+    if input_sample_count > MAX_BROWSER_TEMPO_SYNC_SAMPLE_COUNT {
+        return Err("tempo-synced Browser preview exceeds its processing limit".to_owned());
+    }
+    let output_frame_count_f64 =
+        ((interleaved.len() / CHANNEL_COUNT) as f64 * stretch_ratio).round();
+    if !output_frame_count_f64.is_finite() || output_frame_count_f64 < 1.0 {
+        return Err(
+            "tempo-synced Browser preview duration is outside the supported range".to_owned(),
+        );
+    }
+    let output_sample_count = (output_frame_count_f64 as usize)
+        .checked_mul(CHANNEL_COUNT)
+        .filter(|count| *count <= MAX_BROWSER_TEMPO_SYNC_SAMPLE_COUNT)
+        .ok_or_else(|| "tempo-synced Browser preview exceeds its processing limit".to_owned())?;
+    let parameters = StretchParams::new(stretch_ratio)
+        .with_sample_rate(sample_rate)
+        .with_channels(CHANNEL_COUNT as u32);
+    let stretched = stretch(interleaved, &parameters)
+        .map_err(|error| format!("could not tempo-sync Browser preview: {error}"))?;
+    if stretched.len() != output_sample_count {
+        return Err("tempo-sync engine returned an unexpected preview duration".to_owned());
+    }
+    let mut stretched = stretched;
+    for sample in &mut stretched {
+        *sample = finite_sample(*sample);
+    }
+    Ok(stretched)
 }
 
 fn decoded_audio_to_stereo_samples(
@@ -2013,6 +2198,28 @@ mod tests {
         bytes
     }
 
+    fn pcm16_wav_with_acid_fixture(
+        flags: u32,
+        beat_count: u32,
+        tempo_bpm: f32,
+        frame_count: usize,
+    ) -> Vec<u8> {
+        let mut format = Vec::new();
+        format.extend_from_slice(&1u16.to_le_bytes());
+        format.extend_from_slice(&1u16.to_le_bytes());
+        format.extend_from_slice(&8_000u32.to_le_bytes());
+        format.extend_from_slice(&16_000u32.to_le_bytes());
+        format.extend_from_slice(&2u16.to_le_bytes());
+        format.extend_from_slice(&16u16.to_le_bytes());
+
+        let mut acid = [0u8; 24];
+        acid[..4].copy_from_slice(&flags.to_le_bytes());
+        acid[12..16].copy_from_slice(&beat_count.to_le_bytes());
+        acid[20..24].copy_from_slice(&tempo_bpm.to_le_bytes());
+        let data = vec![0u8; frame_count * 2];
+        wave_with_sampler_chunks(&[("fmt ", &format), ("acid", &acid), ("data", &data)])
+    }
+
     #[test]
     fn writes_selected_audio_frames_to_a_new_interleaved_float_wav() {
         let root = fixture_root();
@@ -2676,6 +2883,56 @@ mod tests {
         );
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reads_only_valid_acid_loop_tempo_metadata() {
+        let root = fixture_root();
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("acid-loop.wav");
+
+        let cases: [(u32, u32, f32, Option<f64>); 5] = [
+            (4, 4, 120.0, Some(120.0)),
+            (5, 4, 120.0, None),
+            (0, 4, 120.0, None),
+            (0, 0, 120.0, None),
+            (0, 4, f32::NAN, None),
+        ];
+        for (flags, beats, tempo, expected) in cases {
+            fs::write(
+                &path,
+                pcm16_wav_with_acid_fixture(flags, beats, tempo, 8_000),
+            )
+            .unwrap();
+            assert_eq!(
+                wav_sampler_metadata(&path).and_then(|metadata| metadata.acid_loop_tempo_bpm),
+                expected
+            );
+        }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn browser_preview_syncs_acid_loops_and_leaves_one_shots_untouched() {
+        let root = fixture_root();
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("acid-loop.wav");
+        fs::write(&path, pcm16_wav_with_acid_fixture(4, 4, 100.0, 8_000)).unwrap();
+
+        let synced = decode_audio_preview_with_tempo(&path, 8_000, None, 200.0).unwrap();
+        assert_eq!(synced.len(), 4_000 * 2);
+
+        let from_position =
+            decode_audio_preview_from_position_with_tempo(&path, 8_000, Some(0.25), 0.25, 200.0)
+                .unwrap();
+        assert_eq!(from_position.len(), 2_000 * 2);
+
+        fs::write(&path, pcm16_wav_with_acid_fixture(5, 4, 100.0, 8_000)).unwrap();
+        let one_shot = decode_audio_preview_with_tempo(&path, 8_000, None, 200.0).unwrap();
+        assert_eq!(one_shot.len(), 8_000 * 2);
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
