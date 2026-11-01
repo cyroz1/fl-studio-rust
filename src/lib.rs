@@ -4475,6 +4475,7 @@ pub(crate) struct MixerSourceInsertRoutePath {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct MixerSourceRoutePlan {
     pub(crate) output_transform: MixerSourceRouteTransform,
+    pub(crate) manual_pdc_offsets_ms_by_track: Vec<(usize, f32)>,
     pub(crate) ordered_output_paths: Vec<MixerSourceRoutePath>,
     pub(crate) insert_meter_transforms: Vec<(usize, MixerSourceRouteTransform)>,
     pub(crate) insert_effect_input_transforms: Vec<(usize, MixerSourceRouteTransform)>,
@@ -4493,6 +4494,7 @@ pub(crate) struct MixerInsertPdcPlan {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct MixerLiveSourceRoutePlan {
     pub(crate) track: usize,
+    pub(crate) manual_pdc_offsets_ms_by_track: Vec<(usize, f32)>,
     pub(crate) source_transform: MixerSourceRouteTransform,
     pub(crate) saved_fader_gain: f32,
     pub(crate) saved_pan_raw: Option<i32>,
@@ -4682,6 +4684,16 @@ impl MixerRouteAudibility {
                     .unwrap_or_default()
             })
             .collect()
+    }
+
+    fn manual_pdc_offsets_by_track(&self) -> Vec<(usize, f32)> {
+        let mut offsets = self
+            .source_manual_pdc_ms
+            .iter()
+            .map(|(track, offset_ms)| (*track as usize, *offset_ms))
+            .collect::<Vec<_>>();
+        offsets.sort_unstable_by_key(|(track, _)| *track);
+        offsets
     }
 
     /// Returns Mixer tracks that remain audible for current solo and mute-lock flags and
@@ -5065,6 +5077,7 @@ impl MixerRouteAudibility {
 
         Some(MixerLiveSourceRoutePlan {
             track: track as usize,
+            manual_pdc_offsets_ms_by_track: self.manual_pdc_offsets_by_track(),
             source_transform: source_transform_without_live_controls,
             saved_fader_gain: saved_fader_raw.map_or(1.0, mixer_fader_gain),
             saved_pan_raw: source_transform.mixer_pan_raw,
@@ -5222,6 +5235,7 @@ impl MixerRouteAudibility {
         MixerLiveSourceRouteData {
             route_plan: MixerSourceRoutePlan {
                 output_transform,
+                manual_pdc_offsets_ms_by_track: self.manual_pdc_offsets_by_track(),
                 ordered_output_paths,
                 insert_meter_transforms: insert_meter_transforms.into_iter().collect(),
                 insert_effect_input_transforms: insert_effect_input_transforms
@@ -5453,9 +5467,18 @@ impl MixerRouteAudibility {
     pub(crate) fn source_route_plan_for_channel(&self, route: Option<i8>) -> MixerSourceRoutePlan {
         let Some(track) = route.filter(|track| *track > 0 && self.known_tracks.contains(track))
         else {
+            let ordered_output_paths = (route.is_none() || route == Some(0))
+                .then(|| MixerSourceRoutePath {
+                    transform: MixerSourceRouteTransform::default(),
+                    track_path: Vec::new(),
+                    manual_pdc_offsets_ms: Vec::new(),
+                })
+                .into_iter()
+                .collect();
             return MixerSourceRoutePlan {
                 output_transform: MixerSourceRouteTransform::default(),
-                ordered_output_paths: Vec::new(),
+                manual_pdc_offsets_ms_by_track: self.manual_pdc_offsets_by_track(),
+                ordered_output_paths,
                 insert_meter_transforms: Vec::new(),
                 insert_effect_input_transforms: Vec::new(),
                 ordered_insert_meter_paths: Vec::new(),
@@ -5468,6 +5491,7 @@ impl MixerRouteAudibility {
             );
             return MixerSourceRoutePlan {
                 output_transform: transform,
+                manual_pdc_offsets_ms_by_track: self.manual_pdc_offsets_by_track(),
                 ordered_output_paths: vec![MixerSourceRoutePath {
                     transform,
                     track_path: vec![track as usize],
@@ -5514,6 +5538,7 @@ impl MixerRouteAudibility {
         );
         MixerSourceRoutePlan {
             output_transform: output,
+            manual_pdc_offsets_ms_by_track: self.manual_pdc_offsets_by_track(),
             ordered_output_paths,
             insert_meter_transforms: insert_meter_transforms.into_iter().collect(),
             insert_effect_input_transforms: insert_effect_input_transforms.into_iter().collect(),
