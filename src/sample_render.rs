@@ -13233,14 +13233,31 @@ struct SamplerFilterConfig {
     cutoff_raw: u32,
     resonance_raw: u32,
     filter_type_raw: u32,
+    mod_x_envelope: Option<SamplerVolumeEnvelope>,
+    mod_y_envelope: Option<SamplerVolumeEnvelope>,
     mod_x_lfo: Option<SamplerLfo>,
     mod_y_lfo: Option<SamplerLfo>,
 }
 
 impl SamplerFilterConfig {
     fn needs_tempo_map(self) -> bool {
-        self.mod_x_lfo.is_some_and(SamplerLfo::needs_tempo_map)
+        self.mod_x_envelope
+            .is_some_and(SamplerVolumeEnvelope::uses_tempo_sync)
+            || self
+                .mod_y_envelope
+                .is_some_and(SamplerVolumeEnvelope::uses_tempo_sync)
+            || self.mod_x_lfo.is_some_and(SamplerLfo::needs_tempo_map)
             || self.mod_y_lfo.is_some_and(SamplerLfo::needs_tempo_map)
+    }
+
+    fn needs_tempo_synced_envelope_release(self) -> bool {
+        self.mod_x_envelope
+            .and_then(SamplerVolumeEnvelope::tick_times)
+            .is_some_and(|times| times.release > 0.0)
+            || self
+                .mod_y_envelope
+                .and_then(SamplerVolumeEnvelope::tick_times)
+                .is_some_and(|times| times.release > 0.0)
     }
 }
 
@@ -13253,6 +13270,18 @@ fn sampler_filter_config(
         cutoff_raw: channel.sampler_filter_cutoff_raw()?,
         resonance_raw: channel.sampler_filter_resonance_raw()?,
         filter_type_raw: channel.sampler_filter_type_raw()?,
+        mod_x_envelope: sampler_envelope_config(
+            channel,
+            SamplerEnvelopeLfoTarget::ModX,
+            sample_rate,
+            ppq,
+        ),
+        mod_y_envelope: sampler_envelope_config(
+            channel,
+            SamplerEnvelopeLfoTarget::ModY,
+            sample_rate,
+            ppq,
+        ),
         mod_x_lfo: sampler_lfo_config(channel, SamplerEnvelopeLfoTarget::ModX, sample_rate, ppq),
         mod_y_lfo: sampler_lfo_config(channel, SamplerEnvelopeLfoTarget::ModY, sample_rate, ppq),
     };
@@ -13332,12 +13361,27 @@ impl SamplerFilterState {
             left_second: SamplerFilterStageState::default(),
             right_second: SamplerFilterStageState::default(),
         };
-        state.update_modulation(started_frame, started_frame, started_tick, started_tick);
-        if !state.active && config.mod_x_lfo.is_none() && config.mod_y_lfo.is_none() {
-            None
-        } else {
-            Some(state)
+        state.update_modulation(
+            started_frame,
+            started_frame,
+            started_tick,
+            started_tick,
+            None,
+            None,
+        );
+        if !state.active
+            && config.mod_x_lfo.is_none()
+            && config.mod_y_lfo.is_none()
+            && config.mod_x_envelope.is_none()
+            && config.mod_y_envelope.is_none()
+        {
+            return None;
         }
+        Some(state)
+    }
+
+    fn needs_tempo_synced_envelope_release(&self) -> bool {
+        self.config.needs_tempo_synced_envelope_release()
     }
 
     fn update_modulation(
@@ -13346,17 +13390,39 @@ impl SamplerFilterState {
         frame: u64,
         started_tick: Option<f64>,
         current_tick: Option<f64>,
+        release_start_frame: Option<u64>,
+        release_start_tick: Option<f64>,
     ) {
-        let mod_x = sampler_filter_lfo_modulation(
+        let mod_x = sampler_filter_envelope_modulation(
             self.note_mod_x,
+            self.config.mod_x_envelope,
+            started_frame,
+            frame,
+            started_tick,
+            current_tick,
+            release_start_frame,
+            release_start_tick,
+        );
+        let mod_x = sampler_filter_lfo_modulation(
+            mod_x,
             self.config.mod_x_lfo,
             started_frame,
             frame,
             started_tick,
             current_tick,
         );
-        let mod_y = sampler_filter_lfo_modulation(
+        let mod_y = sampler_filter_envelope_modulation(
             self.note_mod_y,
+            self.config.mod_y_envelope,
+            started_frame,
+            frame,
+            started_tick,
+            current_tick,
+            release_start_frame,
+            release_start_tick,
+        );
+        let mod_y = sampler_filter_lfo_modulation(
+            mod_y,
             self.config.mod_y_lfo,
             started_frame,
             frame,
@@ -13476,6 +13542,55 @@ fn sampler_filter_coefficients(
         _ => None,
     };
     Some((first, second))
+}
+
+fn sampler_filter_envelope_modulation(
+    note_value: u8,
+    envelope: Option<SamplerVolumeEnvelope>,
+    started_frame: u64,
+    frame: u64,
+    started_tick: Option<f64>,
+    current_tick: Option<f64>,
+    release_start_frame: Option<u64>,
+    release_start_tick: Option<f64>,
+) -> u8 {
+    let Some(envelope) = envelope else {
+        return note_value;
+    };
+    let level = release_start_frame.map_or_else(
+        || envelope.level_at_frame(started_frame, frame, started_tick, current_tick),
+        |release_start_frame| {
+            let release_start_level = envelope.level_at_frame(
+                started_frame,
+                release_start_frame,
+                started_tick,
+                release_start_tick,
+            );
+            let tick_progress =
+                release_start_tick
+                    .zip(current_tick)
+                    .and_then(|(start_tick, current_tick)| {
+                        envelope.release_progress_at_tick(start_tick, current_tick)
+                    });
+            let release_frames = usize::try_from(envelope.frame_times().release)
+                .unwrap_or(usize::MAX)
+                .max(1);
+            let elapsed = frame.saturating_sub(release_start_frame);
+            let frame_progress = if release_frames <= 1 {
+                1.0
+            } else {
+                (elapsed as f32 / (release_frames - 1) as f32).clamp(0.0, 1.0)
+            };
+            let progress = tick_progress.unwrap_or_else(|| {
+                sampler_envelope_tension_curve(frame_progress, envelope.release_tension)
+            });
+            release_start_level * (1.0 - progress)
+        },
+    );
+    // Candidate interpretation: envelope amount scales motion around neutral Mod X/Mod Y value.
+    (f32::from(note_value) + envelope.amount * (level - 1.0) * 128.0)
+        .round()
+        .clamp(0.0, 255.0) as u8
 }
 
 fn sampler_filter_lfo_modulation(
@@ -17845,6 +17960,8 @@ impl<'a> SamplerVoiceEngine<'a> {
                             frame,
                             voice.started_tick,
                             current_tick,
+                            voice.envelope_release_start_frame,
+                            voice.envelope_release_start_tick,
                         );
                         let left = filter.process_left(left);
                         let right = if mono_source {
@@ -18767,16 +18884,23 @@ fn begin_sampler_voice_release(
     voice.note_slide = None;
     voice.envelope_release_start_frame = Some(start_frame);
     voice.envelope_release_start_gain = envelope_start_gain;
+    let volume_tick_synced_release = voice
+        .volume_envelope
+        .and_then(SamplerVolumeEnvelope::tick_times)
+        .is_some_and(|times| times.release > 0.0)
+        && start_tick.is_some();
+    let filter_tick_synced_release = voice
+        .sampler_filter
+        .as_ref()
+        .is_some_and(SamplerFilterState::needs_tempo_synced_envelope_release)
+        && start_tick.is_some();
+    voice.envelope_release_start_tick = (volume_tick_synced_release || filter_tick_synced_release)
+        .then_some(start_tick)
+        .flatten();
     if voice.volume_envelope_enabled {
         let envelope_release_frames =
             sampler_envelope_release_frames(voice.volume_envelope, release_frames);
-        let tick_synced_release = voice
-            .volume_envelope
-            .and_then(SamplerVolumeEnvelope::tick_times)
-            .is_some_and(|times| times.release > 0.0)
-            && start_tick.is_some();
-        voice.envelope_release_start_tick = tick_synced_release.then_some(start_tick).flatten();
-        if tick_synced_release {
+        if volume_tick_synced_release {
             voice.release_remaining = Some(usize::MAX);
             voice.release_total_frames = None;
         } else {
@@ -20431,7 +20555,16 @@ fn sampler_volume_envelope_config(
     sample_rate: u32,
     ppq: u16,
 ) -> Option<SamplerVolumeEnvelope> {
-    let envelope = channel.sampler_volume_envelope()?;
+    sampler_envelope_config(channel, SamplerEnvelopeLfoTarget::Volume, sample_rate, ppq)
+}
+
+fn sampler_envelope_config(
+    channel: &ChannelSummary,
+    target: SamplerEnvelopeLfoTarget,
+    sample_rate: u32,
+    ppq: u16,
+) -> Option<SamplerVolumeEnvelope> {
+    let envelope = channel.sampler_envelope_lfo(target)?;
     if !envelope.enabled() {
         return None;
     }
@@ -24934,6 +25067,8 @@ mod tests {
                 cutoff_raw: 128,
                 resonance_raw: 0,
                 filter_type_raw,
+                mod_x_envelope: None,
+                mod_y_envelope: None,
                 mod_x_lfo: None,
                 mod_y_lfo: None,
             },
@@ -24966,6 +25101,8 @@ mod tests {
                     cutoff_raw: 256,
                     resonance_raw: 0,
                     filter_type_raw: 1,
+                    mod_x_envelope: None,
+                    mod_y_envelope: None,
                     mod_x_lfo: None,
                     mod_y_lfo: None,
                 },
@@ -24999,6 +25136,8 @@ mod tests {
             cutoff_raw: 256,
             resonance_raw: 0,
             filter_type_raw: 1,
+            mod_x_envelope: None,
+            mod_y_envelope: None,
             mod_x_lfo: None,
             mod_y_lfo: None,
         };
@@ -25008,6 +25147,73 @@ mod tests {
         assert!(
             SamplerFilterState::new_for_note(default_filter, 48_000, 0, 128, 0, None).is_some()
         );
+    }
+
+    #[test]
+    fn sampler_filter_envelopes_modulate_from_attack_through_release() {
+        let envelope = SamplerVolumeEnvelope {
+            timing: SamplerEnvelopeTiming::Frames(SamplerEnvelopeFrameTimes {
+                predelay: 0,
+                attack: 4,
+                hold: 0,
+                decay: 0,
+                release: 4,
+            }),
+            sustain_level: 1.0,
+            amount: 1.0,
+            attack_tension: 0,
+            decay_tension: 0,
+            release_tension: 0,
+        };
+
+        assert_eq!(
+            sampler_filter_envelope_modulation(128, Some(envelope), 0, 0, None, None, None, None),
+            0
+        );
+        assert_eq!(
+            sampler_filter_envelope_modulation(128, Some(envelope), 0, 2, None, None, None, None),
+            64
+        );
+        assert_eq!(
+            sampler_filter_envelope_modulation(128, Some(envelope), 0, 4, None, None, None, None),
+            128
+        );
+        assert_eq!(
+            sampler_filter_envelope_modulation(
+                128,
+                Some(envelope),
+                0,
+                7,
+                None,
+                None,
+                Some(4),
+                None
+            ),
+            0
+        );
+
+        let mut filter = SamplerFilterState::new_for_note(
+            SamplerFilterConfig {
+                cutoff_raw: 256,
+                resonance_raw: 0,
+                filter_type_raw: 1,
+                mod_x_envelope: Some(envelope),
+                mod_y_envelope: None,
+                mod_x_lfo: None,
+                mod_y_lfo: None,
+            },
+            48_000,
+            128,
+            128,
+            0,
+            None,
+        )
+        .expect("the enabled Mod X envelope should keep the filter state present");
+        assert_eq!(filter.current_modulated_raw, Some((0, 0)));
+        filter.update_modulation(0, 4, None, None, None, None);
+        assert_eq!(filter.current_modulated_raw, Some((256, 0)));
+        filter.update_modulation(0, 7, None, None, Some(4), None);
+        assert_eq!(filter.current_modulated_raw, Some((0, 0)));
     }
 
     #[test]
@@ -25027,6 +25233,8 @@ mod tests {
                 cutoff_raw: 128,
                 resonance_raw: 64,
                 filter_type_raw: 1,
+                mod_x_envelope: None,
+                mod_y_envelope: None,
                 mod_x_lfo: Some(lfo),
                 mod_y_lfo: Some(lfo),
             },
@@ -25039,9 +25247,9 @@ mod tests {
         .expect("the active Mod X LFO should keep the filter state present");
 
         assert_eq!(filter.current_modulated_raw, Some((128, 64)));
-        filter.update_modulation(0, 1, None, None);
+        filter.update_modulation(0, 1, None, None, None, None);
         assert_eq!(filter.current_modulated_raw, Some((256, 256)));
-        filter.update_modulation(0, 3, None, None);
+        filter.update_modulation(0, 3, None, None, None, None);
         assert_eq!(filter.current_modulated_raw, Some((0, 0)));
         assert!(filter.process_left(1.0).is_finite());
     }
@@ -25054,6 +25262,8 @@ mod tests {
                     cutoff_raw: 192,
                     resonance_raw: 224,
                     filter_type_raw,
+                    mod_x_envelope: None,
+                    mod_y_envelope: None,
                     mod_x_lfo: None,
                     mod_y_lfo: None,
                 },
