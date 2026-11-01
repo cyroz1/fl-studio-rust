@@ -2199,6 +2199,7 @@ def _install_modules(script_name, device_name):
     ui.isPrecountEnabled = lambda: bool(
         _active_transport_state.get("recording_precount_enabled", False)
     )
+    ui.getHintValue = lambda value, maximum: f"{value / maximum:.0%}"
 
     playlist = _module("playlist")
     playlist.trackCount = _playlist_track_count
