@@ -10782,9 +10782,7 @@ impl DawUi {
                 .pattern_vst3_mixer_effect_parameter_automations_for_playlist(document),
             ..Vst3PlaylistAutomationSources::default()
         };
-        let Some(project_path) = self.current_path.as_deref() else {
-            return sources;
-        };
+        let project_path = self.current_path.as_deref();
         let Ok(automation_channels) = document.automation_channels() else {
             return sources;
         };
@@ -10908,11 +10906,11 @@ impl DawUi {
                 }
             }
         }
-        for link in self
-            .playlist_vst3_parameter_links
-            .iter()
-            .filter(|link| project_paths_equal(Path::new(&link.project_path), project_path))
-        {
+        for link in self.playlist_vst3_parameter_links.iter().filter(|link| {
+            project_path.is_some_and(|project_path| {
+                project_paths_equal(Path::new(&link.project_path), project_path)
+            })
+        }) {
             let Some(automation_channel) = automation_channels
                 .get(&link.automation_channel_id)
                 .copied()
@@ -10955,7 +10953,11 @@ impl DawUi {
         for link in self
             .playlist_vst3_mixer_effect_parameter_links
             .iter()
-            .filter(|link| project_paths_equal(Path::new(&link.project_path), project_path))
+            .filter(|link| {
+                project_path.is_some_and(|project_path| {
+                    project_paths_equal(Path::new(&link.project_path), project_path)
+                })
+            })
         {
             let Some(automation_channel) = automation_channels
                 .get(&link.automation_channel_id)
@@ -11059,8 +11061,9 @@ impl DawUi {
             .playlist_clap_mixer_effect_parameter_links
             .iter()
             .filter(|link| {
-                project_paths_equal(Path::new(&link.project_path), project_path)
-                    && valid_playlist_clap_mixer_effect_parameter_link(link)
+                project_path.is_some_and(|project_path| {
+                    project_paths_equal(Path::new(&link.project_path), project_path)
+                }) && valid_playlist_clap_mixer_effect_parameter_link(link)
             })
         {
             let Some(automation_channel) = automation_channels
@@ -24763,15 +24766,14 @@ impl DawUi {
         plugin_path: &Path,
         plugin_id: &str,
     ) -> Result<ClapParameterAutomationPoints, String> {
-        let Some(project_path) = self.current_path.as_deref() else {
-            return Ok(BTreeMap::new());
-        };
+        let project_path = self.current_path.as_deref();
         let links = self
             .playlist_clap_parameter_links
             .iter()
             .filter(|link| {
-                project_paths_equal(Path::new(&link.project_path), project_path)
-                    && link.project_channel_id == channel_id
+                project_path.is_some_and(|project_path| {
+                    project_paths_equal(Path::new(&link.project_path), project_path)
+                }) && link.project_channel_id == channel_id
                     && Path::new(&link.plugin_path) == plugin_path
                     && link.plugin_id == plugin_id
             })
