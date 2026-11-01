@@ -1143,16 +1143,6 @@ impl MidiScriptRuntime {
                     .transport_state
                     .hardware_beat_led_state
                     .load(Ordering::Relaxed),
-                "metronome_enabled": self
-                    .transport_state
-                    .metronome_enabled
-                    .load(Ordering::Relaxed)
-                    != 0,
-                "recording_precount_enabled": self
-                    .transport_state
-                    .recording_precount_enabled
-                    .load(Ordering::Relaxed)
-                    != 0,
                 "song_position_hint": song_position_hint,
                 "song_length_hint": song_length_hint,
                 "arrangement_marker_names": arrangement_marker_names,
@@ -1200,6 +1190,22 @@ impl MidiScriptRuntime {
                 "project_genre": project_genre,
             });
             if let Some(transport_object) = transport.as_object_mut() {
+                transport_object.insert(
+                    "metronome_enabled".to_owned(),
+                    json!(self
+                        .transport_state
+                        .metronome_enabled
+                        .load(Ordering::Relaxed)
+                        != 0),
+                );
+                transport_object.insert(
+                    "recording_precount_enabled".to_owned(),
+                    json!(self
+                        .transport_state
+                        .recording_precount_enabled
+                        .load(Ordering::Relaxed)
+                        != 0),
+                );
                 transport_object.insert(
                     "playlist_track_count".to_owned(),
                     json!(playlist_track_count),
