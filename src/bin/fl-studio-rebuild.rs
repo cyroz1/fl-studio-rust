@@ -120,8 +120,8 @@ use flp_rebuild::{
     QuantizeNoteOptions, RandomNoteChordMap, RandomNoteGeneratorOptions, RandomizerOptions,
     RiffMachineOptions, RiffMachineQuantizeMode, RiffMachineStage, SamplerEnvelopeLfo,
     SamplerEnvelopeLfoEdit, SamplerEnvelopeLfoTarget, ScaleLevelsOptions, StrumOptions, TimeMarker,
-    TimeMarkerEdit, VstPluginStateMetadata, automation_value_for_target_range,
-    normalized_automation_point_value,
+    TimeMarkerEdit, VstPluginStateMetadata, automation_segment_value_with_tension,
+    automation_value_for_target_range, normalized_automation_point_value,
 };
 use md5::{Digest, Md5};
 use vst3_host::midi::{MidiChannel as Vst3MidiChannel, MidiEvent as Vst3MidiEvent};
@@ -24493,7 +24493,9 @@ impl DawUi {
                     clip,
                     document.header().ppq(),
                 )?;
-                for (point_index, point) in expanded.into_iter().enumerate() {
+                let tick_step = u64::from(document.header().ppq()).div_ceil(16).max(1);
+                let mut sampled_points = Vec::new();
+                if let Some(first) = expanded.first() {
                     expanded_point_count = expanded_point_count
                         .checked_add(1)
                         .filter(|count| *count <= MAX_CLAP_PARAMETER_AUTOMATION_POINTS)
@@ -24502,21 +24504,50 @@ impl DawUi {
                                 "CLAP Playlist Automation exceeds {MAX_CLAP_PARAMETER_AUTOMATION_POINTS} points"
                             )
                         })?;
+                    sampled_points.push((first.tick, first.value));
+                }
+                for pair in expanded.windows(2) {
+                    let from = &pair[0];
+                    let to = &pair[1];
+                    let duration = to.tick.saturating_sub(from.tick);
+                    let steps = duration.div_ceil(tick_step).max(1);
+                    for step in 1..=steps {
+                        expanded_point_count = expanded_point_count
+                            .checked_add(1)
+                            .filter(|count| *count <= MAX_CLAP_PARAMETER_AUTOMATION_POINTS)
+                            .ok_or_else(|| {
+                                format!(
+                                    "CLAP Playlist Automation exceeds {MAX_CLAP_PARAMETER_AUTOMATION_POINTS} points"
+                                )
+                            })?;
+                        let fraction = step as f64 / steps as f64;
+                        let offset = duration.saturating_mul(step) / steps;
+                        sampled_points.push((
+                            from.tick.saturating_add(offset),
+                            automation_segment_value_with_tension(
+                                Self::automation_value_for_normalized_target(
+                                    automation_channel,
+                                    from.value,
+                                ),
+                                Self::automation_value_for_normalized_target(
+                                    automation_channel,
+                                    to.value,
+                                ),
+                                fraction,
+                                to.tension,
+                            ),
+                        ));
+                    }
+                }
+                for (point_index, (relative_tick, value)) in sampled_points.into_iter().enumerate()
+                {
                     let tick = u64::from(clip.position_ticks)
-                        .checked_add(point.tick)
+                        .checked_add(relative_tick)
                         .ok_or_else(|| "CLAP Playlist automation position overflow".to_owned())?;
                     points_by_parameter
                         .entry(link.parameter_id)
                         .or_default()
-                        .push((
-                            tick,
-                            clip_index,
-                            point_index,
-                            Self::automation_value_for_normalized_target(
-                                automation_channel,
-                                point.value,
-                            ),
-                        ));
+                        .push((tick, clip_index, point_index, value));
                 }
             }
         }
