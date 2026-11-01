@@ -2341,6 +2341,11 @@ def _dispatch(namespace, value):
         if callback is not None:
             callback(int(value["beat_indicator"]))
         return {"handled": False, "actions": _active_transport_actions}
+    if "display_zone" in value:
+        callback = namespace.get("OnDisplayZone")
+        if callback is not None:
+            callback()
+        return {"handled": False, "actions": _active_transport_actions}
     if value.get("first_connect"):
         callback = namespace.get("OnFirstConnect")
         if callback is not None:

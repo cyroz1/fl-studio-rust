@@ -5212,6 +5212,7 @@ struct DawUi {
     playlist_pending_scroll_offset: Option<Vec2>,
     playlist_grid_viewport: Option<egui::Rect>,
     playlist_grid_scroll_offset: Vec2,
+    last_midi_script_display_zone: Option<(u32, u32)>,
     playlist_time_selection_drag: Option<(u16, u32)>,
     step_sequencer_bar: u32,
     channel_rack_mute_removed_steps: bool,
@@ -8003,6 +8004,7 @@ impl DawUi {
             playlist_pending_scroll_offset: None,
             playlist_grid_viewport: None,
             playlist_grid_scroll_offset: Vec2::ZERO,
+            last_midi_script_display_zone: None,
             playlist_time_selection_drag: None,
             step_sequencer_bar: 0,
             channel_rack_mute_removed_steps,
@@ -9465,6 +9467,36 @@ impl DawUi {
             .as_ref()
             .and_then(|connection| connection.notify_script_beat_indicator(value))
             .unwrap_or(true)
+    }
+
+    fn notify_midi_script_display_zone_if_changed(&mut self) {
+        let Some(viewport) = self.playlist_grid_viewport else {
+            return;
+        };
+        let zoom = self.timeline_zoom.max(0.001);
+        let visible_left = self.playlist_grid_scroll_offset.x.max(PLAYLIST_LABEL_WIDTH);
+        let visible_right = self.playlist_grid_scroll_offset.x + viewport.width();
+        let start_tick = ((visible_left - PLAYLIST_LABEL_WIDTH) / zoom)
+            .floor()
+            .clamp(0.0, u32::MAX as f32) as u32;
+        let end_tick = ((visible_left - PLAYLIST_LABEL_WIDTH
+            + (visible_right - visible_left).max(0.0))
+            / zoom)
+            .ceil()
+            .clamp(0.0, u32::MAX as f32) as u32;
+        let zone = (start_tick, end_tick);
+        if self.last_midi_script_display_zone == Some(zone) {
+            return;
+        }
+        if !self
+            .midi_input_connection
+            .as_ref()
+            .and_then(|connection| connection.notify_script_display_zone())
+            .unwrap_or(true)
+        {
+            return;
+        }
+        self.last_midi_script_display_zone = Some(zone);
     }
 
     fn load_project_from(
@@ -33063,6 +33095,7 @@ impl DawUi {
         });
         self.playlist_grid_viewport = Some(scroll_output.inner_rect);
         self.playlist_grid_scroll_offset = scroll_output.state.offset;
+        self.notify_midi_script_display_zone_if_changed();
 
         if let Some((path, arrangement_id, position_ticks, track_index)) = dropped_playlist_audio {
             self.queue_playlist_audio_drop(
@@ -63827,6 +63860,7 @@ impl DawUi {
     }
 
     fn connect_selected_midi_input(&mut self) {
+        self.last_midi_script_display_zone = None;
         let Some(device_id) = self.midi_selected_input_id.clone() else {
             self.status = "Select a MIDI input device first".to_owned();
             return;
@@ -63926,6 +63960,7 @@ impl DawUi {
     }
 
     fn disconnect_midi_input(&mut self) {
+        self.last_midi_script_display_zone = None;
         self.finish_midi_script_transport_move();
         self.release_all_midi_performance_clips();
         self.stop_live_sampler_input_for_device_change();

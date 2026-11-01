@@ -773,6 +773,15 @@ impl MidiScriptRuntime {
         })
     }
 
+    pub fn process_display_zone(&mut self) -> Result<ScriptMidiResult, String> {
+        let response = self.exchange(&json!({"display_zone": true}))?;
+        Ok(ScriptMidiResult {
+            handled: false,
+            bytes: Vec::new(),
+            actions: parse_transport_actions(&response)?,
+        })
+    }
+
     pub fn process_first_connect(&mut self) -> Result<ScriptMidiResult, String> {
         let response = self.exchange(&json!({"first_connect": true}))?;
         Ok(ScriptMidiResult {
