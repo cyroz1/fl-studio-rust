@@ -74,7 +74,8 @@ use flp_rebuild::sample_render::{
     playlist_performance_static_document_with_vst3_and_clap, playlist_performance_vst3_channel_ids,
     playlist_performance_vst3_clip_indices_with_clap, process_recording_precount_through_mixer,
     project_channel_stereo_output_gains_with_layer_adjustments, render_audio_clips_to_file,
-    render_pattern_mix_to_file, render_playlist_mixer_stems_with_vst3_cancellable,
+    render_pattern_mix_to_file, render_pattern_mixer_stems,
+    render_playlist_mixer_stems_with_vst3_cancellable,
     render_playlist_with_vst3_to_file_from_frame_cancellable,
     render_playlist_with_vst3_to_flac_cancellable, render_playlist_with_vst3_to_mp3_cancellable,
     render_playlist_with_vst3_to_ogg_cancellable, render_playlist_with_vst3_to_wav_cancellable,
@@ -5853,6 +5854,7 @@ struct PendingClapPatternRender {
     insert_placement: Option<PendingPatternRenderPlacement>,
     full_mix: Option<PendingFullPatternMix>,
     is_full_mix: bool,
+    is_mixer_stems: bool,
     write_receiver: Option<Receiver<Result<u64, String>>>,
     write_worker: Option<thread::JoinHandle<()>>,
 }
@@ -43847,6 +43849,7 @@ impl DawUi {
         let mut render_clap_pattern_requested = false;
         let mut render_insert_clap_pattern_requested = false;
         let mut render_full_pattern_mix_requested = false;
+        let mut render_pattern_mixer_stems_requested = false;
         let mut render_insert_full_pattern_mix_requested = false;
         let mut preview_requested = false;
         let mut chord_preview_requested = false;
@@ -46302,6 +46305,19 @@ impl DawUi {
                     render_full_pattern_mix_requested = true;
                     ui.close();
                 }
+                if ui
+                    .add_enabled(
+                        can_render_full_pattern_mix,
+                        egui::Button::new("Render full Pattern Mixer stems…"),
+                    )
+                    .on_hover_text(
+                        "Render each supported Mixer insert bus and the final Master mix for this Pattern",
+                    )
+                    .clicked()
+                {
+                    render_pattern_mixer_stems_requested = true;
+                    ui.close();
+                }
                 let can_insert_full_pattern_mix = can_render_full_pattern_mix
                     && self.document.as_ref().is_some_and(|document| {
                         project_has_audio_clip_template(document)
@@ -47472,6 +47488,9 @@ impl DawUi {
         }
         if render_full_pattern_mix_requested {
             self.render_full_pattern_mix_dialog(false);
+        }
+        if render_pattern_mixer_stems_requested {
+            self.render_pattern_mixer_stems_dialog();
         }
         if render_insert_full_pattern_mix_requested {
             self.render_full_pattern_mix_dialog(true);
@@ -49993,6 +50012,19 @@ impl DawUi {
     }
 
     fn render_pattern_mix_dialog(&mut self, insert_into_playlist: bool, full_mix: bool) {
+        self.render_pattern_mix_dialog_with_stems(insert_into_playlist, full_mix, false);
+    }
+
+    fn render_pattern_mixer_stems_dialog(&mut self) {
+        self.render_pattern_mix_dialog_with_stems(false, true, true);
+    }
+
+    fn render_pattern_mix_dialog_with_stems(
+        &mut self,
+        insert_into_playlist: bool,
+        full_mix: bool,
+        mixer_stems: bool,
+    ) {
         if self.pending_clap_pattern_render.is_some() {
             self.status = "A Pattern render is already running".to_owned();
             return;
@@ -50009,7 +50041,7 @@ impl DawUi {
             self.status = "Open a project before rendering Pattern audio".to_owned();
             return;
         };
-        let project_path = if full_mix {
+        let project_path = if full_mix || mixer_stems {
             let Some(project_path) = self.sample_project_path() else {
                 self.status = "Save the project before rendering its full Pattern mix".to_owned();
                 return;
@@ -50078,7 +50110,9 @@ impl DawUi {
         }
 
         let output_format = self.audio_render_output();
-        let output_name = if full_mix && insert_into_playlist {
+        let output_name = if mixer_stems {
+            format!("Pattern_{pattern_id}_Mixer_Stems")
+        } else if full_mix && insert_into_playlist {
             format!("Pattern_{pattern_id}_Full_Mix_Audio_Clip")
         } else if full_mix {
             format!("Pattern_{pattern_id}_Full_Mix")
@@ -50087,21 +50121,28 @@ impl DawUi {
         } else {
             format!("Pattern_{pattern_id}_CLAP_Channels")
         };
-        let Some(output_path) = add_audio_render_file_filter(
+        let output_path = if mixer_stems {
             rfd::FileDialog::new()
-                .set_title(if full_mix && insert_into_playlist {
-                    "Render and insert full Pattern mix"
-                } else if full_mix {
-                    "Render full Pattern mix"
-                } else if insert_into_playlist {
-                    "Render and insert assigned CLAP Pattern channels"
-                } else {
-                    "Render assigned CLAP Pattern channels"
-                })
-                .set_file_name(format!("{output_name}.{}", output_format.extension())),
-            self.playlist_song_output_format,
-        )
-        .save_file() else {
+                .set_title("Render full Pattern Mixer stems")
+                .pick_folder()
+        } else {
+            add_audio_render_file_filter(
+                rfd::FileDialog::new()
+                    .set_title(if full_mix && insert_into_playlist {
+                        "Render and insert full Pattern mix"
+                    } else if full_mix {
+                        "Render full Pattern mix"
+                    } else if insert_into_playlist {
+                        "Render and insert assigned CLAP Pattern channels"
+                    } else {
+                        "Render assigned CLAP Pattern channels"
+                    })
+                    .set_file_name(format!("{output_name}.{}", output_format.extension())),
+                self.playlist_song_output_format,
+            )
+            .save_file()
+        };
+        let Some(output_path) = output_path else {
             return;
         };
         let encoding = AudioRenderEncodingOptions {
@@ -50109,7 +50150,7 @@ impl DawUi {
             wav_dither_mode: self.playlist_render_dither_mode,
             wav_channel_mode: self.playlist_render_channel_mode,
         };
-        let full_mix_job = if full_mix {
+        let full_mix_job = if full_mix || mixer_stems {
             let project_path = project_path.expect("full Pattern renders capture a project path");
             let pattern = match document.patterns() {
                 Ok(patterns) => match patterns
@@ -50213,6 +50254,7 @@ impl DawUi {
             insert_placement,
             full_mix: full_mix_job,
             is_full_mix: full_mix,
+            is_mixer_stems: mixer_stems,
             write_receiver: None,
             write_worker: None,
         };
@@ -50375,6 +50417,7 @@ impl DawUi {
             return;
         };
         if let Some(full_mix) = pending.full_mix.take() {
+            let is_mixer_stems = pending.is_mixer_stems;
             let audio_layers = pending
                 .audio_layers
                 .drain(..)
@@ -50396,20 +50439,41 @@ impl DawUi {
             let options = full_mix.options;
             let package_workspace = self.package_workspace.clone();
             let worker = thread::Builder::new()
-                .name("full-pattern-mix-render".to_owned())
+                .name(if is_mixer_stems {
+                    "pattern-mixer-stem-render".to_owned()
+                } else {
+                    "full-pattern-mix-render".to_owned()
+                })
                 .spawn(move || {
                     let _package_workspace = package_workspace;
-                    let result = render_pattern_mix_to_file(
-                        &full_mix.document,
-                        &full_mix.project_path,
-                        options,
-                        &output_path,
-                        output_format,
-                        full_mix.processor,
-                        &audio_layers,
-                        &full_mix.clap_audio_channels,
-                        &full_mix.vst3_volume_expression_channels,
-                    )
+                    let result = if is_mixer_stems {
+                        render_pattern_mixer_stems(
+                            &full_mix.document,
+                            &full_mix.project_path,
+                            options,
+                            &output_path,
+                            MixerStemRenderOptions {
+                                include_master: true,
+                                current_track: None,
+                            },
+                            full_mix.processor,
+                            &audio_layers,
+                            &full_mix.clap_audio_channels,
+                            &full_mix.vst3_volume_expression_channels,
+                        )
+                    } else {
+                        render_pattern_mix_to_file(
+                            &full_mix.document,
+                            &full_mix.project_path,
+                            options,
+                            &output_path,
+                            output_format,
+                            full_mix.processor,
+                            &audio_layers,
+                            &full_mix.clap_audio_channels,
+                            &full_mix.vst3_volume_expression_channels,
+                        )
+                    }
                     .map(|summary| summary.frames);
                     let _ = sender.send(result);
                 });
@@ -50418,7 +50482,11 @@ impl DawUi {
                     pending.write_receiver = Some(receiver);
                     pending.write_worker = Some(worker);
                     self.pending_clap_pattern_render = Some(pending);
-                    self.status = "Rendering the full Pattern mix…".into();
+                    self.status = if is_mixer_stems {
+                        "Rendering full Pattern Mixer stems…".into()
+                    } else {
+                        "Rendering the full Pattern mix…".into()
+                    };
                 }
                 Err(error) => {
                     self.status = format!("Could not start full Pattern render: {error}");
@@ -50515,7 +50583,14 @@ impl DawUi {
             }
             match result {
                 Ok(frames) => {
-                    self.status = if pending.is_full_mix {
+                    self.status = if pending.is_mixer_stems {
+                        format!(
+                            "Rendered full Pattern {} Mixer stems into {} ({:.2}s)",
+                            pending.pattern_id,
+                            pending.output_path.display(),
+                            frames as f64 / f64::from(pending.sample_rate),
+                        )
+                    } else if pending.is_full_mix {
                         format!(
                             "Rendered the full Pattern {} mix to {} ({:.2}s)",
                             pending.pattern_id,
@@ -50539,7 +50614,9 @@ impl DawUi {
                     }
                 }
                 Err(error) => {
-                    self.status = if pending.is_full_mix {
+                    self.status = if pending.is_mixer_stems {
+                        format!("Could not render full Pattern Mixer stems: {error}")
+                    } else if pending.is_full_mix {
                         format!("Could not render full Pattern mix: {error}")
                     } else {
                         format!("Could not write CLAP Pattern render: {error}")

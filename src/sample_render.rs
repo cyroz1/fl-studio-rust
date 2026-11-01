@@ -7563,9 +7563,10 @@ pub fn render_pattern_mix_to_file(
                 trim_frames,
                 clap_audio_layers,
                 &clap_routes,
+                false,
                 None,
                 || false,
-                write_block,
+                |block, _, _| write_block(block),
             )
         },
     );
@@ -7577,6 +7578,352 @@ pub fn render_pattern_mix_to_file(
     Ok(summary)
 }
 
+/// Render the supported Mixer buses for one Pattern into separate WAV files.
+///
+/// Insert stems include the Pattern's Sampler, loaded VST3, and prepared CLAP sources through
+/// saved routes. Supported loaded insert effects are included in post-effect stems, and the
+/// optional Master stem contains the final supported mix. Native effect formats and unsupported
+/// route types remain incomplete.
+#[allow(clippy::too_many_arguments)]
+pub fn render_pattern_mixer_stems(
+    document: &FlpDocument,
+    project_path: impl AsRef<Path>,
+    options: SamplerPatternRenderOptions,
+    output_directory: impl AsRef<Path>,
+    stem_options: MixerStemRenderOptions,
+    mut processor: Option<Vst3PlaylistStreamProcessor>,
+    clap_audio_layers: &[PlaylistAudioLayer],
+    clap_audio_channels: &BTreeSet<u16>,
+    vst3_volume_expression_channels: &BTreeSet<u16>,
+) -> Result<PatternMixRenderSummary, String> {
+    let project_path = project_path.as_ref();
+    let output_directory = output_directory.as_ref();
+    fs::create_dir_all(output_directory).map_err(|error| {
+        format!(
+            "could not create Pattern Mixer stem folder {}: {error}",
+            output_directory.display()
+        )
+    })?;
+    if !output_directory.is_dir() {
+        return Err(format!(
+            "Pattern Mixer stem output {} is not a folder",
+            output_directory.display()
+        ));
+    }
+    if clap_audio_layers.iter().any(|layer| {
+        !layer.samples.len().is_multiple_of(2)
+            || layer.samples.iter().any(|sample| !sample.is_finite())
+    }) {
+        return Err("CLAP Pattern sources must contain finite interleaved stereo audio".into());
+    }
+
+    let render = prepare_sampler_pattern_for_channel_internal(
+        document,
+        project_path,
+        options,
+        None,
+        None,
+        SamplerPatternChannelOptions {
+            channel_filter: None,
+            allow_empty: true,
+            include_muted_mixer_sources: false,
+            vst3_volume_expression_channels: Some(vst3_volume_expression_channels),
+            clap_audio_channels: Some(clap_audio_channels),
+        },
+    )?;
+    let mut render_frames = render
+        .summary
+        .frames
+        .max(playlist_clap_audio_frames(clap_audio_layers));
+    if let Some(processor) = processor.as_mut() {
+        processor.stop_pattern_repetition_after_first_pass();
+        let processor_content_frames = processor.content_frames();
+        let vst3_output_end = if processor.summary().notes_scheduled > 0 {
+            processor_content_frames
+                .checked_add(u64::from(options.sample_rate).saturating_mul(2))
+                .ok_or_else(|| "VST3 Pattern instrument tail length overflow".to_owned())?
+        } else {
+            processor_content_frames
+        };
+        render_frames = render_frames.max(vst3_output_end);
+        processor.extend_to_output_frames(render_frames)?;
+        render_frames = processor.summary().frames;
+        if processor.summary().sample_rate != options.sample_rate {
+            return Err("Pattern sources and Mixer effect sample rates do not match".into());
+        }
+    }
+    if render.summary.notes_rendered == 0
+        && processor
+            .as_ref()
+            .is_none_or(|processor| processor.summary().notes_scheduled == 0)
+        && clap_audio_layers.is_empty()
+    {
+        return Err(format!(
+            "Pattern {} has no supported Sampler, VST3, or CLAP notes",
+            options.pattern_id
+        ));
+    }
+    if render_frames == 0 {
+        return Err(format!(
+            "Pattern {} has no supported Sampler, VST3, or CLAP audio",
+            options.pattern_id
+        ));
+    }
+
+    let routing = MixerRouteAudibility::from_document(document);
+    let routed_tracks = document
+        .channels()
+        .into_iter()
+        .flat_map(|channel| {
+            routing
+                .source_route_plan_for_channel(channel.mixer_track())
+                .insert_meter_transforms
+                .into_iter()
+                .map(|(track, _)| track)
+        })
+        .collect::<BTreeSet<_>>();
+    let mut stem_specs = document
+        .mixer_inserts()
+        .into_iter()
+        .filter(|insert| {
+            insert.ordinal() > 0
+                && insert.enabled() != Some(false)
+                && routed_tracks.contains(&insert.ordinal())
+                && insert.ordinal() < MIXER_TRACK_METER_COUNT
+        })
+        .map(|insert| {
+            let track = insert.ordinal();
+            let name = safe_stem_filename_component(insert.name().unwrap_or("").trim());
+            let label = if name.is_empty() {
+                format!("Insert {track:02}")
+            } else {
+                format!("Insert {track:02} - {name}")
+            };
+            MixerStemSpec {
+                track,
+                label,
+                is_master_stem: false,
+                is_current_stem: false,
+            }
+        })
+        .collect::<Vec<_>>();
+    let master_output = MixerMasterOutput::from_document(document);
+    if stem_options.include_master && master_output.enabled != Some(false) {
+        stem_specs.insert(
+            0,
+            MixerStemSpec {
+                track: 0,
+                label: "Master".to_owned(),
+                is_master_stem: true,
+                is_current_stem: false,
+            },
+        );
+    }
+    if let Some(track) = stem_options.current_track {
+        let enabled = if track == 0 {
+            master_output.enabled
+        } else {
+            document
+                .mixer_inserts()
+                .into_iter()
+                .find(|insert| insert.ordinal() == track)
+                .ok_or_else(|| "the selected Current Mixer track is not recognized".to_owned())?
+                .enabled()
+        };
+        stem_specs.push(mixer_current_stem_spec(track, enabled)?);
+    }
+    if stem_specs.is_empty() {
+        return Err("Pattern has no enabled Mixer stems selected for export".into());
+    }
+
+    let clap_routes = prepare_pattern_clap_mixer_routes_for_channels(
+        clap_audio_layers.iter().map(|layer| layer.channel_id),
+        document,
+        None,
+        options.sample_rate,
+    );
+    let processor_summary = processor.as_ref().map(Vst3PlaylistStreamProcessor::summary);
+    let master_pdc_trim_frames = processor
+        .as_ref()
+        .map_or(0, Vst3PlaylistStreamProcessor::pdc_render_start_trim_frames);
+    let logical_output_frames = render_frames.saturating_sub(master_pdc_trim_frames);
+    let stem_pdc_trim_frames = stem_specs
+        .iter()
+        .map(|spec| {
+            processor.as_ref().map_or(0, |processor| {
+                processor.pdc_mixer_stem_start_trim_frames(spec.track, !spec.is_current_stem)
+            })
+        })
+        .collect::<Vec<_>>();
+    let longest_stem_delay = stem_pdc_trim_frames.iter().copied().max().unwrap_or(0);
+    render_frames = render_frames.max(
+        logical_output_frames
+            .checked_add(longest_stem_delay)
+            .ok_or_else(|| "Pattern Mixer stem output length overflow".to_owned())?,
+    );
+    if let Some(processor) = processor.as_mut() {
+        processor.extend_to_output_frames(render_frames)?;
+        render_frames = render_frames.max(processor.summary().frames);
+    }
+    let frames_u32 = u32::try_from(render_frames)
+        .map_err(|_| "Pattern Mixer stem render is too long for RIFF/WAVE".to_owned())?;
+    let block_align =
+        options.wav_sample_format.bytes_per_sample() * options.wav_channel_mode.channel_count();
+    let data_bytes = frames_u32
+        .checked_mul(u32::from(block_align))
+        .filter(|bytes| *bytes <= u32::MAX - 36)
+        .ok_or_else(|| "Pattern Mixer stem WAV exceeds the RIFF/WAVE limit".to_owned())?;
+    let mut outputs = stem_specs
+        .into_iter()
+        .zip(stem_pdc_trim_frames)
+        .map(|(spec, frames_to_skip)| {
+            let output_path = output_directory.join(format!("{}.wav", spec.label));
+            let mut temporary = TemporaryRenderFile::create(&output_path)?;
+            write_wav_header(
+                temporary
+                    .file
+                    .as_mut()
+                    .expect("temporary render file is open"),
+                options.sample_rate,
+                frames_u32,
+                data_bytes,
+                options.wav_sample_format,
+                options.wav_channel_mode,
+            )?;
+            Ok(MixerStemTemporaryOutput {
+                track: spec.track,
+                is_master_stem: spec.is_master_stem,
+                is_current_stem: spec.is_current_stem,
+                frames_to_skip,
+                frames_to_write: logical_output_frames,
+                frames_written: 0,
+                output_path,
+                temporary,
+                peak: 0.0,
+                bytes: Vec::with_capacity(
+                    SAMPLER_BLOCK_FRAMES
+                        * usize::from(options.wav_channel_mode.channel_count())
+                        * usize::from(options.wav_sample_format.bytes_per_sample()),
+                ),
+                dither_state: WavDitherState::new(
+                    options.wav_dither_mode,
+                    options.wav_sample_format,
+                ),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    if let Some(processor) = processor.as_mut() {
+        processor.start_processing()?;
+    }
+    let cancelled = AtomicBool::new(false);
+    let render_result = stream_prepared_pattern_mix(
+        &render,
+        processor.as_mut(),
+        render_frames,
+        0,
+        clap_audio_layers,
+        &clap_routes,
+        true,
+        Some(&cancelled),
+        || false,
+        |block, pre_effect_buses, post_effect_buses| {
+            let pre_effect_buses = pre_effect_buses
+                .ok_or_else(|| "Pattern Mixer insert buses were not prepared".to_owned())?;
+            let post_effect_buses = post_effect_buses.unwrap_or(pre_effect_buses);
+            for output in &mut outputs {
+                let stem_block = mixer_stem_block(
+                    output.track,
+                    block,
+                    pre_effect_buses,
+                    post_effect_buses,
+                    output.is_current_stem,
+                )?;
+                let stem_block = skip_render_block_prefix(stem_block, &mut output.frames_to_skip);
+                let frames_to_write = output.frames_to_write.saturating_sub(output.frames_written);
+                let block_frames = ((stem_block.len() / 2) as u64).min(frames_to_write) as usize;
+                let stem_block = &stem_block[..block_frames * 2];
+                output.frames_written = output
+                    .frames_written
+                    .checked_add((stem_block.len() / 2) as u64)
+                    .ok_or_else(|| "Pattern Mixer stem frame count overflow".to_owned())?;
+                output.peak = stem_block
+                    .iter()
+                    .fold(output.peak, |peak, sample| peak.max(sample.abs()));
+                output.bytes.clear();
+                append_wav_block_samples_with_dither(
+                    stem_block,
+                    options.wav_sample_format,
+                    options.wav_channel_mode,
+                    output.dither_state.as_mut(),
+                    &mut output.bytes,
+                )?;
+                output
+                    .temporary
+                    .file
+                    .as_mut()
+                    .expect("temporary Pattern Mixer stem file is open")
+                    .write_all(&output.bytes)
+                    .map_err(|error| {
+                        format!(
+                            "could not write Pattern Mixer stem {}: {error}",
+                            output.track
+                        )
+                    })?;
+            }
+            Ok(())
+        },
+    );
+    let stop_result = processor
+        .as_mut()
+        .map_or(Ok(()), Vst3PlaylistStreamProcessor::stop_processing);
+    render_result?;
+    stop_result?;
+
+    let rendered_stems = outputs.iter().filter(|output| output.peak > 0.0).count();
+    if rendered_stems == 0 {
+        return Err("Pattern rendered no non-silent selected Mixer stems".into());
+    }
+    let summary = PatternMixRenderSummary {
+        frames: outputs
+            .iter()
+            .map(|output| output.frames_written)
+            .max()
+            .unwrap_or(logical_output_frames),
+        sample_rate: options.sample_rate,
+        sampler_notes_rendered: render.summary.notes_rendered,
+        sampler_channels_rendered: render.summary.sampler_channels_rendered,
+        vst3_plugin_channels_rendered: processor_summary
+            .as_ref()
+            .map_or(0, |summary| summary.plugin_channels_rendered),
+        vst3_notes_rendered: processor_summary
+            .as_ref()
+            .map_or(0, |summary| summary.notes_scheduled),
+        clap_plugin_channels_rendered: clap_audio_layers
+            .iter()
+            .map(|layer| layer.channel_id)
+            .collect::<BTreeSet<_>>()
+            .len(),
+    };
+    for mut output in outputs {
+        if output.peak > 0.0 {
+            let file = output
+                .temporary
+                .file
+                .as_mut()
+                .expect("temporary Pattern Mixer stem file is open");
+            patch_wav_data_length(
+                file,
+                output.frames_written,
+                options.wav_sample_format,
+                options.wav_channel_mode,
+            )?;
+            output.temporary.commit(&output.output_path)?;
+        }
+    }
+    Ok(summary)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn stream_prepared_pattern_mix(
     render: &PreparedSamplerPattern,
@@ -7585,9 +7932,10 @@ fn stream_prepared_pattern_mix(
     trim_frames: u64,
     clap_audio_layers: &[PlaylistAudioLayer],
     clap_routes: &HashMap<u16, PreparedClapMixerRoute>,
+    capture_mixer_buses: bool,
     cancelled: Option<&AtomicBool>,
     mut stream_cancelled: impl FnMut() -> bool,
-    mut write_block: impl FnMut(&[f32]) -> Result<(), String>,
+    mut write_block: impl FnMut(&[f32], Option<&[f32]>, Option<&[f32]>) -> Result<(), String>,
 ) -> Result<(), String> {
     crate::audio::enable_denormal_protection();
     let release_frames = (f64::from(render.summary.sample_rate) * SAMPLER_RELEASE_SECONDS)
@@ -7604,8 +7952,10 @@ fn stream_prepared_pattern_mix(
     );
     engine.tempo_map = Some(&render.tempo_map);
     engine.mixer_transforms_by_channel = Some(&render.mixer_transforms_by_channel);
-    if processor.is_some() {
+    if capture_mixer_buses || processor.is_some() {
         engine.mixer_meter_transforms_by_channel = Some(&render.mixer_meter_transforms_by_channel);
+    }
+    if processor.is_some() {
         engine.mixer_effect_input_transforms_by_channel =
             Some(&render.mixer_effect_input_transforms_by_channel);
     }
@@ -7618,9 +7968,11 @@ fn stream_prepared_pattern_mix(
         pan_law: render.pan_law,
     };
     let mut block = vec![0.0f32; SAMPLER_BLOCK_FRAMES * 2];
-    let mixer_bus_planes = processor.as_ref().map_or(0, |processor| {
-        1 + usize::from(processor.needs_mixer_insert_buses())
-    });
+    let mixer_bus_planes = processor
+        .as_ref()
+        .map_or(usize::from(capture_mixer_buses), |processor| {
+            1 + usize::from(processor.needs_mixer_insert_buses())
+        });
     let mixer_bus_len = MIXER_TRACK_METER_COUNT
         .checked_mul(SAMPLER_BLOCK_FRAMES)
         .and_then(|frames| frames.checked_mul(2))
@@ -7635,6 +7987,15 @@ fn stream_prepared_pattern_mix(
     let mut mixer_bus_delays = (0..mixer_bus_delay_count)
         .map(|_| crate::audio::StereoFrameDelay::new(direct_source_delay_frames))
         .collect::<Result<Vec<_>, _>>()?;
+    let capture_post_effect_buses = capture_mixer_buses
+        && processor
+            .as_ref()
+            .is_some_and(|processor| processor.needs_mixer_insert_buses());
+    let mut post_effect_buses = if capture_post_effect_buses {
+        vec![0.0f32; MIXER_TRACK_METER_COUNT * SAMPLER_BLOCK_FRAMES * 2]
+    } else {
+        Vec::new()
+    };
 
     let mut block_start = 0u64;
     while block_start < render_frames {
@@ -7649,7 +8010,7 @@ fn stream_prepared_pattern_mix(
         let block_samples = &mut block[..sample_count];
         let active_buses =
             &mut mixer_buses[..MIXER_TRACK_METER_COUNT * sample_count * mixer_bus_planes];
-        if processor.is_some() {
+        if mixer_bus_planes > 0 {
             active_buses.fill(0.0);
             engine.render_block_with_meters(
                 block_start,
@@ -7668,20 +8029,31 @@ fn stream_prepared_pattern_mix(
             clap_audio_layers,
             clap_routes,
             channel_controls,
-            processor.as_ref().map(|_| active_buses as &mut [f32]),
+            (mixer_bus_planes > 0).then_some(active_buses as &mut [f32]),
         )?;
 
-        if processor.is_some() {
+        if mixer_bus_planes > 0 {
             for (track, delay) in mixer_bus_delays.iter_mut().enumerate() {
                 let bus_start = track * sample_count;
                 delay
                     .process_interleaved(&mut active_buses[bus_start..bus_start + sample_count])?;
             }
             direct_source_delay.process_interleaved(block_samples)?;
-            processor
-                .as_deref_mut()
-                .expect("processor presence was checked above")
-                .mix_next_block_with_meter_buses(block_samples, active_buses)?;
+            if let Some(processor) = processor.as_deref_mut() {
+                if capture_post_effect_buses {
+                    let post_effect_bus_samples = MIXER_TRACK_METER_COUNT * sample_count;
+                    let active_post_effect_buses =
+                        &mut post_effect_buses[..post_effect_bus_samples];
+                    active_post_effect_buses.fill(0.0);
+                    processor.mix_next_block_with_post_effect_buses(
+                        block_samples,
+                        active_buses,
+                        active_post_effect_buses,
+                    )?;
+                } else {
+                    processor.mix_next_block_with_meter_buses(block_samples, active_buses)?;
+                }
+            }
         }
         for sample in block_samples.iter_mut() {
             if !sample.is_finite() {
@@ -7697,7 +8069,15 @@ fn stream_prepared_pattern_mix(
                 .ok()
                 .and_then(|frames| frames.checked_mul(2))
                 .ok_or_else(|| "Pattern mix PDC trim overflow".to_owned())?;
-            write_block(&block_samples[skip_samples..])?;
+            let pre_effect_buses = (mixer_bus_planes > 0)
+                .then(|| &active_buses[..MIXER_TRACK_METER_COUNT * sample_count]);
+            let post_effect_buses = capture_post_effect_buses
+                .then(|| &post_effect_buses[..MIXER_TRACK_METER_COUNT * sample_count]);
+            write_block(
+                &block_samples[skip_samples..],
+                pre_effect_buses.map(|buses| &buses[skip_samples..]),
+                post_effect_buses.map(|buses| &buses[skip_samples..]),
+            )?;
         }
         block_start += frame_count as u64;
     }
