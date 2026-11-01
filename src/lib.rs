@@ -28061,6 +28061,127 @@ impl FlpDocument {
         preset.encode_lossless()
     }
 
+    /// Encodes one recognized native Mixer effect slot as a format-48 plug-in state preset.
+    ///
+    /// Export requires the observed native wrapper, state, and project-version events. The slot
+    /// marker, other effect slots, and unrelated Mixer and project events are omitted.
+    pub fn encode_native_mixer_effect_state_preset(
+        &self,
+        insert_ordinal: usize,
+        slot_index: u16,
+    ) -> Result<Vec<u8>, FlpError> {
+        let slot = self.unique_mixer_effect_slot(insert_ordinal, slot_index)?;
+        if slot.plugin_identifier().is_none() {
+            return Err(FlpError::UnsupportedEdit(
+                "native Mixer effect preset export requires one recognized 0xC9 plug-in identifier",
+            ));
+        }
+        if slot.state_event_count() != 1 {
+            return Err(FlpError::UnsupportedEdit(
+                "native Mixer effect preset export requires exactly one state event",
+            ));
+        }
+        if slot.vst_metadata().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "recognized VST wrapper states require a VST preset format, not format 48",
+            ));
+        }
+
+        let slot_range = slot.event_range();
+        for (opcode, required) in [
+            (0xC9, true),
+            (0xD4, true),
+            (0xCB, false),
+            (0x9B, true),
+            (0x80, true),
+            (0xD5, true),
+        ] {
+            let indices = slot_range
+                .clone()
+                .filter(|&index| self.events[index].opcode == opcode)
+                .collect::<Vec<_>>();
+            if (required && indices.len() != 1) || (!required && indices.len() > 1) {
+                return Err(FlpError::UnsupportedEdit(
+                    "native Mixer effect preset export requires unique recognized state and wrapper events",
+                ));
+            }
+            if let Some(&index) = indices.first() {
+                let valid_encoding = match opcode {
+                    0x9B | 0x80 => {
+                        self.events[index].encoding == PayloadEncoding::Dword
+                            && self.events[index].payload.len() == 4
+                    }
+                    _ => matches!(self.events[index].encoding, PayloadEncoding::Data { .. }),
+                };
+                if !valid_encoding {
+                    return Err(FlpError::UnsupportedEdit(
+                        "native Mixer effect preset export found an unsupported state or wrapper event encoding",
+                    ));
+                }
+            }
+        }
+
+        let first_channel_start = self
+            .channels()
+            .iter()
+            .map(|channel| channel.event_range().start)
+            .min()
+            .unwrap_or(self.events.len());
+        let project_prefix = &self.events[..first_channel_start];
+        for (opcode, required) in [(0xC7, true), (0x9F, false), (0x1C, true), (0x25, false)] {
+            let events = project_prefix
+                .iter()
+                .filter(|event| event.opcode == opcode)
+                .collect::<Vec<_>>();
+            if (required && events.len() != 1) || (!required && events.len() > 1) {
+                return Err(FlpError::UnsupportedEdit(
+                    "native Mixer effect preset export requires unique project-version metadata",
+                ));
+            }
+            if let Some(event) = events.first() {
+                let valid = match opcode {
+                    0xC7 => matches!(event.encoding, PayloadEncoding::Data { .. }),
+                    0x9F => event.encoding == PayloadEncoding::Dword && event.payload.len() == 4,
+                    _ => event.encoding == PayloadEncoding::Byte && event.payload.len() == 1,
+                };
+                if !valid {
+                    return Err(FlpError::UnsupportedEdit(
+                        "native Mixer effect preset export found unsupported project-version metadata",
+                    ));
+                }
+            }
+        }
+
+        let mut events = project_prefix
+            .iter()
+            .filter(|event| matches!(event.opcode, 0xC7 | 0x9F | 0x1C | 0x25))
+            .cloned()
+            .collect::<Vec<_>>();
+        events.extend(
+            slot_range
+                .filter(|&index| {
+                    matches!(
+                        self.events[index].opcode,
+                        0xC9 | 0xD4 | 0xCB | 0x9B | 0x80 | 0xD5
+                    )
+                })
+                .map(|index| self.events[index].clone()),
+        );
+
+        let mut header = self.header.clone();
+        header.format = 48;
+        header.legacy_channel_count = 1;
+        let mut preset = Self {
+            header,
+            events,
+            project_version: self.project_version.clone(),
+            metadata: ProjectMetadata::default(),
+            trailing_bytes: Vec::new(),
+        };
+        preset.refresh_event_offsets()?;
+        preset.encode_lossless()
+    }
+
     /// Applies one kind-0 Sampler channel block from a format-32 preset to an existing Sampler.
     ///
     /// The target channel ID and display-name event are retained. Source and target project
@@ -31140,6 +31261,42 @@ mod tests {
         }
         event_stream.push(0x93);
         event_stream.extend_from_slice(&output.to_le_bytes());
+    }
+
+    #[test]
+    fn exports_a_native_mixer_effect_slot_as_a_format48_state_preset() {
+        let mut target_events = Vec::new();
+        append_data_event(&mut target_events, 0xC7, b"26.0.0\0");
+        target_events.extend_from_slice(&[0x1C, 3]);
+        append_complete_mixer_insert_with_native_effect(
+            &mut target_events,
+            4,
+            "Fruity Balance",
+            &[1, 2, 3, 4],
+        );
+        let target = FlpDocument::parse(&flp_fixture(&target_events, &[], &[]))
+            .expect("target project should parse");
+
+        let bytes = target
+            .encode_native_mixer_effect_state_preset(0, 4)
+            .expect("native Mixer effect state should export");
+        let preset = FstPreset::parse(&bytes).expect("exported preset should parse");
+        assert_eq!(preset.document().header().format, 48);
+        assert_eq!(preset.kind(), FstPresetKind::NativePluginState);
+        assert_eq!(
+            preset.native_plugin_identifier().as_deref(),
+            Some("Fruity Balance")
+        );
+        assert_eq!(preset.native_plugin_state_bytes(), Some(&[1, 2, 3, 4][..]));
+        assert_eq!(
+            preset
+                .document()
+                .events()
+                .iter()
+                .map(|event| event.opcode())
+                .collect::<Vec<_>>(),
+            [0xC7, 0x1C, 0xC9, 0xD4, 0x9B, 0x80, 0xD5]
+        );
     }
 
     #[test]

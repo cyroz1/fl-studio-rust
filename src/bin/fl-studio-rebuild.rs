@@ -12147,6 +12147,34 @@ impl DawUi {
         self.write_state_preset_file(path, preset_bytes, "native plug-in");
     }
 
+    fn save_native_mixer_effect_state_preset(
+        &mut self,
+        insert_ordinal: usize,
+        slot_index: u16,
+        plugin_name: &str,
+    ) {
+        let Some(document) = self.document.as_ref() else {
+            self.status = "Open a project before saving a native Mixer effect preset".to_owned();
+            return;
+        };
+        let fallback_name = format!("Insert {insert_ordinal} Effect {}", slot_index + 1);
+        let file_name = state_preset_file_stem(plugin_name, &fallback_name);
+        let Some(path) =
+            self.choose_state_preset_path("Save native Mixer effect state preset", &file_name)
+        else {
+            return;
+        };
+        let preset_bytes =
+            match document.encode_native_mixer_effect_state_preset(insert_ordinal, slot_index) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    self.status = format!("Could not save native Mixer effect preset: {error}");
+                    return;
+                }
+            };
+        self.write_state_preset_file(path, preset_bytes, "native Mixer effect");
+    }
+
     fn save_mixer_insert_state_preset(&mut self, insert_ordinal: usize, insert_name: &str) {
         let Some(document) = self.document.as_ref() else {
             self.status = "Open a project before saving a Mixer state".to_owned();
@@ -62975,6 +63003,7 @@ impl DawUi {
         let mut send_route_creation = None;
         let mut load_insert_state = None;
         let mut save_insert_state = None;
+        let mut save_native_effect_state = None;
         let mut effect_slot_move = None;
         let mut effect_editor_open = None;
         let mut clap_effect_editor_open = None;
@@ -64730,6 +64759,34 @@ impl DawUi {
                                                     ));
                                                 }
                                             });
+                                            let native_state_export_supported = slot
+                                                .plugin_identifier()
+                                                .is_some()
+                                                && slot.state_event_count() == 1
+                                                && slot.vst_metadata().is_none();
+                                            if ui
+                                                .add_enabled(
+                                                    native_state_export_supported,
+                                                    egui::Button::new(
+                                                        "Save native state as…",
+                                                    ),
+                                                )
+                                                .on_hover_text(
+                                                    "Export this recognized native effect state as a format-48 .fst preset",
+                                                )
+                                                .clicked()
+                                            {
+                                                let plugin_name = slot
+                                                    .display_name()
+                                                    .or_else(|| slot.plugin_identifier())
+                                                    .unwrap_or("Native effect")
+                                                    .to_owned();
+                                                save_native_effect_state = Some((
+                                                    insert.ordinal(),
+                                                    slot.slot_index(),
+                                                    plugin_name,
+                                                ));
+                                            }
                                             ui.horizontal(|ui| {
                                                 if let Some(mut enabled) = slot.enabled() {
                                                     if ui.checkbox(&mut enabled, "Enabled").changed()
@@ -65430,6 +65487,9 @@ impl DawUi {
         }
         if let Some((insert_ordinal, insert_name)) = save_insert_state {
             self.save_mixer_insert_state_preset(insert_ordinal, &insert_name);
+        }
+        if let Some((insert_ordinal, slot_index, plugin_name)) = save_native_effect_state {
+            self.save_native_mixer_effect_state_preset(insert_ordinal, slot_index, &plugin_name);
         }
         if !rename_edits.is_empty()
             && let Some(document) = self.document.as_mut()

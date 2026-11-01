@@ -1086,6 +1086,16 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u16(channel_id, "native channel id")?,
             )
         }
+        [command, input, output, insert_ordinal, slot_index]
+            if command == "export-native-mixer-effect-state-preset" =>
+        {
+            export_native_mixer_effect_state_preset(
+                Path::new(input),
+                Path::new(output),
+                parse_usize(insert_ordinal, "Mixer insert ordinal")?,
+                parse_u16(slot_index, "Mixer effect slot index")?,
+            )
+        }
         [command, input, output, channel_id, preset]
             if command == "apply-native-channel-plugin-state-preset" =>
         {
@@ -5022,6 +5032,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild apply-automation-state-preset <input.flp> <output.flp> <automation-channel-id> <preset.fst>\n",
             "  flp-rebuild apply-native-state-preset <input.flp> <output.flp> <native-channel-id> <preset.fst>\n",
             "  flp-rebuild export-native-channel-plugin-state-preset <input.flp> <output.fst> <native-channel-id>\n",
+            "  flp-rebuild export-native-mixer-effect-state-preset <input.flp> <output.fst> <insert-ordinal> <slot-index>\n",
             "  flp-rebuild apply-native-channel-plugin-state-preset <input.flp> <output.flp> <native-channel-id> <preset.fst>\n",
             "  flp-rebuild apply-layer-state-preset <input.flp> <output.flp> <layer-channel-id> <preset.fst>\n",
             "  flp-rebuild apply-native-mixer-effect-state-preset <input.flp> <output.flp> <insert-ordinal> <slot-index> <preset.fst>\n",
@@ -8893,6 +8904,25 @@ fn export_native_channel_plugin_state_preset(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "saved format-48 native plug-in state preset for Channel {channel_id} to {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn export_native_mixer_effect_state_preset(
+    input: &Path,
+    output: &Path,
+    insert_ordinal: usize,
+    slot_index: u16,
+) -> Result<(), String> {
+    let (_, document) = load_document(input)?;
+    let preset_bytes = document
+        .encode_native_mixer_effect_state_preset(insert_ordinal, slot_index)
+        .map_err(|error| error.to_string())?;
+    fs::write(output, preset_bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "saved format-48 native Mixer effect state preset for insert {insert_ordinal} slot {slot_index} to {}",
         output.display()
     );
     Ok(())
