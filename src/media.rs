@@ -2909,11 +2909,12 @@ mod tests {
 
     #[test]
     fn reads_only_valid_acid_loop_tempo_metadata() {
+        type AcidLoopTempoCase = (u32, u32, f32, Option<(u32, f64)>);
         let root = fixture_root();
         fs::create_dir_all(&root).unwrap();
         let path = root.join("acid-loop.wav");
 
-        let cases: [(u32, u32, f32, Option<(u32, f64)>); 5] = [
+        let cases: [AcidLoopTempoCase; 5] = [
             (4, 4, 120.0, Some((4, 120.0))),
             (5, 4, 120.0, None),
             (0, 4, 120.0, None),
