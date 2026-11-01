@@ -1847,6 +1847,12 @@ fn playlist_performance_vst3_clip_candidates(
         .collect())
 }
 
+fn playlist_tempo_is_constant_from_tick(tempo_map: &PlaylistTempoMap, start_tick: u64) -> bool {
+    tempo_map
+        .tempo_segments()
+        .all(|(segment_tick, _)| segment_tick <= start_tick)
+}
+
 fn playlist_performance_clap_clip_candidates(
     document: &FlpDocument,
     arrangement_id: u16,
@@ -1858,7 +1864,7 @@ fn playlist_performance_clap_clip_candidates(
         return Ok(BTreeSet::new());
     }
     let tempo_map = PlaylistTempoMap::for_arrangement(document, arrangement_id)?;
-    if tempo_map.tempo_segments().count() != 1 {
+    if !playlist_tempo_is_constant_from_tick(&tempo_map, u64::from(performance_zone_end_tick)) {
         return Ok(BTreeSet::new());
     }
     let arrangement = document
@@ -1980,10 +1986,10 @@ fn playlist_performance_mixed_source_clip_candidates(
         .map(|track| track.id)
         .collect::<BTreeSet<_>>();
     let constant_tempo = !assigned_clap_channels.is_empty()
-        && PlaylistTempoMap::for_arrangement(document, arrangement_id)?
-            .tempo_segments()
-            .count()
-            == 1;
+        && playlist_tempo_is_constant_from_tick(
+            &PlaylistTempoMap::for_arrangement(document, arrangement_id)?,
+            u64::from(performance_zone_end_tick),
+        );
     Ok(arrangement
         .clips
         .iter()
@@ -3418,8 +3424,9 @@ pub fn stream_playlist_with_vst3_to_device_with_monitor_and_latency_updates(
 /// Stream arrangement audio while accepting quantized Audio and Sampler Clip launches.
 ///
 /// The arrangement must contain supported clips before the named Start marker. Launches replace
-/// content from the same Playlist track and repeat at the clip's tick length. Loaded VST3 Pattern Clips can follow Playlist tempo, and assigned CLAP-backed Pattern Clips
-/// can launch in constant-tempo arrangements alongside Sampler and Audio Clips.
+/// content from the same Playlist track and repeat at the clip's tick length. Loaded VST3 Pattern
+/// Clips follow Playlist tempo. Assigned CLAP-backed Pattern Clips can launch when tempo stays
+/// constant from Start, using the tempo active there, alongside Sampler and Audio Clips.
 pub fn stream_playlist_performance_with_vst3_to_device(
     document: &FlpDocument,
     project_path: impl AsRef<Path>,
