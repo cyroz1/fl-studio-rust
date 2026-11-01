@@ -5587,6 +5587,7 @@ struct DawUi {
     midi_vst3_parameter_mappings: Vec<MidiVst3ParameterMapping>,
     pattern_clap_parameter_links: Vec<PatternClapParameterLink>,
     pattern_clap_lfo_parameter_links: Vec<PatternClapLfoParameterLink>,
+    pattern_clap_mixer_effect_lfo_parameter_links: Vec<PatternClapMixerEffectLfoParameterLink>,
     pattern_vst3_parameter_links: Vec<PatternVst3ParameterLink>,
     pattern_vst3_mixer_effect_parameter_links: Vec<PatternVst3MixerEffectParameterLink>,
     playlist_vst3_parameter_links: Vec<PlaylistVst3ParameterLink>,
@@ -7021,6 +7022,26 @@ struct PatternClapLfoParameterLink {
     phase_degrees: u16,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct PatternClapMixerEffectLfoParameterLink {
+    project_path: String,
+    pattern_id: u16,
+    insert_ordinal: usize,
+    slot_index: u16,
+    plugin_path: String,
+    plugin_id: String,
+    parameter_id: u32,
+    parameter_name: String,
+    parameter_min_value: f64,
+    parameter_max_value: f64,
+    parameter_is_stepped: bool,
+    waveform: InternalLfoWaveform,
+    period_millibeats: u32,
+    minimum_raw: u16,
+    maximum_raw: u16,
+    phase_degrees: u16,
+}
+
 impl InternalLfoWaveform {
     const ALL: [Self; 3] = [Self::Sine, Self::Triangle, Self::Square];
 
@@ -7297,6 +7318,140 @@ fn show_pattern_clap_lfo_parameter_link_controls(
     if link.is_none() && scope.is_none() {
         ui.small(
             egui::RichText::new("Save the project and select a Pattern to add a CLAP LFO link.")
+                .color(MUTED),
+        );
+    }
+    (upsert, unlink)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn show_pattern_clap_mixer_effect_lfo_parameter_link_controls(
+    ui: &mut egui::Ui,
+    link: Option<&PatternClapMixerEffectLfoParameterLink>,
+    scope: Option<(&Path, u16)>,
+    insert_ordinal: usize,
+    slot_index: u16,
+    plugin_path: &Path,
+    plugin_id: &str,
+    parameter_id: u32,
+    parameter_name: &str,
+    parameter_min_value: f64,
+    parameter_max_value: f64,
+    parameter_is_stepped: bool,
+    parameter_is_read_only: bool,
+    widget_id: u64,
+) -> (Option<PatternClapMixerEffectLfoParameterLink>, bool) {
+    let mut upsert = None;
+    let mut unlink = false;
+    ui.horizontal(|ui| {
+        if let Some(link) = link {
+            let mut updated = link.clone();
+            updated.parameter_min_value = parameter_min_value;
+            updated.parameter_max_value = parameter_max_value;
+            updated.parameter_is_stepped = parameter_is_stepped;
+            ui.menu_button(
+                format!(
+                    "CLAP Mixer LFO · {} · {:.2} beats",
+                    updated.waveform.label(),
+                    updated.period_millibeats as f32 / 1_000.0
+                ),
+                |ui| {
+                    egui::ComboBox::from_id_salt((
+                        "clap_mixer_effect_lfo_waveform",
+                        widget_id,
+                        parameter_id,
+                    ))
+                    .selected_text(updated.waveform.label())
+                    .show_ui(ui, |ui| {
+                        for waveform in InternalLfoWaveform::ALL {
+                            ui.selectable_value(&mut updated.waveform, waveform, waveform.label());
+                        }
+                    });
+                    let mut period_beats = updated.period_millibeats as f32 / 1_000.0;
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut period_beats, 0.25..=64.0)
+                                .step_by(0.25)
+                                .text("Period (beats)"),
+                        )
+                        .changed()
+                    {
+                        updated.period_millibeats = (period_beats * 1_000.0).round() as u32;
+                    }
+                    let mut minimum = updated.minimum_raw as f32 / 10_000.0;
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut minimum, 0.0..=1.0)
+                                .step_by(0.01)
+                                .text("Min"),
+                        )
+                        .changed()
+                    {
+                        updated.minimum_raw =
+                            (minimum.min(f32::from(updated.maximum_raw) / 10_000.0) * 10_000.0)
+                                .round() as u16;
+                    }
+                    let mut maximum = updated.maximum_raw as f32 / 10_000.0;
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut maximum, 0.0..=1.0)
+                                .step_by(0.01)
+                                .text("Max"),
+                        )
+                        .changed()
+                    {
+                        updated.maximum_raw =
+                            (maximum.max(f32::from(updated.minimum_raw) / 10_000.0) * 10_000.0)
+                                .round() as u16;
+                    }
+                    let mut phase = f32::from(updated.phase_degrees);
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut phase, 0.0..=359.0)
+                                .step_by(1.0)
+                                .text("Phase°"),
+                        )
+                        .changed()
+                    {
+                        updated.phase_degrees = phase.round() as u16;
+                    }
+                    unlink = ui.small_button("Clear LFO").clicked();
+                },
+            );
+            if updated != *link && !unlink {
+                upsert = Some(updated);
+            }
+        } else if ui
+            .add_enabled(
+                !parameter_is_read_only && scope.is_some(),
+                egui::Button::new("Add CLAP Mixer LFO"),
+            )
+            .clicked()
+            && let Some((project_path, pattern_id)) = scope
+        {
+            upsert = Some(PatternClapMixerEffectLfoParameterLink {
+                project_path: project_path.to_string_lossy().into_owned(),
+                pattern_id,
+                insert_ordinal,
+                slot_index,
+                plugin_path: plugin_path.to_string_lossy().into_owned(),
+                plugin_id: plugin_id.to_owned(),
+                parameter_id,
+                parameter_name: parameter_name.to_owned(),
+                parameter_min_value,
+                parameter_max_value,
+                parameter_is_stepped,
+                waveform: InternalLfoWaveform::Sine,
+                period_millibeats: 4_000,
+                minimum_raw: 0,
+                maximum_raw: 10_000,
+                phase_degrees: 0,
+            });
+        }
+    });
+    if link.is_none() && scope.is_none() {
+        ui.small(
+            egui::RichText::new("Save the project and select a Pattern to add a CLAP Mixer LFO.")
                 .color(MUTED),
         );
     }
@@ -7826,6 +7981,8 @@ impl DawUi {
         let vst3_manual_latency_offsets = load_vst3_manual_latency_offsets();
         let pattern_clap_parameter_links = load_pattern_clap_parameter_links();
         let pattern_clap_lfo_parameter_links = load_pattern_clap_lfo_parameter_links();
+        let pattern_clap_mixer_effect_lfo_parameter_links =
+            load_pattern_clap_mixer_effect_lfo_parameter_links();
         let pattern_vst3_parameter_links = load_pattern_vst3_parameter_links();
         let pattern_vst3_mixer_effect_parameter_links =
             load_pattern_vst3_mixer_effect_parameter_links();
@@ -8379,6 +8536,7 @@ impl DawUi {
             midi_vst3_parameter_mappings,
             pattern_clap_parameter_links,
             pattern_clap_lfo_parameter_links,
+            pattern_clap_mixer_effect_lfo_parameter_links,
             pattern_vst3_parameter_links,
             pattern_vst3_mixer_effect_parameter_links,
             playlist_vst3_parameter_links,
@@ -10215,6 +10373,28 @@ impl DawUi {
                     .or_insert_with(Vec::new)
                     .extend(lanes);
             }
+        }
+        for link in self
+            .pattern_clap_mixer_effect_lfo_parameter_links
+            .iter()
+            .filter(|link| {
+                project_paths_equal(Path::new(&link.project_path), project_path)
+                    && link.pattern_id == pattern.id
+                    && valid_pattern_clap_mixer_effect_lfo_parameter_link(link)
+            })
+        {
+            let key = (link.insert_ordinal, link.slot_index);
+            let Some(assignment) = self.clap_mixer_effect_assignments.get(&key) else {
+                continue;
+            };
+            if assignment.path != Path::new(&link.plugin_path)
+                || assignment.plugin_id != link.plugin_id
+            {
+                continue;
+            }
+            automations.entry(key).or_insert_with(Vec::new).push(
+                clap_mixer_effect_internal_lfo_parameter_automation(link, ppq, loop_length_ticks),
+            );
         }
         automations
     }
@@ -63607,6 +63787,62 @@ impl DawUi {
                                                                         if !parameter.module.is_empty() {
                                                                             ui.small(&parameter.module);
                                                                         }
+                                                                        let lfo_scope = self
+                                                                            .current_path
+                                                                            .as_deref()
+                                                                            .zip(self.selected_pattern);
+                                                                        let lfo_link = lfo_scope.and_then(
+                                                                            |(project_path, pattern_id)| {
+                                                                                pattern_clap_mixer_effect_lfo_parameter_link_for_target(
+                                                                                    &self.pattern_clap_mixer_effect_lfo_parameter_links,
+                                                                                    project_path,
+                                                                                    pattern_id,
+                                                                                    insert.ordinal(),
+                                                                                    slot_index_raw,
+                                                                                    &assignment.path,
+                                                                                    &assignment.plugin_id,
+                                                                                    parameter.id,
+                                                                                )
+                                                                            },
+                                                                        );
+                                                                        let widget_id = u64::try_from(
+                                                                            insert.ordinal(),
+                                                                        )
+                                                                        .unwrap_or(u64::MAX)
+                                                                            ^ (u64::from(slot_index_raw)
+                                                                                << 32)
+                                                                            ^ u64::from(parameter.id);
+                                                                        let (lfo_upsert, clear_lfo) =
+                                                                            show_pattern_clap_mixer_effect_lfo_parameter_link_controls(
+                                                                                ui,
+                                                                                lfo_link,
+                                                                                lfo_scope,
+                                                                                insert.ordinal(),
+                                                                                slot_index_raw,
+                                                                                &assignment.path,
+                                                                                &assignment.plugin_id,
+                                                                                parameter.id,
+                                                                                &parameter.name,
+                                                                                parameter.min_value,
+                                                                                parameter.max_value,
+                                                                                flags.contains(
+                                                                                    ParamInfoFlags::IS_STEPPED,
+                                                                                ),
+                                                                                flags.contains(
+                                                                                    ParamInfoFlags::IS_READONLY,
+                                                                                ),
+                                                                                widget_id,
+                                                                            );
+                                                                        if let Some(link) = lfo_upsert {
+                                                                            pattern_clap_mixer_effect_lfo_upserts
+                                                                                .push(link);
+                                                                        }
+                                                                        if clear_lfo
+                                                                            && let Some(link) = lfo_link
+                                                                        {
+                                                                            pattern_clap_mixer_effect_lfo_unlinks
+                                                                                .push(link.clone());
+                                                                        }
                                                                     }
                                                                     if editable_count == 0 {
                                                                         ui.small("No writable ranged parameters were reported.");
@@ -72665,6 +72901,8 @@ impl DawUi {
         let mut pattern_clap_unlink_request: Option<PatternClapParameterLink> = None;
         let mut pattern_clap_lfo_upserts = Vec::new();
         let mut pattern_clap_lfo_unlinks = Vec::new();
+        let mut pattern_clap_mixer_effect_lfo_upserts = Vec::new();
+        let mut pattern_clap_mixer_effect_lfo_unlinks = Vec::new();
         let mut pattern_vst3_link_request: Option<(String, u16, u8, u8, MidiVst3ParameterTarget)> =
             None;
         let mut pattern_vst3_unlink_request: Option<(PathBuf, u16, MidiVst3ParameterTarget)> = None;
@@ -74870,6 +75108,49 @@ impl DawUi {
                 |error| {
                     format!(
                         "Cleared CLAP Pattern LFO link for this session; could not save it: {error}"
+                    )
+                },
+            );
+        }
+        for link in pattern_clap_mixer_effect_lfo_upserts {
+            upsert_pattern_clap_mixer_effect_lfo_parameter_link(
+                &mut self.pattern_clap_mixer_effect_lfo_parameter_links,
+                link.clone(),
+            );
+            self.invalidate_clap_playlist_audio();
+            self.status = save_pattern_clap_mixer_effect_lfo_parameter_links(
+                &self.pattern_clap_mixer_effect_lfo_parameter_links,
+            )
+            .err()
+            .map_or_else(
+                || {
+                    format!(
+                        "Linked {} to a CLAP Mixer Pattern LFO on this machine",
+                        link.parameter_name
+                    )
+                },
+                |error| {
+                    format!(
+                        "Updated the CLAP Mixer Pattern LFO for this session; could not save it: {error}"
+                    )
+                },
+            );
+        }
+        for link in pattern_clap_mixer_effect_lfo_unlinks {
+            remove_pattern_clap_mixer_effect_lfo_parameter_link(
+                &mut self.pattern_clap_mixer_effect_lfo_parameter_links,
+                &link,
+            );
+            self.invalidate_clap_playlist_audio();
+            self.status = save_pattern_clap_mixer_effect_lfo_parameter_links(
+                &self.pattern_clap_mixer_effect_lfo_parameter_links,
+            )
+            .err()
+            .map_or_else(
+                || format!("Cleared CLAP Mixer Pattern LFO for {}", link.parameter_name),
+                |error| {
+                    format!(
+                        "Cleared the CLAP Mixer Pattern LFO for this session; could not save it: {error}"
                     )
                 },
             );
@@ -78802,6 +79083,10 @@ fn pattern_clap_lfo_parameter_links_file() -> Option<PathBuf> {
     midi_control_change_mapping_file("pattern-clap-lfo-parameter-links.txt")
 }
 
+fn pattern_clap_mixer_effect_lfo_parameter_links_file() -> Option<PathBuf> {
+    midi_control_change_mapping_file("pattern-clap-mixer-effect-lfo-parameter-links.txt")
+}
+
 fn pattern_vst3_mixer_effect_parameter_links_file() -> Option<PathBuf> {
     midi_control_change_mapping_file("pattern-vst3-mixer-effect-parameter-links.txt")
 }
@@ -78892,6 +79177,14 @@ fn load_pattern_clap_lfo_parameter_links() -> Vec<PatternClapLfoParameterLink> {
     pattern_clap_lfo_parameter_links_file()
         .and_then(|path| fs::read_to_string(path).ok())
         .map(|contents| parse_pattern_clap_lfo_parameter_links(&contents))
+        .unwrap_or_default()
+}
+
+fn load_pattern_clap_mixer_effect_lfo_parameter_links()
+-> Vec<PatternClapMixerEffectLfoParameterLink> {
+    pattern_clap_mixer_effect_lfo_parameter_links_file()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .map(|contents| parse_pattern_clap_mixer_effect_lfo_parameter_links(&contents))
         .unwrap_or_default()
 }
 
@@ -79201,6 +79494,23 @@ fn save_pattern_clap_lfo_parameter_links(
         .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
     fs::write(&path, serialize_pattern_clap_lfo_parameter_links(links))
         .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
+fn save_pattern_clap_mixer_effect_lfo_parameter_links(
+    links: &[PatternClapMixerEffectLfoParameterLink],
+) -> Result<(), String> {
+    let path = pattern_clap_mixer_effect_lfo_parameter_links_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path.parent().ok_or_else(|| {
+        "the Pattern CLAP Mixer effect LFO link path has no parent folder".to_owned()
+    })?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    fs::write(
+        &path,
+        serialize_pattern_clap_mixer_effect_lfo_parameter_links(links),
+    )
+    .map_err(|error| format!("could not write {}: {error}", path.display()))
 }
 
 fn save_pattern_vst3_mixer_effect_parameter_links(
@@ -79787,6 +80097,81 @@ fn pattern_clap_lfo_parameter_link_for_target<'a>(
             plugin_id,
             parameter_id,
         )
+    })
+}
+
+fn same_pattern_clap_mixer_effect_lfo_parameter_link_target(
+    link: &PatternClapMixerEffectLfoParameterLink,
+    target: &PatternClapMixerEffectLfoParameterLink,
+) -> bool {
+    project_paths_equal(
+        Path::new(&link.project_path),
+        Path::new(&target.project_path),
+    ) && link.pattern_id == target.pattern_id
+        && link.insert_ordinal == target.insert_ordinal
+        && link.slot_index == target.slot_index
+        && Path::new(&link.plugin_path) == Path::new(&target.plugin_path)
+        && link.plugin_id == target.plugin_id
+        && link.parameter_id == target.parameter_id
+}
+
+fn valid_pattern_clap_mixer_effect_lfo_parameter_link(
+    link: &PatternClapMixerEffectLfoParameterLink,
+) -> bool {
+    !link.project_path.is_empty()
+        && link.insert_ordinal > 0
+        && link.slot_index < 10
+        && !link.plugin_path.is_empty()
+        && !link.plugin_id.is_empty()
+        && link.parameter_id != u32::MAX
+        && !link.parameter_name.is_empty()
+        && link.parameter_min_value.is_finite()
+        && link.parameter_max_value.is_finite()
+        && link.parameter_min_value < link.parameter_max_value
+        && (250..=64_000).contains(&link.period_millibeats)
+        && link.minimum_raw <= link.maximum_raw
+        && link.maximum_raw <= 10_000
+        && link.phase_degrees < 360
+}
+
+fn upsert_pattern_clap_mixer_effect_lfo_parameter_link(
+    links: &mut Vec<PatternClapMixerEffectLfoParameterLink>,
+    link: PatternClapMixerEffectLfoParameterLink,
+) {
+    if !valid_pattern_clap_mixer_effect_lfo_parameter_link(&link) {
+        return;
+    }
+    links.retain(|existing| {
+        !same_pattern_clap_mixer_effect_lfo_parameter_link_target(existing, &link)
+    });
+    links.push(link);
+}
+
+fn remove_pattern_clap_mixer_effect_lfo_parameter_link(
+    links: &mut Vec<PatternClapMixerEffectLfoParameterLink>,
+    target: &PatternClapMixerEffectLfoParameterLink,
+) {
+    links.retain(|link| !same_pattern_clap_mixer_effect_lfo_parameter_link_target(link, target));
+}
+
+fn pattern_clap_mixer_effect_lfo_parameter_link_for_target<'a>(
+    links: &'a [PatternClapMixerEffectLfoParameterLink],
+    project_path: &Path,
+    pattern_id: u16,
+    insert_ordinal: usize,
+    slot_index: u16,
+    plugin_path: &Path,
+    plugin_id: &str,
+    parameter_id: u32,
+) -> Option<&'a PatternClapMixerEffectLfoParameterLink> {
+    links.iter().find(|link| {
+        project_paths_equal(Path::new(&link.project_path), project_path)
+            && link.pattern_id == pattern_id
+            && link.insert_ordinal == insert_ordinal
+            && link.slot_index == slot_index
+            && Path::new(&link.plugin_path) == plugin_path
+            && link.plugin_id == plugin_id
+            && link.parameter_id == parameter_id
     })
 }
 
@@ -80589,6 +80974,44 @@ fn clap_internal_lfo_parameter_automation(
         })
         .collect();
     ClapParameterAutomation {
+        parameter_id: link.parameter_id,
+        points,
+    }
+}
+
+fn clap_mixer_effect_internal_lfo_parameter_automation(
+    link: &PatternClapMixerEffectLfoParameterLink,
+    ppq: u16,
+    loop_length_ticks: u64,
+) -> Vst3PlaylistParameterAutomation {
+    let duration_beats = loop_length_ticks as f64 / f64::from(ppq.max(1));
+    let period_beats = f64::from(link.period_millibeats) / 1_000.0;
+    let requested_steps = (duration_beats / period_beats * 32.0).ceil().max(8.0);
+    let step_count = requested_steps.min((MAX_INTERNAL_LFO_AUTOMATION_POINTS - 1) as f64) as usize;
+    let minimum = f64::from(link.minimum_raw) / 10_000.0;
+    let maximum = f64::from(link.maximum_raw) / 10_000.0;
+    let phase_offset = f64::from(link.phase_degrees) / 360.0;
+    let points = (0..=step_count)
+        .map(|step| {
+            let fraction = step as f64 / step_count as f64;
+            let phase = duration_beats * fraction / period_beats + phase_offset;
+            let wave = internal_lfo_value_at_phase(link.waveform, phase);
+            let normalized = minimum + (maximum - minimum) * wave;
+            let value = link.parameter_min_value
+                + (link.parameter_max_value - link.parameter_min_value) * normalized;
+            let value = if link.parameter_is_stepped {
+                value.round()
+            } else {
+                value
+            };
+            Vst3PlaylistAutomationPoint {
+                tick: (loop_length_ticks as f64 * fraction).round() as u64,
+                value: value.clamp(link.parameter_min_value, link.parameter_max_value),
+                tension: 0.0,
+            }
+        })
+        .collect();
+    Vst3PlaylistParameterAutomation {
         parameter_id: link.parameter_id,
         points,
     }
@@ -81421,6 +81844,147 @@ fn serialize_pattern_clap_lfo_parameter_links(links: &[PatternClapLfoParameterLi
         contents.push_str(&link.parameter_id.to_string());
         contents.push('\t');
         contents.push_str(&encode_midi_device_id(&link.parameter_name));
+        contents.push('\t');
+        contents.push_str(&link.waveform.code().to_string());
+        contents.push('\t');
+        contents.push_str(&link.period_millibeats.to_string());
+        contents.push('\t');
+        contents.push_str(&link.minimum_raw.to_string());
+        contents.push('\t');
+        contents.push_str(&link.maximum_raw.to_string());
+        contents.push('\t');
+        contents.push_str(&link.phase_degrees.to_string());
+        contents.push('\n');
+    }
+    contents
+}
+
+fn parse_pattern_clap_mixer_effect_lfo_parameter_links(
+    contents: &str,
+) -> Vec<PatternClapMixerEffectLfoParameterLink> {
+    let mut links = Vec::new();
+    for line in contents.lines() {
+        let Some(encoded) = line.strip_prefix("mixer_link=") else {
+            continue;
+        };
+        let mut fields = encoded.split('\t');
+        let Some(project_path) = fields.next().and_then(decode_midi_device_id) else {
+            continue;
+        };
+        let Some(pattern_id) = fields.next().and_then(|field| field.parse::<u16>().ok()) else {
+            continue;
+        };
+        let Some(insert_ordinal) = fields.next().and_then(|field| field.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        let Some(slot_index) = fields.next().and_then(|field| field.parse::<u16>().ok()) else {
+            continue;
+        };
+        let Some(plugin_path) = fields.next().and_then(decode_midi_device_id) else {
+            continue;
+        };
+        let Some(plugin_id) = fields.next().and_then(decode_midi_device_id) else {
+            continue;
+        };
+        let Some(parameter_id) = fields.next().and_then(|field| field.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(parameter_name) = fields.next().and_then(decode_midi_device_id) else {
+            continue;
+        };
+        let Some(parameter_min_value) = fields.next().and_then(|field| field.parse::<f64>().ok())
+        else {
+            continue;
+        };
+        let Some(parameter_max_value) = fields.next().and_then(|field| field.parse::<f64>().ok())
+        else {
+            continue;
+        };
+        let parameter_is_stepped = match fields.next() {
+            Some("0") => false,
+            Some("1") => true,
+            _ => continue,
+        };
+        let Some(waveform) = fields
+            .next()
+            .and_then(|field| field.parse::<u8>().ok())
+            .and_then(InternalLfoWaveform::from_code)
+        else {
+            continue;
+        };
+        let Some(period_millibeats) = fields.next().and_then(|field| field.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Some(minimum_raw) = fields.next().and_then(|field| field.parse::<u16>().ok()) else {
+            continue;
+        };
+        let Some(maximum_raw) = fields.next().and_then(|field| field.parse::<u16>().ok()) else {
+            continue;
+        };
+        let Some(phase_degrees) = fields.next().and_then(|field| field.parse::<u16>().ok()) else {
+            continue;
+        };
+        if fields.next().is_some() {
+            continue;
+        }
+        upsert_pattern_clap_mixer_effect_lfo_parameter_link(
+            &mut links,
+            PatternClapMixerEffectLfoParameterLink {
+                project_path,
+                pattern_id,
+                insert_ordinal,
+                slot_index,
+                plugin_path,
+                plugin_id,
+                parameter_id,
+                parameter_name,
+                parameter_min_value,
+                parameter_max_value,
+                parameter_is_stepped,
+                waveform,
+                period_millibeats,
+                minimum_raw,
+                maximum_raw,
+                phase_degrees,
+            },
+        );
+    }
+    links
+}
+
+fn serialize_pattern_clap_mixer_effect_lfo_parameter_links(
+    links: &[PatternClapMixerEffectLfoParameterLink],
+) -> String {
+    let mut contents = String::from("version=1\n");
+    let mut normalized = Vec::new();
+    for link in links {
+        upsert_pattern_clap_mixer_effect_lfo_parameter_link(&mut normalized, link.clone());
+    }
+    for link in normalized {
+        contents.push_str("mixer_link=");
+        contents.push_str(&encode_midi_device_id(&link.project_path));
+        contents.push('\t');
+        contents.push_str(&link.pattern_id.to_string());
+        contents.push('\t');
+        contents.push_str(&link.insert_ordinal.to_string());
+        contents.push('\t');
+        contents.push_str(&link.slot_index.to_string());
+        contents.push('\t');
+        contents.push_str(&encode_midi_device_id(&link.plugin_path));
+        contents.push('\t');
+        contents.push_str(&encode_midi_device_id(&link.plugin_id));
+        contents.push('\t');
+        contents.push_str(&link.parameter_id.to_string());
+        contents.push('\t');
+        contents.push_str(&encode_midi_device_id(&link.parameter_name));
+        contents.push('\t');
+        contents.push_str(&link.parameter_min_value.to_string());
+        contents.push('\t');
+        contents.push_str(&link.parameter_max_value.to_string());
+        contents.push('\t');
+        contents.push_str(if link.parameter_is_stepped { "1" } else { "0" });
         contents.push('\t');
         contents.push_str(&link.waveform.code().to_string());
         contents.push('\t');
