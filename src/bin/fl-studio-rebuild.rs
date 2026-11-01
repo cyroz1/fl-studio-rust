@@ -40271,7 +40271,7 @@ impl DawUi {
                                                 ));
                                             }
                                             ui.small(
-                                                "Changes are saved to the project; playback does not apply the filter yet.",
+                                                "Saved cutoff, resonance, and filter type affect Sampler playback; note Mod X/Mod Y and their envelope/LFO modulation remain unsupported.",
                                             );
                                         });
                                     }

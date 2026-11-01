@@ -12838,6 +12838,7 @@ fn prepare_sampler_arrangement(
             let (gain, pan) = channel_gain_pan(channel.volume(), channel.pan());
             let volume_envelope = sampler_volume_envelope_config(channel, options.sample_rate, ppq);
             source_entry.insert(SamplerVoiceSource {
+                sampler_filter: sampler_filter_config(channel),
                 audio,
                 gain: gain
                     * sampler_metadata_gain(sample_metadata.gain_db)
@@ -13146,6 +13147,7 @@ struct PreparedSamplerPattern {
 #[derive(Clone)]
 struct SamplerVoiceSource {
     audio: Arc<DecodedAudio>,
+    sampler_filter: Option<SamplerFilterConfig>,
     gain: f32,
     pan: f32,
     reverse: bool,
@@ -13214,6 +13216,255 @@ struct SamplerLfo {
     amount: f32,
     shape: i32,
     phase_retrigger: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SamplerFilterConfig {
+    cutoff_raw: u32,
+    resonance_raw: u32,
+    filter_type_raw: u32,
+}
+
+fn sampler_filter_config(channel: &ChannelSummary) -> Option<SamplerFilterConfig> {
+    let config = SamplerFilterConfig {
+        cutoff_raw: channel.sampler_filter_cutoff_raw()?,
+        resonance_raw: channel.sampler_filter_resonance_raw()?,
+        filter_type_raw: channel.sampler_filter_type_raw()?,
+    };
+    (config.cutoff_raw <= 256
+        && config.resonance_raw <= 256
+        && config.filter_type_raw <= 7
+        && (config.cutoff_raw < 256 || config.resonance_raw > 0))
+        .then_some(config)
+}
+
+#[derive(Clone, Copy)]
+enum SamplerFilterStageCoefficients {
+    OnePole {
+        alpha: f32,
+    },
+    Biquad {
+        b0: f32,
+        b1: f32,
+        b2: f32,
+        a1: f32,
+        a2: f32,
+    },
+    StateVariable {
+        a1: f32,
+        a2: f32,
+        a3: f32,
+    },
+}
+
+#[derive(Clone, Copy, Default)]
+struct SamplerFilterStageState {
+    input_1: f32,
+    input_2: f32,
+    output_1: f32,
+    output_2: f32,
+    integrator_1: f32,
+    integrator_2: f32,
+}
+
+#[derive(Clone)]
+struct SamplerFilterState {
+    first_coefficients: SamplerFilterStageCoefficients,
+    second_coefficients: Option<SamplerFilterStageCoefficients>,
+    left_first: SamplerFilterStageState,
+    right_first: SamplerFilterStageState,
+    left_second: SamplerFilterStageState,
+    right_second: SamplerFilterStageState,
+}
+
+impl SamplerFilterState {
+    fn new(config: SamplerFilterConfig, sample_rate: u32) -> Option<Self> {
+        if config.cutoff_raw > 256 || config.resonance_raw > 256 || config.filter_type_raw > 7 {
+            return None;
+        }
+        if config.cutoff_raw == 256 && config.resonance_raw == 0 {
+            return None;
+        }
+
+        let sample_rate = f64::from(sample_rate.max(1));
+        let cutoff_hz = sampler_filter_cutoff_hz(config.cutoff_raw, sample_rate);
+        let resonance_q = sampler_filter_resonance_q(config.resonance_raw);
+        let filter_type = config.filter_type_raw;
+        let first_coefficients = match filter_type {
+            0 => SamplerFilterStageCoefficients::OnePole {
+                alpha: (1.0 - (-std::f64::consts::TAU * cutoff_hz / sample_rate).exp()) as f32,
+            },
+            1 => sampler_filter_biquad(
+                cutoff_hz,
+                sample_rate,
+                resonance_q,
+                SamplerBiquadMode::LowPass,
+            ),
+            2 => sampler_filter_biquad(
+                cutoff_hz,
+                sample_rate,
+                resonance_q,
+                SamplerBiquadMode::BandPass,
+            ),
+            3 => sampler_filter_biquad(
+                cutoff_hz,
+                sample_rate,
+                resonance_q,
+                SamplerBiquadMode::HighPass,
+            ),
+            4 => sampler_filter_biquad(
+                cutoff_hz,
+                sample_rate,
+                resonance_q,
+                SamplerBiquadMode::BandStop,
+            ),
+            5 => sampler_filter_biquad(
+                cutoff_hz,
+                sample_rate,
+                resonance_q,
+                SamplerBiquadMode::LowPass,
+            ),
+            6 => sampler_filter_state_variable(cutoff_hz, sample_rate, resonance_q),
+            7 => sampler_filter_state_variable(cutoff_hz, sample_rate, resonance_q),
+            _ => return None,
+        };
+        let second_coefficients = match filter_type {
+            5 => Some(sampler_filter_biquad(
+                cutoff_hz,
+                sample_rate,
+                resonance_q,
+                SamplerBiquadMode::LowPass,
+            )),
+            7 => Some(sampler_filter_state_variable(
+                cutoff_hz,
+                sample_rate,
+                resonance_q,
+            )),
+            _ => None,
+        };
+
+        Some(Self {
+            first_coefficients,
+            second_coefficients,
+            left_first: SamplerFilterStageState::default(),
+            right_first: SamplerFilterStageState::default(),
+            left_second: SamplerFilterStageState::default(),
+            right_second: SamplerFilterStageState::default(),
+        })
+    }
+
+    fn process_left(&mut self, sample: f32) -> f32 {
+        let output =
+            sampler_filter_process_stage(sample, self.first_coefficients, &mut self.left_first);
+        self.second_coefficients.map_or(output, |coefficients| {
+            sampler_filter_process_stage(output, coefficients, &mut self.left_second)
+        })
+    }
+
+    fn process_right(&mut self, sample: f32) -> f32 {
+        let output =
+            sampler_filter_process_stage(sample, self.first_coefficients, &mut self.right_first);
+        self.second_coefficients.map_or(output, |coefficients| {
+            sampler_filter_process_stage(output, coefficients, &mut self.right_second)
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SamplerBiquadMode {
+    LowPass,
+    BandPass,
+    HighPass,
+    BandStop,
+}
+
+/// Candidate 20 Hz–20 kHz logarithmic mapping; the public manual does not specify the raw curve.
+fn sampler_filter_cutoff_hz(raw: u32, sample_rate: f64) -> f64 {
+    let normalized = f64::from(raw.min(256)) / 256.0;
+    let candidate_hz = 20.0 * 1_000.0_f64.powf(normalized);
+    candidate_hz.clamp(10.0, (sample_rate * 0.45).max(10.0))
+}
+
+/// Candidate Butterworth-to-high-Q mapping; native resonance calibration remains open.
+fn sampler_filter_resonance_q(raw: u32) -> f64 {
+    let normalized = f64::from(raw.min(256)) / 256.0;
+    0.707_106_781_186_547_6 * 10.0_f64.powf(normalized)
+}
+
+fn sampler_filter_biquad(
+    cutoff_hz: f64,
+    sample_rate: f64,
+    resonance_q: f64,
+    mode: SamplerBiquadMode,
+) -> SamplerFilterStageCoefficients {
+    let omega = (std::f64::consts::TAU * cutoff_hz / sample_rate).min(std::f64::consts::PI * 0.9);
+    let cosine = omega.cos();
+    let sine = omega.sin();
+    let alpha = sine / (2.0 * resonance_q.max(0.1));
+    let (b0, b1, b2) = match mode {
+        SamplerBiquadMode::LowPass => ((1.0 - cosine) * 0.5, 1.0 - cosine, (1.0 - cosine) * 0.5),
+        SamplerBiquadMode::BandPass => (alpha, 0.0, -alpha),
+        SamplerBiquadMode::HighPass => {
+            ((1.0 + cosine) * 0.5, -(1.0 + cosine), (1.0 + cosine) * 0.5)
+        }
+        SamplerBiquadMode::BandStop => (1.0, -2.0 * cosine, 1.0),
+    };
+    let a0 = 1.0 + alpha;
+    SamplerFilterStageCoefficients::Biquad {
+        b0: (b0 / a0) as f32,
+        b1: (b1 / a0) as f32,
+        b2: (b2 / a0) as f32,
+        a1: (-2.0 * cosine / a0) as f32,
+        a2: ((1.0 - alpha) / a0) as f32,
+    }
+}
+
+fn sampler_filter_state_variable(
+    cutoff_hz: f64,
+    sample_rate: f64,
+    resonance_q: f64,
+) -> SamplerFilterStageCoefficients {
+    let g = (std::f64::consts::PI * cutoff_hz / sample_rate).tan();
+    let k = 1.0 / resonance_q.max(0.1);
+    let a1 = 1.0 / (1.0 + g * (g + k));
+    let a2 = g * a1;
+    let a3 = g * a2;
+    SamplerFilterStageCoefficients::StateVariable {
+        a1: a1 as f32,
+        a2: a2 as f32,
+        a3: a3 as f32,
+    }
+}
+
+fn sampler_filter_process_stage(
+    sample: f32,
+    coefficients: SamplerFilterStageCoefficients,
+    state: &mut SamplerFilterStageState,
+) -> f32 {
+    match coefficients {
+        SamplerFilterStageCoefficients::OnePole { alpha } => {
+            state.output_1 += alpha * (sample - state.output_1);
+            state.output_1
+        }
+        SamplerFilterStageCoefficients::Biquad { b0, b1, b2, a1, a2 } => {
+            let output = b0 * sample + b1 * state.input_1 + b2 * state.input_2
+                - a1 * state.output_1
+                - a2 * state.output_2;
+            state.input_2 = state.input_1;
+            state.input_1 = sample;
+            state.output_2 = state.output_1;
+            state.output_1 = output;
+            output
+        }
+        SamplerFilterStageCoefficients::StateVariable { a1, a2, a3 } => {
+            let v3 = sample - state.integrator_2;
+            let v1 = a1 * state.integrator_1 + a2 * v3;
+            let v2 = state.integrator_2 + a2 * state.integrator_1 + a3 * v3;
+            state.integrator_1 = 2.0 * v1 - state.integrator_1;
+            state.integrator_2 = 2.0 * v2 - state.integrator_2;
+            v2
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -16511,6 +16762,7 @@ fn prepare_sampler_pattern_for_channel_internal(
             let (gain, pan) = channel_gain_pan(channel.volume(), channel.pan());
             let volume_envelope = sampler_volume_envelope_config(channel, options.sample_rate, ppq);
             source_entry.insert(SamplerVoiceSource {
+                sampler_filter: sampler_filter_config(channel),
                 audio,
                 gain: gain
                     * sampler_metadata_gain(sample_metadata.gain_db)
@@ -16919,6 +17171,7 @@ struct SamplerVoice {
     pan_lfo: Option<SamplerLfo>,
     volume_lfo: Option<SamplerLfo>,
     pitch_lfo: Option<SamplerLfo>,
+    sampler_filter: Option<SamplerFilterState>,
     lfo_pitch_cents: f64,
     envelope_release_start_frame: Option<u64>,
     envelope_release_start_tick: Option<f64>,
@@ -17439,7 +17692,8 @@ impl<'a> SamplerVoiceEngine<'a> {
                         voice.source_step,
                         self.resampling_quality,
                     );
-                    let right = if voice.source.channels.len() == 1 {
+                    let mono_source = voice.source.channels.len() == 1;
+                    let right = if mono_source {
                         left
                     } else {
                         resample_sample(
@@ -17448,6 +17702,17 @@ impl<'a> SamplerVoiceEngine<'a> {
                             voice.source_step,
                             self.resampling_quality,
                         )
+                    };
+                    let (left, right) = if let Some(filter) = voice.sampler_filter.as_mut() {
+                        let left = filter.process_left(left);
+                        let right = if mono_source {
+                            left
+                        } else {
+                            filter.process_right(right)
+                        };
+                        (left, right)
+                    } else {
+                        (left, right)
                     };
                     let envelope_gain =
                         sampler_voice_volume_envelope_gain(voice, frame, current_tick);
@@ -17775,6 +18040,9 @@ impl<'a> SamplerVoiceEngine<'a> {
             pan_lfo: source.pan_lfo,
             volume_lfo: source.volume_lfo,
             pitch_lfo: source.pitch_lfo,
+            sampler_filter: source
+                .sampler_filter
+                .and_then(|config| SamplerFilterState::new(config, self.output_sample_rate)),
             lfo_pitch_cents: 0.0,
             envelope_release_start_frame: None,
             envelope_release_start_tick: None,
@@ -23338,6 +23606,7 @@ mod tests {
             sources_by_channel: HashMap::from([(
                 2,
                 SamplerVoiceSource {
+                    sampler_filter: None,
                     audio: Arc::new(DecodedAudio {
                         sample_rate: 4,
                         channels: vec![vec![2.0; 2]],
@@ -24488,6 +24757,78 @@ mod tests {
         assert_eq!(channel_gain_pan(None, None), (1.0, 0.0));
     }
 
+    fn sampler_filter_sine_rms(filter_type_raw: u32, frequency_hz: f64) -> f64 {
+        let sample_rate = 48_000.0_f64;
+        let mut filter = SamplerFilterState::new(
+            SamplerFilterConfig {
+                cutoff_raw: 128,
+                resonance_raw: 0,
+                filter_type_raw,
+            },
+            sample_rate as u32,
+        )
+        .expect("the selected filter should be enabled");
+        let samples = 12_000;
+        let mut squared_sum = 0.0;
+        let mut measured = 0;
+        for frame in 0..samples {
+            let phase = std::f64::consts::TAU * frequency_hz * frame as f64 / sample_rate;
+            let output = filter.process_left(phase.sin() as f32);
+            if frame >= samples / 2 {
+                squared_sum += f64::from(output).powi(2);
+                measured += 1;
+            }
+        }
+        (squared_sum / measured as f64).sqrt()
+    }
+
+    #[test]
+    fn sampler_filter_bypass_and_cutoff_modes_behave_as_expected() {
+        assert!(
+            SamplerFilterState::new(
+                SamplerFilterConfig {
+                    cutoff_raw: 256,
+                    resonance_raw: 0,
+                    filter_type_raw: 1,
+                },
+                48_000,
+            )
+            .is_none()
+        );
+
+        let low_pass_low = sampler_filter_sine_rms(1, 100.0);
+        let low_pass_high = sampler_filter_sine_rms(1, 8_000.0);
+        assert!(low_pass_low > low_pass_high * 10.0);
+
+        let high_pass_low = sampler_filter_sine_rms(3, 100.0);
+        let high_pass_high = sampler_filter_sine_rms(3, 8_000.0);
+        assert!(high_pass_high > high_pass_low * 10.0);
+    }
+
+    #[test]
+    fn sampler_filter_modes_keep_impulse_output_finite() {
+        for filter_type_raw in 0..=7 {
+            let mut filter = SamplerFilterState::new(
+                SamplerFilterConfig {
+                    cutoff_raw: 192,
+                    resonance_raw: 224,
+                    filter_type_raw,
+                },
+                44_100,
+            )
+            .expect("known filter types should construct");
+            for frame in 0..2_048 {
+                let impulse = if frame == 0 { 1.0 } else { 0.0 };
+                let output = filter.process_left(impulse);
+                assert!(output.is_finite(), "filter type {filter_type_raw} diverged");
+                assert!(
+                    output.abs() < 500.0,
+                    "filter type {filter_type_raw} exploded"
+                );
+            }
+        }
+    }
+
     #[test]
     fn sampler_volume_envelope_applies_sustain_for_zero_time_stages() {
         let gain = |sustain, amount| {
@@ -24548,6 +24889,7 @@ mod tests {
     #[test]
     fn sampler_volume_envelope_release_uses_saved_release_duration() {
         let source = SamplerVoiceSource {
+            sampler_filter: None,
             audio: Arc::new(DecodedAudio {
                 sample_rate: 4,
                 channels: vec![vec![1.0; 32]],
@@ -24720,6 +25062,7 @@ mod tests {
         let sources = HashMap::from([(
             7,
             SamplerVoiceSource {
+                sampler_filter: None,
                 audio: source,
                 gain: 1.0,
                 pan: 0.0,
@@ -24786,6 +25129,7 @@ mod tests {
         let sources = HashMap::from([(
             7,
             SamplerVoiceSource {
+                sampler_filter: None,
                 audio: Arc::new(DecodedAudio {
                     sample_rate: 8,
                     channels: vec![vec![1.0; 8]],
@@ -24851,6 +25195,7 @@ mod tests {
         let sources = HashMap::from([(
             7,
             SamplerVoiceSource {
+                sampler_filter: None,
                 audio: Arc::new(DecodedAudio {
                     sample_rate: 8,
                     channels: vec![(0..6).map(|frame| frame as f32).collect()],
@@ -24988,6 +25333,7 @@ mod tests {
         let sources = HashMap::from([(
             7,
             SamplerVoiceSource {
+                sampler_filter: None,
                 audio: Arc::new(DecodedAudio {
                     sample_rate: 8,
                     channels: vec![(0..16).map(|frame| frame as f32 / 16.0).collect()],
@@ -25054,6 +25400,7 @@ mod tests {
         let sources = HashMap::from([(
             7,
             SamplerVoiceSource {
+                sampler_filter: None,
                 audio: Arc::new(DecodedAudio {
                     sample_rate: 4,
                     channels: vec![vec![1.0; 4]],
@@ -25143,6 +25490,7 @@ mod tests {
         let sources = HashMap::from([(
             7,
             SamplerVoiceSource {
+                sampler_filter: None,
                 audio: Arc::new(DecodedAudio {
                     sample_rate: 4,
                     channels: vec![vec![1.0; 8]],
@@ -25283,6 +25631,7 @@ mod tests {
         let sources = HashMap::from([(
             7,
             SamplerVoiceSource {
+                sampler_filter: None,
                 audio: Arc::new(DecodedAudio {
                     sample_rate: 4,
                     channels: vec![vec![1.0; 8]],
@@ -25371,6 +25720,7 @@ mod tests {
         let sources = HashMap::from([(
             7,
             SamplerVoiceSource {
+                sampler_filter: None,
                 audio: Arc::new(DecodedAudio {
                     sample_rate: 4,
                     channels: vec![vec![0.5]],
@@ -25438,6 +25788,7 @@ mod tests {
         let sources = HashMap::from([(
             7,
             SamplerVoiceSource {
+                sampler_filter: None,
                 audio: Arc::new(DecodedAudio {
                     sample_rate: 4,
                     channels: vec![vec![1.0]],
@@ -25498,6 +25849,7 @@ mod tests {
         let sources = HashMap::from([(
             7,
             SamplerVoiceSource {
+                sampler_filter: None,
                 audio: Arc::new(DecodedAudio {
                     sample_rate: 4,
                     channels: vec![vec![1.0]],
@@ -25564,6 +25916,7 @@ mod tests {
         let sources = HashMap::from([(
             7,
             SamplerVoiceSource {
+                sampler_filter: None,
                 audio: source,
                 gain: 1.0,
                 pan: -1.0,
@@ -25620,6 +25973,7 @@ mod tests {
         let sources = HashMap::from([(
             7,
             SamplerVoiceSource {
+                sampler_filter: None,
                 audio: Arc::new(DecodedAudio {
                     sample_rate: 4,
                     channels: vec![vec![0.0, 1.0, 2.0, 3.0, 4.0]],
@@ -25685,6 +26039,7 @@ mod tests {
         let sources = HashMap::from([(
             7,
             SamplerVoiceSource {
+                sampler_filter: None,
                 audio: Arc::new(DecodedAudio {
                     sample_rate: 4,
                     channels: vec![vec![0.0, 1.0, 2.0, 3.0, 4.0]],
@@ -25750,6 +26105,7 @@ mod tests {
         let sources = HashMap::from([(
             7,
             SamplerVoiceSource {
+                sampler_filter: None,
                 audio: Arc::new(DecodedAudio {
                     sample_rate: 4,
                     channels: vec![vec![0.0, 1.0, 2.0, 3.0, 4.0]],
@@ -25815,6 +26171,7 @@ mod tests {
         let sources = HashMap::from([(
             7,
             SamplerVoiceSource {
+                sampler_filter: None,
                 audio: Arc::new(DecodedAudio {
                     sample_rate: 4,
                     channels: vec![vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]],
@@ -25898,6 +26255,7 @@ mod tests {
         let sources = HashMap::from([(
             2,
             SamplerVoiceSource {
+                sampler_filter: None,
                 audio: source,
                 gain: 1.0,
                 pan: -1.0,
@@ -25956,6 +26314,7 @@ mod tests {
         let sources = HashMap::from([(
             2,
             SamplerVoiceSource {
+                sampler_filter: None,
                 audio: Arc::new(DecodedAudio {
                     sample_rate: 4,
                     channels: vec![(0..8).map(|frame| frame as f32).collect()],
@@ -26024,6 +26383,7 @@ mod tests {
     #[test]
     fn sampler_source_honors_inclusive_sample_key_and_velocity_ranges() {
         let source = SamplerVoiceSource {
+            sampler_filter: None,
             audio: Arc::new(DecodedAudio {
                 sample_rate: 1,
                 channels: vec![vec![0.0]],
@@ -26104,6 +26464,7 @@ mod tests {
         let sources = HashMap::from([(
             7,
             SamplerVoiceSource {
+                sampler_filter: None,
                 audio: Arc::new(DecodedAudio {
                     sample_rate: 4,
                     channels: vec![vec![1.0; 8]],
@@ -26187,6 +26548,7 @@ mod tests {
         let sources = HashMap::from([(
             3,
             SamplerVoiceSource {
+                sampler_filter: None,
                 audio: source,
                 gain: 1.0,
                 pan: -1.0,
@@ -26256,6 +26618,7 @@ mod tests {
             (
                 1,
                 SamplerVoiceSource {
+                    sampler_filter: None,
                     audio: source_a,
                     gain: 1.0,
                     pan: -1.0,
@@ -26285,6 +26648,7 @@ mod tests {
             (
                 2,
                 SamplerVoiceSource {
+                    sampler_filter: None,
                     audio: source_b,
                     gain: 1.0,
                     pan: -1.0,
@@ -26366,6 +26730,7 @@ mod tests {
             (
                 1,
                 SamplerVoiceSource {
+                    sampler_filter: None,
                     audio: Arc::new(DecodedAudio {
                         sample_rate: 4,
                         channels: vec![vec![1.0, 3.0, 5.0, 7.0]],
@@ -26398,6 +26763,7 @@ mod tests {
             (
                 2,
                 SamplerVoiceSource {
+                    sampler_filter: None,
                     audio: Arc::new(DecodedAudio {
                         sample_rate: 4,
                         channels: vec![vec![10.0; 4]],
@@ -26516,6 +26882,7 @@ mod tests {
         let sources = HashMap::from([(
             1,
             SamplerVoiceSource {
+                sampler_filter: None,
                 audio: Arc::new(DecodedAudio {
                     sample_rate: 4,
                     channels: vec![vec![1.0; 8]],
@@ -26610,6 +26977,7 @@ mod tests {
     #[test]
     fn sampler_cut_groups_stop_matching_channels_and_leave_other_groups_alone() {
         let make_source = |sample: f32, groups| SamplerVoiceSource {
+            sampler_filter: None,
             audio: Arc::new(DecodedAudio {
                 sample_rate: 1_000,
                 channels: vec![vec![sample; 16]],
@@ -26693,6 +27061,7 @@ mod tests {
     #[test]
     fn fast_declick_for_cut_groups_fades_then_stops_the_previous_sample() {
         let make_source = |sample: f32, groups, fast_declick_for_cut_groups| SamplerVoiceSource {
+            sampler_filter: None,
             audio: Arc::new(DecodedAudio {
                 sample_rate: 1_000,
                 channels: vec![vec![sample; 32]],
@@ -26775,6 +27144,7 @@ mod tests {
     #[test]
     fn sampler_slide_notes_glide_overlapping_notes_in_their_midi_color_group() {
         let source = SamplerVoiceSource {
+            sampler_filter: None,
             audio: Arc::new(DecodedAudio {
                 sample_rate: 1_000,
                 channels: vec![vec![1.0; 64]],
@@ -26872,6 +27242,7 @@ mod tests {
     #[test]
     fn sampler_sequential_slide_notes_target_their_piano_roll_pitch() {
         let source = SamplerVoiceSource {
+            sampler_filter: None,
             audio: Arc::new(DecodedAudio {
                 sample_rate: 1_000,
                 channels: vec![vec![1.0; 256]],
@@ -26940,6 +27311,7 @@ mod tests {
     #[test]
     fn sampler_slide_notes_interpolate_velocity_and_pan() {
         let source = SamplerVoiceSource {
+            sampler_filter: None,
             audio: Arc::new(DecodedAudio {
                 sample_rate: 1_000,
                 channels: vec![vec![1.0; 256]],
@@ -27018,6 +27390,7 @@ mod tests {
     #[test]
     fn sampler_downward_slide_extends_one_shot_render_duration() {
         let source = SamplerVoiceSource {
+            sampler_filter: None,
             audio: Arc::new(DecodedAudio {
                 sample_rate: 1_000,
                 channels: vec![vec![1.0; 64]],
@@ -27108,6 +27481,7 @@ mod tests {
     #[test]
     fn sampler_slide_note_without_an_overlapping_voice_is_silent() {
         let source = SamplerVoiceSource {
+            sampler_filter: None,
             audio: Arc::new(DecodedAudio {
                 sample_rate: 1_000,
                 channels: vec![vec![1.0; 16]],
