@@ -2717,7 +2717,9 @@ mod tests {
         assert_eq!(shifted.len(), sample_rate as usize * 2);
         let middle = &shifted[4_410 * 2..39_690 * 2];
         let positive_crossings = middle
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|frame| frame[0])
             .collect::<Vec<_>>()
             .windows(2)
@@ -2770,7 +2772,9 @@ mod tests {
         assert_eq!(preview.len(), sample_rate as usize * 2);
         let middle = &preview[1_000 * 2..7_000 * 2];
         let positive_crossings = middle
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|frame| frame[0])
             .collect::<Vec<_>>()
             .windows(2)
