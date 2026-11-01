@@ -6749,10 +6749,11 @@ fn record_playlist_automation_clip(
     document: &mut FlpDocument,
     links: &mut Vec<PlaylistVst3ParameterLink>,
     mixer_effect_links: &mut Vec<PlaylistVst3MixerEffectParameterLink>,
+    clap_mixer_effect_links: &mut Vec<PlaylistClapMixerEffectParameterLink>,
     project_path: Option<&Path>,
     target: MidiPlaylistAutomationRecordingTarget,
     take: MidiPlaylistAutomationTake<'_>,
-) -> Result<(u16, usize, u32, bool, bool), String> {
+) -> Result<(u16, usize, u32, bool, bool, bool), String> {
     let MidiPlaylistAutomationTake {
         source_label,
         elapsed_ticks,
@@ -6769,6 +6770,7 @@ fn record_playlist_automation_clip(
     let mut candidate = document.clone();
     let mut candidate_links = links.clone();
     let mut candidate_mixer_effect_links = mixer_effect_links.clone();
+    let mut candidate_clap_mixer_effect_links = clap_mixer_effect_links.clone();
     let channel_id = candidate
         .duplicate_automation_channel(target.template_channel_id, &format!("{source_label} Take"))
         .map_err(|error| error.to_string())?;
@@ -6788,6 +6790,7 @@ fn record_playlist_automation_clip(
 
     let mut copied_parameter_links = false;
     let mut copied_mixer_effect_links = false;
+    let mut copied_clap_mixer_effect_links = false;
     if let Some(project_path) = project_path {
         let source_links = links
             .iter()
@@ -6818,6 +6821,22 @@ fn record_playlist_automation_clip(
             );
             copied_mixer_effect_links = true;
         }
+        let source_clap_effect_links = clap_mixer_effect_links
+            .iter()
+            .filter(|link| {
+                link.automation_channel_id == target.template_channel_id
+                    && project_paths_equal(Path::new(&link.project_path), project_path)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for mut link in source_clap_effect_links {
+            link.automation_channel_id = channel_id;
+            upsert_playlist_clap_mixer_effect_parameter_link(
+                &mut candidate_clap_mixer_effect_links,
+                link,
+            );
+            copied_clap_mixer_effect_links = true;
+        }
     }
 
     let last_point_tick = points.last().map_or(0, |(position, _)| *position);
@@ -6839,12 +6858,14 @@ fn record_playlist_automation_clip(
     *document = candidate;
     *links = candidate_links;
     *mixer_effect_links = candidate_mixer_effect_links;
+    *clap_mixer_effect_links = candidate_clap_mixer_effect_links;
     Ok((
         channel_id,
         clip_index,
         length_ticks,
         copied_parameter_links,
         copied_mixer_effect_links,
+        copied_clap_mixer_effect_links,
     ))
 }
 
@@ -66920,6 +66941,8 @@ impl DawUi {
         let mut updated_playlist_vst3_parameter_links = self.playlist_vst3_parameter_links.clone();
         let mut updated_playlist_vst3_mixer_effect_parameter_links =
             self.playlist_vst3_mixer_effect_parameter_links.clone();
+        let mut updated_playlist_clap_mixer_effect_parameter_links =
+            self.playlist_clap_mixer_effect_parameter_links.clone();
         let playlist_automation_result =
             match (playlist_automation_target, automation_info.as_ref()) {
                 (Some(target), Some((source_label, _, _, _))) if !automation_points.is_empty() => {
@@ -66927,6 +66950,7 @@ impl DawUi {
                         &mut updated,
                         &mut updated_playlist_vst3_parameter_links,
                         &mut updated_playlist_vst3_mixer_effect_parameter_links,
+                        &mut updated_playlist_clap_mixer_effect_parameter_links,
                         result.project_path.as_deref(),
                         target,
                         MidiPlaylistAutomationTake {
@@ -66984,13 +67008,15 @@ impl DawUi {
             })
         };
         let mut playlist_automation_links_save_error = None;
-        if let Some(Ok((_, _, _, copied_links, copied_effect_links))) =
+        if let Some(Ok((_, _, _, copied_links, copied_effect_links, copied_clap_effect_links))) =
             playlist_automation_result.as_ref()
         {
             self.playlist_vst3_parameter_links = updated_playlist_vst3_parameter_links;
             self.playlist_vst3_mixer_effect_parameter_links =
                 updated_playlist_vst3_mixer_effect_parameter_links;
-            if *copied_links || *copied_effect_links {
+            self.playlist_clap_mixer_effect_parameter_links =
+                updated_playlist_clap_mixer_effect_parameter_links;
+            if *copied_links || *copied_effect_links || *copied_clap_effect_links {
                 let mut save_errors = Vec::new();
                 if *copied_links
                     && let Err(error) =
@@ -67001,6 +67027,13 @@ impl DawUi {
                 if *copied_effect_links
                     && let Err(error) = save_playlist_vst3_mixer_effect_parameter_links(
                         &self.playlist_vst3_mixer_effect_parameter_links,
+                    )
+                {
+                    save_errors.push(error);
+                }
+                if *copied_clap_effect_links
+                    && let Err(error) = save_playlist_clap_mixer_effect_parameter_links(
+                        &self.playlist_clap_mixer_effect_parameter_links,
                     )
                 {
                     save_errors.push(error);
@@ -67126,7 +67159,7 @@ impl DawUi {
             (playlist_automation_target, playlist_automation_result)
         {
             match recording_result {
-                Ok((channel_id, clip_index, length_ticks, _, _)) => {
+                Ok((channel_id, clip_index, length_ticks, _, _, _)) => {
                     self.selected_automation_channel = Some(channel_id);
                     self.selected_arrangement = Some(target.arrangement_id);
                     self.selected_clip = Some(clip_index);
@@ -67141,7 +67174,7 @@ impl DawUi {
                     ));
                     if playlist_automation_links_save_error.is_some() {
                         status.push_str(
-                            " · its copied VST3 parameter links work for this session but could not be saved",
+                            " · its copied VST3 or CLAP Mixer parameter links work for this session but could not be saved",
                         );
                     }
                 }
