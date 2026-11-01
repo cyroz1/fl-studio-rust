@@ -73070,7 +73070,9 @@ impl DawUi {
                             .changed();
                         if selected
                             && cfg!(target_os = "windows")
-                            && (device.id.starts_with("asio:") || device.id.starts_with("dsound:"))
+                            && (device.id.starts_with("asio:")
+                                || device.id.starts_with("dsound:")
+                                || device.id.starts_with("dsound-capture:"))
                         {
                             self.audio_settings.access = AudioAccess::Shared;
                         }
@@ -73672,7 +73674,7 @@ impl DawUi {
             .as_deref()
             .into_iter()
             .chain(self.audio_settings.output_device_id.as_deref())
-            .any(|id| id.starts_with("dsound:"));
+            .any(|id| id.starts_with("dsound:") || id.starts_with("dsound-capture:"));
         ui.horizontal(|ui| {
             ui.label("Audio access");
             egui::ComboBox::from_id_salt("audio_access_mode")

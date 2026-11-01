@@ -1,10 +1,10 @@
 //! Live device input and output for the desktop application.
 //!
 //! Shared streams use CPAL (ALSA, JACK, PipeWire, or PulseAudio on Linux;
-//! WASAPI or ASIO on Windows). Windows DirectSound render devices use a native
-//! shared-mode output worker. Windows exclusive streams are opened directly
-//! with WASAPI so the requested endpoint format and exclusive-access errors are
-//! visible to the application.
+//! WASAPI or ASIO on Windows). Windows DirectSound endpoints use native
+//! shared-mode input and output workers. Windows exclusive streams are opened
+//! directly with WASAPI so the requested endpoint format and exclusive-access
+//! errors are visible to the application.
 
 use std::collections::{HashMap, VecDeque};
 use std::ops::Deref;
@@ -4025,6 +4025,14 @@ pub fn enumerate_devices() -> AudioDeviceCatalog {
         }
         Err(error) => errors.push(error),
     }
+    #[cfg(windows)]
+    match enumerate_directsound_inputs() {
+        Ok((inputs, mut directsound_errors)) => {
+            catalog.inputs.extend(inputs);
+            errors.append(&mut directsound_errors);
+        }
+        Err(error) => errors.push(error),
+    }
     if !errors.is_empty() {
         catalog.error = Some(errors.join("; "));
     }
@@ -4040,6 +4048,13 @@ pub fn enumerate_devices() -> AudioDeviceCatalog {
 
 #[cfg(windows)]
 struct DirectSoundDeviceDescriptor {
+    id: String,
+    name: String,
+    guid: Option<windows::core::GUID>,
+}
+
+#[cfg(windows)]
+struct DirectSoundCaptureDeviceDescriptor {
     id: String,
     name: String,
     guid: Option<windows::core::GUID>,
@@ -4098,6 +4113,213 @@ fn enumerate_directsound_outputs() -> Result<(Vec<AudioDeviceInfo>, Vec<String>)
     match result {
         Ok(result) => result,
         Err(_) => Err("DirectSound device discovery worker panicked".to_owned()),
+    }
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn directsound_capture_enumeration_callback(
+    guid: *mut windows::core::GUID,
+    description: windows::core::PCWSTR,
+    _module: windows::core::PCWSTR,
+    context: *mut std::ffi::c_void,
+) -> windows::core::BOOL {
+    if context.is_null() {
+        return windows::core::BOOL(0);
+    }
+    let devices = unsafe { &mut *(context.cast::<Vec<DirectSoundCaptureDeviceDescriptor>>()) };
+    let guid = if guid.is_null() {
+        None
+    } else {
+        Some(unsafe { *guid })
+    };
+    let id = guid.map_or_else(
+        || "dsound-capture:default".to_owned(),
+        |guid| format!("dsound-capture:{}", directsound_guid_text(guid)),
+    );
+    let name = if description.is_null() {
+        "DirectSound capture".to_owned()
+    } else {
+        unsafe { description.to_string() }.unwrap_or_else(|_| "DirectSound capture".to_owned())
+    };
+    devices.push(DirectSoundCaptureDeviceDescriptor { id, name, guid });
+    windows::core::BOOL(1)
+}
+
+#[cfg(windows)]
+fn enumerate_directsound_inputs() -> Result<(Vec<AudioDeviceInfo>, Vec<String>), String> {
+    let result = std::thread::spawn(enumerate_directsound_inputs_on_mta).join();
+    match result {
+        Ok(result) => result,
+        Err(_) => Err("DirectSound capture discovery worker panicked".to_owned()),
+    }
+}
+
+#[cfg(windows)]
+fn enumerate_directsound_inputs_on_mta() -> Result<(Vec<AudioDeviceInfo>, Vec<String>), String> {
+    use windows::Win32::Media::Audio::DirectSound::{
+        DirectSoundCaptureCreate8, DirectSoundCaptureEnumerateW,
+    };
+
+    wasapi::initialize_mta().ok().map_err(|error| {
+        format!("Could not initialize DirectSound capture discovery COM: {error}")
+    })?;
+    let _com = WasapiComGuard;
+    let mut descriptors: Vec<DirectSoundCaptureDeviceDescriptor> = Vec::new();
+    unsafe {
+        DirectSoundCaptureEnumerateW(
+            Some(directsound_capture_enumeration_callback),
+            Some((&mut descriptors as *mut Vec<DirectSoundCaptureDeviceDescriptor>).cast()),
+        )
+    }
+    .map_err(|error| format!("Could not enumerate DirectSound capture devices: {error}"))?;
+
+    let mut inputs = Vec::with_capacity(descriptors.len());
+    let mut errors = Vec::new();
+    for descriptor in descriptors {
+        let mut device = None;
+        let create_result = unsafe {
+            DirectSoundCaptureCreate8(
+                descriptor.guid.as_ref().map(std::ptr::from_ref),
+                &mut device,
+                None::<&windows::core::IUnknown>,
+            )
+        };
+        if let Err(error) = create_result {
+            errors.push(format!(
+                "{} DirectSound capture open: {error}",
+                descriptor.name
+            ));
+            continue;
+        }
+        let Some(device) = device else {
+            errors.push(format!(
+                "{} DirectSound capture open returned no device",
+                descriptor.name
+            ));
+            continue;
+        };
+        let caps = match unsafe { device.GetCaps() } {
+            Ok(caps) => caps,
+            Err(error) => {
+                errors.push(format!(
+                    "{} DirectSound capture capabilities: {error}",
+                    descriptor.name
+                ));
+                continue;
+            }
+        };
+        let config_ranges = directsound_capture_config_ranges(caps.dwFormats, caps.dwChannels);
+        if config_ranges.is_empty() {
+            errors.push(format!(
+                "{} DirectSound capture reports no supported PCM formats",
+                descriptor.name
+            ));
+            continue;
+        }
+        inputs.push(AudioDeviceInfo {
+            id: descriptor.id,
+            name: format!("DIRECTSOUND CAPTURE · {}", descriptor.name),
+            config_ranges,
+            exclusive_sample_rates: Vec::new(),
+            exclusive_default_period_hns: None,
+            exclusive_minimum_period_hns: None,
+        });
+    }
+    Ok((inputs, errors))
+}
+
+#[cfg(windows)]
+fn directsound_capture_config_ranges(
+    format_flags: u32,
+    maximum_channels: u32,
+) -> Vec<AudioDeviceConfigRange> {
+    let mut ranges = Vec::new();
+    for (sample_rate, mono_8, mono_16, stereo_8, stereo_16) in
+        directsound_capture_format_flag_groups()
+    {
+        let supports_mono = format_flags & (mono_8 | mono_16) != 0;
+        let supports_stereo = maximum_channels >= 2 && format_flags & (stereo_8 | stereo_16) != 0;
+        let channels = if supports_stereo {
+            2
+        } else if supports_mono && maximum_channels >= 1 {
+            1
+        } else {
+            continue;
+        };
+        ranges.push(AudioDeviceConfigRange {
+            minimum_sample_rate: sample_rate,
+            maximum_sample_rate: sample_rate,
+            channels,
+            minimum_buffer_frames: None,
+            maximum_buffer_frames: None,
+        });
+    }
+    ranges
+}
+
+#[cfg(windows)]
+fn directsound_capture_format_flag_groups() -> [(u32, u32, u32, u32, u32); 4] {
+    use windows::Win32::Media::Audio::{
+        WAVE_FORMAT_1M08, WAVE_FORMAT_1M16, WAVE_FORMAT_1S08, WAVE_FORMAT_1S16, WAVE_FORMAT_2M08,
+        WAVE_FORMAT_2M16, WAVE_FORMAT_2S08, WAVE_FORMAT_2S16, WAVE_FORMAT_44M08, WAVE_FORMAT_44M16,
+        WAVE_FORMAT_44S08, WAVE_FORMAT_44S16, WAVE_FORMAT_48M08, WAVE_FORMAT_48M16,
+        WAVE_FORMAT_48S08, WAVE_FORMAT_48S16,
+    };
+
+    [
+        (
+            11_025,
+            WAVE_FORMAT_1M08,
+            WAVE_FORMAT_1M16,
+            WAVE_FORMAT_1S08,
+            WAVE_FORMAT_1S16,
+        ),
+        (
+            22_050,
+            WAVE_FORMAT_2M08,
+            WAVE_FORMAT_2M16,
+            WAVE_FORMAT_2S08,
+            WAVE_FORMAT_2S16,
+        ),
+        (
+            44_100,
+            WAVE_FORMAT_44M08,
+            WAVE_FORMAT_44M16,
+            WAVE_FORMAT_44S08,
+            WAVE_FORMAT_44S16,
+        ),
+        (
+            48_000,
+            WAVE_FORMAT_48M08,
+            WAVE_FORMAT_48M16,
+            WAVE_FORMAT_48S08,
+            WAVE_FORMAT_48S16,
+        ),
+    ]
+}
+
+#[cfg(windows)]
+fn directsound_capture_sample_format(
+    format_flags: u32,
+    maximum_channels: u32,
+    sample_rate: u32,
+) -> Result<(u16, u16), String> {
+    let (_, mono_8, mono_16, stereo_8, stereo_16) = directsound_capture_format_flag_groups()
+        .into_iter()
+        .find(|(rate, ..)| *rate == sample_rate)
+        .ok_or_else(|| format!("DirectSound capture does not advertise {sample_rate} Hz"))?;
+    if maximum_channels >= 2 && format_flags & stereo_16 != 0 {
+        Ok((2, 16))
+    } else if maximum_channels >= 2 && format_flags & stereo_8 != 0 {
+        Ok((2, 8))
+    } else if maximum_channels >= 1 && format_flags & mono_16 != 0 {
+        Ok((1, 16))
+    } else if maximum_channels >= 1 && format_flags & mono_8 != 0 {
+        Ok((1, 8))
+    } else {
+        Err(format!(
+            "DirectSound capture does not advertise a mono or stereo PCM format at {sample_rate} Hz"
+        ))
     }
 }
 
@@ -5174,8 +5396,15 @@ impl AudioEngine {
             .output_device_id
             .as_deref()
             .is_some_and(|id| id.starts_with("dsound:"));
+        #[cfg(windows)]
+        let directsound_input = settings
+            .input_device_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("dsound-capture:"));
         #[cfg(not(windows))]
         let directsound_output = false;
+        #[cfg(not(windows))]
+        let directsound_input = false;
         let ring = Arc::new(AudioRingBuffer::new(INPUT_MONITOR_RING_CAPACITY));
         let source = Arc::new(AtomicU8::new(AUDIO_SOURCE_SILENT));
         let playback = Arc::new(PlaybackState::new());
@@ -5200,7 +5429,11 @@ impl AudioEngine {
             None
         };
         let input_device = if settings.enable_input {
-            resolve_device(&host, settings.input_device_id.as_deref(), true)?
+            if directsound_input {
+                None
+            } else {
+                resolve_device(&host, settings.input_device_id.as_deref(), true)?
+            }
         } else {
             None
         };
@@ -5209,8 +5442,12 @@ impl AudioEngine {
         let mut input_channel_count = 0;
         #[cfg(windows)]
         let mut directsound_output_active = false;
+        #[cfg(windows)]
+        let mut directsound_input_active = false;
         #[cfg(not(windows))]
         let directsound_output_active = false;
+        #[cfg(not(windows))]
+        let directsound_input_active = false;
         #[cfg(windows)]
         let mut windows_worker_stop = None;
         #[cfg(windows)]
@@ -5260,7 +5497,9 @@ impl AudioEngine {
             use std::sync::mpsc;
             use std::thread;
 
-            let stop = Arc::new(AtomicBool::new(false));
+            let stop = windows_worker_stop
+                .get_or_insert_with(|| Arc::new(AtomicBool::new(false)))
+                .clone();
             let (ready_tx, ready_rx) = mpsc::sync_channel(1);
             let worker_settings = settings.clone();
             let worker_source = Arc::clone(&source);
@@ -5288,7 +5527,6 @@ impl AudioEngine {
             match ready_rx.recv_timeout(Duration::from_secs(10)) {
                 Ok(Ok(())) => {
                     directsound_output_active = true;
-                    windows_worker_stop = Some(stop);
                     windows_worker_threads.push(output_thread);
                 }
                 Ok(Err(message)) => {
@@ -5306,7 +5544,96 @@ impl AudioEngine {
             }
         }
 
-        if output_stream.is_none() && input_stream.is_none() && !directsound_output_active {
+        #[cfg(windows)]
+        if settings.enable_input && directsound_input {
+            use std::sync::mpsc;
+            use std::thread;
+
+            let stop = windows_worker_stop
+                .get_or_insert_with(|| Arc::new(AtomicBool::new(false)))
+                .clone();
+            let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+            let worker_settings = settings.clone();
+            let worker_source = Arc::clone(&source);
+            let worker_playback = Arc::clone(&playback);
+            let worker_ring = Arc::clone(&ring);
+            let worker_peak = Arc::clone(&input_peak);
+            let worker_input_callback_frames = Arc::clone(&input_callback_frames);
+            let worker_recording = Arc::clone(&input_recording);
+            let worker_monitor_recording = Arc::clone(&input_monitor_recording);
+            let worker_input_latency_estimate = Arc::clone(&input_latency_estimate);
+            let worker_input_channel_pair = Arc::clone(&input_channel_pair);
+            let worker_input_channel_count = Arc::new(AtomicU16::new(0));
+            let worker_input_channel_count_for_thread = Arc::clone(&worker_input_channel_count);
+            let worker_error = Arc::clone(&error);
+            let worker_stop = Arc::clone(&stop);
+            let input_thread = thread::Builder::new()
+                .name("directsound-shared-capture".into())
+                .spawn(move || {
+                    directsound_shared_input_worker(
+                        worker_settings.input_device_id.as_deref(),
+                        &worker_settings,
+                        WasapiWorkerState {
+                            source: worker_source,
+                            playback: worker_playback,
+                            ring: worker_ring,
+                            input_peak: worker_peak,
+                            input_callback_frames: worker_input_callback_frames,
+                            input_recording: worker_recording,
+                            input_monitor_recording: worker_monitor_recording,
+                            input_latency_estimate: worker_input_latency_estimate,
+                            input_channel_pair: worker_input_channel_pair,
+                            input_channel_count: worker_input_channel_count_for_thread,
+                            error: worker_error,
+                            stop: worker_stop,
+                        },
+                        ready_tx,
+                    );
+                });
+            let input_thread = match input_thread {
+                Ok(thread) => thread,
+                Err(error) => {
+                    stop.store(true, Ordering::Release);
+                    for thread in windows_worker_threads.drain(..) {
+                        let _ = thread.join();
+                    }
+                    return Err(format!(
+                        "Could not start DirectSound capture worker: {error}"
+                    ));
+                }
+            };
+            match ready_rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(Ok(())) => {
+                    directsound_input_active = true;
+                    input_channel_count = worker_input_channel_count.load(Ordering::Acquire);
+                    windows_worker_threads.push(input_thread);
+                }
+                Ok(Err(message)) => {
+                    stop.store(true, Ordering::Release);
+                    for thread in windows_worker_threads.drain(..) {
+                        let _ = thread.join();
+                    }
+                    let _ = input_thread.join();
+                    return Err(format!("DirectSound shared input failed: {message}"));
+                }
+                Err(error_kind) => {
+                    stop.store(true, Ordering::Release);
+                    for thread in windows_worker_threads.drain(..) {
+                        let _ = thread.join();
+                    }
+                    let _ = input_thread.join();
+                    return Err(format!(
+                        "DirectSound shared input did not start: {error_kind}"
+                    ));
+                }
+            }
+        }
+
+        if output_stream.is_none()
+            && input_stream.is_none()
+            && !directsound_output_active
+            && !directsound_input_active
+        {
             return Err("No active input or output device is available".into());
         }
 
@@ -5324,7 +5651,7 @@ impl AudioEngine {
             input_channel_count,
             input_latency_estimate,
             error,
-            input_active: input_stream.is_some(),
+            input_active: input_stream.is_some() || directsound_input_active,
             output_active: output_stream.is_some() || directsound_output_active,
             input_stream,
             output_stream,
@@ -6547,6 +6874,24 @@ fn directsound_device_guid(
 }
 
 #[cfg(windows)]
+fn directsound_capture_device_guid(
+    selected_id: Option<&str>,
+) -> Result<Option<windows::core::GUID>, String> {
+    let device_id =
+        selected_id.ok_or_else(|| "No DirectSound capture device was selected".to_owned())?;
+    let guid = device_id.strip_prefix("dsound-capture:").ok_or_else(|| {
+        format!("Selected input is not a DirectSound capture device: {device_id}")
+    })?;
+    if guid.eq_ignore_ascii_case("default") {
+        Ok(None)
+    } else {
+        windows::core::GUID::try_from(guid)
+            .map(Some)
+            .map_err(|error| format!("Invalid DirectSound capture device id {device_id}: {error}"))
+    }
+}
+
+#[cfg(windows)]
 fn directsound_circular_distance(start: usize, end: usize, buffer_bytes: usize) -> usize {
     if end >= start {
         end - start
@@ -6792,6 +7137,287 @@ fn directsound_shared_output_worker(
             format!("DirectSound shared output stopped: {message}"),
         );
         if !started {
+            let _ = ready.send(Err(message));
+        }
+    }
+}
+
+#[cfg(windows)]
+fn directsound_shared_input_worker(
+    selected_id: Option<&str>,
+    settings: &AudioSettings,
+    state: WasapiWorkerState,
+    ready: std::sync::mpsc::SyncSender<Result<(), String>>,
+) {
+    use windows::Win32::Media::Audio::DirectSound::{
+        DSCBSTART_LOOPING, DSCBUFFERDESC, DirectSoundCaptureCreate8, IDirectSoundCapture,
+        IDirectSoundCaptureBuffer,
+    };
+    use windows::Win32::Media::Audio::WAVEFORMATEX;
+
+    enable_denormal_protection();
+    let WasapiWorkerState {
+        ring,
+        playback,
+        input_peak: peak,
+        input_callback_frames,
+        input_recording,
+        input_monitor_recording,
+        input_latency_estimate,
+        input_channel_pair,
+        input_channel_count,
+        source,
+        error,
+        stop,
+    } = state;
+    let mut ready_sent = false;
+    let result = (|| -> Result<(), String> {
+        wasapi::initialize_mta()
+            .ok()
+            .map_err(|error| format!("Could not initialize DirectSound capture COM: {error}"))?;
+        let _com = WasapiComGuard;
+        let device_guid = directsound_capture_device_guid(selected_id)?;
+        let mut device: Option<IDirectSoundCapture> = None;
+        unsafe {
+            DirectSoundCaptureCreate8(
+                device_guid.as_ref().map(std::ptr::from_ref),
+                &mut device,
+                None::<&windows::core::IUnknown>,
+            )
+        }
+        .map_err(|error| format!("Could not open DirectSound capture device: {error}"))?;
+        let device = device.ok_or_else(|| "DirectSound returned no capture device".to_owned())?;
+        let caps = unsafe { device.GetCaps() }
+            .map_err(|error| format!("Could not query DirectSound capture formats: {error}"))?;
+        let (channels, storage_bits) = directsound_capture_sample_format(
+            caps.dwFormats,
+            caps.dwChannels,
+            settings.sample_rate,
+        )?;
+        let bits_per_sample = storage_bits;
+        let block_align = channels
+            .checked_mul(bits_per_sample / 8)
+            .ok_or_else(|| "DirectSound capture frame size overflowed".to_owned())?;
+        let wave_format = WAVEFORMATEX {
+            wFormatTag: 1,
+            nChannels: channels,
+            nSamplesPerSec: settings.sample_rate,
+            nAvgBytesPerSec: settings.sample_rate.saturating_mul(u32::from(block_align)),
+            nBlockAlign: block_align,
+            wBitsPerSample: bits_per_sample,
+            cbSize: 0,
+        };
+        let format_spec = WasapiSampleSpec {
+            sample_type: wasapi::SampleType::Int,
+            storage_bits: usize::from(storage_bits),
+            valid_bits: usize::from(storage_bits),
+            channels: usize::from(channels),
+            sample_bytes: usize::from(storage_bits / 8),
+            frame_bytes: usize::from(block_align),
+            sample_rate: settings.sample_rate,
+        };
+        input_channel_count.store(channels, Ordering::Release);
+        let fallback_channels = selected_stereo_input_channels(
+            usize::from(channels),
+            input_channel_pair.load(Ordering::Acquire),
+        )?;
+        let buffer_frames = settings
+            .buffer_frames
+            .max(settings.sample_rate / 10)
+            .max(256);
+        let buffer_bytes = buffer_frames
+            .checked_mul(u32::from(block_align))
+            .ok_or_else(|| "DirectSound capture buffer size overflowed".to_owned())?;
+        let description = DSCBUFFERDESC {
+            dwSize: std::mem::size_of::<DSCBUFFERDESC>() as u32,
+            dwBufferBytes: buffer_bytes,
+            lpwfxFormat: std::ptr::from_ref(&wave_format).cast_mut(),
+            ..DSCBUFFERDESC::default()
+        };
+        let mut capture_buffer = None;
+        unsafe {
+            device.CreateCaptureBuffer(
+                &description,
+                &mut capture_buffer,
+                None::<&windows::core::IUnknown>,
+            )
+        }
+        .map_err(|error| format!("Could not create DirectSound capture buffer: {error}"))?;
+        let capture_buffer: IDirectSoundCaptureBuffer =
+            capture_buffer.ok_or_else(|| "DirectSound returned no capture buffer".to_owned())?;
+        unsafe { capture_buffer.Start(DSCBSTART_LOOPING) }
+            .map_err(|error| format!("Could not start DirectSound capture: {error}"))?;
+
+        let buffer_byte_count = usize::try_from(buffer_bytes)
+            .map_err(|_| "DirectSound capture buffer size was invalid".to_owned())?;
+        let frame_bytes = format_spec.frame_bytes;
+        let mut capture_cursor = 0_u32;
+        let mut read_cursor = 0_u32;
+        unsafe {
+            capture_buffer
+                .GetCurrentPosition(Some(&mut capture_cursor), Some(&mut read_cursor))
+                .map_err(|error| format!("Could not query DirectSound capture cursors: {error}"))?;
+        }
+        let mut next_read_offset =
+            (read_cursor as usize % buffer_byte_count) / frame_bytes * frame_bytes;
+        ready_sent = ready.send(Ok(())).is_ok();
+
+        while !stop.load(Ordering::Acquire) {
+            unsafe {
+                capture_buffer
+                    .GetCurrentPosition(Some(&mut capture_cursor), Some(&mut read_cursor))
+                    .map_err(|error| {
+                        format!("Could not query DirectSound capture cursors: {error}")
+                    })?;
+            }
+            let capture_cursor =
+                (capture_cursor as usize % buffer_byte_count) / frame_bytes * frame_bytes;
+            let read_cursor =
+                (read_cursor as usize % buffer_byte_count) / frame_bytes * frame_bytes;
+            let readable_bytes =
+                directsound_circular_distance(next_read_offset, read_cursor, buffer_byte_count);
+            let readable_bytes = readable_bytes / frame_bytes * frame_bytes;
+            if readable_bytes >= frame_bytes {
+                let frames = readable_bytes / frame_bytes;
+                let recording = input_recording.load();
+                let recording_callback = recording
+                    .as_deref()
+                    .and_then(InputRecordingState::begin_callback);
+                let monitor_recording = input_monitor_recording.load();
+                let monitor_queue_active = monitor_recording.is_some();
+                let monitor_callback = monitor_recording
+                    .as_deref()
+                    .and_then(InputRecordingState::begin_callback);
+                let (left_channel, right_channel) = selected_stereo_input_channels(
+                    usize::from(input_channel_count.load(Ordering::Acquire)),
+                    input_channel_pair.load(Ordering::Acquire),
+                )
+                .unwrap_or(fallback_channels);
+                let mut first_ptr = std::ptr::null_mut();
+                let mut first_bytes = 0_u32;
+                let mut second_ptr = std::ptr::null_mut();
+                let mut second_bytes = 0_u32;
+                unsafe {
+                    capture_buffer
+                        .Lock(
+                            u32::try_from(next_read_offset)
+                                .map_err(|_| "DirectSound capture read offset overflowed")?,
+                            u32::try_from(readable_bytes)
+                                .map_err(|_| "DirectSound capture read size overflowed")?,
+                            &mut first_ptr,
+                            &mut first_bytes,
+                            Some(&mut second_ptr),
+                            Some(&mut second_bytes),
+                            0,
+                        )
+                        .map_err(|error| {
+                            format!("Could not lock DirectSound capture buffer: {error}")
+                        })?;
+                }
+                let locked_bytes = usize::try_from(first_bytes)
+                    .unwrap_or(usize::MAX)
+                    .saturating_add(usize::try_from(second_bytes).unwrap_or(usize::MAX));
+                if locked_bytes != readable_bytes
+                    || (first_bytes > 0 && first_ptr.is_null())
+                    || (second_bytes > 0 && second_ptr.is_null())
+                {
+                    let _ = unsafe {
+                        capture_buffer.Unlock(
+                            first_ptr,
+                            first_bytes,
+                            Some(second_ptr),
+                            second_bytes,
+                        )
+                    };
+                    return Err("DirectSound locked an unexpected capture-buffer range".to_owned());
+                }
+
+                let mut max_peak = 0.0_f32;
+                let processing_result = unsafe {
+                    (|| -> Result<(), String> {
+                        let first_slice = if first_bytes == 0 {
+                            &[]
+                        } else {
+                            std::slice::from_raw_parts(first_ptr.cast::<u8>(), first_bytes as usize)
+                        };
+                        let second_slice = if second_bytes == 0 {
+                            &[]
+                        } else {
+                            std::slice::from_raw_parts(
+                                second_ptr.cast::<u8>(),
+                                second_bytes as usize,
+                            )
+                        };
+                        let mut process_bytes = |bytes: &[u8]| -> Result<(), String> {
+                            for frame in bytes.chunks_exact(format_spec.frame_bytes) {
+                                let mut stereo = [0.0_f32; 2];
+                                for (channel, sample_bytes) in
+                                    frame.chunks_exact(format_spec.sample_bytes).enumerate()
+                                {
+                                    let sample = format_spec.decode(sample_bytes)?;
+                                    if channel == left_channel {
+                                        stereo[0] = sample;
+                                    }
+                                    if channel == right_channel {
+                                        stereo[1] = sample;
+                                    }
+                                }
+                                max_peak = max_peak.max(stereo[0].abs()).max(stereo[1].abs());
+                                if (source.load(Ordering::Acquire) == AUDIO_SOURCE_INPUT_MONITOR
+                                    || playback.input_monitor_active.load(Ordering::Acquire))
+                                    && !monitor_queue_active
+                                {
+                                    ring.push_stereo_frame(stereo[0], stereo[1]);
+                                }
+                                if let Some(recording) = recording_callback.as_ref() {
+                                    recording.push_frame(stereo[0], stereo[1]);
+                                }
+                                if let Some(recording) = monitor_callback.as_ref() {
+                                    recording.push_frame(stereo[0], stereo[1]);
+                                }
+                            }
+                            Ok(())
+                        };
+                        process_bytes(first_slice)?;
+                        process_bytes(second_slice)
+                    })()
+                };
+                let unlock_result = unsafe {
+                    capture_buffer.Unlock(
+                        first_ptr.cast_const(),
+                        first_bytes,
+                        Some(second_ptr.cast_const()),
+                        second_bytes,
+                    )
+                };
+                processing_result?;
+                unlock_result.map_err(|error| {
+                    format!("Could not unlock DirectSound capture buffer: {error}")
+                })?;
+                input_callback_frames
+                    .store(u32::try_from(frames).unwrap_or(u32::MAX), Ordering::Release);
+                peak.store(max_peak.clamp(0.0, 1.0).to_bits(), Ordering::Release);
+                next_read_offset = (next_read_offset + readable_bytes) % buffer_byte_count;
+
+                let unread_safe_delay =
+                    directsound_circular_distance(read_cursor, capture_cursor, buffer_byte_count);
+                let delay_frames = unread_safe_delay / frame_bytes;
+                input_latency_estimate.observe(Some(Duration::from_secs_f64(
+                    delay_frames as f64 / f64::from(settings.sample_rate),
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        unsafe { capture_buffer.Stop() }
+            .map_err(|error| format!("Could not stop DirectSound capture: {error}"))?;
+        Ok(())
+    })();
+    if let Err(message) = result {
+        set_error(
+            &error,
+            format!("DirectSound shared input stopped: {message}"),
+        );
+        if !ready_sent {
             let _ = ready.send(Err(message));
         }
     }
