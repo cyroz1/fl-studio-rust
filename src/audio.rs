@@ -597,6 +597,7 @@ fn publish_positive_peak(slot: &AtomicU32, peak: f32) {
 #[derive(Debug)]
 pub(crate) struct LiveMixerSourceControl {
     route_plan: crate::MixerLiveSourceRoutePlan,
+    delay_lines: Mutex<LiveMixerSourceDelayLines>,
     current_gain_bits: Arc<AtomicU32>,
     current_pan_raw_bits: Arc<AtomicU32>,
     current_stereo_separation_raw_bits: Arc<AtomicU32>,
@@ -623,10 +624,25 @@ pub(crate) struct LiveMixerSourceControl {
     smoothing_alpha: f32,
 }
 
+#[derive(Clone, Debug, Default)]
+struct LiveMixerSourceDelayLines {
+    output: Vec<StereoFrameDelay>,
+    meter: Vec<StereoFrameDelay>,
+    effect_input: Vec<StereoFrameDelay>,
+}
+
+const MAX_LIVE_MIXER_PDC_DELAY_BYTES: u64 = 128 * 1024 * 1024;
+
 impl Clone for LiveMixerSourceControl {
     fn clone(&self) -> Self {
         Self {
             route_plan: self.route_plan.clone(),
+            delay_lines: Mutex::new(
+                self.delay_lines
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            ),
             current_gain_bits: Arc::new(AtomicU32::new(
                 self.current_gain_bits.load(Ordering::Relaxed),
             )),
@@ -741,7 +757,17 @@ pub(crate) struct LiveMixerSourceFrameControls {
 }
 
 impl LiveMixerSourceControl {
+    #[cfg(test)]
     pub(crate) fn new(route_plan: crate::MixerLiveSourceRoutePlan, sample_rate: u32) -> Self {
+        Self::try_new(route_plan, sample_rate)
+            .expect("Mixer live source PDC delay plan must fit available storage")
+    }
+
+    pub(crate) fn try_new(
+        route_plan: crate::MixerLiveSourceRoutePlan,
+        sample_rate: u32,
+    ) -> Result<Self, String> {
+        let delay_lines = live_mixer_source_delay_lines(&route_plan, sample_rate)?;
         let current_send_gain_bits = route_plan
             .saved_live_send_gains
             .iter()
@@ -807,7 +833,8 @@ impl LiveMixerSourceControl {
                 0.0
             }
         });
-        Self {
+        Ok(Self {
+            delay_lines: Mutex::new(delay_lines),
             current_gain_bits: Arc::new(AtomicU32::new(route_plan.saved_fader_gain.to_bits())),
             current_pan_raw_bits: Arc::new(AtomicU32::new(
                 (route_plan.saved_pan_raw.unwrap_or_default() as f32).to_bits(),
@@ -861,10 +888,13 @@ impl LiveMixerSourceControl {
             insert_enabled_started,
             smoothing_alpha: output_gain_smoothing_alpha(sample_rate as f32),
             route_plan,
-        }
+        })
     }
 
     pub(crate) fn targets(&self, meters: &MixerTrackPeakMeters) -> Option<LiveMixerSourceTargets> {
+        if self.route_plan.track == 0 {
+            return None;
+        }
         let send_targets = self
             .route_plan
             .live_send_target_keys
@@ -1179,6 +1209,43 @@ impl LiveMixerSourceControl {
         }
     }
 
+    pub(crate) fn next_frame_controls_optional(
+        &self,
+        targets: Option<&LiveMixerSourceTargets>,
+    ) -> LiveMixerSourceFrameControls {
+        let Some(targets) = targets else {
+            let saved_solo_gain = self.route_plan.live_solo.map(|solo| {
+                if !solo.any_soloed || solo.soloed {
+                    1.0
+                } else {
+                    0.0
+                }
+            });
+            return LiveMixerSourceFrameControls {
+                gain: self.route_plan.saved_fader_gain,
+                pan_raw: self.route_plan.saved_pan_raw.map(|raw| raw as f32),
+                stereo_separation_raw: self
+                    .route_plan
+                    .saved_stereo_separation_raw
+                    .map(|raw| raw as f32),
+                signal_flags_mix: self.route_plan.saved_signal_flags.map(|(polarity, swap)| {
+                    (
+                        if polarity { 1.0 } else { 0.0 },
+                        if swap { 1.0 } else { 0.0 },
+                    )
+                }),
+                enabled_gain: self.route_plan.saved_enabled.map(
+                    |enabled| {
+                        if enabled { 1.0 } else { 0.0 }
+                    },
+                ),
+                solo_gain: saved_solo_gain,
+                pan_law_raw: self.route_plan.pan_law_raw,
+            };
+        };
+        self.next_frame_controls(targets)
+    }
+
     pub(crate) fn apply_output_frame(
         &self,
         controls: LiveMixerSourceFrameControls,
@@ -1205,6 +1272,10 @@ impl LiveMixerSourceControl {
         frame[0] *= controls.gain;
         frame[1] *= controls.gain;
 
+        let mut delay_lines = self
+            .delay_lines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(paths) = &self.route_plan.live_send_output_paths {
             let source_frame = *frame;
             let mut routed_frame = [0.0; 2];
@@ -1215,13 +1286,26 @@ impl LiveMixerSourceControl {
                     .map_or(1.0, |gain| f32::from_bits(gain.load(Ordering::Relaxed)));
                 let gain =
                     self.send_path_gain(&path.send_gains, &path.insert_enabled_gains, solo_gain);
-                if gain == 0.0 {
-                    continue;
-                }
                 let mut branch_frame = source_frame;
                 path.transform.apply_frame(&mut branch_frame);
+                if let Some(delay) = delay_lines.output.get_mut(path_index) {
+                    delay.process_frame(&mut branch_frame);
+                }
                 routed_frame[0] += branch_frame[0] * gain;
                 routed_frame[1] += branch_frame[1] * gain;
+            }
+            *frame = routed_frame;
+        } else if !self.route_plan.ordered_output_paths.is_empty() {
+            let source_frame = *frame;
+            let mut routed_frame = [0.0; 2];
+            for (path_index, path) in self.route_plan.ordered_output_paths.iter().enumerate() {
+                let mut branch_frame = source_frame;
+                path.transform.apply_frame(&mut branch_frame);
+                if let Some(delay) = delay_lines.output.get_mut(path_index) {
+                    delay.process_frame(&mut branch_frame);
+                }
+                routed_frame[0] += branch_frame[0];
+                routed_frame[1] += branch_frame[1];
             }
             *frame = routed_frame;
         } else {
@@ -1257,6 +1341,10 @@ impl LiveMixerSourceControl {
         frame[0] *= controls.gain;
         frame[1] *= controls.gain;
 
+        let mut delay_lines = self
+            .delay_lines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.route_plan.live_send_output_paths.is_some() {
             let source_frame = *frame;
             let mut meter_frame = [0.0; 2];
@@ -1275,11 +1363,11 @@ impl LiveMixerSourceControl {
                     .map_or(1.0, |gain| f32::from_bits(gain.load(Ordering::Relaxed)));
                 let gain =
                     self.send_path_gain(&path.send_gains, &path.insert_enabled_gains, solo_gain);
-                if gain == 0.0 {
-                    continue;
-                }
                 let mut branch_frame = source_frame;
                 path.transform.apply_frame(&mut branch_frame);
+                if let Some(delay) = delay_lines.meter.get_mut(path_index) {
+                    delay.process_frame(&mut branch_frame);
+                }
                 meter_frame[0] += branch_frame[0] * gain;
                 meter_frame[1] += branch_frame[1] * gain;
             }
@@ -1288,6 +1376,30 @@ impl LiveMixerSourceControl {
             } else {
                 route_transform.apply_frame(frame);
             }
+        } else if self
+            .route_plan
+            .ordered_insert_meter_paths
+            .iter()
+            .any(|path| path.track == track)
+        {
+            let source_frame = *frame;
+            let mut meter_frame = [0.0; 2];
+            for (path_index, path) in self
+                .route_plan
+                .ordered_insert_meter_paths
+                .iter()
+                .enumerate()
+                .filter(|(_, path)| path.track == track)
+            {
+                let mut branch_frame = source_frame;
+                path.transform.apply_frame(&mut branch_frame);
+                if let Some(delay) = delay_lines.meter.get_mut(path_index) {
+                    delay.process_frame(&mut branch_frame);
+                }
+                meter_frame[0] += branch_frame[0];
+                meter_frame[1] += branch_frame[1];
+            }
+            *frame = meter_frame;
         } else {
             route_transform.apply_frame(frame);
         }
@@ -1321,6 +1433,10 @@ impl LiveMixerSourceControl {
         frame[0] *= controls.gain;
         frame[1] *= controls.gain;
 
+        let mut delay_lines = self
+            .delay_lines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.route_plan.live_send_output_paths.is_some() {
             let source_frame = *frame;
             let mut input_frame = [0.0; 2];
@@ -1339,11 +1455,11 @@ impl LiveMixerSourceControl {
                     .map_or(1.0, |gain| f32::from_bits(gain.load(Ordering::Relaxed)));
                 let gain =
                     self.send_path_gain(&path.send_gains, &path.insert_enabled_gains, solo_gain);
-                if gain == 0.0 {
-                    continue;
-                }
                 let mut branch_frame = source_frame;
                 path.transform.apply_frame(&mut branch_frame);
+                if let Some(delay) = delay_lines.effect_input.get_mut(path_index) {
+                    delay.process_frame(&mut branch_frame);
+                }
                 input_frame[0] += branch_frame[0] * gain;
                 input_frame[1] += branch_frame[1] * gain;
             }
@@ -1352,6 +1468,30 @@ impl LiveMixerSourceControl {
             } else {
                 route_transform.apply_frame(frame);
             }
+        } else if self
+            .route_plan
+            .ordered_insert_effect_input_paths
+            .iter()
+            .any(|path| path.track == track)
+        {
+            let source_frame = *frame;
+            let mut input_frame = [0.0; 2];
+            for (path_index, path) in self
+                .route_plan
+                .ordered_insert_effect_input_paths
+                .iter()
+                .enumerate()
+                .filter(|(_, path)| path.track == track)
+            {
+                let mut branch_frame = source_frame;
+                path.transform.apply_frame(&mut branch_frame);
+                if let Some(delay) = delay_lines.effect_input.get_mut(path_index) {
+                    delay.process_frame(&mut branch_frame);
+                }
+                input_frame[0] += branch_frame[0];
+                input_frame[1] += branch_frame[1];
+            }
+            *frame = input_frame;
         } else {
             route_transform.apply_frame(frame);
         }
@@ -1419,7 +1559,7 @@ fn live_solo_path_gain(mask: Option<&[u64; 2]>, path_tracks: &[usize], saved_gai
 }
 
 /// A bounded stereo ring buffer used to align source timing in the Mixer.
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct StereoFrameDelay {
     frames: Vec<[f32; 2]>,
     cursor: usize,
@@ -1492,6 +1632,108 @@ impl StereoFrameDelay {
             self.cursor = 0;
         }
     }
+}
+
+fn live_mixer_source_delay_lines(
+    route_plan: &crate::MixerLiveSourceRoutePlan,
+    sample_rate: u32,
+) -> Result<LiveMixerSourceDelayLines, String> {
+    let mut total_delay_bytes = 0_u64;
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(route_plan.ordered_output_paths.len())
+        .map_err(|error| format!("could not allocate Mixer output delay plans: {error}"))?;
+    for path in &route_plan.ordered_output_paths {
+        output.push(new_route_delay_line(
+            &path.track_path,
+            None,
+            &route_plan.manual_pdc_offsets_ms_by_track,
+            sample_rate,
+            &mut total_delay_bytes,
+        )?);
+    }
+
+    let mut meter = Vec::new();
+    meter
+        .try_reserve_exact(route_plan.ordered_insert_meter_paths.len())
+        .map_err(|error| format!("could not allocate Mixer meter delay plans: {error}"))?;
+    for path in &route_plan.ordered_insert_meter_paths {
+        meter.push(new_route_delay_line(
+            &path.track_path,
+            None,
+            &route_plan.manual_pdc_offsets_ms_by_track,
+            sample_rate,
+            &mut total_delay_bytes,
+        )?);
+    }
+
+    let mut effect_input = Vec::new();
+    effect_input
+        .try_reserve_exact(route_plan.ordered_insert_effect_input_paths.len())
+        .map_err(|error| format!("could not allocate Mixer effect-input delay plans: {error}"))?;
+    for path in &route_plan.ordered_insert_effect_input_paths {
+        effect_input.push(new_route_delay_line(
+            &path.track_path,
+            Some(path.track),
+            &route_plan.manual_pdc_offsets_ms_by_track,
+            sample_rate,
+            &mut total_delay_bytes,
+        )?);
+    }
+
+    Ok(LiveMixerSourceDelayLines {
+        output,
+        meter,
+        effect_input,
+    })
+}
+
+fn new_route_delay_line(
+    track_path: &[usize],
+    effect_input_track: Option<usize>,
+    manual_offsets_ms: &[(usize, f32)],
+    sample_rate: u32,
+    total_delay_bytes: &mut u64,
+) -> Result<StereoFrameDelay, String> {
+    let path_delay_ms = manual_offsets_ms
+        .iter()
+        .fold(0.0_f64, |delay_ms, (track, offset_ms)| {
+            if !offset_ms.is_finite() || offset_ms.abs() > crate::MAX_MIXER_TRACK_MANUAL_PDC_MS {
+                return delay_ms;
+            }
+            let track_is_in_path = track_path.contains(track);
+            if *offset_ms > 0.0 && track_is_in_path && effect_input_track != Some(*track) {
+                delay_ms + f64::from(*offset_ms)
+            } else if *offset_ms < 0.0 && !track_is_in_path {
+                delay_ms + f64::from(-*offset_ms)
+            } else {
+                delay_ms
+            }
+        });
+    if path_delay_ms == 0.0 {
+        return Ok(StereoFrameDelay::default());
+    }
+    if sample_rate == 0 {
+        return Err("Mixer manual PDC requires a positive sample rate".to_owned());
+    }
+    let frames = (path_delay_ms * f64::from(sample_rate) / 1_000.0).round();
+    if !frames.is_finite() || frames < 0.0 || frames > u64::MAX as f64 {
+        return Err("Mixer manual PDC delay size overflow".to_owned());
+    }
+    let frames = frames as u64;
+    let delay_bytes = frames
+        .checked_mul(std::mem::size_of::<[f32; 2]>() as u64)
+        .ok_or_else(|| "Mixer manual PDC delay storage size overflow".to_owned())?;
+    *total_delay_bytes = total_delay_bytes
+        .checked_add(delay_bytes)
+        .filter(|bytes| *bytes <= MAX_LIVE_MIXER_PDC_DELAY_BYTES)
+        .ok_or_else(|| {
+            format!(
+                "Mixer manual PDC delays exceed the {} MiB per-source limit",
+                MAX_LIVE_MIXER_PDC_DELAY_BYTES / (1024 * 1024)
+            )
+        })?;
+    StereoFrameDelay::new(frames)
 }
 
 /// Enable flush-to-zero for floating-point work on the current audio/render thread.

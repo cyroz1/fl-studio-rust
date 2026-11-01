@@ -4505,6 +4505,9 @@ pub(crate) struct MixerLiveSourceRoutePlan {
     pub(crate) output_transform: MixerSourceRouteTransform,
     pub(crate) insert_meter_transforms: Vec<(usize, MixerSourceRouteTransform)>,
     pub(crate) insert_effect_input_transforms: Vec<(usize, MixerSourceRouteTransform)>,
+    pub(crate) ordered_output_paths: Vec<MixerSourceRoutePath>,
+    pub(crate) ordered_insert_meter_paths: Vec<MixerSourceInsertRoutePath>,
+    pub(crate) ordered_insert_effect_input_paths: Vec<MixerSourceInsertRoutePath>,
     pub(crate) live_send_target_keys: Vec<MixerLiveSendTargetKey>,
     pub(crate) saved_live_send_gains: Vec<f32>,
     pub(crate) saved_live_send_enabled: Vec<bool>,
@@ -5026,6 +5029,28 @@ impl MixerRouteAudibility {
         &self,
         route: Option<i8>,
     ) -> Option<MixerLiveSourceRoutePlan> {
+        if route.is_none() || route == Some(0) {
+            if !self
+                .source_manual_pdc_ms
+                .values()
+                .any(|offset_ms| *offset_ms < 0.0)
+            {
+                return None;
+            }
+            let route_plan = self.source_route_plan_for_channel(route);
+            return Some(MixerLiveSourceRoutePlan {
+                track: 0,
+                manual_pdc_offsets_ms_by_track: self.manual_pdc_offsets_by_track(),
+                saved_fader_gain: 1.0,
+                output_transform: route_plan.output_transform,
+                insert_meter_transforms: route_plan.insert_meter_transforms,
+                insert_effect_input_transforms: route_plan.insert_effect_input_transforms,
+                ordered_output_paths: route_plan.ordered_output_paths,
+                ordered_insert_meter_paths: route_plan.ordered_insert_meter_paths,
+                ordered_insert_effect_input_paths: route_plan.ordered_insert_effect_input_paths,
+                ..MixerLiveSourceRoutePlan::default()
+            });
+        }
         let track = route.filter(|track| *track > 0 && self.known_tracks.contains(track))?;
         let live_direct_solo = !self.complete_send_sources.contains(&track);
         let live_send_solo = self.complete_send_sources.contains(&track);
@@ -5090,6 +5115,11 @@ impl MixerRouteAudibility {
             insert_effect_input_transforms: live_route_data
                 .route_plan
                 .insert_effect_input_transforms,
+            ordered_output_paths: live_route_data.route_plan.ordered_output_paths,
+            ordered_insert_meter_paths: live_route_data.route_plan.ordered_insert_meter_paths,
+            ordered_insert_effect_input_paths: live_route_data
+                .route_plan
+                .ordered_insert_effect_input_paths,
             live_send_target_keys: live_route_data.target_keys,
             saved_live_send_gains: live_route_data.saved_target_gains,
             saved_live_send_enabled: live_route_data.saved_target_enabled,

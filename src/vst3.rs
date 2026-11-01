@@ -817,9 +817,10 @@ struct PlaylistMixerEffectLiveSource {
 
 impl PlaylistMixerEffectLiveSource {
     fn next_frame_controls(&self) -> Option<LiveMixerSourceFrameControls> {
-        self.targets
-            .as_ref()
-            .map(|targets| self.control.next_frame_controls(targets))
+        Some(
+            self.control
+                .next_frame_controls_optional(self.targets.as_ref()),
+        )
     }
 
     fn insert_meter_transform(
@@ -1272,10 +1273,15 @@ impl Vst3PlaylistStreamProcessor {
                 bus.mixer_effect_input_transforms = route_plan.insert_effect_input_transforms;
                 bus.live_mixer_source = routing
                     .live_source_route_plan_for_channel(mixer_route)
-                    .map(|route_plan| PlaylistLiveMixerSource {
-                        control: LiveMixerSourceControl::new(route_plan, self.output_sample_rate),
-                        targets: None,
-                    });
+                    .map(|route_plan| {
+                        LiveMixerSourceControl::try_new(route_plan, self.output_sample_rate).map(
+                            |control| PlaylistLiveMixerSource {
+                                control,
+                                targets: None,
+                            },
+                        )
+                    })
+                    .transpose()?;
             }
         }
         for effect in &mut self.mixer_effects {
@@ -1304,13 +1310,17 @@ impl Vst3PlaylistStreamProcessor {
                 .map_or_else(MixerSourceRouteTransform::default, |(_, transform)| {
                     *transform
                 });
-            chain.live_source =
-                routing
-                    .live_source_route_plan_for_channel(Some(track))
-                    .map(|route_plan| PlaylistMixerEffectLiveSource {
-                        control: LiveMixerSourceControl::new(route_plan, self.output_sample_rate),
-                        targets: None,
-                    });
+            chain.live_source = routing
+                .live_source_route_plan_for_channel(Some(track))
+                .map(|route_plan| {
+                    LiveMixerSourceControl::try_new(route_plan, self.output_sample_rate).map(
+                        |control| PlaylistMixerEffectLiveSource {
+                            control,
+                            targets: None,
+                        },
+                    )
+                })
+                .transpose()?;
             chain.route_plan = route_plan;
         }
         let instrument_delay_frames = if self.automatic_pdc_enabled {
@@ -2235,11 +2245,10 @@ impl Vst3PlaylistStreamProcessor {
                         frame[1] * bus.gain * bus.right_pan_gain,
                     ];
                     let mut routed_frame = source_frame;
-                    let live_controls = bus.live_mixer_source.as_ref().and_then(|source| {
+                    let live_controls = bus.live_mixer_source.as_ref().map(|source| {
                         source
-                            .targets
-                            .as_ref()
-                            .map(|targets| source.control.next_frame_controls(targets))
+                            .control
+                            .next_frame_controls_optional(source.targets.as_ref())
                     });
                     if let (Some(source), Some(controls)) =
                         (bus.live_mixer_source.as_ref(), live_controls)
@@ -7390,10 +7399,15 @@ impl Vst3HostRuntime {
                 })?;
                 routing
                     .live_source_route_plan_for_channel(Some(track))
-                    .map(|route_plan| PlaylistMixerEffectLiveSource {
-                        control: LiveMixerSourceControl::new(route_plan, output_sample_rate),
-                        targets: None,
+                    .map(|route_plan| {
+                        LiveMixerSourceControl::try_new(route_plan, output_sample_rate).map(
+                            |control| PlaylistMixerEffectLiveSource {
+                                control,
+                                targets: None,
+                            },
+                        )
                     })
+                    .transpose()?
             };
             let latency_frames = processor.mixer_effects[first_effect_index..end_effect_index]
                 .iter()
@@ -9333,13 +9347,17 @@ fn prepare_playlist_plugin_output_buses(
                     .and_then(|offsets| offsets.get(bus_index).copied()),
             );
             let route_plan = routing.source_route_plan_for_channel(mixer_route);
-            let live_mixer_source =
-                routing
-                    .live_source_route_plan_for_channel(mixer_route)
-                    .map(|route_plan| PlaylistLiveMixerSource {
-                        control: LiveMixerSourceControl::new(route_plan, output_sample_rate),
-                        targets: None,
-                    });
+            let live_mixer_source = routing
+                .live_source_route_plan_for_channel(mixer_route)
+                .map(|route_plan| {
+                    LiveMixerSourceControl::try_new(route_plan, output_sample_rate).map(|control| {
+                        PlaylistLiveMixerSource {
+                            control,
+                            targets: None,
+                        }
+                    })
+                })
+                .transpose()?;
             let (left_pan_gain, right_pan_gain) =
                 channel_pan_gains(pan, *channel_count == 1, pan_law);
             Ok(PlaylistPluginOutputBus {
