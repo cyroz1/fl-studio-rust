@@ -5587,6 +5587,7 @@ struct DawUi {
     midi_vst3_parameter_mappings: Vec<MidiVst3ParameterMapping>,
     pattern_clap_parameter_links: Vec<PatternClapParameterLink>,
     pattern_clap_lfo_parameter_links: Vec<PatternClapLfoParameterLink>,
+    pattern_clap_mixer_effect_parameter_links: Vec<PatternClapMixerEffectParameterLink>,
     pattern_clap_mixer_effect_lfo_parameter_links: Vec<PatternClapMixerEffectLfoParameterLink>,
     pattern_vst3_parameter_links: Vec<PatternVst3ParameterLink>,
     pattern_vst3_mixer_effect_parameter_links: Vec<PatternVst3MixerEffectParameterLink>,
@@ -7042,6 +7043,23 @@ struct PatternClapMixerEffectLfoParameterLink {
     phase_degrees: u16,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct PatternClapMixerEffectParameterLink {
+    project_path: String,
+    pattern_id: u16,
+    stream_channel: u8,
+    stream_flags: u8,
+    insert_ordinal: usize,
+    slot_index: u16,
+    plugin_path: String,
+    plugin_id: String,
+    parameter_id: u32,
+    parameter_name: String,
+    parameter_min_value: f64,
+    parameter_max_value: f64,
+    parameter_is_stepped: bool,
+}
+
 impl InternalLfoWaveform {
     const ALL: [Self; 3] = [Self::Sine, Self::Triangle, Self::Square];
 
@@ -7456,6 +7474,92 @@ fn show_pattern_clap_mixer_effect_lfo_parameter_link_controls(
         );
     }
     (upsert, unlink)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn show_pattern_clap_mixer_effect_parameter_link_controls(
+    ui: &mut egui::Ui,
+    link: Option<&PatternClapMixerEffectParameterLink>,
+    source: Option<&(String, u16, u8, u8)>,
+    insert_ordinal: usize,
+    slot_index: u16,
+    plugin_path: &Path,
+    plugin_id: &str,
+    parameter_id: u32,
+    parameter_name: &str,
+    parameter_min_value: f64,
+    parameter_max_value: f64,
+    parameter_is_stepped: bool,
+    parameter_is_read_only: bool,
+) -> (Option<PatternClapMixerEffectParameterLink>, bool) {
+    let mut upsert = None;
+    let mut unlink = false;
+    let mut updated_link = link.cloned();
+    if let Some(updated) = &mut updated_link {
+        updated.parameter_min_value = parameter_min_value;
+        updated.parameter_max_value = parameter_max_value;
+        updated.parameter_is_stepped = parameter_is_stepped;
+    }
+    ui.horizontal(|ui| {
+        if let Some(updated) = &updated_link {
+            ui.small(format!(
+                "Pattern {} · Event channel {} · flags 0x{:02X}",
+                updated.pattern_id, updated.stream_channel, updated.stream_flags
+            ));
+            let source_matches =
+                source.is_some_and(|(project_path, pattern_id, stream_channel, stream_flags)| {
+                    project_paths_equal(Path::new(&updated.project_path), Path::new(project_path))
+                        && updated.pattern_id == *pattern_id
+                        && updated.stream_channel == *stream_channel
+                        && updated.stream_flags == *stream_flags
+                });
+            if source_matches {
+                ui.small("Linked");
+            }
+            if let Some((project_path, pattern_id, stream_channel, stream_flags)) = source
+                && !source_matches
+                && ui.small_button("Relink Event").clicked()
+            {
+                let mut relinked = updated.clone();
+                relinked.project_path = project_path.clone();
+                relinked.pattern_id = *pattern_id;
+                relinked.stream_channel = *stream_channel;
+                relinked.stream_flags = *stream_flags;
+                upsert = Some(relinked);
+            }
+            unlink = ui.small_button("Clear event").clicked();
+        } else if ui
+            .add_enabled(
+                !parameter_is_read_only && source.is_some(),
+                egui::Button::new("Link Event"),
+            )
+            .clicked()
+            && let Some((project_path, pattern_id, stream_channel, stream_flags)) = source
+        {
+            upsert = Some(PatternClapMixerEffectParameterLink {
+                project_path: project_path.clone(),
+                pattern_id: *pattern_id,
+                stream_channel: *stream_channel,
+                stream_flags: *stream_flags,
+                insert_ordinal,
+                slot_index,
+                plugin_path: plugin_path.to_string_lossy().into_owned(),
+                plugin_id: plugin_id.to_owned(),
+                parameter_id,
+                parameter_name: parameter_name.to_owned(),
+                parameter_min_value,
+                parameter_max_value,
+                parameter_is_stepped,
+            });
+        } else if source.is_none() && link.is_none() {
+            ui.add_enabled(false, egui::Button::new("Link Event"))
+                .on_hover_text("Select a Pattern Event stream in the Piano roll first.");
+        }
+    });
+    (
+        upsert.or(updated_link.filter(|updated| link != Some(updated))),
+        unlink,
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -7981,6 +8085,8 @@ impl DawUi {
         let vst3_manual_latency_offsets = load_vst3_manual_latency_offsets();
         let pattern_clap_parameter_links = load_pattern_clap_parameter_links();
         let pattern_clap_lfo_parameter_links = load_pattern_clap_lfo_parameter_links();
+        let pattern_clap_mixer_effect_parameter_links =
+            load_pattern_clap_mixer_effect_parameter_links();
         let pattern_clap_mixer_effect_lfo_parameter_links =
             load_pattern_clap_mixer_effect_lfo_parameter_links();
         let pattern_vst3_parameter_links = load_pattern_vst3_parameter_links();
@@ -8536,6 +8642,7 @@ impl DawUi {
             midi_vst3_parameter_mappings,
             pattern_clap_parameter_links,
             pattern_clap_lfo_parameter_links,
+            pattern_clap_mixer_effect_parameter_links,
             pattern_clap_mixer_effect_lfo_parameter_links,
             pattern_vst3_parameter_links,
             pattern_vst3_mixer_effect_parameter_links,
@@ -10374,6 +10481,41 @@ impl DawUi {
                     .extend(lanes);
             }
         }
+        let mut event_linked_parameters = BTreeSet::new();
+        for link in self
+            .pattern_clap_mixer_effect_parameter_links
+            .iter()
+            .filter(|link| {
+                project_paths_equal(Path::new(&link.project_path), project_path)
+                    && link.pattern_id == pattern.id
+                    && valid_pattern_clap_mixer_effect_parameter_link(link)
+            })
+        {
+            let key = (link.insert_ordinal, link.slot_index);
+            let Some(assignment) = self.clap_mixer_effect_assignments.get(&key) else {
+                continue;
+            };
+            if assignment.path != Path::new(&link.plugin_path)
+                || assignment.plugin_id != link.plugin_id
+            {
+                continue;
+            }
+            let Some(automation) = pattern_clap_mixer_effect_parameter_automation(link, pattern)
+            else {
+                continue;
+            };
+            event_linked_parameters.insert((
+                key.0,
+                key.1,
+                link.plugin_path.clone(),
+                link.plugin_id.clone(),
+                link.parameter_id,
+            ));
+            automations
+                .entry(key)
+                .or_insert_with(Vec::new)
+                .push(automation);
+        }
         for link in self
             .pattern_clap_mixer_effect_lfo_parameter_links
             .iter()
@@ -10384,6 +10526,15 @@ impl DawUi {
             })
         {
             let key = (link.insert_ordinal, link.slot_index);
+            if event_linked_parameters.contains(&(
+                key.0,
+                key.1,
+                link.plugin_path.clone(),
+                link.plugin_id.clone(),
+                link.parameter_id,
+            )) {
+                continue;
+            }
             let Some(assignment) = self.clap_mixer_effect_assignments.get(&key) else {
                 continue;
             };
@@ -61551,6 +61702,7 @@ impl DawUi {
         let effect_slots = document.mixer_effect_slots();
         let clap_mixer_effect_assignments = self.clap_mixer_effect_assignments.clone();
         let project_id = self.current_path.as_deref().map(stable_project_id);
+        let pattern_clap_event_source = self.selected_pattern_vst3_parameter_source();
         let parameters = document.mixer_parameter_records().unwrap_or_default();
         let eq_parameters = document.mixer_eq_parameter_summaries().unwrap_or_default();
         let send_summaries = document.mixer_send_summaries().unwrap_or_default();
@@ -61657,6 +61809,8 @@ impl DawUi {
         let mut clap_effect_manual_latency_offset_edits = Vec::new();
         let mut clap_effect_parameter_override_apply = Vec::new();
         let mut clap_effect_parameter_override_clear = Vec::new();
+        let mut pattern_clap_mixer_effect_event_upserts = Vec::new();
+        let mut pattern_clap_mixer_effect_event_unlinks = Vec::new();
         let mut pattern_clap_mixer_effect_lfo_upserts = Vec::new();
         let mut pattern_clap_mixer_effect_lfo_unlinks = Vec::new();
         let mut clap_effect_assignment_edit = None;
@@ -63789,6 +63943,63 @@ impl DawUi {
                                                                         if !parameter.module.is_empty() {
                                                                             ui.small(&parameter.module);
                                                                         }
+                                                                        let event_scope = self
+                                                                            .current_path
+                                                                            .as_deref()
+                                                                            .zip(self.selected_pattern);
+                                                                        let event_link = event_scope.and_then(
+                                                                            |(project_path, pattern_id)| {
+                                                                                pattern_clap_mixer_effect_parameter_link_for_target(
+                                                                                    &self.pattern_clap_mixer_effect_parameter_links,
+                                                                                    project_path,
+                                                                                    pattern_id,
+                                                                                    insert.ordinal(),
+                                                                                    slot_index_raw,
+                                                                                    &assignment.path,
+                                                                                    &assignment.plugin_id,
+                                                                                    parameter.id,
+                                                                                )
+                                                                            },
+                                                                        );
+                                                                        let widget_id = u64::try_from(
+                                                                            insert.ordinal(),
+                                                                        )
+                                                                        .unwrap_or(u64::MAX)
+                                                                            ^ (u64::from(slot_index_raw)
+                                                                                << 32)
+                                                                            ^ u64::from(parameter.id);
+                                                                        let (event_upsert, clear_event) =
+                                                                            show_pattern_clap_mixer_effect_parameter_link_controls(
+                                                                                ui,
+                                                                                event_link,
+                                                                                pattern_clap_event_source.as_ref(),
+                                                                                insert.ordinal(),
+                                                                                slot_index_raw,
+                                                                                &assignment.path,
+                                                                                &assignment.plugin_id,
+                                                                                parameter.id,
+                                                                                &parameter.name,
+                                                                                parameter.min_value,
+                                                                                parameter.max_value,
+                                                                                flags.contains(
+                                                                                    ParamInfoFlags::IS_STEPPED,
+                                                                                ),
+                                                                                flags.contains(
+                                                                                    ParamInfoFlags::IS_READONLY,
+                                                                                ) || !flags.contains(
+                                                                                    ParamInfoFlags::IS_AUTOMATABLE,
+                                                                                ),
+                                                                            );
+                                                                        if let Some(link) = event_upsert {
+                                                                            pattern_clap_mixer_effect_event_upserts
+                                                                                .push(link);
+                                                                        }
+                                                                        if clear_event
+                                                                            && let Some(link) = event_link
+                                                                        {
+                                                                            pattern_clap_mixer_effect_event_unlinks
+                                                                                .push(link.clone());
+                                                                        }
                                                                         let lfo_scope = self
                                                                             .current_path
                                                                             .as_deref()
@@ -63807,13 +64018,6 @@ impl DawUi {
                                                                                 )
                                                                             },
                                                                         );
-                                                                        let widget_id = u64::try_from(
-                                                                            insert.ordinal(),
-                                                                        )
-                                                                        .unwrap_or(u64::MAX)
-                                                                            ^ (u64::from(slot_index_raw)
-                                                                                << 32)
-                                                                            ^ u64::from(parameter.id);
                                                                         let (lfo_upsert, clear_lfo) =
                                                                             show_pattern_clap_mixer_effect_lfo_parameter_link_controls(
                                                                                 ui,
@@ -63832,6 +64036,8 @@ impl DawUi {
                                                                                 ),
                                                                                 flags.contains(
                                                                                     ParamInfoFlags::IS_READONLY,
+                                                                                ) || !flags.contains(
+                                                                                    ParamInfoFlags::IS_AUTOMATABLE,
                                                                                 ),
                                                                                 widget_id,
                                                                             );
@@ -64626,6 +64832,49 @@ impl DawUi {
             } else {
                 self.status = "Save the project before editing CLAP parameters".to_owned();
             }
+        }
+        for link in pattern_clap_mixer_effect_event_upserts {
+            upsert_pattern_clap_mixer_effect_parameter_link(
+                &mut self.pattern_clap_mixer_effect_parameter_links,
+                link.clone(),
+            );
+            self.invalidate_clap_playlist_audio();
+            self.status = save_pattern_clap_mixer_effect_parameter_links(
+                &self.pattern_clap_mixer_effect_parameter_links,
+            )
+            .err()
+            .map_or_else(
+                || {
+                    format!(
+                        "Linked {} to a CLAP Mixer Pattern Event on this machine",
+                        link.parameter_name
+                    )
+                },
+                |error| {
+                    format!(
+                        "Updated the CLAP Mixer Pattern Event for this session; could not save it: {error}"
+                    )
+                },
+            );
+        }
+        for link in pattern_clap_mixer_effect_event_unlinks {
+            remove_pattern_clap_mixer_effect_parameter_link(
+                &mut self.pattern_clap_mixer_effect_parameter_links,
+                &link,
+            );
+            self.invalidate_clap_playlist_audio();
+            self.status = save_pattern_clap_mixer_effect_parameter_links(
+                &self.pattern_clap_mixer_effect_parameter_links,
+            )
+            .err()
+            .map_or_else(
+                || format!("Cleared CLAP Mixer Pattern Event for {}", link.parameter_name),
+                |error| {
+                    format!(
+                        "Cleared the CLAP Mixer Pattern Event for this session; could not save it: {error}"
+                    )
+                },
+            );
         }
         for link in pattern_clap_mixer_effect_lfo_upserts {
             upsert_pattern_clap_mixer_effect_lfo_parameter_link(
@@ -79083,6 +79332,10 @@ fn pattern_clap_lfo_parameter_links_file() -> Option<PathBuf> {
     midi_control_change_mapping_file("pattern-clap-lfo-parameter-links.txt")
 }
 
+fn pattern_clap_mixer_effect_parameter_links_file() -> Option<PathBuf> {
+    midi_control_change_mapping_file("pattern-clap-mixer-effect-parameter-links.txt")
+}
+
 fn pattern_clap_mixer_effect_lfo_parameter_links_file() -> Option<PathBuf> {
     midi_control_change_mapping_file("pattern-clap-mixer-effect-lfo-parameter-links.txt")
 }
@@ -79177,6 +79430,13 @@ fn load_pattern_clap_lfo_parameter_links() -> Vec<PatternClapLfoParameterLink> {
     pattern_clap_lfo_parameter_links_file()
         .and_then(|path| fs::read_to_string(path).ok())
         .map(|contents| parse_pattern_clap_lfo_parameter_links(&contents))
+        .unwrap_or_default()
+}
+
+fn load_pattern_clap_mixer_effect_parameter_links() -> Vec<PatternClapMixerEffectParameterLink> {
+    pattern_clap_mixer_effect_parameter_links_file()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .map(|contents| parse_pattern_clap_mixer_effect_parameter_links(&contents))
         .unwrap_or_default()
 }
 
@@ -79494,6 +79754,23 @@ fn save_pattern_clap_lfo_parameter_links(
         .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
     fs::write(&path, serialize_pattern_clap_lfo_parameter_links(links))
         .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
+fn save_pattern_clap_mixer_effect_parameter_links(
+    links: &[PatternClapMixerEffectParameterLink],
+) -> Result<(), String> {
+    let path = pattern_clap_mixer_effect_parameter_links_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path.parent().ok_or_else(|| {
+        "the Pattern CLAP Mixer effect parameter link path has no parent folder".to_owned()
+    })?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    fs::write(
+        &path,
+        serialize_pattern_clap_mixer_effect_parameter_links(links),
+    )
+    .map_err(|error| format!("could not write {}: {error}", path.display()))
 }
 
 fn save_pattern_clap_mixer_effect_lfo_parameter_links(
@@ -80097,6 +80374,76 @@ fn pattern_clap_lfo_parameter_link_for_target<'a>(
             plugin_id,
             parameter_id,
         )
+    })
+}
+
+fn same_pattern_clap_mixer_effect_parameter_link_target(
+    link: &PatternClapMixerEffectParameterLink,
+    target: &PatternClapMixerEffectParameterLink,
+) -> bool {
+    project_paths_equal(
+        Path::new(&link.project_path),
+        Path::new(&target.project_path),
+    ) && link.pattern_id == target.pattern_id
+        && link.insert_ordinal == target.insert_ordinal
+        && link.slot_index == target.slot_index
+        && Path::new(&link.plugin_path) == Path::new(&target.plugin_path)
+        && link.plugin_id == target.plugin_id
+        && link.parameter_id == target.parameter_id
+}
+
+fn valid_pattern_clap_mixer_effect_parameter_link(
+    link: &PatternClapMixerEffectParameterLink,
+) -> bool {
+    !link.project_path.is_empty()
+        && link.insert_ordinal > 0
+        && link.slot_index < 10
+        && !link.plugin_path.is_empty()
+        && !link.plugin_id.is_empty()
+        && link.parameter_id != u32::MAX
+        && !link.parameter_name.is_empty()
+        && link.parameter_min_value.is_finite()
+        && link.parameter_max_value.is_finite()
+        && link.parameter_min_value < link.parameter_max_value
+}
+
+fn upsert_pattern_clap_mixer_effect_parameter_link(
+    links: &mut Vec<PatternClapMixerEffectParameterLink>,
+    link: PatternClapMixerEffectParameterLink,
+) {
+    if !valid_pattern_clap_mixer_effect_parameter_link(&link) {
+        return;
+    }
+    links.retain(|existing| !same_pattern_clap_mixer_effect_parameter_link_target(existing, &link));
+    links.push(link);
+}
+
+fn remove_pattern_clap_mixer_effect_parameter_link(
+    links: &mut Vec<PatternClapMixerEffectParameterLink>,
+    target: &PatternClapMixerEffectParameterLink,
+) {
+    links.retain(|link| !same_pattern_clap_mixer_effect_parameter_link_target(link, target));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pattern_clap_mixer_effect_parameter_link_for_target<'a>(
+    links: &'a [PatternClapMixerEffectParameterLink],
+    project_path: &Path,
+    pattern_id: u16,
+    insert_ordinal: usize,
+    slot_index: u16,
+    plugin_path: &Path,
+    plugin_id: &str,
+    parameter_id: u32,
+) -> Option<&'a PatternClapMixerEffectParameterLink> {
+    links.iter().find(|link| {
+        project_paths_equal(Path::new(&link.project_path), project_path)
+            && link.pattern_id == pattern_id
+            && link.insert_ordinal == insert_ordinal
+            && link.slot_index == slot_index
+            && Path::new(&link.plugin_path) == plugin_path
+            && link.plugin_id == plugin_id
+            && link.parameter_id == parameter_id
     })
 }
 
@@ -80980,6 +81327,40 @@ fn clap_internal_lfo_parameter_automation(
     }
 }
 
+fn pattern_clap_mixer_effect_parameter_automation(
+    link: &PatternClapMixerEffectParameterLink,
+    pattern: &Pattern,
+) -> Option<Vst3PlaylistParameterAutomation> {
+    if !valid_pattern_clap_mixer_effect_parameter_link(link) {
+        return None;
+    }
+    let points = pattern
+        .controllers
+        .iter()
+        .filter(|point| point.channel == link.stream_channel && point.flags == link.stream_flags)
+        .filter_map(|point| {
+            let normalized = point.value();
+            if !normalized.is_finite() || !(0.0..=1.0).contains(&normalized) {
+                return None;
+            }
+            let mut value = link.parameter_min_value
+                + (link.parameter_max_value - link.parameter_min_value) * f64::from(normalized);
+            if link.parameter_is_stepped {
+                value = value.round();
+            }
+            Some(Vst3PlaylistAutomationPoint {
+                tick: u64::from(point.position),
+                value: value.clamp(link.parameter_min_value, link.parameter_max_value),
+                tension: 0.0,
+            })
+        })
+        .collect::<Vec<_>>();
+    (!points.is_empty()).then_some(Vst3PlaylistParameterAutomation {
+        parameter_id: link.parameter_id,
+        points,
+    })
+}
+
 fn clap_mixer_effect_internal_lfo_parameter_automation(
     link: &PatternClapMixerEffectLfoParameterLink,
     ppq: u16,
@@ -81855,6 +82236,124 @@ fn serialize_pattern_clap_lfo_parameter_links(links: &[PatternClapLfoParameterLi
         contents.push_str(&link.maximum_raw.to_string());
         contents.push('\t');
         contents.push_str(&link.phase_degrees.to_string());
+        contents.push('\n');
+    }
+    contents
+}
+
+fn parse_pattern_clap_mixer_effect_parameter_links(
+    contents: &str,
+) -> Vec<PatternClapMixerEffectParameterLink> {
+    let mut links = Vec::new();
+    for line in contents.lines() {
+        let Some(encoded) = line.strip_prefix("mixer_event_link=") else {
+            continue;
+        };
+        let mut fields = encoded.split('\t');
+        let Some(project_path) = fields.next().and_then(decode_midi_device_id) else {
+            continue;
+        };
+        let Some(pattern_id) = fields.next().and_then(|field| field.parse::<u16>().ok()) else {
+            continue;
+        };
+        let Some(stream_channel) = fields.next().and_then(|field| field.parse::<u8>().ok()) else {
+            continue;
+        };
+        let Some(stream_flags) = fields.next().and_then(|field| field.parse::<u8>().ok()) else {
+            continue;
+        };
+        let Some(insert_ordinal) = fields.next().and_then(|field| field.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        let Some(slot_index) = fields.next().and_then(|field| field.parse::<u16>().ok()) else {
+            continue;
+        };
+        let Some(plugin_path) = fields.next().and_then(decode_midi_device_id) else {
+            continue;
+        };
+        let Some(plugin_id) = fields.next().and_then(decode_midi_device_id) else {
+            continue;
+        };
+        let Some(parameter_id) = fields.next().and_then(|field| field.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(parameter_name) = fields.next().and_then(decode_midi_device_id) else {
+            continue;
+        };
+        let Some(parameter_min_value) = fields.next().and_then(|field| field.parse::<f64>().ok())
+        else {
+            continue;
+        };
+        let Some(parameter_max_value) = fields.next().and_then(|field| field.parse::<f64>().ok())
+        else {
+            continue;
+        };
+        let parameter_is_stepped = match fields.next() {
+            Some("0") => false,
+            Some("1") => true,
+            _ => continue,
+        };
+        if fields.next().is_some() {
+            continue;
+        }
+        upsert_pattern_clap_mixer_effect_parameter_link(
+            &mut links,
+            PatternClapMixerEffectParameterLink {
+                project_path,
+                pattern_id,
+                stream_channel,
+                stream_flags,
+                insert_ordinal,
+                slot_index,
+                plugin_path,
+                plugin_id,
+                parameter_id,
+                parameter_name,
+                parameter_min_value,
+                parameter_max_value,
+                parameter_is_stepped,
+            },
+        );
+    }
+    links
+}
+
+fn serialize_pattern_clap_mixer_effect_parameter_links(
+    links: &[PatternClapMixerEffectParameterLink],
+) -> String {
+    let mut contents = String::from("version=1\n");
+    let mut normalized = Vec::new();
+    for link in links {
+        upsert_pattern_clap_mixer_effect_parameter_link(&mut normalized, link.clone());
+    }
+    for link in normalized {
+        contents.push_str("mixer_event_link=");
+        contents.push_str(&encode_midi_device_id(&link.project_path));
+        contents.push('\t');
+        contents.push_str(&link.pattern_id.to_string());
+        contents.push('\t');
+        contents.push_str(&link.stream_channel.to_string());
+        contents.push('\t');
+        contents.push_str(&link.stream_flags.to_string());
+        contents.push('\t');
+        contents.push_str(&link.insert_ordinal.to_string());
+        contents.push('\t');
+        contents.push_str(&link.slot_index.to_string());
+        contents.push('\t');
+        contents.push_str(&encode_midi_device_id(&link.plugin_path));
+        contents.push('\t');
+        contents.push_str(&encode_midi_device_id(&link.plugin_id));
+        contents.push('\t');
+        contents.push_str(&link.parameter_id.to_string());
+        contents.push('\t');
+        contents.push_str(&encode_midi_device_id(&link.parameter_name));
+        contents.push('\t');
+        contents.push_str(&link.parameter_min_value.to_string());
+        contents.push('\t');
+        contents.push_str(&link.parameter_max_value.to_string());
+        contents.push('\t');
+        contents.push_str(if link.parameter_is_stepped { "1" } else { "0" });
         contents.push('\n');
     }
     contents
