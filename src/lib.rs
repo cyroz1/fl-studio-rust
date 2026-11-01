@@ -27942,6 +27942,17 @@ impl FlpDocument {
         self.apply_channel_state_preset_for_type(target_channel_id, preset, ChannelType::Native)
     }
 
+    /// Applies one kind-3 Layer channel block when its ordered child references exactly match
+    /// the destination Layer. The destination ID and name are retained, and each child must
+    /// resolve uniquely to an existing non-Layer channel. Project string encodings must match.
+    pub fn apply_layer_channel_state_preset(
+        &mut self,
+        target_channel_id: u16,
+        preset: &FstPreset,
+    ) -> Result<usize, FlpError> {
+        self.apply_channel_state_preset_for_type(target_channel_id, preset, ChannelType::Layer)
+    }
+
     fn apply_channel_state_preset_for_type(
         &mut self,
         target_channel_id: u16,
@@ -27989,6 +28000,13 @@ impl FlpDocument {
                 true,
                 "native-generator state import requires matching, recognized project string encodings",
                 "native-generator state import requires one well-formed channel marker and name, without note or Playlist events",
+            ),
+            ChannelType::Layer => (
+                "Layer state import requires exactly one kind-3 Layer channel",
+                "Layer state import requires a kind-3 Layer target channel",
+                true,
+                "Layer state import requires matching, recognized project string encodings",
+                "Layer state import requires one well-formed channel marker and name, without note or Playlist events",
             ),
             _ => {
                 return Err(FlpError::UnsupportedEdit(
@@ -28047,6 +28065,50 @@ impl FlpDocument {
             {
                 return Err(FlpError::UnsupportedEdit(
                     "native-generator state import requires one unique string-encoded 0xC9 plug-in identifier on each channel, and the identifiers must match",
+                ));
+            }
+        }
+        if channel_type == ChannelType::Layer {
+            let read_layer_children = |events: &[FlpEvent], range: &std::ops::Range<usize>| {
+                range
+                    .clone()
+                    .filter(|&index| events[index].opcode == 0x5E)
+                    .map(|index| {
+                        let event = &events[index];
+                        if event.encoding != PayloadEncoding::Word || event.payload.len() != 2 {
+                            return None;
+                        }
+                        Some(u16::from_le_bytes([event.payload[0], event.payload[1]]))
+                    })
+                    .collect::<Option<Vec<_>>>()
+            };
+            let source_children = read_layer_children(&preset.document().events, &source_range);
+            let target_children = read_layer_children(&self.events, &target_range);
+            let destination_channels = self.channels();
+            let child_is_valid = |child_id: u16| {
+                let mut matching_children = destination_channels
+                    .iter()
+                    .filter(|channel| channel.id() == child_id);
+                matching_children.next().is_some_and(|child| {
+                    child.channel_type() != Some(ChannelType::Layer)
+                        && matching_children.next().is_none()
+                })
+            };
+            let target_children_resolve_uniquely =
+                target_children.as_ref().is_some_and(|children| {
+                    let mut seen = HashSet::new();
+                    children.iter().all(|child_id| {
+                        *child_id != target_channel_id
+                            && seen.insert(*child_id)
+                            && child_is_valid(*child_id)
+                    })
+                });
+            if source_children.is_none()
+                || source_children != target_children
+                || !target_children_resolve_uniquely
+            {
+                return Err(FlpError::UnsupportedEdit(
+                    "Layer state import requires valid ordered child references that match the destination and resolve uniquely to non-Layer channels",
                 ));
             }
         }
@@ -29793,6 +29855,32 @@ mod tests {
         flp_fixture(&event_stream, &[], &[])
     }
 
+    fn layer_channel_state_fixture(
+        format: u16,
+        channel_id: u16,
+        name: &str,
+        flags: u32,
+        child_ids: &[u16],
+        level_adjustments: &[u8],
+    ) -> Vec<u8> {
+        let mut event_stream = Vec::new();
+        append_data_event(&mut event_stream, 0xC7, b"26.0.0\0");
+        event_stream.extend_from_slice(&[0x40]);
+        event_stream.extend_from_slice(&channel_id.to_le_bytes());
+        event_stream.extend_from_slice(&[0x15, 3, 0x90]);
+        event_stream.extend_from_slice(&flags.to_le_bytes());
+        for child_id in child_ids {
+            event_stream.push(0x5E);
+            event_stream.extend_from_slice(&child_id.to_le_bytes());
+        }
+        append_data_event(&mut event_stream, 0xD5, level_adjustments);
+        append_project_info_string(&mut event_stream, 0xCB, name);
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+        let mut bytes = flp_fixture(&event_stream, &[], &[]);
+        bytes[8..10].copy_from_slice(&format.to_le_bytes());
+        bytes
+    }
+
     #[test]
     fn applies_sampler_channel_state_while_preserving_target_identity_and_project_events() {
         let source_bytes =
@@ -30468,6 +30556,123 @@ mod tests {
             Err(FlpError::UnsupportedEdit(_))
         ));
         assert_eq!(duplicate_target, duplicate_target_before);
+    }
+
+    #[test]
+    fn applies_layer_channel_state_when_ordered_child_references_match() {
+        let source_state = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60];
+        let source_bytes =
+            layer_channel_state_fixture(32, 8, "Preset Layer", 0xA500_0003, &[2, 3], &source_state);
+        let preset = FstPreset::parse(&source_bytes).expect("Layer state preset should parse");
+
+        let mut target_stream = Vec::new();
+        append_data_event(&mut target_stream, 0xC7, b"26.0.0\0");
+        append_project_info_string(&mut target_stream, 0xC2, "Project title");
+        target_stream.extend_from_slice(&[0x40, 5, 0, 0x15, 3, 0x90]);
+        target_stream.extend_from_slice(&0x0000_0001_u32.to_le_bytes());
+        target_stream.extend_from_slice(&[0x5E, 2, 0, 0x5E, 3, 0]);
+        append_data_event(&mut target_stream, 0xD5, &[0xAA, 0xBB]);
+        append_project_info_string(&mut target_stream, 0xCB, "Destination Layer");
+        target_stream.extend_from_slice(&[0x40, 2, 0, 0x15, 0]);
+        append_project_info_string(&mut target_stream, 0xCB, "Child Sampler");
+        target_stream.extend_from_slice(&[0x40, 3, 0, 0x15, 2]);
+        append_project_info_string(&mut target_stream, 0xCB, "Child Generator");
+        target_stream.extend_from_slice(&[0x62, 0, 0]);
+        let mut target = FlpDocument::parse(&flp_fixture(&target_stream, &[], &[]))
+            .expect("target project with Layer children should parse");
+        let layer_target_name = target.events()[target.channels()[0].event_range()]
+            .iter()
+            .find(|event| event.opcode() == 0xCB)
+            .expect("target Layer should have a name")
+            .wire_bytes()
+            .to_vec();
+        let original_project_title = target.events()[1].wire_bytes().to_vec();
+        let original_children = target.channels()[1..]
+            .iter()
+            .flat_map(|channel| {
+                target.events()[channel.event_range()]
+                    .iter()
+                    .map(|event| event.wire_bytes().to_vec())
+            })
+            .collect::<Vec<_>>();
+
+        let replaced = target
+            .apply_layer_channel_state_preset(5, &preset)
+            .expect("Layer state with the same ordered children should apply");
+
+        assert_eq!(replaced, 7);
+        assert_eq!(target.channels()[0].id(), 5);
+        assert_eq!(
+            target.channels()[0].channel_type(),
+            Some(super::ChannelType::Layer)
+        );
+        assert_eq!(target.channels()[0].layer_child_ids(), Some(&[2, 3][..]));
+        assert_eq!(target.channels()[0].layer_flags(), Some(0xA500_0003));
+        assert_eq!(
+            target.channels()[0].display_name(),
+            Some("Destination Layer")
+        );
+        let target_range = target.channels()[0].event_range();
+        let channel_events = &target.events()[target_range];
+        assert_eq!(
+            channel_events
+                .iter()
+                .find(|event| event.opcode() == 0xCB)
+                .expect("target Layer should retain its name event")
+                .wire_bytes(),
+            layer_target_name
+        );
+        assert!(
+            channel_events
+                .iter()
+                .any(|event| { event.opcode() == 0xD5 && event.payload() == source_state })
+        );
+        assert_eq!(target.events()[1].wire_bytes(), original_project_title);
+        assert_eq!(
+            target.channels()[1..]
+                .iter()
+                .flat_map(|channel| {
+                    target.events()[channel.event_range()]
+                        .iter()
+                        .map(|event| event.wire_bytes().to_vec())
+                })
+                .collect::<Vec<_>>(),
+            original_children
+        );
+    }
+
+    #[test]
+    fn layer_channel_state_import_rejects_different_child_order_atomically() {
+        let preset = FstPreset::parse(&layer_channel_state_fixture(
+            32,
+            8,
+            "Preset Layer",
+            0x0000_0001,
+            &[3, 2],
+            &[0x10, 0x20],
+        ))
+        .expect("Layer preset should parse");
+        let mut target_stream = Vec::new();
+        append_data_event(&mut target_stream, 0xC7, b"26.0.0\0");
+        target_stream.extend_from_slice(&[0x40, 5, 0, 0x15, 3, 0x90]);
+        target_stream.extend_from_slice(&0_u32.to_le_bytes());
+        target_stream.extend_from_slice(&[0x5E, 2, 0, 0x5E, 3, 0]);
+        append_data_event(&mut target_stream, 0xD5, &[0xAA, 0xBB]);
+        append_project_info_string(&mut target_stream, 0xCB, "Destination Layer");
+        target_stream.extend_from_slice(&[0x40, 2, 0, 0x15, 0]);
+        append_project_info_string(&mut target_stream, 0xCB, "Child Sampler");
+        target_stream.extend_from_slice(&[0x40, 3, 0, 0x15, 2]);
+        append_project_info_string(&mut target_stream, 0xCB, "Child Generator");
+        target_stream.extend_from_slice(&[0x62, 0, 0]);
+        let mut target = FlpDocument::parse(&flp_fixture(&target_stream, &[], &[]))
+            .expect("target Layer project with children should parse");
+        let before = target.clone();
+
+        assert!(matches!(
+            target.apply_layer_channel_state_preset(5, &preset),
+            Err(FlpError::UnsupportedEdit(_))
+        ));
+        assert_eq!(target, before);
     }
 
     fn append_complete_mixer_insert_state(

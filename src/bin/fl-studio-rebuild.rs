@@ -22825,6 +22825,33 @@ impl DawUi {
         }
     }
 
+    fn apply_fst_preset_to_layer_channel(
+        &mut self,
+        preset: &FstPreset,
+        target_channel_id: u16,
+        preset_name: &str,
+    ) -> bool {
+        let Some(mut document) = self.document.clone() else {
+            self.status = "Open a project before applying a channel preset".to_owned();
+            return false;
+        };
+        match document.apply_layer_channel_state_preset(target_channel_id, preset) {
+            Ok(event_count) => {
+                self.document = Some(document);
+                self.dirty = true;
+                self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+                self.status = format!(
+                    "Applied {preset_name} to Layer Channel {target_channel_id} ({event_count} channel-state events)"
+                );
+                true
+            }
+            Err(error) => {
+                self.status = format!("Could not apply Layer preset: {error}");
+                false
+            }
+        }
+    }
+
     fn selected_sample_channel(&self) -> Option<(u16, String)> {
         let channel_id = self.selected_graph_channel?;
         let channel = self
@@ -23023,12 +23050,30 @@ impl DawUi {
         let apply_native_available = details.preset.kind() == FstPresetKind::ChannelState
             && native_generator_target_available
             && native_plugin_identity_matches;
+        let layer_preset_children = (preset_channels.len() == 1
+            && preset_channels[0].channel_type() == Some(ChannelType::Layer))
+        .then(|| preset_channels[0].layer_child_ids())
+        .flatten();
+        let layer_child_references_match = layer_preset_children.is_some_and(|source_children| {
+            target_channel_id.is_some_and(|channel_id| {
+                self.document.as_ref().is_some_and(|document| {
+                    document.channels().into_iter().any(|channel| {
+                        channel.id() == channel_id
+                            && channel.channel_type() == Some(ChannelType::Layer)
+                            && channel.layer_child_ids() == Some(source_children)
+                    })
+                })
+            })
+        });
+        let apply_layer_available =
+            details.preset.kind() == FstPresetKind::ChannelState && layer_child_references_match;
         let apply_available = apply_vst3_available
             || apply_sampler_available
             || apply_midi_out_available
             || apply_audio_clip_available
             || apply_automation_available
-            || apply_native_available;
+            || apply_native_available
+            || apply_layer_available;
         let mut open = true;
         let mut close = false;
         let mut apply_requested = false;
@@ -23109,7 +23154,7 @@ impl DawUi {
                             egui::Button::new("Apply to selected Channel"),
                         )
                         .on_hover_text(
-                            "Applies a compatible Sampler, MIDI Out, Audio Clip, or Automation Clip preset, a native generator preset with the same plug-in identifier, or a matching marker-12 VST3 preset",
+                            "Applies a compatible Sampler, MIDI Out, Audio Clip, or Automation Clip preset, a native generator preset with the same plug-in identifier, a Layer preset with matching children, or a matching marker-12 VST3 preset",
                         )
                         .clicked()
                     {
@@ -23118,7 +23163,7 @@ impl DawUi {
                     if !apply_available {
                         ui.label(
                             egui::RichText::new(
-                                "Select a compatible Sampler, MIDI Out, Audio Clip, Automation Clip, matching native generator, or loaded VST3 Channel.",
+                                "Select a compatible Sampler, MIDI Out, Audio Clip, Automation Clip, matching native generator or Layer, or loaded VST3 Channel.",
                             )
                             .color(MUTED),
                         );
@@ -23152,6 +23197,8 @@ impl DawUi {
                 )
             } else if apply_native_available {
                 self.apply_fst_preset_to_native_channel(&details.preset, channel_id, preset_name)
+            } else if apply_layer_available {
+                self.apply_fst_preset_to_layer_channel(&details.preset, channel_id, preset_name)
             } else {
                 self.apply_fst_preset_to_vst3_channel(&details.preset, channel_id, preset_name)
             };
