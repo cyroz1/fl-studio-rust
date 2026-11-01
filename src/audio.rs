@@ -1,7 +1,8 @@
 //! Live device input and output for the desktop application.
 //!
 //! Shared streams use CPAL (ALSA, JACK, PipeWire, or PulseAudio on Linux;
-//! WASAPI or ASIO on Windows). Windows exclusive streams are opened directly
+//! WASAPI or ASIO on Windows). Windows DirectSound render devices use a native
+//! shared-mode output worker. Windows exclusive streams are opened directly
 //! with WASAPI so the requested endpoint format and exclusive-access errors are
 //! visible to the application.
 
@@ -1965,7 +1966,7 @@ impl AudioAccess {
 pub struct AudioDeviceInfo {
     pub id: String,
     pub name: String,
-    /// Stream formats reported by CPAL for this device and direction.
+    /// Stream format ranges reported by the selected shared-mode backend.
     pub config_ranges: Vec<AudioDeviceConfigRange>,
     /// Sample rates accepted by the Windows WASAPI exclusive format probe.
     pub exclusive_sample_rates: Vec<u32>,
@@ -4016,6 +4017,14 @@ pub fn enumerate_devices() -> AudioDeviceCatalog {
     }
     #[cfg(windows)]
     enumerate_wasapi_exclusive_capabilities(&mut catalog, &mut errors);
+    #[cfg(windows)]
+    match enumerate_directsound_outputs() {
+        Ok((outputs, mut directsound_errors)) => {
+            catalog.outputs.extend(outputs);
+            errors.append(&mut directsound_errors);
+        }
+        Err(error) => errors.push(error),
+    }
     if !errors.is_empty() {
         catalog.error = Some(errors.join("; "));
     }
@@ -4027,6 +4036,142 @@ pub fn enumerate_devices() -> AudioDeviceCatalog {
         .outputs
         .sort_by(|left, right| left.name.cmp(&right.name));
     catalog
+}
+
+#[cfg(windows)]
+struct DirectSoundDeviceDescriptor {
+    id: String,
+    name: String,
+    guid: Option<windows::core::GUID>,
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn directsound_enumeration_callback(
+    guid: *mut windows::core::GUID,
+    description: windows::core::PCWSTR,
+    _module: windows::core::PCWSTR,
+    context: *mut std::ffi::c_void,
+) -> windows::core::BOOL {
+    if context.is_null() {
+        return windows::core::BOOL(0);
+    }
+    let devices = unsafe { &mut *(context.cast::<Vec<DirectSoundDeviceDescriptor>>()) };
+    let guid = if guid.is_null() {
+        None
+    } else {
+        Some(unsafe { *guid })
+    };
+    let id = guid.map_or_else(
+        || "dsound:default".to_owned(),
+        |guid| format!("dsound:{guid:?}"),
+    );
+    let name = if description.is_null() {
+        "DirectSound output".to_owned()
+    } else {
+        unsafe { description.to_string() }.unwrap_or_else(|_| "DirectSound output".to_owned())
+    };
+    devices.push(DirectSoundDeviceDescriptor { id, name, guid });
+    windows::core::BOOL(1)
+}
+
+#[cfg(windows)]
+fn enumerate_directsound_outputs() -> Result<(Vec<AudioDeviceInfo>, Vec<String>), String> {
+    let result = std::thread::spawn(enumerate_directsound_outputs_on_mta).join();
+    match result {
+        Ok(result) => result,
+        Err(_) => Err("DirectSound device discovery worker panicked".to_owned()),
+    }
+}
+
+#[cfg(windows)]
+fn enumerate_directsound_outputs_on_mta() -> Result<(Vec<AudioDeviceInfo>, Vec<String>), String> {
+    use windows::Win32::Media::Audio::DirectSound::{
+        DSCAPS, DirectSoundCreate8, DirectSoundEnumerateW, IDirectSound8,
+    };
+
+    wasapi::initialize_mta()
+        .ok()
+        .map_err(|error| format!("Could not initialize DirectSound discovery COM: {error}"))?;
+    let _com = WasapiComGuard;
+    let mut descriptors = Vec::new();
+    unsafe {
+        DirectSoundEnumerateW(
+            Some(directsound_enumeration_callback),
+            Some((&mut descriptors as *mut Vec<DirectSoundDeviceDescriptor>).cast()),
+        )
+    }
+    .map_err(|error| format!("Could not enumerate DirectSound outputs: {error}"))?;
+
+    let mut outputs = Vec::with_capacity(descriptors.len());
+    let mut errors = Vec::new();
+    for descriptor in descriptors {
+        let mut device: Option<IDirectSound8> = None;
+        let create_result = unsafe {
+            DirectSoundCreate8(
+                descriptor.guid.as_ref().map(std::ptr::from_ref),
+                &mut device,
+                None::<&windows::core::IUnknown>,
+            )
+        };
+        let (minimum_sample_rate, maximum_sample_rate) = match create_result {
+            Ok(()) => {
+                let mut caps = DSCAPS {
+                    dwSize: std::mem::size_of::<DSCAPS>() as u32,
+                    ..DSCAPS::default()
+                };
+                match unsafe {
+                    device
+                        .as_ref()
+                        .expect("DirectSound device was created")
+                        .GetCaps(&mut caps)
+                } {
+                    Ok(()) => {
+                        let minimum = if caps.dwMinSecondarySampleRate == 0 {
+                            8_000
+                        } else {
+                            caps.dwMinSecondarySampleRate.clamp(8_000, 384_000)
+                        };
+                        let maximum = if caps.dwMaxSecondarySampleRate == 0 {
+                            200_000
+                        } else {
+                            caps.dwMaxSecondarySampleRate.min(384_000)
+                        };
+                        if maximum >= minimum {
+                            (minimum, maximum)
+                        } else {
+                            (8_000, 200_000)
+                        }
+                    }
+                    Err(error) => {
+                        errors.push(format!(
+                            "{} DirectSound capabilities: {error}",
+                            descriptor.name
+                        ));
+                        (8_000, 200_000)
+                    }
+                }
+            }
+            Err(error) => {
+                errors.push(format!("{} DirectSound open: {error}", descriptor.name));
+                (8_000, 200_000)
+            }
+        };
+        outputs.push(AudioDeviceInfo {
+            id: descriptor.id,
+            name: format!("DIRECTSOUND · {}", descriptor.name),
+            config_ranges: vec![AudioDeviceConfigRange {
+                minimum_sample_rate,
+                maximum_sample_rate,
+                channels: 2,
+                minimum_buffer_frames: None,
+                maximum_buffer_frames: None,
+            }],
+            exclusive_sample_rates: Vec::new(),
+            exclusive_default_period_hns: None,
+            exclusive_minimum_period_hns: None,
+        });
+    }
+    Ok((outputs, errors))
 }
 
 #[cfg(windows)]
@@ -5006,6 +5151,13 @@ impl AudioEngine {
 
     fn start_shared(settings: &AudioSettings) -> Result<Self, String> {
         let host = cpal::default_host();
+        #[cfg(windows)]
+        let directsound_output = settings
+            .output_device_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("dsound:"));
+        #[cfg(not(windows))]
+        let directsound_output = false;
         let ring = Arc::new(AudioRingBuffer::new(INPUT_MONITOR_RING_CAPACITY));
         let source = Arc::new(AtomicU8::new(AUDIO_SOURCE_SILENT));
         let playback = Arc::new(PlaybackState::new());
@@ -5021,7 +5173,11 @@ impl AudioEngine {
         let error = Arc::new(AudioErrorState::default());
 
         let output_device = if settings.enable_output {
-            resolve_device(&host, settings.output_device_id.as_deref(), false)?
+            if directsound_output {
+                None
+            } else {
+                resolve_device(&host, settings.output_device_id.as_deref(), false)?
+            }
         } else {
             None
         };
@@ -5033,6 +5189,14 @@ impl AudioEngine {
         let mut output_stream = None;
         let mut input_stream = None;
         let mut input_channel_count = 0;
+        #[cfg(windows)]
+        let mut directsound_output_active = false;
+        #[cfg(not(windows))]
+        let directsound_output_active = false;
+        #[cfg(windows)]
+        let mut windows_worker_stop = None;
+        #[cfg(windows)]
+        let mut windows_worker_threads = Vec::new();
 
         if let Some(device) = output_device {
             let stream = build_output_stream(
@@ -5073,7 +5237,58 @@ impl AudioEngine {
             input_channel_count = channel_count;
         }
 
-        if output_stream.is_none() && input_stream.is_none() {
+        #[cfg(windows)]
+        if settings.enable_output && directsound_output {
+            use std::sync::mpsc;
+            use std::thread;
+
+            let stop = Arc::new(AtomicBool::new(false));
+            let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+            let worker_settings = settings.clone();
+            let worker_source = Arc::clone(&source);
+            let worker_playback = Arc::clone(&playback);
+            let worker_ring = Arc::clone(&ring);
+            let worker_error = Arc::clone(&error);
+            let worker_stop = Arc::clone(&stop);
+            let output_thread = thread::Builder::new()
+                .name("directsound-shared-render".into())
+                .spawn(move || {
+                    directsound_shared_output_worker(
+                        worker_settings.output_device_id.as_deref(),
+                        &worker_settings,
+                        DirectSoundOutputState {
+                            source: worker_source,
+                            playback: worker_playback,
+                            ring: worker_ring,
+                            error: worker_error,
+                            stop: worker_stop,
+                        },
+                        ready_tx,
+                    );
+                })
+                .map_err(|error| format!("Could not start DirectSound output worker: {error}"))?;
+            match ready_rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(Ok(())) => {
+                    directsound_output_active = true;
+                    windows_worker_stop = Some(stop);
+                    windows_worker_threads.push(output_thread);
+                }
+                Ok(Err(message)) => {
+                    stop.store(true, Ordering::Release);
+                    let _ = output_thread.join();
+                    return Err(format!("DirectSound shared output failed: {message}"));
+                }
+                Err(error_kind) => {
+                    stop.store(true, Ordering::Release);
+                    let _ = output_thread.join();
+                    return Err(format!(
+                        "DirectSound shared output did not start: {error_kind}"
+                    ));
+                }
+            }
+        }
+
+        if output_stream.is_none() && input_stream.is_none() && !directsound_output_active {
             return Err("No active input or output device is available".into());
         }
 
@@ -5092,13 +5307,13 @@ impl AudioEngine {
             input_latency_estimate,
             error,
             input_active: input_stream.is_some(),
-            output_active: output_stream.is_some(),
+            output_active: output_stream.is_some() || directsound_output_active,
             input_stream,
             output_stream,
             #[cfg(windows)]
-            exclusive_stop: None,
+            exclusive_stop: windows_worker_stop,
             #[cfg(windows)]
-            exclusive_threads: Vec::new(),
+            exclusive_threads: windows_worker_threads,
         })
     }
 
@@ -6284,6 +6499,287 @@ struct WasapiWorkerState {
     input_channel_count: Arc<AtomicU16>,
     error: Arc<AudioErrorState>,
     stop: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(windows)]
+struct DirectSoundOutputState {
+    source: Arc<AtomicU8>,
+    playback: Arc<PlaybackState>,
+    ring: Arc<AudioRingBuffer>,
+    error: Arc<AudioErrorState>,
+    stop: Arc<AtomicBool>,
+}
+
+#[cfg(windows)]
+fn directsound_device_guid(
+    selected_id: Option<&str>,
+) -> Result<Option<windows::core::GUID>, String> {
+    let device_id =
+        selected_id.ok_or_else(|| "No DirectSound output device was selected".to_owned())?;
+    let guid = device_id
+        .strip_prefix("dsound:")
+        .ok_or_else(|| format!("Selected output is not a DirectSound device: {device_id}"))?;
+    if guid.eq_ignore_ascii_case("default") {
+        Ok(None)
+    } else {
+        windows::core::GUID::try_from(guid)
+            .map(Some)
+            .map_err(|error| format!("Invalid DirectSound device id {device_id}: {error}"))
+    }
+}
+
+#[cfg(windows)]
+fn directsound_circular_distance(start: usize, end: usize, buffer_bytes: usize) -> usize {
+    if end >= start {
+        end - start
+    } else {
+        buffer_bytes - start + end
+    }
+}
+
+#[cfg(windows)]
+fn directsound_write_buffer(
+    buffer: &windows::Win32::Media::Audio::DirectSound::IDirectSoundBuffer,
+    offset: u32,
+    audio: &[u8],
+    flags: u32,
+) -> Result<(), String> {
+    let mut first_ptr = std::ptr::null_mut();
+    let mut first_bytes = 0_u32;
+    let mut second_ptr = std::ptr::null_mut();
+    let mut second_bytes = 0_u32;
+    unsafe {
+        buffer
+            .Lock(
+                offset,
+                u32::try_from(audio.len()).map_err(|_| "DirectSound write size overflowed")?,
+                &mut first_ptr,
+                &mut first_bytes,
+                Some(&mut second_ptr),
+                Some(&mut second_bytes),
+                flags,
+            )
+            .map_err(|error| format!("Could not lock DirectSound output buffer: {error}"))?;
+    }
+    let locked_bytes = usize::try_from(first_bytes)
+        .unwrap_or(usize::MAX)
+        .saturating_add(usize::try_from(second_bytes).unwrap_or(usize::MAX));
+    if locked_bytes != audio.len()
+        || (first_bytes > 0 && first_ptr.is_null())
+        || (second_bytes > 0 && second_ptr.is_null())
+    {
+        let _ = unsafe { buffer.Unlock(first_ptr, first_bytes, Some(second_ptr), second_bytes) };
+        return Err("DirectSound locked an unexpected output-buffer range".to_owned());
+    }
+    let first_len = first_bytes as usize;
+    unsafe {
+        if first_len > 0 {
+            std::ptr::copy_nonoverlapping(audio.as_ptr(), first_ptr.cast::<u8>(), first_len);
+        }
+        if second_bytes > 0 {
+            std::ptr::copy_nonoverlapping(
+                audio.as_ptr().add(first_len),
+                second_ptr.cast::<u8>(),
+                second_bytes as usize,
+            );
+        }
+        buffer
+            .Unlock(
+                first_ptr.cast_const(),
+                first_bytes,
+                Some(second_ptr.cast_const()),
+                second_bytes,
+            )
+            .map_err(|error| format!("Could not unlock DirectSound output buffer: {error}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn directsound_shared_output_worker(
+    selected_id: Option<&str>,
+    settings: &AudioSettings,
+    state: DirectSoundOutputState,
+    ready: std::sync::mpsc::SyncSender<Result<(), String>>,
+) {
+    use windows::Win32::Media::Audio::DirectSound::{
+        DSBCAPS_GETCURRENTPOSITION2, DSBCAPS_GLOBALFOCUS, DSBPLAY_LOOPING, DSBUFFERDESC,
+        DSSCL_NORMAL, DirectSoundCreate8, IDirectSound8,
+    };
+    use windows::Win32::Media::Audio::WAVEFORMATEX;
+    use windows::Win32::UI::WindowsAndMessaging::GetDesktopWindow;
+
+    enable_denormal_protection();
+    let DirectSoundOutputState {
+        source,
+        playback,
+        ring,
+        error,
+        stop,
+    } = state;
+    let mut started = false;
+    let result = (|| -> Result<(), String> {
+        wasapi::initialize_mta()
+            .ok()
+            .map_err(|error| format!("Could not initialize DirectSound COM: {error}"))?;
+        let _com = WasapiComGuard;
+        let device_guid = directsound_device_guid(selected_id)?;
+        let mut device: Option<IDirectSound8> = None;
+        unsafe {
+            DirectSoundCreate8(
+                device_guid.as_ref().map(std::ptr::from_ref),
+                &mut device,
+                None::<&windows::core::IUnknown>,
+            )
+        }
+        .map_err(|error| format!("Could not open DirectSound output: {error}"))?;
+        let device = device.ok_or_else(|| "DirectSound returned no output device".to_owned())?;
+        unsafe { device.SetCooperativeLevel(GetDesktopWindow(), DSSCL_NORMAL) }
+            .map_err(|error| format!("Could not set DirectSound cooperative level: {error}"))?;
+
+        let sample_rate = settings.sample_rate;
+        let channels = 2_u16;
+        let bits_per_sample = 16_u16;
+        let block_align = channels * (bits_per_sample / 8);
+        let wave_format = WAVEFORMATEX {
+            wFormatTag: 1,
+            nChannels: channels,
+            nSamplesPerSec: sample_rate,
+            nAvgBytesPerSec: sample_rate.saturating_mul(u32::from(block_align)),
+            nBlockAlign: block_align,
+            wBitsPerSample: bits_per_sample,
+            cbSize: 0,
+        };
+        let format_spec = WasapiSampleSpec {
+            sample_type: wasapi::SampleType::Int,
+            storage_bits: usize::from(bits_per_sample),
+            valid_bits: usize::from(bits_per_sample),
+            channels: usize::from(channels),
+            sample_bytes: usize::from(bits_per_sample / 8),
+            frame_bytes: usize::from(block_align),
+            sample_rate,
+        };
+        let chunk_frames = settings
+            .buffer_frames
+            .min((sample_rate / 100).max(32))
+            .max(32);
+        let buffer_frames = chunk_frames
+            .saturating_mul(4)
+            .max(sample_rate / 25)
+            .max(256);
+        let buffer_bytes = buffer_frames
+            .checked_mul(u32::from(block_align))
+            .ok_or_else(|| "DirectSound output buffer size overflowed".to_owned())?;
+        let description = DSBUFFERDESC {
+            dwSize: std::mem::size_of::<DSBUFFERDESC>() as u32,
+            dwFlags: DSBCAPS_GETCURRENTPOSITION2 | DSBCAPS_GLOBALFOCUS,
+            dwBufferBytes: buffer_bytes,
+            lpwfxFormat: std::ptr::from_ref(&wave_format).cast_mut(),
+            ..DSBUFFERDESC::default()
+        };
+        let mut output_buffer = None;
+        unsafe {
+            device.CreateSoundBuffer(
+                &description,
+                &mut output_buffer,
+                None::<&windows::core::IUnknown>,
+            )
+        }
+        .map_err(|error| format!("Could not create DirectSound output buffer: {error}"))?;
+        let output_buffer =
+            output_buffer.ok_or_else(|| "DirectSound returned no output buffer".to_owned())?;
+
+        let mut render_state = WasapiRenderState {
+            phase: 0.0,
+            output_gain: settings.output_gain,
+        };
+        let buffer_byte_count = usize::try_from(buffer_bytes)
+            .map_err(|_| "DirectSound buffer size was invalid".to_owned())?;
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(buffer_byte_count)
+            .map_err(|error| format!("Could not allocate DirectSound output buffer: {error}"))?;
+        render_wasapi_buffer(
+            usize::try_from(buffer_frames).unwrap_or(usize::MAX),
+            &format_spec,
+            &source,
+            &playback,
+            &ring,
+            &mut render_state,
+            &mut output,
+        )?;
+        directsound_write_buffer(
+            &output_buffer,
+            0,
+            &output,
+            windows::Win32::Media::Audio::DirectSound::DSBLOCK_ENTIREBUFFER,
+        )?;
+        unsafe { output_buffer.SetCurrentPosition(0) }
+            .map_err(|error| format!("Could not position DirectSound output: {error}"))?;
+        unsafe { output_buffer.Play(0, 0, DSBPLAY_LOOPING) }
+            .map_err(|error| format!("Could not start DirectSound output: {error}"))?;
+        started = true;
+        let _ = ready.send(Ok(()));
+
+        let buffer_bytes = buffer_byte_count;
+        let frame_bytes = format_spec.frame_bytes;
+        let chunk_frames = usize::try_from(chunk_frames).unwrap_or(usize::MAX);
+        let mut next_write_offset = 0_usize;
+        while !stop.load(Ordering::Acquire) {
+            let mut play_cursor = 0_u32;
+            let mut write_cursor = 0_u32;
+            unsafe {
+                output_buffer
+                    .GetCurrentPosition(Some(&mut play_cursor), Some(&mut write_cursor))
+                    .map_err(|error| format!("Could not query DirectSound cursors: {error}"))?;
+            }
+            let play_cursor = (play_cursor as usize % buffer_bytes) / frame_bytes * frame_bytes;
+            let write_cursor = (write_cursor as usize % buffer_bytes) / frame_bytes * frame_bytes;
+            let safe_bytes = directsound_circular_distance(write_cursor, play_cursor, buffer_bytes);
+            while !stop.load(Ordering::Acquire) {
+                let next_distance =
+                    directsound_circular_distance(write_cursor, next_write_offset, buffer_bytes);
+                if next_distance >= safe_bytes {
+                    break;
+                }
+                let available_frames = (safe_bytes - next_distance) / frame_bytes;
+                let frames = available_frames.min(chunk_frames);
+                if frames == 0 {
+                    break;
+                }
+                render_wasapi_buffer(
+                    frames,
+                    &format_spec,
+                    &source,
+                    &playback,
+                    &ring,
+                    &mut render_state,
+                    &mut output,
+                )?;
+                directsound_write_buffer(
+                    &output_buffer,
+                    u32::try_from(next_write_offset)
+                        .map_err(|_| "DirectSound write offset overflowed")?,
+                    &output,
+                    0,
+                )?;
+                next_write_offset = (next_write_offset + output.len()) % buffer_bytes;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        unsafe { output_buffer.Stop() }
+            .map_err(|error| format!("Could not stop DirectSound output: {error}"))?;
+        Ok(())
+    })();
+    if let Err(message) = result {
+        set_error(
+            &error,
+            format!("DirectSound shared output stopped: {message}"),
+        );
+        if !started {
+            let _ = ready.send(Err(message));
+        }
+    }
 }
 
 #[cfg(windows)]

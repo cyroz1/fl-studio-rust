@@ -73068,7 +73068,9 @@ impl DawUi {
                                 &device.name,
                             )
                             .changed();
-                        if selected && cfg!(target_os = "windows") && device.id.starts_with("asio:")
+                        if selected
+                            && cfg!(target_os = "windows")
+                            && (device.id.starts_with("asio:") || device.id.starts_with("dsound:"))
                         {
                             self.audio_settings.access = AudioAccess::Shared;
                         }
@@ -73461,7 +73463,9 @@ impl DawUi {
                                 &device.name,
                             )
                             .changed();
-                        if selected && cfg!(target_os = "windows") && device.id.starts_with("asio:")
+                        if selected
+                            && cfg!(target_os = "windows")
+                            && (device.id.starts_with("asio:") || device.id.starts_with("dsound:"))
                         {
                             self.audio_settings.access = AudioAccess::Shared;
                         }
@@ -73662,11 +73666,20 @@ impl DawUi {
             .into_iter()
             .chain(self.audio_settings.output_device_id.as_deref())
             .any(|id| id.starts_with("asio:"));
+        let directsound_selected = self
+            .audio_settings
+            .input_device_id
+            .as_deref()
+            .into_iter()
+            .chain(self.audio_settings.output_device_id.as_deref())
+            .any(|id| id.starts_with("dsound:"));
         ui.horizontal(|ui| {
             ui.label("Audio access");
             egui::ComboBox::from_id_salt("audio_access_mode")
                 .selected_text(if self.audio_settings.access == AudioAccess::Exclusive {
                     "WASAPI · Exclusive"
+                } else if cfg!(target_os = "windows") && directsound_selected {
+                    "Shared · DirectSound selected"
                 } else if cfg!(target_os = "windows") && asio_selected {
                     "Shared · ASIO selected"
                 } else if cfg!(target_os = "windows") {
@@ -73680,13 +73693,16 @@ impl DawUi {
                         AudioAccess::Shared,
                         "Shared",
                     );
-                    ui.add_enabled_ui(cfg!(target_os = "windows") && !asio_selected, |ui| {
-                        ui.selectable_value(
-                            &mut self.audio_settings.access,
-                            AudioAccess::Exclusive,
-                            "WASAPI · Exclusive",
-                        );
-                    });
+                    ui.add_enabled_ui(
+                        cfg!(target_os = "windows") && !asio_selected && !directsound_selected,
+                        |ui| {
+                            ui.selectable_value(
+                                &mut self.audio_settings.access,
+                                AudioAccess::Exclusive,
+                                "WASAPI · Exclusive",
+                            );
+                        },
+                    );
                 });
             if !cfg!(target_os = "windows") {
                 ui.label(
@@ -73694,6 +73710,8 @@ impl DawUi {
                 );
             } else if asio_selected {
                 ui.label(egui::RichText::new("ASIO devices use Shared access").color(MUTED));
+            } else if directsound_selected {
+                ui.label(egui::RichText::new("DirectSound devices use Shared access").color(MUTED));
             }
         });
 
