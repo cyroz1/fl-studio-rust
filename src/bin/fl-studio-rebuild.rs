@@ -4841,6 +4841,83 @@ struct PendingBrowserIndex {
 
 type BrowserPreviewResult = Result<(Vec<f32>, Option<SampleKeyMetadata>), String>;
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BrowserPreviewPreferences {
+    full_sample: bool,
+    looping: bool,
+    volume: f32,
+    key_enabled: bool,
+    target_key: Option<u8>,
+    semitone_offset: i8,
+}
+
+impl Default for BrowserPreviewPreferences {
+    fn default() -> Self {
+        Self {
+            full_sample: false,
+            looping: false,
+            volume: 1.0,
+            key_enabled: false,
+            target_key: None,
+            semitone_offset: 0,
+        }
+    }
+}
+
+impl BrowserPreviewPreferences {
+    fn parse(contents: &str) -> Self {
+        let mut lines = contents.lines();
+        let defaults = Self::default();
+        let full_sample = lines
+            .next()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(defaults.full_sample);
+        let looping = lines
+            .next()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(defaults.looping);
+        let volume = lines
+            .next()
+            .and_then(|value| value.parse::<f32>().ok())
+            .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
+            .unwrap_or(defaults.volume);
+        let key_enabled = lines
+            .next()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(defaults.key_enabled);
+        let target_key = lines
+            .next()
+            .and_then(|value| value.parse::<i16>().ok())
+            .filter(|value| (0..=127).contains(value))
+            .map(|value| value as u8);
+        let semitone_offset = lines
+            .next()
+            .and_then(|value| value.parse::<i8>().ok())
+            .filter(|value| (-24..=24).contains(value))
+            .unwrap_or(defaults.semitone_offset);
+        Self {
+            full_sample,
+            looping,
+            volume,
+            key_enabled,
+            target_key,
+            semitone_offset,
+        }
+    }
+
+    fn serialize(self) -> String {
+        format!(
+            "{}\n{}\n{:.6}\n{}\n{}\n{}\n",
+            self.full_sample,
+            self.looping,
+            self.volume,
+            self.key_enabled,
+            self.target_key.map_or(-1, i16::from),
+            self.semitone_offset,
+        )
+    }
+}
+
 struct PendingBrowserPreview {
     path: PathBuf,
     full_sample: bool,
@@ -5710,6 +5787,8 @@ struct DawUi {
     browser_preview_target_key: Option<u8>,
     browser_preview_semitone_offset: i8,
     browser_preview_key_metadata: Option<(PathBuf, Option<SampleKeyMetadata>)>,
+    browser_preview_preferences_dirty: bool,
+    browser_preview_pitch_reload_pending: bool,
     browser_preview_loaded_full_sample: bool,
     browser_preview_loaded_start_fraction: Option<f64>,
     browser_preview_pending: Option<PendingBrowserPreview>,
@@ -8262,6 +8341,7 @@ impl DawUi {
         let playlist_pattern_color_mode = load_playlist_pattern_color_mode();
         let playlist_edit_patterns_in = load_playlist_edit_patterns_in();
         let playlist_scroll_to_position = load_playlist_scroll_to_position();
+        let browser_preview_preferences = load_browser_preview_preferences();
         let browser_path = initial_project
             .as_deref()
             .and_then(Path::parent)
@@ -8883,13 +8963,15 @@ impl DawUi {
             browser_fst_details: None,
             browser_recent_projects: load_recent_projects(),
             browser_error: None,
-            browser_full_sample: false,
-            browser_preview_looping: false,
-            browser_preview_volume: 1.0,
-            browser_preview_key_enabled: false,
-            browser_preview_target_key: None,
-            browser_preview_semitone_offset: 0,
+            browser_full_sample: browser_preview_preferences.full_sample,
+            browser_preview_looping: browser_preview_preferences.looping,
+            browser_preview_volume: browser_preview_preferences.volume,
+            browser_preview_key_enabled: browser_preview_preferences.key_enabled,
+            browser_preview_target_key: browser_preview_preferences.target_key,
+            browser_preview_semitone_offset: browser_preview_preferences.semitone_offset,
             browser_preview_key_metadata: None,
+            browser_preview_preferences_dirty: false,
+            browser_preview_pitch_reload_pending: false,
             browser_preview_loaded_full_sample: false,
             browser_preview_loaded_start_fraction: None,
             browser_preview_pending: None,
@@ -28184,9 +28266,11 @@ impl DawUi {
         let mut play_to_end = false;
         let mut stop_preview = false;
         let mut edit_sample = false;
+        let mut full_sample_changed = false;
         let mut volume_changed = false;
         let mut looping_changed = false;
         let mut key_pitch_changed = false;
+        let mut preview_preference_drag_active = false;
         let mut seek_frame = None;
         ui.group(|ui| {
             ui.horizontal(|ui| {
@@ -28195,10 +28279,12 @@ impl DawUi {
                     .on_hover_text(path.display().to_string());
             });
             ui.horizontal_wrapped(|ui| {
-                ui.checkbox(&mut self.browser_full_sample, "Full sample")
+                full_sample_changed = ui
+                    .checkbox(&mut self.browser_full_sample, "Full sample")
                     .on_hover_text(
                         "Play the full file on click; otherwise previews stop after five seconds",
-                    );
+                    )
+                    .changed();
                 looping_changed = ui
                     .checkbox(&mut self.browser_preview_looping, "Loop")
                     .on_hover_text(
@@ -28235,14 +28321,15 @@ impl DawUi {
             }
             ui.horizontal(|ui| {
                 ui.small("Volume");
-                volume_changed = ui
+                let volume = ui
                     .add_sized(
                         Vec2::new(110.0, 18.0),
                         egui::Slider::new(&mut self.browser_preview_volume, 0.0..=1.0)
                             .show_value(false),
                     )
-                    .on_hover_text("Preview volume")
-                    .changed();
+                    .on_hover_text("Preview volume");
+                volume_changed = volume.changed();
+                preview_preference_drag_active |= volume.dragged();
             });
             ui.horizontal_wrapped(|ui| {
                 if let Some((root_key, fine_tune_cents)) = key_metadata {
@@ -28280,13 +28367,31 @@ impl DawUi {
                                 }
                             });
                         ui.small("Semitone");
-                        key_pitch_changed |= ui
+                        let semitone = ui
                             .add(
                                 egui::DragValue::new(&mut self.browser_preview_semitone_offset)
                                     .range(-24..=24)
                                     .suffix(" st"),
-                            )
-                            .changed();
+                            );
+                        if semitone.changed() {
+                            self.browser_preview_preferences_dirty = true;
+                            if semitone.dragged() {
+                                self.browser_preview_pitch_reload_pending = true;
+                            } else if semitone.clicked() {
+                                key_pitch_changed = true;
+                            } else {
+                                self.browser_preview_pitch_reload_pending = true;
+                            }
+                        }
+                        preview_preference_drag_active |= semitone.dragged();
+                        if self.browser_preview_pitch_reload_pending
+                            && (semitone.drag_stopped()
+                                || semitone.lost_focus()
+                                || semitone.clicked())
+                        {
+                            key_pitch_changed = true;
+                            self.browser_preview_pitch_reload_pending = false;
+                        }
                         if ui.small_button("Original key").clicked() {
                             self.browser_preview_target_key = None;
                             self.browser_preview_semitone_offset = 0;
@@ -28352,6 +28457,23 @@ impl DawUi {
         }
         if edit_sample {
             self.request_sample_editor(path, ui.ctx());
+        }
+        if full_sample_changed || looping_changed || volume_changed || key_pitch_changed {
+            self.browser_preview_preferences_dirty = true;
+        }
+        if self.browser_preview_preferences_dirty && !preview_preference_drag_active {
+            self.browser_preview_preferences_dirty = false;
+            let preferences = BrowserPreviewPreferences {
+                full_sample: self.browser_full_sample,
+                looping: self.browser_preview_looping,
+                volume: self.browser_preview_volume,
+                key_enabled: self.browser_preview_key_enabled,
+                target_key: self.browser_preview_target_key,
+                semitone_offset: self.browser_preview_semitone_offset,
+            };
+            if let Err(error) = save_browser_preview_preferences(preferences) {
+                self.status = format!("Could not save Browser preview settings: {error}");
+            }
         }
     }
 
@@ -86236,6 +86358,32 @@ fn browser_visibility_settings_file() -> Option<PathBuf> {
         .map(|directory| directory.join("browser-visible.txt"))
 }
 
+fn browser_preview_preferences_file() -> Option<PathBuf> {
+    browser_favorites_file()?
+        .parent()
+        .map(|directory| directory.join("browser-preview-settings.txt"))
+}
+
+fn load_browser_preview_preferences() -> BrowserPreviewPreferences {
+    browser_preview_preferences_file()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .map_or_else(BrowserPreviewPreferences::default, |contents| {
+            BrowserPreviewPreferences::parse(&contents)
+        })
+}
+
+fn save_browser_preview_preferences(preferences: BrowserPreviewPreferences) -> Result<(), String> {
+    let path = browser_preview_preferences_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the Browser preview settings path has no parent folder".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    fs::write(&path, preferences.serialize())
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
 fn read_sample_root_note_settings_file() -> Option<PathBuf> {
     browser_favorites_file()?
         .parent()
@@ -92244,6 +92392,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::PathBuf;
 
+    use super::BrowserPreviewPreferences;
     use super::{
         ActivePlaylistClipDrag, Arrangement, AudioWaveform, ChannelDisplayFilter,
         ChannelNoteRouter, DetachedWindowKind, DetachedWindowPlacement, DetachedWindowPlacements,
@@ -92346,6 +92495,32 @@ mod tests {
         upsert_playlist_vst3_mixer_effect_parameter_link, upsert_playlist_vst3_parameter_link,
         zoom_to_fit,
     };
+
+    #[test]
+    fn browser_preview_preferences_round_trip_and_reject_invalid_values() {
+        let preferences = BrowserPreviewPreferences {
+            full_sample: true,
+            looping: true,
+            volume: 0.375,
+            key_enabled: true,
+            target_key: Some(73),
+            semitone_offset: -7,
+        };
+        assert_eq!(
+            BrowserPreviewPreferences::parse(&preferences.serialize()),
+            preferences
+        );
+
+        assert_eq!(
+            BrowserPreviewPreferences::parse("true\nfalse\nNaN\ntrue\n200\n90\n"),
+            BrowserPreviewPreferences {
+                full_sample: true,
+                looping: false,
+                key_enabled: true,
+                ..BrowserPreviewPreferences::default()
+            }
+        );
+    }
 
     #[test]
     fn next_empty_pattern_uses_pattern_order_wraps_and_skips_the_current_slot() {
