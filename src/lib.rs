@@ -27883,6 +27883,110 @@ impl FlpDocument {
         preset.encode_lossless()
     }
 
+    /// Applies one kind-0 Sampler channel block from a format-32 preset to an existing Sampler.
+    ///
+    /// The target channel ID and display-name event are retained. Source and target project
+    /// string encodings must be known and match because the copied block may contain a sample
+    /// path. Note and Playlist events are excluded from this channel-state operation.
+    pub fn apply_sampler_channel_state_preset(
+        &mut self,
+        target_channel_id: u16,
+        preset: &FstPreset,
+    ) -> Result<usize, FlpError> {
+        if preset.kind() != FstPresetKind::ChannelState {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected preset is not a channel state",
+            ));
+        }
+
+        let source_channels = preset.document().channels();
+        if source_channels.len() != 1
+            || source_channels[0].channel_type() != Some(ChannelType::Sampler)
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "Sampler state import requires exactly one kind-0 Sampler channel",
+            ));
+        }
+        let source_channel = &source_channels[0];
+
+        let mut matching_targets = self
+            .channels()
+            .into_iter()
+            .filter(|channel| channel.id() == target_channel_id);
+        let target_channel = matching_targets
+            .next()
+            .ok_or(FlpError::ChannelNotFound(target_channel_id))?;
+        if matching_targets.next().is_some() {
+            return Err(FlpError::AmbiguousChannelId(target_channel_id));
+        }
+        if target_channel.channel_type() != Some(ChannelType::Sampler) {
+            return Err(FlpError::UnsupportedEdit(
+                "Sampler state import requires a kind-0 Sampler target channel",
+            ));
+        }
+
+        if preset.document().project_string_encoding().is_none()
+            || self.project_string_encoding().is_none()
+            || preset.document().project_string_encoding() != self.project_string_encoding()
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "Sampler state import requires matching, recognized project string encodings",
+            ));
+        }
+
+        let source_range = source_channel.event_range();
+        let target_range = target_channel.event_range();
+        let channel_block_is_supported = |events: &[FlpEvent], range: &std::ops::Range<usize>| {
+            let markers = range
+                .clone()
+                .filter(|&index| events[index].opcode == 0x40)
+                .collect::<Vec<_>>();
+            let names = range
+                .clone()
+                .filter(|&index| events[index].opcode == 0xCB)
+                .collect::<Vec<_>>();
+            markers.len() == 1
+                && events[markers[0]].encoding == PayloadEncoding::Word
+                && events[markers[0]].payload.len() == 2
+                && names.len() == 1
+                && matches!(events[names[0]].encoding, PayloadEncoding::Data { .. })
+                && !range.clone().any(|index| {
+                    matches!(events[index].opcode, 0x41 | 0x63)
+                        || Self::is_pattern_note_event(&events[index])
+                })
+        };
+        if !channel_block_is_supported(&preset.document().events, &source_range)
+            || !channel_block_is_supported(&self.events, &target_range)
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "Sampler state import requires one well-formed channel marker and name, without note or Playlist events",
+            ));
+        }
+
+        let target_name_event = target_range
+            .clone()
+            .find(|&index| self.events[index].opcode == 0xCB)
+            .expect("a supported channel block has one name event");
+        let mut replacement = preset.document().events[source_range.clone()].to_vec();
+        let source_marker_offset = source_range
+            .clone()
+            .position(|index| preset.document().events[index].opcode == 0x40)
+            .expect("a supported channel block has one marker");
+        let source_name_offset = source_range
+            .clone()
+            .position(|index| preset.document().events[index].opcode == 0xCB)
+            .expect("a supported channel block has one name event");
+        replacement[source_marker_offset].replace_word_payload(target_channel_id)?;
+        replacement[source_name_offset] = self.events[target_name_event].clone();
+
+        let replacement_count = replacement.len();
+        let mut updated = self.clone();
+        updated.events.splice(target_range, replacement);
+        updated.refresh_event_offsets()?;
+        *self = updated;
+        Ok(replacement_count)
+    }
+
     /// Encodes one Mixer insert and its recognized ten-slot effect chain as a format-64 preset.
     ///
     /// The insert event bytes and project-version event are retained. Project events, trailing
@@ -29448,6 +29552,178 @@ mod tests {
             document.encode_channel_state_preset(5),
             Err(FlpError::AmbiguousChannelId(5))
         ));
+    }
+
+    fn sampler_channel_state_fixture(
+        format: u16,
+        channel_id: u16,
+        name: &str,
+        sample_path: &str,
+        sampler_state: &[u8],
+    ) -> Vec<u8> {
+        let mut event_stream = Vec::new();
+        append_data_event(&mut event_stream, 0xC7, b"26.0.0\0");
+        append_data_event(&mut event_stream, 0xC2, b"Project title\0");
+        event_stream.extend_from_slice(&[0x40]);
+        event_stream.extend_from_slice(&channel_id.to_le_bytes());
+        event_stream.extend_from_slice(&[0x15, 0]);
+        append_data_event(&mut event_stream, 0xD4, sampler_state);
+        append_data_event(&mut event_stream, 0xC4, &utf16_project_string(sample_path));
+        append_project_info_string(&mut event_stream, 0xCB, name);
+        let mut bytes = flp_fixture(&event_stream, &[], &[]);
+        bytes[8..10].copy_from_slice(&format.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn applies_sampler_channel_state_while_preserving_target_identity_and_project_events() {
+        let source_bytes =
+            sampler_channel_state_fixture(32, 8, "Preset Name", "preset.wav", &[1, 2, 3]);
+        let preset = FstPreset::parse(&source_bytes).expect("Sampler preset should parse");
+
+        let mut target_stream = Vec::new();
+        append_data_event(&mut target_stream, 0xC7, b"26.0.0\0");
+        append_data_event(&mut target_stream, 0xC2, b"Project title\0");
+        target_stream.extend_from_slice(&[0x40, 5, 0, 0x15, 0]);
+        append_data_event(&mut target_stream, 0xD4, &[9]);
+        append_data_event(
+            &mut target_stream,
+            0xC4,
+            &utf16_project_string("target.wav"),
+        );
+        append_project_info_string(&mut target_stream, 0xCB, "Destination");
+        target_stream.extend_from_slice(&[0x40, 6, 0, 0x15, 0]);
+        append_data_event(&mut target_stream, 0xD4, &[0xA5]);
+        append_project_info_string(&mut target_stream, 0xCB, "Sibling");
+        let mut target = FlpDocument::parse(&flp_fixture(&target_stream, &[], &[]))
+            .expect("target project should parse");
+        let original_project_title = target.events()[1].wire_bytes().to_vec();
+        let target_range = target.channels()[0].event_range();
+        let original_target_name = target.events()[target_range]
+            .iter()
+            .find(|event| event.opcode() == 0xCB)
+            .expect("target channel should have a name event")
+            .wire_bytes()
+            .to_vec();
+        let sibling_start = target.channels()[1].event_range().start;
+        let original_sibling = target.events()[sibling_start..]
+            .iter()
+            .map(|event| event.wire_bytes().to_vec())
+            .collect::<Vec<_>>();
+
+        let replaced = target
+            .apply_sampler_channel_state_preset(5, &preset)
+            .expect("compatible Sampler state should apply");
+
+        assert_eq!(replaced, 5);
+        assert_eq!(target.channels()[0].id(), 5);
+        assert_eq!(
+            target.channels()[0].display_name().as_deref(),
+            Some("Destination")
+        );
+        let first_channel = target.channels()[0].event_range();
+        let applied_name = target.events()[first_channel.clone()]
+            .iter()
+            .find(|event| event.opcode() == 0xCB)
+            .expect("target channel should retain its name event");
+        assert_eq!(applied_name.wire_bytes(), original_target_name);
+        assert_eq!(
+            target.events()[1].wire_bytes(),
+            original_project_title.as_slice()
+        );
+        assert_eq!(target.channels()[1].id(), 6);
+        let sibling_start = target.channels()[1].event_range().start;
+        assert_eq!(
+            target.events()[sibling_start..]
+                .iter()
+                .map(|event| event.wire_bytes().to_vec())
+                .collect::<Vec<_>>(),
+            original_sibling
+        );
+        assert!(
+            target.events()[first_channel.clone()]
+                .iter()
+                .any(|event| { event.opcode() == 0xD4 && event.payload() == [1, 2, 3] })
+        );
+        assert!(target.events()[first_channel.clone()].iter().any(|event| {
+            event.opcode() == 0xC4 && event.payload() == utf16_project_string("preset.wav")
+        }));
+        let marker = &target.events()[first_channel.start];
+        assert_eq!(marker.opcode(), 0x40);
+        assert_eq!(marker.payload(), &5_u16.to_le_bytes());
+    }
+
+    #[test]
+    fn sampler_channel_state_import_rejects_unsupported_targets_and_string_encodings_atomically() {
+        let preset = FstPreset::parse(&sampler_channel_state_fixture(
+            32,
+            8,
+            "Preset Name",
+            "preset.wav",
+            &[1, 2, 3],
+        ))
+        .expect("Sampler preset should parse");
+        let mut target_stream = Vec::new();
+        append_data_event(&mut target_stream, 0xC7, b"26.0.0\0");
+        target_stream.extend_from_slice(&[0x40, 5, 0, 0x15, 0]);
+        append_project_info_string(&mut target_stream, 0xCB, "Destination");
+        let mut target = FlpDocument::parse(&flp_fixture(&target_stream, &[], &[]))
+            .expect("target project should parse");
+        let before = target.clone();
+
+        assert!(matches!(
+            target.apply_sampler_channel_state_preset(99, &preset),
+            Err(FlpError::ChannelNotFound(99))
+        ));
+        assert_eq!(target, before);
+
+        let wrong_kind = sampler_channel_state_fixture(32, 5, "Instrument", "x.wav", &[1]);
+        let mut wrong_kind = wrong_kind;
+        let marker_type = wrong_kind
+            .windows(5)
+            .position(|bytes| bytes == [0x40, 5, 0, 0x15, 0])
+            .expect("Sampler channel marker should exist");
+        wrong_kind[marker_type + 4] = 2;
+        let wrong_kind = FstPreset::parse(&wrong_kind).expect("instrument preset should parse");
+        assert!(matches!(
+            target.apply_sampler_channel_state_preset(5, &wrong_kind),
+            Err(FlpError::UnsupportedEdit(_))
+        ));
+        assert_eq!(target, before);
+
+        for blocked_event in [0xD0_u8, 0x63] {
+            let mut blocked_stream = Vec::new();
+            append_data_event(&mut blocked_stream, 0xC7, b"26.0.0\0");
+            blocked_stream.extend_from_slice(&[0x40, 8, 0, 0x15, 0]);
+            if blocked_event == 0xD0 {
+                append_data_event(&mut blocked_stream, blocked_event, &[1, 2]);
+            } else {
+                blocked_stream.extend_from_slice(&[blocked_event, 0, 0]);
+            }
+            append_project_info_string(&mut blocked_stream, 0xCB, "Blocked");
+            let mut blocked_bytes = flp_fixture(&blocked_stream, &[], &[]);
+            blocked_bytes[8..10].copy_from_slice(&32_u16.to_le_bytes());
+            let blocked_preset =
+                FstPreset::parse(&blocked_bytes).expect("blocked preset should parse");
+            assert!(matches!(
+                target.apply_sampler_channel_state_preset(5, &blocked_preset),
+                Err(FlpError::UnsupportedEdit(_))
+            ));
+            assert_eq!(target, before);
+        }
+
+        let mut legacy_target_stream = Vec::new();
+        append_data_event(&mut legacy_target_stream, 0xC7, b"10.0.0\0");
+        legacy_target_stream.extend_from_slice(&[0x40, 5, 0, 0x15, 0]);
+        append_data_event(&mut legacy_target_stream, 0xCB, b"Destination\0");
+        let mut legacy_target = FlpDocument::parse(&flp_fixture(&legacy_target_stream, &[], &[]))
+            .expect("legacy target project should parse");
+        let legacy_before = legacy_target.clone();
+        assert!(matches!(
+            legacy_target.apply_sampler_channel_state_preset(5, &preset),
+            Err(FlpError::UnsupportedEdit(_))
+        ));
+        assert_eq!(legacy_target, legacy_before);
     }
 
     fn append_complete_mixer_insert_state(

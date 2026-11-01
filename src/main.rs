@@ -1031,6 +1031,14 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 name,
             )
         }
+        [command, input, output, channel_id, preset] if command == "apply-sampler-state-preset" => {
+            apply_sampler_state_preset(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(channel_id, "Sampler channel id")?,
+                Path::new(preset),
+            )
+        }
         [command, input, output, channel_id, name] if command == "rename-channel" => {
             let channel_id = channel_id
                 .parse::<u16>()
@@ -4932,6 +4940,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild channels <file.flp>\n",
             "  flp-rebuild channel-groups <file.flp>\n",
             "  flp-rebuild duplicate-channel <input.flp> <output.flp> <channel-id> <name>\n",
+            "  flp-rebuild apply-sampler-state-preset <input.flp> <output.flp> <sampler-channel-id> <preset.fst>\n",
             "  flp-rebuild mixer <file.flp>\n",
             "  flp-rebuild set-mixer-automatic-pdc <input.flp> <output.flp> <0|1>\n",
             "  flp-rebuild set-mixer-insert-manual-pdc <input.flp> <output.flp> <insert-ordinal> <offset-ms>\n",
@@ -8580,6 +8589,37 @@ fn duplicate_channel(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "duplicated channel {channel_id} as channel {new_channel_id} named {name:?} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn apply_sampler_state_preset(
+    input: &Path,
+    output: &Path,
+    channel_id: u16,
+    preset_path: &Path,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let preset_bytes = fs::read(preset_path)
+        .map_err(|error| format!("could not read {}: {error}", preset_path.display()))?;
+    let preset = FstPreset::parse(&preset_bytes).map_err(|error| {
+        format!(
+            "could not parse Sampler state preset {}: {error}",
+            preset_path.display()
+        )
+    })?;
+    let event_count = document
+        .apply_sampler_channel_state_preset(channel_id, &preset)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "applied {event_count} Sampler state events from {} to channel {channel_id} in {}",
+        preset_path.display(),
         output.display()
     );
     Ok(())
