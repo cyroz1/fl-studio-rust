@@ -19134,6 +19134,9 @@ impl DawUi {
         self.midi_script_transport_state
             .recording_precount_enabled
             .store(u8::from(self.recording_precount_enabled), Ordering::Relaxed);
+        if let Ok(mut hint_message) = self.midi_script_transport_state.hint_message.lock() {
+            *hint_message = self.status.clone();
+        }
         self.midi_script_transport_state
             .midi_pickup_enabled
             .store(u8::from(self.midi_pickup_enabled), Ordering::Relaxed);
@@ -67734,6 +67737,9 @@ impl DawUi {
             }
             MidiTransportCommand::ToggleRecordingPrecount => {
                 self.toggle_recording_precount();
+            }
+            MidiTransportCommand::SetHintMessage(message) => {
+                self.status = message;
             }
             MidiTransportCommand::SetSongPosition(position) => {
                 self.set_midi_script_song_position(position);

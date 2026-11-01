@@ -161,6 +161,18 @@ def _request_transport_action(action):
         _active_transport_actions.append(action)
 
 
+def _get_hint_msg():
+    message = _active_transport_state.get("hint_message", "")
+    return message if isinstance(message, str) else ""
+
+
+def _set_hint_msg(message):
+    if not isinstance(message, str) or "\0" in message:
+        raise ValueError("ui.setHintMsg() message must be a string without NUL characters")
+    _active_transport_state["hint_message"] = message
+    _request_transport_action({"action": "set_hint_message", "message": message})
+
+
 def _playlist_track_count():
     try:
         return max(0, int(_active_transport_state.get("playlist_track_count", 0)))
@@ -2199,6 +2211,8 @@ def _install_modules(script_name, device_name):
     ui.isPrecountEnabled = lambda: bool(
         _active_transport_state.get("recording_precount_enabled", False)
     )
+    ui.getHintMsg = _get_hint_msg
+    ui.setHintMsg = _set_hint_msg
     ui.getHintValue = lambda value, max: f"{value / max:.0%}"
 
     playlist = _module("playlist")

@@ -92,6 +92,7 @@ pub enum ScriptTransportAction {
         stop: bool,
     },
     SetPlaylistTrackSelection(Vec<u32>),
+    SetHintMessage(String),
     SetPlaylistTrackName {
         track_id: u32,
         name: String,
@@ -339,6 +340,7 @@ pub struct MidiScriptTransportState {
     pub project_title: Mutex<String>,
     pub project_author: Mutex<String>,
     pub project_genre: Mutex<String>,
+    pub hint_message: Mutex<String>,
 }
 
 impl Default for MidiScriptTransportState {
@@ -406,6 +408,7 @@ impl Default for MidiScriptTransportState {
             project_title: Mutex::new(String::new()),
             project_author: Mutex::new(String::new()),
             project_genre: Mutex::new(String::new()),
+            hint_message: Mutex::new(String::new()),
         }
     }
 }
@@ -1086,6 +1089,12 @@ impl MidiScriptRuntime {
             .lock()
             .map(|value| value.clone())
             .unwrap_or_default();
+        let hint_message = self
+            .transport_state
+            .hint_message
+            .lock()
+            .map(|value| value.clone())
+            .unwrap_or_default();
         let mut request = value.clone();
         if let Some(object) = request.as_object_mut() {
             let mut transport = json!({
@@ -1289,6 +1298,7 @@ impl MidiScriptRuntime {
                     "mixer_track_recording_file_names".to_owned(),
                     json!(mixer_track_recording_file_names),
                 );
+                transport_object.insert("hint_message".to_owned(), json!(hint_message));
             }
             object.insert("transport".to_owned(), transport);
         }
@@ -1360,6 +1370,13 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
             .ok_or_else(|| "MIDI script returned an unknown transport action".to_owned());
     }
     let name = action["action"].as_str();
+    if name == Some("set_hint_message") {
+        let message = action["message"]
+            .as_str()
+            .filter(|message| !message.contains('\0'))
+            .ok_or_else(|| "MIDI script returned an invalid hint message".to_owned())?;
+        return Ok(ScriptTransportAction::SetHintMessage(message.to_owned()));
+    }
     if name == Some("set_playlist_track_selection") {
         let track_ids = action["track_ids"]
             .as_array()
