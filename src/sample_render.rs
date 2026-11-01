@@ -13388,7 +13388,7 @@ fn sampler_filter_cutoff_hz(raw: u32, sample_rate: f64) -> f64 {
 /// Candidate Butterworth-to-high-Q mapping; native resonance calibration remains open.
 fn sampler_filter_resonance_q(raw: u32) -> f64 {
     let normalized = f64::from(raw.min(256)) / 256.0;
-    0.707_106_781_186_547_6 * 10.0_f64.powf(normalized)
+    std::f64::consts::FRAC_1_SQRT_2 * 10.0_f64.powf(normalized)
 }
 
 fn sampler_filter_biquad(
