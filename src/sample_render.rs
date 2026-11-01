@@ -12885,6 +12885,18 @@ fn prepare_sampler_arrangement(
                 reverse: channel.sample_reversed(),
                 volume_envelope_enabled: channel.sampler_volume_envelope_enabled().unwrap_or(false),
                 volume_envelope,
+                pan_envelope: sampler_envelope_config(
+                    channel,
+                    SamplerEnvelopeLfoTarget::Panning,
+                    options.sample_rate,
+                    ppq,
+                ),
+                pitch_envelope: sampler_envelope_config(
+                    channel,
+                    SamplerEnvelopeLfoTarget::Pitch,
+                    options.sample_rate,
+                    ppq,
+                ),
                 pan_lfo: sampler_lfo_config(
                     channel,
                     SamplerEnvelopeLfoTarget::Panning,
@@ -13191,6 +13203,8 @@ struct SamplerVoiceSource {
     reverse: bool,
     volume_envelope_enabled: bool,
     volume_envelope: Option<SamplerVolumeEnvelope>,
+    pan_envelope: Option<SamplerVolumeEnvelope>,
+    pitch_envelope: Option<SamplerVolumeEnvelope>,
     pan_lfo: Option<SamplerLfo>,
     volume_lfo: Option<SamplerLfo>,
     pitch_lfo: Option<SamplerLfo>,
@@ -13580,13 +13594,12 @@ fn sampler_filter_coefficients(
     Some((first, second))
 }
 
-fn sampler_filter_envelope_modulation(
-    note_value: u8,
+fn sampler_envelope_modulation(
     envelope: Option<SamplerVolumeEnvelope>,
     context: SamplerEnvelopeFrameContext,
-) -> u8 {
+) -> f32 {
     let Some(envelope) = envelope else {
-        return note_value;
+        return 0.0;
     };
     let level = context.release_start_frame.map_or_else(
         || {
@@ -13625,8 +13638,32 @@ fn sampler_filter_envelope_modulation(
             release_start_level * (1.0 - progress)
         },
     );
+    envelope.amount * (level - 1.0)
+}
+
+fn sampler_pan_envelope_offset(
+    envelope: Option<SamplerVolumeEnvelope>,
+    context: SamplerEnvelopeFrameContext,
+) -> f32 {
+    // Candidate interpretation: the full signed envelope amount spans the normalized pan range.
+    sampler_envelope_modulation(envelope, context)
+}
+
+fn sampler_pitch_envelope_cents(
+    envelope: Option<SamplerVolumeEnvelope>,
+    context: SamplerEnvelopeFrameContext,
+) -> f64 {
+    // Candidate interpretation: the full signed envelope amount spans one octave.
+    f64::from(sampler_envelope_modulation(envelope, context)) * 1_200.0
+}
+
+fn sampler_filter_envelope_modulation(
+    note_value: u8,
+    envelope: Option<SamplerVolumeEnvelope>,
+    context: SamplerEnvelopeFrameContext,
+) -> u8 {
     // Candidate interpretation: envelope amount scales motion around neutral Mod X/Mod Y value.
-    (f32::from(note_value) + envelope.amount * (level - 1.0) * 128.0)
+    (f32::from(note_value) + sampler_envelope_modulation(envelope, context) * 128.0)
         .round()
         .clamp(0.0, 255.0) as u8
 }
@@ -17069,6 +17106,18 @@ fn prepare_sampler_pattern_for_channel_internal(
                 reverse: channel.sample_reversed(),
                 volume_envelope_enabled: channel.sampler_volume_envelope_enabled().unwrap_or(false),
                 volume_envelope,
+                pan_envelope: sampler_envelope_config(
+                    channel,
+                    SamplerEnvelopeLfoTarget::Panning,
+                    options.sample_rate,
+                    ppq,
+                ),
+                pitch_envelope: sampler_envelope_config(
+                    channel,
+                    SamplerEnvelopeLfoTarget::Pitch,
+                    options.sample_rate,
+                    ppq,
+                ),
                 pan_lfo: sampler_lfo_config(
                     channel,
                     SamplerEnvelopeLfoTarget::Panning,
@@ -17468,6 +17517,8 @@ struct SamplerVoice {
     release_started: bool,
     volume_envelope_enabled: bool,
     volume_envelope: Option<SamplerVolumeEnvelope>,
+    pan_envelope: Option<SamplerVolumeEnvelope>,
+    pitch_envelope: Option<SamplerVolumeEnvelope>,
     pan_lfo: Option<SamplerLfo>,
     volume_lfo: Option<SamplerLfo>,
     pitch_lfo: Option<SamplerLfo>,
@@ -17610,6 +17661,12 @@ impl<'a> SamplerVoiceEngine<'a> {
             source
                 .volume_envelope
                 .is_some_and(SamplerVolumeEnvelope::uses_tempo_sync)
+                || source
+                    .pan_envelope
+                    .is_some_and(SamplerVolumeEnvelope::uses_tempo_sync)
+                || source
+                    .pitch_envelope
+                    .is_some_and(SamplerVolumeEnvelope::uses_tempo_sync)
                 || source.pan_lfo.is_some_and(SamplerLfo::needs_tempo_map)
                 || source.volume_lfo.is_some_and(SamplerLfo::needs_tempo_map)
                 || source.pitch_lfo.is_some_and(SamplerLfo::needs_tempo_map)
@@ -17937,15 +17994,27 @@ impl<'a> SamplerVoiceEngine<'a> {
                     *voice_slot = None;
                     continue;
                 }
-                if let Some(pitch_lfo) = voice.pitch_lfo {
-                    // Candidate depth pending a native render comparison: full raw amount spans
-                    // one octave in either direction.
-                    voice.lfo_pitch_cents = f64::from(pitch_lfo.value_at_frame(
-                        voice.started_frame,
+                if voice.pitch_lfo.is_some() || voice.pitch_envelope.is_some() {
+                    // Candidate mapping: full saved LFO or envelope amount spans one octave.
+                    let pitch_lfo_cents = voice.pitch_lfo.map_or(0.0, |pitch_lfo| {
+                        f64::from(pitch_lfo.value_at_frame(
+                            voice.started_frame,
+                            frame,
+                            voice.started_tick,
+                            current_tick,
+                        )) * 1_200.0
+                    });
+                    let envelope_context = SamplerEnvelopeFrameContext {
+                        started_frame: voice.started_frame,
                         frame,
-                        voice.started_tick,
+                        started_tick: voice.started_tick,
                         current_tick,
-                    )) * 1_200.0;
+                        release_start_frame: voice.envelope_release_start_frame,
+                        release_start_tick: voice.envelope_release_start_tick,
+                    };
+                    let pitch_envelope_cents =
+                        sampler_pitch_envelope_cents(voice.pitch_envelope, envelope_context);
+                    voice.lfo_pitch_cents = pitch_lfo_cents + pitch_envelope_cents;
                     let pitch_bend = voice
                         .input_midi_channel
                         .map_or(0, |channel| pitch_bend_cents[usize::from(channel)]);
@@ -18020,15 +18089,29 @@ impl<'a> SamplerVoiceEngine<'a> {
                     None
                 };
                 if render_samples {
-                    if let Some(pan_lfo) = voice.pan_lfo {
-                        let pan = (sampler_note_pan_value(voice.channel_pan, voice.note_pan_value)
-                            + pan_lfo.value_at_frame(
+                    if voice.pan_lfo.is_some() || voice.pan_envelope.is_some() {
+                        let envelope_context = SamplerEnvelopeFrameContext {
+                            started_frame: voice.started_frame,
+                            frame,
+                            started_tick: voice.started_tick,
+                            current_tick,
+                            release_start_frame: voice.envelope_release_start_frame,
+                            release_start_tick: voice.envelope_release_start_tick,
+                        };
+                        let pan_lfo = voice.pan_lfo.map_or(0.0, |pan_lfo| {
+                            pan_lfo.value_at_frame(
                                 voice.started_frame,
                                 frame,
                                 voice.started_tick,
                                 current_tick,
-                            ))
-                        .clamp(-1.0, 1.0);
+                            )
+                        });
+                        let pan_envelope =
+                            sampler_pan_envelope_offset(voice.pan_envelope, envelope_context);
+                        let pan = (sampler_note_pan_value(voice.channel_pan, voice.note_pan_value)
+                            + pan_lfo
+                            + pan_envelope)
+                            .clamp(-1.0, 1.0);
                         (voice.left_gain, voice.right_gain) =
                             channel_pan_gains(pan, voice.source.channels.len() == 1, pan_law);
                     }
@@ -18357,6 +18440,8 @@ impl<'a> SamplerVoiceEngine<'a> {
             release_started: false,
             volume_envelope_enabled: source.volume_envelope_enabled,
             volume_envelope: source.volume_envelope,
+            pan_envelope: source.pan_envelope,
+            pitch_envelope: source.pitch_envelope,
             pan_lfo: source.pan_lfo,
             volume_lfo: source.volume_lfo,
             pitch_lfo: source.pitch_lfo,
@@ -18970,7 +19055,20 @@ fn begin_sampler_voice_release(
         .as_ref()
         .is_some_and(SamplerFilterState::needs_tempo_synced_envelope_release)
         && start_tick.is_some();
-    voice.envelope_release_start_tick = (volume_tick_synced_release || filter_tick_synced_release)
+    let pan_tick_synced_release = voice
+        .pan_envelope
+        .and_then(SamplerVolumeEnvelope::tick_times)
+        .is_some_and(|times| times.release > 0.0)
+        && start_tick.is_some();
+    let pitch_tick_synced_release = voice
+        .pitch_envelope
+        .and_then(SamplerVolumeEnvelope::tick_times)
+        .is_some_and(|times| times.release > 0.0)
+        && start_tick.is_some();
+    voice.envelope_release_start_tick = (volume_tick_synced_release
+        || filter_tick_synced_release
+        || pan_tick_synced_release
+        || pitch_tick_synced_release)
         .then_some(start_tick)
         .flatten();
     if voice.volume_envelope_enabled {
@@ -24010,6 +24108,8 @@ mod tests {
                     backward_loop: false,
                     release_loop_bounds: None,
                     release_ping_pong_loop: false,
+                    pan_envelope: None,
+                    pitch_envelope: None,
                     pan_lfo: None,
                     volume_lfo: None,
                     pitch_lfo: None,
@@ -25292,6 +25392,66 @@ mod tests {
     }
 
     #[test]
+    fn sampler_pan_and_pitch_envelopes_apply_signed_amount_through_release() {
+        let envelope = SamplerVolumeEnvelope {
+            timing: SamplerEnvelopeTiming::Frames(SamplerEnvelopeFrameTimes {
+                predelay: 0,
+                attack: 4,
+                hold: 0,
+                decay: 0,
+                release: 4,
+            }),
+            sustain_level: 1.0,
+            amount: 1.0,
+            attack_tension: 0,
+            decay_tension: 0,
+            release_tension: 0,
+        };
+        let envelope_context = |frame, release_start_frame| SamplerEnvelopeFrameContext {
+            started_frame: 0,
+            frame,
+            started_tick: None,
+            current_tick: None,
+            release_start_frame,
+            release_start_tick: None,
+        };
+
+        assert_eq!(
+            sampler_pan_envelope_offset(Some(envelope), envelope_context(0, None)),
+            -1.0
+        );
+        assert_eq!(
+            sampler_pan_envelope_offset(Some(envelope), envelope_context(2, None)),
+            -0.5
+        );
+        assert_eq!(
+            sampler_pitch_envelope_cents(Some(envelope), envelope_context(2, None)),
+            -600.0
+        );
+        assert_eq!(
+            sampler_pan_envelope_offset(Some(envelope), envelope_context(7, Some(4))),
+            -1.0
+        );
+        assert_eq!(
+            sampler_pitch_envelope_cents(Some(envelope), envelope_context(7, Some(4))),
+            -1_200.0
+        );
+
+        let inverted_envelope = SamplerVolumeEnvelope {
+            amount: -1.0,
+            ..envelope
+        };
+        assert_eq!(
+            sampler_pan_envelope_offset(Some(inverted_envelope), envelope_context(0, None)),
+            1.0
+        );
+        assert_eq!(
+            sampler_pitch_envelope_cents(Some(inverted_envelope), envelope_context(0, None)),
+            1_200.0
+        );
+    }
+
+    #[test]
     fn sampler_filter_mod_x_y_lfos_move_cutoff_and_resonance_during_a_note() {
         let lfo = SamplerLfo {
             timing: SamplerLfoTiming::Frames {
@@ -25459,6 +25619,8 @@ mod tests {
             backward_loop: false,
             release_loop_bounds: None,
             release_ping_pong_loop: false,
+            pan_envelope: None,
+            pitch_envelope: None,
             pan_lfo: None,
             volume_lfo: None,
             pitch_lfo: None,
@@ -25618,6 +25780,8 @@ mod tests {
                 backward_loop: false,
                 release_loop_bounds: None,
                 release_ping_pong_loop: false,
+                pan_envelope: None,
+                pitch_envelope: None,
                 pan_lfo: None,
                 volume_lfo: None,
                 pitch_lfo: None,
@@ -25690,6 +25854,8 @@ mod tests {
                 backward_loop: false,
                 release_loop_bounds: None,
                 release_ping_pong_loop: false,
+                pan_envelope: None,
+                pitch_envelope: None,
                 pan_lfo: None,
                 volume_lfo: None,
                 pitch_lfo: None,
@@ -25758,6 +25924,8 @@ mod tests {
                 backward_loop: false,
                 release_loop_bounds: None,
                 release_ping_pong_loop: false,
+                pan_envelope: None,
+                pitch_envelope: None,
                 pan_lfo: None,
                 volume_lfo: None,
                 pitch_lfo: None,
@@ -25898,6 +26066,8 @@ mod tests {
                 backward_loop: false,
                 release_loop_bounds: None,
                 release_ping_pong_loop: false,
+                pan_envelope: None,
+                pitch_envelope: None,
                 pan_lfo: None,
                 volume_lfo: None,
                 pitch_lfo: None,
@@ -25967,6 +26137,8 @@ mod tests {
                 backward_loop: false,
                 release_loop_bounds: None,
                 release_ping_pong_loop: false,
+                pan_envelope: None,
+                pitch_envelope: None,
                 pan_lfo: None,
                 volume_lfo: None,
                 pitch_lfo: None,
@@ -26061,6 +26233,8 @@ mod tests {
                 backward_loop: false,
                 release_loop_bounds: None,
                 release_ping_pong_loop: false,
+                pan_envelope: None,
+                pitch_envelope: None,
                 pan_lfo: None,
                 volume_lfo: None,
                 pitch_lfo: None,
@@ -26259,6 +26433,8 @@ mod tests {
                 backward_loop: false,
                 release_loop_bounds: None,
                 release_ping_pong_loop: false,
+                pan_envelope: None,
+                pitch_envelope: None,
                 pan_lfo: None,
                 volume_lfo: None,
                 pitch_lfo: None,
@@ -26350,6 +26526,8 @@ mod tests {
                 backward_loop: false,
                 release_loop_bounds: None,
                 release_ping_pong_loop: false,
+                pan_envelope: None,
+                pitch_envelope: None,
                 pan_lfo: None,
                 volume_lfo: None,
                 pitch_lfo: None,
@@ -26420,6 +26598,8 @@ mod tests {
                 backward_loop: false,
                 release_loop_bounds: None,
                 release_ping_pong_loop: false,
+                pan_envelope: None,
+                pitch_envelope: None,
                 pan_lfo: None,
                 volume_lfo: None,
                 pitch_lfo: None,
@@ -26483,6 +26663,8 @@ mod tests {
                 backward_loop: false,
                 release_loop_bounds: None,
                 release_ping_pong_loop: false,
+                pan_envelope: None,
+                pitch_envelope: None,
                 pan_lfo: None,
                 volume_lfo: None,
                 pitch_lfo: None,
@@ -26549,6 +26731,8 @@ mod tests {
                 backward_loop: false,
                 release_loop_bounds: None,
                 release_ping_pong_loop: false,
+                pan_envelope: None,
+                pitch_envelope: None,
                 pan_lfo: None,
                 volume_lfo: None,
                 pitch_lfo: None,
@@ -26611,6 +26795,8 @@ mod tests {
                 backward_loop: false,
                 release_loop_bounds: None,
                 release_ping_pong_loop: false,
+                pan_envelope: None,
+                pitch_envelope: None,
                 pan_lfo: None,
                 volume_lfo: None,
                 pitch_lfo: None,
@@ -26679,6 +26865,8 @@ mod tests {
                 backward_loop: false,
                 release_loop_bounds: None,
                 release_ping_pong_loop: false,
+                pan_envelope: None,
+                pitch_envelope: None,
                 pan_lfo: None,
                 volume_lfo: None,
                 pitch_lfo: None,
@@ -26747,6 +26935,8 @@ mod tests {
                 backward_loop: true,
                 release_loop_bounds: None,
                 release_ping_pong_loop: false,
+                pan_envelope: None,
+                pitch_envelope: None,
                 pan_lfo: None,
                 volume_lfo: None,
                 pitch_lfo: None,
@@ -26815,6 +27005,8 @@ mod tests {
                 backward_loop: false,
                 release_loop_bounds: Some(SampleBounds { start: 2, end: 4 }),
                 release_ping_pong_loop: false,
+                pan_envelope: None,
+                pitch_envelope: None,
                 pan_lfo: None,
                 volume_lfo: None,
                 pitch_lfo: None,
@@ -26898,6 +27090,8 @@ mod tests {
                 backward_loop: false,
                 release_loop_bounds: None,
                 release_ping_pong_loop: false,
+                pan_envelope: None,
+                pitch_envelope: None,
                 pan_lfo: None,
                 volume_lfo: None,
                 pitch_lfo: None,
@@ -26962,6 +27156,8 @@ mod tests {
                 backward_loop: false,
                 release_loop_bounds: None,
                 release_ping_pong_loop: false,
+                pan_envelope: None,
+                pitch_envelope: None,
                 pan_lfo: None,
                 volume_lfo: None,
                 pitch_lfo: None,
@@ -27033,6 +27229,8 @@ mod tests {
             backward_loop: false,
             release_loop_bounds: None,
             release_ping_pong_loop: false,
+            pan_envelope: None,
+            pitch_envelope: None,
             pan_lfo: None,
             volume_lfo: None,
             pitch_lfo: None,
@@ -27114,6 +27312,8 @@ mod tests {
                 backward_loop: false,
                 release_loop_bounds: None,
                 release_ping_pong_loop: false,
+                pan_envelope: None,
+                pitch_envelope: None,
                 pan_lfo: None,
                 volume_lfo: None,
                 pitch_lfo: None,
@@ -27197,6 +27397,8 @@ mod tests {
                 backward_loop: false,
                 release_loop_bounds: None,
                 release_ping_pong_loop: false,
+                pan_envelope: None,
+                pitch_envelope: None,
                 pan_lfo: None,
                 volume_lfo: None,
                 pitch_lfo: None,
@@ -27269,6 +27471,8 @@ mod tests {
                     backward_loop: false,
                     release_loop_bounds: None,
                     release_ping_pong_loop: false,
+                    pan_envelope: None,
+                    pitch_envelope: None,
                     pan_lfo: None,
                     volume_lfo: None,
                     pitch_lfo: None,
@@ -27299,6 +27503,8 @@ mod tests {
                     backward_loop: false,
                     release_loop_bounds: None,
                     release_ping_pong_loop: false,
+                    pan_envelope: None,
+                    pitch_envelope: None,
                     pan_lfo: None,
                     volume_lfo: None,
                     pitch_lfo: None,
@@ -27388,6 +27594,8 @@ mod tests {
                     backward_loop: false,
                     release_loop_bounds: None,
                     release_ping_pong_loop: false,
+                    pan_envelope: None,
+                    pitch_envelope: None,
                     pan_lfo: None,
                     volume_lfo: None,
                     pitch_lfo: None,
@@ -27421,6 +27629,8 @@ mod tests {
                     backward_loop: false,
                     release_loop_bounds: None,
                     release_ping_pong_loop: false,
+                    pan_envelope: None,
+                    pitch_envelope: None,
                     pan_lfo: None,
                     volume_lfo: None,
                     pitch_lfo: None,
@@ -27546,6 +27756,8 @@ mod tests {
                 backward_loop: false,
                 release_loop_bounds: None,
                 release_ping_pong_loop: false,
+                pan_envelope: None,
+                pitch_envelope: None,
                 pan_lfo: None,
                 volume_lfo: None,
                 pitch_lfo: None,
@@ -27645,6 +27857,8 @@ mod tests {
             backward_loop: false,
             release_loop_bounds: None,
             release_ping_pong_loop: false,
+            pan_envelope: None,
+            pitch_envelope: None,
             pan_lfo: None,
             volume_lfo: None,
             pitch_lfo: None,
@@ -27731,6 +27945,8 @@ mod tests {
             backward_loop: false,
             release_loop_bounds: None,
             release_ping_pong_loop: false,
+            pan_envelope: None,
+            pitch_envelope: None,
             pan_lfo: None,
             volume_lfo: None,
             pitch_lfo: None,
@@ -27816,6 +28032,8 @@ mod tests {
             backward_loop: false,
             release_loop_bounds: None,
             release_ping_pong_loop: false,
+            pan_envelope: None,
+            pitch_envelope: None,
             pan_lfo: None,
             volume_lfo: None,
             pitch_lfo: None,
@@ -27916,6 +28134,8 @@ mod tests {
             backward_loop: false,
             release_loop_bounds: None,
             release_ping_pong_loop: false,
+            pan_envelope: None,
+            pitch_envelope: None,
             pan_lfo: None,
             volume_lfo: None,
             pitch_lfo: None,
@@ -27987,6 +28207,8 @@ mod tests {
             backward_loop: false,
             release_loop_bounds: None,
             release_ping_pong_loop: false,
+            pan_envelope: None,
+            pitch_envelope: None,
             pan_lfo: None,
             volume_lfo: None,
             pitch_lfo: None,
@@ -28068,6 +28290,8 @@ mod tests {
             backward_loop: false,
             release_loop_bounds: None,
             release_ping_pong_loop: false,
+            pan_envelope: None,
+            pitch_envelope: None,
             pan_lfo: None,
             volume_lfo: None,
             pitch_lfo: None,
@@ -28163,6 +28387,8 @@ mod tests {
             backward_loop: false,
             release_loop_bounds: None,
             release_ping_pong_loop: false,
+            pan_envelope: None,
+            pitch_envelope: None,
             pan_lfo: None,
             volume_lfo: None,
             pitch_lfo: None,
