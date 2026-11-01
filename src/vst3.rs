@@ -4262,6 +4262,23 @@ struct HostedPlugin {
     editor_open: bool,
 }
 
+fn hosted_plugin_matches_saved_class_uid(
+    loaded: &HostedPlugin,
+    saved_class_uid: &str,
+) -> Result<bool, String> {
+    if loaded.info.uid.eq_ignore_ascii_case(saved_class_uid) {
+        return Ok(true);
+    }
+    let plugin = loaded
+        .plugin
+        .lock()
+        .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
+    Ok(plugin
+        .replaced_class_ids()
+        .iter()
+        .any(|class_id| class_id.eq_ignore_ascii_case(saved_class_uid)))
+}
+
 fn read_32bit_x86_binary(path: &Path) -> bool {
     let Ok(mut file) = std::fs::File::open(path) else {
         return false;
@@ -5006,9 +5023,9 @@ impl Vst3HostRuntime {
             .iter()
             .find(|loaded| loaded.info.id == id)
             .ok_or_else(|| format!("no loaded VST3 instance with id {id}"))?;
-        if !loaded.info.uid.eq_ignore_ascii_case(&expected_uid) {
+        if !hosted_plugin_matches_saved_class_uid(loaded, &expected_uid)? {
             return Err(format!(
-                "FLP state class UID {expected_uid} does not match loaded plug-in UID {}",
+                "FLP state class UID {expected_uid} does not match loaded plug-in UID {} or its declared retired class IDs",
                 loaded.info.uid
             ));
         }
@@ -5054,9 +5071,9 @@ impl Vst3HostRuntime {
                 loaded.info.name
             ));
         }
-        if !loaded.info.uid.eq_ignore_ascii_case(&expected_uid) {
+        if !hosted_plugin_matches_saved_class_uid(loaded, &expected_uid)? {
             return Err(format!(
-                "FLP Mixer effect class UID {expected_uid} does not match loaded plug-in UID {}",
+                "FLP Mixer effect class UID {expected_uid} does not match loaded plug-in UID {} or its declared retired class IDs",
                 loaded.info.uid
             ));
         }
@@ -5103,9 +5120,9 @@ impl Vst3HostRuntime {
                 loaded.info.name
             ));
         }
-        if !loaded.info.uid.eq_ignore_ascii_case(&expected_uid) {
+        if !hosted_plugin_matches_saved_class_uid(loaded, &expected_uid)? {
             return Err(format!(
-                "FLP Mixer effect class UID {expected_uid} does not match loaded plug-in UID {}",
+                "FLP Mixer effect class UID {expected_uid} does not match loaded plug-in UID {} or its declared retired class IDs",
                 loaded.info.uid
             ));
         }
@@ -5155,9 +5172,9 @@ impl Vst3HostRuntime {
             .iter()
             .find(|loaded| loaded.info.id == id)
             .ok_or_else(|| format!("no loaded VST3 instance with id {id}"))?;
-        if !loaded.info.uid.eq_ignore_ascii_case(&expected_uid) {
+        if !hosted_plugin_matches_saved_class_uid(loaded, &expected_uid)? {
             return Err(format!(
-                "FLP state class UID {expected_uid} does not match loaded plug-in UID {}",
+                "FLP state class UID {expected_uid} does not match loaded plug-in UID {} or its declared retired class IDs",
                 loaded.info.uid
             ));
         }
