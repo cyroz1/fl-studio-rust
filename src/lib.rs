@@ -27932,6 +27932,16 @@ impl FlpDocument {
         self.apply_channel_state_preset_for_type(target_channel_id, preset, ChannelType::Automation)
     }
 
+    /// Applies one kind-2 native-generator channel block to an existing channel with the same
+    /// recognized `0xC9` plug-in identifier. The target ID and name are retained.
+    pub fn apply_native_channel_state_preset(
+        &mut self,
+        target_channel_id: u16,
+        preset: &FstPreset,
+    ) -> Result<usize, FlpError> {
+        self.apply_channel_state_preset_for_type(target_channel_id, preset, ChannelType::Native)
+    }
+
     fn apply_channel_state_preset_for_type(
         &mut self,
         target_channel_id: u16,
@@ -27973,6 +27983,13 @@ impl FlpDocument {
                 "Automation Clip state import requires matching, recognized project string encodings when the preset contains a sample path",
                 "Automation Clip state import requires one well-formed channel marker and name, without note or Playlist events",
             ),
+            ChannelType::Native => (
+                "native-generator state import requires exactly one kind-2 Native channel",
+                "native-generator state import requires a kind-2 Native target channel",
+                true,
+                "native-generator state import requires matching, recognized project string encodings",
+                "native-generator state import requires one well-formed channel marker and name, without note or Playlist events",
+            ),
             _ => {
                 return Err(FlpError::UnsupportedEdit(
                     "state-preset import is not supported for this channel type",
@@ -28004,9 +28021,36 @@ impl FlpDocument {
         if target_channel.channel_type() != Some(channel_type) {
             return Err(FlpError::UnsupportedEdit(target_channel_error));
         }
-
         let source_range = source_channel.event_range();
         let target_range = target_channel.event_range();
+        if channel_type == ChannelType::Native {
+            let source_identifier_events = source_range
+                .clone()
+                .filter(|&index| preset.document().events[index].opcode == 0xC9)
+                .collect::<Vec<_>>();
+            let target_identifier_events = target_range
+                .clone()
+                .filter(|&index| self.events[index].opcode == 0xC9)
+                .collect::<Vec<_>>();
+            if source_identifier_events.len() != 1
+                || target_identifier_events.len() != 1
+                || !matches!(
+                    preset.document().events[source_identifier_events[0]].encoding,
+                    PayloadEncoding::Data { .. }
+                )
+                || !matches!(
+                    self.events[target_identifier_events[0]].encoding,
+                    PayloadEncoding::Data { .. }
+                )
+                || source_channel.plugin_identifier().is_none()
+                || source_channel.plugin_identifier() != target_channel.plugin_identifier()
+            {
+                return Err(FlpError::UnsupportedEdit(
+                    "native-generator state import requires one unique string-encoded 0xC9 plug-in identifier on each channel, and the identifiers must match",
+                ));
+            }
+        }
+
         let has_project_string_path = channel_type == ChannelType::Automation
             && source_range
                 .clone()
@@ -29731,6 +29775,24 @@ mod tests {
         flp_fixture(&event_stream, &[], &[])
     }
 
+    fn native_generator_channel_state_fixture(
+        channel_id: u16,
+        plugin_identifier: &str,
+        name: &str,
+        state: &[u8],
+    ) -> Vec<u8> {
+        let mut event_stream = Vec::new();
+        append_data_event(&mut event_stream, 0xC7, b"26.0.0\0");
+        event_stream.extend_from_slice(&[0x40]);
+        event_stream.extend_from_slice(&channel_id.to_le_bytes());
+        event_stream.extend_from_slice(&[0x15, 2]);
+        append_project_info_string(&mut event_stream, 0xC9, plugin_identifier);
+        append_data_event(&mut event_stream, 0xD5, state);
+        append_project_info_string(&mut event_stream, 0xCB, name);
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+        flp_fixture(&event_stream, &[], &[])
+    }
+
     #[test]
     fn applies_sampler_channel_state_while_preserving_target_identity_and_project_events() {
         let source_bytes =
@@ -30281,6 +30343,131 @@ mod tests {
             Err(FlpError::UnsupportedEdit(_))
         ));
         assert_eq!(target, before);
+    }
+
+    #[test]
+    fn applies_native_generator_channel_state_only_for_matching_plugin_identity() {
+        let source = FlpDocument::parse(&native_generator_channel_state_fixture(
+            8,
+            "Fruity Limiter",
+            "Preset Limiter",
+            &[0x11, 0x22, 0x33, 0x44],
+        ))
+        .expect("source Native channel project should parse");
+        let preset = FstPreset::parse(
+            &source
+                .encode_channel_state_preset(8)
+                .expect("Native channel state should export as format 32"),
+        )
+        .expect("exported Native preset should parse");
+
+        let mut target_stream = Vec::new();
+        append_data_event(&mut target_stream, 0xC7, b"26.0.0\0");
+        append_project_info_string(&mut target_stream, 0xC2, "Project title");
+        target_stream.extend_from_slice(&[0x40, 5, 0, 0x15, 2]);
+        append_project_info_string(&mut target_stream, 0xC9, "Fruity Limiter");
+        append_data_event(&mut target_stream, 0xD5, &[0xAA]);
+        append_project_info_string(&mut target_stream, 0xCB, "Destination");
+        target_stream.extend_from_slice(&[0x40, 6, 0, 0x15, 0]);
+        append_project_info_string(&mut target_stream, 0xCB, "Sibling");
+        target_stream.extend_from_slice(&[0x62, 0, 0]);
+        let mut target = FlpDocument::parse(&flp_fixture(&target_stream, &[], &[]))
+            .expect("target project should parse");
+        let target_name_bytes = target.events()[target.channels()[0].event_range()]
+            .iter()
+            .find(|event| event.opcode() == 0xCB)
+            .expect("target Native channel should have a name")
+            .wire_bytes()
+            .to_vec();
+        let original_project_title = target.events()[1].wire_bytes().to_vec();
+        let original_sibling = target.events()[target.channels()[1].event_range()]
+            .iter()
+            .map(|event| event.wire_bytes().to_vec())
+            .collect::<Vec<_>>();
+
+        let replaced = target
+            .apply_native_channel_state_preset(5, &preset)
+            .expect("same-plugin Native state should apply");
+
+        assert_eq!(replaced, 5);
+        assert_eq!(target.channels()[0].id(), 5);
+        assert_eq!(
+            target.channels()[0].channel_type(),
+            Some(super::ChannelType::Native)
+        );
+        assert_eq!(
+            target.channels()[0].plugin_identifier(),
+            Some("Fruity Limiter")
+        );
+        assert_eq!(target.channels()[0].display_name(), Some("Destination"));
+        let target_range = target.channels()[0].event_range();
+        let channel_events = &target.events()[target_range];
+        assert_eq!(
+            channel_events
+                .iter()
+                .find(|event| event.opcode() == 0xCB)
+                .expect("target Native channel should retain its name event")
+                .wire_bytes(),
+            target_name_bytes
+        );
+        assert!(
+            channel_events
+                .iter()
+                .any(|event| event.opcode() == 0xD5 && event.payload() == [0x11, 0x22, 0x33, 0x44])
+        );
+        assert_eq!(target.events()[1].wire_bytes(), original_project_title);
+        assert_eq!(
+            target.events()[target.channels()[1].event_range()]
+                .iter()
+                .map(|event| event.wire_bytes().to_vec())
+                .collect::<Vec<_>>(),
+            original_sibling
+        );
+    }
+
+    #[test]
+    fn native_generator_channel_state_import_rejects_mismatched_plugin_identity_atomically() {
+        let source = FlpDocument::parse(&native_generator_channel_state_fixture(
+            8,
+            "Fruity Limiter",
+            "Preset Limiter",
+            &[0x11, 0x22],
+        ))
+        .expect("source Native channel project should parse");
+        let preset = FstPreset::parse(
+            &source
+                .encode_channel_state_preset(8)
+                .expect("Native channel state should export as format 32"),
+        )
+        .expect("exported Native preset should parse");
+        let target_bytes =
+            native_generator_channel_state_fixture(5, "Fruity Reeverb 2", "Destination", &[0xAA]);
+        let mut target = FlpDocument::parse(&target_bytes).expect("target project should parse");
+        let before = target.clone();
+
+        assert!(matches!(
+            target.apply_native_channel_state_preset(5, &preset),
+            Err(FlpError::UnsupportedEdit(_))
+        ));
+        assert_eq!(target, before);
+
+        let mut duplicate_identifier_stream = Vec::new();
+        append_data_event(&mut duplicate_identifier_stream, 0xC7, b"26.0.0\0");
+        duplicate_identifier_stream.extend_from_slice(&[0x40, 5, 0, 0x15, 2]);
+        append_project_info_string(&mut duplicate_identifier_stream, 0xC9, "Fruity Limiter");
+        append_project_info_string(&mut duplicate_identifier_stream, 0xC9, "Fruity Limiter");
+        append_data_event(&mut duplicate_identifier_stream, 0xD5, &[0xAA]);
+        append_project_info_string(&mut duplicate_identifier_stream, 0xCB, "Destination");
+        duplicate_identifier_stream.extend_from_slice(&[0x62, 0, 0]);
+        let mut duplicate_target =
+            FlpDocument::parse(&flp_fixture(&duplicate_identifier_stream, &[], &[]))
+                .expect("target with duplicate plugin identifiers should parse losslessly");
+        let duplicate_target_before = duplicate_target.clone();
+        assert!(matches!(
+            duplicate_target.apply_native_channel_state_preset(5, &preset),
+            Err(FlpError::UnsupportedEdit(_))
+        ));
+        assert_eq!(duplicate_target, duplicate_target_before);
     }
 
     fn append_complete_mixer_insert_state(
