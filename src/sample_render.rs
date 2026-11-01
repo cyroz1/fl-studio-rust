@@ -13261,6 +13261,16 @@ impl SamplerFilterConfig {
     }
 }
 
+#[derive(Clone, Copy)]
+struct SamplerEnvelopeFrameContext {
+    started_frame: u64,
+    frame: u64,
+    started_tick: Option<f64>,
+    current_tick: Option<f64>,
+    release_start_frame: Option<u64>,
+    release_start_tick: Option<f64>,
+}
+
 fn sampler_filter_config(
     channel: &ChannelSummary,
     sample_rate: u32,
@@ -13393,15 +13403,18 @@ impl SamplerFilterState {
         release_start_frame: Option<u64>,
         release_start_tick: Option<f64>,
     ) {
-        let mod_x = sampler_filter_envelope_modulation(
-            self.note_mod_x,
-            self.config.mod_x_envelope,
+        let envelope_context = SamplerEnvelopeFrameContext {
             started_frame,
             frame,
             started_tick,
             current_tick,
             release_start_frame,
             release_start_tick,
+        };
+        let mod_x = sampler_filter_envelope_modulation(
+            self.note_mod_x,
+            self.config.mod_x_envelope,
+            envelope_context,
         );
         let mod_x = sampler_filter_lfo_modulation(
             mod_x,
@@ -13414,12 +13427,7 @@ impl SamplerFilterState {
         let mod_y = sampler_filter_envelope_modulation(
             self.note_mod_y,
             self.config.mod_y_envelope,
-            started_frame,
-            frame,
-            started_tick,
-            current_tick,
-            release_start_frame,
-            release_start_tick,
+            envelope_context,
         );
         let mod_y = sampler_filter_lfo_modulation(
             mod_y,
@@ -13547,35 +13555,37 @@ fn sampler_filter_coefficients(
 fn sampler_filter_envelope_modulation(
     note_value: u8,
     envelope: Option<SamplerVolumeEnvelope>,
-    started_frame: u64,
-    frame: u64,
-    started_tick: Option<f64>,
-    current_tick: Option<f64>,
-    release_start_frame: Option<u64>,
-    release_start_tick: Option<f64>,
+    context: SamplerEnvelopeFrameContext,
 ) -> u8 {
     let Some(envelope) = envelope else {
         return note_value;
     };
-    let level = release_start_frame.map_or_else(
-        || envelope.level_at_frame(started_frame, frame, started_tick, current_tick),
+    let level = context.release_start_frame.map_or_else(
+        || {
+            envelope.level_at_frame(
+                context.started_frame,
+                context.frame,
+                context.started_tick,
+                context.current_tick,
+            )
+        },
         |release_start_frame| {
             let release_start_level = envelope.level_at_frame(
-                started_frame,
+                context.started_frame,
                 release_start_frame,
-                started_tick,
-                release_start_tick,
+                context.started_tick,
+                context.release_start_tick,
             );
-            let tick_progress =
-                release_start_tick
-                    .zip(current_tick)
-                    .and_then(|(start_tick, current_tick)| {
-                        envelope.release_progress_at_tick(start_tick, current_tick)
-                    });
+            let tick_progress = context
+                .release_start_tick
+                .zip(context.current_tick)
+                .and_then(|(start_tick, current_tick)| {
+                    envelope.release_progress_at_tick(start_tick, current_tick)
+                });
             let release_frames = usize::try_from(envelope.frame_times().release)
                 .unwrap_or(usize::MAX)
                 .max(1);
-            let elapsed = frame.saturating_sub(release_start_frame);
+            let elapsed = context.frame.saturating_sub(release_start_frame);
             let frame_progress = if release_frames <= 1 {
                 1.0
             } else {
@@ -25165,30 +25175,29 @@ mod tests {
             decay_tension: 0,
             release_tension: 0,
         };
+        let envelope_context = |frame, release_start_frame| SamplerEnvelopeFrameContext {
+            started_frame: 0,
+            frame,
+            started_tick: None,
+            current_tick: None,
+            release_start_frame,
+            release_start_tick: None,
+        };
 
         assert_eq!(
-            sampler_filter_envelope_modulation(128, Some(envelope), 0, 0, None, None, None, None),
+            sampler_filter_envelope_modulation(128, Some(envelope), envelope_context(0, None)),
             0
         );
         assert_eq!(
-            sampler_filter_envelope_modulation(128, Some(envelope), 0, 2, None, None, None, None),
+            sampler_filter_envelope_modulation(128, Some(envelope), envelope_context(2, None)),
             64
         );
         assert_eq!(
-            sampler_filter_envelope_modulation(128, Some(envelope), 0, 4, None, None, None, None),
+            sampler_filter_envelope_modulation(128, Some(envelope), envelope_context(4, None)),
             128
         );
         assert_eq!(
-            sampler_filter_envelope_modulation(
-                128,
-                Some(envelope),
-                0,
-                7,
-                None,
-                None,
-                Some(4),
-                None
-            ),
+            sampler_filter_envelope_modulation(128, Some(envelope), envelope_context(7, Some(4))),
             0
         );
 
