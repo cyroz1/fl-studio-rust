@@ -12126,6 +12126,27 @@ impl DawUi {
         self.write_state_preset_file(path, preset_bytes, "channel");
     }
 
+    fn save_native_channel_plugin_state_preset(&mut self, channel_id: u16, channel_name: &str) {
+        let Some(document) = self.document.clone() else {
+            self.status = "Open a project before saving a native plug-in preset".to_owned();
+            return;
+        };
+        let file_name = state_preset_file_stem(channel_name, &format!("Channel {channel_id}"));
+        let Some(path) =
+            self.choose_state_preset_path("Save native plug-in state preset", &file_name)
+        else {
+            return;
+        };
+        let preset_bytes = match document.encode_native_channel_plugin_state_preset(channel_id) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.status = format!("Could not save native plug-in preset: {error}");
+                return;
+            }
+        };
+        self.write_state_preset_file(path, preset_bytes, "native plug-in");
+    }
+
     fn save_mixer_insert_state_preset(&mut self, insert_ordinal: usize, insert_name: &str) {
         let Some(document) = self.document.as_ref() else {
             self.status = "Open a project before saving a Mixer state".to_owned();
@@ -39910,6 +39931,7 @@ impl DawUi {
         let mut rename_group_dialog = None;
         let mut delete_group = None;
         let mut save_channel_preset = None;
+        let mut save_native_channel_preset = None;
         let mut duplicate_channel_request = None;
         let mut delete_channels_request = None;
         let mut channel_enabled_edits = Vec::new();
@@ -41101,6 +41123,15 @@ impl DawUi {
                                     ));
                                     ui.close();
                                 }
+                                if channel.channel_type() == Some(ChannelType::Native)
+                                    && ui.button("Save native plug-in state as…").clicked()
+                                {
+                                    save_native_channel_preset = Some((
+                                        channel.id(),
+                                        channel.display_name().unwrap_or("Channel").to_owned(),
+                                    ));
+                                    ui.close();
+                                }
                                 if !preset_supported {
                                     ui.small("Layer channels with children cannot be saved alone");
                                 }
@@ -41870,6 +41901,9 @@ impl DawUi {
         });
         if let Some((channel_id, channel_name)) = save_channel_preset {
             self.save_channel_state_preset(channel_id, &channel_name);
+        }
+        if let Some((channel_id, channel_name)) = save_native_channel_preset {
+            self.save_native_channel_plugin_state_preset(channel_id, &channel_name);
         }
         for (channel_id, path) in dropped_samples {
             self.load_browser_sample_into_channel(channel_id, &path);

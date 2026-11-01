@@ -27914,6 +27914,153 @@ impl FlpDocument {
         preset.encode_lossless()
     }
 
+    /// Encodes a Native Channel Rack plug-in's observed state-event block as a format-48 preset.
+    ///
+    /// Export requires a unique plug-in ID and the recognized wrapper, state, and metadata events
+    /// present in the local format-48 corpus. Unrelated Channel Rack controls and sibling channels
+    /// are omitted.
+    pub fn encode_native_channel_plugin_state_preset(
+        &self,
+        channel_id: u16,
+    ) -> Result<Vec<u8>, FlpError> {
+        let channels = self.channels();
+        let matching_channels = channels
+            .iter()
+            .filter(|channel| channel.id() == channel_id)
+            .collect::<Vec<_>>();
+        let [channel] = matching_channels.as_slice() else {
+            return Err(FlpError::UnsupportedEdit(
+                "native plug-in preset export requires one unique target channel",
+            ));
+        };
+        if channel.channel_type() != Some(ChannelType::Native) {
+            return Err(FlpError::UnsupportedEdit(
+                "native plug-in preset export requires a Native Channel Rack channel",
+            ));
+        }
+        if channel.plugin_identifier().is_none() {
+            return Err(FlpError::UnsupportedEdit(
+                "native plug-in preset export requires one recognized 0xC9 plug-in identifier",
+            ));
+        }
+        let channel_range = channel.event_range();
+        let mut channel_preset_events = Vec::new();
+        for (opcode, required) in [
+            (0xC9, true),
+            (0xD4, true),
+            (0xCB, false),
+            (0x9B, true),
+            (0x80, true),
+            (0xD5, true),
+        ] {
+            let indices = channel_range
+                .clone()
+                .filter(|&index| self.events[index].opcode == opcode)
+                .collect::<Vec<_>>();
+            if (required && indices.len() != 1) || (!required && indices.len() > 1) {
+                return Err(FlpError::UnsupportedEdit(
+                    "native plug-in preset export requires unique recognized state and wrapper events",
+                ));
+            }
+            if let Some(&index) = indices.first() {
+                let valid_encoding = match opcode {
+                    0x9B | 0x80 => {
+                        self.events[index].encoding == PayloadEncoding::Dword
+                            && self.events[index].payload.len() == 4
+                    }
+                    _ => {
+                        matches!(self.events[index].encoding, PayloadEncoding::Data { .. })
+                    }
+                };
+                if !valid_encoding {
+                    return Err(FlpError::UnsupportedEdit(
+                        "native plug-in preset export found an unsupported state or wrapper event encoding",
+                    ));
+                }
+            }
+        }
+        if channel_range
+            .clone()
+            .filter(|&index| self.events[index].opcode == 0xC9)
+            .count()
+            != 1
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "native plug-in preset export requires one unique 0xC9 plug-in identifier",
+            ));
+        }
+        let state = self
+            .channel_plugin_states()
+            .into_iter()
+            .find(|state| state.channel_id() == channel_id)
+            .ok_or(FlpError::UnsupportedEdit(
+                "native plug-in preset export could not decode the channel state event",
+            ))?;
+        if state.vst_metadata().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "recognized VST wrapper states require a VST preset format, not format 48",
+            ));
+        }
+
+        let first_channel_start = channels
+            .iter()
+            .map(|channel| channel.event_range().start)
+            .min()
+            .unwrap_or(self.events.len());
+        let project_prefix = &self.events[..first_channel_start];
+        for (opcode, required) in [(0xC7, true), (0x9F, false), (0x1C, true), (0x25, false)] {
+            let events = project_prefix
+                .iter()
+                .filter(|event| event.opcode == opcode)
+                .collect::<Vec<_>>();
+            if (required && events.len() != 1) || (!required && events.len() > 1) {
+                return Err(FlpError::UnsupportedEdit(
+                    "native plug-in preset export requires unique project-version metadata",
+                ));
+            }
+            if let Some(event) = events.first() {
+                let valid = match opcode {
+                    0xC7 => matches!(event.encoding, PayloadEncoding::Data { .. }),
+                    0x9F => event.encoding == PayloadEncoding::Dword && event.payload.len() == 4,
+                    _ => event.encoding == PayloadEncoding::Byte && event.payload.len() == 1,
+                };
+                if !valid {
+                    return Err(FlpError::UnsupportedEdit(
+                        "native plug-in preset export found unsupported project-version metadata",
+                    ));
+                }
+            }
+        }
+
+        let mut events = project_prefix
+            .iter()
+            .filter(|event| matches!(event.opcode, 0xC7 | 0x9F | 0x1C | 0x25))
+            .cloned()
+            .collect::<Vec<_>>();
+        for index in channel_range {
+            if matches!(
+                self.events[index].opcode,
+                0xC9 | 0xD4 | 0xCB | 0x9B | 0x80 | 0xD5
+            ) {
+                channel_preset_events.push(self.events[index].clone());
+            }
+        }
+        events.extend(channel_preset_events);
+
+        let mut header = self.header.clone();
+        header.format = 48;
+        header.legacy_channel_count = 1;
+        let mut preset = Self {
+            header,
+            events,
+            project_version: self.project_version.clone(),
+            metadata: ProjectMetadata::default(),
+            trailing_bytes: Vec::new(),
+        };
+        preset.refresh_event_offsets()?;
+        preset.encode_lossless()
+    }
+
     /// Applies one kind-0 Sampler channel block from a format-32 preset to an existing Sampler.
     ///
     /// The target channel ID and display-name event are retained. Source and target project
@@ -29936,6 +30083,65 @@ mod tests {
             document.encode_channel_state_preset(5),
             Err(FlpError::AmbiguousChannelId(5))
         ));
+    }
+
+    #[test]
+    fn exports_a_native_channel_plugin_as_a_format48_state_preset() {
+        let mut event_stream = Vec::new();
+        append_data_event(&mut event_stream, 0xC7, b"20.8.4.2576\0");
+        event_stream.push(0x9F);
+        event_stream.extend_from_slice(&0x0000_0A10_u32.to_le_bytes());
+        event_stream.extend_from_slice(&[0x1C, 1, 0x25, 1]);
+        append_data_event(&mut event_stream, 0xC2, b"Project title\0");
+        event_stream.extend_from_slice(&[0x40, 5, 0, 0x15, 2]);
+        append_project_info_string(&mut event_stream, 0xC9, "BooBass");
+        append_data_event(&mut event_stream, 0xD4, &[0xD4; 52]);
+        append_project_info_string(&mut event_stream, 0xCB, "BooBass");
+        event_stream.push(0x9B);
+        event_stream.extend_from_slice(&0_u32.to_le_bytes());
+        event_stream.push(0x80);
+        event_stream.extend_from_slice(&0x005B_6985_u32.to_le_bytes());
+        append_data_event(&mut event_stream, 0xD5, &[1, 2, 3, 4]);
+        event_stream.push(0x45);
+        event_stream.extend_from_slice(&7_u16.to_le_bytes());
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+        let mut source_bytes = flp_fixture(&event_stream, &[0xA5, 0x5A], &[0xDE, 0xAD]);
+        source_bytes[10..12].copy_from_slice(&19_u16.to_le_bytes());
+        let source = FlpDocument::parse(&source_bytes).expect("source project should parse");
+
+        let preset_bytes = source
+            .encode_native_channel_plugin_state_preset(5)
+            .expect("native plug-in channel should export as format 48");
+        let preset = FstPreset::parse(&preset_bytes).expect("exported preset should parse");
+        assert_eq!(preset.kind(), FstPresetKind::NativePluginState);
+        assert_eq!(preset.document().header().format(), 48);
+        assert_eq!(preset.document().header().legacy_channel_count(), 1);
+        assert_eq!(preset.document().header().ppq(), 96);
+        assert_eq!(preset.document().header().extension(), &[0xA5, 0x5A]);
+        assert_eq!(preset.document().project_version(), Some("20.8.4.2576"));
+        assert!(preset.document().trailing_bytes().is_empty());
+        assert!(preset.document().channels().is_empty());
+        assert_eq!(
+            preset.native_plugin_identifier().as_deref(),
+            Some("BooBass")
+        );
+        assert_eq!(preset.native_plugin_state_bytes(), Some(&[1, 2, 3, 4][..]));
+        assert_eq!(
+            preset
+                .document()
+                .events()
+                .iter()
+                .map(FlpEvent::opcode)
+                .collect::<Vec<_>>(),
+            [0xC7, 0x9F, 0x1C, 0x25, 0xC9, 0xD4, 0xCB, 0x9B, 0x80, 0xD5]
+        );
+        assert!(
+            preset
+                .document()
+                .events()
+                .iter()
+                .all(|event| event.opcode() != 0xC2 && event.opcode() != 0x45)
+        );
     }
 
     fn sampler_channel_state_fixture(
