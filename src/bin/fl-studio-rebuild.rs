@@ -18669,8 +18669,12 @@ impl DawUi {
         if let Ok(mut value) = self.midi_script_transport_state.project_genre.lock() {
             *value = project_genre;
         }
-        let (playlist_track_ids, playlist_track_names, playlist_track_muted) =
-            self.midi_script_playlist_track_snapshot();
+        let (
+            playlist_track_ids,
+            playlist_track_names,
+            playlist_track_muted,
+            playlist_track_group_ranges,
+        ) = self.midi_script_playlist_track_snapshot();
         let supported_playlist_track_ids =
             playlist_track_ids.iter().copied().collect::<BTreeSet<_>>();
         self.midi_script_transport_state
@@ -18681,6 +18685,13 @@ impl DawUi {
         }
         if let Ok(mut muted) = self.midi_script_transport_state.playlist_track_muted.lock() {
             *muted = playlist_track_muted;
+        }
+        if let Ok(mut group_ranges) = self
+            .midi_script_transport_state
+            .playlist_track_group_ranges
+            .lock()
+        {
+            *group_ranges = playlist_track_group_ranges;
         }
         if let Ok(mut soloed) = self
             .midi_script_transport_state
@@ -35574,9 +35585,11 @@ impl DawUi {
         };
     }
 
-    fn midi_script_playlist_track_snapshot(&self) -> (Vec<u32>, Vec<String>, Vec<bool>) {
+    fn midi_script_playlist_track_snapshot(
+        &self,
+    ) -> (Vec<u32>, Vec<String>, Vec<bool>, Vec<Option<(u32, u32)>>) {
         let Some(document) = self.document.as_ref() else {
-            return (Vec::new(), Vec::new(), Vec::new());
+            return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         };
         let arrangements = document.arrangements().unwrap_or_default();
         let Some(arrangement) = arrangements
@@ -35584,13 +35597,14 @@ impl DawUi {
             .find(|arrangement| Some(arrangement.id) == self.selected_arrangement)
             .or_else(|| arrangements.first())
         else {
-            return (Vec::new(), Vec::new(), Vec::new());
+            return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         };
         let tracks = document.playlist_tracks_in_arrangement(arrangement.id);
         let track_ids = midi_script_playlist_track_ids(arrangement, &tracks);
         let track_names = midi_script_playlist_track_names(&track_ids, &tracks);
         let track_muted = midi_script_playlist_track_mute_states(&track_ids, &tracks);
-        (track_ids, track_names, track_muted)
+        let track_group_ranges = midi_script_playlist_track_group_ranges(&track_ids, &tracks);
+        (track_ids, track_names, track_muted, track_group_ranges)
     }
 
     fn midi_script_playlist_track_ids(&self) -> Vec<u32> {
@@ -35652,12 +35666,13 @@ impl DawUi {
         }
     }
 
-    fn set_midi_script_playlist_track_mute(&mut self, track_id: u32, muted: bool) {
+    fn set_midi_script_playlist_track_mute(&mut self, track_id: u32, muted: bool, in_group: bool) {
         if self.document.is_none() {
             self.status = "Open a project to mute Playlist tracks".to_owned();
             return;
         }
-        let (track_ids, _, track_muted) = self.midi_script_playlist_track_snapshot();
+        let (track_ids, _, track_muted, track_group_ranges) =
+            self.midi_script_playlist_track_snapshot();
         let Some(track_index) = track_ids
             .iter()
             .position(|candidate| *candidate == track_id)
@@ -35667,7 +35682,31 @@ impl DawUi {
             );
             return;
         };
-        if track_muted.get(track_index).copied() == Some(muted) {
+        let affected_track_ids = if in_group {
+            track_group_ranges
+                .get(track_index)
+                .copied()
+                .flatten()
+                .map(|(first, last)| {
+                    track_ids
+                        .iter()
+                        .copied()
+                        .filter(|candidate| (first..=last).contains(candidate))
+                        .collect::<Vec<_>>()
+                })
+                .filter(|members| !members.is_empty())
+                .unwrap_or_else(|| vec![track_id])
+        } else {
+            vec![track_id]
+        };
+        let has_changes = affected_track_ids.iter().any(|affected_id| {
+            track_ids
+                .iter()
+                .position(|candidate| candidate == affected_id)
+                .and_then(|index| track_muted.get(index))
+                .is_some_and(|current| *current != muted)
+        });
+        if !has_changes {
             return;
         }
         let arrangements = self
@@ -35684,22 +35723,39 @@ impl DawUi {
             self.status = "Open a project to mute Playlist tracks".to_owned();
             return;
         };
-        let result = self.document.as_mut().map(|document| {
-            document.edit_playlist_track_in_arrangement(
-                arrangement_id,
-                track_id,
-                PlaylistTrackEdit {
-                    enabled: Some(!muted),
-                    ..PlaylistTrackEdit::default()
-                },
-            )
+        let result = self.document.as_ref().map(|document| {
+            let mut candidate = document.clone();
+            for affected_id in &affected_track_ids {
+                candidate
+                    .edit_playlist_track_in_arrangement(
+                        arrangement_id,
+                        *affected_id,
+                        PlaylistTrackEdit {
+                            enabled: Some(!muted),
+                            ..PlaylistTrackEdit::default()
+                        },
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok::<_, String>(candidate)
         });
         match result {
-            Some(Ok(())) => {
+            Some(Ok(document)) => {
+                self.document = Some(document);
                 self.stop_project_playback();
                 self.dirty = true;
                 self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
-                self.status = if muted {
+                let (first_track, last_track) = (
+                    affected_track_ids[0],
+                    *affected_track_ids.last().unwrap_or(&track_id),
+                );
+                self.status = if in_group && first_track != last_track {
+                    if muted {
+                        format!("Muted Playlist track group {first_track}–{last_track}")
+                    } else {
+                        format!("Unmuted Playlist track group {first_track}–{last_track}")
+                    }
+                } else if muted {
                     format!("Muted Playlist track {track_id}")
                 } else {
                     format!("Unmuted Playlist track {track_id}")
@@ -35720,7 +35776,7 @@ impl DawUi {
             self.status = "Open a project to solo Playlist tracks".to_owned();
             return;
         }
-        let (track_ids, _, _) = self.midi_script_playlist_track_snapshot();
+        let (track_ids, _, _, _) = self.midi_script_playlist_track_snapshot();
         if !track_ids.contains(&track_id) {
             self.status = format!(
                 "Could not change Playlist track {track_id} solo state: track is outside the supported rows"
@@ -66520,8 +66576,12 @@ impl DawUi {
             MidiTransportCommand::SetPlaylistTrackName { track_id, name } => {
                 self.set_midi_script_playlist_track_name(track_id, name);
             }
-            MidiTransportCommand::SetPlaylistTrackMute { track_id, muted } => {
-                self.set_midi_script_playlist_track_mute(track_id, muted);
+            MidiTransportCommand::SetPlaylistTrackMute {
+                track_id,
+                muted,
+                in_group,
+            } => {
+                self.set_midi_script_playlist_track_mute(track_id, muted, in_group);
             }
             MidiTransportCommand::SetPlaylistTrackSolo {
                 track_id,
@@ -87405,6 +87465,34 @@ fn midi_script_playlist_track_ids(arrangement: &Arrangement, tracks: &[PlaylistT
         .unwrap_or(15)
         .max(15);
     (1..=u32::from(last_track) + 1).collect()
+}
+
+fn midi_script_playlist_track_group_ranges(
+    track_ids: &[u32],
+    tracks: &[PlaylistTrack],
+) -> Vec<Option<(u32, u32)>> {
+    let mut ordered_tracks = tracks.iter().collect::<Vec<_>>();
+    ordered_tracks.sort_by_key(|track| track.id);
+    let mut ranges_by_track = BTreeMap::new();
+    let mut first_index = 0;
+    while first_index < ordered_tracks.len() {
+        let mut last_index = first_index;
+        while last_index + 1 < ordered_tracks.len()
+            && ordered_tracks[last_index + 1].grouped == Some(true)
+        {
+            last_index += 1;
+        }
+        let first_track = ordered_tracks[first_index].id;
+        let last_track = ordered_tracks[last_index].id;
+        for track in &ordered_tracks[first_index..=last_index] {
+            ranges_by_track.insert(track.id, (first_track, last_track));
+        }
+        first_index = last_index + 1;
+    }
+    track_ids
+        .iter()
+        .map(|track_id| ranges_by_track.get(track_id).copied())
+        .collect()
 }
 
 fn midi_script_playlist_track_names(track_ids: &[u32], tracks: &[PlaylistTrack]) -> Vec<String> {

@@ -205,14 +205,17 @@ def _playlist_is_track_muted(index):
     return bool(muted[index - 1]) if index <= len(muted) else False
 
 
-def _playlist_mute_track(index, value=-1):
+def _playlist_mute_track(index, value=-1, inGroup=0):
     index = _playlist_track_index(index)
     try:
         value = int(value)
+        inGroup = int(inGroup)
     except (TypeError, ValueError, OverflowError) as error:
-        raise ValueError("Playlist mute value must be -1, 0, or 1") from error
+        raise ValueError("Playlist mute value and group flag must be integers") from error
     if value not in (-1, 0, 1):
         raise ValueError("Playlist mute value must be -1, 0, or 1")
+    if inGroup not in (0, 1):
+        raise ValueError("Playlist mute group flag must be 0 or 1")
     muted = not _playlist_is_track_muted(index) if value == -1 else bool(value)
     muted_states = [
         bool(track_muted)
@@ -220,10 +223,29 @@ def _playlist_mute_track(index, value=-1):
     ]
     while len(muted_states) < _playlist_track_count():
         muted_states.append(False)
-    muted_states[index - 1] = muted
+    track_ids = [index]
+    if inGroup:
+        group_ranges = _active_transport_state.get("playlist_track_group_ranges", [])
+        if index <= len(group_ranges):
+            group_range = group_ranges[index - 1]
+            if isinstance(group_range, (list, tuple)) and len(group_range) == 2:
+                try:
+                    first_track, last_track = (int(track_id) for track_id in group_range)
+                except (TypeError, ValueError, OverflowError):
+                    pass
+                else:
+                    if 1 <= first_track <= index <= last_track <= _playlist_track_count():
+                        track_ids = list(range(first_track, last_track + 1))
+    for track_id in track_ids:
+        muted_states[track_id - 1] = muted
     _active_transport_state["playlist_track_muted"] = muted_states
     _request_transport_action(
-        {"action": "set_playlist_track_mute", "track_id": index, "muted": muted}
+        {
+            "action": "set_playlist_track_mute",
+            "track_id": index,
+            "muted": muted,
+            "in_group": bool(inGroup),
+        }
     )
 
 

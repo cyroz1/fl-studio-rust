@@ -883,9 +883,15 @@ fn queue_script_transport_actions(
             ScriptTransportAction::SetPlaylistTrackName { track_id, name } => {
                 MidiTransportCommand::SetPlaylistTrackName { track_id, name }
             }
-            ScriptTransportAction::SetPlaylistTrackMute { track_id, muted } => {
-                MidiTransportCommand::SetPlaylistTrackMute { track_id, muted }
-            }
+            ScriptTransportAction::SetPlaylistTrackMute {
+                track_id,
+                muted,
+                in_group,
+            } => MidiTransportCommand::SetPlaylistTrackMute {
+                track_id,
+                muted,
+                in_group,
+            },
             ScriptTransportAction::SetPlaylistTrackSolo {
                 track_id,
                 value,
@@ -1074,6 +1080,7 @@ pub enum MidiTransportCommand {
     SetPlaylistTrackMute {
         track_id: u32,
         muted: bool,
+        in_group: bool,
     },
     SetPlaylistTrackSolo {
         track_id: u32,
@@ -2767,6 +2774,7 @@ mod tests {
                 ScriptTransportAction::SetPlaylistTrackMute {
                     track_id: 3,
                     muted: true,
+                    in_group: false,
                 },
                 ScriptTransportAction::SetPlaylistTrackSolo {
                     track_id: 1,
@@ -2837,6 +2845,7 @@ mod tests {
             MidiInputEvent::Transport(MidiTransportCommand::SetPlaylistTrackMute {
                 track_id: 3,
                 muted: true,
+                in_group: false,
             })
         );
         assert_eq!(

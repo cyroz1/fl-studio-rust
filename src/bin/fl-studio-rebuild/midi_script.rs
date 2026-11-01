@@ -99,6 +99,7 @@ pub enum ScriptTransportAction {
     SetPlaylistTrackMute {
         track_id: u32,
         muted: bool,
+        in_group: bool,
     },
     SetPlaylistTrackSolo {
         track_id: u32,
@@ -303,6 +304,7 @@ pub struct MidiScriptTransportState {
     pub playlist_track_count: AtomicU64,
     pub playlist_track_names: Mutex<Vec<String>>,
     pub playlist_track_muted: Mutex<Vec<bool>>,
+    pub playlist_track_group_ranges: Mutex<Vec<Option<(u32, u32)>>>,
     pub playlist_track_soloed: Mutex<Vec<bool>>,
     pub playlist_track_activity_levels: Mutex<Vec<f32>>,
     pub playlist_track_performance_modes: Mutex<Vec<[Option<u8>; 4]>>,
@@ -367,6 +369,7 @@ impl Default for MidiScriptTransportState {
             playlist_track_count: AtomicU64::new(0),
             playlist_track_names: Mutex::new(Vec::new()),
             playlist_track_muted: Mutex::new(Vec::new()),
+            playlist_track_group_ranges: Mutex::new(Vec::new()),
             playlist_track_soloed: Mutex::new(Vec::new()),
             playlist_track_activity_levels: Mutex::new(Vec::new()),
             playlist_track_performance_modes: Mutex::new(Vec::new()),
@@ -881,6 +884,12 @@ impl MidiScriptRuntime {
             .lock()
             .map(|muted| muted.clone())
             .unwrap_or_default();
+        let playlist_track_group_ranges = self
+            .transport_state
+            .playlist_track_group_ranges
+            .lock()
+            .map(|group_ranges| group_ranges.clone())
+            .unwrap_or_default();
         let playlist_track_soloed = self
             .transport_state
             .playlist_track_soloed
@@ -1189,6 +1198,10 @@ impl MidiScriptRuntime {
                     json!(playlist_track_muted),
                 );
                 transport_object.insert(
+                    "playlist_track_group_ranges".to_owned(),
+                    json!(playlist_track_group_ranges),
+                );
+                transport_object.insert(
                     "playlist_track_soloed".to_owned(),
                     json!(playlist_track_soloed),
                 );
@@ -1373,7 +1386,14 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
         let muted = action["muted"]
             .as_bool()
             .ok_or_else(|| "MIDI script returned an invalid Playlist mute state".to_owned())?;
-        return Ok(ScriptTransportAction::SetPlaylistTrackMute { track_id, muted });
+        let in_group = action["in_group"]
+            .as_bool()
+            .ok_or_else(|| "MIDI script returned an invalid Playlist mute group flag".to_owned())?;
+        return Ok(ScriptTransportAction::SetPlaylistTrackMute {
+            track_id,
+            muted,
+            in_group,
+        });
     }
     if name == Some("set_playlist_track_solo") {
         let track_id = action["track_id"]
@@ -2310,14 +2330,17 @@ mod tests {
                 ScriptTransportAction::SetPlaylistTrackMute {
                     track_id: 2,
                     muted: true,
+                    in_group: false,
                 },
                 ScriptTransportAction::SetPlaylistTrackMute {
                     track_id: 1,
                     muted: false,
+                    in_group: false,
                 },
                 ScriptTransportAction::SetPlaylistTrackMute {
                     track_id: 2,
                     muted: true,
+                    in_group: false,
                 },
             ]
         );
