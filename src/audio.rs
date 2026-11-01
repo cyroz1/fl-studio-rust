@@ -6663,10 +6663,7 @@ fn directsound_shared_output_worker(
             .buffer_frames
             .min((sample_rate / 100).max(32))
             .max(32);
-        let buffer_frames = chunk_frames
-            .saturating_mul(4)
-            .max(sample_rate / 25)
-            .max(256);
+        let buffer_frames = settings.buffer_frames.max(sample_rate / 25).max(256);
         let buffer_bytes = buffer_frames
             .checked_mul(u32::from(block_align))
             .ok_or_else(|| "DirectSound output buffer size overflowed".to_owned())?;
