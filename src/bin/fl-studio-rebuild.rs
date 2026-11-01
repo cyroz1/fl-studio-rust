@@ -63576,6 +63576,7 @@ impl DawUi {
                         if let Some((insert_ordinal, slot_index)) =
                             mixer_effect_mix_locations.get(&(event_index, record_index))
                         {
+                            mixer_refresh_flags |= SCRIPT_HW_DIRTY_CONTROL_VALUES;
                             applied_live_mixer_effect_mixes.push((
                                 *insert_ordinal,
                                 *slot_index,
@@ -63912,6 +63913,12 @@ impl DawUi {
                     }
                     changed_slots.insert(slot_key);
                 }
+                let dirty_tracks = changed_slots
+                    .iter()
+                    .map(|(insert_ordinal, _)| i32::try_from(*insert_ordinal).unwrap_or(-1))
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>();
                 match save_clap_project_mixer_effects(project_id, &assignments) {
                     Ok(()) => {
                         self.stop_project_playback();
@@ -63923,6 +63930,15 @@ impl DawUi {
                             || "Updated CLAP Mixer parameter overrides".to_owned(),
                             |message| format!("Updated CLAP Mixer parameter overrides; {message}"),
                         );
+                        if !dirty_tracks.is_empty()
+                            && !self.notify_midi_script_mixer_tracks_changed(
+                                &dirty_tracks,
+                                SCRIPT_HW_DIRTY_MIXER_CONTROLS | SCRIPT_HW_DIRTY_CONTROL_VALUES,
+                            )
+                        {
+                            self.status
+                                .push_str(" · MIDI script Mixer refresh callback queue is full");
+                        }
                     }
                     Err(error) => {
                         self.status =
