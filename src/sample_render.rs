@@ -26147,8 +26147,8 @@ mod tests {
             controller_gain * angle.sin()
         );
 
-        apply_live_layer_sampler_controller(&mut engine, 2, 74, 127);
-        apply_live_layer_sampler_controller(&mut engine, 2, 71, 0);
+        apply_live_layer_sampler_controller(&mut engine, 2, 74, 0);
+        apply_live_layer_sampler_controller(&mut engine, 2, 71, 127);
         let new_slot_index = engine
             .start_voice(ScheduledSamplerNote {
                 clip_index: 0,
@@ -26200,12 +26200,12 @@ mod tests {
                 .sampler_filter
                 .as_mut()
                 .expect("test filter should be enabled");
-            assert_eq!(filter.note_mod_x, 255);
-            assert_eq!(filter.note_mod_y, 0);
-            assert_eq!(filter.current_modulated_raw, Some((256, 0)));
+            assert_eq!(filter.note_mod_x, 0);
+            assert_eq!(filter.note_mod_y, 255);
+            assert_eq!(filter.current_modulated_raw, Some((0, 256)));
         }
-        apply_live_layer_sampler_controller(&mut engine, 2, 74, 0);
-        apply_live_layer_sampler_controller(&mut engine, 2, 71, 127);
+        apply_live_layer_sampler_controller(&mut engine, 2, 74, 127);
+        apply_live_layer_sampler_controller(&mut engine, 2, 71, 0);
         let voice = engine.voices[new_slot_index]
             .as_mut()
             .expect("second live voice should remain active");
@@ -26214,9 +26214,9 @@ mod tests {
             .as_mut()
             .expect("test filter should remain enabled");
         filter.update_modulation(6, 7, None, None, None, None);
-        assert_eq!(filter.note_mod_x, 0);
-        assert_eq!(filter.note_mod_y, 255);
-        assert_eq!(filter.current_modulated_raw, Some((0, 256)));
+        assert_eq!(filter.note_mod_x, 255);
+        assert_eq!(filter.note_mod_y, 0);
+        assert_eq!(filter.current_modulated_raw, Some((256, 0)));
         let expected_pan = 8_193.0 / 128.0;
         assert!(
             (engine.voices[new_slot_index]
