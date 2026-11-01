@@ -4638,6 +4638,7 @@ struct FstPresetDetails {
     automation_channel_count: usize,
     automation_summaries: Vec<String>,
     trailing_byte_count: usize,
+    mixer_effect_slot_target: Option<(usize, u16)>,
 }
 
 struct BrowserTagEditor {
@@ -22570,6 +22571,7 @@ impl DawUi {
             automation_channel_count: automation_channels.len(),
             automation_summaries,
             trailing_byte_count: document.trailing_bytes().len(),
+            mixer_effect_slot_target: None,
         });
         self.status = format!("Inspected preset {}; state was not applied", path.display());
     }
@@ -22852,6 +22854,45 @@ impl DawUi {
         }
     }
 
+    fn apply_fst_preset_to_native_mixer_effect_slot(
+        &mut self,
+        preset: &FstPreset,
+        insert_ordinal: usize,
+        slot_index: u16,
+        preset_name: &str,
+    ) -> bool {
+        let Some(mut document) = self.document.clone() else {
+            self.status = "Open a project before applying a Mixer effect preset".to_owned();
+            return false;
+        };
+        match document.apply_native_mixer_effect_state_preset(insert_ordinal, slot_index, preset) {
+            Ok(_) => {
+                self.document = Some(document);
+                self.dirty = true;
+                self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+                self.status = format!(
+                    "Applied {preset_name} to Mixer insert {insert_ordinal} effect slot {slot_index}"
+                );
+                if !self.notify_midi_script_mixer_tracks_changed(
+                    &[i32::try_from(insert_ordinal).unwrap_or(-1)],
+                    SCRIPT_HW_DIRTY_MIXER_DISPLAY
+                        | SCRIPT_HW_DIRTY_MIXER_CONTROLS
+                        | SCRIPT_HW_DIRTY_CONTROL_VALUES
+                        | SCRIPT_HW_DIRTY_COLORS
+                        | SCRIPT_HW_DIRTY_NAMES,
+                ) {
+                    self.status
+                        .push_str(" · MIDI script Mixer refresh callback queue is full");
+                }
+                true
+            }
+            Err(error) => {
+                self.status = format!("Could not apply native Mixer effect preset: {error}");
+                false
+            }
+        }
+    }
+
     fn selected_sample_channel(&self) -> Option<(u16, String)> {
         let channel_id = self.selected_graph_channel?;
         let channel = self
@@ -22948,6 +22989,66 @@ impl DawUi {
             return;
         };
         let target_channel_id = self.selected_note_channel;
+        let native_plugin_identifier = details.preset.native_plugin_identifier();
+        let native_plugin_state_bytes = details.preset.native_plugin_state_bytes().map(<[u8]>::len);
+        let mixer_effect_slot_candidates = self
+            .document
+            .as_ref()
+            .map(|document| {
+                let inserts = document.mixer_inserts();
+                document
+                    .mixer_effect_slots()
+                    .into_iter()
+                    .filter_map(|slot| {
+                        let identifier_matches = native_plugin_identifier
+                            .as_deref()
+                            .is_some_and(|identifier| slot.plugin_identifier() == Some(identifier));
+                        if !identifier_matches || slot.state_event_count() != 1 {
+                            return None;
+                        }
+                        let insert_ordinal = slot.insert_ordinal();
+                        let insert_name = inserts
+                            .iter()
+                            .find(|insert| insert.ordinal() == insert_ordinal)
+                            .and_then(|insert| insert.name())
+                            .unwrap_or("(unnamed insert)");
+                        let slot_index = slot.slot_index();
+                        Some((
+                            insert_ordinal,
+                            slot_index,
+                            format!(
+                                "Insert {} · {} · slot {}",
+                                insert_ordinal + 1,
+                                insert_name,
+                                slot_index + 1
+                            ),
+                        ))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut native_effect_target = details
+            .mixer_effect_slot_target
+            .filter(|(insert_ordinal, slot_index)| {
+                mixer_effect_slot_candidates
+                    .iter()
+                    .any(|candidate| candidate.0 == *insert_ordinal && candidate.1 == *slot_index)
+            })
+            .or_else(|| {
+                self.selected_mixer_insert.and_then(|selected_insert| {
+                    mixer_effect_slot_candidates
+                        .iter()
+                        .find(|candidate| candidate.0 == selected_insert)
+                        .map(|candidate| (candidate.0, candidate.1))
+                })
+            })
+            .or_else(|| {
+                mixer_effect_slot_candidates
+                    .first()
+                    .map(|candidate| (candidate.0, candidate.1))
+            });
+        let apply_native_effect_available =
+            native_plugin_state_bytes.is_some() && native_effect_target.is_some();
         let target_state = target_channel_id.and_then(|channel_id| {
             self.document
                 .as_ref()?
@@ -23077,6 +23178,7 @@ impl DawUi {
         let mut open = true;
         let mut close = false;
         let mut apply_requested = false;
+        let mut apply_mixer_effect_requested = false;
         egui::Window::new("FST preset details")
             .id(Id::new("browser-fst-details-dialog"))
             .open(&mut open)
@@ -23087,6 +23189,17 @@ impl DawUi {
                 ui.separator();
                 ui.label(format!("State kind: {}", details.kind));
                 ui.label(format!("Header format: {}", details.format));
+                if details.kind == FstPresetKind::NativePluginState {
+                    ui.label(format!(
+                        "Native plug-in: {}",
+                        native_plugin_identifier.as_deref().unwrap_or("unrecognized")
+                    ));
+                    ui.label(format!(
+                        "Native state: {}",
+                        native_plugin_state_bytes
+                            .map_or_else(|| "unrecognized layout".to_owned(), |bytes| format!("{bytes} bytes"))
+                    ));
+                }
                 ui.label(format!("FL Studio version: {}", details.version));
                 ui.label(format!("Size: {} bytes", details.file_size));
                 ui.separator();
@@ -23147,32 +23260,86 @@ impl DawUi {
                     },
                 );
                 ui.separator();
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(
-                            apply_available,
-                            egui::Button::new("Apply to selected Channel"),
-                        )
-                        .on_hover_text(
-                            "Applies a compatible Sampler, MIDI Out, Audio Clip, or Automation Clip preset, a native generator preset with the same plug-in identifier, a Layer preset with matching children, or a matching marker-12 VST3 preset",
-                        )
-                        .clicked()
-                    {
-                        apply_requested = true;
-                    }
-                    if !apply_available {
-                        ui.label(
-                            egui::RichText::new(
-                                "Select a compatible Sampler, MIDI Out, Audio Clip, Automation Clip, matching native generator or Layer, or loaded VST3 Channel.",
+                if details.kind == FstPresetKind::ChannelState {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(
+                                apply_available,
+                                egui::Button::new("Apply to selected Channel"),
                             )
-                            .color(MUTED),
-                        );
+                            .on_hover_text(
+                                "Applies a compatible Sampler, MIDI Out, Audio Clip, or Automation Clip preset, a native generator preset with the same plug-in identifier, a Layer preset with matching children, or a matching marker-12 VST3 preset",
+                            )
+                            .clicked()
+                        {
+                            apply_requested = true;
+                        }
+                        if !apply_available {
+                            ui.label(
+                                egui::RichText::new(
+                                    "Select a compatible Sampler, MIDI Out, Audio Clip, Automation Clip, matching native generator or Layer, or loaded VST3 Channel.",
+                                )
+                                .color(MUTED),
+                            );
+                        }
+                    });
+                }
+                if details.kind == FstPresetKind::NativePluginState {
+                    ui.horizontal(|ui| {
+                        let selected_text = native_effect_target
+                            .and_then(|target| {
+                                mixer_effect_slot_candidates
+                                    .iter()
+                                    .find(|candidate| {
+                                        candidate.0 == target.0 && candidate.1 == target.1
+                                    })
+                                    .map(|candidate| candidate.2.clone())
+                            })
+                            .unwrap_or_else(|| "No matching effect slot".to_owned());
+                        egui::ComboBox::from_id_salt("browser-fst-native-effect-target")
+                            .selected_text(selected_text)
+                            .show_ui(ui, |ui| {
+                                for (insert_ordinal, slot_index, label) in
+                                    &mixer_effect_slot_candidates
+                                {
+                                    ui.selectable_value(
+                                        &mut native_effect_target,
+                                        Some((*insert_ordinal, *slot_index)),
+                                        label,
+                                    );
+                                }
+                            });
+                        if ui
+                            .add_enabled(
+                                apply_native_effect_available,
+                                egui::Button::new("Apply to selected Mixer effect slot"),
+                            )
+                            .on_hover_text(
+                                "Copies the native plug-in state event into a slot with the same recognized plug-in identifier, retaining the target slot wrapper and Mixer controls",
+                            )
+                            .clicked()
+                        {
+                            apply_mixer_effect_requested = true;
+                        }
+                    });
+                    if !apply_native_effect_available {
+                        let message = if native_plugin_identifier.is_none()
+                            || native_plugin_state_bytes.is_none()
+                        {
+                            "This format-48 preset has no unique recognized plug-in ID and state event."
+                        } else {
+                            "The project has no matching Mixer effect slot with one state event."
+                        };
+                        ui.label(egui::RichText::new(message).color(MUTED));
                     }
-                });
+                }
                 if ui.button("Close").clicked() {
                     close = true;
                 }
             });
+        if let Some(details) = self.browser_fst_details.as_mut() {
+            details.mixer_effect_slot_target = native_effect_target;
+        }
         if apply_requested && let Some(channel_id) = target_channel_id {
             let preset_name = details
                 .path
@@ -23202,6 +23369,21 @@ impl DawUi {
             } else {
                 self.apply_fst_preset_to_vst3_channel(&details.preset, channel_id, preset_name)
             };
+        }
+        if apply_mixer_effect_requested
+            && let Some((insert_ordinal, slot_index)) = native_effect_target
+        {
+            let preset_name = details
+                .path
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .unwrap_or("native effect preset");
+            close = self.apply_fst_preset_to_native_mixer_effect_slot(
+                &details.preset,
+                insert_ordinal,
+                slot_index,
+                preset_name,
+            );
         }
         if !open || close {
             self.browser_fst_details = None;

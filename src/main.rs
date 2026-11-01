@@ -26,14 +26,14 @@ use flp_rebuild::{
     ChannelSampleEffectsEdit, ChannelSampleFxFlagsEdit, ChannelSampleTrimEdit,
     ChannelSampleWindowEdit, ChannelSamplerFilterEdit, ChannelSortOrder,
     ChannelStretchSettingsEdit, ChannelType, ClawMachineOptions, FlamOptions, FlpDocument,
-    FscControllerStreamImportOptions, FscScore, FstPreset, HumanizerOptions, LimitNoteOptions,
-    LimitSnapDirection, MixerInsertEdit, MixerParameterKind, PatternControllerEdit, PatternNote,
-    PatternNoteEdit, PatternNoteRotation, PlaylistClipEdit, PlaylistTrackEdit, PlaylistTrackMotion,
-    PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit,
-    QuantizeNoteLevels, QuantizeNoteMode, QuantizeNoteOptions, RandomNoteChordMap,
-    RandomNoteGeneratorOptions, RandomizerOptions, RiffMachineOptions, RiffMachineQuantizeMode,
-    SamplerEnvelopeLfoEdit, SamplerEnvelopeLfoTarget, SamplerVolumeEnvelopeEdit,
-    ScaleLevelsOptions, StrumOptions, TimeMarkerEdit,
+    FscControllerStreamImportOptions, FscScore, FstPreset, FstPresetKind, HumanizerOptions,
+    LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerParameterKind,
+    PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation, PlaylistClipEdit,
+    PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit,
+    ProjectSettingsEdit, QuantizeNoteLevels, QuantizeNoteMode, QuantizeNoteOptions,
+    RandomNoteChordMap, RandomNoteGeneratorOptions, RandomizerOptions, RiffMachineOptions,
+    RiffMachineQuantizeMode, SamplerEnvelopeLfoEdit, SamplerEnvelopeLfoTarget,
+    SamplerVolumeEnvelopeEdit, ScaleLevelsOptions, StrumOptions, TimeMarkerEdit,
 };
 
 struct MidiControlChangeImport<'a> {
@@ -1082,6 +1082,17 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 Path::new(input),
                 Path::new(output),
                 parse_u16(channel_id, "Layer channel id")?,
+                Path::new(preset),
+            )
+        }
+        [command, input, output, insert_ordinal, slot_index, preset]
+            if command == "apply-native-mixer-effect-state-preset" =>
+        {
+            apply_native_mixer_effect_state_preset(
+                Path::new(input),
+                Path::new(output),
+                parse_usize(insert_ordinal, "Mixer insert ordinal")?,
+                parse_u16(slot_index, "Mixer effect slot index")?,
                 Path::new(preset),
             )
         }
@@ -4992,6 +5003,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild apply-automation-state-preset <input.flp> <output.flp> <automation-channel-id> <preset.fst>\n",
             "  flp-rebuild apply-native-state-preset <input.flp> <output.flp> <native-channel-id> <preset.fst>\n",
             "  flp-rebuild apply-layer-state-preset <input.flp> <output.flp> <layer-channel-id> <preset.fst>\n",
+            "  flp-rebuild apply-native-mixer-effect-state-preset <input.flp> <output.flp> <insert-ordinal> <slot-index> <preset.fst>\n",
             "  flp-rebuild mixer <file.flp>\n",
             "  flp-rebuild set-mixer-automatic-pdc <input.flp> <output.flp> <0|1>\n",
             "  flp-rebuild set-mixer-insert-manual-pdc <input.flp> <output.flp> <insert-ordinal> <offset-ms>\n",
@@ -6921,6 +6933,22 @@ fn inspect_preset(path: &Path) -> Result<(), String> {
     println!("size: {} bytes", bytes.len());
     println!("state format: {}", document.header().format());
     println!("state kind: {}", preset.kind());
+    if preset.kind() == FstPresetKind::NativePluginState {
+        println!(
+            "native plug-in identifier: {}",
+            preset
+                .native_plugin_identifier()
+                .as_deref()
+                .unwrap_or("unrecognized")
+        );
+        println!(
+            "native plug-in state bytes: {}",
+            preset.native_plugin_state_bytes().map_or_else(
+                || "unrecognized layout".to_owned(),
+                |state| state.len().to_string()
+            )
+        );
+    }
     println!(
         "FL Studio version: {}",
         document.project_version().unwrap_or("unknown")
@@ -8825,6 +8853,38 @@ fn apply_layer_state_preset(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "applied {event_count} Layer state events from {} to channel {channel_id} in {}",
+        preset_path.display(),
+        output.display()
+    );
+    Ok(())
+}
+
+fn apply_native_mixer_effect_state_preset(
+    input: &Path,
+    output: &Path,
+    insert_ordinal: usize,
+    slot_index: u16,
+    preset_path: &Path,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let preset_bytes = fs::read(preset_path)
+        .map_err(|error| format!("could not read {}: {error}", preset_path.display()))?;
+    let preset = FstPreset::parse(&preset_bytes).map_err(|error| {
+        format!(
+            "could not parse native Mixer effect state preset {}: {error}",
+            preset_path.display()
+        )
+    })?;
+    let event_count = document
+        .apply_native_mixer_effect_state_preset(insert_ordinal, slot_index, &preset)
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "applied {event_count} native plug-in state event from {} to Mixer insert {insert_ordinal} slot {slot_index} in {}",
         preset_path.display(),
         output.display()
     );

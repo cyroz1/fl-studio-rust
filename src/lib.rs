@@ -307,6 +307,37 @@ impl FstPreset {
         self.kind
     }
 
+    /// Plug-in identifier from a format-48 native effect preset, when it has one unique `0xC9`
+    /// project string.
+    pub fn native_plugin_identifier(&self) -> Option<String> {
+        if self.kind != FstPresetKind::NativePluginState {
+            return None;
+        }
+
+        unique_project_string_in_events(
+            &self.document.events,
+            0xC9,
+            self.document.project_version.as_deref(),
+        )
+    }
+
+    /// Opaque native plug-in state from a format-48 preset with exactly one data-encoded `0xD5`
+    /// event.
+    pub fn native_plugin_state_bytes(&self) -> Option<&[u8]> {
+        if self.kind != FstPresetKind::NativePluginState {
+            return None;
+        }
+
+        let mut state_events = self
+            .document
+            .events
+            .iter()
+            .filter(|event| event.opcode == 0xD5);
+        let state = state_events.next()?;
+        (state_events.next().is_none() && matches!(state.encoding, PayloadEncoding::Data { .. }))
+            .then_some(state.payload.as_slice())
+    }
+
     pub fn document(&self) -> &FlpDocument {
         &self.document
     }
@@ -28266,6 +28297,71 @@ impl FlpDocument {
         Ok(replacement_count)
     }
 
+    /// Applies one format-48 native plug-in state event to an existing Mixer effect slot with
+    /// the same recognized plug-in identifier. The target slot's wrapper, name, color, enabled
+    /// state, mix, and surrounding Mixer events remain unchanged.
+    pub fn apply_native_mixer_effect_state_preset(
+        &mut self,
+        insert_ordinal: usize,
+        slot_index: u16,
+        preset: &FstPreset,
+    ) -> Result<usize, FlpError> {
+        if preset.kind() != FstPresetKind::NativePluginState {
+            return Err(FlpError::UnsupportedEdit(
+                "the selected preset is not a native plug-in state",
+            ));
+        }
+        let source_plugin_identifier =
+            preset
+                .native_plugin_identifier()
+                .ok_or(FlpError::UnsupportedEdit(
+                    "native plug-in state import requires one recognized plug-in identifier",
+                ))?;
+        if preset.native_plugin_state_bytes().is_none() {
+            return Err(FlpError::UnsupportedEdit(
+                "native plug-in state import requires one data-encoded state event",
+            ));
+        }
+        let source_state_event = preset
+            .document
+            .events
+            .iter()
+            .find(|event| event.opcode == 0xD5)
+            .ok_or(FlpError::UnsupportedEdit(
+                "native plug-in state preset has no state event",
+            ))?;
+
+        let target = self.unique_mixer_effect_slot(insert_ordinal, slot_index)?;
+        if target.plugin_identifier.as_deref() != Some(source_plugin_identifier.as_str()) {
+            return Err(FlpError::UnsupportedEdit(
+                "native plug-in state preset does not match the target Mixer effect",
+            ));
+        }
+        if target.state_event_count != 1 {
+            return Err(FlpError::UnsupportedEdit(
+                "native plug-in state import requires exactly one target state event",
+            ));
+        }
+        let target_state_index = target
+            .event_range()
+            .find(|&event_index| self.events[event_index].opcode == 0xD5)
+            .filter(|&event_index| {
+                matches!(
+                    self.events[event_index].encoding,
+                    PayloadEncoding::Data { .. }
+                )
+            })
+            .ok_or(FlpError::UnsupportedEdit(
+                "native plug-in state import requires one data-encoded target state event",
+            ))?;
+
+        let mut updated = self.clone();
+        updated.events[target_state_index] = source_state_event.clone();
+        updated.refresh_event_offsets()?;
+        *self = updated;
+        Ok(1)
+    }
+
     fn mixer_insert_state_event_ranges(
         &self,
         insert_ordinal: usize,
@@ -30702,6 +30798,229 @@ mod tests {
         }
         event_stream.push(0x93);
         event_stream.extend_from_slice(&output.to_le_bytes());
+    }
+
+    fn native_effect_state_preset_fixture(plugin_identifier: &str, state: &[u8]) -> Vec<u8> {
+        let mut event_stream = Vec::new();
+        append_data_event(&mut event_stream, 0xC7, b"26.0.0\0");
+        event_stream.extend_from_slice(&[0x1C, 3]);
+        append_project_info_string(&mut event_stream, 0xC9, plugin_identifier);
+        append_data_event(&mut event_stream, 0xD4, &[0xA4; 52]);
+        event_stream.push(0x9B);
+        event_stream.extend_from_slice(&0_u32.to_le_bytes());
+        event_stream.push(0x80);
+        event_stream.extend_from_slice(&0x0056_5148_u32.to_le_bytes());
+        append_data_event(&mut event_stream, 0xD5, state);
+        let mut bytes = flp_fixture(&event_stream, &[], &[]);
+        bytes[8..10].copy_from_slice(&48_u16.to_le_bytes());
+        bytes
+    }
+
+    fn append_complete_mixer_insert_with_native_effect(
+        event_stream: &mut Vec<u8>,
+        target_slot: u16,
+        plugin_identifier: &str,
+        state: &[u8],
+    ) {
+        let input = -1_i32;
+        let output = 0_i32;
+        let color = 0x001C_1F8C_u32;
+        event_stream.push(0x9A);
+        event_stream.extend_from_slice(&input.to_le_bytes());
+        event_stream.push(0x93);
+        event_stream.extend_from_slice(&output.to_le_bytes());
+        event_stream.push(0x95);
+        event_stream.extend_from_slice(&color.to_le_bytes());
+        let name = "TARGET"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        append_data_event(event_stream, 0xCC, &name);
+        for slot_index in 0_u16..10 {
+            event_stream.push(0x62);
+            event_stream.extend_from_slice(&slot_index.to_le_bytes());
+            if slot_index == target_slot {
+                append_project_info_string(event_stream, 0xC9, plugin_identifier);
+                append_data_event(event_stream, 0xD4, &[0xB4; 52]);
+                event_stream.push(0x9B);
+                event_stream.extend_from_slice(&0_u32.to_le_bytes());
+                event_stream.push(0x80);
+                event_stream.extend_from_slice(&color.to_le_bytes());
+                append_data_event(event_stream, 0xD5, state);
+            }
+        }
+        event_stream.push(0x93);
+        event_stream.extend_from_slice(&output.to_le_bytes());
+    }
+
+    #[test]
+    fn applies_format48_native_plugin_state_to_the_matching_mixer_effect_slot() {
+        let preset_bytes = native_effect_state_preset_fixture("Fruity Balance", &[1, 2, 3, 4]);
+        let preset = FstPreset::parse(&preset_bytes).expect("native effect preset should parse");
+        assert_eq!(preset.kind(), FstPresetKind::NativePluginState);
+        assert_eq!(
+            preset.native_plugin_identifier().as_deref(),
+            Some("Fruity Balance")
+        );
+        assert_eq!(preset.native_plugin_state_bytes(), Some(&[1, 2, 3, 4][..]));
+
+        let mut target_events = Vec::new();
+        append_data_event(&mut target_events, 0xC7, b"26.0.0\0");
+        append_complete_mixer_insert_with_native_effect(
+            &mut target_events,
+            4,
+            "Fruity Balance",
+            &[9, 8],
+        );
+        append_data_event(&mut target_events, 0xE1, &[0xD0; 12]);
+        let mut target = FlpDocument::parse(&flp_fixture(&target_events, &[], &[0xED]))
+            .expect("target project should parse");
+        let before = target.clone();
+        let target_state_index = target
+            .mixer_effect_slots()
+            .into_iter()
+            .find(|slot| slot.insert_ordinal() == 0 && slot.slot_index() == 4)
+            .expect("the target slot should be recognized")
+            .event_range()
+            .find(|&event_index| target.events()[event_index].opcode() == 0xD5)
+            .expect("the target slot should contain one state event");
+        let source_state_wire = preset
+            .document()
+            .events()
+            .iter()
+            .find(|event| event.opcode() == 0xD5)
+            .expect("the preset should contain one state event")
+            .wire_bytes()
+            .to_vec();
+
+        assert_eq!(
+            target.apply_native_mixer_effect_state_preset(0, 4, &preset),
+            Ok(1)
+        );
+        assert_eq!(
+            target.events()[target_state_index].wire_bytes(),
+            source_state_wire
+        );
+        assert_eq!(target.events().len(), before.events().len());
+        assert_eq!(target.header(), before.header());
+        assert_eq!(target.metadata(), before.metadata());
+        assert_eq!(target.trailing_bytes(), before.trailing_bytes());
+        for (event_index, event) in target.events().iter().enumerate() {
+            if event_index == target_state_index {
+                continue;
+            }
+            assert_eq!(
+                event.wire_bytes(),
+                before.events()[event_index].wire_bytes()
+            );
+        }
+        let slot = target
+            .mixer_effect_slots()
+            .into_iter()
+            .find(|slot| slot.insert_ordinal() == 0 && slot.slot_index() == 4)
+            .expect("the target slot should remain recognized");
+        assert_eq!(slot.plugin_identifier(), Some("Fruity Balance"));
+        assert_eq!(slot.state_event_count(), 1);
+        let insert = &target.mixer_inserts()[0];
+        assert_eq!(insert.name(), Some("TARGET"));
+        assert_eq!(insert.input_raw(), -1);
+        assert_eq!(insert.output_raw(), 0);
+        assert_eq!(insert.color_raw(), 0x001C_1F8C);
+        let encoded = target
+            .encode_lossless()
+            .expect("the updated project should encode");
+        let reparsed = FlpDocument::parse(&encoded).expect("the updated project should reparse");
+        let reparsed_slot = reparsed
+            .mixer_effect_slots()
+            .into_iter()
+            .find(|slot| slot.insert_ordinal() == 0 && slot.slot_index() == 4)
+            .expect("the reparsed target slot should remain recognized");
+        let reparsed_state_index = reparsed_slot
+            .event_range()
+            .find(|&event_index| reparsed.events()[event_index].opcode() == 0xD5)
+            .expect("the reparsed target slot should retain its state event");
+        assert_eq!(
+            reparsed.events()[reparsed_state_index].payload(),
+            &[1, 2, 3, 4]
+        );
+
+        let mut mismatched_events = Vec::new();
+        append_data_event(&mut mismatched_events, 0xC7, b"26.0.0\0");
+        append_complete_mixer_insert_with_native_effect(
+            &mut mismatched_events,
+            4,
+            "Fruity Send",
+            &[9, 8],
+        );
+        let mut mismatched = FlpDocument::parse(&flp_fixture(&mismatched_events, &[], &[]))
+            .expect("mismatched target should parse");
+        let mismatched_before = mismatched.clone();
+        assert!(matches!(
+            mismatched.apply_native_mixer_effect_state_preset(0, 4, &preset),
+            Err(FlpError::UnsupportedEdit(_))
+        ));
+        assert_eq!(mismatched, mismatched_before);
+    }
+
+    #[test]
+    fn format48_native_plugin_state_rejects_ambiguous_or_non_native_presets_atomically() {
+        let valid_bytes = native_effect_state_preset_fixture("Fruity Balance", &[1, 2, 3]);
+        let valid = FstPreset::parse(&valid_bytes).expect("native effect preset should parse");
+
+        let mut target_events = Vec::new();
+        append_data_event(&mut target_events, 0xC7, b"26.0.0\0");
+        append_complete_mixer_insert_with_native_effect(
+            &mut target_events,
+            0,
+            "Fruity Balance",
+            &[0],
+        );
+        let target_bytes = flp_fixture(&target_events, &[], &[]);
+        let mut target = FlpDocument::parse(&target_bytes).expect("target should parse");
+
+        let mut wrong_kind_bytes = valid_bytes.clone();
+        wrong_kind_bytes[8..10].copy_from_slice(&32_u16.to_le_bytes());
+        let wrong_kind = FstPreset::parse(&wrong_kind_bytes).expect("preset should parse");
+        let before = target.clone();
+        assert!(matches!(
+            target.apply_native_mixer_effect_state_preset(0, 0, &wrong_kind),
+            Err(FlpError::UnsupportedEdit(_))
+        ));
+        assert_eq!(target, before);
+
+        let mut duplicate_state_stream = Vec::new();
+        append_data_event(&mut duplicate_state_stream, 0xC7, b"26.0.0\0");
+        append_project_info_string(&mut duplicate_state_stream, 0xC9, "Fruity Balance");
+        append_data_event(&mut duplicate_state_stream, 0xD5, &[1]);
+        append_data_event(&mut duplicate_state_stream, 0xD5, &[2]);
+        let mut duplicate_state_bytes = flp_fixture(&duplicate_state_stream, &[], &[]);
+        duplicate_state_bytes[8..10].copy_from_slice(&48_u16.to_le_bytes());
+        let duplicate_state =
+            FstPreset::parse(&duplicate_state_bytes).expect("duplicate state should parse");
+        assert_eq!(duplicate_state.native_plugin_state_bytes(), None);
+        assert!(matches!(
+            target.apply_native_mixer_effect_state_preset(0, 0, &duplicate_state),
+            Err(FlpError::UnsupportedEdit(_))
+        ));
+        assert_eq!(target, before);
+
+        let mut duplicate_identifier_stream = Vec::new();
+        append_data_event(&mut duplicate_identifier_stream, 0xC7, b"26.0.0\0");
+        append_project_info_string(&mut duplicate_identifier_stream, 0xC9, "Fruity Balance");
+        append_project_info_string(&mut duplicate_identifier_stream, 0xC9, "Fruity Send");
+        append_data_event(&mut duplicate_identifier_stream, 0xD5, &[1]);
+        let mut duplicate_identifier_bytes = flp_fixture(&duplicate_identifier_stream, &[], &[]);
+        duplicate_identifier_bytes[8..10].copy_from_slice(&48_u16.to_le_bytes());
+        let duplicate_identifier = FstPreset::parse(&duplicate_identifier_bytes)
+            .expect("duplicate identifiers should parse");
+        assert_eq!(duplicate_identifier.native_plugin_identifier(), None);
+        assert!(matches!(
+            target.apply_native_mixer_effect_state_preset(0, 0, &duplicate_identifier),
+            Err(FlpError::UnsupportedEdit(_))
+        ));
+        assert_eq!(target, before);
+
+        assert_eq!(valid.native_plugin_state_bytes(), Some(&[1, 2, 3][..]));
     }
 
     #[test]
