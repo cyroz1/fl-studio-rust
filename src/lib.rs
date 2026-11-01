@@ -332,10 +332,25 @@ impl FstPreset {
         }
         let target_uid = target_metadata.class_uid()?;
 
-        self.document
-            .channel_plugin_states()
-            .into_iter()
-            .find(|state| {
+        self.matching_vst3_channel_state_for_class_uids(&[target_uid])
+    }
+
+    /// Finds a supported VST3 channel state matching a class UID accepted by the loaded plug-in.
+    ///
+    /// `accepted_class_uids` should contain the loaded class UID and compatibility IDs declared
+    /// by that loaded plug-in. Only format-32 channel states using FL's marker-12 VST3 wrapper
+    /// are accepted. The first UID has priority when a preset contains more than one match.
+    pub fn matching_vst3_channel_state_for_class_uids(
+        &self,
+        accepted_class_uids: &[String],
+    ) -> Option<ChannelPluginState> {
+        if self.kind != FstPresetKind::ChannelState || accepted_class_uids.is_empty() {
+            return None;
+        }
+
+        let states = self.document.channel_plugin_states();
+        for class_uid in accepted_class_uids {
+            if let Some(state) = states.iter().find(|state| {
                 let Some(metadata) = state.vst_metadata() else {
                     return false;
                 };
@@ -344,8 +359,13 @@ impl FstPreset {
                     && state.vst_state_bytes().is_some()
                     && metadata
                         .class_uid()
-                        .is_some_and(|uid| uid.eq_ignore_ascii_case(&target_uid))
-            })
+                        .is_some_and(|uid| uid.eq_ignore_ascii_case(class_uid))
+            }) {
+                return Some(state.clone());
+            }
+        }
+
+        None
     }
 
     pub fn into_document(self) -> FlpDocument {

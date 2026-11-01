@@ -7877,6 +7877,29 @@ impl Vst3HostRuntime {
             .collect()
     }
 
+    /// Returns a loaded plug-in's class UID followed by the retired IDs it declares replaced.
+    pub fn accepted_class_uids(&self, id: u64) -> Result<Vec<String>, String> {
+        let loaded = self
+            .loaded
+            .iter()
+            .find(|loaded| loaded.info.id == id)
+            .ok_or_else(|| format!("no loaded VST3 instance with id {id}"))?;
+        let mut accepted = vec![loaded.info.uid.clone()];
+        let plugin = loaded
+            .plugin
+            .lock()
+            .map_err(|_| "plug-in state lock was poisoned".to_owned())?;
+        for class_id in plugin.replaced_class_ids() {
+            if !accepted
+                .iter()
+                .any(|uid| uid.eq_ignore_ascii_case(class_id))
+            {
+                accepted.push(class_id.clone());
+            }
+        }
+        Ok(accepted)
+    }
+
     /// Unloads one hosted instance, closing its editor and releasing its plug-in state.
     pub fn unload_instance(&mut self, id: u64) -> Result<(), String> {
         let index = self

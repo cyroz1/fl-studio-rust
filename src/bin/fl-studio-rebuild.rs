@@ -22501,12 +22501,26 @@ impl DawUi {
             self.status = format!("Channel {target_channel_id} has no plug-in state to replace");
             return false;
         };
-        let Some(preset_state) = preset.matching_vst3_channel_state(&target_state) else {
-            self.status = "This preset has no matching marker-12 VST3 channel state".to_owned();
-            return false;
-        };
         let Some(instance_id) = self.channel_vst3_instances.get(&target_channel_id).copied() else {
             self.status = format!("Load the VST3 instrument on Channel {target_channel_id} first");
+            return false;
+        };
+        let accepted_class_uids = match self
+            .vst3_host
+            .as_ref()
+            .ok_or_else(|| "the VST3 host is not running".to_owned())
+            .and_then(|host| host.accepted_class_uids(instance_id))
+        {
+            Ok(class_uids) => class_uids,
+            Err(error) => {
+                self.status = error;
+                return false;
+            }
+        };
+        let Some(preset_state) =
+            preset.matching_vst3_channel_state_for_class_uids(&accepted_class_uids)
+        else {
+            self.status = "This preset has no matching marker-12 VST3 channel state".to_owned();
             return false;
         };
 
@@ -22688,9 +22702,21 @@ impl DawUi {
                 .into_iter()
                 .find(|state| state.channel_id() == channel_id)
         });
-        let matching_state_available = target_state
-            .as_ref()
-            .is_some_and(|target| details.preset.matching_vst3_channel_state(target).is_some());
+        let matching_state_available = target_state.is_some()
+            && target_channel_id
+                .and_then(|channel_id| self.channel_vst3_instances.get(&channel_id).copied())
+                .and_then(|instance_id| {
+                    self.vst3_host
+                        .as_ref()?
+                        .accepted_class_uids(instance_id)
+                        .ok()
+                })
+                .is_some_and(|class_uids| {
+                    details
+                        .preset
+                        .matching_vst3_channel_state_for_class_uids(&class_uids)
+                        .is_some()
+                });
         let apply_available = matching_state_available
             && target_channel_id
                 .is_some_and(|channel_id| self.channel_vst3_instances.contains_key(&channel_id))
