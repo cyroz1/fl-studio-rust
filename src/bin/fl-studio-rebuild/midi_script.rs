@@ -1192,19 +1192,21 @@ impl MidiScriptRuntime {
             if let Some(transport_object) = transport.as_object_mut() {
                 transport_object.insert(
                     "metronome_enabled".to_owned(),
-                    json!(self
-                        .transport_state
-                        .metronome_enabled
-                        .load(Ordering::Relaxed)
-                        != 0),
+                    json!(
+                        self.transport_state
+                            .metronome_enabled
+                            .load(Ordering::Relaxed)
+                            != 0
+                    ),
                 );
                 transport_object.insert(
                     "recording_precount_enabled".to_owned(),
-                    json!(self
-                        .transport_state
-                        .recording_precount_enabled
-                        .load(Ordering::Relaxed)
-                        != 0),
+                    json!(
+                        self.transport_state
+                            .recording_precount_enabled
+                            .load(Ordering::Relaxed)
+                            != 0
+                    ),
                 );
                 transport_object.insert(
                     "playlist_track_count".to_owned(),
