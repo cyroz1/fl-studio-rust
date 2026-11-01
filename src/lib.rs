@@ -29617,10 +29617,7 @@ mod tests {
 
         assert_eq!(replaced, 5);
         assert_eq!(target.channels()[0].id(), 5);
-        assert_eq!(
-            target.channels()[0].display_name().as_deref(),
-            Some("Destination")
-        );
+        assert_eq!(target.channels()[0].display_name(), Some("Destination"));
         let first_channel = target.channels()[0].event_range();
         let applied_name = target.events()[first_channel.clone()]
             .iter()
