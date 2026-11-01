@@ -27921,6 +27921,17 @@ impl FlpDocument {
         self.apply_channel_state_preset_for_type(target_channel_id, preset, ChannelType::Instrument)
     }
 
+    /// Applies one kind-5 Automation Clip channel block from a format-32 preset to an existing
+    /// Automation Clip. The destination ID, name, and project-level target links are retained.
+    /// A copied `0xEA` curve blob must be well-formed; note and Playlist events are excluded.
+    pub fn apply_automation_channel_state_preset(
+        &mut self,
+        target_channel_id: u16,
+        preset: &FstPreset,
+    ) -> Result<usize, FlpError> {
+        self.apply_channel_state_preset_for_type(target_channel_id, preset, ChannelType::Automation)
+    }
+
     fn apply_channel_state_preset_for_type(
         &mut self,
         target_channel_id: u16,
@@ -27955,6 +27966,13 @@ impl FlpDocument {
                 "Audio Clip state import requires matching, recognized project string encodings",
                 "Audio Clip state import requires one well-formed channel marker and name, without note or Playlist events",
             ),
+            ChannelType::Automation => (
+                "Automation Clip state import requires exactly one kind-5 Automation channel",
+                "Automation Clip state import requires a kind-5 Automation target channel",
+                false,
+                "Automation Clip state import requires matching, recognized project string encodings when the preset contains a sample path",
+                "Automation Clip state import requires one well-formed channel marker and name, without note or Playlist events",
+            ),
             _ => {
                 return Err(FlpError::UnsupportedEdit(
                     "state-preset import is not supported for this channel type",
@@ -27987,7 +28005,13 @@ impl FlpDocument {
             return Err(FlpError::UnsupportedEdit(target_channel_error));
         }
 
-        if require_string_encodings
+        let source_range = source_channel.event_range();
+        let target_range = target_channel.event_range();
+        let has_project_string_path = channel_type == ChannelType::Automation
+            && source_range
+                .clone()
+                .any(|index| preset.document().events[index].opcode == 0xC4);
+        if (require_string_encodings || has_project_string_path)
             && (preset.document().project_string_encoding().is_none()
                 || self.project_string_encoding().is_none()
                 || preset.document().project_string_encoding() != self.project_string_encoding())
@@ -27995,8 +28019,6 @@ impl FlpDocument {
             return Err(FlpError::UnsupportedEdit(string_encoding_error));
         }
 
-        let source_range = source_channel.event_range();
-        let target_range = target_channel.event_range();
         let channel_block_is_supported = |events: &[FlpEvent], range: &std::ops::Range<usize>| {
             let markers = range
                 .clone()
@@ -28020,6 +28042,24 @@ impl FlpDocument {
             || !channel_block_is_supported(&self.events, &target_range)
         {
             return Err(FlpError::UnsupportedEdit(channel_block_error));
+        }
+
+        if channel_type == ChannelType::Automation {
+            let source_automation_events = source_range
+                .clone()
+                .filter(|&index| preset.document().events[index].opcode == 0xEA)
+                .collect::<Vec<_>>();
+            if source_automation_events.len() > 1
+                || source_automation_events.first().is_some_and(|&index| {
+                    let event = &preset.document().events[index];
+                    !matches!(event.encoding, PayloadEncoding::Data { .. })
+                        || decode_automation_points(event).is_err()
+                })
+            {
+                return Err(FlpError::UnsupportedEdit(
+                    "Automation Clip state import requires at most one well-formed 0xEA curve blob",
+                ));
+            }
         }
 
         let target_name_event = target_range
@@ -29673,6 +29713,24 @@ mod tests {
         bytes
     }
 
+    fn automation_clip_channel_state_fixture(
+        channel_id: u16,
+        name: &str,
+        automation_state: &[u8],
+        range_state: &[u8],
+    ) -> Vec<u8> {
+        let mut event_stream = Vec::new();
+        append_data_event(&mut event_stream, 0xC7, b"26.0.0\0");
+        event_stream.extend_from_slice(&[0x40]);
+        event_stream.extend_from_slice(&channel_id.to_le_bytes());
+        event_stream.extend_from_slice(&[0x15, 5]);
+        append_data_event(&mut event_stream, 0xDB, range_state);
+        append_data_event(&mut event_stream, 0xEA, automation_state);
+        append_project_info_string(&mut event_stream, 0xCB, name);
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+        flp_fixture(&event_stream, &[], &[])
+    }
+
     #[test]
     fn applies_sampler_channel_state_while_preserving_target_identity_and_project_events() {
         let source_bytes =
@@ -30055,6 +30113,171 @@ mod tests {
 
         assert!(matches!(
             target.apply_audio_clip_channel_state_preset(5, &preset),
+            Err(FlpError::UnsupportedEdit(_))
+        ));
+        assert_eq!(target, before);
+    }
+
+    #[test]
+    fn applies_automation_clip_channel_state_while_preserving_target_identity_and_links() {
+        let source_state_project = FlpDocument::parse(&automation_channel_fixture(
+            &[
+                (0.0, 0.2, -0.5, [1, 2, 3, 4]),
+                (2.5, 0.9, 0.75, [5, 6, 7, 8]),
+            ],
+            &(0..48)
+                .map(|index| (index * 17 % 256) as u8)
+                .collect::<Vec<_>>(),
+        ))
+        .expect("source automation data should parse");
+        let source_state = source_state_project
+            .events()
+            .iter()
+            .find(|event| event.opcode() == 0xEA)
+            .expect("source should have one curve blob")
+            .payload()
+            .to_vec();
+        let source_range = [32_i32.to_le_bytes(), 224_i32.to_le_bytes()].concat();
+        let source = FlpDocument::parse(&automation_clip_channel_state_fixture(
+            8,
+            "Preset Automation",
+            &source_state,
+            &source_range,
+        ))
+        .expect("source Automation Clip project should parse");
+        let preset = FstPreset::parse(
+            &source
+                .encode_channel_state_preset(8)
+                .expect("Automation Clip state should export as format 32"),
+        )
+        .expect("exported Automation Clip preset should parse");
+
+        let target_state_project = FlpDocument::parse(&automation_channel_fixture(
+            &[(0.0, 0.6, 0.0, [9, 10, 11, 12])],
+            &(0..56)
+                .map(|index| (index * 23 % 256) as u8)
+                .collect::<Vec<_>>(),
+        ))
+        .expect("target automation data should parse");
+        let target_state = target_state_project
+            .events()
+            .iter()
+            .find(|event| event.opcode() == 0xEA)
+            .expect("target should have one curve blob")
+            .payload()
+            .to_vec();
+        let target_range = [64_i32.to_le_bytes(), 192_i32.to_le_bytes()].concat();
+        let mut target_stream = Vec::new();
+        append_data_event(&mut target_stream, 0xC7, b"26.0.0\0");
+        append_project_info_string(&mut target_stream, 0xC2, "Project title");
+        target_stream.extend_from_slice(&[0x40, 5, 0, 0x15, 5]);
+        append_data_event(&mut target_stream, 0xDB, &target_range);
+        append_data_event(&mut target_stream, 0xEA, &target_state);
+        append_project_info_string(&mut target_stream, 0xCB, "Destination Automation");
+        target_stream.extend_from_slice(&[0x40, 6, 0, 0x15, 0]);
+        append_project_info_string(&mut target_stream, 0xCB, "Sibling");
+        target_stream.extend_from_slice(&[0x62, 0, 0]);
+        append_data_event(&mut target_stream, 0xE3, &[0x5A; 20]);
+        let mut target = FlpDocument::parse(&flp_fixture(&target_stream, &[], &[]))
+            .expect("target project with a project-level automation link should parse");
+        let target_name_bytes = target.events()[target.channels()[0].event_range()]
+            .iter()
+            .find(|event| event.opcode() == 0xCB)
+            .expect("target Automation Clip should have a name")
+            .wire_bytes()
+            .to_vec();
+        let original_project_title = target.events()[1].wire_bytes().to_vec();
+        let original_sibling = target.events()[target.channels()[1].event_range()]
+            .iter()
+            .map(|event| event.wire_bytes().to_vec())
+            .collect::<Vec<_>>();
+        let original_link = target
+            .events()
+            .iter()
+            .find(|event| event.opcode() == 0xE3)
+            .expect("target project should have an automation link")
+            .wire_bytes()
+            .to_vec();
+
+        let replaced = target
+            .apply_automation_channel_state_preset(5, &preset)
+            .expect("compatible Automation Clip state should apply");
+
+        assert_eq!(replaced, 5);
+        assert_eq!(target.channels()[0].id(), 5);
+        assert_eq!(target.channels()[0].kind(), Some(5));
+        assert_eq!(
+            target.channels()[0].display_name(),
+            Some("Destination Automation")
+        );
+        let target_range = target.channels()[0].event_range();
+        let channel_events = &target.events()[target_range.clone()];
+        assert_eq!(
+            channel_events
+                .iter()
+                .find(|event| event.opcode() == 0xCB)
+                .expect("target Automation Clip should retain its name event")
+                .wire_bytes(),
+            target_name_bytes
+        );
+        assert!(
+            channel_events
+                .iter()
+                .any(|event| { event.opcode() == 0xEA && event.payload() == source_state })
+        );
+        assert!(
+            channel_events
+                .iter()
+                .any(|event| { event.opcode() == 0xDB && event.payload() == source_range })
+        );
+        assert_eq!(target.events()[1].wire_bytes(), original_project_title);
+        assert_eq!(
+            target.events()[target.channels()[1].event_range()]
+                .iter()
+                .map(|event| event.wire_bytes().to_vec())
+                .collect::<Vec<_>>(),
+            original_sibling
+        );
+        assert_eq!(
+            target
+                .events()
+                .iter()
+                .find(|event| event.opcode() == 0xE3)
+                .expect("the target automation link should remain")
+                .wire_bytes(),
+            original_link
+        );
+        assert_eq!(
+            target.events()[target_range.start].payload(),
+            &5_u16.to_le_bytes()
+        );
+    }
+
+    #[test]
+    fn automation_channel_state_import_rejects_malformed_curve_blob_atomically() {
+        let source = FlpDocument::parse(&automation_clip_channel_state_fixture(
+            8,
+            "Malformed Automation",
+            &[0xA7; 8],
+            &[0; 8],
+        ))
+        .expect("source Automation Clip project should parse despite malformed curve data");
+        let preset = FstPreset::parse(
+            &source
+                .encode_channel_state_preset(8)
+                .expect("malformed Automation Clip state should still export losslessly"),
+        )
+        .expect("exported malformed Automation Clip preset should parse losslessly");
+        let mut target_stream = Vec::new();
+        target_stream.extend_from_slice(&[0x40, 5, 0, 0x15, 5]);
+        append_data_event(&mut target_stream, 0xCB, b"Destination\0");
+        target_stream.extend_from_slice(&[0x62, 0, 0]);
+        let mut target = FlpDocument::parse(&flp_fixture(&target_stream, &[], &[]))
+            .expect("target Automation Clip project should parse");
+        let before = target.clone();
+
+        assert!(matches!(
+            target.apply_automation_channel_state_preset(5, &preset),
             Err(FlpError::UnsupportedEdit(_))
         ));
         assert_eq!(target, before);
