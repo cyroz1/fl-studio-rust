@@ -717,6 +717,8 @@ pub(crate) struct SamplerFileMetadata {
     pub(crate) acid_loop_tempo_bpm: Option<f64>,
     /// ACID loop beat count paired with `acid_loop_tempo_bpm` for valid stretch-enabled loops.
     pub(crate) acid_loop_beat_count: Option<u32>,
+    /// Decoded WAVE duration when its `fact` or PCM `data` chunks provide a reliable frame count.
+    pub(crate) wave_source_duration_seconds: Option<f64>,
 }
 
 /// Read standard sampler metadata from a RIFF/WAVE file.
@@ -753,6 +755,11 @@ pub(crate) fn wav_sampler_metadata(path: &Path) -> Option<SamplerFileMetadata> {
     let mut backward_loop = None;
     let mut acid_loop_tempo_bpm = None;
     let mut acid_loop_beat_count = None;
+    let mut wave_format_tag = None;
+    let mut wave_sample_rate = None;
+    let mut wave_block_align = None;
+    let mut wave_fact_frame_count = None;
+    let mut wave_data_byte_count = 0_u64;
     while cursor.checked_add(8)? <= riff_end {
         file.seek(SeekFrom::Start(cursor)).ok()?;
         let mut chunk_header = [0; 8];
@@ -765,6 +772,29 @@ pub(crate) fn wav_sampler_metadata(path: &Path) -> Option<SamplerFileMetadata> {
         }
 
         match &chunk_header[..4] {
+            b"fmt " if chunk_size >= 16 && wave_format_tag.is_none() => {
+                file.seek(SeekFrom::Start(body_start)).ok()?;
+                let mut format = [0; 40];
+                let format_size = usize::try_from(chunk_size.min(format.len() as u64)).ok()?;
+                file.read_exact(&mut format[..format_size]).ok()?;
+                let format_tag = u16::from_le_bytes(format[..2].try_into().ok()?);
+                wave_format_tag = Some(if format_tag == 0xfffe && format_size >= 26 {
+                    u16::from_le_bytes(format[24..26].try_into().ok()?)
+                } else {
+                    format_tag
+                });
+                wave_sample_rate = Some(u32::from_le_bytes(format[4..8].try_into().ok()?));
+                wave_block_align = Some(u16::from_le_bytes(format[12..14].try_into().ok()?));
+            }
+            b"fact" if chunk_size >= 4 && wave_fact_frame_count.is_none() => {
+                file.seek(SeekFrom::Start(body_start)).ok()?;
+                let mut fact = [0; 4];
+                file.read_exact(&mut fact).ok()?;
+                wave_fact_frame_count = Some(u32::from_le_bytes(fact));
+            }
+            b"data" => {
+                wave_data_byte_count = wave_data_byte_count.checked_add(chunk_size)?;
+            }
             b"acid" if chunk_size >= 24 && acid_loop_tempo_bpm.is_none() => {
                 file.seek(SeekFrom::Start(body_start)).ok()?;
                 let mut acid = [0; 24];
@@ -876,6 +906,23 @@ pub(crate) fn wav_sampler_metadata(path: &Path) -> Option<SamplerFileMetadata> {
         }
     }
 
+    let wave_source_duration_seconds = (|| {
+        let sample_rate = wave_sample_rate.filter(|sample_rate| *sample_rate > 0)?;
+        let frame_count = wave_fact_frame_count
+            .filter(|frame_count| *frame_count > 0)
+            .map(u64::from)
+            .or_else(|| {
+                if !matches!(wave_format_tag, Some(1 | 3)) {
+                    return None;
+                }
+                let block_align = u64::from(wave_block_align.filter(|align| *align > 0)?);
+                (wave_data_byte_count > 0 && wave_data_byte_count.is_multiple_of(block_align))
+                    .then_some(wave_data_byte_count / block_align)
+            })?;
+        let duration = frame_count as f64 / f64::from(sample_rate);
+        (duration.is_finite() && duration > 0.0).then_some(duration)
+    })();
+
     let metadata = SamplerFileMetadata {
         root_key: inst_root_key.or(smpl_root_key),
         fine_tune_cents: inst_fine_tune_cents.or(smpl_fine_tune_cents),
@@ -889,6 +936,7 @@ pub(crate) fn wav_sampler_metadata(path: &Path) -> Option<SamplerFileMetadata> {
         release_ping_pong_loop: None,
         acid_loop_tempo_bpm,
         acid_loop_beat_count,
+        wave_source_duration_seconds,
     };
     (metadata.root_key.is_some()
         || metadata.gain_db.is_some()
@@ -1033,6 +1081,7 @@ pub(crate) fn aiff_sampler_metadata(path: &Path) -> Option<SamplerFileMetadata> 
         release_ping_pong_loop,
         acid_loop_tempo_bpm: None,
         acid_loop_beat_count: None,
+        wave_source_duration_seconds: None,
     };
     (metadata.root_key.is_some()
         || metadata.gain_db.is_some()
@@ -1221,7 +1270,18 @@ fn decode_audio_preview_with_tempo_from_position(
     project_tempo_bpm: f64,
 ) -> Result<Vec<f32>, String> {
     let path = path.as_ref();
-    let Some((beat_count, source_tempo_bpm)) = wave_acid_loop_tempo_metadata(path) else {
+    let Some(metadata) = wav_sampler_metadata(path) else {
+        return decode_audio_preview_without_tempo_sync(
+            path,
+            output_sample_rate,
+            maximum_seconds,
+            start_fraction,
+        );
+    };
+    let Some((beat_count, source_tempo_bpm)) = metadata
+        .acid_loop_beat_count
+        .zip(metadata.acid_loop_tempo_bpm)
+    else {
         return decode_audio_preview_without_tempo_sync(
             path,
             output_sample_rate,
@@ -1245,6 +1305,13 @@ fn decode_audio_preview_with_tempo_from_position(
     }
 
     let estimated_stretch_ratio = source_tempo_bpm / project_tempo_bpm;
+    let metadata_stretch_ratio = metadata
+        .wave_source_duration_seconds
+        .map(|source_duration_seconds| {
+            (f64::from(beat_count) * 60.0 / project_tempo_bpm) / source_duration_seconds
+        })
+        .filter(|ratio| ratio.is_finite() && *ratio > 0.0);
+    let estimated_stretch_ratio = metadata_stretch_ratio.unwrap_or(estimated_stretch_ratio);
     let estimated_maximum_source_seconds =
         maximum_seconds.map(|seconds| seconds / estimated_stretch_ratio);
     let audio = decode_audio_file_for_preview(
@@ -1260,8 +1327,12 @@ fn decode_audio_preview_with_tempo_from_position(
         return Err(format!("sample {} has no audio frames", path.display()));
     }
     let decoded_full_source = start_fraction.is_some()
-        || estimated_maximum_source_seconds
-            .is_none_or(|maximum| source_duration_seconds + f64::EPSILON < maximum);
+        || estimated_maximum_source_seconds.is_none_or(|maximum| {
+            metadata
+                .wave_source_duration_seconds
+                .is_some_and(|duration| duration <= maximum)
+                || source_duration_seconds + f64::EPSILON < maximum
+        });
     let stretch_ratio = if decoded_full_source {
         (f64::from(beat_count) * 60.0 / project_tempo_bpm) / source_duration_seconds
     } else {
@@ -2974,6 +3045,15 @@ mod tests {
             decode_audio_preview_from_position_with_tempo(&path, 8_000, Some(0.25), 0.25, 200.0)
                 .unwrap();
         assert_eq!(metadata_sized_from_position.len(), 2_000 * 2);
+
+        fs::write(&path, pcm16_wav_with_acid_fixture(4, 4, 100.0, 192_000)).unwrap();
+        assert_eq!(
+            wav_sampler_metadata(&path).and_then(|metadata| metadata.wave_source_duration_seconds),
+            Some(24.0)
+        );
+        let bounded_metadata_sized =
+            decode_audio_preview_with_tempo(&path, 8_000, Some(5.0), 200.0).unwrap();
+        assert_eq!(bounded_metadata_sized.len(), 9_600 * 2);
 
         fs::write(&path, pcm16_wav_with_acid_fixture(5, 4, 100.0, 8_000)).unwrap();
         let one_shot = decode_audio_preview_with_tempo(&path, 8_000, None, 200.0).unwrap();
