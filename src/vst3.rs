@@ -7828,6 +7828,31 @@ impl Vst3HostRuntime {
             .collect()
     }
 
+    /// Unloads one hosted instance, closing its editor and releasing its plug-in state.
+    pub fn unload_instance(&mut self, id: u64) -> Result<(), String> {
+        let index = self
+            .loaded
+            .iter()
+            .position(|loaded| loaded.info.id == id)
+            .ok_or_else(|| format!("no loaded VST3 instance with id {id}"))?;
+        let mut loaded = self.loaded.remove(index);
+        self.pending_latency_refresh.remove(&id);
+        self.manual_latency_offset_overrides.remove(&id);
+
+        let close_result = if loaded.editor_open {
+            loaded
+                .plugin
+                .lock()
+                .map_err(|_| "plug-in state lock was poisoned".to_owned())
+                .and_then(|mut plugin| plugin.close_editor().map_err(|error| error.to_string()))
+        } else {
+            Ok(())
+        };
+        loaded.editor_open = false;
+        drop(loaded);
+        close_result
+    }
+
     /// Apply a latency report received from an active Playlist processor.
     pub fn apply_latency_report(&mut self, report: Vst3LatencyReport) {
         if let Some(loaded) = self

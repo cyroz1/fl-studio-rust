@@ -155,15 +155,16 @@ use midi_output::{
 use midi_script::{
     MidiControllerScript, MidiScriptTransportState, MixerSendRouteSnapshot, MixerTrackFlag,
     MixerTrackParameter, PlaylistTrackPerformanceParameter, SCRIPT_BEAT_INDICATOR_BAR,
-    SCRIPT_BEAT_INDICATOR_BEAT, SCRIPT_BEAT_INDICATOR_OFF, SCRIPT_CHANNEL_EVENT_NEW,
-    SCRIPT_CHANNEL_EVENT_RENAME, SCRIPT_CHANNEL_EVENT_REPLACE, SCRIPT_CHANNEL_EVENT_SELECT,
-    SCRIPT_HW_CHANNEL_EVENT, SCRIPT_HW_DIRTY_CHANNEL_RACK_GROUP, SCRIPT_HW_DIRTY_COLORS,
-    SCRIPT_HW_DIRTY_CONTROL_VALUES, SCRIPT_HW_DIRTY_FOCUSED_WINDOW, SCRIPT_HW_DIRTY_MIXER_CONTROLS,
-    SCRIPT_HW_DIRTY_MIXER_DISPLAY, SCRIPT_HW_DIRTY_MIXER_SEL, SCRIPT_HW_DIRTY_NAMES,
-    SCRIPT_HW_DIRTY_UNDO, SCRIPT_MIXER_SCROLL_TO_MAKE_VISIBLE, SCRIPT_PROJECT_LOAD_ERROR,
-    SCRIPT_PROJECT_LOAD_OK, SCRIPT_PROJECT_LOAD_START, SCRIPT_TRANSPORT_PATTERN_MODE,
-    SCRIPT_TRANSPORT_PLAYING, SCRIPT_TRANSPORT_RECORDING, absolute_song_position_ticks,
-    discover_midi_scripts, find_script_for_device, normalized_song_position, song_position_ticks,
+    SCRIPT_BEAT_INDICATOR_BEAT, SCRIPT_BEAT_INDICATOR_OFF, SCRIPT_CHANNEL_EVENT_DELETE,
+    SCRIPT_CHANNEL_EVENT_NEW, SCRIPT_CHANNEL_EVENT_RENAME, SCRIPT_CHANNEL_EVENT_REPLACE,
+    SCRIPT_CHANNEL_EVENT_SELECT, SCRIPT_HW_CHANNEL_EVENT, SCRIPT_HW_DIRTY_CHANNEL_RACK_GROUP,
+    SCRIPT_HW_DIRTY_COLORS, SCRIPT_HW_DIRTY_CONTROL_VALUES, SCRIPT_HW_DIRTY_FOCUSED_WINDOW,
+    SCRIPT_HW_DIRTY_MIXER_CONTROLS, SCRIPT_HW_DIRTY_MIXER_DISPLAY, SCRIPT_HW_DIRTY_MIXER_SEL,
+    SCRIPT_HW_DIRTY_NAMES, SCRIPT_HW_DIRTY_UNDO, SCRIPT_MIXER_SCROLL_TO_MAKE_VISIBLE,
+    SCRIPT_PROJECT_LOAD_ERROR, SCRIPT_PROJECT_LOAD_OK, SCRIPT_PROJECT_LOAD_START,
+    SCRIPT_TRANSPORT_PATTERN_MODE, SCRIPT_TRANSPORT_PLAYING, SCRIPT_TRANSPORT_RECORDING,
+    absolute_song_position_ticks, discover_midi_scripts, find_script_for_device,
+    normalized_song_position, song_position_ticks,
 };
 use midi_thru::{MidiThruSettings, MidiThruWorker};
 
@@ -9170,6 +9171,226 @@ impl DawUi {
                 self.status = format!("Could not delete display group: {error}");
             }
             None => self.status = "Open a project before deleting a display group".to_owned(),
+        }
+    }
+
+    fn delete_channels_from_ui(&mut self, channel_ids: &[u16]) {
+        let Some(document) = self.document.as_ref() else {
+            self.status = "Open a project before deleting Channel Rack channels".to_owned();
+            return;
+        };
+        let channels_before = document.channels();
+        let previous_blocks = channels_before
+            .iter()
+            .map(|channel| {
+                (
+                    channel.id(),
+                    (
+                        channel.display_name().map(str::to_owned),
+                        document.events()[channel.event_range()].to_vec(),
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut channel_notifications = channel_ids
+            .iter()
+            .filter_map(|channel_id| {
+                channels_before
+                    .iter()
+                    .position(|channel| channel.id() == *channel_id)
+                    .and_then(|index| i32::try_from(index).ok())
+                    .map(|index| (index, SCRIPT_CHANNEL_EVENT_DELETE))
+            })
+            .collect::<Vec<_>>();
+        channel_notifications.sort_by_key(|(index, _)| std::cmp::Reverse(*index));
+
+        let result = self
+            .document
+            .as_mut()
+            .map(|document| document.delete_channels(channel_ids));
+        match result {
+            Some(Ok(())) => {
+                self.stop_project_playback();
+                let deleted_ids = channel_ids.iter().copied().collect::<BTreeSet<_>>();
+                let mut cleanup_errors = Vec::new();
+
+                if let Some(document) = self.document.as_ref() {
+                    let channels_after = document.channels();
+                    for (channel_id, (previous_name, previous_events)) in &previous_blocks {
+                        if deleted_ids.contains(channel_id) {
+                            continue;
+                        }
+                        let Some((channel_index, channel)) = channels_after
+                            .iter()
+                            .enumerate()
+                            .find(|(_, channel)| channel.id() == *channel_id)
+                        else {
+                            continue;
+                        };
+                        if document.events().get(channel.event_range())
+                            == Some(previous_events.as_slice())
+                        {
+                            continue;
+                        }
+                        let flag = if channel.display_name() != previous_name.as_deref() {
+                            SCRIPT_CHANNEL_EVENT_RENAME
+                        } else {
+                            SCRIPT_CHANNEL_EVENT_REPLACE
+                        };
+                        if let Ok(index) = i32::try_from(channel_index) {
+                            channel_notifications.push((index, flag));
+                        }
+                    }
+                }
+
+                let vst3_instance_ids = deleted_ids
+                    .iter()
+                    .filter_map(|channel_id| self.channel_vst3_instances.remove(channel_id))
+                    .collect::<BTreeSet<_>>();
+                if let Some(host) = self.vst3_host.as_mut() {
+                    for instance_id in &vst3_instance_ids {
+                        if let Err(error) = host.unload_instance(*instance_id) {
+                            cleanup_errors.push(format!("VST3 channel: {error}"));
+                        }
+                    }
+                }
+                self.vst3_manual_latency_offset_keys
+                    .retain(|instance_id, _| !vst3_instance_ids.contains(instance_id));
+                self.vst3_manual_latency_offset_labels
+                    .retain(|instance_id, _| !vst3_instance_ids.contains(instance_id));
+                let project_latency_offset_count = self.vst3_project_manual_latency_offsets.len();
+                self.vst3_project_manual_latency_offsets.retain(|key, _| {
+                    !deleted_ids
+                        .iter()
+                        .any(|channel_id| key.starts_with(&format!("channel\t{channel_id}\t")))
+                });
+                if self.vst3_project_manual_latency_offsets.len() < project_latency_offset_count
+                    && let Some(project_path) = self.current_path.as_deref()
+                    && let Err(error) = save_vst3_project_manual_latency_offsets(
+                        &stable_project_id(project_path),
+                        &self.vst3_project_manual_latency_offsets,
+                    )
+                {
+                    cleanup_errors.push(format!("VST3 latency settings: {error}"));
+                }
+
+                let mut clap_assignments_changed = false;
+                for channel_id in &deleted_ids {
+                    clap_assignments_changed |= self
+                        .clap_pattern_playback_instruments
+                        .remove(channel_id)
+                        .is_some();
+                }
+                self.clap_parameter_overrides
+                    .retain(|(channel_id, _, _, _), _| !deleted_ids.contains(channel_id));
+                self.clap_pattern_preview_states
+                    .retain(|(_, _, _, channel_id), _| !deleted_ids.contains(channel_id));
+                self.clap_instrument_editor_processes
+                    .retain(|editor| !deleted_ids.contains(&editor.channel_id));
+                if self
+                    .pending_clap_parameter_edit
+                    .as_ref()
+                    .is_some_and(|edit| deleted_ids.contains(&edit.channel_id))
+                {
+                    self.pending_clap_parameter_edit = None;
+                }
+                if self
+                    .pending_clap_state_capture
+                    .as_ref()
+                    .is_some_and(|capture| deleted_ids.contains(&capture.channel_id))
+                {
+                    self.pending_clap_state_capture = None;
+                }
+                if clap_assignments_changed {
+                    self.invalidate_clap_playlist_audio();
+                    if let Some(project_path) = self.current_path.as_deref()
+                        && let Err(error) = save_clap_project_instruments(
+                            &stable_project_id(project_path),
+                            &self.clap_pattern_playback_instruments,
+                        )
+                    {
+                        cleanup_errors.push(format!("CLAP assignments: {error}"));
+                    }
+                }
+
+                let channels_after = self
+                    .document
+                    .as_ref()
+                    .map(FlpDocument::channels)
+                    .unwrap_or_default();
+                let remaining_ids = channels_after
+                    .iter()
+                    .map(ChannelSummary::id)
+                    .collect::<BTreeSet<_>>();
+                self.selected_rack_channels
+                    .retain(|channel_id| remaining_ids.contains(channel_id));
+                if self
+                    .selected_graph_channel
+                    .is_none_or(|channel_id| !remaining_ids.contains(&channel_id))
+                {
+                    self.selected_graph_channel = channels_after.first().map(ChannelSummary::id);
+                }
+                if self
+                    .selected_note_channel
+                    .is_none_or(|channel_id| !remaining_ids.contains(&channel_id))
+                {
+                    self.selected_note_channel = channels_after.first().map(ChannelSummary::id);
+                }
+                if self.selected_rack_channels.is_empty()
+                    && let Some(channel_id) = self.selected_graph_channel
+                {
+                    self.selected_rack_channels.insert(channel_id);
+                }
+                if self
+                    .rack_selection_anchor
+                    .is_none_or(|channel_id| !remaining_ids.contains(&channel_id))
+                {
+                    self.rack_selection_anchor = self.selected_graph_channel;
+                }
+                if self
+                    .selected_automation_channel
+                    .is_some_and(|channel_id| deleted_ids.contains(&channel_id))
+                {
+                    self.selected_automation_channel = self
+                        .document
+                        .as_ref()
+                        .and_then(|document| document.automation_channels().ok())
+                        .and_then(|automation| {
+                            automation.first().map(AutomationChannel::channel_id)
+                        });
+                    self.selected_automation_point = None;
+                }
+                self.selected_note = None;
+                self.selected_piano_notes
+                    .retain(|(_, channel_id, _)| !deleted_ids.contains(channel_id));
+                self.selected_clip = None;
+                self.selected_playlist_clips.clear();
+                self.active_playlist_clip_drag = None;
+                self.dirty = true;
+                self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+                self.status = format!(
+                    "Deleted {} Channel Rack channel{}",
+                    deleted_ids.len(),
+                    if deleted_ids.len() == 1 { "" } else { "s" }
+                );
+                if !cleanup_errors.is_empty() {
+                    self.status.push_str(" · cleanup issue: ");
+                    self.status.push_str(&cleanup_errors.join("; "));
+                }
+                if !channel_notifications.is_empty()
+                    && !self.notify_midi_script_channel_events_changed(
+                        &channel_notifications,
+                        SCRIPT_HW_CHANNEL_EVENT,
+                    )
+                {
+                    self.status
+                        .push_str(" · MIDI script channel refresh callback queue is full");
+                }
+            }
+            Some(Err(error)) => {
+                self.status = format!("Could not delete Channel Rack channels: {error}");
+            }
+            None => {}
         }
     }
 
@@ -38155,6 +38376,7 @@ impl DawUi {
         let mut delete_group = None;
         let mut save_channel_preset = None;
         let mut duplicate_channel_request = None;
+        let mut delete_channels_request = None;
         let mut channel_enabled_edits = Vec::new();
         let mut channel_sample_reverse_edits = Vec::new();
         let mut channel_sample_effect_edits = Vec::new();
@@ -38168,21 +38390,25 @@ impl DawUi {
         let mut channel_zipped_edits = Vec::new();
         let mut playlist_clap_control_link_edits = Vec::new();
         let mut playlist_clap_control_unlink_edits = Vec::new();
-        let (zip_selected, unzip_all, group_selected, previous_group, next_group) =
+        let (zip_selected, unzip_all, group_selected, delete_selected, previous_group, next_group) =
             if ui.memory(|memory| memory.focused().is_none()) {
                 ui.input_mut(|input| {
                     (
                         input.consume_key(egui::Modifiers::ALT, egui::Key::Z),
                         input.consume_key(egui::Modifiers::ALT, egui::Key::U),
                         input.consume_key(egui::Modifiers::ALT, egui::Key::G),
+                        input.consume_key(egui::Modifiers::ALT, egui::Key::Delete),
                         input.consume_key(egui::Modifiers::NONE, egui::Key::PageUp),
                         input.consume_key(egui::Modifiers::NONE, egui::Key::PageDown),
                     )
                 })
             } else {
-                (false, false, false, false, false)
+                (false, false, false, false, false, false)
             };
         open_group_dialog |= group_selected;
+        if delete_selected && !self.selected_rack_channels.is_empty() {
+            delete_channels_request = Some(self.selected_rack_channels.iter().copied().collect());
+        }
         if previous_group {
             self.channel_display_filter =
                 self.channel_display_filter.step_group(&group_indices, -1);
@@ -38813,6 +39039,23 @@ impl DawUi {
                                             }
                                         }
                                     });
+                                }
+                                let delete_channel_ids = if channel_selected {
+                                    self.selected_rack_channels
+                                        .iter()
+                                        .copied()
+                                        .collect::<Vec<_>>()
+                                } else {
+                                    vec![channel.id()]
+                                };
+                                let delete_label = if delete_channel_ids.len() == 1 {
+                                    "Delete channel".to_owned()
+                                } else {
+                                    format!("Delete {} selected channels", delete_channel_ids.len())
+                                };
+                                if ui.button(delete_label).clicked() {
+                                    delete_channels_request = Some(delete_channel_ids);
+                                    ui.close();
                                 }
                                 if ui
                                     .add_enabled(
@@ -40127,6 +40370,9 @@ impl DawUi {
                 }
                 None => {}
             }
+        }
+        if let Some(channel_ids) = delete_channels_request {
+            self.delete_channels_from_ui(&channel_ids);
         }
         let mut channel_event_candidate_ids = BTreeSet::new();
         channel_event_candidate_ids.extend(channel_enabled_edits.iter().map(|(id, _)| *id));

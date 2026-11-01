@@ -1056,6 +1056,13 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_channel_group_index(group_index)?,
             )
         }
+        [command, input, output, channel_ids] if command == "delete-channels" => {
+            delete_channels(
+                Path::new(input),
+                Path::new(output),
+                &parse_channel_id_list(channel_ids)?,
+            )
+        }
         [command, input, output, channel_id, color] if command == "set-channel-color" => {
             set_channel_color(
                 Path::new(input),
@@ -4971,6 +4978,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild group-channels <input.flp> <output.flp> <channel-ids:comma-separated> <name>\n",
             "  flp-rebuild rename-channel-group <input.flp> <output.flp> <group-index> <name>\n",
             "  flp-rebuild delete-channel-group <input.flp> <output.flp> <group-index>\n",
+            "  flp-rebuild delete-channels <input.flp> <output.flp> <channel-ids:comma-separated>\n",
             "  flp-rebuild set-channel-color <input.flp> <output.flp> <channel-id> <RRGGBB>\n",
             "  flp-rebuild move-channel <input.flp> <output.flp> <channel-id> <target-index:zero-based>\n",
             "  flp-rebuild reorder-channels <input.flp> <output.flp> <complete-channel-id-order:comma-separated>\n",
@@ -7664,6 +7672,15 @@ fn delete_channel_group(input: &Path, output: &Path, group_index: i32) -> Result
             .delete_channel_group(group_index)
             .map_err(|error| error.to_string())?;
         Ok(format!("deleted Channel Rack group {group_index}"))
+    })
+}
+
+fn delete_channels(input: &Path, output: &Path, channel_ids: &[u16]) -> Result<(), String> {
+    edit_channel_groups(input, output, |document| {
+        document
+            .delete_channels(channel_ids)
+            .map_err(|error| error.to_string())?;
+        Ok(format!("deleted Channel Rack channels {channel_ids:?}"))
     })
 }
 

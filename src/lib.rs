@@ -26869,6 +26869,146 @@ impl FlpDocument {
         Ok(())
     }
 
+    /// Deletes one or more Channel Rack channels and removes their linked score data.
+    ///
+    /// Notes assigned to the deleted channels, recognized Playlist clips targeting those
+    /// channels, and Layer child references to them are removed. Unrelated event bytes and
+    /// channel IDs are retained. The edit is atomic if any referenced data cannot be decoded.
+    pub fn delete_channels(&mut self, channel_ids: &[u16]) -> Result<(), FlpError> {
+        if channel_ids.is_empty() {
+            return Err(FlpError::UnsupportedEdit(
+                "at least one Channel Rack channel must be selected",
+            ));
+        }
+
+        let channels = self.channels();
+        let mut deleted_ids = BTreeSet::new();
+        let mut deleted_channels = Vec::with_capacity(channel_ids.len());
+        for &channel_id in channel_ids {
+            if !deleted_ids.insert(channel_id) {
+                return Err(FlpError::AmbiguousChannelId(channel_id));
+            }
+            self.require_unique_channel(channel_id)?;
+            let channel = channels
+                .iter()
+                .find(|channel| channel.id() == channel_id)
+                .expect("a unique channel was checked above");
+            deleted_channels.push(channel.clone());
+        }
+
+        let remaining_count =
+            channels
+                .len()
+                .checked_sub(deleted_ids.len())
+                .ok_or(FlpError::UnsupportedEdit(
+                    "the selected channels are not present in the Channel Rack",
+                ))?;
+        let remaining_count = u16::try_from(remaining_count).map_err(|_| {
+            FlpError::UnsupportedEdit("the project has too many channels to update its header")
+        })?;
+
+        let playlist_target_ids = deleted_channels
+            .iter()
+            .filter(|channel| matches!(channel.kind(), Some(4 | 5)))
+            .map(ChannelSummary::id)
+            .collect::<BTreeSet<_>>();
+        let mut candidate = self.clone();
+
+        if !playlist_target_ids.is_empty() {
+            let arrangements = candidate.arrangements()?;
+            let mut arrangement_ids = BTreeSet::new();
+            let mut clips_to_delete = Vec::new();
+            for arrangement in arrangements {
+                if !arrangement_ids.insert(arrangement.id) {
+                    return Err(FlpError::UnsupportedEdit(
+                        "a Playlist arrangement ID is ambiguous",
+                    ));
+                }
+                clips_to_delete.extend(arrangement.clips.iter().enumerate().filter_map(
+                    |(clip_index, clip)| {
+                        matches!(
+                            clip.target(),
+                            PlaylistClipTarget::Channel { id }
+                                if playlist_target_ids.contains(&id)
+                        )
+                        .then_some((arrangement.id, clip_index))
+                    },
+                ));
+            }
+            clips_to_delete.sort_by_key(|(arrangement_id, clip_index)| {
+                (*arrangement_id, std::cmp::Reverse(*clip_index))
+            });
+            for (arrangement_id, clip_index) in clips_to_delete {
+                candidate.delete_playlist_clip(arrangement_id, clip_index)?;
+            }
+        }
+
+        for event in &mut candidate.events {
+            if !Self::is_pattern_note_event(event) {
+                continue;
+            }
+            let (records, remainder) = event.payload.as_chunks::<FLP_NOTE_RECORD_SIZE>();
+            if !remainder.is_empty() {
+                return Err(FlpError::InvalidEvent {
+                    offset: event.file_offset,
+                    detail: "pattern note payload is not a whole number of 24-byte records",
+                });
+            }
+            if records
+                .iter()
+                .any(|record| deleted_ids.contains(&PatternNote::decode(record).channel_id))
+            {
+                let mut replacement = Vec::with_capacity(event.payload.len());
+                for record in records {
+                    if !deleted_ids.contains(&PatternNote::decode(record).channel_id) {
+                        replacement.extend_from_slice(record);
+                    }
+                }
+                event.replace_data_payload(replacement)?;
+            }
+        }
+
+        let mut deleted_channels_by_index = deleted_channels;
+        deleted_channels_by_index
+            .sort_by_key(|channel| std::cmp::Reverse(channel.first_event_index));
+        for channel in deleted_channels_by_index {
+            let range = channel.event_range();
+            if range.start >= range.end || range.end > candidate.events.len() {
+                return Err(FlpError::UnsupportedEdit(
+                    "Channel Rack event ranges are inconsistent",
+                ));
+            }
+            candidate.events.drain(range);
+        }
+
+        let mut layer_child_events_to_remove = Vec::new();
+        for channel in candidate.channels() {
+            if channel.channel_type() != Some(ChannelType::Layer) {
+                continue;
+            }
+            for event_index in channel.event_range() {
+                let event = &candidate.events[event_index];
+                if event.opcode == 0x5E
+                    && event.encoding == PayloadEncoding::Word
+                    && event.payload.len() == 2
+                    && deleted_ids
+                        .contains(&u16::from_le_bytes([event.payload[0], event.payload[1]]))
+                {
+                    layer_child_events_to_remove.push(event_index);
+                }
+            }
+        }
+        layer_child_events_to_remove.sort_unstable_by(|left, right| right.cmp(left));
+        for event_index in layer_child_events_to_remove {
+            candidate.events.remove(event_index);
+        }
+
+        candidate.header.legacy_channel_count = remaining_count;
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
     /// Reorders every channel using a stable Channel Rack sort while preserving each channel's
     /// complete event block and ID. Name sorting is case-insensitive; color sorting follows hue
     /// from red through violet, then achromatic and uncolored channels; type sorting follows the
