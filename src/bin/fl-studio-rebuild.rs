@@ -40832,7 +40832,7 @@ impl DawUi {
                                                 ));
                                             }
                                             ui.small(
-                                                "Saved filter settings and Pattern/Playlist note Mod X/Mod Y affect Sampler playback with provisional scaling; Mod X/Mod Y envelopes, LFOs, and live MIDI CC remain unsupported.",
+                                                "Saved filter settings, note Mod X/Mod Y, their envelopes and LFOs, and MIDI CC 74/71 affect Sampler playback with provisional scaling; native mapping still needs comparison.",
                                             );
                                         });
                                     }
@@ -41669,7 +41669,7 @@ impl DawUi {
                             });
                             ui.collapsing("Sampler envelopes and LFOs (raw)", |ui| {
                                 ui.small(
-                                    "Edits the five saved targets. Zero-time Volume envelope sustain is applied in playback; other envelope stages and all LFO modulation remain unsupported.",
+                                    "Edits the five saved targets. Panning, Volume, and Pitch envelopes/LFOs affect Sampler playback; Mod X/Mod Y envelopes and LFOs modulate filter cutoff/resonance. Raw timing, depth, and tension mappings still need native comparison.",
                                 );
                                 for target in SamplerEnvelopeLfoTarget::all() {
                                     if let Some(record) = channel.sampler_envelope_lfo(target) {
