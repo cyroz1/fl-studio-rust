@@ -6,7 +6,7 @@
 
 - **Working foundations:** lossless FLP parsing and round-trip writing, selected project and note edits, MIDI import and partial export, and cross-platform CI packaging.
 - **Partial runtime and editing:** early Playlist, Channel Rack, Piano roll, Mixer, plug-in, and audio views; the Piano roll includes a saved Grouping switch and repeatable Magic Lasso selection; Windows shared and exclusive audio; playback and a first combined WAV render for supported audio clips, Sampler notes, and mapped installed VST3 instruments. Loaded VST3 instances support a machine-local manual PDC offset per class UID, added to reported latency. Supported Mixer direct and complete send paths include live fader, pan, stereo-width, phase, and channel-swap smoothing. Direct-to-Master sources smooth live mute changes, and direct plus complete send-routed paths smooth live solo changes; route and parameter mappings remain provisional.
-- **Major parity gaps:** native-verified Mixer mappings, manual per-track PDC offsets, sidechain audio, broad automation parity, VST compatibility and state write-back, full FL Studio window/control behavior, and verified compatibility across FL Studio versions.
+- **Major parity gaps:** native-verified Mixer mappings (see the [render comparison procedure](docs/native-render-comparison.md)), manual per-track PDC offsets, sidechain audio, broad automation parity, VST compatibility and state write-back, full FL Studio window/control behavior, and verified compatibility across FL Studio versions.
 
 See the roadmap for subsystem-level status and evidence.
 
