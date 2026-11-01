@@ -21203,6 +21203,7 @@ mod tests {
         let source_control = LiveMixerSourceControl::new(
             MixerLiveSourceRoutePlan {
                 track: 1,
+                manual_pdc_offsets_ms_by_track: Vec::new(),
                 source_transform: MixerSourceRouteTransform::default(),
                 saved_fader_gain: 1.0,
                 saved_pan_raw: None,
