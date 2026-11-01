@@ -15,6 +15,36 @@ _mixer_pickup_previous_values = {}
 _tap_tempo_times = []
 _active_midi_input_callback = False
 _has_meters = False
+_MIDI_REFRESH_FLAGS = {
+    "HW_Dirty_Mixer_Sel": 1,
+    "HW_Dirty_Mixer_Display": 2,
+    "HW_Dirty_Mixer_Controls": 4,
+    "HW_Dirty_RemoteLinks": 16,
+    "HW_Dirty_FocusedWindow": 32,
+    "HW_Dirty_Performance": 64,
+    "HW_Dirty_LEDs": 256,
+    "HW_Dirty_RemoteLinkValues": 512,
+    "HW_Dirty_Patterns": 1024,
+    "HW_Dirty_Tracks": 2048,
+    "HW_Dirty_ControlValues": 4096,
+    "HW_Dirty_Colors": 8192,
+    "HW_Dirty_Names": 16384,
+    "HW_Dirty_ChannelRackGroup": 32768,
+    "HW_ChannelEvent": 65536,
+    "HW_Dirty_Undo": 131072,
+    "HW_Dirty_ChannelRack": 262144,
+    "HW_Dirty_GraphEditor": 524288,
+}
+_MIDI_CHANNEL_DIRTY_FLAGS = {
+    "CE_New": 0,
+    "CE_Delete": 1,
+    "CE_Replace": 2,
+    "CE_Rename": 3,
+    "CE_Select": 4,
+}
+_FULL_PROJECT_REFRESH_FLAGS = 0
+for _refresh_flag in _MIDI_REFRESH_FLAGS.values():
+    _FULL_PROJECT_REFRESH_FLAGS |= _refresh_flag
 
 
 def _emit(value):
@@ -2089,6 +2119,8 @@ def _install_modules(script_name, device_name):
         "PIM_AlwaysPickup": 1,
         "PIM_FollowGlobal": 2,
     }
+    constants.update(_MIDI_REFRESH_FLAGS)
+    constants.update(_MIDI_CHANNEL_DIRTY_FLAGS)
     for key, value in constants.items():
         setattr(midi, key, value)
     midi.REC_InitStore = midi.REC_Init | midi.REC_Store
@@ -2332,6 +2364,9 @@ def _dispatch(namespace, value):
         if callback is not None:
             callback(status)
         if status == 100:
+            callback = namespace.get("OnRefresh")
+            if callback is not None:
+                callback(_FULL_PROJECT_REFRESH_FLAGS)
             callback = namespace.get("OnDoFullRefresh")
             if callback is not None:
                 callback()

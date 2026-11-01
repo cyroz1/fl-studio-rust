@@ -4140,6 +4140,32 @@ def OnMidiIn(event):
     }
 
     #[test]
+    fn python_refresh_callback_receives_full_change_mask_after_project_load() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport midi\nimport transport\ndef OnRefresh(flags):\n    expected = (midi.HW_Dirty_Mixer_Sel | midi.HW_Dirty_Mixer_Display | midi.HW_Dirty_Mixer_Controls | midi.HW_Dirty_RemoteLinks | midi.HW_Dirty_FocusedWindow | midi.HW_Dirty_Performance | midi.HW_Dirty_LEDs | midi.HW_Dirty_RemoteLinkValues | midi.HW_Dirty_Patterns | midi.HW_Dirty_Tracks | midi.HW_Dirty_ControlValues | midi.HW_Dirty_Colors | midi.HW_Dirty_Names | midi.HW_Dirty_ChannelRackGroup | midi.HW_ChannelEvent | midi.HW_Dirty_Undo | midi.HW_Dirty_ChannelRack | midi.HW_Dirty_GraphEditor)\n    if flags != expected:\n        raise RuntimeError('project load refresh flags were incomplete')\n    transport.stop()\ndef OnDoFullRefresh():\n    transport.start()\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let mut runtime = MidiScriptRuntime::start_for_device(&script, "Test Input").unwrap();
+
+        assert!(runtime.process_project_load(0).unwrap().actions.is_empty());
+        assert_eq!(
+            runtime.process_project_load(100).unwrap().actions,
+            [ScriptTransportAction::Stop, ScriptTransportAction::Start]
+        );
+        assert!(
+            runtime
+                .process_project_load(101)
+                .unwrap()
+                .actions
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn python_beat_indicator_callback_receives_off_bar_and_beat_values() {
         let temporary = TestDirectory::new();
         let script_path = temporary.path().join("device_test.py");
