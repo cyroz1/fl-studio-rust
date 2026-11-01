@@ -63823,6 +63823,16 @@ impl DawUi {
                             status
                         }
                     });
+                    if !self.notify_midi_script_mixer_tracks_changed(
+                        &[i32::try_from(slot_key.0).unwrap_or(-1)],
+                        SCRIPT_HW_DIRTY_MIXER_DISPLAY
+                            | SCRIPT_HW_DIRTY_MIXER_CONTROLS
+                            | SCRIPT_HW_DIRTY_CONTROL_VALUES
+                            | SCRIPT_HW_DIRTY_NAMES,
+                    ) {
+                        self.status
+                            .push_str(" · MIDI script Mixer refresh callback queue is full");
+                    }
                 }
                 Err(error) => {
                     self.status = format!("Could not save CLAP Mixer effect assignment: {error}");
