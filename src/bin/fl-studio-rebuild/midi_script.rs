@@ -257,6 +257,11 @@ pub const SCRIPT_PROJECT_LOAD_ERROR: i32 = 101;
 pub const SCRIPT_BEAT_INDICATOR_OFF: i32 = 0;
 pub const SCRIPT_BEAT_INDICATOR_BAR: i32 = 1;
 pub const SCRIPT_BEAT_INDICATOR_BEAT: i32 = 2;
+pub const SCRIPT_HW_DIRTY_MIXER_SEL: i32 = 1;
+pub const SCRIPT_HW_DIRTY_MIXER_DISPLAY: i32 = 2;
+pub const SCRIPT_HW_DIRTY_MIXER_CONTROLS: i32 = 4;
+pub const SCRIPT_HW_DIRTY_COLORS: i32 = 8192;
+pub const SCRIPT_HW_DIRTY_NAMES: i32 = 16384;
 pub const SCRIPT_MIXER_SCROLL_TO_MAKE_VISIBLE: u32 = 1 << 0;
 
 pub struct MidiScriptTransportState {
@@ -784,6 +789,22 @@ impl MidiScriptRuntime {
 
     pub fn process_first_connect(&mut self) -> Result<ScriptMidiResult, String> {
         let response = self.exchange(&json!({"first_connect": true}))?;
+        Ok(ScriptMidiResult {
+            handled: false,
+            bytes: Vec::new(),
+            actions: parse_transport_actions(&response)?,
+        })
+    }
+
+    pub fn process_mixer_tracks_changed(
+        &mut self,
+        track_indices: &[i32],
+        refresh_flags: i32,
+    ) -> Result<ScriptMidiResult, String> {
+        let response = self.exchange(&json!({
+            "dirty_mixer_tracks": track_indices,
+            "refresh_flags": refresh_flags,
+        }))?;
         Ok(ScriptMidiResult {
             handled: false,
             bytes: Vec::new(),
@@ -4162,6 +4183,31 @@ def OnMidiIn(event):
                 .unwrap()
                 .actions
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn python_dirty_mixer_track_callbacks_precede_refresh_callback() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            "# name=Test Script\nimport midi\nimport transport\ndef OnDirtyMixerTrack(index):\n    if index == 2:\n        transport.stop()\n    elif index == 5:\n        transport.record()\ndef OnRefresh(flags):\n    expected = midi.HW_Dirty_Mixer_Controls | midi.HW_Dirty_Names\n    if flags != expected:\n        raise RuntimeError('Mixer refresh flags were incorrect')\n    transport.start()\n",
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let mut runtime = MidiScriptRuntime::start_for_device(&script, "Test Input").unwrap();
+
+        assert_eq!(
+            runtime
+                .process_mixer_tracks_changed(&[2, 5], 4 | 16_384)
+                .unwrap()
+                .actions,
+            [
+                ScriptTransportAction::Stop,
+                ScriptTransportAction::RecordToggle,
+                ScriptTransportAction::Start
+            ]
         );
     }
 

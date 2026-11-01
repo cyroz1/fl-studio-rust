@@ -2371,6 +2371,16 @@ def _dispatch(namespace, value):
             if callback is not None:
                 callback()
         return {"handled": False, "actions": _active_transport_actions}
+    if "dirty_mixer_tracks" in value:
+        callback = namespace.get("OnDirtyMixerTrack")
+        if callback is not None:
+            for track_index in value["dirty_mixer_tracks"]:
+                callback(int(track_index))
+        refresh_flags = int(value.get("refresh_flags", 0))
+        callback = namespace.get("OnRefresh")
+        if callback is not None and refresh_flags:
+            callback(refresh_flags)
+        return {"handled": False, "actions": _active_transport_actions}
     if "beat_indicator" in value:
         callback = namespace.get("OnUpdateBeatIndicator")
         if callback is not None:

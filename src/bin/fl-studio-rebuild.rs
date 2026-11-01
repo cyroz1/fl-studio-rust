@@ -155,11 +155,12 @@ use midi_output::{
 use midi_script::{
     MidiControllerScript, MidiScriptTransportState, MixerSendRouteSnapshot, MixerTrackFlag,
     MixerTrackParameter, PlaylistTrackPerformanceParameter, SCRIPT_BEAT_INDICATOR_BAR,
-    SCRIPT_BEAT_INDICATOR_BEAT, SCRIPT_BEAT_INDICATOR_OFF, SCRIPT_MIXER_SCROLL_TO_MAKE_VISIBLE,
-    SCRIPT_PROJECT_LOAD_ERROR, SCRIPT_PROJECT_LOAD_OK, SCRIPT_PROJECT_LOAD_START,
-    SCRIPT_TRANSPORT_PATTERN_MODE, SCRIPT_TRANSPORT_PLAYING, SCRIPT_TRANSPORT_RECORDING,
-    absolute_song_position_ticks, discover_midi_scripts, find_script_for_device,
-    normalized_song_position, song_position_ticks,
+    SCRIPT_BEAT_INDICATOR_BEAT, SCRIPT_BEAT_INDICATOR_OFF, SCRIPT_HW_DIRTY_COLORS,
+    SCRIPT_HW_DIRTY_MIXER_CONTROLS, SCRIPT_HW_DIRTY_MIXER_DISPLAY, SCRIPT_HW_DIRTY_MIXER_SEL,
+    SCRIPT_HW_DIRTY_NAMES, SCRIPT_MIXER_SCROLL_TO_MAKE_VISIBLE, SCRIPT_PROJECT_LOAD_ERROR,
+    SCRIPT_PROJECT_LOAD_OK, SCRIPT_PROJECT_LOAD_START, SCRIPT_TRANSPORT_PATTERN_MODE,
+    SCRIPT_TRANSPORT_PLAYING, SCRIPT_TRANSPORT_RECORDING, absolute_song_position_ticks,
+    discover_midi_scripts, find_script_for_device, normalized_song_position, song_position_ticks,
 };
 use midi_thru::{MidiThruSettings, MidiThruWorker};
 
@@ -9466,6 +9467,19 @@ impl DawUi {
         self.midi_input_connection
             .as_ref()
             .and_then(|connection| connection.notify_script_beat_indicator(value))
+            .unwrap_or(true)
+    }
+
+    fn notify_midi_script_mixer_tracks_changed(
+        &self,
+        track_indices: &[i32],
+        refresh_flags: i32,
+    ) -> bool {
+        self.midi_input_connection
+            .as_ref()
+            .and_then(|connection| {
+                connection.notify_script_mixer_tracks_changed(track_indices, refresh_flags)
+            })
             .unwrap_or(true)
     }
 
@@ -19648,12 +19662,19 @@ impl DawUi {
             );
             return;
         }
+        let selection_changed = self.selected_mixer_insert != Some(track_ordinal);
         self.selected_mixer_insert = Some(track_ordinal);
         self.mixer_scroll_to_track =
             (flags & SCRIPT_MIXER_SCROLL_TO_MAKE_VISIBLE != 0).then_some(track_ordinal);
         self.midi_script_transport_state
             .mixer_selected_track
             .store(u64::from(index), Ordering::Relaxed);
+        if selection_changed
+            && !self.notify_midi_script_mixer_tracks_changed(&[], SCRIPT_HW_DIRTY_MIXER_SEL)
+        {
+            self.status
+                .push_str(" · MIDI script Mixer refresh callback queue is full");
+        }
     }
 
     fn link_midi_script_channel_to_mixer_track(
@@ -19772,6 +19793,13 @@ impl DawUi {
                 self.dirty = true;
                 self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                 self.status = format!("MIDI script renamed Mixer track {index}");
+                if !self.notify_midi_script_mixer_tracks_changed(
+                    &[i32::from(index)],
+                    SCRIPT_HW_DIRTY_NAMES,
+                ) {
+                    self.status
+                        .push_str(" · MIDI script Mixer refresh callback queue is full");
+                }
             }
             Ok(false) => {}
             Err(error) => {
@@ -19807,6 +19835,13 @@ impl DawUi {
                 self.dirty = true;
                 self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                 self.status = format!("MIDI script recolored Mixer track {index}");
+                if !self.notify_midi_script_mixer_tracks_changed(
+                    &[i32::from(index)],
+                    SCRIPT_HW_DIRTY_COLORS,
+                ) {
+                    self.status
+                        .push_str(" · MIDI script Mixer refresh callback queue is full");
+                }
             }
             Ok(false) => {}
             Err(error) => {
@@ -19846,6 +19881,13 @@ impl DawUi {
                 self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                 self.status =
                     format!("MIDI script recolored Mixer track {index} effect slot {slot}");
+                if !self.notify_midi_script_mixer_tracks_changed(
+                    &[i32::from(index)],
+                    SCRIPT_HW_DIRTY_COLORS,
+                ) {
+                    self.status
+                        .push_str(" · MIDI script Mixer refresh callback queue is full");
+                }
             }
             Ok(false) => {}
             Err(error) => {
@@ -20001,6 +20043,20 @@ impl DawUi {
                 if enabled { "enabled" } else { "disabled" },
             );
         }
+        let dirty_tracks = if source == destination {
+            vec![i32::try_from(source).unwrap_or(-1)]
+        } else {
+            vec![
+                i32::try_from(source).unwrap_or(-1),
+                i32::try_from(destination).unwrap_or(-1),
+            ]
+        };
+        if !self
+            .notify_midi_script_mixer_tracks_changed(&dirty_tracks, SCRIPT_HW_DIRTY_MIXER_CONTROLS)
+        {
+            self.status
+                .push_str(" · MIDI script Mixer refresh callback queue is full");
+        }
     }
 
     fn set_midi_script_mixer_route_level(
@@ -20062,6 +20118,16 @@ impl DawUi {
         self.dirty = true;
         self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
         self.status = format!("MIDI script set Mixer route {source} to {destination} level");
+        if !self.notify_midi_script_mixer_tracks_changed(
+            &[
+                i32::try_from(source).unwrap_or(-1),
+                i32::try_from(destination).unwrap_or(-1),
+            ],
+            SCRIPT_HW_DIRTY_MIXER_CONTROLS,
+        ) {
+            self.status
+                .push_str(" · MIDI script Mixer refresh callback queue is full");
+        }
     }
 
     fn set_midi_script_mixer_track_parameter(
@@ -20165,6 +20231,13 @@ impl DawUi {
         self.dirty = true;
         self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
         self.status = format!("MIDI script set Mixer track {index} {label}");
+        if !self.notify_midi_script_mixer_tracks_changed(
+            &[i32::from(index)],
+            SCRIPT_HW_DIRTY_MIXER_CONTROLS,
+        ) {
+            self.status
+                .push_str(" · MIDI script Mixer refresh callback queue is full");
+        }
     }
 
     fn set_midi_script_project_time_signature(
@@ -60744,6 +60817,9 @@ impl DawUi {
         let send_summaries = document.mixer_send_summaries().unwrap_or_default();
         let automatic_pdc_enabled = document.mixer_automatic_pdc_enabled();
         let parameter_count = parameters.len();
+        let selected_insert_before_ui = self.selected_mixer_insert;
+        let mut dirty_mixer_tracks = BTreeSet::new();
+        let mut mixer_refresh_flags = 0;
         let mut automatic_pdc_edit = None;
         ui.horizontal(|ui| {
             ui.strong("Mixer");
@@ -63109,6 +63185,8 @@ impl DawUi {
             for (insert_ordinal, name) in rename_edits {
                 match document.set_mixer_insert_name(insert_ordinal, &name) {
                     Ok(()) => {
+                        dirty_mixer_tracks.insert(i32::try_from(insert_ordinal).unwrap_or(-1));
+                        mixer_refresh_flags |= SCRIPT_HW_DIRTY_NAMES;
                         self.dirty = true;
                         self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                         self.status = if insert_ordinal == 0 {
@@ -63129,6 +63207,8 @@ impl DawUi {
             for (insert_ordinal, slot_index, color_raw) in effect_slot_color_edits {
                 match document.set_mixer_effect_slot_color(insert_ordinal, slot_index, color_raw) {
                     Ok(()) => {
+                        dirty_mixer_tracks.insert(i32::try_from(insert_ordinal).unwrap_or(-1));
+                        mixer_refresh_flags |= SCRIPT_HW_DIRTY_COLORS;
                         self.dirty = true;
                         self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                         self.status = format!(
@@ -63149,6 +63229,8 @@ impl DawUi {
             for (insert_ordinal, edit) in flag_edits {
                 match document.edit_mixer_insert_flags(insert_ordinal, edit) {
                     Ok(()) => {
+                        dirty_mixer_tracks.insert(i32::try_from(insert_ordinal).unwrap_or(-1));
+                        mixer_refresh_flags |= SCRIPT_HW_DIRTY_MIXER_CONTROLS;
                         if let Some(effects_enabled) = edit.effects_enabled {
                             self.mixer_track_peak_meters
                                 .set_live_mixer_insert_effects_enabled(
@@ -63218,6 +63300,29 @@ impl DawUi {
             for (event_index, record_index, value) in parameter_edits {
                 match document.set_mixer_parameter_record_value(event_index, record_index, value) {
                     Ok(()) => {
+                        let parameter_location = (event_index, record_index);
+                        if let Some(send) = send_summaries
+                            .iter()
+                            .find(|send| send.parameter_location() == parameter_location)
+                        {
+                            dirty_mixer_tracks
+                                .insert(i32::try_from(send.insert_ordinal()).unwrap_or(-1));
+                            if let Some((source, destination)) =
+                                candidate_live_mixer_send_key(&send_summaries, send)
+                            {
+                                dirty_mixer_tracks.insert(i32::try_from(source).unwrap_or(-1));
+                                dirty_mixer_tracks.insert(i32::try_from(destination).unwrap_or(-1));
+                            }
+                        } else if let Some(track) = parameters
+                            .iter()
+                            .find(|record| {
+                                (record.event_index(), record.record_index()) == parameter_location
+                            })
+                            .and_then(|record| record.candidate_insert_ordinal())
+                        {
+                            dirty_mixer_tracks.insert(i32::try_from(track).unwrap_or(-1));
+                        }
+                        mixer_refresh_flags |= SCRIPT_HW_DIRTY_MIXER_CONTROLS;
                         if let Some((insert_ordinal, slot_index)) =
                             mixer_effect_mix_locations.get(&(event_index, record_index))
                         {
@@ -63357,6 +63462,19 @@ impl DawUi {
                     .and_then(|send| candidate_live_mixer_send_key(&sends, send));
                 match document.set_mixer_routing_flag(event_index, flag_index, enabled) {
                     Ok(()) => {
+                        if let Some(send) = sends.iter().find(|send| {
+                            send.routing_flag_location() == Some((event_index, flag_index))
+                        }) {
+                            let source = send.insert_ordinal();
+                            dirty_mixer_tracks.insert(i32::try_from(source).unwrap_or(-1));
+                            if let Some((source, destination)) =
+                                candidate_live_mixer_send_key(&sends, send)
+                            {
+                                dirty_mixer_tracks.insert(i32::try_from(source).unwrap_or(-1));
+                                dirty_mixer_tracks.insert(i32::try_from(destination).unwrap_or(-1));
+                            }
+                        }
+                        mixer_refresh_flags |= SCRIPT_HW_DIRTY_MIXER_CONTROLS;
                         if let Some((source_track, destination_track)) = live_send_key {
                             applied_live_mixer_send_enabled.push((
                                 source_track,
@@ -63576,6 +63694,9 @@ impl DawUi {
         {
             match document.move_mixer_effect_slot(insert_ordinal, from_slot, to_slot) {
                 Ok(()) => {
+                    dirty_mixer_tracks.insert(i32::try_from(insert_ordinal).unwrap_or(-1));
+                    mixer_refresh_flags |=
+                        SCRIPT_HW_DIRTY_MIXER_DISPLAY | SCRIPT_HW_DIRTY_MIXER_CONTROLS;
                     remap_mixer_effect_instances_after_move(
                         &mut self.mixer_effect_vst3_instances,
                         insert_ordinal,
@@ -63661,6 +63782,7 @@ impl DawUi {
                 .transpose()
             {
                 Ok(Some(())) => {
+                    mixer_refresh_flags |= SCRIPT_HW_DIRTY_MIXER_CONTROLS;
                     let playback_was_active = self.playing;
                     let song_live_pdc_update = playback_was_active
                         && self.playlist_playback_loaded
@@ -63760,6 +63882,18 @@ impl DawUi {
                 Err(error) => {
                     self.status = format!("Could not update Automatic PDC: {error}");
                 }
+            }
+        }
+        if selected_insert_before_ui != self.selected_mixer_insert {
+            mixer_refresh_flags |= SCRIPT_HW_DIRTY_MIXER_SEL;
+        }
+        if !dirty_mixer_tracks.is_empty() || mixer_refresh_flags != 0 {
+            let dirty_mixer_tracks = dirty_mixer_tracks.into_iter().collect::<Vec<_>>();
+            if !self
+                .notify_midi_script_mixer_tracks_changed(&dirty_mixer_tracks, mixer_refresh_flags)
+            {
+                self.status
+                    .push_str(" · MIDI script Mixer refresh callback queue is full");
             }
         }
     }
@@ -66049,6 +66183,13 @@ impl DawUi {
                 format!("Insert {insert_ordinal}")
             }
         );
+        if !self.notify_midi_script_mixer_tracks_changed(
+            &[i32::try_from(insert_ordinal).unwrap_or(-1)],
+            SCRIPT_HW_DIRTY_MIXER_CONTROLS,
+        ) {
+            self.status
+                .push_str(" · MIDI script Mixer refresh callback queue is full");
+        }
         Ok(true)
     }
 
@@ -66382,6 +66523,13 @@ impl DawUi {
                 _ => unreachable!("toggle target was checked above"),
             }
         );
+        if !self.notify_midi_script_mixer_tracks_changed(
+            &[i32::try_from(insert_ordinal).unwrap_or(-1)],
+            SCRIPT_HW_DIRTY_MIXER_CONTROLS,
+        ) {
+            self.status
+                .push_str(" · MIDI script Mixer refresh callback queue is full");
+        }
         Ok(true)
     }
 

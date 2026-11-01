@@ -56,6 +56,10 @@ enum MidiInputScriptMessage {
     BeatIndicator(i32),
     DisplayZone,
     FirstConnect,
+    MixerTracksChanged {
+        track_indices: Vec<i32>,
+        refresh_flags: i32,
+    },
     Stop,
 }
 
@@ -226,6 +230,15 @@ impl MidiInputScriptWorker {
     fn notify_first_connect(&self) -> bool {
         self.sender
             .try_send(MidiInputScriptMessage::FirstConnect)
+            .is_ok()
+    }
+
+    fn notify_mixer_tracks_changed(&self, track_indices: &[i32], refresh_flags: i32) -> bool {
+        self.sender
+            .try_send(MidiInputScriptMessage::MixerTracksChanged {
+                track_indices: track_indices.to_vec(),
+                refresh_flags,
+            })
             .is_ok()
     }
 
@@ -509,6 +522,42 @@ impl MidiInputScriptWorker {
                                 None => {}
                             }
                         }
+                        MidiInputScriptMessage::MixerTracksChanged {
+                            track_indices,
+                            refresh_flags,
+                        } => {
+                            let received_at = Instant::now();
+                            let elapsed_micros = u64::try_from(
+                                received_at
+                                    .duration_since(timestamp_reference_at)
+                                    .as_micros(),
+                            )
+                            .unwrap_or(u64::MAX);
+                            let timestamp_micros =
+                                timestamp_reference_micros.saturating_add(elapsed_micros);
+                            let callback_result = runtime.as_mut().map(|runtime| {
+                                runtime.process_mixer_tracks_changed(&track_indices, refresh_flags)
+                            });
+                            match callback_result {
+                                Some(Ok(result)) => queue_script_actions_with_repeat(
+                                    &output_sender,
+                                    &midi_output_sender,
+                                    &dropped_messages,
+                                    timestamp_micros,
+                                    received_at,
+                                    result.actions,
+                                    &mut repeat_output,
+                                ),
+                                Some(Err(error)) => {
+                                    let _ = error_sender.try_send(error);
+                                    repeat_output = None;
+                                    if let Some(runtime) = runtime.take() {
+                                        runtime.kill();
+                                    }
+                                }
+                                None => {}
+                            }
+                        }
                         MidiInputScriptMessage::Input(message) => {
                             timestamp_reference_micros = message.timestamp_micros;
                             timestamp_reference_at = message.received_at;
@@ -644,6 +693,18 @@ impl ConnectedMidiInput {
 
     pub fn notify_script_first_connect(&self) -> Option<bool> {
         Some(self.script_worker.as_ref()?.notify_first_connect())
+    }
+
+    pub fn notify_script_mixer_tracks_changed(
+        &self,
+        track_indices: &[i32],
+        refresh_flags: i32,
+    ) -> Option<bool> {
+        Some(
+            self.script_worker
+                .as_ref()?
+                .notify_mixer_tracks_changed(track_indices, refresh_flags),
+        )
     }
 
     pub fn midi_script_output_handle(&self) -> Option<MidiScriptOutputHandle> {
