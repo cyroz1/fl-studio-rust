@@ -2193,6 +2193,12 @@ def _install_modules(script_name, device_name):
 
     ui = _module("ui")
     ui.moveJog = _move_jog
+    ui.isMetronomeEnabled = lambda: bool(
+        _active_transport_state.get("metronome_enabled", False)
+    )
+    ui.isPrecountEnabled = lambda: bool(
+        _active_transport_state.get("recording_precount_enabled", False)
+    )
 
     playlist = _module("playlist")
     playlist.trackCount = _playlist_track_count

@@ -291,6 +291,8 @@ pub struct MidiScriptTransportState {
     pub song_position_seconds: AtomicU64,
     pub song_length_seconds: AtomicU64,
     pub hardware_beat_led_state: AtomicI32,
+    pub metronome_enabled: AtomicU8,
+    pub recording_precount_enabled: AtomicU8,
     pub song_position_hint: Mutex<String>,
     pub song_length_hint: Mutex<String>,
     pub arrangement_marker_names: Mutex<Vec<String>>,
@@ -356,6 +358,8 @@ impl Default for MidiScriptTransportState {
             song_position_seconds: AtomicU64::new(0.0_f64.to_bits()),
             song_length_seconds: AtomicU64::new(0.0_f64.to_bits()),
             hardware_beat_led_state: AtomicI32::new(SCRIPT_BEAT_INDICATOR_OFF),
+            metronome_enabled: AtomicU8::new(0),
+            recording_precount_enabled: AtomicU8::new(0),
             song_position_hint: Mutex::new("1:01:000".to_owned()),
             song_length_hint: Mutex::new("0:00:000".to_owned()),
             arrangement_marker_names: Mutex::new(Vec::new()),
@@ -1139,6 +1143,16 @@ impl MidiScriptRuntime {
                     .transport_state
                     .hardware_beat_led_state
                     .load(Ordering::Relaxed),
+                "metronome_enabled": self
+                    .transport_state
+                    .metronome_enabled
+                    .load(Ordering::Relaxed)
+                    != 0,
+                "recording_precount_enabled": self
+                    .transport_state
+                    .recording_precount_enabled
+                    .load(Ordering::Relaxed)
+                    != 0,
                 "song_position_hint": song_position_hint,
                 "song_length_hint": song_length_hint,
                 "arrangement_marker_names": arrangement_marker_names,

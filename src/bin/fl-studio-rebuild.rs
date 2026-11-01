@@ -19129,6 +19129,12 @@ impl DawUi {
             .state
             .store(state, Ordering::Relaxed);
         self.midi_script_transport_state
+            .metronome_enabled
+            .store(u8::from(self.metronome_enabled), Ordering::Relaxed);
+        self.midi_script_transport_state
+            .recording_precount_enabled
+            .store(u8::from(self.recording_precount_enabled), Ordering::Relaxed);
+        self.midi_script_transport_state
             .midi_pickup_enabled
             .store(u8::from(self.midi_pickup_enabled), Ordering::Relaxed);
         let has_script = self
