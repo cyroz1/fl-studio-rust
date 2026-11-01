@@ -7032,6 +7032,8 @@ fn directsound_shared_output_worker(
             .min((sample_rate / 100).max(32))
             .max(32);
         let buffer_frames = settings.buffer_frames.max(sample_rate / 25).max(256);
+        let buffer_duration =
+            Duration::from_secs_f64(f64::from(buffer_frames) / f64::from(sample_rate));
         let buffer_bytes = buffer_frames
             .checked_mul(u32::from(block_align))
             .ok_or_else(|| "DirectSound output buffer size overflowed".to_owned())?;
@@ -7090,6 +7092,7 @@ fn directsound_shared_output_worker(
         let frame_bytes = format_spec.frame_bytes;
         let chunk_frames = usize::try_from(chunk_frames).unwrap_or(usize::MAX);
         let mut next_write_offset = 0_usize;
+        let mut last_output_poll = std::time::Instant::now();
         while !stop.load(Ordering::Acquire) {
             let mut play_cursor = 0_u32;
             let mut write_cursor = 0_u32;
@@ -7100,6 +7103,20 @@ fn directsound_shared_output_worker(
             }
             let play_cursor = (play_cursor as usize % buffer_bytes) / frame_bytes * frame_bytes;
             let write_cursor = (write_cursor as usize % buffer_bytes) / frame_bytes * frame_bytes;
+            let poll_completed_at = std::time::Instant::now();
+            let poll_gap = poll_completed_at.saturating_duration_since(last_output_poll);
+            last_output_poll = poll_completed_at;
+            if poll_gap >= buffer_duration {
+                set_xrun_error(
+                    &error,
+                    format!(
+                        "DirectSound output underrun: worker did not service the render buffer for {:.1} ms, longer than its {:.1} ms playback buffer; resuming at the safe write cursor",
+                        poll_gap.as_secs_f64() * 1_000.0,
+                        buffer_duration.as_secs_f64() * 1_000.0,
+                    ),
+                );
+                next_write_offset = write_cursor;
+            }
             let safe_bytes = directsound_circular_distance(write_cursor, play_cursor, buffer_bytes);
             while !stop.load(Ordering::Acquire) {
                 let next_distance =
