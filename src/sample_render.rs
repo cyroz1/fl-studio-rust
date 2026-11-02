@@ -1141,8 +1141,14 @@ pub struct BoundedLiveInputReceiver<T: Send> {
 
 pub type Vst3LiveInputSender = BoundedLiveInputSender<Vst3LiveInputEvent>;
 pub type Vst3LiveInputReceiver = BoundedLiveInputReceiver<Vst3LiveInputEvent>;
-pub type Vst2LiveInputSender = BoundedLiveInputSender<Vst3LiveInputEvent>;
-pub type Vst2LiveInputReceiver = BoundedLiveInputReceiver<Vst3LiveInputEvent>;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Vst2LiveInputEvent {
+    pub midi: Vst3LiveInputEvent,
+    pub route_seed: Option<u64>,
+}
+
+pub type Vst2LiveInputSender = BoundedLiveInputSender<Vst2LiveInputEvent>;
+pub type Vst2LiveInputReceiver = BoundedLiveInputReceiver<Vst2LiveInputEvent>;
 pub type LayerLiveInputSender = BoundedLiveInputSender<LayerLiveInputEvent>;
 pub type LayerLiveInputReceiver = BoundedLiveInputReceiver<LayerLiveInputEvent>;
 
@@ -10829,16 +10835,21 @@ fn stream_pattern_from_tick_with_vst3_to_device(
             if let Some(live_input) = vst2_live_input.as_mut() {
                 loop {
                     match live_input.receiver.try_recv() {
-                        Ok(Vst3LiveInputEvent::NoteOn {
-                            channel,
-                            key,
-                            velocity,
+                        Ok(Vst2LiveInputEvent {
+                            midi:
+                                Vst3LiveInputEvent::NoteOn {
+                                    channel,
+                                    key,
+                                    velocity,
+                                },
+                            route_seed,
                         }) if velocity > 0 => {
                             let source_key = key.min(127);
+                            let route_seed = route_seed.unwrap_or(vst2_live_note_seed);
                             let targets = vst2_live_note_router
                                 .targets_for_note_with_layer_adjustments(
                                     live_input.source_channel_id,
-                                    vst2_live_note_seed,
+                                    route_seed,
                                     u16::from(source_key),
                                 )
                                 .into_iter()
@@ -10849,7 +10860,7 @@ fn stream_pattern_from_tick_with_vst3_to_device(
                                         .then_some((target_channel_id, layer_gain))
                                 })
                                 .collect::<Vec<_>>();
-                            vst2_live_note_seed = vst2_live_note_seed.wrapping_add(1);
+                            vst2_live_note_seed = route_seed.wrapping_add(1);
                             let processor = vst2_processor.as_mut().ok_or_else(|| {
                                 "VST2 Pattern processor is unavailable for live MIDI".to_owned()
                             })?;
@@ -10876,7 +10887,10 @@ fn stream_pattern_from_tick_with_vst3_to_device(
                                 .or_default()
                                 .push_back(active_targets);
                         }
-                        Ok(Vst3LiveInputEvent::NoteOff { channel, key }) => {
+                        Ok(Vst2LiveInputEvent {
+                            midi: Vst3LiveInputEvent::NoteOff { channel, key },
+                            ..
+                        }) => {
                             let source_note = (channel & 0x0F, key.min(127));
                             let targets = vst2_live_note_targets
                                 .get_mut(&source_note)
@@ -10903,7 +10917,11 @@ fn stream_pattern_from_tick_with_vst3_to_device(
                                 }
                             }
                         }
-                        Ok(event @ Vst3LiveInputEvent::PolyphonicPressure { channel, key, .. }) => {
+                        Ok(Vst2LiveInputEvent {
+                            midi:
+                                event @ Vst3LiveInputEvent::PolyphonicPressure { channel, key, .. },
+                            ..
+                        }) => {
                             let source_note = (channel & 0x0F, key.min(127));
                             let targets = vst2_live_note_targets
                                 .get(&source_note)
@@ -10925,7 +10943,7 @@ fn stream_pattern_from_tick_with_vst3_to_device(
                                 }
                             }
                         }
-                        Ok(event) => {
+                        Ok(Vst2LiveInputEvent { midi: event, .. }) => {
                             if let Vst3LiveInputEvent::ControlChange {
                                 channel,
                                 controller: 120 | 123..=127,
@@ -12496,7 +12514,7 @@ pub fn stream_vst2_midi_input_to_device(
     let stream_result = (|| {
         let mut block_start = start_frame;
         let mut note_targets = HashMap::<(u8, u8), VecDeque<Vec<u16>>>::new();
-        let mut note_seed = 0u64;
+        let mut next_note_seed = 0u64;
         loop {
             if cancelled.load(Ordering::Acquire) || writer.is_cancelled() {
                 return Err("VST2 input audition was stopped".to_owned());
@@ -12504,16 +12522,21 @@ pub fn stream_vst2_midi_input_to_device(
             let mut disconnected = false;
             loop {
                 match events.try_recv() {
-                    Ok(Vst3LiveInputEvent::NoteOn {
-                        channel,
-                        key,
-                        velocity,
+                    Ok(Vst2LiveInputEvent {
+                        midi:
+                            Vst3LiveInputEvent::NoteOn {
+                                channel,
+                                key,
+                                velocity,
+                            },
+                        route_seed,
                     }) if velocity > 0 => {
                         let source_key = key.min(127);
+                        let route_seed = route_seed.unwrap_or(next_note_seed);
                         let routed_targets = channel_router
                             .targets_for_note_with_layer_adjustments(
                                 source_channel_id,
-                                note_seed,
+                                route_seed,
                                 u16::from(source_key),
                             )
                             .into_iter()
@@ -12522,7 +12545,7 @@ pub fn stream_vst2_midi_input_to_device(
                                     .then_some((target_channel_id, layer_gain))
                             })
                             .collect::<Vec<_>>();
-                        note_seed = note_seed.wrapping_add(1);
+                        next_note_seed = route_seed.wrapping_add(1);
                         let mut active_targets = Vec::with_capacity(routed_targets.len());
                         for (target_channel_id, layer_gain) in routed_targets {
                             let adjusted_velocity =
@@ -12546,7 +12569,10 @@ pub fn stream_vst2_midi_input_to_device(
                             .or_default()
                             .push_back(active_targets);
                     }
-                    Ok(Vst3LiveInputEvent::NoteOff { channel, key }) => {
+                    Ok(Vst2LiveInputEvent {
+                        midi: Vst3LiveInputEvent::NoteOff { channel, key },
+                        ..
+                    }) => {
                         let source_note = (channel & 0x0F, key.min(127));
                         let active_targets = note_targets
                             .get_mut(&source_note)
@@ -12570,9 +12596,11 @@ pub fn stream_vst2_midi_input_to_device(
                             }
                         }
                     }
-                    Ok(
-                        live_event @ Vst3LiveInputEvent::PolyphonicPressure { channel, key, .. },
-                    ) => {
+                    Ok(Vst2LiveInputEvent {
+                        midi:
+                            live_event @ Vst3LiveInputEvent::PolyphonicPressure { channel, key, .. },
+                        ..
+                    }) => {
                         let source_note = (channel & 0x0F, key.min(127));
                         let affected_targets = note_targets
                             .get(&source_note)
@@ -12589,7 +12617,9 @@ pub fn stream_vst2_midi_input_to_device(
                             )?;
                         }
                     }
-                    Ok(live_event) => {
+                    Ok(Vst2LiveInputEvent {
+                        midi: live_event, ..
+                    }) => {
                         if let Vst3LiveInputEvent::ControlChange {
                             channel,
                             controller: 120 | 123..=127,
