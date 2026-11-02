@@ -16,6 +16,8 @@ const MIN_HEADER_CONTENT_LENGTH: usize = 6;
 const FLP_NOTE_RECORD_SIZE: usize = 24;
 const FLP_PATTERN_CONTROLLER_RECORD_SIZE: usize = 12;
 const FLP_PLAYLIST_RECORD_SIZES: [usize; 4] = [88, 80, 60, 32];
+const LEGACY_PATTERN_BLOCK_ITEM_INDEX: u16 = 0x6000;
+const LEGACY_PATTERN_BLOCK_PATTERN_INDEX_BASE: u16 = 999;
 const MAX_MERGED_PATTERN_NOTES: usize = 2_000_000;
 const FLP_AUTOMATION_LFO_AMOUNT_OFFSET: usize = 4;
 const FLP_AUTOMATION_COUNT_OFFSET: usize = 17;
@@ -6271,6 +6273,18 @@ impl PlaylistClip {
     }
 
     pub fn target(&self) -> PlaylistClipTarget {
+        // FL Studio 9 Pattern Block records use a zero pattern-base word and
+        // the 0x6000 item marker. In those records the reversed raw track
+        // field carries the Pattern ID (999 - raw_track_index), rather than a
+        // modern Playlist track index.
+        if self.record_size == 32
+            && self.pattern_base == 0
+            && self.item_index == LEGACY_PATTERN_BLOCK_ITEM_INDEX
+            && let Some(id) =
+                LEGACY_PATTERN_BLOCK_PATTERN_INDEX_BASE.checked_sub(self.raw_track_index)
+        {
+            return PlaylistClipTarget::Pattern { id };
+        }
         if self.item_index >= self.pattern_base {
             PlaylistClipTarget::Pattern {
                 id: self.item_index - self.pattern_base,
