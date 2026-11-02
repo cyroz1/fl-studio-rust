@@ -45,12 +45,13 @@ use flp_rebuild::midi::{
 use flp_rebuild::plugin_settings::{
     ClapProjectInstrumentAssignment as ClapPatternPlaybackInstrument,
     ClapProjectMixerEffectAssignment, MAX_CLAP_PROJECT_MIXER_EFFECT_MANUAL_LATENCY_OFFSET_SAMPLES,
-    Vst2MixerEffectAuxiliaryMapKey, load_clap_project_instruments, load_clap_project_mixer_effects,
-    load_vst2_project_mixer_auxiliary_maps, load_vst3_manual_latency_offsets,
-    load_vst3_project_manual_latency_offsets, save_clap_project_instrument_parameter_overrides,
+    Vst2MixerEffectAuxiliaryMapKey, Vst3MixerEffectAuxiliaryMapKey, load_clap_project_instruments,
+    load_clap_project_mixer_effects, load_vst2_project_mixer_auxiliary_maps,
+    load_vst3_manual_latency_offsets, load_vst3_project_manual_latency_offsets,
+    load_vst3_project_mixer_auxiliary_maps, save_clap_project_instrument_parameter_overrides,
     save_clap_project_instruments, save_clap_project_mixer_effects,
     save_vst2_project_mixer_auxiliary_maps, save_vst3_manual_latency_offsets,
-    save_vst3_project_manual_latency_offsets,
+    save_vst3_project_manual_latency_offsets, save_vst3_project_mixer_auxiliary_maps,
 };
 use flp_rebuild::plugins::{PluginCandidate, PluginFormat, scan_installed_plugins};
 use flp_rebuild::project_package::{ProjectPackageWorkspace, copy_unique_sample_file};
@@ -1143,6 +1144,33 @@ fn remap_vst2_mixer_auxiliary_maps_after_move(
             slot
         };
         remapped.insert((insert, slot, class_id), mapping);
+    }
+    *mappings = remapped;
+}
+
+fn remap_vst3_mixer_auxiliary_maps_after_move(
+    mappings: &mut BTreeMap<Vst3MixerEffectAuxiliaryMapKey, BTreeSet<(usize, usize)>>,
+    insert_ordinal: usize,
+    from_slot: u16,
+    to_slot: u16,
+) {
+    if from_slot == to_slot {
+        return;
+    }
+    let mut remapped = BTreeMap::new();
+    for ((insert, slot, uid), mapping) in std::mem::take(mappings) {
+        let slot = if insert != insert_ordinal {
+            slot
+        } else if slot == from_slot {
+            to_slot
+        } else if from_slot < to_slot && slot > from_slot && slot <= to_slot {
+            slot - 1
+        } else if from_slot > to_slot && slot >= to_slot && slot < from_slot {
+            slot + 1
+        } else {
+            slot
+        };
+        remapped.insert((insert, slot, uid), mapping);
     }
     *mappings = remapped;
 }
@@ -5990,6 +6018,8 @@ struct DawUi {
     vst2_channel_parameter_snapshots: BTreeMap<u16, Vst2ChannelParameterSnapshot>,
     mixer_effect_vst3_instances: BTreeMap<(usize, u16), u64>,
     vst2_mixer_effect_assignments: BTreeMap<(usize, u16), Vst2ProjectMixerEffectAssignment>,
+    vst3_mixer_effect_auxiliary_input_maps:
+        BTreeMap<Vst3MixerEffectAuxiliaryMapKey, BTreeSet<(usize, usize)>>,
     vst2_mixer_effect_parameter_snapshots: BTreeMap<(usize, u16), Vst2MixerEffectParameterSnapshot>,
     clap_mixer_effect_assignments: BTreeMap<(usize, u16), ClapProjectMixerEffectAssignment>,
     clap_effect_parameter_drafts: BTreeMap<((usize, u16), u32), f64>,
@@ -9569,6 +9599,7 @@ impl DawUi {
             vst2_channel_parameter_snapshots: BTreeMap::new(),
             mixer_effect_vst3_instances: BTreeMap::new(),
             vst2_mixer_effect_assignments: BTreeMap::new(),
+            vst3_mixer_effect_auxiliary_input_maps: BTreeMap::new(),
             vst2_mixer_effect_parameter_snapshots: BTreeMap::new(),
             clap_mixer_effect_assignments: BTreeMap::new(),
             clap_effect_parameter_drafts: BTreeMap::new(),
@@ -13387,6 +13418,11 @@ impl DawUi {
         self.channel_vst3_instances.clear();
         self.mixer_effect_vst3_instances.clear();
         self.vst2_mixer_effect_assignments.clear();
+        self.vst3_mixer_effect_auxiliary_input_maps = self
+            .current_path
+            .as_ref()
+            .map(|path| load_vst3_project_mixer_auxiliary_maps(&stable_project_id(path)))
+            .unwrap_or_default();
         self.clap_mixer_effect_assignments = self
             .current_path
             .as_ref()
@@ -13502,6 +13538,9 @@ impl DawUi {
             self.vst2_mixer_effect_parameter_sync.clone(),
             self.clap_mixer_effect_state_capture_controller.clone(),
         ));
+        host.set_mixer_effect_auxiliary_input_source_maps(
+            &self.vst3_mixer_effect_auxiliary_input_maps,
+        );
         host.set_manual_latency_offsets(&self.vst3_manual_latency_offsets);
         let mut channel_instances = BTreeMap::new();
         let mut mixer_effect_instances = BTreeMap::new();
@@ -15441,6 +15480,11 @@ impl DawUi {
             .as_ref()
             .map(|path| load_vst2_project_mixer_auxiliary_maps(&stable_project_id(path)))
             .unwrap_or_default();
+        self.vst3_mixer_effect_auxiliary_input_maps = self
+            .current_path
+            .as_ref()
+            .map(|path| load_vst3_project_mixer_auxiliary_maps(&stable_project_id(path)))
+            .unwrap_or_default();
         let (vst2_effect_assignments, _, mut warnings) = resolve_vst2_mixer_effect_assignments(
             &effect_slots,
             &self.plugin_candidates,
@@ -15460,6 +15504,9 @@ impl DawUi {
             self.vst2_mixer_effect_parameter_sync.clone(),
             self.clap_mixer_effect_state_capture_controller.clone(),
         ));
+        host.set_mixer_effect_auxiliary_input_source_maps(
+            &self.vst3_mixer_effect_auxiliary_input_maps,
+        );
         for state in states {
             let Some(instance_id) = instances.get(&state.channel_id()).copied() else {
                 continue;
@@ -66304,6 +66351,8 @@ impl DawUi {
         let mut clap_effect_sidechain_mapping_use_auto = Vec::new();
         let mut vst2_effect_sidechain_mapping_edits = Vec::new();
         let mut vst2_effect_sidechain_mapping_use_auto = Vec::new();
+        let mut vst3_effect_sidechain_mapping_edits = Vec::new();
+        let mut vst3_effect_sidechain_mapping_use_auto = Vec::new();
         let mut clap_effect_manual_latency_offset_edits = Vec::new();
         let mut clap_effect_parameter_override_apply = Vec::new();
         let mut clap_effect_parameter_override_clear = Vec::new();
@@ -67966,6 +68015,38 @@ impl DawUi {
                                     .mixer_effect_vst3_instances
                                     .get(&slot_key)
                                     .copied();
+                                let vst3_class_uid = slot
+                                    .vst_metadata()
+                                    .and_then(|metadata| metadata.class_uid());
+                                let vst3_auxiliary_input_buses = loaded_effect_instance
+                                    .and_then(|instance_id| {
+                                        self.vst3_host
+                                            .as_ref()?
+                                            .audio_bus_layout(instance_id)
+                                            .ok()
+                                    })
+                                    .map(|layout| {
+                                        layout
+                                            .inputs
+                                            .iter()
+                                            .enumerate()
+                                            .skip(1)
+                                            .filter(|(_, bus)| {
+                                                bus.active && matches!(bus.channel_count, 1 | 2)
+                                            })
+                                            .map(|(index, bus)| (index, bus.channel_count))
+                                            .collect::<Vec<_>>()
+                                    })
+                                    .unwrap_or_default();
+                                let vst3_auxiliary_input_source_map = vst3_class_uid
+                                    .as_ref()
+                                    .and_then(|uid| {
+                                        self.vst3_mixer_effect_auxiliary_input_maps.get(&(
+                                            slot_key.0,
+                                            slot_key.1,
+                                            uid.to_ascii_lowercase(),
+                                        ))
+                                    });
                                 let vst2_effect_assignment =
                                     self.vst2_mixer_effect_assignments.get(&slot_key);
                                 let vst2_editor_loaded = self
@@ -68530,6 +68611,100 @@ impl DawUi {
                                                         }
                                                     }
                                                 });
+                                            }
+                                            if loaded_effect_instance.is_some()
+                                                && let Some(class_uid) = vst3_class_uid.as_ref()
+                                            {
+                                                ui.collapsing(
+                                                    "VST3 sidechain input mapping",
+                                                    |ui| {
+                                                        ui.small("Explicit maps are stored in machine-local project settings; the FLP file is unchanged.");
+                                                        if vst3_auxiliary_input_source_map.is_some()
+                                                            && project_id.is_some()
+                                                            && ui
+                                                                .small_button(
+                                                                    "Use automatic source/bus ordering",
+                                                                )
+                                                                .clicked()
+                                                        {
+                                                            vst3_effect_sidechain_mapping_use_auto
+                                                                .push((slot_key, class_uid.clone()));
+                                                        }
+                                                        if vst3_auxiliary_input_buses.is_empty() {
+                                                            ui.small("This effect has no active supported mono or stereo auxiliary inputs.");
+                                                        } else {
+                                                            if vst3_auxiliary_input_source_map.is_none() {
+                                                                ui.small("Automatic source/bus ordering is active. Selecting sources switches to an explicit map; only selected sources are routed.");
+                                                            } else if vst3_auxiliary_input_source_map
+                                                                .is_some_and(BTreeSet::is_empty)
+                                                            {
+                                                                ui.small("Explicit mapping is active with no sources routed.");
+                                                            }
+                                                            if project_id.is_none() {
+                                                                ui.small("Save the project before editing its VST3 sidechain map.");
+                                                            }
+                                                            for (bus_index, channel_count) in
+                                                                &vst3_auxiliary_input_buses
+                                                            {
+                                                                let mapping_label =
+                                                                    vst3_auxiliary_input_source_map
+                                                                        .map(|mapping| {
+                                                                            format!(
+                                                                                "{} mapped",
+                                                                                mapping
+                                                                                    .iter()
+                                                                                    .filter(|(_, mapped_bus)| mapped_bus == bus_index)
+                                                                                    .count()
+                                                                            )
+                                                                        })
+                                                                        .unwrap_or_else(|| "automatic".to_owned());
+                                                                let label = format!(
+                                                                    "Input bus {} · {mapping_label}",
+                                                                    bus_index + 1
+                                                                );
+                                                                if project_id.is_some() {
+                                                                    ui.menu_button(label, |menu| {
+                                                                        egui::ScrollArea::vertical()
+                                                                            .max_height(220.0)
+                                                                            .show(menu, |menu| {
+                                                                                for source in inserts.iter().filter(|source| {
+                                                                                    source.ordinal() != 0
+                                                                                        && source.ordinal() != insert.ordinal()
+                                                                                }) {
+                                                                                    let mut mapped = vst3_auxiliary_input_source_map
+                                                                                        .is_some_and(|mapping| {
+                                                                                            mapping.contains(&(source.ordinal(), *bus_index))
+                                                                                        });
+                                                                                    if menu.checkbox(
+                                                                                        &mut mapped,
+                                                                                        format!(
+                                                                                            "Insert {} · {}",
+                                                                                            source.ordinal(),
+                                                                                            source.name().unwrap_or("(unnamed)")
+                                                                                        ),
+                                                                                    ).changed() {
+                                                                                        vst3_effect_sidechain_mapping_edits.push((
+                                                                                            slot_key,
+                                                                                            class_uid.clone(),
+                                                                                            source.ordinal(),
+                                                                                            *bus_index,
+                                                                                            mapped,
+                                                                                        ));
+                                                                                    }
+                                                                                }
+                                                                            });
+                                                                    });
+                                                                } else {
+                                                                    ui.small(label);
+                                                                }
+                                                                ui.small(format!(
+                                                                    "Input bus {} · {channel_count} channel(s)",
+                                                                    bus_index + 1
+                                                                ));
+                                                            }
+                                                        }
+                                                    },
+                                                );
                                             }
                                             ui.horizontal(|ui| {
                                                 if let Some(project_id) = project_id.as_ref() {
@@ -69792,6 +69967,46 @@ impl DawUi {
                 self.status = "Save the project before editing its VST2 sidechain map".to_owned();
             }
         }
+        if !vst3_effect_sidechain_mapping_edits.is_empty()
+            || !vst3_effect_sidechain_mapping_use_auto.is_empty()
+        {
+            if let Some(project_id) = project_id.as_deref() {
+                let mut mappings = load_vst3_project_mixer_auxiliary_maps(project_id);
+                for (slot_key, class_uid) in vst3_effect_sidechain_mapping_use_auto {
+                    mappings.remove(&(slot_key.0, slot_key.1, class_uid.to_ascii_lowercase()));
+                }
+                for (slot_key, class_uid, source_track, bus_index, mapped) in
+                    vst3_effect_sidechain_mapping_edits
+                {
+                    let mapping = mappings
+                        .entry((slot_key.0, slot_key.1, class_uid.to_ascii_lowercase()))
+                        .or_default();
+                    if mapped {
+                        mapping.insert((source_track, bus_index));
+                    } else {
+                        mapping.remove(&(source_track, bus_index));
+                    }
+                }
+                match save_vst3_project_mixer_auxiliary_maps(project_id, &mappings) {
+                    Ok(()) => {
+                        self.stop_project_playback();
+                        self.vst3_mixer_effect_auxiliary_input_maps = mappings;
+                        let reload_status = self.load_project_plugins();
+                        self.status = reload_status.map_or_else(
+                            || "Updated VST3 Mixer sidechain input mapping".to_owned(),
+                            |message| {
+                                format!("Updated VST3 Mixer sidechain input mapping; {message}")
+                            },
+                        );
+                    }
+                    Err(error) => {
+                        self.status = format!("Could not save VST3 Mixer sidechain map: {error}");
+                    }
+                }
+            } else {
+                self.status = "Save the project before editing its VST3 sidechain map".to_owned();
+            }
+        }
         if !clap_effect_parameter_override_apply.is_empty()
             || !clap_effect_parameter_override_clear.is_empty()
         {
@@ -70277,6 +70492,12 @@ impl DawUi {
                         from_slot,
                         to_slot,
                     );
+                    remap_vst3_mixer_auxiliary_maps_after_move(
+                        &mut self.vst3_mixer_effect_auxiliary_input_maps,
+                        insert_ordinal,
+                        from_slot,
+                        to_slot,
+                    );
                     let pattern_event_links_changed =
                         remap_pattern_vst2_mixer_effect_parameter_links_after_move(
                             &mut self.pattern_vst2_mixer_effect_parameter_links,
@@ -70332,6 +70553,17 @@ impl DawUi {
                             );
                             save_vst2_project_mixer_auxiliary_maps(project_id, &mappings).err()
                         });
+                    let vst3_auxiliary_map_save_error =
+                        project_id.as_deref().and_then(|project_id| {
+                            let mut mappings = load_vst3_project_mixer_auxiliary_maps(project_id);
+                            remap_vst3_mixer_auxiliary_maps_after_move(
+                                &mut mappings,
+                                insert_ordinal,
+                                from_slot,
+                                to_slot,
+                            );
+                            save_vst3_project_mixer_auxiliary_maps(project_id, &mappings).err()
+                        });
                     let factory = combined_mixer_effect_processor_factory(
                         self.clap_mixer_effect_assignments.clone(),
                         self.vst2_mixer_effect_assignments.clone(),
@@ -70340,6 +70572,9 @@ impl DawUi {
                     );
                     if let Some(host) = &mut self.vst3_host {
                         host.set_mixer_effect_processor_factory(factory);
+                        host.set_mixer_effect_auxiliary_input_source_maps(
+                            &self.vst3_mixer_effect_auxiliary_input_maps,
+                        );
                     }
                     let mappings_changed =
                         remap_midi_vst3_mixer_effect_parameter_targets_after_move(
@@ -70355,6 +70590,7 @@ impl DawUi {
                         .and_then(Result::err)
                         .or(clap_assignment_save_error)
                         .or(vst2_auxiliary_map_save_error)
+                        .or(vst3_auxiliary_map_save_error)
                         .or_else(|| {
                             pattern_event_links_changed
                                 .then(|| {

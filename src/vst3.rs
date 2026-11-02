@@ -17,6 +17,7 @@ use crate::audio::{
     MixerTrackPeakMeters, StereoFrameDelay, StreamingAudioWriter, mixer_effect_wet_mix,
 };
 use crate::media::DecodedAudio;
+use crate::plugin_settings::Vst3MixerEffectAuxiliaryMapKey;
 use crate::sample_render::{
     AudioFileRenderOptions, PlaylistPatternScheduleOptions, PlaylistRenderOptions,
     PlaylistTempoMap, PlaylistTrackFilter, apply_mixer_master_output_to_stereo, channel_gain_pan,
@@ -730,7 +731,7 @@ struct PlaylistMixerEffectStream {
     input_channels: usize,
     output_channels: usize,
     external_auxiliary_input_buses: Vec<(usize, usize)>,
-    external_auxiliary_input_source_map: Option<Vec<(usize, usize)>>,
+    auxiliary_input_source_map: Option<Vec<(usize, usize)>>,
     external_auxiliary_scratch: Vec<f32>,
     sidechain_inputs: Vec<PlaylistMixerEffectSidechainInput>,
     parameter_automation: Vec<PreparedParameterAutomation>,
@@ -2964,10 +2965,10 @@ fn fill_playlist_mixer_sidechain_inputs(
             let left = sidechain.stereo_scratch[frame_index * 2];
             let right = sidechain.stereo_scratch[frame_index * 2 + 1];
             if sidechain.channel_count == 1 {
-                input_bus.channels[0][frame_index] = (left + right) * 0.5;
+                input_bus.channels[0][frame_index] += (left + right) * 0.5;
             } else {
-                input_bus.channels[0][frame_index] = left;
-                input_bus.channels[1][frame_index] = right;
+                input_bus.channels[0][frame_index] += left;
+                input_bus.channels[1][frame_index] += right;
             }
         }
     }
@@ -3174,7 +3175,7 @@ fn update_playlist_mixer_effect_sidechain_inputs(
     } else {
         effect.external_auxiliary_input_buses.clone()
     };
-    if effect.external_processor.is_some() && effect.external_auxiliary_input_source_map.is_none() {
+    if effect.external_processor.is_some() && effect.auxiliary_input_source_map.is_none() {
         let active_source_count = sources
             .iter()
             .filter(|(_, saved_enabled, live_control)| *saved_enabled || *live_control)
@@ -3188,7 +3189,7 @@ fn update_playlist_mixer_effect_sidechain_inputs(
             ));
         }
     }
-    let sidechain_pairs = if let Some(mapping) = &effect.external_auxiliary_input_source_map {
+    let sidechain_pairs = if let Some(mapping) = &effect.auxiliary_input_source_map {
         let mut mapped_sources = Vec::new();
         mapped_sources
             .try_reserve_exact(mapping.len())
@@ -3207,7 +3208,7 @@ fn update_playlist_mixer_effect_sidechain_inputs(
                 .find(|(available_bus, _)| available_bus == bus_index)
             else {
                 return Err(format!(
-                    "External Mixer insert {} effect slot {} maps source insert {source_track} to unavailable auxiliary input {bus_index}",
+                    "Mixer insert {} effect slot {} maps source insert {source_track} to unavailable auxiliary input {bus_index}",
                     effect.insert_ordinal,
                     effect.slot_index + 1
                 ));
@@ -3240,8 +3241,8 @@ fn update_playlist_mixer_effect_sidechain_inputs(
     sidechain_inputs
         .try_reserve_exact(sidechain_pairs.len())
         .map_err(|error| format!("could not allocate Mixer sidechain inputs: {error}"))?;
-    // VST3 buses and unmapped CLAP ports retain stable source-order pairing. Explicit
-    // Explicit external maps may route several source inserts into one auxiliary port.
+    // VST3 buses and unmapped CLAP ports retain stable source-order pairing. Explicit maps may
+    // route several source inserts into one auxiliary bus.
     for ((bus_index, channel_count), (source_track, saved_enabled, live_control)) in sidechain_pairs
     {
         let mut input = previous_inputs
@@ -4478,6 +4479,8 @@ pub struct Vst3HostRuntime {
     host: Vst3Host,
     loaded: Vec<HostedPlugin>,
     mixer_effect_processor_factory: Option<Arc<dyn MixerEffectProcessorFactory>>,
+    mixer_effect_auxiliary_input_source_maps:
+        BTreeMap<Vst3MixerEffectAuxiliaryMapKey, BTreeSet<(usize, usize)>>,
     pending_latency_refresh: BTreeSet<u64>,
     manual_latency_offsets_by_uid: BTreeMap<String, i32>,
     manual_latency_offset_overrides: BTreeSet<u64>,
@@ -4769,6 +4772,7 @@ impl Vst3HostRuntime {
             host,
             loaded: Vec::new(),
             mixer_effect_processor_factory: None,
+            mixer_effect_auxiliary_input_source_maps: BTreeMap::new(),
             pending_latency_refresh: BTreeSet::new(),
             manual_latency_offsets_by_uid: BTreeMap::new(),
             manual_latency_offset_overrides: BTreeSet::new(),
@@ -4782,6 +4786,19 @@ impl Vst3HostRuntime {
         factory: Option<Arc<dyn MixerEffectProcessorFactory>>,
     ) {
         self.mixer_effect_processor_factory = factory;
+    }
+
+    /// Install project-local source-to-bus maps for loaded VST3 Mixer effect slots.
+    pub fn set_mixer_effect_auxiliary_input_source_maps(
+        &mut self,
+        mappings: &BTreeMap<Vst3MixerEffectAuxiliaryMapKey, BTreeSet<(usize, usize)>>,
+    ) {
+        self.mixer_effect_auxiliary_input_source_maps = mappings
+            .iter()
+            .map(|((insert, slot, uid), mapping)| {
+                ((*insert, *slot, uid.to_ascii_lowercase()), mapping.clone())
+            })
+            .collect();
     }
 
     /// Install per-class manual latency offsets before loading project plug-ins.
@@ -7175,7 +7192,7 @@ impl Vst3HostRuntime {
                     input_channels,
                     output_channels,
                     external_auxiliary_input_buses,
-                    external_auxiliary_input_source_map,
+                    auxiliary_input_source_map,
                     external_auxiliary_scratch,
                     sample_rate,
                     latency_samples,
@@ -7216,7 +7233,7 @@ impl Vst3HostRuntime {
                         .block_size()
                         .clamp(1, VST3_EFFECT_RENDER_BLOCK_FRAMES);
                     let external_auxiliary_input_buses = processor.auxiliary_input_buses().to_vec();
-                    let external_auxiliary_input_source_map = processor
+                    let auxiliary_input_source_map = processor
                         .auxiliary_input_source_map()
                         .map(<[(usize, usize)]>::to_vec);
                     if external_auxiliary_input_buses.len() > 16
@@ -7251,7 +7268,7 @@ impl Vst3HostRuntime {
                         input_channels,
                         output_channels,
                         external_auxiliary_input_buses,
-                        external_auxiliary_input_source_map,
+                        auxiliary_input_source_map,
                         external_auxiliary_scratch,
                         sample_rate,
                         latency_samples,
@@ -7262,6 +7279,17 @@ impl Vst3HostRuntime {
                     let Some(id) = mixer_effect_instances.get(&key).copied() else {
                         continue;
                     };
+                    let auxiliary_input_source_map = slot
+                        .vst_metadata()
+                        .and_then(|metadata| metadata.class_uid())
+                        .and_then(|uid| {
+                            self.mixer_effect_auxiliary_input_source_maps.get(&(
+                                key.0,
+                                key.1,
+                                uid.to_ascii_lowercase(),
+                            ))
+                        })
+                        .map(|mapping| mapping.iter().copied().collect());
                     let plugin = Arc::clone(self.plugin(id)?);
                     let (
                         buffers,
@@ -7335,7 +7363,7 @@ impl Vst3HostRuntime {
                         input_channels,
                         output_channels,
                         Vec::new(),
-                        None,
+                        auxiliary_input_source_map,
                         Vec::new(),
                         sample_rate,
                         latency_samples,
@@ -7430,7 +7458,7 @@ impl Vst3HostRuntime {
                     input_channels,
                     output_channels,
                     external_auxiliary_input_buses,
-                    external_auxiliary_input_source_map,
+                    auxiliary_input_source_map,
                     external_auxiliary_scratch,
                     sidechain_inputs: Vec::new(),
                     parameter_automation,
