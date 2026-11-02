@@ -2033,6 +2033,21 @@ def _set_pattern_length(index, length):
     )
 
 
+def _increment_pattern_length(index, offset):
+    try:
+        index = int(index)
+        offset = int(offset)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("patterns.incrementPatternLength() arguments must be integers") from error
+    if not 0 <= index <= 999:
+        raise IndexError("patterns.incrementPatternLength() index must be between 0 and 999")
+    if not -(2**31) <= offset < 2**31:
+        raise ValueError("patterns.incrementPatternLength() offset is outside the supported range")
+    _request_transport_action(
+        {"action": "increment_pattern_length", "index": index, "offset_beats": offset}
+    )
+
+
 def _get_song_step_pos():
     position_ticks = int(_active_transport_state.get("song_position_ticks", 0))
     ppq = max(1, int(_active_transport_state.get("ticks_per_quarter", 96)))
@@ -2624,6 +2639,7 @@ def _install_modules(script_name, device_name):
     patterns.getPatternColor = _pattern_color
     patterns.getPatternLength = _pattern_length
     patterns.setPatternLength = _set_pattern_length
+    patterns.incrementPatternLength = _increment_pattern_length
     patterns.setPatternColor = _set_pattern_color
 
     mixer.getTrackName = _mixer_get_track_name

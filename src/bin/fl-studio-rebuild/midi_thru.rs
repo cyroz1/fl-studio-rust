@@ -696,6 +696,7 @@ fn midi_input_thru_message(event: MidiInputEvent) -> Option<([u8; 3], usize)> {
             | MidiTransportCommand::SetPatternName { .. }
             | MidiTransportCommand::SetPatternColor { .. }
             | MidiTransportCommand::SetPatternLength { .. }
+            | MidiTransportCommand::IncrementPatternLength { .. }
             | MidiTransportCommand::SetGlobalSwingMixRaw(_)
             | MidiTransportCommand::SetHintMessage(_)
             | MidiTransportCommand::AddArrangementTimeMarker { .. }

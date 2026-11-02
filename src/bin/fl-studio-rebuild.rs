@@ -20940,6 +20940,29 @@ impl DawUi {
         }
     }
 
+    fn increment_midi_script_pattern_length(&mut self, index: u16, offset_beats: i32) {
+        if offset_beats == 0 {
+            return;
+        }
+        let current_length_ticks = match self.selected_pattern_loop_length_ticks(index) {
+            Ok(length_ticks) => length_ticks,
+            Err(error) => {
+                self.status =
+                    format!("MIDI script could not inspect Pattern {index} length: {error}");
+                return;
+            }
+        };
+        let ppq = self
+            .document
+            .as_ref()
+            .map(|document| u64::from(document.header().ppq().max(1)))
+            .unwrap_or(96);
+        let current_length_beats = current_length_ticks.div_ceil(ppq);
+        let requested_length_beats = (current_length_beats as i64 + i64::from(offset_beats))
+            .clamp(1, i64::from(u32::MAX)) as u32;
+        self.set_midi_script_pattern_length(index, requested_length_beats);
+    }
+
     fn jog_midi_script_pattern(&mut self, increment: i32) {
         if increment == 0 {
             return;
@@ -69939,6 +69962,12 @@ impl DawUi {
                 length_beats,
             } => {
                 self.set_midi_script_pattern_length(index, length_beats);
+            }
+            MidiTransportCommand::IncrementPatternLength {
+                index,
+                offset_beats,
+            } => {
+                self.increment_midi_script_pattern_length(index, offset_beats);
             }
             MidiTransportCommand::SetGlobalSwingMixRaw(value_raw) => {
                 self.set_midi_script_global_swing_mix(value_raw);
