@@ -5775,6 +5775,8 @@ struct DawUi {
     browser_filter: BrowserFilter,
     browser_path: PathBuf,
     browser_visible: bool,
+    browser_font_scale: f32,
+    browser_pointer_active: bool,
     browser_column_width: f32,
     browser_entries: Vec<BrowserEntry>,
     browser_index: Option<BrowserIndex>,
@@ -8999,6 +9001,8 @@ impl DawUi {
             browser_filter: BrowserFilter::All,
             browser_path,
             browser_visible: load_browser_visibility(),
+            browser_font_scale: 1.0,
+            browser_pointer_active: false,
             browser_column_width: load_browser_column_width(),
             browser_entries: Vec::new(),
             browser_index: None,
@@ -20835,6 +20839,17 @@ impl DawUi {
 
     fn jog_midi_script_zoom(&mut self, horizontal: bool, increment: i32) {
         if increment == 0 {
+            return;
+        }
+        if self.browser_visible && self.browser_pointer_active {
+            let Some(scale) = midi_script_zoom_target(self.browser_font_scale, increment, 0.6, 2.0)
+            else {
+                return;
+            };
+            if (scale - self.browser_font_scale).abs() > f32::EPSILON {
+                self.browser_font_scale = scale;
+                self.status = format!("MIDI script Browser font size {:.0}%", scale * 100.0);
+            }
             return;
         }
         match (self.view, horizontal) {
@@ -79050,7 +79065,8 @@ impl eframe::App for DawUi {
                     self.browser_column_width = self
                         .browser_column_width
                         .clamp(MIN_BROWSER_COLUMN_WIDTH, browser_max_width);
-                    ui.allocate_ui_with_layout(
+                    let browser_font_scale = self.browser_font_scale;
+                    let browser_area = ui.allocate_ui_with_layout(
                         Vec2::new(self.browser_column_width, content_height),
                         egui::Layout::top_down(egui::Align::Min),
                         |ui| {
@@ -79058,6 +79074,7 @@ impl eframe::App for DawUi {
                                 .fill(PANEL)
                                 .inner_margin(egui::Margin::same(8))
                                 .show(ui, |ui| {
+                                    apply_local_ui_scale(ui, browser_font_scale);
                                     egui::ScrollArea::vertical()
                                         .id_salt("browser-panel-content")
                                         .auto_shrink([false, false])
@@ -79065,6 +79082,9 @@ impl eframe::App for DawUi {
                                 });
                         },
                     );
+                    if let Some(pointer) = ui.ctx().pointer_hover_pos() {
+                        self.browser_pointer_active = browser_area.response.rect.contains(pointer);
+                    }
                     let (_, splitter) = ui.allocate_exact_size(
                         Vec2::new(8.0, content_height),
                         Sense::click_and_drag(),
@@ -79094,6 +79114,8 @@ impl eframe::App for DawUi {
                     {
                         self.status = format!("Could not save Browser width: {error}");
                     }
+                } else {
+                    self.browser_pointer_active = false;
                 }
                 let content_width = ui.available_width().max(100.0);
                 ui.allocate_ui_with_layout(
