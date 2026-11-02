@@ -20781,6 +20781,43 @@ impl DawUi {
         self.status = format!("Selected Playlist marker at tick {tick}");
     }
 
+    fn set_midi_script_pattern_name(&mut self, index: u16, name: String) {
+        let result = self.document.as_mut().map(|document| {
+            let current_name = document
+                .patterns()
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .find(|pattern| pattern.id == index)
+                .map(|pattern| pattern.name.unwrap_or_default())
+                .ok_or_else(|| format!("Pattern {index} is not available in the project"))?;
+            if current_name == name {
+                return Ok(false);
+            }
+            document
+                .set_pattern_name(index, &name)
+                .map(|()| true)
+                .map_err(|error| error.to_string())
+        });
+        match result {
+            Some(Ok(true)) => {
+                self.dirty = true;
+                self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+                self.status = if name.is_empty() {
+                    format!("Reset Pattern {index} name")
+                } else {
+                    format!("Renamed Pattern {index}")
+                };
+            }
+            Some(Ok(false)) => {}
+            Some(Err(error)) => {
+                self.status = format!("MIDI script could not rename Pattern {index}: {error}");
+            }
+            None => {
+                self.status = "Open a project to rename Patterns".to_owned();
+            }
+        }
+    }
+
     fn jog_midi_script_pattern(&mut self, increment: i32) {
         if increment == 0 {
             return;
@@ -69768,6 +69805,9 @@ impl DawUi {
             }
             MidiTransportCommand::SetProjectTimeSignatureDenominator(denominator) => {
                 self.set_midi_script_project_time_signature(None, Some(denominator));
+            }
+            MidiTransportCommand::SetPatternName { index, name } => {
+                self.set_midi_script_pattern_name(index, name);
             }
             MidiTransportCommand::SetGlobalSwingMixRaw(value_raw) => {
                 self.set_midi_script_global_swing_mix(value_raw);

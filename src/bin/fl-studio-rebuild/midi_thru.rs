@@ -693,6 +693,7 @@ fn midi_input_thru_message(event: MidiInputEvent) -> Option<([u8; 3], usize)> {
             | MidiTransportCommand::SetCurrentTempo(_)
             | MidiTransportCommand::SetProjectTimeSignatureNumerator(_)
             | MidiTransportCommand::SetProjectTimeSignatureDenominator(_)
+            | MidiTransportCommand::SetPatternName { .. }
             | MidiTransportCommand::SetGlobalSwingMixRaw(_)
             | MidiTransportCommand::SetHintMessage(_)
             | MidiTransportCommand::AddArrangementTimeMarker { .. }

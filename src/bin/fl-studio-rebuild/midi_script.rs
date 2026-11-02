@@ -81,6 +81,10 @@ pub enum ScriptTransportAction {
     SetCurrentTempoMilliBpm(u32),
     SetProjectTimeSignatureNumerator(u8),
     SetProjectTimeSignatureDenominator(u8),
+    SetPatternName {
+        index: u16,
+        name: String,
+    },
     SetGlobalSwingMixRaw(u8),
     AddArrangementTimeMarker {
         tick: u32,
@@ -1742,6 +1746,21 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
             ScriptTransportAction::SetProjectTimeSignatureNumerator(value)
         } else {
             ScriptTransportAction::SetProjectTimeSignatureDenominator(value)
+        });
+    }
+    if name == Some("set_pattern_name") {
+        let index = action["index"]
+            .as_u64()
+            .and_then(|index| u16::try_from(index).ok())
+            .filter(|index| *index <= 999)
+            .ok_or_else(|| "MIDI script returned an invalid Pattern index".to_owned())?;
+        let pattern_name = action["name"]
+            .as_str()
+            .filter(|name| !name.contains('\0'))
+            .ok_or_else(|| "MIDI script returned an invalid Pattern name".to_owned())?;
+        return Ok(ScriptTransportAction::SetPatternName {
+            index,
+            name: pattern_name.to_owned(),
         });
     }
     if name == Some("add_arrangement_time_marker") {

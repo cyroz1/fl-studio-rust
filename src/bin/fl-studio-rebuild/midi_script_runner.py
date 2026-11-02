@@ -1952,6 +1952,22 @@ def _pattern_name(index):
     return ""
 
 
+def _set_pattern_name(index, name):
+    try:
+        index = int(index)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("patterns.setPatternName() index must be an integer") from error
+    if not 0 <= index <= 999:
+        raise IndexError("patterns.setPatternName() index must be between 0 and 999")
+    if not isinstance(name, str):
+        raise TypeError("patterns.setPatternName() name must be a string")
+    if "\0" in name:
+        raise ValueError("patterns.setPatternName() name cannot contain an embedded NUL")
+    _request_transport_action(
+        {"action": "set_pattern_name", "index": index, "name": name}
+    )
+
+
 def _get_song_step_pos():
     position_ticks = int(_active_transport_state.get("song_position_ticks", 0))
     ppq = max(1, int(_active_transport_state.get("ticks_per_quarter", 96)))
@@ -2539,6 +2555,7 @@ def _install_modules(script_name, device_name):
     patterns.patternCount = _pattern_count
     patterns.patternMax = lambda: 999
     patterns.getPatternName = _pattern_name
+    patterns.setPatternName = _set_pattern_name
 
     mixer.getTrackName = _mixer_get_track_name
     mixer.setTrackName = _mixer_set_track_name
