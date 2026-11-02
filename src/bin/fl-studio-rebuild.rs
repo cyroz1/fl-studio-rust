@@ -19530,7 +19530,12 @@ impl DawUi {
                 .and_then(|document| document.patterns().ok())
                 .unwrap_or_default()
                 .into_iter()
-                .map(|pattern| (pattern.id, pattern.name.unwrap_or_default()))
+                .map(|pattern| {
+                    let color = pattern.color.map(|[red, green, blue, _]| {
+                        u32::from(red) | (u32::from(green) << 8) | (u32::from(blue) << 16)
+                    });
+                    (pattern.id, pattern.name.unwrap_or_default(), color)
+                })
                 .collect::<Vec<_>>()
         } else {
             Vec::new()
@@ -20814,6 +20819,46 @@ impl DawUi {
             }
             None => {
                 self.status = "Open a project to rename Patterns".to_owned();
+            }
+        }
+    }
+
+    fn set_midi_script_pattern_color(&mut self, index: u16, color: u32) {
+        let result = self.document.as_mut().map(|document| {
+            let current_color = document
+                .patterns()
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .find(|pattern| pattern.id == index)
+                .map(|pattern| {
+                    pattern.color.map(|[red, green, blue, _]| {
+                        u32::from(red) | (u32::from(green) << 8) | (u32::from(blue) << 16)
+                    })
+                })
+                .ok_or_else(|| format!("Pattern {index} is not available in the project"))?;
+            if current_color == Some(color & 0x00FF_FFFF) {
+                return Ok(false);
+            }
+            document
+                .set_pattern_color(
+                    index,
+                    [color as u8, (color >> 8) as u8, (color >> 16) as u8],
+                )
+                .map(|()| true)
+                .map_err(|error| error.to_string())
+        });
+        match result {
+            Some(Ok(true)) => {
+                self.dirty = true;
+                self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+                self.status = format!("Recolored Pattern {index}");
+            }
+            Some(Ok(false)) => {}
+            Some(Err(error)) => {
+                self.status = format!("MIDI script could not recolor Pattern {index}: {error}");
+            }
+            None => {
+                self.status = "Open a project to recolor Patterns".to_owned();
             }
         }
     }
@@ -69808,6 +69853,9 @@ impl DawUi {
             }
             MidiTransportCommand::SetPatternName { index, name } => {
                 self.set_midi_script_pattern_name(index, name);
+            }
+            MidiTransportCommand::SetPatternColor { index, color } => {
+                self.set_midi_script_pattern_color(index, color);
             }
             MidiTransportCommand::SetGlobalSwingMixRaw(value_raw) => {
                 self.set_midi_script_global_swing_mix(value_raw);

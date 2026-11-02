@@ -865,6 +865,9 @@ fn queue_script_transport_actions(
             ScriptTransportAction::SetPatternName { index, name } => {
                 MidiTransportCommand::SetPatternName { index, name }
             }
+            ScriptTransportAction::SetPatternColor { index, color } => {
+                MidiTransportCommand::SetPatternColor { index, color }
+            }
             ScriptTransportAction::SetGlobalSwingMixRaw(value_raw) => {
                 MidiTransportCommand::SetGlobalSwingMixRaw(value_raw)
             }
@@ -1108,6 +1111,10 @@ pub enum MidiTransportCommand {
     SetPatternName {
         index: u16,
         name: String,
+    },
+    SetPatternColor {
+        index: u16,
+        color: u32,
     },
     SetGlobalSwingMixRaw(u8),
     AddArrangementTimeMarker {
@@ -1936,6 +1943,7 @@ pub fn describe_event(event: MidiInputEvent) -> String {
                 "MIDI script Project Time Signature".to_owned()
             }
             MidiTransportCommand::SetPatternName { .. } => "MIDI script Pattern Name".to_owned(),
+            MidiTransportCommand::SetPatternColor { .. } => "MIDI script Pattern Color".to_owned(),
             MidiTransportCommand::SetGlobalSwingMixRaw(_) => {
                 "MIDI script Global Shuffle".to_owned()
             }

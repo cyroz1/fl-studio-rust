@@ -1952,6 +1952,24 @@ def _pattern_name(index):
     return ""
 
 
+def _pattern_color(index):
+    try:
+        index = int(index)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("patterns.getPatternColor() index must be an integer") from error
+    if not 0 <= index <= 999:
+        raise IndexError("patterns.getPatternColor() index must be between 0 and 999")
+    for entry in _active_transport_state.get("pattern_entries", []):
+        if isinstance(entry, (list, tuple)) and len(entry) >= 3:
+            try:
+                if int(entry[0]) == index:
+                    color = entry[2]
+                    return int(color) if color is not None else 0
+            except (TypeError, ValueError, OverflowError):
+                continue
+    return 0
+
+
 def _set_pattern_name(index, name):
     try:
         index = int(index)
@@ -1965,6 +1983,21 @@ def _set_pattern_name(index, name):
         raise ValueError("patterns.setPatternName() name cannot contain an embedded NUL")
     _request_transport_action(
         {"action": "set_pattern_name", "index": index, "name": name}
+    )
+
+
+def _set_pattern_color(index, color):
+    try:
+        index = int(index)
+        color = int(color)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("patterns.setPatternColor() arguments must be integers") from error
+    if not 0 <= index <= 999:
+        raise IndexError("patterns.setPatternColor() index must be between 0 and 999")
+    if not 0 <= color <= 0xFFFFFFFF:
+        raise ValueError("patterns.setPatternColor() color is outside the supported range")
+    _request_transport_action(
+        {"action": "set_pattern_color", "index": index, "color": color}
     )
 
 
@@ -2556,6 +2589,8 @@ def _install_modules(script_name, device_name):
     patterns.patternMax = lambda: 999
     patterns.getPatternName = _pattern_name
     patterns.setPatternName = _set_pattern_name
+    patterns.getPatternColor = _pattern_color
+    patterns.setPatternColor = _set_pattern_color
 
     mixer.getTrackName = _mixer_get_track_name
     mixer.setTrackName = _mixer_set_track_name

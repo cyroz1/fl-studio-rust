@@ -85,6 +85,10 @@ pub enum ScriptTransportAction {
         index: u16,
         name: String,
     },
+    SetPatternColor {
+        index: u16,
+        color: u32,
+    },
     SetGlobalSwingMixRaw(u8),
     AddArrangementTimeMarker {
         tick: u32,
@@ -312,7 +316,7 @@ pub struct MidiScriptTransportState {
     pub current_tempo_milli_bpm: AtomicU64,
     pub project_changed_flag: AtomicI32,
     pub pattern_number: AtomicU64,
-    pub pattern_entries: Mutex<Vec<(u16, String)>>,
+    pub pattern_entries: Mutex<Vec<(u16, String, Option<u32>)>>,
     pub time_signature_numerator: AtomicU64,
     pub time_signature_denominator: AtomicU64,
     pub global_swing_mix_raw: AtomicU64,
@@ -1762,6 +1766,18 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
             index,
             name: pattern_name.to_owned(),
         });
+    }
+    if name == Some("set_pattern_color") {
+        let index = action["index"]
+            .as_u64()
+            .and_then(|index| u16::try_from(index).ok())
+            .filter(|index| *index <= 999)
+            .ok_or_else(|| "MIDI script returned an invalid Pattern index".to_owned())?;
+        let color = action["color"]
+            .as_u64()
+            .and_then(|color| u32::try_from(color).ok())
+            .ok_or_else(|| "MIDI script returned an invalid Pattern color".to_owned())?;
+        return Ok(ScriptTransportAction::SetPatternColor { index, color });
     }
     if name == Some("add_arrangement_time_marker") {
         let tick = action["time_ticks"]
