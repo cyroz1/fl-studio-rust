@@ -1507,6 +1507,19 @@ pub struct PlaylistRenderRange {
     pub minimum_content_frames: u64,
 }
 
+/// Output format and optional timeline selection for an offline Playlist render.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PlaylistRenderRequest {
+    pub output_format: AudioRenderOutput,
+    pub range: Option<PlaylistRenderRange>,
+}
+
+/// Already loaded plug-in processors used by offline Playlist renders.
+pub struct PlaylistRenderPlugins {
+    pub vst3_processor: Option<Vst3PlaylistStreamProcessor>,
+    pub vst2_runtime: Option<Arc<Mutex<Vst2HostRuntime>>>,
+}
+
 /// A Performance Mode Playlist Clip launch scheduled on the timeline.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PlaylistPerformanceLaunch {
@@ -2588,6 +2601,8 @@ pub struct PlaylistRenderSummary {
     pub audio_clips_skipped_unsupported_scale: usize,
     pub pattern_clips_skipped_unsupported_scale: usize,
     pub notes_skipped_unresolved_sample: usize,
+    pub vst2_plugin_channels_rendered: usize,
+    pub vst2_notes_rendered: usize,
     pub vst3_plugin_channels_rendered: usize,
     pub vst3_notes_rendered: usize,
     pub vst3_plugin_channels_unloaded: usize,
@@ -3700,6 +3715,8 @@ pub fn stream_playlist_performance_with_vst3_to_device(
         audio_clips_skipped_unsupported_scale: audio.summary.clips_skipped_unsupported_scale,
         pattern_clips_skipped_unsupported_scale: sampler.pattern_clips_skipped_unsupported_scale,
         notes_skipped_unresolved_sample: sampler.summary.notes_skipped_unresolved_sample,
+        vst2_plugin_channels_rendered: 0,
+        vst2_notes_rendered: 0,
         vst3_plugin_channels_rendered: vst3_summary
             .as_ref()
             .map_or(0, |summary| summary.plugin_channels_rendered),
@@ -3726,6 +3743,7 @@ pub fn stream_playlist_performance_with_vst3_to_device(
             frames: u64::MAX,
             master_output,
             vst3_processor: vst3_processor.as_mut(),
+            vst2_processor: None,
             remainder_stop: None,
         },
         PlaylistPreparedRenderControls {
@@ -3893,6 +3911,8 @@ fn stream_playlist_with_vst3_to_device_from_frame_inner(
         audio_clips_skipped_unsupported_scale: audio.summary.clips_skipped_unsupported_scale,
         pattern_clips_skipped_unsupported_scale: sampler.pattern_clips_skipped_unsupported_scale,
         notes_skipped_unresolved_sample: sampler.summary.notes_skipped_unresolved_sample,
+        vst2_plugin_channels_rendered: 0,
+        vst2_notes_rendered: 0,
         vst3_plugin_channels_rendered: vst3_summary
             .as_ref()
             .map_or(0, |summary| summary.plugin_channels_rendered),
@@ -3921,6 +3941,7 @@ fn stream_playlist_with_vst3_to_device_from_frame_inner(
         frames,
         master_output,
         vst3_processor: vst3_processor.as_mut(),
+        vst2_processor: None,
         remainder_stop: None,
     };
     let block_summary = if let Some(latency_updates) = latency_updates {
@@ -3997,7 +4018,10 @@ pub fn render_playlist_with_vst3_to_wav_cancellable(
             minimum_content_frames: 0,
             full_song_wav: true,
         },
-        vst3_processor,
+        PlaylistRenderPlugins {
+            vst3_processor,
+            vst2_runtime: None,
+        },
         cancelled,
     )
 }
@@ -4024,7 +4048,10 @@ pub fn render_playlist_with_vst3_to_flac_cancellable(
             minimum_content_frames: 0,
             full_song_wav: false,
         },
-        vst3_processor,
+        PlaylistRenderPlugins {
+            vst3_processor,
+            vst2_runtime: None,
+        },
         cancelled,
     )
 }
@@ -4051,7 +4078,10 @@ pub fn render_playlist_with_vst3_to_ogg_cancellable(
             minimum_content_frames: 0,
             full_song_wav: false,
         },
-        vst3_processor,
+        PlaylistRenderPlugins {
+            vst3_processor,
+            vst2_runtime: None,
+        },
         cancelled,
     )
 }
@@ -4078,7 +4108,10 @@ pub fn render_playlist_with_vst3_to_mp3_cancellable(
             minimum_content_frames: 0,
             full_song_wav: false,
         },
-        vst3_processor,
+        PlaylistRenderPlugins {
+            vst3_processor,
+            vst2_runtime: None,
+        },
         cancelled,
     )
 }
@@ -4115,7 +4148,59 @@ pub fn render_playlist_with_vst3_to_file_from_frame_cancellable(
             minimum_content_frames: range.minimum_content_frames,
             full_song_wav: false,
         },
-        vst3_processor,
+        PlaylistRenderPlugins {
+            vst3_processor,
+            vst2_runtime: None,
+        },
+        cancelled,
+    )
+}
+
+/// Render a Playlist mix with any loaded VST3 and VST2 instrument channels.
+pub fn render_playlist_with_vst2_and_vst3_to_file_cancellable(
+    document: &FlpDocument,
+    project_path: impl AsRef<Path>,
+    options: PlaylistRenderOptions,
+    output_path: impl AsRef<Path>,
+    request: PlaylistRenderRequest,
+    plugins: PlaylistRenderPlugins,
+    cancelled: &AtomicBool,
+) -> Result<PlaylistRenderSummary, String> {
+    let PlaylistRenderRequest {
+        output_format,
+        range,
+    } = request;
+    let (output, output_start_frame, output_end_frame, minimum_content_frames, full_song_wav) =
+        if let Some(range) = range {
+            (
+                playlist_render_output(range.output_format),
+                range.output_start_frame,
+                range.output_end_frame,
+                range.minimum_content_frames,
+                false,
+            )
+        } else {
+            (
+                playlist_render_output(output_format),
+                0,
+                None,
+                0,
+                matches!(output_format, AudioRenderOutput::Wav),
+            )
+        };
+    render_playlist_with_vst3_cancellable(
+        document,
+        project_path,
+        options,
+        output_path,
+        PlaylistRenderWindow {
+            output,
+            output_start_frame,
+            output_end_frame,
+            minimum_content_frames,
+            full_song_wav,
+        },
+        plugins,
         cancelled,
     )
 }
@@ -4126,6 +4211,17 @@ enum PlaylistRenderOutput {
     Flac { bits_per_sample: u8 },
     Ogg { bitrate_kbps: u16 },
     Mp3 { bitrate_kbps: u16 },
+}
+
+fn playlist_render_output(output: AudioRenderOutput) -> PlaylistRenderOutput {
+    match output {
+        AudioRenderOutput::Wav => PlaylistRenderOutput::Wav,
+        AudioRenderOutput::Flac { bits_per_sample } => {
+            PlaylistRenderOutput::Flac { bits_per_sample }
+        }
+        AudioRenderOutput::Ogg { bitrate_kbps } => PlaylistRenderOutput::Ogg { bitrate_kbps },
+        AudioRenderOutput::Mp3 { bitrate_kbps } => PlaylistRenderOutput::Mp3 { bitrate_kbps },
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -4140,12 +4236,14 @@ struct PlaylistRenderWindow {
 fn render_playlist_with_vst3_cancellable(
     document: &FlpDocument,
     project_path: impl AsRef<Path>,
-    options: PlaylistRenderOptions,
+    mut options: PlaylistRenderOptions,
     output_path: impl AsRef<Path>,
     window: PlaylistRenderWindow,
-    mut vst3_processor: Option<Vst3PlaylistStreamProcessor>,
+    plugins: PlaylistRenderPlugins,
     cancelled: &AtomicBool,
 ) -> Result<PlaylistRenderSummary, String> {
+    let mut vst3_processor = plugins.vst3_processor;
+    let vst2_runtime = plugins.vst2_runtime;
     let PlaylistRenderWindow {
         output,
         output_start_frame,
@@ -4208,6 +4306,35 @@ fn render_playlist_with_vst3_cancellable(
         .as_ref()
         .map(|processor| processor.volume_expression_channel_ids().clone())
         .unwrap_or_default();
+    let loaded_vst2_channel_ids = vst2_runtime
+        .as_ref()
+        .map(|runtime| {
+            runtime
+                .lock()
+                .map_err(|_| "VST2 host runtime lock was poisoned".to_owned())
+                .map(|runtime| {
+                    runtime
+                        .loaded_channels()
+                        .into_iter()
+                        .map(|channel| channel.channel_id)
+                        .collect::<BTreeSet<_>>()
+                })
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let mut external_channel_ids = options.clap_audio_channel_ids.as_ref().clone();
+    external_channel_ids.extend(loaded_vst2_channel_ids.iter().copied());
+    if let Some(processor) = vst3_processor.as_ref() {
+        external_channel_ids.extend(processor.performance_channel_ids());
+    }
+    options.clap_audio_channel_ids = Arc::new(external_channel_ids);
+    let mut vst2_processor = vst2_runtime
+        .as_ref()
+        .map(|runtime| {
+            prepare_vst2_playlist_processor(document, &options, runtime, vst3_processor.as_mut())
+        })
+        .transpose()?
+        .flatten();
     let sampler = prepare_sampler_arrangement(
         document,
         project_path,
@@ -4222,6 +4349,7 @@ fn render_playlist_with_vst3_cancellable(
         && vst3_processor
             .as_ref()
             .is_none_or(|processor| processor.summary().plugin_channels_rendered == 0)
+        && vst2_processor.is_none()
     {
         if let Some(processor) = vst3_processor.as_ref() {
             let unloaded_channels = processor.summary().unloaded_plugin_channels;
@@ -4237,7 +4365,7 @@ fn render_playlist_with_vst3_cancellable(
             }
         }
         return Err(
-            "arrangement contains no supported audio clips, Sampler notes, CLAP audio, or loaded VST3 notes in Pattern Clips"
+                "arrangement contains no supported audio clips, Sampler notes, CLAP audio, or loaded VST2/VST3 notes in Pattern Clips"
                 .to_owned(),
         );
     }
@@ -4256,6 +4384,9 @@ fn render_playlist_with_vst3_cancellable(
         .max(clap_content_frames);
     if let Some(processor) = vst3_processor.as_mut() {
         content_frames = content_frames.max(processor.content_frames());
+    }
+    if let Some(processor) = vst2_processor.as_ref() {
+        content_frames = content_frames.max(processor.content_frames);
     }
     let mut wav_cue_points = if matches!(output, PlaylistRenderOutput::Wav)
         && (options.wav_save_playlist_markers || options.wav_save_note_markers)
@@ -4346,6 +4477,11 @@ fn render_playlist_with_vst3_cancellable(
         vst3_processor
             .as_ref()
             .map_or(0, Vst3PlaylistStreamProcessor::pdc_render_start_trim_frames)
+            .max(
+                vst2_processor
+                    .as_ref()
+                    .map_or(0, Vst2PatternStreamProcessor::pdc_render_start_trim_frames),
+            )
     } else {
         0
     };
@@ -4384,6 +4520,12 @@ fn render_playlist_with_vst3_cancellable(
         audio_clips_skipped_unsupported_scale: audio.summary.clips_skipped_unsupported_scale,
         pattern_clips_skipped_unsupported_scale: sampler.pattern_clips_skipped_unsupported_scale,
         notes_skipped_unresolved_sample: sampler.summary.notes_skipped_unresolved_sample,
+        vst2_plugin_channels_rendered: vst2_processor
+            .as_ref()
+            .map_or(0, |processor| processor.channels.len()),
+        vst2_notes_rendered: vst2_processor
+            .as_ref()
+            .map_or(0, |processor| processor.notes_scheduled),
         vst3_plugin_channels_rendered: vst3_summary
             .as_ref()
             .map_or(0, |summary| summary.plugin_channels_rendered),
@@ -4416,6 +4558,7 @@ fn render_playlist_with_vst3_cancellable(
                 frames,
                 master_output,
                 vst3_processor: vst3_processor.as_mut(),
+                vst2_processor: vst2_processor.as_mut(),
                 remainder_stop,
             },
             Some(&mixer_track_meters),
@@ -4505,6 +4648,7 @@ fn render_playlist_with_vst3_cancellable(
                     frames,
                     master_output,
                     vst3_processor: vst3_processor.as_mut(),
+                    vst2_processor: vst2_processor.as_mut(),
                     remainder_stop,
                 },
                 Some(&mixer_track_meters),
@@ -4550,6 +4694,7 @@ fn render_playlist_with_vst3_cancellable(
                     frames,
                     master_output,
                     vst3_processor: vst3_processor.as_mut(),
+                    vst2_processor: vst2_processor.as_mut(),
                     remainder_stop,
                 },
                 Some(&mixer_track_meters),
@@ -4588,6 +4733,7 @@ fn render_playlist_with_vst3_cancellable(
                     frames,
                     master_output,
                     vst3_processor: vst3_processor.as_mut(),
+                    vst2_processor: vst2_processor.as_mut(),
                     remainder_stop,
                 },
                 Some(&mixer_track_meters),
@@ -4627,6 +4773,7 @@ fn render_playlist_with_vst3_cancellable(
                     frames,
                     master_output,
                     vst3_processor: vst3_processor.as_mut(),
+                    vst2_processor: vst2_processor.as_mut(),
                     remainder_stop,
                 },
                 Some(&mixer_track_meters),
@@ -4681,9 +4828,35 @@ pub fn render_playlist_mixer_stems_with_vst3_cancellable(
     options: PlaylistRenderOptions,
     output_directory: impl AsRef<Path>,
     stem_options: MixerStemRenderOptions,
-    mut vst3_processor: Option<Vst3PlaylistStreamProcessor>,
+    vst3_processor: Option<Vst3PlaylistStreamProcessor>,
     cancelled: &AtomicBool,
 ) -> Result<PlaylistRenderSummary, String> {
+    render_playlist_mixer_stems_with_vst2_and_vst3_cancellable(
+        document,
+        project_path,
+        options,
+        output_directory,
+        stem_options,
+        PlaylistRenderPlugins {
+            vst3_processor,
+            vst2_runtime: None,
+        },
+        cancelled,
+    )
+}
+
+/// Render Mixer stems with any loaded VST3 and VST2 instrument channels.
+pub fn render_playlist_mixer_stems_with_vst2_and_vst3_cancellable(
+    document: &FlpDocument,
+    project_path: impl AsRef<Path>,
+    mut options: PlaylistRenderOptions,
+    output_directory: impl AsRef<Path>,
+    stem_options: MixerStemRenderOptions,
+    plugins: PlaylistRenderPlugins,
+    cancelled: &AtomicBool,
+) -> Result<PlaylistRenderSummary, String> {
+    let mut vst3_processor = plugins.vst3_processor;
+    let vst2_runtime = plugins.vst2_runtime;
     let project_path = project_path.as_ref();
     let output_directory = output_directory.as_ref();
     let MixerStemRenderOptions {
@@ -4795,6 +4968,35 @@ pub fn render_playlist_mixer_stems_with_vst3_cancellable(
         .as_ref()
         .map(|processor| processor.volume_expression_channel_ids().clone())
         .unwrap_or_default();
+    let loaded_vst2_channel_ids = vst2_runtime
+        .as_ref()
+        .map(|runtime| {
+            runtime
+                .lock()
+                .map_err(|_| "VST2 host runtime lock was poisoned".to_owned())
+                .map(|runtime| {
+                    runtime
+                        .loaded_channels()
+                        .into_iter()
+                        .map(|channel| channel.channel_id)
+                        .collect::<BTreeSet<_>>()
+                })
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let mut external_channel_ids = options.clap_audio_channel_ids.as_ref().clone();
+    external_channel_ids.extend(loaded_vst2_channel_ids.iter().copied());
+    if let Some(processor) = vst3_processor.as_ref() {
+        external_channel_ids.extend(processor.performance_channel_ids());
+    }
+    options.clap_audio_channel_ids = Arc::new(external_channel_ids);
+    let mut vst2_processor = vst2_runtime
+        .as_ref()
+        .map(|runtime| {
+            prepare_vst2_playlist_processor(document, &options, runtime, vst3_processor.as_mut())
+        })
+        .transpose()?
+        .flatten();
     let sampler = prepare_sampler_arrangement(
         document,
         project_path,
@@ -4808,6 +5010,7 @@ pub fn render_playlist_mixer_stems_with_vst3_cancellable(
         && vst3_processor
             .as_ref()
             .is_none_or(|processor| processor.summary().plugin_channels_rendered == 0)
+        && vst2_processor.is_none()
     {
         if let Some(processor) = vst3_processor.as_ref() {
             let unloaded_channels = processor.summary().unloaded_plugin_channels;
@@ -4823,7 +5026,7 @@ pub fn render_playlist_mixer_stems_with_vst3_cancellable(
             }
         }
         return Err(
-            "arrangement contains no supported audio clips, Sampler notes, or loaded VST3 notes in Pattern Clips"
+            "arrangement contains no supported audio clips, Sampler notes, or loaded VST2/VST3 notes in Pattern Clips"
                 .to_owned(),
         );
     }
@@ -4831,6 +5034,9 @@ pub fn render_playlist_mixer_stems_with_vst3_cancellable(
     let mut content_frames = audio.summary.frames.max(sampler.summary.frames);
     if let Some(processor) = vst3_processor.as_mut() {
         content_frames = content_frames.max(processor.content_frames());
+    }
+    if let Some(processor) = vst2_processor.as_ref() {
+        content_frames = content_frames.max(processor.content_frames);
     }
     let wav_cue_points = if options.wav_save_playlist_markers || options.wav_save_note_markers {
         playlist_wav_cue_points(
@@ -4861,9 +5067,17 @@ pub fn render_playlist_mixer_stems_with_vst3_cancellable(
         .iter()
         .map(|spec| {
             if options.wav_trim_pdc_silence {
-                vst3_processor.as_ref().map_or(0, |processor| {
-                    processor.pdc_mixer_stem_start_trim_frames(spec.track, !spec.is_current_stem)
-                })
+                vst3_processor
+                    .as_ref()
+                    .map_or(0, |processor| {
+                        processor
+                            .pdc_mixer_stem_start_trim_frames(spec.track, !spec.is_current_stem)
+                    })
+                    .max(
+                        vst2_processor
+                            .as_ref()
+                            .map_or(0, Vst2PatternStreamProcessor::pdc_render_start_trim_frames),
+                    )
             } else {
                 0
             }
@@ -4873,6 +5087,11 @@ pub fn render_playlist_mixer_stems_with_vst3_cancellable(
         vst3_processor
             .as_ref()
             .map_or(0, Vst3PlaylistStreamProcessor::pdc_render_start_trim_frames)
+            .max(
+                vst2_processor
+                    .as_ref()
+                    .map_or(0, Vst2PatternStreamProcessor::pdc_render_start_trim_frames),
+            )
     } else {
         0
     };
@@ -4946,6 +5165,12 @@ pub fn render_playlist_mixer_stems_with_vst3_cancellable(
         audio_clips_skipped_unsupported_scale: audio.summary.clips_skipped_unsupported_scale,
         pattern_clips_skipped_unsupported_scale: sampler.pattern_clips_skipped_unsupported_scale,
         notes_skipped_unresolved_sample: sampler.summary.notes_skipped_unresolved_sample,
+        vst2_plugin_channels_rendered: vst2_processor
+            .as_ref()
+            .map_or(0, |processor| processor.channels.len()),
+        vst2_notes_rendered: vst2_processor
+            .as_ref()
+            .map_or(0, |processor| processor.notes_scheduled),
         vst3_plugin_channels_rendered: vst3_summary
             .as_ref()
             .map_or(0, |summary| summary.plugin_channels_rendered),
@@ -4968,6 +5193,7 @@ pub fn render_playlist_mixer_stems_with_vst3_cancellable(
             frames,
             master_output,
             vst3_processor: vst3_processor.as_mut(),
+            vst2_processor: vst2_processor.as_mut(),
             remainder_stop: None,
         },
         Some(&meters),
@@ -6104,6 +6330,7 @@ struct PreparedPlaylistBlockMix<'a> {
     frames: u64,
     master_output: MixerMasterOutput,
     vst3_processor: Option<&'a mut Vst3PlaylistStreamProcessor>,
+    vst2_processor: Option<&'a mut Vst2PatternStreamProcessor>,
     remainder_stop: Option<PlaylistRemainderStop>,
 }
 
@@ -6929,10 +7156,19 @@ fn stream_prepared_playlist_render_with_performance(
     };
     let mut post_effect_buses =
         mixer_post_effect_buses_required.then(|| vec![0.0f32; meter_plane_samples]);
-    let direct_source_delay_frames = render.vst3_processor.as_deref().map_or(
-        0,
-        Vst3PlaylistStreamProcessor::pdc_direct_source_delay_frames,
-    );
+    let direct_source_delay_frames = render
+        .vst3_processor
+        .as_deref()
+        .map_or(
+            0,
+            Vst3PlaylistStreamProcessor::pdc_direct_source_delay_frames,
+        )
+        .max(
+            render
+                .vst2_processor
+                .as_deref()
+                .map_or(0, Vst2PatternStreamProcessor::pdc_target_frames),
+        );
     let mixer_bus_delay_count = if (meters.is_some() || mixer_effect_buses_required)
         && (performance.is_some() || latency_updates.is_some() || direct_source_delay_frames > 0)
     {
@@ -7132,6 +7368,18 @@ fn stream_prepared_playlist_render_with_performance(
                         )?;
                     }
                 }
+                if let Some(processor) = render.vst2_processor.as_deref_mut() {
+                    processor.process_block(block_start, frame_count)?;
+                    mix_pattern_audio_layers(
+                        block,
+                        frame_count,
+                        0,
+                        frame_count as u64,
+                        &processor.audio_layers,
+                        &processor.mixer_routes,
+                        meter_buses.as_deref_mut(),
+                    )?;
+                }
                 if let Some(processor) = render.vst3_processor.as_deref_mut() {
                     if let (Some(meter_buses), Some(post_effect_buses)) =
                         (meter_buses.as_deref_mut(), post_effect_buses.as_deref_mut())
@@ -7232,16 +7480,19 @@ fn stream_prepared_playlist_render_with_performance(
             (Ok(frames_rendered), Ok(())) => Ok(frames_rendered),
         }
     });
-    let stop_result = if let Some(processor) = render.vst3_processor.as_deref_mut() {
+    let vst3_stop_result = if let Some(processor) = render.vst3_processor.as_deref_mut() {
         processor.stop_processing()
     } else {
         Ok(())
     };
-    let frames_rendered = match (mix_result, stop_result) {
-        (Err(error), _) => return Err(error),
-        (Ok(_), Err(error)) => return Err(error),
-        (Ok(frames_rendered), Ok(())) => frames_rendered,
+    let vst2_stop_result = if let Some(processor) = render.vst2_processor.as_deref_mut() {
+        processor.stop()
+    } else {
+        Ok(())
     };
+    let frames_rendered = mix_result?;
+    vst3_stop_result?;
+    vst2_stop_result?;
     Ok(PlaylistBlockRenderSummary {
         voices_stolen: sampler_engine.voices_stolen,
         frames_rendered,
@@ -8726,27 +8977,36 @@ impl Vst2PatternStreamProcessor {
         runtime: Arc<Mutex<Vst2HostRuntime>>,
         setup: Vst2PatternStreamSetup<'_>,
     ) -> Result<Self, String> {
+        let channel_ids = setup
+            .channel_infos
+            .iter()
+            .map(|channel| channel.channel_id)
+            .collect::<BTreeSet<_>>();
+        let note_plan = build_vst2_pattern_note_events(
+            setup.document,
+            setup.pattern_notes,
+            &channel_ids,
+            setup.external_channel_ids,
+            setup.volume_expression_channels,
+            &setup.settings,
+        )?;
+        Self::from_note_plan(runtime, setup, note_plan)
+    }
+
+    fn from_note_plan(
+        runtime: Arc<Mutex<Vst2HostRuntime>>,
+        setup: Vst2PatternStreamSetup<'_>,
+        note_plan: Vst2PatternNotePlan,
+    ) -> Result<Self, String> {
         let Vst2PatternStreamSetup {
             document,
-            pattern_notes,
             channel_infos,
             external_channel_ids,
             volume_expression_channels,
             meters,
             settings,
+            ..
         } = setup;
-        let channel_ids = channel_infos
-            .iter()
-            .map(|channel| channel.channel_id)
-            .collect::<BTreeSet<_>>();
-        let note_plan = build_vst2_pattern_note_events(
-            document,
-            pattern_notes,
-            &channel_ids,
-            external_channel_ids,
-            volume_expression_channels,
-            &settings,
-        )?;
         let channels_by_id = document
             .channels()
             .into_iter()
@@ -8823,6 +9083,14 @@ impl Vst2PatternStreamProcessor {
         };
         processor.reset_schedules(0)?;
         Ok(processor)
+    }
+
+    fn pdc_render_start_trim_frames(&self) -> u64 {
+        self.settings.pdc_target_frames
+    }
+
+    fn pdc_target_frames(&self) -> u64 {
+        self.settings.pdc_target_frames
     }
 
     fn notes_scheduled(&self) -> usize {
@@ -9636,6 +9904,262 @@ fn build_vst2_pattern_note_events(
         notes_scheduled,
         content_frames,
     })
+}
+
+fn build_vst2_playlist_note_events(
+    document: &FlpDocument,
+    arrangement_id: u16,
+    sample_rate: u32,
+    soloed_playlist_track_range: Option<(u32, u32)>,
+    loaded_channel_ids: &BTreeSet<u16>,
+    external_channel_ids: &BTreeSet<u16>,
+    volume_expression_channels: &BTreeSet<u16>,
+) -> Result<(Vst2PatternNotePlan, PlaylistTempoMap), String> {
+    let ppq = document.header().ppq();
+    if ppq == 0 {
+        return Err("project PPQ must be greater than zero".to_owned());
+    }
+    let tempo_map = PlaylistTempoMap::for_arrangement(document, arrangement_id)?;
+    let arrangement = document
+        .arrangements()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|arrangement| arrangement.id == arrangement_id)
+        .ok_or_else(|| format!("arrangement {arrangement_id} was not found"))?;
+    let patterns = document.patterns().map_err(|error| error.to_string())?;
+    let disabled_track_ids = document
+        .playlist_tracks()
+        .into_iter()
+        .filter(|track| track.enabled == Some(false))
+        .map(|track| track.id)
+        .collect::<BTreeSet<_>>();
+    let track_filter = PlaylistTrackFilter::new(&disabled_track_ids, soloed_playlist_track_range);
+    let channels = document.channels();
+    let channels_by_id = channels
+        .iter()
+        .map(|channel| (channel.id(), channel))
+        .collect::<BTreeMap<_, _>>();
+    let router = ChannelNoteRouter::new(channels.clone());
+    let schedule = schedule_playlist_pattern_notes_with_adjustments(
+        &patterns,
+        &arrangement,
+        track_filter,
+        PlaylistPatternScheduleOptions {
+            ppq,
+            global_swing_mix_raw: document.metadata().global_swing_mix(),
+            play_truncated_notes_in_clips: document
+                .project_settings()
+                .is_none_or(|settings| settings.play_truncated_notes_in_clips),
+        },
+        |channel_id| {
+            channels_by_id
+                .get(&channel_id)
+                .map_or(128, |channel| channel.swing_mix())
+        },
+        |channel_id, seed, key| {
+            router
+                .targets_for_note_with_clap_and_mixed_crossfade(
+                    channel_id,
+                    seed,
+                    key,
+                    volume_expression_channels,
+                    external_channel_ids,
+                )
+                .into_iter()
+                .filter(|(target_channel_id, _, _)| {
+                    loaded_channel_ids.contains(target_channel_id)
+                        && channels_by_id
+                            .get(target_channel_id)
+                            .is_some_and(|channel| channel.enabled() != Some(false))
+                })
+                .collect()
+        },
+    )?;
+    let mut events_by_channel = loaded_channel_ids
+        .iter()
+        .map(|channel_id| (*channel_id, Vec::new()))
+        .collect::<BTreeMap<_, _>>();
+    let mut notes_scheduled = 0usize;
+    let mut content_frames = 0u64;
+    for placed in schedule.notes {
+        let note = placed.note;
+        if note.key > 127 {
+            return Err(format!(
+                "Playlist Pattern channel {} contains key {} outside the MIDI note range",
+                note.channel_id, note.key
+            ));
+        }
+        if note.length == 0 || placed.stop_tick.is_none() {
+            return Err(format!(
+                "Playlist Pattern channel {} contains a zero-length note",
+                note.channel_id
+            ));
+        }
+        if note.velocity > 127 {
+            return Err(format!(
+                "Playlist Pattern channel {} contains velocity {} outside the MIDI range",
+                note.channel_id, note.velocity
+            ));
+        }
+        let Some(channel) = channels_by_id.get(&placed.target_channel_id) else {
+            continue;
+        };
+        let pitch_offset =
+            channel.master_pitch_note_offset_semitones(document.metadata().master_pitch_cents());
+        let key = i32::from(note.key) + i32::from(pitch_offset);
+        if !(0..=127).contains(&key) {
+            return Err(format!(
+                "Playlist Pattern key {} with project pitch offset is outside the MIDI note range",
+                note.key
+            ));
+        }
+        let velocity = vst2_layer_adjusted_velocity(note.velocity, placed.target_gain);
+        if velocity == 0 {
+            continue;
+        }
+        let start_frame = tempo_map.frame_at_tick(placed.start_tick, sample_rate)?;
+        let stop_frame = tempo_map
+            .frame_at_tick(
+                placed.stop_tick.expect("validated VST2 note end"),
+                sample_rate,
+            )?
+            .max(start_frame.saturating_add(1));
+        events_by_channel
+            .entry(placed.target_channel_id)
+            .or_default()
+            .push(Vst2PatternNoteEvent {
+                start_frame,
+                duration_frames: stop_frame.saturating_sub(start_frame).max(1),
+                channel: note.midi_channel_index(),
+                key: key as u8,
+                velocity,
+            });
+        content_frames = content_frames.max(stop_frame);
+        notes_scheduled = notes_scheduled.saturating_add(1);
+    }
+    for events in events_by_channel.values_mut() {
+        events.sort_by_key(|event| event.start_frame);
+    }
+    Ok((
+        Vst2PatternNotePlan {
+            events_by_channel,
+            notes_scheduled,
+            content_frames,
+        },
+        tempo_map,
+    ))
+}
+
+fn prepare_vst2_playlist_processor(
+    document: &FlpDocument,
+    options: &PlaylistRenderOptions,
+    runtime: &Arc<Mutex<Vst2HostRuntime>>,
+    vst3_processor: Option<&mut Vst3PlaylistStreamProcessor>,
+) -> Result<Option<Vst2PatternStreamProcessor>, String> {
+    let channel_infos = runtime
+        .lock()
+        .map_err(|_| "VST2 host runtime lock was poisoned".to_owned())?
+        .loaded_channels();
+    if channel_infos.is_empty() {
+        return Ok(None);
+    }
+    let loaded_channel_ids = channel_infos
+        .iter()
+        .map(|channel| channel.channel_id)
+        .collect::<BTreeSet<_>>();
+    let mut external_channel_ids = options.clap_audio_channel_ids.as_ref().clone();
+    external_channel_ids.extend(
+        options
+            .clap_audio_layers
+            .iter()
+            .map(|layer| layer.channel_id),
+    );
+    external_channel_ids.extend(loaded_channel_ids.iter().copied());
+    let volume_expression_channels = vst3_processor
+        .as_ref()
+        .map(|processor| processor.volume_expression_channel_ids().clone())
+        .unwrap_or_default();
+    if let Some(processor) = vst3_processor.as_ref() {
+        external_channel_ids.extend(processor.performance_channel_ids());
+    }
+    let (mut note_plan, tempo_map) = build_vst2_playlist_note_events(
+        document,
+        options.arrangement_id,
+        options.sample_rate,
+        options.soloed_playlist_track_range,
+        &loaded_channel_ids,
+        &external_channel_ids,
+        &volume_expression_channels,
+    )?;
+    note_plan
+        .events_by_channel
+        .retain(|_, events| !events.is_empty());
+    if note_plan.notes_scheduled == 0 {
+        return Ok(None);
+    }
+    let used_channel_ids = note_plan
+        .events_by_channel
+        .keys()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let used_channel_infos = channel_infos
+        .into_iter()
+        .filter(|channel| used_channel_ids.contains(&channel.channel_id))
+        .collect::<Vec<_>>();
+    if used_channel_infos
+        .iter()
+        .any(|channel| channel.sample_rate != options.sample_rate)
+    {
+        return Err(
+            "VST2 Playlist instruments are running at a different sample rate; reload the project plug-ins after changing the render rate"
+                .to_owned(),
+        );
+    }
+    let max_vst2_latency_frames = used_channel_infos
+        .iter()
+        .map(|channel| channel.latency_frames as u64)
+        .max()
+        .unwrap_or(0);
+    let automatic_pdc_enabled = document.mixer_automatic_pdc_enabled().unwrap_or(true);
+    let pdc_target_frames = if automatic_pdc_enabled {
+        if let Some(processor) = vst3_processor {
+            processor.set_external_pattern_source_latency_frames(max_vst2_latency_frames)?;
+            processor
+                .pdc_direct_source_delay_frames()
+                .max(max_vst2_latency_frames)
+        } else {
+            max_vst2_latency_frames
+        }
+    } else {
+        0
+    };
+    let tempo_bpm = tempo_map.tempo_bpm_at_tick(0);
+    let settings = Vst2PatternStreamSettings {
+        ppq: document.header().ppq(),
+        tempo_bpm,
+        sample_rate: options.sample_rate,
+        loop_frames: note_plan.content_frames.max(1),
+        repeat_pattern: false,
+        transport_playing: true,
+        transport_tempo_map: Some(tempo_map),
+        transport_cycle_frames: None,
+        pdc_target_frames,
+        master_pitch_cents: document.metadata().master_pitch_cents(),
+    };
+    Vst2PatternStreamProcessor::from_note_plan(
+        Arc::clone(runtime),
+        Vst2PatternStreamSetup {
+            document,
+            pattern_notes: &[],
+            channel_infos: &used_channel_infos,
+            external_channel_ids: &external_channel_ids,
+            volume_expression_channels: &volume_expression_channels,
+            meters: None,
+            settings,
+        },
+        note_plan,
+    )
+    .map(Some)
 }
 
 fn mix_pattern_audio_layers(
@@ -26270,6 +26794,7 @@ mod tests {
                 frames: 2,
                 master_output: MixerMasterOutput::default(),
                 vst3_processor: None,
+                vst2_processor: None,
                 remainder_stop: None,
             },
             Some(&meters),

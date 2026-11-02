@@ -1585,7 +1585,7 @@ impl Vst3PlaylistStreamProcessor {
         Ok(reports)
     }
 
-    pub(crate) fn performance_channel_ids(&self) -> BTreeSet<u16> {
+    pub fn performance_channel_ids(&self) -> BTreeSet<u16> {
         self.streams
             .iter()
             .filter(|stream| stream.live_performance)

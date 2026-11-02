@@ -63,23 +63,22 @@ use flp_rebuild::sample_render::{
     PlaylistLiveStreamControls, PlaylistPatternScheduleOptions, PlaylistPerformanceClapLayer,
     PlaylistPerformanceCommand, PlaylistPerformanceLaunch, PlaylistPerformanceLiveStatus,
     PlaylistPerformanceStream, PlaylistPlaybackLoopRange, PlaylistRenderOptions,
-    PlaylistRenderRange, PlaylistRenderSummary, PlaylistStreamMonitor, PlaylistTailMode,
-    PlaylistTempoMap, PlaylistTrackFilter, ResamplingQuality, SamplerLiveInputRouting,
-    SamplerLiveNoteEvent, SamplerLiveNoteSender, SamplerPatternRenderOptions,
-    SamplerPatternRenderSummary, Vst2LiveInputEvent, Vst2LiveInputPlayback, Vst2LiveInputRouting,
-    Vst2LiveInputSender, Vst3LatencyUpdateControls, Vst3LiveInputEvent, Vst3LiveInputSender,
-    WavChannelMode, WavDitherMode, WavSampleFormat, layer_live_input_queue,
-    nearest_playlist_audio_clip_zero_crossing_tick, playlist_audio_clip_fade_gain,
-    playlist_performance_clap_clip_indices, playlist_performance_clip_indices_with_vst3_and_clap,
+    PlaylistRenderPlugins, PlaylistRenderRange, PlaylistRenderRequest, PlaylistRenderSummary,
+    PlaylistStreamMonitor, PlaylistTailMode, PlaylistTempoMap, PlaylistTrackFilter,
+    ResamplingQuality, SamplerLiveInputRouting, SamplerLiveNoteEvent, SamplerLiveNoteSender,
+    SamplerPatternRenderOptions, SamplerPatternRenderSummary, Vst2LiveInputEvent,
+    Vst2LiveInputPlayback, Vst2LiveInputRouting, Vst2LiveInputSender, Vst3LatencyUpdateControls,
+    Vst3LiveInputEvent, Vst3LiveInputSender, WavChannelMode, WavDitherMode, WavSampleFormat,
+    layer_live_input_queue, nearest_playlist_audio_clip_zero_crossing_tick,
+    playlist_audio_clip_fade_gain, playlist_performance_clap_clip_indices,
+    playlist_performance_clip_indices_with_vst3_and_clap,
     playlist_performance_static_document_with_vst3_and_clap, playlist_performance_vst3_channel_ids,
     playlist_performance_vst3_clip_indices_with_clap, process_recording_precount_through_mixer,
     project_channel_stereo_output_gains_with_layer_adjustments, render_audio_clips_to_file,
     render_pattern_mix_to_file, render_pattern_mixer_stems,
-    render_playlist_mixer_stems_with_vst3_cancellable,
-    render_playlist_with_vst3_to_file_from_frame_cancellable,
-    render_playlist_with_vst3_to_flac_cancellable, render_playlist_with_vst3_to_mp3_cancellable,
-    render_playlist_with_vst3_to_ogg_cancellable, render_playlist_with_vst3_to_wav_cancellable,
-    render_sampler_pattern_to_file, render_sampler_pattern_to_file_with_mixer_effects,
+    render_playlist_mixer_stems_with_vst2_and_vst3_cancellable,
+    render_playlist_with_vst2_and_vst3_to_file_cancellable, render_sampler_pattern_to_file,
+    render_sampler_pattern_to_file_with_mixer_effects,
     render_selected_audio_clips_to_file_with_mixer_effects, sampler_live_note_queue,
     schedule_playlist_pattern_notes_with_adjustments, stream_input_monitor_through_mixer,
     stream_mixed_layer_midi_input_to_device,
@@ -6050,6 +6049,7 @@ struct PlaylistOfflineRenderJob {
     output_path: PathBuf,
     options: PlaylistRenderOptions,
     vst3_processor: Option<Vst3PlaylistStreamProcessor>,
+    vst2_runtime: Option<Arc<Mutex<Vst2HostRuntime>>>,
     range: Option<PlaylistRenderRange>,
     kind: PlaylistOfflineRenderKind,
     track_freeze: Option<PendingPlaylistTrackFreeze>,
@@ -16051,6 +16051,7 @@ impl DawUi {
                     arrangement_id,
                     &playlist_tempo_map,
                     &vst3_volume_expression_channels,
+                    &BTreeSet::new(),
                     self.soloed_playlist_track_range,
                 )
             });
@@ -25828,6 +25829,7 @@ impl DawUi {
         arrangement_id: u16,
         tempo_map: &PlaylistTempoMap,
         vst3_volume_expression_channels: &BTreeSet<u16>,
+        additional_external_channel_ids: &BTreeSet<u16>,
         soloed_playlist_track_range: Option<(u32, u32)>,
     ) -> Result<Vec<ClapPlaylistPreviewRequest>, String> {
         let assigned_channel_ids = self
@@ -25835,6 +25837,8 @@ impl DawUi {
             .keys()
             .copied()
             .collect::<BTreeSet<_>>();
+        let mut external_channel_ids = assigned_channel_ids.clone();
+        external_channel_ids.extend(additional_external_channel_ids.iter().copied());
         if assigned_channel_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -25887,7 +25891,7 @@ impl DawUi {
                                 note_index as u64,
                                 note.key,
                                 vst3_volume_expression_channels,
-                                &assigned_channel_ids,
+                                &external_channel_ids,
                             )
                             .iter()
                             .any(|(target_channel_id, _, _)| {
@@ -25930,7 +25934,7 @@ impl DawUi {
                         seed,
                         key,
                         vst3_volume_expression_channels,
-                        &assigned_channel_ids,
+                        &external_channel_ids,
                     )
                     .into_iter()
                     .filter(|(target_channel_id, gain, _)| {
@@ -26860,11 +26864,31 @@ impl DawUi {
             .as_ref()
             .map(|processor| processor.volume_expression_channel_ids().clone())
             .unwrap_or_default();
+        let mut additional_external_channel_ids =
+            job.options.clap_audio_channel_ids.as_ref().clone();
+        if let Some(processor) = job.vst3_processor.as_ref() {
+            additional_external_channel_ids.extend(processor.performance_channel_ids());
+        }
+        if let Some(runtime) = job.vst2_runtime.as_ref() {
+            let loaded_channels = match runtime.lock() {
+                Ok(runtime) => runtime.loaded_channels(),
+                Err(_) => {
+                    self.status = "VST2 host runtime lock was poisoned".to_owned();
+                    return;
+                }
+            };
+            additional_external_channel_ids.extend(
+                loaded_channels
+                    .into_iter()
+                    .map(|channel| channel.channel_id),
+            );
+        }
         let mut requests = match self.clap_playlist_preview_settings_for_arrangement(
             &job.document,
             job.options.arrangement_id,
             &tempo_map,
             &vst3_volume_expression_channels,
+            &additional_external_channel_ids,
             job.options.soloed_playlist_track_range,
         ) {
             Ok(requests) => requests,
@@ -26951,6 +26975,7 @@ impl DawUi {
             output_path,
             options,
             vst3_processor,
+            vst2_runtime,
             range,
             kind,
             track_freeze,
@@ -26969,86 +26994,58 @@ impl DawUi {
                 PlaylistOfflineRenderKind::MixerStems { .. } => "mixer-stem-render".to_owned(),
             })
             .spawn(move || {
-                let result = match (kind, range) {
-                    (PlaylistOfflineRenderKind::Mix { .. }, Some(range)) => {
-                        render_playlist_with_vst3_to_file_from_frame_cancellable(
+                let result = match kind {
+                    PlaylistOfflineRenderKind::Mix {
+                        output_format,
+                        flac_bits_per_sample,
+                        ogg_bitrate_kbps,
+                        mp3_bitrate_kbps,
+                    } => {
+                        let output_format = match output_format {
+                            PlaylistSongOutputFormat::Wav => AudioRenderOutput::Wav,
+                            PlaylistSongOutputFormat::Flac => AudioRenderOutput::Flac {
+                                bits_per_sample: flac_bits_per_sample,
+                            },
+                            PlaylistSongOutputFormat::Ogg => AudioRenderOutput::Ogg {
+                                bitrate_kbps: ogg_bitrate_kbps,
+                            },
+                            PlaylistSongOutputFormat::Mp3 => AudioRenderOutput::Mp3 {
+                                bitrate_kbps: mp3_bitrate_kbps,
+                            },
+                        };
+                        render_playlist_with_vst2_and_vst3_to_file_cancellable(
                             &document,
                             &project_path,
                             options,
                             &worker_output_path,
-                            range,
-                            vst3_processor,
+                            PlaylistRenderRequest {
+                                output_format,
+                                range,
+                            },
+                            PlaylistRenderPlugins {
+                                vst3_processor,
+                                vst2_runtime,
+                            },
                             &worker_cancelled,
                         )
                     }
-                    (
-                        PlaylistOfflineRenderKind::Mix {
-                            output_format,
-                            flac_bits_per_sample,
-                            ogg_bitrate_kbps,
-                            mp3_bitrate_kbps,
-                        },
-                        None,
-                    ) => match output_format {
-                        PlaylistSongOutputFormat::Wav => {
-                            render_playlist_with_vst3_to_wav_cancellable(
-                                &document,
-                                &project_path,
-                                options,
-                                &worker_output_path,
+                    PlaylistOfflineRenderKind::MixerStems {
+                        options: stem_options,
+                    } if range.is_none() => {
+                        render_playlist_mixer_stems_with_vst2_and_vst3_cancellable(
+                            &document,
+                            &project_path,
+                            options,
+                            &worker_output_path,
+                            stem_options,
+                            PlaylistRenderPlugins {
                                 vst3_processor,
-                                &worker_cancelled,
-                            )
-                        }
-                        PlaylistSongOutputFormat::Flac => {
-                            render_playlist_with_vst3_to_flac_cancellable(
-                                &document,
-                                &project_path,
-                                options,
-                                &worker_output_path,
-                                flac_bits_per_sample,
-                                vst3_processor,
-                                &worker_cancelled,
-                            )
-                        }
-                        PlaylistSongOutputFormat::Ogg => {
-                            render_playlist_with_vst3_to_ogg_cancellable(
-                                &document,
-                                &project_path,
-                                options,
-                                &worker_output_path,
-                                ogg_bitrate_kbps,
-                                vst3_processor,
-                                &worker_cancelled,
-                            )
-                        }
-                        PlaylistSongOutputFormat::Mp3 => {
-                            render_playlist_with_vst3_to_mp3_cancellable(
-                                &document,
-                                &project_path,
-                                options,
-                                &worker_output_path,
-                                mp3_bitrate_kbps,
-                                vst3_processor,
-                                &worker_cancelled,
-                            )
-                        }
-                    },
-                    (
-                        PlaylistOfflineRenderKind::MixerStems {
-                            options: stem_options,
-                        },
-                        None,
-                    ) => render_playlist_mixer_stems_with_vst3_cancellable(
-                        &document,
-                        &project_path,
-                        options,
-                        &worker_output_path,
-                        stem_options,
-                        vst3_processor,
-                        &worker_cancelled,
-                    ),
-                    (PlaylistOfflineRenderKind::MixerStems { .. }, Some(_)) => Err(
+                                vst2_runtime,
+                            },
+                            &worker_cancelled,
+                        )
+                    }
+                    PlaylistOfflineRenderKind::MixerStems { .. } => Err(
                         "time-range selection is not supported for Mixer stem export".to_owned(),
                     ),
                 };
@@ -57384,6 +57381,7 @@ impl DawUi {
             output_path,
             options,
             vst3_processor,
+            vst2_runtime: self.vst2_host.clone(),
             range: Some(PlaylistRenderRange {
                 output_format: audio_output_format,
                 output_start_frame,
@@ -57429,6 +57427,7 @@ impl DawUi {
             return;
         }
         if summary.sampler_notes_rendered
+            + summary.vst2_notes_rendered
             + summary.vst3_notes_rendered
             + clap_instrument_channels_rendered
             == 0
@@ -58114,6 +58113,7 @@ impl DawUi {
             output_path,
             options,
             vst3_processor,
+            vst2_runtime: self.vst2_host.clone(),
             range: None,
             kind: PlaylistOfflineRenderKind::Mix {
                 output_format,
@@ -58293,6 +58293,7 @@ impl DawUi {
             output_path,
             options,
             vst3_processor,
+            vst2_runtime: self.vst2_host.clone(),
             range: render_range,
             kind: PlaylistOfflineRenderKind::Mix {
                 output_format,
@@ -58397,6 +58398,7 @@ impl DawUi {
             output_path: output_directory,
             options,
             vst3_processor,
+            vst2_runtime: self.vst2_host.clone(),
             range: None,
             kind: PlaylistOfflineRenderKind::MixerStems {
                 options: stem_options,
@@ -58484,10 +58486,12 @@ impl DawUi {
                 }
                 self.status = match pending.kind {
                     PendingSongRenderKind::Mix => format!(
-                        "Rendered {} audio clips, {} Sampler clips ({} notes), and {} VST3 channels ({} notes) to {} at {} Hz; {} plug-in channels unloaded, {} scaled audio and {} scaled pattern clips skipped. Measured pre-effect peaks for {} Mixer inserts; supported VST3 Mixer effects and linked Pattern Event, LFO, and Automation Clip parameters were included",
+                        "Rendered {} audio clips, {} Sampler clips ({} notes), {} VST2 channels ({} notes), and {} VST3 channels ({} notes) to {} at {} Hz; {} plug-in channels unloaded, {} scaled audio and {} scaled pattern clips skipped. Measured pre-effect peaks for {} Mixer inserts; supported VST3 Mixer effects and linked Pattern Event, LFO, and Automation Clip parameters were included",
                         summary.audio_clips_rendered,
                         summary.sampler_pattern_clips_rendered,
                         summary.sampler_notes_rendered,
+                        summary.vst2_plugin_channels_rendered,
+                        summary.vst2_notes_rendered,
                         summary.vst3_plugin_channels_rendered,
                         summary.vst3_notes_rendered,
                         pending.output_path.display(),
@@ -58498,7 +58502,8 @@ impl DawUi {
                         insert_peaks.len(),
                     ),
                     PendingSongRenderKind::MixerStems => format!(
-                        "Rendered supported Mixer stems into {} at {} Hz; {}, {}. Loaded VST3 insert and Master effects with route PDC and linked Pattern Event, LFO, and Automation Clip parameters were included; native effect formats, other effect automation links, and PDC silence trimming remain unsupported",
+                        "Rendered supported Mixer stems with {} VST2 instrument channels into {} at {} Hz; {}, {}. Loaded VST3 insert and Master effects with route PDC and linked Pattern Event, LFO, and Automation Clip parameters were included; native effect formats, other effect automation links, and PDC silence trimming remain unsupported",
+                        summary.vst2_plugin_channels_rendered,
                         pending.output_path.display(),
                         summary.sample_rate,
                         if summary.mixer_master_stem_rendered {
@@ -58523,7 +58528,7 @@ impl DawUi {
                             format!("{clip_count} selected Playlist Pattern Clips")
                         };
                         format!(
-                            "Rendered {clip_description} from {} to {} at {} Hz ({} Sampler notes, {} VST3 notes, {} CLAP instrument channels; {} unresolved sample notes, {} unloaded VST3 channels skipped). Supported Mixer effects and linked effect automation were included",
+                            "Rendered {clip_description} from {} to {} at {} Hz ({} Sampler notes, {} VST2 notes, {} VST3 notes, {} CLAP instrument channels; {} unresolved sample notes, {} unloaded VST3 channels skipped). Supported Mixer effects and linked effect automation were included",
                             if start_from_song_start {
                                 "song start"
                             } else if clip_count > 1 {
@@ -58534,6 +58539,7 @@ impl DawUi {
                             pending.output_path.display(),
                             summary.sample_rate,
                             summary.sampler_notes_rendered,
+                            summary.vst2_notes_rendered,
                             summary.vst3_notes_rendered,
                             pending.clap_instrument_channels_rendered,
                             summary.notes_skipped_unresolved_sample,
