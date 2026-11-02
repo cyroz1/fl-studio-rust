@@ -61,6 +61,8 @@ pub struct MixerSendRouteSnapshot {
     pub value_raw: i32,
 }
 
+pub type MidiScriptPatternEntry = (u16, String, Option<u32>, u32);
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ScriptTransportAction {
     Start,
@@ -316,7 +318,7 @@ pub struct MidiScriptTransportState {
     pub current_tempo_milli_bpm: AtomicU64,
     pub project_changed_flag: AtomicI32,
     pub pattern_number: AtomicU64,
-    pub pattern_entries: Mutex<Vec<(u16, String, Option<u32>)>>,
+    pub pattern_entries: Mutex<Vec<MidiScriptPatternEntry>>,
     pub time_signature_numerator: AtomicU64,
     pub time_signature_denominator: AtomicU64,
     pub global_swing_mix_raw: AtomicU64,

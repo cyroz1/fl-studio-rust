@@ -19527,16 +19527,56 @@ impl DawUi {
         let pattern_entries = if has_script {
             self.document
                 .as_ref()
-                .and_then(|document| document.patterns().ok())
-                .unwrap_or_default()
-                .into_iter()
-                .map(|pattern| {
-                    let color = pattern.color.map(|[red, green, blue, _]| {
-                        u32::from(red) | (u32::from(green) << 8) | (u32::from(blue) << 16)
-                    });
-                    (pattern.id, pattern.name.unwrap_or_default(), color)
+                .map(|document| {
+                    let ppq = u64::from(document.header().ppq().max(1));
+                    document
+                        .patterns()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|pattern| {
+                            let color = pattern.color.map(|[red, green, blue, _]| {
+                                u32::from(red) | (u32::from(green) << 8) | (u32::from(blue) << 16)
+                            });
+                            let signature = pattern
+                                .time_markers
+                                .iter()
+                                .filter(|marker| {
+                                    marker.is_signature() && marker.position_ticks() == 0
+                                })
+                                .find_map(|marker| {
+                                    Some((marker.numerator()?, marker.denominator()?))
+                                })
+                                .or_else(|| document.metadata().time_signature())
+                                .unwrap_or((4, 4));
+                            let bar_ticks = (ppq * u64::from(signature.0.max(1)) * 4
+                                / u64::from(signature.1.max(1)))
+                            .max(1);
+                            let last_note_end = pattern
+                                .notes
+                                .iter()
+                                .map(|note| {
+                                    u64::from(note.position)
+                                        .saturating_add(u64::from(note.length.max(1)))
+                                })
+                                .max()
+                                .unwrap_or(0);
+                            let explicit_length = pattern.length_ticks.map(u64::from).unwrap_or(0);
+                            let length_ticks = if explicit_length == 0 {
+                                last_note_end.max(bar_ticks)
+                            } else {
+                                explicit_length.max(last_note_end)
+                            };
+                            let length_beats = length_ticks.div_ceil(ppq).min(u64::from(u32::MAX));
+                            (
+                                pattern.id,
+                                pattern.name.unwrap_or_default(),
+                                color,
+                                length_beats as u32,
+                            )
+                        })
+                        .collect::<Vec<_>>()
                 })
-                .collect::<Vec<_>>()
+                .unwrap_or_default()
         } else {
             Vec::new()
         };

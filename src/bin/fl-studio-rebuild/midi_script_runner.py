@@ -1970,6 +1970,23 @@ def _pattern_color(index):
     return 0
 
 
+def _pattern_length(index):
+    try:
+        index = int(index)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("patterns.getPatternLength() index must be an integer") from error
+    if not 0 <= index <= 999:
+        raise IndexError("patterns.getPatternLength() index must be between 0 and 999")
+    for entry in _active_transport_state.get("pattern_entries", []):
+        if isinstance(entry, (list, tuple)) and len(entry) >= 4:
+            try:
+                if int(entry[0]) == index:
+                    return int(entry[3])
+            except (TypeError, ValueError, OverflowError):
+                continue
+    return 0
+
+
 def _set_pattern_name(index, name):
     try:
         index = int(index)
@@ -2590,6 +2607,7 @@ def _install_modules(script_name, device_name):
     patterns.getPatternName = _pattern_name
     patterns.setPatternName = _set_pattern_name
     patterns.getPatternColor = _pattern_color
+    patterns.getPatternLength = _pattern_length
     patterns.setPatternColor = _set_pattern_color
 
     mixer.getTrackName = _mixer_get_track_name
