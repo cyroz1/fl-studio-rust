@@ -2445,6 +2445,7 @@ def _install_modules(script_name, device_name):
     ui.previous = _ui_previous
     ui.next = _ui_next
     ui.navigateBrowser = _ui_navigate_browser
+    ui.navigateBrowserMenu = _ui_navigate_browser
     ui.navigateBrowserTabs = _ui_navigate_browser_tabs
     ui.getFocusedNodeCaption = _ui_get_focused_node_caption
     ui.getFocusedNodeFileType = _ui_get_focused_node_file_type
