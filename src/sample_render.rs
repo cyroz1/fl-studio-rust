@@ -879,8 +879,8 @@ pub struct PatternInstrumentsPlayback {
     pub extend_preview_tail: bool,
     pub vst3_processor: Option<Vst3PlaylistStreamProcessor>,
     pub vst2_runtime: Option<Arc<Mutex<Vst2HostRuntime>>>,
-    /// Live MIDI targeted at the selected VST2 channel during Pattern transport.
-    pub vst2_live_input: Option<(u16, Vst2LiveInputReceiver)>,
+    /// Live MIDI routed from the selected Pattern channel to loaded VST2 destinations.
+    pub vst2_live_input: Option<Vst2LiveInputRouting>,
     pub clap_audio_channel_ids: BTreeSet<u16>,
     pub pattern_audio_layers: Vec<PatternAudioLayer>,
 }
@@ -1145,6 +1145,13 @@ pub type Vst2LiveInputSender = BoundedLiveInputSender<Vst3LiveInputEvent>;
 pub type Vst2LiveInputReceiver = BoundedLiveInputReceiver<Vst3LiveInputEvent>;
 pub type LayerLiveInputSender = BoundedLiveInputSender<LayerLiveInputEvent>;
 pub type LayerLiveInputReceiver = BoundedLiveInputReceiver<LayerLiveInputEvent>;
+
+/// Pattern-transport MIDI routing to loaded VST2 descendants of one selected channel.
+pub struct Vst2LiveInputRouting {
+    pub source_channel_id: u16,
+    pub target_channel_ids: BTreeSet<u16>,
+    pub receiver: Vst2LiveInputReceiver,
+}
 
 fn bounded_live_input_queue<T: Send>(
     capacity: usize,
@@ -8607,7 +8614,7 @@ struct PatternStreamConfig {
     start_tick: u64,
     vst3_processor: Option<Vst3PlaylistStreamProcessor>,
     vst2_runtime: Option<Arc<Mutex<Vst2HostRuntime>>>,
-    vst2_live_input: Option<(u16, Vst2LiveInputReceiver)>,
+    vst2_live_input: Option<Vst2LiveInputRouting>,
     allow_empty_sampler: bool,
     repeat_pattern: bool,
     extend_preview_tail: bool,
@@ -10350,6 +10357,9 @@ fn stream_pattern_from_tick_with_vst3_to_device(
         None
     };
     let mut vst2_live_input = playback.vst2_live_input.take();
+    let vst2_live_note_router = ChannelNoteRouter::new(document.channels());
+    let mut vst2_live_note_targets = HashMap::<(u8, u8), VecDeque<Vec<u16>>>::new();
+    let mut vst2_live_note_seed = 0_u64;
     let pattern_clap_mixer_routes = prepare_pattern_clap_mixer_routes(
         &playback.pattern_audio_layers,
         document,
@@ -10747,13 +10757,116 @@ fn stream_pattern_from_tick_with_vst3_to_device(
             });
             let sample_count = frame_count * 2;
             let mut vst2_input_disconnected = false;
-            if let Some((channel_id, receiver)) = vst2_live_input.as_mut() {
+            if let Some(live_input) = vst2_live_input.as_mut() {
                 loop {
-                    match receiver.try_recv() {
-                        Ok(event) => {
-                            if let Some(processor) = vst2_processor.as_mut() {
+                    match live_input.receiver.try_recv() {
+                        Ok(Vst3LiveInputEvent::NoteOn {
+                            channel,
+                            key,
+                            velocity,
+                        }) if velocity > 0 => {
+                            let source_key = key.min(127);
+                            let targets = vst2_live_note_router
+                                .targets_for_note_with_layer_adjustments(
+                                    live_input.source_channel_id,
+                                    vst2_live_note_seed,
+                                    u16::from(source_key),
+                                )
+                                .into_iter()
+                                .filter_map(|(target_channel_id, _, _)| {
+                                    live_input
+                                        .target_channel_ids
+                                        .contains(&target_channel_id)
+                                        .then_some(target_channel_id)
+                                })
+                                .collect::<Vec<_>>();
+                            vst2_live_note_seed = vst2_live_note_seed.wrapping_add(1);
+                            let event = Vst3LiveInputEvent::NoteOn {
+                                channel,
+                                key: source_key,
+                                velocity: velocity.min(127),
+                            };
+                            let processor = vst2_processor.as_mut().ok_or_else(|| {
+                                "VST2 Pattern processor is unavailable for live MIDI".to_owned()
+                            })?;
+                            for target_channel_id in &targets {
                                 processor.queue_live_midi_input_event(
-                                    *channel_id,
+                                    *target_channel_id,
+                                    block_start,
+                                    event,
+                                )?;
+                            }
+                            vst2_live_note_targets
+                                .entry((channel & 0x0F, source_key))
+                                .or_default()
+                                .push_back(targets);
+                        }
+                        Ok(Vst3LiveInputEvent::NoteOff { channel, key }) => {
+                            let source_note = (channel & 0x0F, key.min(127));
+                            let targets = vst2_live_note_targets
+                                .get_mut(&source_note)
+                                .and_then(VecDeque::pop_front);
+                            if vst2_live_note_targets
+                                .get(&source_note)
+                                .is_some_and(VecDeque::is_empty)
+                            {
+                                vst2_live_note_targets.remove(&source_note);
+                            }
+                            if let Some(targets) = targets {
+                                let processor = vst2_processor.as_mut().ok_or_else(|| {
+                                    "VST2 Pattern processor is unavailable for live MIDI".to_owned()
+                                })?;
+                                for target_channel_id in targets {
+                                    processor.queue_live_midi_input_event(
+                                        target_channel_id,
+                                        block_start,
+                                        Vst3LiveInputEvent::NoteOff {
+                                            channel,
+                                            key: source_note.1,
+                                        },
+                                    )?;
+                                }
+                            }
+                        }
+                        Ok(event @ Vst3LiveInputEvent::PolyphonicPressure { channel, key, .. }) => {
+                            let source_note = (channel & 0x0F, key.min(127));
+                            let targets = vst2_live_note_targets
+                                .get(&source_note)
+                                .into_iter()
+                                .flatten()
+                                .flatten()
+                                .copied()
+                                .collect::<BTreeSet<_>>();
+                            if !targets.is_empty() {
+                                let processor = vst2_processor.as_mut().ok_or_else(|| {
+                                    "VST2 Pattern processor is unavailable for live MIDI".to_owned()
+                                })?;
+                                for target_channel_id in targets {
+                                    processor.queue_live_midi_input_event(
+                                        target_channel_id,
+                                        block_start,
+                                        event,
+                                    )?;
+                                }
+                            }
+                        }
+                        Ok(event) => {
+                            if let Vst3LiveInputEvent::ControlChange {
+                                channel,
+                                controller: 120 | 123..=127,
+                                ..
+                            } = event
+                            {
+                                vst2_live_note_targets.retain(|(midi_channel, _), _| {
+                                    *midi_channel != (channel & 0x0F)
+                                });
+                            }
+                            let processor = vst2_processor.as_mut().ok_or_else(|| {
+                                "VST2 Pattern processor is unavailable for live MIDI".to_owned()
+                            })?;
+                            for target_channel_id in &live_input.target_channel_ids {
+                                processor.queue_live_midi_input_event(
+                                    *target_channel_id,
                                     block_start,
                                     event,
                                 )?;

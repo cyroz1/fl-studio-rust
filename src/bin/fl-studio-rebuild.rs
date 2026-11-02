@@ -66,11 +66,11 @@ use flp_rebuild::sample_render::{
     PlaylistRenderRange, PlaylistRenderSummary, PlaylistStreamMonitor, PlaylistTailMode,
     PlaylistTempoMap, PlaylistTrackFilter, ResamplingQuality, SamplerLiveInputRouting,
     SamplerLiveNoteEvent, SamplerLiveNoteSender, SamplerPatternRenderOptions,
-    SamplerPatternRenderSummary, Vst2LiveInputSender, Vst3LatencyUpdateControls,
-    Vst3LiveInputEvent, Vst3LiveInputSender, WavChannelMode, WavDitherMode, WavSampleFormat,
-    layer_live_input_queue, nearest_playlist_audio_clip_zero_crossing_tick,
-    playlist_audio_clip_fade_gain, playlist_performance_clap_clip_indices,
-    playlist_performance_clip_indices_with_vst3_and_clap,
+    SamplerPatternRenderSummary, Vst2LiveInputRouting, Vst2LiveInputSender,
+    Vst3LatencyUpdateControls, Vst3LiveInputEvent, Vst3LiveInputSender, WavChannelMode,
+    WavDitherMode, WavSampleFormat, layer_live_input_queue,
+    nearest_playlist_audio_clip_zero_crossing_tick, playlist_audio_clip_fade_gain,
+    playlist_performance_clap_clip_indices, playlist_performance_clip_indices_with_vst3_and_clap,
     playlist_performance_static_document_with_vst3_and_clap, playlist_performance_vst3_channel_ids,
     playlist_performance_vst3_clip_indices_with_clap, process_recording_precount_through_mixer,
     project_channel_stereo_output_gains_with_layer_adjustments, render_audio_clips_to_file,
@@ -6136,6 +6136,7 @@ struct PendingSamplerStream {
     live_midi_senders: BTreeMap<u16, Vst3PlaylistLiveInputSender>,
     live_vst2_sender: Option<Vst2LiveInputSender>,
     live_vst2_channel_id: Option<u16>,
+    live_vst2_target_channel_ids: BTreeSet<u16>,
     staged_streaming: Option<StagedStreamingPlayback>,
     staged_handoff_reason: Option<PdcStreamHandoffReason>,
 }
@@ -55035,6 +55036,7 @@ impl DawUi {
                     live_midi_senders: BTreeMap::new(),
                     live_vst2_sender: None,
                     live_vst2_channel_id: None,
+                    live_vst2_target_channel_ids: BTreeSet::new(),
                     staged_streaming: None,
                     staged_handoff_reason: None,
                 });
@@ -55326,6 +55328,7 @@ impl DawUi {
                     live_midi_senders: BTreeMap::new(),
                     live_vst2_sender: None,
                     live_vst2_channel_id: None,
+                    live_vst2_target_channel_ids: BTreeSet::new(),
                     staged_streaming: None,
                     staged_handoff_reason: None,
                 });
@@ -55825,15 +55828,22 @@ impl DawUi {
             .as_ref()
             .map(Vst3PlaylistStreamProcessor::live_midi_input_senders)
             .unwrap_or_default();
-        let live_vst2_channel_id =
-            loop_length_ticks
-                .and(self.selected_note_channel)
-                .filter(|channel_id| {
-                    vst2_channel_infos
-                        .iter()
-                        .any(|channel| channel.channel_id == *channel_id)
-                });
-        let (live_vst2_sender, live_vst2_receiver) = if live_vst2_channel_id.is_some() {
+        let live_vst2_input_routing = loop_length_ticks
+            .and(self.selected_note_channel)
+            .map(|source_channel_id| {
+                (
+                    source_channel_id,
+                    self.live_vst2_input_target_channels(source_channel_id),
+                )
+            })
+            .filter(|(_, target_channel_ids)| !target_channel_ids.is_empty());
+        let live_vst2_channel_id = live_vst2_input_routing
+            .as_ref()
+            .map(|(source_channel_id, _)| *source_channel_id);
+        let live_vst2_target_channel_ids = live_vst2_input_routing
+            .as_ref()
+            .map_or_else(BTreeSet::new, |(_, channel_ids)| channel_ids.clone());
+        let (live_vst2_sender, live_vst2_receiver) = if live_vst2_input_routing.is_some() {
             let (sender, receiver) = vst2_live_input_queue();
             (Some(sender), Some(receiver))
         } else {
@@ -55927,27 +55937,29 @@ impl DawUi {
                 (None, None)
             };
         let (sender, receiver) = mpsc::sync_channel(1);
-        let worker = thread::Builder::new()
-            .name(if loop_length_ticks.is_some() {
-                "sampler-pattern-transport".to_owned()
-            } else {
-                "sampler-pattern-stream".to_owned()
-            })
-            .spawn(move || {
-                let result = FlpDocument::parse(&project_bytes)
-                    .map_err(|error| error.to_string())
-                    .and_then(|document| {
-                        let options = SamplerPatternRenderOptions {
-                            pattern_id,
-                            sample_rate: device_rate,
-                            resampling_quality,
-                            read_sample_root_note,
-                            read_sample_tempo_information,
-                            ..SamplerPatternRenderOptions::default()
-                        };
-                        let extend_preview_tail = loop_length_ticks.is_none()
-                            && (has_vst2_channels || vst3_processor.is_some());
-                        stream_pattern_with_loaded_plugins_to_device_with_live_controls(
+        let worker =
+            thread::Builder::new()
+                .name(if loop_length_ticks.is_some() {
+                    "sampler-pattern-transport".to_owned()
+                } else {
+                    "sampler-pattern-stream".to_owned()
+                })
+                .spawn(move || {
+                    let result =
+                        FlpDocument::parse(&project_bytes)
+                            .map_err(|error| error.to_string())
+                            .and_then(|document| {
+                                let options = SamplerPatternRenderOptions {
+                                    pattern_id,
+                                    sample_rate: device_rate,
+                                    resampling_quality,
+                                    read_sample_root_note,
+                                    read_sample_tempo_information,
+                                    ..SamplerPatternRenderOptions::default()
+                                };
+                                let extend_preview_tail = loop_length_ticks.is_none()
+                                    && (has_vst2_channels || vst3_processor.is_some());
+                                stream_pattern_with_loaded_plugins_to_device_with_live_controls(
                             &document,
                             &project_path,
                             options,
@@ -55965,7 +55977,17 @@ impl DawUi {
                                     extend_preview_tail,
                                     vst3_processor,
                                     vst2_runtime,
-                                    vst2_live_input: live_vst2_channel_id.zip(live_vst2_receiver),
+                                    vst2_live_input: live_vst2_input_routing
+                                        .zip(live_vst2_receiver)
+                                        .map(
+                                            |((source_channel_id, target_channel_ids), receiver)| {
+                                                Vst2LiveInputRouting {
+                                                    source_channel_id,
+                                                    target_channel_ids,
+                                                    receiver,
+                                                }
+                                            },
+                                        ),
                                     clap_audio_channel_ids: worker_clap_pattern_channels,
                                     pattern_audio_layers: worker_pattern_audio_layers,
                                 },
@@ -55983,10 +56005,10 @@ impl DawUi {
                             &writer,
                             &worker_cancelled,
                         )
-                    });
-                writer.finish();
-                let _ = sender.send(result);
-            });
+                            });
+                    writer.finish();
+                    let _ = sender.send(result);
+                });
         match worker {
             Ok(worker) => {
                 if let Some(staged) = staged_streaming.as_ref()
@@ -56007,6 +56029,7 @@ impl DawUi {
                     live_midi_senders,
                     live_vst2_sender,
                     live_vst2_channel_id,
+                    live_vst2_target_channel_ids,
                     staged_streaming,
                     staged_handoff_reason: staged_handoff.map(|(_, reason)| reason),
                 });
@@ -71694,6 +71717,21 @@ impl DawUi {
         .then_some(targets)
     }
 
+    fn live_vst2_input_target_channels(&self, source_channel_id: u16) -> BTreeSet<u16> {
+        let loaded_vst2_channels = self.loaded_vst2_channel_ids();
+        let source_is_enabled_vst2_channel = loaded_vst2_channels.contains(&source_channel_id)
+            && self.document.as_ref().is_some_and(|document| {
+                document.channels().into_iter().any(|channel| {
+                    channel.id() == source_channel_id && channel.enabled() != Some(false)
+                })
+            });
+        if source_is_enabled_vst2_channel {
+            return BTreeSet::from([source_channel_id]);
+        }
+        self.live_layer_input_targets(source_channel_id)
+            .map_or_else(BTreeSet::new, |targets| targets.vst2_channel_ids)
+    }
+
     fn live_playlist_vst3_note_layer_adjustments(
         &self,
         source_channel_id: u16,
@@ -74016,31 +74054,31 @@ impl DawUi {
         {
             return;
         }
-        let is_loaded_vst2_channel = self.vst2_host.as_ref().is_some_and(|runtime| {
-            runtime.lock().is_ok_and(|runtime| {
-                runtime
-                    .loaded_channels()
-                    .iter()
-                    .any(|channel| channel.channel_id == channel_id)
-            })
-        });
-        if !is_loaded_vst2_channel {
+        let vst2_target_channel_ids = self.live_vst2_input_target_channels(channel_id);
+        if vst2_target_channel_ids.is_empty() {
             return;
         }
         if pattern_transport_active
             && !self.pending_sampler_stream.as_ref().is_some_and(|stream| {
-                stream.live_vst2_channel_id == Some(channel_id) && stream.live_vst2_sender.is_some()
+                stream.live_vst2_channel_id == Some(channel_id)
+                    && stream.live_vst2_target_channel_ids == vst2_target_channel_ids
+                    && stream.live_vst2_sender.is_some()
             })
         {
             return;
         }
-        let key_region = self.document.as_ref().and_then(|document| {
-            document
-                .channels()
-                .into_iter()
-                .find(|channel| channel.id() == channel_id)
-                .and_then(|channel| channel.keyboard_key_region())
-        });
+        let key_region = (vst2_target_channel_ids.len() == 1
+            && vst2_target_channel_ids.contains(&channel_id))
+        .then(|| {
+            self.document.as_ref().and_then(|document| {
+                document
+                    .channels()
+                    .into_iter()
+                    .find(|channel| channel.id() == channel_id)
+                    .and_then(|channel| channel.keyboard_key_region())
+            })
+        })
+        .flatten();
         if self.live_vst2_input.as_ref().is_some_and(|session| {
             session.pattern_id != pattern_id || session.channel_id != channel_id
         }) {
@@ -74217,6 +74255,7 @@ impl DawUi {
             self.pending_sampler_stream.as_ref().is_some_and(|stream| {
                 stream.live_vst2_sender.as_ref().is_some_and(|sender| {
                     stream.live_vst2_channel_id == Some(channel_id)
+                        && stream.live_vst2_target_channel_ids == vst2_target_channel_ids
                         && sender.send(live_event).is_ok()
                 })
             })
