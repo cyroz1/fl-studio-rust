@@ -18,12 +18,14 @@ use crate::sample_render::swing_note_start_tick;
 use crate::vst3::{MixerEffectProcessor, MixerEffectProcessorFactory};
 use crate::{ChannelPluginState, PatternNote};
 use vst_audio::{
-    AudioEndpoint, AudioEvent, AudioStatus, BusSelector, ClassInfo, Command, Configuration,
-    EditPhase, EventData, Host, HostEvent, Instance, MAX_EVENTS, PluginDescriptor, PluginFormat,
-    ProcessReport, RequestId, Transport,
+    AudioEndpoint, AudioEvent, AudioStatus, BusChoice, BusKind, BusSelector, ClassInfo, Command,
+    Configuration, EditPhase, EventData, Host, HostEvent, Instance, MAX_EVENTS, PluginDescriptor,
+    PluginFormat, ProcessReport, RequestId, Transport,
 };
 
 const RENDER_QUANTUM: u32 = 512;
+const MAX_VST2_MIXER_AUXILIARY_INPUT_BUSES: usize = 16;
+const MAX_VST2_MIXER_EFFECT_INPUT_CHANNELS: usize = 2 + MAX_VST2_MIXER_AUXILIARY_INPUT_BUSES * 2;
 const MAX_RENDER_SECONDS: f64 = 120.0;
 const MAX_RENDER_BUFFER_BYTES: usize = 512 * 1024 * 1024;
 const VST2_TAIL_PROBE_FLAG: &str = "--vst2-tail-probe";
@@ -1204,6 +1206,145 @@ fn read_vst2_parameters(
     }
 }
 
+#[derive(Default)]
+struct Vst2MixerEffectBusLayout {
+    main_input_offset: usize,
+    main_input_channels: usize,
+    auxiliary_input_buses: Vec<(usize, usize)>,
+    auxiliary_input_channel_offsets: Vec<usize>,
+    input_channels: usize,
+    output_channels: usize,
+}
+
+fn vst2_mixer_effect_bus_selector(
+    selected_layout: Arc<Mutex<Option<Vst2MixerEffectBusLayout>>>,
+) -> BusSelector {
+    BusSelector::new(move |inputs, outputs| {
+        let main_input_index = inputs
+            .iter()
+            .position(|bus| bus.kind == BusKind::Main)
+            .ok_or_else(|| "VST2 Mixer effect has no main input bus".to_owned())?;
+        let main_output_index = outputs
+            .iter()
+            .position(|bus| bus.kind == BusKind::Main)
+            .ok_or_else(|| "VST2 Mixer effect has no main output bus".to_owned())?;
+        let main_input_channels = usize::from(inputs[main_input_index].layout.channels);
+        let output_channels = usize::from(outputs[main_output_index].layout.channels);
+        if !matches!(main_input_channels, 1 | 2) || !matches!(output_channels, 1 | 2) {
+            return Err(
+                "VST2 Mixer effect must expose mono or stereo main input and output buses"
+                    .to_owned(),
+            );
+        }
+
+        let auxiliary_count = inputs.iter().filter(|bus| bus.kind == BusKind::Aux).count();
+        if auxiliary_count > MAX_VST2_MIXER_AUXILIARY_INPUT_BUSES
+            || inputs
+                .iter()
+                .filter(|bus| bus.kind == BusKind::Aux)
+                .any(|bus| !matches!(bus.layout.channels, 1 | 2))
+        {
+            return Err(
+                "VST2 Mixer effect supports up to 16 mono or stereo auxiliary input buses"
+                    .to_owned(),
+            );
+        }
+
+        let mut layout = Vst2MixerEffectBusLayout {
+            main_input_channels,
+            output_channels,
+            ..Vst2MixerEffectBusLayout::default()
+        };
+        let mut channel_offset = 0usize;
+        let input_configurations = inputs
+            .iter()
+            .enumerate()
+            .map(|(bus_index, bus)| {
+                let active = bus_index == main_input_index || bus.kind == BusKind::Aux;
+                if active {
+                    if bus_index == main_input_index {
+                        layout.main_input_offset = channel_offset;
+                    } else {
+                        layout
+                            .auxiliary_input_buses
+                            .push((bus_index, usize::from(bus.layout.channels)));
+                        layout.auxiliary_input_channel_offsets.push(channel_offset);
+                    }
+                    channel_offset =
+                        channel_offset.saturating_add(usize::from(bus.layout.channels));
+                }
+                bus.configuration(active)
+            })
+            .collect();
+        layout.input_channels = channel_offset;
+        let output_configurations = outputs
+            .iter()
+            .enumerate()
+            .map(|(bus_index, bus)| bus.configuration(bus_index == main_output_index))
+            .collect();
+        *selected_layout
+            .lock()
+            .map_err(|_| "VST2 Mixer effect bus layout state was poisoned".to_owned())? =
+            Some(layout);
+        Ok(BusChoice {
+            inputs: input_configurations,
+            outputs: output_configurations,
+        })
+    })
+}
+
+fn copy_vst2_mixer_stereo_bus(
+    input_buffers: &mut [Vec<f32>],
+    channel_offset: usize,
+    channels: usize,
+    stereo_samples: &[f32],
+    frames: usize,
+) -> Result<(), String> {
+    let expected_sample_count = frames
+        .checked_mul(2)
+        .ok_or_else(|| "VST2 Mixer bus block size overflow".to_owned())?;
+    if stereo_samples.len() != expected_sample_count {
+        return Err("VST2 Mixer bus block has an invalid size".to_owned());
+    }
+    let stereo_frames = stereo_samples.as_chunks::<2>().0;
+    if channels == 1 {
+        let mono_buffer = input_buffers
+            .get_mut(channel_offset)
+            .and_then(|buffer| buffer.get_mut(..frames))
+            .ok_or_else(|| "VST2 Mixer mono bus channel is outside its active layout".to_owned())?;
+        for (mono, stereo) in mono_buffer.iter_mut().zip(stereo_frames.iter()) {
+            *mono = finite_sample((stereo[0] + stereo[1]) * 0.5);
+        }
+    } else if channels == 2 {
+        let right_channel = channel_offset
+            .checked_add(1)
+            .ok_or_else(|| "VST2 Mixer stereo bus channel offset overflow".to_owned())?;
+        if right_channel >= input_buffers.len() {
+            return Err("VST2 Mixer stereo bus is outside its active layout".to_owned());
+        }
+        let (left_buffers, right_buffers) = input_buffers.split_at_mut(right_channel);
+        let left_buffer = left_buffers
+            .get_mut(channel_offset)
+            .and_then(|buffer| buffer.get_mut(..frames))
+            .ok_or_else(|| "VST2 Mixer left channel is outside its active layout".to_owned())?;
+        let right_buffer = right_buffers
+            .first_mut()
+            .and_then(|buffer| buffer.get_mut(..frames))
+            .ok_or_else(|| "VST2 Mixer right channel is outside its active layout".to_owned())?;
+        for ((left, right), stereo) in left_buffer
+            .iter_mut()
+            .zip(right_buffer.iter_mut())
+            .zip(stereo_frames.iter())
+        {
+            *left = finite_sample(stereo[0]);
+            *right = finite_sample(stereo[1]);
+        }
+    } else {
+        return Err("VST2 Mixer bus must be mono or stereo".to_owned());
+    }
+    Ok(())
+}
+
 struct Vst2MixerEffectProcessor {
     _instance: Instance,
     audio: AudioEndpoint,
@@ -1211,12 +1352,14 @@ struct Vst2MixerEffectProcessor {
     quantum: usize,
     input_channels: usize,
     output_channels: usize,
+    main_input_offset: usize,
+    auxiliary_input_buses: Vec<(usize, usize)>,
+    auxiliary_input_channel_offsets: Vec<usize>,
     latency_samples: u32,
     tail_samples: Option<u64>,
     startup_fallbacks: usize,
     transport: Transport,
-    input_left: Vec<f32>,
-    input_right: Vec<f32>,
+    input_buffers: Vec<Vec<f32>>,
     output_left: Vec<f32>,
     output_right: Vec<f32>,
     parameter_events: Vec<AudioEvent>,
@@ -1235,12 +1378,15 @@ impl Vst2MixerEffectProcessor {
     ) -> Result<Self, String> {
         let tail_samples = probe_vst2_mixer_effect_tail_samples(assignment, sample_rate);
         let (parameter_sync_revision, pending_parameter_updates) = parameter_sync.snapshot(key);
+        let selected_bus_layout = Arc::new(Mutex::new(None));
         let configuration = Configuration {
             sample_rate,
             quantum: RENDER_QUANTUM,
             max_callback_frames: Some(RENDER_QUANTUM),
             offline: false,
-            buses: Some(BusSelector::main_only()),
+            buses: Some(vst2_mixer_effect_bus_selector(Arc::clone(
+                &selected_bus_layout,
+            ))),
             ..Configuration::default()
         };
         let descriptor = PluginDescriptor {
@@ -1256,11 +1402,16 @@ impl Vst2MixerEffectProcessor {
             "VST2 worker did not provide a Mixer effect audio endpoint".to_owned()
         })?;
         let geometry = audio.geometry();
-        let input_channels = geometry.input_channels as usize;
-        let output_channels = geometry.output_channels as usize;
-        if !matches!(input_channels, 1 | 2) || !matches!(output_channels, 1 | 2) {
+        let bus_layout = selected_bus_layout
+            .lock()
+            .map_err(|_| "VST2 Mixer effect bus layout state was poisoned".to_owned())?
+            .take()
+            .ok_or_else(|| "VST2 Mixer effect bus layout was not selected".to_owned())?;
+        if geometry.input_channels as usize != bus_layout.input_channels
+            || geometry.output_channels as usize != bus_layout.output_channels
+        {
             return Err(format!(
-                "VST2 Mixer effect {} must expose mono or stereo main input and output buses",
+                "VST2 Mixer effect {} has inconsistent active bus geometry",
                 assignment.fourcc
             ));
         }
@@ -1273,14 +1424,16 @@ impl Vst2MixerEffectProcessor {
             audio,
             sample_rate,
             quantum,
-            input_channels,
-            output_channels,
+            input_channels: bus_layout.main_input_channels,
+            output_channels: bus_layout.output_channels,
+            main_input_offset: bus_layout.main_input_offset,
+            auxiliary_input_buses: bus_layout.auxiliary_input_buses,
+            auxiliary_input_channel_offsets: bus_layout.auxiliary_input_channel_offsets,
             latency_samples,
             tail_samples,
             startup_fallbacks: (latency_samples as usize).div_ceil(quantum),
             transport: Transport::default(),
-            input_left: vec![0.0; quantum],
-            input_right: vec![0.0; quantum],
+            input_buffers: vec![vec![0.0; quantum]; bus_layout.input_channels],
             output_left: vec![0.0; quantum],
             output_right: vec![0.0; quantum],
             parameter_events: Vec::with_capacity(MAX_EVENTS),
@@ -1305,6 +1458,10 @@ impl MixerEffectProcessor for Vst2MixerEffectProcessor {
         self.input_channels
     }
 
+    fn auxiliary_input_buses(&self) -> &[(usize, usize)] {
+        &self.auxiliary_input_buses
+    }
+
     fn output_channels(&self) -> usize {
         self.output_channels
     }
@@ -1323,11 +1480,16 @@ impl MixerEffectProcessor for Vst2MixerEffectProcessor {
         auxiliary_input_samples: &[f32],
         parameter_changes: &[(u32, u32, f64)],
     ) -> Result<(), String> {
-        if !auxiliary_input_samples.is_empty() {
-            return Err("VST2 Mixer effects do not accept auxiliary input buses".to_owned());
-        }
         if samples.is_empty() || !samples.len().is_multiple_of(2) {
             return Err("VST2 Mixer effect input must contain non-empty stereo frames".to_owned());
+        }
+        let expected_auxiliary_sample_count = self
+            .auxiliary_input_buses
+            .len()
+            .checked_mul(samples.len())
+            .ok_or_else(|| "VST2 Mixer sidechain block size overflow".to_owned())?;
+        if auxiliary_input_samples.len() != expected_auxiliary_sample_count {
+            return Err("VST2 Mixer sidechain block has an invalid size".to_owned());
         }
         let frames = samples.len() / 2;
         if frames > self.quantum {
@@ -1388,30 +1550,42 @@ impl MixerEffectProcessor for Vst2MixerEffectProcessor {
         self.parameter_events
             .sort_by_key(|event| event.sample_offset);
 
-        if self.input_channels == 1 {
-            for (mono, stereo) in self.input_left[..frames]
-                .iter_mut()
-                .zip(samples.as_chunks::<2>().0.iter())
-            {
-                *mono = finite_sample((stereo[0] + stereo[1]) * 0.5);
-            }
-        } else {
-            for ((left, right), stereo) in self.input_left[..frames]
-                .iter_mut()
-                .zip(self.input_right[..frames].iter_mut())
-                .zip(samples.as_chunks::<2>().0.iter())
-            {
-                *left = finite_sample(stereo[0]);
-                *right = finite_sample(stereo[1]);
-            }
+        copy_vst2_mixer_stereo_bus(
+            &mut self.input_buffers,
+            self.main_input_offset,
+            self.input_channels,
+            samples,
+            frames,
+        )?;
+        for (bus_position, ((_, channels), channel_offset)) in self
+            .auxiliary_input_buses
+            .iter()
+            .zip(self.auxiliary_input_channel_offsets.iter())
+            .enumerate()
+        {
+            let bus_start = bus_position
+                .checked_mul(samples.len())
+                .ok_or_else(|| "VST2 Mixer sidechain offset overflow".to_owned())?;
+            let bus_end = bus_start
+                .checked_add(samples.len())
+                .ok_or_else(|| "VST2 Mixer sidechain block end overflow".to_owned())?;
+            let bus_samples = auxiliary_input_samples
+                .get(bus_start..bus_end)
+                .ok_or_else(|| "VST2 Mixer sidechain block has an invalid size".to_owned())?;
+            copy_vst2_mixer_stereo_bus(
+                &mut self.input_buffers,
+                *channel_offset,
+                *channels,
+                bus_samples,
+                frames,
+            )?;
         }
         self.output_left[..frames].fill(0.0);
         self.output_right[..frames].fill(0.0);
 
-        let mut inputs = [&[][..]; 2];
-        inputs[0] = &self.input_left[..frames];
-        if self.input_channels == 2 {
-            inputs[1] = &self.input_right[..frames];
+        let mut inputs = [&[][..]; MAX_VST2_MIXER_EFFECT_INPUT_CHANNELS];
+        for (input, buffer) in inputs.iter_mut().zip(self.input_buffers.iter()) {
+            *input = &buffer[..frames];
         }
         let mut outputs: [&mut [f32]; 2] = [&mut [], &mut []];
         outputs[0] = &mut self.output_left[..frames];
@@ -1420,7 +1594,7 @@ impl MixerEffectProcessor for Vst2MixerEffectProcessor {
         }
         let report = self.audio.process_events(
             frames,
-            &inputs[..self.input_channels],
+            &inputs[..self.input_buffers.len()],
             &mut outputs[..self.output_channels],
             self.transport,
             &self.parameter_events,
