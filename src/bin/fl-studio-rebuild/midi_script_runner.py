@@ -185,7 +185,14 @@ def _ui_snap_mode(value):
 
 
 def _ui_selection_jog(increment):
-    _request_transport_action({"action": "selection_jog", "increment": increment})
+    try:
+        increment = int(increment)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("selection jog increment must be an integer") from error
+    if not -(2**31) <= increment < 2**31:
+        raise ValueError("selection jog increment is outside the supported range")
+    if increment:
+        _request_transport_action({"action": "selection_jog", "increment": increment})
     return 8
 
 
@@ -1894,6 +1901,12 @@ def _global_transport(command, value, pmeflags=2, flags=15):
                 {"action": "piano_roll_snap_jog", "increment": value}
             )
         return 8
+    if command == 0:  # FPT_Jog: generic selection jog
+        if value != 0:
+            _request_transport_action({"action": "selection_jog", "increment": value})
+        return 8
+    if command == 1:  # FPT_Jog2: generic move jog
+        return _move_jog(value)
     if command == 5:  # FPT_Previous
         if value != 0:
             _request_transport_action({"action": "selection_jog", "increment": -1})
@@ -2241,6 +2254,8 @@ def _install_modules(script_name, device_name):
 
     ui = _module("ui")
     ui.moveJog = _move_jog
+    ui.jog = _ui_selection_jog
+    ui.jog2 = _move_jog
     ui.isMetronomeEnabled = lambda: bool(
         _active_transport_state.get("metronome_enabled", False)
     )

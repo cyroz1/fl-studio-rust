@@ -4140,7 +4140,7 @@ def OnMidiIn(event):
     }
 
     #[test]
-    fn python_global_transport_previous_next_and_ui_controls_dispatch_selection_jogs() {
+    fn python_generic_jogs_dispatch_selection_and_move_actions() {
         let temporary = TestDirectory::new();
         let script_path = temporary.path().join("device_test.py");
         fs::write(
@@ -4150,13 +4150,22 @@ import midi
 import transport
 import ui
 def OnMidiIn(event):
+    selected = ui.jog(2)
+    moved = ui.jog2(-3)
     previous = ui.previous()
     next = ui.next()
+    transport.globalTransport(midi.FPT_Jog, -2, event.pmeflags)
+    transport.globalTransport(midi.FPT_Jog2, 4, event.pmeflags)
     transport.globalTransport(midi.FPT_Previous, 1, event.pmeflags)
     transport.globalTransport(midi.FPT_Next, 1, event.pmeflags)
     transport.globalTransport(midi.FPT_PreviousNext, 3, event.pmeflags)
     transport.globalTransport(midi.FPT_PreviousNext, 0, event.pmeflags)
-    event.data1 = int(previous == midi.GT_Global and next == midi.GT_Global)
+    event.data1 = int(
+        selected == midi.GT_Global
+        and moved == midi.GT_Global
+        and previous == midi.GT_Global
+        and next == midi.GT_Global
+    )
 "#,
         )
         .unwrap();
@@ -4169,8 +4178,12 @@ def OnMidiIn(event):
         assert_eq!(
             result.actions,
             [
+                ScriptTransportAction::SelectionJog(2),
+                ScriptTransportAction::MoveJog(-3),
                 ScriptTransportAction::SelectionJog(-1),
                 ScriptTransportAction::SelectionJog(1),
+                ScriptTransportAction::SelectionJog(-2),
+                ScriptTransportAction::MoveJog(4),
                 ScriptTransportAction::SelectionJog(-1),
                 ScriptTransportAction::SelectionJog(1),
                 ScriptTransportAction::SelectionJog(3),
