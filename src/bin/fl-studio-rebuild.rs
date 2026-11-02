@@ -11989,6 +11989,74 @@ impl DawUi {
                 lanes.push(lane);
             }
         }
+        for link in document
+            .automation_target_links()
+            .unwrap_or_default()
+            .into_iter()
+        {
+            let destination_raw = link.destination_raw() as u16;
+            if destination_raw & 0xc000 != 0 || link.candidate_vst_parameter() != Some(true) {
+                continue;
+            }
+            let Some(parameter_id) = link.candidate_parameter_index().map(u32::from) else {
+                continue;
+            };
+            let Some((insert, slot)) = link.candidate_mixer_effect_target() else {
+                continue;
+            };
+            if !(1..=127).contains(&insert) || slot >= 10 {
+                continue;
+            }
+            let effect_target = (usize::from(insert), slot);
+            if self
+                .clap_mixer_effect_assignments
+                .contains_key(&effect_target)
+                || self
+                    .mixer_effect_vst3_instances
+                    .contains_key(&effect_target)
+            {
+                continue;
+            }
+            let Some(assignment) = self.vst2_mixer_effect_assignments.get(&effect_target) else {
+                continue;
+            };
+            let Some(snapshot) = self
+                .vst2_mixer_effect_parameter_snapshots
+                .get(&effect_target)
+            else {
+                continue;
+            };
+            if assignment.plugin_path != snapshot.plugin_path
+                || assignment.fourcc != snapshot.fourcc
+                || !snapshot.parameters.iter().any(|parameter| {
+                    parameter.id == parameter_id && parameter.automatable && !parameter.read_only
+                })
+            {
+                continue;
+            }
+            let Some(automation_channel) =
+                automation_channels.get(&link.source_channel_id()).copied()
+            else {
+                continue;
+            };
+            let points = points_for_channel(automation_channel);
+            if points.is_empty() {
+                continue;
+            }
+            let lanes = sources
+                .mixer_effect_automation_clips
+                .entry((link.source_channel_id(), effect_target.0, effect_target.1))
+                .or_default();
+            if !lanes
+                .iter()
+                .any(|existing| existing.parameter_id == parameter_id)
+            {
+                lanes.push(Vst3ParameterAutomation {
+                    parameter_id,
+                    points,
+                });
+            }
+        }
         for link in self
             .playlist_clap_mixer_effect_parameter_links
             .iter()
@@ -13022,6 +13090,35 @@ impl DawUi {
         if assignments.is_empty() {
             return Vec::new();
         }
+        let native_automation_targets = self
+            .document
+            .as_ref()
+            .map(|document| {
+                document
+                    .automation_target_links()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|link| {
+                        let destination_raw = link.destination_raw() as u16;
+                        if destination_raw & 0xc000 != 0
+                            || link.candidate_vst_parameter() != Some(true)
+                        {
+                            return None;
+                        }
+                        let (insert, slot) = link.candidate_mixer_effect_target()?;
+                        ((1..=127).contains(&insert) && slot < 10)
+                            .then_some((usize::from(insert), slot))
+                    })
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        self.vst2_mixer_effect_parameter_snapshots
+            .retain(|key, snapshot| {
+                assignments.get(key).is_some_and(|assignment| {
+                    assignment.plugin_path == snapshot.plugin_path
+                        && assignment.fourcc == snapshot.fourcc
+                })
+            });
         let mut host = match Vst2HostRuntime::new(self.audio_settings.sample_rate, 512) {
             Ok(host) => host,
             Err(error) => {
@@ -13034,7 +13131,28 @@ impl DawUi {
         let mut warnings = Vec::new();
         for (&key, assignment) in assignments {
             match host.load_mixer_effect(key, assignment) {
-                Ok(()) => loaded_count += 1,
+                Ok(()) => {
+                    loaded_count += 1;
+                    if native_automation_targets.contains(&key) {
+                        match host.mixer_effect_parameters(key) {
+                            Ok(parameters) => {
+                                self.vst2_mixer_effect_parameter_snapshots.insert(
+                                    key,
+                                    Vst2MixerEffectParameterSnapshot {
+                                        plugin_path: assignment.plugin_path.clone(),
+                                        fourcc: assignment.fourcc.clone(),
+                                        parameters,
+                                    },
+                                );
+                            }
+                            Err(error) => warnings.push(format!(
+                                "Mixer insert {} effect slot {} native Automation parameters could not be read: {error}",
+                                key.0,
+                                key.1 + 1
+                            )),
+                        }
+                    }
+                }
                 Err(error) => warnings.push(format!(
                     "Mixer insert {} effect slot {} editor worker could not load: {error}",
                     key.0,
