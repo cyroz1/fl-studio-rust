@@ -181,6 +181,10 @@ pub enum ScriptTransportAction {
     PianoRollSnapJog(i32),
     SelectionJog(i32),
     BrowserNavigate(u8),
+    BrowserNavigateShift {
+        direction: u8,
+        shift_held: bool,
+    },
     BrowserTabSelect(u8),
     WindowJog(i32),
     ZoomJog {
@@ -289,7 +293,9 @@ pub const SCRIPT_MIXER_SCROLL_TO_MAKE_VISIBLE: u32 = 1 << 0;
 
 pub struct MidiScriptTransportState {
     pub state: AtomicU8,
+    pub browser_visible: AtomicU8,
     pub browser_tab_index: AtomicU8,
+    pub browser_navigation_targets: Mutex<Vec<(String, bool)>>,
     pub midi_output_port_number: AtomicI32,
     pub song_position: AtomicU64,
     pub song_position_ticks: AtomicU64,
@@ -358,7 +364,9 @@ impl Default for MidiScriptTransportState {
     fn default() -> Self {
         Self {
             state: AtomicU8::new(0),
+            browser_visible: AtomicU8::new(0),
             browser_tab_index: AtomicU8::new(0),
+            browser_navigation_targets: Mutex::new(Vec::new()),
             midi_output_port_number: AtomicI32::new(-1),
             song_position: AtomicU64::new(0.0_f64.to_bits()),
             song_position_ticks: AtomicU64::new(0),
@@ -1212,12 +1220,26 @@ impl MidiScriptRuntime {
             });
             if let Some(transport_object) = transport.as_object_mut() {
                 transport_object.insert(
+                    "browser_visible".to_owned(),
+                    json!(self.transport_state.browser_visible.load(Ordering::Relaxed) != 0),
+                );
+                transport_object.insert(
                     "browser_tab_index".to_owned(),
                     json!(
                         self.transport_state
                             .browser_tab_index
                             .load(Ordering::Relaxed)
                     ),
+                );
+                let browser_navigation_targets = self
+                    .transport_state
+                    .browser_navigation_targets
+                    .lock()
+                    .map(|targets| targets.clone())
+                    .unwrap_or_default();
+                transport_object.insert(
+                    "browser_navigation_targets".to_owned(),
+                    json!(browser_navigation_targets),
                 );
                 transport_object.insert(
                     "metronome_enabled".to_owned(),
@@ -1580,6 +1602,20 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
             .filter(|index| *index < 5)
             .ok_or_else(|| "MIDI script returned an invalid Browser tab index".to_owned())?;
         return Ok(ScriptTransportAction::BrowserTabSelect(index));
+    }
+    if name == Some("browser_navigate_shift") {
+        let direction = action["direction"]
+            .as_u64()
+            .and_then(|direction| u8::try_from(direction).ok())
+            .filter(|direction| *direction <= 3)
+            .ok_or_else(|| "MIDI script returned an invalid Browser direction".to_owned())?;
+        let shift_held = action["shift_held"]
+            .as_bool()
+            .ok_or_else(|| "MIDI script returned an invalid Browser shift state".to_owned())?;
+        return Ok(ScriptTransportAction::BrowserNavigateShift {
+            direction,
+            shift_held,
+        });
     }
     if name == Some("window_jog") {
         let increment = action["increment"]

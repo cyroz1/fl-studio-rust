@@ -228,6 +228,40 @@ def _ui_navigate_browser_tabs(direction):
     return tab_names[target_index]
 
 
+def _ui_navigate_browser(direction, shiftHeld=0):
+    try:
+        direction = int(direction)
+        shift_held = bool(int(shiftHeld))
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("Browser navigation arguments must be integers") from error
+    if direction not in (40, 41, 42, 43):
+        raise ValueError("Browser direction must be FPT_Up, FPT_Down, FPT_Left or FPT_Right")
+    if not _active_transport_state.get("browser_visible", False):
+        return ""
+    if int(_active_transport_state.get("browser_tab_index", 0)) != 0:
+        return ""
+    targets = _active_transport_state.get("browser_navigation_targets", [])
+    target_index = direction - 40
+    if target_index >= len(targets):
+        return ""
+    target = targets[target_index]
+    caption = target[0] if isinstance(target, (list, tuple)) and target else ""
+    is_directory = (
+        bool(target[1]) if isinstance(target, (list, tuple)) and len(target) > 1 else False
+    )
+    if not isinstance(caption, str):
+        caption = ""
+    shift_held = shift_held and direction in (40, 41) and is_directory
+    _request_transport_action(
+        {
+            "action": "browser_navigate_shift",
+            "direction": direction - 40,
+            "shift_held": shift_held,
+        }
+    )
+    return caption
+
+
 def _ui_zoom_jog(horizontal, increment):
     try:
         increment = int(increment)
@@ -2334,6 +2368,7 @@ def _install_modules(script_name, device_name):
     ui.snapMode = _ui_snap_mode
     ui.previous = _ui_previous
     ui.next = _ui_next
+    ui.navigateBrowser = _ui_navigate_browser
     ui.navigateBrowserTabs = _ui_navigate_browser_tabs
 
     playlist = _module("playlist")
