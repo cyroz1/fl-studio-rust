@@ -1013,6 +1013,9 @@ fn queue_script_transport_actions(
             ScriptTransportAction::SelectionJog(increment) => {
                 MidiTransportCommand::SelectionJog(increment)
             }
+            ScriptTransportAction::BrowserNavigate(direction) => {
+                MidiTransportCommand::BrowserNavigate(direction)
+            }
             ScriptTransportAction::ZoomJog {
                 horizontal,
                 increment,
@@ -1175,6 +1178,7 @@ pub enum MidiTransportCommand {
     TogglePianoRollSnap,
     PianoRollSnapJog(i32),
     SelectionJog(i32),
+    BrowserNavigate(u8),
     ZoomJog {
         horizontal: bool,
         increment: i32,
@@ -1976,6 +1980,7 @@ pub fn describe_event(event: MidiInputEvent) -> String {
             MidiTransportCommand::SelectionJog(_) => {
                 "MIDI script Previous/Next Selection".to_owned()
             }
+            MidiTransportCommand::BrowserNavigate(_) => "MIDI script Browser Navigation".to_owned(),
             MidiTransportCommand::ZoomJog { horizontal, .. } => {
                 if horizontal {
                     "MIDI script Horizontal Zoom".to_owned()
@@ -2843,6 +2848,7 @@ mod tests {
                 ScriptTransportAction::ToggleAudioSettingsWindow,
                 ScriptTransportAction::ToggleProjectInfo,
                 ScriptTransportAction::CloseAllWindows,
+                ScriptTransportAction::BrowserNavigate(2),
             ],
         );
 
@@ -2956,6 +2962,10 @@ mod tests {
         assert_eq!(
             transport_receiver.try_recv().unwrap().event,
             MidiInputEvent::Transport(MidiTransportCommand::CloseAllWindows)
+        );
+        assert_eq!(
+            transport_receiver.try_recv().unwrap().event,
+            MidiInputEvent::Transport(MidiTransportCommand::BrowserNavigate(2))
         );
         assert_eq!(dropped_messages.load(Ordering::Relaxed), 0);
     }

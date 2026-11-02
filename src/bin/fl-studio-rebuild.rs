@@ -5784,6 +5784,7 @@ struct DawUi {
     browser_search_all_active: bool,
     browser_search: String,
     browser_selected: Option<PathBuf>,
+    midi_script_browser_navigation: VecDeque<u8>,
     browser_favorites: BTreeSet<PathBuf>,
     browser_tags: BTreeMap<PathBuf, BTreeSet<String>>,
     browser_tag_editor: Option<BrowserTagEditor>,
@@ -9007,6 +9008,7 @@ impl DawUi {
             browser_search_all_active: false,
             browser_search: String::new(),
             browser_selected: None,
+            midi_script_browser_navigation: VecDeque::new(),
             browser_favorites: load_browser_favorites(),
             browser_tags: load_browser_tags(),
             browser_tag_editor: None,
@@ -20804,6 +20806,17 @@ impl DawUi {
         }
     }
 
+    fn navigate_midi_script_browser(&mut self, direction: u8) {
+        if !self.browser_visible || self.browser_tab != BrowserTab::Files {
+            return;
+        }
+        if self.midi_script_browser_navigation.len() < 128 {
+            self.midi_script_browser_navigation.push_back(direction);
+        } else {
+            self.status = "MIDI script Browser navigation queue is full".to_owned();
+        }
+    }
+
     fn jog_midi_script_zoom(&mut self, horizontal: bool, increment: i32) {
         if increment == 0 {
             return;
@@ -28484,6 +28497,9 @@ impl DawUi {
             self.apply_browser_search(search);
         }
         ui.separator();
+        if self.browser_tab != BrowserTab::Files {
+            self.midi_script_browser_navigation.clear();
+        }
 
         match self.browser_tab {
             BrowserTab::Files => self.browser_files(ui),
@@ -29554,6 +29570,25 @@ impl DawUi {
     }
 
     fn browser_files(&mut self, ui: &mut egui::Ui) {
+        let navigation_direction = self.midi_script_browser_navigation.pop_front();
+        match navigation_direction {
+            Some(2) => {
+                if let Some(parent) = self.browser_path.parent().map(Path::to_path_buf) {
+                    self.set_browser_directory(parent);
+                }
+            }
+            Some(3) => {
+                if let Some(selected) = self
+                    .browser_selected
+                    .as_ref()
+                    .filter(|path| path.is_dir())
+                    .cloned()
+                {
+                    self.set_browser_directory(selected);
+                }
+            }
+            _ => {}
+        }
         self.collect_browser_index();
         let home = default_browser_directory();
         let project_folder = self
@@ -29845,6 +29880,31 @@ impl DawUi {
             })
             .cloned()
             .collect::<Vec<_>>();
+        let navigated_path = navigation_direction.and_then(|direction| {
+            if entries.is_empty() {
+                return None;
+            }
+            let selected_index = self
+                .browser_selected
+                .as_ref()
+                .and_then(|selected| entries.iter().position(|entry| &entry.path == selected));
+            let next_index = match direction {
+                0 => selected_index
+                    .map(|index| index.saturating_sub(1))
+                    .unwrap_or(entries.len() - 1),
+                1 => selected_index
+                    .map(|index| (index + 1).min(entries.len() - 1))
+                    .unwrap_or(0),
+                _ => return None,
+            };
+            if selected_index == Some(next_index) {
+                return None;
+            }
+            entries.get(next_index).map(|entry| entry.path.clone())
+        });
+        if let Some(path) = navigated_path.as_ref() {
+            self.browser_selected = Some(path.clone());
+        }
         let bulk_tag_paths = entries
             .iter()
             .filter(|entry| !entry.is_directory)
@@ -30042,6 +30102,7 @@ impl DawUi {
                     ) = row.inner;
                     if step_sample_path.as_ref() == Some(&entry.path)
                         || next_match_path.as_ref() == Some(&entry.path)
+                        || navigated_path.as_ref() == Some(&entry.path)
                     {
                         ui.scroll_to_rect(row_rect, Some(egui::Align::Center));
                     }
@@ -30067,6 +30128,11 @@ impl DawUi {
         if let Some(path) = favorite {
             self.toggle_browser_favorite(path);
         }
+        if let Some(path) = navigated_path.filter(|path| {
+            path.is_file() && browser_file_kind(path) == Some(BrowserFileKind::Audio)
+        }) {
+            self.request_browser_preview(path, self.browser_full_sample, None);
+        }
         if let Some((path, start_fraction)) = preview {
             self.request_browser_preview(path, self.browser_full_sample, start_fraction);
         }
@@ -30083,6 +30149,9 @@ impl DawUi {
             self.load_browser_sample_into_channel(channel_id, &path);
         } else if let (Some((channel_id, _)), Some(path)) = (sample_target, step_sample_path) {
             self.load_browser_sample_into_channel(channel_id, &path);
+        }
+        if !self.midi_script_browser_navigation.is_empty() {
+            ui.ctx().request_repaint();
         }
     }
 
@@ -69320,6 +69389,9 @@ impl DawUi {
             }
             MidiTransportCommand::SelectionJog(increment) => {
                 self.jog_midi_script_selection(increment);
+            }
+            MidiTransportCommand::BrowserNavigate(direction) => {
+                self.navigate_midi_script_browser(direction);
             }
             MidiTransportCommand::ZoomJog {
                 horizontal,

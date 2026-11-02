@@ -723,6 +723,7 @@ fn midi_input_thru_message(event: MidiInputEvent) -> Option<([u8; 3], usize)> {
             | MidiTransportCommand::TogglePianoRollSnap
             | MidiTransportCommand::PianoRollSnapJog(_)
             | MidiTransportCommand::SelectionJog(_)
+            | MidiTransportCommand::BrowserNavigate(_)
             | MidiTransportCommand::ZoomJog { .. }
             | MidiTransportCommand::MoveJog(_)
             | MidiTransportCommand::PatternJog(_)
