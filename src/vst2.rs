@@ -6,12 +6,13 @@
 use std::ffi::OsStr;
 use std::path::Path;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use crate::ChannelPluginState;
 use crate::media::{DecodedAudio, decode_audio_file, write_audio_range_to_wav};
 use vst_audio::{
-    AudioEvent, AudioStatus, BusSelector, ClassInfo, Configuration, Host, PluginDescriptor,
-    PluginFormat, Transport,
+    AudioEvent, AudioStatus, BusSelector, ClassInfo, Command, Configuration, Host, HostEvent,
+    Instance, PluginDescriptor, PluginFormat, Transport,
 };
 
 const RENDER_QUANTUM: u32 = 512;
@@ -62,6 +63,19 @@ pub struct Vst2AudioEffectRenderSummary {
     pub peak: f32,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Vst2StateProbeSummary {
+    pub plugin_name: String,
+    pub vendor: String,
+    pub saved_plugin_name: String,
+    pub saved_vendor: String,
+    pub saved_fourcc: String,
+    pub class_id: String,
+    pub id_byte_order: &'static str,
+    pub state_bytes: usize,
+    pub state_roundtrip_identical: bool,
+}
+
 /// Run the embedded worker when this binary is launched by `vst-audio`.
 ///
 /// `vst-audio` starts the configured executable with `--control-in` as its
@@ -98,6 +112,132 @@ pub fn inspect_vst2_plugin(path: impl AsRef<Path>) -> Result<Vec<ClassInfo>, Str
         return Err("VST2 plug-in did not report a loadable class".to_owned());
     }
     Ok(classes)
+}
+
+/// Try restoring one FLP VST2 channel's field-53 state in an isolated worker.
+///
+/// FL stores the FourCC as a little-endian 32-bit value; the worker class ID
+/// encodes the VST2 unique ID in big-endian bytes. The state is only sent after
+/// exactly one loaded class matches.
+pub fn probe_vst2_channel_state(
+    plugin_path: impl AsRef<Path>,
+    state: &ChannelPluginState,
+) -> Result<Vst2StateProbeSummary, String> {
+    let metadata = state
+        .vst_metadata()
+        .ok_or_else(|| "FLP channel has no recognized VST state envelope".to_owned())?;
+    let fourcc = metadata
+        .fourcc()
+        .ok_or_else(|| "FLP channel state has no VST2 FourCC identifier".to_owned())?;
+    let fourcc_bytes: [u8; 4] = fourcc
+        .as_bytes()
+        .try_into()
+        .map_err(|_| "FLP VST2 FourCC identifier is not exactly four bytes".to_owned())?;
+    if !fourcc_bytes.is_ascii() {
+        return Err("FLP VST2 FourCC identifier is not ASCII".to_owned());
+    }
+    let state_bytes = state
+        .vst_state_bytes()
+        .ok_or_else(|| "FLP VST2 channel state has no nested field 53".to_owned())?;
+    let saved_unique_id = i32::from_le_bytes(fourcc_bytes);
+    let worker_uid_bytes = saved_unique_id.to_be_bytes();
+
+    let mut matching_classes = inspect_vst2_plugin(plugin_path.as_ref())?
+        .into_iter()
+        .filter_map(|class| {
+            if &class.id[..4] != b"VST2" || class.id[8..].iter().any(|byte| *byte != 0) {
+                return None;
+            }
+            let class_uid = &class.id[4..8];
+            if class_uid == worker_uid_bytes {
+                Some((class, "FLP-little-endian"))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    if matching_classes.is_empty() {
+        return Err(format!(
+            "no VST2 class in {} matches saved FourCC {fourcc}",
+            plugin_path.as_ref().display()
+        ));
+    }
+    if matching_classes.len() != 1 {
+        return Err(format!(
+            "saved VST2 FourCC {fourcc} matches multiple classes in {}",
+            plugin_path.as_ref().display()
+        ));
+    }
+    let (class, id_byte_order) = matching_classes.pop().expect("one VST2 class matched");
+    let class_id = class
+        .id
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<String>();
+    let descriptor = PluginDescriptor {
+        path: plugin_path.as_ref().to_path_buf(),
+        format: PluginFormat::Vst2,
+        class_id: Some(class.id),
+    };
+    let host = host_for_current_executable()?;
+    let configuration = Configuration {
+        offline: true,
+        ..Configuration::default()
+    };
+    let instance = host
+        .spawn(&descriptor, &configuration, Some(state_bytes))
+        .map_err(|error| format!("could not restore FLP VST2 state in worker: {error}"))?;
+    let worker_state = save_worker_vst2_state(&instance)?;
+    let state_roundtrip_identical = worker_state.as_slice() == state_bytes;
+    drop(instance);
+
+    Ok(Vst2StateProbeSummary {
+        plugin_name: class.name,
+        vendor: class.vendor,
+        saved_plugin_name: metadata.name().unwrap_or("unknown").to_owned(),
+        saved_vendor: metadata.vendor().unwrap_or("unknown").to_owned(),
+        saved_fourcc: fourcc.to_owned(),
+        class_id,
+        id_byte_order,
+        state_bytes: state_bytes.len(),
+        state_roundtrip_identical,
+    })
+}
+
+fn save_worker_vst2_state(instance: &Instance) -> Result<Vec<u8>, String> {
+    let controller = instance.controller();
+    let request = controller
+        .request(Command::SaveState)
+        .map_err(|error| format!("could not request VST2 state snapshot: {error}"))?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(event) = instance.try_next_event() {
+            match event {
+                HostEvent::State {
+                    request: Some(state_request),
+                    bytes,
+                } if state_request == request => return Ok(bytes),
+                HostEvent::RequestFailed {
+                    request: failed_request,
+                    reason,
+                } if failed_request == request => {
+                    return Err(format!("VST2 state snapshot failed: {reason}"));
+                }
+                HostEvent::Failed { reason } => {
+                    return Err(format!(
+                        "VST2 worker failed during state snapshot: {reason}"
+                    ));
+                }
+                HostEvent::RecoveryRequired | HostEvent::Stopped => {
+                    return Err("VST2 worker stopped during state snapshot".to_owned());
+                }
+                _ => {}
+            }
+        } else if Instant::now() >= deadline {
+            return Err("VST2 state snapshot timed out".to_owned());
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn is_vst2_plugin_path(path: &Path) -> bool {

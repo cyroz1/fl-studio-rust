@@ -19,7 +19,8 @@ use flp_rebuild::sample_render::{
 };
 use flp_rebuild::vst2::{
     Vst2AudioEffectRenderOptions, Vst2NoteRenderOptions, inspect_vst2_plugin,
-    render_audio_through_vst2_effect_to_wav, render_vst2_note_to_wav, run_vst2_worker_if_requested,
+    probe_vst2_channel_state, render_audio_through_vst2_effect_to_wav, render_vst2_note_to_wav,
+    run_vst2_worker_if_requested,
 };
 use flp_rebuild::vst3::{Vst3AudioEffectRenderOptions, Vst3HostRuntime, Vst3PatternRenderOptions};
 use flp_rebuild::{
@@ -264,6 +265,11 @@ fn run(args: Vec<String>) -> Result<(), String> {
         [command, path, channel_id] if command == "plugin-state-preview" => {
             preview_plugin_state(Path::new(path), parse_u16(channel_id, "channel id")?, 64)
         }
+        [command, plugin, path, channel_id] if command == "vst2-state-probe" => probe_vst2_state(
+            Path::new(plugin),
+            Path::new(path),
+            parse_u16(channel_id, "channel id")?,
+        ),
         [command, bundle, path, channel_id] if command == "vst3-state-probe" => probe_vst3_state(
             Path::new(bundle),
             Path::new(path),
@@ -5077,6 +5083,10 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild midi-events <file.mid> <track> [start] [count]\n",
             "  flp-rebuild scan <directory>\n",
             "  flp-rebuild plugin-scan\n",
+            "  flp-rebuild vst2-info <plugin-file-or-bundle>\n",
+            "  flp-rebuild vst2-state-probe <plugin-file-or-bundle> <file.flp> <channel-id>\n",
+            "  flp-rebuild render-vst2-note <plugin-file-or-bundle> <output.wav> <note> <velocity> <note-seconds> <tail-seconds> [sample-rate]\n",
+            "  flp-rebuild render-audio-vst2 <input-audio> <effect-file-or-bundle> <output.wav> [tail-seconds]\n",
             "  flp-rebuild render-pattern-vst3 <project.flp> <pattern-id> <channel-id> <plugin.vst3> <output.{wav|flac|ogg|mp3}> [tail-seconds]\n",
             "  flp-rebuild render-audio-vst3 <input-audio> <effect.vst3> <output.{wav|flac|ogg|mp3}> [class-uid|-] [tail-seconds]\n",
             "  flp-rebuild channels <file.flp>\n",
@@ -8319,6 +8329,30 @@ fn preview_plugin_state(path: &Path, channel_id: u16, prefix_len: usize) -> Resu
         state.wrapper_payload().map_or_else(String::new, prefix),
         state.data_payload().len(),
         prefix(state.data_payload()),
+    );
+    Ok(())
+}
+
+fn probe_vst2_state(plugin: &Path, project: &Path, channel_id: u16) -> Result<(), String> {
+    let (_, document) = load_document(project)?;
+    let state = document
+        .channel_plugin_states()
+        .into_iter()
+        .find(|state| state.channel_id() == channel_id)
+        .ok_or_else(|| format!("channel {channel_id} has no recognized 0xD5 state event"))?;
+    let summary = probe_vst2_channel_state(plugin, &state)?;
+    println!(
+        "FLP VST2 state restored in isolated worker: channel={} saved_name={} saved_vendor={} plugin={} vendor={} saved_fourcc={} class_id={} id_byte_order={} nested_state_bytes={} state_roundtrip_identical={}",
+        state.channel_id(),
+        summary.saved_plugin_name,
+        summary.saved_vendor,
+        summary.plugin_name,
+        summary.vendor,
+        summary.saved_fourcc,
+        summary.class_id,
+        summary.id_byte_order,
+        summary.state_bytes,
+        summary.state_roundtrip_identical
     );
     Ok(())
 }
