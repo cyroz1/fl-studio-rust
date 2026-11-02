@@ -72228,6 +72228,48 @@ impl DawUi {
             ),
             ..PlaylistRenderOptions::default()
         };
+        let transport_tempo_map = if transport_playing {
+            match PlaylistTempoMap::for_arrangement(&document, options.arrangement_id) {
+                Ok(tempo_map) => Some(tempo_map),
+                Err(error) => {
+                    self.status = format!("Could not prepare VST2 transport timing: {error}");
+                    return false;
+                }
+            }
+        } else {
+            None
+        };
+        let transport_cycle_frames = if transport_playing && !performance_mode {
+            self.playlist_time_selection
+                .filter(|(arrangement_id, start_tick, end_tick)| {
+                    *arrangement_id == options.arrangement_id && end_tick > start_tick
+                })
+                .map(|(_, start_tick, end_tick)| {
+                    let tempo_map = transport_tempo_map
+                        .as_ref()
+                        .ok_or_else(|| "Playlist tempo map is unavailable".to_owned())?;
+                    let start_frame =
+                        tempo_map.frame_at_tick(u64::from(start_tick), options.sample_rate)?;
+                    let end_frame =
+                        tempo_map.frame_at_tick(u64::from(end_tick), options.sample_rate)?;
+                    if end_frame <= start_frame {
+                        return Err(
+                            "Playlist time selection is shorter than one output frame".to_owned()
+                        );
+                    }
+                    Ok::<_, String>((start_frame, end_frame))
+                })
+                .transpose()
+        } else {
+            Ok(None)
+        };
+        let transport_cycle_frames = match transport_cycle_frames {
+            Ok(cycle_frames) => cycle_frames,
+            Err(error) => {
+                self.status = format!("Could not prepare VST2 Playlist cycle: {error}");
+                return false;
+            }
+        };
         let mut preparation_document = document.clone();
         let arrangement_clip_count = match preparation_document
             .arrangements()
@@ -72295,6 +72337,8 @@ impl DawUi {
         let worker_runtime = Arc::clone(&runtime);
         let worker_document = document;
         let worker_target_channel_ids = target_channel_ids.clone();
+        let worker_transport_tempo_map = transport_tempo_map;
+        let worker_transport_cycle_frames = transport_cycle_frames;
         let worker = thread::Builder::new()
             .name("vst2-midi-input".to_owned())
             .spawn(move || {
@@ -72306,6 +72350,8 @@ impl DawUi {
                         target_channel_ids: worker_target_channel_ids,
                         transport_playing,
                         start_frame,
+                        tempo_map: worker_transport_tempo_map,
+                        cycle_frames: worker_transport_cycle_frames,
                     },
                     worker_runtime,
                     event_receiver,

@@ -1153,12 +1153,14 @@ pub struct Vst2LiveInputRouting {
     pub receiver: Vst2LiveInputReceiver,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct Vst2LiveInputPlayback {
     pub source_channel_id: u16,
     pub target_channel_ids: BTreeSet<u16>,
     pub transport_playing: bool,
     pub start_frame: u64,
+    pub tempo_map: Option<PlaylistTempoMap>,
+    pub cycle_frames: Option<(u64, u64)>,
 }
 
 fn bounded_live_input_queue<T: Send>(
@@ -8630,7 +8632,7 @@ struct PatternStreamConfig {
     pattern_audio_layers: Vec<PatternAudioLayer>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Debug)]
 struct Vst2PatternStreamSettings {
     ppq: u16,
     tempo_bpm: f64,
@@ -8638,6 +8640,8 @@ struct Vst2PatternStreamSettings {
     loop_frames: u64,
     repeat_pattern: bool,
     transport_playing: bool,
+    transport_tempo_map: Option<PlaylistTempoMap>,
+    transport_cycle_frames: Option<(u64, u64)>,
     pdc_target_frames: u64,
     master_pitch_cents: Option<i16>,
 }
@@ -8735,7 +8739,7 @@ impl Vst2PatternStreamProcessor {
             &channel_ids,
             external_channel_ids,
             volume_expression_channels,
-            settings,
+            &settings,
         )?;
         let channels_by_id = document
             .channels()
@@ -9014,7 +9018,7 @@ impl Vst2PatternStreamProcessor {
             &channel_ids,
             &self.external_channel_ids,
             &self.volume_expression_channels,
-            self.settings,
+            &self.settings,
         )?;
         let channels_by_id = document
             .channels()
@@ -9428,19 +9432,67 @@ impl Vst2PatternChannelStream {
 }
 
 impl Vst2PatternStreamSettings {
-    fn transport_at(self, frame: u64) -> Vst2Transport {
-        let mut transport = Vst2Transport::default();
-        transport.playing = self.transport_playing;
-        transport.sample_position = i64::try_from(frame).unwrap_or(i64::MAX);
-        transport.continuous_position = transport.sample_position;
-        transport.ppq_position = frame as f64 * self.tempo_bpm * f64::from(self.ppq)
-            / (60.0 * f64::from(self.sample_rate.max(1)));
-        transport.tempo = self.tempo_bpm;
-        transport.cycling = self.repeat_pattern;
-        transport.cycle_start = 0.0;
-        transport.cycle_end = self.loop_frames as f64 * self.tempo_bpm * f64::from(self.ppq)
-            / (60.0 * f64::from(self.sample_rate.max(1)));
-        transport
+    fn transport_at(&self, frame: u64) -> Vst2Transport {
+        let active_cycle = self
+            .transport_cycle_frames
+            .filter(|(start, end)| end > start);
+        let sample_frame = active_cycle.map_or(frame, |(start, end)| {
+            if frame < end {
+                frame
+            } else {
+                start + (frame - end) % (end - start)
+            }
+        });
+        let tick_position = self
+            .transport_tempo_map
+            .as_ref()
+            .and_then(|tempo_map| tempo_map.tick_at_frame(sample_frame, self.sample_rate))
+            .unwrap_or_else(|| {
+                sample_frame as f64 * self.tempo_bpm * f64::from(self.ppq)
+                    / (60.0 * f64::from(self.sample_rate.max(1)))
+            });
+        let ppq_position = tick_position / f64::from(self.ppq.max(1));
+        let tempo = self
+            .transport_tempo_map
+            .as_ref()
+            .map(|tempo_map| tempo_map.tempo_bpm_at_tick(tick_position.floor() as u64))
+            .unwrap_or(self.tempo_bpm);
+        let (cycling, cycle_start, cycle_end) =
+            if let Some((cycle_start_frame, cycle_end_frame)) = active_cycle {
+                let frame_to_quarters = |frame| {
+                    self.transport_tempo_map
+                        .as_ref()
+                        .and_then(|tempo_map| tempo_map.tick_at_frame(frame, self.sample_rate))
+                        .unwrap_or_else(|| {
+                            frame as f64 * self.tempo_bpm * f64::from(self.ppq)
+                                / (60.0 * f64::from(self.sample_rate.max(1)))
+                        })
+                        / f64::from(self.ppq.max(1))
+                };
+                (
+                    true,
+                    frame_to_quarters(cycle_start_frame),
+                    frame_to_quarters(cycle_end_frame),
+                )
+            } else {
+                (
+                    self.repeat_pattern,
+                    0.0,
+                    self.loop_frames as f64 * self.tempo_bpm
+                        / (60.0 * f64::from(self.sample_rate.max(1))),
+                )
+            };
+        Vst2Transport {
+            sample_position: i64::try_from(sample_frame).unwrap_or(i64::MAX),
+            continuous_position: i64::try_from(frame).unwrap_or(i64::MAX),
+            ppq_position,
+            tempo,
+            cycling,
+            cycle_start,
+            cycle_end,
+            playing: self.transport_playing,
+            ..Vst2Transport::default()
+        }
     }
 }
 
@@ -9450,7 +9502,7 @@ fn build_vst2_pattern_note_events(
     loaded_channel_ids: &BTreeSet<u16>,
     external_channel_ids: &BTreeSet<u16>,
     volume_expression_channels: &BTreeSet<u16>,
-    settings: Vst2PatternStreamSettings,
+    settings: &Vst2PatternStreamSettings,
 ) -> Result<Vst2PatternNotePlan, String> {
     if settings.ppq == 0 {
         return Err("project PPQ must be greater than zero".to_owned());
@@ -10363,6 +10415,8 @@ fn stream_pattern_from_tick_with_vst3_to_device(
                     loop_frames,
                     repeat_pattern: playback.repeat_pattern,
                     transport_playing: true,
+                    transport_tempo_map: None,
+                    transport_cycle_frames: None,
                     pdc_target_frames,
                     master_pitch_cents: document.metadata().master_pitch_cents(),
                 },
@@ -11706,6 +11760,8 @@ pub fn stream_mixed_layer_midi_input_to_device(
                         loop_frames: LIVE_BLOCK_FRAMES as u64,
                         repeat_pattern: false,
                         transport_playing: false,
+                        transport_tempo_map: None,
+                        transport_cycle_frames: None,
                         pdc_target_frames,
                         master_pitch_cents: document.metadata().master_pitch_cents(),
                     },
@@ -12342,6 +12398,8 @@ pub fn stream_vst2_midi_input_to_device(
         target_channel_ids,
         transport_playing,
         start_frame,
+        tempo_map,
+        cycle_frames,
     } = playback;
     let channels = document.channels();
     let channels_by_id = channels
@@ -12416,6 +12474,8 @@ pub fn stream_vst2_midi_input_to_device(
                 loop_frames,
                 repeat_pattern: false,
                 transport_playing,
+                transport_tempo_map: tempo_map,
+                transport_cycle_frames: cycle_frames,
                 pdc_target_frames: 0,
                 master_pitch_cents: document.metadata().master_pitch_cents(),
             },
