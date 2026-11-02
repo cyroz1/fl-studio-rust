@@ -2534,6 +2534,8 @@ pub struct PlaylistLiveStreamControls<'a> {
     pub monitor: PlaylistStreamMonitor<'a>,
     pub latency_updates: Option<Vst3LatencyUpdateControls>,
     pub metronome: Option<MetronomeStreamPlayback>,
+    /// Loaded VST2 channels to schedule from Playlist Pattern Clips.
+    pub vst2_runtime: Option<Arc<Mutex<Vst2HostRuntime>>>,
 }
 
 struct LiveLatencyUpdateState {
@@ -3417,7 +3419,7 @@ pub fn stream_playlist_to_device(
     stream_playlist_with_vst3_to_device(document, project_path, options, writer, cancelled, None)
 }
 
-/// Stream Playlist audio, Sampler Pattern Clips, and prepared VST3 instruments into one mix.
+/// Stream Playlist audio, Sampler Pattern Clips, and prepared VST2/VST3 instruments into one mix.
 pub fn stream_playlist_with_vst3_to_device(
     document: &FlpDocument,
     project_path: impl AsRef<Path>,
@@ -3459,6 +3461,7 @@ pub fn stream_playlist_with_vst3_to_device_from_frame(
             monitor: PlaylistStreamMonitor::from_frame(start_frame),
             latency_updates: None,
             metronome: None,
+            vst2_runtime: None,
         },
     )
 }
@@ -3484,11 +3487,12 @@ pub fn stream_playlist_with_vst3_to_device_with_monitor(
             monitor,
             latency_updates: None,
             metronome: None,
+            vst2_runtime: None,
         },
     )
 }
 
-/// Stream Playlist playback with block-boundary VST3 latency refreshes.
+/// Stream Playlist playback with block-boundary VST3 latency refreshes and optional VST2 channels.
 pub fn stream_playlist_with_vst3_to_device_with_monitor_and_latency_updates(
     document: &FlpDocument,
     project_path: impl AsRef<Path>,
@@ -3787,6 +3791,7 @@ fn stream_playlist_with_vst3_to_device_from_frame_inner(
         monitor,
         latency_updates: latency_controls,
         metronome,
+        vst2_runtime,
     } = controls;
     let start_frame = monitor.start_frame;
     let loop_range = monitor.loop_range;
@@ -3864,12 +3869,26 @@ fn stream_playlist_with_vst3_to_device_from_frame_inner(
         &vst3_crossfade_volume_expression_channels,
         Some(cancelled),
     )?;
+    let mut vst2_processor = vst2_runtime
+        .as_ref()
+        .map(|runtime| {
+            prepare_vst2_playlist_processor(
+                document,
+                &options,
+                runtime,
+                vst3_processor.as_mut(),
+                loop_range,
+            )
+        })
+        .transpose()?
+        .flatten();
     if audio.clips.is_empty()
         && sampler.notes.is_empty()
         && options.clap_audio_layers.is_empty()
         && vst3_processor
             .as_ref()
             .is_none_or(|processor| processor.summary().plugin_channels_rendered == 0)
+        && vst2_processor.is_none()
     {
         if let Some(processor) = vst3_processor.as_ref() {
             let unloaded_channels = processor.summary().unloaded_plugin_channels;
@@ -3885,7 +3904,7 @@ fn stream_playlist_with_vst3_to_device_from_frame_inner(
             }
         }
         return Err(
-            "arrangement contains no supported audio clips, Sampler notes, CLAP audio, or loaded VST3 notes in Pattern Clips"
+            "arrangement contains no supported audio clips, Sampler notes, CLAP audio, or loaded VST2/VST3 notes in Pattern Clips"
                 .to_owned(),
         );
     }
@@ -3895,6 +3914,9 @@ fn stream_playlist_with_vst3_to_device_from_frame_inner(
         .frames
         .max(sampler.summary.frames)
         .max(playlist_clap_audio_frames(&options.clap_audio_layers));
+    if let Some(processor) = vst2_processor.as_ref() {
+        frames = frames.max(processor.content_frames());
+    }
     if let Some(processor) = vst3_processor.as_mut() {
         frames = frames.max(processor.content_frames());
         processor.extend_to_output_frames(frames)?;
@@ -3918,8 +3940,12 @@ fn stream_playlist_with_vst3_to_device_from_frame_inner(
         audio_clips_skipped_unsupported_scale: audio.summary.clips_skipped_unsupported_scale,
         pattern_clips_skipped_unsupported_scale: sampler.pattern_clips_skipped_unsupported_scale,
         notes_skipped_unresolved_sample: sampler.summary.notes_skipped_unresolved_sample,
-        vst2_plugin_channels_rendered: 0,
-        vst2_notes_rendered: 0,
+        vst2_plugin_channels_rendered: vst2_processor
+            .as_ref()
+            .map_or(0, Vst2PatternStreamProcessor::channels_rendered),
+        vst2_notes_rendered: vst2_processor
+            .as_ref()
+            .map_or(0, Vst2PatternStreamProcessor::notes_scheduled),
         vst3_plugin_channels_rendered: vst3_summary
             .as_ref()
             .map_or(0, |summary| summary.plugin_channels_rendered),
@@ -3948,7 +3974,7 @@ fn stream_playlist_with_vst3_to_device_from_frame_inner(
         frames,
         master_output,
         vst3_processor: vst3_processor.as_mut(),
-        vst2_processor: None,
+        vst2_processor: vst2_processor.as_mut(),
         remainder_stop: None,
     };
     let block_summary = if let Some(latency_updates) = latency_updates {
@@ -3991,6 +4017,9 @@ fn stream_playlist_with_vst3_to_device_from_frame_inner(
     summary.frames = summary.frames.max(block_summary.frames_rendered);
     if let Some(processor) = vst3_processor.as_ref() {
         summary.frames = summary.frames.max(processor.summary().frames);
+    }
+    if let Some(processor) = vst2_processor.as_ref() {
+        summary.frames = summary.frames.max(processor.content_frames());
     }
     Ok(summary)
 }
@@ -4338,7 +4367,13 @@ fn render_playlist_with_vst3_cancellable(
     let mut vst2_processor = vst2_runtime
         .as_ref()
         .map(|runtime| {
-            prepare_vst2_playlist_processor(document, &options, runtime, vst3_processor.as_mut())
+            prepare_vst2_playlist_processor(
+                document,
+                &options,
+                runtime,
+                vst3_processor.as_mut(),
+                None,
+            )
         })
         .transpose()?
         .flatten();
@@ -5000,7 +5035,13 @@ pub fn render_playlist_mixer_stems_with_vst2_and_vst3_cancellable(
     let mut vst2_processor = vst2_runtime
         .as_ref()
         .map(|runtime| {
-            prepare_vst2_playlist_processor(document, &options, runtime, vst3_processor.as_mut())
+            prepare_vst2_playlist_processor(
+                document,
+                &options,
+                runtime,
+                vst3_processor.as_mut(),
+                None,
+            )
         })
         .transpose()?
         .flatten();
@@ -7330,6 +7371,9 @@ fn stream_prepared_playlist_render_with_performance(
                         loop_range.end_frame,
                         loop_range.length_frames(),
                     );
+                    if let Some(processor) = render.vst2_processor.as_deref_mut() {
+                        processor.reset_for_playlist_loop(block_start)?;
+                    }
                 }
                 let sampler_samples = &mut sampler_block[..sample_count];
                 if let Some(meter_buses) = meter_buses.as_deref_mut() {
@@ -8936,6 +8980,36 @@ struct Vst2PatternNotePlan {
     content_frames: u64,
 }
 
+fn prepare_vst2_playlist_loop_note_events(
+    note_events: &[Vst2PatternNoteEvent],
+    cycle_frames: Option<(u64, u64)>,
+) -> Result<Vec<Vst2PatternNoteEvent>, String> {
+    let Some((cycle_start, cycle_end)) = cycle_frames.filter(|(start, end)| end > start) else {
+        return Ok(Vec::new());
+    };
+    let mut loop_events = Vec::new();
+    for note in note_events {
+        let note_end = note
+            .start_frame
+            .checked_add(note.duration_frames)
+            .ok_or_else(|| "VST2 Playlist note end position overflow".to_owned())?;
+        if note_end <= cycle_start || note.start_frame >= cycle_end {
+            continue;
+        }
+        let source_start = note.start_frame.max(cycle_start);
+        let source_end = note_end.min(cycle_end);
+        loop_events.push(Vst2PatternNoteEvent {
+            start_frame: source_start - cycle_start,
+            duration_frames: source_end - source_start,
+            channel: note.channel,
+            key: note.key,
+            velocity: note.velocity,
+        });
+    }
+    loop_events.sort_by_key(|note| note.start_frame);
+    Ok(loop_events)
+}
+
 fn vst2_layer_adjusted_velocity(velocity: u8, layer_gain: f32) -> u8 {
     if !layer_gain.is_finite() || layer_gain <= 0.0 {
         return 0;
@@ -8969,6 +9043,7 @@ struct Vst2PatternChannelStream {
     layer_index: usize,
     note_pitch_offset: i16,
     note_events: Vec<Vst2PatternNoteEvent>,
+    playlist_loop_note_events: Vec<Vst2PatternNoteEvent>,
     parameter_automation: Vec<Vst2ParameterAutomationLane>,
     next_loop_frame: u64,
     pending_events: BTreeMap<u64, Vec<Vst2PendingMidiEvent>>,
@@ -9062,16 +9137,22 @@ impl Vst2PatternStreamProcessor {
                 right_gain,
                 samples: Vec::new(),
             });
+            let note_events = note_plan
+                .events_by_channel
+                .get(&info.channel_id)
+                .cloned()
+                .unwrap_or_default();
+            let playlist_loop_note_events = prepare_vst2_playlist_loop_note_events(
+                &note_events,
+                settings.transport_cycle_frames,
+            )?;
             channels.push(Vst2PatternChannelStream {
                 info: info.clone(),
                 layer_index,
                 note_pitch_offset: channel
                     .master_pitch_note_offset_semitones(settings.master_pitch_cents),
-                note_events: note_plan
-                    .events_by_channel
-                    .get(&info.channel_id)
-                    .cloned()
-                    .unwrap_or_default(),
+                note_events,
+                playlist_loop_note_events,
                 parameter_automation: prepare_vst2_parameter_automation(
                     &channel_parameter_automation
                         .remove(&info.channel_id)
@@ -9124,6 +9205,17 @@ impl Vst2PatternStreamProcessor {
 
     fn notes_scheduled(&self) -> usize {
         self.notes_scheduled
+    }
+
+    fn channels_rendered(&self) -> usize {
+        self.channels.len()
+    }
+
+    fn reset_for_playlist_loop(&mut self, output_cycle_start_frame: u64) -> Result<(), String> {
+        for channel in &mut self.channels {
+            channel.reset_for_playlist_loop(output_cycle_start_frame)?;
+        }
+        Ok(())
     }
 
     fn queue_live_midi_input_event(
@@ -9718,6 +9810,50 @@ impl Vst2PatternChannelStream {
         }
     }
 
+    fn reset_for_playlist_loop(&mut self, output_cycle_start_frame: u64) -> Result<(), String> {
+        self.pending_events.clear();
+        let active_notes = self
+            .active_notes
+            .iter()
+            .map(|(&(midi_channel, key), &count)| (midi_channel, key, count))
+            .collect::<Vec<_>>();
+        for (midi_channel, key, count) in active_notes {
+            for _ in 0..count {
+                self.queue_event(
+                    output_cycle_start_frame,
+                    Vst2PendingMidiEvent {
+                        priority: 0,
+                        data: [0x80 | midi_channel, key, 0],
+                    },
+                );
+            }
+        }
+        for note_index in 0..self.playlist_loop_note_events.len() {
+            let note = self.playlist_loop_note_events[note_index];
+            let output_note_start = output_cycle_start_frame
+                .checked_add(note.start_frame)
+                .ok_or_else(|| "VST2 Playlist loop note position overflow".to_owned())?;
+            let output_note_end = output_note_start
+                .checked_add(note.duration_frames)
+                .ok_or_else(|| "VST2 Playlist loop note end overflow".to_owned())?;
+            self.queue_event(
+                output_note_start,
+                Vst2PendingMidiEvent {
+                    priority: 1,
+                    data: [0x90 | note.channel, note.key, note.velocity],
+                },
+            );
+            self.queue_event(
+                output_note_end,
+                Vst2PendingMidiEvent {
+                    priority: 0,
+                    data: [0x80 | note.channel, note.key, 0],
+                },
+            );
+        }
+        Ok(())
+    }
+
     fn schedule_loop(
         &mut self,
         loop_start_frame: u64,
@@ -10270,6 +10406,7 @@ fn prepare_vst2_playlist_processor(
     options: &PlaylistRenderOptions,
     runtime: &Arc<Mutex<Vst2HostRuntime>>,
     vst3_processor: Option<&mut Vst3PlaylistStreamProcessor>,
+    loop_range: Option<PlaylistPlaybackLoopRange>,
 ) -> Result<Option<Vst2PatternStreamProcessor>, String> {
     let channel_infos = runtime
         .lock()
@@ -10363,7 +10500,7 @@ fn prepare_vst2_playlist_processor(
         repeat_pattern: false,
         transport_playing: true,
         transport_tempo_map: Some(tempo_map),
-        transport_cycle_frames: None,
+        transport_cycle_frames: loop_range.map(|range| (range.start_frame(), range.end_frame())),
         pdc_target_frames,
         master_pitch_cents: document.metadata().master_pitch_cents(),
     };

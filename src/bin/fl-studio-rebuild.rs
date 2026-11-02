@@ -17424,6 +17424,7 @@ impl DawUi {
         let playlist_pdc_update_sender_for_ui = playlist_pdc_update_sender.clone();
         let (sender, receiver) = mpsc::sync_channel(1);
         let worker_options = options.clone();
+        let vst2_runtime = self.vst2_host.clone();
         let worker = thread::Builder::new()
             .name("project-audio-render".to_owned())
             .spawn(move || {
@@ -17450,6 +17451,7 @@ impl DawUi {
                                     pdc_updates: playlist_pdc_update_receiver,
                                 }),
                                 metronome: Some(worker_metronome),
+                                vst2_runtime,
                             },
                         )
                     });
@@ -17498,7 +17500,7 @@ impl DawUi {
                             .to_owned(),
                     }
                 } else {
-                    "Preparing Playlist audio, Samplers, and VST3 instruments…".to_owned()
+                    "Preparing Playlist audio, Samplers, VST2, and VST3 instruments…".to_owned()
                 };
                 if !handoff_in_progress {
                     self.start_midi_clock(false);
