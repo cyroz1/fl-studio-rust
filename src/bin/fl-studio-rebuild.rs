@@ -20903,6 +20903,43 @@ impl DawUi {
         }
     }
 
+    fn set_midi_script_pattern_length(&mut self, index: u16, length_beats: u32) {
+        let result = self.document.as_mut().map(|document| {
+            let ppq = u32::from(document.header().ppq().max(1));
+            let length_ticks = length_beats
+                .checked_mul(ppq)
+                .ok_or_else(|| "Pattern length exceeds the supported tick range".to_owned())?;
+            let current_length = document
+                .patterns()
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .find(|pattern| pattern.id == index)
+                .map(|pattern| pattern.length_ticks)
+                .ok_or_else(|| format!("Pattern {index} is not available in the project"))?;
+            if current_length == Some(length_ticks) {
+                return Ok(false);
+            }
+            document
+                .set_pattern_length_ticks(index, length_ticks)
+                .map(|()| true)
+                .map_err(|error| error.to_string())
+        });
+        match result {
+            Some(Ok(true)) => {
+                self.dirty = true;
+                self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+                self.status = format!("Set Pattern {index} length to {length_beats} beats");
+            }
+            Some(Ok(false)) => {}
+            Some(Err(error)) => {
+                self.status = format!("MIDI script could not set Pattern {index} length: {error}");
+            }
+            None => {
+                self.status = "Open a project to set Pattern length".to_owned();
+            }
+        }
+    }
+
     fn jog_midi_script_pattern(&mut self, increment: i32) {
         if increment == 0 {
             return;
@@ -69896,6 +69933,12 @@ impl DawUi {
             }
             MidiTransportCommand::SetPatternColor { index, color } => {
                 self.set_midi_script_pattern_color(index, color);
+            }
+            MidiTransportCommand::SetPatternLength {
+                index,
+                length_beats,
+            } => {
+                self.set_midi_script_pattern_length(index, length_beats);
             }
             MidiTransportCommand::SetGlobalSwingMixRaw(value_raw) => {
                 self.set_midi_script_global_swing_mix(value_raw);

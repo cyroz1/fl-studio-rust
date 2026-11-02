@@ -91,6 +91,10 @@ pub enum ScriptTransportAction {
         index: u16,
         color: u32,
     },
+    SetPatternLength {
+        index: u16,
+        length_beats: u32,
+    },
     SetGlobalSwingMixRaw(u8),
     AddArrangementTimeMarker {
         tick: u32,
@@ -1780,6 +1784,22 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
             .and_then(|color| u32::try_from(color).ok())
             .ok_or_else(|| "MIDI script returned an invalid Pattern color".to_owned())?;
         return Ok(ScriptTransportAction::SetPatternColor { index, color });
+    }
+    if name == Some("set_pattern_length") {
+        let index = action["index"]
+            .as_u64()
+            .and_then(|index| u16::try_from(index).ok())
+            .filter(|index| *index <= 999)
+            .ok_or_else(|| "MIDI script returned an invalid Pattern index".to_owned())?;
+        let length_beats = action["length_beats"]
+            .as_u64()
+            .and_then(|length| u32::try_from(length).ok())
+            .filter(|length| *length > 0)
+            .ok_or_else(|| "MIDI script returned an invalid Pattern length".to_owned())?;
+        return Ok(ScriptTransportAction::SetPatternLength {
+            index,
+            length_beats,
+        });
     }
     if name == Some("add_arrangement_time_marker") {
         let tick = action["time_ticks"]

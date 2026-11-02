@@ -2018,6 +2018,21 @@ def _set_pattern_color(index, color):
     )
 
 
+def _set_pattern_length(index, length):
+    try:
+        index = int(index)
+        length = int(length)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("patterns.setPatternLength() arguments must be integers") from error
+    if not 0 <= index <= 999:
+        raise IndexError("patterns.setPatternLength() index must be between 0 and 999")
+    if not 1 <= length <= 0xFFFFFFFF:
+        raise ValueError("patterns.setPatternLength() length must be a positive integer")
+    _request_transport_action(
+        {"action": "set_pattern_length", "index": index, "length_beats": length}
+    )
+
+
 def _get_song_step_pos():
     position_ticks = int(_active_transport_state.get("song_position_ticks", 0))
     ppq = max(1, int(_active_transport_state.get("ticks_per_quarter", 96)))
@@ -2608,6 +2623,7 @@ def _install_modules(script_name, device_name):
     patterns.setPatternName = _set_pattern_name
     patterns.getPatternColor = _pattern_color
     patterns.getPatternLength = _pattern_length
+    patterns.setPatternLength = _set_pattern_length
     patterns.setPatternColor = _set_pattern_color
 
     mixer.getTrackName = _mixer_get_track_name

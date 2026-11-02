@@ -9306,6 +9306,86 @@ impl FlpDocument {
         Ok(())
     }
 
+    /// Sets a Pattern's explicit length in project ticks, preserving its other events.
+    pub fn set_pattern_length_ticks(
+        &mut self,
+        pattern_id: u16,
+        length_ticks: u32,
+    ) -> Result<(), FlpError> {
+        if !self
+            .patterns()?
+            .iter()
+            .any(|pattern| pattern.id == pattern_id)
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested pattern does not exist",
+            ));
+        }
+
+        let mut markers = self.events.iter().enumerate().filter(|(_, event)| {
+            event.opcode == 0x41
+                && event.encoding == PayloadEncoding::Word
+                && event.payload.as_slice() == pattern_id.to_le_bytes()
+        });
+        let Some((marker_index, _)) = markers.next() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested pattern marker does not exist",
+            ));
+        };
+        if markers.next().is_some() {
+            return Err(FlpError::UnsupportedEdit(
+                "the requested pattern id is ambiguous",
+            ));
+        }
+        let region_end = self.events[marker_index + 1..]
+            .iter()
+            .position(|event| {
+                (event.opcode == 0x41 && event.encoding == PayloadEncoding::Word)
+                    || matches!(event.opcode, 0x40 | 0x62 | 0x63)
+            })
+            .map_or(self.events.len(), |offset| marker_index + 1 + offset);
+        let length_events = (marker_index + 1..region_end)
+            .filter(|index| self.events[*index].opcode == 0xA4)
+            .collect::<Vec<_>>();
+        if length_events.len() > 1 {
+            return Err(FlpError::UnsupportedEdit(
+                "the Pattern has multiple 0xA4 length events",
+            ));
+        }
+
+        let mut candidate = self.clone();
+        if let Some(length_event_index) = length_events.first().copied() {
+            let event = &candidate.events[length_event_index];
+            if event.encoding != PayloadEncoding::Dword || event.payload.len() != 4 {
+                return Err(FlpError::UnsupportedEdit(
+                    "the Pattern's 0xA4 length event is not a four-byte value",
+                ));
+            }
+            candidate.events[length_event_index].replace_dword_payload(length_ticks)?;
+        } else {
+            let last_metadata_event = (marker_index + 1..region_end)
+                .rfind(|index| matches!(self.events[*index].opcode, 0xC1 | 0x96));
+            let insertion_index = last_metadata_event.map_or_else(
+                || {
+                    marker_index
+                        + 1
+                        + usize::from(
+                            self.events
+                                .get(marker_index + 1)
+                                .is_some_and(Self::is_pattern_note_event),
+                        )
+                },
+                |metadata_index| metadata_index + 1,
+            );
+            candidate
+                .events
+                .insert(insertion_index, FlpEvent::new_dword(0xA4, length_ticks));
+        }
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
     /// Deletes an unreferenced Pattern and its complete event region.
     ///
     /// Pattern Clips that still target this Pattern prevent deletion. Projects whose
