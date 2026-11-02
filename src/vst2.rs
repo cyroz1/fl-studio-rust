@@ -293,6 +293,16 @@ struct Vst2HostedChannel {
     info: Vst2HostedChannelInfo,
     instance: Instance,
     audio: AudioEndpoint,
+    parameter_events: Vec<AudioEvent>,
+    pending_parameter_updates: BTreeMap<u32, f64>,
+}
+
+impl Vst2HostedChannel {
+    fn queue_parameter_edit(&mut self, parameter_id: u32, value: f64) {
+        if value.is_finite() && (0.0..=1.0).contains(&value) {
+            self.pending_parameter_updates.insert(parameter_id, value);
+        }
+    }
 }
 
 struct Vst2HostedMixerEffect {
@@ -458,7 +468,7 @@ pub fn probe_vst2_channel_state(
     let instance = host
         .spawn(&descriptor, &configuration, Some(state_bytes))
         .map_err(|error| format!("could not restore FLP VST2 state in worker: {error}"))?;
-    let worker_state = save_worker_vst2_state(&instance)?;
+    let worker_state = save_worker_vst2_state(&instance, |_| {})?;
     let state_roundtrip_identical = worker_state.as_slice() == state_bytes;
     drop(instance);
 
@@ -618,6 +628,8 @@ impl Vst2HostRuntime {
                 info: info.clone(),
                 instance,
                 audio,
+                parameter_events: Vec::with_capacity(MAX_EVENTS),
+                pending_parameter_updates: BTreeMap::new(),
             },
         );
         Ok(info)
@@ -715,28 +727,42 @@ impl Vst2HostRuntime {
         &mut self,
         channel_id: u16,
     ) -> Result<Vec<Vst2MixerEffectParameter>, String> {
-        let pending_requests = &mut self.pending_editor_requests;
-        let pending_failures = &mut self.pending_editor_failures;
-        let channel = self
-            .channels
-            .get(&channel_id)
-            .ok_or_else(|| format!("VST2 channel {channel_id} is not loaded"))?;
-        read_vst2_parameters(
-            &channel.instance,
-            &channel.info.fourcc,
-            "channel",
-            |event| match event {
-                HostEvent::Completed { request } => {
-                    pending_requests.remove(&(channel_id, request));
-                }
-                HostEvent::RequestFailed { request, reason }
-                    if pending_requests.remove(&(channel_id, request)) =>
-                {
-                    pending_failures.push((channel_id, reason));
-                }
-                _ => {}
-            },
-        )
+        let mut parameter_edits = Vec::new();
+        let result = {
+            let pending_requests = &mut self.pending_editor_requests;
+            let pending_failures = &mut self.pending_editor_failures;
+            let channel = self
+                .channels
+                .get(&channel_id)
+                .ok_or_else(|| format!("VST2 channel {channel_id} is not loaded"))?;
+            read_vst2_parameters(
+                &channel.instance,
+                &channel.info.fourcc,
+                "channel",
+                |event| match event {
+                    HostEvent::Completed { request } => {
+                        pending_requests.remove(&(channel_id, request));
+                    }
+                    HostEvent::RequestFailed { request, reason }
+                        if pending_requests.remove(&(channel_id, request)) =>
+                    {
+                        pending_failures.push((channel_id, reason));
+                    }
+                    HostEvent::ParameterEdited {
+                        id,
+                        phase: EditPhase::Perform,
+                        value,
+                    } => parameter_edits.push((id, value)),
+                    _ => {}
+                },
+            )
+        };
+        if let Some(channel) = self.channels.get_mut(&channel_id) {
+            for (parameter_id, value) in parameter_edits {
+                channel.queue_parameter_edit(parameter_id, value);
+            }
+        }
+        result
     }
 
     /// Request the native editor for one loaded VST2 Mixer effect.
@@ -918,13 +944,30 @@ impl Vst2HostRuntime {
     }
 
     /// Snapshot one loaded channel's current plug-in state for FLP field 53.
-    pub fn save_channel_state(&self, channel_id: u16) -> Result<Vec<u8>, String> {
-        let channel = self
-            .channels
-            .get(&channel_id)
-            .ok_or_else(|| format!("VST2 channel {channel_id} is not loaded"))?;
-        save_worker_vst2_state(&channel.instance)
-            .map_err(|error| format!("VST2 channel {channel_id} state snapshot failed: {error}"))
+    pub fn save_channel_state(&mut self, channel_id: u16) -> Result<Vec<u8>, String> {
+        let mut parameter_edits = Vec::new();
+        let result = {
+            let channel = self
+                .channels
+                .get(&channel_id)
+                .ok_or_else(|| format!("VST2 channel {channel_id} is not loaded"))?;
+            save_worker_vst2_state(&channel.instance, |event| {
+                if let HostEvent::ParameterEdited {
+                    id,
+                    phase: EditPhase::Perform,
+                    value,
+                } = event
+                {
+                    parameter_edits.push((id, value));
+                }
+            })
+        };
+        if let Some(channel) = self.channels.get_mut(&channel_id) {
+            for (parameter_id, value) in parameter_edits {
+                channel.queue_parameter_edit(parameter_id, value);
+            }
+        }
+        result.map_err(|error| format!("VST2 channel {channel_id} state snapshot failed: {error}"))
     }
 
     /// Process one block through a loaded channel. MIDI event buses use bus zero;
@@ -944,9 +987,39 @@ impl Vst2HostRuntime {
             .channels
             .get_mut(&channel_id)
             .ok_or_else(|| format!("VST2 channel {channel_id} is not loaded"))?;
-        Ok(channel
-            .audio
-            .process_events(frames, inputs, outputs, transport, events, output_events))
+        channel.parameter_events.clear();
+        let parameter_event_count = MAX_EVENTS.saturating_sub(events.len());
+        let pending_parameter_ids = channel
+            .pending_parameter_updates
+            .keys()
+            .take(parameter_event_count)
+            .copied()
+            .collect::<Vec<_>>();
+        for parameter_id in pending_parameter_ids {
+            let Some(value) = channel.pending_parameter_updates.remove(&parameter_id) else {
+                continue;
+            };
+            channel.parameter_events.push(AudioEvent {
+                sample_offset: 0,
+                bus: 0,
+                data: EventData::Parameter {
+                    id: parameter_id,
+                    value,
+                },
+            });
+        }
+        channel.parameter_events.extend_from_slice(events);
+        channel
+            .parameter_events
+            .sort_by_key(|event| event.sample_offset);
+        Ok(channel.audio.process_events(
+            frames,
+            inputs,
+            outputs,
+            transport,
+            &channel.parameter_events,
+            output_events,
+        ))
     }
 
     /// Consume worker lifecycle errors for channels loaded into this host.
@@ -983,6 +1056,11 @@ impl Vst2HostRuntime {
                             "VST2 worker stopped or requires recovery".to_owned(),
                         ))
                     }
+                    HostEvent::ParameterEdited {
+                        id,
+                        phase: EditPhase::Perform,
+                        value,
+                    } => channel.queue_parameter_edit(id, value),
                     _ => {}
                 }
             }
@@ -1824,7 +1902,10 @@ fn prepare_vst2_pattern_events(
     Ok((events, note_count))
 }
 
-fn save_worker_vst2_state(instance: &Instance) -> Result<Vec<u8>, String> {
+fn save_worker_vst2_state(
+    instance: &Instance,
+    mut handle_unrelated_event: impl FnMut(HostEvent),
+) -> Result<Vec<u8>, String> {
     let controller = instance.controller();
     let request = controller
         .request(Command::SaveState)
@@ -1851,7 +1932,7 @@ fn save_worker_vst2_state(instance: &Instance) -> Result<Vec<u8>, String> {
                 HostEvent::RecoveryRequired | HostEvent::Stopped => {
                     return Err("VST2 worker stopped during state snapshot".to_owned());
                 }
-                _ => {}
+                event => handle_unrelated_event(event),
             }
         } else if Instant::now() >= deadline {
             return Err("VST2 state snapshot timed out".to_owned());

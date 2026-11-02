@@ -42939,19 +42939,6 @@ impl DawUi {
     }
 
     fn channel_rack(&mut self, ui: &mut egui::Ui) {
-        let editor_failures = self
-            .vst2_host
-            .as_ref()
-            .and_then(|runtime| {
-                runtime
-                    .lock()
-                    .ok()
-                    .map(|mut runtime| runtime.take_editor_failures())
-            })
-            .unwrap_or_default();
-        if let Some((channel_id, reason)) = editor_failures.last() {
-            self.status = format!("VST2 editor for Channel {channel_id} failed: {reason}");
-        }
         let Some(document) = &self.document else {
             empty_view(ui, "Open a project to see its Channel Rack");
             return;
@@ -44544,7 +44531,13 @@ impl DawUi {
                                             open_editor = Some(instance_id);
                                         }
                                     } else if loaded_vst2_channels.contains(&channel.id()) {
-                                        if ui.button("VST2 editor").clicked() {
+                                        if ui
+                                            .button("VST2 editor")
+                                            .on_hover_text(
+                                                "Native VST2 parameter edits reach the channel audio worker at the next audio block boundary.",
+                                            )
+                                            .clicked()
+                                        {
                                             open_vst2_editor = Some(channel.id());
                                         }
                                         if ui
@@ -82310,6 +82303,19 @@ impl eframe::App for DawUi {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.publish_live_pattern_note_updates();
         self.publish_midi_script_transport_state();
+        let vst2_channel_editor_failures = self
+            .vst2_host
+            .as_ref()
+            .and_then(|runtime| {
+                runtime
+                    .lock()
+                    .ok()
+                    .map(|mut runtime| runtime.take_editor_failures())
+            })
+            .unwrap_or_default();
+        if let Some((channel_id, reason)) = vst2_channel_editor_failures.last() {
+            self.status = format!("VST2 editor for Channel {channel_id} failed: {reason}");
+        }
         let vst2_mixer_editor_failures = self
             .vst2_mixer_effect_host
             .as_ref()
