@@ -278,6 +278,19 @@ def _ui_get_focused_node_caption():
     return caption if isinstance(caption, str) else ""
 
 
+def _ui_get_focused_node_file_type():
+    if not _ui_get_focused_node_caption():
+        return -1
+    targets = _active_transport_state.get("browser_navigation_targets", [])
+    target = targets[3]
+    if isinstance(target, (list, tuple)) and len(target) > 2:
+        try:
+            return int(target[2])
+        except (TypeError, ValueError, OverflowError):
+            pass
+    return -1
+
+
 def _ui_select_browser_menu_item():
     if _ui_get_focused_node_caption():
         _request_transport_action("browser_select_selected")
@@ -2187,6 +2200,43 @@ def _install_modules(script_name, device_name):
     midi = _module("midi")
     constants = {
         "FromMIDI_Max": 127,
+        "SBN_FLP": 1,
+        "SBN_ZIP": 2,
+        "SBN_FLM": 3,
+        "SBN_FST": 4,
+        "SBN_DS": 5,
+        "SBN_SS": 6,
+        "SBN_WAV": 7,
+        "SBN_XI": 8,
+        "SBN_FPR": 9,
+        "SBN_FSC": 10,
+        "SBN_SF2": 11,
+        "SBN_Speech": 12,
+        "SBN_MP3": 13,
+        "SBN_OGG": 14,
+        "SBN_FLAC": 15,
+        "SBN_OSM": 16,
+        "SBN_REX": 17,
+        "SBN_DWP": 18,
+        "SBN_FNV": 19,
+        "SBN_FXB": 20,
+        "SBN_AIFF": 21,
+        "SBN_TXT": 22,
+        "SBN_BMP": 23,
+        "SBN_WV": 24,
+        "SBN_TS": 25,
+        "SBN_RBS": 26,
+        "SBN_MID": 27,
+        "SBN_FLEXPack": 28,
+        "SBN_NEWS": 29,
+        "SBN_SHOP": 30,
+        "SBN_LIB": 31,
+        "SBN_LIBOWNED": 32,
+        "SBN_NOTIFICATION": 33,
+        "SBN_DOWNLOAD": 34,
+        "SBN_M4A": 35,
+        "SBN_INSTR": 36,
+        "SBN_REDIRECT": 37,
         "TN_Master": 0,
         "TN_FirstIns": 1,
         "TN_LastIns": 2,
@@ -2397,6 +2447,7 @@ def _install_modules(script_name, device_name):
     ui.navigateBrowser = _ui_navigate_browser
     ui.navigateBrowserTabs = _ui_navigate_browser_tabs
     ui.getFocusedNodeCaption = _ui_get_focused_node_caption
+    ui.getFocusedNodeFileType = _ui_get_focused_node_file_type
     ui.selectBrowserMenuItem = _ui_select_browser_menu_item
     ui.previewBrowserMenuItem = _ui_preview_browser_menu_item
 

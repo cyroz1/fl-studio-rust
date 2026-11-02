@@ -299,7 +299,7 @@ pub struct MidiScriptTransportState {
     pub state: AtomicU8,
     pub browser_visible: AtomicU8,
     pub browser_tab_index: AtomicU8,
-    pub browser_navigation_targets: Mutex<Vec<(String, bool)>>,
+    pub browser_navigation_targets: Mutex<Vec<(String, bool, i32)>>,
     pub midi_output_port_number: AtomicI32,
     pub song_position: AtomicU64,
     pub song_position_ticks: AtomicU64,

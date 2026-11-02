@@ -29708,7 +29708,7 @@ impl DawUi {
         (entries, recursive_results)
     }
 
-    fn midi_script_browser_navigation_targets(&self) -> Vec<(String, bool)> {
+    fn midi_script_browser_navigation_targets(&self) -> Vec<(String, bool, i32)> {
         let (entries, _) = self.visible_browser_file_entries();
         let selected_index = self
             .browser_selected
@@ -29735,7 +29735,13 @@ impl DawUi {
         let target = |index: Option<usize>| {
             index
                 .and_then(|index| entries.get(index))
-                .map(|entry| (entry.name.clone(), entry.is_directory))
+                .map(|entry| {
+                    (
+                        entry.name.clone(),
+                        entry.is_directory,
+                        midi_script_browser_node_type(&entry.path),
+                    )
+                })
                 .unwrap_or_default()
         };
         let parent = self
@@ -29744,6 +29750,8 @@ impl DawUi {
             .and_then(Path::file_name)
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
+        let parent_is_directory = !parent.is_empty();
+        let parent_type = if parent_is_directory { -100 } else { -1 };
         let selected = self
             .browser_selected
             .as_ref()
@@ -29754,13 +29762,14 @@ impl DawUi {
                         .map(|name| name.to_string_lossy().into_owned())
                         .unwrap_or_else(|| selected.display().to_string()),
                     selected.is_dir(),
+                    midi_script_browser_node_type(selected),
                 )
             })
             .unwrap_or_default();
         vec![
             target(up_index),
             target(down_index),
-            (parent, false),
+            (parent, parent_is_directory, parent_type),
             selected,
         ]
     }
@@ -88487,6 +88496,31 @@ fn browser_file_kind(path: &Path) -> Option<BrowserFileKind> {
         "fst" | "fxp" | "fxb" | "vstpreset" => Some(BrowserFileKind::Preset),
         "mid" | "midi" => Some(BrowserFileKind::Midi),
         _ => None,
+    }
+}
+
+fn midi_script_browser_node_type(path: &Path) -> i32 {
+    if path.is_dir() {
+        return -100;
+    }
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase);
+    match extension.as_deref() {
+        Some("flp") => 1,
+        Some("zip") => 2,
+        Some("fst") => 4,
+        Some("wav" | "wave") => 7,
+        Some("mp3") => 13,
+        Some("ogg") => 14,
+        Some("flac") => 15,
+        Some("fxb") => 20,
+        Some("aif" | "aiff") => 21,
+        Some("wv") => 24,
+        Some("mid" | "midi") => 27,
+        Some("m4a") => 35,
+        _ => -1,
     }
 }
 
