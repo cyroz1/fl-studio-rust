@@ -1240,6 +1240,37 @@ fn remap_pattern_vst2_mixer_effect_lfo_parameter_links_after_move(
     changed
 }
 
+fn remap_playlist_vst2_mixer_effect_lfo_parameter_links_after_move(
+    links: &mut [PlaylistVst2MixerEffectLfoParameterLink],
+    insert_ordinal: usize,
+    from_slot: u16,
+    to_slot: u16,
+) -> bool {
+    if from_slot == to_slot {
+        return false;
+    }
+    let mut changed = false;
+    for link in links {
+        if link.insert_ordinal != insert_ordinal {
+            continue;
+        }
+        let next_slot = if link.slot_index == from_slot {
+            to_slot
+        } else if from_slot < to_slot && (from_slot < link.slot_index && link.slot_index <= to_slot)
+        {
+            link.slot_index - 1
+        } else if to_slot < from_slot && (to_slot <= link.slot_index && link.slot_index < from_slot)
+        {
+            link.slot_index + 1
+        } else {
+            link.slot_index
+        };
+        changed |= next_slot != link.slot_index;
+        link.slot_index = next_slot;
+    }
+    changed
+}
+
 #[cfg(test)]
 mod mixer_effect_instance_tests {
     use super::{
@@ -5984,6 +6015,7 @@ struct DawUi {
     pattern_vst2_mixer_effect_parameter_links: Vec<PatternVst2MixerEffectParameterLink>,
     pattern_vst2_mixer_effect_lfo_parameter_links: Vec<PatternVst2MixerEffectLfoParameterLink>,
     playlist_vst2_mixer_effect_parameter_links: Vec<PlaylistVst2MixerEffectParameterLink>,
+    playlist_vst2_mixer_effect_lfo_parameter_links: Vec<PlaylistVst2MixerEffectLfoParameterLink>,
     playlist_vst3_parameter_links: Vec<PlaylistVst3ParameterLink>,
     playlist_vst3_mixer_effect_parameter_links: Vec<PlaylistVst3MixerEffectParameterLink>,
     playlist_clap_parameter_links: Vec<PlaylistClapParameterLink>,
@@ -7490,6 +7522,23 @@ struct PlaylistVst2MixerEffectParameterLink {
     parameter_name: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PlaylistVst2MixerEffectLfoParameterLink {
+    project_path: String,
+    automation_channel_id: u16,
+    insert_ordinal: usize,
+    slot_index: u16,
+    plugin_path: String,
+    fourcc: String,
+    parameter_id: u32,
+    parameter_name: String,
+    waveform: InternalLfoWaveform,
+    period_millibeats: u32,
+    minimum_raw: u16,
+    maximum_raw: u16,
+    phase_degrees: u16,
+}
+
 struct Vst2MixerEffectParameterSnapshot {
     plugin_path: PathBuf,
     fourcc: String,
@@ -7761,6 +7810,126 @@ fn show_pattern_vst2_mixer_effect_lfo_parameter_link_controls(
                 }
             } else {
                 response.on_hover_text("Save the project and select a Pattern to add an LFO link.");
+            }
+        }
+    });
+    (upsert, unlink)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn show_playlist_vst2_mixer_effect_lfo_parameter_link_controls(
+    ui: &mut egui::Ui,
+    link: Option<&PlaylistVst2MixerEffectLfoParameterLink>,
+    scope: Option<(&str, u16)>,
+    insert_ordinal: usize,
+    slot_index: u16,
+    plugin_path: &Path,
+    fourcc: &str,
+    parameter_id: u32,
+    parameter_name: &str,
+) -> (Option<PlaylistVst2MixerEffectLfoParameterLink>, bool) {
+    let mut upsert = None;
+    let mut unlink = false;
+    ui.horizontal(|ui| {
+        if let Some(link) = link {
+            let mut updated = link.clone();
+            let label = format!(
+                "Playlist LFO · {} · {:.2} beats",
+                updated.waveform.label(),
+                updated.period_millibeats as f32 / 1_000.0
+            );
+            ui.menu_button(label, |ui| {
+                egui::ComboBox::from_id_salt((
+                    "vst2_mixer_playlist_lfo_waveform",
+                    insert_ordinal,
+                    slot_index,
+                    parameter_id,
+                ))
+                .selected_text(updated.waveform.label())
+                .show_ui(ui, |ui| {
+                    for waveform in InternalLfoWaveform::ALL {
+                        ui.selectable_value(&mut updated.waveform, waveform, waveform.label());
+                    }
+                });
+
+                let mut period_beats = updated.period_millibeats as f32 / 1_000.0;
+                if ui
+                    .add(
+                        egui::Slider::new(&mut period_beats, 0.25..=64.0)
+                            .step_by(0.25)
+                            .text("Period (beats)"),
+                    )
+                    .changed()
+                {
+                    updated.period_millibeats = (period_beats * 1_000.0).round() as u32;
+                }
+
+                let mut minimum = updated.minimum_raw as f32 / 10_000.0;
+                if ui
+                    .add(
+                        egui::Slider::new(&mut minimum, 0.0..=1.0)
+                            .step_by(0.01)
+                            .text("Min"),
+                    )
+                    .changed()
+                {
+                    updated.minimum_raw = (minimum.min(f32::from(updated.maximum_raw) / 10_000.0)
+                        * 10_000.0)
+                        .round() as u16;
+                }
+
+                let mut maximum = updated.maximum_raw as f32 / 10_000.0;
+                if ui
+                    .add(
+                        egui::Slider::new(&mut maximum, 0.0..=1.0)
+                            .step_by(0.01)
+                            .text("Max"),
+                    )
+                    .changed()
+                {
+                    updated.maximum_raw = (maximum.max(f32::from(updated.minimum_raw) / 10_000.0)
+                        * 10_000.0)
+                        .round() as u16;
+                }
+
+                let mut phase = f32::from(updated.phase_degrees);
+                if ui
+                    .add(
+                        egui::Slider::new(&mut phase, 0.0..=359.0)
+                            .step_by(1.0)
+                            .text("Phase°"),
+                    )
+                    .changed()
+                {
+                    updated.phase_degrees = phase.round() as u16;
+                }
+                unlink = ui.small_button("Clear LFO").clicked();
+            });
+            if updated != *link && !unlink {
+                upsert = Some(updated);
+            }
+        } else {
+            let response = ui.add_enabled(scope.is_some(), egui::Button::new("Add Playlist LFO"));
+            if let Some((project_path, automation_channel_id)) = scope {
+                if response.clicked() {
+                    upsert = Some(PlaylistVst2MixerEffectLfoParameterLink {
+                        project_path: project_path.to_owned(),
+                        automation_channel_id,
+                        insert_ordinal,
+                        slot_index,
+                        plugin_path: plugin_path.to_string_lossy().into_owned(),
+                        fourcc: fourcc.to_owned(),
+                        parameter_id,
+                        parameter_name: parameter_name.to_owned(),
+                        waveform: InternalLfoWaveform::Sine,
+                        period_millibeats: 4_000,
+                        minimum_raw: 0,
+                        maximum_raw: 10_000,
+                        phase_degrees: 0,
+                    });
+                }
+            } else {
+                response.on_hover_text("Select a Playlist Automation channel to add an LFO link.");
             }
         }
     });
@@ -8844,6 +9013,8 @@ impl DawUi {
             load_pattern_vst2_mixer_effect_lfo_parameter_links();
         let playlist_vst2_mixer_effect_parameter_links =
             load_playlist_vst2_mixer_effect_parameter_links();
+        let playlist_vst2_mixer_effect_lfo_parameter_links =
+            load_playlist_vst2_mixer_effect_lfo_parameter_links();
         let playlist_vst3_parameter_links = load_playlist_vst3_parameter_links();
         let playlist_vst3_mixer_effect_parameter_links =
             load_playlist_vst3_mixer_effect_parameter_links();
@@ -9415,6 +9586,7 @@ impl DawUi {
             pattern_vst2_mixer_effect_parameter_links,
             pattern_vst2_mixer_effect_lfo_parameter_links,
             playlist_vst2_mixer_effect_parameter_links,
+            playlist_vst2_mixer_effect_lfo_parameter_links,
             playlist_vst3_parameter_links,
             playlist_vst3_mixer_effect_parameter_links,
             playlist_clap_parameter_links,
@@ -11916,6 +12088,79 @@ impl DawUi {
                 parameter_id: link.parameter_id,
                 points,
             };
+            if let Some(existing) = lanes
+                .iter_mut()
+                .find(|existing| existing.parameter_id == link.parameter_id)
+            {
+                *existing = lane;
+            } else {
+                lanes.push(lane);
+            }
+        }
+        for link in self
+            .playlist_vst2_mixer_effect_lfo_parameter_links
+            .iter()
+            .filter(|link| {
+                project_path.is_some_and(|project_path| {
+                    project_paths_equal(Path::new(&link.project_path), project_path)
+                }) && valid_playlist_vst2_mixer_effect_lfo_parameter_link(link)
+            })
+        {
+            let Some(automation_channel) = automation_channels
+                .get(&link.automation_channel_id)
+                .copied()
+            else {
+                continue;
+            };
+            let event_target = PlaylistVst2MixerEffectParameterLink {
+                project_path: link.project_path.clone(),
+                automation_channel_id: link.automation_channel_id,
+                insert_ordinal: link.insert_ordinal,
+                slot_index: link.slot_index,
+                plugin_path: link.plugin_path.clone(),
+                fourcc: link.fourcc.clone(),
+                parameter_id: link.parameter_id,
+                parameter_name: link.parameter_name.clone(),
+            };
+            let event_has_points = self
+                .playlist_vst2_mixer_effect_parameter_links
+                .iter()
+                .find(|event_link| {
+                    same_playlist_vst2_mixer_effect_parameter_link_target(event_link, &event_target)
+                })
+                .is_some_and(|_| {
+                    automation_channel.points().iter().any(|point| {
+                        point.position_beats().is_finite()
+                            && point.position_beats() >= 0.0
+                            && normalized_automation_point_value(point.value()).is_some()
+                    })
+                });
+            if event_has_points {
+                continue;
+            }
+            let key = (link.insert_ordinal, link.slot_index);
+            if self.clap_mixer_effect_assignments.contains_key(&key)
+                || self.mixer_effect_vst3_instances.contains_key(&key)
+            {
+                continue;
+            }
+            let Some(assignment) = self.vst2_mixer_effect_assignments.get(&key) else {
+                continue;
+            };
+            if assignment.plugin_path != Path::new(&link.plugin_path)
+                || assignment.fourcc != link.fourcc
+            {
+                continue;
+            }
+            let Some(lane) =
+                playlist_vst2_mixer_effect_lfo_parameter_automation(link, automation_channel)
+            else {
+                continue;
+            };
+            let lanes = sources
+                .mixer_effect_automation_clips
+                .entry((link.automation_channel_id, key.0, key.1))
+                .or_default();
             if let Some(existing) = lanes
                 .iter_mut()
                 .find(|existing| existing.parameter_id == link.parameter_id)
@@ -65758,6 +66003,8 @@ impl DawUi {
         let mut pattern_vst2_mixer_effect_lfo_unlinks = Vec::new();
         let mut playlist_vst2_mixer_effect_link_requests = Vec::new();
         let mut playlist_vst2_mixer_effect_unlink_requests = Vec::new();
+        let mut playlist_vst2_mixer_effect_lfo_upserts = Vec::new();
+        let mut playlist_vst2_mixer_effect_lfo_unlinks = Vec::new();
         let mut clap_effect_assignment_edit = None;
         let mut clap_effect_assignment_remove = None;
         let mut capture_clap_mixer_effect_state = None;
@@ -67658,6 +67905,65 @@ impl DawUi {
                                                                         }
                                                                     });
                                                                 }
+                                                                let playlist_lfo_target =
+                                                                    playlist_clap_mixer_effect_source
+                                                                        .as_ref()
+                                                                        .map(|source| {
+                                                                            PlaylistVst2MixerEffectLfoParameterLink {
+                                                                                project_path: source.0.clone(),
+                                                                                automation_channel_id: source.1,
+                                                                                insert_ordinal: insert.ordinal(),
+                                                                                slot_index: slot.slot_index(),
+                                                                                plugin_path: assignment
+                                                                                    .plugin_path
+                                                                                    .to_string_lossy()
+                                                                                    .into_owned(),
+                                                                                fourcc: assignment.fourcc.clone(),
+                                                                                parameter_id: parameter.id,
+                                                                                parameter_name: parameter_name.clone(),
+                                                                                waveform: InternalLfoWaveform::Sine,
+                                                                                period_millibeats: 4_000,
+                                                                                minimum_raw: 0,
+                                                                                maximum_raw: 10_000,
+                                                                                phase_degrees: 0,
+                                                                            }
+                                                                        });
+                                                                let playlist_lfo_link =
+                                                                    playlist_lfo_target.as_ref().and_then(
+                                                                        |target| {
+                                                                            playlist_vst2_mixer_effect_lfo_parameter_link_for_target(
+                                                                                &self.playlist_vst2_mixer_effect_lfo_parameter_links,
+                                                                                target,
+                                                                            )
+                                                                        },
+                                                                    );
+                                                                let playlist_lfo_scope =
+                                                                    playlist_clap_mixer_effect_source
+                                                                        .as_ref()
+                                                                        .filter(|source| source.3)
+                                                                        .map(|source| (source.0.as_str(), source.1));
+                                                                let (playlist_lfo_upsert, clear_playlist_lfo) =
+                                                                    show_playlist_vst2_mixer_effect_lfo_parameter_link_controls(
+                                                                        ui,
+                                                                        playlist_lfo_link,
+                                                                        playlist_lfo_scope,
+                                                                        insert.ordinal(),
+                                                                        slot.slot_index(),
+                                                                        &assignment.plugin_path,
+                                                                        &assignment.fourcc,
+                                                                        parameter.id,
+                                                                        &parameter_name,
+                                                                    );
+                                                                if let Some(link) = playlist_lfo_upsert {
+                                                                    playlist_vst2_mixer_effect_lfo_upserts
+                                                                        .push(link);
+                                                                }
+                                                                if clear_playlist_lfo
+                                                                    && let Some(link) = playlist_lfo_link
+                                                                {
+                                                                    playlist_vst2_mixer_effect_lfo_unlinks
+                                                                        .push(link.clone());
+                                                                }
                                                                 let lfo_scope =
                                                                     self.current_path.as_deref().zip(self.selected_pattern);
                                                                 let lfo_target = lfo_scope.map(
@@ -69241,6 +69547,47 @@ impl DawUi {
                 },
             );
         }
+        for link in playlist_vst2_mixer_effect_lfo_upserts {
+            upsert_playlist_vst2_mixer_effect_lfo_parameter_link(
+                &mut self.playlist_vst2_mixer_effect_lfo_parameter_links,
+                link.clone(),
+            );
+            self.status = save_playlist_vst2_mixer_effect_lfo_parameter_links(
+                &self.playlist_vst2_mixer_effect_lfo_parameter_links,
+            )
+            .err()
+            .map_or_else(
+                || {
+                    format!(
+                        "Linked {} to a VST2 Mixer Playlist LFO on this machine",
+                        link.parameter_name
+                    )
+                },
+                |error| {
+                    format!(
+                        "Updated the VST2 Mixer Playlist LFO for this session; could not save it: {error}"
+                    )
+                },
+            );
+        }
+        for link in playlist_vst2_mixer_effect_lfo_unlinks {
+            remove_playlist_vst2_mixer_effect_lfo_parameter_link(
+                &mut self.playlist_vst2_mixer_effect_lfo_parameter_links,
+                &link,
+            );
+            self.status = save_playlist_vst2_mixer_effect_lfo_parameter_links(
+                &self.playlist_vst2_mixer_effect_lfo_parameter_links,
+            )
+            .err()
+            .map_or_else(
+                || format!("Cleared VST2 Mixer Playlist LFO for {}", link.parameter_name),
+                |error| {
+                    format!(
+                        "Cleared the VST2 Mixer Playlist LFO for this session; could not save it: {error}"
+                    )
+                },
+            );
+        }
         for link in playlist_clap_mixer_effect_link_requests {
             upsert_playlist_clap_mixer_effect_parameter_link(
                 &mut self.playlist_clap_mixer_effect_parameter_links,
@@ -69481,6 +69828,13 @@ impl DawUi {
                             from_slot,
                             to_slot,
                         );
+                    let playlist_lfo_links_changed =
+                        remap_playlist_vst2_mixer_effect_lfo_parameter_links_after_move(
+                            &mut self.playlist_vst2_mixer_effect_lfo_parameter_links,
+                            insert_ordinal,
+                            from_slot,
+                            to_slot,
+                        );
                     if let Some(editor_host) = &self.vst2_mixer_effect_host
                         && let Ok(mut editor_host) = editor_host.lock()
                     {
@@ -69541,6 +69895,15 @@ impl DawUi {
                                 .then(|| {
                                     save_pattern_vst2_mixer_effect_lfo_parameter_links(
                                         &self.pattern_vst2_mixer_effect_lfo_parameter_links,
+                                    )
+                                })
+                                .and_then(Result::err)
+                        })
+                        .or_else(|| {
+                            playlist_lfo_links_changed
+                                .then(|| {
+                                    save_playlist_vst2_mixer_effect_lfo_parameter_links(
+                                        &self.playlist_vst2_mixer_effect_lfo_parameter_links,
                                     )
                                 })
                                 .and_then(Result::err)
@@ -84921,6 +85284,10 @@ fn playlist_vst2_mixer_effect_parameter_links_file() -> Option<PathBuf> {
     midi_control_change_mapping_file("playlist-vst2-mixer-effect-parameter-links.txt")
 }
 
+fn playlist_vst2_mixer_effect_lfo_parameter_links_file() -> Option<PathBuf> {
+    midi_control_change_mapping_file("playlist-vst2-mixer-effect-lfo-parameter-links.txt")
+}
+
 fn playlist_vst3_parameter_links_file() -> Option<PathBuf> {
     midi_control_change_mapping_file("playlist-vst3-parameter-links.txt")
 }
@@ -85055,6 +85422,14 @@ fn load_playlist_vst2_mixer_effect_parameter_links() -> Vec<PlaylistVst2MixerEff
     playlist_vst2_mixer_effect_parameter_links_file()
         .and_then(|path| fs::read_to_string(path).ok())
         .map(|contents| parse_playlist_vst2_mixer_effect_parameter_links(&contents))
+        .unwrap_or_default()
+}
+
+fn load_playlist_vst2_mixer_effect_lfo_parameter_links()
+-> Vec<PlaylistVst2MixerEffectLfoParameterLink> {
+    playlist_vst2_mixer_effect_lfo_parameter_links_file()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .map(|contents| parse_playlist_vst2_mixer_effect_lfo_parameter_links(&contents))
         .unwrap_or_default()
 }
 
@@ -85464,6 +85839,23 @@ fn save_playlist_vst2_mixer_effect_parameter_links(
     fs::write(
         &path,
         serialize_playlist_vst2_mixer_effect_parameter_links(links),
+    )
+    .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
+fn save_playlist_vst2_mixer_effect_lfo_parameter_links(
+    links: &[PlaylistVst2MixerEffectLfoParameterLink],
+) -> Result<(), String> {
+    let path = playlist_vst2_mixer_effect_lfo_parameter_links_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the Playlist VST2 Mixer effect LFO path has no parent folder".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    fs::write(
+        &path,
+        serialize_playlist_vst2_mixer_effect_lfo_parameter_links(links),
     )
     .map_err(|error| format!("could not write {}: {error}", path.display()))
 }
@@ -86490,6 +86882,66 @@ fn playlist_vst2_mixer_effect_parameter_link_for_target<'a>(
         .find(|link| same_playlist_vst2_mixer_effect_parameter_link_target(link, target))
 }
 
+fn valid_playlist_vst2_mixer_effect_lfo_parameter_link(
+    link: &PlaylistVst2MixerEffectLfoParameterLink,
+) -> bool {
+    !link.project_path.is_empty()
+        && link.automation_channel_id != u16::MAX
+        && link.insert_ordinal <= 127
+        && link.slot_index < 10
+        && !link.plugin_path.is_empty()
+        && !link.fourcc.is_empty()
+        && !link.parameter_name.is_empty()
+        && (250..=64_000).contains(&link.period_millibeats)
+        && link.minimum_raw <= link.maximum_raw
+        && link.maximum_raw <= 10_000
+        && link.phase_degrees < 360
+}
+
+fn same_playlist_vst2_mixer_effect_lfo_parameter_link_target(
+    link: &PlaylistVst2MixerEffectLfoParameterLink,
+    target: &PlaylistVst2MixerEffectLfoParameterLink,
+) -> bool {
+    project_paths_equal(
+        Path::new(&link.project_path),
+        Path::new(&target.project_path),
+    ) && link.automation_channel_id == target.automation_channel_id
+        && link.insert_ordinal == target.insert_ordinal
+        && link.slot_index == target.slot_index
+        && Path::new(&link.plugin_path) == Path::new(&target.plugin_path)
+        && link.fourcc == target.fourcc
+        && link.parameter_id == target.parameter_id
+}
+
+fn upsert_playlist_vst2_mixer_effect_lfo_parameter_link(
+    links: &mut Vec<PlaylistVst2MixerEffectLfoParameterLink>,
+    link: PlaylistVst2MixerEffectLfoParameterLink,
+) {
+    if !valid_playlist_vst2_mixer_effect_lfo_parameter_link(&link) {
+        return;
+    }
+    links.retain(|existing| {
+        !same_playlist_vst2_mixer_effect_lfo_parameter_link_target(existing, &link)
+    });
+    links.push(link);
+}
+
+fn remove_playlist_vst2_mixer_effect_lfo_parameter_link(
+    links: &mut Vec<PlaylistVst2MixerEffectLfoParameterLink>,
+    target: &PlaylistVst2MixerEffectLfoParameterLink,
+) {
+    links.retain(|link| !same_playlist_vst2_mixer_effect_lfo_parameter_link_target(link, target));
+}
+
+fn playlist_vst2_mixer_effect_lfo_parameter_link_for_target<'a>(
+    links: &'a [PlaylistVst2MixerEffectLfoParameterLink],
+    target: &PlaylistVst2MixerEffectLfoParameterLink,
+) -> Option<&'a PlaylistVst2MixerEffectLfoParameterLink> {
+    links
+        .iter()
+        .find(|link| same_playlist_vst2_mixer_effect_lfo_parameter_link_target(link, target))
+}
+
 fn valid_playlist_vst3_parameter_link(link: &PlaylistVst3ParameterLink) -> bool {
     !link.project_path.is_empty()
         && !link.target.plugin_uid.is_empty()
@@ -87362,6 +87814,49 @@ fn pattern_vst2_mixer_effect_lfo_parameter_automation(
         })
         .collect();
     Some(Vst3PlaylistParameterAutomation {
+        parameter_id: link.parameter_id,
+        points,
+    })
+}
+
+fn playlist_vst2_mixer_effect_lfo_parameter_automation(
+    link: &PlaylistVst2MixerEffectLfoParameterLink,
+    automation_channel: &AutomationChannel,
+) -> Option<Vst3ParameterAutomation> {
+    if !valid_playlist_vst2_mixer_effect_lfo_parameter_link(link) {
+        return None;
+    }
+    let duration_beats = automation_channel
+        .points()
+        .iter()
+        .filter_map(|point| {
+            let position = point.position_beats();
+            (position.is_finite() && position >= 0.0).then_some(position)
+        })
+        .reduce(f64::max)?;
+    if duration_beats <= 0.0 {
+        return None;
+    }
+    let period_beats = f64::from(link.period_millibeats) / 1_000.0;
+    let requested_steps = (duration_beats / period_beats * 32.0).ceil().max(8.0);
+    let step_count = requested_steps.min((MAX_INTERNAL_LFO_AUTOMATION_POINTS - 1) as f64) as usize;
+    let minimum = f64::from(link.minimum_raw) / 10_000.0;
+    let maximum = f64::from(link.maximum_raw) / 10_000.0;
+    let phase_offset = f64::from(link.phase_degrees) / 360.0;
+    let points = (0..=step_count)
+        .map(|step| {
+            let fraction = step as f64 / step_count as f64;
+            let position_beats = duration_beats * fraction;
+            let phase = position_beats / period_beats + phase_offset;
+            let wave = internal_lfo_value_at_phase(link.waveform, phase);
+            Vst3AutomationPoint {
+                position_beats,
+                value: minimum + (maximum - minimum) * wave,
+                tension: 0.0,
+            }
+        })
+        .collect();
+    Some(Vst3ParameterAutomation {
         parameter_id: link.parameter_id,
         points,
     })
@@ -88975,6 +89470,126 @@ fn serialize_playlist_vst2_mixer_effect_parameter_links(
         contents.push_str(&link.parameter_id.to_string());
         contents.push('\t');
         contents.push_str(&encode_midi_device_id(&link.parameter_name));
+        contents.push('\n');
+    }
+    contents
+}
+
+fn parse_playlist_vst2_mixer_effect_lfo_parameter_links(
+    contents: &str,
+) -> Vec<PlaylistVst2MixerEffectLfoParameterLink> {
+    let mut links = Vec::new();
+    for line in contents.lines() {
+        let Some(encoded) = line.strip_prefix("link=") else {
+            continue;
+        };
+        let mut fields = encoded.split('\t');
+        let Some(project_path) = fields.next().and_then(decode_midi_device_id) else {
+            continue;
+        };
+        let Some(automation_channel_id) = fields.next().and_then(|field| field.parse::<u16>().ok())
+        else {
+            continue;
+        };
+        let Some(insert_ordinal) = fields.next().and_then(|field| field.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        let Some(slot_index) = fields.next().and_then(|field| field.parse::<u16>().ok()) else {
+            continue;
+        };
+        let Some(plugin_path) = fields.next().and_then(decode_midi_device_id) else {
+            continue;
+        };
+        let Some(fourcc) = fields.next().and_then(decode_midi_device_id) else {
+            continue;
+        };
+        let Some(parameter_id) = fields.next().and_then(|field| field.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(parameter_name) = fields.next().and_then(decode_midi_device_id) else {
+            continue;
+        };
+        let Some(waveform) = fields
+            .next()
+            .and_then(|field| field.parse::<u8>().ok())
+            .and_then(InternalLfoWaveform::from_code)
+        else {
+            continue;
+        };
+        let Some(period_millibeats) = fields.next().and_then(|field| field.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Some(minimum_raw) = fields.next().and_then(|field| field.parse::<u16>().ok()) else {
+            continue;
+        };
+        let Some(maximum_raw) = fields.next().and_then(|field| field.parse::<u16>().ok()) else {
+            continue;
+        };
+        let Some(phase_degrees) = fields.next().and_then(|field| field.parse::<u16>().ok()) else {
+            continue;
+        };
+        if fields.next().is_some() {
+            continue;
+        }
+        upsert_playlist_vst2_mixer_effect_lfo_parameter_link(
+            &mut links,
+            PlaylistVst2MixerEffectLfoParameterLink {
+                project_path,
+                automation_channel_id,
+                insert_ordinal,
+                slot_index,
+                plugin_path,
+                fourcc,
+                parameter_id,
+                parameter_name,
+                waveform,
+                period_millibeats,
+                minimum_raw,
+                maximum_raw,
+                phase_degrees,
+            },
+        );
+    }
+    links
+}
+
+fn serialize_playlist_vst2_mixer_effect_lfo_parameter_links(
+    links: &[PlaylistVst2MixerEffectLfoParameterLink],
+) -> String {
+    let mut contents = String::from("version=1\n");
+    let mut normalized = Vec::new();
+    for link in links {
+        upsert_playlist_vst2_mixer_effect_lfo_parameter_link(&mut normalized, link.clone());
+    }
+    for link in normalized {
+        contents.push_str("link=");
+        contents.push_str(&encode_midi_device_id(&link.project_path));
+        contents.push('\t');
+        contents.push_str(&link.automation_channel_id.to_string());
+        contents.push('\t');
+        contents.push_str(&link.insert_ordinal.to_string());
+        contents.push('\t');
+        contents.push_str(&link.slot_index.to_string());
+        contents.push('\t');
+        contents.push_str(&encode_midi_device_id(&link.plugin_path));
+        contents.push('\t');
+        contents.push_str(&encode_midi_device_id(&link.fourcc));
+        contents.push('\t');
+        contents.push_str(&link.parameter_id.to_string());
+        contents.push('\t');
+        contents.push_str(&encode_midi_device_id(&link.parameter_name));
+        contents.push('\t');
+        contents.push_str(&link.waveform.code().to_string());
+        contents.push('\t');
+        contents.push_str(&link.period_millibeats.to_string());
+        contents.push('\t');
+        contents.push_str(&link.minimum_raw.to_string());
+        contents.push('\t');
+        contents.push_str(&link.maximum_raw.to_string());
+        contents.push('\t');
+        contents.push_str(&link.phase_degrees.to_string());
         contents.push('\n');
     }
     contents
