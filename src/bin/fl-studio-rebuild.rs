@@ -6284,6 +6284,7 @@ struct LiveSamplerInputSession {
 struct LiveLayerInputTargets {
     sampler_channel_ids: BTreeSet<u16>,
     vst3_channel_ids: BTreeSet<u16>,
+    vst2_channel_ids: BTreeSet<u16>,
 }
 
 struct LiveLayerInputSession {
@@ -71604,6 +71605,20 @@ impl DawUi {
         }
     }
 
+    fn loaded_vst2_channel_ids(&self) -> BTreeSet<u16> {
+        self.vst2_host
+            .as_ref()
+            .and_then(|runtime| runtime.lock().ok())
+            .map(|runtime| {
+                runtime
+                    .loaded_channels()
+                    .into_iter()
+                    .map(|channel| channel.channel_id)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn live_sampler_target_channels(&self, source_channel_id: u16) -> Option<BTreeSet<u16>> {
         let channels = self.document.as_ref()?.channels();
         let channels_by_id = channels
@@ -71620,9 +71635,11 @@ impl DawUi {
         if source.channel_type() != Some(ChannelType::Layer) {
             return None;
         }
+        let loaded_vst2_channels = self.loaded_vst2_channel_ids();
         let targets = self.collect_live_layer_destinations(
             source_channel_id,
             &channels_by_id,
+            &loaded_vst2_channels,
             &mut BTreeSet::new(),
         )?;
         (!targets.sampler_channel_ids.is_empty()).then_some(targets.sampler_channel_ids)
@@ -71644,9 +71661,11 @@ impl DawUi {
         if source.channel_type() != Some(ChannelType::Layer) {
             return None;
         }
+        let loaded_vst2_channels = self.loaded_vst2_channel_ids();
         let targets = self.collect_live_layer_destinations(
             source_channel_id,
             &channels_by_id,
+            &loaded_vst2_channels,
             &mut BTreeSet::new(),
         )?;
         (!targets.vst3_channel_ids.is_empty()).then_some(targets.vst3_channel_ids)
@@ -71662,13 +71681,17 @@ impl DawUi {
         if source.enabled() == Some(false) || source.channel_type() != Some(ChannelType::Layer) {
             return None;
         }
+        let loaded_vst2_channels = self.loaded_vst2_channel_ids();
         let targets = self.collect_live_layer_destinations(
             source_channel_id,
             &channels_by_id,
+            &loaded_vst2_channels,
             &mut BTreeSet::new(),
         )?;
-        (!targets.sampler_channel_ids.is_empty() && !targets.vst3_channel_ids.is_empty())
-            .then_some(targets)
+        (!targets.sampler_channel_ids.is_empty()
+            || !targets.vst3_channel_ids.is_empty()
+            || !targets.vst2_channel_ids.is_empty())
+        .then_some(targets)
     }
 
     fn live_playlist_vst3_note_layer_adjustments(
@@ -71692,6 +71715,7 @@ impl DawUi {
         &self,
         layer_channel_id: u16,
         channels_by_id: &BTreeMap<u16, &ChannelSummary>,
+        loaded_vst2_channels: &BTreeSet<u16>,
         active_layers: &mut BTreeSet<u16>,
     ) -> Option<LiveLayerInputTargets> {
         let layer = channels_by_id.get(&layer_channel_id)?;
@@ -71699,12 +71723,14 @@ impl DawUi {
             return Some(LiveLayerInputTargets {
                 sampler_channel_ids: BTreeSet::new(),
                 vst3_channel_ids: BTreeSet::new(),
+                vst2_channel_ids: BTreeSet::new(),
             });
         }
         let result = (|| {
             let mut targets = LiveLayerInputTargets {
                 sampler_channel_ids: BTreeSet::new(),
                 vst3_channel_ids: BTreeSet::new(),
+                vst2_channel_ids: BTreeSet::new(),
             };
             let mut seen = BTreeSet::new();
             for child_id in layer.layer_child_ids()? {
@@ -71721,16 +71747,20 @@ impl DawUi {
                     let nested = self.collect_live_layer_destinations(
                         *child_id,
                         channels_by_id,
+                        loaded_vst2_channels,
                         active_layers,
                     )?;
                     targets
                         .sampler_channel_ids
                         .extend(nested.sampler_channel_ids);
                     targets.vst3_channel_ids.extend(nested.vst3_channel_ids);
+                    targets.vst2_channel_ids.extend(nested.vst2_channel_ids);
                 } else if child.kind() == Some(0) {
                     targets.sampler_channel_ids.insert(*child_id);
                 } else if self.channel_vst3_instances.contains_key(child_id) {
                     targets.vst3_channel_ids.insert(*child_id);
+                } else if loaded_vst2_channels.contains(child_id) {
+                    targets.vst2_channel_ids.insert(*child_id);
                 } else {
                     return None;
                 }
@@ -72246,9 +72276,14 @@ impl DawUi {
         let Some(document) = self.document.as_ref().cloned() else {
             return false;
         };
-        let Some(project_path) = self.sample_project_path() else {
-            self.status = "Save the project before auditioning its Sampler input".to_owned();
-            return false;
+        let project_path = if targets.sampler_channel_ids.is_empty() {
+            None
+        } else {
+            let Some(path) = self.sample_project_path() else {
+                self.status = "Save the project before auditioning its Sampler input".to_owned();
+                return false;
+            };
+            Some(path)
         };
         if self.audio_engine.is_none() {
             match AudioEngine::start(&self.audio_settings) {
@@ -72268,6 +72303,40 @@ impl DawUi {
                 "Enable an output device in Audio settings before Layer audition".to_owned();
             return false;
         }
+        let vst2_runtime = if targets.vst2_channel_ids.is_empty() {
+            None
+        } else {
+            let Some(runtime) = self.vst2_host.as_ref().cloned() else {
+                self.status = "Load the Layer's VST2 children before live MIDI audition".to_owned();
+                return false;
+            };
+            let loaded_channels = match runtime.lock() {
+                Ok(runtime) => runtime.loaded_channels(),
+                Err(_) => {
+                    self.status = "VST2 host runtime lock was poisoned".to_owned();
+                    return false;
+                }
+            };
+            for channel_id in &targets.vst2_channel_ids {
+                let Some(channel) = loaded_channels
+                    .iter()
+                    .find(|channel| channel.channel_id == *channel_id)
+                else {
+                    self.status =
+                        format!("Load VST2 Layer child {channel_id} before live MIDI audition");
+                    return false;
+                };
+                if channel.sample_rate != engine.sample_rate() {
+                    self.status = format!(
+                        "VST2 Layer child {channel_id} is running at {} Hz, but audio output is {} Hz; reload the project plug-ins after changing the audio sample rate",
+                        channel.sample_rate,
+                        engine.sample_rate()
+                    );
+                    return false;
+                }
+            }
+            Some(runtime)
+        };
         engine.set_test_tone(false);
         if self.audio_monitor_input || self.audio_monitor_session.is_some() {
             stop_audio_input_monitor_with_engine(
@@ -72315,10 +72384,6 @@ impl DawUi {
                 return false;
             }
         }
-        let Some(host) = self.vst3_host.as_ref() else {
-            self.status = "Load the Layer's VST3 children before live MIDI audition".to_owned();
-            return false;
-        };
         let channel_instances = self
             .channel_vst3_instances
             .iter()
@@ -72326,21 +72391,39 @@ impl DawUi {
             .map(|(&target_id, &instance_id)| (target_id, instance_id))
             .collect::<BTreeMap<_, _>>();
         let live_channels = targets.vst3_channel_ids.clone();
-        let mut processor = match host.prepare_playlist_performance_stream(
-            &preparation_document,
-            options,
-            &channel_instances,
-            &live_channels,
-            true,
-        ) {
-            Ok(processor) => processor,
-            Err(error) => {
-                self.status = format!("Could not prepare Layer input audition: {error}");
+        let needs_vst3_processor =
+            !live_channels.is_empty() || !self.mixer_effect_vst3_instances.is_empty();
+        let mut processor = if needs_vst3_processor {
+            let Some(host) = self.vst3_host.as_ref() else {
+                self.status = "Load the Layer's VST3 children before live MIDI audition".to_owned();
                 return false;
+            };
+            let automation_sources = self.vst3_playlist_automation_sources(&preparation_document);
+            match host
+                .prepare_playlist_performance_stream_with_mixer_effects_and_automation_sources(
+                    &preparation_document,
+                    options,
+                    &channel_instances,
+                    &live_channels,
+                    &self.mixer_effect_vst3_instances,
+                    true,
+                    &automation_sources,
+                ) {
+                Ok(processor) => Some(processor),
+                Err(error) => {
+                    self.status = format!("Could not prepare Layer input audition: {error}");
+                    return false;
+                }
             }
+        } else {
+            None
         };
         for target_channel_id in &targets.vst3_channel_ids {
-            if let Err(error) = processor.clear_live_input_events(*target_channel_id) {
+            if let Err(error) = processor
+                .as_mut()
+                .ok_or_else(|| "VST3 Layer processor is unavailable".to_owned())
+                .and_then(|processor| processor.clear_live_input_events(*target_channel_id))
+            {
                 self.status = format!("Could not prepare Layer input audition: {error}");
                 return false;
             }
@@ -72356,6 +72439,7 @@ impl DawUi {
             source_channel_id: channel_id,
             sampler_target_channel_ids: targets.sampler_channel_ids.clone(),
             vst3_target_channel_ids: targets.vst3_channel_ids.clone(),
+            vst2_target_channel_ids: targets.vst2_channel_ids.clone(),
             project_path,
             sampler_options: SamplerPatternRenderOptions {
                 pattern_id,
@@ -72376,6 +72460,7 @@ impl DawUi {
             .spawn(move || {
                 let result = stream_mixed_layer_midi_input_to_device(
                     processor,
+                    vst2_runtime,
                     worker_document,
                     worker_config,
                     event_receiver,

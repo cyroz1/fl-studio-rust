@@ -1055,7 +1055,7 @@ pub struct SamplerLiveInputRouting {
 /// Live MIDI and Sampler controller state for a mixed-child Layer source.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LayerLiveInputEvent {
-    /// MIDI message forwarded to VST3 children and interpreted for Sampler children as applicable.
+    /// MIDI message forwarded to plug-in children and interpreted for Sampler children as applicable.
     Midi(Vst3LiveInputEvent),
     /// Updated Sampler pitch-bend offset for an input MIDI channel.
     SamplerPitchBend { channel: u8, cents: i16 },
@@ -1083,8 +1083,10 @@ pub struct LayerLiveInputConfig {
     pub sampler_target_channel_ids: BTreeSet<u16>,
     /// Loaded VST3 children that receive routed Layer notes.
     pub vst3_target_channel_ids: BTreeSet<u16>,
-    /// Saved-project location used to resolve Sampler sample paths.
-    pub project_path: PathBuf,
+    /// Loaded VST2 children that receive routed Layer notes.
+    pub vst2_target_channel_ids: BTreeSet<u16>,
+    /// Saved-project location used to resolve Sampler sample paths, when any Sampler is targeted.
+    pub project_path: Option<PathBuf>,
     /// Sample rate, resampling, and selected Pattern used for Sampler preparation.
     pub sampler_options: SamplerPatternRenderOptions,
 }
@@ -11408,19 +11410,29 @@ enum LiveLayerNoteDestination {
         note_id: i32,
         key: u8,
     },
+    Vst2 {
+        channel_id: u16,
+    },
 }
 
-/// Stream a mixed Sampler/VST3 Layer through one synchronized live audio path.
+/// Stream a mixed Sampler/VST2/VST3 Layer through one synchronized live audio path.
 pub fn stream_mixed_layer_midi_input_to_device(
-    mut processor: Vst3PlaylistStreamProcessor,
+    mut processor: Option<Vst3PlaylistStreamProcessor>,
+    vst2_runtime: Option<Arc<Mutex<Vst2HostRuntime>>>,
     document: FlpDocument,
     config: LayerLiveInputConfig,
     events: LayerLiveInputReceiver,
     writer: &StreamingAudioWriter,
     cancelled: &AtomicBool,
 ) -> Result<(), String> {
-    let available_vst3_channels = processor.performance_channel_ids();
-    let vst3_volume_expression_channels = processor.performance_volume_expression_channel_ids();
+    let vst3_volume_expression_channels = processor
+        .as_ref()
+        .map(Vst3PlaylistStreamProcessor::performance_volume_expression_channel_ids)
+        .unwrap_or_default();
+    let available_vst3_channels = processor
+        .as_ref()
+        .map(Vst3PlaylistStreamProcessor::performance_channel_ids)
+        .unwrap_or_default();
     if !config
         .vst3_target_channel_ids
         .is_subset(&available_vst3_channels)
@@ -11430,56 +11442,151 @@ pub fn stream_mixed_layer_midi_input_to_device(
             config.source_channel_id
         ));
     }
-    if config.sampler_target_channel_ids.is_empty() || config.vst3_target_channel_ids.is_empty() {
-        return Err("mixed Layer audition needs both Sampler and VST3 destinations".to_owned());
+    if config.sampler_target_channel_ids.is_empty()
+        && config.vst3_target_channel_ids.is_empty()
+        && config.vst2_target_channel_ids.is_empty()
+    {
+        return Err("Layer has no available Sampler, VST2, or VST3 destinations".to_owned());
     }
     if !config
         .sampler_target_channel_ids
         .is_disjoint(&config.vst3_target_channel_ids)
+        || !config
+            .sampler_target_channel_ids
+            .is_disjoint(&config.vst2_target_channel_ids)
+        || !config
+            .vst3_target_channel_ids
+            .is_disjoint(&config.vst2_target_channel_ids)
     {
         return Err("mixed Layer destinations overlap".to_owned());
     }
 
-    let (sampler_render, sampler_pitch_offsets) = prepare_live_sampler_destinations(
-        &document,
-        &config.project_path,
-        config.sampler_options,
-        config.source_channel_id,
-        &config.sampler_target_channel_ids,
-        Some(cancelled),
-    )?;
+    let sampler_render = if config.sampler_target_channel_ids.is_empty() {
+        None
+    } else {
+        let project_path = config
+            .project_path
+            .as_deref()
+            .ok_or_else(|| "Save the project before auditioning its Sampler input".to_owned())?;
+        Some(prepare_live_sampler_destinations(
+            &document,
+            project_path,
+            config.sampler_options,
+            config.source_channel_id,
+            &config.sampler_target_channel_ids,
+            Some(cancelled),
+        )?)
+    };
+    let sampler_pitch_offsets = sampler_render
+        .as_ref()
+        .map(|(_, offsets)| offsets.clone())
+        .unwrap_or_default();
     let channels = document.channels();
     let ppq = document.header().ppq();
     let tempo_bpm = document.metadata().tempo_bpm().unwrap_or(140.0);
     let channel_router = ChannelNoteRouter::new(channels);
     let master_output = MixerMasterOutput::from_document(&document);
     let empty_notes = [];
-    let mut sampler_engine = SamplerVoiceEngine::with_resampling_quality_and_pan_law(
-        &sampler_render.sources_by_channel,
-        &empty_notes,
-        sampler_render.voice_limit,
-        (f64::from(sampler_render.summary.sample_rate) * SAMPLER_RELEASE_SECONDS)
-            .round()
-            .max(1.0) as usize,
-        sampler_render.summary.sample_rate,
-        sampler_render.resampling_quality,
-        sampler_render.pan_law,
-    );
-    sampler_engine.tempo_map = Some(&sampler_render.tempo_map);
-    sampler_engine.mixer_transforms_by_channel = Some(&sampler_render.mixer_transforms_by_channel);
-    sampler_engine.live_mixer_source_routes_by_channel =
-        Some(&sampler_render.live_mixer_source_routes_by_channel);
-    sampler_engine.mixer_meter_transforms_by_channel =
-        Some(&sampler_render.mixer_meter_transforms_by_channel);
-    sampler_engine.mixer_effect_input_transforms_by_channel =
-        Some(&sampler_render.mixer_effect_input_transforms_by_channel);
+    let mut sampler_engine = sampler_render.as_ref().map(|(sampler_render, _)| {
+        let mut engine = SamplerVoiceEngine::with_resampling_quality_and_pan_law(
+            &sampler_render.sources_by_channel,
+            &empty_notes,
+            sampler_render.voice_limit,
+            (f64::from(sampler_render.summary.sample_rate) * SAMPLER_RELEASE_SECONDS)
+                .round()
+                .max(1.0) as usize,
+            sampler_render.summary.sample_rate,
+            sampler_render.resampling_quality,
+            sampler_render.pan_law,
+        );
+        engine.tempo_map = Some(&sampler_render.tempo_map);
+        engine.mixer_transforms_by_channel = Some(&sampler_render.mixer_transforms_by_channel);
+        engine.live_mixer_source_routes_by_channel =
+            Some(&sampler_render.live_mixer_source_routes_by_channel);
+        engine.mixer_meter_transforms_by_channel =
+            Some(&sampler_render.mixer_meter_transforms_by_channel);
+        engine.mixer_effect_input_transforms_by_channel =
+            Some(&sampler_render.mixer_effect_input_transforms_by_channel);
+        engine
+    });
 
     const LIVE_BLOCK_FRAMES: usize = 128;
     let mut block = vec![0.0f32; LIVE_BLOCK_FRAMES * 2];
     let mut sampler_block = vec![0.0f32; LIVE_BLOCK_FRAMES * 2];
-    let direct_source_delay_frames = processor.pdc_direct_source_delay_frames();
+    let vst3_pdc_target_frames = processor.as_ref().map_or(
+        0,
+        Vst3PlaylistStreamProcessor::pdc_direct_source_delay_frames,
+    );
+    let vst2_channel_infos = if config.vst2_target_channel_ids.is_empty() {
+        Vec::new()
+    } else {
+        let runtime = vst2_runtime
+            .as_ref()
+            .ok_or_else(|| "VST2 children for this Layer are not loaded".to_owned())?;
+        let loaded_channels = runtime
+            .lock()
+            .map_err(|_| "VST2 host runtime lock was poisoned".to_owned())?
+            .loaded_channels();
+        let infos = loaded_channels
+            .into_iter()
+            .filter(|channel| config.vst2_target_channel_ids.contains(&channel.channel_id))
+            .collect::<Vec<_>>();
+        if infos.len() != config.vst2_target_channel_ids.len() {
+            return Err(format!(
+                "one or more VST2 children for Layer {} are no longer loaded",
+                config.source_channel_id
+            ));
+        }
+        if infos
+            .iter()
+            .any(|channel| channel.sample_rate != config.sampler_options.sample_rate)
+        {
+            return Err(
+                "reload VST2 Layer children after changing the audio sample rate".to_owned(),
+            );
+        }
+        infos
+    };
+    let pdc_target_frames = vst3_pdc_target_frames.max(
+        vst2_channel_infos
+            .iter()
+            .map(|channel| channel.latency_frames as u64)
+            .max()
+            .unwrap_or_default(),
+    );
+    let mut vst2_processor =
+        if let Some(runtime) = vst2_runtime.filter(|_| !vst2_channel_infos.is_empty()) {
+            Some(Vst2PatternStreamProcessor::new(
+                runtime,
+                Vst2PatternStreamSetup {
+                    document: &document,
+                    pattern_notes: &[],
+                    channel_infos: &vst2_channel_infos,
+                    external_channel_ids: &config.vst2_target_channel_ids,
+                    volume_expression_channels: &BTreeSet::new(),
+                    meters: None,
+                    settings: Vst2PatternStreamSettings {
+                        ppq,
+                        tempo_bpm,
+                        sample_rate: config.sampler_options.sample_rate,
+                        loop_frames: LIVE_BLOCK_FRAMES as u64,
+                        repeat_pattern: false,
+                        transport_playing: false,
+                        pdc_target_frames,
+                        master_pitch_cents: document.metadata().master_pitch_cents(),
+                    },
+                },
+            )?)
+        } else {
+            None
+        };
+    let direct_source_delay_frames = pdc_target_frames;
     let mut direct_source_delay = crate::audio::StereoFrameDelay::new(direct_source_delay_frames)?;
-    let mixer_effect_buses_required = processor.needs_mixer_insert_buses();
+    let extra_vst3_delay_frames = pdc_target_frames.saturating_sub(vst3_pdc_target_frames);
+    let mut extra_vst3_output_delay = crate::audio::StereoFrameDelay::new(extra_vst3_delay_frames)?;
+    let mixer_effect_buses_required = processor
+        .as_ref()
+        .is_some_and(Vst3PlaylistStreamProcessor::needs_mixer_insert_buses);
     let mixer_bus_planes = 1 + usize::from(mixer_effect_buses_required);
     let mut mixer_buses = mixer_effect_buses_required
         .then(|| vec![0.0f32; MIXER_TRACK_METER_COUNT * LIVE_BLOCK_FRAMES * 2 * mixer_bus_planes]);
@@ -11492,7 +11599,9 @@ pub fn stream_mixed_layer_midi_input_to_device(
     };
     let mut note_targets = HashMap::<(u8, u8), VecDeque<Vec<LiveLayerNoteDestination>>>::new();
     let mut note_seed = 0u64;
-    processor.start_processing()?;
+    if let Some(processor) = processor.as_mut() {
+        processor.start_processing()?;
+    }
     let stream_result = (|| {
         let mut block_start = 0u64;
         loop {
@@ -11521,6 +11630,7 @@ pub fn stream_mixed_layer_midi_input_to_device(
                                     .sampler_target_channel_ids
                                     .contains(target_channel_id)
                                     || config.vst3_target_channel_ids.contains(target_channel_id)
+                                    || config.vst2_target_channel_ids.contains(target_channel_id)
                             });
                         note_seed = note_seed.wrapping_add(1);
                         let mut active_targets = Vec::new();
@@ -11529,47 +11639,47 @@ pub fn stream_mixed_layer_midi_input_to_device(
                                 .sampler_target_channel_ids
                                 .contains(&target_channel_id)
                             {
+                                let Some(engine) = sampler_engine.as_mut() else {
+                                    continue;
+                                };
                                 let pitch_offset = sampler_pitch_offsets
                                     .get(&target_channel_id)
                                     .copied()
                                     .unwrap_or_default();
                                 let rendered_key =
                                     transpose_sampler_note_key(u16::from(source_key), pitch_offset);
-                                if let Some(slot_index) =
-                                    sampler_engine.start_voice(ScheduledSamplerNote {
-                                        clip_index: 0,
-                                        playlist_track_id: None,
-                                        start_tick: 0,
-                                        stop_tick: None,
-                                        start_frame: block_start,
-                                        stop_frame: Some(u64::MAX),
-                                        channel_id: target_channel_id,
-                                        key: rendered_key,
-                                        midi_channel: 0,
-                                        slide_note: false,
-                                        slide_duration_frames: sampler_engine
-                                            .sources_by_channel
-                                            .get(&target_channel_id)
-                                            .map_or(0, |source| {
-                                                sampler_polyphony_slide_frames(
-                                                    source.polyphony_slide_raw,
-                                                    ppq,
-                                                    tempo_bpm,
-                                                    sampler_render.summary.sample_rate,
-                                                )
-                                            }),
-                                        velocity,
-                                        mod_x: sampler_engine.live_midi_mod_x_value(channel),
-                                        mod_y: sampler_engine.live_midi_mod_y_value(channel),
-                                        pan: sampler_engine.live_midi_pan(channel),
-                                        fine_pitch_offset_cents: 0,
-                                        layer_gain,
-                                        layer_pan_raw,
-                                    })
-                                {
-                                    sampler_engine
-                                        .set_voice_input_midi_channel(slot_index, channel);
-                                    sampler_engine.refresh_live_pan_for_channel(channel);
+                                if let Some(slot_index) = engine.start_voice(ScheduledSamplerNote {
+                                    clip_index: 0,
+                                    playlist_track_id: None,
+                                    start_tick: 0,
+                                    stop_tick: None,
+                                    start_frame: block_start,
+                                    stop_frame: Some(u64::MAX),
+                                    channel_id: target_channel_id,
+                                    key: rendered_key,
+                                    midi_channel: 0,
+                                    slide_note: false,
+                                    slide_duration_frames: engine
+                                        .sources_by_channel
+                                        .get(&target_channel_id)
+                                        .map_or(0, |source| {
+                                            sampler_polyphony_slide_frames(
+                                                source.polyphony_slide_raw,
+                                                ppq,
+                                                tempo_bpm,
+                                                config.sampler_options.sample_rate,
+                                            )
+                                        }),
+                                    velocity,
+                                    mod_x: engine.live_midi_mod_x_value(channel),
+                                    mod_y: engine.live_midi_mod_y_value(channel),
+                                    pan: engine.live_midi_pan(channel),
+                                    fine_pitch_offset_cents: 0,
+                                    layer_gain,
+                                    layer_pan_raw,
+                                }) {
+                                    engine.set_voice_input_midi_channel(slot_index, channel);
+                                    engine.refresh_live_pan_for_channel(channel);
                                     active_targets.push(LiveLayerNoteDestination::Sampler {
                                         channel_id: target_channel_id,
                                         key: rendered_key,
@@ -11577,6 +11687,10 @@ pub fn stream_mixed_layer_midi_input_to_device(
                                 }
                             } else if config.vst3_target_channel_ids.contains(&target_channel_id) {
                                 let (note_id, rendered_key) = processor
+                                    .as_mut()
+                                    .ok_or_else(|| {
+                                        "VST3 Layer processor is unavailable".to_owned()
+                                    })?
                                     .schedule_live_input_note_on(
                                         target_channel_id,
                                         channel,
@@ -11589,6 +11703,25 @@ pub fn stream_mixed_layer_midi_input_to_device(
                                     channel_id: target_channel_id,
                                     note_id,
                                     key: rendered_key,
+                                });
+                            } else if config.vst2_target_channel_ids.contains(&target_channel_id) {
+                                let live_event = Vst3LiveInputEvent::NoteOn {
+                                    channel,
+                                    key: source_key,
+                                    velocity,
+                                };
+                                vst2_processor
+                                    .as_mut()
+                                    .ok_or_else(|| {
+                                        "VST2 Layer processor is unavailable".to_owned()
+                                    })?
+                                    .queue_live_midi_input_event(
+                                        target_channel_id,
+                                        block_start,
+                                        live_event,
+                                    )?;
+                                active_targets.push(LiveLayerNoteDestination::Vst2 {
+                                    channel_id: target_channel_id,
                                 });
                             }
                         }
@@ -11612,16 +11745,38 @@ pub fn stream_mixed_layer_midi_input_to_device(
                             for target in active_targets {
                                 match target {
                                     LiveLayerNoteDestination::Sampler { channel_id, key } => {
-                                        sampler_engine.release_note(channel_id, key, channel);
+                                        if let Some(engine) = sampler_engine.as_mut() {
+                                            engine.release_note(channel_id, key, channel);
+                                        }
                                     }
                                     LiveLayerNoteDestination::Vst3 {
                                         channel_id,
                                         note_id,
                                         key,
                                     } => {
-                                        processor.schedule_live_input_note_off(
-                                            channel_id, channel, key, note_id,
-                                        )?;
+                                        processor
+                                            .as_mut()
+                                            .ok_or_else(|| {
+                                                "VST3 Layer processor is unavailable".to_owned()
+                                            })?
+                                            .schedule_live_input_note_off(
+                                                channel_id, channel, key, note_id,
+                                            )?;
+                                    }
+                                    LiveLayerNoteDestination::Vst2 { channel_id } => {
+                                        vst2_processor
+                                            .as_mut()
+                                            .ok_or_else(|| {
+                                                "VST2 Layer processor is unavailable".to_owned()
+                                            })?
+                                            .queue_live_midi_input_event(
+                                                channel_id,
+                                                block_start,
+                                                Vst3LiveInputEvent::NoteOff {
+                                                    channel,
+                                                    key: key.min(127),
+                                                },
+                                            )?;
                                     }
                                 }
                             }
@@ -11631,21 +11786,36 @@ pub fn stream_mixed_layer_midi_input_to_device(
                         live_event @ Vst3LiveInputEvent::PolyphonicPressure { channel, key, .. },
                     )) => {
                         let source_note = (channel & 0x0F, key.min(127));
-                        let affected_channels = note_targets
+                        let mut affected_vst3_channels = BTreeSet::new();
+                        let mut affected_vst2_channels = BTreeSet::new();
+                        for target in note_targets
                             .get(&source_note)
                             .into_iter()
                             .flatten()
                             .flatten()
-                            .filter_map(|target| match target {
+                        {
+                            match target {
                                 LiveLayerNoteDestination::Vst3 { channel_id, .. } => {
-                                    Some(*channel_id)
+                                    affected_vst3_channels.insert(*channel_id);
                                 }
-                                LiveLayerNoteDestination::Sampler { .. } => None,
-                            })
-                            .collect::<BTreeSet<_>>();
+                                LiveLayerNoteDestination::Vst2 { channel_id } => {
+                                    affected_vst2_channels.insert(*channel_id);
+                                }
+                                LiveLayerNoteDestination::Sampler { .. } => {}
+                            }
+                        }
                         let midi_event = live_input_controller_event(live_event)?;
-                        for channel_id in affected_channels {
-                            processor.schedule_live_input_midi_event(channel_id, midi_event)?;
+                        for channel_id in affected_vst3_channels {
+                            processor
+                                .as_mut()
+                                .ok_or_else(|| "VST3 Layer processor is unavailable".to_owned())?
+                                .schedule_live_input_midi_event(channel_id, midi_event)?;
+                        }
+                        for channel_id in affected_vst2_channels {
+                            vst2_processor
+                                .as_mut()
+                                .ok_or_else(|| "VST2 Layer processor is unavailable".to_owned())?
+                                .queue_live_midi_input_event(channel_id, block_start, live_event)?;
                         }
                     }
                     Ok(LayerLiveInputEvent::Midi(live_event)) => {
@@ -11655,56 +11825,82 @@ pub fn stream_mixed_layer_midi_input_to_device(
                             value,
                         } = live_event
                         {
-                            apply_live_layer_sampler_controller(
-                                &mut sampler_engine,
-                                channel,
-                                controller,
-                                value,
-                            );
+                            if let Some(engine) = sampler_engine.as_mut() {
+                                apply_live_layer_sampler_controller(
+                                    engine, channel, controller, value,
+                                );
+                            }
                             match controller {
                                 120 => {
                                     note_targets.retain(|(midi_channel, _), _| {
                                         *midi_channel != (channel & 0x0F)
                                     });
-                                    sampler_engine.stop_live_voices(channel);
+                                    if let Some(engine) = sampler_engine.as_mut() {
+                                        engine.stop_live_voices(channel);
+                                    }
                                 }
                                 123..=127 => {
                                     note_targets.retain(|(midi_channel, _), _| {
                                         *midi_channel != (channel & 0x0F)
                                     });
-                                    sampler_engine.release_live_notes(channel);
+                                    if let Some(engine) = sampler_engine.as_mut() {
+                                        engine.release_live_notes(channel);
+                                    }
                                 }
                                 _ => {}
                             }
                         }
                         let midi_event = live_input_controller_event(live_event)?;
                         for channel_id in &config.vst3_target_channel_ids {
-                            processor.schedule_live_input_midi_event(*channel_id, midi_event)?;
+                            processor
+                                .as_mut()
+                                .ok_or_else(|| "VST3 Layer processor is unavailable".to_owned())?
+                                .schedule_live_input_midi_event(*channel_id, midi_event)?;
+                        }
+                        for channel_id in &config.vst2_target_channel_ids {
+                            vst2_processor
+                                .as_mut()
+                                .ok_or_else(|| "VST2 Layer processor is unavailable".to_owned())?
+                                .queue_live_midi_input_event(
+                                    *channel_id,
+                                    block_start,
+                                    live_event,
+                                )?;
                         }
                     }
                     Ok(LayerLiveInputEvent::SamplerPitchBend { channel, cents }) => {
-                        sampler_engine.apply_live_pitch_bend(channel, cents);
+                        if let Some(engine) = sampler_engine.as_mut() {
+                            engine.apply_live_pitch_bend(channel, cents);
+                        }
                     }
                     Ok(LayerLiveInputEvent::SamplerPan14Bit { channel, value }) => {
-                        sampler_engine.apply_live_pan_14bit(channel, value);
+                        if let Some(engine) = sampler_engine.as_mut() {
+                            engine.apply_live_pan_14bit(channel, value);
+                        }
                     }
                     Ok(LayerLiveInputEvent::SamplerChannelVolume14Bit { channel, value }) => {
-                        sampler_engine.apply_live_channel_volume_14bit(channel, value);
+                        if let Some(engine) = sampler_engine.as_mut() {
+                            engine.apply_live_channel_volume_14bit(channel, value);
+                        }
                     }
                     Ok(LayerLiveInputEvent::SamplerExpression14Bit { channel, value }) => {
-                        sampler_engine.apply_live_expression_14bit(channel, value);
+                        if let Some(engine) = sampler_engine.as_mut() {
+                            engine.apply_live_expression_14bit(channel, value);
+                        }
                     }
                     Ok(LayerLiveInputEvent::SamplerResetControllers {
                         channel,
                         pan,
                         pitch_bend_cents,
                     }) => {
-                        reset_live_layer_sampler_controllers(
-                            &mut sampler_engine,
-                            channel,
-                            pan,
-                            pitch_bend_cents,
-                        );
+                        if let Some(engine) = sampler_engine.as_mut() {
+                            reset_live_layer_sampler_controllers(
+                                engine,
+                                channel,
+                                pan,
+                                pitch_bend_cents,
+                            );
+                        }
                     }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
@@ -11718,31 +11914,64 @@ pub fn stream_mixed_layer_midi_input_to_device(
             }
             if let Some(mixer_buses) = mixer_buses.as_mut() {
                 mixer_buses.fill(0.0);
-                sampler_engine.render_block_with_meters(
-                    block_start,
-                    LIVE_BLOCK_FRAMES,
-                    &mut sampler_block,
-                    Some(mixer_buses),
-                    LIVE_BLOCK_FRAMES * 2,
-                );
+                if let Some(engine) = sampler_engine.as_mut() {
+                    engine.render_block_with_meters(
+                        block_start,
+                        LIVE_BLOCK_FRAMES,
+                        &mut sampler_block,
+                        Some(mixer_buses),
+                        LIVE_BLOCK_FRAMES * 2,
+                    );
+                } else {
+                    sampler_block.fill(0.0);
+                }
                 for (track, delay) in mixer_bus_delays.iter_mut().enumerate() {
                     let bus_start = track * LIVE_BLOCK_FRAMES * 2;
                     delay.process_interleaved(
                         &mut mixer_buses[bus_start..bus_start + LIVE_BLOCK_FRAMES * 2],
                     )?;
                 }
+            } else if let Some(engine) = sampler_engine.as_mut() {
+                engine.render_block(block_start, LIVE_BLOCK_FRAMES, &mut sampler_block);
             } else {
-                sampler_engine.render_block(block_start, LIVE_BLOCK_FRAMES, &mut sampler_block);
+                sampler_block.fill(0.0);
             }
             direct_source_delay.process_interleaved(&mut sampler_block)?;
             block.fill(0.0);
             for (mixed, sampler_sample) in block.iter_mut().zip(&sampler_block) {
                 *mixed += *sampler_sample;
             }
-            if let Some(mixer_buses) = mixer_buses.as_mut() {
-                processor.mix_next_block_with_meter_buses(&mut block, mixer_buses)?;
-            } else {
-                processor.mix_next_block(&mut block)?;
+            if let Some(vst2_processor) = vst2_processor.as_mut() {
+                vst2_processor.process_block(block_start, LIVE_BLOCK_FRAMES)?;
+                if let Some(mixer_buses) = mixer_buses.as_deref_mut() {
+                    mix_pattern_audio_layers(
+                        &mut block,
+                        LIVE_BLOCK_FRAMES,
+                        0,
+                        LIVE_BLOCK_FRAMES as u64,
+                        vst2_processor.audio_layers(),
+                        vst2_processor.mixer_routes(),
+                        Some(mixer_buses),
+                    )?;
+                } else {
+                    mix_pattern_audio_layers(
+                        &mut block,
+                        LIVE_BLOCK_FRAMES,
+                        0,
+                        LIVE_BLOCK_FRAMES as u64,
+                        vst2_processor.audio_layers(),
+                        vst2_processor.mixer_routes(),
+                        None,
+                    )?;
+                }
+            }
+            if let Some(processor) = processor.as_mut() {
+                if let Some(mixer_buses) = mixer_buses.as_deref_mut() {
+                    processor.mix_next_block_with_meter_buses(&mut block, mixer_buses)?;
+                } else {
+                    processor.mix_next_block(&mut block)?;
+                }
+                extra_vst3_output_delay.process_interleaved(&mut block)?;
             }
             master_output.apply(&mut block);
             writer.write_stereo_samples(&block)?;
@@ -11751,9 +11980,19 @@ pub fn stream_mixed_layer_midi_input_to_device(
         Ok(())
     })();
 
-    let cleanup_result = processor.stop_live_input_notes();
-    let stop_result = processor.stop_processing();
-    stream_result.and(cleanup_result).and(stop_result)
+    let vst3_cleanup_result = processor
+        .as_mut()
+        .map_or(Ok(()), Vst3PlaylistStreamProcessor::stop_live_input_notes);
+    let vst3_stop_result = processor
+        .as_mut()
+        .map_or(Ok(()), Vst3PlaylistStreamProcessor::stop_processing);
+    let vst2_stop_result = vst2_processor
+        .as_mut()
+        .map_or(Ok(()), Vst2PatternStreamProcessor::stop);
+    stream_result
+        .and(vst3_cleanup_result)
+        .and(vst3_stop_result)
+        .and(vst2_stop_result)
 }
 
 fn apply_live_layer_sampler_controller(
