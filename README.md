@@ -334,7 +334,7 @@ The Channel Rack step grid selects a pattern and bar, then toggles notes at sixt
 
 ## Layer children
 
-Layer child relationships and raw flags are available in the project model. The desktop Channel Rack exposes a child selector with channel names and IDs; `set-layer-children` replaces a Layer channel's repeated `0x5E` references while retaining other channel events. Pass comma-separated child IDs or `-` to clear the list. Playlist pattern notes route through enabled Sampler and mapped VST3 children. The Random option selects one child per note using a stable pseudo-random choice; the exact native sequence, Sequential mode, keyboard/velocity ranges, Layer level/pan adjustment, and Crossfade remain incomplete.
+Layer child relationships and raw flags are available in the project model. The desktop Channel Rack exposes a child selector with channel names and IDs; `set-layer-children` replaces a Layer channel's repeated `0x5E` references while retaining other channel events. Pass comma-separated child IDs or `-` to clear the list. Playlist pattern notes route through enabled Sampler and mapped VST3 children. The Random option selects one child per note using a stable pseudo-random choice; the exact native sequence, Sequential mode, keyboard/velocity ranges, and Layer level/pan mappings remain incomplete. Layer Crossfade uses the saved Fade position only when every active child subtree resolves to an enabled Sampler. An active external plug-in disables Crossfade for the whole Layer, matching Image-Line’s native-format-only rule ([Layer manual](https://www.image-line.com/fl-studio-learning/fl-studio-online-manual/html/chansettings_layer.htm)). The fade curve still needs native audio comparison.
 
 ## Mixer
 

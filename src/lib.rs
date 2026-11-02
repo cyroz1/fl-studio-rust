@@ -1710,8 +1710,8 @@ impl ChannelNoteRouter {
     /// Returns Layer-adjusted routes as `(channel_id, gain, pan_raw)`.
     /// Layer volume and pan adjustments compose through nested Layers. The
     /// playback ranges are provisional. VST3 descendants receive these values
-    /// only through supported note-expression dimensions; use
-    /// [`Self::targets_for_note_with_vst3_crossfade`] for VST3-only crossfade.
+    /// only through supported note-expression dimensions; Layer Crossfade is
+    /// limited to native-format child subtrees.
     pub fn targets_for_note_with_layer_adjustments(
         &self,
         source_channel_id: u16,
@@ -1729,10 +1729,9 @@ impl ChannelNoteRouter {
         )
     }
 
-    /// Returns Layer-adjusted routes for a VST3-only render path, applying
-    /// Layer Crossfade when every active child leaf is a VST3 channel whose
-    /// plug-in advertises Volume note expression. Mixed Sampler/VST3 child
-    /// trees retain the normal fan-out gains.
+    /// Returns Layer-adjusted routes for a VST3-only render path. FL Studio's
+    /// native Layer Crossfade does not apply to external VST3 plug-ins, so
+    /// VST3 leaves retain the normal fan-out gain.
     pub fn targets_for_note_with_vst3_crossfade(
         &self,
         source_channel_id: u16,
@@ -1751,10 +1750,10 @@ impl ChannelNoteRouter {
         )
     }
 
-    /// Returns Layer-adjusted routes for a render that combines Sampler and
-    /// VST3 output. Crossfade applies when each active child subtree ends in
-    /// enabled Sampler channels or loaded VST3 channels whose plug-ins
-    /// advertise Volume note expression.
+    /// Returns Layer-adjusted routes for a render that combines Samplers and
+    /// VST3 output. Layer Crossfade applies only when every active child
+    /// subtree ends in enabled Sampler channels; an external VST3 leaf keeps
+    /// the complete Layer fan-out at unity gain.
     pub fn targets_for_note_with_mixed_crossfade(
         &self,
         source_channel_id: u16,
@@ -1774,8 +1773,9 @@ impl ChannelNoteRouter {
     }
 
     /// Returns Layer-adjusted routes for a Pattern mix that renders assigned
-    /// CLAP channels as prepared audio layers. Crossfade includes Samplers and
-    /// assigned CLAP leaves, whose output gain and pan can be applied after rendering.
+    /// CLAP channels as prepared audio layers. Layer Crossfade applies only
+    /// to all-Sampler child subtrees; external CLAP leaves keep the full Layer
+    /// fan-out at unity gain.
     pub fn targets_for_note_with_clap_audio_layers(
         &self,
         source_channel_id: u16,
@@ -1795,9 +1795,9 @@ impl ChannelNoteRouter {
     }
 
     /// Returns Layer-adjusted routes for a render that combines Samplers,
-    /// assigned CLAP audio layers, and VST3 channels whose plug-ins advertise
-    /// Volume note expression. Every active child subtree must end in one of
-    /// those supported destinations for Layer Crossfade to apply.
+    /// assigned CLAP audio layers, and VST3 channels. Layer Crossfade applies
+    /// only to all-Sampler child subtrees; external plug-in leaves keep the
+    /// full Layer fan-out at unity gain.
     pub fn targets_for_note_with_clap_and_mixed_crossfade(
         &self,
         source_channel_id: u16,
@@ -1969,8 +1969,8 @@ impl ChannelNoteRouter {
         channel_id: u16,
         key: u16,
         crossfade_samplers: bool,
-        vst3_volume_expression_channels: Option<&BTreeSet<u16>>,
-        clap_audio_channels: Option<&BTreeSet<u16>>,
+        _vst3_volume_expression_channels: Option<&BTreeSet<u16>>,
+        _clap_audio_channels: Option<&BTreeSet<u16>>,
         active_layers: &mut HashSet<u16>,
     ) -> bool {
         let Some(channel) = self.channels_by_id.get(&channel_id) else {
@@ -1981,12 +1981,10 @@ impl ChannelNoteRouter {
         }
         match channel.channel_type() {
             Some(ChannelType::Sampler) => crossfade_samplers,
-            Some(ChannelType::Native) => {
-                (channel.plugin_identifier().is_some()
-                    && vst3_volume_expression_channels
-                        .is_some_and(|channels| channels.contains(&channel_id)))
-                    || clap_audio_channels.is_some_and(|channels| channels.contains(&channel_id))
-            }
+            // The kind-2 leaves this runtime can render are external plug-ins.
+            // Image-Line limits Layer Crossfade to its native plug-in format;
+            // VST3/CLAP note-expression support does not make them eligible.
+            Some(ChannelType::Native) => false,
             Some(ChannelType::Layer) => {
                 if !active_layers.insert(channel_id) {
                     return false;
@@ -2012,8 +2010,8 @@ impl ChannelNoteRouter {
                             *child_id,
                             key,
                             crossfade_samplers,
-                            vst3_volume_expression_channels,
-                            clap_audio_channels,
+                            _vst3_volume_expression_channels,
+                            _clap_audio_channels,
                             active_layers,
                         )
                     });
@@ -46344,6 +46342,43 @@ mod tests {
             .expect("edited Layer should encode");
         let reopened = FlpDocument::parse(&encoded).expect("edited Layer should reopen");
         assert_eq!(reopened.channels()[0].layer_fade_raw(), Some(192));
+    }
+
+    #[test]
+    fn layer_crossfade_does_not_attenuate_external_plugin_children() {
+        let document =
+            FlpDocument::parse(&layer_crossfade_fixture(128)).expect("Layer fixture should parse");
+        let mut channels = document.channels().to_vec();
+        let external_ids = channels
+            .iter_mut()
+            .skip(1)
+            .map(|channel| {
+                channel.kind = Some(2);
+                channel.plugin_identifier = Some(format!("external-{}", channel.id));
+                channel.id
+            })
+            .collect::<BTreeSet<_>>();
+        let router = ChannelNoteRouter::new(channels);
+        let expected = vec![(1, 1.0, 0), (2, 1.0, 0), (3, 1.0, 0)];
+
+        assert_eq!(
+            router.targets_for_note_with_vst3_crossfade(0, 0, 60, &external_ids),
+            expected
+        );
+        assert_eq!(
+            router.targets_for_note_with_clap_audio_layers(0, 0, 60, &external_ids),
+            expected
+        );
+        assert_eq!(
+            router.targets_for_note_with_clap_and_mixed_crossfade(
+                0,
+                0,
+                60,
+                &external_ids,
+                &external_ids,
+            ),
+            expected
+        );
     }
 
     #[test]
