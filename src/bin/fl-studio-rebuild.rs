@@ -20820,7 +20820,7 @@ impl DawUi {
                 }
                 self.status = format!("MIDI script Playlist snap: {}", self.playlist_snap.label());
             }
-            _ => return,
+            _ => (),
         }
     }
 
