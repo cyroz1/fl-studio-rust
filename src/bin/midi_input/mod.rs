@@ -1023,6 +1023,9 @@ fn queue_script_transport_actions(
                 direction,
                 shift_held,
             },
+            ScriptTransportAction::BrowserToggleNode(value) => {
+                MidiTransportCommand::BrowserToggleNode(value)
+            }
             ScriptTransportAction::BrowserTabSelect(index) => {
                 MidiTransportCommand::BrowserTabSelect(index)
             }
@@ -1202,6 +1205,7 @@ pub enum MidiTransportCommand {
         direction: u8,
         shift_held: bool,
     },
+    BrowserToggleNode(i32),
     BrowserTabSelect(u8),
     BrowserSelectSelected,
     BrowserPreviewSelected,
@@ -2010,6 +2014,9 @@ pub fn describe_event(event: MidiInputEvent) -> String {
             MidiTransportCommand::BrowserNavigate(_) => "MIDI script Browser Navigation".to_owned(),
             MidiTransportCommand::BrowserNavigateShift { .. } => {
                 "MIDI script Browser Navigation".to_owned()
+            }
+            MidiTransportCommand::BrowserToggleNode(_) => {
+                "MIDI script Browser Node Toggle".to_owned()
             }
             MidiTransportCommand::BrowserTabSelect(_) => {
                 "MIDI script Browser Tab Navigation".to_owned()

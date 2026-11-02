@@ -301,6 +301,21 @@ def _ui_preview_browser_menu_item():
         _request_transport_action("browser_preview_selected")
 
 
+def _ui_toggle_browser_node(value=-1):
+    try:
+        value = int(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("Browser node value must be an integer") from error
+    if value not in (-1, 0, 1):
+        raise ValueError("Browser node value must be -1, 0 or 1")
+    try:
+        browser_tab_index = int(_active_transport_state.get("browser_tab_index", 0))
+    except (TypeError, ValueError, OverflowError):
+        return
+    if _active_transport_state.get("browser_visible", False) and browser_tab_index == 0:
+        _request_transport_action({"action": "browser_toggle_node", "value": value})
+
+
 def _ui_zoom_jog(horizontal, increment):
     try:
         increment = int(increment)
@@ -2447,6 +2462,7 @@ def _install_modules(script_name, device_name):
     ui.navigateBrowser = _ui_navigate_browser
     ui.navigateBrowserMenu = _ui_navigate_browser
     ui.navigateBrowserTabs = _ui_navigate_browser_tabs
+    ui.toggleBrowserNode = _ui_toggle_browser_node
     ui.getFocusedNodeCaption = _ui_get_focused_node_caption
     ui.getFocusedNodeFileType = _ui_get_focused_node_file_type
     ui.selectBrowserMenuItem = _ui_select_browser_menu_item

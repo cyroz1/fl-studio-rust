@@ -185,6 +185,7 @@ pub enum ScriptTransportAction {
         direction: u8,
         shift_held: bool,
     },
+    BrowserToggleNode(i32),
     BrowserTabSelect(u8),
     BrowserSelectSelected,
     BrowserPreviewSelected,
@@ -1620,6 +1621,14 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
             direction,
             shift_held,
         });
+    }
+    if name == Some("browser_toggle_node") {
+        let value = action["value"]
+            .as_i64()
+            .and_then(|value| i32::try_from(value).ok())
+            .filter(|value| matches!(value, -1..=1))
+            .ok_or_else(|| "MIDI script returned an invalid Browser node value".to_owned())?;
+        return Ok(ScriptTransportAction::BrowserToggleNode(value));
     }
     if name == Some("window_jog") {
         let increment = action["increment"]

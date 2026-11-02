@@ -725,6 +725,7 @@ fn midi_input_thru_message(event: MidiInputEvent) -> Option<([u8; 3], usize)> {
             | MidiTransportCommand::SelectionJog(_)
             | MidiTransportCommand::BrowserNavigate(_)
             | MidiTransportCommand::BrowserNavigateShift { .. }
+            | MidiTransportCommand::BrowserToggleNode(_)
             | MidiTransportCommand::BrowserTabSelect(_)
             | MidiTransportCommand::BrowserSelectSelected
             | MidiTransportCommand::BrowserPreviewSelected

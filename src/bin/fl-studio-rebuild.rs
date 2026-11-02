@@ -20853,6 +20853,25 @@ impl DawUi {
         }
     }
 
+    fn toggle_midi_script_browser_node(&mut self, value: i32) {
+        if !self.browser_visible || self.browser_tab != BrowserTab::Files {
+            return;
+        }
+        if let Some(selected) = self.browser_selected.clone() {
+            if selected.is_dir() && matches!(value, -1 | 1) {
+                self.set_browser_directory(selected);
+            }
+            return;
+        }
+        if matches!(value, -1 | 0) {
+            let expanded_folder = self.browser_path.clone();
+            if let Some(parent) = expanded_folder.parent().map(Path::to_path_buf) {
+                self.set_browser_directory(parent);
+                self.browser_selected = Some(expanded_folder);
+            }
+        }
+    }
+
     fn select_midi_script_browser_tab(&mut self, index: u8) {
         let Some(tab) = BrowserTab::ALL.get(usize::from(index)).copied() else {
             return;
@@ -69575,6 +69594,9 @@ impl DawUi {
                 direction,
                 shift_held,
             } => self.navigate_midi_script_browser_with_shift(direction, shift_held),
+            MidiTransportCommand::BrowserToggleNode(value) => {
+                self.toggle_midi_script_browser_node(value);
+            }
             MidiTransportCommand::BrowserTabSelect(index) => {
                 self.select_midi_script_browser_tab(index);
             }
