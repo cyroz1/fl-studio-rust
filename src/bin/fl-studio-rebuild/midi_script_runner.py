@@ -2004,6 +2004,16 @@ def _pattern_is_default(index):
     return True
 
 
+def _pattern_is_selected(index):
+    try:
+        index = int(index)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("patterns.isPatternSelected() index must be an integer") from error
+    if not 1 <= index <= 999:
+        raise IndexError("patterns.isPatternSelected() index must be between 1 and 999")
+    return int(_active_transport_state.get("pattern_number", 0)) == index
+
+
 def _set_pattern_name(index, name):
     try:
         index = int(index)
@@ -2666,6 +2676,7 @@ def _install_modules(script_name, device_name):
     patterns.getPatternColor = _pattern_color
     patterns.getPatternLength = _pattern_length
     patterns.isPatternDefault = _pattern_is_default
+    patterns.isPatternSelected = _pattern_is_selected
     patterns.setPatternLength = _set_pattern_length
     patterns.incrementPatternLength = _increment_pattern_length
     patterns.jumpToPattern = _jump_to_pattern
