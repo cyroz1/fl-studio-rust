@@ -8253,13 +8253,19 @@ fn list_plugin_states(path: &Path) -> Result<(), String> {
     for state in states {
         let vst = state.vst_metadata();
         println!(
-            "channel={} plugin={} channel_name={} vst_name={} vendor={} class_uid={} path={} data_event={} data_bytes={} nested_state_bytes={} wrapper_bytes={}",
+            "channel={} plugin={} channel_name={} vst_name={} vendor={} vst_format={} vst_fourcc={} class_uid={} path={} data_event={} data_bytes={} nested_state_bytes={} wrapper_bytes={}",
             state.channel_id(),
             state.plugin_identifier().unwrap_or("unknown"),
             state.display_name().unwrap_or("(unnamed)"),
             vst.and_then(|metadata| metadata.name())
                 .unwrap_or("unknown"),
             vst.and_then(|metadata| metadata.vendor())
+                .unwrap_or("unknown"),
+            vst.map_or_else(
+                || "unknown".to_owned(),
+                |metadata| metadata.format_marker().to_string()
+            ),
+            vst.and_then(|metadata| metadata.fourcc())
                 .unwrap_or("unknown"),
             vst.and_then(|metadata| metadata.class_uid())
                 .unwrap_or_else(|| "unknown".to_owned()),
@@ -8292,9 +8298,23 @@ fn preview_plugin_state(path: &Path, channel_id: u16, prefix_len: usize) -> Resu
             .collect::<Vec<_>>()
             .join(" ")
     };
+    let vst = state.vst_metadata();
+    let nested_state = state.vst_state_bytes();
     println!(
-        "channel={} wrapper_bytes={} wrapper_prefix=[{}] data_bytes={} data_prefix=[{}]",
+        "channel={} vst_format={} vst_fourcc={} vst_name={} vendor={} nested_state_bytes={} nested_state_prefix=[{}] wrapper_bytes={} wrapper_prefix=[{}] data_bytes={} data_prefix=[{}]",
         state.channel_id(),
+        vst.map_or_else(
+            || "unknown".to_owned(),
+            |metadata| metadata.format_marker().to_string()
+        ),
+        vst.and_then(|metadata| metadata.fourcc())
+            .unwrap_or("unknown"),
+        vst.and_then(|metadata| metadata.name())
+            .unwrap_or("unknown"),
+        vst.and_then(|metadata| metadata.vendor())
+            .unwrap_or("unknown"),
+        nested_state.map_or_else(|| "unknown".to_owned(), |bytes| bytes.len().to_string()),
+        nested_state.map_or_else(String::new, prefix),
         state.wrapper_payload().map_or(0, <[u8]>::len),
         state.wrapper_payload().map_or_else(String::new, prefix),
         state.data_payload().len(),
