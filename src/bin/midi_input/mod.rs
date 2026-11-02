@@ -885,6 +885,11 @@ fn queue_script_transport_actions(
             ScriptTransportAction::JumpToPattern(index) => {
                 MidiTransportCommand::JumpToPattern(index)
             }
+            ScriptTransportAction::SelectPattern { index, value } => {
+                MidiTransportCommand::SelectPattern { index, value }
+            }
+            ScriptTransportAction::SelectAllPatterns => MidiTransportCommand::SelectAllPatterns,
+            ScriptTransportAction::DeselectAllPatterns => MidiTransportCommand::DeselectAllPatterns,
             ScriptTransportAction::SetGlobalSwingMixRaw(value_raw) => {
                 MidiTransportCommand::SetGlobalSwingMixRaw(value_raw)
             }
@@ -1142,6 +1147,12 @@ pub enum MidiTransportCommand {
         offset_beats: i32,
     },
     JumpToPattern(u16),
+    SelectPattern {
+        index: u16,
+        value: i8,
+    },
+    SelectAllPatterns,
+    DeselectAllPatterns,
     SetGlobalSwingMixRaw(u8),
     AddArrangementTimeMarker {
         tick: u32,
@@ -1977,6 +1988,11 @@ pub fn describe_event(event: MidiInputEvent) -> String {
                 "MIDI script Pattern Length".to_owned()
             }
             MidiTransportCommand::JumpToPattern(_) => "MIDI script Pattern Selection".to_owned(),
+            MidiTransportCommand::SelectPattern { .. }
+            | MidiTransportCommand::SelectAllPatterns
+            | MidiTransportCommand::DeselectAllPatterns => {
+                "MIDI script Pattern Selection".to_owned()
+            }
             MidiTransportCommand::SetGlobalSwingMixRaw(_) => {
                 "MIDI script Global Shuffle".to_owned()
             }

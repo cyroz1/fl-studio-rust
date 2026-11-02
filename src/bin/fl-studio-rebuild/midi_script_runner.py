@@ -2011,7 +2011,42 @@ def _pattern_is_selected(index):
         raise ValueError("patterns.isPatternSelected() index must be an integer") from error
     if not 1 <= index <= 999:
         raise IndexError("patterns.isPatternSelected() index must be between 1 and 999")
-    return int(_active_transport_state.get("pattern_number", 0)) == index
+    for entry in _active_transport_state.get("pattern_entries", []):
+        if isinstance(entry, (list, tuple)) and len(entry) >= 6:
+            try:
+                if int(entry[0]) == index:
+                    return bool(entry[5])
+            except (TypeError, ValueError, OverflowError):
+                continue
+    return False
+
+
+def _select_pattern(index, value=-1, preview=0):
+    try:
+        index = int(index)
+        value = int(value)
+        preview = int(preview)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("patterns.selectPattern() arguments must be integers") from error
+    if not 1 <= index <= 999:
+        raise IndexError("patterns.selectPattern() index must be between 1 and 999")
+    if value not in (-1, 0, 1):
+        raise ValueError("patterns.selectPattern() value must be -1, 0, or 1")
+    if preview not in (0, 1):
+        raise ValueError("patterns.selectPattern() preview must be 0 or 1")
+    if preview:
+        raise NotImplementedError("Pattern preview selection is not supported")
+    _request_transport_action(
+        {"action": "select_pattern", "index": index, "value": value}
+    )
+
+
+def _select_all_patterns():
+    _request_transport_action({"action": "select_all_patterns"})
+
+
+def _deselect_all_patterns():
+    _request_transport_action({"action": "deselect_all_patterns"})
 
 
 def _set_pattern_name(index, name):
@@ -2677,6 +2712,9 @@ def _install_modules(script_name, device_name):
     patterns.getPatternLength = _pattern_length
     patterns.isPatternDefault = _pattern_is_default
     patterns.isPatternSelected = _pattern_is_selected
+    patterns.selectPattern = _select_pattern
+    patterns.selectAll = _select_all_patterns
+    patterns.deselectAll = _deselect_all_patterns
     patterns.setPatternLength = _set_pattern_length
     patterns.incrementPatternLength = _increment_pattern_length
     patterns.jumpToPattern = _jump_to_pattern

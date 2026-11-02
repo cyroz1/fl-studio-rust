@@ -5275,6 +5275,8 @@ struct DawUi {
     midi_script_playback_speed_millionths: u32,
     tempo_bpm: f64,
     selected_pattern: Option<u16>,
+    selected_pattern_ids: BTreeSet<u16>,
+    last_midi_script_selected_pattern: Option<u16>,
     channel_display_filter: ChannelDisplayFilter,
     channel_group_dialog: Option<ChannelGroupDialog>,
     pattern_rename_dialog: Option<PatternRenameDialog>,
@@ -8502,6 +8504,8 @@ impl DawUi {
             midi_script_playback_speed_millionths: 1_000_000,
             tempo_bpm: 140.0,
             selected_pattern: None,
+            selected_pattern_ids: BTreeSet::new(),
+            last_midi_script_selected_pattern: None,
             channel_display_filter: ChannelDisplayFilter::All,
             channel_group_dialog: None,
             pattern_rename_dialog: None,
@@ -10495,6 +10499,8 @@ impl DawUi {
                     .patterns()
                     .ok()
                     .and_then(|patterns| patterns.first().map(|pattern| pattern.id));
+                self.selected_pattern_ids.clear();
+                self.last_midi_script_selected_pattern = None;
                 self.selected_note_channel =
                     document.channels().first().map(|channel| channel.id());
                 self.selected_graph_channel =
@@ -19524,6 +19530,13 @@ impl DawUi {
             .as_ref()
             .map(|document| u64::from(document.metadata().global_swing_mix()))
             .unwrap_or(0);
+        if self.selected_pattern != self.last_midi_script_selected_pattern {
+            self.selected_pattern_ids.clear();
+            if let Some(pattern_id) = self.selected_pattern {
+                self.selected_pattern_ids.insert(pattern_id);
+            }
+            self.last_midi_script_selected_pattern = self.selected_pattern;
+        }
         let pattern_entries = if has_script {
             self.document
                 .as_ref()
@@ -19573,12 +19586,14 @@ impl DawUi {
                                 && pattern.notes.is_empty()
                                 && pattern.controllers.is_empty()
                                 && pattern.time_markers.is_empty();
+                            let is_selected = self.selected_pattern_ids.contains(&pattern.id);
                             (
                                 pattern.id,
                                 pattern.name.unwrap_or_default(),
                                 color,
                                 length_beats as u32,
                                 is_default,
+                                is_selected,
                             )
                         })
                         .collect::<Vec<_>>()
@@ -20988,6 +21003,9 @@ impl DawUi {
         match result {
             Some(Ok(created)) => {
                 self.selected_pattern = Some(index);
+                self.selected_pattern_ids.clear();
+                self.selected_pattern_ids.insert(index);
+                self.last_midi_script_selected_pattern = Some(index);
                 if created {
                     self.dirty = true;
                     self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
@@ -21003,6 +21021,83 @@ impl DawUi {
                 self.status = "Open a project to select a Pattern".to_owned();
             }
         }
+    }
+
+    fn select_midi_script_pattern(&mut self, index: u16, value: i8) {
+        let exists = match self.document.as_ref() {
+            Some(document) => match document.patterns() {
+                Ok(patterns) => patterns.iter().any(|pattern| pattern.id == index),
+                Err(error) => {
+                    self.status = format!("Could not inspect Patterns for MIDI script: {error}");
+                    return;
+                }
+            },
+            None => {
+                self.status = "Open a project before selecting a Pattern".to_owned();
+                return;
+            }
+        };
+        if !exists {
+            self.status = format!("Pattern {index} is not available in the project");
+            return;
+        }
+
+        let was_selected = self.selected_pattern_ids.contains(&index);
+        let select = match value {
+            -1 => !was_selected,
+            0 => false,
+            1 => true,
+            _ => return,
+        };
+        if select {
+            self.selected_pattern_ids.insert(index);
+            self.selected_pattern = Some(index);
+        } else {
+            self.selected_pattern_ids.remove(&index);
+            if self.selected_pattern == Some(index)
+                && let Some(next_active) = self.selected_pattern_ids.first().copied()
+            {
+                self.selected_pattern = Some(next_active);
+            }
+        }
+        self.last_midi_script_selected_pattern = self.selected_pattern;
+        self.status = if select {
+            format!("Selected Pattern {index}")
+        } else {
+            format!("Deselected Pattern {index}")
+        };
+    }
+
+    fn select_all_midi_script_patterns(&mut self) {
+        let pattern_ids = match self.document.as_ref() {
+            Some(document) => match document.patterns() {
+                Ok(patterns) => patterns
+                    .into_iter()
+                    .map(|pattern| pattern.id)
+                    .filter(|pattern_id| (1..=999).contains(pattern_id))
+                    .collect::<BTreeSet<_>>(),
+                Err(error) => {
+                    self.status = format!("Could not inspect Patterns for MIDI script: {error}");
+                    return;
+                }
+            },
+            None => {
+                self.status = "Open a project before selecting Patterns".to_owned();
+                return;
+            }
+        };
+        self.selected_pattern_ids = pattern_ids;
+        if self.selected_pattern.is_none() {
+            self.selected_pattern = self.selected_pattern_ids.first().copied();
+        }
+        self.last_midi_script_selected_pattern = self.selected_pattern;
+        self.status = "Selected all Patterns".to_owned();
+    }
+
+    fn deselect_all_midi_script_patterns(&mut self) {
+        self.selected_pattern_ids.clear();
+        self.last_midi_script_selected_pattern = self.selected_pattern;
+        self.status = "Deselected all Patterns".to_owned();
     }
 
     fn jog_midi_script_pattern(&mut self, increment: i32) {
@@ -70013,6 +70108,15 @@ impl DawUi {
             }
             MidiTransportCommand::JumpToPattern(index) => {
                 self.jump_midi_script_to_pattern(index);
+            }
+            MidiTransportCommand::SelectPattern { index, value } => {
+                self.select_midi_script_pattern(index, value);
+            }
+            MidiTransportCommand::SelectAllPatterns => {
+                self.select_all_midi_script_patterns();
+            }
+            MidiTransportCommand::DeselectAllPatterns => {
+                self.deselect_all_midi_script_patterns();
             }
             MidiTransportCommand::SetGlobalSwingMixRaw(value_raw) => {
                 self.set_midi_script_global_swing_mix(value_raw);
