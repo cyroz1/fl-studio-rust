@@ -307,6 +307,8 @@ pub struct MidiScriptTransportState {
     pub ticks_per_quarter: AtomicU64,
     pub current_tempo_milli_bpm: AtomicU64,
     pub project_changed_flag: AtomicI32,
+    pub pattern_number: AtomicU64,
+    pub pattern_entries: Mutex<Vec<(u16, String)>>,
     pub time_signature_numerator: AtomicU64,
     pub time_signature_denominator: AtomicU64,
     pub global_swing_mix_raw: AtomicU64,
@@ -378,6 +380,8 @@ impl Default for MidiScriptTransportState {
             ticks_per_quarter: AtomicU64::new(96),
             current_tempo_milli_bpm: AtomicU64::new(140_000),
             project_changed_flag: AtomicI32::new(0),
+            pattern_number: AtomicU64::new(0),
+            pattern_entries: Mutex::new(Vec::new()),
             time_signature_numerator: AtomicU64::new(4),
             time_signature_denominator: AtomicU64::new(4),
             global_swing_mix_raw: AtomicU64::new(0),
@@ -901,6 +905,12 @@ impl MidiScriptRuntime {
             .lock()
             .map(|names| names.clone())
             .unwrap_or_default();
+        let pattern_entries = self
+            .transport_state
+            .pattern_entries
+            .lock()
+            .map(|entries| entries.clone())
+            .unwrap_or_default();
         let playlist_track_count = self
             .transport_state
             .playlist_track_count
@@ -1223,6 +1233,13 @@ impl MidiScriptRuntime {
                 "project_author": project_author,
                 "project_genre": project_genre,
             });
+            if let Some(transport_object) = transport.as_object_mut() {
+                transport_object.insert(
+                    "pattern_number".to_owned(),
+                    json!(self.transport_state.pattern_number.load(Ordering::Relaxed)),
+                );
+                transport_object.insert("pattern_entries".to_owned(), json!(pattern_entries));
+            }
             if let Some(transport_object) = transport.as_object_mut() {
                 transport_object.insert(
                     "browser_visible".to_owned(),

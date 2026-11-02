@@ -1927,6 +1927,31 @@ def _set_current_tempo(tempo, asInt=0):
     )
 
 
+def _pattern_number():
+    return int(_active_transport_state.get("pattern_number", 0))
+
+
+def _pattern_count():
+    return len(_active_transport_state.get("pattern_entries", []))
+
+
+def _pattern_name(index):
+    try:
+        index = int(index)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("patterns.getPatternName() index must be an integer") from error
+    if not 0 <= index <= 999:
+        raise IndexError("patterns.getPatternName() index must be between 0 and 999")
+    for entry in _active_transport_state.get("pattern_entries", []):
+        if isinstance(entry, (list, tuple)) and len(entry) >= 2:
+            try:
+                if int(entry[0]) == index:
+                    return str(entry[1])
+            except (TypeError, ValueError, OverflowError):
+                continue
+    return ""
+
+
 def _get_song_step_pos():
     position_ticks = int(_active_transport_state.get("song_position_ticks", 0))
     ppq = max(1, int(_active_transport_state.get("ticks_per_quarter", 96)))
@@ -2508,6 +2533,13 @@ def _install_modules(script_name, device_name):
     channels = _module("channels")
     channels.getShuffle = _get_shuffle
     channels.setShuffle = _set_shuffle
+
+    patterns = _module("patterns")
+    patterns.patternNumber = _pattern_number
+    patterns.patternCount = _pattern_count
+    patterns.patternMax = lambda: 999
+    patterns.getPatternName = _pattern_name
+
     mixer.getTrackName = _mixer_get_track_name
     mixer.setTrackName = _mixer_set_track_name
     mixer.getTrackColor = _mixer_get_track_color

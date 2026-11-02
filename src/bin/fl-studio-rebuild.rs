@@ -19524,6 +19524,18 @@ impl DawUi {
             .as_ref()
             .map(|document| u64::from(document.metadata().global_swing_mix()))
             .unwrap_or(0);
+        let pattern_entries = if has_script {
+            self.document
+                .as_ref()
+                .and_then(|document| document.patterns().ok())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|pattern| (pattern.id, pattern.name.unwrap_or_default()))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let pattern_number = self.selected_pattern.map(u64::from).unwrap_or(0);
         self.midi_script_transport_state
             .ticks_per_quarter
             .store(ticks_per_quarter, Ordering::Relaxed);
@@ -19555,6 +19567,12 @@ impl DawUi {
         self.midi_script_transport_state
             .project_changed_flag
             .store(project_changed_flag, Ordering::Relaxed);
+        self.midi_script_transport_state
+            .pattern_number
+            .store(pattern_number, Ordering::Relaxed);
+        if let Ok(mut entries) = self.midi_script_transport_state.pattern_entries.lock() {
+            *entries = pattern_entries;
+        }
         self.midi_script_transport_state
             .time_signature_numerator
             .store(time_signature_numerator, Ordering::Relaxed);
