@@ -40391,6 +40391,7 @@ impl DawUi {
         let mut sampler_portamento_edits = Vec::new();
         let mut sampler_envelope_lfo_edits = Vec::new();
         let mut channel_fine_tune_edits = Vec::new();
+        let mut sampler_root_key_edits = Vec::new();
         let mut midi_out_settings_edits = Vec::<(u16, ChannelMidiOutSettingsEdit)>::new();
         let mut layer_edits = Vec::new();
         let mut layer_flag_edits = Vec::new();
@@ -40653,6 +40654,7 @@ impl DawUi {
                 let mut sampler_envelope_lfo_applies = Vec::new();
                 let mut channel_fine_tune_apply = None;
                 let mut channel_key_region_apply = None;
+                let mut sampler_root_key_apply = None;
                 let layer_flags = channel.layer_flags();
                 let mut layer_random = channel.layer_random_enabled().unwrap_or(false);
                 let mut layer_crossfade = channel.layer_crossfade_enabled().unwrap_or(false);
@@ -41847,6 +41849,36 @@ impl DawUi {
                                 channel_key_region_apply = Some((low_key, high_key));
                             }
                         }
+                        if channel.kind() == Some(0) {
+                            let saved_root_key = channel.sampler_root_key();
+                            let mut root_key = saved_root_key.unwrap_or(60);
+                            ui.collapsing("Sampler root note", |ui| {
+                                if saved_root_key.is_none() {
+                                    ui.small(
+                                        "No saved root-note override. Sample metadata or the C5 default applies until you set one.",
+                                    );
+                                } else {
+                                    ui.small(
+                                        "Sets the Sampler's saved root note. The current value is also used by the Browser key action.",
+                                    );
+                                }
+                                if ui
+                                    .add(
+                                        egui::Slider::new(&mut root_key, 0..=127)
+                                            .text("Root key"),
+                                    )
+                                    .changed()
+                                {
+                                    sampler_root_key_apply = Some(root_key);
+                                }
+                                if saved_root_key.is_none()
+                                    && ui.button("Save root note").clicked()
+                                {
+                                    sampler_root_key_apply = Some(root_key);
+                                }
+                                ui.small(format!("{} · MIDI {}", note_name(root_key), root_key));
+                            });
+                        }
                         if let Some(mut selected_children) =
                             channel.layer_child_ids().map(<[u16]>::to_vec)
                         {
@@ -42174,6 +42206,9 @@ impl DawUi {
                 }
                 if let Some((low_key, high_key)) = channel_key_region_apply {
                     channel_key_region_edits.push((channel.id(), low_key, high_key));
+                }
+                if let Some(root_key) = sampler_root_key_apply {
+                    sampler_root_key_edits.push((channel.id(), root_key));
                 }
                 sampler_envelope_lfo_edits.extend(
                     sampler_envelope_lfo_applies
@@ -42783,6 +42818,26 @@ impl DawUi {
                 }
                 Some(Err(error)) => {
                     self.status = format!("Could not change channel Fine Tune: {error}");
+                }
+                None => {}
+            }
+        }
+        for (channel_id, root_key) in sampler_root_key_edits {
+            let result = self
+                .document
+                .as_mut()
+                .map(|document| document.set_channel_sampler_root_key(channel_id, root_key));
+            match result {
+                Some(Ok(())) => {
+                    self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+                    self.status = format!(
+                        "Channel {channel_id} Sampler root note set to {}",
+                        note_name(root_key)
+                    );
+                }
+                Some(Err(error)) => {
+                    self.status = format!("Could not change Sampler root note: {error}");
                 }
                 None => {}
             }
