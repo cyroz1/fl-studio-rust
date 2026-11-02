@@ -24,7 +24,7 @@ use vst_audio::{
 };
 
 const RENDER_QUANTUM: u32 = 512;
-const MAX_VST2_MIXER_AUXILIARY_INPUT_BUSES: usize = 16;
+pub const MAX_VST2_MIXER_AUXILIARY_INPUT_BUSES: usize = 16;
 const MAX_VST2_MIXER_EFFECT_INPUT_CHANNELS: usize = 2 + MAX_VST2_MIXER_AUXILIARY_INPUT_BUSES * 2;
 const MAX_RENDER_SECONDS: f64 = 120.0;
 const MAX_RENDER_BUFFER_BYTES: usize = 512 * 1024 * 1024;
@@ -124,6 +124,8 @@ pub struct Vst2ProjectMixerEffectAssignment {
     pub fourcc: String,
     pub class_id: [u8; 16],
     pub state_bytes: Vec<u8>,
+    /// Optional machine-local map from source Mixer insert to plug-in input bus index.
+    pub auxiliary_input_source_map: Option<Vec<(usize, usize)>>,
 }
 
 /// One automatable parameter reported by an assigned VST2 Mixer effect.
@@ -311,6 +313,7 @@ struct Vst2HostedMixerEffect {
     fourcc: String,
     instance: Instance,
     _audio: AudioEndpoint,
+    auxiliary_input_buses: Vec<(usize, usize)>,
 }
 
 /// Persistent isolated VST2 instances restored from FLP Channel Rack state.
@@ -650,12 +653,15 @@ impl Vst2HostRuntime {
         key: (usize, u16),
         assignment: &Vst2ProjectMixerEffectAssignment,
     ) -> Result<(), String> {
+        let selected_bus_layout = Arc::new(Mutex::new(None));
         let configuration = Configuration {
             sample_rate: self.sample_rate,
             quantum: self.quantum,
             max_callback_frames: Some(self.quantum),
             offline: false,
-            buses: Some(BusSelector::main_only()),
+            buses: Some(vst2_mixer_effect_bus_inspector(Arc::clone(
+                &selected_bus_layout,
+            ))),
             ..Configuration::default()
         };
         let descriptor = PluginDescriptor {
@@ -670,6 +676,11 @@ impl Vst2HostRuntime {
         let audio = instance.take_audio().ok_or_else(|| {
             "VST2 worker did not provide a Mixer effect audio endpoint".to_owned()
         })?;
+        let bus_layout = selected_bus_layout
+            .lock()
+            .map_err(|_| "VST2 Mixer effect bus layout state was poisoned".to_owned())?
+            .take()
+            .ok_or_else(|| "VST2 Mixer effect bus layout was not selected".to_owned())?;
         self.unload_mixer_effect(key);
         self.mixer_effects.insert(
             key,
@@ -677,9 +688,19 @@ impl Vst2HostRuntime {
                 fourcc: assignment.fourcc.clone(),
                 instance,
                 _audio: audio,
+                auxiliary_input_buses: bus_layout.auxiliary_input_buses,
             },
         );
         Ok(())
+    }
+
+    pub fn mixer_effect_auxiliary_input_buses(
+        &self,
+        key: (usize, u16),
+    ) -> Option<Vec<(usize, usize)>> {
+        self.mixer_effects
+            .get(&key)
+            .map(|effect| effect.auxiliary_input_buses.clone())
     }
 
     pub fn has_mixer_effect(&self, key: (usize, u16)) -> bool {
@@ -1293,6 +1314,51 @@ fn vst2_mixer_effect_bus_selector(
     })
 }
 
+fn vst2_mixer_effect_bus_inspector(
+    selected_layout: Arc<Mutex<Option<Vst2MixerEffectBusLayout>>>,
+) -> BusSelector {
+    BusSelector::new(move |inputs, outputs| {
+        let main_input_index = inputs
+            .iter()
+            .position(|bus| bus.kind == BusKind::Main)
+            .ok_or_else(|| "VST2 Mixer effect has no main input bus".to_owned())?;
+        let main_output_index = outputs
+            .iter()
+            .position(|bus| bus.kind == BusKind::Main)
+            .ok_or_else(|| "VST2 Mixer effect has no main output bus".to_owned())?;
+        let mut auxiliary_input_buses = Vec::new();
+        for (bus_index, bus) in inputs.iter().enumerate() {
+            if bus.kind == BusKind::Aux
+                && matches!(bus.layout.channels, 1 | 2)
+                && auxiliary_input_buses.len() < MAX_VST2_MIXER_AUXILIARY_INPUT_BUSES
+            {
+                auxiliary_input_buses.push((bus_index, usize::from(bus.layout.channels)));
+            }
+        }
+        *selected_layout
+            .lock()
+            .map_err(|_| "VST2 Mixer effect bus layout state was poisoned".to_owned())? =
+            Some(Vst2MixerEffectBusLayout {
+                main_input_channels: usize::from(inputs[main_input_index].layout.channels),
+                output_channels: usize::from(outputs[main_output_index].layout.channels),
+                auxiliary_input_buses,
+                ..Vst2MixerEffectBusLayout::default()
+            });
+        Ok(BusChoice {
+            inputs: inputs
+                .iter()
+                .enumerate()
+                .map(|(bus_index, bus)| bus.configuration(bus_index == main_input_index))
+                .collect(),
+            outputs: outputs
+                .iter()
+                .enumerate()
+                .map(|(bus_index, bus)| bus.configuration(bus_index == main_output_index))
+                .collect(),
+        })
+    })
+}
+
 fn copy_vst2_mixer_stereo_bus(
     input_buffers: &mut [Vec<f32>],
     channel_offset: usize,
@@ -1355,6 +1421,7 @@ struct Vst2MixerEffectProcessor {
     main_input_offset: usize,
     auxiliary_input_buses: Vec<(usize, usize)>,
     auxiliary_input_channel_offsets: Vec<usize>,
+    auxiliary_input_source_map: Option<Vec<(usize, usize)>>,
     latency_samples: u32,
     tail_samples: Option<u64>,
     startup_fallbacks: usize,
@@ -1429,6 +1496,7 @@ impl Vst2MixerEffectProcessor {
             main_input_offset: bus_layout.main_input_offset,
             auxiliary_input_buses: bus_layout.auxiliary_input_buses,
             auxiliary_input_channel_offsets: bus_layout.auxiliary_input_channel_offsets,
+            auxiliary_input_source_map: assignment.auxiliary_input_source_map.clone(),
             latency_samples,
             tail_samples,
             startup_fallbacks: (latency_samples as usize).div_ceil(quantum),
@@ -1460,6 +1528,10 @@ impl MixerEffectProcessor for Vst2MixerEffectProcessor {
 
     fn auxiliary_input_buses(&self) -> &[(usize, usize)] {
         &self.auxiliary_input_buses
+    }
+
+    fn auxiliary_input_source_map(&self) -> Option<&[(usize, usize)]> {
+        self.auxiliary_input_source_map.as_deref()
     }
 
     fn output_channels(&self) -> usize {

@@ -9,10 +9,14 @@ const CLAP_PROJECT_INSTRUMENTS_DIRECTORY: &str = "clap-project-instruments";
 const CLAP_PROJECT_INSTRUMENT_PARAMETER_OVERRIDES_DIRECTORY: &str =
     "clap-project-instrument-parameter-overrides";
 const CLAP_PROJECT_MIXER_EFFECTS_DIRECTORY: &str = "clap-project-mixer-effects";
+const VST2_PROJECT_MIXER_AUXILIARY_MAPS_DIRECTORY: &str = "vst2-project-mixer-auxiliary-maps";
 pub const MAX_CLAP_PROJECT_PLUGIN_STATE_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_CLAP_PROJECT_MIXER_AUXILIARY_BUSES: usize = 16;
+const MAX_VST2_PROJECT_MIXER_AUXILIARY_BUS_INDEX_EXCLUSIVE: usize = 17;
 pub const MAX_CLAP_PROJECT_MIXER_EFFECT_MANUAL_LATENCY_OFFSET_SAMPLES: i32 = 100_000;
 const MAX_CLAP_PROJECT_PARAMETER_OVERRIDES: usize = 512;
+
+pub type Vst2MixerEffectAuxiliaryMapKey = (usize, u16, [u8; 16]);
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ClapProjectInstrumentAssignment {
@@ -105,6 +109,17 @@ fn clap_project_mixer_effects_file(project_id: &str) -> Option<PathBuf> {
     Some(
         app_settings_directory()?
             .join(CLAP_PROJECT_MIXER_EFFECTS_DIRECTORY)
+            .join(format!("{}.txt", project_id.to_ascii_lowercase())),
+    )
+}
+
+fn vst2_project_mixer_auxiliary_maps_file(project_id: &str) -> Option<PathBuf> {
+    if project_id.len() != 16 || !project_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(
+        app_settings_directory()?
+            .join(VST2_PROJECT_MIXER_AUXILIARY_MAPS_DIRECTORY)
             .join(format!("{}.txt", project_id.to_ascii_lowercase())),
     )
 }
@@ -281,6 +296,147 @@ pub fn save_clap_project_mixer_effects(
         .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
     fs::write(&path, serialize_clap_project_mixer_effects(assignments))
         .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
+/// Read machine-local VST2 Mixer auxiliary-input maps for a project.
+/// Missing entries use automatic source/bus ordering; an empty map disables all sidechains.
+pub fn load_vst2_project_mixer_auxiliary_maps(
+    project_id: &str,
+) -> BTreeMap<Vst2MixerEffectAuxiliaryMapKey, BTreeSet<(usize, usize)>> {
+    vst2_project_mixer_auxiliary_maps_file(project_id)
+        .and_then(|path| fs::read_to_string(path).ok())
+        .map(|contents| parse_vst2_project_mixer_auxiliary_maps(&contents))
+        .unwrap_or_default()
+}
+
+/// Save machine-local VST2 Mixer auxiliary-input maps outside the FLP file.
+pub fn save_vst2_project_mixer_auxiliary_maps(
+    project_id: &str,
+    mappings: &BTreeMap<Vst2MixerEffectAuxiliaryMapKey, BTreeSet<(usize, usize)>>,
+) -> Result<(), String> {
+    if mappings
+        .iter()
+        .any(|((insert_ordinal, slot_index, _), mapping)| {
+            *insert_ordinal >= crate::audio::MIXER_TRACK_METER_COUNT
+                || *slot_index >= 10
+                || mapping.iter().any(|(source_track, bus_index)| {
+                    *source_track == 0
+                        || *source_track >= crate::audio::MIXER_TRACK_METER_COUNT
+                        || *bus_index >= MAX_VST2_PROJECT_MIXER_AUXILIARY_BUS_INDEX_EXCLUSIVE
+                })
+        })
+    {
+        return Err("VST2 Mixer auxiliary-input mappings are invalid".to_owned());
+    }
+    let path = vst2_project_mixer_auxiliary_maps_file(project_id)
+        .ok_or_else(|| "the project VST2 Mixer auxiliary-map path is not valid".to_owned())?;
+    let parent = path.parent().ok_or_else(|| {
+        "the project VST2 Mixer auxiliary-map path has no parent folder".to_owned()
+    })?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    fs::write(&path, serialize_vst2_project_mixer_auxiliary_maps(mappings))
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
+fn parse_vst2_project_mixer_auxiliary_maps(
+    contents: &str,
+) -> BTreeMap<Vst2MixerEffectAuxiliaryMapKey, BTreeSet<(usize, usize)>> {
+    let mut mappings = BTreeMap::new();
+    if contents.lines().next() != Some("vst2-mixer-auxiliary-maps-v1") {
+        return mappings;
+    }
+    for line in contents.lines().skip(1) {
+        let mut fields = line.split('\t');
+        let Some(insert_ordinal) = fields.next().and_then(|field| field.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        let Some(slot_index) = fields.next().and_then(|field| field.parse::<u16>().ok()) else {
+            continue;
+        };
+        let Some(class_id) = fields
+            .next()
+            .and_then(decode_bytes_hex)
+            .filter(|bytes| bytes.len() == 16)
+            .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok())
+        else {
+            continue;
+        };
+        let Some(encoded_mapping) = fields.next() else {
+            continue;
+        };
+        let Some(mapping) = parse_vst2_mixer_auxiliary_input_map(encoded_mapping) else {
+            continue;
+        };
+        if fields.next().is_some()
+            || insert_ordinal >= crate::audio::MIXER_TRACK_METER_COUNT
+            || slot_index >= 10
+        {
+            continue;
+        }
+        mappings.insert((insert_ordinal, slot_index, class_id), mapping);
+    }
+    mappings
+}
+
+fn serialize_vst2_project_mixer_auxiliary_maps(
+    mappings: &BTreeMap<Vst2MixerEffectAuxiliaryMapKey, BTreeSet<(usize, usize)>>,
+) -> String {
+    let mut contents = String::from("vst2-mixer-auxiliary-maps-v1\n");
+    for ((insert_ordinal, slot_index, class_id), mapping) in mappings {
+        if *insert_ordinal >= crate::audio::MIXER_TRACK_METER_COUNT
+            || *slot_index >= 10
+            || mapping.iter().any(|(source_track, bus_index)| {
+                *source_track == 0
+                    || *source_track >= crate::audio::MIXER_TRACK_METER_COUNT
+                    || *bus_index >= MAX_VST2_PROJECT_MIXER_AUXILIARY_BUS_INDEX_EXCLUSIVE
+            })
+        {
+            continue;
+        }
+        contents.push_str(&insert_ordinal.to_string());
+        contents.push('\t');
+        contents.push_str(&slot_index.to_string());
+        contents.push('\t');
+        contents.push_str(&encode_bytes_hex(class_id));
+        contents.push('\t');
+        if mapping.is_empty() {
+            contents.push('!');
+        } else {
+            for (index, (source_track, bus_index)) in mapping.iter().enumerate() {
+                if index > 0 {
+                    contents.push(',');
+                }
+                contents.push_str(&format!("{source_track}:{bus_index}"));
+            }
+        }
+        contents.push('\n');
+    }
+    contents
+}
+
+fn parse_vst2_mixer_auxiliary_input_map(encoded: &str) -> Option<BTreeSet<(usize, usize)>> {
+    if encoded == "!" {
+        return Some(BTreeSet::new());
+    }
+    if encoded.is_empty() {
+        return None;
+    }
+    let mut mapping = BTreeSet::new();
+    for entry in encoded.split(',') {
+        let (source_track, bus_index) = entry.split_once(':')?;
+        let source_track = source_track.parse::<usize>().ok()?;
+        let bus_index = bus_index.parse::<usize>().ok()?;
+        if source_track == 0
+            || source_track >= crate::audio::MIXER_TRACK_METER_COUNT
+            || bus_index >= MAX_VST2_PROJECT_MIXER_AUXILIARY_BUS_INDEX_EXCLUSIVE
+            || !mapping.insert((source_track, bus_index))
+        {
+            return None;
+        }
+    }
+    Some(mapping)
 }
 
 pub fn parse_clap_project_mixer_effects(

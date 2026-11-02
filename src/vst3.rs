@@ -3063,14 +3063,14 @@ fn fill_external_playlist_mixer_sidechain_inputs(
     )?;
     let sample_count = frame_count
         .checked_mul(2)
-        .ok_or_else(|| "CLAP Mixer sidechain block size overflow".to_owned())?;
+        .ok_or_else(|| "Mixer sidechain block size overflow".to_owned())?;
     let total_sample_count = effect
         .external_auxiliary_input_buses
         .len()
         .checked_mul(sample_count)
-        .ok_or_else(|| "CLAP Mixer sidechain scratch size overflow".to_owned())?;
+        .ok_or_else(|| "Mixer sidechain scratch size overflow".to_owned())?;
     if total_sample_count > effect.external_auxiliary_scratch.capacity() {
-        return Err("CLAP Mixer sidechain scratch capacity is too small".to_owned());
+        return Err("Mixer sidechain scratch capacity is too small".to_owned());
     }
     effect
         .external_auxiliary_scratch
@@ -3083,15 +3083,15 @@ fn fill_external_playlist_mixer_sidechain_inputs(
             .position(|(bus_index, channel_count)| {
                 *bus_index == sidechain.bus_index && *channel_count == sidechain.channel_count
             })
-            .ok_or_else(|| "CLAP Mixer sidechain bus is unavailable".to_owned())?;
+            .ok_or_else(|| "Mixer sidechain bus is unavailable".to_owned())?;
         let source = &sidechain.stereo_scratch[..sample_count];
         let destination_start = bus_position
             .checked_mul(sample_count)
-            .ok_or_else(|| "CLAP Mixer sidechain offset overflow".to_owned())?;
+            .ok_or_else(|| "Mixer sidechain offset overflow".to_owned())?;
         let destination_end = destination_start
             .checked_add(sample_count)
             .filter(|end| *end <= effect.external_auxiliary_scratch.len())
-            .ok_or_else(|| "CLAP Mixer sidechain scratch is too small".to_owned())?;
+            .ok_or_else(|| "Mixer sidechain scratch is too small".to_owned())?;
         for (destination, source) in effect.external_auxiliary_scratch
             [destination_start..destination_end]
             .iter_mut()
@@ -3181,7 +3181,7 @@ fn update_playlist_mixer_effect_sidechain_inputs(
             .count();
         if active_source_count > auxiliary_buses.len() {
             return Err(format!(
-                "Mixer insert {} CLAP effect slot {} has {active_source_count} active sidechain routes but only {} supported auxiliary inputs",
+                "Mixer insert {} external effect slot {} has {active_source_count} active sidechain routes but only {} supported auxiliary inputs",
                 effect.insert_ordinal,
                 effect.slot_index + 1,
                 auxiliary_buses.len()
@@ -3207,7 +3207,7 @@ fn update_playlist_mixer_effect_sidechain_inputs(
                 .find(|(available_bus, _)| available_bus == bus_index)
             else {
                 return Err(format!(
-                    "CLAP Mixer insert {} effect slot {} maps source insert {source_track} to unavailable auxiliary input {bus_index}",
+                    "External Mixer insert {} effect slot {} maps source insert {source_track} to unavailable auxiliary input {bus_index}",
                     effect.insert_ordinal,
                     effect.slot_index + 1
                 ));
@@ -3241,7 +3241,7 @@ fn update_playlist_mixer_effect_sidechain_inputs(
         .try_reserve_exact(sidechain_pairs.len())
         .map_err(|error| format!("could not allocate Mixer sidechain inputs: {error}"))?;
     // VST3 buses and unmapped CLAP ports retain stable source-order pairing. Explicit
-    // CLAP maps may route several source inserts into one auxiliary port.
+    // Explicit external maps may route several source inserts into one auxiliary port.
     for ((bus_index, channel_count), (source_track, saved_enabled, live_control)) in sidechain_pairs
     {
         let mut input = previous_inputs
@@ -7234,7 +7234,7 @@ impl Vst3HostRuntime {
                         .len()
                         .checked_mul(block_size)
                         .and_then(|count| count.checked_mul(2))
-                        .ok_or_else(|| "CLAP sidechain scratch size overflow".to_owned())?;
+                        .ok_or_else(|| "Mixer sidechain scratch size overflow".to_owned())?;
                     let external_auxiliary_scratch = Vec::with_capacity(auxiliary_scratch_capacity);
                     let manual_latency_offset_samples = processor.manual_latency_offset_samples();
                     let latency_samples = apply_manual_latency_offset(

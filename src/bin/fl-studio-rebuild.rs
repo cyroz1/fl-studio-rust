@@ -45,10 +45,11 @@ use flp_rebuild::midi::{
 use flp_rebuild::plugin_settings::{
     ClapProjectInstrumentAssignment as ClapPatternPlaybackInstrument,
     ClapProjectMixerEffectAssignment, MAX_CLAP_PROJECT_MIXER_EFFECT_MANUAL_LATENCY_OFFSET_SAMPLES,
-    load_clap_project_instruments, load_clap_project_mixer_effects,
-    load_vst3_manual_latency_offsets, load_vst3_project_manual_latency_offsets,
-    save_clap_project_instrument_parameter_overrides, save_clap_project_instruments,
-    save_clap_project_mixer_effects, save_vst3_manual_latency_offsets,
+    Vst2MixerEffectAuxiliaryMapKey, load_clap_project_instruments, load_clap_project_mixer_effects,
+    load_vst2_project_mixer_auxiliary_maps, load_vst3_manual_latency_offsets,
+    load_vst3_project_manual_latency_offsets, save_clap_project_instrument_parameter_overrides,
+    save_clap_project_instruments, save_clap_project_mixer_effects,
+    save_vst2_project_mixer_auxiliary_maps, save_vst3_manual_latency_offsets,
     save_vst3_project_manual_latency_offsets,
 };
 use flp_rebuild::plugins::{PluginCandidate, PluginFormat, scan_installed_plugins};
@@ -848,6 +849,7 @@ fn vst2_candidate_match_rank(
 fn resolve_vst2_mixer_effect_assignments(
     effect_slots: &[MixerEffectSlotSummary],
     candidates: &[PluginCandidate],
+    auxiliary_input_maps: &BTreeMap<Vst2MixerEffectAuxiliaryMapKey, BTreeSet<(usize, usize)>>,
 ) -> (
     BTreeMap<(usize, u16), Vst2ProjectMixerEffectAssignment>,
     usize,
@@ -909,13 +911,17 @@ fn resolve_vst2_mixer_effect_assignments(
                 continue;
             }
         };
+        let key = (slot.insert_ordinal(), slot.slot_index());
         assignments.insert(
-            (slot.insert_ordinal(), slot.slot_index()),
+            key,
             Vst2ProjectMixerEffectAssignment {
                 plugin_path: best[0].path.clone(),
                 fourcc: fourcc.to_owned(),
                 class_id,
                 state_bytes: state_bytes.to_vec(),
+                auxiliary_input_source_map: auxiliary_input_maps
+                    .get(&(key.0, key.1, class_id))
+                    .map(|mapping| mapping.iter().copied().collect()),
             },
         );
     }
@@ -1112,6 +1118,33 @@ fn remap_mixer_effect_instances_after_move<T>(
     if let Some(instance) = moved_instance {
         instances.insert((insert_ordinal, to_slot), instance);
     }
+}
+
+fn remap_vst2_mixer_auxiliary_maps_after_move(
+    mappings: &mut BTreeMap<Vst2MixerEffectAuxiliaryMapKey, BTreeSet<(usize, usize)>>,
+    insert_ordinal: usize,
+    from_slot: u16,
+    to_slot: u16,
+) {
+    if from_slot == to_slot {
+        return;
+    }
+    let mut remapped = BTreeMap::new();
+    for ((insert, slot, class_id), mapping) in std::mem::take(mappings) {
+        let slot = if insert != insert_ordinal {
+            slot
+        } else if slot == from_slot {
+            to_slot
+        } else if from_slot < to_slot && slot > from_slot && slot <= to_slot {
+            slot - 1
+        } else if from_slot > to_slot && slot >= to_slot && slot < from_slot {
+            slot + 1
+        } else {
+            slot
+        };
+        remapped.insert((insert, slot, class_id), mapping);
+    }
+    *mappings = remapped;
 }
 
 fn remap_midi_vst3_mixer_effect_parameter_targets_after_move(
@@ -13387,8 +13420,17 @@ impl DawUi {
             }
         }
 
+        let vst2_auxiliary_input_maps = self
+            .current_path
+            .as_ref()
+            .map(|path| load_vst2_project_mixer_auxiliary_maps(&stable_project_id(path)))
+            .unwrap_or_default();
         let (vst2_effect_assignments, eligible_vst2_effects, vst2_unresolved) =
-            resolve_vst2_mixer_effect_assignments(&effect_slots, &self.plugin_candidates);
+            resolve_vst2_mixer_effect_assignments(
+                &effect_slots,
+                &self.plugin_candidates,
+                &vst2_auxiliary_input_maps,
+            );
         unresolved.extend(vst2_unresolved);
         self.vst2_mixer_effect_assignments = vst2_effect_assignments.clone();
         unresolved.extend(self.load_vst2_mixer_effect_editor_host(&vst2_effect_assignments));
@@ -15394,8 +15436,16 @@ impl DawUi {
             .as_ref()
             .map(FlpDocument::mixer_effect_slots)
             .unwrap_or_default();
-        let (vst2_effect_assignments, _, mut warnings) =
-            resolve_vst2_mixer_effect_assignments(&effect_slots, &self.plugin_candidates);
+        let vst2_auxiliary_input_maps = self
+            .current_path
+            .as_ref()
+            .map(|path| load_vst2_project_mixer_auxiliary_maps(&stable_project_id(path)))
+            .unwrap_or_default();
+        let (vst2_effect_assignments, _, mut warnings) = resolve_vst2_mixer_effect_assignments(
+            &effect_slots,
+            &self.plugin_candidates,
+            &vst2_auxiliary_input_maps,
+        );
         self.vst2_mixer_effect_assignments = vst2_effect_assignments.clone();
         warnings.extend(self.load_vst2_mixer_effect_editor_host(&vst2_effect_assignments));
         let instances = self.channel_vst3_instances.clone();
@@ -66252,6 +66302,8 @@ impl DawUi {
         let mut inspect_clap_instance = None;
         let mut clap_effect_sidechain_mapping_edits = Vec::new();
         let mut clap_effect_sidechain_mapping_use_auto = Vec::new();
+        let mut vst2_effect_sidechain_mapping_edits = Vec::new();
+        let mut vst2_effect_sidechain_mapping_use_auto = Vec::new();
         let mut clap_effect_manual_latency_offset_edits = Vec::new();
         let mut clap_effect_parameter_override_apply = Vec::new();
         let mut clap_effect_parameter_override_clear = Vec::new();
@@ -67925,6 +67977,15 @@ impl DawUi {
                                             .map(|host| host.has_mixer_effect(slot_key))
                                             .unwrap_or(false)
                                     });
+                                let vst2_auxiliary_input_buses = self
+                                    .vst2_mixer_effect_host
+                                    .as_ref()
+                                    .and_then(|runtime| {
+                                        runtime.lock().ok().and_then(|host| {
+                                            host.mixer_effect_auxiliary_input_buses(slot_key)
+                                        })
+                                    })
+                                    .unwrap_or_default();
                                 let saved_state = if loaded_effect_instance.is_some() {
                                     format!("{saved_state} · VST3 loaded")
                                 } else if vst2_editor_loaded {
@@ -68369,6 +68430,107 @@ impl DawUi {
                                                     );
                                                 }
                                             });
+                                            if let Some(assignment) = vst2_effect_assignment {
+                                                ui.collapsing("VST2 sidechain input mapping", |ui| {
+                                                    ui.small("Explicit maps are stored in machine-local project settings; the FLP file is unchanged.");
+                                                    if assignment.auxiliary_input_source_map.is_some()
+                                                        && project_id.is_some()
+                                                        && ui
+                                                            .small_button(
+                                                                "Use automatic source/bus ordering",
+                                                            )
+                                                            .clicked()
+                                                    {
+                                                        vst2_effect_sidechain_mapping_use_auto
+                                                            .push(slot_key);
+                                                    }
+                                                    if !vst2_editor_loaded {
+                                                        ui.small("The isolated VST2 worker could not inspect this effect's input buses.");
+                                                    } else if vst2_auxiliary_input_buses.is_empty() {
+                                                        ui.small("This effect has no supported mono or stereo auxiliary inputs.");
+                                                    } else {
+                                                        if assignment
+                                                            .auxiliary_input_source_map
+                                                            .is_none()
+                                                        {
+                                                            ui.small("Automatic source/bus ordering is active. Selecting sources switches to an explicit map; only selected sources are routed.");
+                                                        } else if assignment
+                                                            .auxiliary_input_source_map
+                                                            .as_ref()
+                                                            .is_some_and(Vec::is_empty)
+                                                        {
+                                                            ui.small("Explicit mapping is active with no sources routed.");
+                                                        }
+                                                        if project_id.is_none() {
+                                                            ui.small("Save the project before editing its VST2 sidechain map.");
+                                                        }
+                                                        for (bus_index, channel_count) in
+                                                            &vst2_auxiliary_input_buses
+                                                        {
+                                                            let mapping_label = assignment
+                                                                .auxiliary_input_source_map
+                                                                .as_ref()
+                                                                .map(|mapping| {
+                                                                    format!(
+                                                                        "{} mapped",
+                                                                        mapping
+                                                                            .iter()
+                                                                            .filter(|(_, mapped_bus)| mapped_bus == bus_index)
+                                                                            .count()
+                                                                    )
+                                                                })
+                                                                .unwrap_or_else(|| "automatic".to_owned());
+                                                            let label = format!(
+                                                                "Input bus {} · {mapping_label}",
+                                                                bus_index + 1
+                                                            );
+                                                            if project_id.is_some() {
+                                                                ui.menu_button(label, |menu| {
+                                                                    egui::ScrollArea::vertical()
+                                                                        .max_height(220.0)
+                                                                        .show(menu, |menu| {
+                                                                            for source in inserts.iter().filter(|source| {
+                                                                                source.ordinal() != 0
+                                                                                    && source.ordinal() != insert.ordinal()
+                                                                            }) {
+                                                                                let mut mapped = assignment
+                                                                                    .auxiliary_input_source_map
+                                                                                    .as_ref()
+                                                                                    .is_some_and(|mapping| {
+                                                                                        mapping.contains(&(source.ordinal(), *bus_index))
+                                                                                    });
+                                                                                if menu
+                                                                                    .checkbox(
+                                                                                        &mut mapped,
+                                                                                        format!(
+                                                                                            "Insert {} · {}",
+                                                                                            source.ordinal(),
+                                                                                            source.name().unwrap_or("(unnamed)")
+                                                                                        ),
+                                                                                    )
+                                                                                    .changed()
+                                                                                {
+                                                                                    vst2_effect_sidechain_mapping_edits.push((
+                                                                                        slot_key,
+                                                                                        source.ordinal(),
+                                                                                        *bus_index,
+                                                                                        mapped,
+                                                                                    ));
+                                                                                }
+                                                                            }
+                                                                        });
+                                                                });
+                                                            } else {
+                                                                ui.small(label);
+                                                            }
+                                                            ui.small(format!(
+                                                                "Input bus {} · {channel_count} channel(s)",
+                                                                bus_index + 1
+                                                            ));
+                                                        }
+                                                    }
+                                                });
+                                            }
                                             ui.horizontal(|ui| {
                                                 if let Some(project_id) = project_id.as_ref() {
                                                     let selected_text = clap_effect_assignment
@@ -68938,7 +69100,7 @@ impl DawUi {
                             }
                             ui.small(
                                 egui::RichText::new(
-                                    "Open editor controls a loaded VST3 effect; Open VST2 editor launches the saved VST2 Mixer effect in an isolated worker, and its parameter edits synchronize with active Mixer processing at the next audio block. Capture VST2 state writes editor state into FLP field 53. Move up/down carries saved slot events with the effect. CLAP assignments process in saved slot order with timed parameter automation, saved machine-local parameter overrides, and reported-latency PDC. VST2 Mixer effects receive routed sidechains on up to 16 mono/stereo auxiliary inputs, pairing sources and plug-in buses in ascending order. This follows Image-Line's documented Auto Map rule; manual native input assignments are not restored. CLAP sidechains feed supported mono/stereo auxiliary inputs in source-track and bus order by default; a slot can save explicit source-insert-to-input maps that sum multiple sources on one port. PDC and runtime latency/tail reports apply between audio blocks. Capture state reads one active effect at the next block boundary, or refreshes the prior machine-local snapshot if none is active; simultaneous active instances must be stopped to avoid an ambiguous capture. Native saved connection mapping remains unverified. Assigned CLAP Mixer effects open isolated native editors; writable parameters synchronize to active processing while open, and state is saved on close. VST3 Mix edits use a 20 ms ramp.",
+                                    "Open editor controls a loaded VST3 effect; Open VST2 editor launches the saved VST2 Mixer effect in an isolated worker, and its parameter edits synchronize with active Mixer processing at the next audio block. Capture VST2 state writes editor state into FLP field 53. Move up/down carries saved slot events with the effect. CLAP assignments process in saved slot order with timed parameter automation, saved machine-local parameter overrides, and reported-latency PDC. VST2 Mixer effects receive routed sidechains on up to 16 mono/stereo auxiliary inputs, pairing sources and plug-in buses in ascending order. This follows Image-Line's documented Auto Map rule; explicit VST2 source-to-bus maps save in machine-local settings per project and plug-in class ID, while native FLP map restoration remains incomplete. CLAP sidechains feed supported mono/stereo auxiliary inputs in source-track and bus order by default; a slot can save explicit source-insert-to-input maps that sum multiple sources on one port. PDC and runtime latency/tail reports apply between audio blocks. Capture state reads one active effect at the next block boundary, or refreshes the prior machine-local snapshot if none is active; simultaneous active instances must be stopped to avoid an ambiguous capture. Native saved connection mapping remains unverified. Assigned CLAP Mixer effects open isolated native editors; writable parameters synchronize to active processing while open, and state is saved on close. VST3 Mix edits use a 20 ms ramp.",
                                 )
                                 .color(MUTED),
                             );
@@ -69586,6 +69748,50 @@ impl DawUi {
                     "Save the project before editing CLAP Mixer effect settings".to_owned();
             }
         }
+        if !vst2_effect_sidechain_mapping_edits.is_empty()
+            || !vst2_effect_sidechain_mapping_use_auto.is_empty()
+        {
+            if let Some(project_id) = project_id.as_deref() {
+                let mut mappings = load_vst2_project_mixer_auxiliary_maps(project_id);
+                for slot_key in vst2_effect_sidechain_mapping_use_auto {
+                    if let Some(assignment) = self.vst2_mixer_effect_assignments.get(&slot_key) {
+                        mappings.remove(&(slot_key.0, slot_key.1, assignment.class_id));
+                    }
+                }
+                for (slot_key, source_track, bus_index, mapped) in
+                    vst2_effect_sidechain_mapping_edits
+                {
+                    let Some(assignment) = self.vst2_mixer_effect_assignments.get(&slot_key) else {
+                        continue;
+                    };
+                    let mapping = mappings
+                        .entry((slot_key.0, slot_key.1, assignment.class_id))
+                        .or_default();
+                    if mapped {
+                        mapping.insert((source_track, bus_index));
+                    } else {
+                        mapping.remove(&(source_track, bus_index));
+                    }
+                }
+                match save_vst2_project_mixer_auxiliary_maps(project_id, &mappings) {
+                    Ok(()) => {
+                        self.stop_project_playback();
+                        let reload_status = self.load_project_plugins();
+                        self.status = reload_status.map_or_else(
+                            || "Updated VST2 Mixer sidechain input mapping".to_owned(),
+                            |message| {
+                                format!("Updated VST2 Mixer sidechain input mapping; {message}")
+                            },
+                        );
+                    }
+                    Err(error) => {
+                        self.status = format!("Could not save VST2 Mixer sidechain map: {error}");
+                    }
+                }
+            } else {
+                self.status = "Save the project before editing its VST2 sidechain map".to_owned();
+            }
+        }
         if !clap_effect_parameter_override_apply.is_empty()
             || !clap_effect_parameter_override_clear.is_empty()
         {
@@ -70115,6 +70321,17 @@ impl DawUi {
                         )
                         .err()
                     });
+                    let vst2_auxiliary_map_save_error =
+                        project_id.as_deref().and_then(|project_id| {
+                            let mut mappings = load_vst2_project_mixer_auxiliary_maps(project_id);
+                            remap_vst2_mixer_auxiliary_maps_after_move(
+                                &mut mappings,
+                                insert_ordinal,
+                                from_slot,
+                                to_slot,
+                            );
+                            save_vst2_project_mixer_auxiliary_maps(project_id, &mappings).err()
+                        });
                     let factory = combined_mixer_effect_processor_factory(
                         self.clap_mixer_effect_assignments.clone(),
                         self.vst2_mixer_effect_assignments.clone(),
@@ -70137,6 +70354,7 @@ impl DawUi {
                         })
                         .and_then(Result::err)
                         .or(clap_assignment_save_error)
+                        .or(vst2_auxiliary_map_save_error)
                         .or_else(|| {
                             pattern_event_links_changed
                                 .then(|| {
