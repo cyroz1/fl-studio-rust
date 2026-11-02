@@ -1,0 +1,49 @@
+[package]
+name = "vst-audio-worker-sys"
+description = "Internal native plugin ABI and editor implementation for vst-audio workers"
+keywords = ["vst", "vst3", "audio", "plugin", "ffi"]
+categories = ["multimedia::audio", "external-ffi-bindings"]
+readme.workspace = true
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT AND BSD-3-Clause AND ISC"
+repository.workspace = true
+publish.workspace = true
+
+[lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
+missing_safety_doc = "deny"
+dbg_macro = "deny"
+
+[features]
+# Test only: never enable in distribution builds.
+__test-drop-editor-edits = []
+
+[dependencies]
+crossbeam-queue = "0.3"
+vst-audio-protocol.workspace = true
+vst3.workspace = true
+vst-audio-ring.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = "0.13"
+wayland-client = "0.31"
+wayland-backend = { version = "0.3", features = ["client_system", "dlopen"] }
+wayland-protocols = { version = "0.32", features = ["client", "unstable", "staging"] }
+wayland-sys = { version = "0.31", features = ["client", "dlopen"] }
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSDate", "NSGeometry", "NSRunLoop", "NSObject", "NSProcessInfo"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSWindow", "NSView", "NSResponder", "NSEvent", "NSRunningApplication", "NSGraphics", "NSBitmapImageRep", "NSImageRep"] }

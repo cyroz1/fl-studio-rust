@@ -1,0 +1,6 @@
+{
+  "git": {
+    "sha1": "9c23223ec7942d6bb84e0c6f845c1c16f550c511"
+  },
+  "path_in_vcs": "crates/vst-audio-worker-sys"
+}

@@ -23,13 +23,17 @@ included under its MIT license. The license text is included at
 ## VST2 hosting
 
 VST2 class scanning and one-note audio rendering use `vst-audio` and
-`vst-audio-worker-runtime` 0.7.0. The crates are MIT-licensed. Their VST2 ABI
-bindings carry the BSD-3-Clause notice from Xaymar's translated header, and
-their MIDI layouts carry the ISC notice from DISTRHO/DPF. The corresponding
-license and provenance files are included as application resources under
-`assets/licenses/`; package versions and checksums are pinned in `Cargo.lock`.
-The project uses a worker mode in its own executable, so the plug-in binary
-runs in a child process without an additional worker binary.
+`vst-audio-worker-runtime` 0.7.0. The `vst-audio-worker-sys` 0.7.0 source is
+vendored at `vendor/vst-audio-worker-sys` with a local patch that exposes
+ordinary VST2 unique IDs through the existing class ID field; its shell child
+IDs use the same encoding. The crates are MIT-licensed. Their VST2 ABI bindings
+carry the BSD-3-Clause notice from Xaymar's translated header, and their MIDI
+layouts carry the ISC notice from DISTRHO/DPF. The corresponding license and
+provenance files are included as application resources under `assets/licenses/`;
+registry dependency versions and checksums are pinned in `Cargo.lock`, and the
+patched source retains its crate metadata and notices in `vendor/`. The project
+uses a worker mode in its own executable, so the plug-in binary runs in a child
+process without an additional worker binary.
 
 - [vst-audio 0.7.0](https://crates.io/crates/vst-audio/0.7.0)
 - [vst-audio-worker-runtime 0.7.0](https://crates.io/crates/vst-audio-worker-runtime/0.7.0)

@@ -4875,8 +4875,6 @@ dependencies = [
 [[package]]
 name = "vst-audio-worker-sys"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "849cb9ff9cfca959a3e770457f4de8e3e1b0d00e6772c0d55a7e0de2a1784346"
 dependencies = [
  "crossbeam-queue",
  "libc",

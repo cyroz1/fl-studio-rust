@@ -44,6 +44,9 @@ cpal = "0.18.2"
 [target.'cfg(not(any(windows, target_os = "linux")))'.dependencies]
 cpal = "0.18.2"
 
+[patch.crates-io]
+vst-audio-worker-sys = { path = "vendor/vst-audio-worker-sys" }
+
 [lib]
 name = "flp_rebuild"
 path = "src/lib.rs"
