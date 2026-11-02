@@ -6134,6 +6134,8 @@ struct PendingSamplerStream {
     cancelled: Arc<AtomicBool>,
     worker: thread::JoinHandle<()>,
     live_midi_senders: BTreeMap<u16, Vst3PlaylistLiveInputSender>,
+    live_vst2_sender: Option<Vst2LiveInputSender>,
+    live_vst2_channel_id: Option<u16>,
     staged_streaming: Option<StagedStreamingPlayback>,
     staged_handoff_reason: Option<PdcStreamHandoffReason>,
 }
@@ -55030,6 +55032,8 @@ impl DawUi {
                     cancelled,
                     worker,
                     live_midi_senders: BTreeMap::new(),
+                    live_vst2_sender: None,
+                    live_vst2_channel_id: None,
                     staged_streaming: None,
                     staged_handoff_reason: None,
                 });
@@ -55319,6 +55323,8 @@ impl DawUi {
                     cancelled,
                     worker,
                     live_midi_senders: BTreeMap::new(),
+                    live_vst2_sender: None,
+                    live_vst2_channel_id: None,
                     staged_streaming: None,
                     staged_handoff_reason: None,
                 });
@@ -55818,6 +55824,20 @@ impl DawUi {
             .as_ref()
             .map(Vst3PlaylistStreamProcessor::live_midi_input_senders)
             .unwrap_or_default();
+        let live_vst2_channel_id =
+            loop_length_ticks
+                .and(self.selected_note_channel)
+                .filter(|channel_id| {
+                    vst2_channel_infos
+                        .iter()
+                        .any(|channel| channel.channel_id == *channel_id)
+                });
+        let (live_vst2_sender, live_vst2_receiver) = if live_vst2_channel_id.is_some() {
+            let (sender, receiver) = vst2_live_input_queue();
+            (Some(sender), Some(receiver))
+        } else {
+            (None, None)
+        };
         let vst3_summary = vst3_processor
             .as_ref()
             .map(Vst3PlaylistStreamProcessor::summary);
@@ -55944,6 +55964,7 @@ impl DawUi {
                                     extend_preview_tail,
                                     vst3_processor,
                                     vst2_runtime,
+                                    vst2_live_input: live_vst2_channel_id.zip(live_vst2_receiver),
                                     clap_audio_channel_ids: worker_clap_pattern_channels,
                                     pattern_audio_layers: worker_pattern_audio_layers,
                                 },
@@ -55983,9 +56004,18 @@ impl DawUi {
                     cancelled,
                     worker,
                     live_midi_senders,
+                    live_vst2_sender,
+                    live_vst2_channel_id,
                     staged_streaming,
                     staged_handoff_reason: staged_handoff.map(|(_, reason)| reason),
                 });
+                if let Some(sender) = self
+                    .pending_sampler_stream
+                    .as_ref()
+                    .and_then(|stream| stream.live_vst2_sender.as_ref())
+                {
+                    self.send_live_vst3_controller_state(sender);
+                }
                 self.playing = true;
                 self.project_playback_loaded = true;
                 self.pattern_note_update_sender = pattern_note_update_sender_for_ui;
@@ -73873,7 +73903,12 @@ impl DawUi {
     }
 
     fn handle_live_vst2_input(&mut self, event: MidiInputEvent) {
-        if self.playing
+        let pattern_transport_active = self.playing
+            && self.pattern_playback_mode
+            && !self.performance_mode_active
+            && self.performance_launch_sender.is_none()
+            && self.can_audition_live_midi_input();
+        if (self.playing && !pattern_transport_active)
             || !self.can_audition_live_midi_input()
             || (self.performance_launch_sender.is_some()
                 && is_performance_clip_trigger_channel_event(
@@ -73888,6 +73923,14 @@ impl DawUi {
         else {
             return;
         };
+        if pattern_transport_active
+            && self
+                .pattern_mode_playback_source
+                .map(|(active_pattern_id, _)| active_pattern_id)
+                != Some(pattern_id)
+        {
+            return;
+        }
         let is_loaded_vst2_channel = self.vst2_host.as_ref().is_some_and(|runtime| {
             runtime.lock().is_ok_and(|runtime| {
                 runtime
@@ -73897,6 +73940,13 @@ impl DawUi {
             })
         });
         if !is_loaded_vst2_channel {
+            return;
+        }
+        if pattern_transport_active
+            && !self.pending_sampler_stream.as_ref().is_some_and(|stream| {
+                stream.live_vst2_channel_id == Some(channel_id) && stream.live_vst2_sender.is_some()
+            })
+        {
             return;
         }
         let key_region = self.document.as_ref().and_then(|document| {
@@ -74071,16 +74121,25 @@ impl DawUi {
             self.midi_live_vst2_note_mapping
                 .retain(|(mapped_channel, _), _| *mapped_channel != channel);
         }
-        if self.live_vst2_input.is_none()
+        if !pattern_transport_active
+            && self.live_vst2_input.is_none()
             && matches!(live_event, Vst3LiveInputEvent::NoteOn { .. })
             && !self.start_live_vst2_input(pattern_id, channel_id)
         {
             return;
         }
-        let sent = self
-            .live_vst2_input
-            .as_ref()
-            .is_some_and(|session| session.sender.send(live_event).is_ok());
+        let sent = if pattern_transport_active {
+            self.pending_sampler_stream.as_ref().is_some_and(|stream| {
+                stream.live_vst2_sender.as_ref().is_some_and(|sender| {
+                    stream.live_vst2_channel_id == Some(channel_id)
+                        && sender.send(live_event).is_ok()
+                })
+            })
+        } else {
+            self.live_vst2_input
+                .as_ref()
+                .is_some_and(|session| session.sender.send(live_event).is_ok())
+        };
         if sent {
             if let Some((source_note, Some(audition_key))) = mapped_note_on {
                 self.midi_live_vst2_note_mapping
@@ -74088,6 +74147,11 @@ impl DawUi {
                     .or_default()
                     .push_back(Some(audition_key));
             }
+        } else if pattern_transport_active {
+            self.stop_project_playback();
+            self.status =
+                "Could not queue VST2 live MIDI; Pattern playback stopped to release active notes"
+                    .to_owned();
         } else if self.live_vst2_input.is_some() {
             self.stop_live_vst2_input();
             self.stop_live_audition_playback_if_stopped();

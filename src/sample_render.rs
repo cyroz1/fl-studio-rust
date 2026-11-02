@@ -879,6 +879,8 @@ pub struct PatternInstrumentsPlayback {
     pub extend_preview_tail: bool,
     pub vst3_processor: Option<Vst3PlaylistStreamProcessor>,
     pub vst2_runtime: Option<Arc<Mutex<Vst2HostRuntime>>>,
+    /// Live MIDI targeted at the selected VST2 channel during Pattern transport.
+    pub vst2_live_input: Option<(u16, Vst2LiveInputReceiver)>,
     pub clap_audio_channel_ids: BTreeSet<u16>,
     pub pattern_audio_layers: Vec<PatternAudioLayer>,
 }
@@ -8241,6 +8243,7 @@ pub fn stream_sampler_pattern_to_device_with_live_controls(
             start_tick: 0,
             vst3_processor: None,
             vst2_runtime: None,
+            vst2_live_input: None,
             allow_empty_sampler: false,
             repeat_pattern: false,
             extend_preview_tail: false,
@@ -8300,6 +8303,7 @@ pub fn stream_sampler_pattern_loop_from_tick_to_device(
             start_tick,
             vst3_processor: None,
             vst2_runtime: None,
+            vst2_live_input: None,
             allow_empty_sampler: false,
             repeat_pattern: true,
             extend_preview_tail: false,
@@ -8364,6 +8368,7 @@ pub fn stream_sampler_pattern_loop_from_tick_to_device_with_live_controls(
             start_tick: controls.playback.start_tick,
             vst3_processor: None,
             vst2_runtime: None,
+            vst2_live_input: None,
             allow_empty_sampler,
             repeat_pattern: true,
             extend_preview_tail: false,
@@ -8399,6 +8404,7 @@ pub fn stream_pattern_loop_with_vst3_from_tick_to_device(
             start_tick: playback.start_tick,
             vst3_processor: Some(playback.processor),
             vst2_runtime: None,
+            vst2_live_input: None,
             allow_empty_sampler: true,
             repeat_pattern: true,
             extend_preview_tail: false,
@@ -8435,6 +8441,7 @@ pub fn stream_pattern_loop_with_vst3_from_tick_to_device_with_live_master_contro
             start_tick: playback.start_tick,
             vst3_processor: Some(playback.processor),
             vst2_runtime: None,
+            vst2_live_input: None,
             allow_empty_sampler: true,
             repeat_pattern: true,
             extend_preview_tail: false,
@@ -8470,6 +8477,7 @@ pub fn stream_pattern_loop_with_vst3_from_tick_to_device_with_live_controls(
             start_tick: controls.playback.start_tick,
             vst3_processor: Some(controls.playback.processor),
             vst2_runtime: None,
+            vst2_live_input: None,
             allow_empty_sampler: true,
             repeat_pattern: true,
             extend_preview_tail: false,
@@ -8530,6 +8538,7 @@ pub fn stream_pattern_with_vst3_to_device_with_live_controls(
             start_tick: 0,
             vst3_processor: Some(controls.playback.processor),
             vst2_runtime: None,
+            vst2_live_input: None,
             allow_empty_sampler: true,
             repeat_pattern: false,
             extend_preview_tail: true,
@@ -8573,6 +8582,7 @@ pub fn stream_pattern_with_loaded_plugins_to_device_with_live_controls(
             start_tick: playback.start_tick,
             vst3_processor: playback.vst3_processor,
             vst2_runtime: playback.vst2_runtime,
+            vst2_live_input: playback.vst2_live_input,
             allow_empty_sampler,
             repeat_pattern: playback.repeat_pattern,
             extend_preview_tail: playback.extend_preview_tail,
@@ -8595,6 +8605,7 @@ struct PatternStreamConfig {
     start_tick: u64,
     vst3_processor: Option<Vst3PlaylistStreamProcessor>,
     vst2_runtime: Option<Arc<Mutex<Vst2HostRuntime>>>,
+    vst2_live_input: Option<(u16, Vst2LiveInputReceiver)>,
     allow_empty_sampler: bool,
     repeat_pattern: bool,
     extend_preview_tail: bool,
@@ -8648,10 +8659,12 @@ struct Vst2PendingMidiEvent {
 struct Vst2PatternChannelStream {
     info: Vst2HostedChannelInfo,
     layer_index: usize,
+    note_pitch_offset: i16,
     note_events: Vec<Vst2PatternNoteEvent>,
     next_loop_frame: u64,
     pending_events: BTreeMap<u64, Vec<Vst2PendingMidiEvent>>,
     active_notes: BTreeMap<(u8, u8), usize>,
+    live_note_keys: HashMap<(u8, u8), VecDeque<Option<u8>>>,
     input_buffers: Vec<Vec<f32>>,
     output_buffers: Vec<Vec<f32>>,
     pdc_delay: StereoFrameDelay,
@@ -8669,7 +8682,7 @@ struct Vst2PatternStreamProcessor {
     settings: Vst2PatternStreamSettings,
     content_frames: u64,
     notes_scheduled: usize,
-    live_sustain_controllers_used: BTreeMap<u8, BTreeSet<u8>>,
+    live_sustain_controllers_used: BTreeMap<u16, BTreeMap<u8, BTreeSet<u8>>>,
 }
 
 impl Vst2PatternStreamProcessor {
@@ -8733,6 +8746,8 @@ impl Vst2PatternStreamProcessor {
             channels.push(Vst2PatternChannelStream {
                 info: info.clone(),
                 layer_index,
+                note_pitch_offset: channel
+                    .master_pitch_note_offset_semitones(settings.master_pitch_cents),
                 note_events: note_plan
                     .events_by_channel
                     .get(&info.channel_id)
@@ -8741,6 +8756,7 @@ impl Vst2PatternStreamProcessor {
                 next_loop_frame: 0,
                 pending_events: BTreeMap::new(),
                 active_notes: BTreeMap::new(),
+                live_note_keys: HashMap::new(),
                 input_buffers: (0..info.input_channels)
                     .map(|_| vec![0.0; VST2_PATTERN_QUANTUM_FRAMES])
                     .collect(),
@@ -8777,28 +8793,167 @@ impl Vst2PatternStreamProcessor {
         self.notes_scheduled
     }
 
-    fn queue_live_midi_event(
+    fn queue_live_midi_input_event(
         &mut self,
         channel_id: u16,
         frame: u64,
-        priority: u8,
-        data: [u8; 3],
+        event: Vst3LiveInputEvent,
     ) -> Result<(), String> {
         let channel = self
             .channels
             .iter_mut()
             .find(|channel| channel.info.channel_id == channel_id)
             .ok_or_else(|| format!("VST2 channel {channel_id} is not available for live input"))?;
-        if data[0] & 0xF0 == 0xB0 {
-            let midi_channel = data[0] & 0x0F;
-            if matches!(data[1], 64 | 66) {
-                self.live_sustain_controllers_used
-                    .entry(midi_channel)
+        match event {
+            Vst3LiveInputEvent::NoteOn {
+                channel: midi_channel,
+                key,
+                velocity,
+            } if velocity > 0 => {
+                let source_key = key.min(127);
+                let rendered_key = i16::from(source_key) + channel.note_pitch_offset;
+                let rendered_key = if (0..=127).contains(&rendered_key) {
+                    let rendered_key = rendered_key as u8;
+                    channel.queue_event(
+                        frame,
+                        Vst2PendingMidiEvent {
+                            priority: 0,
+                            data: [
+                                0x90 | (midi_channel & 0x0F),
+                                rendered_key,
+                                velocity.min(127),
+                            ],
+                        },
+                    );
+                    Some(rendered_key)
+                } else {
+                    None
+                };
+                channel
+                    .live_note_keys
+                    .entry((midi_channel & 0x0F, source_key))
                     .or_default()
-                    .insert(data[1]);
+                    .push_back(rendered_key);
+            }
+            Vst3LiveInputEvent::NoteOn {
+                channel: midi_channel,
+                key,
+                ..
+            }
+            | Vst3LiveInputEvent::NoteOff {
+                channel: midi_channel,
+                key,
+            } => {
+                let source_note = (midi_channel & 0x0F, key.min(127));
+                let rendered_key = channel
+                    .live_note_keys
+                    .get_mut(&source_note)
+                    .and_then(VecDeque::pop_front);
+                if channel
+                    .live_note_keys
+                    .get(&source_note)
+                    .is_some_and(VecDeque::is_empty)
+                {
+                    channel.live_note_keys.remove(&source_note);
+                }
+                if let Some(Some(rendered_key)) = rendered_key {
+                    channel.queue_event(
+                        frame,
+                        Vst2PendingMidiEvent {
+                            priority: 0,
+                            data: [0x80 | (midi_channel & 0x0F), rendered_key, 0],
+                        },
+                    );
+                }
+            }
+            Vst3LiveInputEvent::ControlChange {
+                channel: midi_channel,
+                controller,
+                value,
+            } => {
+                if matches!(controller, 120 | 123..=127) {
+                    channel
+                        .live_note_keys
+                        .retain(|(active_channel, _), _| *active_channel != (midi_channel & 0x0F));
+                }
+                let data = [
+                    0xB0 | (midi_channel & 0x0F),
+                    controller.min(127),
+                    value.min(127),
+                ];
+                if matches!(controller, 64 | 66) {
+                    self.live_sustain_controllers_used
+                        .entry(channel_id)
+                        .or_default()
+                        .entry(midi_channel & 0x0F)
+                        .or_default()
+                        .insert(controller.min(127));
+                }
+                channel.queue_event(frame, Vst2PendingMidiEvent { priority: 0, data });
+            }
+            Vst3LiveInputEvent::ProgramChange {
+                channel: midi_channel,
+                program,
+            } => channel.queue_event(
+                frame,
+                Vst2PendingMidiEvent {
+                    priority: 0,
+                    data: [0xC0 | (midi_channel & 0x0F), program.min(127), 0],
+                },
+            ),
+            Vst3LiveInputEvent::PitchBend {
+                channel: midi_channel,
+                value,
+            } => {
+                let value = value.min(16_383);
+                channel.queue_event(
+                    frame,
+                    Vst2PendingMidiEvent {
+                        priority: 0,
+                        data: [
+                            0xE0 | (midi_channel & 0x0F),
+                            (value & 0x7F) as u8,
+                            (value >> 7) as u8,
+                        ],
+                    },
+                );
+            }
+            Vst3LiveInputEvent::ChannelPressure {
+                channel: midi_channel,
+                pressure,
+            } => channel.queue_event(
+                frame,
+                Vst2PendingMidiEvent {
+                    priority: 0,
+                    data: [0xD0 | (midi_channel & 0x0F), pressure.min(127), 0],
+                },
+            ),
+            Vst3LiveInputEvent::PolyphonicPressure {
+                channel: midi_channel,
+                key,
+                pressure,
+            } => {
+                let source_note = (midi_channel & 0x0F, key.min(127));
+                if let Some(Some(rendered_key)) = channel
+                    .live_note_keys
+                    .get(&source_note)
+                    .and_then(VecDeque::front)
+                    .copied()
+                {
+                    channel.queue_event(
+                        frame,
+                        Vst2PendingMidiEvent {
+                            priority: 0,
+                            data: [
+                                0xA0 | (midi_channel & 0x0F),
+                                rendered_key,
+                                pressure.min(127),
+                            ],
+                        },
+                    );
+                }
             }
         }
-        channel.queue_event(frame, Vst2PendingMidiEvent { priority, data });
         Ok(())
     }
 
@@ -8847,6 +9002,8 @@ impl Vst2PatternStreamProcessor {
                 .cloned()
                 .unwrap_or_default();
             if let Some(summary) = channels_by_id.get(&channel.info.channel_id) {
+                channel.note_pitch_offset =
+                    summary.master_pitch_note_offset_semitones(self.settings.master_pitch_cents);
                 let (left_gain, right_gain) =
                     project_channel_stereo_output_gains_with_layer_adjustments(
                         document,
@@ -9046,11 +9203,14 @@ impl Vst2PatternStreamProcessor {
             .lock()
             .map_err(|_| "VST2 host runtime lock was poisoned".to_owned())?;
         let live_sustain_controllers = std::mem::take(&mut self.live_sustain_controllers_used);
-        for (channel_index, channel) in self.channels.iter_mut().enumerate() {
+        for channel in &mut self.channels {
             channel.pending_events.clear();
+            channel.live_note_keys.clear();
             let mut events = Vec::new();
-            if channel_index == 0 {
-                for (midi_channel, controllers) in &live_sustain_controllers {
+            if let Some(channel_sustain_controllers) =
+                live_sustain_controllers.get(&channel.info.channel_id)
+            {
+                for (midi_channel, controllers) in channel_sustain_controllers {
                     for controller in controllers {
                         events.push(Vst2AudioEvent::midi(
                             0,
@@ -10187,6 +10347,7 @@ fn stream_pattern_from_tick_with_vst3_to_device(
     } else {
         None
     };
+    let mut vst2_live_input = playback.vst2_live_input.take();
     let pattern_clap_mixer_routes = prepare_pattern_clap_mixer_routes(
         &playback.pattern_audio_layers,
         document,
@@ -10583,6 +10744,30 @@ fn stream_pattern_from_tick_with_vst3_to_device(
                     .min(SAMPLER_BLOCK_FRAMES as u64) as usize
             });
             let sample_count = frame_count * 2;
+            let mut vst2_input_disconnected = false;
+            if let Some((channel_id, receiver)) = vst2_live_input.as_mut() {
+                loop {
+                    match receiver.try_recv() {
+                        Ok(event) => {
+                            if let Some(processor) = vst2_processor.as_mut() {
+                                processor.queue_live_midi_input_event(
+                                    *channel_id,
+                                    block_start,
+                                    event,
+                                )?;
+                            }
+                        }
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => {
+                            vst2_input_disconnected = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if vst2_input_disconnected {
+                vst2_live_input = None;
+            }
             if let Some(mixer_buses) = mixer_buses.as_mut() {
                 let active_buses =
                     &mut mixer_buses[..MIXER_TRACK_METER_COUNT * sample_count * mixer_bus_planes];
@@ -11818,8 +12003,6 @@ pub fn stream_vst2_midi_input_to_device(
             },
         },
     )?;
-    let note_pitch_offset =
-        channel.master_pitch_note_offset_semitones(document.metadata().master_pitch_cents());
     let mixer_effect_buses_required = vst3_processor
         .as_ref()
         .is_some_and(Vst3PlaylistStreamProcessor::needs_mixer_insert_buses);
@@ -11832,7 +12015,6 @@ pub fn stream_vst2_midi_input_to_device(
     if let Some(processor) = vst3_processor.as_mut() {
         processor.start_processing()?;
     }
-    let mut active_note_keys = HashMap::<(u8, u8), VecDeque<Option<u8>>>::new();
     let stream_result = (|| {
         let mut block_start = 0_u64;
         loop {
@@ -11842,134 +12024,8 @@ pub fn stream_vst2_midi_input_to_device(
             let mut disconnected = false;
             loop {
                 match events.try_recv() {
-                    Ok(Vst3LiveInputEvent::NoteOn {
-                        channel: midi_channel,
-                        key,
-                        velocity,
-                    }) if velocity > 0 => {
-                        let source_key = key.min(127);
-                        let transposed_key = i16::from(source_key) + note_pitch_offset;
-                        if !(0..=127).contains(&transposed_key) {
-                            active_note_keys
-                                .entry((midi_channel & 0x0F, source_key))
-                                .or_default()
-                                .push_back(None);
-                            continue;
-                        }
-                        let rendered_key = transposed_key as u8;
-                        processor.queue_live_midi_event(
-                            channel_id,
-                            block_start,
-                            0,
-                            [
-                                0x90 | (midi_channel & 0x0F),
-                                rendered_key,
-                                velocity.min(127),
-                            ],
-                        )?;
-                        active_note_keys
-                            .entry((midi_channel & 0x0F, source_key))
-                            .or_default()
-                            .push_back(Some(rendered_key));
-                    }
-                    Ok(Vst3LiveInputEvent::NoteOn { channel, key, .. })
-                    | Ok(Vst3LiveInputEvent::NoteOff { channel, key }) => {
-                        let source_note = (channel & 0x0F, key.min(127));
-                        let rendered_key = active_note_keys
-                            .get_mut(&source_note)
-                            .and_then(VecDeque::pop_front);
-                        if active_note_keys
-                            .get(&source_note)
-                            .is_some_and(VecDeque::is_empty)
-                        {
-                            active_note_keys.remove(&source_note);
-                        }
-                        if let Some(Some(rendered_key)) = rendered_key {
-                            processor.queue_live_midi_event(
-                                channel_id,
-                                block_start,
-                                0,
-                                [0x80 | (channel & 0x0F), rendered_key, 0],
-                            )?;
-                        }
-                    }
-                    Ok(Vst3LiveInputEvent::ControlChange {
-                        channel: midi_channel,
-                        controller,
-                        value,
-                    }) => {
-                        if matches!(controller, 120 | 123..=127) {
-                            active_note_keys.retain(|(active_channel, _), _| {
-                                *active_channel != (midi_channel & 0x0F)
-                            });
-                        }
-                        processor.queue_live_midi_event(
-                            channel_id,
-                            block_start,
-                            0,
-                            [
-                                0xB0 | (midi_channel & 0x0F),
-                                controller.min(127),
-                                value.min(127),
-                            ],
-                        )?;
-                    }
-                    Ok(Vst3LiveInputEvent::ProgramChange {
-                        channel: midi_channel,
-                        program,
-                    }) => processor.queue_live_midi_event(
-                        channel_id,
-                        block_start,
-                        0,
-                        [0xC0 | (midi_channel & 0x0F), program.min(127), 0],
-                    )?,
-                    Ok(Vst3LiveInputEvent::PitchBend {
-                        channel: midi_channel,
-                        value,
-                    }) => {
-                        let value = value.min(16_383);
-                        processor.queue_live_midi_event(
-                            channel_id,
-                            block_start,
-                            0,
-                            [
-                                0xE0 | (midi_channel & 0x0F),
-                                (value & 0x7F) as u8,
-                                (value >> 7) as u8,
-                            ],
-                        )?;
-                    }
-                    Ok(Vst3LiveInputEvent::ChannelPressure {
-                        channel: midi_channel,
-                        pressure,
-                    }) => processor.queue_live_midi_event(
-                        channel_id,
-                        block_start,
-                        0,
-                        [0xD0 | (midi_channel & 0x0F), pressure.min(127), 0],
-                    )?,
-                    Ok(Vst3LiveInputEvent::PolyphonicPressure {
-                        channel: midi_channel,
-                        key,
-                        pressure,
-                    }) => {
-                        let source_note = (midi_channel & 0x0F, key.min(127));
-                        if let Some(Some(rendered_key)) = active_note_keys
-                            .get(&source_note)
-                            .and_then(VecDeque::front)
-                            .copied()
-                        {
-                            processor.queue_live_midi_event(
-                                channel_id,
-                                block_start,
-                                0,
-                                [
-                                    0xA0 | (midi_channel & 0x0F),
-                                    rendered_key,
-                                    pressure.min(127),
-                                ],
-                            )?;
-                        }
+                    Ok(event) => {
+                        processor.queue_live_midi_input_event(channel_id, block_start, event)?
                     }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
