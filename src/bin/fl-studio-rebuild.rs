@@ -19416,12 +19416,16 @@ impl DawUi {
         self.midi_script_transport_state
             .browser_tab_index
             .store(browser_tab_index as u8, Ordering::Relaxed);
-        let browser_navigation_targets =
-            if has_script && self.browser_visible && self.browser_tab == BrowserTab::Files {
-                self.midi_script_browser_navigation_targets()
-            } else {
-                Vec::new()
-            };
+        let browser_navigation_targets = if has_script
+            && self.browser_visible
+            && matches!(
+                self.browser_tab,
+                BrowserTab::Files | BrowserTab::Favorites | BrowserTab::Recent
+            ) {
+            self.midi_script_browser_navigation_targets()
+        } else {
+            Vec::new()
+        };
         if let Ok(mut targets) = self
             .midi_script_transport_state
             .browser_navigation_targets
@@ -20842,7 +20846,12 @@ impl DawUi {
     }
 
     fn queue_midi_script_browser_navigation(&mut self, direction: u8, shift_held: bool) {
-        if !self.browser_visible || self.browser_tab != BrowserTab::Files {
+        if !self.browser_visible
+            || !matches!(
+                self.browser_tab,
+                BrowserTab::Files | BrowserTab::Favorites | BrowserTab::Recent
+            )
+        {
             return;
         }
         if self.midi_script_browser_navigation.len() < 128 {
@@ -20854,16 +20863,19 @@ impl DawUi {
     }
 
     fn toggle_midi_script_browser_node(&mut self, value: i32) {
-        if !self.browser_visible || self.browser_tab != BrowserTab::Files {
+        if !self.browser_visible
+            || !matches!(self.browser_tab, BrowserTab::Files | BrowserTab::Favorites)
+        {
             return;
         }
         if let Some(selected) = self.browser_selected.clone() {
             if selected.is_dir() && matches!(value, -1 | 1) {
+                self.browser_tab = BrowserTab::Files;
                 self.set_browser_directory(selected);
             }
             return;
         }
-        if matches!(value, -1 | 0) {
+        if self.browser_tab == BrowserTab::Files && matches!(value, -1 | 0) {
             let expanded_folder = self.browser_path.clone();
             if let Some(parent) = expanded_folder.parent().map(Path::to_path_buf) {
                 self.set_browser_directory(parent);
@@ -20882,16 +20894,26 @@ impl DawUi {
     }
 
     fn select_midi_script_browser_menu_item(&mut self) {
-        if !self.browser_visible || self.browser_tab != BrowserTab::Files {
+        if !self.browser_visible
+            || !matches!(
+                self.browser_tab,
+                BrowserTab::Files | BrowserTab::Favorites | BrowserTab::Recent
+            )
+        {
             return;
         }
         if let Some(path) = self.browser_selected.clone() {
+            if path.is_dir() && self.browser_tab == BrowserTab::Favorites {
+                self.browser_tab = BrowserTab::Files;
+            }
             self.activate_browser_path(path);
         }
     }
 
     fn preview_midi_script_browser_menu_item(&mut self) {
-        if !self.browser_visible || self.browser_tab != BrowserTab::Files {
+        if !self.browser_visible
+            || !matches!(self.browser_tab, BrowserTab::Files | BrowserTab::Favorites)
+        {
             return;
         }
         if let Some(path) = self
@@ -28611,7 +28633,10 @@ impl DawUi {
             self.apply_browser_search(search);
         }
         ui.separator();
-        if self.browser_tab != BrowserTab::Files {
+        if !matches!(
+            self.browser_tab,
+            BrowserTab::Files | BrowserTab::Favorites | BrowserTab::Recent
+        ) {
             self.midi_script_browser_navigation.clear();
         }
 
@@ -29727,8 +29752,57 @@ impl DawUi {
         (entries, recursive_results)
     }
 
+    fn midi_script_browser_navigation_entries(&self) -> Vec<BrowserEntry> {
+        match self.browser_tab {
+            BrowserTab::Files => self.visible_browser_file_entries().0,
+            BrowserTab::Favorites => {
+                let query = self.browser_search.to_lowercase();
+                self.browser_favorites
+                    .iter()
+                    .filter(|path| {
+                        browser_tag_selection_matches(
+                            self.browser_tag_logic,
+                            &self.browser_selected_tags,
+                            self.browser_tags.get(*path),
+                        ) && (query.is_empty()
+                            || path.to_string_lossy().to_lowercase().contains(&query)
+                            || self.browser_tags.get(*path).is_some_and(|tags| {
+                                tags.iter().any(|tag| tag.to_lowercase().contains(&query))
+                            }))
+                    })
+                    .map(|path| BrowserEntry {
+                        path: path.clone(),
+                        name: path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| path.display().to_string()),
+                        is_directory: path.is_dir(),
+                    })
+                    .collect()
+            }
+            BrowserTab::Recent => {
+                let query = self.browser_search.to_lowercase();
+                self.browser_recent_projects
+                    .iter()
+                    .filter(|path| {
+                        query.is_empty() || path.to_string_lossy().to_lowercase().contains(&query)
+                    })
+                    .map(|path| BrowserEntry {
+                        path: path.clone(),
+                        name: path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| path.display().to_string()),
+                        is_directory: path.is_dir(),
+                    })
+                    .collect()
+            }
+            BrowserTab::CurrentProject | BrowserTab::Plugins => Vec::new(),
+        }
+    }
+
     fn midi_script_browser_navigation_targets(&self) -> Vec<(String, bool, i32)> {
-        let (entries, _) = self.visible_browser_file_entries();
+        let entries = self.midi_script_browser_navigation_entries();
         let selected_index = self
             .browser_selected
             .as_ref()
@@ -29763,25 +29837,28 @@ impl DawUi {
                 })
                 .unwrap_or_default()
         };
-        let parent = self
-            .browser_path
-            .parent()
-            .and_then(Path::file_name)
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let parent_is_directory = !parent.is_empty();
-        let parent_type = if parent_is_directory { -100 } else { -1 };
+        let (parent, parent_is_directory, parent_type) = if self.browser_tab == BrowserTab::Files {
+            let parent = self
+                .browser_path
+                .parent()
+                .and_then(Path::file_name)
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let parent_is_directory = !parent.is_empty();
+            let parent_type = if parent_is_directory { -100 } else { -1 };
+            (parent, parent_is_directory, parent_type)
+        } else {
+            (String::new(), false, -1)
+        };
         let selected = self
             .browser_selected
             .as_ref()
-            .map(|selected| {
+            .and_then(|selected| entries.iter().find(|entry| &entry.path == selected))
+            .map(|entry| {
                 (
-                    selected
-                        .file_name()
-                        .map(|name| name.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| selected.display().to_string()),
-                    selected.is_dir(),
-                    midi_script_browser_node_type(selected),
+                    entry.name.clone(),
+                    entry.is_directory,
+                    midi_script_browser_node_type(&entry.path),
                 )
             })
             .unwrap_or_default();
@@ -30453,6 +30530,38 @@ impl DawUi {
             })
             .cloned()
             .collect::<Vec<_>>();
+        if let Some((direction, shift_held)) = self.midi_script_browser_navigation.pop_front() {
+            let selected_index = self
+                .browser_selected
+                .as_ref()
+                .and_then(|selected| favorites.iter().position(|path| path == selected));
+            let navigated_path = match direction {
+                0 if !favorites.is_empty() => selected_index
+                    .map(|index| index.saturating_sub(1))
+                    .or_else(|| Some(favorites.len() - 1))
+                    .and_then(|index| favorites.get(index)),
+                1 if !favorites.is_empty() => selected_index
+                    .map(|index| (index + 1).min(favorites.len() - 1))
+                    .or(Some(0))
+                    .and_then(|index| favorites.get(index)),
+                3 => self
+                    .browser_selected
+                    .as_ref()
+                    .filter(|path| path.is_dir())
+                    .and_then(|selected| favorites.iter().find(|path| *path == selected)),
+                _ => None,
+            }
+            .cloned();
+            if let Some(path) = navigated_path {
+                self.browser_selected = Some(path.clone());
+                if path.is_dir() && (direction == 3 || shift_held) {
+                    self.browser_tab = BrowserTab::Files;
+                    self.set_browser_directory(path);
+                    ui.ctx().request_repaint();
+                    return;
+                }
+            }
+        }
         let bulk_tag_paths = favorites.clone();
         let mut edit_filtered_tags = false;
         ui.horizontal_wrapped(|ui| {
@@ -30625,6 +30734,27 @@ impl DawUi {
             })
             .cloned()
             .collect::<Vec<_>>();
+        if let Some((direction, _)) = self.midi_script_browser_navigation.pop_front() {
+            let selected_index = self
+                .browser_selected
+                .as_ref()
+                .and_then(|selected| recent.iter().position(|path| path == selected));
+            let navigated_path = match direction {
+                0 if !recent.is_empty() => selected_index
+                    .map(|index| index.saturating_sub(1))
+                    .or_else(|| Some(recent.len() - 1))
+                    .and_then(|index| recent.get(index)),
+                1 if !recent.is_empty() => selected_index
+                    .map(|index| (index + 1).min(recent.len() - 1))
+                    .or(Some(0))
+                    .and_then(|index| recent.get(index)),
+                _ => None,
+            }
+            .cloned();
+            if let Some(path) = navigated_path {
+                self.browser_selected = Some(path);
+            }
+        }
         if recent.is_empty() {
             ui.label(egui::RichText::new("No recent projects").color(MUTED));
         }
@@ -30638,8 +30768,14 @@ impl DawUi {
                         .map(|name| name.to_string_lossy().into_owned())
                         .unwrap_or_else(|| path.display().to_string());
                     let response = ui
-                        .selectable_label(false, format!("◷ {name}"))
+                        .selectable_label(
+                            self.browser_selected.as_ref() == Some(&path),
+                            format!("◷ {name}"),
+                        )
                         .on_hover_text(path.display().to_string());
+                    if response.clicked() {
+                        self.browser_selected = Some(path.clone());
+                    }
                     if response.double_clicked() {
                         activate = Some(path);
                     }
