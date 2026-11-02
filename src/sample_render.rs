@@ -1164,6 +1164,10 @@ pub struct Vst2LiveInputPlayback {
     pub source_channel_id: u16,
     pub target_channel_ids: BTreeSet<u16>,
     pub transport_playing: bool,
+    pub arrangement_id: u16,
+    pub soloed_playlist_track_range: Option<(u32, u32)>,
+    /// Native Automation Clip curves keyed by (automation channel, VST2 channel).
+    pub vst2_channel_automation_clips: BTreeMap<(u16, u16), Vec<Vst3ParameterAutomation>>,
     pub start_frame: u64,
     pub tempo_map: Option<PlaylistTempoMap>,
     pub cycle_frames: Option<(u64, u64)>,
@@ -9416,10 +9420,20 @@ impl Vst2PatternStreamProcessor {
             let mut subblock_start = block_start;
             let mut layer_frame_offset = 0usize;
             while subblock_start < block_end {
-                let subblock_frames =
+                let mut subblock_frames =
                     (block_end - subblock_start).min(VST2_PATTERN_QUANTUM_FRAMES as u64) as usize;
+                if let Some(frames_until_cycle_boundary) =
+                    settings.frames_until_cycle_boundary(subblock_start)
+                {
+                    subblock_frames = subblock_frames.min(
+                        usize::try_from(frames_until_cycle_boundary)
+                            .unwrap_or(usize::MAX)
+                            .max(1),
+                    );
+                }
                 let subblock_end = subblock_start + subblock_frames as u64;
-                let mut events = channel.parameter_events(subblock_start, subblock_frames)?;
+                let automation_frame = settings.automation_frame_at(subblock_start);
+                let mut events = channel.parameter_events(automation_frame, subblock_frames)?;
                 events.extend(channel.take_events(subblock_start, subblock_end)?);
                 events.sort_by_key(|event| event.sample_offset);
                 if events.len() > VST2_MAX_EVENTS {
@@ -9802,6 +9816,32 @@ impl Vst2PatternChannelStream {
 }
 
 impl Vst2PatternStreamSettings {
+    fn automation_frame_at(&self, frame: u64) -> u64 {
+        let Some((start, end)) = self
+            .transport_cycle_frames
+            .filter(|(start, end)| end > start)
+        else {
+            return frame;
+        };
+        if frame < end {
+            frame
+        } else {
+            start + (frame - end) % (end - start)
+        }
+    }
+
+    fn frames_until_cycle_boundary(&self, frame: u64) -> Option<u64> {
+        let (start, end) = self
+            .transport_cycle_frames
+            .filter(|(start, end)| end > start)?;
+        Some(if frame < end {
+            end - frame
+        } else {
+            let cycle_length = end - start;
+            cycle_length - (frame - end) % cycle_length
+        })
+    }
+
     fn transport_at(&self, frame: u64) -> Vst2Transport {
         let active_cycle = self
             .transport_cycle_frames
@@ -13123,6 +13163,9 @@ pub fn stream_vst2_midi_input_to_device(
         source_channel_id,
         target_channel_ids,
         transport_playing,
+        arrangement_id,
+        soloed_playlist_track_range,
+        vst2_channel_automation_clips,
         start_frame,
         tempo_map,
         cycle_frames,
@@ -13184,13 +13227,28 @@ pub fn stream_vst2_midi_input_to_device(
     }
     let loop_frames =
         ticks_to_frames(u64::from(ppq) * 4, ppq, tempo_bpm, channel_info.sample_rate)?.max(1);
+    let channel_parameter_automation = if transport_playing {
+        expand_playlist_parameter_automation(
+            &document,
+            PlaylistRenderOptions {
+                arrangement_id,
+                sample_rate: channel_info.sample_rate,
+                soloed_playlist_track_range,
+                ..PlaylistRenderOptions::default()
+            },
+            &BTreeMap::new(),
+            &vst2_channel_automation_clips,
+        )?
+    } else {
+        BTreeMap::new()
+    };
     let mut processor = Vst2PatternStreamProcessor::new(
         Arc::clone(&runtime),
         Vst2PatternStreamSetup {
             document: &document,
             pattern_notes: &[],
             channel_infos: &channel_infos,
-            channel_parameter_automation: BTreeMap::new(),
+            channel_parameter_automation,
             external_channel_ids: &target_channel_ids,
             volume_expression_channels: &BTreeSet::new(),
             meters: None,

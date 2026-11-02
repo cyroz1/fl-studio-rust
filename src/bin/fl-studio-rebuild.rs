@@ -74262,6 +74262,10 @@ impl DawUi {
             }
         }
         let automation_sources = self.vst3_playlist_automation_sources(&preparation_document);
+        let vst2_channel_automation_clips =
+            automation_sources.vst2_channel_automation_clips.clone();
+        let automation_arrangement_id = options.arrangement_id;
+        let automation_soloed_track_range = options.soloed_playlist_track_range;
         let can_prepare_mixer_effects = if transport_playing {
             self.has_external_mixer_effect_processing()
                 && self.channel_vst3_instances.is_empty()
@@ -74327,6 +74331,9 @@ impl DawUi {
                         source_channel_id: channel_id,
                         target_channel_ids: worker_target_channel_ids,
                         transport_playing,
+                        arrangement_id: automation_arrangement_id,
+                        soloed_playlist_track_range: automation_soloed_track_range,
+                        vst2_channel_automation_clips,
                         start_frame,
                         tempo_map: worker_transport_tempo_map,
                         cycle_frames: worker_transport_cycle_frames,
