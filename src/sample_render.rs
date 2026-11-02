@@ -39,7 +39,7 @@ use crate::vst2::{Vst2HostRuntime, Vst2HostedChannelInfo};
 use crate::vst3::{
     MAX_PDC_DELAY_BYTES, PlaylistMidiNote, Vst3LatencyReport, Vst3ParameterAutomation,
     Vst3PlaylistAutomationPoint, Vst3PlaylistParameterAutomation, Vst3PlaylistStreamProcessor,
-    expand_pattern_parameter_automation_for_clip,
+    expand_pattern_parameter_automation_for_clip, expand_playlist_parameter_automation,
 };
 use crate::{
     Arrangement, ChannelNoteRouter, ChannelStretchMode, ChannelSummary, FlpDocument,
@@ -1455,7 +1455,7 @@ impl WavChannelMode {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PlaylistRenderOptions {
     pub arrangement_id: u16,
     pub sample_rate: u32,
@@ -1484,6 +1484,8 @@ pub struct PlaylistRenderOptions {
     pub clap_audio_layers: Arc<Vec<PlaylistAudioLayer>>,
     /// Assigned CLAP channels, available before their Playlist audio is rendered.
     pub clap_audio_channel_ids: Arc<BTreeSet<u16>>,
+    /// Native FLP Automation Clips linked to loaded VST2 instrument parameters.
+    pub vst2_channel_automation_clips: Arc<BTreeMap<(u16, u16), Vec<Vst3ParameterAutomation>>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -2428,6 +2430,7 @@ impl Default for PlaylistRenderOptions {
             clip_envelopes: Arc::new(Vec::new()),
             clap_audio_layers: Arc::new(Vec::new()),
             clap_audio_channel_ids: Arc::new(BTreeSet::new()),
+            vst2_channel_automation_clips: Arc::new(BTreeMap::new()),
         }
     }
 }
@@ -8907,6 +8910,7 @@ struct Vst2PatternStreamSetup<'a> {
     document: &'a FlpDocument,
     pattern_notes: &'a [PatternNote],
     channel_infos: &'a [Vst2HostedChannelInfo],
+    channel_parameter_automation: BTreeMap<u16, Vec<Vst3PlaylistParameterAutomation>>,
     external_channel_ids: &'a BTreeSet<u16>,
     volume_expression_channels: &'a BTreeSet<u16>,
     meters: Option<&'a MixerTrackPeakMeters>,
@@ -8943,11 +8947,25 @@ struct Vst2PendingMidiEvent {
     data: [u8; 3],
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Vst2ScheduledParameterPoint {
+    frame: u64,
+    value: f64,
+    tension: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct Vst2ParameterAutomationLane {
+    parameter_id: u32,
+    points: Vec<Vst2ScheduledParameterPoint>,
+}
+
 struct Vst2PatternChannelStream {
     info: Vst2HostedChannelInfo,
     layer_index: usize,
     note_pitch_offset: i16,
     note_events: Vec<Vst2PatternNoteEvent>,
+    parameter_automation: Vec<Vst2ParameterAutomationLane>,
     next_loop_frame: u64,
     pending_events: BTreeMap<u64, Vec<Vst2PendingMidiEvent>>,
     active_notes: BTreeMap<(u8, u8), usize>,
@@ -9004,6 +9022,7 @@ impl Vst2PatternStreamProcessor {
             external_channel_ids,
             volume_expression_channels,
             meters,
+            mut channel_parameter_automation,
             settings,
             ..
         } = setup;
@@ -9049,6 +9068,12 @@ impl Vst2PatternStreamProcessor {
                     .get(&info.channel_id)
                     .cloned()
                     .unwrap_or_default(),
+                parameter_automation: prepare_vst2_parameter_automation(
+                    &channel_parameter_automation
+                        .remove(&info.channel_id)
+                        .unwrap_or_default(),
+                    &settings,
+                )?,
                 next_loop_frame: 0,
                 pending_events: BTreeMap::new(),
                 active_notes: BTreeMap::new(),
@@ -9394,7 +9419,16 @@ impl Vst2PatternStreamProcessor {
                 let subblock_frames =
                     (block_end - subblock_start).min(VST2_PATTERN_QUANTUM_FRAMES as u64) as usize;
                 let subblock_end = subblock_start + subblock_frames as u64;
-                let events = channel.take_events(subblock_start, subblock_end)?;
+                let mut events = channel.parameter_events(subblock_start, subblock_frames)?;
+                events.extend(channel.take_events(subblock_start, subblock_end)?);
+                events.sort_by_key(|event| event.sample_offset);
+                if events.len() > VST2_MAX_EVENTS {
+                    return Err(format!(
+                        "VST2 channel {} needs {} Pattern MIDI/parameter events in one block; the worker limit is {VST2_MAX_EVENTS}",
+                        channel.info.channel_id,
+                        events.len()
+                    ));
+                }
                 for buffer in &mut channel.input_buffers {
                     buffer[..subblock_frames].fill(0.0);
                 }
@@ -9424,7 +9458,7 @@ impl Vst2PatternStreamProcessor {
                 drop(output_slices);
                 if report.events_dropped > 0 {
                     return Err(format!(
-                        "VST2 channel {} dropped {} Pattern MIDI event(s)",
+                        "VST2 channel {} dropped {} Pattern MIDI/parameter event(s)",
                         channel.info.channel_id, report.events_dropped
                     ));
                 }
@@ -9584,6 +9618,68 @@ impl Vst2PatternStreamProcessor {
 impl Vst2PatternChannelStream {
     fn queue_event(&mut self, frame: u64, event: Vst2PendingMidiEvent) {
         self.pending_events.entry(frame).or_default().push(event);
+    }
+
+    fn parameter_events(
+        &self,
+        block_start_frame: u64,
+        frame_count: usize,
+    ) -> Result<Vec<Vst2AudioEvent>, String> {
+        if frame_count == 0 || self.parameter_automation.is_empty() {
+            return Ok(Vec::new());
+        }
+        let block_end_frame = block_start_frame
+            .checked_add(
+                u64::try_from(frame_count)
+                    .map_err(|_| "VST2 parameter block size overflow".to_owned())?,
+            )
+            .ok_or_else(|| "VST2 parameter block end overflow".to_owned())?;
+        let mut events = Vec::new();
+        for lane in &self.parameter_automation {
+            if let Some(value) =
+                vst2_parameter_automation_value_at_frame(&lane.points, block_start_frame)
+            {
+                events.push(Vst2AudioEvent {
+                    sample_offset: 0,
+                    bus: 0,
+                    data: vst_audio::EventData::Parameter {
+                        id: lane.parameter_id,
+                        value,
+                    },
+                });
+                if events.len() > VST2_MAX_EVENTS {
+                    return Err(format!(
+                        "VST2 channel {} exceeds the worker limit of {VST2_MAX_EVENTS} parameter changes in one block",
+                        self.info.channel_id
+                    ));
+                }
+            }
+            let first_in_block = lane
+                .points
+                .partition_point(|point| point.frame <= block_start_frame);
+            for point in &lane.points[first_in_block..] {
+                if point.frame >= block_end_frame {
+                    break;
+                }
+                let sample_offset = u32::try_from(point.frame - block_start_frame)
+                    .map_err(|_| "VST2 parameter event offset exceeds the host range".to_owned())?;
+                events.push(Vst2AudioEvent {
+                    sample_offset,
+                    bus: 0,
+                    data: vst_audio::EventData::Parameter {
+                        id: lane.parameter_id,
+                        value: point.value,
+                    },
+                });
+                if events.len() > VST2_MAX_EVENTS {
+                    return Err(format!(
+                        "VST2 channel {} exceeds the worker limit of {VST2_MAX_EVENTS} parameter changes in one block",
+                        self.info.channel_id
+                    ));
+                }
+            }
+        }
+        Ok(events)
     }
 
     fn schedule_one_shot(&mut self, minimum_frame: u64) {
@@ -9768,6 +9864,85 @@ impl Vst2PatternStreamSettings {
             ..Vst2Transport::default()
         }
     }
+}
+
+fn prepare_vst2_parameter_automation(
+    automation: &[Vst3PlaylistParameterAutomation],
+    settings: &Vst2PatternStreamSettings,
+) -> Result<Vec<Vst2ParameterAutomationLane>, String> {
+    if automation.is_empty() {
+        return Ok(Vec::new());
+    }
+    let tempo_map = settings.transport_tempo_map.as_ref().ok_or_else(|| {
+        "VST2 Playlist parameter automation requires the arrangement tempo map".to_owned()
+    })?;
+    let mut parameter_ids = BTreeSet::new();
+    let mut prepared = Vec::with_capacity(automation.len());
+    for lane in automation {
+        if !parameter_ids.insert(lane.parameter_id) {
+            return Err(format!(
+                "VST2 parameter {} has more than one native Playlist automation lane",
+                lane.parameter_id
+            ));
+        }
+        let mut points = Vec::with_capacity(lane.points.len());
+        for point in &lane.points {
+            if !point.value.is_finite() || !(0.0..=1.0).contains(&point.value) {
+                return Err(
+                    "VST2 Playlist automation values must be finite and normalized to 0..=1"
+                        .to_owned(),
+                );
+            }
+            points.push(Vst2ScheduledParameterPoint {
+                frame: tempo_map.frame_at_tick(point.tick, settings.sample_rate)?,
+                value: point.value,
+                tension: point.tension,
+            });
+        }
+        points.sort_by_key(|point| point.frame);
+        let mut unique_points: Vec<Vst2ScheduledParameterPoint> = Vec::with_capacity(points.len());
+        for point in points {
+            if let Some(previous) = unique_points.last_mut()
+                && previous.frame == point.frame
+            {
+                previous.value = point.value;
+                previous.tension = point.tension;
+            } else {
+                unique_points.push(point);
+            }
+        }
+        if !unique_points.is_empty() {
+            prepared.push(Vst2ParameterAutomationLane {
+                parameter_id: lane.parameter_id,
+                points: unique_points,
+            });
+        }
+    }
+    Ok(prepared)
+}
+
+fn vst2_parameter_automation_value_at_frame(
+    points: &[Vst2ScheduledParameterPoint],
+    frame: u64,
+) -> Option<f64> {
+    let previous_index = points
+        .partition_point(|point| point.frame <= frame)
+        .checked_sub(1)?;
+    let previous = points.get(previous_index)?;
+    if previous.frame == frame {
+        return Some(previous.value);
+    }
+    let next = points.get(previous_index + 1)?;
+    let duration = next.frame.checked_sub(previous.frame)?;
+    if duration == 0 {
+        return Some(next.value);
+    }
+    Some(crate::automation_segment_value_with_tension(
+        previous.value,
+        next.value,
+        (frame - previous.frame) as f64 / duration as f64,
+        next.tension,
+    ))
 }
 
 fn build_vst2_pattern_note_events(
@@ -10097,6 +10272,12 @@ fn prepare_vst2_playlist_processor(
     if note_plan.notes_scheduled == 0 {
         return Ok(None);
     }
+    let channel_parameter_automation = expand_playlist_parameter_automation(
+        document,
+        options.clone(),
+        &BTreeMap::new(),
+        options.vst2_channel_automation_clips.as_ref(),
+    )?;
     let used_channel_ids = note_plan
         .events_by_channel
         .keys()
@@ -10152,6 +10333,7 @@ fn prepare_vst2_playlist_processor(
             document,
             pattern_notes: &[],
             channel_infos: &used_channel_infos,
+            channel_parameter_automation,
             external_channel_ids: &external_channel_ids,
             volume_expression_channels: &volume_expression_channels,
             meters: None,
@@ -10935,6 +11117,7 @@ fn stream_pattern_from_tick_with_vst3_to_device(
                 document,
                 pattern_notes: &pattern.notes,
                 channel_infos: &vst2_channel_infos,
+                channel_parameter_automation: BTreeMap::new(),
                 external_channel_ids: &clap_pattern_channels,
                 volume_expression_channels: &vst3_volume_expression_channels,
                 meters: live_master_meters,
@@ -12292,6 +12475,7 @@ pub fn stream_mixed_layer_midi_input_to_device(
                     document: &document,
                     pattern_notes: &[],
                     channel_infos: &vst2_channel_infos,
+                    channel_parameter_automation: BTreeMap::new(),
                     external_channel_ids: &config.vst2_target_channel_ids,
                     volume_expression_channels: &BTreeSet::new(),
                     meters: None,
@@ -13006,6 +13190,7 @@ pub fn stream_vst2_midi_input_to_device(
             document: &document,
             pattern_notes: &[],
             channel_infos: &channel_infos,
+            channel_parameter_automation: BTreeMap::new(),
             external_channel_ids: &target_channel_ids,
             volume_expression_channels: &BTreeSet::new(),
             meters: None,
@@ -26790,6 +26975,7 @@ mod tests {
                     clip_envelopes: Arc::new(Vec::new()),
                     clap_audio_layers: Arc::new(Vec::new()),
                     clap_audio_channel_ids: Arc::new(BTreeSet::new()),
+                    vst2_channel_automation_clips: Arc::new(BTreeMap::new()),
                 },
                 frames: 2,
                 master_output: MixerMasterOutput::default(),

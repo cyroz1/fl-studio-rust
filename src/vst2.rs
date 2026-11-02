@@ -548,10 +548,8 @@ impl Vst2HostRuntime {
         &mut self,
         key: (usize, u16),
     ) -> Result<Vec<Vst2MixerEffectParameter>, String> {
-        const PAGE_SIZE: u16 = 32;
-        const MAX_PARAMETERS: u32 = 65_536;
-        const TIMEOUT: Duration = Duration::from_secs(5);
-
+        let pending_requests = &mut self.pending_mixer_editor_requests;
+        let pending_failures = &mut self.pending_mixer_editor_failures;
         let effect = self.mixer_effects.get(&key).ok_or_else(|| {
             format!(
                 "VST2 Mixer insert {} effect slot {} is not loaded",
@@ -559,115 +557,51 @@ impl Vst2HostRuntime {
                 key.1 + 1
             )
         })?;
-        let mut start = 0_u32;
-        let mut request = effect
-            .instance
-            .controller()
-            .request(Command::ListParameters {
-                start,
-                count: PAGE_SIZE,
-            })
-            .map_err(|error| format!("could not request VST2 Mixer parameters: {error}"))?;
-        let deadline = Instant::now() + TIMEOUT;
-        let mut parameters = Vec::new();
-        let mut total = None;
-        loop {
-            if Instant::now() >= deadline {
-                return Err(format!(
-                    "VST2 Mixer effect {} parameter query timed out",
-                    effect.fourcc
-                ));
-            }
-            let Some(event) = effect.instance.try_next_event() else {
-                thread::sleep(Duration::from_millis(10));
-                continue;
-            };
-            match event {
-                HostEvent::Parameters {
-                    request: completed_request,
-                    total: reported_total,
-                    entries,
-                } if completed_request == request => {
-                    if total.is_some_and(|expected| expected != reported_total)
-                        || reported_total > MAX_PARAMETERS
-                    {
-                        return Err(format!(
-                            "VST2 Mixer effect {} reported an unsupported parameter count",
-                            effect.fourcc
-                        ));
+        read_vst2_parameters(
+            &effect.instance,
+            &effect.fourcc,
+            "Mixer effect",
+            |event| match event {
+                HostEvent::Completed { request } => {
+                    pending_requests.remove(&request);
+                }
+                HostEvent::RequestFailed { request, reason } => {
+                    if let Some((insert, slot)) = pending_requests.remove(&request) {
+                        pending_failures.push((insert, slot, reason));
                     }
-                    total = Some(reported_total);
-                    let received = u32::try_from(entries.len()).unwrap_or(u32::MAX);
-                    parameters.extend(entries.into_iter().map(|parameter| {
-                        Vst2MixerEffectParameter {
-                            id: parameter.id,
-                            name: parameter.name,
-                            unit: parameter.unit,
-                            value: parameter.value,
-                            automatable: parameter.automatable,
-                            read_only: parameter.read_only,
-                        }
-                    }));
-                    start = start.saturating_add(received);
-                    let total = total.unwrap_or_default();
-                    if start >= total || received == 0 {
-                        return Ok(parameters);
-                    }
-                    request = effect
-                        .instance
-                        .controller()
-                        .request(Command::ListParameters {
-                            start,
-                            count: PAGE_SIZE,
-                        })
-                        .map_err(|error| {
-                            format!("could not request VST2 Mixer parameters: {error}")
-                        })?;
-                }
-                HostEvent::RequestFailed {
-                    request: failed_request,
-                    reason,
-                } if failed_request == request => {
-                    return Err(format!(
-                        "VST2 Mixer effect {} parameter query failed: {reason}",
-                        effect.fourcc
-                    ));
-                }
-                HostEvent::Completed {
-                    request: completed_request,
-                } => {
-                    self.pending_mixer_editor_requests
-                        .remove(&completed_request);
-                }
-                HostEvent::RequestFailed {
-                    request: failed_request,
-                    reason,
-                } => {
-                    if let Some((insert_ordinal, slot_index)) =
-                        self.pending_mixer_editor_requests.remove(&failed_request)
-                    {
-                        self.pending_mixer_editor_failures.push((
-                            insert_ordinal,
-                            slot_index,
-                            reason,
-                        ));
-                    }
-                }
-                HostEvent::Failed { reason } => {
-                    return Err(format!(
-                        "VST2 Mixer effect {} worker failed: {reason}",
-                        effect.fourcc
-                    ));
-                }
-                HostEvent::RecoveryRequired | HostEvent::Stopped => {
-                    return Err(format!(
-                        "VST2 Mixer effect {} worker stopped during parameter query",
-                        effect.fourcc
-                    ));
                 }
                 _ => {}
-            }
-        }
+            },
+        )
+    }
+
+    /// Read a bounded snapshot of the parameters exposed by one loaded Channel Rack plug-in.
+    pub fn channel_parameters(
+        &mut self,
+        channel_id: u16,
+    ) -> Result<Vec<Vst2MixerEffectParameter>, String> {
+        let pending_requests = &mut self.pending_editor_requests;
+        let pending_failures = &mut self.pending_editor_failures;
+        let channel = self
+            .channels
+            .get(&channel_id)
+            .ok_or_else(|| format!("VST2 channel {channel_id} is not loaded"))?;
+        read_vst2_parameters(
+            &channel.instance,
+            &channel.info.fourcc,
+            "channel",
+            |event| match event {
+                HostEvent::Completed { request } => {
+                    pending_requests.remove(&(channel_id, request));
+                }
+                HostEvent::RequestFailed { request, reason }
+                    if pending_requests.remove(&(channel_id, request)) =>
+                {
+                    pending_failures.push((channel_id, reason));
+                }
+                _ => {}
+            },
+        )
     }
 
     /// Request the native editor for one loaded VST2 Mixer effect.
@@ -944,6 +878,102 @@ impl Vst2HostRuntime {
         self.pending_editor_requests
             .retain(|(pending_channel_id, _)| *pending_channel_id != channel_id);
         self.channels.remove(&channel_id).is_some()
+    }
+}
+
+fn read_vst2_parameters(
+    instance: &Instance,
+    identity: &str,
+    plugin_kind: &str,
+    mut handle_unrelated_event: impl FnMut(HostEvent),
+) -> Result<Vec<Vst2MixerEffectParameter>, String> {
+    const PAGE_SIZE: u16 = 32;
+    const MAX_PARAMETERS: u32 = 65_536;
+    const TIMEOUT: Duration = Duration::from_secs(5);
+
+    let mut start = 0_u32;
+    let mut request = instance
+        .controller()
+        .request(Command::ListParameters {
+            start,
+            count: PAGE_SIZE,
+        })
+        .map_err(|error| format!("could not request VST2 {plugin_kind} parameters: {error}"))?;
+    let deadline = Instant::now() + TIMEOUT;
+    let mut parameters = Vec::new();
+    let mut total = None;
+    loop {
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "VST2 {plugin_kind} {identity} parameter query timed out"
+            ));
+        }
+        let Some(event) = instance.try_next_event() else {
+            thread::sleep(Duration::from_millis(10));
+            continue;
+        };
+        match event {
+            HostEvent::Parameters {
+                request: completed_request,
+                total: reported_total,
+                entries,
+            } if completed_request == request => {
+                if total.is_some_and(|expected| expected != reported_total)
+                    || reported_total > MAX_PARAMETERS
+                {
+                    return Err(format!(
+                        "VST2 {plugin_kind} {identity} reported an unsupported parameter count"
+                    ));
+                }
+                total = Some(reported_total);
+                let received = u32::try_from(entries.len()).unwrap_or(u32::MAX);
+                parameters.extend(
+                    entries
+                        .into_iter()
+                        .map(|parameter| Vst2MixerEffectParameter {
+                            id: parameter.id,
+                            name: parameter.name,
+                            unit: parameter.unit,
+                            value: parameter.value,
+                            automatable: parameter.automatable,
+                            read_only: parameter.read_only,
+                        }),
+                );
+                start = start.saturating_add(received);
+                let total = total.unwrap_or_default();
+                if start >= total || received == 0 {
+                    return Ok(parameters);
+                }
+                request = instance
+                    .controller()
+                    .request(Command::ListParameters {
+                        start,
+                        count: PAGE_SIZE,
+                    })
+                    .map_err(|error| {
+                        format!("could not request VST2 {plugin_kind} parameters: {error}")
+                    })?;
+            }
+            HostEvent::RequestFailed {
+                request: failed_request,
+                reason,
+            } if failed_request == request => {
+                return Err(format!(
+                    "VST2 {plugin_kind} {identity} parameter query failed: {reason}"
+                ));
+            }
+            HostEvent::Failed { reason } => {
+                return Err(format!(
+                    "VST2 {plugin_kind} {identity} worker failed: {reason}"
+                ));
+            }
+            HostEvent::RecoveryRequired | HostEvent::Stopped => {
+                return Err(format!(
+                    "VST2 {plugin_kind} {identity} worker stopped during parameter query"
+                ));
+            }
+            event => handle_unrelated_event(event),
+        }
     }
 }
 

@@ -5948,6 +5948,7 @@ struct DawUi {
     vst3_manual_latency_offset_keys: BTreeMap<u64, String>,
     vst3_manual_latency_offset_labels: BTreeMap<u64, String>,
     channel_vst3_instances: BTreeMap<u16, u64>,
+    vst2_channel_parameter_snapshots: BTreeMap<u16, Vst2ChannelParameterSnapshot>,
     mixer_effect_vst3_instances: BTreeMap<(usize, u16), u64>,
     vst2_mixer_effect_assignments: BTreeMap<(usize, u16), Vst2ProjectMixerEffectAssignment>,
     vst2_mixer_effect_parameter_snapshots: BTreeMap<(usize, u16), Vst2MixerEffectParameterSnapshot>,
@@ -7540,6 +7541,12 @@ struct PlaylistVst2MixerEffectLfoParameterLink {
 }
 
 struct Vst2MixerEffectParameterSnapshot {
+    plugin_path: PathBuf,
+    fourcc: String,
+    parameters: Vec<Vst2MixerEffectParameter>,
+}
+
+struct Vst2ChannelParameterSnapshot {
     plugin_path: PathBuf,
     fourcc: String,
     parameters: Vec<Vst2MixerEffectParameter>,
@@ -9519,6 +9526,7 @@ impl DawUi {
             vst3_manual_latency_offset_keys: BTreeMap::new(),
             vst3_manual_latency_offset_labels: BTreeMap::new(),
             channel_vst3_instances: BTreeMap::new(),
+            vst2_channel_parameter_snapshots: BTreeMap::new(),
             mixer_effect_vst3_instances: BTreeMap::new(),
             vst2_mixer_effect_assignments: BTreeMap::new(),
             vst2_mixer_effect_parameter_snapshots: BTreeMap::new(),
@@ -11773,10 +11781,51 @@ impl DawUi {
                 continue;
             }
             let target = if let Some(channel_id) = link.candidate_channel_target_id() {
-                self.channel_vst3_instances
-                    .get(&channel_id)
-                    .copied()
-                    .map(|instance_id| (instance_id, Some(channel_id), None))
+                if let Some(instance_id) = self.channel_vst3_instances.get(&channel_id).copied() {
+                    Some((instance_id, Some(channel_id), None))
+                } else {
+                    let Some(snapshot) = self.vst2_channel_parameter_snapshots.get(&channel_id)
+                    else {
+                        continue;
+                    };
+                    let state = document
+                        .channel_plugin_states()
+                        .into_iter()
+                        .find(|state| state.channel_id() == channel_id);
+                    let Some(metadata) = state.as_ref().and_then(|state| state.vst_metadata())
+                    else {
+                        continue;
+                    };
+                    let installed_identity_matches =
+                        self.plugin_candidates.iter().any(|candidate| {
+                            candidate.path == snapshot.plugin_path
+                                && vst2_candidate_match_rank(candidate, metadata).is_some()
+                        });
+                    if metadata.fourcc() != Some(snapshot.fourcc.as_str())
+                        || !installed_identity_matches
+                        || !snapshot.parameters.iter().any(|parameter| {
+                            parameter.id == parameter_id
+                                && parameter.automatable
+                                && !parameter.read_only
+                        })
+                    {
+                        continue;
+                    }
+                    let lanes = sources
+                        .vst2_channel_automation_clips
+                        .entry((link.source_channel_id(), channel_id))
+                        .or_default();
+                    if !lanes
+                        .iter()
+                        .any(|existing| existing.parameter_id == parameter_id)
+                    {
+                        lanes.push(Vst3ParameterAutomation {
+                            parameter_id,
+                            points,
+                        });
+                    }
+                    continue;
+                }
             } else if let Some((insert, slot)) = link.candidate_mixer_effect_target() {
                 let effect_target = (usize::from(insert), slot);
                 self.mixer_effect_vst3_instances
@@ -13168,7 +13217,19 @@ impl DawUi {
 
     fn load_project_vst2_plugins(&mut self) -> Option<String> {
         self.vst2_host = None;
+        self.vst2_channel_parameter_snapshots.clear();
         let document = self.document.as_ref()?;
+        let native_automation_channel_targets = document
+            .automation_target_links()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|link| {
+                let destination_raw = link.destination_raw() as u16;
+                (destination_raw & 0xc000 == 0 && link.candidate_vst_parameter() == Some(true))
+                    .then(|| link.candidate_channel_target_id())
+                    .flatten()
+            })
+            .collect::<BTreeSet<_>>();
         let mut eligible_channels = 0usize;
         let mut unresolved = Vec::new();
         let mut plans = Vec::new();
@@ -13224,8 +13285,32 @@ impl DawUi {
         let mut loaded_count = 0usize;
         for (state, path) in plans {
             let channel_id = state.channel_id();
-            match host.load_channel(path, &state) {
-                Ok(_) => loaded_count += 1,
+            match host.load_channel(path.clone(), &state) {
+                Ok(_) => {
+                    loaded_count += 1;
+                    if native_automation_channel_targets.contains(&channel_id) {
+                        let fourcc = state
+                            .vst_metadata()
+                            .and_then(|metadata| metadata.fourcc())
+                            .unwrap_or_default()
+                            .to_owned();
+                        match host.channel_parameters(channel_id) {
+                            Ok(parameters) => {
+                                self.vst2_channel_parameter_snapshots.insert(
+                                    channel_id,
+                                    Vst2ChannelParameterSnapshot {
+                                        plugin_path: path,
+                                        fourcc,
+                                        parameters,
+                                    },
+                                );
+                            }
+                            Err(error) => unresolved.push(format!(
+                                "channel {channel_id} native Automation parameters could not be read: {error}"
+                            )),
+                        }
+                    }
+                }
                 Err(error) => unresolved.push(format!(
                     "channel {channel_id} VST2 plug-in could not load: {error}"
                 )),
@@ -17218,6 +17303,11 @@ impl DawUi {
         let playback_document = self.document.as_ref().expect("project was checked above");
         let playlist_parameter_automation =
             self.vst3_playlist_automation_sources(playback_document);
+        options.vst2_channel_automation_clips = Arc::new(
+            playlist_parameter_automation
+                .vst2_channel_automation_clips
+                .clone(),
+        );
         let vst3_processor = self
             .vst3_host
             .as_ref()
@@ -18160,6 +18250,11 @@ impl DawUi {
             }
         };
         let playlist_parameter_automation = self.vst3_playlist_automation_sources(&static_document);
+        options.vst2_channel_automation_clips = Arc::new(
+            playlist_parameter_automation
+                .vst2_channel_automation_clips
+                .clone(),
+        );
         let vst3_processor = self
             .vst3_host
             .as_ref()
@@ -58436,7 +58531,7 @@ impl DawUi {
         let Some(output_path) = file_dialog.save_file() else {
             return;
         };
-        let options = PlaylistRenderOptions {
+        let mut options = PlaylistRenderOptions {
             arrangement_id,
             sample_rate: self.audio_settings.sample_rate,
             soloed_playlist_track_range: None,
@@ -58459,6 +58554,11 @@ impl DawUi {
             ..PlaylistRenderOptions::default()
         };
         let linked_automation_sources = self.vst3_playlist_automation_sources(&render_document);
+        options.vst2_channel_automation_clips = Arc::new(
+            linked_automation_sources
+                .vst2_channel_automation_clips
+                .clone(),
+        );
         let playlist_parameter_automation = Vst3PlaylistAutomationSources {
             pattern_clips: linked_automation_sources.pattern_clips,
             mixer_effect_pattern_clips: linked_automation_sources.mixer_effect_pattern_clips,
@@ -59225,7 +59325,7 @@ impl DawUi {
         let Some(output_path) = file_dialog.save_file() else {
             return;
         };
-        let options = PlaylistRenderOptions {
+        let mut options = PlaylistRenderOptions {
             arrangement_id,
             sample_rate: self.audio_settings.sample_rate,
             soloed_playlist_track_range: Some((track_id, track_id)),
@@ -59248,6 +59348,11 @@ impl DawUi {
             ..PlaylistRenderOptions::default()
         };
         let playlist_parameter_automation = self.vst3_playlist_automation_sources(document);
+        options.vst2_channel_automation_clips = Arc::new(
+            playlist_parameter_automation
+                .vst2_channel_automation_clips
+                .clone(),
+        );
         let vst3_processor = self
             .vst3_host
             .as_ref()
@@ -59425,6 +59530,11 @@ impl DawUi {
             options.tail_seconds = 0;
         }
         let playlist_parameter_automation = self.vst3_playlist_automation_sources(document);
+        options.vst2_channel_automation_clips = Arc::new(
+            playlist_parameter_automation
+                .vst2_channel_automation_clips
+                .clone(),
+        );
         let vst3_processor = self
             .vst3_host
             .as_ref()
@@ -59498,7 +59608,7 @@ impl DawUi {
         else {
             return;
         };
-        let options = PlaylistRenderOptions {
+        let mut options = PlaylistRenderOptions {
             arrangement_id: self.selected_arrangement.unwrap_or_default(),
             sample_rate: self.audio_settings.sample_rate,
             soloed_playlist_track_range: self.soloed_playlist_track_range,
@@ -59524,6 +59634,11 @@ impl DawUi {
             ..PlaylistRenderOptions::default()
         };
         let playlist_parameter_automation = self.vst3_playlist_automation_sources(document);
+        options.vst2_channel_automation_clips = Arc::new(
+            playlist_parameter_automation
+                .vst2_channel_automation_clips
+                .clone(),
+        );
         let vst3_processor = self
             .vst3_host
             .as_ref()

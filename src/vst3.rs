@@ -339,6 +339,8 @@ pub struct Vst3PlaylistAutomationSources {
     pub automation_clips: BTreeMap<(u16, u16), Vec<Vst3ParameterAutomation>>,
     /// Automation Clip curves keyed by `(automation_channel_id, Mixer insert, effect slot)`.
     pub mixer_effect_automation_clips: BTreeMap<(u16, usize, u16), Vec<Vst3ParameterAutomation>>,
+    /// Native Automation Clip curves keyed by `(automation_channel_id, VST2 channel_id)`.
+    pub vst2_channel_automation_clips: BTreeMap<(u16, u16), Vec<Vst3ParameterAutomation>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -8047,7 +8049,7 @@ impl Vst3HostRuntime {
     }
 }
 
-fn expand_playlist_parameter_automation(
+pub(crate) fn expand_playlist_parameter_automation(
     document: &FlpDocument,
     options: PlaylistRenderOptions,
     pattern_automation: &BTreeMap<(u16, u16), Vec<Vst3ParameterAutomation>>,
