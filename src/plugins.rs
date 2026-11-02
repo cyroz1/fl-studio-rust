@@ -78,9 +78,9 @@ struct SearchRoot {
 
 /// Finds VST, CLAP, and macOS Audio Unit bundle candidates in conventional
 /// platform folders. `VST3_PATH`, `VST2_PATH`, and `CLAP_PATH` can add
-/// directories using platform path-list syntax. VST2 DLLs, CLAP bundles, and
-/// Audio Unit bundles are listed as candidates only; checking them requires
-/// loading executable code or consulting the platform's plug-in registry.
+/// directories using platform path-list syntax. VST2 modules and bundles, CLAP
+/// bundles, and Audio Unit bundles are listed as candidates only; checking them
+/// requires loading executable code or consulting the platform's plug-in registry.
 pub fn scan_installed_plugins() -> PluginScanReport {
     let roots = default_search_roots();
     let mut report = PluginScanReport {
@@ -322,7 +322,7 @@ fn walk(
             add_candidate(&path, format, report, found);
             continue;
         }
-        if format == PluginFormat::Vst2Candidate && extension.eq_ignore_ascii_case("dll") {
+        if format == PluginFormat::Vst2Candidate && is_vst2_candidate(&path, extension) {
             add_candidate(&path, format, report, found);
             continue;
         }
@@ -341,6 +341,23 @@ fn walk(
         if path.is_dir() {
             walk(&path, format, depth + 1, report, visited, found);
         }
+    }
+}
+
+fn is_vst2_candidate(path: &Path, extension: &OsStr) -> bool {
+    if path.is_file()
+        && (extension.eq_ignore_ascii_case("dll") || extension.eq_ignore_ascii_case("so"))
+    {
+        return true;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        path.is_dir() && extension.eq_ignore_ascii_case("vst")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
     }
 }
 
