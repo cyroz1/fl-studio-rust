@@ -35,6 +35,7 @@ use crate::media::{
     DecodedAudio, SamplePathResolver, decode_audio_file, process_audio_range_for_playback,
     sample_sampler_metadata,
 };
+use crate::vst2::{Vst2HostRuntime, Vst2HostedChannelInfo};
 use crate::vst3::{
     MAX_PDC_DELAY_BYTES, PlaylistMidiNote, Vst3LatencyReport, Vst3ParameterAutomation,
     Vst3PlaylistAutomationPoint, Vst3PlaylistParameterAutomation, Vst3PlaylistStreamProcessor,
@@ -46,6 +47,10 @@ use crate::{
     MixerSourceRoutePlan, MixerSourceRouteTransform, PATTERN_NOTE_PORTA_FLAG, Pattern, PatternNote,
     PlaylistClip, PlaylistClipTarget, PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync,
     SamplerEnvelopeLfoTarget,
+};
+use vst_audio::{
+    AudioEvent as Vst2AudioEvent, AudioStatus as Vst2AudioStatus, MAX_EVENTS as VST2_MAX_EVENTS,
+    Transport as Vst2Transport,
 };
 
 const DEFAULT_SAMPLE_RATE: u32 = 44_100;
@@ -61,6 +66,7 @@ const SAMPLER_ROOT_KEY: u16 = 60;
 const SAMPLER_POLYPHONY_SLIDE_DEFAULT_RAW: u32 = 820;
 const SAMPLER_POLYPHONY_SLIDE_MAX_RAW: u32 = 1_660;
 const SAMPLER_BLOCK_FRAMES: usize = 1_024;
+const VST2_PATTERN_QUANTUM_FRAMES: usize = 512;
 const PERFORMANCE_DUE_COMMANDS_INITIAL_CAPACITY: usize = 128;
 const FLAC_BLOCK_FRAMES: usize = 4_096;
 const FLAC_MAX_SAMPLE_FRAMES: u64 = (1_u64 << 36) - 1;
@@ -863,6 +869,27 @@ pub struct Vst3PatternStreamControls<'a> {
     pub meters: &'a crate::audio::MixerTrackPeakMeters,
     pub latency_updates: Option<Vst3LatencyUpdateControls>,
     pub metronome: Option<MetronomeStreamPlayback>,
+}
+
+/// Loaded Pattern instruments and external audio sources for one Pattern transport.
+pub struct PatternInstrumentsPlayback {
+    pub loop_length_ticks: u64,
+    pub start_tick: u64,
+    pub repeat_pattern: bool,
+    pub extend_preview_tail: bool,
+    pub vst3_processor: Option<Vst3PlaylistStreamProcessor>,
+    pub vst2_runtime: Option<Arc<Mutex<Vst2HostRuntime>>>,
+    pub clap_audio_channel_ids: BTreeSet<u16>,
+    pub pattern_audio_layers: Vec<PatternAudioLayer>,
+}
+
+/// Pattern transport inputs, live controls, and optional note updates.
+pub struct PatternInstrumentsStreamControls<'a> {
+    pub playback: PatternInstrumentsPlayback,
+    pub meters: &'a MixerTrackPeakMeters,
+    pub latency_updates: Option<Vst3LatencyUpdateControls>,
+    pub metronome: Option<MetronomeStreamPlayback>,
+    pub note_updates: Option<Receiver<PatternLiveUpdate>>,
 }
 
 impl Default for SamplerPatternRenderOptions {
@@ -8206,6 +8233,7 @@ pub fn stream_sampler_pattern_to_device_with_live_controls(
             loop_length_ticks: 1,
             start_tick: 0,
             vst3_processor: None,
+            vst2_runtime: None,
             allow_empty_sampler: false,
             repeat_pattern: false,
             extend_preview_tail: false,
@@ -8264,6 +8292,7 @@ pub fn stream_sampler_pattern_loop_from_tick_to_device(
             loop_length_ticks,
             start_tick,
             vst3_processor: None,
+            vst2_runtime: None,
             allow_empty_sampler: false,
             repeat_pattern: true,
             extend_preview_tail: false,
@@ -8327,6 +8356,7 @@ pub fn stream_sampler_pattern_loop_from_tick_to_device_with_live_controls(
             loop_length_ticks: controls.playback.loop_length_ticks,
             start_tick: controls.playback.start_tick,
             vst3_processor: None,
+            vst2_runtime: None,
             allow_empty_sampler,
             repeat_pattern: true,
             extend_preview_tail: false,
@@ -8361,6 +8391,7 @@ pub fn stream_pattern_loop_with_vst3_from_tick_to_device(
             loop_length_ticks: playback.loop_length_ticks,
             start_tick: playback.start_tick,
             vst3_processor: Some(playback.processor),
+            vst2_runtime: None,
             allow_empty_sampler: true,
             repeat_pattern: true,
             extend_preview_tail: false,
@@ -8396,6 +8427,7 @@ pub fn stream_pattern_loop_with_vst3_from_tick_to_device_with_live_master_contro
             loop_length_ticks: playback.loop_length_ticks,
             start_tick: playback.start_tick,
             vst3_processor: Some(playback.processor),
+            vst2_runtime: None,
             allow_empty_sampler: true,
             repeat_pattern: true,
             extend_preview_tail: false,
@@ -8430,6 +8462,7 @@ pub fn stream_pattern_loop_with_vst3_from_tick_to_device_with_live_controls(
             loop_length_ticks: controls.playback.loop_length_ticks,
             start_tick: controls.playback.start_tick,
             vst3_processor: Some(controls.playback.processor),
+            vst2_runtime: None,
             allow_empty_sampler: true,
             repeat_pattern: true,
             extend_preview_tail: false,
@@ -8489,6 +8522,7 @@ pub fn stream_pattern_with_vst3_to_device_with_live_controls(
             loop_length_ticks: controls.playback.duration_ticks,
             start_tick: 0,
             vst3_processor: Some(controls.playback.processor),
+            vst2_runtime: None,
             allow_empty_sampler: true,
             repeat_pattern: false,
             extend_preview_tail: true,
@@ -8506,15 +8540,805 @@ pub fn stream_pattern_with_vst3_to_device_with_live_controls(
     )
 }
 
+/// Stream one Pattern with every currently loaded VST2/VST3 instrument and assigned audio layer.
+pub fn stream_pattern_with_loaded_plugins_to_device_with_live_controls(
+    document: &FlpDocument,
+    project_path: impl AsRef<Path>,
+    options: SamplerPatternRenderOptions,
+    controls: PatternInstrumentsStreamControls<'_>,
+    writer: &StreamingAudioWriter,
+    cancelled: &AtomicBool,
+) -> Result<SamplerPatternRenderSummary, String> {
+    let playback = controls.playback;
+    if playback.loop_length_ticks == 0 {
+        return Err("pattern duration must be greater than zero".to_owned());
+    }
+    let allow_empty_sampler = playback.vst3_processor.is_some()
+        || playback.vst2_runtime.is_some()
+        || !playback.clap_audio_channel_ids.is_empty()
+        || !playback.pattern_audio_layers.is_empty();
+    stream_pattern_from_tick_with_vst3_to_device(
+        document,
+        project_path,
+        options,
+        PatternStreamConfig {
+            loop_length_ticks: playback.loop_length_ticks,
+            start_tick: playback.start_tick,
+            vst3_processor: playback.vst3_processor,
+            vst2_runtime: playback.vst2_runtime,
+            allow_empty_sampler,
+            repeat_pattern: playback.repeat_pattern,
+            extend_preview_tail: playback.extend_preview_tail,
+            clap_audio_channel_ids: playback.clap_audio_channel_ids,
+            pattern_audio_layers: playback.pattern_audio_layers,
+        },
+        PatternLiveStreamControls {
+            meters: Some(controls.meters),
+            latency_updates: controls.latency_updates,
+            metronome: controls.metronome,
+            note_updates: controls.note_updates,
+        },
+        writer,
+        cancelled,
+    )
+}
+
 struct PatternStreamConfig {
     loop_length_ticks: u64,
     start_tick: u64,
     vst3_processor: Option<Vst3PlaylistStreamProcessor>,
+    vst2_runtime: Option<Arc<Mutex<Vst2HostRuntime>>>,
     allow_empty_sampler: bool,
     repeat_pattern: bool,
     extend_preview_tail: bool,
     clap_audio_channel_ids: BTreeSet<u16>,
     pattern_audio_layers: Vec<PatternAudioLayer>,
+}
+
+#[derive(Clone, Copy)]
+struct Vst2PatternStreamSettings {
+    ppq: u16,
+    tempo_bpm: f64,
+    sample_rate: u32,
+    loop_frames: u64,
+    repeat_pattern: bool,
+    pdc_target_frames: u64,
+    master_pitch_cents: Option<i16>,
+}
+
+struct Vst2PatternStreamSetup<'a> {
+    document: &'a FlpDocument,
+    pattern_notes: &'a [PatternNote],
+    channel_infos: &'a [Vst2HostedChannelInfo],
+    external_channel_ids: &'a BTreeSet<u16>,
+    volume_expression_channels: &'a BTreeSet<u16>,
+    meters: Option<&'a MixerTrackPeakMeters>,
+    settings: Vst2PatternStreamSettings,
+}
+
+#[derive(Clone, Copy)]
+struct Vst2PatternNoteEvent {
+    start_frame: u64,
+    duration_frames: u64,
+    channel: u8,
+    key: u8,
+    velocity: u8,
+}
+
+struct Vst2PatternNotePlan {
+    events_by_channel: BTreeMap<u16, Vec<Vst2PatternNoteEvent>>,
+    notes_scheduled: usize,
+    content_frames: u64,
+}
+
+#[derive(Clone, Copy)]
+struct Vst2PendingMidiEvent {
+    priority: u8,
+    data: [u8; 3],
+}
+
+struct Vst2PatternChannelStream {
+    info: Vst2HostedChannelInfo,
+    layer_index: usize,
+    note_events: Vec<Vst2PatternNoteEvent>,
+    next_loop_frame: u64,
+    pending_events: BTreeMap<u64, Vec<Vst2PendingMidiEvent>>,
+    active_notes: BTreeMap<(u8, u8), usize>,
+    input_buffers: Vec<Vec<f32>>,
+    output_buffers: Vec<Vec<f32>>,
+    pdc_delay: StereoFrameDelay,
+    startup_fallbacks: usize,
+}
+
+/// Processes scheduled Pattern MIDI through already restored VST2 workers.
+struct Vst2PatternStreamProcessor {
+    runtime: Arc<Mutex<Vst2HostRuntime>>,
+    channels: Vec<Vst2PatternChannelStream>,
+    audio_layers: Vec<PatternAudioLayer>,
+    mixer_routes: HashMap<u16, PreparedClapMixerRoute>,
+    external_channel_ids: BTreeSet<u16>,
+    volume_expression_channels: BTreeSet<u16>,
+    settings: Vst2PatternStreamSettings,
+    content_frames: u64,
+    notes_scheduled: usize,
+}
+
+impl Vst2PatternStreamProcessor {
+    fn new(
+        runtime: Arc<Mutex<Vst2HostRuntime>>,
+        setup: Vst2PatternStreamSetup<'_>,
+    ) -> Result<Self, String> {
+        let Vst2PatternStreamSetup {
+            document,
+            pattern_notes,
+            channel_infos,
+            external_channel_ids,
+            volume_expression_channels,
+            meters,
+            settings,
+        } = setup;
+        let channel_ids = channel_infos
+            .iter()
+            .map(|channel| channel.channel_id)
+            .collect::<BTreeSet<_>>();
+        let note_plan = build_vst2_pattern_note_events(
+            document,
+            pattern_notes,
+            &channel_ids,
+            external_channel_ids,
+            volume_expression_channels,
+            settings,
+        )?;
+        let channels_by_id = document
+            .channels()
+            .into_iter()
+            .map(|channel| (channel.id(), channel))
+            .collect::<BTreeMap<_, _>>();
+        let mut channels = Vec::new();
+        let mut audio_layers = Vec::new();
+        for info in channel_infos {
+            let Some(channel) = channels_by_id.get(&info.channel_id) else {
+                continue;
+            };
+            if channel.enabled() == Some(false) {
+                continue;
+            }
+            let (left_gain, right_gain) =
+                project_channel_stereo_output_gains_with_layer_adjustments(
+                    document,
+                    info.channel_id,
+                    1.0,
+                    0,
+                )
+                .unwrap_or((1.0, 1.0));
+            let pdc_delay_frames = settings
+                .pdc_target_frames
+                .saturating_sub(info.latency_frames as u64);
+            let layer_index = audio_layers.len();
+            audio_layers.push(PatternAudioLayer {
+                channel_id: info.channel_id,
+                left_gain,
+                right_gain,
+                samples: Vec::new(),
+            });
+            channels.push(Vst2PatternChannelStream {
+                info: info.clone(),
+                layer_index,
+                note_events: note_plan
+                    .events_by_channel
+                    .get(&info.channel_id)
+                    .cloned()
+                    .unwrap_or_default(),
+                next_loop_frame: 0,
+                pending_events: BTreeMap::new(),
+                active_notes: BTreeMap::new(),
+                input_buffers: (0..info.input_channels)
+                    .map(|_| vec![0.0; VST2_PATTERN_QUANTUM_FRAMES])
+                    .collect(),
+                output_buffers: (0..info.output_channels)
+                    .map(|_| vec![0.0; VST2_PATTERN_QUANTUM_FRAMES])
+                    .collect(),
+                pdc_delay: StereoFrameDelay::new(pdc_delay_frames)?,
+                startup_fallbacks: info.latency_frames.div_ceil(VST2_PATTERN_QUANTUM_FRAMES),
+            });
+        }
+        let mixer_routes = prepare_pattern_clap_mixer_routes_for_channels(
+            channels.iter().map(|channel| channel.info.channel_id),
+            document,
+            meters,
+            settings.sample_rate,
+        )?;
+        let mut processor = Self {
+            runtime,
+            channels,
+            audio_layers,
+            mixer_routes,
+            external_channel_ids: external_channel_ids.clone(),
+            volume_expression_channels: volume_expression_channels.clone(),
+            settings,
+            content_frames: note_plan.content_frames,
+            notes_scheduled: note_plan.notes_scheduled,
+        };
+        processor.reset_schedules(0)?;
+        Ok(processor)
+    }
+
+    fn notes_scheduled(&self) -> usize {
+        self.notes_scheduled
+    }
+
+    fn content_frames(&self) -> u64 {
+        self.content_frames
+    }
+
+    fn audio_layers(&self) -> &[PatternAudioLayer] {
+        &self.audio_layers
+    }
+
+    fn mixer_routes(&self) -> &HashMap<u16, PreparedClapMixerRoute> {
+        &self.mixer_routes
+    }
+
+    fn update_live_pattern_notes(
+        &mut self,
+        document: &FlpDocument,
+        pattern_notes: &[PatternNote],
+        output_frame: u64,
+        meters: Option<&MixerTrackPeakMeters>,
+    ) -> Result<(), String> {
+        self.settings.master_pitch_cents = document.metadata().master_pitch_cents();
+        let channel_ids = self
+            .channels
+            .iter()
+            .map(|channel| channel.info.channel_id)
+            .collect::<BTreeSet<_>>();
+        let note_plan = build_vst2_pattern_note_events(
+            document,
+            pattern_notes,
+            &channel_ids,
+            &self.external_channel_ids,
+            &self.volume_expression_channels,
+            self.settings,
+        )?;
+        let channels_by_id = document
+            .channels()
+            .into_iter()
+            .map(|channel| (channel.id(), channel))
+            .collect::<BTreeMap<_, _>>();
+        for (channel, layer) in self.channels.iter_mut().zip(&mut self.audio_layers) {
+            channel.note_events = note_plan
+                .events_by_channel
+                .get(&channel.info.channel_id)
+                .cloned()
+                .unwrap_or_default();
+            if let Some(summary) = channels_by_id.get(&channel.info.channel_id) {
+                let (left_gain, right_gain) =
+                    project_channel_stereo_output_gains_with_layer_adjustments(
+                        document,
+                        channel.info.channel_id,
+                        1.0,
+                        0,
+                    )
+                    .unwrap_or((1.0, 1.0));
+                layer.left_gain = left_gain;
+                layer.right_gain = right_gain;
+                if summary.enabled() == Some(false) {
+                    channel.note_events.clear();
+                }
+            }
+            channel.pending_events.clear();
+            let active_notes = channel
+                .active_notes
+                .iter()
+                .map(|(&(midi_channel, key), &count)| ((midi_channel, key), count))
+                .collect::<Vec<_>>();
+            for ((midi_channel, key), count) in active_notes {
+                for _ in 0..count {
+                    channel.queue_event(
+                        output_frame,
+                        Vst2PendingMidiEvent {
+                            priority: 0,
+                            data: [0x80 | midi_channel, key, 0],
+                        },
+                    );
+                }
+            }
+            channel.next_loop_frame = 0;
+        }
+        self.reset_schedules(output_frame)?;
+        self.mixer_routes = prepare_pattern_clap_mixer_routes_for_channels(
+            self.channels.iter().map(|channel| channel.info.channel_id),
+            document,
+            meters,
+            self.settings.sample_rate,
+        )?;
+        self.notes_scheduled = note_plan.notes_scheduled;
+        self.content_frames = note_plan.content_frames;
+        Ok(())
+    }
+
+    fn process_block(&mut self, block_start: u64, frame_count: usize) -> Result<(), String> {
+        if frame_count == 0 || frame_count > SAMPLER_BLOCK_FRAMES {
+            return Err("VST2 Pattern block frame count is outside the supported range".to_owned());
+        }
+        let block_end = block_start
+            .checked_add(frame_count as u64)
+            .ok_or_else(|| "VST2 Pattern block position overflow".to_owned())?;
+        let Vst2PatternStreamProcessor {
+            runtime: runtime_arc,
+            channels,
+            audio_layers,
+            settings,
+            ..
+        } = self;
+        let mut runtime = runtime_arc
+            .lock()
+            .map_err(|_| "VST2 host runtime lock was poisoned".to_owned())?;
+        for channel in channels.iter_mut() {
+            if settings.repeat_pattern {
+                while channel.next_loop_frame < block_end {
+                    channel.schedule_loop(channel.next_loop_frame, block_start, false)?;
+                    channel.next_loop_frame = channel
+                        .next_loop_frame
+                        .checked_add(settings.loop_frames)
+                        .ok_or_else(|| "VST2 Pattern loop position overflow".to_owned())?;
+                }
+            }
+            let layer = audio_layers
+                .get_mut(channel.layer_index)
+                .ok_or_else(|| "VST2 Pattern audio layer index is invalid".to_owned())?;
+            let sample_count = frame_count
+                .checked_mul(2)
+                .ok_or_else(|| "VST2 Pattern audio block size overflow".to_owned())?;
+            layer.samples.resize(sample_count, 0.0);
+            layer.samples.fill(0.0);
+            let mut subblock_start = block_start;
+            let mut layer_frame_offset = 0usize;
+            while subblock_start < block_end {
+                let subblock_frames =
+                    (block_end - subblock_start).min(VST2_PATTERN_QUANTUM_FRAMES as u64) as usize;
+                let subblock_end = subblock_start + subblock_frames as u64;
+                let events = channel.take_events(subblock_start, subblock_end)?;
+                for buffer in &mut channel.input_buffers {
+                    buffer[..subblock_frames].fill(0.0);
+                }
+                let input_slices = channel
+                    .input_buffers
+                    .iter()
+                    .map(|buffer| &buffer[..subblock_frames])
+                    .collect::<Vec<_>>();
+                for buffer in &mut channel.output_buffers {
+                    buffer[..subblock_frames].fill(0.0);
+                }
+                let mut output_slices = channel
+                    .output_buffers
+                    .iter_mut()
+                    .map(|buffer| &mut buffer[..subblock_frames])
+                    .collect::<Vec<_>>();
+                let transport = settings.transport_at(subblock_start);
+                let report = runtime.process_events(
+                    channel.info.channel_id,
+                    subblock_frames,
+                    &input_slices,
+                    &mut output_slices,
+                    transport,
+                    &events,
+                    &mut [],
+                )?;
+                drop(output_slices);
+                if report.events_dropped > 0 {
+                    return Err(format!(
+                        "VST2 channel {} dropped {} Pattern MIDI event(s)",
+                        channel.info.channel_id, report.events_dropped
+                    ));
+                }
+                match report.status {
+                    Vst2AudioStatus::Processed => channel.startup_fallbacks = 0,
+                    Vst2AudioStatus::Fallback if channel.startup_fallbacks > 0 => {
+                        channel.startup_fallbacks -= 1;
+                    }
+                    Vst2AudioStatus::Fallback => {
+                        return Err(format!(
+                            "VST2 channel {} worker missed its Pattern audio deadline",
+                            channel.info.channel_id
+                        ));
+                    }
+                    status => {
+                        return Err(format!(
+                            "VST2 channel {} rejected its Pattern block: {status:?}",
+                            channel.info.channel_id
+                        ));
+                    }
+                }
+                for event in &events {
+                    channel.update_active_notes(event.data);
+                }
+                let output_channels = channel.output_buffers.len();
+                if output_channels == 0 {
+                    return Err(format!(
+                        "VST2 channel {} has no active output channels",
+                        channel.info.channel_id
+                    ));
+                }
+                let (left_output, remaining_outputs) = channel
+                    .output_buffers
+                    .split_first()
+                    .ok_or_else(|| "VST2 channel has no output buffer".to_owned())?;
+                let right_output = remaining_outputs.first().unwrap_or(left_output);
+                for frame in 0..subblock_frames {
+                    let sample = (layer_frame_offset + frame) * 2;
+                    let left = left_output[frame];
+                    let right = right_output[frame];
+                    layer.samples[sample] = if left.is_finite() { left } else { 0.0 };
+                    layer.samples[sample + 1] = if right.is_finite() { right } else { 0.0 };
+                }
+                layer_frame_offset += subblock_frames;
+                subblock_start = subblock_end;
+            }
+            channel.pdc_delay.process_interleaved(&mut layer.samples)?;
+        }
+        for (channel_id, reason) in runtime.poll_failures() {
+            if channels
+                .iter()
+                .any(|channel| channel.info.channel_id == channel_id)
+            {
+                return Err(format!("VST2 channel {channel_id} worker failed: {reason}"));
+            }
+        }
+        Ok(())
+    }
+
+    fn reset_schedules(&mut self, minimum_frame: u64) -> Result<(), String> {
+        for channel in &mut self.channels {
+            if self.settings.repeat_pattern {
+                let loop_start =
+                    minimum_frame / self.settings.loop_frames * self.settings.loop_frames;
+                channel.schedule_loop(loop_start, minimum_frame, true)?;
+                channel.next_loop_frame = loop_start
+                    .checked_add(self.settings.loop_frames)
+                    .ok_or_else(|| "VST2 Pattern loop position overflow".to_owned())?;
+            } else {
+                channel.schedule_one_shot(minimum_frame);
+                channel.next_loop_frame = 0;
+            }
+        }
+        Ok(())
+    }
+
+    fn stop(&mut self) -> Result<(), String> {
+        let mut runtime = self
+            .runtime
+            .lock()
+            .map_err(|_| "VST2 host runtime lock was poisoned".to_owned())?;
+        for channel in &mut self.channels {
+            channel.pending_events.clear();
+            let mut events = Vec::new();
+            for (&(midi_channel, key), &count) in &channel.active_notes {
+                for _ in 0..count {
+                    events.push(Vst2AudioEvent::midi(0, 0, [0x80 | midi_channel, key, 0]));
+                }
+            }
+            channel.active_notes.clear();
+            for chunk in events.chunks(VST2_MAX_EVENTS.max(1)) {
+                for buffer in &mut channel.input_buffers {
+                    buffer[..VST2_PATTERN_QUANTUM_FRAMES].fill(0.0);
+                }
+                let input_slices = channel
+                    .input_buffers
+                    .iter()
+                    .map(|buffer| &buffer[..VST2_PATTERN_QUANTUM_FRAMES])
+                    .collect::<Vec<_>>();
+                let mut output_slices = channel
+                    .output_buffers
+                    .iter_mut()
+                    .map(|buffer| &mut buffer[..VST2_PATTERN_QUANTUM_FRAMES])
+                    .collect::<Vec<_>>();
+                let report = runtime.process_events(
+                    channel.info.channel_id,
+                    VST2_PATTERN_QUANTUM_FRAMES,
+                    &input_slices,
+                    &mut output_slices,
+                    Vst2Transport {
+                        playing: false,
+                        ..Vst2Transport::default()
+                    },
+                    chunk,
+                    &mut [],
+                )?;
+                if report.events_dropped > 0
+                    || !matches!(
+                        report.status,
+                        Vst2AudioStatus::Processed | Vst2AudioStatus::Fallback
+                    )
+                {
+                    return Err(format!(
+                        "VST2 channel {} could not release active Pattern notes",
+                        channel.info.channel_id
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Vst2PatternChannelStream {
+    fn queue_event(&mut self, frame: u64, event: Vst2PendingMidiEvent) {
+        self.pending_events.entry(frame).or_default().push(event);
+    }
+
+    fn schedule_one_shot(&mut self, minimum_frame: u64) {
+        for note in self.note_events.clone() {
+            if note.start_frame < minimum_frame {
+                continue;
+            }
+            self.queue_event(
+                note.start_frame,
+                Vst2PendingMidiEvent {
+                    priority: 1,
+                    data: [0x90 | note.channel, note.key, note.velocity],
+                },
+            );
+            self.queue_event(
+                note.start_frame + note.duration_frames,
+                Vst2PendingMidiEvent {
+                    priority: 0,
+                    data: [0x80 | note.channel, note.key, 0],
+                },
+            );
+        }
+    }
+
+    fn schedule_loop(
+        &mut self,
+        loop_start_frame: u64,
+        minimum_frame: u64,
+        skip_before_minimum: bool,
+    ) -> Result<(), String> {
+        for note in self.note_events.clone() {
+            let start_frame = loop_start_frame
+                .checked_add(note.start_frame)
+                .ok_or_else(|| "VST2 Pattern note position overflow".to_owned())?;
+            let stop_frame = start_frame
+                .checked_add(note.duration_frames)
+                .ok_or_else(|| "VST2 Pattern note end position overflow".to_owned())?;
+            if skip_before_minimum && stop_frame <= minimum_frame {
+                continue;
+            }
+            let scheduled_start_frame = start_frame.max(minimum_frame);
+            self.queue_event(
+                scheduled_start_frame,
+                Vst2PendingMidiEvent {
+                    priority: 1,
+                    data: [0x90 | note.channel, note.key, note.velocity],
+                },
+            );
+            self.queue_event(
+                stop_frame,
+                Vst2PendingMidiEvent {
+                    priority: 0,
+                    data: [0x80 | note.channel, note.key, 0],
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn take_events(
+        &mut self,
+        start_frame: u64,
+        end_frame: u64,
+    ) -> Result<Vec<Vst2AudioEvent>, String> {
+        let due_frames = self
+            .pending_events
+            .range(start_frame..end_frame)
+            .map(|(frame, _)| *frame)
+            .collect::<Vec<_>>();
+        let event_count = due_frames.iter().try_fold(0usize, |total, frame| {
+            total
+                .checked_add(self.pending_events.get(frame).map_or(0, Vec::len))
+                .ok_or_else(|| "VST2 Pattern MIDI event count overflow".to_owned())
+        })?;
+        if event_count > VST2_MAX_EVENTS {
+            return Err(format!(
+                "VST2 channel {} needs {event_count} Pattern MIDI events in one block; the worker limit is {VST2_MAX_EVENTS}",
+                self.info.channel_id
+            ));
+        }
+        let mut events = Vec::with_capacity(event_count);
+        for frame in due_frames {
+            if let Some(mut queued) = self.pending_events.remove(&frame) {
+                queued.sort_by_key(|event| event.priority);
+                let offset = u32::try_from(frame - start_frame)
+                    .map_err(|_| "VST2 Pattern event offset exceeds the block".to_owned())?;
+                events.extend(
+                    queued
+                        .into_iter()
+                        .map(|event| Vst2AudioEvent::midi(offset, 0, event.data)),
+                );
+            }
+        }
+        Ok(events)
+    }
+
+    fn update_active_notes(&mut self, data: vst_audio::EventData) {
+        let vst_audio::EventData::Midi([status, key, velocity]) = data else {
+            return;
+        };
+        let channel = status & 0x0f;
+        match status & 0xf0 {
+            0x90 if velocity > 0 => {
+                let count = self.active_notes.entry((channel, key)).or_default();
+                *count = count.saturating_add(1);
+            }
+            0x80 | 0x90 => {
+                let note = (channel, key);
+                if let Some(count) = self.active_notes.get_mut(&note) {
+                    if *count <= 1 {
+                        self.active_notes.remove(&note);
+                    } else {
+                        *count -= 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Vst2PatternStreamSettings {
+    fn transport_at(self, frame: u64) -> Vst2Transport {
+        let mut transport = Vst2Transport::default();
+        transport.playing = true;
+        transport.sample_position = i64::try_from(frame).unwrap_or(i64::MAX);
+        transport.continuous_position = transport.sample_position;
+        transport.ppq_position = frame as f64 * self.tempo_bpm * f64::from(self.ppq)
+            / (60.0 * f64::from(self.sample_rate.max(1)));
+        transport.tempo = self.tempo_bpm;
+        transport.cycling = self.repeat_pattern;
+        transport.cycle_start = 0.0;
+        transport.cycle_end = self.loop_frames as f64 * self.tempo_bpm * f64::from(self.ppq)
+            / (60.0 * f64::from(self.sample_rate.max(1)));
+        transport
+    }
+}
+
+fn build_vst2_pattern_note_events(
+    document: &FlpDocument,
+    notes: &[PatternNote],
+    loaded_channel_ids: &BTreeSet<u16>,
+    external_channel_ids: &BTreeSet<u16>,
+    volume_expression_channels: &BTreeSet<u16>,
+    settings: Vst2PatternStreamSettings,
+) -> Result<Vst2PatternNotePlan, String> {
+    if settings.ppq == 0 {
+        return Err("project PPQ must be greater than zero".to_owned());
+    }
+    if !settings.tempo_bpm.is_finite() || settings.tempo_bpm <= 0.0 {
+        return Err("project tempo must be finite and positive".to_owned());
+    }
+    let channels = document.channels();
+    let channels_by_id = channels
+        .iter()
+        .map(|channel| (channel.id(), channel))
+        .collect::<BTreeMap<_, _>>();
+    let router = ChannelNoteRouter::new(channels.clone());
+    let global_swing_mix = document.metadata().global_swing_mix();
+    let mut events_by_channel = loaded_channel_ids
+        .iter()
+        .map(|channel_id| (*channel_id, Vec::new()))
+        .collect::<BTreeMap<_, _>>();
+    let mut notes_scheduled = 0usize;
+    let mut content_frames = 0u64;
+    for (note_index, note) in notes.iter().enumerate() {
+        if note.is_muted() {
+            continue;
+        }
+        let source_swing_mix = channels_by_id
+            .get(&note.channel_id)
+            .map_or(128, |channel| channel.swing_mix());
+        let nominal_start_tick = u64::from(note.position);
+        let start_tick = swing_note_start_tick(
+            nominal_start_tick,
+            settings.ppq,
+            global_swing_mix,
+            source_swing_mix,
+        )?;
+        let swing_offset = start_tick.saturating_sub(nominal_start_tick);
+        let end_tick = nominal_start_tick
+            .checked_add(u64::from(note.length.max(1)))
+            .and_then(|tick| tick.checked_add(swing_offset))
+            .ok_or_else(|| "VST2 Pattern note end position overflow".to_owned())?;
+        let start_frame = ticks_to_frames(
+            start_tick,
+            settings.ppq,
+            settings.tempo_bpm,
+            settings.sample_rate,
+        )?;
+        if settings.repeat_pattern && start_frame >= settings.loop_frames {
+            continue;
+        }
+        for (channel_id, layer_gain, _) in router.targets_for_note_with_clap_and_mixed_crossfade(
+            note.channel_id,
+            note_index as u64,
+            note.key,
+            volume_expression_channels,
+            external_channel_ids,
+        ) {
+            if !loaded_channel_ids.contains(&channel_id)
+                || !channels_by_id
+                    .get(&channel_id)
+                    .is_some_and(|channel| channel.enabled() != Some(false))
+            {
+                continue;
+            }
+            if note.key > 127 {
+                return Err(format!(
+                    "Pattern channel {} contains key {} outside the MIDI note range",
+                    note.channel_id, note.key
+                ));
+            }
+            if note.length == 0 {
+                return Err(format!(
+                    "Pattern channel {} contains a zero-length note",
+                    note.channel_id
+                ));
+            }
+            if note.velocity > 127 {
+                return Err(format!(
+                    "Pattern channel {} contains velocity {} outside the MIDI range",
+                    note.channel_id, note.velocity
+                ));
+            }
+            let target_channel = channels_by_id[&channel_id];
+            let pitch_offset =
+                target_channel.master_pitch_note_offset_semitones(settings.master_pitch_cents);
+            let key = i32::from(note.key) + i32::from(pitch_offset);
+            if !(0..=127).contains(&key) {
+                return Err(format!(
+                    "Pattern key {} with project pitch offset is outside the MIDI note range",
+                    note.key
+                ));
+            }
+            let velocity = (f32::from(note.velocity) * layer_gain)
+                .round()
+                .clamp(0.0, 127.0) as u8;
+            if velocity == 0 {
+                continue;
+            }
+            let mut stop_frame = ticks_to_frames(
+                end_tick,
+                settings.ppq,
+                settings.tempo_bpm,
+                settings.sample_rate,
+            )?
+            .max(start_frame.saturating_add(1));
+            if settings.repeat_pattern {
+                stop_frame = stop_frame.min(settings.loop_frames);
+            }
+            let duration_frames = stop_frame.saturating_sub(start_frame).max(1);
+            events_by_channel
+                .entry(channel_id)
+                .or_default()
+                .push(Vst2PatternNoteEvent {
+                    start_frame,
+                    duration_frames,
+                    channel: note.midi_channel_index(),
+                    key: key as u8,
+                    velocity,
+                });
+            content_frames = content_frames.max(start_frame.saturating_add(duration_frames));
+            notes_scheduled = notes_scheduled.saturating_add(1);
+        }
+    }
+    for events in events_by_channel.values_mut() {
+        events.sort_by_key(|event| event.start_frame);
+    }
+    Ok(Vst2PatternNotePlan {
+        events_by_channel,
+        notes_scheduled,
+        content_frames,
+    })
 }
 
 fn mix_pattern_audio_layers(
@@ -9145,6 +9969,44 @@ fn stream_pattern_from_tick_with_vst3_to_device(
     if loop_frames == 0 {
         return Err("pattern loop length rounds to zero audio frames".to_owned());
     }
+    let enabled_channel_ids = document
+        .channels()
+        .into_iter()
+        .filter(|channel| channel.enabled() != Some(false))
+        .map(|channel| channel.id())
+        .collect::<BTreeSet<_>>();
+    let vst2_channel_infos = playback
+        .vst2_runtime
+        .as_ref()
+        .map(|runtime| {
+            runtime
+                .lock()
+                .map_err(|_| "VST2 host runtime lock was poisoned".to_owned())
+                .map(|runtime| runtime.loaded_channels())
+        })
+        .transpose()?
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|channel| enabled_channel_ids.contains(&channel.channel_id))
+        .collect::<Vec<_>>();
+    if let Some(channel) = vst2_channel_infos
+        .iter()
+        .find(|channel| channel.sample_rate != options.sample_rate)
+    {
+        return Err(format!(
+            "VST2 channel {} is running at {} Hz, but Pattern playback is {} Hz; reload the project plug-ins after changing the audio sample rate",
+            channel.channel_id, channel.sample_rate, options.sample_rate
+        ));
+    }
+    let max_vst2_latency_frames = vst2_channel_infos
+        .iter()
+        .map(|channel| channel.latency_frames as u64)
+        .max()
+        .unwrap_or(0);
+    let automatic_pdc_enabled = document.mixer_automatic_pdc_enabled().unwrap_or(true);
+    if let Some(processor) = playback.vst3_processor.as_mut() {
+        processor.set_external_pattern_source_latency_frames(max_vst2_latency_frames)?;
+    }
     if !playback.repeat_pattern && !playback.pattern_audio_layers.is_empty() {
         return Err("pre-rendered Pattern audio layers require looping playback".to_owned());
     }
@@ -9180,6 +10042,7 @@ fn stream_pattern_from_tick_with_vst3_to_device(
             .iter()
             .map(|layer| layer.channel_id),
     );
+    clap_pattern_channels.extend(vst2_channel_infos.iter().map(|channel| channel.channel_id));
     let render = if !clap_pattern_channels.is_empty() {
         let included_channels = document
             .channels()
@@ -9222,6 +10085,52 @@ fn stream_pattern_from_tick_with_vst3_to_device(
             Some(cancelled),
         )?
     };
+    let mut vst2_processor = if let Some(runtime) = playback
+        .vst2_runtime
+        .as_ref()
+        .filter(|_| !vst2_channel_infos.is_empty())
+    {
+        let pattern = document
+            .patterns()
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|pattern| pattern.id == options.pattern_id)
+            .ok_or_else(|| format!("Pattern {} was not found", options.pattern_id))?;
+        let pdc_target_frames = if automatic_pdc_enabled {
+            playback
+                .vst3_processor
+                .as_ref()
+                .map_or(max_vst2_latency_frames, |processor| {
+                    processor
+                        .pdc_direct_source_delay_frames()
+                        .max(max_vst2_latency_frames)
+                })
+        } else {
+            0
+        };
+        Some(Vst2PatternStreamProcessor::new(
+            Arc::clone(runtime),
+            Vst2PatternStreamSetup {
+                document,
+                pattern_notes: &pattern.notes,
+                channel_infos: &vst2_channel_infos,
+                external_channel_ids: &clap_pattern_channels,
+                volume_expression_channels: &vst3_volume_expression_channels,
+                meters: live_master_meters,
+                settings: Vst2PatternStreamSettings {
+                    ppq,
+                    tempo_bpm,
+                    sample_rate: options.sample_rate,
+                    loop_frames,
+                    repeat_pattern: playback.repeat_pattern,
+                    pdc_target_frames,
+                    master_pitch_cents: document.metadata().master_pitch_cents(),
+                },
+            },
+        )?)
+    } else {
+        None
+    };
     let pattern_clap_mixer_routes = prepare_pattern_clap_mixer_routes(
         &playback.pattern_audio_layers,
         document,
@@ -9237,10 +10146,13 @@ fn stream_pattern_from_tick_with_vst3_to_device(
             .vst3_processor
             .as_ref()
             .is_none_or(|processor| processor.summary().plugin_channels_rendered == 0)
+        && vst2_processor
+            .as_ref()
+            .is_none_or(|processor| processor.notes_scheduled() == 0)
         && playback.pattern_audio_layers.is_empty()
     {
         return Err(format!(
-            "Pattern {} has no supported Sampler notes or loaded VST3 instruments",
+            "Pattern {} has no supported Sampler notes or loaded plug-in instruments",
             options.pattern_id
         ));
     }
@@ -9252,6 +10164,11 @@ fn stream_pattern_from_tick_with_vst3_to_device(
                 .vst3_processor
                 .as_ref()
                 .map_or(0, |processor| processor.summary().frames),
+        );
+        let base_frames = base_frames.max(
+            vst2_processor
+                .as_ref()
+                .map_or(0, Vst2PatternStreamProcessor::content_frames),
         );
         let tail_frames = if playback.extend_preview_tail {
             u64::from(options.sample_rate).saturating_mul(2)
@@ -9302,8 +10219,14 @@ fn stream_pattern_from_tick_with_vst3_to_device(
         }
         processor.start_processing()?;
     }
-    let sampler_delay_frames = playback.vst3_processor.as_ref().map_or(
-        0,
+    let sampler_delay_frames = playback.vst3_processor.as_ref().map_or_else(
+        || {
+            if automatic_pdc_enabled {
+                max_vst2_latency_frames
+            } else {
+                0
+            }
+        },
         Vst3PlaylistStreamProcessor::pdc_direct_source_delay_frames,
     );
     let mut sampler_delay = StereoFrameDelay::new(sampler_delay_frames)?;
@@ -9369,6 +10292,11 @@ fn stream_pattern_from_tick_with_vst3_to_device(
             {
                 *output_frames = (*output_frames).max(processor.summary().frames);
             }
+            if let Some(output_frames) = finite_output_frames.as_mut()
+                && let Some(processor) = vst2_processor.as_ref()
+            {
+                *output_frames = (*output_frames).max(processor.content_frames());
+            }
             let frame_count = (start_frame - block_start).min(SAMPLER_BLOCK_FRAMES as u64) as usize;
             let sample_count = frame_count * 2;
             if let Some(mixer_buses) = mixer_buses.as_mut() {
@@ -9410,6 +10338,18 @@ fn stream_pattern_from_tick_with_vst3_to_device(
                 )?;
             }
             sampler_delay.process_interleaved(&mut block[..sample_count])?;
+            if let Some(processor) = vst2_processor.as_mut() {
+                processor.process_block(block_start, frame_count)?;
+                mix_pattern_audio_layers(
+                    &mut block[..sample_count],
+                    frame_count,
+                    0,
+                    frame_count as u64,
+                    processor.audio_layers(),
+                    processor.mixer_routes(),
+                    mixer_buses.as_deref_mut(),
+                )?;
+            }
             if let Some(processor) = playback.vst3_processor.as_mut() {
                 if let Some(mixer_buses) = mixer_buses.as_mut() {
                     let active_buses = &mut mixer_buses
@@ -9505,6 +10445,14 @@ fn stream_pattern_from_tick_with_vst3_to_device(
                             block_start,
                         );
                     }
+                    if let Some(processor) = vst2_processor.as_mut() {
+                        let _ = processor.update_live_pattern_notes(
+                            live_document,
+                            &notes,
+                            block_start,
+                            live_master_meters,
+                        );
+                    }
                     if let Ok(scheduled_notes) = schedule_live_sampler_pattern_notes(
                         live_document,
                         &notes,
@@ -9556,6 +10504,11 @@ fn stream_pattern_from_tick_with_vst3_to_device(
                 && let Some(processor) = playback.vst3_processor.as_ref()
             {
                 *output_frames = (*output_frames).max(processor.summary().frames);
+            }
+            if let Some(output_frames) = finite_output_frames.as_mut()
+                && let Some(processor) = vst2_processor.as_ref()
+            {
+                *output_frames = (*output_frames).max(processor.content_frames());
             }
             let block_end = block_start.saturating_add(SAMPLER_BLOCK_FRAMES as u64);
             if playback.repeat_pattern {
@@ -9613,6 +10566,18 @@ fn stream_pattern_from_tick_with_vst3_to_device(
                 )?;
             }
             sampler_delay.process_interleaved(&mut block[..sample_count])?;
+            if let Some(processor) = vst2_processor.as_mut() {
+                processor.process_block(block_start, frame_count)?;
+                mix_pattern_audio_layers(
+                    &mut block[..sample_count],
+                    frame_count,
+                    0,
+                    frame_count as u64,
+                    processor.audio_layers(),
+                    processor.mixer_routes(),
+                    mixer_buses.as_deref_mut(),
+                )?;
+            }
             if let Some(processor) = playback.vst3_processor.as_mut() {
                 if let Some(mixer_buses) = mixer_buses.as_mut() {
                     let active_buses = &mut mixer_buses
@@ -9687,10 +10652,14 @@ fn stream_pattern_from_tick_with_vst3_to_device(
         .vst3_processor
         .as_mut()
         .map_or(Ok(()), Vst3PlaylistStreamProcessor::stop_processing);
-    match (stream_result, stop_result) {
-        (Err(stream_error), _) => Err(stream_error),
-        (Ok(_), Err(stop_error)) => Err(stop_error),
-        (Ok(()), Ok(())) => Ok(render.summary),
+    let vst2_stop_result = vst2_processor
+        .as_mut()
+        .map_or(Ok(()), Vst2PatternStreamProcessor::stop);
+    match (stream_result, stop_result, vst2_stop_result) {
+        (Err(stream_error), _, _) => Err(stream_error),
+        (Ok(_), Err(stop_error), _) => Err(stop_error),
+        (Ok(_), Ok(()), Err(stop_error)) => Err(stop_error),
+        (Ok(()), Ok(()), Ok(())) => Ok(render.summary),
     }
 }
 

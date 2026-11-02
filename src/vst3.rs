@@ -932,6 +932,7 @@ pub struct Vst3PlaylistStreamProcessor {
     content_frames: u64,
     output_frames: u64,
     maximum_latency_frames: u64,
+    external_pattern_latency_frames: u64,
     automatic_pdc_enabled: bool,
     notes_scheduled: usize,
     unloaded_plugin_channels: Vec<u16>,
@@ -1247,6 +1248,19 @@ impl Vst3PlaylistStreamProcessor {
         meters: Option<&MixerTrackPeakMeters>,
     ) -> Result<(), String> {
         self.automatic_pdc_enabled = document.mixer_automatic_pdc_enabled().unwrap_or(true);
+        let stream_latencies = self
+            .streams
+            .iter()
+            .map(|stream| stream.latency_frames)
+            .collect::<Vec<_>>();
+        self.maximum_latency_frames =
+            plan_pdc_delays(&stream_latencies)
+                .0
+                .max(if self.automatic_pdc_enabled {
+                    self.external_pattern_latency_frames
+                } else {
+                    0
+                });
         let routing = MixerRouteAudibility::from_document(document);
         self.mixer_routing = routing.clone();
         let channels_by_id = document
@@ -1559,7 +1573,14 @@ impl Vst3PlaylistStreamProcessor {
             .iter()
             .map(|stream| stream.latency_frames)
             .collect::<Vec<_>>();
-        self.maximum_latency_frames = plan_pdc_delays(&stream_latencies).0;
+        self.maximum_latency_frames =
+            plan_pdc_delays(&stream_latencies)
+                .0
+                .max(if self.automatic_pdc_enabled {
+                    self.external_pattern_latency_frames
+                } else {
+                    0
+                });
         self.apply_live_mixer_routing(document, meters)?;
         Ok(reports)
     }
@@ -2061,6 +2082,48 @@ impl Vst3PlaylistStreamProcessor {
             stream.render.total_frames = source_frames as u64;
         }
         Ok(())
+    }
+
+    /// Include a Pattern source hosted outside this processor in automatic instrument PDC.
+    pub(crate) fn set_external_pattern_source_latency_frames(
+        &mut self,
+        frames: u64,
+    ) -> Result<(), String> {
+        if self.started_count > 0 || self.started_mixer_effect_count > 0 {
+            return Err(
+                "external Pattern latency must be configured before VST3 processing starts"
+                    .to_owned(),
+            );
+        }
+        self.external_pattern_latency_frames = frames;
+        let stream_latencies = self
+            .streams
+            .iter()
+            .map(|stream| stream.latency_frames)
+            .collect::<Vec<_>>();
+        let planned_latency_frames = plan_pdc_delays(&stream_latencies).0;
+        self.maximum_latency_frames = planned_latency_frames.max(if self.automatic_pdc_enabled {
+            frames
+        } else {
+            0
+        });
+        let instrument_delay_frames = if self.automatic_pdc_enabled {
+            self.streams
+                .iter()
+                .try_fold(self.maximum_latency_frames, |total, stream| {
+                    total
+                        .checked_add(
+                            self.maximum_latency_frames
+                                .saturating_sub(stream.latency_frames),
+                        )
+                        .ok_or_else(|| "PDC delay storage size overflow".to_owned())
+                })?
+        } else {
+            0
+        };
+        let routing = self.mixer_routing.clone();
+        configure_mixer_effect_pdc(self, &routing, instrument_delay_frames)?;
+        self.extend_to_output_frames(self.content_frames)
     }
 
     pub(crate) fn pdc_direct_source_delay_frames(&self) -> u64 {
@@ -6931,6 +6994,7 @@ impl Vst3HostRuntime {
             content_frames: loop_output_frames,
             output_frames: loop_output_frames,
             maximum_latency_frames,
+            external_pattern_latency_frames: 0,
             automatic_pdc_enabled: document.mixer_automatic_pdc_enabled().unwrap_or(true),
             notes_scheduled,
             unloaded_plugin_channels: unloaded_plugin_channels.into_iter().collect(),
@@ -7827,6 +7891,7 @@ impl Vst3HostRuntime {
             content_frames: output_frames,
             output_frames,
             maximum_latency_frames,
+            external_pattern_latency_frames: 0,
             automatic_pdc_enabled: document.mixer_automatic_pdc_enabled().unwrap_or(true),
             notes_scheduled,
             unloaded_plugin_channels: unloaded_plugin_channels.into_iter().collect(),

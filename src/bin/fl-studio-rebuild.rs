@@ -57,19 +57,17 @@ use flp_rebuild::sample_render::{
     AudioClipRenderOptions, AudioClipRenderSummary, AudioFileRenderOptions, AudioRecordingSummary,
     AudioRenderEncodingOptions, AudioRenderOutput, LayerLiveInputConfig, LayerLiveInputEvent,
     LayerLiveInputSender, MP3_BITRATES_KBPS, MixerStemRenderOptions,
-    PLAYLIST_AUDIO_CLIP_GAIN_MINUS_INFINITY, PatternAudioLayer, PatternLiveUpdate,
-    PlaylistAudioClipEnvelope, PlaylistAudioClipFadeCurve, PlaylistAudioLayer,
-    PlaylistChannelAutomationPoint, PlaylistLiveStreamControls, PlaylistPatternScheduleOptions,
-    PlaylistPerformanceClapLayer, PlaylistPerformanceCommand, PlaylistPerformanceLaunch,
-    PlaylistPerformanceLiveStatus, PlaylistPerformanceStream, PlaylistPlaybackLoopRange,
-    PlaylistRenderOptions, PlaylistRenderRange, PlaylistRenderSummary, PlaylistStreamMonitor,
-    PlaylistTailMode, PlaylistTempoMap, PlaylistTrackFilter, ResamplingQuality,
-    SamplerLiveInputRouting, SamplerLiveNoteEvent, SamplerLiveNoteSender,
-    SamplerPatternLoopPlayback, SamplerPatternLoopStreamControls, SamplerPatternRenderOptions,
-    SamplerPatternRenderSummary, SamplerPatternStreamControls, Vst3LatencyUpdateControls,
-    Vst3LiveInputEvent, Vst3LiveInputSender, Vst3PatternLoopPlayback,
-    Vst3PatternLoopStreamControls, Vst3PatternPlayback, Vst3PatternStreamControls, WavChannelMode,
-    WavDitherMode, WavSampleFormat, layer_live_input_queue,
+    PLAYLIST_AUDIO_CLIP_GAIN_MINUS_INFINITY, PatternAudioLayer, PatternInstrumentsPlayback,
+    PatternInstrumentsStreamControls, PatternLiveUpdate, PlaylistAudioClipEnvelope,
+    PlaylistAudioClipFadeCurve, PlaylistAudioLayer, PlaylistChannelAutomationPoint,
+    PlaylistLiveStreamControls, PlaylistPatternScheduleOptions, PlaylistPerformanceClapLayer,
+    PlaylistPerformanceCommand, PlaylistPerformanceLaunch, PlaylistPerformanceLiveStatus,
+    PlaylistPerformanceStream, PlaylistPlaybackLoopRange, PlaylistRenderOptions,
+    PlaylistRenderRange, PlaylistRenderSummary, PlaylistStreamMonitor, PlaylistTailMode,
+    PlaylistTempoMap, PlaylistTrackFilter, ResamplingQuality, SamplerLiveInputRouting,
+    SamplerLiveNoteEvent, SamplerLiveNoteSender, SamplerPatternRenderOptions,
+    SamplerPatternRenderSummary, Vst3LatencyUpdateControls, Vst3LiveInputEvent,
+    Vst3LiveInputSender, WavChannelMode, WavDitherMode, WavSampleFormat, layer_live_input_queue,
     nearest_playlist_audio_clip_zero_crossing_tick, playlist_audio_clip_fade_gain,
     playlist_performance_clap_clip_indices, playlist_performance_clip_indices_with_vst3_and_clap,
     playlist_performance_static_document_with_vst3_and_clap, playlist_performance_vst3_channel_ids,
@@ -84,13 +82,10 @@ use flp_rebuild::sample_render::{
     render_selected_audio_clips_to_file_with_mixer_effects, sampler_live_note_queue,
     schedule_playlist_pattern_notes_with_adjustments, stream_input_monitor_through_mixer,
     stream_mixed_layer_midi_input_to_device,
-    stream_pattern_loop_with_vst3_from_tick_to_device_with_live_controls,
-    stream_pattern_with_vst3_to_device_with_live_controls,
+    stream_pattern_with_loaded_plugins_to_device_with_live_controls,
     stream_playlist_performance_with_vst3_to_device,
     stream_playlist_with_vst3_to_device_with_monitor_and_latency_updates,
-    stream_sampler_midi_input_to_device,
-    stream_sampler_pattern_loop_from_tick_to_device_with_live_controls,
-    stream_sampler_pattern_to_device, stream_sampler_pattern_to_device_with_live_controls,
+    stream_sampler_midi_input_to_device, stream_sampler_pattern_to_device,
     stream_vst3_midi_input_to_device, vst3_live_input_queue, write_input_recording_to_wav,
     write_stereo_audio_buffer_to_file,
 };
@@ -5688,7 +5683,7 @@ struct DawUi {
     clap_preview_note_key: u8,
     clap_preview_velocity: u8,
     clap_preview_note_duration_milliseconds: u32,
-    vst2_host: Option<Vst2HostRuntime>,
+    vst2_host: Option<Arc<Mutex<Vst2HostRuntime>>>,
     vst3_host: Option<Vst3HostRuntime>,
     vst3_manual_latency_offsets: BTreeMap<String, i32>,
     vst3_project_manual_latency_offsets: BTreeMap<String, i32>,
@@ -12240,7 +12235,7 @@ impl DawUi {
             }
         }
         if loaded_count > 0 {
-            self.vst2_host = Some(host);
+            self.vst2_host = Some(Arc::new(Mutex::new(host)));
         }
         if unresolved.is_empty() {
             Some(format!(
@@ -55648,8 +55643,43 @@ impl DawUi {
                 return;
             }
         };
+        let vst2_runtime = self.vst2_host.clone();
+        let enabled_vst2_channel_ids = document
+            .channels()
+            .into_iter()
+            .filter(|channel| channel.enabled() != Some(false))
+            .map(|channel| channel.id())
+            .collect::<BTreeSet<_>>();
+        let vst2_channel_infos = match vst2_runtime.as_ref().map(|runtime| {
+            runtime
+                .lock()
+                .map_err(|_| "VST2 host runtime lock was poisoned".to_owned())
+                .map(|runtime| runtime.loaded_channels())
+        }) {
+            Some(Ok(channels)) => channels,
+            Some(Err(error)) => {
+                self.status = format!("Could not prepare Pattern VST2 instruments: {error}");
+                return;
+            }
+            None => Vec::new(),
+        }
+        .into_iter()
+        .filter(|channel| enabled_vst2_channel_ids.contains(&channel.channel_id))
+        .collect::<Vec<_>>();
+        if let Some(channel) = vst2_channel_infos
+            .iter()
+            .find(|channel| channel.sample_rate != device_rate)
+        {
+            self.status = format!(
+                "VST2 channel {} is running at {} Hz, but Pattern playback is {} Hz; reload the project plug-ins after changing the audio sample rate",
+                channel.channel_id, channel.sample_rate, device_rate
+            );
+            return;
+        }
+        let has_vst2_channels = !vst2_channel_infos.is_empty();
         let mut clap_pattern_channels = clap_audio_channel_ids;
         clap_pattern_channels.extend(pattern_audio_layers.iter().map(|layer| layer.channel_id));
+        clap_pattern_channels.extend(vst2_channel_infos.iter().map(|channel| channel.channel_id));
         let pattern_vst3_instances = self
             .channel_vst3_instances
             .iter()
@@ -55658,7 +55688,7 @@ impl DawUi {
             .collect::<BTreeMap<_, _>>();
         let pattern_for_vst3 = if should_prepare_pattern_vst3_stream(
             loop_length_ticks,
-            !pattern_vst3_instances.is_empty(),
+            !pattern_vst3_instances.is_empty() || has_vst2_channels,
             !self.mixer_effect_vst3_instances.is_empty(),
         ) {
             let pattern = match document.patterns() {
@@ -55878,107 +55908,43 @@ impl DawUi {
                             read_sample_tempo_information,
                             ..SamplerPatternRenderOptions::default()
                         };
-                        if let Some(vst3_processor) = vst3_processor {
-                            if let Some(loop_length_ticks) = loop_length_ticks {
-                                stream_pattern_loop_with_vst3_from_tick_to_device_with_live_controls(
-                                    &document,
-                                    &project_path,
-                                    options,
-                                    Vst3PatternLoopStreamControls {
-                                        playback: Vst3PatternLoopPlayback {
-                                            loop_length_ticks,
-                                            start_tick: loop_start_tick,
-                                            processor: vst3_processor,
-                                        },
-                                        meters: &worker_mixer_meters,
-                                        metronome: worker_metronome.clone(),
-                                        latency_updates: pattern_latency_update_receiver
-                                            .zip(pattern_latency_report_sender)
-                                            .map(|(updates, reports)| {
-                                                Vst3LatencyUpdateControls {
-                                                    updates,
-                                                    reports,
-                                                    pdc_updates: pattern_pdc_update_receiver,
-                                                }
-                                            }),
-                                        note_updates: pattern_note_update_receiver,
-                                        clap_audio_channel_ids: worker_clap_pattern_channels.clone(),
-                                        pattern_audio_layers: worker_pattern_audio_layers,
+                        let extend_preview_tail = loop_length_ticks.is_none()
+                            && (has_vst2_channels || vst3_processor.is_some());
+                        stream_pattern_with_loaded_plugins_to_device_with_live_controls(
+                            &document,
+                            &project_path,
+                            options,
+                            PatternInstrumentsStreamControls {
+                                playback: PatternInstrumentsPlayback {
+                                    loop_length_ticks: loop_length_ticks
+                                        .or(vst3_stream_duration_ticks)
+                                        .unwrap_or(1),
+                                    start_tick: if loop_length_ticks.is_some() {
+                                        loop_start_tick
+                                    } else {
+                                        0
                                     },
-                                    &writer,
-                                    &worker_cancelled,
-                                )
-                            } else {
-                                stream_pattern_with_vst3_to_device_with_live_controls(
-                                    &document,
-                                    &project_path,
-                                    options,
-                                    Vst3PatternStreamControls {
-                                        playback: Vst3PatternPlayback {
-                                            duration_ticks:
-                                                vst3_stream_duration_ticks.unwrap_or(1),
-                                            processor: vst3_processor,
-                                        },
-                                        meters: &worker_mixer_meters,
-                                        metronome: worker_metronome.clone(),
-                                        latency_updates: pattern_latency_update_receiver
-                                            .zip(pattern_latency_report_sender)
-                                            .map(|(updates, reports)| Vst3LatencyUpdateControls {
-                                                updates,
-                                                reports,
-                                                pdc_updates: pattern_pdc_update_receiver,
-                                            }),
-                                    },
-                                    &writer,
-                                    &worker_cancelled,
-                                )
-                            }
-                        } else if let Some(loop_length_ticks) = loop_length_ticks {
-                            stream_sampler_pattern_loop_from_tick_to_device_with_live_controls(
-                                &document,
-                                &project_path,
-                                options,
-                                SamplerPatternLoopStreamControls {
-                                    playback: SamplerPatternLoopPlayback {
-                                        loop_length_ticks,
-                                        start_tick: loop_start_tick,
-                                    },
-                                    meters: &worker_mixer_meters,
-                                    metronome: worker_metronome.clone(),
-                                    latency_updates: pattern_latency_update_receiver
-                                        .zip(pattern_latency_report_sender)
-                                        .map(|(updates, reports)| Vst3LatencyUpdateControls {
-                                            updates,
-                                            reports,
-                                            pdc_updates: pattern_pdc_update_receiver,
-                                        }),
-                                    note_updates: pattern_note_update_receiver,
-                                    clap_audio_channel_ids: worker_clap_pattern_channels.clone(),
+                                    repeat_pattern: loop_length_ticks.is_some(),
+                                    extend_preview_tail,
+                                    vst3_processor,
+                                    vst2_runtime,
+                                    clap_audio_channel_ids: worker_clap_pattern_channels,
                                     pattern_audio_layers: worker_pattern_audio_layers,
                                 },
-                                &writer,
-                                &worker_cancelled,
-                            )
-                        } else {
-                            stream_sampler_pattern_to_device_with_live_controls(
-                                &document,
-                                &project_path,
-                                options,
-                                SamplerPatternStreamControls {
-                                    meters: &worker_mixer_meters,
-                                    metronome: worker_metronome.clone(),
-                                    latency_updates: pattern_latency_update_receiver
-                                        .zip(pattern_latency_report_sender)
-                                        .map(|(updates, reports)| Vst3LatencyUpdateControls {
-                                            updates,
-                                            reports,
-                                            pdc_updates: pattern_pdc_update_receiver,
-                                        }),
-                                },
-                                &writer,
-                                &worker_cancelled,
-                            )
-                        }
+                                meters: &worker_mixer_meters,
+                                latency_updates: pattern_latency_update_receiver
+                                    .zip(pattern_latency_report_sender)
+                                    .map(|(updates, reports)| Vst3LatencyUpdateControls {
+                                        updates,
+                                        reports,
+                                        pdc_updates: pattern_pdc_update_receiver,
+                                    }),
+                                metronome: worker_metronome,
+                                note_updates: pattern_note_update_receiver,
+                            },
+                            &writer,
+                            &worker_cancelled,
+                        )
                     });
                 writer.finish();
                 let _ = sender.send(result);
