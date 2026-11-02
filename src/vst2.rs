@@ -122,6 +122,17 @@ pub struct Vst2ProjectMixerEffectAssignment {
     pub state_bytes: Vec<u8>,
 }
 
+/// One automatable parameter reported by an assigned VST2 Mixer effect.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Vst2MixerEffectParameter {
+    pub id: u32,
+    pub name: String,
+    pub unit: String,
+    pub value: f64,
+    pub automatable: bool,
+    pub read_only: bool,
+}
+
 /// Creates isolated VST2 effect workers for the shared Mixer processing graph.
 pub struct Vst2ProjectMixerEffectProcessorFactory {
     assignments: BTreeMap<(usize, u16), Vst2ProjectMixerEffectAssignment>,
@@ -530,6 +541,133 @@ impl Vst2HostRuntime {
 
     pub fn has_mixer_effect(&self, key: (usize, u16)) -> bool {
         self.mixer_effects.contains_key(&key)
+    }
+
+    /// Read a bounded snapshot of the parameters exposed by one loaded Mixer effect.
+    pub fn mixer_effect_parameters(
+        &mut self,
+        key: (usize, u16),
+    ) -> Result<Vec<Vst2MixerEffectParameter>, String> {
+        const PAGE_SIZE: u16 = 32;
+        const MAX_PARAMETERS: u32 = 65_536;
+        const TIMEOUT: Duration = Duration::from_secs(5);
+
+        let effect = self.mixer_effects.get(&key).ok_or_else(|| {
+            format!(
+                "VST2 Mixer insert {} effect slot {} is not loaded",
+                key.0,
+                key.1 + 1
+            )
+        })?;
+        let mut start = 0_u32;
+        let mut request = effect
+            .instance
+            .controller()
+            .request(Command::ListParameters {
+                start,
+                count: PAGE_SIZE,
+            })
+            .map_err(|error| format!("could not request VST2 Mixer parameters: {error}"))?;
+        let deadline = Instant::now() + TIMEOUT;
+        let mut parameters = Vec::new();
+        let mut total = None;
+        loop {
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "VST2 Mixer effect {} parameter query timed out",
+                    effect.fourcc
+                ));
+            }
+            let Some(event) = effect.instance.try_next_event() else {
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            };
+            match event {
+                HostEvent::Parameters {
+                    request: completed_request,
+                    total: reported_total,
+                    entries,
+                } if completed_request == request => {
+                    if total.is_some_and(|expected| expected != reported_total)
+                        || reported_total > MAX_PARAMETERS
+                    {
+                        return Err(format!(
+                            "VST2 Mixer effect {} reported an unsupported parameter count",
+                            effect.fourcc
+                        ));
+                    }
+                    total = Some(reported_total);
+                    let received = u32::try_from(entries.len()).unwrap_or(u32::MAX);
+                    parameters.extend(entries.into_iter().map(|parameter| {
+                        Vst2MixerEffectParameter {
+                            id: parameter.id,
+                            name: parameter.name,
+                            unit: parameter.unit,
+                            value: parameter.value,
+                            automatable: parameter.automatable,
+                            read_only: parameter.read_only,
+                        }
+                    }));
+                    start = start.saturating_add(received);
+                    let total = total.unwrap_or_default();
+                    if start >= total || received == 0 {
+                        return Ok(parameters);
+                    }
+                    request = effect
+                        .instance
+                        .controller()
+                        .request(Command::ListParameters {
+                            start,
+                            count: PAGE_SIZE,
+                        })
+                        .map_err(|error| {
+                            format!("could not request VST2 Mixer parameters: {error}")
+                        })?;
+                }
+                HostEvent::RequestFailed {
+                    request: failed_request,
+                    reason,
+                } if failed_request == request => {
+                    return Err(format!(
+                        "VST2 Mixer effect {} parameter query failed: {reason}",
+                        effect.fourcc
+                    ));
+                }
+                HostEvent::Completed {
+                    request: completed_request,
+                } => {
+                    self.pending_mixer_editor_requests
+                        .remove(&completed_request);
+                }
+                HostEvent::RequestFailed {
+                    request: failed_request,
+                    reason,
+                } => {
+                    if let Some((insert_ordinal, slot_index)) =
+                        self.pending_mixer_editor_requests.remove(&failed_request)
+                    {
+                        self.pending_mixer_editor_failures.push((
+                            insert_ordinal,
+                            slot_index,
+                            reason,
+                        ));
+                    }
+                }
+                HostEvent::Failed { reason } => {
+                    return Err(format!(
+                        "VST2 Mixer effect {} worker failed: {reason}",
+                        effect.fourcc
+                    ));
+                }
+                HostEvent::RecoveryRequired | HostEvent::Stopped => {
+                    return Err(format!(
+                        "VST2 Mixer effect {} worker stopped during parameter query",
+                        effect.fourcc
+                    ));
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Request the native editor for one loaded VST2 Mixer effect.
