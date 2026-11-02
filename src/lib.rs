@@ -9446,6 +9446,21 @@ impl FlpDocument {
     /// Projects without a uniquely recognized pattern-note encoding are rejected rather than
     /// guessing between version-specific score event layouts.
     pub fn create_pattern(&mut self) -> Result<u16, FlpError> {
+        self.create_pattern_with_id(None)
+    }
+
+    /// Creates an empty Pattern at the requested ID using the project's recognized note-event
+    /// encoding. Existing Pattern IDs are rejected so their score data cannot be overwritten.
+    pub fn create_pattern_at(&mut self, pattern_id: u16) -> Result<u16, FlpError> {
+        if !(1..=999).contains(&pattern_id) {
+            return Err(FlpError::UnsupportedEdit(
+                "new MIDI script patterns must use an index from 1 through 999",
+            ));
+        }
+        self.create_pattern_with_id(Some(pattern_id))
+    }
+
+    fn create_pattern_with_id(&mut self, requested_id: Option<u16>) -> Result<u16, FlpError> {
         let mut score_regions = Vec::new();
         let mut note_opcode = None;
         let mut conflicting_opcodes = false;
@@ -9516,9 +9531,18 @@ impl FlpDocument {
             ));
         };
 
-        let new_id = highest_pattern_id
-            .checked_add(1)
-            .ok_or(FlpError::LengthOverflow)?;
+        let new_id = if let Some(requested_id) = requested_id {
+            if pattern_ids.contains(&requested_id) {
+                return Err(FlpError::UnsupportedEdit(
+                    "the requested Pattern ID already exists",
+                ));
+            }
+            requested_id
+        } else {
+            highest_pattern_id
+                .checked_add(1)
+                .ok_or(FlpError::LengthOverflow)?
+        };
 
         let mut candidate = self.clone();
         candidate

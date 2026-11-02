@@ -99,6 +99,7 @@ pub enum ScriptTransportAction {
         index: u16,
         offset_beats: i32,
     },
+    JumpToPattern(u16),
     SetGlobalSwingMixRaw(u8),
     AddArrangementTimeMarker {
         tick: u32,
@@ -1819,6 +1820,14 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
             index,
             offset_beats,
         });
+    }
+    if name == Some("jump_to_pattern") {
+        let index = action["index"]
+            .as_u64()
+            .and_then(|index| u16::try_from(index).ok())
+            .filter(|index| (1..=999).contains(index))
+            .ok_or_else(|| "MIDI script returned an invalid Pattern index".to_owned())?;
+        return Ok(ScriptTransportAction::JumpToPattern(index));
     }
     if name == Some("add_arrangement_time_marker") {
         let tick = action["time_ticks"]

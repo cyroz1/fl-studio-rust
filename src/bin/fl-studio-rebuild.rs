@@ -20963,6 +20963,41 @@ impl DawUi {
         self.set_midi_script_pattern_length(index, requested_length_beats);
     }
 
+    fn jump_midi_script_to_pattern(&mut self, index: u16) {
+        let result = self.document.as_mut().map(|document| {
+            let exists = document
+                .patterns()
+                .map_err(|error| error.to_string())?
+                .iter()
+                .any(|pattern| pattern.id == index);
+            if exists {
+                return Ok(false);
+            }
+            document
+                .create_pattern_at(index)
+                .map(|_| true)
+                .map_err(|error| error.to_string())
+        });
+        match result {
+            Some(Ok(created)) => {
+                self.selected_pattern = Some(index);
+                if created {
+                    self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+                    self.status = format!("Created and selected Pattern {index}");
+                } else {
+                    self.status = format!("Selected Pattern {index}");
+                }
+            }
+            Some(Err(error)) => {
+                self.status = format!("MIDI script could not jump to Pattern {index}: {error}");
+            }
+            None => {
+                self.status = "Open a project to select a Pattern".to_owned();
+            }
+        }
+    }
+
     fn jog_midi_script_pattern(&mut self, increment: i32) {
         if increment == 0 {
             return;
@@ -69968,6 +70003,9 @@ impl DawUi {
                 offset_beats,
             } => {
                 self.increment_midi_script_pattern_length(index, offset_beats);
+            }
+            MidiTransportCommand::JumpToPattern(index) => {
+                self.jump_midi_script_to_pattern(index);
             }
             MidiTransportCommand::SetGlobalSwingMixRaw(value_raw) => {
                 self.set_midi_script_global_swing_mix(value_raw);

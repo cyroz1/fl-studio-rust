@@ -2048,6 +2048,16 @@ def _increment_pattern_length(index, offset):
     )
 
 
+def _jump_to_pattern(index):
+    try:
+        index = int(index)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("patterns.jumpToPattern() index must be an integer") from error
+    if not 1 <= index <= 999:
+        raise IndexError("patterns.jumpToPattern() index must be between 1 and 999")
+    _request_transport_action({"action": "jump_to_pattern", "index": index})
+
+
 def _get_song_step_pos():
     position_ticks = int(_active_transport_state.get("song_position_ticks", 0))
     ppq = max(1, int(_active_transport_state.get("ticks_per_quarter", 96)))
@@ -2640,6 +2650,7 @@ def _install_modules(script_name, device_name):
     patterns.getPatternLength = _pattern_length
     patterns.setPatternLength = _set_pattern_length
     patterns.incrementPatternLength = _increment_pattern_length
+    patterns.jumpToPattern = _jump_to_pattern
     patterns.setPatternColor = _set_pattern_color
 
     mixer.getTrackName = _mixer_get_track_name
