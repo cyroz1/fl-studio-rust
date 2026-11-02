@@ -187,6 +187,8 @@ decision, not a roadmap item.
 
 ---
 
+VST2 Mixer effects also support machine-local Pattern LFO links for reported writable, automatable parameters. The Mixer inspector exposes Sine, Triangle, and Square waveforms, a 0.25–64 beat period, normalized minimum/maximum, and phase. Links run through Pattern preview and transport, Playlist and Performance playback, and supported offline Pattern, song, and stem renders; Pattern Event points take precedence on the same parameter. Playlist LFO links remain incomplete.
+
 ## 6. Piano roll
 
 Current: note create/drag/resize/snap, velocity editing, Pattern-scoped time-signature editing with bar divisions that follow meter changes, and a selected-note
