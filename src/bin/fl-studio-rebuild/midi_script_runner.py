@@ -238,7 +238,7 @@ def _ui_navigate_browser(direction, shiftHeld=0):
         raise ValueError("Browser direction must be FPT_Up, FPT_Down, FPT_Left or FPT_Right")
     if not _active_transport_state.get("browser_visible", False):
         return ""
-    if int(_active_transport_state.get("browser_tab_index", 0)) not in (0, 3, 4):
+    if int(_active_transport_state.get("browser_tab_index", 0)) not in (0, 2, 3, 4):
         return ""
     targets = _active_transport_state.get("browser_navigation_targets", [])
     target_index = direction - 40
@@ -266,7 +266,7 @@ def _ui_get_focused_node_caption():
     if not _active_transport_state.get("browser_visible", False):
         return ""
     try:
-        if int(_active_transport_state.get("browser_tab_index", 0)) not in (0, 3, 4):
+        if int(_active_transport_state.get("browser_tab_index", 0)) not in (0, 2, 3, 4):
             return ""
     except (TypeError, ValueError, OverflowError):
         return ""

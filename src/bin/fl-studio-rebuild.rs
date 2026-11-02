@@ -19420,7 +19420,10 @@ impl DawUi {
             && self.browser_visible
             && matches!(
                 self.browser_tab,
-                BrowserTab::Files | BrowserTab::Favorites | BrowserTab::Recent
+                BrowserTab::Files
+                    | BrowserTab::Plugins
+                    | BrowserTab::Favorites
+                    | BrowserTab::Recent
             ) {
             self.midi_script_browser_navigation_targets()
         } else {
@@ -20849,7 +20852,10 @@ impl DawUi {
         if !self.browser_visible
             || !matches!(
                 self.browser_tab,
-                BrowserTab::Files | BrowserTab::Favorites | BrowserTab::Recent
+                BrowserTab::Files
+                    | BrowserTab::Plugins
+                    | BrowserTab::Favorites
+                    | BrowserTab::Recent
             )
         {
             return;
@@ -28633,7 +28639,7 @@ impl DawUi {
         ui.separator();
         if !matches!(
             self.browser_tab,
-            BrowserTab::Files | BrowserTab::Favorites | BrowserTab::Recent
+            BrowserTab::Files | BrowserTab::Plugins | BrowserTab::Favorites | BrowserTab::Recent
         ) {
             self.midi_script_browser_navigation.clear();
         }
@@ -29795,7 +29801,27 @@ impl DawUi {
                     })
                     .collect()
             }
-            BrowserTab::CurrentProject | BrowserTab::Plugins => Vec::new(),
+            BrowserTab::Plugins => {
+                let query = self.browser_search.to_lowercase();
+                self.plugin_candidates
+                    .iter()
+                    .filter(|candidate| {
+                        query.is_empty()
+                            || candidate.name.to_lowercase().contains(&query)
+                            || candidate
+                                .path
+                                .to_string_lossy()
+                                .to_lowercase()
+                                .contains(&query)
+                    })
+                    .map(|candidate| BrowserEntry {
+                        path: candidate.path.clone(),
+                        name: candidate.name.clone(),
+                        is_directory: false,
+                    })
+                    .collect()
+            }
+            BrowserTab::CurrentProject => Vec::new(),
         }
     }
 
@@ -30488,16 +30514,43 @@ impl DawUi {
             })
             .cloned()
             .collect::<Vec<_>>();
+        if let Some((direction, _)) = self.midi_script_browser_navigation.pop_front() {
+            let selected_index = self.browser_selected.as_ref().and_then(|selected| {
+                candidates
+                    .iter()
+                    .position(|candidate| &candidate.path == selected)
+            });
+            let navigated_index = match direction {
+                0 if !candidates.is_empty() => selected_index
+                    .map(|index| index.saturating_sub(1))
+                    .or_else(|| Some(candidates.len() - 1)),
+                1 if !candidates.is_empty() => selected_index
+                    .map(|index| (index + 1).min(candidates.len() - 1))
+                    .or(Some(0)),
+                _ => None,
+            };
+            if let Some(candidate) = navigated_index.and_then(|index| candidates.get(index)) {
+                self.browser_selected = Some(candidate.path.clone());
+            }
+        }
         ui.small(format!("{} installed plug-ins", candidates.len()));
         let mut favorite = None;
+        let mut selected_plugin = None;
         egui::ScrollArea::vertical()
             .id_salt("browser-plugin-list")
             .show(ui, |ui| {
                 for candidate in candidates {
                     let is_favorite = self.browser_favorites.contains(&candidate.path);
                     ui.horizontal(|ui| {
-                        ui.label(format!("{} · {}", candidate.name, candidate.format))
+                        let response = ui
+                            .selectable_label(
+                                self.browser_selected.as_ref() == Some(&candidate.path),
+                                format!("{} · {}", candidate.name, candidate.format),
+                            )
                             .on_hover_text(candidate.path.display().to_string());
+                        if response.clicked() {
+                            selected_plugin = Some(candidate.path.clone());
+                        }
                         if ui
                             .small_button(if is_favorite { "★" } else { "☆" })
                             .clicked()
@@ -30507,6 +30560,9 @@ impl DawUi {
                     });
                 }
             });
+        if let Some(path) = selected_plugin {
+            self.browser_selected = Some(path);
+        }
         if let Some(path) = favorite {
             self.toggle_browser_favorite(path);
         }
