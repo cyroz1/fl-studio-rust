@@ -1163,6 +1163,9 @@ fn clap_descriptor_supports_note_preview(features: &[String]) -> bool {
 
 fn main() -> eframe::Result {
     let args = std::env::args_os().collect::<Vec<_>>();
+    if flp_rebuild::vst2::run_vst2_worker_if_requested() {
+        return Ok(());
+    }
     if args
         .get(1)
         .is_some_and(|argument| argument == std::ffi::OsStr::new(audio_unit_probe::PROBE_FLAG))

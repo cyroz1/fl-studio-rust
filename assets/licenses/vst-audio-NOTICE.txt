@@ -1,0 +1,21 @@
+vst-audio source provenance
+
+Initial extraction: https://github.com/115dkk/spatial-audio-softdriver
+Commit: b6d4df9172584f3566cd266b1748ec24671cb224
+Original paths: crates/streamring, crates/plughost-proto, crates/plughost-sys, crates/plughost, crates/plughost-testplugin, apps/ssr-plughost
+Copyright (c) 2026 115dkk. MIT (see vst-audio-MIT.txt).
+
+The shared audio ring is derived from the author's EqualizerAPO-XT StreamRing
+at 1432f61cc437c99fde8e8e84e10e648fe516d4ce with permission to distribute under MIT.
+The VST2 ABI is translated from Xaymar/vst2sdk at
+339d4f31590bf77c0d0d248e09a380ac6285e069, BSD-3-Clause. The complete
+copyright and license notice is reproduced in vst2-abi-BSD-3-Clause.txt.
+VST3 bindings: coupler-rs/vst3-rs 0.3, MIT OR Apache-2.0.
+No Steinberg VST2 SDK, private third-party plugin, ASIO code or app UI was copied.
+VST is a registered trademark of Steinberg Media Technologies GmbH.
+This project is independent of Steinberg.
+
+VST2 MIDI-list and time-record layouts were cross-checked/adapted from
+DISTRHO/DPF distrho/src/DistrhoPluginVST2.cpp at
+4238e1c7f0351bbe488d79f0899c540543ac7583. Copyright (C) 2012-2024
+Filipe Coelho. ISC; the complete notice is reproduced in vst2-midi-ISC.txt.

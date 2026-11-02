@@ -2,6 +2,7 @@
 name = "flp-rebuild"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.99"
 description = "A clean-room Rust compatibility core for FL Studio project files"
 license = "MIT"
 
@@ -26,6 +27,8 @@ vst3-host = { path = "vendor/vst3-host", default-features = false, features = ["
 vorbis_rs = "0.5.6"
 zip = { version = "8.6.0", default-features = false, features = ["bzip2", "deflate", "deflate64", "legacy-zip", "lzma", "ppmd", "unreserved", "xz", "zstd"] }
 plist = "1.10.1"
+vst-audio = "=0.7.0"
+vst-audio-worker-runtime = "=0.7.0"
 
 [target.'cfg(windows)'.dependencies]
 cpal = { version = "0.18.2", features = ["asio"] }

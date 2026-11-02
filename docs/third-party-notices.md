@@ -19,3 +19,17 @@ included under its MIT license. The license text is included at
 `vendor/vst3-host` and `Cargo.lock`.
 
 - [vst3-host source](https://github.com/HelgeSverre/rust-vst3-host/tree/v0.10.0)
+
+## VST2 hosting
+
+VST2 class scanning and one-note audio rendering use `vst-audio` and
+`vst-audio-worker-runtime` 0.7.0. The crates are MIT-licensed. Their VST2 ABI
+bindings carry the BSD-3-Clause notice from Xaymar's translated header, and
+their MIDI layouts carry the ISC notice from DISTRHO/DPF. The corresponding
+license and provenance files are included as application resources under
+`assets/licenses/`; package versions and checksums are pinned in `Cargo.lock`.
+The project uses a worker mode in its own executable, so the plug-in binary
+runs in a child process without an additional worker binary.
+
+- [vst-audio 0.7.0](https://crates.io/crates/vst-audio/0.7.0)
+- [vst-audio-worker-runtime 0.7.0](https://crates.io/crates/vst-audio-worker-runtime/0.7.0)

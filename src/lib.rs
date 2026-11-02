@@ -8,6 +8,7 @@ pub mod plugin_settings;
 pub mod plugins;
 pub mod project_package;
 pub mod sample_render;
+pub mod vst2;
 pub mod vst3;
 
 const FLHD: &[u8; 4] = b"FLhd";

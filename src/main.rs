@@ -17,6 +17,10 @@ use flp_rebuild::sample_render::{
     AudioClipRenderOptions, AudioFileRenderOptions, AudioRenderEncodingOptions, AudioRenderOutput,
     SamplerPatternRenderOptions, render_audio_clips_to_wav, render_sampler_pattern_to_wav,
 };
+use flp_rebuild::vst2::{
+    Vst2NoteRenderOptions, inspect_vst2_plugin, render_vst2_note_to_wav,
+    run_vst2_worker_if_requested,
+};
 use flp_rebuild::vst3::{Vst3AudioEffectRenderOptions, Vst3HostRuntime, Vst3PatternRenderOptions};
 use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, ArpeggioRangePattern, ArpeggioScoreOptions,
@@ -140,6 +144,9 @@ struct MidiControlChangeStreamImport<'a> {
 }
 
 fn main() -> ExitCode {
+    if run_vst2_worker_if_requested() {
+        return ExitCode::SUCCESS;
+    }
     match run(env::args().skip(1).collect()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
@@ -829,6 +836,27 @@ fn run(args: Vec<String>) -> Result<(), String> {
         ),
         [command, path] if command == "scan" => scan_corpus(Path::new(path)),
         [command] if command == "plugin-scan" => scan_plugins(),
+        [command, path] if command == "vst2-info" => inspect_vst2(Path::new(path)),
+        [command, plugin, output, note, velocity, note_seconds, tail_seconds]
+            if command == "render-vst2-note" => render_vst2_note(
+                Path::new(plugin),
+                Path::new(output),
+                note,
+                velocity,
+                note_seconds,
+                tail_seconds,
+                None,
+            ),
+        [command, plugin, output, note, velocity, note_seconds, tail_seconds, sample_rate]
+            if command == "render-vst2-note" => render_vst2_note(
+                Path::new(plugin),
+                Path::new(output),
+                note,
+                velocity,
+                note_seconds,
+                tail_seconds,
+                Some(sample_rate),
+            ),
         [command, path, start] if command == "events" => {
             dump_events(Path::new(path), parse_usize(start, "event start")?, 64)
         }
@@ -7565,6 +7593,63 @@ fn scan_plugins() -> Result<(), String> {
             println!("  {}: {error}", path.display());
         }
     }
+    Ok(())
+}
+
+fn inspect_vst2(path: &Path) -> Result<(), String> {
+    let classes = inspect_vst2_plugin(path)?;
+    println!("VST2 classes: {}", classes.len());
+    for (index, class) in classes.iter().enumerate() {
+        let id = class
+            .id
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<String>();
+        println!(
+            "  {} name={} vendor={} category={} id={id}",
+            index + 1,
+            class.name,
+            class.vendor,
+            class.category
+        );
+    }
+    Ok(())
+}
+
+fn render_vst2_note(
+    plugin: &Path,
+    output: &Path,
+    note: &str,
+    velocity: &str,
+    note_seconds: &str,
+    tail_seconds: &str,
+    sample_rate: Option<&str>,
+) -> Result<(), String> {
+    let summary = render_vst2_note_to_wav(
+        plugin,
+        output,
+        Vst2NoteRenderOptions {
+            sample_rate: sample_rate
+                .map(|value| parse_u32(value, "sample rate"))
+                .transpose()?
+                .unwrap_or(48_000),
+            midi_note: parse_u8(note, "MIDI note")?,
+            velocity: parse_u8(velocity, "MIDI velocity")?,
+            note_seconds: parse_f64(note_seconds, "note duration")?,
+            tail_seconds: parse_f64(tail_seconds, "tail duration")?,
+        },
+    )?;
+    println!(
+        "rendered {} from {} by {}: {} frames, {} channels at {} Hz, latency {} frames, peak {:.6}",
+        output.display(),
+        summary.plugin_name,
+        summary.vendor,
+        summary.frames,
+        summary.channels,
+        summary.sample_rate,
+        summary.latency_frames,
+        summary.peak
+    );
     Ok(())
 }
 

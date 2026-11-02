@@ -1,0 +1,298 @@
+//! Isolated VST2 plug-in inspection and offline note rendering.
+//!
+//! The plug-in ABI and worker process are provided by `vst-audio`; the host
+//! application only talks to its bounded process and audio APIs.
+
+use std::ffi::OsStr;
+use std::path::Path;
+use std::thread;
+use std::time::Duration;
+
+use crate::media::{DecodedAudio, write_audio_range_to_wav};
+use vst_audio::{
+    AudioEvent, AudioStatus, BusSelector, ClassInfo, Configuration, Host, PluginDescriptor,
+    PluginFormat, Transport,
+};
+
+const RENDER_QUANTUM: u32 = 512;
+const MAX_RENDER_SECONDS: f64 = 120.0;
+const MAX_RENDER_BUFFER_BYTES: usize = 512 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Vst2NoteRenderOptions {
+    pub sample_rate: u32,
+    pub midi_note: u8,
+    pub velocity: u8,
+    pub note_seconds: f64,
+    pub tail_seconds: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Vst2NoteRenderSummary {
+    pub plugin_name: String,
+    pub vendor: String,
+    pub sample_rate: u32,
+    pub frames: usize,
+    pub latency_frames: usize,
+    pub channels: usize,
+    pub peak: f32,
+}
+
+/// Run the embedded worker when this binary is launched by `vst-audio`.
+///
+/// `vst-audio` starts the configured executable with `--control-in` as its
+/// first argument. Dispatching before the normal CLI or GUI keeps plug-in code
+/// in the child process while allowing installers to ship one application
+/// executable.
+pub fn run_vst2_worker_if_requested() -> bool {
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|argument| argument == OsStr::new("--control-in"))
+    {
+        vst_audio_worker_runtime::host::main();
+        true
+    } else {
+        false
+    }
+}
+
+/// Load and inspect a VST2 binary in the isolated worker process.
+pub fn inspect_vst2_plugin(path: impl AsRef<Path>) -> Result<Vec<ClassInfo>, String> {
+    let path = path.as_ref();
+    if !is_vst2_plugin_path(path) {
+        return Err(format!(
+            "VST2 plug-in file or bundle does not exist: {}",
+            path.display()
+        ));
+    }
+    let host = host_for_current_executable()?;
+    let descriptor = PluginDescriptor::new(path, PluginFormat::Vst2);
+    let classes = host
+        .scan(&descriptor)
+        .map_err(|error| format!("could not inspect VST2 plug-in: {error}"))?;
+    if classes.is_empty() {
+        return Err("VST2 plug-in did not report a loadable class".to_owned());
+    }
+    Ok(classes)
+}
+
+fn is_vst2_plugin_path(path: &Path) -> bool {
+    if path.is_file() {
+        return true;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        path.is_dir()
+            && path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("vst"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+/// Render a MIDI note through the first class exposed by a VST2 plug-in.
+///
+/// The plug-in's first main output bus is rendered. At most its first two
+/// channels are written, and worker misses after the startup latency fail the
+/// render instead of silently writing fallback audio.
+pub fn render_vst2_note_to_wav(
+    plugin_path: impl AsRef<Path>,
+    output_path: impl AsRef<Path>,
+    options: Vst2NoteRenderOptions,
+) -> Result<Vst2NoteRenderSummary, String> {
+    validate_render_options(options)?;
+    let plugin_path = plugin_path.as_ref();
+    let output_path = output_path.as_ref();
+    let classes = inspect_vst2_plugin(plugin_path)?;
+    let class = classes
+        .into_iter()
+        .next()
+        .ok_or_else(|| "VST2 plug-in did not report a loadable class".to_owned())?;
+    let descriptor = PluginDescriptor {
+        path: plugin_path.to_path_buf(),
+        format: PluginFormat::Vst2,
+        class_id: Some(class.id),
+    };
+    let host = host_for_current_executable()?;
+    let configuration = Configuration {
+        sample_rate: options.sample_rate,
+        quantum: RENDER_QUANTUM,
+        max_callback_frames: Some(RENDER_QUANTUM),
+        offline: true,
+        buses: Some(BusSelector::main_only()),
+        ..Configuration::default()
+    };
+    let mut instance = host
+        .spawn(&descriptor, &configuration, None)
+        .map_err(|error| format!("could not start VST2 plug-in: {error}"))?;
+    let mut audio = instance
+        .take_audio()
+        .ok_or_else(|| "VST2 worker did not provide an audio endpoint".to_owned())?;
+    let geometry = audio.geometry();
+    let output_channel_count = geometry.output_channels as usize;
+    let captured_channel_count = output_channel_count.min(2);
+    if output_channel_count == 0 || captured_channel_count == 0 {
+        return Err("VST2 plug-in has no active main output bus".to_owned());
+    }
+    let input_channel_count = geometry.input_channels as usize;
+    let note_frames = seconds_to_frames(options.note_seconds, options.sample_rate)?;
+    let tail_frames = seconds_to_frames(options.tail_seconds, options.sample_rate)?;
+    let content_frames = note_frames
+        .checked_add(tail_frames)
+        .ok_or_else(|| "VST2 render frame count overflow".to_owned())?;
+    let latency_frames = audio.latency_frames();
+    let frames_with_latency = content_frames
+        .checked_add(latency_frames)
+        .ok_or_else(|| "VST2 render frame count overflow".to_owned())?;
+    let quantum = RENDER_QUANTUM as usize;
+    let process_frames = frames_with_latency
+        .checked_add(quantum - 1)
+        .map(|frames| frames / quantum * quantum)
+        .ok_or_else(|| "VST2 render frame count overflow".to_owned())?;
+    let buffer_bytes = process_frames
+        .checked_mul(captured_channel_count)
+        .and_then(|samples| samples.checked_mul(std::mem::size_of::<f32>()))
+        .ok_or_else(|| "VST2 render buffer size overflow".to_owned())?;
+    if buffer_bytes > MAX_RENDER_BUFFER_BYTES {
+        return Err(format!(
+            "VST2 render needs {buffer_bytes} bytes of audio storage; limit is {MAX_RENDER_BUFFER_BYTES}"
+        ));
+    }
+
+    let mut captured = (0..captured_channel_count)
+        .map(|_| Vec::with_capacity(process_frames))
+        .collect::<Vec<_>>();
+    let mut transport = Transport::default();
+    let mut startup_fallbacks = latency_frames.div_ceil(quantum);
+    for block_start in (0..process_frames).step_by(quantum) {
+        let mut events = Vec::with_capacity(2);
+        if block_start == 0 {
+            events.push(AudioEvent::midi(
+                0,
+                0,
+                [0x90, options.midi_note, options.velocity],
+            ));
+        }
+        if note_frames >= block_start && note_frames < block_start + quantum {
+            events.push(AudioEvent::midi(
+                (note_frames - block_start) as u32,
+                0,
+                [0x80, options.midi_note, 0],
+            ));
+        }
+
+        let inputs = (0..input_channel_count)
+            .map(|_| vec![0.0f32; quantum])
+            .collect::<Vec<_>>();
+        let input_slices = inputs.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let mut outputs = (0..output_channel_count)
+            .map(|_| vec![0.0f32; quantum])
+            .collect::<Vec<_>>();
+        let mut output_slices = outputs
+            .iter_mut()
+            .map(Vec::as_mut_slice)
+            .collect::<Vec<_>>();
+        let report = audio.process_events(
+            quantum,
+            &input_slices,
+            &mut output_slices,
+            transport,
+            &events,
+            &mut [],
+        );
+        match report.status {
+            AudioStatus::Processed => startup_fallbacks = 0,
+            AudioStatus::Fallback if startup_fallbacks > 0 => startup_fallbacks -= 1,
+            status => {
+                return Err(format!(
+                    "VST2 worker did not process block {}: {status:?}",
+                    block_start / quantum
+                ));
+            }
+        }
+        for channel in 0..captured_channel_count {
+            captured[channel].extend_from_slice(&outputs[channel]);
+        }
+        transport = transport.advanced(quantum, options.sample_rate);
+
+        // The public block endpoint is nonblocking. Give its worker several
+        // callback periods to complete each block before submitting the next.
+        thread::sleep(Duration::from_secs_f64(
+            f64::from(RENDER_QUANTUM) / f64::from(options.sample_rate) * 3.0,
+        ));
+    }
+
+    let end = latency_frames
+        .checked_add(content_frames)
+        .ok_or_else(|| "VST2 render slice overflow".to_owned())?;
+    if captured.iter().any(|channel| channel.len() < end) {
+        return Err("VST2 render did not produce the requested audio range".to_owned());
+    }
+    let channels = captured
+        .into_iter()
+        .map(|channel| channel[latency_frames..end].to_vec())
+        .collect::<Vec<_>>();
+    let peak = channels
+        .iter()
+        .flat_map(|channel| channel.iter())
+        .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
+    write_audio_range_to_wav(
+        &DecodedAudio {
+            sample_rate: options.sample_rate,
+            channels,
+        },
+        0..content_frames,
+        output_path,
+    )?;
+
+    Ok(Vst2NoteRenderSummary {
+        plugin_name: class.name,
+        vendor: class.vendor,
+        sample_rate: options.sample_rate,
+        frames: content_frames,
+        latency_frames,
+        channels: captured_channel_count,
+        peak,
+    })
+}
+
+fn host_for_current_executable() -> Result<Host, String> {
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("could not locate the VST2 worker executable: {error}"))?;
+    Ok(Host::new(executable))
+}
+
+fn validate_render_options(options: Vst2NoteRenderOptions) -> Result<(), String> {
+    if !(8_000..=384_000).contains(&options.sample_rate) {
+        return Err("sample rate must be between 8,000 and 384,000 Hz".to_owned());
+    }
+    if options.midi_note > 127 {
+        return Err("MIDI note must be between 0 and 127".to_owned());
+    }
+    if !(1..=127).contains(&options.velocity) {
+        return Err("MIDI velocity must be between 1 and 127".to_owned());
+    }
+    if !options.note_seconds.is_finite()
+        || options.note_seconds <= 0.0
+        || !options.tail_seconds.is_finite()
+        || options.tail_seconds < 0.0
+        || options.note_seconds + options.tail_seconds > MAX_RENDER_SECONDS
+    {
+        return Err(format!(
+            "note plus tail duration must be finite, positive, and at most {MAX_RENDER_SECONDS} seconds"
+        ));
+    }
+    Ok(())
+}
+
+fn seconds_to_frames(seconds: f64, sample_rate: u32) -> Result<usize, String> {
+    let frames = (seconds * f64::from(sample_rate)).ceil();
+    if !frames.is_finite() || frames < 0.0 || frames > usize::MAX as f64 {
+        return Err("VST2 render frame count is outside the supported range".to_owned());
+    }
+    Ok(frames as usize)
+}

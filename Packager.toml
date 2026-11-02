@@ -7,7 +7,7 @@ out-dir = "dist"
 binaries-dir = "target/release"
 formats = ["default"]
 icons = ["assets/icon.png"]
-resources = ["assets/fonts/Inter-OFL.txt", "assets/licenses/LGPL-3.0.txt", "docs/third-party-notices.md"]
+resources = ["assets/fonts/Inter-OFL.txt", "assets/licenses/LGPL-3.0.txt", "assets/licenses/vst-audio-MIT.txt", "assets/licenses/vst2-abi-BSD-3-Clause.txt", "assets/licenses/vst2-midi-ISC.txt", "assets/licenses/vst-audio-NOTICE.txt", "docs/third-party-notices.md"]
 binaries = [
     { path = "fl-studio-rebuild", main = true },
     { path = "vst3-host-helper" },
