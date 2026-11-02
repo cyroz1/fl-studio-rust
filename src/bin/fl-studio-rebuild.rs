@@ -20868,7 +20868,7 @@ impl DawUi {
         {
             return;
         }
-        if let Some(selected) = self.browser_selected.clone() {
+        if let Some(selected) = self.midi_script_browser_selected_path() {
             if selected.is_dir() && matches!(value, -1 | 1) {
                 self.browser_tab = BrowserTab::Files;
                 self.set_browser_directory(selected);
@@ -20902,7 +20902,7 @@ impl DawUi {
         {
             return;
         }
-        if let Some(path) = self.browser_selected.clone() {
+        if let Some(path) = self.midi_script_browser_selected_path() {
             if path.is_dir() && self.browser_tab == BrowserTab::Favorites {
                 self.browser_tab = BrowserTab::Files;
             }
@@ -20917,10 +20917,8 @@ impl DawUi {
             return;
         }
         if let Some(path) = self
-            .browser_selected
-            .as_ref()
+            .midi_script_browser_selected_path()
             .filter(|path| browser_file_kind(path) == Some(BrowserFileKind::Audio))
-            .cloned()
         {
             self.request_browser_preview(path, self.browser_full_sample, None);
         }
@@ -29868,6 +29866,14 @@ impl DawUi {
             (parent, parent_is_directory, parent_type),
             selected,
         ]
+    }
+
+    fn midi_script_browser_selected_path(&self) -> Option<PathBuf> {
+        let selected = self.browser_selected.as_ref()?;
+        self.midi_script_browser_navigation_entries()
+            .into_iter()
+            .find(|entry| &entry.path == selected)
+            .map(|entry| entry.path)
     }
 
     fn browser_files(&mut self, ui: &mut egui::Ui) {
