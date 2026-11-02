@@ -8,7 +8,7 @@ use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
-use crate::media::{DecodedAudio, write_audio_range_to_wav};
+use crate::media::{DecodedAudio, decode_audio_file, write_audio_range_to_wav};
 use vst_audio::{
     AudioEvent, AudioStatus, BusSelector, ClassInfo, Configuration, Host, PluginDescriptor,
     PluginFormat, Transport,
@@ -34,6 +34,30 @@ pub struct Vst2NoteRenderSummary {
     pub sample_rate: u32,
     pub frames: usize,
     pub latency_frames: usize,
+    pub channels: usize,
+    pub peak: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Vst2AudioEffectRenderOptions {
+    pub tail_seconds: f64,
+}
+
+impl Default for Vst2AudioEffectRenderOptions {
+    fn default() -> Self {
+        Self { tail_seconds: 2.0 }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Vst2AudioEffectRenderSummary {
+    pub plugin_name: String,
+    pub vendor: String,
+    pub input_frames: usize,
+    pub output_frames: usize,
+    pub sample_rate: u32,
+    pub latency_frames: usize,
+    pub tail_frames: usize,
     pub channels: usize,
     pub peak: f32,
 }
@@ -260,6 +284,217 @@ pub fn render_vst2_note_to_wav(
     })
 }
 
+/// Process a mono or stereo file through the first class and first main output bus
+/// exposed by a VST2 effect, then write at most two output channels to WAV.
+pub fn render_audio_through_vst2_effect_to_wav(
+    input_path: impl AsRef<Path>,
+    plugin_path: impl AsRef<Path>,
+    output_path: impl AsRef<Path>,
+    options: Vst2AudioEffectRenderOptions,
+) -> Result<Vst2AudioEffectRenderSummary, String> {
+    let output_path = output_path.as_ref();
+    if !output_path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("wav"))
+    {
+        return Err("VST2 effect output must use the .wav extension".to_owned());
+    }
+    let audio = decode_audio_file(input_path)?;
+    if !(8_000..=384_000).contains(&audio.sample_rate) {
+        return Err("audio sample rate must be between 8000 and 384000 Hz".to_owned());
+    }
+    if audio.channels.is_empty() || audio.channels.len() > 2 {
+        return Err("VST2 effect rendering requires mono or stereo input audio".to_owned());
+    }
+    let input_frames = audio.frame_count();
+    if input_frames == 0 {
+        return Err("input audio contains no frames".to_owned());
+    }
+    if audio
+        .channels
+        .iter()
+        .any(|channel| channel.len() != input_frames)
+    {
+        return Err("input audio channels have different frame counts".to_owned());
+    }
+    if !options.tail_seconds.is_finite() || !(0.0..=60.0).contains(&options.tail_seconds) {
+        return Err("VST2 effect tail must be between 0 and 60 seconds".to_owned());
+    }
+
+    let plugin_path = plugin_path.as_ref();
+    let class = inspect_vst2_plugin(plugin_path)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "VST2 plug-in did not report a loadable class".to_owned())?;
+    let descriptor = PluginDescriptor {
+        path: plugin_path.to_path_buf(),
+        format: PluginFormat::Vst2,
+        class_id: Some(class.id),
+    };
+    let host = host_for_current_executable()?;
+    let configuration = Configuration {
+        sample_rate: audio.sample_rate,
+        quantum: RENDER_QUANTUM,
+        max_callback_frames: Some(RENDER_QUANTUM),
+        offline: true,
+        buses: Some(BusSelector::main_only()),
+        ..Configuration::default()
+    };
+    let mut instance = host
+        .spawn(&descriptor, &configuration, None)
+        .map_err(|error| format!("could not start VST2 effect: {error}"))?;
+    let mut endpoint = instance
+        .take_audio()
+        .ok_or_else(|| "VST2 worker did not provide an audio endpoint".to_owned())?;
+    let geometry = endpoint.geometry();
+    let input_channel_count = geometry.input_channels as usize;
+    let output_channel_count = geometry.output_channels as usize;
+    let captured_channel_count = output_channel_count.min(2);
+    if input_channel_count == 0 || captured_channel_count == 0 {
+        return Err("VST2 plug-in must expose active main audio input and output buses".to_owned());
+    }
+
+    let tail_frames = seconds_to_frames(options.tail_seconds, audio.sample_rate)?;
+    let content_frames = input_frames
+        .checked_add(tail_frames)
+        .ok_or_else(|| "VST2 effect render frame count overflow".to_owned())?;
+    if content_frames as f64 / f64::from(audio.sample_rate) > MAX_RENDER_SECONDS {
+        return Err(format!(
+            "VST2 effect input plus tail must be at most {MAX_RENDER_SECONDS} seconds"
+        ));
+    }
+    let latency_frames = endpoint.latency_frames();
+    let frames_with_latency = content_frames
+        .checked_add(latency_frames)
+        .ok_or_else(|| "VST2 effect render frame count overflow".to_owned())?;
+    let quantum = RENDER_QUANTUM as usize;
+    let process_frames = frames_with_latency
+        .checked_add(quantum - 1)
+        .map(|frames| frames / quantum * quantum)
+        .ok_or_else(|| "VST2 effect render frame count overflow".to_owned())?;
+    let buffer_bytes = process_frames
+        .checked_mul(captured_channel_count)
+        .and_then(|samples| samples.checked_mul(std::mem::size_of::<f32>()))
+        .ok_or_else(|| "VST2 effect render buffer size overflow".to_owned())?;
+    if buffer_bytes > MAX_RENDER_BUFFER_BYTES {
+        return Err(format!(
+            "VST2 effect render needs {buffer_bytes} bytes of audio storage; limit is {MAX_RENDER_BUFFER_BYTES}"
+        ));
+    }
+
+    let mut captured = (0..captured_channel_count)
+        .map(|_| Vec::with_capacity(process_frames))
+        .collect::<Vec<_>>();
+    let mut transport = Transport::default();
+    let mut startup_fallbacks = latency_frames.div_ceil(quantum);
+    for block_start in (0..process_frames).step_by(quantum) {
+        let mut inputs = (0..input_channel_count)
+            .map(|_| vec![0.0f32; quantum])
+            .collect::<Vec<_>>();
+        let (first_input, remaining_inputs) = inputs
+            .split_first_mut()
+            .ok_or_else(|| "VST2 plug-in has no active main input bus".to_owned())?;
+        if let Some(second_input) = remaining_inputs.first_mut() {
+            for (frame, (left_slot, right_slot)) in first_input
+                .iter_mut()
+                .zip(second_input.iter_mut())
+                .enumerate()
+            {
+                let source_frame = block_start + frame;
+                if source_frame >= input_frames {
+                    break;
+                }
+                *left_slot = finite_sample(audio.channels[0][source_frame]);
+                *right_slot = audio
+                    .channels
+                    .get(1)
+                    .map_or(*left_slot, |channel| finite_sample(channel[source_frame]));
+            }
+        } else {
+            for (frame, input_slot) in first_input.iter_mut().enumerate() {
+                let source_frame = block_start + frame;
+                if source_frame >= input_frames {
+                    break;
+                }
+                let left = finite_sample(audio.channels[0][source_frame]);
+                let right = audio
+                    .channels
+                    .get(1)
+                    .map_or(left, |channel| finite_sample(channel[source_frame]));
+                *input_slot = (left + right) * 0.5;
+            }
+        }
+        let input_slices = inputs.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let mut outputs = (0..output_channel_count)
+            .map(|_| vec![0.0f32; quantum])
+            .collect::<Vec<_>>();
+        let mut output_slices = outputs
+            .iter_mut()
+            .map(Vec::as_mut_slice)
+            .collect::<Vec<_>>();
+        let report = endpoint.process_events(
+            quantum,
+            &input_slices,
+            &mut output_slices,
+            transport,
+            &[],
+            &mut [],
+        );
+        match report.status {
+            AudioStatus::Processed => startup_fallbacks = 0,
+            AudioStatus::Fallback if startup_fallbacks > 0 => startup_fallbacks -= 1,
+            status => {
+                return Err(format!(
+                    "VST2 worker did not process block {}: {status:?}",
+                    block_start / quantum
+                ));
+            }
+        }
+        for channel in 0..captured_channel_count {
+            captured[channel].extend_from_slice(&outputs[channel]);
+        }
+        transport = transport.advanced(quantum, audio.sample_rate);
+        thread::sleep(Duration::from_secs_f64(
+            f64::from(RENDER_QUANTUM) / f64::from(audio.sample_rate) * 3.0,
+        ));
+    }
+
+    let end = latency_frames
+        .checked_add(content_frames)
+        .ok_or_else(|| "VST2 effect render slice overflow".to_owned())?;
+    if captured.iter().any(|channel| channel.len() < end) {
+        return Err("VST2 effect render did not produce the requested audio range".to_owned());
+    }
+    let channels = captured
+        .into_iter()
+        .map(|channel| channel[latency_frames..end].to_vec())
+        .collect::<Vec<_>>();
+    let peak = channels
+        .iter()
+        .flat_map(|channel| channel.iter())
+        .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
+    write_audio_range_to_wav(
+        &DecodedAudio {
+            sample_rate: audio.sample_rate,
+            channels,
+        },
+        0..content_frames,
+        output_path,
+    )?;
+
+    Ok(Vst2AudioEffectRenderSummary {
+        plugin_name: class.name,
+        vendor: class.vendor,
+        input_frames,
+        output_frames: content_frames,
+        sample_rate: audio.sample_rate,
+        latency_frames,
+        tail_frames,
+        channels: captured_channel_count,
+        peak,
+    })
+}
+
 fn host_for_current_executable() -> Result<Host, String> {
     let executable = std::env::current_exe()
         .map_err(|error| format!("could not locate the VST2 worker executable: {error}"))?;
@@ -295,4 +530,12 @@ fn seconds_to_frames(seconds: f64, sample_rate: u32) -> Result<usize, String> {
         return Err("VST2 render frame count is outside the supported range".to_owned());
     }
     Ok(frames as usize)
+}
+
+fn finite_sample(sample: f32) -> f32 {
+    if sample.is_finite() {
+        sample.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    }
 }

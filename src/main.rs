@@ -18,8 +18,8 @@ use flp_rebuild::sample_render::{
     SamplerPatternRenderOptions, render_audio_clips_to_wav, render_sampler_pattern_to_wav,
 };
 use flp_rebuild::vst2::{
-    Vst2NoteRenderOptions, inspect_vst2_plugin, render_vst2_note_to_wav,
-    run_vst2_worker_if_requested,
+    Vst2AudioEffectRenderOptions, Vst2NoteRenderOptions, inspect_vst2_plugin,
+    render_audio_through_vst2_effect_to_wav, render_vst2_note_to_wav, run_vst2_worker_if_requested,
 };
 use flp_rebuild::vst3::{Vst3AudioEffectRenderOptions, Vst3HostRuntime, Vst3PatternRenderOptions};
 use flp_rebuild::{
@@ -322,6 +322,24 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 Path::new(output),
                 class_uid,
                 Vst3AudioEffectRenderOptions {
+                    tail_seconds: parse_f64(tail, "effect tail")?,
+                },
+            )
+        }
+        [command, input, plugin, output] if command == "render-audio-vst2" => {
+            render_audio_vst2(
+                Path::new(input),
+                Path::new(plugin),
+                Path::new(output),
+                Vst2AudioEffectRenderOptions::default(),
+            )
+        }
+        [command, input, plugin, output, tail] if command == "render-audio-vst2" => {
+            render_audio_vst2(
+                Path::new(input),
+                Path::new(plugin),
+                Path::new(output),
+                Vst2AudioEffectRenderOptions {
                     tail_seconds: parse_f64(tail, "effect tail")?,
                 },
             )
@@ -6877,6 +6895,30 @@ fn render_audio_vst3(
         summary.output_frames,
         summary.latency_compensated_frames,
         summary.tail_frames
+    );
+    Ok(())
+}
+
+fn render_audio_vst2(
+    input_path: &Path,
+    plugin_path: &Path,
+    output_path: &Path,
+    options: Vst2AudioEffectRenderOptions,
+) -> Result<(), String> {
+    let summary =
+        render_audio_through_vst2_effect_to_wav(input_path, plugin_path, output_path, options)?;
+    println!(
+        "rendered {} input frames through {} by {} at {} Hz to {} ({} output frames, {} latency frames compensated, {} tail frames, {} channels, peak {:.6})",
+        summary.input_frames,
+        summary.plugin_name,
+        summary.vendor,
+        summary.sample_rate,
+        output_path.display(),
+        summary.output_frames,
+        summary.latency_frames,
+        summary.tail_frames,
+        summary.channels,
+        summary.peak,
     );
     Ok(())
 }
