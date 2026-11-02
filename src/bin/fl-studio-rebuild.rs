@@ -13409,6 +13409,9 @@ impl DawUi {
         match document.create_pattern() {
             Ok(pattern_id) => {
                 self.selected_pattern = Some(pattern_id);
+                self.selected_pattern_ids.clear();
+                self.selected_pattern_ids.insert(pattern_id);
+                self.last_midi_script_selected_pattern = Some(pattern_id);
                 self.dirty = true;
                 self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                 self.status = format!("Created empty pattern {pattern_id}");
@@ -13422,6 +13425,10 @@ impl DawUi {
     }
 
     fn select_next_empty_pattern(&mut self) -> Option<u16> {
+        self.select_empty_pattern(false)
+    }
+
+    fn select_empty_pattern(&mut self, find_first: bool) -> Option<u16> {
         let Some(document) = self.document.as_ref() else {
             self.status = "Open a project before selecting an empty pattern".to_owned();
             return None;
@@ -13433,8 +13440,16 @@ impl DawUi {
                 return None;
             }
         };
-        if let Some(pattern_id) = next_empty_pattern_id(&patterns, self.selected_pattern) {
+        let after_pattern = if find_first {
+            None
+        } else {
+            self.selected_pattern
+        };
+        if let Some(pattern_id) = next_empty_pattern_id(&patterns, after_pattern) {
             self.selected_pattern = Some(pattern_id);
+            self.selected_pattern_ids.clear();
+            self.selected_pattern_ids.insert(pattern_id);
+            self.last_midi_script_selected_pattern = Some(pattern_id);
             self.status = format!("Selected empty pattern {pattern_id}");
             Some(pattern_id)
         } else {
@@ -70117,6 +70132,16 @@ impl DawUi {
             }
             MidiTransportCommand::DeselectAllPatterns => {
                 self.deselect_all_midi_script_patterns();
+            }
+            MidiTransportCommand::FindNextEmptyPattern {
+                find_first,
+                prompt_name,
+            } => {
+                if let Some(pattern_id) = self.select_empty_pattern(find_first)
+                    && prompt_name
+                {
+                    self.open_pattern_rename_dialog(pattern_id);
+                }
             }
             MidiTransportCommand::SetGlobalSwingMixRaw(value_raw) => {
                 self.set_midi_script_global_swing_mix(value_raw);

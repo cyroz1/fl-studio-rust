@@ -2049,6 +2049,22 @@ def _deselect_all_patterns():
     _request_transport_action({"action": "deselect_all_patterns"})
 
 
+def _find_first_next_empty_pattern(flags, x=-1, y=-1):
+    try:
+        flags = int(flags)
+        x = int(x)
+        y = int(y)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("patterns.findFirstNextEmptyPat() arguments must be integers") from error
+    if flags not in (0, 2):
+        raise ValueError("patterns.findFirstNextEmptyPat() flags must be 0 or 2")
+    if x != -1 or y != -1:
+        raise NotImplementedError("Pattern Picker coordinate selection is not supported")
+    _request_transport_action(
+        {"action": "find_first_next_empty_pattern", "flags": flags}
+    )
+
+
 def _set_pattern_name(index, name):
     try:
         index = int(index)
@@ -2408,6 +2424,8 @@ def _install_modules(script_name, device_name):
     midi = _module("midi")
     constants = {
         "FromMIDI_Max": 127,
+        "FFNEP_FindFirst": 0,
+        "FFNEP_DontPromptName": 2,
         "SBN_FLP": 1,
         "SBN_ZIP": 2,
         "SBN_FLM": 3,
@@ -2715,6 +2733,7 @@ def _install_modules(script_name, device_name):
     patterns.selectPattern = _select_pattern
     patterns.selectAll = _select_all_patterns
     patterns.deselectAll = _deselect_all_patterns
+    patterns.findFirstNextEmptyPat = _find_first_next_empty_pattern
     patterns.setPatternLength = _set_pattern_length
     patterns.incrementPatternLength = _increment_pattern_length
     patterns.jumpToPattern = _jump_to_pattern

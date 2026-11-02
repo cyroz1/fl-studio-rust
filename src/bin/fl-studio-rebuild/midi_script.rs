@@ -106,6 +106,10 @@ pub enum ScriptTransportAction {
     },
     SelectAllPatterns,
     DeselectAllPatterns,
+    FindNextEmptyPattern {
+        find_first: bool,
+        prompt_name: bool,
+    },
     SetGlobalSwingMixRaw(u8),
     AddArrangementTimeMarker {
         tick: u32,
@@ -1853,6 +1857,17 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
     }
     if name == Some("deselect_all_patterns") {
         return Ok(ScriptTransportAction::DeselectAllPatterns);
+    }
+    if name == Some("find_first_next_empty_pattern") {
+        let flags = action["flags"]
+            .as_i64()
+            .and_then(|flags| i8::try_from(flags).ok())
+            .filter(|flags| matches!(flags, 0 | 2))
+            .ok_or_else(|| "MIDI script returned invalid empty-Pattern flags".to_owned())?;
+        return Ok(ScriptTransportAction::FindNextEmptyPattern {
+            find_first: flags == 0,
+            prompt_name: flags & 2 == 0,
+        });
     }
     if name == Some("add_arrangement_time_marker") {
         let tick = action["time_ticks"]

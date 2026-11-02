@@ -890,6 +890,13 @@ fn queue_script_transport_actions(
             }
             ScriptTransportAction::SelectAllPatterns => MidiTransportCommand::SelectAllPatterns,
             ScriptTransportAction::DeselectAllPatterns => MidiTransportCommand::DeselectAllPatterns,
+            ScriptTransportAction::FindNextEmptyPattern {
+                find_first,
+                prompt_name,
+            } => MidiTransportCommand::FindNextEmptyPattern {
+                find_first,
+                prompt_name,
+            },
             ScriptTransportAction::SetGlobalSwingMixRaw(value_raw) => {
                 MidiTransportCommand::SetGlobalSwingMixRaw(value_raw)
             }
@@ -1153,6 +1160,10 @@ pub enum MidiTransportCommand {
     },
     SelectAllPatterns,
     DeselectAllPatterns,
+    FindNextEmptyPattern {
+        find_first: bool,
+        prompt_name: bool,
+    },
     SetGlobalSwingMixRaw(u8),
     AddArrangementTimeMarker {
         tick: u32,
@@ -1990,7 +2001,8 @@ pub fn describe_event(event: MidiInputEvent) -> String {
             MidiTransportCommand::JumpToPattern(_) => "MIDI script Pattern Selection".to_owned(),
             MidiTransportCommand::SelectPattern { .. }
             | MidiTransportCommand::SelectAllPatterns
-            | MidiTransportCommand::DeselectAllPatterns => {
+            | MidiTransportCommand::DeselectAllPatterns
+            | MidiTransportCommand::FindNextEmptyPattern { .. } => {
                 "MIDI script Pattern Selection".to_owned()
             }
             MidiTransportCommand::SetGlobalSwingMixRaw(_) => {

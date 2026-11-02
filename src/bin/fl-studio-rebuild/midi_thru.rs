@@ -701,6 +701,7 @@ fn midi_input_thru_message(event: MidiInputEvent) -> Option<([u8; 3], usize)> {
             | MidiTransportCommand::SelectPattern { .. }
             | MidiTransportCommand::SelectAllPatterns
             | MidiTransportCommand::DeselectAllPatterns
+            | MidiTransportCommand::FindNextEmptyPattern { .. }
             | MidiTransportCommand::SetGlobalSwingMixRaw(_)
             | MidiTransportCommand::SetHintMessage(_)
             | MidiTransportCommand::AddArrangementTimeMarker { .. }
