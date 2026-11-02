@@ -6273,9 +6273,7 @@ impl PlaylistClip {
     }
 
     fn is_legacy_pattern_block(&self) -> bool {
-        self.record_size == 32
-            && self.pattern_base == 0
-            && self.item_index == LEGACY_PATTERN_BLOCK_ITEM_INDEX
+        is_legacy_pattern_block_layout(self.record_size, self.pattern_base, self.item_index)
     }
 
     fn legacy_pattern_block_pattern_id(&self) -> Option<u16> {
@@ -6411,6 +6409,10 @@ impl PlaylistClip {
     pub fn has_opaque_record_tail(&self) -> bool {
         self.record_size == 88
     }
+}
+
+fn is_legacy_pattern_block_layout(record_size: usize, pattern_base: u16, item_index: u16) -> bool {
+    record_size == 32 && pattern_base == 0 && item_index == LEGACY_PATTERN_BLOCK_ITEM_INDEX
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -29471,6 +29473,11 @@ fn decode_playlist_clip(
     let f32_at = |offset: usize| f32::from_le_bytes(record[offset..offset + 4].try_into().unwrap());
     let record_size = record.len();
     let modern_record = record_size == 88;
+    let pattern_base = u16_at(4);
+    let item_index = u16_at(6);
+    let raw_track_index = u16_at(12);
+    let legacy_pattern_block =
+        is_legacy_pattern_block_layout(record_size, pattern_base, item_index);
     let source_window_ticks = modern_record.then(|| (u32_at(24), u32_at(28)));
     let clip_id = playlist_record_has_clip_id(record_size).then(|| u32_at(32));
     let reserved = match record_size {
@@ -29495,11 +29502,15 @@ fn decode_playlist_clip(
 
     PlaylistClip {
         position_ticks: u32_at(0),
-        pattern_base: u16_at(4),
-        item_index: u16_at(6),
+        pattern_base,
+        item_index,
         length_ticks: u32_at(8),
-        raw_track_index: u16_at(12),
-        track_index: 499u16.checked_sub(u16_at(12)),
+        raw_track_index,
+        track_index: if legacy_pattern_block {
+            None
+        } else {
+            499u16.checked_sub(raw_track_index)
+        },
         group: u16_at(14),
         unknown_word: if modern_record { 0 } else { u16_at(16) },
         item_flags: if modern_record { 0 } else { u16_at(18) },
