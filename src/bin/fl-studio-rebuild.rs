@@ -72796,6 +72796,8 @@ impl DawUi {
                 .is_some_and(|session| {
                     session.channel_id == channel_id
                         && session.pattern_id == pattern_id
+                        && session.pattern_mode == self.pattern_playback_mode
+                        && session.performance_mode == self.performance_launch_sender.is_some()
                         && self
                             .live_layer_input_targets(channel_id)
                             .is_some_and(|targets| {
@@ -73307,6 +73309,7 @@ impl DawUi {
         let keep_vst2_layer_session = self.live_vst2_input.as_ref().is_some_and(|session| {
             session.transport_playing
                 && session.pattern_id == pattern_id
+                && session.performance_mode == self.performance_launch_sender.is_some()
                 && session.channel_id == channel_id
                 && self
                     .live_layer_input_targets(channel_id)
@@ -73322,6 +73325,8 @@ impl DawUi {
                 .is_some_and(|session| {
                     session.channel_id == channel_id
                         && session.pattern_id == pattern_id
+                        && session.pattern_mode == self.pattern_playback_mode
+                        && session.performance_mode == self.performance_launch_sender.is_some()
                         && self
                             .live_layer_input_targets(channel_id)
                             .is_some_and(|targets| {
@@ -74185,14 +74190,15 @@ impl DawUi {
         if vst2_target_channel_ids.is_empty() {
             return;
         }
-        let playlist_layer_targets = playlist_or_performance_transport_active
+        let transport_layer_targets = (pattern_transport_active
+            || playlist_or_performance_transport_active)
             .then(|| self.live_layer_input_targets(channel_id))
             .flatten()
             .filter(|targets| targets.vst2_channel_ids == vst2_target_channel_ids);
         if playlist_or_performance_transport_active {
             let direct_vst2_target =
                 vst2_target_channel_ids.len() == 1 && vst2_target_channel_ids.contains(&channel_id);
-            if !direct_vst2_target && playlist_layer_targets.is_none() {
+            if !direct_vst2_target && transport_layer_targets.is_none() {
                 return;
             }
         }
@@ -74218,7 +74224,10 @@ impl DawUi {
         })
         .flatten();
         if self.live_vst2_input.as_ref().is_some_and(|session| {
-            session.pattern_id != pattern_id
+            pattern_transport_active
+                || session.transport_playing != playlist_or_performance_transport_active
+                || session.performance_mode != self.performance_launch_sender.is_some()
+                || session.pattern_id != pattern_id
                 || session.channel_id != channel_id
                 || session.target_channel_ids != vst2_target_channel_ids
         }) {
@@ -74229,7 +74238,7 @@ impl DawUi {
             self.stop_live_layer_input();
             self.stop_live_audition_playback_if_stopped();
         }
-        let keep_sampler_layer_session = playlist_layer_targets.as_ref().is_some_and(|targets| {
+        let keep_sampler_layer_session = transport_layer_targets.as_ref().is_some_and(|targets| {
             self.live_sampler_input.as_ref().is_some_and(|session| {
                 session.channel_id == channel_id
                     && session.pattern_id == pattern_id
@@ -74240,12 +74249,14 @@ impl DawUi {
             self.stop_live_sampler_input();
             self.stop_live_audition_playback_if_stopped();
         }
-        let keep_vst3_layer_session = playlist_layer_targets.as_ref().is_some_and(|targets| {
+        let keep_vst3_layer_session = transport_layer_targets.as_ref().is_some_and(|targets| {
             self.live_playlist_vst3_input
                 .as_ref()
                 .is_some_and(|session| {
                     session.channel_id == channel_id
                         && session.pattern_id == pattern_id
+                        && session.pattern_mode == self.pattern_playback_mode
+                        && session.performance_mode == self.performance_launch_sender.is_some()
                         && session.target_channel_ids == targets.vst3_channel_ids
                 })
         });
