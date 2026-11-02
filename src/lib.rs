@@ -6272,17 +6272,24 @@ impl PlaylistClip {
             .and_then(|track_index| u32::from(track_index).checked_add(1))
     }
 
+    fn is_legacy_pattern_block(&self) -> bool {
+        self.record_size == 32
+            && self.pattern_base == 0
+            && self.item_index == LEGACY_PATTERN_BLOCK_ITEM_INDEX
+    }
+
+    fn legacy_pattern_block_pattern_id(&self) -> Option<u16> {
+        self.is_legacy_pattern_block()
+            .then(|| LEGACY_PATTERN_BLOCK_PATTERN_INDEX_BASE.checked_sub(self.raw_track_index))
+            .flatten()
+    }
+
     pub fn target(&self) -> PlaylistClipTarget {
         // FL Studio 9 Pattern Block records use a zero pattern-base word and
         // the 0x6000 item marker. In those records the reversed raw track
         // field carries the Pattern ID (999 - raw_track_index), rather than a
         // modern Playlist track index.
-        if self.record_size == 32
-            && self.pattern_base == 0
-            && self.item_index == LEGACY_PATTERN_BLOCK_ITEM_INDEX
-            && let Some(id) =
-                LEGACY_PATTERN_BLOCK_PATTERN_INDEX_BASE.checked_sub(self.raw_track_index)
-        {
+        if let Some(id) = self.legacy_pattern_block_pattern_id() {
             return PlaylistClipTarget::Pattern { id };
         }
         if self.item_index >= self.pattern_base {
@@ -12137,6 +12144,18 @@ impl FlpDocument {
                 "the requested playlist clip does not exist",
             ));
         };
+        if clip.is_legacy_pattern_block()
+            && (edit
+                .item_index
+                .is_some_and(|value| value != clip.item_index)
+                || edit
+                    .raw_track_index
+                    .is_some_and(|value| value != clip.raw_track_index))
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "FL Studio 9 Pattern Block targets cannot be changed through modern Playlist fields",
+            ));
+        }
         if edit.start_offset.is_some_and(|value| !value.is_finite())
             || edit.end_offset.is_some_and(|value| !value.is_finite())
             || edit.scale.is_some_and(|value| {
@@ -12924,33 +12943,29 @@ impl FlpDocument {
                 "the requested arrangement id is ambiguous",
             ));
         }
-        let template_in_arrangement = arrangement
-            .clips
+        let template_in_arrangement = arrangement.clips.iter().enumerate().find(|(_, clip)| {
+            !clip.is_legacy_pattern_block()
+                && matches!(clip.target(), PlaylistClipTarget::Pattern { .. })
+        });
+        let project_pattern_template = arrangements
             .iter()
-            .enumerate()
-            .find(|(_, clip)| matches!(clip.target(), PlaylistClipTarget::Pattern { .. }))
-            .or_else(|| arrangement.clips.iter().enumerate().next());
+            .flat_map(|arrangement| arrangement.clips.iter())
+            .find(|clip| {
+                !clip.is_legacy_pattern_block()
+                    && matches!(clip.target(), PlaylistClipTarget::Pattern { .. })
+            });
         let item_index = template_in_arrangement
             .map(|(_, template)| template.pattern_base)
-            .or_else(|| {
-                arrangements
-                    .iter()
-                    .flat_map(|arrangement| arrangement.clips.iter())
-                    .find(|clip| matches!(clip.target(), PlaylistClipTarget::Pattern { .. }))
-                    .map(|template| template.pattern_base)
-            })
+            .or_else(|| project_pattern_template.map(|template| template.pattern_base))
             .ok_or(FlpError::UnsupportedEdit(
-                "the project has no recognized Pattern Clip record to use as a template",
+                "the project has no track-based Pattern Clip record to use as a template",
             ))?
             .checked_add(pattern_id)
             .ok_or(FlpError::LengthOverflow)?;
 
         if template_in_arrangement.is_none() {
-            let template = arrangements
-                .iter()
-                .flat_map(|arrangement| arrangement.clips.iter())
-                .find(|clip| matches!(clip.target(), PlaylistClipTarget::Pattern { .. }))
-                .expect("a Pattern Clip template was checked above");
+            let template =
+                project_pattern_template.expect("a Pattern Clip template was checked above");
             let record_size = template.record_size;
             let record_start = template
                 .source_record_index
@@ -13776,6 +13791,12 @@ impl FlpDocument {
                 "Playlist track index must be between 0 and 499",
             ));
         }
+        let clipboard_clip = decode_playlist_clip(&clipboard.raw_record, 0, 0);
+        if clipboard_clip.is_legacy_pattern_block() {
+            return Err(FlpError::UnsupportedEdit(
+                "FL Studio 9 Pattern Block clips cannot be pasted onto modern Playlist tracks",
+            ));
+        }
 
         let arrangements = self.arrangements()?;
         let mut matching_arrangements = arrangements
@@ -13966,6 +13987,13 @@ impl FlpDocument {
                 "the requested playlist clip does not exist",
             ));
         };
+        if clip.is_legacy_pattern_block()
+            && raw_track_index.is_some_and(|value| value != clip.raw_track_index)
+        {
+            return Err(FlpError::UnsupportedEdit(
+                "FL Studio 9 Pattern Block clips cannot be moved onto modern Playlist tracks",
+            ));
+        }
         let record_size = clip.record_size;
         let record_start = clip
             .source_record_index
