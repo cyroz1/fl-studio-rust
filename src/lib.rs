@@ -8063,6 +8063,53 @@ impl FlpDocument {
         Ok(())
     }
 
+    /// Replaces field 53 in a Mixer effect slot's recognized VST2 state event.
+    ///
+    /// The slot must contain exactly one VST2 `0xD5` event. Wrapper identity fields and every
+    /// other envelope field remain byte-exact.
+    pub fn replace_vst2_mixer_effect_slot_state_bytes(
+        &mut self,
+        insert_ordinal: usize,
+        slot_index: u16,
+        nested_state: &[u8],
+    ) -> Result<(), FlpError> {
+        let mut candidate = self.clone();
+        let slot = candidate.unique_mixer_effect_slot(insert_ordinal, slot_index)?;
+        let state_events = slot
+            .event_range()
+            .filter(|index| candidate.events[*index].opcode == 0xD5)
+            .collect::<Vec<_>>();
+        let [state_event_index] = state_events.as_slice() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the Mixer effect slot must contain exactly one VST plug-in data event",
+            ));
+        };
+        let Some(metadata) = slot.vst_metadata() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the Mixer effect slot has an unsupported VST plug-in state envelope",
+            ));
+        };
+        let Some(fourcc) = metadata.fourcc() else {
+            return Err(FlpError::UnsupportedEdit(
+                "VST2 state write-back requires a saved VST2 FourCC identifier",
+            ));
+        };
+        if fourcc.len() != 4 || !fourcc.is_ascii() {
+            return Err(FlpError::UnsupportedEdit(
+                "the Mixer effect VST2 state has an invalid FourCC identifier",
+            ));
+        }
+        let replacement_payload = replace_vst_state_field(
+            &candidate.events[*state_event_index].payload,
+            metadata.state_data_range.as_ref(),
+            nested_state,
+        )?;
+        candidate.events[*state_event_index].replace_data_payload(replacement_payload)?;
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
     /// Returns pattern metadata, note records, and raw controller points.
     pub fn patterns(&self) -> Result<Vec<Pattern>, FlpError> {
         let mut patterns = Vec::<Pattern>::new();

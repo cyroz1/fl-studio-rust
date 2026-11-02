@@ -156,6 +156,12 @@ struct Vst2HostedChannel {
     audio: AudioEndpoint,
 }
 
+struct Vst2HostedMixerEffect {
+    fourcc: String,
+    instance: Instance,
+    _audio: AudioEndpoint,
+}
+
 /// Persistent isolated VST2 instances restored from FLP Channel Rack state.
 pub struct Vst2HostRuntime {
     host: Host,
@@ -163,8 +169,11 @@ pub struct Vst2HostRuntime {
     quantum: u32,
     next_id: u64,
     channels: BTreeMap<u16, Vst2HostedChannel>,
+    mixer_effects: BTreeMap<(usize, u16), Vst2HostedMixerEffect>,
     pending_editor_requests: BTreeSet<(u16, RequestId)>,
     pending_editor_failures: Vec<(u16, String)>,
+    pending_mixer_editor_requests: BTreeMap<RequestId, (usize, u16)>,
+    pending_mixer_editor_failures: Vec<(usize, u16, String)>,
     pending_worker_failures: Vec<(u16, String)>,
 }
 
@@ -329,8 +338,11 @@ impl Vst2HostRuntime {
             quantum,
             next_id: 1,
             channels: BTreeMap::new(),
+            mixer_effects: BTreeMap::new(),
             pending_editor_requests: BTreeSet::new(),
             pending_editor_failures: Vec::new(),
+            pending_mixer_editor_requests: BTreeMap::new(),
+            pending_mixer_editor_failures: Vec::new(),
             pending_worker_failures: Vec::new(),
         })
     }
@@ -403,6 +415,203 @@ impl Vst2HostRuntime {
             .collect()
     }
 
+    /// Load one VST2 Mixer effect into a persistent isolated worker for its native editor.
+    pub fn load_mixer_effect(
+        &mut self,
+        key: (usize, u16),
+        assignment: &Vst2ProjectMixerEffectAssignment,
+    ) -> Result<(), String> {
+        let configuration = Configuration {
+            sample_rate: self.sample_rate,
+            quantum: self.quantum,
+            max_callback_frames: Some(self.quantum),
+            offline: false,
+            buses: Some(BusSelector::main_only()),
+            ..Configuration::default()
+        };
+        let descriptor = PluginDescriptor {
+            path: assignment.plugin_path.clone(),
+            format: PluginFormat::Vst2,
+            class_id: Some(assignment.class_id),
+        };
+        let mut instance = self
+            .host
+            .spawn(&descriptor, &configuration, Some(&assignment.state_bytes))
+            .map_err(|error| format!("could not restore VST2 Mixer effect state: {error}"))?;
+        let audio = instance.take_audio().ok_or_else(|| {
+            "VST2 worker did not provide a Mixer effect audio endpoint".to_owned()
+        })?;
+        self.unload_mixer_effect(key);
+        self.mixer_effects.insert(
+            key,
+            Vst2HostedMixerEffect {
+                fourcc: assignment.fourcc.clone(),
+                instance,
+                _audio: audio,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn has_mixer_effect(&self, key: (usize, u16)) -> bool {
+        self.mixer_effects.contains_key(&key)
+    }
+
+    /// Request the native editor for one loaded VST2 Mixer effect.
+    pub fn open_mixer_effect_editor(&mut self, key: (usize, u16)) -> Result<(), String> {
+        let effect = self.mixer_effects.get(&key).ok_or_else(|| {
+            format!(
+                "VST2 Mixer insert {} effect slot {} is not loaded",
+                key.0,
+                key.1 + 1
+            )
+        })?;
+        let request = effect
+            .instance
+            .controller()
+            .request(Command::OpenEditor)
+            .map_err(|error| format!("could not request VST2 Mixer effect editor: {error}"))?;
+        self.pending_mixer_editor_requests.insert(request, key);
+        Ok(())
+    }
+
+    /// Snapshot the editor worker's current state for writing back to FLP field 53.
+    pub fn save_mixer_effect_state(&mut self, key: (usize, u16)) -> Result<Vec<u8>, String> {
+        let effect = self.mixer_effects.get(&key).ok_or_else(|| {
+            format!(
+                "VST2 Mixer insert {} effect slot {} is not loaded",
+                key.0,
+                key.1 + 1
+            )
+        })?;
+        let request = effect
+            .instance
+            .controller()
+            .request(Command::SaveState)
+            .map_err(|error| format!("could not request VST2 Mixer effect state: {error}"))?;
+        let fourcc = effect.fourcc.clone();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "VST2 Mixer effect {fourcc} state snapshot timed out"
+                ));
+            }
+            let Some(event) = effect.instance.try_next_event() else {
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            };
+            match event {
+                HostEvent::Completed {
+                    request: completed_request,
+                } => {
+                    self.pending_mixer_editor_requests
+                        .remove(&completed_request);
+                }
+                HostEvent::State {
+                    request: Some(state_request),
+                    bytes,
+                } if state_request == request => return Ok(bytes),
+                HostEvent::RequestFailed {
+                    request: failed_request,
+                    reason,
+                } if failed_request == request => {
+                    return Err(format!(
+                        "VST2 Mixer effect {fourcc} state snapshot failed: {reason}"
+                    ));
+                }
+                HostEvent::RequestFailed { request, reason } => {
+                    if let Some((insert_ordinal, slot_index)) =
+                        self.pending_mixer_editor_requests.remove(&request)
+                    {
+                        self.pending_mixer_editor_failures.push((
+                            insert_ordinal,
+                            slot_index,
+                            reason,
+                        ));
+                    }
+                }
+                HostEvent::Failed { reason } => {
+                    return Err(format!(
+                        "VST2 Mixer effect {fourcc} worker failed: {reason}"
+                    ));
+                }
+                HostEvent::RecoveryRequired | HostEvent::Stopped => {
+                    return Err(format!(
+                        "VST2 Mixer effect {fourcc} worker stopped during state snapshot"
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    pub fn take_mixer_editor_failures(&mut self) -> Vec<(usize, u16, String)> {
+        self.poll_events();
+        std::mem::take(&mut self.pending_mixer_editor_failures)
+    }
+
+    pub fn unload_mixer_effect(&mut self, key: (usize, u16)) -> bool {
+        self.pending_mixer_editor_requests
+            .retain(|_, pending_key| *pending_key != key);
+        self.mixer_effects.remove(&key).is_some()
+    }
+
+    pub fn remap_mixer_effects_after_move(
+        &mut self,
+        insert_ordinal: usize,
+        from_slot: u16,
+        to_slot: u16,
+    ) {
+        if from_slot == to_slot {
+            return;
+        }
+        let mut remapped = BTreeMap::new();
+        for (key, effect) in std::mem::take(&mut self.mixer_effects) {
+            let slot_index = if key.0 != insert_ordinal {
+                key.1
+            } else if key.1 == from_slot {
+                to_slot
+            } else if from_slot < to_slot && key.1 > from_slot && key.1 <= to_slot {
+                key.1 - 1
+            } else if from_slot > to_slot && key.1 >= to_slot && key.1 < from_slot {
+                key.1 + 1
+            } else {
+                key.1
+            };
+            remapped.insert((key.0, slot_index), effect);
+        }
+        self.mixer_effects = remapped;
+        for key in self.pending_mixer_editor_requests.values_mut() {
+            if key.0 == insert_ordinal {
+                key.1 = if key.1 == from_slot {
+                    to_slot
+                } else if from_slot < to_slot && key.1 > from_slot && key.1 <= to_slot {
+                    key.1 - 1
+                } else if from_slot > to_slot && key.1 >= to_slot && key.1 < from_slot {
+                    key.1 + 1
+                } else {
+                    key.1
+                };
+            }
+        }
+        for (effect_insert, effect_slot, _) in &mut self.pending_mixer_editor_failures {
+            if *effect_insert == insert_ordinal {
+                *effect_slot = if *effect_slot == from_slot {
+                    to_slot
+                } else if from_slot < to_slot && *effect_slot > from_slot && *effect_slot <= to_slot
+                {
+                    *effect_slot - 1
+                } else if from_slot > to_slot && *effect_slot >= to_slot && *effect_slot < from_slot
+                {
+                    *effect_slot + 1
+                } else {
+                    *effect_slot
+                };
+            }
+        }
+    }
+
     /// Request the plug-in's native editor in its isolated worker process.
     pub fn open_editor(&mut self, channel_id: u16) -> Result<(), String> {
         let channel = self
@@ -471,6 +680,35 @@ impl Vst2HostRuntime {
                         self.pending_worker_failures.push((
                             *channel_id,
                             "VST2 worker stopped or requires recovery".to_owned(),
+                        ))
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for (key, effect) in &mut self.mixer_effects {
+            while let Some(event) = effect.instance.try_next_event() {
+                match event {
+                    HostEvent::Completed { request } => {
+                        self.pending_mixer_editor_requests.remove(&request);
+                    }
+                    HostEvent::RequestFailed { request, reason }
+                        if self
+                            .pending_mixer_editor_requests
+                            .remove(&request)
+                            .is_some() =>
+                    {
+                        self.pending_mixer_editor_failures
+                            .push((key.0, key.1, reason));
+                    }
+                    HostEvent::Failed { reason } => self
+                        .pending_mixer_editor_failures
+                        .push((key.0, key.1, reason)),
+                    HostEvent::RecoveryRequired | HostEvent::Stopped => {
+                        self.pending_mixer_editor_failures.push((
+                            key.0,
+                            key.1,
+                            "VST2 Mixer effect worker stopped or requires recovery".to_owned(),
                         ))
                     }
                     _ => {}

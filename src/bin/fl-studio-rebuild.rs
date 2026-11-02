@@ -5817,6 +5817,7 @@ struct DawUi {
     clap_preview_velocity: u8,
     clap_preview_note_duration_milliseconds: u32,
     vst2_host: Option<Arc<Mutex<Vst2HostRuntime>>>,
+    vst2_mixer_effect_host: Option<Arc<Mutex<Vst2HostRuntime>>>,
     vst3_host: Option<Vst3HostRuntime>,
     vst3_manual_latency_offsets: BTreeMap<String, i32>,
     vst3_project_manual_latency_offsets: BTreeMap<String, i32>,
@@ -9068,6 +9069,7 @@ impl DawUi {
             clap_preview_velocity: 100,
             clap_preview_note_duration_milliseconds: 500,
             vst2_host: None,
+            vst2_mixer_effect_host: None,
             vst3_host: None,
             vst3_manual_latency_offsets,
             vst3_project_manual_latency_offsets: BTreeMap::new(),
@@ -12339,6 +12341,40 @@ impl DawUi {
         (!summaries.is_empty()).then(|| summaries.join(" · "))
     }
 
+    fn load_vst2_mixer_effect_editor_host(
+        &mut self,
+        assignments: &BTreeMap<(usize, u16), Vst2ProjectMixerEffectAssignment>,
+    ) -> Vec<String> {
+        self.vst2_mixer_effect_host = None;
+        if assignments.is_empty() {
+            return Vec::new();
+        }
+        let mut host = match Vst2HostRuntime::new(self.audio_settings.sample_rate, 512) {
+            Ok(host) => host,
+            Err(error) => {
+                return vec![format!(
+                    "VST2 Mixer editor host initialization failed: {error}"
+                )];
+            }
+        };
+        let mut loaded_count = 0;
+        let mut warnings = Vec::new();
+        for (&key, assignment) in assignments {
+            match host.load_mixer_effect(key, assignment) {
+                Ok(()) => loaded_count += 1,
+                Err(error) => warnings.push(format!(
+                    "Mixer insert {} effect slot {} editor worker could not load: {error}",
+                    key.0,
+                    key.1 + 1
+                )),
+            }
+        }
+        if loaded_count > 0 {
+            self.vst2_mixer_effect_host = Some(Arc::new(Mutex::new(host)));
+        }
+        warnings
+    }
+
     fn load_project_vst2_plugins(&mut self) -> Option<String> {
         self.vst2_host = None;
         let document = self.document.as_ref()?;
@@ -12427,6 +12463,7 @@ impl DawUi {
 
     fn load_project_vst3_plugins(&mut self) -> Option<String> {
         self.vst3_host = None;
+        self.vst2_mixer_effect_host = None;
         self.vst3_manual_latency_offset_keys.clear();
         self.vst3_manual_latency_offset_labels.clear();
         self.channel_vst3_instances.clear();
@@ -12468,6 +12505,8 @@ impl DawUi {
         let (vst2_effect_assignments, eligible_vst2_effects, vst2_unresolved) =
             resolve_vst2_mixer_effect_assignments(&effect_slots, &self.plugin_candidates);
         unresolved.extend(vst2_unresolved);
+        self.vst2_mixer_effect_assignments = vst2_effect_assignments.clone();
+        unresolved.extend(self.load_vst2_mixer_effect_editor_host(&vst2_effect_assignments));
 
         let mut effect_plans = Vec::new();
         for slot in effect_slots {
@@ -12530,7 +12569,6 @@ impl DawUi {
                 return Some(format!("VST3 host initialization failed: {error}"));
             }
         };
-        self.vst2_mixer_effect_assignments = vst2_effect_assignments.clone();
         host.set_mixer_effect_processor_factory(combined_mixer_effect_processor_factory(
             clap_effect_assignments.clone(),
             vst2_effect_assignments.clone(),
@@ -12693,7 +12731,8 @@ impl DawUi {
             return;
         };
 
-        let plugin_state_warnings = self.capture_loaded_vst3_state(&mut document);
+        let mut plugin_state_warnings = self.capture_loaded_vst3_state(&mut document);
+        plugin_state_warnings.extend(self.capture_loaded_vst2_mixer_effect_state(&mut document));
         let selected_channel_warning = format!("channel {channel_id}: ");
         if let Some(warning) = plugin_state_warnings
             .iter()
@@ -12815,7 +12854,8 @@ impl DawUi {
             self.status = "Open a project before loading a Mixer state".to_owned();
             return;
         };
-        let capture_warnings = self.capture_loaded_vst3_state(&mut document);
+        let mut capture_warnings = self.capture_loaded_vst3_state(&mut document);
+        capture_warnings.extend(self.capture_loaded_vst2_mixer_effect_state(&mut document));
         match document.apply_mixer_insert_state_preset(insert_ordinal, &preset) {
             Ok(event_count) => {
                 self.document = Some(document);
@@ -12827,7 +12867,10 @@ impl DawUi {
                 let capture_warning = if capture_warnings.is_empty() {
                     String::new()
                 } else {
-                    format!(" · {} VST3 state capture issue(s)", capture_warnings.len())
+                    format!(
+                        " · {} plug-in state capture issue(s)",
+                        capture_warnings.len()
+                    )
                 };
                 self.status = format!(
                     "Loaded {event_count} Mixer effect-state events into insert {insert_ordinal} from {}{plugin_summary}{capture_warning}",
@@ -12972,7 +13015,8 @@ impl DawUi {
             .flatten();
         let project_edit_revision = self.project_edit_revision;
         let mut document = document.clone();
-        let plugin_state_warnings = self.capture_loaded_vst3_state(&mut document);
+        let mut plugin_state_warnings = self.capture_loaded_vst3_state(&mut document);
+        plugin_state_warnings.extend(self.capture_loaded_vst2_mixer_effect_state(&mut document));
         let result = document
             .encode_lossless()
             .map_err(|error| error.to_string())
@@ -13029,7 +13073,8 @@ impl DawUi {
             .flatten();
         let project_edit_revision = self.project_edit_revision;
         let mut document = document.clone();
-        let plugin_state_warnings = self.capture_loaded_vst3_state(&mut document);
+        let mut plugin_state_warnings = self.capture_loaded_vst3_state(&mut document);
+        plugin_state_warnings.extend(self.capture_loaded_vst2_mixer_effect_state(&mut document));
         let bytes = match document.encode_lossless() {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -14461,6 +14506,7 @@ impl DawUi {
         let (vst2_effect_assignments, _, mut warnings) =
             resolve_vst2_mixer_effect_assignments(&effect_slots, &self.plugin_candidates);
         self.vst2_mixer_effect_assignments = vst2_effect_assignments.clone();
+        warnings.extend(self.load_vst2_mixer_effect_editor_host(&vst2_effect_assignments));
         let instances = self.channel_vst3_instances.clone();
         let channel_instance_ids = instances.values().copied().collect::<BTreeSet<_>>();
         self.mixer_effect_vst3_instances.clear();
@@ -14768,13 +14814,82 @@ impl DawUi {
         warnings
     }
 
+    fn capture_vst2_mixer_effect_state_for_slot(
+        &mut self,
+        document: &mut FlpDocument,
+        key: (usize, u16),
+    ) -> Result<(), String> {
+        let runtime = self
+            .vst2_mixer_effect_host
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "VST2 Mixer effect editor host is not running".to_owned())?;
+        let nested_state = runtime
+            .lock()
+            .map_err(|_| "VST2 Mixer effect host lock was poisoned".to_owned())?
+            .save_mixer_effect_state(key)?;
+        document
+            .replace_vst2_mixer_effect_slot_state_bytes(key.0, key.1, &nested_state)
+            .map_err(|error| error.to_string())?;
+        let assignment = self
+            .vst2_mixer_effect_assignments
+            .get_mut(&key)
+            .ok_or_else(|| {
+                format!(
+                    "Mixer insert {} effect slot {} has no resolved VST2 assignment",
+                    key.0,
+                    key.1 + 1
+                )
+            })?;
+        assignment.state_bytes = nested_state;
+        Ok(())
+    }
+
+    fn refresh_vst2_mixer_effect_processor_factory(&mut self) {
+        if let Some(host) = &mut self.vst3_host {
+            host.set_mixer_effect_processor_factory(combined_mixer_effect_processor_factory(
+                self.clap_mixer_effect_assignments.clone(),
+                self.vst2_mixer_effect_assignments.clone(),
+                self.clap_mixer_effect_state_capture_controller.clone(),
+            ));
+        }
+    }
+
+    fn capture_loaded_vst2_mixer_effect_state(
+        &mut self,
+        document: &mut FlpDocument,
+    ) -> Vec<String> {
+        let keys = self
+            .vst2_mixer_effect_assignments
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        let mut warnings = Vec::new();
+        let mut captured_any = false;
+        for key in keys {
+            match self.capture_vst2_mixer_effect_state_for_slot(document, key) {
+                Ok(()) => captured_any = true,
+                Err(error) => warnings.push(format!(
+                    "Mixer insert {} effect slot {}: {error}",
+                    key.0,
+                    key.1 + 1
+                )),
+            }
+        }
+        if captured_any {
+            self.refresh_vst2_mixer_effect_processor_factory();
+        }
+        warnings
+    }
+
     fn write_project(&mut self, path: &Path) {
         self.finish_active_midi_recording();
         let Some(mut document) = self.document.as_ref().cloned() else {
             self.status = "Open a project before saving".to_owned();
             return;
         };
-        let plugin_state_warnings = self.capture_loaded_vst3_state(&mut document);
+        let mut plugin_state_warnings = self.capture_loaded_vst3_state(&mut document);
+        plugin_state_warnings.extend(self.capture_loaded_vst2_mixer_effect_state(&mut document));
         let encoded = match document.encode_lossless() {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -64991,6 +65106,22 @@ impl DawUi {
     }
 
     fn mixer(&mut self, ui: &mut egui::Ui) {
+        let vst2_editor_failures = self
+            .vst2_mixer_effect_host
+            .as_ref()
+            .and_then(|runtime| {
+                runtime
+                    .lock()
+                    .ok()
+                    .map(|mut runtime| runtime.take_mixer_editor_failures())
+            })
+            .unwrap_or_default();
+        if let Some((insert_ordinal, slot_index, reason)) = vst2_editor_failures.last() {
+            self.status = format!(
+                "VST2 editor for Mixer insert {insert_ordinal} slot {} failed: {reason}",
+                slot_index + 1
+            );
+        }
         let Some(document) = self.document.as_ref() else {
             empty_view(ui, "Open a project to see the Mixer");
             return;
@@ -65100,6 +65231,8 @@ impl DawUi {
         let mut save_native_effect_state = None;
         let mut effect_slot_move = None;
         let mut effect_editor_open = None;
+        let mut vst2_effect_editor_open = None;
+        let mut capture_vst2_effect_state = None;
         let mut clap_effect_editor_open = None;
         let mut inspect_clap_effect_path = None;
         let mut inspect_clap_instance = None;
@@ -66759,8 +66892,23 @@ impl DawUi {
                                     .mixer_effect_vst3_instances
                                     .get(&slot_key)
                                     .copied();
+                                let vst2_effect_assignment =
+                                    self.vst2_mixer_effect_assignments.get(&slot_key);
+                                let vst2_editor_loaded = self
+                                    .vst2_mixer_effect_host
+                                    .as_ref()
+                                    .is_some_and(|runtime| {
+                                        runtime
+                                            .lock()
+                                            .map(|host| host.has_mixer_effect(slot_key))
+                                            .unwrap_or(false)
+                                    });
                                 let saved_state = if loaded_effect_instance.is_some() {
                                     format!("{saved_state} · VST3 loaded")
+                                } else if vst2_editor_loaded {
+                                    format!("{saved_state} · VST2 loaded")
+                                } else if vst2_effect_assignment.is_some() {
+                                    format!("{saved_state} · VST2 matched")
                                 } else {
                                     saved_state
                                 };
@@ -66829,6 +66977,11 @@ impl DawUi {
                                                         instance_id,
                                                     ));
                                                 }
+                                                if vst2_editor_loaded
+                                                    && ui.small_button("Open VST2 editor").clicked()
+                                                {
+                                                    vst2_effect_editor_open = Some(slot_key);
+                                                }
                                                 if clap_effect_assignment.is_some()
                                                     && ui.small_button("Open CLAP editor").clicked()
                                                 {
@@ -66853,6 +67006,14 @@ impl DawUi {
                                                     ));
                                                 }
                                             });
+                                            if vst2_editor_loaded
+                                                && ui
+                                                    .small_button("Capture VST2 state")
+                                                    .on_hover_text("Snapshot the isolated VST2 editor worker and write its current state into this Mixer slot's FLP field 53. Newly built audio chains use the captured state.")
+                                                    .clicked()
+                                            {
+                                                capture_vst2_effect_state = Some(slot_key);
+                                            }
                                             let native_state_export_supported = slot
                                                 .plugin_identifier()
                                                 .is_some()
@@ -67503,7 +67664,7 @@ impl DawUi {
                             }
                             ui.small(
                                 egui::RichText::new(
-                                    "Open editor controls a loaded VST3 effect through its native editor. Move up/down carries saved slot events with the effect. CLAP assignments process in saved slot order with timed parameter automation, saved machine-local parameter overrides, and reported-latency PDC. CLAP sidechains feed supported mono/stereo auxiliary inputs in source-track and bus order by default; a slot can save explicit source-insert-to-input maps that sum multiple sources on one port. PDC and runtime latency/tail reports apply between audio blocks. Capture state reads one active effect at the next block boundary, or refreshes the prior machine-local snapshot if none is active; simultaneous active instances must be stopped to avoid an ambiguous capture. Native FLP bus mapping remains unverified. Assigned CLAP Mixer effects open isolated native editors; writable parameters synchronize to active processing while open, and state is saved on close. VST3 Mix edits use a 20 ms ramp.",
+                                    "Open editor controls a loaded VST3 effect; Open VST2 editor launches the saved VST2 Mixer effect in an isolated worker, and Capture VST2 state writes that editor state into FLP field 53. Move up/down carries saved slot events with the effect. CLAP assignments process in saved slot order with timed parameter automation, saved machine-local parameter overrides, and reported-latency PDC. CLAP sidechains feed supported mono/stereo auxiliary inputs in source-track and bus order by default; a slot can save explicit source-insert-to-input maps that sum multiple sources on one port. PDC and runtime latency/tail reports apply between audio blocks. Capture state reads one active effect at the next block boundary, or refreshes the prior machine-local snapshot if none is active; simultaneous active instances must be stopped to avoid an ambiguous capture. Native FLP bus mapping remains unverified. Assigned CLAP Mixer effects open isolated native editors; writable parameters synchronize to active processing while open, and state is saved on close. VST3 Mix edits use a 20 ms ramp.",
                                 )
                                 .color(MUTED),
                             );
@@ -68346,6 +68507,61 @@ impl DawUi {
         if let Some((insert_ordinal, slot_index)) = clap_effect_editor_open {
             self.request_clap_plugin_editor(insert_ordinal, slot_index);
         }
+        if let Some(key) = vst2_effect_editor_open {
+            let result = self
+                .vst2_mixer_effect_host
+                .as_ref()
+                .ok_or_else(|| "VST2 Mixer effect editor host is not running".to_owned())
+                .and_then(|runtime| {
+                    runtime
+                        .lock()
+                        .map_err(|_| "VST2 Mixer effect host lock was poisoned".to_owned())?
+                        .open_mixer_effect_editor(key)
+                });
+            match result {
+                Ok(()) => {
+                    self.status = format!(
+                        "Requested VST2 editor for Mixer insert {} slot {}",
+                        key.0,
+                        key.1 + 1
+                    );
+                }
+                Err(error) => {
+                    self.status = format!(
+                        "Could not open VST2 editor for Mixer insert {} slot {}: {error}",
+                        key.0,
+                        key.1 + 1
+                    );
+                }
+            }
+        }
+        if let Some(key) = capture_vst2_effect_state {
+            let Some(mut document) = self.document.as_ref().cloned() else {
+                self.status = "Open a project before capturing VST2 Mixer state".to_owned();
+                return;
+            };
+            match self.capture_vst2_mixer_effect_state_for_slot(&mut document, key) {
+                Ok(()) => {
+                    self.refresh_vst2_mixer_effect_processor_factory();
+                    self.stop_project_playback();
+                    self.document = Some(document);
+                    self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+                    self.status = format!(
+                        "Captured VST2 state for Mixer insert {} slot {}",
+                        key.0,
+                        key.1 + 1
+                    );
+                }
+                Err(error) => {
+                    self.status = format!(
+                        "Could not capture VST2 state for Mixer insert {} slot {}: {error}",
+                        key.0,
+                        key.1 + 1
+                    );
+                }
+            }
+        }
         if let Some((insert_ordinal, from_slot, to_slot)) = effect_slot_move
             && let Some(document) = self.document.as_mut()
         {
@@ -68374,6 +68590,15 @@ impl DawUi {
                         from_slot,
                         to_slot,
                     );
+                    if let Some(editor_host) = &self.vst2_mixer_effect_host
+                        && let Ok(mut editor_host) = editor_host.lock()
+                    {
+                        editor_host.remap_mixer_effects_after_move(
+                            insert_ordinal,
+                            from_slot,
+                            to_slot,
+                        );
+                    }
                     let clap_assignment_save_error = project_id.as_deref().and_then(|project_id| {
                         save_clap_project_mixer_effects(
                             project_id,
