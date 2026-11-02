@@ -4583,6 +4583,19 @@ impl BrowserTab {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BrowserProjectNodeId {
+    Channel(u16),
+    Pattern(usize),
+    PluginState(usize),
+}
+
+#[derive(Clone)]
+struct BrowserProjectNode {
+    id: BrowserProjectNodeId,
+    caption: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BrowserFilter {
     All,
     Audio,
@@ -5786,6 +5799,7 @@ struct DawUi {
     browser_search_all_active: bool,
     browser_search: String,
     browser_selected: Option<PathBuf>,
+    browser_project_selected: Option<BrowserProjectNodeId>,
     midi_script_browser_navigation: VecDeque<(u8, bool)>,
     browser_favorites: BTreeSet<PathBuf>,
     browser_tags: BTreeMap<PathBuf, BTreeSet<String>>,
@@ -9012,6 +9026,7 @@ impl DawUi {
             browser_search_all_active: false,
             browser_search: String::new(),
             browser_selected: None,
+            browser_project_selected: None,
             midi_script_browser_navigation: VecDeque::new(),
             browser_favorites: load_browser_favorites(),
             browser_tags: load_browser_tags(),
@@ -19421,6 +19436,7 @@ impl DawUi {
             && matches!(
                 self.browser_tab,
                 BrowserTab::Files
+                    | BrowserTab::CurrentProject
                     | BrowserTab::Plugins
                     | BrowserTab::Favorites
                     | BrowserTab::Recent
@@ -20853,6 +20869,7 @@ impl DawUi {
             || !matches!(
                 self.browser_tab,
                 BrowserTab::Files
+                    | BrowserTab::CurrentProject
                     | BrowserTab::Plugins
                     | BrowserTab::Favorites
                     | BrowserTab::Recent
@@ -29756,6 +29773,88 @@ impl DawUi {
         (entries, recursive_results)
     }
 
+    fn midi_script_browser_project_entries(&self) -> Vec<BrowserProjectNode> {
+        let Some(document) = self.document.as_ref() else {
+            return Vec::new();
+        };
+        let mut entries = document
+            .channels()
+            .into_iter()
+            .map(|channel| BrowserProjectNode {
+                id: BrowserProjectNodeId::Channel(channel.id()),
+                caption: channel
+                    .display_name()
+                    .unwrap_or("(unnamed channel)")
+                    .to_owned(),
+            })
+            .collect::<Vec<_>>();
+        if let Ok(patterns) = document.patterns() {
+            entries.extend(patterns.into_iter().enumerate().map(|(index, pattern)| {
+                BrowserProjectNode {
+                    id: BrowserProjectNodeId::Pattern(index),
+                    caption: pattern.name.as_deref().unwrap_or("Pattern").to_owned(),
+                }
+            }));
+        }
+        entries.extend(
+            document
+                .channel_plugin_states()
+                .into_iter()
+                .enumerate()
+                .map(|(index, state)| BrowserProjectNode {
+                    id: BrowserProjectNodeId::PluginState(index),
+                    caption: format!(
+                        "{} · {} bytes",
+                        state.plugin_identifier().unwrap_or("Plug-in"),
+                        state.data_payload().len()
+                    ),
+                }),
+        );
+        entries
+    }
+
+    fn midi_script_browser_project_navigation_targets(&self) -> Vec<(String, bool, i32)> {
+        let entries = self.midi_script_browser_project_entries();
+        let selected_index = self
+            .browser_project_selected
+            .and_then(|selected| entries.iter().position(|entry| entry.id == selected));
+        let target = |index: Option<usize>| {
+            index
+                .and_then(|index| entries.get(index))
+                .map(|entry| (entry.caption.clone(), false, -1))
+                .unwrap_or_default()
+        };
+        let up_index = if entries.is_empty() {
+            None
+        } else {
+            Some(
+                selected_index
+                    .map(|index| index.saturating_sub(1))
+                    .unwrap_or(entries.len() - 1),
+            )
+        };
+        let down_index = if entries.is_empty() {
+            None
+        } else {
+            Some(
+                selected_index
+                    .map(|index| (index + 1).min(entries.len() - 1))
+                    .unwrap_or(0),
+            )
+        };
+        let selected = self
+            .browser_project_selected
+            .and_then(|selected| entries.iter().find(|entry| entry.id == selected))
+            .map(|entry| (entry.caption.clone(), false, -1))
+            .unwrap_or_default();
+        vec![
+            target(up_index),
+            target(down_index),
+            (String::new(), false, -1),
+            selected,
+        ]
+    }
+
     fn midi_script_browser_navigation_entries(&self) -> Vec<BrowserEntry> {
         match self.browser_tab {
             BrowserTab::Files => self.visible_browser_file_entries().0,
@@ -29826,6 +29925,9 @@ impl DawUi {
     }
 
     fn midi_script_browser_navigation_targets(&self) -> Vec<(String, bool, i32)> {
+        if self.browser_tab == BrowserTab::CurrentProject {
+            return self.midi_script_browser_project_navigation_targets();
+        }
         let entries = self.midi_script_browser_navigation_entries();
         let selected_index = self
             .browser_selected
@@ -30461,36 +30563,99 @@ impl DawUi {
         }
     }
 
-    fn browser_current_project(&self, ui: &mut egui::Ui) {
-        if let Some(document) = &self.document {
-            egui::CollapsingHeader::new("Channels")
-                .default_open(true)
-                .show(ui, |ui| {
-                    for channel in document.channels() {
-                        ui.label(channel.display_name().unwrap_or("(unnamed channel)"));
+    fn browser_current_project(&mut self, ui: &mut egui::Ui) {
+        let entries = self.midi_script_browser_project_entries();
+        let mut selected = self
+            .browser_project_selected
+            .filter(|selected| entries.iter().any(|entry| entry.id == *selected));
+        if let Some((direction, _)) = self.midi_script_browser_navigation.pop_front() {
+            let selected_index =
+                selected.and_then(|selected| entries.iter().position(|entry| entry.id == selected));
+            let target_index = match direction {
+                0 if !entries.is_empty() => selected_index
+                    .map(|index| index.saturating_sub(1))
+                    .or_else(|| Some(entries.len() - 1)),
+                1 if !entries.is_empty() => selected_index
+                    .map(|index| (index + 1).min(entries.len() - 1))
+                    .or(Some(0)),
+                _ => None,
+            };
+            selected = target_index.and_then(|index| entries.get(index).map(|entry| entry.id));
+        }
+        if self.document.is_none() {
+            ui.label(egui::RichText::new("No project open").color(MUTED));
+            self.browser_project_selected = None;
+            return;
+        }
+
+        let mut clicked = None;
+        egui::CollapsingHeader::new("Channels")
+            .default_open(true)
+            .open(
+                if selected.is_some_and(|id| matches!(id, BrowserProjectNodeId::Channel(_))) {
+                    Some(true)
+                } else {
+                    None
+                },
+            )
+            .show(ui, |ui| {
+                for entry in entries
+                    .iter()
+                    .filter(|entry| matches!(entry.id, BrowserProjectNodeId::Channel(_)))
+                {
+                    if ui
+                        .selectable_label(selected == Some(entry.id), &entry.caption)
+                        .clicked()
+                    {
+                        clicked = Some(entry.id);
                     }
-                });
-            egui::CollapsingHeader::new("Patterns")
-                .default_open(true)
-                .show(ui, |ui| {
-                    if let Ok(patterns) = document.patterns() {
-                        for pattern in patterns {
-                            ui.label(pattern.name.as_deref().unwrap_or("Pattern"));
-                        }
-                    }
-                });
-            ui.collapsing("Plug-in state", |ui| {
-                for state in document.channel_plugin_states() {
-                    ui.label(format!(
-                        "{} · {} bytes",
-                        state.plugin_identifier().unwrap_or("Plug-in"),
-                        state.data_payload().len()
-                    ));
                 }
             });
-        } else {
-            ui.label(egui::RichText::new("No project open").color(MUTED));
-        }
+        egui::CollapsingHeader::new("Patterns")
+            .default_open(true)
+            .open(
+                if selected.is_some_and(|id| matches!(id, BrowserProjectNodeId::Pattern(_))) {
+                    Some(true)
+                } else {
+                    None
+                },
+            )
+            .show(ui, |ui| {
+                for entry in entries
+                    .iter()
+                    .filter(|entry| matches!(entry.id, BrowserProjectNodeId::Pattern(_)))
+                {
+                    if ui
+                        .selectable_label(selected == Some(entry.id), &entry.caption)
+                        .clicked()
+                    {
+                        clicked = Some(entry.id);
+                    }
+                }
+            });
+        egui::CollapsingHeader::new("Plug-in state")
+            .default_open(true)
+            .open(
+                if selected.is_some_and(|id| matches!(id, BrowserProjectNodeId::PluginState(_))) {
+                    Some(true)
+                } else {
+                    None
+                },
+            )
+            .show(ui, |ui| {
+                for entry in entries
+                    .iter()
+                    .filter(|entry| matches!(entry.id, BrowserProjectNodeId::PluginState(_)))
+                {
+                    if ui
+                        .selectable_label(selected == Some(entry.id), &entry.caption)
+                        .clicked()
+                    {
+                        clicked = Some(entry.id);
+                    }
+                }
+            });
+        self.browser_project_selected = clicked.or(selected);
     }
 
     fn browser_plugins(&mut self, ui: &mut egui::Ui) {
