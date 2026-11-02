@@ -1153,9 +1153,10 @@ pub struct Vst2LiveInputRouting {
     pub receiver: Vst2LiveInputReceiver,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Vst2LiveInputPlayback {
-    pub channel_id: u16,
+    pub source_channel_id: u16,
+    pub target_channel_ids: BTreeSet<u16>,
     pub transport_playing: bool,
     pub start_frame: u64,
 }
@@ -12337,25 +12338,61 @@ pub fn stream_vst2_midi_input_to_device(
     cancelled: &AtomicBool,
 ) -> Result<(), String> {
     let Vst2LiveInputPlayback {
-        channel_id,
+        source_channel_id,
+        target_channel_ids,
         transport_playing,
         start_frame,
     } = playback;
-    let channel = document
-        .channels()
-        .into_iter()
-        .find(|channel| channel.id() == channel_id)
-        .ok_or_else(|| format!("VST2 input channel {channel_id} is not in the project"))?;
-    if channel.enabled() == Some(false) {
-        return Err(format!("VST2 input channel {channel_id} is disabled"));
+    let channels = document.channels();
+    let channels_by_id = channels
+        .iter()
+        .map(|channel| (channel.id(), channel))
+        .collect::<BTreeMap<_, _>>();
+    let source_channel = channels_by_id
+        .get(&source_channel_id)
+        .ok_or_else(|| format!("MIDI source channel {source_channel_id} is not in the project"))?;
+    if source_channel.enabled() == Some(false) {
+        return Err(format!(
+            "MIDI source channel {source_channel_id} is disabled"
+        ));
     }
-    let channel_info = runtime
+    if target_channel_ids.is_empty() {
+        return Err(format!(
+            "MIDI source channel {source_channel_id} has no VST2 destinations"
+        ));
+    }
+    for target_channel_id in &target_channel_ids {
+        let Some(channel) = channels_by_id.get(target_channel_id) else {
+            return Err(format!(
+                "VST2 channel {target_channel_id} is not in the project"
+            ));
+        };
+        if channel.enabled() == Some(false) {
+            return Err(format!("VST2 channel {target_channel_id} is disabled"));
+        }
+    }
+    let channel_infos = runtime
         .lock()
         .map_err(|_| "VST2 host runtime lock was poisoned".to_owned())?
         .loaded_channels()
         .into_iter()
-        .find(|channel| channel.channel_id == channel_id)
-        .ok_or_else(|| format!("VST2 channel {channel_id} is not loaded"))?;
+        .filter(|channel| target_channel_ids.contains(&channel.channel_id))
+        .collect::<Vec<_>>();
+    if channel_infos.len() != target_channel_ids.len() {
+        return Err(format!(
+            "one or more VST2 destinations for source channel {source_channel_id} are not loaded"
+        ));
+    }
+    let Some(channel_info) = channel_infos.first() else {
+        return Err("VST2 live input has no loaded destinations".to_owned());
+    };
+    if channel_infos
+        .iter()
+        .any(|channel| channel.sample_rate != channel_info.sample_rate)
+    {
+        return Err("VST2 live input destinations use different sample rates".to_owned());
+    }
+    let channel_router = ChannelNoteRouter::new(channels);
     let ppq = document.header().ppq();
     let tempo_bpm = document.metadata().tempo_bpm().unwrap_or(140.0);
     if ppq == 0 {
@@ -12363,15 +12400,13 @@ pub fn stream_vst2_midi_input_to_device(
     }
     let loop_frames =
         ticks_to_frames(u64::from(ppq) * 4, ppq, tempo_bpm, channel_info.sample_rate)?.max(1);
-    let channel_infos = vec![channel_info.clone()];
-    let channel_ids = BTreeSet::from([channel_id]);
     let mut processor = Vst2PatternStreamProcessor::new(
         Arc::clone(&runtime),
         Vst2PatternStreamSetup {
             document: &document,
             pattern_notes: &[],
             channel_infos: &channel_infos,
-            external_channel_ids: &channel_ids,
+            external_channel_ids: &target_channel_ids,
             volume_expression_channels: &BTreeSet::new(),
             meters: None,
             settings: Vst2PatternStreamSettings {
@@ -12400,6 +12435,8 @@ pub fn stream_vst2_midi_input_to_device(
     }
     let stream_result = (|| {
         let mut block_start = start_frame;
+        let mut note_targets = HashMap::<(u8, u8), VecDeque<Vec<u16>>>::new();
+        let mut note_seed = 0u64;
         loop {
             if cancelled.load(Ordering::Acquire) || writer.is_cancelled() {
                 return Err("VST2 input audition was stopped".to_owned());
@@ -12407,8 +12444,108 @@ pub fn stream_vst2_midi_input_to_device(
             let mut disconnected = false;
             loop {
                 match events.try_recv() {
-                    Ok(event) => {
-                        processor.queue_live_midi_input_event(channel_id, block_start, event)?
+                    Ok(Vst3LiveInputEvent::NoteOn {
+                        channel,
+                        key,
+                        velocity,
+                    }) if velocity > 0 => {
+                        let source_key = key.min(127);
+                        let routed_targets = channel_router
+                            .targets_for_note_with_layer_adjustments(
+                                source_channel_id,
+                                note_seed,
+                                u16::from(source_key),
+                            )
+                            .into_iter()
+                            .filter_map(|(target_channel_id, layer_gain, _)| {
+                                (target_channel_ids.contains(&target_channel_id))
+                                    .then_some((target_channel_id, layer_gain))
+                            })
+                            .collect::<Vec<_>>();
+                        note_seed = note_seed.wrapping_add(1);
+                        let mut active_targets = Vec::with_capacity(routed_targets.len());
+                        for (target_channel_id, layer_gain) in routed_targets {
+                            let adjusted_velocity =
+                                vst2_layer_adjusted_velocity(velocity, layer_gain);
+                            if adjusted_velocity == 0 {
+                                continue;
+                            }
+                            processor.queue_live_midi_input_event(
+                                target_channel_id,
+                                block_start,
+                                Vst3LiveInputEvent::NoteOn {
+                                    channel,
+                                    key: source_key,
+                                    velocity: adjusted_velocity,
+                                },
+                            )?;
+                            active_targets.push(target_channel_id);
+                        }
+                        note_targets
+                            .entry((channel & 0x0F, source_key))
+                            .or_default()
+                            .push_back(active_targets);
+                    }
+                    Ok(Vst3LiveInputEvent::NoteOff { channel, key }) => {
+                        let source_note = (channel & 0x0F, key.min(127));
+                        let active_targets = note_targets
+                            .get_mut(&source_note)
+                            .and_then(VecDeque::pop_front);
+                        if note_targets
+                            .get(&source_note)
+                            .is_some_and(VecDeque::is_empty)
+                        {
+                            note_targets.remove(&source_note);
+                        }
+                        if let Some(active_targets) = active_targets {
+                            for target_channel_id in active_targets {
+                                processor.queue_live_midi_input_event(
+                                    target_channel_id,
+                                    block_start,
+                                    Vst3LiveInputEvent::NoteOff {
+                                        channel,
+                                        key: source_note.1,
+                                    },
+                                )?;
+                            }
+                        }
+                    }
+                    Ok(
+                        live_event @ Vst3LiveInputEvent::PolyphonicPressure { channel, key, .. },
+                    ) => {
+                        let source_note = (channel & 0x0F, key.min(127));
+                        let affected_targets = note_targets
+                            .get(&source_note)
+                            .into_iter()
+                            .flatten()
+                            .flatten()
+                            .copied()
+                            .collect::<BTreeSet<_>>();
+                        for target_channel_id in affected_targets {
+                            processor.queue_live_midi_input_event(
+                                target_channel_id,
+                                block_start,
+                                live_event,
+                            )?;
+                        }
+                    }
+                    Ok(live_event) => {
+                        if let Vst3LiveInputEvent::ControlChange {
+                            channel,
+                            controller: 120 | 123..=127,
+                            ..
+                        } = live_event
+                        {
+                            note_targets
+                                .retain(|(midi_channel, _), _| *midi_channel != (channel & 0x0F));
+                        }
+                        for target_channel_id in &target_channel_ids {
+                            processor.queue_live_midi_input_event(
+                                *target_channel_id,
+                                block_start,
+                                live_event,
+                            )?;
+                        }
                     }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {

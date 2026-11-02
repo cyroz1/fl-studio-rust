@@ -6311,6 +6311,7 @@ struct LiveVst3InputSession {
 struct LiveVst2InputSession {
     pattern_id: u16,
     channel_id: u16,
+    target_channel_ids: BTreeSet<u16>,
     transport_playing: bool,
     performance_mode: bool,
     sender: Vst2LiveInputSender,
@@ -72127,7 +72128,12 @@ impl DawUi {
         }
     }
 
-    fn start_live_vst2_input(&mut self, pattern_id: u16, channel_id: u16) -> bool {
+    fn start_live_vst2_input(
+        &mut self,
+        pattern_id: u16,
+        channel_id: u16,
+        target_channel_ids: BTreeSet<u16>,
+    ) -> bool {
         let transport_playing = self.playing;
         let performance_mode = transport_playing && self.performance_launch_sender.is_some();
         let Some(document) = self.document.as_ref().cloned() else {
@@ -72141,27 +72147,32 @@ impl DawUi {
             return false;
         };
         if channel.enabled() == Some(false) {
-            self.status = "Enable the selected VST2 channel for live MIDI audition".to_owned();
+            self.status = "Enable the selected MIDI source for live VST2 input".to_owned();
+            return false;
+        }
+        if target_channel_ids.is_empty() {
+            self.status = "Select a VST2 channel or a Layer with loaded VST2 children".to_owned();
             return false;
         }
         let Some(runtime) = self.vst2_host.as_ref().cloned() else {
             self.status = "Load the selected VST2 channel before live MIDI audition".to_owned();
             return false;
         };
-        let channel_info = match runtime.lock() {
+        let channel_infos = match runtime.lock() {
             Ok(runtime) => runtime
                 .loaded_channels()
                 .into_iter()
-                .find(|channel| channel.channel_id == channel_id),
+                .filter(|channel| target_channel_ids.contains(&channel.channel_id))
+                .collect::<Vec<_>>(),
             Err(_) => {
                 self.status = "VST2 host runtime lock was poisoned".to_owned();
                 return false;
             }
         };
-        let Some(channel_info) = channel_info else {
-            self.status = "Load the selected VST2 channel before live MIDI audition".to_owned();
+        if channel_infos.len() != target_channel_ids.len() {
+            self.status = "Load all VST2 destinations before live MIDI audition".to_owned();
             return false;
-        };
+        }
         if self.audio_engine.is_none() {
             match AudioEngine::start(&self.audio_settings) {
                 Ok(engine) => self.audio_engine = Some(engine),
@@ -72180,10 +72191,12 @@ impl DawUi {
                 "Enable an output device in Audio settings before VST2 audition".to_owned();
             return false;
         }
-        if channel_info.sample_rate != engine.sample_rate() {
+        if channel_infos
+            .iter()
+            .any(|channel_info| channel_info.sample_rate != engine.sample_rate())
+        {
             self.status = format!(
-                "VST2 channel {channel_id} is running at {} Hz, but audio output is {} Hz; reload the project plug-ins after changing the audio sample rate",
-                channel_info.sample_rate,
+                "VST2 destinations are not all running at the audio output rate of {} Hz; reload the project plug-ins after changing the audio sample rate",
                 engine.sample_rate()
             );
             return false;
@@ -72281,6 +72294,7 @@ impl DawUi {
         let worker_cancelled = Arc::clone(&cancelled);
         let worker_runtime = Arc::clone(&runtime);
         let worker_document = document;
+        let worker_target_channel_ids = target_channel_ids.clone();
         let worker = thread::Builder::new()
             .name("vst2-midi-input".to_owned())
             .spawn(move || {
@@ -72288,7 +72302,8 @@ impl DawUi {
                     vst3_processor,
                     worker_document,
                     Vst2LiveInputPlayback {
-                        channel_id,
+                        source_channel_id: channel_id,
+                        target_channel_ids: worker_target_channel_ids,
                         transport_playing,
                         start_frame,
                     },
@@ -72306,6 +72321,7 @@ impl DawUi {
                 self.live_vst2_input = Some(LiveVst2InputSession {
                     pattern_id,
                     channel_id,
+                    target_channel_ids,
                     transport_playing,
                     performance_mode,
                     sender: event_sender,
@@ -74090,11 +74106,19 @@ impl DawUi {
         if vst2_target_channel_ids.is_empty() {
             return;
         }
-        if playlist_or_performance_transport_active
-            && (vst2_target_channel_ids.len() != 1
-                || !vst2_target_channel_ids.contains(&channel_id))
-        {
-            return;
+        if playlist_or_performance_transport_active {
+            let direct_vst2_target =
+                vst2_target_channel_ids.len() == 1 && vst2_target_channel_ids.contains(&channel_id);
+            let vst2_only_layer_targets =
+                self.live_layer_input_targets(channel_id)
+                    .is_some_and(|targets| {
+                        targets.vst2_channel_ids == vst2_target_channel_ids
+                            && targets.sampler_channel_ids.is_empty()
+                            && targets.vst3_channel_ids.is_empty()
+                    });
+            if !direct_vst2_target && !vst2_only_layer_targets {
+                return;
+            }
         }
         if pattern_transport_active
             && !self.pending_sampler_stream.as_ref().is_some_and(|stream| {
@@ -74118,7 +74142,9 @@ impl DawUi {
         })
         .flatten();
         if self.live_vst2_input.as_ref().is_some_and(|session| {
-            session.pattern_id != pattern_id || session.channel_id != channel_id
+            session.pattern_id != pattern_id
+                || session.channel_id != channel_id
+                || session.target_channel_ids != vst2_target_channel_ids
         }) {
             self.stop_live_vst2_input();
             self.stop_live_audition_playback_if_stopped();
@@ -74285,7 +74311,7 @@ impl DawUi {
         if !pattern_transport_active
             && self.live_vst2_input.is_none()
             && matches!(live_event, Vst3LiveInputEvent::NoteOn { .. })
-            && !self.start_live_vst2_input(pattern_id, channel_id)
+            && !self.start_live_vst2_input(pattern_id, channel_id, vst2_target_channel_ids.clone())
         {
             return;
         }
@@ -74337,12 +74363,16 @@ impl DawUi {
                 || self.midi_input_connection.is_none()
                 || Some(session.pattern_id) != self.selected_pattern
                 || Some(session.channel_id) != self.selected_note_channel
+                || self.live_vst2_input_target_channels(session.channel_id)
+                    != session.target_channel_ids
                 || !self.vst2_host.as_ref().is_some_and(|runtime| {
                     runtime.lock().is_ok_and(|runtime| {
-                        runtime
+                        let loaded_channel_ids = runtime
                             .loaded_channels()
-                            .iter()
-                            .any(|channel| channel.channel_id == session.channel_id)
+                            .into_iter()
+                            .map(|channel| channel.channel_id)
+                            .collect::<BTreeSet<_>>();
+                        session.target_channel_ids.is_subset(&loaded_channel_ids)
                     })
                 })
         }) {
