@@ -61,7 +61,7 @@ pub struct MixerSendRouteSnapshot {
     pub value_raw: i32,
 }
 
-pub type MidiScriptPatternEntry = (u16, String, Option<u32>, u32);
+pub type MidiScriptPatternEntry = (u16, String, Option<u32>, u32, bool);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ScriptTransportAction {

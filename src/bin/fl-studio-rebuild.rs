@@ -19567,11 +19567,18 @@ impl DawUi {
                                 explicit_length.max(last_note_end)
                             };
                             let length_beats = length_ticks.div_ceil(ppq).min(u64::from(u32::MAX));
+                            let is_default = pattern.name.is_none()
+                                && color.is_none()
+                                && pattern.length_ticks.is_none()
+                                && pattern.notes.is_empty()
+                                && pattern.controllers.is_empty()
+                                && pattern.time_markers.is_empty();
                             (
                                 pattern.id,
                                 pattern.name.unwrap_or_default(),
                                 color,
                                 length_beats as u32,
+                                is_default,
                             )
                         })
                         .collect::<Vec<_>>()

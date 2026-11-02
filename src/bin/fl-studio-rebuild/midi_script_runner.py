@@ -1987,6 +1987,23 @@ def _pattern_length(index):
     return 0
 
 
+def _pattern_is_default(index):
+    try:
+        index = int(index)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("patterns.isPatternDefault() index must be an integer") from error
+    if not 0 <= index <= 999:
+        raise IndexError("patterns.isPatternDefault() index must be between 0 and 999")
+    for entry in _active_transport_state.get("pattern_entries", []):
+        if isinstance(entry, (list, tuple)) and len(entry) >= 5:
+            try:
+                if int(entry[0]) == index:
+                    return bool(entry[4])
+            except (TypeError, ValueError, OverflowError):
+                continue
+    return True
+
+
 def _set_pattern_name(index, name):
     try:
         index = int(index)
@@ -2648,6 +2665,7 @@ def _install_modules(script_name, device_name):
     patterns.setPatternName = _set_pattern_name
     patterns.getPatternColor = _pattern_color
     patterns.getPatternLength = _pattern_length
+    patterns.isPatternDefault = _pattern_is_default
     patterns.setPatternLength = _set_pattern_length
     patterns.incrementPatternLength = _increment_pattern_length
     patterns.jumpToPattern = _jump_to_pattern
