@@ -3,12 +3,13 @@
 //! The plug-in ABI and worker process are provided by `vst-audio`; the host
 //! application only talks to its bounded process and audio APIs.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -18,7 +19,7 @@ use crate::vst3::{MixerEffectProcessor, MixerEffectProcessorFactory};
 use crate::{ChannelPluginState, PatternNote};
 use vst_audio::{
     AudioEndpoint, AudioEvent, AudioStatus, BusSelector, ClassInfo, Command, Configuration,
-    EventData, Host, HostEvent, Instance, MAX_EVENTS, PluginDescriptor, PluginFormat,
+    EditPhase, EventData, Host, HostEvent, Instance, MAX_EVENTS, PluginDescriptor, PluginFormat,
     ProcessReport, RequestId, Transport,
 };
 
@@ -30,6 +31,7 @@ const VST2_TAIL_PROBE_MARKER: &str = "FLP_VST2_TAIL_V1 ";
 const VST2_TAIL_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_VST2_TAIL_PROBE_STATE_BYTES: usize = 64 * 1024 * 1024 - 9;
 const MAX_VST2_TAIL_PROBE_OUTPUT_BYTES: usize = 16 * 1024;
+const MAX_VST2_MIXER_PARAMETER_HISTORY: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Vst2NoteRenderOptions {
@@ -133,14 +135,132 @@ pub struct Vst2MixerEffectParameter {
     pub read_only: bool,
 }
 
+#[derive(Clone, Default)]
+pub struct Vst2MixerEffectParameterSync {
+    state: Arc<Mutex<BTreeMap<(usize, u16), Vst2MixerEffectParameterUpdates>>>,
+}
+
+#[derive(Default)]
+struct Vst2MixerEffectParameterUpdates {
+    revision: u64,
+    history: VecDeque<(u64, u32, f64)>,
+    latest: BTreeMap<u32, f64>,
+}
+
+impl Vst2MixerEffectParameterSync {
+    pub fn clear(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+
+    pub fn remap_after_move(&self, insert_ordinal: usize, from_slot: u16, to_slot: u16) {
+        if from_slot == to_slot {
+            return;
+        }
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let mut remapped = BTreeMap::new();
+        for (key, updates) in std::mem::take(&mut *state) {
+            let slot_index = if key.0 != insert_ordinal {
+                key.1
+            } else if key.1 == from_slot {
+                to_slot
+            } else if from_slot < to_slot && key.1 > from_slot && key.1 <= to_slot {
+                key.1 - 1
+            } else if from_slot > to_slot && key.1 >= to_slot && key.1 < from_slot {
+                key.1 + 1
+            } else {
+                key.1
+            };
+            remapped.insert((key.0, slot_index), updates);
+        }
+        *state = remapped;
+    }
+
+    fn publish(&self, key: (usize, u16), parameter_id: u32, value: f64) {
+        if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+            return;
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let updates = state.entry(key).or_default();
+        updates.revision = updates.revision.wrapping_add(1).max(1);
+        let revision = updates.revision;
+        updates.history.push_back((revision, parameter_id, value));
+        if updates.history.len() > MAX_VST2_MIXER_PARAMETER_HISTORY {
+            updates.history.pop_front();
+        }
+        updates.latest.insert(parameter_id, value);
+    }
+
+    fn snapshot(&self, key: (usize, u16)) -> (u64, BTreeMap<u32, f64>) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+            .map(|updates| (updates.revision, updates.latest.clone()))
+            .unwrap_or_default()
+    }
+
+    fn updates_since(
+        &self,
+        key: (usize, u16),
+        last_revision: u64,
+    ) -> Option<(u64, Vec<(u32, f64)>)> {
+        let state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        };
+        let updates = state.get(&key)?;
+        if updates.revision == last_revision {
+            return None;
+        }
+
+        let first_revision = updates.history.front().map(|entry| entry.0);
+        if first_revision.is_some_and(|first| last_revision.saturating_add(1) < first) {
+            let values = updates
+                .latest
+                .iter()
+                .map(|(parameter_id, value)| (*parameter_id, *value))
+                .collect();
+            return Some((updates.revision, values));
+        }
+
+        let mut values = Vec::new();
+        let mut revision = last_revision;
+        for (next_revision, parameter_id, value) in updates
+            .history
+            .iter()
+            .filter(|entry| entry.0 > last_revision)
+        {
+            values.push((*parameter_id, *value));
+            revision = *next_revision;
+        }
+        (!values.is_empty()).then_some((revision, values))
+    }
+}
+
 /// Creates isolated VST2 effect workers for the shared Mixer processing graph.
 pub struct Vst2ProjectMixerEffectProcessorFactory {
     assignments: BTreeMap<(usize, u16), Vst2ProjectMixerEffectAssignment>,
+    parameter_sync: Vst2MixerEffectParameterSync,
 }
 
 impl Vst2ProjectMixerEffectProcessorFactory {
-    pub fn new(assignments: BTreeMap<(usize, u16), Vst2ProjectMixerEffectAssignment>) -> Self {
-        Self { assignments }
+    pub fn new(
+        assignments: BTreeMap<(usize, u16), Vst2ProjectMixerEffectAssignment>,
+        parameter_sync: Vst2MixerEffectParameterSync,
+    ) -> Self {
+        Self {
+            assignments,
+            parameter_sync,
+        }
     }
 }
 
@@ -193,6 +313,7 @@ pub struct Vst2HostRuntime {
     pending_editor_failures: Vec<(u16, String)>,
     pending_mixer_editor_requests: BTreeMap<RequestId, (usize, u16)>,
     pending_mixer_editor_failures: Vec<(usize, u16, String)>,
+    mixer_effect_parameter_sync: Vst2MixerEffectParameterSync,
     pending_worker_failures: Vec<(u16, String)>,
 }
 
@@ -429,8 +550,16 @@ impl Vst2HostRuntime {
             pending_editor_failures: Vec::new(),
             pending_mixer_editor_requests: BTreeMap::new(),
             pending_mixer_editor_failures: Vec::new(),
+            mixer_effect_parameter_sync: Vst2MixerEffectParameterSync::default(),
             pending_worker_failures: Vec::new(),
         })
+    }
+
+    pub fn set_mixer_effect_parameter_sync(
+        &mut self,
+        parameter_sync: Vst2MixerEffectParameterSync,
+    ) {
+        self.mixer_effect_parameter_sync = parameter_sync;
     }
 
     /// Load a project VST2 channel in its isolated worker and restore its nested field-53 state.
@@ -550,6 +679,7 @@ impl Vst2HostRuntime {
     ) -> Result<Vec<Vst2MixerEffectParameter>, String> {
         let pending_requests = &mut self.pending_mixer_editor_requests;
         let pending_failures = &mut self.pending_mixer_editor_failures;
+        let parameter_sync = self.mixer_effect_parameter_sync.clone();
         let effect = self.mixer_effects.get(&key).ok_or_else(|| {
             format!(
                 "VST2 Mixer insert {} effect slot {} is not loaded",
@@ -570,6 +700,11 @@ impl Vst2HostRuntime {
                         pending_failures.push((insert, slot, reason));
                     }
                 }
+                HostEvent::ParameterEdited {
+                    id,
+                    phase: EditPhase::Perform,
+                    value,
+                } => parameter_sync.publish(key, id, value),
                 _ => {}
             },
         )
@@ -637,6 +772,7 @@ impl Vst2HostRuntime {
             .request(Command::SaveState)
             .map_err(|error| format!("could not request VST2 Mixer effect state: {error}"))?;
         let fourcc = effect.fourcc.clone();
+        let parameter_sync = self.mixer_effect_parameter_sync.clone();
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if Instant::now() >= deadline {
@@ -678,6 +814,11 @@ impl Vst2HostRuntime {
                         ));
                     }
                 }
+                HostEvent::ParameterEdited {
+                    id,
+                    phase: EditPhase::Perform,
+                    value,
+                } => parameter_sync.publish(key, id, value),
                 HostEvent::Failed { reason } => {
                     return Err(format!(
                         "VST2 Mixer effect {fourcc} worker failed: {reason}"
@@ -713,6 +854,8 @@ impl Vst2HostRuntime {
         if from_slot == to_slot {
             return;
         }
+        self.mixer_effect_parameter_sync
+            .remap_after_move(insert_ordinal, from_slot, to_slot);
         let mut remapped = BTreeMap::new();
         for (key, effect) in std::mem::take(&mut self.mixer_effects) {
             let slot_index = if key.0 != insert_ordinal {
@@ -819,6 +962,7 @@ impl Vst2HostRuntime {
     }
 
     fn poll_events(&mut self) {
+        let parameter_sync = self.mixer_effect_parameter_sync.clone();
         for (channel_id, channel) in &mut self.channels {
             while let Some(event) = channel.instance.try_next_event() {
                 match event {
@@ -868,6 +1012,11 @@ impl Vst2HostRuntime {
                             "VST2 Mixer effect worker stopped or requires recovery".to_owned(),
                         ))
                     }
+                    HostEvent::ParameterEdited {
+                        id,
+                        phase: EditPhase::Perform,
+                        value,
+                    } => parameter_sync.publish(*key, id, value),
                     _ => {}
                 }
             }
@@ -993,14 +1142,21 @@ struct Vst2MixerEffectProcessor {
     output_left: Vec<f32>,
     output_right: Vec<f32>,
     parameter_events: Vec<AudioEvent>,
+    parameter_sync: Vst2MixerEffectParameterSync,
+    parameter_sync_key: (usize, u16),
+    parameter_sync_revision: u64,
+    pending_parameter_updates: BTreeMap<u32, f64>,
 }
 
 impl Vst2MixerEffectProcessor {
     fn spawn(
         assignment: &Vst2ProjectMixerEffectAssignment,
+        key: (usize, u16),
         sample_rate: u32,
+        parameter_sync: Vst2MixerEffectParameterSync,
     ) -> Result<Self, String> {
         let tail_samples = probe_vst2_mixer_effect_tail_samples(assignment, sample_rate);
+        let (parameter_sync_revision, pending_parameter_updates) = parameter_sync.snapshot(key);
         let configuration = Configuration {
             sample_rate,
             quantum: RENDER_QUANTUM,
@@ -1050,6 +1206,10 @@ impl Vst2MixerEffectProcessor {
             output_left: vec![0.0; quantum],
             output_right: vec![0.0; quantum],
             parameter_events: Vec::with_capacity(MAX_EVENTS),
+            parameter_sync,
+            parameter_sync_key: key,
+            parameter_sync_revision,
+            pending_parameter_updates,
         })
     }
 }
@@ -1106,6 +1266,31 @@ impl MixerEffectProcessor for Vst2MixerEffectProcessor {
         }
 
         self.parameter_events.clear();
+        if let Some((revision, updates)) = self
+            .parameter_sync
+            .updates_since(self.parameter_sync_key, self.parameter_sync_revision)
+        {
+            self.parameter_sync_revision = revision;
+            self.pending_parameter_updates.extend(updates);
+        }
+        let remaining_parameter_events = MAX_EVENTS.saturating_sub(parameter_changes.len());
+        let pending_updates = self
+            .pending_parameter_updates
+            .iter()
+            .take(remaining_parameter_events)
+            .map(|(parameter_id, value)| (*parameter_id, *value))
+            .collect::<Vec<_>>();
+        for (parameter_id, value) in pending_updates {
+            self.pending_parameter_updates.remove(&parameter_id);
+            self.parameter_events.push(AudioEvent {
+                sample_offset: 0,
+                bus: 0,
+                data: EventData::Parameter {
+                    id: parameter_id,
+                    value,
+                },
+            });
+        }
         for (sample_offset, parameter_id, value) in parameter_changes {
             if *sample_offset as usize >= frames
                 || !value.is_finite()
@@ -1122,6 +1307,8 @@ impl MixerEffectProcessor for Vst2MixerEffectProcessor {
                 },
             });
         }
+        self.parameter_events
+            .sort_by_key(|event| event.sample_offset);
 
         if self.input_channels == 1 {
             for (mono, stereo) in self.input_left[..frames]
@@ -1313,7 +1500,12 @@ impl MixerEffectProcessorFactory for Vst2ProjectMixerEffectProcessorFactory {
         let Some(assignment) = self.assignments.get(&(insert_ordinal, slot_index)) else {
             return Ok(None);
         };
-        let processor = Vst2MixerEffectProcessor::spawn(assignment, sample_rate)?;
+        let processor = Vst2MixerEffectProcessor::spawn(
+            assignment,
+            (insert_ordinal, slot_index),
+            sample_rate,
+            self.parameter_sync.clone(),
+        )?;
         Ok(Some(Box::new(processor)))
     }
 }

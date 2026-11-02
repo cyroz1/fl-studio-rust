@@ -92,8 +92,9 @@ use flp_rebuild::sample_render::{
     vst3_live_input_queue, write_input_recording_to_wav, write_stereo_audio_buffer_to_file,
 };
 use flp_rebuild::vst2::{
-    Vst2HostRuntime, Vst2MixerEffectParameter, Vst2ProjectMixerEffectAssignment,
-    Vst2ProjectMixerEffectProcessorFactory, vst2_class_id_for_fourcc,
+    Vst2HostRuntime, Vst2MixerEffectParameter, Vst2MixerEffectParameterSync,
+    Vst2ProjectMixerEffectAssignment, Vst2ProjectMixerEffectProcessorFactory,
+    vst2_class_id_for_fourcc,
 };
 use flp_rebuild::vst3::{
     MAX_REPORTED_TAIL_SECONDS, MixerEffectProcessor, MixerEffectProcessorFactory,
@@ -5475,6 +5476,7 @@ impl MixerEffectProcessorFactory for CombinedMixerEffectProcessorFactory {
 fn combined_mixer_effect_processor_factory(
     clap_assignments: BTreeMap<(usize, u16), ClapProjectMixerEffectAssignment>,
     vst2_assignments: BTreeMap<(usize, u16), Vst2ProjectMixerEffectAssignment>,
+    vst2_parameter_sync: Vst2MixerEffectParameterSync,
     clap_capture_controller: ClapMixerEffectStateCaptureController,
 ) -> Option<Arc<dyn MixerEffectProcessorFactory>> {
     let mut factories: Vec<Arc<dyn MixerEffectProcessorFactory>> = Vec::new();
@@ -5489,6 +5491,7 @@ fn combined_mixer_effect_processor_factory(
     if !vst2_assignments.is_empty() {
         factories.push(Arc::new(Vst2ProjectMixerEffectProcessorFactory::new(
             vst2_assignments,
+            vst2_parameter_sync,
         )));
     }
     (!factories.is_empty()).then(|| {
@@ -5944,6 +5947,7 @@ struct DawUi {
     clap_preview_note_duration_milliseconds: u32,
     vst2_host: Option<Arc<Mutex<Vst2HostRuntime>>>,
     vst2_mixer_effect_host: Option<Arc<Mutex<Vst2HostRuntime>>>,
+    vst2_mixer_effect_parameter_sync: Vst2MixerEffectParameterSync,
     vst3_host: Option<Vst3HostRuntime>,
     vst3_manual_latency_offsets: BTreeMap<String, i32>,
     vst3_project_manual_latency_offsets: BTreeMap<String, i32>,
@@ -9522,6 +9526,7 @@ impl DawUi {
             clap_preview_note_duration_milliseconds: 500,
             vst2_host: None,
             vst2_mixer_effect_host: None,
+            vst2_mixer_effect_parameter_sync: Vst2MixerEffectParameterSync::default(),
             vst3_host: None,
             vst3_manual_latency_offsets,
             vst3_project_manual_latency_offsets: BTreeMap::new(),
@@ -13138,6 +13143,7 @@ impl DawUi {
         assignments: &BTreeMap<(usize, u16), Vst2ProjectMixerEffectAssignment>,
     ) -> Vec<String> {
         self.vst2_mixer_effect_host = None;
+        self.vst2_mixer_effect_parameter_sync.clear();
         if assignments.is_empty() {
             return Vec::new();
         }
@@ -13178,6 +13184,7 @@ impl DawUi {
                 )];
             }
         };
+        host.set_mixer_effect_parameter_sync(self.vst2_mixer_effect_parameter_sync.clone());
         let mut loaded_count = 0;
         let mut warnings = Vec::new();
         for (&key, assignment) in assignments {
@@ -13450,6 +13457,7 @@ impl DawUi {
         host.set_mixer_effect_processor_factory(combined_mixer_effect_processor_factory(
             clap_effect_assignments.clone(),
             vst2_effect_assignments.clone(),
+            self.vst2_mixer_effect_parameter_sync.clone(),
             self.clap_mixer_effect_state_capture_controller.clone(),
         ));
         host.set_manual_latency_offsets(&self.vst3_manual_latency_offsets);
@@ -15399,6 +15407,7 @@ impl DawUi {
         host.set_mixer_effect_processor_factory(combined_mixer_effect_processor_factory(
             self.clap_mixer_effect_assignments.clone(),
             vst2_effect_assignments,
+            self.vst2_mixer_effect_parameter_sync.clone(),
             self.clap_mixer_effect_state_capture_controller.clone(),
         ));
         for state in states {
@@ -15774,6 +15783,7 @@ impl DawUi {
             host.set_mixer_effect_processor_factory(combined_mixer_effect_processor_factory(
                 self.clap_mixer_effect_assignments.clone(),
                 self.vst2_mixer_effect_assignments.clone(),
+                self.vst2_mixer_effect_parameter_sync.clone(),
                 self.clap_mixer_effect_state_capture_controller.clone(),
             ));
         }
@@ -29246,6 +29256,7 @@ impl DawUi {
                                 let factory = combined_mixer_effect_processor_factory(
                                     assignments,
                                     self.vst2_mixer_effect_assignments.clone(),
+                                    self.vst2_mixer_effect_parameter_sync.clone(),
                                     self.clap_mixer_effect_state_capture_controller.clone(),
                                 );
                                 if let Some(host) = &mut self.vst3_host {
@@ -29541,6 +29552,7 @@ impl DawUi {
                         let factory = combined_mixer_effect_processor_factory(
                             self.clap_mixer_effect_assignments.clone(),
                             self.vst2_mixer_effect_assignments.clone(),
+                            self.vst2_mixer_effect_parameter_sync.clone(),
                             self.clap_mixer_effect_state_capture_controller.clone(),
                         );
                         if let Some(host) = self.vst3_host.as_mut() {
@@ -66130,22 +66142,6 @@ impl DawUi {
     }
 
     fn mixer(&mut self, ui: &mut egui::Ui) {
-        let vst2_editor_failures = self
-            .vst2_mixer_effect_host
-            .as_ref()
-            .and_then(|runtime| {
-                runtime
-                    .lock()
-                    .ok()
-                    .map(|mut runtime| runtime.take_mixer_editor_failures())
-            })
-            .unwrap_or_default();
-        if let Some((insert_ordinal, slot_index, reason)) = vst2_editor_failures.last() {
-            self.status = format!(
-                "VST2 editor for Mixer insert {insert_ordinal} slot {} failed: {reason}",
-                slot_index + 1
-            );
-        }
         let Some(document) = self.document.as_ref() else {
             empty_view(ui, "Open a project to see the Mixer");
             return;
@@ -68949,7 +68945,7 @@ impl DawUi {
                             }
                             ui.small(
                                 egui::RichText::new(
-                                    "Open editor controls a loaded VST3 effect; Open VST2 editor launches the saved VST2 Mixer effect in an isolated worker, and Capture VST2 state writes that editor state into FLP field 53. Move up/down carries saved slot events with the effect. CLAP assignments process in saved slot order with timed parameter automation, saved machine-local parameter overrides, and reported-latency PDC. CLAP sidechains feed supported mono/stereo auxiliary inputs in source-track and bus order by default; a slot can save explicit source-insert-to-input maps that sum multiple sources on one port. PDC and runtime latency/tail reports apply between audio blocks. Capture state reads one active effect at the next block boundary, or refreshes the prior machine-local snapshot if none is active; simultaneous active instances must be stopped to avoid an ambiguous capture. Native FLP bus mapping remains unverified. Assigned CLAP Mixer effects open isolated native editors; writable parameters synchronize to active processing while open, and state is saved on close. VST3 Mix edits use a 20 ms ramp.",
+                                    "Open editor controls a loaded VST3 effect; Open VST2 editor launches the saved VST2 Mixer effect in an isolated worker, and its parameter edits synchronize with active Mixer processing at the next audio block. Capture VST2 state writes editor state into FLP field 53. Move up/down carries saved slot events with the effect. CLAP assignments process in saved slot order with timed parameter automation, saved machine-local parameter overrides, and reported-latency PDC. CLAP sidechains feed supported mono/stereo auxiliary inputs in source-track and bus order by default; a slot can save explicit source-insert-to-input maps that sum multiple sources on one port. PDC and runtime latency/tail reports apply between audio blocks. Capture state reads one active effect at the next block boundary, or refreshes the prior machine-local snapshot if none is active; simultaneous active instances must be stopped to avoid an ambiguous capture. Native FLP bus mapping remains unverified. Assigned CLAP Mixer effects open isolated native editors; writable parameters synchronize to active processing while open, and state is saved on close. VST3 Mix edits use a 20 ms ramp.",
                                 )
                                 .color(MUTED),
                             );
@@ -70129,6 +70125,7 @@ impl DawUi {
                     let factory = combined_mixer_effect_processor_factory(
                         self.clap_mixer_effect_assignments.clone(),
                         self.vst2_mixer_effect_assignments.clone(),
+                        self.vst2_mixer_effect_parameter_sync.clone(),
                         self.clap_mixer_effect_state_capture_controller.clone(),
                     );
                     if let Some(host) = &mut self.vst3_host {
@@ -82313,6 +82310,22 @@ impl eframe::App for DawUi {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.publish_live_pattern_note_updates();
         self.publish_midi_script_transport_state();
+        let vst2_mixer_editor_failures = self
+            .vst2_mixer_effect_host
+            .as_ref()
+            .and_then(|runtime| {
+                runtime
+                    .lock()
+                    .ok()
+                    .map(|mut runtime| runtime.take_mixer_editor_failures())
+            })
+            .unwrap_or_default();
+        if let Some((insert_ordinal, slot_index, reason)) = vst2_mixer_editor_failures.last() {
+            self.status = format!(
+                "VST2 editor for Mixer insert {insert_ordinal} slot {} failed: {reason}",
+                slot_index + 1
+            );
+        }
         // Reassert the app theme before building child Uis. Some native
         // window backends report a system appearance after startup.
         ui.ctx().set_theme(egui::Theme::Dark);
