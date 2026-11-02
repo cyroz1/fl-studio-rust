@@ -1016,6 +1016,9 @@ fn queue_script_transport_actions(
             ScriptTransportAction::BrowserNavigate(direction) => {
                 MidiTransportCommand::BrowserNavigate(direction)
             }
+            ScriptTransportAction::BrowserTabSelect(index) => {
+                MidiTransportCommand::BrowserTabSelect(index)
+            }
             ScriptTransportAction::WindowJog(increment) => {
                 MidiTransportCommand::WindowJog(increment)
             }
@@ -1182,6 +1185,7 @@ pub enum MidiTransportCommand {
     PianoRollSnapJog(i32),
     SelectionJog(i32),
     BrowserNavigate(u8),
+    BrowserTabSelect(u8),
     WindowJog(i32),
     ZoomJog {
         horizontal: bool,
@@ -1985,6 +1989,9 @@ pub fn describe_event(event: MidiInputEvent) -> String {
                 "MIDI script Previous/Next Selection".to_owned()
             }
             MidiTransportCommand::BrowserNavigate(_) => "MIDI script Browser Navigation".to_owned(),
+            MidiTransportCommand::BrowserTabSelect(_) => {
+                "MIDI script Browser Tab Navigation".to_owned()
+            }
             MidiTransportCommand::WindowJog(_) => "MIDI script Window Selection".to_owned(),
             MidiTransportCommand::ZoomJog { horizontal, .. } => {
                 if horizontal {

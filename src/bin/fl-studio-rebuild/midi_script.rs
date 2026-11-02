@@ -181,6 +181,7 @@ pub enum ScriptTransportAction {
     PianoRollSnapJog(i32),
     SelectionJog(i32),
     BrowserNavigate(u8),
+    BrowserTabSelect(u8),
     WindowJog(i32),
     ZoomJog {
         horizontal: bool,
@@ -288,6 +289,7 @@ pub const SCRIPT_MIXER_SCROLL_TO_MAKE_VISIBLE: u32 = 1 << 0;
 
 pub struct MidiScriptTransportState {
     pub state: AtomicU8,
+    pub browser_tab_index: AtomicU8,
     pub midi_output_port_number: AtomicI32,
     pub song_position: AtomicU64,
     pub song_position_ticks: AtomicU64,
@@ -356,6 +358,7 @@ impl Default for MidiScriptTransportState {
     fn default() -> Self {
         Self {
             state: AtomicU8::new(0),
+            browser_tab_index: AtomicU8::new(0),
             midi_output_port_number: AtomicI32::new(-1),
             song_position: AtomicU64::new(0.0_f64.to_bits()),
             song_position_ticks: AtomicU64::new(0),
@@ -1209,6 +1212,14 @@ impl MidiScriptRuntime {
             });
             if let Some(transport_object) = transport.as_object_mut() {
                 transport_object.insert(
+                    "browser_tab_index".to_owned(),
+                    json!(
+                        self.transport_state
+                            .browser_tab_index
+                            .load(Ordering::Relaxed)
+                    ),
+                );
+                transport_object.insert(
                     "metronome_enabled".to_owned(),
                     json!(
                         self.transport_state
@@ -1561,6 +1572,14 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
             .filter(|direction| *direction <= 3)
             .ok_or_else(|| "MIDI script returned an invalid Browser direction".to_owned())?;
         return Ok(ScriptTransportAction::BrowserNavigate(direction));
+    }
+    if name == Some("browser_tab_select") {
+        let index = action["index"]
+            .as_u64()
+            .and_then(|index| u8::try_from(index).ok())
+            .filter(|index| *index < 5)
+            .ok_or_else(|| "MIDI script returned an invalid Browser tab index".to_owned())?;
+        return Ok(ScriptTransportAction::BrowserTabSelect(index));
     }
     if name == Some("window_jog") {
         let increment = action["increment"]

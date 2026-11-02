@@ -19402,6 +19402,13 @@ impl DawUi {
         self.midi_script_transport_state
             .state
             .store(state, Ordering::Relaxed);
+        let browser_tab_index = BrowserTab::ALL
+            .iter()
+            .position(|tab| *tab == self.browser_tab)
+            .unwrap_or(0);
+        self.midi_script_transport_state
+            .browser_tab_index
+            .store(browser_tab_index as u8, Ordering::Relaxed);
         self.midi_script_transport_state
             .metronome_enabled
             .store(u8::from(self.metronome_enabled), Ordering::Relaxed);
@@ -20819,6 +20826,15 @@ impl DawUi {
         } else {
             self.status = "MIDI script Browser navigation queue is full".to_owned();
         }
+    }
+
+    fn select_midi_script_browser_tab(&mut self, index: u8) {
+        let Some(tab) = BrowserTab::ALL.get(usize::from(index)).copied() else {
+            return;
+        };
+        self.browser_tab = tab;
+        self.browser_active_saved_search = None;
+        self.status = format!("MIDI script selected the {} Browser tab", tab.label());
     }
 
     fn jog_midi_script_window(&mut self, increment: i32) {
@@ -69423,6 +69439,9 @@ impl DawUi {
             }
             MidiTransportCommand::BrowserNavigate(direction) => {
                 self.navigate_midi_script_browser(direction);
+            }
+            MidiTransportCommand::BrowserTabSelect(index) => {
+                self.select_midi_script_browser_tab(index);
             }
             MidiTransportCommand::WindowJog(increment) => {
                 self.jog_midi_script_window(increment);

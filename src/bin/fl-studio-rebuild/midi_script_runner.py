@@ -204,6 +204,30 @@ def _ui_next():
     return _ui_selection_jog(1)
 
 
+def _ui_navigate_browser_tabs(direction):
+    try:
+        direction = int(direction)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("Browser tab direction must be an integer") from error
+    tab_names = ("Files", "Project", "Plugins", "Favorites", "Recent")
+    try:
+        current_index = int(_active_transport_state.get("browser_tab_index", 0))
+    except (TypeError, ValueError, OverflowError):
+        current_index = 0
+    current_index %= len(tab_names)
+    if direction == 42:  # FPT_Left
+        target_index = (current_index - 1) % len(tab_names)
+    elif direction == 43:  # FPT_Right
+        target_index = (current_index + 1) % len(tab_names)
+    else:
+        target_index = 0
+    _active_transport_state["browser_tab_index"] = target_index
+    _request_transport_action(
+        {"action": "browser_tab_select", "index": target_index}
+    )
+    return tab_names[target_index]
+
+
 def _ui_zoom_jog(horizontal, increment):
     try:
         increment = int(increment)
@@ -2310,6 +2334,7 @@ def _install_modules(script_name, device_name):
     ui.snapMode = _ui_snap_mode
     ui.previous = _ui_previous
     ui.next = _ui_next
+    ui.navigateBrowserTabs = _ui_navigate_browser_tabs
 
     playlist = _module("playlist")
     playlist.trackCount = _playlist_track_count
