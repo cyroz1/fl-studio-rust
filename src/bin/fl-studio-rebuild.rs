@@ -8178,6 +8178,26 @@ fn midi_script_pattern_jog_target(
     pattern_ids.get(target_index).copied()
 }
 
+fn midi_script_selection_jog_index(
+    item_count: usize,
+    selected_index: Option<usize>,
+    increment: i32,
+) -> Option<usize> {
+    if item_count == 0 || increment == 0 {
+        return None;
+    }
+    let last_index = i64::try_from(item_count - 1).ok()?;
+    let target_index =
+        if let Some(current_index) = selected_index.filter(|index| *index < item_count) {
+            i64::try_from(current_index).ok()? + i64::from(increment)
+        } else if increment > 0 {
+            i64::from(increment) - 1
+        } else {
+            i64::try_from(item_count).ok()? + i64::from(increment)
+        };
+    usize::try_from(target_index.clamp(0, last_index)).ok()
+}
+
 fn midi_script_tempo_jog_target(current_bpm: f64, increment: i32) -> Option<f64> {
     if !current_bpm.is_finite() || current_bpm <= 0.0 {
         return None;
@@ -20701,6 +20721,69 @@ impl DawUi {
         };
         self.selected_pattern = Some(pattern_id);
         self.status = format!("Selected pattern {pattern_id}");
+    }
+
+    fn jog_midi_script_selection(&mut self, increment: i32) {
+        if increment == 0 {
+            return;
+        }
+        match self.view {
+            MainView::ChannelRack => {
+                let channel_ids = self
+                    .document
+                    .as_ref()
+                    .map(|document| {
+                        document
+                            .channels()
+                            .iter()
+                            .map(|channel| channel.id())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let selected_channel = self.selected_graph_channel.or(self.selected_note_channel);
+                let selected_index = selected_channel.and_then(|channel_id| {
+                    channel_ids
+                        .iter()
+                        .position(|candidate| *candidate == channel_id)
+                });
+                if let Some(index) =
+                    midi_script_selection_jog_index(channel_ids.len(), selected_index, increment)
+                    && let Some(channel_id) = channel_ids.get(index)
+                {
+                    self.set_midi_script_channel_selection(*channel_id);
+                }
+            }
+            MainView::Mixer => {
+                let track_ordinals = self
+                    .document
+                    .as_ref()
+                    .map(|document| {
+                        let mut ordinals = document
+                            .mixer_inserts()
+                            .iter()
+                            .map(|insert| insert.ordinal())
+                            .collect::<Vec<_>>();
+                        ordinals.sort_unstable();
+                        ordinals.dedup();
+                        ordinals
+                    })
+                    .unwrap_or_else(|| vec![0]);
+                let selected_index = self.selected_mixer_insert.and_then(|selected| {
+                    track_ordinals.iter().position(|index| *index == selected)
+                });
+                if let Some(index) =
+                    midi_script_selection_jog_index(track_ordinals.len(), selected_index, increment)
+                    && let Some(track_ordinal) = track_ordinals.get(index).copied()
+                    && let Ok(track_index) = u16::try_from(track_ordinal)
+                {
+                    self.set_midi_script_mixer_track_selection(
+                        track_index,
+                        SCRIPT_MIXER_SCROLL_TO_MAKE_VISIBLE,
+                    );
+                }
+            }
+            _ => {}
+        }
     }
 
     fn jog_midi_script_tempo(&mut self, increment: i32) {
@@ -69137,6 +69220,9 @@ impl DawUi {
             MidiTransportCommand::PianoRollSnapJog(increment) => {
                 self.jog_midi_script_piano_roll_snap(increment);
             }
+            MidiTransportCommand::SelectionJog(increment) => {
+                self.jog_midi_script_selection(increment);
+            }
             MidiTransportCommand::MoveJog(increment) => {
                 self.move_midi_script_items(increment);
             }
@@ -92682,17 +92768,18 @@ mod tests {
         midi_script_playlist_performance_block_index, midi_script_playlist_track_activity_levels,
         midi_script_playlist_track_ids, midi_script_playlist_track_mute_states,
         midi_script_playlist_track_names, midi_script_playlist_track_performance_modes,
-        midi_script_tempo_jog_target, midi_script_time_position_seconds_to_ticks,
-        midi_vst3_parameter_mapping_for_target, midi_vst3_parameter_mappings_for_cc,
-        next_empty_pattern_id, next_piano_roll_note_group, note_from_grid_position,
-        parse_internal_lfo_parameter_links, parse_midi_control_change_mapping,
-        parse_midi_controller_templates, parse_midi_device_selections,
-        parse_midi_mixer_control_mappings, parse_midi_output_programs, parse_midi_output_routes,
-        parse_midi_output_values, parse_midi_vst3_parameter_mappings,
-        parse_pattern_vst3_mixer_effect_parameter_links, parse_pattern_vst3_parameter_links,
-        parse_playlist_audio_clip_envelopes, parse_playlist_vst3_mixer_effect_parameter_links,
-        parse_playlist_vst3_parameter_links, parse_window_layout_presets,
-        pattern_color_from_random_index, pattern_lfo_loop_length_ticks, pattern_loop_frame_at_tick,
+        midi_script_selection_jog_index, midi_script_tempo_jog_target,
+        midi_script_time_position_seconds_to_ticks, midi_vst3_parameter_mapping_for_target,
+        midi_vst3_parameter_mappings_for_cc, next_empty_pattern_id, next_piano_roll_note_group,
+        note_from_grid_position, parse_internal_lfo_parameter_links,
+        parse_midi_control_change_mapping, parse_midi_controller_templates,
+        parse_midi_device_selections, parse_midi_mixer_control_mappings,
+        parse_midi_output_programs, parse_midi_output_routes, parse_midi_output_values,
+        parse_midi_vst3_parameter_mappings, parse_pattern_vst3_mixer_effect_parameter_links,
+        parse_pattern_vst3_parameter_links, parse_playlist_audio_clip_envelopes,
+        parse_playlist_vst3_mixer_effect_parameter_links, parse_playlist_vst3_parameter_links,
+        parse_window_layout_presets, pattern_color_from_random_index,
+        pattern_lfo_loop_length_ticks, pattern_loop_frame_at_tick,
         pattern_loop_handoff_tick_at_frame, pattern_loop_tick_at_frame,
         pattern_vst3_mixer_effect_parameter_automation_for_target,
         pattern_vst3_mixer_effect_parameter_automation_for_target_with_lfo,
@@ -97201,6 +97288,25 @@ mod tests {
         );
         assert_eq!(midi_script_pattern_jog_target(&pattern_ids, None, 0), None);
         assert_eq!(midi_script_pattern_jog_target(&[], Some(2), 1), None);
+    }
+
+    #[test]
+    fn midi_script_selection_jog_moves_from_current_or_list_edges() {
+        assert_eq!(midi_script_selection_jog_index(3, Some(1), 1), Some(2));
+        assert_eq!(midi_script_selection_jog_index(3, Some(1), -1), Some(0));
+        assert_eq!(
+            midi_script_selection_jog_index(3, Some(0), i32::MAX),
+            Some(2)
+        );
+        assert_eq!(
+            midi_script_selection_jog_index(3, Some(2), i32::MIN),
+            Some(0)
+        );
+        assert_eq!(midi_script_selection_jog_index(3, None, 1), Some(0));
+        assert_eq!(midi_script_selection_jog_index(3, None, -1), Some(2));
+        assert_eq!(midi_script_selection_jog_index(3, None, 3), Some(2));
+        assert_eq!(midi_script_selection_jog_index(3, None, 0), None);
+        assert_eq!(midi_script_selection_jog_index(0, None, 1), None);
     }
 
     #[test]

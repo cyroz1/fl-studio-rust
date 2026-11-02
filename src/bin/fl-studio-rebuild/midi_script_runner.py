@@ -184,6 +184,19 @@ def _ui_snap_mode(value):
     return 8
 
 
+def _ui_selection_jog(increment):
+    _request_transport_action({"action": "selection_jog", "increment": increment})
+    return 8
+
+
+def _ui_previous():
+    return _ui_selection_jog(-1)
+
+
+def _ui_next():
+    return _ui_selection_jog(1)
+
+
 def _playlist_track_count():
     try:
         return max(0, int(_active_transport_state.get("playlist_track_count", 0)))
@@ -1881,6 +1894,18 @@ def _global_transport(command, value, pmeflags=2, flags=15):
                 {"action": "piano_roll_snap_jog", "increment": value}
             )
         return 8
+    if command == 5:  # FPT_Previous
+        if value != 0:
+            _request_transport_action({"action": "selection_jog", "increment": -1})
+        return 8
+    if command == 6:  # FPT_Next
+        if value != 0:
+            _request_transport_action({"action": "selection_jog", "increment": 1})
+        return 8
+    if command == 7:  # FPT_PreviousNext
+        if value != 0:
+            _request_transport_action({"action": "selection_jog", "increment": value})
+        return 8
     if command == 8:  # FPT_MoveJog
         return _move_jog(value)
     if command == 122:  # FPT_ShuffleJog
@@ -2226,6 +2251,8 @@ def _install_modules(script_name, device_name):
     ui.setHintMsg = _set_hint_msg
     ui.getHintValue = lambda value, max: f"{value / max:.0%}"
     ui.snapMode = _ui_snap_mode
+    ui.previous = _ui_previous
+    ui.next = _ui_next
 
     playlist = _module("playlist")
     playlist.trackCount = _playlist_track_count

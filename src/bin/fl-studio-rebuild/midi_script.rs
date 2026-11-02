@@ -179,6 +179,7 @@ pub enum ScriptTransportAction {
     UndoHistoryJog(i32),
     TogglePianoRollSnap,
     PianoRollSnapJog(i32),
+    SelectionJog(i32),
     MoveJog(i32),
     PatternJog(i32),
     TempoJog(i32),
@@ -236,6 +237,8 @@ impl ScriptTransportAction {
             "undo" => Some(Self::Undo),
             "redo" => Some(Self::Redo),
             "toggle_piano_roll_snap" => Some(Self::TogglePianoRollSnap),
+            "previous" => Some(Self::SelectionJog(-1)),
+            "next" => Some(Self::SelectionJog(1)),
             _ => None,
         }
     }
@@ -1537,6 +1540,13 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
             .and_then(|increment| i32::try_from(increment).ok())
             .ok_or_else(|| "MIDI script returned an invalid snap-mode increment".to_owned())?;
         return Ok(ScriptTransportAction::PianoRollSnapJog(increment));
+    }
+    if name == Some("selection_jog") {
+        let increment = action["increment"]
+            .as_i64()
+            .and_then(|increment| i32::try_from(increment).ok())
+            .ok_or_else(|| "MIDI script returned an invalid selection increment".to_owned())?;
+        return Ok(ScriptTransportAction::SelectionJog(increment));
     }
     if name == Some("move_jog") {
         let increment = action["increment"]
@@ -4127,6 +4137,45 @@ def OnMidiIn(event):
 
         assert_eq!(result.bytes, [0xB0, 8, 1]);
         assert_eq!(result.actions, [ScriptTransportAction::PatternJog(-2)]);
+    }
+
+    #[test]
+    fn python_global_transport_previous_next_and_ui_controls_dispatch_selection_jogs() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            r#"# name=Test Script
+import midi
+import transport
+import ui
+def OnMidiIn(event):
+    previous = ui.previous()
+    next = ui.next()
+    transport.globalTransport(midi.FPT_Previous, 1, event.pmeflags)
+    transport.globalTransport(midi.FPT_Next, 1, event.pmeflags)
+    transport.globalTransport(midi.FPT_PreviousNext, 3, event.pmeflags)
+    transport.globalTransport(midi.FPT_PreviousNext, 0, event.pmeflags)
+    event.data1 = int(previous == midi.GT_Global and next == midi.GT_Global)
+"#,
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let mut runtime = MidiScriptRuntime::start_for_device(&script, "Test Input").unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
+
+        assert_eq!(result.bytes, [0xB0, 1, 1]);
+        assert_eq!(
+            result.actions,
+            [
+                ScriptTransportAction::SelectionJog(-1),
+                ScriptTransportAction::SelectionJog(1),
+                ScriptTransportAction::SelectionJog(-1),
+                ScriptTransportAction::SelectionJog(1),
+                ScriptTransportAction::SelectionJog(3),
+            ]
+        );
     }
 
     #[test]
