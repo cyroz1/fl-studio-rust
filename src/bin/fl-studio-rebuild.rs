@@ -70,10 +70,12 @@ use flp_rebuild::sample_render::{
     Vst2LiveInputPlayback, Vst2LiveInputRouting, Vst2LiveInputSender, Vst3LatencyUpdateControls,
     Vst3LiveInputEvent, Vst3LiveInputSender, WavChannelMode, WavDitherMode, WavSampleFormat,
     layer_live_input_queue, nearest_playlist_audio_clip_zero_crossing_tick,
-    playlist_audio_clip_fade_gain, playlist_performance_clap_clip_indices,
-    playlist_performance_clip_indices_with_vst3_and_clap,
-    playlist_performance_static_document_with_vst3_and_clap, playlist_performance_vst3_channel_ids,
-    playlist_performance_vst3_clip_indices_with_clap, process_recording_precount_through_mixer,
+    playlist_audio_clip_fade_gain, playlist_performance_clap_clip_indices_with_vst2,
+    playlist_performance_clip_indices_with_vst2_vst3_and_clap,
+    playlist_performance_static_document_with_vst2_vst3_and_clap,
+    playlist_performance_vst3_channel_ids,
+    playlist_performance_vst3_clip_indices_with_vst2_and_clap,
+    process_recording_precount_through_mixer,
     project_channel_stereo_output_gains_with_layer_adjustments, render_audio_clips_to_file,
     render_pattern_mix_to_file, render_pattern_mixer_stems,
     render_playlist_mixer_stems_with_vst2_and_vst3_cancellable,
@@ -16185,6 +16187,23 @@ impl DawUi {
         arrangement_id: u16,
         performance_zone_end_tick: u32,
     ) -> Result<BTreeSet<usize>, String> {
+        let loaded_vst2_channels = self
+            .vst2_host
+            .as_ref()
+            .map(|runtime| {
+                runtime
+                    .lock()
+                    .map_err(|_| "VST2 host runtime lock was poisoned".to_owned())
+                    .map(|runtime| {
+                        runtime
+                            .loaded_channels()
+                            .into_iter()
+                            .map(|channel| channel.channel_id)
+                            .collect::<BTreeSet<_>>()
+                    })
+            })
+            .transpose()?
+            .unwrap_or_default();
         let loaded_vst3_channels = self
             .channel_vst3_instances
             .keys()
@@ -16195,10 +16214,11 @@ impl DawUi {
             .keys()
             .copied()
             .collect::<BTreeSet<_>>();
-        playlist_performance_clip_indices_with_vst3_and_clap(
+        playlist_performance_clip_indices_with_vst2_vst3_and_clap(
             document,
             arrangement_id,
             performance_zone_end_tick,
+            &loaded_vst2_channels,
             &loaded_vst3_channels,
             &assigned_clap_channels,
         )
@@ -18037,6 +18057,20 @@ impl DawUi {
             self.status = "Performance Mode needs a non-signature time marker named Start".into();
             return;
         };
+        let loaded_vst2_channels = match self.vst2_host.as_ref() {
+            Some(runtime) => match runtime.lock() {
+                Ok(runtime) => runtime
+                    .loaded_channels()
+                    .into_iter()
+                    .map(|channel| channel.channel_id)
+                    .collect::<BTreeSet<_>>(),
+                Err(_) => {
+                    self.status = "Could not inspect loaded VST2 instruments".to_owned();
+                    return;
+                }
+            },
+            None => BTreeSet::new(),
+        };
         let loaded_vst3_channels = self
             .channel_vst3_instances
             .keys()
@@ -18057,26 +18091,28 @@ impl DawUi {
             };
         if performance_clip_indices.is_empty() {
             self.status =
-                "Add a supported Audio Clip, Sampler Pattern Clip, loaded VST3 Pattern Clip, or assigned CLAP Pattern Clip before Start"
+                "Add a supported Audio Clip, Sampler Pattern Clip, loaded VST2/VST3 Pattern Clip, or assigned CLAP Pattern Clip before Start"
                     .into();
             return;
         }
-        let performance_vst3_clip_indices = match playlist_performance_vst3_clip_indices_with_clap(
-            document,
-            arrangement_id,
-            start_tick,
-            &loaded_vst3_channels,
-            &assigned_clap_channel_ids,
-        ) {
-            Ok(indices) => indices
-                .intersection(&performance_clip_indices)
-                .copied()
-                .collect::<BTreeSet<_>>(),
-            Err(error) => {
-                self.status = format!("Could not prepare Performance Mode VST3 clips: {error}");
-                return;
-            }
-        };
+        let performance_vst3_clip_indices =
+            match playlist_performance_vst3_clip_indices_with_vst2_and_clap(
+                document,
+                arrangement_id,
+                start_tick,
+                &loaded_vst2_channels,
+                &loaded_vst3_channels,
+                &assigned_clap_channel_ids,
+            ) {
+                Ok(indices) => indices
+                    .intersection(&performance_clip_indices)
+                    .copied()
+                    .collect::<BTreeSet<_>>(),
+                Err(error) => {
+                    self.status = format!("Could not prepare Performance Mode VST3 clips: {error}");
+                    return;
+                }
+            };
         let performance_vst3_channel_ids = match playlist_performance_vst3_channel_ids(
             document,
             arrangement_id,
@@ -18088,10 +18124,11 @@ impl DawUi {
                 return;
             }
         };
-        let performance_clap_clip_indices = match playlist_performance_clap_clip_indices(
+        let performance_clap_clip_indices = match playlist_performance_clap_clip_indices_with_vst2(
             document,
             arrangement_id,
             start_tick,
+            &loaded_vst2_channels,
             &loaded_vst3_channels,
             &assigned_clap_channel_ids,
         ) {
@@ -18238,10 +18275,11 @@ impl DawUi {
                 .collect(),
         );
         self.initialize_live_mixer_insert_fader_targets(document);
-        let static_document = match playlist_performance_static_document_with_vst3_and_clap(
+        let static_document = match playlist_performance_static_document_with_vst2_vst3_and_clap(
             document,
             arrangement_id,
             start_tick,
+            &loaded_vst2_channels,
             &loaded_vst3_channels,
             &assigned_clap_channel_ids,
         ) {
@@ -18324,6 +18362,7 @@ impl DawUi {
         let worker_live_status = Arc::clone(&live_status);
         let worker_options = options.clone();
         let worker_clap_performance_audio_layers = Arc::clone(&performance_clap_audio_layers);
+        let worker_vst2_runtime = self.vst2_host.clone();
         let worker = thread::Builder::new()
             .name("performance-audio-render".to_owned())
             .spawn(move || {
@@ -18347,6 +18386,7 @@ impl DawUi {
                                 live_status: Arc::clone(&worker_live_status),
                                 meters: Some(worker_mixer_meters),
                                 metronome: Some(worker_metronome),
+                                vst2_runtime: worker_vst2_runtime,
                                 clap_audio_layers: worker_clap_performance_audio_layers,
                             },
                         )
