@@ -41656,6 +41656,19 @@ impl DawUi {
     }
 
     fn channel_rack(&mut self, ui: &mut egui::Ui) {
+        let editor_failures = self
+            .vst2_host
+            .as_ref()
+            .and_then(|runtime| {
+                runtime
+                    .lock()
+                    .ok()
+                    .map(|mut runtime| runtime.take_editor_failures())
+            })
+            .unwrap_or_default();
+        if let Some((channel_id, reason)) = editor_failures.last() {
+            self.status = format!("VST2 editor for Channel {channel_id} failed: {reason}");
+        }
         let Some(document) = &self.document else {
             empty_view(ui, "Open a project to see its Channel Rack");
             return;

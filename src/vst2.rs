@@ -3,7 +3,7 @@
 //! The plug-in ABI and worker process are provided by `vst-audio`; the host
 //! application only talks to its bounded process and audio APIs.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::path::Path;
 use std::thread;
@@ -14,7 +14,8 @@ use crate::sample_render::swing_note_start_tick;
 use crate::{ChannelPluginState, PatternNote};
 use vst_audio::{
     AudioEndpoint, AudioEvent, AudioStatus, BusSelector, ClassInfo, Command, Configuration, Host,
-    HostEvent, Instance, MAX_EVENTS, PluginDescriptor, PluginFormat, ProcessReport, Transport,
+    HostEvent, Instance, MAX_EVENTS, PluginDescriptor, PluginFormat, ProcessReport, RequestId,
+    Transport,
 };
 
 const RENDER_QUANTUM: u32 = 512;
@@ -141,6 +142,9 @@ pub struct Vst2HostRuntime {
     quantum: u32,
     next_id: u64,
     channels: BTreeMap<u16, Vst2HostedChannel>,
+    pending_editor_requests: BTreeSet<(u16, RequestId)>,
+    pending_editor_failures: Vec<(u16, String)>,
+    pending_worker_failures: Vec<(u16, String)>,
 }
 
 /// Run the embedded worker when this binary is launched by `vst-audio`.
@@ -292,6 +296,9 @@ impl Vst2HostRuntime {
             quantum,
             next_id: 1,
             channels: BTreeMap::new(),
+            pending_editor_requests: BTreeSet::new(),
+            pending_editor_failures: Vec::new(),
+            pending_worker_failures: Vec::new(),
         })
     }
 
@@ -343,6 +350,8 @@ impl Vst2HostRuntime {
             output_channels,
         };
         self.next_id = self.next_id.wrapping_add(1).max(1);
+        self.pending_editor_requests
+            .retain(|(channel_id, _)| *channel_id != info.channel_id);
         self.channels.insert(
             info.channel_id,
             Vst2HostedChannel {
@@ -367,12 +376,13 @@ impl Vst2HostRuntime {
             .channels
             .get(&channel_id)
             .ok_or_else(|| format!("VST2 channel {channel_id} is not loaded"))?;
-        channel
+        let request = channel
             .instance
             .controller()
             .request(Command::OpenEditor)
-            .map(|_| ())
-            .map_err(|error| format!("could not request VST2 editor: {error}"))
+            .map_err(|error| format!("could not request VST2 editor: {error}"))?;
+        self.pending_editor_requests.insert((channel_id, request));
+        Ok(())
     }
 
     /// Process one block through a loaded channel. MIDI event buses use bus zero;
@@ -399,23 +409,46 @@ impl Vst2HostRuntime {
 
     /// Consume worker lifecycle errors for channels loaded into this host.
     pub fn poll_failures(&mut self) -> Vec<(u16, String)> {
-        let mut failures = Vec::new();
+        self.poll_events();
+        std::mem::take(&mut self.pending_worker_failures)
+    }
+
+    /// Consume asynchronous errors from native editor requests.
+    pub fn take_editor_failures(&mut self) -> Vec<(u16, String)> {
+        self.poll_events();
+        std::mem::take(&mut self.pending_editor_failures)
+    }
+
+    fn poll_events(&mut self) {
         for (channel_id, channel) in &mut self.channels {
             while let Some(event) = channel.instance.try_next_event() {
                 match event {
-                    HostEvent::Failed { reason } => failures.push((*channel_id, reason)),
-                    HostEvent::RecoveryRequired | HostEvent::Stopped => failures.push((
-                        *channel_id,
-                        "VST2 worker stopped or requires recovery".to_owned(),
-                    )),
+                    HostEvent::Completed { request } => {
+                        self.pending_editor_requests.remove(&(*channel_id, request));
+                    }
+                    HostEvent::RequestFailed { request, reason }
+                        if self.pending_editor_requests.remove(&(*channel_id, request)) =>
+                    {
+                        self.pending_editor_failures.push((*channel_id, reason));
+                    }
+                    HostEvent::Failed { reason } => {
+                        self.pending_worker_failures.push((*channel_id, reason));
+                    }
+                    HostEvent::RecoveryRequired | HostEvent::Stopped => {
+                        self.pending_worker_failures.push((
+                            *channel_id,
+                            "VST2 worker stopped or requires recovery".to_owned(),
+                        ))
+                    }
                     _ => {}
                 }
             }
         }
-        failures
     }
 
     pub fn unload_channel(&mut self, channel_id: u16) -> bool {
+        self.pending_editor_requests
+            .retain(|(pending_channel_id, _)| *pending_channel_id != channel_id);
         self.channels.remove(&channel_id).is_some()
     }
 }
