@@ -1013,6 +1013,13 @@ fn queue_script_transport_actions(
             ScriptTransportAction::SelectionJog(increment) => {
                 MidiTransportCommand::SelectionJog(increment)
             }
+            ScriptTransportAction::ZoomJog {
+                horizontal,
+                increment,
+            } => MidiTransportCommand::ZoomJog {
+                horizontal,
+                increment,
+            },
             ScriptTransportAction::MoveJog(increment) => MidiTransportCommand::MoveJog(increment),
             ScriptTransportAction::PatternJog(increment) => {
                 MidiTransportCommand::PatternJog(increment)
@@ -1168,6 +1175,10 @@ pub enum MidiTransportCommand {
     TogglePianoRollSnap,
     PianoRollSnapJog(i32),
     SelectionJog(i32),
+    ZoomJog {
+        horizontal: bool,
+        increment: i32,
+    },
     MoveJog(i32),
     PatternJog(i32),
     TempoJog(i32),
@@ -1964,6 +1975,13 @@ pub fn describe_event(event: MidiInputEvent) -> String {
             }
             MidiTransportCommand::SelectionJog(_) => {
                 "MIDI script Previous/Next Selection".to_owned()
+            }
+            MidiTransportCommand::ZoomJog { horizontal, .. } => {
+                if horizontal {
+                    "MIDI script Horizontal Zoom".to_owned()
+                } else {
+                    "MIDI script Vertical Zoom".to_owned()
+                }
             }
             MidiTransportCommand::MoveJog(_) => "MIDI script Move Jog".to_owned(),
             MidiTransportCommand::PatternJog(_) => "MIDI script Pattern Selection".to_owned(),

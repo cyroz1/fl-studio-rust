@@ -204,6 +204,28 @@ def _ui_next():
     return _ui_selection_jog(1)
 
 
+def _ui_zoom_jog(horizontal, increment):
+    try:
+        increment = int(increment)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("zoom increment must be an integer") from error
+    if not -(2**31) <= increment < 2**31:
+        raise ValueError("zoom increment is outside the supported range")
+    if increment:
+        _request_transport_action(
+            {"action": "zoom_jog", "horizontal": bool(horizontal), "increment": increment}
+        )
+    return 8
+
+
+def _ui_hor_zoom(increment):
+    return _ui_zoom_jog(True, increment)
+
+
+def _ui_ver_zoom(increment):
+    return _ui_zoom_jog(False, increment)
+
+
 def _playlist_track_count():
     try:
         return max(0, int(_active_transport_state.get("playlist_track_count", 0)))
@@ -1907,6 +1929,10 @@ def _global_transport(command, value, pmeflags=2, flags=15):
         return 8
     if command == 1:  # FPT_Jog2: generic move jog
         return _move_jog(value)
+    if command == 44:  # FPT_HZoomJog
+        return _ui_hor_zoom(value)
+    if command == 45:  # FPT_VZoomJog
+        return _ui_ver_zoom(value)
     if command == 5:  # FPT_Previous
         if value != 0:
             _request_transport_action({"action": "selection_jog", "increment": -1})
@@ -2256,6 +2282,8 @@ def _install_modules(script_name, device_name):
     ui.moveJog = _move_jog
     ui.jog = _ui_selection_jog
     ui.jog2 = _move_jog
+    ui.horZoom = _ui_hor_zoom
+    ui.verZoom = _ui_ver_zoom
     ui.isMetronomeEnabled = lambda: bool(
         _active_transport_state.get("metronome_enabled", False)
     )

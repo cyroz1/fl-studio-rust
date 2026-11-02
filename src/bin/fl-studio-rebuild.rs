@@ -8198,6 +8198,24 @@ fn midi_script_selection_jog_index(
     usize::try_from(target_index.clamp(0, last_index)).ok()
 }
 
+fn midi_script_zoom_target(
+    current_zoom: f32,
+    increment: i32,
+    minimum: f32,
+    maximum: f32,
+) -> Option<f32> {
+    if !current_zoom.is_finite()
+        || !minimum.is_finite()
+        || !maximum.is_finite()
+        || minimum <= 0.0
+        || maximum < minimum
+    {
+        return None;
+    }
+    let factor = 1.2_f32.powi(increment.clamp(-32, 32));
+    Some((current_zoom.clamp(minimum, maximum) * factor).clamp(minimum, maximum))
+}
+
 fn midi_script_tempo_jog_target(current_bpm: f64, increment: i32) -> Option<f64> {
     if !current_bpm.is_finite() || current_bpm <= 0.0 {
         return None;
@@ -20781,6 +20799,86 @@ impl DawUi {
                         SCRIPT_MIXER_SCROLL_TO_MAKE_VISIBLE,
                     );
                 }
+            }
+            _ => {}
+        }
+    }
+
+    fn jog_midi_script_zoom(&mut self, horizontal: bool, increment: i32) {
+        if increment == 0 {
+            return;
+        }
+        match (self.view, horizontal) {
+            (MainView::Playlist, true) => {
+                let Some(zoom) = midi_script_zoom_target(self.timeline_zoom, increment, 0.04, 0.24)
+                else {
+                    return;
+                };
+                let old_zoom = self.timeline_zoom.max(f32::EPSILON);
+                if (zoom - old_zoom).abs() <= f32::EPSILON {
+                    return;
+                }
+                let viewport_width = self
+                    .playlist_grid_viewport
+                    .map_or(0.0, |viewport| viewport.width());
+                let anchor = viewport_width * 0.5;
+                let source_content_x = self.playlist_grid_scroll_offset.x + anchor;
+                let anchored_content_x = PLAYLIST_LABEL_WIDTH
+                    + (source_content_x - PLAYLIST_LABEL_WIDTH) * (zoom / old_zoom);
+                self.playlist_pending_scroll_offset = Some(Vec2::new(
+                    (anchored_content_x - anchor).max(0.0),
+                    self.playlist_grid_scroll_offset.y,
+                ));
+                self.timeline_zoom = zoom;
+                self.status = format!("MIDI script Playlist horizontal zoom {:.0}%", zoom * 1000.0);
+            }
+            (MainView::Playlist, false) => {
+                let Some(zoom) =
+                    midi_script_zoom_target(self.playlist_track_zoom, increment, 0.6, 2.0)
+                else {
+                    return;
+                };
+                let old_zoom = self.playlist_track_zoom.max(f32::EPSILON);
+                if (zoom - old_zoom).abs() <= f32::EPSILON {
+                    return;
+                }
+                let anchor = self
+                    .playlist_grid_viewport
+                    .map_or(0.0, |viewport| viewport.height() * 0.5);
+                let anchored_content_y = self.playlist_grid_scroll_offset.y + anchor;
+                let offset_y = (anchored_content_y * (zoom / old_zoom) - anchor).max(0.0);
+                self.playlist_pending_scroll_offset =
+                    Some(Vec2::new(self.playlist_grid_scroll_offset.x, offset_y));
+                self.playlist_track_zoom = zoom;
+                self.status = format!("MIDI script Playlist vertical zoom {:.0}%", zoom * 100.0);
+            }
+            (MainView::PianoRoll, true) => {
+                let Some(zoom) =
+                    midi_script_zoom_target(self.piano_roll_zoom, increment, 0.06, 0.24)
+                else {
+                    return;
+                };
+                let anchor = self
+                    .piano_roll_grid_viewport
+                    .map_or(0.0, |viewport| viewport.width() * 0.5);
+                self.request_piano_roll_zoom(zoom, anchor, anchor);
+            }
+            (MainView::PianoRoll, false) => {
+                let old_zoom = self.piano_roll_vertical_zoom.max(f32::EPSILON);
+                let Some(zoom) = midi_script_zoom_target(old_zoom, increment, 0.5, 2.0) else {
+                    return;
+                };
+                if (zoom - old_zoom).abs() <= f32::EPSILON {
+                    return;
+                }
+                let anchor = self
+                    .piano_roll_grid_viewport
+                    .map_or(0.0, |viewport| viewport.height() * 0.5);
+                let anchored_content_y = self.piano_roll_grid_scroll_offset.y + anchor;
+                let offset_y = (anchored_content_y * (zoom / old_zoom) - anchor).max(0.0);
+                self.piano_roll_vertical_zoom = zoom;
+                self.piano_roll_pending_scroll_offset =
+                    Some(Vec2::new(self.piano_roll_grid_scroll_offset.x, offset_y));
             }
             _ => {}
         }
@@ -69223,6 +69321,10 @@ impl DawUi {
             MidiTransportCommand::SelectionJog(increment) => {
                 self.jog_midi_script_selection(increment);
             }
+            MidiTransportCommand::ZoomJog {
+                horizontal,
+                increment,
+            } => self.jog_midi_script_zoom(horizontal, increment),
             MidiTransportCommand::MoveJog(increment) => {
                 self.move_midi_script_items(increment);
             }
@@ -92769,17 +92871,17 @@ mod tests {
         midi_script_playlist_track_ids, midi_script_playlist_track_mute_states,
         midi_script_playlist_track_names, midi_script_playlist_track_performance_modes,
         midi_script_selection_jog_index, midi_script_tempo_jog_target,
-        midi_script_time_position_seconds_to_ticks, midi_vst3_parameter_mapping_for_target,
-        midi_vst3_parameter_mappings_for_cc, next_empty_pattern_id, next_piano_roll_note_group,
-        note_from_grid_position, parse_internal_lfo_parameter_links,
-        parse_midi_control_change_mapping, parse_midi_controller_templates,
-        parse_midi_device_selections, parse_midi_mixer_control_mappings,
-        parse_midi_output_programs, parse_midi_output_routes, parse_midi_output_values,
-        parse_midi_vst3_parameter_mappings, parse_pattern_vst3_mixer_effect_parameter_links,
-        parse_pattern_vst3_parameter_links, parse_playlist_audio_clip_envelopes,
-        parse_playlist_vst3_mixer_effect_parameter_links, parse_playlist_vst3_parameter_links,
-        parse_window_layout_presets, pattern_color_from_random_index,
-        pattern_lfo_loop_length_ticks, pattern_loop_frame_at_tick,
+        midi_script_time_position_seconds_to_ticks, midi_script_zoom_target,
+        midi_vst3_parameter_mapping_for_target, midi_vst3_parameter_mappings_for_cc,
+        next_empty_pattern_id, next_piano_roll_note_group, note_from_grid_position,
+        parse_internal_lfo_parameter_links, parse_midi_control_change_mapping,
+        parse_midi_controller_templates, parse_midi_device_selections,
+        parse_midi_mixer_control_mappings, parse_midi_output_programs, parse_midi_output_routes,
+        parse_midi_output_values, parse_midi_vst3_parameter_mappings,
+        parse_pattern_vst3_mixer_effect_parameter_links, parse_pattern_vst3_parameter_links,
+        parse_playlist_audio_clip_envelopes, parse_playlist_vst3_mixer_effect_parameter_links,
+        parse_playlist_vst3_parameter_links, parse_window_layout_presets,
+        pattern_color_from_random_index, pattern_lfo_loop_length_ticks, pattern_loop_frame_at_tick,
         pattern_loop_handoff_tick_at_frame, pattern_loop_tick_at_frame,
         pattern_vst3_mixer_effect_parameter_automation_for_target,
         pattern_vst3_mixer_effect_parameter_automation_for_target_with_lfo,
@@ -97307,6 +97409,22 @@ mod tests {
         assert_eq!(midi_script_selection_jog_index(3, None, 3), Some(2));
         assert_eq!(midi_script_selection_jog_index(3, None, 0), None);
         assert_eq!(midi_script_selection_jog_index(0, None, 1), None);
+    }
+
+    #[test]
+    fn midi_script_zoom_jog_scales_and_clamps_to_editor_ranges() {
+        assert!((midi_script_zoom_target(0.1, 1, 0.04, 0.24).unwrap() - 0.12).abs() < 0.0001);
+        assert!((midi_script_zoom_target(1.0, -1, 0.5, 2.0).unwrap() - (1.0 / 1.2)).abs() < 0.0001);
+        assert_eq!(
+            midi_script_zoom_target(0.1, i32::MAX, 0.04, 0.24),
+            Some(0.24)
+        );
+        assert_eq!(
+            midi_script_zoom_target(0.1, i32::MIN, 0.04, 0.24),
+            Some(0.04)
+        );
+        assert_eq!(midi_script_zoom_target(f32::NAN, 1, 0.04, 0.24), None);
+        assert_eq!(midi_script_zoom_target(1.0, 1, 0.0, 2.0), None);
     }
 
     #[test]
