@@ -8,11 +8,12 @@ use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::ChannelPluginState;
 use crate::media::{DecodedAudio, decode_audio_file, write_audio_range_to_wav};
+use crate::sample_render::swing_note_start_tick;
+use crate::{ChannelPluginState, PatternNote};
 use vst_audio::{
     AudioEvent, AudioStatus, BusSelector, ClassInfo, Command, Configuration, Host, HostEvent,
-    Instance, PluginDescriptor, PluginFormat, Transport,
+    Instance, MAX_EVENTS, PluginDescriptor, PluginFormat, Transport,
 };
 
 const RENDER_QUANTUM: u32 = 512;
@@ -76,6 +77,43 @@ pub struct Vst2StateProbeSummary {
     pub state_roundtrip_identical: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Vst2PatternRenderOptions {
+    pub channel_id: u16,
+    pub ppq: u16,
+    pub tempo_bpm: f64,
+    pub tail_seconds: f64,
+    pub sample_rate: u32,
+    pub global_swing_mix_raw: u8,
+    pub channel_swing_mix_raw: u16,
+    /// Project Master pitch as a note transposition for channels using Add to Key.
+    pub note_pitch_offset_semitones: i16,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Vst2PatternRenderSummary {
+    pub plugin_name: String,
+    pub vendor: String,
+    pub notes_rendered: usize,
+    pub sample_rate: u32,
+    pub frames: usize,
+    pub latency_frames: usize,
+    pub channels: usize,
+    pub peak: f32,
+}
+
+struct Vst2ChannelClass {
+    class: ClassInfo,
+    fourcc: String,
+}
+
+#[derive(Clone, Copy)]
+struct ScheduledVst2MidiEvent {
+    frame: u64,
+    priority: u8,
+    data: [u8; 3],
+}
+
 /// Run the embedded worker when this binary is launched by `vst-audio`.
 ///
 /// `vst-audio` starts the configured executable with `--control-in` as its
@@ -123,61 +161,24 @@ pub fn probe_vst2_channel_state(
     plugin_path: impl AsRef<Path>,
     state: &ChannelPluginState,
 ) -> Result<Vst2StateProbeSummary, String> {
+    let plugin_path = plugin_path.as_ref();
+    let matched = match_vst2_channel_class(plugin_path, state)?;
     let metadata = state
         .vst_metadata()
         .ok_or_else(|| "FLP channel has no recognized VST state envelope".to_owned())?;
-    let fourcc = metadata
-        .fourcc()
-        .ok_or_else(|| "FLP channel state has no VST2 FourCC identifier".to_owned())?;
-    let fourcc_bytes: [u8; 4] = fourcc
-        .as_bytes()
-        .try_into()
-        .map_err(|_| "FLP VST2 FourCC identifier is not exactly four bytes".to_owned())?;
-    if !fourcc_bytes.is_ascii() {
-        return Err("FLP VST2 FourCC identifier is not ASCII".to_owned());
-    }
     let state_bytes = state
         .vst_state_bytes()
         .ok_or_else(|| "FLP VST2 channel state has no nested field 53".to_owned())?;
-    let saved_unique_id = i32::from_le_bytes(fourcc_bytes);
-    let worker_uid_bytes = saved_unique_id.to_be_bytes();
-
-    let mut matching_classes = inspect_vst2_plugin(plugin_path.as_ref())?
-        .into_iter()
-        .filter_map(|class| {
-            if &class.id[..4] != b"VST2" || class.id[8..].iter().any(|byte| *byte != 0) {
-                return None;
-            }
-            let class_uid = &class.id[4..8];
-            if class_uid == worker_uid_bytes {
-                Some((class, "FLP-little-endian"))
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
-    if matching_classes.is_empty() {
-        return Err(format!(
-            "no VST2 class in {} matches saved FourCC {fourcc}",
-            plugin_path.as_ref().display()
-        ));
-    }
-    if matching_classes.len() != 1 {
-        return Err(format!(
-            "saved VST2 FourCC {fourcc} matches multiple classes in {}",
-            plugin_path.as_ref().display()
-        ));
-    }
-    let (class, id_byte_order) = matching_classes.pop().expect("one VST2 class matched");
-    let class_id = class
+    let class_id = matched
+        .class
         .id
         .iter()
         .map(|byte| format!("{byte:02X}"))
         .collect::<String>();
     let descriptor = PluginDescriptor {
-        path: plugin_path.as_ref().to_path_buf(),
+        path: plugin_path.to_path_buf(),
         format: PluginFormat::Vst2,
-        class_id: Some(class.id),
+        class_id: Some(matched.class.id),
     };
     let host = host_for_current_executable()?;
     let configuration = Configuration {
@@ -192,16 +193,374 @@ pub fn probe_vst2_channel_state(
     drop(instance);
 
     Ok(Vst2StateProbeSummary {
-        plugin_name: class.name,
-        vendor: class.vendor,
+        plugin_name: matched.class.name,
+        vendor: matched.class.vendor,
         saved_plugin_name: metadata.name().unwrap_or("unknown").to_owned(),
         saved_vendor: metadata.vendor().unwrap_or("unknown").to_owned(),
-        saved_fourcc: fourcc.to_owned(),
+        saved_fourcc: matched.fourcc,
         class_id,
-        id_byte_order,
+        id_byte_order: "FLP-little-endian",
         state_bytes: state_bytes.len(),
         state_roundtrip_identical,
     })
+}
+
+fn match_vst2_channel_class(
+    plugin_path: &Path,
+    state: &ChannelPluginState,
+) -> Result<Vst2ChannelClass, String> {
+    let fourcc = state
+        .vst_metadata()
+        .and_then(|metadata| metadata.fourcc())
+        .ok_or_else(|| "FLP channel state has no VST2 FourCC identifier".to_owned())?;
+    let fourcc_bytes: [u8; 4] = fourcc
+        .as_bytes()
+        .try_into()
+        .map_err(|_| "FLP VST2 FourCC identifier is not exactly four bytes".to_owned())?;
+    if !fourcc_bytes.is_ascii() {
+        return Err("FLP VST2 FourCC identifier is not ASCII".to_owned());
+    }
+    if state.vst_state_bytes().is_none() {
+        return Err("FLP VST2 channel state has no nested field 53".to_owned());
+    }
+    let saved_unique_id = i32::from_le_bytes(fourcc_bytes);
+    let worker_uid_bytes = saved_unique_id.to_be_bytes();
+    let matching_classes = inspect_vst2_plugin(plugin_path)?
+        .into_iter()
+        .filter(|class| {
+            &class.id[..4] == b"VST2"
+                && class.id[8..].iter().all(|byte| *byte == 0)
+                && class.id[4..8] == worker_uid_bytes
+        })
+        .collect::<Vec<_>>();
+    match matching_classes.as_slice() {
+        [] => Err(format!(
+            "no VST2 class in {} matches saved FourCC {fourcc}",
+            plugin_path.display()
+        )),
+        [class] => Ok(Vst2ChannelClass {
+            class: class.clone(),
+            fourcc: fourcc.to_owned(),
+        }),
+        _ => Err(format!(
+            "saved VST2 FourCC {fourcc} matches multiple classes in {}",
+            plugin_path.display()
+        )),
+    }
+}
+
+/// Render one FLP Pattern channel through its matching VST2 plug-in and saved field-53 state.
+///
+/// Pattern timing, note keys, velocity, MIDI channel, and project swing are applied. VST2
+/// receives standard MIDI note events, so FLP per-note pitch, pan, release, and modulation
+/// expression are not represented by this renderer.
+pub fn render_vst2_pattern_channel_to_wav(
+    plugin_path: impl AsRef<Path>,
+    output_path: impl AsRef<Path>,
+    state: &ChannelPluginState,
+    notes: &[PatternNote],
+    options: Vst2PatternRenderOptions,
+) -> Result<Vst2PatternRenderSummary, String> {
+    let plugin_path = plugin_path.as_ref();
+    let output_path = output_path.as_ref();
+    if state.channel_id() != options.channel_id {
+        return Err(format!(
+            "VST2 state belongs to channel {}, not channel {}",
+            state.channel_id(),
+            options.channel_id
+        ));
+    }
+    if !output_path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("wav"))
+    {
+        return Err("VST2 Pattern output must use the .wav extension".to_owned());
+    }
+    if !(8_000..=384_000).contains(&options.sample_rate) {
+        return Err("sample rate must be between 8,000 and 384,000 Hz".to_owned());
+    }
+    let (mut scheduled_events, note_count) = prepare_vst2_pattern_events(notes, options)?;
+    if note_count == 0 {
+        return Err(format!(
+            "pattern channel {} has no unmuted notes to render",
+            options.channel_id
+        ));
+    }
+    let final_note_frame = scheduled_events
+        .iter()
+        .map(|event| event.frame)
+        .max()
+        .ok_or_else(|| "pattern channel has no renderable notes".to_owned())?;
+    let tail_frames = seconds_to_frames(options.tail_seconds, options.sample_rate)?;
+    let content_frames = final_note_frame
+        .checked_add(tail_frames as u64)
+        .and_then(|frames| frames.checked_add(1))
+        .ok_or_else(|| "VST2 Pattern render frame count overflow".to_owned())?;
+    if content_frames as f64 / f64::from(options.sample_rate) > MAX_RENDER_SECONDS {
+        return Err(format!(
+            "VST2 Pattern render must be at most {MAX_RENDER_SECONDS} seconds"
+        ));
+    }
+
+    let matched = match_vst2_channel_class(plugin_path, state)?;
+    let state_bytes = state
+        .vst_state_bytes()
+        .ok_or_else(|| "FLP VST2 channel state has no nested field 53".to_owned())?;
+    let descriptor = PluginDescriptor {
+        path: plugin_path.to_path_buf(),
+        format: PluginFormat::Vst2,
+        class_id: Some(matched.class.id),
+    };
+    let host = host_for_current_executable()?;
+    let configuration = Configuration {
+        sample_rate: options.sample_rate,
+        quantum: RENDER_QUANTUM,
+        max_callback_frames: Some(RENDER_QUANTUM),
+        offline: true,
+        buses: Some(BusSelector::main_only()),
+        ..Configuration::default()
+    };
+    let mut instance = host
+        .spawn(&descriptor, &configuration, Some(state_bytes))
+        .map_err(|error| format!("could not restore and start FLP VST2 plug-in: {error}"))?;
+    let mut audio = instance
+        .take_audio()
+        .ok_or_else(|| "VST2 worker did not provide an audio endpoint".to_owned())?;
+    let geometry = audio.geometry();
+    let output_channel_count = geometry.output_channels as usize;
+    let captured_channel_count = output_channel_count.min(2);
+    if captured_channel_count == 0 {
+        return Err("VST2 plug-in has no active main output bus".to_owned());
+    }
+    let input_channel_count = geometry.input_channels as usize;
+    let latency_frames = audio.latency_frames();
+    let frames_with_latency = content_frames
+        .checked_add(latency_frames as u64)
+        .ok_or_else(|| "VST2 Pattern render frame count overflow".to_owned())?;
+    let quantum = RENDER_QUANTUM as usize;
+    let process_frames = usize::try_from(frames_with_latency)
+        .ok()
+        .and_then(|frames| frames.checked_add(quantum - 1))
+        .map(|frames| frames / quantum * quantum)
+        .ok_or_else(|| "VST2 Pattern render frame count overflow".to_owned())?;
+    let buffer_bytes = process_frames
+        .checked_mul(captured_channel_count)
+        .and_then(|samples| samples.checked_mul(std::mem::size_of::<f32>()))
+        .ok_or_else(|| "VST2 Pattern render buffer size overflow".to_owned())?;
+    if buffer_bytes > MAX_RENDER_BUFFER_BYTES {
+        return Err(format!(
+            "VST2 Pattern render needs {buffer_bytes} bytes of audio storage; limit is {MAX_RENDER_BUFFER_BYTES}"
+        ));
+    }
+
+    scheduled_events.sort_by_key(|event| (event.frame, event.priority));
+    let mut next_event = 0usize;
+    let mut captured = (0..captured_channel_count)
+        .map(|_| Vec::with_capacity(process_frames))
+        .collect::<Vec<_>>();
+    let mut transport = Transport {
+        tempo: options.tempo_bpm,
+        ..Transport::default()
+    };
+    let mut startup_fallbacks = latency_frames.div_ceil(quantum);
+    for block_start in (0..process_frames).step_by(quantum) {
+        let block_end = (block_start + quantum) as u64;
+        let mut events = Vec::new();
+        while scheduled_events
+            .get(next_event)
+            .is_some_and(|event| event.frame < block_end)
+        {
+            let event = scheduled_events[next_event];
+            let offset = u32::try_from(event.frame.saturating_sub(block_start as u64))
+                .map_err(|_| "VST2 Pattern MIDI event offset is outside the block".to_owned())?;
+            events.push(AudioEvent::midi(offset, 0, event.data));
+            next_event += 1;
+        }
+        if events.len() > MAX_EVENTS {
+            return Err(format!(
+                "VST2 worker accepts at most {MAX_EVENTS} MIDI events in one audio block"
+            ));
+        }
+        let inputs = (0..input_channel_count)
+            .map(|_| vec![0.0f32; quantum])
+            .collect::<Vec<_>>();
+        let input_slices = inputs.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let mut outputs = (0..output_channel_count)
+            .map(|_| vec![0.0f32; quantum])
+            .collect::<Vec<_>>();
+        let mut output_slices = outputs
+            .iter_mut()
+            .map(Vec::as_mut_slice)
+            .collect::<Vec<_>>();
+        let report = audio.process_events(
+            quantum,
+            &input_slices,
+            &mut output_slices,
+            transport,
+            &events,
+            &mut [],
+        );
+        match report.status {
+            AudioStatus::Processed if report.events_dropped == 0 => {
+                startup_fallbacks = 0;
+            }
+            AudioStatus::Processed => {
+                return Err(format!(
+                    "VST2 worker dropped {} Pattern MIDI events in block {}",
+                    report.events_dropped,
+                    block_start / quantum
+                ));
+            }
+            AudioStatus::Fallback if startup_fallbacks > 0 => startup_fallbacks -= 1,
+            status => {
+                return Err(format!(
+                    "VST2 worker did not process Pattern block {}: {status:?}",
+                    block_start / quantum
+                ));
+            }
+        }
+        for channel in 0..captured_channel_count {
+            captured[channel].extend_from_slice(&outputs[channel]);
+        }
+        transport = transport.advanced(quantum, options.sample_rate);
+        thread::sleep(Duration::from_secs_f64(
+            f64::from(RENDER_QUANTUM) / f64::from(options.sample_rate) * 3.0,
+        ));
+    }
+
+    let end = latency_frames
+        .checked_add(content_frames as usize)
+        .ok_or_else(|| "VST2 Pattern render slice overflow".to_owned())?;
+    if captured.iter().any(|channel| channel.len() < end) {
+        return Err("VST2 Pattern render did not produce the requested audio range".to_owned());
+    }
+    let channels = captured
+        .into_iter()
+        .map(|channel| channel[latency_frames..end].to_vec())
+        .collect::<Vec<_>>();
+    let peak = channels
+        .iter()
+        .flat_map(|channel| channel.iter())
+        .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
+    write_audio_range_to_wav(
+        &DecodedAudio {
+            sample_rate: options.sample_rate,
+            channels,
+        },
+        0..content_frames as usize,
+        output_path,
+    )?;
+
+    Ok(Vst2PatternRenderSummary {
+        plugin_name: matched.class.name,
+        vendor: matched.class.vendor,
+        notes_rendered: note_count,
+        sample_rate: options.sample_rate,
+        frames: content_frames as usize,
+        latency_frames,
+        channels: captured_channel_count,
+        peak,
+    })
+}
+
+fn prepare_vst2_pattern_events(
+    notes: &[PatternNote],
+    options: Vst2PatternRenderOptions,
+) -> Result<(Vec<ScheduledVst2MidiEvent>, usize), String> {
+    if options.ppq == 0 {
+        return Err("project PPQ must be greater than zero".to_owned());
+    }
+    if !options.tempo_bpm.is_finite() || options.tempo_bpm <= 0.0 {
+        return Err("project tempo must be finite and positive".to_owned());
+    }
+    if !options.tail_seconds.is_finite() || !(0.0..=60.0).contains(&options.tail_seconds) {
+        return Err("VST2 Pattern tail must be between 0 and 60 seconds".to_owned());
+    }
+    if !(-12..=12).contains(&options.note_pitch_offset_semitones) {
+        return Err("VST2 note pitch offset must be between -12 and 12 semitones".to_owned());
+    }
+    let matching_notes = notes
+        .iter()
+        .filter(|note| note.channel_id == options.channel_id && !note.is_muted())
+        .collect::<Vec<_>>();
+    if matching_notes.len() > 2_000_000 {
+        return Err("Pattern channel expands to more than 2000000 notes".to_owned());
+    }
+    let mut events = Vec::with_capacity(matching_notes.len().saturating_mul(2));
+    let mut note_count = 0usize;
+    for note in matching_notes {
+        if note.key > 127 {
+            return Err(format!(
+                "Pattern channel {} contains key {} outside the MIDI note range",
+                options.channel_id, note.key
+            ));
+        }
+        if note.length == 0 {
+            return Err(format!(
+                "Pattern channel {} contains a zero-length note",
+                options.channel_id
+            ));
+        }
+        if note.velocity > 127 {
+            return Err(format!(
+                "Pattern channel {} contains velocity {} outside the MIDI range",
+                options.channel_id, note.velocity
+            ));
+        }
+        let key = i32::from(note.key) + i32::from(options.note_pitch_offset_semitones);
+        if !(0..=127).contains(&key) {
+            return Err(format!(
+                "Pattern key {} with project pitch offset is outside the MIDI note range",
+                note.key
+            ));
+        }
+        let midi_channel = note.midi_channel_index();
+        let nominal_start_tick = u64::from(note.position);
+        let start_tick = swing_note_start_tick(
+            nominal_start_tick,
+            options.ppq,
+            options.global_swing_mix_raw,
+            options.channel_swing_mix_raw,
+        )?;
+        let swing_offset = start_tick.saturating_sub(nominal_start_tick);
+        let end_tick = nominal_start_tick
+            .checked_add(u64::from(note.length))
+            .and_then(|tick| tick.checked_add(swing_offset))
+            .ok_or_else(|| "Pattern note end position overflow".to_owned())?;
+        let frame_for_tick = |tick: u64| {
+            ((tick as f64 / f64::from(options.ppq))
+                * (60.0 / options.tempo_bpm)
+                * f64::from(options.sample_rate))
+            .round()
+        };
+        let start_frame = frame_for_tick(start_tick);
+        let end_frame = frame_for_tick(end_tick);
+        if !start_frame.is_finite()
+            || !end_frame.is_finite()
+            || start_frame < 0.0
+            || end_frame < start_frame
+            || end_frame > u64::MAX as f64
+        {
+            return Err("Pattern note timing is outside the renderable range".to_owned());
+        }
+        let start_frame = start_frame as u64;
+        let end_frame = (end_frame as u64).max(start_frame.saturating_add(1));
+        let key = key as u8;
+        let channel_status = midi_channel & 0x0f;
+        events.push(ScheduledVst2MidiEvent {
+            frame: start_frame,
+            priority: 1,
+            data: [0x90 | channel_status, key, note.velocity],
+        });
+        events.push(ScheduledVst2MidiEvent {
+            frame: end_frame,
+            priority: 0,
+            data: [0x80 | channel_status, key, 0],
+        });
+        note_count += 1;
+    }
+    events.sort_by_key(|event| (event.frame, event.priority));
+    Ok((events, note_count))
 }
 
 fn save_worker_vst2_state(instance: &Instance) -> Result<Vec<u8>, String> {

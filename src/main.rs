@@ -18,9 +18,9 @@ use flp_rebuild::sample_render::{
     SamplerPatternRenderOptions, render_audio_clips_to_wav, render_sampler_pattern_to_wav,
 };
 use flp_rebuild::vst2::{
-    Vst2AudioEffectRenderOptions, Vst2NoteRenderOptions, inspect_vst2_plugin,
-    probe_vst2_channel_state, render_audio_through_vst2_effect_to_wav, render_vst2_note_to_wav,
-    run_vst2_worker_if_requested,
+    Vst2AudioEffectRenderOptions, Vst2NoteRenderOptions, Vst2PatternRenderOptions,
+    inspect_vst2_plugin, probe_vst2_channel_state, render_audio_through_vst2_effect_to_wav,
+    render_vst2_note_to_wav, render_vst2_pattern_channel_to_wav, run_vst2_worker_if_requested,
 };
 use flp_rebuild::vst3::{Vst3AudioEffectRenderOptions, Vst3HostRuntime, Vst3PatternRenderOptions};
 use flp_rebuild::{
@@ -287,6 +287,18 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 2.0,
             )
         }
+        [command, project, pattern_id, channel_id, plugin, output]
+            if command == "render-pattern-vst2" =>
+        {
+            render_pattern_vst2(
+                Path::new(project),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                Path::new(plugin),
+                Path::new(output),
+                2.0,
+            )
+        }
         [command, project, pattern_id, channel_id, bundle, output, tail]
             if command == "render-pattern-vst3" =>
         {
@@ -298,6 +310,21 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_u16(pattern_id, "pattern id")?,
                 parse_u16(channel_id, "channel id")?,
                 Path::new(bundle),
+                Path::new(output),
+                tail_seconds,
+            )
+        }
+        [command, project, pattern_id, channel_id, plugin, output, tail]
+            if command == "render-pattern-vst2" =>
+        {
+            let tail_seconds = tail
+                .parse::<f64>()
+                .map_err(|_| "render tail must be a number of seconds".to_owned())?;
+            render_pattern_vst2(
+                Path::new(project),
+                parse_u16(pattern_id, "pattern id")?,
+                parse_u16(channel_id, "channel id")?,
+                Path::new(plugin),
                 Path::new(output),
                 tail_seconds,
             )
@@ -5087,6 +5114,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild vst2-state-probe <plugin-file-or-bundle> <file.flp> <channel-id>\n",
             "  flp-rebuild render-vst2-note <plugin-file-or-bundle> <output.wav> <note> <velocity> <note-seconds> <tail-seconds> [sample-rate]\n",
             "  flp-rebuild render-audio-vst2 <input-audio> <effect-file-or-bundle> <output.wav> [tail-seconds]\n",
+            "  flp-rebuild render-pattern-vst2 <project.flp> <pattern-id> <channel-id> <plugin-file-or-bundle> <output.wav> [tail-seconds]\n",
             "  flp-rebuild render-pattern-vst3 <project.flp> <pattern-id> <channel-id> <plugin.vst3> <output.{wav|flac|ogg|mp3}> [tail-seconds]\n",
             "  flp-rebuild render-audio-vst3 <input-audio> <effect.vst3> <output.{wav|flac|ogg|mp3}> [class-uid|-] [tail-seconds]\n",
             "  flp-rebuild channels <file.flp>\n",
@@ -6857,6 +6885,65 @@ fn render_pattern_vst3(
     );
     println!(
         "render uses the plug-in's initial state; FLP plug-in state, Playlist clips, Mixer routing, and effects are not applied"
+    );
+    Ok(())
+}
+
+fn render_pattern_vst2(
+    project_path: &Path,
+    pattern_id: u16,
+    channel_id: u16,
+    plugin_path: &Path,
+    output_path: &Path,
+    tail_seconds: f64,
+) -> Result<(), String> {
+    let (_, document) = load_document(project_path)?;
+    let pattern = document
+        .patterns()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|pattern| pattern.id == pattern_id)
+        .ok_or_else(|| format!("pattern id {pattern_id} was not found"))?;
+    let channel = document
+        .channels()
+        .into_iter()
+        .find(|channel| channel.id() == channel_id)
+        .ok_or_else(|| format!("channel id {channel_id} was not found"))?;
+    let state = document
+        .channel_plugin_states()
+        .into_iter()
+        .find(|state| state.channel_id() == channel_id)
+        .ok_or_else(|| format!("channel {channel_id} has no saved VST plug-in state"))?;
+    let summary = render_vst2_pattern_channel_to_wav(
+        plugin_path,
+        output_path,
+        &state,
+        &pattern.notes,
+        Vst2PatternRenderOptions {
+            channel_id,
+            ppq: document.header().ppq(),
+            tempo_bpm: document.metadata().tempo_bpm().unwrap_or(120.0),
+            tail_seconds,
+            sample_rate: 48_000,
+            global_swing_mix_raw: document.metadata().global_swing_mix(),
+            channel_swing_mix_raw: channel.swing_mix(),
+            note_pitch_offset_semitones: channel
+                .master_pitch_note_offset_semitones(document.metadata().master_pitch_cents()),
+        },
+    )?;
+    println!(
+        "rendered pattern {} channel {} through {} to {} using saved FLP state: {} notes, {:.2} seconds, {} Hz, {} channels",
+        pattern_id,
+        channel_id,
+        summary.plugin_name,
+        output_path.display(),
+        summary.notes_rendered,
+        summary.frames as f64 / f64::from(summary.sample_rate),
+        summary.sample_rate,
+        summary.channels,
+    );
+    println!(
+        "render is a VST2 channel stem; FLP per-note pitch, pan, release, and modulation, Mixer routing, and effects are not applied"
     );
     Ok(())
 }
