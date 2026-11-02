@@ -1392,7 +1392,7 @@ impl Vst3PlaylistStreamProcessor {
             let sample_rate = external_processor.sample_rate();
             if !sample_rate.is_finite() || sample_rate <= 0.0 {
                 return Err(format!(
-                    "CLAP Mixer insert {} effect slot {} reported an invalid sample rate",
+                    "external Mixer effect on insert {} slot {} reported an invalid sample rate",
                     effect.insert_ordinal,
                     effect.slot_index + 1
                 ));
@@ -1406,7 +1406,7 @@ impl Vst3PlaylistStreamProcessor {
                 (sample_rate * MAX_VST3_EFFECT_LATENCY_SECONDS).ceil() as u64;
             if latency_frames > maximum_latency_frames {
                 return Err(format!(
-                    "CLAP Mixer insert {} effect slot {} has a PDC-adjusted latency of {latency_frames} frames, exceeding the {MAX_VST3_EFFECT_LATENCY_SECONDS}-second processing limit",
+                    "external Mixer effect on insert {} slot {} has a PDC-adjusted latency of {latency_frames} frames, exceeding the {MAX_VST3_EFFECT_LATENCY_SECONDS}-second processing limit",
                     effect.insert_ordinal,
                     effect.slot_index + 1
                 ));
@@ -7187,7 +7187,7 @@ impl Vst3HostRuntime {
                         .create(key.0, key.1, output_sample_rate)?
                         .ok_or_else(|| {
                             format!(
-                                "Mixer insert {} effect slot {} has a CLAP assignment but no processor",
+                                "Mixer insert {} effect slot {} has an external assignment but no processor",
                                 key.0,
                                 key.1 + 1
                             )
@@ -7196,7 +7196,7 @@ impl Vst3HostRuntime {
                     let rate_tolerance = sample_rate.abs().max(1.0) * 1e-12;
                     if (sample_rate - f64::from(output_sample_rate)).abs() > rate_tolerance {
                         return Err(format!(
-                            "CLAP Mixer insert {} effect slot {} uses {sample_rate} Hz but Playlist output is {output_sample_rate} Hz",
+                            "external Mixer effect on insert {} slot {} uses {sample_rate} Hz but Playlist output is {output_sample_rate} Hz",
                             key.0,
                             key.1 + 1
                         ));
@@ -7205,7 +7205,7 @@ impl Vst3HostRuntime {
                     let output_channels = processor.output_channels();
                     if !matches!(input_channels, 1 | 2) || !matches!(output_channels, 1 | 2) {
                         return Err(format!(
-                            "CLAP Mixer insert {} effect slot {} needs mono or stereo main buses",
+                            "external Mixer effect on insert {} slot {} needs mono or stereo main buses",
                             key.0,
                             key.1 + 1
                         ));
@@ -7223,7 +7223,7 @@ impl Vst3HostRuntime {
                             .any(|(_, channels)| !matches!(channels, 1 | 2))
                     {
                         return Err(format!(
-                            "CLAP Mixer insert {} effect slot {} reports an unsupported auxiliary input layout",
+                            "external Mixer effect on insert {} slot {} reports an unsupported auxiliary input layout",
                             key.0,
                             key.1 + 1
                         ));

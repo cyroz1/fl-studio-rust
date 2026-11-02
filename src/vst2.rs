@@ -5,17 +5,18 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::media::{DecodedAudio, decode_audio_file, write_audio_range_to_wav};
 use crate::sample_render::swing_note_start_tick;
+use crate::vst3::{MixerEffectProcessor, MixerEffectProcessorFactory};
 use crate::{ChannelPluginState, PatternNote};
 use vst_audio::{
-    AudioEndpoint, AudioEvent, AudioStatus, BusSelector, ClassInfo, Command, Configuration, Host,
-    HostEvent, Instance, MAX_EVENTS, PluginDescriptor, PluginFormat, ProcessReport, RequestId,
-    Transport,
+    AudioEndpoint, AudioEvent, AudioStatus, BusSelector, ClassInfo, Command, Configuration,
+    EventData, Host, HostEvent, Instance, MAX_EVENTS, PluginDescriptor, PluginFormat,
+    ProcessReport, RequestId, Transport,
 };
 
 const RENDER_QUANTUM: u32 = 512;
@@ -102,6 +103,26 @@ pub struct Vst2PatternRenderSummary {
     pub latency_frames: usize,
     pub channels: usize,
     pub peak: f32,
+}
+
+/// Saved project state for one VST2 Mixer effect slot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Vst2ProjectMixerEffectAssignment {
+    pub plugin_path: PathBuf,
+    pub fourcc: String,
+    pub class_id: [u8; 16],
+    pub state_bytes: Vec<u8>,
+}
+
+/// Creates isolated VST2 effect workers for the shared Mixer processing graph.
+pub struct Vst2ProjectMixerEffectProcessorFactory {
+    assignments: BTreeMap<(usize, u16), Vst2ProjectMixerEffectAssignment>,
+}
+
+impl Vst2ProjectMixerEffectProcessorFactory {
+    pub fn new(assignments: BTreeMap<(usize, u16), Vst2ProjectMixerEffectAssignment>) -> Self {
+        Self { assignments }
+    }
 }
 
 struct Vst2ChannelClass {
@@ -246,15 +267,19 @@ fn match_vst2_channel_class(
         .vst_metadata()
         .and_then(|metadata| metadata.fourcc())
         .ok_or_else(|| "FLP channel state has no VST2 FourCC identifier".to_owned())?;
+    if state.vst_state_bytes().is_none() {
+        return Err("FLP VST2 channel state has no nested field 53".to_owned());
+    }
+    match_vst2_fourcc(plugin_path, fourcc)
+}
+
+fn match_vst2_fourcc(plugin_path: &Path, fourcc: &str) -> Result<Vst2ChannelClass, String> {
     let fourcc_bytes: [u8; 4] = fourcc
         .as_bytes()
         .try_into()
         .map_err(|_| "FLP VST2 FourCC identifier is not exactly four bytes".to_owned())?;
     if !fourcc_bytes.is_ascii() {
         return Err("FLP VST2 FourCC identifier is not ASCII".to_owned());
-    }
-    if state.vst_state_bytes().is_none() {
-        return Err("FLP VST2 channel state has no nested field 53".to_owned());
     }
     let saved_unique_id = i32::from_le_bytes(fourcc_bytes);
     let worker_uid_bytes = saved_unique_id.to_be_bytes();
@@ -280,6 +305,14 @@ fn match_vst2_channel_class(
             plugin_path.display()
         )),
     }
+}
+
+/// Resolve a saved VST2 FourCC to its isolated worker class identifier.
+pub fn vst2_class_id_for_fourcc(
+    plugin_path: impl AsRef<Path>,
+    fourcc: &str,
+) -> Result<[u8; 16], String> {
+    match_vst2_fourcc(plugin_path.as_ref(), fourcc).map(|matched| matched.class.id)
 }
 
 impl Vst2HostRuntime {
@@ -450,6 +483,239 @@ impl Vst2HostRuntime {
         self.pending_editor_requests
             .retain(|(pending_channel_id, _)| *pending_channel_id != channel_id);
         self.channels.remove(&channel_id).is_some()
+    }
+}
+
+struct Vst2MixerEffectProcessor {
+    _instance: Instance,
+    audio: AudioEndpoint,
+    sample_rate: u32,
+    quantum: usize,
+    input_channels: usize,
+    output_channels: usize,
+    latency_samples: u32,
+    startup_fallbacks: usize,
+    transport: Transport,
+    input_left: Vec<f32>,
+    input_right: Vec<f32>,
+    output_left: Vec<f32>,
+    output_right: Vec<f32>,
+    parameter_events: Vec<AudioEvent>,
+}
+
+impl Vst2MixerEffectProcessor {
+    fn spawn(
+        assignment: &Vst2ProjectMixerEffectAssignment,
+        sample_rate: u32,
+    ) -> Result<Self, String> {
+        let configuration = Configuration {
+            sample_rate,
+            quantum: RENDER_QUANTUM,
+            max_callback_frames: Some(RENDER_QUANTUM),
+            offline: false,
+            buses: Some(BusSelector::main_only()),
+            ..Configuration::default()
+        };
+        let descriptor = PluginDescriptor {
+            path: assignment.plugin_path.clone(),
+            format: PluginFormat::Vst2,
+            class_id: Some(assignment.class_id),
+        };
+        let host = host_for_current_executable()?;
+        let mut instance = host
+            .spawn(&descriptor, &configuration, Some(&assignment.state_bytes))
+            .map_err(|error| format!("could not restore VST2 Mixer effect state: {error}"))?;
+        let audio = instance.take_audio().ok_or_else(|| {
+            "VST2 worker did not provide a Mixer effect audio endpoint".to_owned()
+        })?;
+        let geometry = audio.geometry();
+        let input_channels = geometry.input_channels as usize;
+        let output_channels = geometry.output_channels as usize;
+        if !matches!(input_channels, 1 | 2) || !matches!(output_channels, 1 | 2) {
+            return Err(format!(
+                "VST2 Mixer effect {} must expose mono or stereo main input and output buses",
+                assignment.fourcc
+            ));
+        }
+        let latency_samples = u32::try_from(audio.latency_frames()).map_err(|_| {
+            "VST2 Mixer effect latency exceeds the supported sample range".to_owned()
+        })?;
+        let quantum = RENDER_QUANTUM as usize;
+        Ok(Self {
+            _instance: instance,
+            audio,
+            sample_rate,
+            quantum,
+            input_channels,
+            output_channels,
+            latency_samples,
+            startup_fallbacks: (latency_samples as usize).div_ceil(quantum),
+            transport: Transport::default(),
+            input_left: vec![0.0; quantum],
+            input_right: vec![0.0; quantum],
+            output_left: vec![0.0; quantum],
+            output_right: vec![0.0; quantum],
+            parameter_events: Vec::with_capacity(MAX_EVENTS),
+        })
+    }
+}
+
+impl MixerEffectProcessor for Vst2MixerEffectProcessor {
+    fn sample_rate(&self) -> f64 {
+        f64::from(self.sample_rate)
+    }
+
+    fn block_size(&self) -> usize {
+        self.quantum
+    }
+
+    fn input_channels(&self) -> usize {
+        self.input_channels
+    }
+
+    fn output_channels(&self) -> usize {
+        self.output_channels
+    }
+
+    fn latency_samples(&self) -> u32 {
+        self.latency_samples
+    }
+
+    fn tail_samples(&self) -> Option<u64> {
+        None
+    }
+
+    fn process_block(
+        &mut self,
+        samples: &mut [f32],
+        auxiliary_input_samples: &[f32],
+        parameter_changes: &[(u32, u32, f64)],
+    ) -> Result<(), String> {
+        if !auxiliary_input_samples.is_empty() {
+            return Err("VST2 Mixer effects do not accept auxiliary input buses".to_owned());
+        }
+        if samples.is_empty() || !samples.len().is_multiple_of(2) {
+            return Err("VST2 Mixer effect input must contain non-empty stereo frames".to_owned());
+        }
+        let frames = samples.len() / 2;
+        if frames > self.quantum {
+            return Err(format!(
+                "VST2 Mixer effect block has {frames} frames; maximum is {}",
+                self.quantum
+            ));
+        }
+        if parameter_changes.len() > MAX_EVENTS {
+            return Err(format!(
+                "VST2 Mixer effect block has {} parameter changes; maximum is {MAX_EVENTS}",
+                parameter_changes.len()
+            ));
+        }
+
+        self.parameter_events.clear();
+        for (sample_offset, parameter_id, value) in parameter_changes {
+            if *sample_offset as usize >= frames
+                || !value.is_finite()
+                || !(0.0..=1.0).contains(value)
+            {
+                return Err("VST2 Mixer effect received an invalid parameter change".to_owned());
+            }
+            self.parameter_events.push(AudioEvent {
+                sample_offset: *sample_offset,
+                bus: 0,
+                data: EventData::Parameter {
+                    id: *parameter_id,
+                    value: *value,
+                },
+            });
+        }
+
+        if self.input_channels == 1 {
+            for (mono, stereo) in self.input_left[..frames]
+                .iter_mut()
+                .zip(samples.as_chunks::<2>().0.iter())
+            {
+                *mono = finite_sample((stereo[0] + stereo[1]) * 0.5);
+            }
+        } else {
+            for ((left, right), stereo) in self.input_left[..frames]
+                .iter_mut()
+                .zip(self.input_right[..frames].iter_mut())
+                .zip(samples.as_chunks::<2>().0.iter())
+            {
+                *left = finite_sample(stereo[0]);
+                *right = finite_sample(stereo[1]);
+            }
+        }
+        self.output_left[..frames].fill(0.0);
+        self.output_right[..frames].fill(0.0);
+
+        let mut inputs = [&[][..]; 2];
+        inputs[0] = &self.input_left[..frames];
+        if self.input_channels == 2 {
+            inputs[1] = &self.input_right[..frames];
+        }
+        let mut outputs: [&mut [f32]; 2] = [&mut [], &mut []];
+        outputs[0] = &mut self.output_left[..frames];
+        if self.output_channels == 2 {
+            outputs[1] = &mut self.output_right[..frames];
+        }
+        let report = self.audio.process_events(
+            frames,
+            &inputs[..self.input_channels],
+            &mut outputs[..self.output_channels],
+            self.transport,
+            &self.parameter_events,
+            &mut [],
+        );
+        match report.status {
+            AudioStatus::Processed => self.startup_fallbacks = 0,
+            AudioStatus::Fallback if self.startup_fallbacks > 0 => {
+                self.startup_fallbacks -= 1;
+            }
+            status => {
+                return Err(format!("VST2 Mixer effect processing failed: {status:?}"));
+            }
+        }
+        if report.events_dropped != 0 {
+            return Err(format!(
+                "VST2 Mixer effect dropped {} parameter event(s)",
+                report.events_dropped
+            ));
+        }
+        for (index, stereo) in samples.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+            let left = finite_sample(self.output_left[index]);
+            let right = if self.output_channels == 1 {
+                left
+            } else {
+                finite_sample(self.output_right[index])
+            };
+            *stereo = [left, right];
+        }
+        self.transport = self.transport.advanced(frames, self.sample_rate);
+        Ok(())
+    }
+
+    fn stop_processing(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+impl MixerEffectProcessorFactory for Vst2ProjectMixerEffectProcessorFactory {
+    fn contains(&self, insert_ordinal: usize, slot_index: u16) -> bool {
+        self.assignments.contains_key(&(insert_ordinal, slot_index))
+    }
+
+    fn create(
+        &self,
+        insert_ordinal: usize,
+        slot_index: u16,
+        sample_rate: u32,
+    ) -> Result<Option<Box<dyn MixerEffectProcessor>>, String> {
+        let Some(assignment) = self.assignments.get(&(insert_ordinal, slot_index)) else {
+            return Ok(None);
+        };
+        let processor = Vst2MixerEffectProcessor::spawn(assignment, sample_rate)?;
+        Ok(Some(Box::new(processor)))
     }
 }
 

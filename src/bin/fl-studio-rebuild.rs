@@ -89,13 +89,17 @@ use flp_rebuild::sample_render::{
     stream_vst2_midi_input_to_device, stream_vst3_midi_input_to_device, vst2_live_input_queue,
     vst3_live_input_queue, write_input_recording_to_wav, write_stereo_audio_buffer_to_file,
 };
-use flp_rebuild::vst2::Vst2HostRuntime;
+use flp_rebuild::vst2::{
+    Vst2HostRuntime, Vst2ProjectMixerEffectAssignment, Vst2ProjectMixerEffectProcessorFactory,
+    vst2_class_id_for_fourcc,
+};
 use flp_rebuild::vst3::{
-    MAX_REPORTED_TAIL_SECONDS, Vst3AutomationPoint, Vst3HostRuntime, Vst3LatencyReport,
-    Vst3ParameterAutomation, Vst3PatternChannelRenderRequest, Vst3PatternRenderOptions,
-    Vst3PatternStreamHandle, Vst3PlaylistAutomationPoint, Vst3PlaylistAutomationSources,
-    Vst3PlaylistLiveInputSender, Vst3PlaylistLiveInputSession, Vst3PlaylistParameterAutomation,
-    Vst3PlaylistStreamProcessor, expand_automation_channel_curve_for_clip,
+    MAX_REPORTED_TAIL_SECONDS, MixerEffectProcessor, MixerEffectProcessorFactory,
+    Vst3AutomationPoint, Vst3HostRuntime, Vst3LatencyReport, Vst3ParameterAutomation,
+    Vst3PatternChannelRenderRequest, Vst3PatternRenderOptions, Vst3PatternStreamHandle,
+    Vst3PlaylistAutomationPoint, Vst3PlaylistAutomationSources, Vst3PlaylistLiveInputSender,
+    Vst3PlaylistLiveInputSession, Vst3PlaylistParameterAutomation, Vst3PlaylistStreamProcessor,
+    expand_automation_channel_curve_for_clip,
 };
 use flp_rebuild::{
     ArpeggioDirection, ArpeggioOptions, ArpeggioRangePattern, ArpeggioScoreOptions,
@@ -107,17 +111,18 @@ use flp_rebuild::{
     ChannelSampleWindowEdit, ChannelSamplerFilterEdit, ChannelSortOrder, ChannelStretchMode,
     ChannelStretchSettingsEdit, ChannelSummary, ChannelType, ClawMachineOptions, FlamOptions,
     FlpDocument, FlpError, FscControllerStreamImportOptions, FscScore, FstPreset, FstPresetKind,
-    HumanizerOptions, LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerInsertSummary,
-    MixerParameterKind, MixerParameterRecord, MixerSendSummary, PATTERN_NOTE_DEFAULT_FLAGS,
-    PATTERN_NOTE_DEFAULT_RELEASE, PATTERN_NOTE_SLIDE_FLAG, Pattern, PatternController,
-    PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation, PayloadEncoding,
-    PlaylistClip, PlaylistClipEdit, PlaylistClipSelectionClipboard, PlaylistClipTarget,
-    PlaylistTrack, PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync,
-    ProjectInfoEdit, ProjectSettingsEdit, QuantizeNoteLevels, QuantizeNoteMode,
-    QuantizeNoteOptions, RandomNoteChordMap, RandomNoteGeneratorOptions, RandomizerOptions,
-    RiffMachineOptions, RiffMachineQuantizeMode, RiffMachineStage, SamplerEnvelopeLfo,
-    SamplerEnvelopeLfoEdit, SamplerEnvelopeLfoTarget, ScaleLevelsOptions, StrumOptions, TimeMarker,
-    TimeMarkerEdit, VstPluginStateMetadata, automation_segment_value_with_tension,
+    HumanizerOptions, LimitNoteOptions, LimitSnapDirection, MixerEffectSlotSummary,
+    MixerInsertEdit, MixerInsertSummary, MixerParameterKind, MixerParameterRecord,
+    MixerSendSummary, PATTERN_NOTE_DEFAULT_FLAGS, PATTERN_NOTE_DEFAULT_RELEASE,
+    PATTERN_NOTE_SLIDE_FLAG, Pattern, PatternController, PatternControllerEdit, PatternNote,
+    PatternNoteEdit, PatternNoteRotation, PayloadEncoding, PlaylistClip, PlaylistClipEdit,
+    PlaylistClipSelectionClipboard, PlaylistClipTarget, PlaylistTrack, PlaylistTrackEdit,
+    PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit,
+    ProjectSettingsEdit, QuantizeNoteLevels, QuantizeNoteMode, QuantizeNoteOptions,
+    RandomNoteChordMap, RandomNoteGeneratorOptions, RandomizerOptions, RiffMachineOptions,
+    RiffMachineQuantizeMode, RiffMachineStage, SamplerEnvelopeLfo, SamplerEnvelopeLfoEdit,
+    SamplerEnvelopeLfoTarget, ScaleLevelsOptions, StrumOptions, TimeMarker, TimeMarkerEdit,
+    VstPluginStateMetadata, automation_segment_value_with_tension,
     automation_value_for_target_range, normalized_automation_point_value,
 };
 use md5::{Digest, Md5};
@@ -835,6 +840,83 @@ fn vst2_candidate_match_rank(
         .name()
         .is_some_and(|name| name.eq_ignore_ascii_case(&candidate.name))
         .then_some(1)
+}
+
+fn resolve_vst2_mixer_effect_assignments(
+    effect_slots: &[MixerEffectSlotSummary],
+    candidates: &[PluginCandidate],
+) -> (
+    BTreeMap<(usize, u16), Vst2ProjectMixerEffectAssignment>,
+    usize,
+    Vec<String>,
+) {
+    let mut assignments = BTreeMap::new();
+    let mut eligible = 0usize;
+    let mut unresolved = Vec::new();
+    for slot in effect_slots {
+        let Some(metadata) = slot.vst_metadata() else {
+            continue;
+        };
+        let Some(fourcc) = metadata.fourcc() else {
+            continue;
+        };
+        eligible += 1;
+        let slot_label = format!(
+            "Mixer insert {} effect slot {}",
+            slot.insert_ordinal(),
+            slot.slot_index() + 1
+        );
+        if fourcc.len() != 4 || !fourcc.is_ascii() {
+            unresolved.push(format!("{slot_label} has an invalid VST2 FourCC"));
+            continue;
+        }
+        let ranked = candidates
+            .iter()
+            .filter_map(|candidate| {
+                vst2_candidate_match_rank(candidate, metadata).map(|rank| (rank, candidate))
+            })
+            .collect::<Vec<_>>();
+        let Some(best_rank) = ranked.iter().map(|(rank, _)| *rank).max() else {
+            unresolved.push(format!("{slot_label} has no installed VST2 identity match"));
+            continue;
+        };
+        let best = ranked
+            .into_iter()
+            .filter(|(rank, _)| *rank == best_rank)
+            .map(|(_, candidate)| candidate)
+            .collect::<Vec<_>>();
+        if best.len() != 1 {
+            unresolved.push(format!(
+                "{slot_label} has an ambiguous installed VST2 identity match"
+            ));
+            continue;
+        }
+        let Some(state_bytes) = slot.vst_state_bytes() else {
+            unresolved.push(format!(
+                "{slot_label} has no recognized VST2 field-53 state"
+            ));
+            continue;
+        };
+        let class_id = match vst2_class_id_for_fourcc(&best[0].path, fourcc) {
+            Ok(class_id) => class_id,
+            Err(error) => {
+                unresolved.push(format!(
+                    "{slot_label} could not load its VST2 class: {error}"
+                ));
+                continue;
+            }
+        };
+        assignments.insert(
+            (slot.insert_ordinal(), slot.slot_index()),
+            Vst2ProjectMixerEffectAssignment {
+                plugin_path: best[0].path.clone(),
+                fourcc: fourcc.to_owned(),
+                class_id,
+                state_bytes: state_bytes.to_vec(),
+            },
+        );
+    }
+    (assignments, eligible, unresolved)
 }
 
 fn candidate_matches_vst_identity(
@@ -5238,6 +5320,57 @@ struct MidiScriptTransportMove {
     resume_playback: bool,
 }
 
+struct CombinedMixerEffectProcessorFactory {
+    factories: Vec<Arc<dyn MixerEffectProcessorFactory>>,
+}
+
+impl MixerEffectProcessorFactory for CombinedMixerEffectProcessorFactory {
+    fn contains(&self, insert_ordinal: usize, slot_index: u16) -> bool {
+        self.factories
+            .iter()
+            .any(|factory| factory.contains(insert_ordinal, slot_index))
+    }
+
+    fn create(
+        &self,
+        insert_ordinal: usize,
+        slot_index: u16,
+        sample_rate: u32,
+    ) -> Result<Option<Box<dyn MixerEffectProcessor>>, String> {
+        for factory in &self.factories {
+            if factory.contains(insert_ordinal, slot_index) {
+                return factory.create(insert_ordinal, slot_index, sample_rate);
+            }
+        }
+        Ok(None)
+    }
+}
+
+fn combined_mixer_effect_processor_factory(
+    clap_assignments: BTreeMap<(usize, u16), ClapProjectMixerEffectAssignment>,
+    vst2_assignments: BTreeMap<(usize, u16), Vst2ProjectMixerEffectAssignment>,
+    clap_capture_controller: ClapMixerEffectStateCaptureController,
+) -> Option<Arc<dyn MixerEffectProcessorFactory>> {
+    let mut factories: Vec<Arc<dyn MixerEffectProcessorFactory>> = Vec::new();
+    if !clap_assignments.is_empty() {
+        factories.push(Arc::new(
+            clap_probe::ClapProjectMixerEffectProcessorFactory::new(
+                clap_assignments,
+                clap_capture_controller,
+            ),
+        ));
+    }
+    if !vst2_assignments.is_empty() {
+        factories.push(Arc::new(Vst2ProjectMixerEffectProcessorFactory::new(
+            vst2_assignments,
+        )));
+    }
+    (!factories.is_empty()).then(|| {
+        Arc::new(CombinedMixerEffectProcessorFactory { factories })
+            as Arc<dyn MixerEffectProcessorFactory>
+    })
+}
+
 struct DawUi {
     document: Option<FlpDocument>,
     current_path: Option<PathBuf>,
@@ -5691,6 +5824,7 @@ struct DawUi {
     vst3_manual_latency_offset_labels: BTreeMap<u64, String>,
     channel_vst3_instances: BTreeMap<u16, u64>,
     mixer_effect_vst3_instances: BTreeMap<(usize, u16), u64>,
+    vst2_mixer_effect_assignments: BTreeMap<(usize, u16), Vst2ProjectMixerEffectAssignment>,
     clap_mixer_effect_assignments: BTreeMap<(usize, u16), ClapProjectMixerEffectAssignment>,
     clap_effect_parameter_drafts: BTreeMap<((usize, u16), u32), f64>,
     audio_catalog: AudioDeviceCatalog,
@@ -8941,6 +9075,7 @@ impl DawUi {
             vst3_manual_latency_offset_labels: BTreeMap::new(),
             channel_vst3_instances: BTreeMap::new(),
             mixer_effect_vst3_instances: BTreeMap::new(),
+            vst2_mixer_effect_assignments: BTreeMap::new(),
             clap_mixer_effect_assignments: BTreeMap::new(),
             clap_effect_parameter_drafts: BTreeMap::new(),
             audio_catalog,
@@ -10619,6 +10754,7 @@ impl DawUi {
                 self.vst3_manual_latency_offset_labels.clear();
                 self.channel_vst3_instances.clear();
                 self.mixer_effect_vst3_instances.clear();
+                self.vst2_mixer_effect_assignments.clear();
                 self.clap_pattern_playback_instruments =
                     load_clap_project_instruments(&stable_project_id(target_path));
                 self.active_clap_pattern_audio_layers.clear();
@@ -12181,6 +12317,12 @@ impl DawUi {
         ctx.request_repaint();
     }
 
+    fn has_mixer_effect_processing(&self) -> bool {
+        !self.mixer_effect_vst3_instances.is_empty()
+            || !self.vst2_mixer_effect_assignments.is_empty()
+            || !self.clap_mixer_effect_assignments.is_empty()
+    }
+
     fn load_project_plugins(&mut self) -> Option<String> {
         let mut summaries = Vec::new();
         if let Some(summary) = self.load_project_vst2_plugins() {
@@ -12284,6 +12426,7 @@ impl DawUi {
         self.vst3_manual_latency_offset_labels.clear();
         self.channel_vst3_instances.clear();
         self.mixer_effect_vst3_instances.clear();
+        self.vst2_mixer_effect_assignments.clear();
         self.clap_mixer_effect_assignments = self
             .current_path
             .as_ref()
@@ -12317,6 +12460,10 @@ impl DawUi {
             }
         }
 
+        let (vst2_effect_assignments, eligible_vst2_effects, vst2_unresolved) =
+            resolve_vst2_mixer_effect_assignments(&effect_slots, &self.plugin_candidates);
+        unresolved.extend(vst2_unresolved);
+
         let mut effect_plans = Vec::new();
         for slot in effect_slots {
             let Some(metadata) = slot.vst_metadata() else {
@@ -12341,16 +12488,35 @@ impl DawUi {
         }
 
         let clap_effect_assignments = self.clap_mixer_effect_assignments.clone();
-        let eligible_plugins = eligible_channels + eligible_effects + clap_effect_assignments.len();
+        let eligible_plugins = eligible_channels
+            + eligible_effects
+            + eligible_vst2_effects
+            + clap_effect_assignments.len();
         if eligible_plugins == 0 {
             return None;
         }
-        if channel_plans.is_empty() && effect_plans.is_empty() && clap_effect_assignments.is_empty()
+        if channel_plans.is_empty()
+            && effect_plans.is_empty()
+            && vst2_effect_assignments.is_empty()
+            && clap_effect_assignments.is_empty()
         {
-            return Some(format!(
-                "no installed VST3 matched {} project channel(s) or {} Mixer effect slot(s)",
-                eligible_channels, eligible_effects
-            ));
+            return Some(if unresolved.is_empty() {
+                format!(
+                    "no installed plug-in matched {} VST3 channel(s), {} VST3 effect slot(s), or {} VST2 effect slot(s)",
+                    eligible_channels, eligible_effects, eligible_vst2_effects
+                )
+            } else {
+                format!(
+                    "no project plug-in assignment could be loaded; {} issue(s) ({})",
+                    unresolved.len(),
+                    unresolved
+                        .iter()
+                        .take(2)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )
+            });
         }
 
         let mut host = match Vst3HostRuntime::new(f64::from(self.audio_settings.sample_rate), 512) {
@@ -12359,14 +12525,12 @@ impl DawUi {
                 return Some(format!("VST3 host initialization failed: {error}"));
             }
         };
-        if !clap_effect_assignments.is_empty() {
-            host.set_mixer_effect_processor_factory(Some(Arc::new(
-                clap_probe::ClapProjectMixerEffectProcessorFactory::new(
-                    clap_effect_assignments.clone(),
-                    self.clap_mixer_effect_state_capture_controller.clone(),
-                ),
-            )));
-        }
+        self.vst2_mixer_effect_assignments = vst2_effect_assignments.clone();
+        host.set_mixer_effect_processor_factory(combined_mixer_effect_processor_factory(
+            clap_effect_assignments.clone(),
+            vst2_effect_assignments.clone(),
+            self.clap_mixer_effect_state_capture_controller.clone(),
+        ));
         host.set_manual_latency_offsets(&self.vst3_manual_latency_offsets);
         let mut channel_instances = BTreeMap::new();
         let mut mixer_effect_instances = BTreeMap::new();
@@ -12447,23 +12611,31 @@ impl DawUi {
                 )),
             }
         }
-        let loaded_count = channel_instances.len() + loaded_effect_count;
+        let loaded_vst2_effect_count = vst2_effect_assignments.len();
+        let loaded_count = channel_instances.len()
+            + loaded_effect_count
+            + loaded_vst2_effect_count
+            + clap_effect_assignments.len();
         self.channel_vst3_instances = channel_instances;
         self.mixer_effect_vst3_instances = mixer_effect_instances;
         self.vst3_manual_latency_offset_keys = manual_latency_offset_keys;
         self.vst3_manual_latency_offset_labels = manual_latency_offset_labels;
-        if !host.loaded_plugins().is_empty() || !clap_effect_assignments.is_empty() {
+        if !host.loaded_plugins().is_empty()
+            || !clap_effect_assignments.is_empty()
+            || !vst2_effect_assignments.is_empty()
+        {
             self.vst3_host = Some(host);
         }
 
         if unresolved.is_empty() {
             Some(format!(
-                "auto-loaded {} project VST3 channel(s) and {loaded_effect_count} Mixer effect(s); restored {restored_count} state(s)",
-                self.channel_vst3_instances.len()
+                "Loaded {} VST3 channel(s) and {loaded_effect_count} VST3 Mixer effect(s); matched {loaded_vst2_effect_count} VST2 Mixer effect(s), assigned {} CLAP effect(s), and restored {restored_count} VST3 state(s)",
+                self.channel_vst3_instances.len(),
+                clap_effect_assignments.len()
             ))
         } else {
             Some(format!(
-                "auto-loaded {loaded_count}/{eligible_plugins} project VST3 channel/effect instance(s); restored {restored_count} state(s); {} issue(s) ({})",
+                "matched {loaded_count}/{eligible_plugins} project plug-in channel/effect assignment(s); restored {restored_count} VST3 state(s); {} issue(s) ({})",
                 unresolved.len(),
                 unresolved
                     .iter()
@@ -14281,13 +14453,20 @@ impl DawUi {
             .as_ref()
             .map(FlpDocument::mixer_effect_slots)
             .unwrap_or_default();
+        let (vst2_effect_assignments, _, mut warnings) =
+            resolve_vst2_mixer_effect_assignments(&effect_slots, &self.plugin_candidates);
+        self.vst2_mixer_effect_assignments = vst2_effect_assignments.clone();
         let instances = self.channel_vst3_instances.clone();
         let channel_instance_ids = instances.values().copied().collect::<BTreeSet<_>>();
         self.mixer_effect_vst3_instances.clear();
         let Some(host) = self.vst3_host.as_mut() else {
-            return Vec::new();
+            return warnings;
         };
-        let mut warnings = Vec::new();
+        host.set_mixer_effect_processor_factory(combined_mixer_effect_processor_factory(
+            self.clap_mixer_effect_assignments.clone(),
+            vst2_effect_assignments,
+            self.clap_mixer_effect_state_capture_controller.clone(),
+        ));
         for state in states {
             let Some(instance_id) = instances.get(&state.channel_id()).copied() else {
                 continue;
@@ -27969,13 +28148,13 @@ impl DawUi {
                         match save_clap_project_mixer_effects(&editor.project_id, &assignments) {
                             Ok(()) => {
                                 self.stop_project_playback();
+                                let factory = combined_mixer_effect_processor_factory(
+                                    assignments,
+                                    self.vst2_mixer_effect_assignments.clone(),
+                                    self.clap_mixer_effect_state_capture_controller.clone(),
+                                );
                                 if let Some(host) = &mut self.vst3_host {
-                                    host.set_mixer_effect_processor_factory(Some(Arc::new(
-                                        clap_probe::ClapProjectMixerEffectProcessorFactory::new(
-                                            assignments,
-                                            self.clap_mixer_effect_state_capture_controller.clone(),
-                                        ),
-                                    )));
+                                    host.set_mixer_effect_processor_factory(factory);
                                 }
                                 self.clap_effect_parameter_drafts
                                     .retain(|(slot_key, _), _| {
@@ -28264,13 +28443,13 @@ impl DawUi {
                 ) {
                     Ok(()) => {
                         self.stop_project_playback();
+                        let factory = combined_mixer_effect_processor_factory(
+                            self.clap_mixer_effect_assignments.clone(),
+                            self.vst2_mixer_effect_assignments.clone(),
+                            self.clap_mixer_effect_state_capture_controller.clone(),
+                        );
                         if let Some(host) = self.vst3_host.as_mut() {
-                            host.set_mixer_effect_processor_factory(Some(Arc::new(
-                                clap_probe::ClapProjectMixerEffectProcessorFactory::new(
-                                    self.clap_mixer_effect_assignments.clone(),
-                                    self.clap_mixer_effect_state_capture_controller.clone(),
-                                ),
-                            )));
+                            host.set_mixer_effect_processor_factory(factory);
                         }
                         self.status = format!(
                             "Saved the CLAP state snapshot for {plugin_name} on Mixer insert {insert_ordinal} slot {}",
@@ -54265,11 +54444,7 @@ impl DawUi {
                     loop_length_ticks,
                 );
             let mixer_effect_instances = self.mixer_effect_vst3_instances.clone();
-            let has_clap_mixer_effects = !self.clap_mixer_effect_assignments.is_empty();
-            let processor = if !channel_instances.is_empty()
-                || !mixer_effect_instances.is_empty()
-                || has_clap_mixer_effects
-            {
+            let processor = if !channel_instances.is_empty() || self.has_mixer_effect_processing() {
                 let Some(host) = self.vst3_host.as_ref() else {
                     self.status = "VST3 host is not initialized".to_owned();
                     return;
@@ -55750,7 +55925,7 @@ impl DawUi {
         let pattern_for_vst3 = if should_prepare_pattern_vst3_stream(
             loop_length_ticks,
             !pattern_vst3_instances.is_empty() || has_vst2_channels,
-            !self.mixer_effect_vst3_instances.is_empty(),
+            self.has_mixer_effect_processing(),
         ) {
             let pattern = match document.patterns() {
                 Ok(patterns) => patterns
@@ -56353,7 +56528,7 @@ impl DawUi {
             Some(options.clip_indices.clone())
         };
         let mixer_effect_processor = match selected_clip_indices.as_deref() {
-            Some(selected_clip_indices) if !self.mixer_effect_vst3_instances.is_empty() => {
+            Some(selected_clip_indices) if self.has_mixer_effect_processing() => {
                 let Some(host) = self.vst3_host.as_ref() else {
                     self.status = "VST3 host is not initialized".to_owned();
                     return;
@@ -58663,7 +58838,7 @@ impl DawUi {
             ..SamplerPatternRenderOptions::default()
         };
         let mixer_effect_instances = self.mixer_effect_vst3_instances.clone();
-        let mixer_effect_processor = if mixer_effect_instances.is_empty() {
+        let mixer_effect_processor = if !self.has_mixer_effect_processing() {
             None
         } else {
             let Some(host) = self.vst3_host.as_ref() else {
@@ -68188,6 +68363,12 @@ impl DawUi {
                         from_slot,
                         to_slot,
                     );
+                    remap_mixer_effect_instances_after_move(
+                        &mut self.vst2_mixer_effect_assignments,
+                        insert_ordinal,
+                        from_slot,
+                        to_slot,
+                    );
                     let clap_assignment_save_error = project_id.as_deref().and_then(|project_id| {
                         save_clap_project_mixer_effects(
                             project_id,
@@ -68195,13 +68376,13 @@ impl DawUi {
                         )
                         .err()
                     });
+                    let factory = combined_mixer_effect_processor_factory(
+                        self.clap_mixer_effect_assignments.clone(),
+                        self.vst2_mixer_effect_assignments.clone(),
+                        self.clap_mixer_effect_state_capture_controller.clone(),
+                    );
                     if let Some(host) = &mut self.vst3_host {
-                        host.set_mixer_effect_processor_factory(Some(Arc::new(
-                            clap_probe::ClapProjectMixerEffectProcessorFactory::new(
-                                self.clap_mixer_effect_assignments.clone(),
-                                self.clap_mixer_effect_state_capture_controller.clone(),
-                            ),
-                        )));
+                        host.set_mixer_effect_processor_factory(factory);
                     }
                     let mappings_changed =
                         remap_midi_vst3_mixer_effect_parameter_targets_after_move(
@@ -72340,7 +72521,7 @@ impl DawUi {
         let vst3_processor = self
             .vst3_host
             .as_ref()
-            .filter(|_| !transport_playing && !self.mixer_effect_vst3_instances.is_empty())
+            .filter(|_| !transport_playing && self.has_mixer_effect_processing())
             .map(|host| {
                 host.prepare_playlist_performance_stream_with_mixer_effects_and_automation_sources(
                     &preparation_document,
@@ -72563,8 +72744,7 @@ impl DawUi {
             .map(|(&target_id, &instance_id)| (target_id, instance_id))
             .collect::<BTreeMap<_, _>>();
         let live_channels = targets.vst3_channel_ids.clone();
-        let needs_vst3_processor =
-            !live_channels.is_empty() || !self.mixer_effect_vst3_instances.is_empty();
+        let needs_vst3_processor = !live_channels.is_empty() || self.has_mixer_effect_processing();
         let mut processor = if needs_vst3_processor {
             let Some(host) = self.vst3_host.as_ref() else {
                 self.status = "Load the Layer's VST3 children before live MIDI audition".to_owned();
