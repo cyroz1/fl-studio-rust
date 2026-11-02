@@ -12925,7 +12925,7 @@ pub fn stream_vst3_midi_input_to_device(
 ///
 /// During transport, the caller supplies a song-frame offset and an overlay writer. The VST2
 /// worker receives ordinary MIDI messages and its stereo return follows the channel's saved Mixer
-/// route, including any loaded VST3 Mixer effects prepared by the caller.
+/// route, including any VST2, CLAP, or VST3 Mixer effects prepared by the caller.
 pub fn stream_vst2_midi_input_to_device(
     mut vst3_processor: Option<Vst3PlaylistStreamProcessor>,
     document: FlpDocument,

@@ -12323,6 +12323,11 @@ impl DawUi {
             || !self.clap_mixer_effect_assignments.is_empty()
     }
 
+    fn has_external_mixer_effect_processing(&self) -> bool {
+        !self.vst2_mixer_effect_assignments.is_empty()
+            || !self.clap_mixer_effect_assignments.is_empty()
+    }
+
     fn load_project_plugins(&mut self) -> Option<String> {
         let mut summaries = Vec::new();
         if let Some(summary) = self.load_project_vst2_plugins() {
@@ -72518,17 +72523,29 @@ impl DawUi {
             }
         }
         let automation_sources = self.vst3_playlist_automation_sources(&preparation_document);
+        let can_prepare_mixer_effects = if transport_playing {
+            self.has_external_mixer_effect_processing()
+                && self.channel_vst3_instances.is_empty()
+                && self.mixer_effect_vst3_instances.is_empty()
+        } else {
+            self.has_mixer_effect_processing()
+        };
+        let mixer_effect_instances = if transport_playing {
+            BTreeMap::new()
+        } else {
+            self.mixer_effect_vst3_instances.clone()
+        };
         let vst3_processor = self
             .vst3_host
             .as_ref()
-            .filter(|_| !transport_playing && self.has_mixer_effect_processing())
+            .filter(|_| can_prepare_mixer_effects)
             .map(|host| {
                 host.prepare_playlist_performance_stream_with_mixer_effects_and_automation_sources(
                     &preparation_document,
                     options,
                     &BTreeMap::new(),
                     &BTreeSet::new(),
-                    &self.mixer_effect_vst3_instances,
+                    &mixer_effect_instances,
                     true,
                     &automation_sources,
                 )
