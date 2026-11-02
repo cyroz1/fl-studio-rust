@@ -3,6 +3,7 @@
 //! The plug-in ABI and worker process are provided by `vst-audio`; the host
 //! application only talks to its bounded process and audio APIs.
 
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::Path;
 use std::thread;
@@ -12,8 +13,8 @@ use crate::media::{DecodedAudio, decode_audio_file, write_audio_range_to_wav};
 use crate::sample_render::swing_note_start_tick;
 use crate::{ChannelPluginState, PatternNote};
 use vst_audio::{
-    AudioEvent, AudioStatus, BusSelector, ClassInfo, Command, Configuration, Host, HostEvent,
-    Instance, MAX_EVENTS, PluginDescriptor, PluginFormat, Transport,
+    AudioEndpoint, AudioEvent, AudioStatus, BusSelector, ClassInfo, Command, Configuration, Host,
+    HostEvent, Instance, MAX_EVENTS, PluginDescriptor, PluginFormat, ProcessReport, Transport,
 };
 
 const RENDER_QUANTUM: u32 = 512;
@@ -112,6 +113,34 @@ struct ScheduledVst2MidiEvent {
     frame: u64,
     priority: u8,
     data: [u8; 3],
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Vst2HostedChannelInfo {
+    pub id: u64,
+    pub channel_id: u16,
+    pub plugin_name: String,
+    pub vendor: String,
+    pub fourcc: String,
+    pub sample_rate: u32,
+    pub latency_frames: usize,
+    pub input_channels: usize,
+    pub output_channels: usize,
+}
+
+struct Vst2HostedChannel {
+    info: Vst2HostedChannelInfo,
+    instance: Instance,
+    audio: AudioEndpoint,
+}
+
+/// Persistent isolated VST2 instances restored from FLP Channel Rack state.
+pub struct Vst2HostRuntime {
+    host: Host,
+    sample_rate: u32,
+    quantum: u32,
+    next_id: u64,
+    channels: BTreeMap<u16, Vst2HostedChannel>,
 }
 
 /// Run the embedded worker when this binary is launched by `vst-audio`.
@@ -246,6 +275,134 @@ fn match_vst2_channel_class(
             "saved VST2 FourCC {fourcc} matches multiple classes in {}",
             plugin_path.display()
         )),
+    }
+}
+
+impl Vst2HostRuntime {
+    pub fn new(sample_rate: u32, quantum: u32) -> Result<Self, String> {
+        if !(8_000..=384_000).contains(&sample_rate) {
+            return Err("VST2 host sample rate must be between 8,000 and 384,000 Hz".to_owned());
+        }
+        if quantum == 0 || quantum > 65_536 {
+            return Err("VST2 host quantum must be between 1 and 65,536 frames".to_owned());
+        }
+        Ok(Self {
+            host: host_for_current_executable()?,
+            sample_rate,
+            quantum,
+            next_id: 1,
+            channels: BTreeMap::new(),
+        })
+    }
+
+    /// Load a project VST2 channel in its isolated worker and restore its nested field-53 state.
+    pub fn load_channel(
+        &mut self,
+        plugin_path: impl AsRef<Path>,
+        state: &ChannelPluginState,
+    ) -> Result<Vst2HostedChannelInfo, String> {
+        let plugin_path = plugin_path.as_ref();
+        let matched = match_vst2_channel_class(plugin_path, state)?;
+        let state_bytes = state
+            .vst_state_bytes()
+            .ok_or_else(|| "FLP VST2 channel state has no nested field 53".to_owned())?;
+        let descriptor = PluginDescriptor {
+            path: plugin_path.to_path_buf(),
+            format: PluginFormat::Vst2,
+            class_id: Some(matched.class.id),
+        };
+        let configuration = Configuration {
+            sample_rate: self.sample_rate,
+            quantum: self.quantum,
+            max_callback_frames: Some(self.quantum),
+            offline: false,
+            buses: Some(BusSelector::main_only()),
+            ..Configuration::default()
+        };
+        let mut instance = self
+            .host
+            .spawn(&descriptor, &configuration, Some(state_bytes))
+            .map_err(|error| format!("could not restore FLP VST2 state in worker: {error}"))?;
+        let audio = instance
+            .take_audio()
+            .ok_or_else(|| "VST2 worker did not provide an audio endpoint".to_owned())?;
+        let geometry = audio.geometry();
+        let output_channels = geometry.output_channels as usize;
+        if output_channels == 0 {
+            return Err("VST2 plug-in has no active main output bus".to_owned());
+        }
+        let info = Vst2HostedChannelInfo {
+            id: self.next_id,
+            channel_id: state.channel_id(),
+            plugin_name: matched.class.name,
+            vendor: matched.class.vendor,
+            fourcc: matched.fourcc,
+            sample_rate: self.sample_rate,
+            latency_frames: audio.latency_frames(),
+            input_channels: geometry.input_channels as usize,
+            output_channels,
+        };
+        self.next_id = self.next_id.wrapping_add(1).max(1);
+        self.channels.insert(
+            info.channel_id,
+            Vst2HostedChannel {
+                info: info.clone(),
+                instance,
+                audio,
+            },
+        );
+        Ok(info)
+    }
+
+    pub fn loaded_channels(&self) -> Vec<Vst2HostedChannelInfo> {
+        self.channels
+            .values()
+            .map(|channel| channel.info.clone())
+            .collect()
+    }
+
+    /// Process one block through a loaded channel. MIDI event buses use bus zero;
+    /// MIDI channel selection is carried in each event's status byte.
+    #[allow(clippy::too_many_arguments)]
+    pub fn process_events(
+        &mut self,
+        channel_id: u16,
+        frames: usize,
+        inputs: &[&[f32]],
+        outputs: &mut [&mut [f32]],
+        transport: Transport,
+        events: &[AudioEvent],
+        output_events: &mut [AudioEvent],
+    ) -> Result<ProcessReport, String> {
+        let channel = self
+            .channels
+            .get_mut(&channel_id)
+            .ok_or_else(|| format!("VST2 channel {channel_id} is not loaded"))?;
+        Ok(channel
+            .audio
+            .process_events(frames, inputs, outputs, transport, events, output_events))
+    }
+
+    /// Consume worker lifecycle errors for channels loaded into this host.
+    pub fn poll_failures(&mut self) -> Vec<(u16, String)> {
+        let mut failures = Vec::new();
+        for (channel_id, channel) in &mut self.channels {
+            while let Some(event) = channel.instance.try_next_event() {
+                match event {
+                    HostEvent::Failed { reason } => failures.push((*channel_id, reason)),
+                    HostEvent::RecoveryRequired | HostEvent::Stopped => failures.push((
+                        *channel_id,
+                        "VST2 worker stopped or requires recovery".to_owned(),
+                    )),
+                    _ => {}
+                }
+            }
+        }
+        failures
+    }
+
+    pub fn unload_channel(&mut self, channel_id: u16) -> bool {
+        self.channels.remove(&channel_id).is_some()
     }
 }
 

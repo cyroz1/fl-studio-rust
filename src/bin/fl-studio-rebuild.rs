@@ -94,6 +94,7 @@ use flp_rebuild::sample_render::{
     stream_vst3_midi_input_to_device, vst3_live_input_queue, write_input_recording_to_wav,
     write_stereo_audio_buffer_to_file,
 };
+use flp_rebuild::vst2::Vst2HostRuntime;
 use flp_rebuild::vst3::{
     MAX_REPORTED_TAIL_SECONDS, Vst3AutomationPoint, Vst3HostRuntime, Vst3LatencyReport,
     Vst3ParameterAutomation, Vst3PatternChannelRenderRequest, Vst3PatternRenderOptions,
@@ -794,6 +795,51 @@ fn candidate_matches_vst_metadata(
         metadata.path(),
         metadata.name(),
     )
+}
+
+fn vst2_candidate_match_rank(
+    candidate: &PluginCandidate,
+    metadata: &VstPluginStateMetadata,
+) -> Option<u8> {
+    if candidate.format != PluginFormat::Vst2Candidate {
+        return None;
+    }
+    let candidate_path = candidate.path.to_string_lossy();
+    if metadata
+        .path()
+        .map(|path| path.replace('\\', "/"))
+        .is_some_and(|path| path.eq_ignore_ascii_case(candidate_path.as_ref()))
+    {
+        return Some(3);
+    }
+    let saved_basename = metadata.path().and_then(|path| {
+        path.replace('\\', "/")
+            .rsplit('/')
+            .next()
+            .map(str::to_owned)
+    });
+    let candidate_basename = candidate
+        .path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned());
+    let candidate_stem = candidate
+        .path
+        .file_stem()
+        .map(|name| name.to_string_lossy().into_owned());
+    if saved_basename.as_deref().is_some_and(|saved| {
+        candidate_basename
+            .as_deref()
+            .is_some_and(|name| saved.eq_ignore_ascii_case(name))
+            || candidate_stem
+                .as_deref()
+                .is_some_and(|name| saved.eq_ignore_ascii_case(name))
+    }) {
+        return Some(2);
+    }
+    metadata
+        .name()
+        .is_some_and(|name| name.eq_ignore_ascii_case(&candidate.name))
+        .then_some(1)
 }
 
 fn candidate_matches_vst_identity(
@@ -5642,6 +5688,7 @@ struct DawUi {
     clap_preview_note_key: u8,
     clap_preview_velocity: u8,
     clap_preview_note_duration_milliseconds: u32,
+    vst2_host: Option<Vst2HostRuntime>,
     vst3_host: Option<Vst3HostRuntime>,
     vst3_manual_latency_offsets: BTreeMap<String, i32>,
     vst3_project_manual_latency_offsets: BTreeMap<String, i32>,
@@ -8871,6 +8918,7 @@ impl DawUi {
             clap_preview_note_key: 60,
             clap_preview_velocity: 100,
             clap_preview_note_duration_milliseconds: 500,
+            vst2_host: None,
             vst3_host: None,
             vst3_manual_latency_offsets,
             vst3_project_manual_latency_offsets: BTreeMap::new(),
@@ -10547,6 +10595,7 @@ impl DawUi {
                 self.automation_interpolate_mode = false;
                 self.automation_interpolation_anchor = None;
                 self.last_plugin_action = None;
+                self.vst2_host = None;
                 self.vst3_host = None;
                 self.vst3_manual_latency_offset_keys.clear();
                 self.vst3_manual_latency_offset_labels.clear();
@@ -10595,7 +10644,7 @@ impl DawUi {
                         recovery_prompt_for_project(target_path, self.backup_directory.as_deref());
                 }
                 let plugin_summary = self
-                    .load_project_vst3_plugins()
+                    .load_project_plugins()
                     .map_or_else(String::new, |summary| format!(" · {summary}"));
                 if check_recovery {
                     self.status = format!("Opened {}{plugin_summary}", target_path.display());
@@ -12114,6 +12163,103 @@ impl DawUi {
         ctx.request_repaint();
     }
 
+    fn load_project_plugins(&mut self) -> Option<String> {
+        let mut summaries = Vec::new();
+        if let Some(summary) = self.load_project_vst2_plugins() {
+            summaries.push(summary);
+        }
+        if let Some(summary) = self.load_project_vst3_plugins() {
+            summaries.push(summary);
+        }
+        (!summaries.is_empty()).then(|| summaries.join(" · "))
+    }
+
+    fn load_project_vst2_plugins(&mut self) -> Option<String> {
+        self.vst2_host = None;
+        let document = self.document.as_ref()?;
+        let mut eligible_channels = 0usize;
+        let mut unresolved = Vec::new();
+        let mut plans = Vec::new();
+        for state in document.channel_plugin_states() {
+            let Some(metadata) = state.vst_metadata() else {
+                continue;
+            };
+            if metadata.fourcc().is_none() {
+                continue;
+            }
+            eligible_channels += 1;
+            let ranked = self
+                .plugin_candidates
+                .iter()
+                .filter_map(|candidate| {
+                    vst2_candidate_match_rank(candidate, metadata).map(|rank| (rank, candidate))
+                })
+                .collect::<Vec<_>>();
+            let Some(best_rank) = ranked.iter().map(|(rank, _)| *rank).max() else {
+                unresolved.push(format!(
+                    "channel {} has no installed VST2 identity match",
+                    state.channel_id()
+                ));
+                continue;
+            };
+            let best = ranked
+                .into_iter()
+                .filter(|(rank, _)| *rank == best_rank)
+                .map(|(_, candidate)| candidate)
+                .collect::<Vec<_>>();
+            if best.len() != 1 {
+                unresolved.push(format!(
+                    "channel {} has an ambiguous installed VST2 identity match",
+                    state.channel_id()
+                ));
+                continue;
+            }
+            plans.push((state.clone(), best[0].path.clone()));
+        }
+
+        if eligible_channels == 0 {
+            return None;
+        }
+        if plans.is_empty() {
+            return Some(format!(
+                "no installed VST2 matched {eligible_channels} project channel(s)"
+            ));
+        }
+        let mut host = match Vst2HostRuntime::new(self.audio_settings.sample_rate, 512) {
+            Ok(host) => host,
+            Err(error) => return Some(format!("VST2 host initialization failed: {error}")),
+        };
+        let mut loaded_count = 0usize;
+        for (state, path) in plans {
+            let channel_id = state.channel_id();
+            match host.load_channel(path, &state) {
+                Ok(_) => loaded_count += 1,
+                Err(error) => unresolved.push(format!(
+                    "channel {channel_id} VST2 plug-in could not load: {error}"
+                )),
+            }
+        }
+        if loaded_count > 0 {
+            self.vst2_host = Some(host);
+        }
+        if unresolved.is_empty() {
+            Some(format!(
+                "auto-loaded {loaded_count} project VST2 channel(s) and restored their state"
+            ))
+        } else {
+            Some(format!(
+                "auto-loaded {loaded_count}/{eligible_channels} project VST2 channel(s); {} issue(s) ({})",
+                unresolved.len(),
+                unresolved
+                    .iter()
+                    .take(2)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ))
+        }
+    }
+
     fn load_project_vst3_plugins(&mut self) -> Option<String> {
         self.vst3_host = None;
         self.vst3_manual_latency_offset_keys.clear();
@@ -12481,7 +12627,7 @@ impl DawUi {
                 self.dirty = true;
                 self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
                 let plugin_summary = self
-                    .load_project_vst3_plugins()
+                    .load_project_plugins()
                     .map_or_else(String::new, |summary| format!(" · {summary}"));
                 let capture_warning = if capture_warnings.is_empty() {
                     String::new()
@@ -67658,7 +67804,7 @@ impl DawUi {
                 Ok(()) => {
                     self.stop_project_playback();
                     self.clap_mixer_effect_assignments = assignments;
-                    let reload_status = self.load_project_vst3_plugins();
+                    let reload_status = self.load_project_plugins();
                     self.status = reload_status.map_or(status.clone(), |message| {
                         if message.contains("failed")
                             || message.contains("issue")
@@ -67730,7 +67876,7 @@ impl DawUi {
                     Ok(()) => {
                         self.stop_project_playback();
                         self.clap_mixer_effect_assignments = assignments;
-                        let reload_status = self.load_project_vst3_plugins();
+                        let reload_status = self.load_project_plugins();
                         self.status = reload_status.map_or_else(
                             || update_label.to_owned(),
                             |message| format!("{update_label}; {message}"),
@@ -67781,7 +67927,7 @@ impl DawUi {
                         self.clap_mixer_effect_assignments = assignments;
                         self.clap_effect_parameter_drafts
                             .retain(|(slot_key, _), _| !changed_slots.contains(slot_key));
-                        let reload_status = self.load_project_vst3_plugins();
+                        let reload_status = self.load_project_plugins();
                         self.status = reload_status.map_or_else(
                             || "Updated CLAP Mixer parameter overrides".to_owned(),
                             |message| format!("Updated CLAP Mixer parameter overrides; {message}"),
