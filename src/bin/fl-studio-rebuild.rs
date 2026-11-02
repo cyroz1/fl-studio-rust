@@ -12732,6 +12732,7 @@ impl DawUi {
         };
 
         let mut plugin_state_warnings = self.capture_loaded_vst3_state(&mut document);
+        plugin_state_warnings.extend(self.capture_loaded_vst2_channel_states(&mut document));
         plugin_state_warnings.extend(self.capture_loaded_vst2_mixer_effect_state(&mut document));
         let selected_channel_warning = format!("channel {channel_id}: ");
         if let Some(warning) = plugin_state_warnings
@@ -12855,6 +12856,7 @@ impl DawUi {
             return;
         };
         let mut capture_warnings = self.capture_loaded_vst3_state(&mut document);
+        capture_warnings.extend(self.capture_loaded_vst2_channel_states(&mut document));
         capture_warnings.extend(self.capture_loaded_vst2_mixer_effect_state(&mut document));
         match document.apply_mixer_insert_state_preset(insert_ordinal, &preset) {
             Ok(event_count) => {
@@ -13016,6 +13018,7 @@ impl DawUi {
         let project_edit_revision = self.project_edit_revision;
         let mut document = document.clone();
         let mut plugin_state_warnings = self.capture_loaded_vst3_state(&mut document);
+        plugin_state_warnings.extend(self.capture_loaded_vst2_channel_states(&mut document));
         plugin_state_warnings.extend(self.capture_loaded_vst2_mixer_effect_state(&mut document));
         let result = document
             .encode_lossless()
@@ -13074,6 +13077,7 @@ impl DawUi {
         let project_edit_revision = self.project_edit_revision;
         let mut document = document.clone();
         let mut plugin_state_warnings = self.capture_loaded_vst3_state(&mut document);
+        plugin_state_warnings.extend(self.capture_loaded_vst2_channel_states(&mut document));
         plugin_state_warnings.extend(self.capture_loaded_vst2_mixer_effect_state(&mut document));
         let bytes = match document.encode_lossless() {
             Ok(bytes) => bytes,
@@ -14486,6 +14490,7 @@ impl DawUi {
         // FLP document. Capture that state into the clone so history includes it
         // without changing the project's saved bytes during ordinary editing.
         self.capture_loaded_vst3_state(&mut document);
+        self.capture_loaded_vst2_channel_states(&mut document);
         document
             .encode_lossless()
             .map(Some)
@@ -14845,6 +14850,47 @@ impl DawUi {
         Ok(())
     }
 
+    fn capture_vst2_channel_state_for_channel(
+        &self,
+        document: &mut FlpDocument,
+        channel_id: u16,
+    ) -> Result<(), String> {
+        let runtime = self
+            .vst2_host
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "VST2 channel host is not running".to_owned())?;
+        let nested_state = runtime
+            .lock()
+            .map_err(|_| "VST2 channel host lock was poisoned".to_owned())?
+            .save_channel_state(channel_id)?;
+        document
+            .replace_vst2_channel_state_bytes(channel_id, &nested_state)
+            .map_err(|error| error.to_string())
+    }
+
+    fn capture_loaded_vst2_channel_states(&self, document: &mut FlpDocument) -> Vec<String> {
+        let Some(runtime) = self.vst2_host.as_ref().cloned() else {
+            return Vec::new();
+        };
+        let channel_ids = match runtime.lock() {
+            Ok(runtime) => runtime
+                .loaded_channels()
+                .into_iter()
+                .map(|channel| channel.channel_id)
+                .collect::<Vec<_>>(),
+            Err(_) => return vec!["VST2 channel host lock was poisoned".to_owned()],
+        };
+        channel_ids
+            .into_iter()
+            .filter_map(|channel_id| {
+                self.capture_vst2_channel_state_for_channel(document, channel_id)
+                    .err()
+                    .map(|error| format!("channel {channel_id}: {error}"))
+            })
+            .collect()
+    }
+
     fn refresh_vst2_mixer_effect_processor_factory(&mut self) {
         if let Some(host) = &mut self.vst3_host {
             host.set_mixer_effect_processor_factory(combined_mixer_effect_processor_factory(
@@ -14889,6 +14935,7 @@ impl DawUi {
             return;
         };
         let mut plugin_state_warnings = self.capture_loaded_vst3_state(&mut document);
+        plugin_state_warnings.extend(self.capture_loaded_vst2_channel_states(&mut document));
         plugin_state_warnings.extend(self.capture_loaded_vst2_mixer_effect_state(&mut document));
         let encoded = match document.encode_lossless() {
             Ok(bytes) => bytes,
@@ -42052,6 +42099,7 @@ impl DawUi {
             .clamp(1, 64) as usize;
         let mut open_editor = None;
         let mut open_vst2_editor = None;
+        let mut capture_vst2_channel_state = None;
         let mut open_group_dialog = false;
         let mut open_empty_group_dialog = false;
         let mut rename_group_dialog = None;
@@ -43559,6 +43607,15 @@ impl DawUi {
                                         if ui.button("VST2 editor").clicked() {
                                             open_vst2_editor = Some(channel.id());
                                         }
+                                        if ui
+                                            .small_button("Capture state")
+                                            .on_hover_text(
+                                                "Capture the loaded VST2 channel's current state into FLP field 53.",
+                                            )
+                                            .clicked()
+                                        {
+                                            capture_vst2_channel_state = Some(channel.id());
+                                        }
                                     } else {
                                         ui.add_enabled(false, egui::Button::new("Plug-in editor"));
                                     }
@@ -45063,6 +45120,25 @@ impl DawUi {
             match result {
                 Ok(()) => self.status = format!("Requested VST2 editor for Channel {channel_id}"),
                 Err(error) => self.status = format!("Could not open VST2 editor: {error}"),
+            }
+        }
+        if let Some(channel_id) = capture_vst2_channel_state {
+            self.stop_project_playback();
+            let Some(mut document) = self.document.as_ref().cloned() else {
+                self.status = "Open a project before capturing VST2 channel state".to_owned();
+                return;
+            };
+            match self.capture_vst2_channel_state_for_channel(&mut document, channel_id) {
+                Ok(()) => {
+                    self.document = Some(document);
+                    self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+                    self.status = format!("Captured VST2 state for Channel {channel_id}");
+                }
+                Err(error) => {
+                    self.status =
+                        format!("Could not capture VST2 state for Channel {channel_id}: {error}");
+                }
             }
         }
         if open_group_dialog {

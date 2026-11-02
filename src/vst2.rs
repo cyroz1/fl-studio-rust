@@ -702,6 +702,16 @@ impl Vst2HostRuntime {
         Ok(())
     }
 
+    /// Snapshot one loaded channel's current plug-in state for FLP field 53.
+    pub fn save_channel_state(&self, channel_id: u16) -> Result<Vec<u8>, String> {
+        let channel = self
+            .channels
+            .get(&channel_id)
+            .ok_or_else(|| format!("VST2 channel {channel_id} is not loaded"))?;
+        save_worker_vst2_state(&channel.instance)
+            .map_err(|error| format!("VST2 channel {channel_id} state snapshot failed: {error}"))
+    }
+
     /// Process one block through a loaded channel. MIDI event buses use bus zero;
     /// MIDI channel selection is carried in each event's status byte.
     #[allow(clippy::too_many_arguments)]

@@ -7922,6 +7922,63 @@ impl FlpDocument {
         Ok(())
     }
 
+    /// Replaces field 53 of a recognized VST2 channel state while retaining its
+    /// wrapper metadata, identity fields, and every unrelated field byte-for-byte.
+    pub fn replace_vst2_channel_state_bytes(
+        &mut self,
+        channel_id: u16,
+        nested_state: &[u8],
+    ) -> Result<(), FlpError> {
+        let mut candidate = self.clone();
+        let channel = candidate
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id() == channel_id)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the VST2 state channel does not exist",
+            ))?;
+        let data_events = channel
+            .event_range()
+            .filter(|index| candidate.events[*index].opcode == 0xD5)
+            .collect::<Vec<_>>();
+        let [data_event_index] = data_events.as_slice() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the channel must contain exactly one VST plug-in data event",
+            ));
+        };
+        let state = candidate
+            .channel_plugin_states()
+            .into_iter()
+            .find(|state| state.channel_id() == channel_id)
+            .ok_or(FlpError::UnsupportedEdit(
+                "the channel VST plug-in data event could not be decoded",
+            ))?;
+        let Some(metadata) = state.vst_metadata() else {
+            return Err(FlpError::UnsupportedEdit(
+                "the channel has an unsupported VST plug-in state envelope",
+            ));
+        };
+        let Some(fourcc) = metadata.fourcc() else {
+            return Err(FlpError::UnsupportedEdit(
+                "VST2 state write-back requires a saved VST2 FourCC identifier",
+            ));
+        };
+        if fourcc.len() != 4 || !fourcc.is_ascii() {
+            return Err(FlpError::UnsupportedEdit(
+                "the channel VST2 state has an invalid FourCC identifier",
+            ));
+        }
+        let replacement_payload = replace_vst_state_field(
+            state.data_payload(),
+            metadata.state_data_range.as_ref(),
+            nested_state,
+        )?;
+        candidate.events[*data_event_index].replace_data_payload(replacement_payload)?;
+        candidate.refresh_event_offsets()?;
+        *self = candidate;
+        Ok(())
+    }
+
     /// Routes one saved VST3 instrument output bus to a Mixer track while preserving
     /// the wrapper envelope and all other output-bus record bytes.
     ///
