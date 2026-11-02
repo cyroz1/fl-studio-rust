@@ -20817,6 +20817,22 @@ impl DawUi {
         }
     }
 
+    fn jog_midi_script_window(&mut self, increment: i32) {
+        if increment == 0 {
+            return;
+        }
+        let views = MainView::ALL;
+        let selected_index = views
+            .iter()
+            .position(|view| *view == self.view)
+            .unwrap_or(0);
+        let view_count = i32::try_from(views.len()).expect("main view count fits in i32");
+        let offset = increment.rem_euclid(view_count) as usize;
+        let next_index = (selected_index + offset) % views.len();
+        self.view = views[next_index];
+        self.status = format!("MIDI script selected the {} view", self.view.label());
+    }
+
     fn jog_midi_script_zoom(&mut self, horizontal: bool, increment: i32) {
         if increment == 0 {
             return;
@@ -69392,6 +69408,9 @@ impl DawUi {
             }
             MidiTransportCommand::BrowserNavigate(direction) => {
                 self.navigate_midi_script_browser(direction);
+            }
+            MidiTransportCommand::WindowJog(increment) => {
+                self.jog_midi_script_window(increment);
             }
             MidiTransportCommand::ZoomJog {
                 horizontal,

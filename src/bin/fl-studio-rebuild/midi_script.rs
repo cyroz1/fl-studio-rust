@@ -181,6 +181,7 @@ pub enum ScriptTransportAction {
     PianoRollSnapJog(i32),
     SelectionJog(i32),
     BrowserNavigate(u8),
+    WindowJog(i32),
     ZoomJog {
         horizontal: bool,
         increment: i32,
@@ -1560,6 +1561,13 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
             .filter(|direction| *direction <= 3)
             .ok_or_else(|| "MIDI script returned an invalid Browser direction".to_owned())?;
         return Ok(ScriptTransportAction::BrowserNavigate(direction));
+    }
+    if name == Some("window_jog") {
+        let increment = action["increment"]
+            .as_i64()
+            .and_then(|increment| i32::try_from(increment).ok())
+            .ok_or_else(|| "MIDI script returned an invalid window increment".to_owned())?;
+        return Ok(ScriptTransportAction::WindowJog(increment));
     }
     if name == Some("zoom_jog") {
         let horizontal = action["horizontal"]
@@ -4296,6 +4304,38 @@ def OnMidiIn(event):
                 ScriptTransportAction::BrowserNavigate(1),
                 ScriptTransportAction::BrowserNavigate(2),
                 ScriptTransportAction::BrowserNavigate(3),
+            ]
+        );
+    }
+
+    #[test]
+    fn python_global_transport_window_controls_dispatch_signed_jogs() {
+        let temporary = TestDirectory::new();
+        let script_path = temporary.path().join("device_test.py");
+        fs::write(
+            &script_path,
+            r#"# name=Test Script
+import midi
+import transport
+def OnMidiIn(event):
+    next_window = transport.globalTransport(midi.FPT_NextWindow, 1, event.pmeflags)
+    jog = transport.globalTransport(midi.FPT_WindowJog, -2, event.pmeflags)
+    transport.globalTransport(midi.FPT_WindowJog, 0, event.pmeflags)
+    event.data1 = int(next_window == midi.GT_Global and jog == midi.GT_Global)
+"#,
+        )
+        .unwrap();
+        let script = MidiControllerScript::parse(script_path).unwrap();
+        let mut runtime = MidiScriptRuntime::start_for_device(&script, "Test Input").unwrap();
+
+        let result = runtime.process_event(12, &[0xB0, 7, 1]).unwrap();
+
+        assert_eq!(result.bytes, [0xB0, 1, 1]);
+        assert_eq!(
+            result.actions,
+            [
+                ScriptTransportAction::WindowJog(1),
+                ScriptTransportAction::WindowJog(-2),
             ]
         );
     }

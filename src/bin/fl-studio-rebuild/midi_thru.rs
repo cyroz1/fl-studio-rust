@@ -724,6 +724,7 @@ fn midi_input_thru_message(event: MidiInputEvent) -> Option<([u8; 3], usize)> {
             | MidiTransportCommand::PianoRollSnapJog(_)
             | MidiTransportCommand::SelectionJog(_)
             | MidiTransportCommand::BrowserNavigate(_)
+            | MidiTransportCommand::WindowJog(_)
             | MidiTransportCommand::ZoomJog { .. }
             | MidiTransportCommand::MoveJog(_)
             | MidiTransportCommand::PatternJog(_)

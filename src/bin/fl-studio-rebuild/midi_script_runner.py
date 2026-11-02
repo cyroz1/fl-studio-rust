@@ -1953,6 +1953,14 @@ def _global_transport(command, value, pmeflags=2, flags=15):
                 {"action": "browser_navigate", "direction": command - 40}
             )
         return 8
+    if command == 58:  # FPT_NextWindow
+        if value != 0:
+            _request_transport_action({"action": "window_jog", "increment": 1})
+        return 8
+    if command == 59:  # FPT_WindowJog
+        if value != 0:
+            _request_transport_action({"action": "window_jog", "increment": value})
+        return 8
     if command == 122:  # FPT_ShuffleJog
         current = min(
             128,
