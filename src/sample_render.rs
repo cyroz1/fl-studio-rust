@@ -8659,6 +8659,15 @@ struct Vst2PatternNotePlan {
     content_frames: u64,
 }
 
+fn vst2_layer_adjusted_velocity(velocity: u8, layer_gain: f32) -> u8 {
+    if !layer_gain.is_finite() || layer_gain <= 0.0 {
+        return 0;
+    }
+    (f32::from(velocity.min(127)) * layer_gain)
+        .round()
+        .clamp(0.0, 127.0) as u8
+}
+
 #[derive(Clone, Copy)]
 struct Vst2PendingMidiEvent {
     priority: u8,
@@ -9524,9 +9533,7 @@ fn build_vst2_pattern_note_events(
                     note.key
                 ));
             }
-            let velocity = (f32::from(note.velocity) * layer_gain)
-                .round()
-                .clamp(0.0, 127.0) as u8;
+            let velocity = vst2_layer_adjusted_velocity(note.velocity, layer_gain);
             if velocity == 0 {
                 continue;
             }
@@ -10773,33 +10780,39 @@ fn stream_pattern_from_tick_with_vst3_to_device(
                                     u16::from(source_key),
                                 )
                                 .into_iter()
-                                .filter_map(|(target_channel_id, _, _)| {
-                                    live_input
-                                        .target_channel_ids
-                                        .contains(&target_channel_id)
-                                        .then_some(target_channel_id)
+                                .filter_map(|(target_channel_id, layer_gain, _)| {
+                                    (live_input.target_channel_ids.contains(&target_channel_id)
+                                        && layer_gain.is_finite()
+                                        && layer_gain > 0.0)
+                                        .then_some((target_channel_id, layer_gain))
                                 })
                                 .collect::<Vec<_>>();
                             vst2_live_note_seed = vst2_live_note_seed.wrapping_add(1);
-                            let event = Vst3LiveInputEvent::NoteOn {
-                                channel,
-                                key: source_key,
-                                velocity: velocity.min(127),
-                            };
                             let processor = vst2_processor.as_mut().ok_or_else(|| {
                                 "VST2 Pattern processor is unavailable for live MIDI".to_owned()
                             })?;
-                            for target_channel_id in &targets {
+                            let mut active_targets = Vec::with_capacity(targets.len());
+                            for (target_channel_id, layer_gain) in targets {
+                                let adjusted_velocity =
+                                    vst2_layer_adjusted_velocity(velocity, layer_gain);
+                                if adjusted_velocity == 0 {
+                                    continue;
+                                }
                                 processor.queue_live_midi_input_event(
-                                    *target_channel_id,
+                                    target_channel_id,
                                     block_start,
-                                    event,
+                                    Vst3LiveInputEvent::NoteOn {
+                                        channel,
+                                        key: source_key,
+                                        velocity: adjusted_velocity,
+                                    },
                                 )?;
+                                active_targets.push(target_channel_id);
                             }
                             vst2_live_note_targets
                                 .entry((channel & 0x0F, source_key))
                                 .or_default()
-                                .push_back(targets);
+                                .push_back(active_targets);
                         }
                         Ok(Vst3LiveInputEvent::NoteOff { channel, key }) => {
                             let source_note = (channel & 0x0F, key.min(127));
@@ -11818,10 +11831,15 @@ pub fn stream_mixed_layer_midi_input_to_device(
                                     key: rendered_key,
                                 });
                             } else if config.vst2_target_channel_ids.contains(&target_channel_id) {
+                                let adjusted_velocity =
+                                    vst2_layer_adjusted_velocity(velocity, layer_gain);
+                                if adjusted_velocity == 0 {
+                                    continue;
+                                }
                                 let live_event = Vst3LiveInputEvent::NoteOn {
                                     channel,
                                     key: source_key,
-                                    velocity,
+                                    velocity: adjusted_velocity,
                                 };
                                 vst2_processor
                                     .as_mut()
