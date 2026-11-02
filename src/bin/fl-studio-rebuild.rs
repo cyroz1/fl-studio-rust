@@ -66,7 +66,7 @@ use flp_rebuild::sample_render::{
     PlaylistRenderRange, PlaylistRenderSummary, PlaylistStreamMonitor, PlaylistTailMode,
     PlaylistTempoMap, PlaylistTrackFilter, ResamplingQuality, SamplerLiveInputRouting,
     SamplerLiveNoteEvent, SamplerLiveNoteSender, SamplerPatternRenderOptions,
-    SamplerPatternRenderSummary, Vst2LiveInputRouting, Vst2LiveInputSender,
+    SamplerPatternRenderSummary, Vst2LiveInputPlayback, Vst2LiveInputRouting, Vst2LiveInputSender,
     Vst3LatencyUpdateControls, Vst3LiveInputEvent, Vst3LiveInputSender, WavChannelMode,
     WavDitherMode, WavSampleFormat, layer_live_input_queue,
     nearest_playlist_audio_clip_zero_crossing_tick, playlist_audio_clip_fade_gain,
@@ -6311,6 +6311,8 @@ struct LiveVst3InputSession {
 struct LiveVst2InputSession {
     pattern_id: u16,
     channel_id: u16,
+    transport_playing: bool,
+    performance_mode: bool,
     sender: Vst2LiveInputSender,
     receiver: Receiver<Result<(), String>>,
     cancelled: Arc<AtomicBool>,
@@ -72126,6 +72128,8 @@ impl DawUi {
     }
 
     fn start_live_vst2_input(&mut self, pattern_id: u16, channel_id: u16) -> bool {
+        let transport_playing = self.playing;
+        let performance_mode = transport_playing && self.performance_launch_sender.is_some();
         let Some(document) = self.document.as_ref().cloned() else {
             return false;
         };
@@ -72184,6 +72188,11 @@ impl DawUi {
             );
             return false;
         }
+        let start_frame = if transport_playing {
+            engine.project_playback_position_frames()
+        } else {
+            0
+        };
         engine.set_test_tone(false);
         if self.audio_monitor_input || self.audio_monitor_session.is_some() {
             stop_audio_input_monitor_with_engine(
@@ -72235,7 +72244,7 @@ impl DawUi {
         let vst3_processor = self
             .vst3_host
             .as_ref()
-            .filter(|_| !self.mixer_effect_vst3_instances.is_empty())
+            .filter(|_| !transport_playing && !self.mixer_effect_vst3_instances.is_empty())
             .map(|host| {
                 host.prepare_playlist_performance_stream_with_mixer_effects_and_automation_sources(
                     &preparation_document,
@@ -72255,7 +72264,11 @@ impl DawUi {
                 return false;
             }
         };
-        let writer = match engine.begin_live_streaming_playback() {
+        let writer = match if transport_playing {
+            engine.begin_live_streaming_overlay()
+        } else {
+            engine.begin_live_streaming_playback()
+        } {
             Ok(writer) => writer,
             Err(error) => {
                 self.status = format!("Could not start VST2 input audition: {error}");
@@ -72274,7 +72287,11 @@ impl DawUi {
                 let result = stream_vst2_midi_input_to_device(
                     vst3_processor,
                     worker_document,
-                    channel_id,
+                    Vst2LiveInputPlayback {
+                        channel_id,
+                        transport_playing,
+                        start_frame,
+                    },
                     worker_runtime,
                     event_receiver,
                     &writer,
@@ -72289,16 +72306,30 @@ impl DawUi {
                 self.live_vst2_input = Some(LiveVst2InputSession {
                     pattern_id,
                     channel_id,
+                    transport_playing,
+                    performance_mode,
                     sender: event_sender,
                     receiver: result_receiver,
                     cancelled,
                     worker,
                 });
-                self.status = format!("Preparing live MIDI audition on VST2 channel {channel_id}");
+                self.status = if performance_mode {
+                    format!(
+                        "Preparing live MIDI input on VST2 channel {channel_id} during Performance playback"
+                    )
+                } else if transport_playing {
+                    format!(
+                        "Preparing live MIDI input on VST2 channel {channel_id} during Playlist playback"
+                    )
+                } else {
+                    format!("Preparing live MIDI audition on VST2 channel {channel_id}")
+                };
                 true
             }
             Err(error) => {
-                engine.stop_project_playback();
+                if !transport_playing {
+                    engine.stop_project_playback();
+                }
                 self.status = format!("Could not start VST2 input worker: {error}");
                 false
             }
@@ -74031,8 +74062,9 @@ impl DawUi {
             && !self.performance_mode_active
             && self.performance_launch_sender.is_none()
             && self.can_audition_live_midi_input();
-        if (self.playing && !pattern_transport_active)
-            || !self.can_audition_live_midi_input()
+        let playlist_or_performance_transport_active =
+            self.playing && !pattern_transport_active && self.can_audition_live_midi_input();
+        if (self.playing && !pattern_transport_active && !playlist_or_performance_transport_active)
             || (self.performance_launch_sender.is_some()
                 && is_performance_clip_trigger_channel_event(
                     event.clone(),
@@ -74056,6 +74088,12 @@ impl DawUi {
         }
         let vst2_target_channel_ids = self.live_vst2_input_target_channels(channel_id);
         if vst2_target_channel_ids.is_empty() {
+            return;
+        }
+        if playlist_or_performance_transport_active
+            && (vst2_target_channel_ids.len() != 1
+                || !vst2_target_channel_ids.contains(&channel_id))
+        {
             return;
         }
         if pattern_transport_active
@@ -74279,15 +74317,22 @@ impl DawUi {
         } else if self.live_vst2_input.is_some() {
             self.stop_live_vst2_input();
             self.stop_live_audition_playback_if_stopped();
-            self.status =
+            self.status = if self.playing {
+                "Could not queue VST2 live MIDI; input overlay stopped to release active notes"
+                    .to_owned()
+            } else {
                 "Could not queue VST2 live MIDI; audition stopped to release active notes"
-                    .to_owned();
+                    .to_owned()
+            };
         }
     }
 
     fn poll_live_vst2_input(&mut self) {
         if self.live_vst2_input.as_ref().is_some_and(|session| {
-            self.playing
+            self.playing != session.transport_playing
+                || (session.transport_playing
+                    && (self.pattern_playback_mode
+                        || session.performance_mode != self.performance_launch_sender.is_some()))
                 || !self.can_audition_live_midi_input()
                 || self.midi_input_connection.is_none()
                 || Some(session.pattern_id) != self.selected_pattern

@@ -1153,6 +1153,13 @@ pub struct Vst2LiveInputRouting {
     pub receiver: Vst2LiveInputReceiver,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Vst2LiveInputPlayback {
+    pub channel_id: u16,
+    pub transport_playing: bool,
+    pub start_frame: u64,
+}
+
 fn bounded_live_input_queue<T: Send>(
     capacity: usize,
 ) -> (BoundedLiveInputSender<T>, BoundedLiveInputReceiver<T>) {
@@ -12315,19 +12322,25 @@ pub fn stream_vst3_midi_input_to_device(
     stream_result.and(cleanup_result).and(stop_result)
 }
 
-/// Stream live MIDI through one already restored VST2 channel while transport is stopped.
+/// Stream live MIDI through one already restored VST2 channel.
 ///
-/// The VST2 worker receives ordinary MIDI messages and its stereo return follows the channel's
-/// saved Mixer route, including loaded VST3 Mixer effects prepared by the caller.
+/// During transport, the caller supplies a song-frame offset and an overlay writer. The VST2
+/// worker receives ordinary MIDI messages and its stereo return follows the channel's saved Mixer
+/// route, including any loaded VST3 Mixer effects prepared by the caller.
 pub fn stream_vst2_midi_input_to_device(
     mut vst3_processor: Option<Vst3PlaylistStreamProcessor>,
     document: FlpDocument,
-    channel_id: u16,
+    playback: Vst2LiveInputPlayback,
     runtime: Arc<Mutex<Vst2HostRuntime>>,
     events: Vst2LiveInputReceiver,
     writer: &StreamingAudioWriter,
     cancelled: &AtomicBool,
 ) -> Result<(), String> {
+    let Vst2LiveInputPlayback {
+        channel_id,
+        transport_playing,
+        start_frame,
+    } = playback;
     let channel = document
         .channels()
         .into_iter()
@@ -12367,7 +12380,7 @@ pub fn stream_vst2_midi_input_to_device(
                 sample_rate: channel_info.sample_rate,
                 loop_frames,
                 repeat_pattern: false,
-                transport_playing: false,
+                transport_playing,
                 pdc_target_frames: 0,
                 master_pitch_cents: document.metadata().master_pitch_cents(),
             },
@@ -12386,7 +12399,7 @@ pub fn stream_vst2_midi_input_to_device(
         processor.start_processing()?;
     }
     let stream_result = (|| {
-        let mut block_start = 0_u64;
+        let mut block_start = start_frame;
         loop {
             if cancelled.load(Ordering::Acquire) || writer.is_cancelled() {
                 return Err("VST2 input audition was stopped".to_owned());
