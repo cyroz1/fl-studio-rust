@@ -41686,6 +41686,7 @@ impl DawUi {
             self.channel_display_filter = ChannelDisplayFilter::All;
         }
         let channel_ids = channels.iter().map(ChannelSummary::id).collect::<Vec<_>>();
+        let loaded_vst2_channels = self.loaded_vst2_channel_ids();
         let plugin_states = document.channel_plugin_states();
         let vst3_output_routes_by_channel = plugin_states
             .iter()
@@ -41741,6 +41742,7 @@ impl DawUi {
             .unwrap_or(1)
             .clamp(1, 64) as usize;
         let mut open_editor = None;
+        let mut open_vst2_editor = None;
         let mut open_group_dialog = false;
         let mut open_empty_group_dialog = false;
         let mut rename_group_dialog = None;
@@ -43244,6 +43246,10 @@ impl DawUi {
                                         if ui.button("Plug-in editor").clicked() {
                                             open_editor = Some(instance_id);
                                         }
+                                    } else if loaded_vst2_channels.contains(&channel.id()) {
+                                        if ui.button("VST2 editor").clicked() {
+                                            open_vst2_editor = Some(channel.id());
+                                        }
                                     } else {
                                         ui.add_enabled(false, egui::Button::new("Plug-in editor"));
                                     }
@@ -44732,6 +44738,22 @@ impl DawUi {
             match host.open_editor(instance_id) {
                 Ok(()) => self.status = "VST3 editor opened from Channel Rack".to_owned(),
                 Err(error) => self.status = format!("Could not open VST3 editor: {error}"),
+            }
+        }
+        if let Some(channel_id) = open_vst2_editor {
+            let result = self
+                .vst2_host
+                .as_ref()
+                .ok_or_else(|| "VST2 host is not available".to_owned())
+                .and_then(|runtime| {
+                    runtime
+                        .lock()
+                        .map_err(|_| "VST2 host lock was poisoned".to_owned())?
+                        .open_editor(channel_id)
+                });
+            match result {
+                Ok(()) => self.status = format!("Requested VST2 editor for Channel {channel_id}"),
+                Err(error) => self.status = format!("Could not open VST2 editor: {error}"),
             }
         }
         if open_group_dialog {

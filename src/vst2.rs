@@ -361,6 +361,20 @@ impl Vst2HostRuntime {
             .collect()
     }
 
+    /// Request the plug-in's native editor in its isolated worker process.
+    pub fn open_editor(&mut self, channel_id: u16) -> Result<(), String> {
+        let channel = self
+            .channels
+            .get(&channel_id)
+            .ok_or_else(|| format!("VST2 channel {channel_id} is not loaded"))?;
+        channel
+            .instance
+            .controller()
+            .request(Command::OpenEditor)
+            .map(|_| ())
+            .map_err(|error| format!("could not request VST2 editor: {error}"))
+    }
+
     /// Process one block through a loaded channel. MIDI event buses use bus zero;
     /// MIDI channel selection is carried in each event's status byte.
     #[allow(clippy::too_many_arguments)]
