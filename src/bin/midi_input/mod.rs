@@ -1026,6 +1026,12 @@ fn queue_script_transport_actions(
             ScriptTransportAction::BrowserTabSelect(index) => {
                 MidiTransportCommand::BrowserTabSelect(index)
             }
+            ScriptTransportAction::BrowserSelectSelected => {
+                MidiTransportCommand::BrowserSelectSelected
+            }
+            ScriptTransportAction::BrowserPreviewSelected => {
+                MidiTransportCommand::BrowserPreviewSelected
+            }
             ScriptTransportAction::WindowJog(increment) => {
                 MidiTransportCommand::WindowJog(increment)
             }
@@ -1197,6 +1203,8 @@ pub enum MidiTransportCommand {
         shift_held: bool,
     },
     BrowserTabSelect(u8),
+    BrowserSelectSelected,
+    BrowserPreviewSelected,
     WindowJog(i32),
     ZoomJog {
         horizontal: bool,
@@ -2005,6 +2013,10 @@ pub fn describe_event(event: MidiInputEvent) -> String {
             }
             MidiTransportCommand::BrowserTabSelect(_) => {
                 "MIDI script Browser Tab Navigation".to_owned()
+            }
+            MidiTransportCommand::BrowserSelectSelected => "MIDI script Browser Select".to_owned(),
+            MidiTransportCommand::BrowserPreviewSelected => {
+                "MIDI script Browser Preview".to_owned()
             }
             MidiTransportCommand::WindowJog(_) => "MIDI script Window Selection".to_owned(),
             MidiTransportCommand::ZoomJog { horizontal, .. } => {

@@ -20862,6 +20862,29 @@ impl DawUi {
         self.status = format!("MIDI script selected the {} Browser tab", tab.label());
     }
 
+    fn select_midi_script_browser_menu_item(&mut self) {
+        if !self.browser_visible || self.browser_tab != BrowserTab::Files {
+            return;
+        }
+        if let Some(path) = self.browser_selected.clone() {
+            self.activate_browser_path(path);
+        }
+    }
+
+    fn preview_midi_script_browser_menu_item(&mut self) {
+        if !self.browser_visible || self.browser_tab != BrowserTab::Files {
+            return;
+        }
+        if let Some(path) = self
+            .browser_selected
+            .as_ref()
+            .filter(|path| browser_file_kind(path) == Some(BrowserFileKind::Audio))
+            .cloned()
+        {
+            self.request_browser_preview(path, self.browser_full_sample, None);
+        }
+    }
+
     fn jog_midi_script_window(&mut self, increment: i32) {
         if increment == 0 {
             return;
@@ -69545,6 +69568,12 @@ impl DawUi {
             } => self.navigate_midi_script_browser_with_shift(direction, shift_held),
             MidiTransportCommand::BrowserTabSelect(index) => {
                 self.select_midi_script_browser_tab(index);
+            }
+            MidiTransportCommand::BrowserSelectSelected => {
+                self.select_midi_script_browser_menu_item();
+            }
+            MidiTransportCommand::BrowserPreviewSelected => {
+                self.preview_midi_script_browser_menu_item();
             }
             MidiTransportCommand::WindowJog(increment) => {
                 self.jog_midi_script_window(increment);

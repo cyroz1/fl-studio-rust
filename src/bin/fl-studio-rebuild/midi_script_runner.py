@@ -262,6 +262,32 @@ def _ui_navigate_browser(direction, shiftHeld=0):
     return caption
 
 
+def _ui_get_focused_node_caption():
+    if not _active_transport_state.get("browser_visible", False):
+        return ""
+    try:
+        if int(_active_transport_state.get("browser_tab_index", 0)) != 0:
+            return ""
+    except (TypeError, ValueError, OverflowError):
+        return ""
+    targets = _active_transport_state.get("browser_navigation_targets", [])
+    if len(targets) <= 3:
+        return ""
+    target = targets[3]
+    caption = target[0] if isinstance(target, (list, tuple)) and target else ""
+    return caption if isinstance(caption, str) else ""
+
+
+def _ui_select_browser_menu_item():
+    if _ui_get_focused_node_caption():
+        _request_transport_action("browser_select_selected")
+
+
+def _ui_preview_browser_menu_item():
+    if _ui_get_focused_node_caption():
+        _request_transport_action("browser_preview_selected")
+
+
 def _ui_zoom_jog(horizontal, increment):
     try:
         increment = int(increment)
@@ -2370,6 +2396,9 @@ def _install_modules(script_name, device_name):
     ui.next = _ui_next
     ui.navigateBrowser = _ui_navigate_browser
     ui.navigateBrowserTabs = _ui_navigate_browser_tabs
+    ui.getFocusedNodeCaption = _ui_get_focused_node_caption
+    ui.selectBrowserMenuItem = _ui_select_browser_menu_item
+    ui.previewBrowserMenuItem = _ui_preview_browser_menu_item
 
     playlist = _module("playlist")
     playlist.trackCount = _playlist_track_count

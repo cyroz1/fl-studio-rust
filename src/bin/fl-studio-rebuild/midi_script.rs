@@ -186,6 +186,8 @@ pub enum ScriptTransportAction {
         shift_held: bool,
     },
     BrowserTabSelect(u8),
+    BrowserSelectSelected,
+    BrowserPreviewSelected,
     WindowJog(i32),
     ZoomJog {
         horizontal: bool,
@@ -248,6 +250,8 @@ impl ScriptTransportAction {
             "undo" => Some(Self::Undo),
             "redo" => Some(Self::Redo),
             "toggle_piano_roll_snap" => Some(Self::TogglePianoRollSnap),
+            "browser_select_selected" => Some(Self::BrowserSelectSelected),
+            "browser_preview_selected" => Some(Self::BrowserPreviewSelected),
             "previous" => Some(Self::SelectionJog(-1)),
             "next" => Some(Self::SelectionJog(1)),
             _ => None,
