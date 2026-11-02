@@ -4186,6 +4186,7 @@ struct PlaylistClipDragContext {
     row_height: f32,
     ppq: u16,
     snap: bool,
+    snap_ticks: u32,
     max_track_index: u16,
 }
 
@@ -5329,6 +5330,8 @@ struct DawUi {
     active_note_drag: Option<ActiveNoteDrag>,
     piano_roll_snap: PianoRollSnap,
     piano_roll_snap_before_none: PianoRollSnap,
+    playlist_snap: PianoRollSnap,
+    playlist_snap_before_none: PianoRollSnap,
     piano_roll_mouse_wheel_remainder: f32,
     piano_roll_mouse_wheel_action: Option<PianoRollMouseWheelAction>,
     piano_roll_mouse_wheel_fine: bool,
@@ -8512,6 +8515,8 @@ impl DawUi {
             active_note_drag: None,
             piano_roll_snap: PianoRollSnap::QuarterBeat,
             piano_roll_snap_before_none: PianoRollSnap::QuarterBeat,
+            playlist_snap: PianoRollSnap::QuarterBeat,
+            playlist_snap_before_none: PianoRollSnap::QuarterBeat,
             piano_roll_mouse_wheel_remainder: 0.0,
             piano_roll_mouse_wheel_action: None,
             piano_roll_mouse_wheel_fine: false,
@@ -20780,24 +20785,59 @@ impl DawUi {
     }
 
     fn jog_midi_script_piano_roll_snap(&mut self, increment: i32) {
-        if self.view != MainView::PianoRoll || increment == 0 {
+        if increment == 0 {
             return;
         }
-        let current_index = PianoRollSnap::ALL
-            .iter()
-            .position(|snap| *snap == self.piano_roll_snap)
-            .unwrap_or(1);
-        let next_index = (current_index as i64 + i64::from(increment))
-            .clamp(0, PianoRollSnap::ALL.len().saturating_sub(1) as i64)
-            as usize;
-        self.piano_roll_snap = PianoRollSnap::ALL[next_index];
-        if self.piano_roll_snap != PianoRollSnap::None {
-            self.piano_roll_snap_before_none = self.piano_roll_snap;
+        match self.view {
+            MainView::PianoRoll => {
+                let current_index = PianoRollSnap::ALL
+                    .iter()
+                    .position(|snap| *snap == self.piano_roll_snap)
+                    .unwrap_or(1);
+                let next_index = (current_index as i64 + i64::from(increment))
+                    .clamp(0, PianoRollSnap::ALL.len().saturating_sub(1) as i64)
+                    as usize;
+                self.piano_roll_snap = PianoRollSnap::ALL[next_index];
+                if self.piano_roll_snap != PianoRollSnap::None {
+                    self.piano_roll_snap_before_none = self.piano_roll_snap;
+                }
+                self.status = format!(
+                    "MIDI script Piano roll snap: {}",
+                    self.piano_roll_snap.label()
+                );
+            }
+            MainView::Playlist => {
+                let current_index = PianoRollSnap::ALL
+                    .iter()
+                    .position(|snap| *snap == self.playlist_snap)
+                    .unwrap_or(1);
+                let next_index = (current_index as i64 + i64::from(increment))
+                    .clamp(0, PianoRollSnap::ALL.len().saturating_sub(1) as i64)
+                    as usize;
+                self.playlist_snap = PianoRollSnap::ALL[next_index];
+                if self.playlist_snap != PianoRollSnap::None {
+                    self.playlist_snap_before_none = self.playlist_snap;
+                }
+                self.status = format!("MIDI script Playlist snap: {}", self.playlist_snap.label());
+            }
+            _ => return,
         }
-        self.status = format!(
-            "MIDI script Piano roll snap: {}",
-            self.piano_roll_snap.label()
-        );
+    }
+
+    fn toggle_midi_script_snap(&mut self) {
+        match self.view {
+            MainView::PianoRoll => self.toggle_midi_script_piano_roll_snap(),
+            MainView::Playlist => {
+                self.playlist_snap = if self.playlist_snap == PianoRollSnap::None {
+                    self.playlist_snap_before_none
+                } else {
+                    self.playlist_snap_before_none = self.playlist_snap;
+                    PianoRollSnap::None
+                };
+                self.status = format!("MIDI script Playlist snap: {}", self.playlist_snap.label());
+            }
+            _ => {}
+        }
     }
 
     fn move_midi_script_items(&mut self, increment: i32) {
@@ -20895,7 +20935,10 @@ impl DawUi {
             return;
         }
 
-        let snap_ticks = (u32::from(document.header().ppq()) / 4).max(1);
+        let snap_ticks = self.playlist_snap.ticks(
+            document.header().ppq(),
+            document.metadata().time_signature(),
+        );
         let tick_delta = i64::from(increment).saturating_mul(i64::from(snap_ticks));
         let arrangement_id = arrangement.id;
         let positions = clip_indices
@@ -20931,10 +20974,11 @@ impl DawUi {
         self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
         let direction = if increment < 0 { "left" } else { "right" };
         self.status = format!(
-            "Moved {} selected Playlist clip{} {direction} by {} sixteenth-note step{}",
+            "Moved {} selected Playlist clip{} {direction} by {} {} snap step{}",
             positions.len(),
             if positions.len() == 1 { "" } else { "s" },
             increment.unsigned_abs(),
+            self.playlist_snap.label(),
             if increment.unsigned_abs() == 1 {
                 ""
             } else {
@@ -30481,6 +30525,22 @@ impl DawUi {
             ui.separator();
             ui.label(format!("{} PPQ", ppq));
             ui.separator();
+            ui.label("Snap");
+            let previous_playlist_snap = self.playlist_snap;
+            egui::ComboBox::from_id_salt("playlist-clip-snap")
+                .selected_text(self.playlist_snap.label())
+                .show_ui(ui, |ui| {
+                    for snap in PianoRollSnap::ALL {
+                        ui.selectable_value(&mut self.playlist_snap, snap, snap.label());
+                    }
+                });
+            if self.playlist_snap != previous_playlist_snap {
+                if self.playlist_snap != PianoRollSnap::None {
+                    self.playlist_snap_before_none = self.playlist_snap;
+                }
+                self.status = format!("Playlist snap: {}", self.playlist_snap.label());
+            }
+            ui.separator();
             let performance_mode_button = ui
                 .add_enabled(
                     !self.project_playback_loaded,
@@ -32575,12 +32635,16 @@ impl DawUi {
                             dropped_playlist_audio = Some((
                                 sample.0.clone(),
                                 arrangement.id,
-                                playlist_audio_drop_position_ticks(
+                                playlist_audio_drop_position_ticks_with_snap(
                                     pointer.x,
                                     grid_rect.left(),
                                     tick_scale,
-                                    ppq,
-                                    snap,
+                                    if snap {
+                                        self.playlist_snap
+                                            .ticks(ppq, project_time_signature)
+                                    } else {
+                                        1
+                                    },
                                 ),
                                 row,
                             ));
@@ -32794,12 +32858,16 @@ impl DawUi {
                                 dropped_playlist_audio = Some((
                                     sample.0.clone(),
                                     arrangement.id,
-                                    playlist_audio_drop_position_ticks(
+                                    playlist_audio_drop_position_ticks_with_snap(
                                         pointer.x,
                                         grid_rect.left(),
                                         tick_scale,
-                                        ppq,
-                                        snap,
+                                        if snap {
+                                            self.playlist_snap
+                                                .ticks(ppq, project_time_signature)
+                                        } else {
+                                            1
+                                        },
                                     ),
                                     row,
                                 ));
@@ -34738,6 +34806,10 @@ impl DawUi {
                                             row_height,
                                             ppq,
                                             snap,
+                                            snap_ticks: self.playlist_snap.ticks(
+                                                ppq,
+                                                project_time_signature,
+                                            ),
                                             max_track_index: last_track.min(499),
                                         },
                                     )
@@ -34763,6 +34835,10 @@ impl DawUi {
                                             row_height,
                                             ppq,
                                             snap,
+                                            snap_ticks: self.playlist_snap.ticks(
+                                                ppq,
+                                                project_time_signature,
+                                            ),
                                             max_track_index: last_track.min(499),
                                         },
                                     )
@@ -34786,6 +34862,10 @@ impl DawUi {
                                             row_height,
                                             ppq,
                                             snap,
+                                            snap_ticks: self.playlist_snap.ticks(
+                                                ppq,
+                                                project_time_signature,
+                                            ),
                                             max_track_index: last_track.min(499),
                                         },
                                     )
@@ -34804,19 +34884,28 @@ impl DawUi {
                                             row_height,
                                             ppq,
                                             snap,
+                                            snap_ticks: self.playlist_snap.ticks(
+                                                ppq,
+                                                project_time_signature,
+                                            ),
                                             max_track_index: last_track.min(499),
                                         },
                                     )
                                 } else {
                                     vec![(
                                         clip_index,
-                                        playlist_clip_drag_edit(
+                                        playlist_clip_drag_edit_with_snap(
                                             drag,
                                             pointer,
                                             tick_scale,
                                             row_height,
                                             ppq,
-                                            snap,
+                                            if snap {
+                                                self.playlist_snap
+                                                    .ticks(ppq, project_time_signature)
+                                            } else {
+                                                1
+                                            },
                                             last_track.min(499),
                                         ),
                                     )]
@@ -35136,12 +35225,17 @@ impl DawUi {
                                 && !modifiers.shift
                                 && !clicked_on_playlist_clip(pointer)
                             {
-                                let position_ticks = playlist_audio_drop_position_ticks(
+                                let position_ticks =
+                                    playlist_audio_drop_position_ticks_with_snap(
                                     pointer.x,
                                     grid_rect.left(),
                                     tick_scale,
-                                    ppq,
-                                    !modifiers.alt,
+                                    if modifiers.alt {
+                                        1
+                                    } else {
+                                        self.playlist_snap
+                                            .ticks(ppq, project_time_signature)
+                                    },
                                 );
                                 let measure_length_at_position = playlist_bar_ticks(
                                     ppq,
@@ -35265,12 +35359,17 @@ impl DawUi {
                                 && !modifiers.shift
                                 && !clicked_on_playlist_clip(pointer)
                             {
-                                let position_ticks = playlist_audio_drop_position_ticks(
+                                let position_ticks =
+                                    playlist_audio_drop_position_ticks_with_snap(
                                     pointer.x,
                                     grid_rect.left(),
                                     tick_scale,
-                                    ppq,
-                                    !modifiers.alt,
+                                    if modifiers.alt {
+                                        1
+                                    } else {
+                                        self.playlist_snap
+                                            .ticks(ppq, project_time_signature)
+                                    },
                                 );
                                 match self.playlist_clip_focus {
                                     PlaylistClipFocus::Pattern => {
@@ -69033,7 +69132,7 @@ impl DawUi {
                 }
             }
             MidiTransportCommand::TogglePianoRollSnap => {
-                self.toggle_midi_script_piano_roll_snap();
+                self.toggle_midi_script_snap();
             }
             MidiTransportCommand::PianoRollSnapJog(increment) => {
                 self.jog_midi_script_piano_roll_snap(increment);
@@ -90009,6 +90108,7 @@ fn playlist_freeze_pattern_sources_supported(
     Ok(())
 }
 
+#[cfg(test)]
 fn playlist_audio_drop_position_ticks(
     pointer_x: f32,
     grid_left: f32,
@@ -90016,15 +90116,28 @@ fn playlist_audio_drop_position_ticks(
     ppq: u16,
     snap: bool,
 ) -> u32 {
+    playlist_audio_drop_position_ticks_with_snap(
+        pointer_x,
+        grid_left,
+        tick_scale,
+        if snap {
+            (u32::from(ppq.max(1)) / 4).max(1)
+        } else {
+            1
+        },
+    )
+}
+
+fn playlist_audio_drop_position_ticks_with_snap(
+    pointer_x: f32,
+    grid_left: f32,
+    tick_scale: f32,
+    snap_ticks: u32,
+) -> u32 {
     let relative_tick = ((pointer_x - grid_left).max(0.0) / tick_scale.max(f32::EPSILON))
         .round()
         .clamp(0.0, u32::MAX as f32) as i64;
-    let snap_ticks = if snap {
-        (u32::from(ppq.max(1)) / 4).max(1)
-    } else {
-        1
-    };
-    snap_note_tick(relative_tick, snap_ticks, 0)
+    snap_note_tick(relative_tick, snap_ticks.max(1), 0)
 }
 
 fn browser_audio_drop_tempo_sync(
@@ -91489,6 +91602,7 @@ fn append_playlist_measures(
     }
 }
 
+#[cfg(test)]
 fn playlist_clip_drag_edit(
     drag: ActivePlaylistClipDrag,
     pointer: egui::Pos2,
@@ -91498,13 +91612,34 @@ fn playlist_clip_drag_edit(
     snap: bool,
     max_track_index: u16,
 ) -> PlaylistClipEdit {
-    let tick_scale = tick_scale.max(f32::EPSILON);
-    let tick_delta = ((pointer.x - drag.start_pointer.x) / tick_scale).round() as i64;
     let snap_ticks = if snap {
         (u32::from(ppq.max(1)) / 4).max(1)
     } else {
         1
     };
+    playlist_clip_drag_edit_with_snap(
+        drag,
+        pointer,
+        tick_scale,
+        row_height,
+        ppq,
+        snap_ticks,
+        max_track_index,
+    )
+}
+
+fn playlist_clip_drag_edit_with_snap(
+    drag: ActivePlaylistClipDrag,
+    pointer: egui::Pos2,
+    tick_scale: f32,
+    row_height: f32,
+    ppq: u16,
+    snap_ticks: u32,
+    max_track_index: u16,
+) -> PlaylistClipEdit {
+    let tick_scale = tick_scale.max(f32::EPSILON);
+    let tick_delta = ((pointer.x - drag.start_pointer.x) / tick_scale).round() as i64;
+    let snap_ticks = snap_ticks.max(1);
 
     match drag.kind {
         PlaylistClipDragKind::Move => {
@@ -91665,11 +91800,7 @@ fn playlist_clip_drag_edit(
             }
         }
         PlaylistClipDragKind::Slip => {
-            let tick_delta = if snap {
-                snap_signed_tick_delta(tick_delta, snap_ticks)
-            } else {
-                tick_delta
-            };
+            let tick_delta = snap_signed_tick_delta(tick_delta, snap_ticks);
             let tempo_bpm = drag.tempo_bpm.max(f64::MIN_POSITIVE);
             let delta_ms = tick_delta as f64 * 60_000.0 / (f64::from(ppq.max(1)) * tempo_bpm);
             let window_length_ms = (drag.start_source_end_ms - drag.start_source_start_ms).max(0.0);
@@ -91687,11 +91818,7 @@ fn playlist_clip_drag_edit(
             source_end_tick,
             source_length_ticks,
         } => {
-            let tick_delta = if snap {
-                snap_signed_tick_delta(tick_delta, snap_ticks)
-            } else {
-                tick_delta
-            };
+            let tick_delta = snap_signed_tick_delta(tick_delta, snap_ticks);
             let window_length_ticks = source_end_tick.saturating_sub(source_start_tick);
             let max_start_tick = source_length_ticks.saturating_sub(window_length_ticks);
             let next_start_tick = i64::from(source_start_tick)
@@ -91715,13 +91842,13 @@ fn playlist_clip_group_drag_edits(
         return Vec::new();
     }
 
-    let anchor_edit = playlist_clip_drag_edit(
+    let anchor_edit = playlist_clip_drag_edit_with_snap(
         drag,
         context.pointer,
         context.tick_scale,
         context.row_height,
         context.ppq,
-        context.snap,
+        if context.snap { context.snap_ticks } else { 1 },
         context.max_track_index,
     );
     let anchor_position = anchor_edit
@@ -91790,13 +91917,13 @@ fn playlist_clip_group_resize_edits(
         return Vec::new();
     }
 
-    let anchor_edit = playlist_clip_drag_edit(
+    let anchor_edit = playlist_clip_drag_edit_with_snap(
         drag,
         context.pointer,
         context.tick_scale,
         context.row_height,
         context.ppq,
-        context.snap,
+        if context.snap { context.snap_ticks } else { 1 },
         context.max_track_index,
     );
     let anchor_length = anchor_edit.length_ticks.unwrap_or(drag.start_length_ticks);
@@ -91884,13 +92011,13 @@ fn playlist_clip_group_left_resize_edits(
         return Vec::new();
     }
 
-    let anchor_edit = playlist_clip_drag_edit(
+    let anchor_edit = playlist_clip_drag_edit_with_snap(
         drag,
         context.pointer,
         context.tick_scale,
         context.row_height,
         context.ppq,
-        context.snap,
+        if context.snap { context.snap_ticks } else { 1 },
         context.max_track_index,
     );
     let anchor_position = anchor_edit
@@ -92014,13 +92141,13 @@ fn playlist_clip_group_slip_edits(
         return Vec::new();
     }
 
-    let anchor_edit = playlist_clip_drag_edit(
+    let anchor_edit = playlist_clip_drag_edit_with_snap(
         drag,
         context.pointer,
         context.tick_scale,
         context.row_height,
         context.ppq,
-        context.snap,
+        if context.snap { context.snap_ticks } else { 1 },
         context.max_track_index,
     );
     match drag.kind {
