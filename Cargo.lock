@@ -1653,6 +1653,7 @@ dependencies = [
  "vorbis_rs",
  "vst-audio",
  "vst-audio-worker-runtime",
+ "vst-audio-worker-sys",
  "vst3-host",
  "wasapi",
  "wavicle",

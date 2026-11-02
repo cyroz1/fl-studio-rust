@@ -28,6 +28,7 @@ vorbis_rs = "0.5.6"
 zip = { version = "8.6.0", default-features = false, features = ["bzip2", "deflate", "deflate64", "legacy-zip", "lzma", "ppmd", "unreserved", "xz", "zstd"] }
 plist = "1.10.1"
 vst-audio = "=0.7.0"
+vst-audio-worker-sys = "=0.7.0"
 vst-audio-worker-runtime = "=0.7.0"
 
 [target.'cfg(windows)'.dependencies]

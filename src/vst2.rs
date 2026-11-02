@@ -5,7 +5,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command as ProcessCommand, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -22,6 +25,11 @@ use vst_audio::{
 const RENDER_QUANTUM: u32 = 512;
 const MAX_RENDER_SECONDS: f64 = 120.0;
 const MAX_RENDER_BUFFER_BYTES: usize = 512 * 1024 * 1024;
+const VST2_TAIL_PROBE_FLAG: &str = "--vst2-tail-probe";
+const VST2_TAIL_PROBE_MARKER: &str = "FLP_VST2_TAIL_V1 ";
+const VST2_TAIL_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_VST2_TAIL_PROBE_STATE_BYTES: usize = 64 * 1024 * 1024 - 9;
+const MAX_VST2_TAIL_PROBE_OUTPUT_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Vst2NoteRenderOptions {
@@ -184,15 +192,82 @@ pub struct Vst2HostRuntime {
 /// in the child process while allowing installers to ship one application
 /// executable.
 pub fn run_vst2_worker_if_requested() -> bool {
-    if std::env::args_os()
-        .nth(1)
-        .is_some_and(|argument| argument == OsStr::new("--control-in"))
-    {
-        vst_audio_worker_runtime::host::main();
-        true
-    } else {
-        false
+    let mut arguments = std::env::args_os().skip(1);
+    match arguments.next() {
+        Some(argument) if argument == OsStr::new("--control-in") => {
+            vst_audio_worker_runtime::host::main();
+            true
+        }
+        Some(argument) if argument == OsStr::new(VST2_TAIL_PROBE_FLAG) => {
+            let result = run_vst2_tail_probe_child(arguments);
+            let response = match result {
+                Ok(Some(samples)) => format!("samples={samples}"),
+                Ok(None) => "unknown".to_owned(),
+                Err(error) => {
+                    eprintln!("VST2 tail probe failed: {error}");
+                    "unknown".to_owned()
+                }
+            };
+            println!("{VST2_TAIL_PROBE_MARKER}{response}");
+            true
+        }
+        _ => false,
     }
+}
+
+fn run_vst2_tail_probe_child(
+    mut arguments: impl Iterator<Item = std::ffi::OsString>,
+) -> Result<Option<u32>, String> {
+    let plugin_path = arguments
+        .next()
+        .map(PathBuf::from)
+        .ok_or_else(|| "missing VST2 plug-in path".to_owned())?;
+    let class_id = arguments
+        .next()
+        .and_then(|value| value.into_string().ok())
+        .and_then(|value| decode_vst2_class_id(&value))
+        .ok_or_else(|| "invalid VST2 class ID".to_owned())?;
+    let sample_rate = arguments
+        .next()
+        .and_then(|value| value.into_string().ok())
+        .and_then(|value| value.parse::<u32>().ok())
+        .ok_or_else(|| "invalid VST2 sample rate".to_owned())?;
+    if arguments.next().is_some() {
+        return Err("unexpected VST2 tail probe argument".to_owned());
+    }
+
+    let mut state = Vec::new();
+    std::io::stdin()
+        .take((MAX_VST2_TAIL_PROBE_STATE_BYTES + 1) as u64)
+        .read_to_end(&mut state)
+        .map_err(|error| format!("could not read VST2 plug-in state: {error}"))?;
+    if state.len() > MAX_VST2_TAIL_PROBE_STATE_BYTES {
+        return Err("VST2 plug-in state exceeds the tail probe limit".to_owned());
+    }
+
+    let mut plugin =
+        vst_audio_worker_sys::plugin::Vst2Plugin::load_class(&plugin_path, Some(class_id))
+            .map_err(|error| error.to_string())?;
+    plugin
+        .set_state(&state)
+        .map_err(|error| format!("could not restore VST2 plug-in state: {error}"))?;
+    let info = plugin.info();
+    plugin
+        .configure(sample_rate, RENDER_QUANTUM, info.inputs, info.outputs)
+        .map_err(|error| format!("could not configure VST2 plug-in: {error}"))?;
+    plugin.activate();
+    Ok(plugin.tail_samples())
+}
+
+fn decode_vst2_class_id(encoded: &str) -> Option<[u8; 16]> {
+    if encoded.len() != 32 || !encoded.is_ascii() {
+        return None;
+    }
+    let mut class_id = [0_u8; 16];
+    for (index, byte) in class_id.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&encoded[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    Some(class_id)
 }
 
 /// Load and inspect a VST2 binary in the isolated worker process.
@@ -732,6 +807,7 @@ struct Vst2MixerEffectProcessor {
     input_channels: usize,
     output_channels: usize,
     latency_samples: u32,
+    tail_samples: Option<u64>,
     startup_fallbacks: usize,
     transport: Transport,
     input_left: Vec<f32>,
@@ -746,6 +822,7 @@ impl Vst2MixerEffectProcessor {
         assignment: &Vst2ProjectMixerEffectAssignment,
         sample_rate: u32,
     ) -> Result<Self, String> {
+        let tail_samples = probe_vst2_mixer_effect_tail_samples(assignment, sample_rate);
         let configuration = Configuration {
             sample_rate,
             quantum: RENDER_QUANTUM,
@@ -787,6 +864,7 @@ impl Vst2MixerEffectProcessor {
             input_channels,
             output_channels,
             latency_samples,
+            tail_samples,
             startup_fallbacks: (latency_samples as usize).div_ceil(quantum),
             transport: Transport::default(),
             input_left: vec![0.0; quantum],
@@ -820,7 +898,7 @@ impl MixerEffectProcessor for Vst2MixerEffectProcessor {
     }
 
     fn tail_samples(&self) -> Option<u64> {
-        None
+        self.tail_samples
     }
 
     fn process_block(
@@ -936,6 +1014,111 @@ impl MixerEffectProcessor for Vst2MixerEffectProcessor {
     fn stop_processing(&mut self) -> Result<(), String> {
         Ok(())
     }
+}
+
+fn probe_vst2_mixer_effect_tail_samples(
+    assignment: &Vst2ProjectMixerEffectAssignment,
+    sample_rate: u32,
+) -> Option<u64> {
+    if assignment.state_bytes.len() > MAX_VST2_TAIL_PROBE_STATE_BYTES {
+        return None;
+    }
+    let executable = std::env::current_exe().ok()?;
+    let class_id = assignment
+        .class_id
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<String>();
+    let mut child = ProcessCommand::new(executable)
+        .arg(VST2_TAIL_PROBE_FLAG)
+        .arg(&assignment.plugin_path)
+        .arg(class_id)
+        .arg(sample_rate.to_string())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let Some(mut stdin) = child.stdin.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    };
+    if stdin.write_all(&assignment.state_bytes).is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    }
+    drop(stdin);
+
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    };
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let reader = match thread::Builder::new()
+        .name("vst2-tail-probe-output".to_owned())
+        .spawn(move || {
+            let _ = sender.send(read_vst2_tail_probe_output(stdout));
+        }) {
+        Ok(reader) => reader,
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+    };
+
+    let deadline = Instant::now() + VST2_TAIL_PROBE_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    let output = receiver
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .ok()?
+        .ok()?;
+    if reader.join().is_err() || !status.success() {
+        return None;
+    }
+    let output = String::from_utf8_lossy(&output);
+    let response = output
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix(VST2_TAIL_PROBE_MARKER))?;
+    response
+        .strip_prefix("samples=")
+        .and_then(|samples| samples.parse::<u64>().ok())
+}
+
+fn read_vst2_tail_probe_output(mut stdout: impl Read) -> std::io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut chunk = [0_u8; 2048];
+    loop {
+        let length = stdout.read(&mut chunk)?;
+        if length == 0 {
+            break;
+        }
+        let excess = output
+            .len()
+            .saturating_add(length)
+            .saturating_sub(MAX_VST2_TAIL_PROBE_OUTPUT_BYTES);
+        if excess >= output.len() {
+            output.clear();
+        } else if excess != 0 {
+            output.drain(..excess);
+        }
+        output.extend_from_slice(&chunk[..length]);
+    }
+    Ok(output)
 }
 
 impl MixerEffectProcessorFactory for Vst2ProjectMixerEffectProcessorFactory {

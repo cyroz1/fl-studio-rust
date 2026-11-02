@@ -345,6 +345,25 @@ impl Vst2Plugin {
     pub fn info(&self) -> Info {
         self.info.clone()
     }
+    /// Returns the VST2 `effGetTailSize` result when the plug-in reports one.
+    ///
+    /// The VST2 SDK defines `1` as no tail and `0` as the default/unspecified
+    /// value. Positive values above one are tail frames. Other values are
+    /// treated as unknown because the VST2 contract does not define them.
+    pub fn tail_samples(&self) -> Option<u32> {
+        let control = self.shared.control();
+        match i32::try_from(control.call(
+            GET_TAIL_SIZE,
+            0,
+            0,
+            std::ptr::null_mut(),
+            0.0,
+        )) {
+            Ok(1) => Some(0),
+            Ok(samples) if samples > 1 => Some(samples as u32),
+            _ => None,
+        }
+    }
     pub fn configure(
         &mut self,
         rate: u32,
