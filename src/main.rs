@@ -7088,11 +7088,13 @@ fn pattern_vst2_channel_parameter_links_file() -> Option<PathBuf> {
 
 fn decode_hex_text(encoded: &str) -> Option<String> {
     let bytes = encoded.as_bytes();
-    if bytes.is_empty() || bytes.len() % 2 != 0 {
+    if bytes.is_empty() || !bytes.len().is_multiple_of(2) {
         return None;
     }
     let decoded = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let high = (pair[0] as char).to_digit(16)? as u8;
             let low = (pair[1] as char).to_digit(16)? as u8;
