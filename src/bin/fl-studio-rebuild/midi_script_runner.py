@@ -882,14 +882,14 @@ def _playlist_deselect_all():
     _playlist_set_track_selection(())
 
 
-def _mixer_track_index(index):
+def _mixer_track_index(index, resolve_current=True):
     try:
         index = int(index)
     except (TypeError, ValueError, OverflowError) as error:
         raise ValueError("mixer track index must be an integer") from error
     if not 0 <= index <= 65535:
         raise IndexError("mixer track index is outside the supported range")
-    if index == _mixer_track_count() - 1:
+    if resolve_current and index == _mixer_track_count() - 1:
         return _mixer_track_number()
     return index
 
@@ -913,7 +913,7 @@ def _mixer_get_track_name(index, maxLen=-1):
 
 
 def _mixer_get_track_recording_file_name(index):
-    index = _mixer_track_index(index)
+    index = _mixer_track_index(index, resolve_current=False)
     file_names = _active_transport_state.get("mixer_track_recording_file_names", [])
     if index < len(file_names):
         return str(file_names[index])
@@ -1231,8 +1231,8 @@ def _mixer_set_slot_color(index, slot, color):
     )
 
 
-def _mixer_track_flag_state(index, state_name, default):
-    index = _mixer_track_index(index)
+def _mixer_track_flag_state(index, state_name, default, resolve_current=True):
+    index = _mixer_track_index(index, resolve_current=resolve_current)
     states = _active_transport_state.get(state_name, [])
     if index < len(states) and states[index] is not None:
         return bool(states[index])
@@ -1244,7 +1244,9 @@ def _mixer_track_enabled(index):
 
 
 def _mixer_is_track_mute_lock(index):
-    return _mixer_track_flag_state(index, "mixer_track_mute_locked", False)
+    return _mixer_track_flag_state(
+        index, "mixer_track_mute_locked", False, resolve_current=False
+    )
 
 
 def _mixer_track_flag(index, state_name):
