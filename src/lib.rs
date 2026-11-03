@@ -15415,9 +15415,10 @@ impl FlpDocument {
     /// points are repeated and carried into the merged pattern without interpreting their
     /// channel or flags. Recognized Pattern time markers are repeated with their raw flags and
     /// meter/name events preserved. The receiver Pattern's name and color are retained. Original
-    /// patterns remain unchanged. Unknown per-pattern data and scaled clips are rejected because
-    /// their score timing or payload is not modeled. Trimmed or unrecognized Pattern source
-    /// windows are rejected because this merge path only expands full-source clips.
+    /// patterns remain unchanged. Selected clips must share raw item flags, and unknown
+    /// per-pattern data and scaled clips are rejected because their score timing or payload is
+    /// not modeled. Trimmed or unrecognized Pattern source windows are rejected because this
+    /// merge path only expands full-source clips.
     pub fn merge_playlist_pattern_clips(
         &mut self,
         arrangement_id: u16,
@@ -15454,6 +15455,7 @@ impl FlpDocument {
 
         let selected_indices = selected_indices.into_iter().collect::<Vec<_>>();
         let mut selected_clips = Vec::with_capacity(selected_indices.len());
+        let mut selected_item_flags = None;
         let mut merged_start = u64::MAX;
         let mut merged_end = 0u64;
         for &clip_index in &selected_indices {
@@ -15487,6 +15489,12 @@ impl FlpDocument {
                     "selected Pattern Clips must have nonzero timeline lengths",
                 ));
             }
+            if selected_item_flags.is_some_and(|flags| flags != clip.item_flags) {
+                return Err(FlpError::UnsupportedEdit(
+                    "selected Pattern Clips with differing raw item flags cannot be merged",
+                ));
+            }
+            selected_item_flags.get_or_insert(clip.item_flags);
             if clip.recognized_pattern_source_window_ticks() != Some((0, clip.length_ticks)) {
                 return Err(FlpError::UnsupportedEdit(
                     "merging Pattern Clips with a trimmed or unrecognized source window is unsupported",
