@@ -35,6 +35,7 @@ use crate::media::{
     DecodedAudio, SamplePathResolver, decode_audio_file, process_audio_range_for_playback,
     sample_sampler_metadata,
 };
+use crate::midi::fl_note_release_to_midi_velocity;
 use crate::vst2::{Vst2HostRuntime, Vst2HostedChannelInfo};
 use crate::vst3::{
     MAX_PDC_DELAY_BYTES, PlaylistMidiNote, Vst3LatencyReport, Vst3ParameterAutomation,
@@ -9362,6 +9363,7 @@ struct Vst2PatternNoteEvent {
     channel: u8,
     key: u8,
     velocity: u8,
+    release_velocity: u8,
 }
 
 struct Vst2PatternNotePlan {
@@ -9394,6 +9396,7 @@ fn prepare_vst2_playlist_loop_note_events(
             channel: note.channel,
             key: note.key,
             velocity: note.velocity,
+            release_velocity: note.release_velocity,
         });
     }
     loop_events.sort_by_key(|note| note.start_frame);
@@ -9426,6 +9429,7 @@ struct PerformanceVst2ScheduledNote {
     channel_id: u16,
     midi_channel: u8,
     key: u8,
+    release_velocity: u8,
     start_frame: u64,
     stop_frame: u64,
 }
@@ -9833,7 +9837,7 @@ impl Vst2PatternStreamProcessor {
             stop_frame,
             Vst2PendingMidiEvent {
                 priority: 0,
-                data: [0x80 | midi_channel, key, 0],
+                data: [0x80 | midi_channel, key, note.release_velocity],
             },
             track_id,
         );
@@ -9844,6 +9848,7 @@ impl Vst2PatternStreamProcessor {
                 channel_id: note.channel_id,
                 midi_channel,
                 key,
+                release_velocity: note.release_velocity,
                 start_frame,
                 stop_frame,
             });
@@ -9872,7 +9877,7 @@ impl Vst2PatternStreamProcessor {
                     stop_frame,
                     Vst2PendingMidiEvent {
                         priority: 0,
-                        data: [0x80 | note.midi_channel, note.key, 0],
+                        data: [0x80 | note.midi_channel, note.key, note.release_velocity],
                     },
                     track_id,
                 );
@@ -10373,7 +10378,7 @@ impl Vst2PatternChannelStream {
                 note.start_frame + note.duration_frames,
                 Vst2PendingMidiEvent {
                     priority: 0,
-                    data: [0x80 | note.channel, note.key, 0],
+                    data: [0x80 | note.channel, note.key, note.release_velocity],
                 },
             );
         }
@@ -10416,7 +10421,7 @@ impl Vst2PatternChannelStream {
                 output_note_end,
                 Vst2PendingMidiEvent {
                     priority: 0,
-                    data: [0x80 | note.channel, note.key, 0],
+                    data: [0x80 | note.channel, note.key, note.release_velocity],
                 },
             );
         }
@@ -10451,7 +10456,7 @@ impl Vst2PatternChannelStream {
                 stop_frame,
                 Vst2PendingMidiEvent {
                     priority: 0,
-                    data: [0x80 | note.channel, note.key, 0],
+                    data: [0x80 | note.channel, note.key, note.release_velocity],
                 },
             );
         }
@@ -10811,6 +10816,7 @@ fn build_vst2_pattern_note_events(
                     channel: note.midi_channel_index(),
                     key: key as u8,
                     velocity,
+                    release_velocity: fl_note_release_to_midi_velocity(note.release),
                 });
             content_frames = content_frames.max(start_frame.saturating_add(duration_frames));
             notes_scheduled = notes_scheduled.saturating_add(1);
@@ -10953,6 +10959,7 @@ fn build_vst2_playlist_note_events(
                 channel: note.midi_channel_index(),
                 key: key as u8,
                 velocity,
+                release_velocity: fl_note_release_to_midi_velocity(note.release),
             });
         content_frames = content_frames.max(stop_frame);
         notes_scheduled = notes_scheduled.saturating_add(1);
@@ -17675,6 +17682,7 @@ struct PerformanceVst2Note {
     key: u16,
     velocity: u8,
     midi_channel: u8,
+    release_velocity: u8,
 }
 
 #[derive(Clone, Copy)]
@@ -18464,6 +18472,7 @@ impl PlaylistPerformanceRuntime {
                         key: placed.note.key,
                         velocity,
                         midi_channel: placed.note.midi_channel_index(),
+                        release_velocity: fl_note_release_to_midi_velocity(placed.note.release),
                     });
             }
             for &clip_index in sources.vst2_clip_indices {
