@@ -67099,9 +67099,9 @@ impl DawUi {
             .collect::<HashMap<_, _>>();
         let mut live_master_fader_gain_edits = Vec::new();
         let mut live_mixer_insert_fader_edits = Vec::new();
-        let mut live_mixer_insert_pan_edit = None;
+        let mut live_mixer_insert_pan_edits = Vec::new();
         let mut live_mixer_insert_stereo_separation_edit = None;
-        let mut live_master_pan_edit = None;
+        let mut live_master_pan_edits = Vec::new();
         let mut live_master_stereo_separation_edit = None;
         let mut send_flag_edits = Vec::new();
         let mut send_route_creation = None;
@@ -67406,7 +67406,7 @@ impl DawUi {
                                                         ui.small("PAN");
                                                         let mut pan_value = pan_record.value();
                                                         if (-6400..=6400).contains(&pan_value) {
-                                                            if ui
+                                                            let pan_response = ui
                                                                 .add_sized(
                                                                     [90.0, 18.0],
                                                                     egui::Slider::new(
@@ -67416,22 +67416,26 @@ impl DawUi {
                                                                     .show_value(false)
                                                                     .step_by(1.0),
                                                                 )
-                                                                .changed()
-                                                            {
+                                                                .on_hover_text(
+                                                                    "When this insert is selected with others, the same pan change is applied to every selected insert with a supported pan control.",
+                                                                );
+                                                            if pan_response.changed() {
+                                                                let pan_delta =
+                                                                    pan_value - pan_record.value();
                                                                 parameter_edits.push((
                                                                     pan_record.event_index(),
                                                                     pan_record.record_index(),
                                                                     pan_value,
                                                                 ));
                                                                 if insert.ordinal() == 0 {
-                                                                    live_master_pan_edit = Some((
+                                                                    live_master_pan_edits.push((
                                                                         pan_record.event_index(),
                                                                         pan_record.record_index(),
                                                                         pan_value,
                                                                     ));
                                                                 } else {
-                                                                    live_mixer_insert_pan_edit =
-                                                                        Some((
+                                                                    live_mixer_insert_pan_edits
+                                                                        .push((
                                                                             insert.ordinal(),
                                                                             pan_record
                                                                                 .event_index(),
@@ -67439,6 +67443,78 @@ impl DawUi {
                                                                                 .record_index(),
                                                                             pan_value,
                                                                         ));
+                                                                }
+                                                                if pan_delta != 0
+                                                                    && self
+                                                                        .selected_mixer_inserts
+                                                                        .contains(&insert.ordinal())
+                                                                    && self
+                                                                        .selected_mixer_inserts
+                                                                        .len()
+                                                                        > 1
+                                                                {
+                                                                    for selected_ordinal in self
+                                                                        .selected_mixer_inserts
+                                                                        .iter()
+                                                                        .copied()
+                                                                        .filter(|ordinal| {
+                                                                            *ordinal
+                                                                                != insert.ordinal()
+                                                                        })
+                                                                    {
+                                                                        let Some(selected_pan) =
+                                                                            unique_candidate_mixer_parameter(
+                                                                                &parameters,
+                                                                                selected_ordinal,
+                                                                                MixerParameterKind::Pan,
+                                                                            )
+                                                                        else {
+                                                                            continue;
+                                                                        };
+                                                                        let selected_value =
+                                                                            selected_pan.value();
+                                                                        if !(-6_400..=6_400)
+                                                                            .contains(&selected_value)
+                                                                        {
+                                                                            continue;
+                                                                        }
+                                                                        let grouped_value =
+                                                                            (selected_value
+                                                                                + pan_delta)
+                                                                                .clamp(-6_400, 6_400);
+                                                                        if grouped_value
+                                                                            == selected_value
+                                                                        {
+                                                                            continue;
+                                                                        }
+                                                                        parameter_edits.push((
+                                                                            selected_pan
+                                                                                .event_index(),
+                                                                            selected_pan
+                                                                                .record_index(),
+                                                                            grouped_value,
+                                                                        ));
+                                                                        if selected_ordinal == 0 {
+                                                                            live_master_pan_edits
+                                                                                .push((
+                                                                                    selected_pan
+                                                                                        .event_index(),
+                                                                                    selected_pan
+                                                                                        .record_index(),
+                                                                                    grouped_value,
+                                                                                ));
+                                                                        } else {
+                                                                            live_mixer_insert_pan_edits
+                                                                                .push((
+                                                                                    selected_ordinal,
+                                                                                    selected_pan
+                                                                                        .event_index(),
+                                                                                    selected_pan
+                                                                                        .record_index(),
+                                                                                    grouped_value,
+                                                                                ));
+                                                                        }
+                                                                    }
                                                                 }
                                                             }
                                                             let pan_label = if pan_value == 0 {
@@ -70497,9 +70573,9 @@ impl DawUi {
         {
             let mut applied_live_master_fader_gains = Vec::new();
             let mut applied_live_mixer_insert_fader_raw = Vec::new();
-            let mut applied_live_mixer_insert_pan_raw = None;
+            let mut applied_live_mixer_insert_pan_raw = Vec::new();
             let mut applied_live_mixer_insert_stereo_separation_raw = None;
-            let mut applied_live_master_pan = None;
+            let mut applied_live_master_pan = Vec::new();
             let mut applied_live_master_stereo_separation = None;
             let mut applied_live_mixer_send_levels = Vec::new();
             let mut applied_live_mixer_effect_mixes = Vec::new();
@@ -70578,18 +70654,22 @@ impl DawUi {
                         {
                             applied_live_mixer_insert_fader_raw.push((*track, *volume_raw));
                         }
-                        if let Some((track, insert_event, insert_record, pan_raw)) =
-                            live_mixer_insert_pan_edit
-                            && insert_event == event_index
-                            && insert_record == record_index
+                        if let Some((track, _, _, pan_raw)) = live_mixer_insert_pan_edits
+                            .iter()
+                            .find(|(_, insert_event, insert_record, _)| {
+                                *insert_event == event_index && *insert_record == record_index
+                            })
                         {
-                            applied_live_mixer_insert_pan_raw = Some((track, pan_raw));
+                            applied_live_mixer_insert_pan_raw.push((*track, *pan_raw));
                         }
-                        if let Some((master_event, master_record, pan_raw)) = live_master_pan_edit
-                            && master_event == event_index
-                            && master_record == record_index
+                        if let Some((_, _, pan_raw)) =
+                            live_master_pan_edits
+                                .iter()
+                                .find(|(master_event, master_record, _)| {
+                                    *master_event == event_index && *master_record == record_index
+                                })
                         {
-                            applied_live_master_pan = Some(pan_raw);
+                            applied_live_master_pan.push(*pan_raw);
                         }
                         if let Some((master_event, master_record, separation_raw)) =
                             live_master_stereo_separation_edit
@@ -70625,7 +70705,7 @@ impl DawUi {
                 self.mixer_track_peak_meters
                     .set_live_mixer_insert_fader_raw(track, Some(volume_raw));
             }
-            if let Some((track, pan_raw)) = applied_live_mixer_insert_pan_raw {
+            for (track, pan_raw) in applied_live_mixer_insert_pan_raw {
                 self.mixer_track_peak_meters
                     .set_live_mixer_insert_pan_raw(track, Some(pan_raw));
             }
@@ -70633,7 +70713,7 @@ impl DawUi {
                 self.mixer_track_peak_meters
                     .set_live_mixer_insert_stereo_separation_raw(track, Some(separation_raw));
             }
-            if let Some(pan_raw) = applied_live_master_pan {
+            for pan_raw in applied_live_master_pan {
                 self.mixer_track_peak_meters
                     .set_live_master_pan_raw(Some(pan_raw));
             }
