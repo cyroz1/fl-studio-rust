@@ -21676,11 +21676,19 @@ impl DawUi {
                     .iter()
                     .filter_map(|insert| u16::try_from(insert.ordinal()).ok())
                     .collect::<Vec<_>>();
-                let max_ordinal = inserts
+                let max_saved_ordinal = inserts
                     .iter()
                     .map(|insert| insert.ordinal())
                     .max()
                     .unwrap_or(0);
+                let max_assigned_ordinal = document
+                    .channels()
+                    .into_iter()
+                    .filter_map(|channel| channel.mixer_track())
+                    .filter_map(|track| usize::try_from(track).ok())
+                    .max()
+                    .unwrap_or(0);
+                let max_ordinal = max_saved_ordinal.max(max_assigned_ordinal);
                 let mut names = (0..=max_ordinal)
                     .map(|ordinal| {
                         if ordinal == 0 {
@@ -23603,17 +23611,10 @@ impl DawUi {
 
     fn set_midi_script_mixer_track_selection(&mut self, index: u16, flags: u32) {
         let track_ordinal = usize::from(index);
-        let track_exists = track_ordinal < MIXER_TRACK_METER_COUNT
-            && match self.document.as_ref() {
-                Some(document) => document
-                    .mixer_inserts()
-                    .iter()
-                    .any(|insert| insert.ordinal() == track_ordinal),
-                None => track_ordinal == 0,
-            };
+        let track_exists = self.midi_script_mixer_track_is_available(track_ordinal);
         if !track_exists {
             self.status = format!(
-                "MIDI script cannot select Mixer track {track_ordinal} without a recognized project record"
+                "MIDI script cannot select Mixer track {track_ordinal} without saved Mixer data or a Channel Rack assignment"
             );
             return;
         }
@@ -23646,17 +23647,10 @@ impl DawUi {
         let mut selected_inserts = BTreeSet::new();
         for index in indices {
             let track_ordinal = usize::from(index);
-            let track_exists = track_ordinal < MIXER_TRACK_METER_COUNT
-                && match self.document.as_ref() {
-                    Some(document) => document
-                        .mixer_inserts()
-                        .iter()
-                        .any(|insert| insert.ordinal() == track_ordinal),
-                    None => track_ordinal == 0,
-                };
+            let track_exists = self.midi_script_mixer_track_is_available(track_ordinal);
             if !track_exists {
                 self.status = format!(
-                    "MIDI script cannot select Mixer track {track_ordinal} without a recognized project record"
+                    "MIDI script cannot select Mixer track {track_ordinal} without saved Mixer data or a Channel Rack assignment"
                 );
                 return;
             }
@@ -23696,6 +23690,27 @@ impl DawUi {
         }
     }
 
+    fn midi_script_mixer_track_is_available(&self, track_ordinal: usize) -> bool {
+        if track_ordinal >= MIXER_TRACK_METER_COUNT {
+            return false;
+        }
+        match self.document.as_ref() {
+            Some(document) => {
+                document
+                    .mixer_inserts()
+                    .iter()
+                    .any(|insert| insert.ordinal() == track_ordinal)
+                    || i8::try_from(track_ordinal).is_ok_and(|track| {
+                        document
+                            .channels()
+                            .iter()
+                            .any(|channel| channel.mixer_track() == Some(track))
+                    })
+            }
+            None => track_ordinal == 0,
+        }
+    }
+
     fn link_midi_script_channel_to_mixer_track(
         &mut self,
         channel_index: u16,
@@ -23726,20 +23741,10 @@ impl DawUi {
         };
 
         let track = usize::from(track_index);
-        let track_assignment = i8::try_from(track_index)
-            .expect("MIDI script Mixer track indices are bounded to 0 through 127");
-        let track_exists = track == 0
-            || self.document.as_ref().is_some_and(|document| {
-                document
-                    .mixer_inserts()
-                    .iter()
-                    .any(|insert| insert.ordinal() == track)
-            });
-        if !track_exists {
-            self.status =
-                format!("MIDI script cannot link a channel to unrecognized Mixer track {track}");
+        let Ok(track_assignment) = i8::try_from(track_index) else {
+            self.status = format!("MIDI script Mixer track {track} is outside the supported range");
             return;
-        }
+        };
 
         let current_track = self.document.as_ref().and_then(|document| {
             let mut matches = document

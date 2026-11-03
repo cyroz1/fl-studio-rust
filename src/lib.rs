@@ -4714,6 +4714,16 @@ impl MixerRouteAudibility {
             &parameters,
             document.metadata().pan_law_raw(),
         );
+        for track in document
+            .channels()
+            .into_iter()
+            .filter_map(|channel| channel.mixer_track())
+            .filter(|track| *track > 0)
+        {
+            // A Channel Rack assignment can reference a default insert that has no saved
+            // Mixer event block. Treat that insert as the native default pass-through path.
+            routing.known_tracks.insert(track);
+        }
         routing.add_send_summaries(document.mixer_send_summaries().unwrap_or_default());
         for insert in &inserts {
             let Ok(track) = i8::try_from(insert.ordinal()) else {
