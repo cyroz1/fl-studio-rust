@@ -15411,7 +15411,8 @@ impl FlpDocument {
 
     /// Merges selected Pattern Clip scores into a new pattern assigned to the uppermost clip.
     /// The output clip spans the selected timeline range; repeated source scores are expanded
-    /// into that range and clipped at each source clip's endpoint. Raw Pattern controller
+    /// into that range, with note tails clipped at source endpoints only when the project
+    /// disables Play truncated notes in clips. Raw Pattern controller
     /// points are repeated and carried into the merged pattern without interpreting their
     /// channel or flags. Recognized Pattern time markers are repeated with their raw flags and
     /// meter/name events preserved. The receiver Pattern's name and color are retained. Original
@@ -15575,6 +15576,9 @@ impl FlpDocument {
             .unwrap_or("Merged")
             .to_owned();
         let pattern_color = receiver_pattern.color;
+        let play_truncated_notes_in_clips = self
+            .project_settings()
+            .is_none_or(|settings| settings.play_truncated_notes_in_clips);
         let mut merged_notes = Vec::<PatternNote>::new();
         let mut merged_controllers = Vec::<PatternController>::new();
         let mut merged_time_markers = Vec::<PlaylistPatternMergeMarker>::new();
@@ -15641,7 +15645,7 @@ impl FlpDocument {
                             .ok_or(FlpError::LengthOverflow)?,
                     )
                     .map_err(|_| FlpError::LengthOverflow)?;
-                    if merged_note.length > 0 {
+                    if merged_note.length > 0 && !play_truncated_notes_in_clips {
                         merged_note.length = u32::try_from(
                             u64::from(merged_note.length).min(clip_length - source_position),
                         )
