@@ -152,6 +152,7 @@ pub enum ScriptTransportAction {
         index: u16,
         flags: u32,
     },
+    SetMixerTrackSelectionSet(Vec<u16>),
     SetMixerTrackName {
         index: u16,
         name: String,
@@ -375,7 +376,9 @@ pub struct MidiScriptTransportState {
     pub selected_channel_id: AtomicU64,
     pub mixer_track_names: Mutex<Vec<String>>,
     pub mixer_track_recording_file_names: Mutex<Vec<String>>,
+    pub mixer_track_indices: Mutex<Vec<u16>>,
     pub mixer_selected_track: AtomicU64,
+    pub mixer_selected_tracks: Mutex<Vec<u16>>,
     pub mixer_track_colors: Mutex<Vec<u32>>,
     pub mixer_track_slot_colors: Mutex<Vec<Vec<Option<u32>>>>,
     pub mixer_track_peaks: Mutex<Vec<(f32, f32)>>,
@@ -448,7 +451,9 @@ impl Default for MidiScriptTransportState {
             selected_channel_id: AtomicU64::new(u64::MAX),
             mixer_track_names: Mutex::new(vec!["Master".to_owned()]),
             mixer_track_recording_file_names: Mutex::new(vec![String::new()]),
+            mixer_track_indices: Mutex::new(vec![0]),
             mixer_selected_track: AtomicU64::new(0),
+            mixer_selected_tracks: Mutex::new(vec![0]),
             mixer_track_colors: Mutex::new(vec![0]),
             mixer_track_slot_colors: Mutex::new(vec![vec![None; 10]]),
             mixer_track_peaks: Mutex::new(vec![(0.0, 0.0)]),
@@ -1023,6 +1028,18 @@ impl MidiScriptRuntime {
             .lock()
             .map(|names| names.clone())
             .unwrap_or_else(|_| vec!["Master".to_owned()]);
+        let mixer_selected_tracks = self
+            .transport_state
+            .mixer_selected_tracks
+            .lock()
+            .map(|tracks| tracks.clone())
+            .unwrap_or_default();
+        let mixer_track_indices = self
+            .transport_state
+            .mixer_track_indices
+            .lock()
+            .map(|indices| indices.clone())
+            .unwrap_or_else(|_| vec![0]);
         let mixer_track_recording_file_names = self
             .transport_state
             .mixer_track_recording_file_names
@@ -1268,6 +1285,12 @@ impl MidiScriptRuntime {
                     json!(self.transport_state.pattern_number.load(Ordering::Relaxed)),
                 );
                 transport_object.insert("pattern_entries".to_owned(), json!(pattern_entries));
+                transport_object
+                    .insert("mixer_track_indices".to_owned(), json!(mixer_track_indices));
+                transport_object.insert(
+                    "mixer_selected_tracks".to_owned(),
+                    json!(mixer_selected_tracks),
+                );
             }
             if let Some(transport_object) = transport.as_object_mut() {
                 transport_object.insert(
@@ -1927,6 +1950,20 @@ fn parse_transport_action(action: &Value) -> Result<ScriptTransportAction, Strin
             .and_then(|flags| u32::try_from(flags).ok())
             .ok_or_else(|| "MIDI script returned invalid Mixer track selection flags".to_owned())?;
         return Ok(ScriptTransportAction::SetMixerTrackSelection { index, flags });
+    }
+    if name == Some("set_mixer_track_selection_set") {
+        let indices = action["indices"]
+            .as_array()
+            .ok_or_else(|| "MIDI script returned an invalid Mixer track selection".to_owned())?
+            .iter()
+            .map(|index| {
+                index
+                    .as_u64()
+                    .and_then(|index| u16::try_from(index).ok())
+                    .ok_or_else(|| "MIDI script returned an invalid Mixer track index".to_owned())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(ScriptTransportAction::SetMixerTrackSelectionSet(indices));
     }
     if name == Some("select_channel") {
         let channel_id = action["channel_id"]

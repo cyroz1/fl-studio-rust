@@ -965,6 +965,9 @@ fn queue_script_transport_actions(
             ScriptTransportAction::SetMixerTrackSelection { index, flags } => {
                 MidiTransportCommand::SetMixerTrackSelection { index, flags }
             }
+            ScriptTransportAction::SetMixerTrackSelectionSet(indices) => {
+                MidiTransportCommand::SetMixerTrackSelectionSet(indices)
+            }
             ScriptTransportAction::SetMixerTrackName { index, name } => {
                 MidiTransportCommand::SetMixerTrackName { index, name }
             }
@@ -1205,6 +1208,7 @@ pub enum MidiTransportCommand {
         index: u16,
         flags: u32,
     },
+    SetMixerTrackSelectionSet(Vec<u16>),
     SetMixerTrackName {
         index: u16,
         name: String,
@@ -2035,6 +2039,9 @@ pub fn describe_event(event: MidiInputEvent) -> String {
             MidiTransportCommand::SelectChannel(_) => "MIDI script Select Channel".to_owned(),
             MidiTransportCommand::SetMixerTrackSelection { .. } => {
                 "MIDI script Select Mixer Track".to_owned()
+            }
+            MidiTransportCommand::SetMixerTrackSelectionSet(_) => {
+                "MIDI script Change Mixer Track Selection".to_owned()
             }
             MidiTransportCommand::SetMixerTrackName { .. } => {
                 "MIDI script Rename Mixer Track".to_owned()

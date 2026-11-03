@@ -5998,6 +5998,7 @@ struct DawUi {
     pattern_time_marker_name: String,
     pattern_time_signature_dialog_open: bool,
     selected_mixer_insert: Option<usize>,
+    selected_mixer_inserts: BTreeSet<usize>,
     mixer_scroll_to_track: Option<usize>,
     mixer_track_name_editor_requested: bool,
     open_help_manual_requested: bool,
@@ -9632,6 +9633,7 @@ impl DawUi {
             pattern_time_marker_name: String::new(),
             pattern_time_signature_dialog_open: false,
             selected_mixer_insert: None,
+            selected_mixer_inserts: BTreeSet::new(),
             mixer_scroll_to_track: None,
             mixer_track_name_editor_requested: false,
             open_help_manual_requested: false,
@@ -21661,11 +21663,15 @@ impl DawUi {
             selected_channel_id.map_or(u64::MAX, u64::from),
             Ordering::Relaxed,
         );
-        let mixer_track_names = self
+        let (mixer_track_names, mixer_track_indices) = self
             .document
             .as_ref()
             .map(|document| {
                 let inserts = document.mixer_inserts();
+                let indices = inserts
+                    .iter()
+                    .filter_map(|insert| u16::try_from(insert.ordinal()).ok())
+                    .collect::<Vec<_>>();
                 let max_ordinal = inserts
                     .iter()
                     .map(|insert| insert.ordinal())
@@ -21687,9 +21693,9 @@ impl DawUi {
                         *track_name = name.to_owned();
                     }
                 }
-                names
+                (names, indices)
             })
-            .unwrap_or_else(|| vec!["Master".to_owned()]);
+            .unwrap_or_else(|| (vec!["Master".to_owned()], vec![0]));
         let active_recording = self
             .audio_recording
             .as_ref()
@@ -21704,6 +21710,9 @@ impl DawUi {
         if let Ok(mut names) = self.midi_script_transport_state.mixer_track_names.lock() {
             *names = mixer_track_names;
         }
+        if let Ok(mut indices) = self.midi_script_transport_state.mixer_track_indices.lock() {
+            *indices = mixer_track_indices;
+        }
         if let Ok(mut file_names) = self
             .midi_script_transport_state
             .mixer_track_recording_file_names
@@ -21715,6 +21724,17 @@ impl DawUi {
             u64::try_from(self.selected_mixer_insert.unwrap_or(0)).unwrap_or(0),
             Ordering::Relaxed,
         );
+        if let Ok(mut selected_tracks) = self
+            .midi_script_transport_state
+            .mixer_selected_tracks
+            .lock()
+        {
+            *selected_tracks = self
+                .selected_mixer_inserts
+                .iter()
+                .filter_map(|index| u16::try_from(*index).ok())
+                .collect();
+        }
         let mixer_track_colors = self
             .document
             .as_ref()
@@ -23593,13 +23613,77 @@ impl DawUi {
             );
             return;
         }
-        let selection_changed = self.selected_mixer_insert != Some(track_ordinal);
+        let selection_changed = self.selected_mixer_inserts.len() != 1
+            || !self.selected_mixer_inserts.contains(&track_ordinal);
         self.selected_mixer_insert = Some(track_ordinal);
+        self.selected_mixer_inserts.clear();
+        self.selected_mixer_inserts.insert(track_ordinal);
         self.mixer_scroll_to_track =
             (flags & SCRIPT_MIXER_SCROLL_TO_MAKE_VISIBLE != 0).then_some(track_ordinal);
         self.midi_script_transport_state
             .mixer_selected_track
             .store(u64::from(index), Ordering::Relaxed);
+        if let Ok(mut selected_tracks) = self
+            .midi_script_transport_state
+            .mixer_selected_tracks
+            .lock()
+        {
+            *selected_tracks = vec![index];
+        }
+        if selection_changed
+            && !self.notify_midi_script_mixer_tracks_changed(&[], SCRIPT_HW_DIRTY_MIXER_SEL)
+        {
+            self.status
+                .push_str(" · MIDI script Mixer refresh callback queue is full");
+        }
+    }
+
+    fn set_midi_script_mixer_track_selection_set(&mut self, indices: Vec<u16>) {
+        let mut selected_inserts = BTreeSet::new();
+        for index in indices {
+            let track_ordinal = usize::from(index);
+            let track_exists = track_ordinal < MIXER_TRACK_METER_COUNT
+                && match self.document.as_ref() {
+                    Some(document) => document
+                        .mixer_inserts()
+                        .iter()
+                        .any(|insert| insert.ordinal() == track_ordinal),
+                    None => track_ordinal == 0,
+                };
+            if !track_exists {
+                self.status = format!(
+                    "MIDI script cannot select Mixer track {track_ordinal} without a recognized project record"
+                );
+                return;
+            }
+            selected_inserts.insert(track_ordinal);
+        }
+
+        let selection_changed = self.selected_mixer_inserts != selected_inserts;
+        self.selected_mixer_inserts = selected_inserts;
+        if let Some(primary_track) = self.selected_mixer_inserts.first().copied() {
+            self.selected_mixer_insert = Some(primary_track);
+            self.midi_script_transport_state
+                .mixer_selected_track
+                .store(u64::try_from(primary_track).unwrap_or(0), Ordering::Relaxed);
+        } else if self.selected_mixer_insert.is_none() {
+            let current_track = self
+                .midi_script_transport_state
+                .mixer_selected_track
+                .load(Ordering::Relaxed);
+            self.selected_mixer_insert = usize::try_from(current_track).ok();
+        }
+        if let Ok(mut selected_tracks) = self
+            .midi_script_transport_state
+            .mixer_selected_tracks
+            .lock()
+        {
+            *selected_tracks = self
+                .selected_mixer_inserts
+                .iter()
+                .filter_map(|index| u16::try_from(*index).ok())
+                .collect();
+        }
         if selection_changed
             && !self.notify_midi_script_mixer_tracks_changed(&[], SCRIPT_HW_DIRTY_MIXER_SEL)
         {
@@ -23666,10 +23750,7 @@ impl DawUi {
         });
         if current_track == Some(track_assignment) {
             if select {
-                self.selected_mixer_insert = Some(track);
-                self.midi_script_transport_state
-                    .mixer_selected_track
-                    .store(u64::from(track_index), Ordering::Relaxed);
+                self.set_midi_script_mixer_track_selection(u16::from(track_index), 0);
             }
             return;
         }
@@ -23682,10 +23763,7 @@ impl DawUi {
             Ok(()) => {
                 self.stop_project_playback();
                 if select {
-                    self.selected_mixer_insert = Some(track);
-                    self.midi_script_transport_state
-                        .mixer_selected_track
-                        .store(u64::from(track_index), Ordering::Relaxed);
+                    self.set_midi_script_mixer_track_selection(u16::from(track_index), 0);
                 }
                 self.dirty = true;
                 self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
@@ -66912,6 +66990,7 @@ impl DawUi {
         let automatic_pdc_enabled = document.mixer_automatic_pdc_enabled();
         let parameter_count = parameters.len();
         let selected_insert_before_ui = self.selected_mixer_insert;
+        let selected_inserts_before_ui = self.selected_mixer_inserts.clone();
         let mut dirty_mixer_tracks = BTreeSet::new();
         let mut mixer_refresh_flags = 0;
         let mut automatic_pdc_edit = None;
@@ -66966,11 +67045,30 @@ impl DawUi {
             ui.separator();
         }
 
+        self.selected_mixer_inserts
+            .retain(|ordinal| inserts.iter().any(|insert| insert.ordinal() == *ordinal));
+        let had_selected_insert = self.selected_mixer_insert.is_some();
         let active_insert = self
             .selected_mixer_insert
             .filter(|ordinal| inserts.iter().any(|insert| insert.ordinal() == *ordinal))
+            .filter(|ordinal| {
+                self.selected_mixer_inserts.is_empty()
+                    || self.selected_mixer_inserts.contains(ordinal)
+            })
+            .or_else(|| {
+                self.selected_mixer_inserts
+                    .iter()
+                    .copied()
+                    .find(|ordinal| inserts.iter().any(|insert| insert.ordinal() == *ordinal))
+            })
             .or_else(|| inserts.first().map(|insert| insert.ordinal()));
         self.selected_mixer_insert = active_insert;
+        if !had_selected_insert
+            && self.selected_mixer_inserts.is_empty()
+            && let Some(active_insert) = active_insert
+        {
+            self.selected_mixer_inserts.insert(active_insert);
+        }
         let mixer_scroll_to_track = self.mixer_scroll_to_track.take();
 
         let mut rename_edits = Vec::new();
@@ -67089,7 +67187,8 @@ impl DawUi {
                         .show(ui, |ui| {
                             ui.horizontal_top(|ui| {
                                 for insert in &inserts {
-                                    let selected = active_insert == Some(insert.ordinal());
+                                    let selected =
+                                        self.selected_mixer_inserts.contains(&insert.ordinal());
                                     let fill = if selected { PANEL_LIGHT } else { PANEL_DARK };
                                     let stroke = if selected {
                                         Stroke::new(1.5, GREEN)
@@ -67136,6 +67235,9 @@ impl DawUi {
                                                 {
                                                     self.selected_mixer_insert =
                                                         Some(insert.ordinal());
+                                                    self.selected_mixer_inserts.clear();
+                                                    self.selected_mixer_inserts
+                                                        .insert(insert.ordinal());
                                                 }
                                                 ui.horizontal(|ui| {
                                                     let flags_editable = insert.flags().is_some();
@@ -71568,7 +71670,9 @@ impl DawUi {
                 }
             }
         }
-        if selected_insert_before_ui != self.selected_mixer_insert {
+        if selected_insert_before_ui != self.selected_mixer_insert
+            || selected_inserts_before_ui != self.selected_mixer_inserts
+        {
             mixer_refresh_flags |= SCRIPT_HW_DIRTY_MIXER_SEL;
         }
         if !dirty_mixer_tracks.is_empty() || mixer_refresh_flags != 0 {
@@ -73662,6 +73766,9 @@ impl DawUi {
             }
             MidiTransportCommand::SetMixerTrackSelection { index, flags } => {
                 self.set_midi_script_mixer_track_selection(index, flags);
+            }
+            MidiTransportCommand::SetMixerTrackSelectionSet(indices) => {
+                self.set_midi_script_mixer_track_selection_set(indices);
             }
             MidiTransportCommand::SetMixerTrackName { index, name } => {
                 self.set_midi_script_mixer_track_name(index, name);

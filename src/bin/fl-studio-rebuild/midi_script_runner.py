@@ -1039,6 +1039,7 @@ def _mixer_set_track_number(index, flags=0):
     if not 0 <= flags <= 0xFFFFFFFF:
         raise ValueError("Mixer selection flags are outside the supported range")
     _active_transport_state["mixer_selected_track"] = index
+    _active_transport_state["mixer_selected_tracks"] = [index]
     _request_transport_action(
         {
             "action": "set_mixer_track_selection",
@@ -1054,7 +1055,47 @@ def _mixer_set_active_track(index):
 
 def _mixer_is_track_selected(index):
     index = _mixer_track_index(index)
-    return index == _mixer_track_number()
+    selected_tracks = _active_transport_state.get("mixer_selected_tracks")
+    if selected_tracks is None:
+        selected_tracks = [_mixer_track_number()]
+    return index in {int(track) for track in selected_tracks}
+
+
+def _mixer_set_track_selection_set(indices):
+    selected_tracks = sorted({_mixer_track_index(index) for index in indices})
+    _active_transport_state["mixer_selected_tracks"] = selected_tracks
+    if selected_tracks:
+        _active_transport_state["mixer_selected_track"] = selected_tracks[0]
+    _request_transport_action(
+        {
+            "action": "set_mixer_track_selection_set",
+            "indices": selected_tracks,
+        }
+    )
+
+
+def _mixer_select_track(index):
+    index = _mixer_track_index(index)
+    selected_tracks = _active_transport_state.get("mixer_selected_tracks")
+    if selected_tracks is None:
+        selected_tracks = [_mixer_track_number()]
+    selected_tracks = {int(track) for track in selected_tracks}
+    if index in selected_tracks:
+        selected_tracks.remove(index)
+    else:
+        selected_tracks.add(index)
+    _mixer_set_track_selection_set(selected_tracks)
+
+
+def _mixer_select_all_tracks():
+    track_indices = _active_transport_state.get("mixer_track_indices")
+    if track_indices is None:
+        track_indices = range(max(1, _mixer_track_count() - 1))
+    _mixer_set_track_selection_set(track_indices)
+
+
+def _mixer_deselect_all_tracks():
+    _mixer_set_track_selection_set(())
 
 
 def _mixer_route_summary(index, destIndex):
@@ -2768,6 +2809,9 @@ def _install_modules(script_name, device_name):
     mixer.trackNumber = _mixer_track_number
     mixer.setTrackNumber = _mixer_set_track_number
     mixer.isTrackSelected = _mixer_is_track_selected
+    mixer.selectTrack = _mixer_select_track
+    mixer.selectAll = _mixer_select_all_tracks
+    mixer.deselectAll = _mixer_deselect_all_tracks
     mixer.setActiveTrack = _mixer_set_active_track
     mixer.isTrackEnabled = _mixer_track_enabled
     mixer.isTrackMuteLock = _mixer_is_track_mute_lock

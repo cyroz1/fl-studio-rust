@@ -714,6 +714,7 @@ fn midi_input_thru_message(event: MidiInputEvent) -> Option<([u8; 3], usize)> {
             | MidiTransportCommand::TriggerPlaylistLiveClip { .. }
             | MidiTransportCommand::SelectChannel(_)
             | MidiTransportCommand::SetMixerTrackSelection { .. }
+            | MidiTransportCommand::SetMixerTrackSelectionSet(_)
             | MidiTransportCommand::SetMixerTrackName { .. }
             | MidiTransportCommand::SetMixerTrackColor { .. }
             | MidiTransportCommand::SetMixerSlotColor { .. }
