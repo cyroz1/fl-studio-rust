@@ -18,9 +18,10 @@ use flp_rebuild::sample_render::{
     SamplerPatternRenderOptions, render_audio_clips_to_wav, render_sampler_pattern_to_wav,
 };
 use flp_rebuild::vst2::{
-    Vst2AudioEffectRenderOptions, Vst2NoteRenderOptions, Vst2PatternRenderOptions,
-    inspect_vst2_plugin, probe_vst2_channel_state, render_audio_through_vst2_effect_to_wav,
-    render_vst2_note_to_wav, render_vst2_pattern_channel_to_wav, run_vst2_worker_if_requested,
+    Vst2AudioEffectRenderOptions, Vst2NoteRenderOptions, Vst2PatternParameterAutomation,
+    Vst2PatternParameterPoint, Vst2PatternRenderOptions, inspect_vst2_plugin,
+    probe_vst2_channel_state, render_audio_through_vst2_effect_to_wav, render_vst2_note_to_wav,
+    render_vst2_pattern_channel_to_wav_with_automation, run_vst2_worker_if_requested,
 };
 use flp_rebuild::vst3::{Vst3AudioEffectRenderOptions, Vst3HostRuntime, Vst3PatternRenderOptions};
 use flp_rebuild::{
@@ -32,7 +33,7 @@ use flp_rebuild::{
     ChannelSampleWindowEdit, ChannelSamplerFilterEdit, ChannelSortOrder,
     ChannelStretchSettingsEdit, ChannelType, ClawMachineOptions, FlamOptions, FlpDocument,
     FscControllerStreamImportOptions, FscScore, FstPreset, FstPresetKind, HumanizerOptions,
-    LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerParameterKind,
+    LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerParameterKind, PatternController,
     PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation, PlaylistClipEdit,
     PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit,
     ProjectSettingsEdit, QuantizeNoteLevels, QuantizeNoteMode, QuantizeNoteOptions,
@@ -6914,11 +6915,26 @@ fn render_pattern_vst2(
         .into_iter()
         .find(|state| state.channel_id() == channel_id)
         .ok_or_else(|| format!("channel {channel_id} has no saved VST plug-in state"))?;
-    let summary = render_vst2_pattern_channel_to_wav(
+    let parameter_automation = state
+        .vst_metadata()
+        .and_then(|metadata| metadata.fourcc())
+        .map(|fourcc| {
+            load_vst2_channel_pattern_parameter_automation(
+                project_path,
+                &pattern.controllers,
+                channel_id,
+                plugin_path,
+                fourcc,
+                pattern.id,
+            )
+        })
+        .unwrap_or_default();
+    let summary = render_vst2_pattern_channel_to_wav_with_automation(
         plugin_path,
         output_path,
         &state,
         &pattern.notes,
+        &parameter_automation,
         Vst2PatternRenderOptions {
             channel_id,
             ppq: document.header().ppq(),
@@ -6943,9 +6959,156 @@ fn render_pattern_vst2(
         summary.channels,
     );
     println!(
-        "render is a VST2 channel stem; FLP per-note pitch, pan, release, and modulation, Mixer routing, and effects are not applied"
+        "render is a VST2 channel stem with {} app-local Pattern Event parameter lanes; FLP per-note pitch, pan, release, and modulation, unlinked Pattern Event streams, Mixer routing, and effects are not applied",
+        parameter_automation.len(),
     );
     Ok(())
+}
+
+fn load_vst2_channel_pattern_parameter_automation(
+    project_path: &Path,
+    controllers: &[PatternController],
+    channel_id: u16,
+    plugin_path: &Path,
+    fourcc: &str,
+    pattern_id: u16,
+) -> Vec<Vst2PatternParameterAutomation> {
+    let Some(path) = pattern_vst2_channel_parameter_links_file() else {
+        return Vec::new();
+    };
+    let Ok(contents) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut automation = Vec::new();
+    for line in contents.lines() {
+        let Some(encoded) = line.strip_prefix("link=") else {
+            continue;
+        };
+        let mut fields = encoded.split('\t');
+        let Some(link_project_path) = fields.next().and_then(decode_hex_text) else {
+            continue;
+        };
+        let Some(link_pattern_id) = fields.next().and_then(|field| field.parse::<u16>().ok())
+        else {
+            continue;
+        };
+        let Some(stream_channel) = fields.next().and_then(|field| field.parse::<u8>().ok()) else {
+            continue;
+        };
+        let Some(stream_flags) = fields.next().and_then(|field| field.parse::<u8>().ok()) else {
+            continue;
+        };
+        let Some(link_channel_id) = fields.next().and_then(|field| field.parse::<u16>().ok())
+        else {
+            continue;
+        };
+        let Some(link_plugin_path) = fields.next().and_then(decode_hex_text) else {
+            continue;
+        };
+        let Some(link_fourcc) = fields.next().and_then(decode_hex_text) else {
+            continue;
+        };
+        let Some(parameter_id) = fields.next().and_then(|field| field.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(_parameter_name) = fields.next().and_then(decode_hex_text) else {
+            continue;
+        };
+        if fields.next().is_some()
+            || link_pattern_id != pattern_id
+            || link_channel_id != channel_id
+            || link_fourcc != fourcc
+            || !paths_equal(Path::new(&link_project_path), project_path)
+            || !paths_equal(Path::new(&link_plugin_path), plugin_path)
+        {
+            continue;
+        }
+        let points = controllers
+            .iter()
+            .filter(|point| point.channel == stream_channel && point.flags == stream_flags)
+            .filter_map(|point| {
+                let value = f32::from_bits(point.value_bits);
+                (value.is_finite() && (0.0..=1.0).contains(&value)).then_some(
+                    Vst2PatternParameterPoint {
+                        tick: u64::from(point.position),
+                        value: f64::from(value),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        if !points.is_empty() {
+            automation.push(Vst2PatternParameterAutomation {
+                parameter_id,
+                points,
+            });
+        }
+    }
+    automation
+}
+
+fn pattern_vst2_channel_parameter_links_file() -> Option<PathBuf> {
+    let root = if cfg!(target_os = "windows") {
+        env::var_os("APPDATA").map(PathBuf::from).or_else(|| {
+            env::var_os("USERPROFILE")
+                .map(PathBuf::from)
+                .map(|home| home.join("AppData").join("Roaming"))
+        })
+    } else if cfg!(target_os = "macos") {
+        env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join("Library").join("Application Support"))
+    } else {
+        env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| {
+                env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .map(|home| home.join(".config"))
+            })
+    }?;
+    Some(
+        root.join("fl-studio-rebuild")
+            .join("pattern-vst2-channel-parameter-links.txt"),
+    )
+}
+
+fn decode_hex_text(encoded: &str) -> Option<String> {
+    let bytes = encoded.as_bytes();
+    if bytes.is_empty() || bytes.len() % 2 != 0 {
+        return None;
+    }
+    let decoded = bytes
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = (pair[0] as char).to_digit(16)? as u8;
+            let low = (pair[1] as char).to_digit(16)? as u8;
+            Some((high << 4) | low)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    String::from_utf8(decoded)
+        .ok()
+        .filter(|value| !value.is_empty())
+}
+
+fn paths_equal(left: &Path, right: &Path) -> bool {
+    let left = fs::canonicalize(left).unwrap_or_else(|_| absolute_path(left));
+    let right = fs::canonicalize(right).unwrap_or_else(|_| absolute_path(right));
+    if cfg!(target_os = "windows") {
+        left.to_string_lossy()
+            .eq_ignore_ascii_case(&right.to_string_lossy())
+    } else {
+        left == right
+    }
+}
+
+fn absolute_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()
+            .map(|directory| directory.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    }
 }
 
 fn render_audio_vst3(

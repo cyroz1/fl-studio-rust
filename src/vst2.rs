@@ -105,6 +105,18 @@ pub struct Vst2PatternRenderOptions {
     pub note_pitch_offset_semitones: i16,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Vst2PatternParameterPoint {
+    pub tick: u64,
+    pub value: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Vst2PatternParameterAutomation {
+    pub parameter_id: u32,
+    pub points: Vec<Vst2PatternParameterPoint>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Vst2PatternRenderSummary {
     pub plugin_name: String,
@@ -278,6 +290,17 @@ struct ScheduledVst2MidiEvent {
     frame: u64,
     priority: u8,
     data: [u8; 3],
+}
+
+#[derive(Clone, Copy)]
+struct ScheduledVst2ParameterPoint {
+    frame: u64,
+    value: f64,
+}
+
+struct ScheduledVst2ParameterLane {
+    parameter_id: u32,
+    points: Vec<ScheduledVst2ParameterPoint>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1907,6 +1930,26 @@ pub fn render_vst2_pattern_channel_to_wav(
     notes: &[PatternNote],
     options: Vst2PatternRenderOptions,
 ) -> Result<Vst2PatternRenderSummary, String> {
+    render_vst2_pattern_channel_to_wav_with_automation(
+        plugin_path,
+        output_path,
+        state,
+        notes,
+        &[],
+        options,
+    )
+}
+
+/// Render one FLP Pattern channel through its matching VST2 plug-in, saved field-53 state, and
+/// optional normalized parameter automation lanes.
+pub fn render_vst2_pattern_channel_to_wav_with_automation(
+    plugin_path: impl AsRef<Path>,
+    output_path: impl AsRef<Path>,
+    state: &ChannelPluginState,
+    notes: &[PatternNote],
+    parameter_automation: &[Vst2PatternParameterAutomation],
+    options: Vst2PatternRenderOptions,
+) -> Result<Vst2PatternRenderSummary, String> {
     let plugin_path = plugin_path.as_ref();
     let output_path = output_path.as_ref();
     if state.channel_id() != options.channel_id {
@@ -1926,6 +1969,8 @@ pub fn render_vst2_pattern_channel_to_wav(
         return Err("sample rate must be between 8,000 and 384,000 Hz".to_owned());
     }
     let (mut scheduled_events, note_count) = prepare_vst2_pattern_events(notes, options)?;
+    let scheduled_parameter_lanes =
+        prepare_vst2_pattern_parameter_automation(parameter_automation, options)?;
     if note_count == 0 {
         return Err(format!(
             "pattern channel {} has no unmuted notes to render",
@@ -2012,6 +2057,40 @@ pub fn render_vst2_pattern_channel_to_wav(
     for block_start in (0..process_frames).step_by(quantum) {
         let block_end = (block_start + quantum) as u64;
         let mut events = Vec::new();
+        for lane in &scheduled_parameter_lanes {
+            if let Some(value) =
+                vst2_pattern_parameter_value_at_frame(&lane.points, block_start as u64)
+            {
+                events.push(AudioEvent {
+                    sample_offset: 0,
+                    bus: 0,
+                    data: EventData::Parameter {
+                        id: lane.parameter_id,
+                        value,
+                    },
+                });
+            }
+            let first_in_block = lane
+                .points
+                .partition_point(|point| point.frame <= block_start as u64);
+            for point in &lane.points[first_in_block..] {
+                if point.frame >= block_end {
+                    break;
+                }
+                let sample_offset =
+                    u32::try_from(point.frame - block_start as u64).map_err(|_| {
+                        "VST2 Pattern parameter offset is outside the audio block".to_owned()
+                    })?;
+                events.push(AudioEvent {
+                    sample_offset,
+                    bus: 0,
+                    data: EventData::Parameter {
+                        id: lane.parameter_id,
+                        value: point.value,
+                    },
+                });
+            }
+        }
         while scheduled_events
             .get(next_event)
             .is_some_and(|event| event.frame < block_end)
@@ -2022,9 +2101,10 @@ pub fn render_vst2_pattern_channel_to_wav(
             events.push(AudioEvent::midi(offset, 0, event.data));
             next_event += 1;
         }
+        events.sort_by_key(|event| event.sample_offset);
         if events.len() > MAX_EVENTS {
             return Err(format!(
-                "VST2 worker accepts at most {MAX_EVENTS} MIDI events in one audio block"
+                "VST2 worker accepts at most {MAX_EVENTS} events in one audio block"
             ));
         }
         let inputs = (0..input_channel_count)
@@ -2207,6 +2287,80 @@ fn prepare_vst2_pattern_events(
     }
     events.sort_by_key(|event| (event.frame, event.priority));
     Ok((events, note_count))
+}
+
+fn prepare_vst2_pattern_parameter_automation(
+    automation: &[Vst2PatternParameterAutomation],
+    options: Vst2PatternRenderOptions,
+) -> Result<Vec<ScheduledVst2ParameterLane>, String> {
+    let mut parameter_ids = BTreeSet::new();
+    let mut lanes = Vec::with_capacity(automation.len());
+    for lane in automation {
+        if !parameter_ids.insert(lane.parameter_id) {
+            return Err(format!(
+                "VST2 parameter {} has more than one Pattern Event link",
+                lane.parameter_id
+            ));
+        }
+        let mut points = Vec::with_capacity(lane.points.len());
+        for point in &lane.points {
+            if !point.value.is_finite() || !(0.0..=1.0).contains(&point.value) {
+                return Err(
+                    "VST2 Pattern parameter values must be finite and normalized to 0..=1"
+                        .to_owned(),
+                );
+            }
+            let frame = point.tick as f64 * 60.0 * f64::from(options.sample_rate)
+                / (f64::from(options.ppq) * options.tempo_bpm);
+            if !frame.is_finite() || frame < 0.0 || frame.round() > u64::MAX as f64 {
+                return Err(
+                    "VST2 Pattern parameter timing is outside the renderable range".to_owned(),
+                );
+            }
+            points.push(ScheduledVst2ParameterPoint {
+                frame: frame.round() as u64,
+                value: point.value,
+            });
+        }
+        points.sort_by_key(|point| point.frame);
+        let mut unique_points: Vec<ScheduledVst2ParameterPoint> = Vec::with_capacity(points.len());
+        for point in points {
+            if let Some(previous) = unique_points.last_mut()
+                && previous.frame == point.frame
+            {
+                previous.value = point.value;
+            } else {
+                unique_points.push(point);
+            }
+        }
+        if !unique_points.is_empty() {
+            lanes.push(ScheduledVst2ParameterLane {
+                parameter_id: lane.parameter_id,
+                points: unique_points,
+            });
+        }
+    }
+    Ok(lanes)
+}
+
+fn vst2_pattern_parameter_value_at_frame(
+    points: &[ScheduledVst2ParameterPoint],
+    frame: u64,
+) -> Option<f64> {
+    let previous_index = points
+        .partition_point(|point| point.frame <= frame)
+        .checked_sub(1)?;
+    let previous = points.get(previous_index)?;
+    if previous.frame == frame {
+        return Some(previous.value);
+    }
+    let next = points.get(previous_index + 1)?;
+    let span = next.frame.saturating_sub(previous.frame);
+    if span == 0 {
+        return Some(next.value);
+    }
+    let amount = (frame - previous.frame) as f64 / span as f64;
+    Some(previous.value + (next.value - previous.value) * amount)
 }
 
 fn save_worker_vst2_state(
