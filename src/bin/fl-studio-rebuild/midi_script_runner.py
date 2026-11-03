@@ -1689,6 +1689,10 @@ def _get_rec_ppq():
     return max(1, int(_active_transport_state.get("ticks_per_quarter", 96)))
 
 
+def _get_rec_pps():
+    return max(1, _get_rec_ppq() // 4)
+
+
 def _get_rec_ppb():
     numerator = max(1, int(_active_transport_state.get("time_signature_numerator", 4)))
     return _get_rec_ppq() * numerator
@@ -2715,6 +2719,7 @@ def _install_modules(script_name, device_name):
     mixer = _module("mixer")
     mixer.getCurrentTempo = _get_current_tempo
     mixer.setCurrentTempo = _set_current_tempo
+    mixer.getRecPPS = _get_rec_pps
 
     channels = _module("channels")
     channels.getShuffle = _get_shuffle
