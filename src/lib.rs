@@ -15416,7 +15416,8 @@ impl FlpDocument {
     /// channel or flags. Recognized Pattern time markers are repeated with their raw flags and
     /// meter/name events preserved. The receiver Pattern's name and color are retained. Original
     /// patterns remain unchanged. Unknown per-pattern data and scaled clips are rejected because
-    /// their score timing or payload is not modeled.
+    /// their score timing or payload is not modeled. Trimmed or unrecognized Pattern source
+    /// windows are rejected because this merge path only expands full-source clips.
     pub fn merge_playlist_pattern_clips(
         &mut self,
         arrangement_id: u16,
@@ -15476,10 +15477,7 @@ impl FlpDocument {
                     "a selected Pattern Clip has an unsupported Playlist track index",
                 ));
             }
-            if clip
-                .scale
-                .is_some_and(|scale| !scale.is_finite() || (scale - 1.0).abs() > 1e-9)
-            {
+            if !clip.has_default_scale() {
                 return Err(FlpError::UnsupportedEdit(
                     "Pattern Clips with a non-default or invalid scale cannot be merged",
                 ));
@@ -15487,6 +15485,11 @@ impl FlpDocument {
             if clip.length_ticks == 0 {
                 return Err(FlpError::UnsupportedEdit(
                     "selected Pattern Clips must have nonzero timeline lengths",
+                ));
+            }
+            if clip.recognized_pattern_source_window_ticks() != Some((0, clip.length_ticks)) {
+                return Err(FlpError::UnsupportedEdit(
+                    "merging Pattern Clips with a trimmed or unrecognized source window is unsupported",
                 ));
             }
             let clip_start = u64::from(clip.position_ticks);
